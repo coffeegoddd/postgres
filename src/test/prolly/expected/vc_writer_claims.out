@@ -12,7 +12,7 @@ ERROR:  branch "main" has uncommitted changes by writer "alice"
 step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
 committed
 ---------
-       66
+       42
 (1 row)
 
 step b_insert: INSERT INTO vwc.t VALUES (4, 'bob');
@@ -50,7 +50,7 @@ alice
 step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
 committed
 ---------
-       66
+       42
 (1 row)
 
 
@@ -123,7 +123,7 @@ step a2_insert: INSERT INTO vwc.t VALUES (3, 'alice too');
 step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
 committed
 ---------
-       66
+       42
 (1 row)
 
 step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';
@@ -136,7 +136,7 @@ step a2_commit: COMMIT;
 step a_dolt: SELECT length(dolt_commit('-m', 'alice')::text) AS committed;
 committed
 ---------
-       66
+       42
 (1 row)
 
 step a_owner: SELECT owner FROM dolt_branches() WHERE name = 'main';

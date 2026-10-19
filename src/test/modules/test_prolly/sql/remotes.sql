@@ -24,7 +24,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 
@@ -197,7 +197,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 SELECT pg_temp.err($$SELECT dolt_fetch()$$);
@@ -223,7 +223,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 SELECT dolt_remote('add', 'bad', :'url_bad');
@@ -250,7 +250,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 CREATE ROLE regress_remote_user;

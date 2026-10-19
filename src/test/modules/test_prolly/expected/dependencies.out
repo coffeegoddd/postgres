@@ -26,7 +26,7 @@ CREATE TABLE dep.plain (id int PRIMARY KEY, n numeric, t text);
 SELECT length(dolt_commit('-Am', 'plain')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT test_commit_dependencies(dolt_hashof('HEAD'));	-- none: built-ins only
@@ -45,7 +45,7 @@ ALTER FUNCTION dep.f() DEPENDS ON EXTENSION hstore;
 SELECT length(dolt_commit('-Am', 'deps')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.deps();
@@ -85,7 +85,7 @@ HINT:  Pass --allow-empty to commit anyway.
 SELECT length(dolt_commit('--allow-empty', '-Am', 'at 1.6')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.deps();
@@ -120,7 +120,7 @@ CREATE TABLE dep.u (id int PRIMARY KEY, m dep_util.mood);
 SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.deps();					-- described now: citext 1.6
@@ -145,7 +145,7 @@ ALTER TABLE dep.t ALTER COLUMN c DROP DEFAULT;	-- the function no longer needed
 SELECT length(dolt_commit('-Am', 'no default')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER EXTENSION citext UPDATE TO '1.8';
@@ -177,7 +177,7 @@ INSERT INTO dep.t (id, m) VALUES (1, 'ok');
 SELECT length(dolt_commit('-Am', 'ltree at 1.2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('dep_side');
@@ -191,7 +191,7 @@ CREATE TABLE dep.c2 (id int PRIMARY KEY, p ltree);
 SELECT length(dolt_commit('-Am', 'ltree at 1.3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -430,7 +430,7 @@ drop cascades to table dep.c
 SELECT length(dolt_commit('-Am', 'dep gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'dep_side');

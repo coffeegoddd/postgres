@@ -20,7 +20,7 @@ INSERT INTO cl.t SELECT g, 'v' || g FROM generate_series(1, 200) g;
 SELECT length(dolt_commit('-Am', 'cl 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('side');
@@ -51,7 +51,7 @@ UPDATE cl.t SET v = 'side' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'on side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_push('origin', 'side') AS pushed;
@@ -313,7 +313,7 @@ INSERT INTO cl.m VALUES (1, 'ok');
 SELECT length(dolt_commit('-Am', 'moods')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_remote('add', 'dep', :'url_dep');
@@ -381,7 +381,7 @@ drop cascades to table cl.m
 SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP TYPE public.cl_mood;
@@ -399,7 +399,7 @@ INSERT INTO t VALUES (1);
 SELECT length(dolt_commit('-Am', 'p 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_remote('add', 'origin', :'url_pub');
@@ -620,7 +620,7 @@ CREATE TABLE app.a (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'app')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('dev');
@@ -634,7 +634,7 @@ NOTICE:  drop cascades to table app.a
 SELECT length(dolt_commit('-Am', 'app gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_remote('add', 'origin', :'url_pub');
@@ -709,7 +709,7 @@ CREATE TABLE s.a (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'bare')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('bare');
@@ -723,7 +723,7 @@ CREATE SCHEMA public VERSIONED;
 SELECT length(dolt_commit('-Am', 'pub')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_remote('add', 'origin', :'url_mix');

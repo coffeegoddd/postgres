@@ -31,7 +31,7 @@ ProllyRefsEndHook prolly_refs_end_hook = NULL;
 
 static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_CHUNKER] = "bytes",
-	[PROLLY_IFACE_CONTENT_HASH] = "sha256",
+	[PROLLY_IFACE_CONTENT_HASH] = "blake3",
 	[PROLLY_IFACE_KEY_ENCODER] = "ordered",
 	[PROLLY_IFACE_VALUE_ENCODER] = "canonical",
 	[PROLLY_IFACE_TABLE_KEYING] = "pk_or_prefix",

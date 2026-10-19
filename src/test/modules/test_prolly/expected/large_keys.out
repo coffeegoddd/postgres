@@ -1,6 +1,6 @@
 -- A row's key is bounded as the row is written.  A commit keys each row of
 -- a table with a primary key by the key columns, encoded and uncompressed,
--- and a tree holds keys of at most 32712 bytes (a text key: 32710 bytes of
+-- and a tree holds keys of at most 32724 bytes (a text key: 32722 bytes of
 -- text, a marker and a terminator).  btree takes longer keys, compressed,
 -- so a row with one used to be written, and every commit of its branch
 -- failed after.  Now the write is refused: INSERT, COPY, UPDATE, and a
@@ -13,14 +13,14 @@ CREATE SCHEMA lk VERSIONED;
 CREATE TABLE lk.t (k text PRIMARY KEY, n int);
 -- The issue's row, and the bound's edges.
 INSERT INTO lk.t VALUES (repeat('z', 100000), 0);
-ERROR:  primary key of 100002 bytes exceeds the maximum 32712 for prolly table "t"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 100002 bytes exceeds the maximum 32724 for prolly table "t"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
-INSERT INTO lk.t VALUES (repeat('z', 32711), 0);
-ERROR:  primary key of 32713 bytes exceeds the maximum 32712 for prolly table "t"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+INSERT INTO lk.t VALUES (repeat('z', 32723), 0);
+ERROR:  primary key of 32725 bytes exceeds the maximum 32724 for prolly table "t"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
-INSERT INTO lk.t SELECT chr(96 + g) || repeat('a', 32709), g
+INSERT INTO lk.t SELECT chr(96 + g) || repeat('a', 32721), g
   FROM generate_series(1, 6) g;
 SELECT dolt_commit('-Am', 'longest keys') IS NOT NULL AS committed;
  committed 
@@ -31,21 +31,21 @@ SELECT dolt_commit('-Am', 'longest keys') IS NOT NULL AS committed;
 SELECT count(*), min(length(k)), max(length(k)) FROM lk.t;
  count |  min  |  max  
 -------+-------+-------
-     6 | 32710 | 32710
+     6 | 32722 | 32722
 (1 row)
 
 -- An update to a key too long; others go on, the longest keys' rows too.
 UPDATE lk.t SET k = k || 'x' WHERE n = 1;
-ERROR:  primary key of 32713 bytes exceeds the maximum 32712 for prolly table "t"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32725 bytes exceeds the maximum 32724 for prolly table "t"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 UPDATE lk.t SET n = n + 10;
-INSERT INTO lk.t VALUES ('a' || repeat('a', 32709), 0)
+INSERT INTO lk.t VALUES ('a' || repeat('a', 32721), 0)
   ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n;
-INSERT INTO lk.t VALUES ('b' || repeat('a', 32710), 0)
+INSERT INTO lk.t VALUES ('b' || repeat('a', 32722), 0)
   ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n;
-ERROR:  primary key of 32713 bytes exceeds the maximum 32712 for prolly table "t"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32725 bytes exceeds the maximum 32724 for prolly table "t"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 SELECT dolt_commit('-am', 'updated') IS NOT NULL AS committed;
  committed 
@@ -58,10 +58,10 @@ SELECT dolt_commit('-am', 'updated') IS NOT NULL AS committed;
 \set long_file :abs_builddir '/results/large_keys_long.data'
 \set ok_file :abs_builddir '/results/large_keys_ok.data'
 COPY (SELECT 'c' || repeat('q', 40000), 1) TO :'long_file';
-COPY (SELECT 'c' || repeat('q', 32709), 1) TO :'ok_file';
+COPY (SELECT 'c' || repeat('q', 32721), 1) TO :'ok_file';
 COPY lk.t FROM :'long_file';
-ERROR:  primary key of 40003 bytes exceeds the maximum 32712 for prolly table "t"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 40003 bytes exceeds the maximum 32724 for prolly table "t"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 CONTEXT:  COPY t, line 2
 COPY lk.t FROM :'ok_file';
@@ -69,14 +69,14 @@ COPY lk.t FROM :'ok_file';
 CREATE TABLE lk.multi (a int, b text, c text, PRIMARY KEY (a, b, c));
 INSERT INTO lk.multi VALUES (1, repeat('m', 16000), repeat('m', 16000));
 INSERT INTO lk.multi VALUES (2, repeat('m', 20000), repeat('m', 20000));
-ERROR:  primary key of 40009 bytes exceeds the maximum 32712 for prolly table "multi"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 40009 bytes exceeds the maximum 32724 for prolly table "multi"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 CREATE TABLE lk.bytes (b bytea PRIMARY KEY);
-INSERT INTO lk.bytes VALUES (decode(repeat('ab', 32707), 'hex'));
-INSERT INTO lk.bytes VALUES (decode(repeat('ab', 32708), 'hex'));
-ERROR:  primary key of 32713 bytes exceeds the maximum 32712 for prolly table "bytes"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+INSERT INTO lk.bytes VALUES (decode(repeat('ab', 32719), 'hex'));
+INSERT INTO lk.bytes VALUES (decode(repeat('ab', 32720), 'hex'));
+ERROR:  primary key of 32725 bytes exceeds the maximum 32724 for prolly table "bytes"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 -- Rows keyed by content take any size: a table without a primary key, and
 -- one whose key is deferrable (it may hold duplicates until commit).
@@ -88,8 +88,8 @@ INSERT INTO lk.deferred VALUES (repeat('d', 100000));
 -- checks them (a column's missing value too), and the rewrite of a column
 -- type rebuilds it.
 ALTER TABLE lk.none ADD PRIMARY KEY (k);
-ERROR:  primary key of 100002 bytes exceeds the maximum 32712 for prolly table "none"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 100002 bytes exceeds the maximum 32724 for prolly table "none"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 CREATE TABLE lk.added (a int);
 INSERT INTO lk.added VALUES (1);
@@ -102,26 +102,26 @@ SELECT atthasmissing FROM pg_attribute  -- (the row holds no k: its default)
 (1 row)
 
 ALTER TABLE lk.added ADD PRIMARY KEY (k);
-ERROR:  primary key of 40002 bytes exceeds the maximum 32712 for prolly table "added"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 40002 bytes exceeds the maximum 32724 for prolly table "added"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 CREATE TABLE lk.retyped (k varchar(40000) PRIMARY KEY);
 INSERT INTO lk.retyped VALUES (repeat('r', 30000));
 ALTER TABLE lk.retyped ALTER COLUMN k TYPE text USING k || k;
-ERROR:  primary key of 60002 bytes exceeds the maximum 32712 for prolly table "retyped"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 60002 bytes exceeds the maximum 32724 for prolly table "retyped"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 -- ... or of a unique index built before.
 CREATE UNIQUE INDEX none_k ON lk.none (k);
 ALTER TABLE lk.none ADD CONSTRAINT none_pk PRIMARY KEY USING INDEX none_k;
 NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "none_k" to "none_pk"
-ERROR:  primary key of 100002 bytes exceeds the maximum 32712 for prolly table "none"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 100002 bytes exceeds the maximum 32724 for prolly table "none"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 ALTER TABLE lk.deferred DROP CONSTRAINT deferred_pkey;
 CREATE UNIQUE INDEX deferred_k ON lk.deferred (k);
 DELETE FROM lk.deferred;
-INSERT INTO lk.deferred VALUES (repeat('d', 32710));
+INSERT INTO lk.deferred VALUES (repeat('d', 32722));
 ALTER TABLE lk.deferred ADD CONSTRAINT deferred_pk PRIMARY KEY USING INDEX deferred_k;
 NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "deferred_k" to "deferred_pk"
 -- None of it stops a commit, and every row comes back from it.
@@ -140,12 +140,12 @@ UNION ALL SELECT 'retyped', count(*), max(length(k)) FROM lk.retyped
 ORDER BY 1;
    tbl    | count |  max   
 ----------+-------+--------
- bytes    |     1 |  32707
- deferred |     1 |  32710
+ bytes    |     1 |  32719
+ deferred |     1 |  32722
  multi    |     1 |  32000
  none     |     1 | 100000
  retyped  |     1 |  30000
- t        |     7 |  32710
+ t        |     7 |  32722
 (6 rows)
 
 SELECT dolt_hashof('main') AS head \gset
@@ -158,7 +158,7 @@ SELECT dolt_reset('--hard', 'HEAD~2') IS NOT NULL AS reset;
 SELECT count(*), max(length(k)) FROM lk.t;
  count |  max  
 -------+-------
-     6 | 32710
+     6 | 32722
 (1 row)
 
 SELECT dolt_reset('--hard', :'head') IS NOT NULL AS reset;
@@ -170,13 +170,13 @@ SELECT dolt_reset('--hard', :'head') IS NOT NULL AS reset;
 SELECT count(*), sum(length(k)) FROM lk.t;
  count |  sum   
 -------+--------
-     7 | 228970
+     7 | 229054
 (1 row)
 
 SELECT count(*), max(length(k)) FROM lk.deferred;
  count |  max  
 -------+-------
-     1 | 32710
+     1 | 32722
 (1 row)
 
 -- A commit made before the bound was may hold keys a little longer than
@@ -187,12 +187,12 @@ SELECT count(*), max(length(k)) FROM lk.deferred;
 -- applier writes them.)  Written anew, they're refused as any row; updated
 -- keeping their keys, they aren't.
 CREATE TABLE lk.held (k text PRIMARY KEY, n int);
-INSERT INTO lk.held VALUES (repeat('h', 32715), 0);
-ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+INSERT INTO lk.held VALUES (repeat('h', 32727), 0);
+ERROR:  primary key of 32729 bytes exceeds the maximum 32724 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 SELECT test_write_held_rows($$INSERT INTO lk.held
-  SELECT chr(96 + g) || repeat('h', 32714), g FROM generate_series(1, 7) g$$);
+  SELECT chr(96 + g) || repeat('h', 32726), g FROM generate_series(1, 7) g$$);
  test_write_held_rows 
 ----------------------
  
@@ -227,7 +227,7 @@ SELECT dolt_reset('--hard', 'HEAD~1') IS NOT NULL AS reset;
 SELECT count(*), max(octet_length(k)) FROM lk.held;
  count |  max  
 -------+-------
-     7 | 32715
+     7 | 32727
 (1 row)
 
 SELECT dolt_reset('--hard', :'deleted') IS NOT NULL AS reset;
@@ -251,7 +251,7 @@ SELECT dolt_checkout('held_old') IS NOT NULL AS checked_out;
 SELECT count(*), max(octet_length(k)) FROM lk.held;
  count |  max  
 -------+-------
-     7 | 32715
+     7 | 32727
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS checked_out;
@@ -269,7 +269,7 @@ SELECT dolt_revert('HEAD') IS NOT NULL AS reverted;
 SELECT count(*), max(octet_length(k)) FROM lk.held;
  count |  max  
 -------+-------
-     7 | 32715
+     7 | 32727
 (1 row)
 
 SELECT dolt_hashof('main') AS reverted \gset
@@ -288,27 +288,27 @@ SELECT dolt_cherry_pick(:'reverted') IS NOT NULL AS picked;
 SELECT count(*), max(octet_length(k)) FROM lk.held;
  count |  max  
 -------+-------
-     7 | 32715
+     7 | 32727
 (1 row)
 
 UPDATE lk.held SET n = n + 10 WHERE n <= 2;
-INSERT INTO lk.held VALUES ('c' || repeat('h', 32714), 3)
+INSERT INTO lk.held VALUES ('c' || repeat('h', 32726), 3)
   ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n + 20;
 UPDATE lk.held SET k = k || 'h' WHERE n = 4;
-ERROR:  primary key of 32718 bytes exceeds the maximum 32712 for prolly table "held"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32730 bytes exceeds the maximum 32724 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 UPDATE lk.held SET k = left(k, 32000) WHERE n = 5;
 DELETE FROM lk.held WHERE n = 11;
 SELECT n, octet_length(k) FROM lk.held ORDER BY n;
  n  | octet_length 
 ----+--------------
-  4 |        32715
+  4 |        32727
   5 |        32000
-  6 |        32715
-  7 |        32715
- 12 |        32715
- 23 |        32715
+  6 |        32727
+  7 |        32727
+ 12 |        32727
+ 23 |        32727
 (6 rows)
 
 -- Nor for what keeps their keys: REINDEX (concurrently too), VACUUM FULL,
@@ -323,14 +323,14 @@ ALTER TABLE lk.held ADD COLUMN r float8 DEFAULT random();
 SELECT count(*), max(octet_length(k)), count(r) FROM lk.held;
  count |  max  | count 
 -------+-------+-------
-     6 | 32715 |     6
+     6 | 32727 |     6
 (1 row)
 
 BEGIN;
 ALTER TABLE lk.held DROP CONSTRAINT held_pkey;
 ALTER TABLE lk.held ADD PRIMARY KEY (k);
-ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32729 bytes exceeds the maximum 32724 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 ROLLBACK;
 BEGIN;
@@ -338,17 +338,17 @@ CREATE UNIQUE INDEX held_k ON lk.held (k);
 ALTER TABLE lk.held DROP CONSTRAINT held_pkey;
 ALTER TABLE lk.held ADD CONSTRAINT held_pk PRIMARY KEY USING INDEX held_k;
 NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "held_k" to "held_pk"
-ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32729 bytes exceeds the maximum 32724 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 ROLLBACK;
 ALTER TABLE lk.held ALTER COLUMN k TYPE text USING k || '';
-ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32729 bytes exceeds the maximum 32724 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 ALTER TABLE lk.held ALTER COLUMN k TYPE text COLLATE "C";
-ERROR:  primary key of 32717 bytes exceeds the maximum 32712 for prolly table "held"
-DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32712 bytes.
+ERROR:  primary key of 32729 bytes exceeds the maximum 32724 for prolly table "held"
+DETAIL:  A commit keys each row by its primary key, encoded and uncompressed, and holds keys of at most 32724 bytes.
 HINT:  Key the table by a shorter value, such as a hash of this one.
 ALTER TABLE lk.held DROP COLUMN r;
 SELECT dolt_commit('-am', 'one held key deleted') IS NOT NULL AS committed;

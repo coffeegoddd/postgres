@@ -151,7 +151,7 @@ sql(q{SELECT injection_points_wakeup('prolly-gc-kept')});
 $win->query_until(qr/collected/, '');
 $win->quit;
 my $named_out = $namer->query_until(qr/named/, '');
-my $late_root = ($named_out =~ /([0-9a-f]{64})/) ? $1 : '';
+my $late_root = ($named_out =~ /([0-9a-f]{40})/) ? $1 : '';
 ok($namer->{stderr} =~ /concurrent collection of the chunk store/
 	  || ($late_root ne '' && has($late_root) eq 't'),
 	'a tree named in the window fails or is kept, never lost');

@@ -21,7 +21,7 @@ INSERT INTO kv.ok VALUES (1, 1), (2, 2);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('theirs_u');
@@ -76,7 +76,7 @@ INSERT INTO kv.sibling VALUES (1);
 SELECT length(dolt_commit('-am', 'theirs u')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('theirs_s');
@@ -91,7 +91,7 @@ INSERT INTO kv.sibling VALUES (1);
 SELECT length(dolt_commit('-am', 'theirs s')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('theirs_c');
@@ -106,7 +106,7 @@ INSERT INTO kv.sibling VALUES (1);
 SELECT length(dolt_commit('-am', 'theirs c')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('theirs_d');
@@ -121,7 +121,7 @@ INSERT INTO kv.sibling VALUES (1);
 SELECT length(dolt_commit('-am', 'theirs d')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -227,7 +227,7 @@ INSERT INTO kv.sibling VALUES (1);
 SELECT length(dolt_commit('-am', 'theirs ok')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -276,7 +276,7 @@ SET LOCAL dolt.allow_commit_conflicts = on;
 SELECT length(dolt_commit('-am', 'merged with a violation')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;

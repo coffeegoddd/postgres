@@ -7,21 +7,21 @@ INSERT INTO rv.t VALUES (1, 'a');
 SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO rv.t VALUES (2, 'b');
 SELECT length(dolt_commit('-am', 'two')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO rv.t VALUES (3, 'c');
 SELECT length(dolt_commit('-am', 'three')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS three \gset
@@ -66,14 +66,14 @@ UPDATE rv.t SET c1 = 'b2' WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'four')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE rv.t SET c1 = 'c2' WHERE pk = 3;
 SELECT length(dolt_commit('-am', 'five')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS five \gset
@@ -197,7 +197,7 @@ UPDATE rv.t SET c1 = 'a6' WHERE pk = 1;
 SELECT length(dolt_commit('-am', 'six')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS six \gset
@@ -205,7 +205,7 @@ INSERT INTO rv.t VALUES (2, 'b7');
 SELECT length(dolt_commit('-am', 'seven')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_revert('HEAD~1', 'HEAD~2'))[1:4] AS stopped;

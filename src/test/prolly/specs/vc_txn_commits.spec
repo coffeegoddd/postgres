@@ -51,7 +51,7 @@ teardown
 session a
 step a_begin	{ BEGIN; }
 step a_tim		{ UPDATE vtc.users SET name = 'tim2' WHERE id = 1; }
-step a_dcommit	{ SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed; }
+step a_dcommit	{ SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed; }
 step a_commit	{ COMMIT; }
 step a_merge	{ SELECT (dolt_merge('vtc_side'))[2:4]; }
 step a_pick		{ SELECT (dolt_cherry_pick('vtc_side'))[2:4]; }
@@ -69,7 +69,7 @@ session b
 step b_begin	{ BEGIN; }
 step b_rr		{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step b_jim		{ UPDATE vtc.users SET name = 'jim2' WHERE id = 2; }
-step b_dcommit	{ SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 64 AS committed; }
+step b_dcommit	{ SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed; }
 step b_commit	{ COMMIT; }
 step b_status	{ SELECT table_name, status FROM dolt_status WHERE table_name LIKE 'vtc.%'; }
 step b_head_users { SELECT string_agg((to_row).id || ':' || (to_row).name, ',' ORDER BY (to_row).id) AS committed_change FROM dolt_diff('HEAD~1', 'HEAD', NULL::vtc.users); }

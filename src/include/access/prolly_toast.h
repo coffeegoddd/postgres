@@ -2,10 +2,10 @@
  *
  * prolly_toast.h
  *	  Versioned tables' values out of line, in their database's chunk store:
- *	  the TOAST destination of SHA-256 hash pointers.
+ *	  the TOAST destination of BLAKE3 hash pointers.
  *
  * A value is stored as a value tree (prolly_tree.h, value_write()) in the
- * database's chunk store, and named by a VARTAG_ONDISK_SHA256 pointer to
+ * database's chunk store, and named by a VARTAG_ONDISK_BLAKE3 pointer to
  * the tree's root.  The tree holds the value's canonical bytes
  * (prolly_datum.h) where they differ from the bytes it holds only in form,
  * so that the pointer's hash is the column's reference in history: a

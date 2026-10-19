@@ -15,7 +15,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g');
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
 END $$;
 
 CREATE SCHEMA app VERSIONED;

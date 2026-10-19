@@ -170,7 +170,7 @@ INSERT INTO app.t SELECT g, repeat('x', 100) || g FROM generate_series(1, 200) g
 SELECT length(dolt_commit('-m', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('kept');
@@ -189,7 +189,7 @@ INSERT INTO app.t SELECT g, repeat('k', 100) || g FROM generate_series(201, 300)
 SELECT length(dolt_commit('-m', 'on kept')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('kept') AS kept_head \gset
@@ -227,7 +227,7 @@ INSERT INTO app.t SELECT g, repeat('y', 100) || g FROM generate_series(201, 400)
 SELECT length(dolt_commit('-m', 'on side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('side') AS side_head \gset
@@ -302,7 +302,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g');
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
 END $$;
 SELECT pg_temp.err(format('SELECT dolt_reset(%L, %L)', '--hard', :'side_head'));	-- collected
                 err                 

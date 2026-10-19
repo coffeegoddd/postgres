@@ -135,7 +135,7 @@ SELECT md5(string_agg(d::text, ',' ORDER BY id)) AS before FROM jc.docs \gset
 SELECT length(dolt_commit('-Am', 'documents')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE jc.docs SET d = '{"changed": true}';

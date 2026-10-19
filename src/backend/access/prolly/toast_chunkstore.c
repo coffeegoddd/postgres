@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * toast_chunkstore.c
- *	  The TOAST destination of SHA-256 hash pointers: value trees in the
+ *	  The TOAST destination of BLAKE3 hash pointers: value trees in the
  *	  current database's chunk store; see prolly_toast.h.
  *
  * A value is stored as the tree implementation's value tree, in the
@@ -142,7 +142,7 @@ make_pointer(const ProllyHash *root, uint64 len, int form, Size rawsize)
 	p.va_extinfo = (uint32) len | ((uint32) form << VARLENA_EXTSIZE_BITS);
 	memcpy(p.va_hash, root->bytes, sizeof(p.va_hash));
 	result = (varlena *) palloc(VARHDRSZ_EXTERNAL + sizeof(p));
-	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK_SHA256);
+	SET_VARTAG_EXTERNAL(result, VARTAG_ONDISK_BLAKE3);
 	memcpy(VARDATA_EXTERNAL(result), &p, sizeof(p));
 	return result;
 }
@@ -270,7 +270,7 @@ prolly_toast_store(Datum value, Oid typid)
 	r.len = ref.len;
 	PROLLY_CALL(tree, value_root, &r, &root, &treelen);
 	if (root.len != sizeof(p.va_hash) || treelen != len)
-		elog(ERROR, "a value tree's root isn't a SHA-256 hash pointer's");
+		elog(ERROR, "a value tree's root isn't a BLAKE3 hash pointer's");
 	PROLLY_CALL(env.chunk_store, keep, env.chunks, &root);
 
 	result = make_pointer(&root, len, form, VARSIZE_ANY_EXHDR(plain) + VARHDRSZ);
@@ -527,7 +527,7 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	List	   *spcs = NIL;
 	ListCell   *lc;
 
-	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_SHA256);
+	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_BLAKE3);
 	rs.visit = visit;
 	rs.arg = arg;
 

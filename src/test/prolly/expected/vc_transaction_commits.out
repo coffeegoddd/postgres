@@ -28,7 +28,7 @@ rows   |dirty
 step c_reset: DELETE FROM vtc.t; SELECT length(dolt_commit('-Am', 'vtc emptied')::text) AS committed;
 committed
 ---------
-       66
+       42
 (1 row)
 
 
@@ -66,6 +66,6 @@ rows   |dirty
 step c_reset: DELETE FROM vtc.t; SELECT length(dolt_commit('-Am', 'vtc emptied')::text) AS committed;
 committed
 ---------
-       66
+       42
 (1 row)
 

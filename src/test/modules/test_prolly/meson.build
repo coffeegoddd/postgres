@@ -196,6 +196,7 @@ tests += {
       't/113_minimal_wal_remap.pl',
       't/120_log_concurrency.pl',
       't/121_log_unsettled.pl',
+      't/122_store_format.pl',
     ],
   },
 }

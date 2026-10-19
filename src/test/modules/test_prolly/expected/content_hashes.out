@@ -83,7 +83,7 @@ SELECT test_content_hash('abc', 'sha256') = encode(sha256('abc'), 'hex') AS sha2
 SELECT length(test_content_hash('')) / 2 AS digest_bytes;
  digest_bytes 
 --------------
-           32
+           20
 (1 row)
 
 SELECT test_content_hash('x', 'no such hash');

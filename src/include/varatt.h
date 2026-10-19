@@ -71,7 +71,7 @@ StaticAssertDecl((sizeof(int32) + 3 * sizeof(uint32) + sizeof(Oid)) ==
  * such trees (a versioned table's chunk store), found by a TOAST
  * destination (access/toast_destination.h).  It names no relation, so any
  * row of any table may hold it.  One tag per hash algorithm:
- * VARTAG_ONDISK_SHA256 for a SHA-256 root.
+ * VARTAG_ONDISK_BLAKE3 for a root named by BLAKE3's first 20 bytes.
  *
  * va_rawsize is the original data size (header included), as for the other
  * pointers.  va_extinfo's low VARLENA_EXTSIZE_BITS are the tree's length,
@@ -85,10 +85,10 @@ typedef struct varatt_external_hash
 {
 	int32		va_rawsize;		/* Original data size (includes header) */
 	uint32		va_extinfo;		/* The tree's length and form */
-	uint8		va_hash[32];	/* The tree's root */
+	uint8		va_hash[20];	/* The tree's root */
 } varatt_external_hash;
 
-StaticAssertDecl(sizeof(int32) + sizeof(uint32) + 32 ==
+StaticAssertDecl(sizeof(int32) + sizeof(uint32) + 20 ==
 				 sizeof(varatt_external_hash),
 				 "varatt_external_hash should have no padding");
 
@@ -157,7 +157,7 @@ typedef enum vartag_external
 	VARTAG_EXPANDED_RO = 2,
 	VARTAG_EXPANDED_RW = 3,
 	VARTAG_ONDISK_OID8 = 4,
-	VARTAG_ONDISK_SHA256 = 5,
+	VARTAG_ONDISK_BLAKE3 = 6,
 	VARTAG_ONDISK_OID = 18
 } vartag_external;
 
@@ -181,7 +181,7 @@ VARTAG_SIZE(vartag_external tag)
 		return sizeof(varatt_external_oid);
 	else if (tag == VARTAG_ONDISK_OID8)
 		return sizeof(varatt_external_oid8);
-	else if (tag == VARTAG_ONDISK_SHA256)
+	else if (tag == VARTAG_ONDISK_BLAKE3)
 		return sizeof(varatt_external_hash);
 	else
 	{
@@ -452,7 +452,7 @@ static inline bool
 VARATT_IS_EXTERNAL_ONDISK_HASH(const void *PTR)
 {
 	return VARATT_IS_EXTERNAL(PTR) &&
-		VARTAG_EXTERNAL(PTR) == VARTAG_ONDISK_SHA256;
+		VARTAG_EXTERNAL(PTR) == VARTAG_ONDISK_BLAKE3;
 }
 
 /* Is varlena datum an indirect pointer? */

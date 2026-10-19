@@ -67,7 +67,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "ancestor commit"
       ],
@@ -144,7 +144,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "right commit"
       ],
@@ -213,7 +213,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "left commit"
       ],

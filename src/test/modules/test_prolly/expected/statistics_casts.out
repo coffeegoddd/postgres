@@ -9,7 +9,7 @@ CREATE TABLE sc.t (id int PRIMARY KEY, a int, b int, c text);
 SELECT length(dolt_commit('-Am', 'table')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sc_other');
@@ -39,7 +39,7 @@ SELECT * FROM dolt_status ORDER BY table_name COLLATE "C";
 SELECT length(dolt_commit('-Am', 'held')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_status;
@@ -144,7 +144,7 @@ SELECT * FROM dolt_status ORDER BY table_name COLLATE "C";
 SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('sc_other');
@@ -194,6 +194,6 @@ drop cascades to cast from sc.e to integer
 SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

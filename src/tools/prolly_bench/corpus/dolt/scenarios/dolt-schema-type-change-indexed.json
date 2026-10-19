@@ -73,7 +73,7 @@
       "id": "h-ancestor",
       "session": "a",
       "op": "query",
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "expect": {
         "rows": [
           [
@@ -150,7 +150,7 @@
       "id": "h-right-commit",
       "session": "a",
       "op": "query",
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "expect": {
         "rows": [
           [
@@ -201,7 +201,7 @@
       "id": "h-left-commit",
       "session": "a",
       "op": "query",
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "expect": {
         "rows": [
           [

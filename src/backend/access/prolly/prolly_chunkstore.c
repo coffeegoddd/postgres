@@ -16,6 +16,8 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_config.h"
+#include "access/prolly_hash.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_xlog.h"
 
@@ -132,4 +134,49 @@ prolly_chunk_references(const void *data, Size len, ProllyChunkRefVisit visit,
 		tree = prolly_tree_lookup(CHUNK_TREE_IMPL);
 	}
 	PROLLY_CALL(tree, references, format, data, len, visit, arg);
+}
+
+const ProllyStoreFormat *
+prolly_store_format(void)
+{
+	static ProllyStoreFormat format;
+	static bool known = false;
+
+	if (!known)
+	{
+		const ProllyHashRoutine *hash = prolly_content_hash();
+		const ProllyChunkFormatRoutine *chunks =
+			prolly_chunkformat_lookup(CHUNK_FORMAT_IMPL);
+		ProllyHashCtx *ctx;
+		ProllyHash	empty;
+
+		if (strlen(hash->info.name) >= PROLLY_STORE_HASH_NAME_LEN)
+			elog(ERROR, "content hash name \"%s\" is too long", hash->info.name);
+		/* (the digest's length is the same for every input) */
+		ctx = PROLLY_CALL(hash, begin, CurrentMemoryContext);
+		PROLLY_CALL(hash, finish, ctx, &empty);
+		memset(&format, 0, sizeof(format));
+		strlcpy(format.hash, hash->info.name, sizeof(format.hash));
+		format.hash_len = empty.len;
+		format.chunk_format = chunks->info.format_version;
+		known = true;
+	}
+	return &format;
+}
+
+bool
+prolly_store_format_equal(const ProllyStoreFormat *a, const ProllyStoreFormat *b)
+{
+	return strncmp(a->hash, b->hash, PROLLY_STORE_HASH_NAME_LEN) == 0 &&
+		a->hash_len == b->hash_len &&
+		a->chunk_format == b->chunk_format;
+}
+
+/* A format, for messages: "blake3 (20 bytes), chunk format 1". */
+char *
+prolly_store_format_text(const ProllyStoreFormat *format)
+{
+	return psprintf("%.*s (%u bytes), chunk format %u",
+					PROLLY_STORE_HASH_NAME_LEN, format->hash,
+					format->hash_len, format->chunk_format);
 }

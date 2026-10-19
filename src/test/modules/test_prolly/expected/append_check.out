@@ -31,7 +31,7 @@ BEGIN;
 SELECT test_chunk_put('ac with dangling') AS with_dangling \gset
 SELECT test_chunk_put_node(1, ARRAY[:'present', :'missing']) AS dangling1 \gset
 COMMIT;
-ERROR:  could not store chunk e7ecadb9fc1b8d7dd44dfb5ba1f859f21d9b5f487c32b9bed02b6cb10385d0ad: chunk a653fd9b93d506d887711bc0f9ec9297d4f92774a940550f82d475425309fe81, which it names, is not in the chunk store
+ERROR:  could not store chunk e6845942474a57bf891ba86a2a5ebdc9702eb555: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 DETAIL:  A garbage collection may have removed it after the transaction read it.
 HINT:  Try the transaction again.
 \set VERBOSITY terse
@@ -45,7 +45,7 @@ SELECT test_chunk_has(:'dangling1') AS dangling_stored,
 BEGIN;
 SELECT test_chunk_put_node(0, ARRAY[:'missing']) AS dangling0 \gset
 COMMIT;
-ERROR:  could not store chunk 4d53d06ddececf3b23e46c691ad41be60431f18bbb060b78ce4b27c551b4d5f9: chunk a653fd9b93d506d887711bc0f9ec9297d4f92774a940550f82d475425309fe81, which it names, is not in the chunk store
+ERROR:  could not store chunk 6c18d31b0dbd81af38f793159bf2b22e8fb5f260: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 SELECT test_chunk_has(:'dangling0');
  test_chunk_has 
 ----------------
@@ -69,7 +69,7 @@ SELECT test_chunk_put_node(1, ARRAY[:'missing']) IS NOT NULL AS put;
 (1 row)
 
 SELECT test_chunk_put(convert_to(repeat('ac batch', 150000), 'UTF8')) IS NOT NULL AS batch;
-ERROR:  could not store chunk e8a85f6aa9a6c8b8ef91ad98655816fe2bfebe464cd965c9758e6c701171600c: chunk a653fd9b93d506d887711bc0f9ec9297d4f92774a940550f82d475425309fe81, which it names, is not in the chunk store
+ERROR:  could not store chunk 6e5d1a2636396dfcb20471f55566d791909d5b03: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 ROLLBACK;
 SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
  sqlstate 

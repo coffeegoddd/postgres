@@ -23,7 +23,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<id>', 'g');
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<id>', 'g');
 END $$;
 -- (with its detail)
 CREATE FUNCTION pg_temp.err_detail(q text) RETURNS text LANGUAGE plpgsql AS $$
@@ -34,7 +34,7 @@ BEGIN
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
 	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
-	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{64}', '<id>', 'g');
+	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{40}', '<id>', 'g');
 END $$;
 -- ------------------------------------------------------------------------
 -- The row-level action matrix.  For each key: its base row (or none),
@@ -82,7 +82,7 @@ INSERT INTO mt.t SELECT k, b1, b2 FROM matrix WHERE b1 IS NOT NULL;
 SELECT length(dolt_commit('-Am', 'matrix base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mt_left');
@@ -119,7 +119,7 @@ UPDATE mt.t SET col1 = -62, col2 = 62 WHERE id = 62
 SELECT length(dolt_commit('-am', 'left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mt_right');
@@ -144,7 +144,7 @@ UPDATE mt.t SET col1 = 62, col2 = -62 WHERE id = 62
 SELECT length(dolt_commit('-am', 'right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Right into left: the merged rows and conflicts match the matrix.
@@ -227,7 +227,7 @@ NOTICE:  drop cascades to table mt.t
 SELECT length(dolt_commit('-Am', 'matrix done')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- ------------------------------------------------------------------------
@@ -243,7 +243,7 @@ INSERT INTO rc.t VALUES (1, 1, 1);
 SELECT length(dolt_commit('-Am', 'rc base 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rc_theirs');
@@ -256,7 +256,7 @@ UPDATE rc.t SET c1 = 2;
 SELECT length(dolt_commit('-am', 'ours 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('rc_theirs');
@@ -269,7 +269,7 @@ UPDATE rc.t SET c2 = 2;
 SELECT length(dolt_commit('-am', 'theirs 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -306,7 +306,7 @@ INSERT INTO rc.t VALUES (1, 1, 2, NULL);
 SELECT length(dolt_commit('-Am', 'rc base 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rc_theirs');
@@ -319,7 +319,7 @@ UPDATE rc.t SET c1 = 2, c3 = 255;
 SELECT length(dolt_commit('-am', 'ours 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('rc_theirs');
@@ -332,7 +332,7 @@ UPDATE rc.t SET c1 = 2, c2 = 3, c3 = 255;
 SELECT length(dolt_commit('-am', 'theirs 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -367,7 +367,7 @@ UPDATE rc.t SET c1 = 1, c2 = 2, c3 = NULL;
 SELECT length(dolt_commit('-am', 'rc base 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rc_theirs');
@@ -380,7 +380,7 @@ UPDATE rc.t SET c1 = 2, c3 = 128;
 SELECT length(dolt_commit('-am', 'ours 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('rc_theirs');
@@ -393,7 +393,7 @@ UPDATE rc.t SET c2 = 3, c3 = 255;
 SELECT length(dolt_commit('-am', 'theirs 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -436,7 +436,7 @@ INSERT INTO rc.t VALUES (1, 1, 2);
 SELECT length(dolt_commit('-Am', 'rc base 4')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rc_theirs');
@@ -449,7 +449,7 @@ UPDATE rc.t SET c1 = 2;
 SELECT length(dolt_commit('-am', 'ours 4')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('rc_theirs');
@@ -463,7 +463,7 @@ UPDATE rc.t SET c2 = 3, c3 = 255;
 SELECT length(dolt_commit('-am', 'theirs 4')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -499,7 +499,7 @@ INSERT INTO rc.t VALUES (1, 1, 1, 1);
 SELECT length(dolt_commit('-Am', 'rc base 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rc_theirs');
@@ -512,7 +512,7 @@ UPDATE rc.t SET c2 = 2;
 SELECT length(dolt_commit('-am', 'ours 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('rc_theirs');
@@ -526,7 +526,7 @@ UPDATE rc.t SET c1 = 2;
 SELECT length(dolt_commit('-am', 'theirs 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -563,7 +563,7 @@ INSERT INTO rc.t VALUES (2, 1, 2, NULL), (3, 1, 1, 1);
 SELECT length(dolt_commit('-Am', 'rc base 6')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rc_theirs');
@@ -578,7 +578,7 @@ UPDATE rc.t SET c1 = NULL, c2 = NULL, c3 = NULL WHERE id = 3;
 SELECT length(dolt_commit('-am', 'ours 6')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('rc_theirs');
@@ -593,7 +593,7 @@ DELETE FROM rc.t WHERE id = 3;
 SELECT length(dolt_commit('-am', 'theirs 6')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -630,7 +630,7 @@ NOTICE:  drop cascades to table rc.t
 SELECT length(dolt_commit('-Am', 'cells done')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- ------------------------------------------------------------------------
@@ -747,7 +747,7 @@ CREATE SCHEMA tw VERSIONED;
 SELECT length(dolt_commit('-Am', 'tw schema')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT s FROM (SELECT DISTINCT sc FROM tw) d, pg_temp.tw_script(d.sc) s
@@ -757,7 +757,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'clash edits' AND side = 'b'
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -777,7 +777,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'clash edits' AND side = 'r'
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -791,7 +791,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'clash edits' AND side = 'l'
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -829,7 +829,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -837,7 +837,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'combine types' AND side = 'b
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -857,7 +857,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'combine types' AND side = 'r
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -871,7 +871,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'combine types' AND side = 'l
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -909,7 +909,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -917,7 +917,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'convergent edits' AND side =
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -937,7 +937,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'convergent edits' AND side =
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -951,7 +951,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'convergent edits' AND side =
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -989,7 +989,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -997,7 +997,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'delete conflicts' AND side =
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1017,7 +1017,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'delete conflicts' AND side =
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1031,7 +1031,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'delete conflicts' AND side =
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1069,7 +1069,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1077,7 +1077,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left adds' AND side = 'b'
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1097,7 +1097,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left adds' AND side = 'r'
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1111,7 +1111,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left adds' AND side = 'l'
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1149,7 +1149,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1157,7 +1157,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left deletes' AND side = 'b'
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1177,7 +1177,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left deletes' AND side = 'r'
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1191,7 +1191,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left deletes' AND side = 'l'
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1229,7 +1229,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1237,7 +1237,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left edits' AND side = 'b'
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1257,7 +1257,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left edits' AND side = 'r'
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1271,7 +1271,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'left edits' AND side = 'l'
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1309,7 +1309,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1317,7 +1317,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'resolvable edits' AND side =
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1337,7 +1337,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'resolvable edits' AND side =
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1351,7 +1351,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'resolvable edits' AND side =
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1389,7 +1389,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1397,7 +1397,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right adds' AND side = 'b'
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1417,7 +1417,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right adds' AND side = 'r'
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1431,7 +1431,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right adds' AND side = 'l'
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1469,7 +1469,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1477,7 +1477,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right deletes' AND side = 'b
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1497,7 +1497,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right deletes' AND side = 'r
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1511,7 +1511,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right deletes' AND side = 'l
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1549,7 +1549,7 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE tw.t (k int PRIMARY KEY, v int, w int)
@@ -1557,7 +1557,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right edits' AND side = 'b'
 SELECT length(dolt_commit('-Am', 'tw base')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('tw_right')
@@ -1577,7 +1577,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right edits' AND side = 'r'
 SELECT length(dolt_commit('-Am', 'tw right')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main')
@@ -1591,7 +1591,7 @@ INSERT INTO tw.t SELECT k, v, w FROM tw WHERE sc = 'right edits' AND side = 'l'
 SELECT length(dolt_commit('-Am', 'tw left')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN
@@ -1629,14 +1629,14 @@ DROP TABLE tw.t
 SELECT length(dolt_commit('-Am', 'tw done')::text) AS committed
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP SCHEMA tw CASCADE;
 SELECT length(dolt_commit('-Am', 'taxonomy done')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- ------------------------------------------------------------------------
@@ -1651,7 +1651,7 @@ INSERT INTO kl.nokey VALUES (1, 2), (1, 2);
 SELECT length(dolt_commit('-Am', 'added rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('kl_other');
@@ -1670,7 +1670,7 @@ INSERT INTO kl.nokey VALUES (3, 4);
 SELECT length(dolt_commit('-am', 'added rows on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1699,7 +1699,7 @@ INSERT INTO kl.nokey VALUES (5, 6);
 SELECT length(dolt_commit('-am', 'added rows on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1735,7 +1735,7 @@ INSERT INTO kl.nokey VALUES (3, 4);
 SELECT length(dolt_commit('-am', 'another on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1748,7 +1748,7 @@ INSERT INTO kl.nokey VALUES (5, 6), (5, 6);
 SELECT length(dolt_commit('-am', 'added rows on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1797,7 +1797,7 @@ INSERT INTO kl.nokey VALUES (3, 4);
 SELECT length(dolt_commit('-am', 'added rows on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1810,7 +1810,7 @@ INSERT INTO kl.nokey VALUES (3, 4);
 SELECT length(dolt_commit('-am', 'added rows on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1847,7 +1847,7 @@ INSERT INTO kl.nokey VALUES (1, 2), (1, 2), (1, 2), (1, 2);
 SELECT length(dolt_commit('-am', 'four rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('kl_other');
@@ -1866,7 +1866,7 @@ DELETE FROM kl.nokey WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 1);
 SELECT length(dolt_commit('-am', 'deleted 1 row on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1879,7 +1879,7 @@ DELETE FROM kl.nokey WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 2);
 SELECT length(dolt_commit('-am', 'deleted 2 rows on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1927,7 +1927,7 @@ UPDATE kl.nokey SET c2 = 9 WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 1);
 SELECT length(dolt_commit('-am', 'updated 1 row on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1940,7 +1940,7 @@ UPDATE kl.nokey SET c2 = 9 WHERE ctid IN (SELECT ctid FROM kl.nokey LIMIT 2);
 SELECT length(dolt_commit('-am', 'updated 2 rows on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1975,7 +1975,7 @@ NOTICE:  drop cascades to table kl.nokey
 SELECT length(dolt_commit('-Am', 'keyless done')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- ------------------------------------------------------------------------

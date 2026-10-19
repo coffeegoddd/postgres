@@ -15,7 +15,7 @@ INSERT INTO dv.t VALUES (1, 1, 1, 'one'), (2, 2, 2, 'two');
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('other');
@@ -39,7 +39,7 @@ UPDATE dv.t SET l = 'TWO' WHERE pk = 2;		-- one that doesn't
 SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -53,7 +53,7 @@ ALTER DOMAIN dv.label SET NOT NULL;
 SELECT length(dolt_commit('-am', 'ours: the domains constrained')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Outside a transaction block, the merge is rolled back.
@@ -113,7 +113,7 @@ SELECT count(*) AS left_over FROM dolt_constraint_violations();
 SELECT length(dolt_commit('-am', 'merged')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -136,7 +136,7 @@ INSERT INTO dv.c VALUES (1, '{1}', '(1,1)');
 SELECT length(dolt_commit('-Am', 'containers')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('other2');
@@ -158,7 +158,7 @@ INSERT INTO dv.c VALUES (5, '{5,NULL}', '(,5)');	-- nulls, which it allows
 SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -171,7 +171,7 @@ ALTER DOMAIN dv.elem ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
 SELECT length(dolt_commit('-am', 'ours: elem constrained')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -208,7 +208,7 @@ INSERT INTO dv.u VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('other3');
@@ -221,7 +221,7 @@ INSERT INTO dv.u VALUES (2, -2), (3, 3);
 SELECT length(dolt_commit('-am', 'ours: u rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('other3');
@@ -235,7 +235,7 @@ INSERT INTO dv.u VALUES (4, 4);
 SELECT length(dolt_commit('-am', 'theirs: ours constrained')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -282,7 +282,7 @@ ALTER DOMAIN dv.ours ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
 SELECT length(dolt_commit('-am', 'theirs: unvalidated check')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -342,7 +342,7 @@ INSERT INTO dv.k2 VALUES (-1, 10), (5, 50);
 SELECT length(dolt_commit('-Am', 'n')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('other4');
@@ -356,7 +356,7 @@ INSERT INTO dv.k2 VALUES (7, 70);
 SELECT length(dolt_commit('-am', 'ours: nv constrained, not valid')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('other4');
@@ -374,7 +374,7 @@ UPDATE dv.nu SET v = -3 WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'theirs: w, v')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -453,7 +453,7 @@ INSERT INTO dv.s VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 's')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('other5');
@@ -467,7 +467,7 @@ ALTER DOMAIN dv.upper ADD CONSTRAINT c CHECK (VALUE < 100);
 SELECT length(dolt_commit('-am', 'ours: lower and upper constrained')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('other5');
@@ -480,7 +480,7 @@ INSERT INTO dv.s VALUES (2, -5), (3, 500), (4, 50);
 SELECT length(dolt_commit('-am', 'theirs: s rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -531,7 +531,7 @@ INSERT INTO dv.c VALUES (7, '{7}', '(7,7)');
 SELECT length(dolt_commit('-am', 'fine')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -597,7 +597,7 @@ INSERT INTO dv.rg VALUES (1, -1, 0);
 SELECT length(dolt_commit('-Am', 'resolution base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('resolve_domains');
@@ -622,7 +622,7 @@ INSERT INTO dv.rv VALUES (1, 3), (2, 4);
 SELECT length(dolt_commit('-am', 'theirs: conflicting domain values')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -645,7 +645,7 @@ ALTER DOMAIN dv.rgrand ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
 SELECT length(dolt_commit('-am', 'ours: conflicting rows and constraints')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET dolt.allow_commit_conflicts = on;

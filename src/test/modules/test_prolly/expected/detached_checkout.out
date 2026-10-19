@@ -14,7 +14,7 @@ INSERT INTO dc.t VALUES (2, 'two');
 SELECT length(dolt_commit('-am', 'second')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_remote('add', 'dc_remote', 'file:///nonexistent/dc_remote');
@@ -87,7 +87,7 @@ INSERT INTO dc.t VALUES (3, 'three');
 SELECT length(dolt_commit('-am', 'on from_first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dc.t ORDER BY id;

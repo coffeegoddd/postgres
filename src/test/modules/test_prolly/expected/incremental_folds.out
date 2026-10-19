@@ -21,7 +21,7 @@ SELECT pg_relation_size('inc.big') / 8192 > 100 AS many_pages;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- fold(): fold the working set from the baseline, say what it read, and
@@ -75,7 +75,7 @@ FROM dolt_diff('HEAD', 'WORKING', NULL::inc.big) ORDER BY coalesce((to_row).id, 
 SELECT length(dolt_commit('-am', 'changes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.fold();
@@ -104,7 +104,7 @@ UPDATE inc.big SET v = 'rolled back' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK;
@@ -118,7 +118,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'kept')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A truncation, and the pages added after it.
@@ -134,7 +134,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'tail')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A table without a primary key keys a row by its content and counts its
@@ -165,7 +165,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.fold();
@@ -206,7 +206,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE inc.keyless SET b = 'mine too' WHERE a = 14;
@@ -219,7 +219,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless twice')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -233,7 +233,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless after')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE inc.keyless SET b = 'later' WHERE a = 13;
@@ -246,7 +246,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'keyless later')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a commit rolled back with its transaction: the baseline before it holds
@@ -255,7 +255,7 @@ UPDATE inc.keyless SET b = 'rolled back' WHERE a = 15;
 SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK;
@@ -269,7 +269,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'kept')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a commit in a savepoint rolled back: the baseline it made goes with it,
@@ -281,7 +281,7 @@ UPDATE inc.big SET v = 'in the savepoint' WHERE id BETWEEN 2000 AND 2099;
 SELECT length(dolt_commit('-am', 'in the savepoint')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK TO s;
@@ -296,7 +296,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'after the savepoint')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -310,7 +310,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'later still')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) AS rows_from_the_savepoint FROM inc.keyless WHERE b = 'in the savepoint';
@@ -338,7 +338,7 @@ UPDATE inc.big SET v = 'picked' WHERE id BETWEEN 100 AND 1099;
 SELECT length(dolt_commit('-am', 'to pick')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -363,7 +363,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'after the pick')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'pick');
@@ -386,7 +386,7 @@ BEGIN;
 SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK;
@@ -400,7 +400,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'two epochs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A row an update deleted before the baseline, its xmax a multixact (a
@@ -420,7 +420,7 @@ COMMIT;
 SELECT length(dolt_commit('-am', 'multixact')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE inc.keyless SET b = 'after the multixact' WHERE ctid = (SELECT pg_temp.on_page(2, false));
@@ -433,7 +433,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'after multixact')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A fold that gives up (a deleted row's value in the TOAST relation may
@@ -445,7 +445,7 @@ RESET debug_toast_relation;
 SELECT length(dolt_commit('-am', 'out of line')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DELETE FROM inc.keyless WHERE a = 5000;
@@ -458,7 +458,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'out of line gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A deleted row's value stored by content stays: the fold doesn't give up.
@@ -467,7 +467,7 @@ INSERT INTO inc.keyless
 SELECT length(dolt_commit('-am', 'by content')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DELETE FROM inc.keyless WHERE a = 5001;
@@ -480,7 +480,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'by content gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A table redefined, or rewritten, is read in full once.
@@ -494,7 +494,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'a column')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.fold();
@@ -514,7 +514,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'rewritten')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- TRUNCATE where the table's storage was made in the transaction, after a
@@ -528,7 +528,7 @@ INSERT INTO inc.made SELECT g, 'x' || g FROM generate_series(1, 5000) g;
 SELECT length(dolt_commit('-Am', 'made')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('made');
@@ -596,7 +596,7 @@ INSERT INTO inc.made SELECT g, 'y' || g FROM generate_series(1, 5000) g;
 SELECT length(dolt_commit('-am', 'made again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('made_again');
@@ -687,7 +687,7 @@ DROP TABLE inc.made, inc.unfolded;
 SELECT length(dolt_commit('-Am', 'made gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A branch starts from its source's baseline.
@@ -713,7 +713,7 @@ SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.fold();

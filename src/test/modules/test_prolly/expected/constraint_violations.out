@@ -16,7 +16,7 @@ INSERT INTO cv.child VALUES (1, 1, 'a');
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('feature');
@@ -36,7 +36,7 @@ INSERT INTO cv.child VALUES (4, 1, 'x');	-- a code main gives another row
 SELECT length(dolt_commit('-am', 'feature children')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -50,7 +50,7 @@ INSERT INTO cv.child VALUES (3, 1, 'x');
 SELECT length(dolt_commit('-am', 'main changes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Outside a transaction block, the merge is rolled back.
@@ -118,7 +118,7 @@ SELECT count(*) AS left_over FROM dolt_constraint_violations();
 SELECT length(dolt_commit('-am', 'merged')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -209,7 +209,7 @@ UPDATE cv.child SET code = 'z' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'feature recodes 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -222,7 +222,7 @@ INSERT INTO cv.child VALUES (7, 1, 'z');
 SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('no_child');
@@ -241,7 +241,7 @@ DROP TABLE cv.child;
 SELECT length(dolt_commit('-am', 'no_child drops cv.child')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -318,7 +318,7 @@ SELECT (dolt_merge('feature'))[3:4];
 SELECT length(dolt_commit('-am', 'merged, a violation kept')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 RESET dolt.allow_commit_conflicts;
@@ -338,7 +338,7 @@ INSERT INTO cv.parent VALUES (3);
 SELECT length(dolt_commit('-am', 'other adds a parent')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -352,7 +352,7 @@ INSERT INTO cv.parent VALUES (4);
 SELECT length(dolt_commit('-am', 'main adds a parent')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('other', '-m', 'merged other'))[3:4];
@@ -452,7 +452,7 @@ SELECT dolt_verify_constraints();
 SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A deferrable unique or exclusion constraint is checked as the merge
@@ -477,7 +477,7 @@ INSERT INTO dv.wo VALUES ('[1,2)', '[1,3)');
 SELECT length(dolt_commit('-Am', 'deferrable base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('deferring');
@@ -500,7 +500,7 @@ INSERT INTO dv.wo VALUES ('[1,2)', '[5,8)'), ('[2,3)', '[5,8)');
 SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -517,7 +517,7 @@ INSERT INTO dv.wo VALUES ('[1,2)', '[6,9)');
 SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -587,7 +587,7 @@ SELECT dolt_verify_constraints();
 SELECT length(dolt_commit('-am', 'merged deferring')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -607,7 +607,7 @@ drop cascades to table dv.wo
 SELECT length(dolt_commit('-Am', 'no dv')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A revert that leaves a child without its parent records it.
@@ -617,7 +617,7 @@ INSERT INTO cv.child VALUES (10, 10, 'ten');
 SELECT length(dolt_commit('-am', 'child of 10')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_revert(:'parent10');
@@ -647,13 +647,13 @@ ROLLBACK TO s;
 SELECT length(dolt_commit('-afm', 'forced')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT length(dolt_commit('--force', '--allow-empty', '-m', 'forced again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -734,7 +734,7 @@ INSERT INTO uv.x VALUES (1, 2, 3), (2, 4, 0), (3, 3, 1), (4, 0, 2);
 SELECT length(dolt_commit('-Am', 'uv base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('uv_theirs');
@@ -758,7 +758,7 @@ CREATE UNIQUE INDEX x_c ON uv.x (c);
 SELECT length(dolt_commit('-Am', 'uv ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('uv_theirs');
@@ -790,7 +790,7 @@ UPDATE uv.x SET b = (ARRAY[4, 3, 0, 3])[pk];
 SELECT length(dolt_commit('-am', 'uv theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -920,7 +920,7 @@ drop cascades to table uv.x
 SELECT length(dolt_commit('-Am', 'uv dropped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- The rows put back and the pinned row updated are checked against a
@@ -942,7 +942,7 @@ INSERT INTO dw.ai VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
 SELECT length(dolt_commit('-Am', 'dw base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('dw_theirs');
@@ -958,7 +958,7 @@ UPDATE dw.ai SET b = 99 WHERE pk = 3;
 SELECT length(dolt_commit('-am', 'dw ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('dw_theirs');
@@ -980,7 +980,7 @@ UPDATE dw.ai SET c = 300 WHERE pk = 1;
 SELECT length(dolt_commit('-am', 'dw theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1058,7 +1058,7 @@ drop cascades to table dw.ai
 SELECT length(dolt_commit('-Am', 'dw dropped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'feature');

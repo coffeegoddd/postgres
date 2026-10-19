@@ -14,7 +14,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g');
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
 END $$;
 CREATE SCHEMA app VERSIONED;
 CREATE TABLE app.t (id int PRIMARY KEY, v text);
@@ -22,7 +22,7 @@ INSERT INTO app.t SELECT g, 'main ' || g FROM generate_series(1, 20) g;
 SELECT length(dolt_commit('-m', 'small main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A big branch, settled by a collection, then deleted.
@@ -42,7 +42,7 @@ INSERT INTO app.t SELECT g, repeat('big', 50) || g FROM generate_series(21, 3000
 SELECT length(dolt_commit('-m', 'on big')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('big') AS big_head \gset
@@ -131,7 +131,7 @@ INSERT INTO app.t SELECT g, repeat('more', 50) || g FROM generate_series(21, 300
 SELECT length(dolt_commit('-m', 'more on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_gc();
@@ -146,7 +146,7 @@ UPDATE app.t SET v = 'changed' WHERE id = 7;
 SELECT length(dolt_commit('-m', 'a change')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_gc();
@@ -162,7 +162,7 @@ SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
 -------------------------------+--------+---------
  prolly_table_0000000000000004 |      1 | t
  prolly_table_0000000000000006 |      5 | t
- prolly_table_0000000000000008 |    164 | t
+ prolly_table_0000000000000008 |    163 | t
  prolly_table_000000000000000a |      7 | t
 (4 rows)
 
@@ -183,7 +183,7 @@ SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
              name              | chunks | settled 
 -------------------------------+--------+---------
  prolly_table_0000000000000006 |      5 | t
- prolly_table_0000000000000008 |    164 | t
+ prolly_table_0000000000000008 |    163 | t
  prolly_table_000000000000000a |      7 | t
 (3 rows)
 

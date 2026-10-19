@@ -11,7 +11,7 @@ INSERT INTO km.t SELECT g % 50, 'row ' || (g % 50), g % 7 FROM generate_series(1
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- 300 rows added, 200 removed (duplicates among them), 100 changed
@@ -91,7 +91,7 @@ INSERT INTO km.k SELECT g, 'v' || g FROM generate_series(1, 2000) g;
 SELECT length(dolt_commit('-Am', 'keyed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE km.k SET v = 'changed' WHERE id % 100 = 0;

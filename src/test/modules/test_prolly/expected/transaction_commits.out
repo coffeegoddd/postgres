@@ -6,7 +6,7 @@ CREATE TABLE tc_plain (id int);
 SELECT length(dolt_commit('-Am', 'tc base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE FUNCTION pg_temp.commits() RETURNS bigint LANGUAGE sql
@@ -138,7 +138,7 @@ INSERT INTO tc.t VALUES (5, 'e');
 SELECT length(dolt_commit('-m', 'mine')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -147,7 +147,7 @@ INSERT INTO tc.t VALUES (6, 'f');
 SELECT length(dolt_commit('-m', 'mine again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO tc.t VALUES (7, 'g');
@@ -292,7 +292,7 @@ RESET client_min_messages;
 SELECT length(dolt_commit('-Am', 'tc clean', '--allow-empty')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET dolt.transaction_commit = off;
@@ -421,7 +421,7 @@ SAVEPOINT s;
 SELECT length(dolt_commit('-Am', 'undone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK TO s;
@@ -494,7 +494,7 @@ SET dolt.transaction_commit = off;
 SELECT length(dolt_commit('-Am', 'outside')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET dolt.transaction_commit = on;
@@ -534,6 +534,6 @@ drop cascades to table tc.nbag
 SELECT length(dolt_commit('-Am', 'tc gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

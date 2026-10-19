@@ -6,7 +6,7 @@ INSERT INTO br.t VALUES (1, 0);
 SELECT length(dolt_commit('-Am', 'init')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A branch with only its head, never used, renamed.
@@ -93,7 +93,7 @@ SELECT a, v FROM br.t ORDER BY a;
 SELECT length(dolt_commit('-am', 'two')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -164,7 +164,7 @@ UPDATE br.t SET v = 10 WHERE a = 1;
 SELECT length(dolt_commit('-am', 'side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('br_mine');
@@ -177,7 +177,7 @@ UPDATE br.t SET v = 20 WHERE a = 1;
 SELECT length(dolt_commit('-am', 'mine')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;

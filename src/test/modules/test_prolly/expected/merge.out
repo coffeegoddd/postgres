@@ -10,7 +10,7 @@ INSERT INTO app.untouched VALUES (1);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('feature');
@@ -28,7 +28,7 @@ INSERT INTO app.k VALUES ('y');
 SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('feature');
@@ -46,7 +46,7 @@ INSERT INTO app.k VALUES ('z');
 SELECT length(dolt_commit('-Am', 'on feature')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -130,7 +130,7 @@ UPDATE app.t SET v = 'feature 6' WHERE id = 6;
 SELECT length(dolt_commit('-Am', 'feature 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -143,7 +143,7 @@ UPDATE app.t SET v = 'main 5' WHERE id = 5;
 SELECT length(dolt_commit('-Am', 'main 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- outside a transaction block, the merge fails and changes nothing
@@ -242,7 +242,7 @@ SELECT v FROM app.t WHERE id IN (5, 6) ORDER BY id;
 SELECT length(dolt_commit('-Am', 'resolved')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -268,7 +268,7 @@ UPDATE app.t SET v = 'feature again' WHERE id = 7;
 SELECT length(dolt_commit('-Am', 'feature 7')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -281,7 +281,7 @@ UPDATE app.t SET v = 'main again' WHERE id = 7;
 SELECT length(dolt_commit('-Am', 'main 7')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -364,7 +364,7 @@ DELETE FROM app.k WHERE a IN ('y', 'z');
 SELECT length(dolt_commit('-Am', 'main drops y and z')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('feature');
@@ -379,7 +379,7 @@ INSERT INTO app.k VALUES ('w');
 SELECT length(dolt_commit('-Am', 'feature drops a y and z')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -414,7 +414,7 @@ ALTER TABLE app.t ADD COLUMN w int;
 SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -427,7 +427,7 @@ UPDATE app.t SET v = 'main 8' WHERE id = 8;
 SELECT length(dolt_commit('-Am', 'main 8')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -542,7 +542,7 @@ INSERT INTO mk.t VALUES (1, 'x');
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mk_side');
@@ -561,7 +561,7 @@ INSERT INTO mk.t VALUES (9, 'hotfix');
 SELECT length(dolt_commit('-am', 'hotfix')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -580,7 +580,7 @@ INSERT INTO mk.t VALUES (2, 'ours');
 SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mk_side'))[2:4];
@@ -608,7 +608,7 @@ NOTICE:  drop cascades to table mk.t
 SELECT length(dolt_commit('-Am', 'mk gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A merge reads rows as they were folded: a NULL in a column added with a
@@ -620,7 +620,7 @@ ALTER TABLE mgd.t ADD COLUMN c int DEFAULT 5;
 SELECT length(dolt_commit('-Am', 'c is 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mgd_side');
@@ -639,7 +639,7 @@ UPDATE mgd.t SET c = NULL;
 SELECT length(dolt_commit('-am', 'c is NULL')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -652,7 +652,7 @@ UPDATE mgd.t SET a = 'uno', c = 7;
 SELECT length(dolt_commit('-am', 'a is uno')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -680,7 +680,7 @@ NOTICE:  drop cascades to table mgd.t
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A merge doesn't read the rows of a table whose collation (of an
@@ -692,7 +692,7 @@ INSERT INTO mgc.t VALUES ('a', 1), ('b', 1);
 SELECT length(dolt_commit('-Am', 'collated')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mgc_side');
@@ -711,7 +711,7 @@ UPDATE mgc.t SET v = 2 WHERE k = 'a';
 SELECT length(dolt_commit('-am', 'a is 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -724,7 +724,7 @@ UPDATE mgc.t SET v = 3 WHERE k = 'b';
 SELECT length(dolt_commit('-am', 'b is 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE pg_collation SET collicurules = '&a<b' WHERE collname = 'mgc_c_utf8';
@@ -758,7 +758,7 @@ DROP COLLATION public.mgc_c_utf8;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Theirs swapping two rows' unique values merges: the rows going are
@@ -769,7 +769,7 @@ INSERT INTO mgu.t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c');
 SELECT length(dolt_commit('-Am', 'unique')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mgu_side');
@@ -790,7 +790,7 @@ UPDATE mgu.t SET u = 2 WHERE id = 1;
 SELECT length(dolt_commit('-am', 'swapped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -803,7 +803,7 @@ UPDATE mgu.t SET v = 'main' WHERE id = 3;
 SELECT length(dolt_commit('-am', 'main too')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mgu_side'))[2:4];
@@ -838,7 +838,7 @@ UPDATE mgu.t SET v = 'k' WHERE id = 3;
 SELECT length(dolt_commit('-am', 'k')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -863,7 +863,7 @@ UPDATE mgu.t SET v = 'm' WHERE id = 3;
 SELECT length(dolt_commit('-am', 'm')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET dolt.allow_commit_conflicts = on;
@@ -954,7 +954,7 @@ UPDATE mgu.t SET v = 'k' WHERE id = 3;
 SELECT length(dolt_commit('-am', 'k')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -968,7 +968,7 @@ INSERT INTO mgu.t VALUES (4, 4, 'main');
 SELECT length(dolt_commit('-am', 'main again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mgu_k') IS NOT NULL AS on_k;
@@ -981,7 +981,7 @@ INSERT INTO mgu.t VALUES (5, 5, 'k');
 SELECT length(dolt_commit('-am', 'k adds 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -1086,7 +1086,7 @@ NOTICE:  drop cascades to table mgu.t
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A history of merges reaches its commits along many paths (each round
@@ -1097,7 +1097,7 @@ INSERT INTO mb.t VALUES (0, 0);
 SELECT length(dolt_commit('-Am', 'mb base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mb_side');
@@ -1144,7 +1144,7 @@ NOTICE:  drop cascades to table mb.t
 SELECT length(dolt_commit('-Am', 'without mb')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Merges of large values and indexed columns: the merged value whole, and
@@ -1157,7 +1157,7 @@ INSERT INTO mt.t SELECT g, g, repeat('a', 3000) || g FROM generate_series(1, 100
 SELECT length(dolt_commit('-Am', 'mt base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mt_side');
@@ -1178,7 +1178,7 @@ UPDATE mt.t SET k = 4000 WHERE id = 4;
 SELECT length(dolt_commit('-am', 'mt side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -1191,7 +1191,7 @@ UPDATE mt.t SET k = 3000 WHERE id = 3;
 SELECT length(dolt_commit('-am', 'mt main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mt_side'))[2] AS fast_forward;
@@ -1244,7 +1244,7 @@ UPDATE mt.t SET k = 5000 WHERE id = 5;
 SELECT length(dolt_commit('-am', 'mt side 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -1257,7 +1257,7 @@ UPDATE mt.t SET k = 5555 WHERE id = 5;
 SELECT length(dolt_commit('-am', 'mt main 5')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1289,7 +1289,7 @@ SELECT count(*) AS stale FROM mt.t WHERE k = 5555;
 SELECT length(dolt_commit('-m', 'mt resolved')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -1307,7 +1307,7 @@ NOTICE:  drop cascades to table mt.t
 SELECT length(dolt_commit('-Am', 'without mt')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A table dropped in a merge with conflicts takes its conflicts with it:
@@ -1320,7 +1320,7 @@ INSERT INTO dc.b VALUES (1, 'base');
 SELECT length(dolt_commit('-Am', 'dc base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('dc_side');
@@ -1334,7 +1334,7 @@ UPDATE dc.b SET v = 'main';
 SELECT length(dolt_commit('-am', 'dc main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
@@ -1348,7 +1348,7 @@ UPDATE dc.b SET v = 'side';
 SELECT length(dolt_commit('-am', 'dc side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -1400,7 +1400,7 @@ SELECT * FROM dolt_conflicts();
 SELECT length(dolt_commit('-Am', 'dc merged without a')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -1415,7 +1415,7 @@ INSERT INTO dc.a VALUES (1, 'base');
 SELECT length(dolt_commit('-Am', 'dc a again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'dc_side');
@@ -1434,7 +1434,7 @@ UPDATE dc.a SET v = 'main';
 SELECT length(dolt_commit('-am', 'dc main 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
@@ -1447,7 +1447,7 @@ UPDATE dc.a SET v = 'side';
 SELECT length(dolt_commit('-am', 'dc side 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -1479,7 +1479,7 @@ SELECT * FROM dolt_conflicts();
 SELECT length(dolt_commit('-Am', 'dc merged after drop')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_status();
@@ -1495,7 +1495,7 @@ INSERT INTO dc.a VALUES (1, 'base');
 SELECT length(dolt_commit('-Am', 'dc a a third time')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'dc_side');
@@ -1526,7 +1526,7 @@ DROP TABLE dc.a;
 SELECT length(dolt_commit('-Am', 'dc_none without a')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
@@ -1539,7 +1539,7 @@ UPDATE dc.a SET v = 'side';
 SELECT length(dolt_commit('-am', 'dc side 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -1552,7 +1552,7 @@ UPDATE dc.a SET v = 'main';
 SELECT length(dolt_commit('-am', 'dc main 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1685,6 +1685,6 @@ drop cascades to table dc.a
 SELECT length(dolt_commit('-Am', 'without dc')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

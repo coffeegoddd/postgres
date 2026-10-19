@@ -10,7 +10,7 @@ INSERT INTO wk.t SELECT g, 'v' || g FROM generate_series(1, 2000) g;
 SELECT length(dolt_commit('-Am', 'wk 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS c1 \gset
@@ -18,7 +18,7 @@ UPDATE wk.t SET v = 'w' WHERE id <= 10;
 SELECT length(dolt_commit('-am', 'wk 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS c2 \gset
@@ -26,7 +26,7 @@ UPDATE wk.t SET v = 'x' WHERE id > 1990;
 SELECT length(dolt_commit('-am', 'wk 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- declining a node below the head commits saves nothing above it; declining
@@ -57,6 +57,6 @@ NOTICE:  drop cascades to table wk.t
 SELECT length(dolt_commit('-Am', 'wk gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

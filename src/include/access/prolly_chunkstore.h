@@ -310,4 +310,25 @@ extern void prolly_chunkstore_checkpoint(void);
 extern void prolly_chunk_references(const void *data, Size len,
 									ProllyChunkRefVisit visit, void *arg);
 
+/*
+ * What a store's chunks are: the content hash that names them (by name, and
+ * its digest's length) and the version of the format the server's trees lay
+ * their nodes out in.  A store records the format it is made in, and a
+ * server of another refuses it.
+ */
+#define PROLLY_STORE_HASH_NAME_LEN	16
+
+typedef struct ProllyStoreFormat
+{
+	char		hash[PROLLY_STORE_HASH_NAME_LEN];	/* zero-padded */
+	uint8		hash_len;
+	uint16		chunk_format;
+} ProllyStoreFormat;
+
+/* The server's (computed once, so first called outside a critical section). */
+extern const ProllyStoreFormat *prolly_store_format(void);
+extern bool prolly_store_format_equal(const ProllyStoreFormat *a,
+									  const ProllyStoreFormat *b);
+extern char *prolly_store_format_text(const ProllyStoreFormat *format);
+
 #endif							/* PROLLY_CHUNKSTORE_H */

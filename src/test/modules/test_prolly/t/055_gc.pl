@@ -109,7 +109,7 @@ $g->query_until(qr/started/, q{
 });
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
-$w->query(qq{SELECT test_chunk_put('\\x0120'::bytea || '\\x20'::bytea || decode('$orphan2', 'hex')); COMMIT});
+$w->query(qq{SELECT test_chunk_put('\\x0120'::bytea || '\\x14'::bytea || decode('$orphan2', 'hex')); COMMIT});
 like($w->{stderr}, qr/a chunk it names was collected while the transaction ran/,
 	'a writer naming it in a chunk\'s bytes is refused');
 like($w->{stderr}, qr/40001|serializ|Try the transaction again/i, 'to be retried');

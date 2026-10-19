@@ -234,7 +234,7 @@ ALTER TABLE app.t ADD COLUMN w int;
 SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -259,7 +259,7 @@ UPDATE app.t SET v = 'diverged' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'diverged')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('at_second'))[2:4];
@@ -292,7 +292,7 @@ UPDATE mhd.t SET c = NULL;
 SELECT length(dolt_commit('-Am', 'a NULL in c')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE mhd.t SET c = 7;
@@ -313,7 +313,7 @@ NOTICE:  drop cascades to table mhd.t
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A move doesn't write the rows of a table whose collation differs now
@@ -326,7 +326,7 @@ INSERT INTO mhc.t VALUES ('a', 1);
 SELECT length(dolt_commit('-Am', 'collated')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE mhc.t SET v = 2;
@@ -354,7 +354,7 @@ DROP COLLATION public.mhc_c_utf8;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Merges into a branch with no commit yet, and between branches with no
@@ -379,7 +379,7 @@ INSERT INTO app.t VALUES (1, 'other');
 SELECT length(dolt_commit('-Am', 'on other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -408,7 +408,7 @@ ERROR:  the current branch has no commit to merge into
 SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('other');
@@ -421,7 +421,7 @@ CREATE TABLE mhf.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'mhf')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mh_ahead');
@@ -440,7 +440,7 @@ INSERT INTO mhf.t VALUES (1);
 SELECT length(dolt_commit('-am', 'ahead')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -472,7 +472,7 @@ NOTICE:  drop cascades to table mhf.t
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A materialized view's rows move too, as the commit holds them, its
@@ -487,7 +487,7 @@ CREATE UNIQUE INDEX ON mhm.ids (id);
 SELECT length(dolt_commit('-Am', 'views')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE mhm.t SET v = 10 WHERE id = 1;
@@ -557,7 +557,7 @@ DROP ROLE mhm_writer;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A reset is hard: there is no staging area to reset to.
@@ -575,7 +575,7 @@ INSERT INTO mhs.t (b) VALUES (1), (2);
 SELECT length(dolt_commit('-Am', 'mhs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO mhs.t (b) VALUES (3), (4);
@@ -604,6 +604,6 @@ NOTICE:  drop cascades to table mhs.t
 SELECT length(dolt_commit('-Am', 'without mhs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

@@ -7,7 +7,7 @@ INSERT INTO app.t VALUES (1, 'a');
 SELECT length(dolt_commit('-m', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_commit('-m', 'again');
@@ -17,7 +17,7 @@ INSERT INTO app.t VALUES (2, 'b');
 SELECT length(dolt_commit('-m', 'second')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT message, commit_order FROM dolt_log('main');
@@ -45,7 +45,7 @@ BEGIN;
 SELECT length(dolt_commit('-m', 'rolled back')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK;
@@ -54,7 +54,7 @@ SAVEPOINT s;
 SELECT length(dolt_commit('-m', 'rolled back to a savepoint')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK TO s;
@@ -80,7 +80,7 @@ RESET client_min_messages;
 SELECT length(dolt_commit('-m', 'before empty')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT sum(chunks) AS chunks FROM test_chunk_segments() \gset
@@ -146,7 +146,7 @@ INSERT INTO app.t VALUES (4, 'd');
 SELECT length(dolt_commit('-m', 'third')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -188,7 +188,7 @@ UPDATE app.t SET v = 'B' WHERE id = 2;
 SELECT length(dolt_commit('-m', 'on f')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') = dolt_hashof('f') AS head_is_f;
@@ -259,7 +259,7 @@ INSERT INTO app.t VALUES (4, 'd'), (3, 'c'), (2, 'b'), (1, 'a');
 SELECT length(dolt_commit('-m', 'same rows', '--allow-empty')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT prolly_root_hash('h') = prolly_root_hash('main') AS same_root;
@@ -272,7 +272,7 @@ UPDATE app.t SET v = 'x' WHERE id = 1;
 SELECT length(dolt_commit('-m', 'other rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT prolly_root_hash('h') <> prolly_root_hash('main') AS other_root;
@@ -319,7 +319,7 @@ SELECT dolt_hashof('HEAD') = :'before_drop' AS same_head;
 SELECT length(dolt_commit('-Am', 'drop the schema')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD~1') = :'before_drop' AS continues_it;
@@ -342,7 +342,7 @@ SET dolt.author = 'Ada Lovelace <ada@example.com>';
 SELECT length(dolt_commit('-Am', 'by ada')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 RESET dolt.author;
@@ -350,7 +350,7 @@ INSERT INTO ca.t VALUES (2);
 SELECT length(dolt_commit('-am', 'by default')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT message, committer = current_user AS session_user,
@@ -593,13 +593,13 @@ BEGIN;
 SELECT length(dolt_commit('--allow-empty', '-m', '--')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT length(dolt_commit('--allow-empty', '-Am', '--', '--author', '--')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT message, committer = '--' AS by_dashes FROM dolt_log('main') LIMIT 2;
@@ -624,7 +624,7 @@ SELECT dolt_checkout('dashed');
 SELECT length(dolt_commit('--allow-empty', '-m', 'on dashed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -763,7 +763,7 @@ INSERT INTO ca.t VALUES (3);
 SELECT length(dolt_commit('-am', 'moved on')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('cased');
@@ -886,7 +886,7 @@ NOTICE:  drop cascades to table ca.t
 SELECT length(dolt_commit('-Am', 'ca gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A cherry-pick resolved to nothing is refused as empty, by the refs
@@ -897,7 +897,7 @@ INSERT INTO cp.t VALUES (1, 'base');
 SELECT length(dolt_commit('-Am', 'cp base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('cp_src');
@@ -916,7 +916,7 @@ UPDATE cp.t SET v = 'src' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'cp src')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -929,7 +929,7 @@ UPDATE cp.t SET v = 'main' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'cp main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -975,6 +975,6 @@ NOTICE:  drop cascades to table cp.t
 SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

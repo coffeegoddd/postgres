@@ -4,7 +4,9 @@
  *	  Chunk store: an append-only journal per database.
  *
  * A database's chunks are records in its journal, in its directory in its
- * default tablespace: in segments, files of a header, then records
+ * default tablespace: in segments, files of a header (the journal's version
+ * and the store's format: the hash its chunks are named by, and their
+ * format's version, which a server of another refuses), then records
  *
  *		uint32 len (of the whole record), uint8 kind, payload,
  *		uint32 CRC-32C of kind and payload
@@ -74,7 +76,8 @@
  * Table files.  Chunks added together (received from another store, or
  * rewritten by conjoin()) go to an immutable table file of their own,
  * prolly_table_<id> (id in hex), in the table file format.  The manifest,
- * prolly_manifest, names the table files (each settled or not: closed
+ * prolly_manifest, records the store's format, as a segment's header does,
+ * and names the table files (each settled or not: closed
  * under what its chunks name), the segments, the files and segments
  * retiring (no longer named, kept until whoever may read them has ended),
  * the last id given, the root as of its writing and the GC generation; it
@@ -166,13 +169,15 @@
 #define MANIFEST_FILE		"prolly_manifest"
 #define MANIFEST_TEMP		"prolly_manifest.tmp"
 #define MANIFEST_MAGIC		"PRLYMAN1"
-#define MANIFEST_VERSION	3
-#define MANIFEST_V2			2	/* no LSN a segment was sealed at */
-#define MANIFEST_V1			1	/* no segments (segment 0 alone), no flags */
+#define MANIFEST_VERSION	4
 #define TABLE_FILE_FORMAT	"basic"
 #define JOURNAL_MAGIC		"PRLYJRN1"
-#define JOURNAL_VERSION		1
-#define JOURNAL_HEADER_SIZE	16	/* magic, version, reserved */
+#define JOURNAL_VERSION		2
+#define JOURNAL_HEADER_SIZE	32	/* magic, version, the store's format */
+
+/* the store's format, as a segment's header and the manifest hold it */
+#define FORMAT_SIZE			(PROLLY_STORE_HASH_NAME_LEN + 1 + 2)
+#define JOURNAL_FORMAT_AT	12	/* in the header, after magic and version */
 
 #define KIND_CHUNK			1
 #define KIND_ROOT			2
@@ -236,6 +241,10 @@ typedef struct xl_chunks_file
 
 /* XLOG_CHUNKS_MANIFEST: the manifest's contents follow */
 #define SizeOfChunksManifest	(offsetof(xl_chunks_file, id))
+
+/* a table file's and a segment's entries in the manifest, in bytes */
+#define MANIFEST_FILE_ENTRY		21	/* id, chunks, size, flags */
+#define MANIFEST_SEGMENT_ENTRY	16	/* id, sealed at */
 
 /* a table file's flags in the manifest */
 #define MANIFEST_FILE_SETTLED	0x01	/* closed under what its chunks name */
@@ -764,10 +773,18 @@ read_exact(Segment *g, char *buf, Size len, uint64 offset)
 						len, (unsigned long long) offset, g->path)));
 }
 
-/* Open a segment's file; false if it has none yet. */
+static bool header_ok(const char *header);
+static void check_header(const char *header, const char *path);
+
+/*
+ * Open a segment's file; false if it has none yet.  One with its header is
+ * checked to be this server's version and format.
+ */
 static bool
 open_segment(Segment *g)
 {
+	char		header[JOURNAL_HEADER_SIZE];
+
 	if (g->file >= 0)
 		return true;
 	g->file = PathNameOpenFile(g->path, O_RDWR | PG_BINARY);
@@ -778,6 +795,17 @@ open_segment(Segment *g)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", g->path)));
+	}
+	if (FileSize(g->file) >= JOURNAL_HEADER_SIZE)
+	{
+		read_exact(g, header, sizeof(header), 0);
+		if (!header_ok(header))
+		{
+			/* (closed, so the next open checks again) */
+			FileClose(g->file);
+			g->file = -1;
+			check_header(header, g->path);
+		}
 	}
 	return true;
 }
@@ -829,6 +857,84 @@ logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
 	END_CRIT_SECTION();
 }
 
+/* The store's format as its files hold it: hash name, its length, version. */
+static void
+format_bytes(const ProllyStoreFormat *f, char *out)
+{
+	memcpy(out, f->hash, PROLLY_STORE_HASH_NAME_LEN);
+	out[PROLLY_STORE_HASH_NAME_LEN] = (char) f->hash_len;
+	out[PROLLY_STORE_HASH_NAME_LEN + 1] = (char) (f->chunk_format & 0xff);
+	out[PROLLY_STORE_HASH_NAME_LEN + 2] = (char) (f->chunk_format >> 8);
+}
+
+static void
+format_read(const char *in, ProllyStoreFormat *f)
+{
+	memcpy(f->hash, in, PROLLY_STORE_HASH_NAME_LEN);
+	f->hash_len = (uint8) in[PROLLY_STORE_HASH_NAME_LEN];
+	f->chunk_format = (uint16) ((uint8) in[PROLLY_STORE_HASH_NAME_LEN + 1] |
+								((uint8) in[PROLLY_STORE_HASH_NAME_LEN + 2] << 8));
+}
+
+/*
+ * Refuse a store file (at path) of another version (what) or format than
+ * this server writes: its chunks are named, or laid out, otherwise.
+ */
+static void
+check_format(const char *path, const char *what, uint32 version,
+			 uint32 expected, const char *format)
+{
+	ProllyStoreFormat theirs;
+	const ProllyStoreFormat *mine = prolly_store_format();
+
+	if (version != expected)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("file \"%s\" is a chunk store %s of version %u, not %u",
+						path, what, version, expected),
+				 errdetail("A server reads only chunk stores made in its own format.")));
+	format_read(format, &theirs);
+	if (!prolly_store_format_equal(&theirs, mine))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("file \"%s\" is a chunk store %s of another format", path, what),
+				 errdetail("Its chunks are %s; this server's are %s.",
+						   prolly_store_format_text(&theirs),
+						   prolly_store_format_text(mine))));
+}
+
+/* Is a segment's header a journal's, of this server's version and format? */
+static bool
+header_ok(const char *header)
+{
+	char		mine[FORMAT_SIZE];
+	uint32		version;
+
+	memcpy(&version, header + 8, sizeof(version));
+	format_bytes(prolly_store_format(), mine);
+	return memcmp(header, JOURNAL_MAGIC, 8) == 0 &&
+		version == JOURNAL_VERSION &&
+		memcmp(header + JOURNAL_FORMAT_AT, mine, FORMAT_SIZE) == 0;
+}
+
+/*
+ * Check a segment's header: a journal's, of this server's version and
+ * format.
+ */
+static void
+check_header(const char *header, const char *path)
+{
+	uint32		version;
+
+	if (memcmp(header, JOURNAL_MAGIC, 8) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("file \"%s\" is not a chunk journal", path)));
+	memcpy(&version, header + 8, sizeof(version));
+	check_format(path, "journal", version, JOURNAL_VERSION,
+				 header + JOURNAL_FORMAT_AT);
+}
+
 /*
  * Give segment id its header, if it has none, logged as any append.  The
  * caller holds ProllyJournalLock.
@@ -842,6 +948,8 @@ segment_header(Oid dboid, Oid spcoid, uint64 id)
 	char		header[JOURNAL_HEADER_SIZE];
 	uint32		version = JOURNAL_VERSION;
 
+	StaticAssertStmt(JOURNAL_FORMAT_AT + FORMAT_SIZE <= JOURNAL_HEADER_SIZE,
+					 "a journal's header holds the store's format");
 	if (fd < 0 || fstat(fd, &st) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -851,6 +959,7 @@ segment_header(Oid dboid, Oid spcoid, uint64 id)
 		memset(header, 0, sizeof(header));
 		memcpy(header, JOURNAL_MAGIC, 8);
 		memcpy(header + 8, &version, sizeof(version));
+		format_bytes(prolly_store_format(), header + JOURNAL_FORMAT_AT);
 		logged_write(dboid, spcoid, id, 0, header, sizeof(header), -1, fd, path);
 	}
 	if (CloseTransientFile(fd) != 0)
@@ -2080,7 +2189,6 @@ journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 static bool
 ensure_journal(ProllyChunkStore *s, bool create)
 {
-	char		header[JOURNAL_HEADER_SIZE];
 	Segment    *g;
 
 	refresh_segments(s);
@@ -2097,13 +2205,9 @@ ensure_journal(ProllyChunkStore *s, bool create)
 		segment_header(s->dboid, s->spcoid, g->id);
 		LWLockRelease(ProllyJournalLock);
 	}
+	/* (open_segment() checks the header) */
 	if (!open_segment(g) || FileSize(g->file) < JOURNAL_HEADER_SIZE)
 		return false;
-	read_exact(g, header, sizeof(header), 0);
-	if (memcmp(header, JOURNAL_MAGIC, 8) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("file \"%s\" is not a chunk journal", g->path)));
 	return true;
 }
 
@@ -2176,9 +2280,12 @@ static void
 manifest_bytes(const Manifest *m, StringInfo out)
 {
 	pg_crc32c	crc;
+	char		format[FORMAT_SIZE];
 
 	appendBinaryStringInfo(out, MANIFEST_MAGIC, 8);
 	append_le(out, MANIFEST_VERSION, 4);
+	format_bytes(prolly_store_format(), format);
+	appendBinaryStringInfo(out, format, FORMAT_SIZE);
 	append_le(out, m->gc_generation, 4);
 	append_le(out, m->last_id, 8);
 	append_le(out, m->root.len, 1);
@@ -2233,8 +2340,7 @@ manifest_segment_zero(Manifest *m)
 
 /*
  * Read the manifest at path into m; false (m empty, but for segment 0) if
- * there is none.  One of version 1 names segment 0 alone, and no file
- * settled.
+ * there is none.  One of another version or format is refused.
  */
 static bool
 read_manifest_at(const char *path, Manifest *m)
@@ -2248,7 +2354,8 @@ read_manifest_at(const char *path, Manifest *m)
 	uint32		version;
 	uint8		rootlen;
 	uint32		nfiles;
-	Size		entry;
+	uint32		nsegs;
+	uint32		nretiring;
 
 	memset(m, 0, sizeof(*m));
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -2276,7 +2383,7 @@ read_manifest_at(const char *path, Manifest *m)
 
 	p = buf;
 	end = buf + st.st_size;
-	if (st.st_size < 8 + 4 + 4 + 8 + 1 + 4 + 4 ||
+	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 4 + 4 + 4 + 4 ||
 		memcmp(p, MANIFEST_MAGIC, 8) != 0)
 		goto corrupt;
 	INIT_CRC32C(crc);
@@ -2288,9 +2395,8 @@ read_manifest_at(const char *path, Manifest *m)
 	p += 8;
 	version = (uint32) read_le(p, 4);
 	p += 4;
-	if (version != MANIFEST_VERSION && version != MANIFEST_V2 &&
-		version != MANIFEST_V1)
-		goto corrupt;
+	check_format(path, "manifest", version, MANIFEST_VERSION, p);
+	p += FORMAT_SIZE;
 	m->gc_generation = (uint32) read_le(p, 4);
 	p += 4;
 	m->last_id = read_le(p, 8);
@@ -2303,8 +2409,7 @@ read_manifest_at(const char *path, Manifest *m)
 	p += rootlen;
 	nfiles = (uint32) read_le(p, 4);
 	p += 4;
-	entry = version == MANIFEST_V1 ? 20 : 21;
-	if ((Size) (end - p) < (Size) nfiles * entry)
+	if ((Size) (end - p) < (Size) nfiles * MANIFEST_FILE_ENTRY + 4)
 		goto corrupt;
 	m->nfiles = nfiles;
 	m->files = palloc0(sizeof(ManifestFile) * Max(nfiles, 1));
@@ -2313,49 +2418,32 @@ read_manifest_at(const char *path, Manifest *m)
 		m->files[i].id = read_le(p, 8);
 		m->files[i].nchunks = (uint32) read_le(p + 8, 4);
 		m->files[i].size = read_le(p + 12, 8);
-		if (version != MANIFEST_V1)
-			m->files[i].flags = (uint8) p[20];
-		p += entry;
+		m->files[i].flags = (uint8) p[20];
+		p += MANIFEST_FILE_ENTRY;
 	}
-	if (version == MANIFEST_V1)
+	nsegs = (uint32) read_le(p, 4);
+	p += 4;
+	if (nsegs < 1 || (Size) (end - p) < (Size) nsegs * MANIFEST_SEGMENT_ENTRY + 4)
+		goto corrupt;
+	m->nsegments = nsegs;
+	m->segments = palloc(sizeof(uint64) * nsegs);
+	m->sealed_at = palloc0(sizeof(XLogRecPtr) * nsegs);
+	for (uint32 i = 0; i < nsegs; i++)
 	{
-		if (p != end)
-			goto corrupt;
-		manifest_segment_zero(m);
+		m->segments[i] = read_le(p, 8);
+		m->sealed_at[i] = read_le(p + 8, 8);
+		p += MANIFEST_SEGMENT_ENTRY;
 	}
-	else
+	nretiring = (uint32) read_le(p, 4);
+	p += 4;
+	if ((Size) (end - p) != (Size) nretiring * 8)
+		goto corrupt;
+	m->nretiring = nretiring;
+	m->retiring = palloc(sizeof(uint64) * Max(nretiring, 1));
+	for (uint32 i = 0; i < nretiring; i++)
 	{
-		uint32		nsegs;
-		uint32		nretiring;
-		Size		segentry = version == MANIFEST_V2 ? 8 : 16;
-
-		if (end - p < 4)
-			goto corrupt;
-		nsegs = (uint32) read_le(p, 4);
-		p += 4;
-		if (nsegs < 1 || (Size) (end - p) < (Size) nsegs * segentry + 4)
-			goto corrupt;
-		m->nsegments = nsegs;
-		m->segments = palloc(sizeof(uint64) * nsegs);
-		m->sealed_at = palloc0(sizeof(XLogRecPtr) * nsegs);
-		for (uint32 i = 0; i < nsegs; i++)
-		{
-			m->segments[i] = read_le(p, 8);
-			if (version != MANIFEST_V2)
-				m->sealed_at[i] = read_le(p + 8, 8);
-			p += segentry;
-		}
-		nretiring = (uint32) read_le(p, 4);
-		p += 4;
-		if ((Size) (end - p) != (Size) nretiring * 8)
-			goto corrupt;
-		m->nretiring = nretiring;
-		m->retiring = palloc(sizeof(uint64) * Max(nretiring, 1));
-		for (uint32 i = 0; i < nretiring; i++)
-		{
-			m->retiring[i] = read_le(p, 8);
-			p += 8;
-		}
+		m->retiring[i] = read_le(p, 8);
+		p += 8;
 	}
 	pfree(buf);
 	return true;

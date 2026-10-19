@@ -70,7 +70,7 @@ for my $db ('postgres', 'latin1')
 	$node->safe_psql($db, q{
 		CREATE TABLE f.short (id int PRIMARY KEY, a text, b text, c text);
 		INSERT INTO f.short
-		SELECT 1, string_agg(md5(i::text), '') FILTER (WHERE i <= 60),
+		SELECT 1, string_agg(md5(i::text), '') FILTER (WHERE i <= 62),
 			   string_agg(md5(i::text || 'b'), ''), string_agg(md5(i::text || 'c'), '')
 		FROM generate_series(1, 120) i;
 	});

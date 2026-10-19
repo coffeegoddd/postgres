@@ -133,7 +133,7 @@ INSERT INTO fl.kl VALUES (0, 1);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('fl_other');
@@ -148,7 +148,7 @@ UPDATE fl.kl SET f = 'NaN';
 SELECT length(dolt_commit('-Am', 'NaN')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('fl_other');
@@ -163,7 +163,7 @@ UPDATE fl.kl SET f = :nan8;
 SELECT length(dolt_commit('-Am', '-NaN')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT prolly_root_hash('main') = prolly_root_hash('fl_other') AS same_root;

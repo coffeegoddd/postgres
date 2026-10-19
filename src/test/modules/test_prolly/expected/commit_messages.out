@@ -6,7 +6,7 @@ CREATE TABLE cm.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'cm base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS base \gset
@@ -38,14 +38,14 @@ SELECT dolt_hashof('HEAD') = :'base' AS nothing_committed;
 SELECT length(dolt_commit('-Am', 'by ada', '--author', 'Ada <ada@example.com>')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO cm.t VALUES (2);
 SELECT length(dolt_commit('-Am', 'by bob', '--author', 'Bob')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT committer, email, message FROM dolt_log('main') LIMIT 2;
@@ -82,7 +82,7 @@ INSERT INTO cm.t VALUES (3);
 SELECT length(dolt_commit('-Am', 'on cm_f')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -135,7 +135,7 @@ INSERT INTO cm.c VALUES (1, 'base');
 SELECT length(dolt_commit('-Am', 'cm.c')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('cm_f');
@@ -154,7 +154,7 @@ UPDATE cm.c SET v = 'theirs';
 SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -167,7 +167,7 @@ UPDATE cm.c SET v = 'ours';
 SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS before_abort \gset
@@ -210,6 +210,6 @@ drop cascades to table cm.c
 SELECT length(dolt_commit('-Am', 'cm gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

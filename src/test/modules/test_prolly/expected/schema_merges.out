@@ -12,7 +12,7 @@ INSERT INTO app.u SELECT g, 'w' || g FROM generate_series(1, 5) g;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('feature');
@@ -39,7 +39,7 @@ CREATE TABLE app.same (k int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'feature defines')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- main: rows of another table, and the same table made alike
@@ -55,7 +55,7 @@ CREATE TABLE app.same (k int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'main rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -146,7 +146,7 @@ CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 1';
 SELECT length(dolt_commit('-Am', 'feature f')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -159,7 +159,7 @@ CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 2';
 SELECT length(dolt_commit('-Am', 'main f')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('feature');
@@ -195,7 +195,7 @@ ALTER TABLE app.u ADD COLUMN more int;
 SELECT length(dolt_commit('-Am', 'feature redefines u')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -208,7 +208,7 @@ UPDATE app.u SET w = 'main again' WHERE id = 2;
 SELECT length(dolt_commit('-Am', 'main changes u')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -247,7 +247,7 @@ ALTER TABLE app.u ADD COLUMN most int DEFAULT 5;
 SELECT length(dolt_commit('-Am', 'feature fills u')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -260,7 +260,7 @@ UPDATE app.u SET w = 'main once more' WHERE id = 3;
 SELECT length(dolt_commit('-Am', 'main changes u again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -300,7 +300,7 @@ CREATE SCHEMA sg_gone VERSIONED;
 SELECT length(dolt_commit('-Am', 'a schema to drop')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sg_side');
@@ -322,7 +322,7 @@ DROP SCHEMA sg_gone;
 SELECT length(dolt_commit('-Am', 'schemas on the side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -335,7 +335,7 @@ CREATE TABLE app.sg_main (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'a table on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('sg_side'))[2:4];
@@ -371,7 +371,7 @@ CREATE TABLE mr.u (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'mr base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mr_side');
@@ -390,7 +390,7 @@ ALTER TABLE mr.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;
 SELECT length(dolt_commit('-Am', 'identity')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -403,7 +403,7 @@ INSERT INTO mr.u VALUES (1);
 SELECT length(dolt_commit('-Am', 'mr main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mr_side'))[2:4];
@@ -443,7 +443,7 @@ INSERT INTO mr.both VALUES (2);
 SELECT length(dolt_commit('-Am', 'side makes both')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -457,7 +457,7 @@ INSERT INTO mr.both VALUES (1);
 SELECT length(dolt_commit('-Am', 'main makes both')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mr_side'))[2:4];
@@ -499,7 +499,7 @@ INSERT INTO mr.t OVERRIDING SYSTEM VALUE VALUES (3, 'abcdefghij');
 SELECT length(dolt_commit('-Am', 'a long one')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -512,7 +512,7 @@ ALTER TABLE mr.t ALTER COLUMN v TYPE varchar(5);
 SELECT length(dolt_commit('-Am', 'narrowed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mr_side'))[2:4];
@@ -535,7 +535,7 @@ CREATE SEQUENCE mr.s;
 SELECT length(dolt_commit('-Am', 'mr.s')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mr_side');
@@ -559,7 +559,7 @@ SELECT nextval('mr.s');
 SELECT length(dolt_commit('-Am', 'side takes a value')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -572,7 +572,7 @@ DROP SEQUENCE mr.s;
 SELECT length(dolt_commit('-Am', 'main drops it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mr_side'))[2:4];
@@ -600,7 +600,7 @@ CREATE FUNCTION mr.twice(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
 SELECT length(dolt_commit('-Am', 'mr_gone, twice')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mr_side');
@@ -619,7 +619,7 @@ DROP SCHEMA mr_gone;
 SELECT length(dolt_commit('-Am', 'side drops mr_gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -633,7 +633,7 @@ INSERT INTO mr_gone.x VALUES (1);
 SELECT length(dolt_commit('-Am', 'main fills mr_gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('mr_side');
@@ -656,7 +656,7 @@ NOTICE:  drop cascades to table mr_gone.x
 SELECT length(dolt_commit('-Am', 'without mr_gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mr_side');
@@ -675,7 +675,7 @@ DROP FUNCTION mr.twice(int);
 SELECT length(dolt_commit('-Am', 'side drops twice')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -688,7 +688,7 @@ CREATE VIEW mr.tv AS SELECT mr.twice(id) AS d FROM mr.u;
 SELECT length(dolt_commit('-Am', 'main uses twice')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('mr_side');
@@ -710,7 +710,7 @@ drop cascades to view mr.tv
 SELECT length(dolt_commit('-Am', 'without mr')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a routine with several arguments kept by a merge (its signature,
@@ -721,7 +721,7 @@ CREATE TABLE ma.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'ma')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('-b', 'ma_side') IS NOT NULL AS on_side;
@@ -734,7 +734,7 @@ CREATE TABLE ma.s (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'side table')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -747,7 +747,7 @@ CREATE TABLE ma.m (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'main table')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('ma_side') IS NOT NULL AS merged;
@@ -784,7 +784,7 @@ drop cascades to table ma.s
 SELECT length(dolt_commit('-Am', 'ma dropped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -797,7 +797,7 @@ CREATE FUNCTION ma.mul(int, int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 * $
 SELECT length(dolt_commit('-Am', 'ma.mul')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('ma_drop');
@@ -819,7 +819,7 @@ drop cascades to function ma.mul(integer,integer,integer)
 SELECT length(dolt_commit('-Am', 'without ma')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a versioned public dropped on one side: what has no schema (the root's
@@ -835,7 +835,7 @@ CREATE TABLE other.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'public')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('-b', 'no_public') IS NOT NULL AS on_side;
@@ -849,7 +849,7 @@ NOTICE:  drop cascades to table t
 SELECT length(dolt_commit('-Am', 'public dropped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -862,7 +862,7 @@ INSERT INTO other.t VALUES (1);
 SELECT length(dolt_commit('-Am', 'a row elsewhere')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('no_public') IS NOT NULL AS merged;
@@ -890,7 +890,7 @@ INSERT INTO svk.t VALUES (1, 0, '1');
 SELECT length(dolt_commit('-Am', 'svk base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('svk_right');
@@ -910,7 +910,7 @@ INSERT INTO svk.t VALUES (2, 1, '2', 'hello');
 SELECT length(dolt_commit('-Am', 'svk right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -923,7 +923,7 @@ INSERT INTO svk.t VALUES (3, 0, '3');
 SELECT length(dolt_commit('-Am', 'svk left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('svk_right'))[2:4];
@@ -956,7 +956,7 @@ INSERT INTO sgc.t VALUES (1);
 SELECT length(dolt_commit('-Am', 'sgc base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sgc_right');
@@ -977,7 +977,7 @@ INSERT INTO sgc.t VALUES (3);
 SELECT length(dolt_commit('-Am', 'sgc right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -990,7 +990,7 @@ INSERT INTO sgc.t VALUES (2);
 SELECT length(dolt_commit('-Am', 'sgc left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('sgc_right'))[2:4];
@@ -1032,7 +1032,7 @@ INSERT INTO sbt.t VALUES (1, 1, 1, 1);
 SELECT length(dolt_commit('-Am', 'sbt base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sbt_right');
@@ -1053,7 +1053,7 @@ INSERT INTO sbt.t VALUES (2, 2, 2, 1, 20);
 SELECT length(dolt_commit('-Am', 'sbt right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1069,7 +1069,7 @@ UPDATE sbt.t SET l = 'one' WHERE pk = 1;
 SELECT length(dolt_commit('-Am', 'sbt left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('sbt_right'))[2:4];
@@ -1113,7 +1113,7 @@ ALTER TABLE sbt.t ALTER COLUMN a TYPE bigint;
 SELECT length(dolt_commit('-am', 'a bigint')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('sbt_other');
@@ -1126,7 +1126,7 @@ ALTER TABLE sbt.t ALTER COLUMN a TYPE numeric;
 SELECT length(dolt_commit('-am', 'a numeric')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1150,7 +1150,7 @@ INSERT INTO sbt.t (pk, a, p) VALUES (4, 4, 1);
 SELECT length(dolt_commit('-am', 'row 4')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('sbt_fk');
@@ -1164,7 +1164,7 @@ ALTER TABLE sbt.t ADD CONSTRAINT t_a_fk FOREIGN KEY (a) REFERENCES sbt.parent (i
 SELECT length(dolt_commit('-am', 'a fk')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1231,7 +1231,7 @@ INSERT INTO snn.t VALUES (1, NULL, 1), (2, NULL, 1);
 SELECT length(dolt_commit('-Am', 'snn base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('snn_right');
@@ -1251,7 +1251,7 @@ ALTER TABLE snn.t ALTER COLUMN a SET NOT NULL, ADD CONSTRAINT b_small CHECK (b <
 SELECT length(dolt_commit('-Am', 'snn right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1264,7 +1264,7 @@ INSERT INTO snn.t VALUES (3, NULL, 1), (4, 4, 9), (5, 5, 1);
 SELECT length(dolt_commit('-Am', 'snn left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1319,7 +1319,7 @@ INSERT INTO sfk.child VALUES (10, 1), (20, 2);
 SELECT length(dolt_commit('-Am', 'sfk base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sfk_right');
@@ -1338,7 +1338,7 @@ ALTER TABLE sfk.parent ADD CONSTRAINT v_pos CHECK (v > 0);
 SELECT length(dolt_commit('-Am', 'sfk right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1351,7 +1351,7 @@ UPDATE sfk.parent SET v = -1 WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'sfk left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1402,7 +1402,7 @@ CREATE TABLE spk.t (a int, b int, c int);
 SELECT length(dolt_commit('-Am', 'spk base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('spk_right');
@@ -1427,7 +1427,7 @@ ALTER TABLE spk.t ADD CONSTRAINT pk2 PRIMARY KEY (b);
 SELECT length(dolt_commit('-Am', 'spk right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('spk_nn');
@@ -1440,7 +1440,7 @@ ALTER TABLE spk.t ADD CONSTRAINT c_set NOT NULL c;
 SELECT length(dolt_commit('-Am', 'spk nn')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1453,7 +1453,7 @@ ALTER TABLE spk.t ADD PRIMARY KEY (a), ALTER COLUMN c SET NOT NULL;
 SELECT length(dolt_commit('-Am', 'spk left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('spk_right');
@@ -1488,7 +1488,7 @@ INSERT INTO sfp.t VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'sfp base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sfp_right');
@@ -1507,7 +1507,7 @@ ALTER TABLE sfp.t ADD CONSTRAINT t_x_fk FOREIGN KEY (x) REFERENCES sfp.parted;
 SELECT length(dolt_commit('-Am', 'sfp right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1520,7 +1520,7 @@ INSERT INTO sfp.t VALUES (2, 150), (3, 999);
 SELECT length(dolt_commit('-Am', 'sfp left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -1563,7 +1563,7 @@ INSERT INTO sqk.t VALUES (1, 1), (2, 2);
 SELECT length(dolt_commit('-Am', 'sqk base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sqk_right');
@@ -1582,7 +1582,7 @@ ALTER TABLE sqk.t ADD PRIMARY KEY ("MyCol");
 SELECT length(dolt_commit('-Am', 'sqk right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1627,7 +1627,7 @@ INSERT INTO sge.t (pk, a) VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'sge base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('sge_right');
@@ -1646,7 +1646,7 @@ ALTER TABLE sge.t ALTER COLUMN g SET EXPRESSION AS (a * 3);
 SELECT length(dolt_commit('-Am', 'sge right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1659,7 +1659,7 @@ INSERT INTO sge.t (pk, a) VALUES (2, 2);
 SELECT length(dolt_commit('-Am', 'sge left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('sge_right'))[2:4];
@@ -1691,7 +1691,7 @@ INSERT INTO slk.t VALUES (1, 1, 1);
 SELECT length(dolt_commit('-Am', 'slk base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('slk_right');
@@ -1710,7 +1710,7 @@ UPDATE slk.t SET c = 2;
 SELECT length(dolt_commit('-Am', 'slk right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1723,7 +1723,7 @@ ALTER TABLE slk.t DROP CONSTRAINT t_pkey, DROP COLUMN c;
 SELECT length(dolt_commit('-Am', 'slk left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('slk_right');
@@ -1748,7 +1748,7 @@ INSERT INTO stc.u VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'stc base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('stc_right');
@@ -1769,7 +1769,7 @@ INSERT INTO stc.t VALUES (2, 'longer', 'cc', 2);
 SELECT length(dolt_commit('-Am', 'stc right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1782,7 +1782,7 @@ INSERT INTO stc.t VALUES (3, 'x', 'y', 3);
 SELECT length(dolt_commit('-Am', 'stc left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('stc_right'))[2:4];
@@ -1833,7 +1833,7 @@ ALTER TABLE stc.t ALTER COLUMN i TYPE bigint;
 SELECT length(dolt_commit('-Am', 'stc right: bigint')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -1846,7 +1846,7 @@ UPDATE stc.t SET i = 30 WHERE pk = 3;
 SELECT length(dolt_commit('-Am', 'stc left: a row')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('stc_right');

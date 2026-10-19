@@ -219,7 +219,9 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "11", primary keys whose opfamily
+ * The format a folded root is in: "12", every chunk and hash pointer named
+ * by BLAKE3's first 20 bytes; "11" named them by SHA-256, and was the
+ * first with primary keys whose opfamily
  * compares them as a type they're binary-coercible to (varchar as text,
  * cidr as inet) ordered by that comparison, rather than rows keyed by
  * content; "10" described table and TOAST options, replica identity and
@@ -245,7 +247,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"11"
+#define FOLDED_FORMAT	"12"
 
 typedef struct Canon
 {

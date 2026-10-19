@@ -292,7 +292,7 @@ BEGIN;
 SELECT length(dolt_commit('-am', 'rolled back')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ROLLBACK;
@@ -333,7 +333,7 @@ SAVEPOINT b;
 SELECT length(dolt_commit('-am', 'in a savepoint')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 RELEASE b;
@@ -348,7 +348,7 @@ SELECT count(*) AS reset FROM test_memo_counters(true);
 SELECT length(dolt_commit('-am', 'savepoints')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT hits = 4 AS others_hit, misses = 1 AS rolled_back_missed
@@ -373,14 +373,14 @@ SELECT count(*) AS reset FROM test_memo_counters(true);
 SELECT length(dolt_commit('-am', 'frozen')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE lv.memo SET n = n + 1 WHERE id = 5;
 SELECT length(dolt_commit('-am', 'frozen again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- (the freeze made every row a candidate: the others hit in both folds)
@@ -480,7 +480,7 @@ UPDATE lv.keep SET n = n + 10;
 SELECT length(dolt_commit('-am', 'counted on a branch')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -493,7 +493,7 @@ UPDATE lv.memo SET n = n + 1 WHERE id = 1;
 SELECT length(dolt_commit('-am', 'a change on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP TABLE before_reset;
@@ -589,6 +589,6 @@ drop cascades to view lv.toasted
 SELECT length(dolt_commit('-Am', 'lv gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

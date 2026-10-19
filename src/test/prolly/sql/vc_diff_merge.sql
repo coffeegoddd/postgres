@@ -19,7 +19,7 @@ SELECT 'checkout feature', (dolt_checkout('vm_feature'))[1] = '0';
 INSERT INTO vm VALUES (2, 'two');
 UPDATE vm SET v = 'ONE' WHERE id = 1;
 DELETE FROM vm WHERE id = 3;
-SELECT 'commit feature', (dolt_commit('-Am', 'vm feature'))[1] ~ '^[0-9a-f]{64}$';
+SELECT 'commit feature', (dolt_commit('-Am', 'vm feature'))[1] ~ '^[0-9a-f]{40}$';
 
 SELECT 'diff base..feature', string_agg(diff_type, ',' ORDER BY diff_type)
 FROM dolt_diff(:'vm_base', 'vm_feature', NULL::vm);
@@ -30,7 +30,7 @@ SELECT 'diff base..base', count(*) FROM dolt_diff(:'vm_base', :'vm_base', NULL::
 SELECT 'checkout main', (dolt_checkout('main'))[1] = '0';
 INSERT INTO vm VALUES (4, 'four');
 UPDATE vm SET v = 'FIVE' WHERE id = 5;
-SELECT 'commit main', (dolt_commit('-Am', 'vm main'))[1] ~ '^[0-9a-f]{64}$';
+SELECT 'commit main', (dolt_commit('-Am', 'vm main'))[1] ~ '^[0-9a-f]{40}$';
 SELECT 'merge', (dolt_merge('vm_feature'))[2:4];
 SELECT 'merge commit', dolt_hashof('HEAD^2') = dolt_hashof('vm_feature');
 SELECT 'merged rows', string_agg(id || ':' || v, ',' ORDER BY id) FROM vm;

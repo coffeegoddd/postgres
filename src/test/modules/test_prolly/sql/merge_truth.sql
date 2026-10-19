@@ -25,7 +25,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<id>', 'g');
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<id>', 'g');
 END $$;
 -- (with its detail)
 CREATE FUNCTION pg_temp.err_detail(q text) RETURNS text LANGUAGE plpgsql AS $$
@@ -36,7 +36,7 @@ BEGIN
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
 	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
-	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{64}', '<id>', 'g');
+	RETURN regexp_replace(SQLERRM || ' (' || detail || ')', '[0-9a-fA-F]{40}', '<id>', 'g');
 END $$;
 
 -- ------------------------------------------------------------------------

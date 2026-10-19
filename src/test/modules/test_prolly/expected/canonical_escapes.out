@@ -9,7 +9,7 @@ CREATE TABLE esc.base (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('esc_reset');
@@ -49,7 +49,7 @@ INSERT INTO esc.U&"t\000Abl" (id, p) VALUES (1, ROW(2, E'z\tz'));
 SELECT length(dolt_commit('-Am', 'escapes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE FUNCTION pg_temp.show() RETURNS SETOF text LANGUAGE sql AS $$
@@ -188,7 +188,7 @@ CREATE TABLE esc.other (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('main') IS NOT NULL AS merged;
@@ -276,7 +276,7 @@ ALTER TYPE esc.U&"tab\0009type" ADD VALUE 'more';
 SELECT length(dolt_commit('-Am', 'more')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('esc_type');
@@ -340,6 +340,6 @@ drop cascades to table esc.keyed
 SELECT length(dolt_commit('-Am', 'esc gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

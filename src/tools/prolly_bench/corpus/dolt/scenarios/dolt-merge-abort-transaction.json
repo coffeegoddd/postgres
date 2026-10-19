@@ -69,7 +69,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-am', 'Step 1'))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-am', 'Step 1'))[1]) = 40",
       "expect": {
         "rows": [
           [
@@ -121,7 +121,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-am', 'this is a normal commit'))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-am', 'this is a normal commit'))[1]) = 40",
       "expect": {
         "rows": [
           [
@@ -164,7 +164,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-am', 'update a value'))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-am', 'update a value'))[1]) = 40",
       "expect": {
         "rows": [
           [

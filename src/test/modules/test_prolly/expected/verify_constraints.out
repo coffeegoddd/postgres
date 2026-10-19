@@ -8,7 +8,7 @@ INSERT INTO vc.t VALUES (1, 1, 2), (2, 5, 5), (3, 7, NULL);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE vc.t ADD CONSTRAINT t_chk CHECK (col1 <> col2) NOT VALID;
@@ -183,7 +183,7 @@ SELECT dolt_verify_constraints('-o');
 SELECT length(dolt_commit('-Am', 'vd')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_verify_constraints('-o');
@@ -307,7 +307,7 @@ SELECT dolt_verify_constraints('vr.child');
 SELECT length(dolt_commit('-Am', 'vr')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_constraint_violations();
@@ -356,7 +356,7 @@ INSERT INTO vr.k VALUES (1, 1, 2), (2, 5, 4), (3, 8, 7);
 SELECT length(dolt_commit('-Am', 'vr.k')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE vr.k ADD CONSTRAINT k_chk CHECK (a < b) NOT VALID;
@@ -397,7 +397,7 @@ ALTER TABLE vr.pk ADD CONSTRAINT pk_chk CHECK (a < b) NOT VALID;
 SELECT length(dolt_commit('-Am', 'vr.pk')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE vr.pk2 ADD CONSTRAINT pk2_chk CHECK (id > 0);
@@ -444,7 +444,7 @@ UPDATE vr.tc SET note = 'still an orphan' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'vr.tc')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET TimeZone = 'America/New_York';
@@ -479,7 +479,7 @@ SELECT dolt_verify_constraints('vr.tc');
 SELECT length(dolt_commit('-Am', 'vr.tc empty')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE vr.jc (id int PRIMARY KEY, p int REFERENCES vr.tp, doc json, s json);
@@ -491,7 +491,7 @@ INSERT INTO vr.gc VALUES (1, 1);
 SELECT length(dolt_commit('-Am', 'vr.jc, vr.gc')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE vr.jc SET p = 2 WHERE id = 1;
@@ -540,7 +540,7 @@ RESET session_replication_role;
 SELECT length(dolt_commit('-Am', 'vr.bc')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET session_replication_role = replica;
@@ -581,7 +581,7 @@ CREATE TABLE vr.fk (k float8 PRIMARY KEY, p int REFERENCES vr.tp);
 SELECT length(dolt_commit('-Am', 'vr.nk, vr.lc, vr.lk, vr.fk')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET session_replication_role = replica;

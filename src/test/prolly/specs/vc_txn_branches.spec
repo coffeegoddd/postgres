@@ -55,7 +55,7 @@ session b
 step b_begin	{ BEGIN; }
 step b_on_other	{ SELECT (dolt_checkout('vtb_other'))[1] = '0' AS ok; }
 step b_change	{ INSERT INTO vtb.t (v) VALUES (2); }
-step b_dcommit	{ SELECT length((dolt_commit('-am', 'other moves'))[1]) = 64 AS committed; }
+step b_dcommit	{ SELECT length((dolt_commit('-am', 'other moves'))[1]) = 40 AS committed; }
 step b_main		{ SELECT (dolt_checkout('main'))[1] = '0' AS ok; }
 step b_branch	{ SELECT dolt_branch('vtb_new'); }
 step b_swap		{ SELECT dolt_branch('-d', 'vtb_other') AS deleted, dolt_branch('vtb_new') AS made; }
