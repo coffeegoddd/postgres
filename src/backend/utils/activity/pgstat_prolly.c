@@ -5,10 +5,11 @@
  *
  * This file contains the implementation of the prolly engine's work
  * counters: tree nodes read and written, chunks appended, bytes hashed,
- * rows folded, commits, head moves, value memo lookups, pages copied.  It
- * is kept separate from pgstat.c to enforce the line between the statistics
- * access / storage implementation and the details about individual types of
- * statistics.
+ * rows folded, commits, head moves, value memo lookups, pages copied, and
+ * the bytes the chunk store and the block map write to their files
+ * themselves.  It is kept separate from pgstat.c to enforce the line
+ * between the statistics access / storage implementation and the details
+ * about individual types of statistics.
  *
  * This statistics kind uses a database's OID as the key of its one entry,
  * with InvalidOid as the object ID.  Backends count in PendingProllyStats,
@@ -54,6 +55,12 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_MEMO_MISSES] = "memo_misses",
 	[PGSTAT_PROLLY_PAGE_COPIES_FOLD] = "page_copies_fold",
 	[PGSTAT_PROLLY_PAGE_COPIES_SHARED] = "page_copies_shared",
+	[PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN] = "journal_bytes_written",
+	[PGSTAT_PROLLY_TABLE_FILE_BYTES_WRITTEN] = "table_file_bytes_written",
+	[PGSTAT_PROLLY_MANIFEST_BYTES_WRITTEN] = "manifest_bytes_written",
+	[PGSTAT_PROLLY_GC_BYTES_COPIED] = "gc_bytes_copied",
+	[PGSTAT_PROLLY_CONJOIN_BYTES_COPIED] = "conjoin_bytes_copied",
+	[PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN] = "bmap_store_bytes_written",
 };
 
 /*

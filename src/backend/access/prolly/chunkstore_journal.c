@@ -823,6 +823,7 @@ logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
 				(errcode_for_file_access(),
 				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
 						len, (unsigned long long) offset, path)));
+	pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN, len);
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 }
@@ -1328,6 +1329,7 @@ append_write(Append *a, const char *data)
 				(errcode_for_file_access(),
 				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
 						a->len, (unsigned long long) a->offset, a->g->path)));
+	pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN, a->len);
 	SpinLockAcquire(&js->mutex);
 	r->len = 0;
 	js->inflight--;
@@ -2407,6 +2409,7 @@ write_manifest_temp(const char *dir, const char *data, Size len)
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m", path)));
 	pgstat_report_wait_end();
+	pgstat_count_prolly(PGSTAT_PROLLY_MANIFEST_BYTES_WRITTEN, len);
 	if (pg_fsync(fd) != 0)
 		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
@@ -2520,6 +2523,7 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
 						len, (unsigned long long) offset, path)));
 	pgstat_report_wait_end();
+	pgstat_count_prolly(PGSTAT_PROLLY_TABLE_FILE_BYTES_WRITTEN, len);
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 }
@@ -2854,12 +2858,13 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 /*
  * Write a table file of the chunks next() gives, and a manifest naming it
  * (with flags) beside the files keep (of m) names and m's segments; the
- * files m names that keep leaves out are removed after.  The manifest's
- * lock is held.
+ * files m names that keep leaves out are removed after; copies says the
+ * chunks are the store's own, written again (conjoining), and counts them
+ * so.  The manifest's lock is held.
  */
 static void
 write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
-				 ProllyChunkNext next, void *arg)
+				 ProllyChunkNext next, void *arg, bool copies)
 {
 	char	   *dir;
 	uint64		id = m->last_id + 1;
@@ -2869,6 +2874,8 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 
 	if (!write_file(s, id, next, arg, &nchunks, &size))
 		return;
+	if (copies)
+		pgstat_count_prolly(PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, size);
 	INJECTION_POINT("prolly-table-file-written", NULL);
 
 	nm = *m;
@@ -3310,13 +3317,16 @@ journal_committed(void)
 	if (!s->moving)
 		return;
 	/* (a PAD not in this append, never expected: the ROOT over it) */
-	if (!in_append &&
-		FileWrite(s->pad_segment->file, s->root_rec, s->root_rec_len,
-				  s->pad_offset, WAIT_EVENT_DATA_FILE_WRITE) != s->root_rec_len)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not write the root in file \"%s\": %m",
-						s->pad_segment->path)));
+	if (!in_append)
+	{
+		if (FileWrite(s->pad_segment->file, s->root_rec, s->root_rec_len,
+					  s->pad_offset, WAIT_EVENT_DATA_FILE_WRITE) != s->root_rec_len)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not write the root in file \"%s\": %m",
+							s->pad_segment->path)));
+		pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN, s->root_rec_len);
+	}
 	s->root = s->new_root;
 	s->root_segment = s->pad_segment->id;
 	s->root_offset = s->pad_offset;
@@ -3586,7 +3596,7 @@ journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
 	for (int i = 0; i < m.nfiles; i++)
 		keep[i] = true;
-	write_table_file(s, &m, keep, 0, next, arg);
+	write_table_file(s, &m, keep, 0, next, arg, false);
 	pfree(keep);
 }
 
@@ -3686,7 +3696,7 @@ journal_conjoin(ProllyChunkStore *s)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, flags, conjoin_next, &cs);
+		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true);
 	}
 	PG_FINALLY();
 	{
@@ -4768,6 +4778,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 		ManifestFile *f = MemoryContextAlloc(gc->cxt, sizeof(ManifestFile));
 		MemoryContext old = MemoryContextSwitchTo(gc->cxt);
 
+		pgstat_count_prolly(PGSTAT_PROLLY_GC_BYTES_COPIED, size);
 		f->id = gc->next_id++;
 		f->nchunks = nchunks;
 		f->size = size;

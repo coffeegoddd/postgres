@@ -21,7 +21,10 @@ class FakeServer:
         self.io = [0, 0, 0]
         self.tuples = {"t": [0, 0, 0]}
         self.row_bytes = {"t": 100.0}
-        self.prolly = {"chunk_bytes_appended": 0, "nodes_written": 0}
+        self.prolly = {"chunk_bytes_appended": 0, "nodes_written": 0,
+                       "journal_bytes_written": 0, "table_file_bytes_written": 0,
+                       "manifest_bytes_written": 0, "gc_bytes_copied": 0,
+                       "conjoin_bytes_copied": 0, "bmap_store_bytes_written": 0}
         self.checkpoints = 0
         self.autovacuum = []        # workers running, read one per query
         self.flushed = None             # flush LSN, if behind the insert LSN
@@ -237,19 +240,45 @@ class WriteAmpTest(unittest.TestCase):
                 s.lsn += 50_000_000
                 return
             s.prolly["chunk_bytes_appended"] += 2_000_000
+            s.prolly["journal_bytes_written"] += 2_090_000
             s.lsn += 2_000_100
         s.on_prolly_checkpoint = fold
 
         def work():
             s.lsn += 1_000_000
             s.tuples["t"] = [0, 20_000, 0]
+            s.prolly["bmap_store_bytes_written"] += 8192
+            # autovacuum collecting in the window: a table file of copies
+            s.prolly["table_file_bytes_written"] += 500_000
+            s.prolly["gc_bytes_copied"] += 500_000
+            s.prolly["manifest_bytes_written"] += 300
+        s.on_checkpoint = lambda: (order.append("checkpoint"), s.io.__setitem__(0, s.io[0] + 1000))
         m = self.run_cell(s, ctx, work, Outcome(transactions=100))
         self.assertEqual(order, ["fold", "checkpoint", "fold", "checkpoint"])
         self.assertEqual(m["wa.tree.chunk_payload_bytes"], 2_000_000)
         self.assertEqual(m["wa.tree.materialize_chunk_payload_bytes"], 2_000_000)
+        self.assertEqual(m["wa.tree.materialize_file_bytes"], 2_090_000)
         self.assertEqual(m["wa.wal.materialize_bytes"], 2_000_100)
         self.assertEqual(m["wa.wal.total_bytes"], 3_000_100)
+        self.assertEqual(m["wa.tree.journal_bytes"], 2_090_000)
+        self.assertEqual(m["wa.tree.file_bytes"], 2_590_300)
+        self.assertEqual(m["wa.tree.gc_copied_bytes"], 500_000)
+        self.assertEqual(m["wa.pages.bmap_store_bytes"], 8192)
+        self.assertEqual(m["wa.server_bytes"], 3_000_100 + 1000 + 2_590_300)
         self.assertAlmostEqual(m["wa_tree_payload"], 1.0)
+        self.assertAlmostEqual(m["wa_tree"], 2_590_300 / 2_000_000)
+
+    def test_prolly_build_without_file_counters_has_no_total(self):
+        s = FakeServer()
+        s.prolly = {"chunk_bytes_appended": 0}
+        def work():
+            s.lsn += 1_000_000
+            s.tuples["t"] = [0, 20_000, 0]
+        m = self.run_cell(s, context(s, am="prolly"), work, Outcome(transactions=100))
+        self.assertIsNone(m["wa.tree.file_bytes"])
+        self.assertIsNone(m["wa.server_bytes"])
+        self.assertIsNone(m["wa_server"])
+        self.assertIsNotNone(m["wa_wal"])
 
     def test_materialize_mode(self):
         s = FakeServer()

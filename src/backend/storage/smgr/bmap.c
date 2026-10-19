@@ -1236,7 +1236,8 @@ lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
  * Make the page store hold the blocks below 'new_hw', zeroing the blocks
  * from 'old_hw', and zero the reused blocks.  Done before the record that
  * maps them, and again by its redo unless 'skip_existing': then blocks the
- * page store already has are left as they are.
+ * page store already has are left as they are.  Counted as the block map's
+ * own page-store writes, which shared buffers' statistics don't see.
  */
 static void
 prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
@@ -1253,6 +1254,7 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		if (skip_existing && reused[i] < store_cur)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, reused[i], &page, 1, false);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN, BLCKSZ);
 	}
 	for (blk = old_hw; blk < new_hw && blk < store_cur; blk++)
 	{
@@ -1261,9 +1263,14 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		if (skip_existing)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, blk, &page, 1, false);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN, BLCKSZ);
 	}
 	if (blk < new_hw)
+	{
 		mdzeroextend(ssrel, MAIN_FORKNUM, blk, new_hw - blk, false);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN,
+							(uint64) (new_hw - blk) * BLCKSZ);
+	}
 }
 
 typedef struct BitsChange
@@ -1604,6 +1611,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 
 		mdwritev(store_smgr(rel), MAIN_FORKNUM, phys[n - 1], &page, 1,
 				 skipFsync);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN, BLCKSZ);
 	}
 
 	/* deltas */
@@ -1833,6 +1841,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 
 				mdwritev(store_smgr(rel), MAIN_FORKNUM, phys, &page, 1,
 						 skipFsync);
+				pgstat_count_prolly(PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN, BLCKSZ);
 			}
 			break;
 		}

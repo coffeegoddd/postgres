@@ -27,7 +27,10 @@ INSTRUCTIONS = ("instructions_user", "instructions_kernel", "cachegrind_instruct
 # Each counter's unit and floor kind (events, bytes or instructions).
 _BYTES = {"wal_bytes", "wal_fpi_bytes", "relation_bytes", "chunk_store_bytes",
           "io_read_bytes", "io_write_bytes",
-          "engine.chunk_bytes_appended", "engine.bytes_hashed"}
+          "engine.chunk_bytes_appended", "engine.bytes_hashed",
+          "engine.journal_bytes_written", "engine.table_file_bytes_written",
+          "engine.manifest_bytes_written", "engine.gc_bytes_copied",
+          "engine.conjoin_bytes_copied", "engine.bmap_store_bytes_written"}
 
 
 def is_counter(metric: str) -> bool:

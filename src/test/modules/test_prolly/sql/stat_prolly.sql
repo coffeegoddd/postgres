@@ -26,6 +26,9 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bytes_hashed') >=
 	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS each_chunk_hashed;
+-- The journal holds each chunk with its record's framing, and the root.
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') >
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS journal_frames_chunks;
 
 -- One row changed: the fold reads the one row the change log names, and
 -- writes it.  No page is kept as the last fold saw it, so none is copied.

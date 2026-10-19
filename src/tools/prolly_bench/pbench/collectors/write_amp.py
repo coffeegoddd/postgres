@@ -12,6 +12,11 @@ pages are written, and then takes its final readings. Deferred writes
 caused by the window's work therefore fall inside the interval, whichever
 engine defers them.
 
+Prolly's chunk store writes its journal, table files and manifests
+itself, outside shared buffers, so pg_stat_io doesn't see them;
+pg_stat_prolly counts them (journal_bytes_written, ...), and the copies
+collection and conjoining make of chunks already stored.
+
 WAL is split by resource manager (pg_walinspect's pg_get_wal_stats over
 the interval): row records
 (Heap, Heap2), index records, prolly's block map (BlockMap) and chunks
@@ -71,6 +76,10 @@ RMGR_GROUPS = {"Heap": "row", "Heap2": "row",
                "SPGist": "index", "BRIN": "index",
                "BlockMap": "blockmap", "ProllyChunks": "chunk"}
 WAL_GROUPS = ("row", "index", "blockmap", "chunk", "other")
+
+# pg_stat_prolly's counters of the chunk store's file bytes (wa.tree.file_bytes).
+TREE_FILES = {"journal_bytes_written": "journal", "table_file_bytes_written": "table_file",
+              "manifest_bytes_written": "manifest"}
 
 _PROLLY_SQL = "SELECT string_agg(name || '=' || value, E'\\n') FROM pg_stat_prolly"
 
@@ -338,13 +347,30 @@ class WriteAmpCollector(Collector):
             "wa.pages.writes": io["writes"],
             "wa.pages.extends": io["extends"],
         }
-        server = wal + io["bytes"]
+        server: Optional[float] = wal + io["bytes"]
+        tree_files = None
         if _is_prolly(ctx):
             chunks = _sum([counter_delta(x["prolly"], y["prolly"]) for _, x, y in self._pairs(ctx)])
             m["wa.tree.chunk_payload_bytes"] = chunks.get("chunk_bytes_appended")
+            # (absent from a build before these counters: then no total)
+            if all(c in chunks for c in TREE_FILES):
+                for c, part in TREE_FILES.items():
+                    m[f"wa.tree.{part}_bytes"] = chunks[c]
+                tree_files = sum(chunks[c] for c in TREE_FILES)
+                # Breakdowns of the table-file bytes, not more of them.
+                m["wa.tree.gc_copied_bytes"] = chunks.get("gc_bytes_copied")
+                m["wa.tree.conjoin_copied_bytes"] = chunks.get("conjoin_bytes_copied")
+                # The block map's own page-store writes: zeroing and
+                # extending, which shared buffers also count as extends,
+                # so it isn't added to the total.
+                m["wa.pages.bmap_store_bytes"] = chunks.get("bmap_store_bytes_written")
+            m["wa.tree.file_bytes"] = tree_files
+            server = server + tree_files if tree_files is not None else None
             if self.unmaterialized is not None:
                 late = counter_delta(self.unmaterialized["prolly"], a["prolly"])
                 m["wa.tree.materialize_chunk_payload_bytes"] = late.get("chunk_bytes_appended")
+                if tree_files is not None:
+                    m["wa.tree.materialize_file_bytes"] = sum(late[c] for c in TREE_FILES)
                 m["wa.wal.materialize_bytes"] = float(ctx.cluster.scalar(
                     f"SELECT pg_wal_lsn_diff('{self.wal_end}', '{self.unmaterialized['lsn']}')"))
         m["wa.server_bytes"] = server
@@ -357,4 +383,5 @@ class WriteAmpCollector(Collector):
         m["wa_server"] = _ratio(server, logical, outcome)
         if _is_prolly(ctx):
             m["wa_tree_payload"] = _ratio(m["wa.tree.chunk_payload_bytes"], logical, outcome)
+            m["wa_tree"] = _ratio(tree_files, logical, outcome)
         return m

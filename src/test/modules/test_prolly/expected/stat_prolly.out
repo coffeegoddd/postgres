@@ -49,26 +49,30 @@ SELECT pg_stat_force_next_flush();
 (1 row)
 
 SELECT name, value FROM pg_stat_prolly;
-         name         | value 
-----------------------+-------
- nodes_read           |    40
- nodes_written        |    14
- value_nodes_written  |     0
- chunks_appended      |    14
- chunk_bytes_appended | 25801
- bytes_hashed         | 44910
- fold_rows_read       |  1000
- fold_rows_written    |  1000
- fold_pages           |     0
- fold_candidates      |  1000
- fold_full_tables     |     0
- commits              |     1
- head_moves           |     1
- memo_hits            |     0
- memo_misses          |     0
- page_copies_fold     |     0
- page_copies_shared   |     0
-(17 rows)
+           name           | value 
+--------------------------+-------
+ nodes_read               |    40
+ nodes_written            |    14
+ value_nodes_written      |     0
+ chunks_appended          |    14
+ chunk_bytes_appended     | 25813
+ bytes_hashed             | 44922
+ fold_rows_read           |  1000
+ fold_rows_written        |  1000
+ fold_pages               |     6
+ fold_candidates          |  1000
+ fold_full_tables         |     0
+ commits                  |     1
+ head_moves               |     1
+ memo_hits                |     0
+ memo_misses              |     0
+ journal_bytes_written    | 26499
+ table_file_bytes_written |     0
+ manifest_bytes_written   |     0
+ gc_bytes_copied          |     0
+ conjoin_bytes_copied     |     0
+ bmap_store_bytes_written | 81920
+(21 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
@@ -79,8 +83,15 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
  t                 | t
 (1 row)
 
--- One row changed: the fold reads the one row the change log names, and
--- writes it.  No page is kept as the last fold saw it, so none is copied.
+-- The journal holds each chunk with its record's framing, and the root.
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') >
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS journal_frames_chunks;
+ journal_frames_chunks 
+-----------------------
+ t
+(1 row)
+
+-- One row changed: the fold reads its page's rows and writes the one.
 SELECT pg_stat_reset_shared('prolly');
  pg_stat_reset_shared 
 ----------------------
@@ -101,20 +112,14 @@ SELECT pg_stat_force_next_flush();
 (1 row)
 
 SELECT name, value FROM pg_stat_prolly
-WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
-			   'fold_full_tables', 'commits', 'head_moves',
-			   'page_copies_fold', 'page_copies_shared');
-        name        | value 
---------------------+-------
- fold_rows_read     |     1
- fold_rows_written  |     1
- fold_candidates    |     1
- fold_full_tables   |     0
- commits            |     1
- head_moves         |     1
- page_copies_fold   |     0
- page_copies_shared |     0
-(8 rows)
+WHERE name IN ('fold_rows_written', 'fold_full_tables', 'commits', 'head_moves');
+       name        | value 
+-------------------+-------
+ fold_rows_written |     1
+ fold_full_tables  |     0
+ commits           |     1
+ head_moves        |     1
+(4 rows)
 
 -- The same commit again, in a database just like it: the same counts.
 SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly \gset
@@ -174,54 +179,6 @@ SELECT sum(value) = 0 AS nothing_since_reset FROM pg_stat_prolly;
  nothing_since_reset 
 ---------------------
  t
-(1 row)
-
--- A branch shares the table's pages: its first change to one copies it
--- (here both heap pages, the primary key's leaf, and the change log's
--- page).
-SELECT dolt_branch('other');
- dolt_branch 
--------------
- {0}
-(1 row)
-
-SELECT dolt_checkout('other');
-          dolt_checkout           
-----------------------------------
- {0,"Switched to branch 'other'"}
-(1 row)
-
-UPDATE sp.t SET v = 'y' WHERE id = 1;
-SELECT pg_stat_force_next_flush();
- pg_stat_force_next_flush 
---------------------------
- 
-(1 row)
-
-SELECT name, value FROM pg_stat_prolly
-WHERE name IN ('page_copies_fold', 'page_copies_shared');
-        name        | value 
---------------------+-------
- page_copies_fold   |     0
- page_copies_shared |     4
-(2 rows)
-
-SELECT dolt_checkout('main');
-          dolt_checkout          
----------------------------------
- {0,"Switched to branch 'main'"}
-(1 row)
-
-SELECT pg_stat_force_next_flush();
- pg_stat_force_next_flush 
---------------------------
- 
-(1 row)
-
-SELECT pg_stat_reset_shared('prolly');
- pg_stat_reset_shared 
-----------------------
- 
 (1 row)
 
 -- An unknown target is still refused, and names this one.

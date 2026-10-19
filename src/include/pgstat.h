@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBF
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC0
 
 typedef struct PgStat_ArchiverStats
 {
@@ -615,9 +615,21 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_PAGE_COPIES_FOLD, /* pages copied only to keep a fold's */
 	PGSTAT_PROLLY_PAGE_COPIES_SHARED,	/* pages copied because another map
 										 * shares them */
+	PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN,	/* bytes written to journal
+											 * segments: records with their
+											 * framing, headers, roots */
+	PGSTAT_PROLLY_TABLE_FILE_BYTES_WRITTEN, /* bytes written to table files */
+	PGSTAT_PROLLY_MANIFEST_BYTES_WRITTEN,	/* bytes of manifests written */
+	PGSTAT_PROLLY_GC_BYTES_COPIED,	/* of the table-file bytes, those
+									 * collection (and moving the journal)
+									 * copied */
+	PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, /* and those conjoining copied */
+	PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN, /* page-store bytes the block
+											 * map wrote itself, not through
+											 * shared buffers */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_PAGE_COPIES_SHARED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {

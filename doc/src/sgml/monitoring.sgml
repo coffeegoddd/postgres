@@ -5679,12 +5679,24 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>commits</literal> (commits written),
        <literal>head_moves</literal> (branch heads set),
        <literal>memo_hits</literal> and <literal>memo_misses</literal>
-       (lookups of the value memo), and
+       (lookups of the value memo),
        <literal>page_copies_fold</literal> and
        <literal>page_copies_shared</literal> (pages of block-mapped
        relations copied before a change: only to keep them as the last
        fold saw them, or because another map, such as a branch's copy,
-       shares them)
+       shares them),
+       <literal>journal_bytes_written</literal>,
+       <literal>table_file_bytes_written</literal> and
+       <literal>manifest_bytes_written</literal> (bytes written to the chunk
+       store's journal segments, with each record's framing, to its table
+       files, and of its manifests; each chunk is also written to WAL),
+       <literal>gc_bytes_copied</literal> and
+       <literal>conjoin_bytes_copied</literal> (of the table-file bytes, those
+       that collection, moving the journal, and conjoining table files copied
+       from the store's existing chunks), and
+       <literal>bmap_store_bytes_written</literal> (bytes the block map wrote
+       to its page store itself, zeroing and extending it, outside shared
+       buffers and so outside <structname>pg_stat_io</structname>)
       </para></entry>
      </row>
 
