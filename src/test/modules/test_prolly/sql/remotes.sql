@@ -106,6 +106,41 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'feature');
 SELECT dolt_pull('origin', 'feat') IS NOT NULL AS pulled;
 
+-- a delete without -D: of a branch merged into its upstream (its
+-- remote-tracking branch, as last fetched), as in Dolt and git; into the
+-- session's branch only when it has no upstream there
+SELECT dolt_checkout('-b', 'up3') IS NOT NULL AS on_up3;
+UPDATE rm.t SET v = 'u' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'up3')::text) AS committed;
+SELECT dolt_push('-u', 'origin', 'up3') AS pushed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-d', 'up3');
+SELECT count(*) AS up3_left FROM dolt_branches WHERE name = 'up3';
+-- (merged into main, but ahead of its upstream: refused)
+SELECT dolt_checkout('-b', 'up4') IS NOT NULL AS on_up4;
+SELECT dolt_push('-u', 'origin', 'up4') AS pushed;
+UPDATE rm.t SET v = 'u' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'up4')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_merge('up4') IS NOT NULL AS merged;
+SELECT dolt_branch('-d', 'up4');
+SELECT dolt_branch('-D', 'up4');
+-- (an upstream not fetched: into the session's branch)
+SELECT dolt_branch('up5');
+SELECT test_refs_set_upstream('up5', 'origin', 'nowhere');
+SELECT dolt_branch('-d', 'up5');
+SELECT dolt_branch('up6');
+SELECT test_refs_set_upstream('up6', 'origin', 'nowhere');
+SELECT dolt_checkout('-b', 'ahead6') IS NOT NULL AS on_ahead6;
+UPDATE rm.t SET v = 'u' WHERE id = 6;
+SELECT length(dolt_commit('-am', 'ahead6')::text) AS committed;
+SELECT dolt_checkout('up6') IS NOT NULL AS on_up6;
+SELECT dolt_merge('ahead6') IS NOT NULL AS merged;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-d', 'up6');
+SELECT dolt_branch('-D', 'up6');
+SELECT dolt_branch('-D', 'ahead6');
+
 -- a walk from a commit: a chunk that isn't a commit visits nothing, one
 -- the store hasn't is an error (its store isn't whole)
 SELECT test_walk_commit_count(dolt_hashof('main')) > 0 AS walks_a_commit;

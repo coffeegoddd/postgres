@@ -281,6 +281,164 @@ SELECT dolt_pull('origin', 'feat') IS NOT NULL AS pulled;
  t
 (1 row)
 
+-- a delete without -D: of a branch merged into its upstream (its
+-- remote-tracking branch, as last fetched), as in Dolt and git; into the
+-- session's branch only when it has no upstream there
+SELECT dolt_checkout('-b', 'up3') IS NOT NULL AS on_up3;
+ on_up3 
+--------
+ t
+(1 row)
+
+UPDATE rm.t SET v = 'u' WHERE id = 3;
+SELECT length(dolt_commit('-am', 'up3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_push('-u', 'origin', 'up3') AS pushed;
+         pushed          
+-------------------------
+ {0,"up3 -> origin/up3"}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-d', 'up3');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT count(*) AS up3_left FROM dolt_branches WHERE name = 'up3';
+ up3_left 
+----------
+        0
+(1 row)
+
+-- (merged into main, but ahead of its upstream: refused)
+SELECT dolt_checkout('-b', 'up4') IS NOT NULL AS on_up4;
+ on_up4 
+--------
+ t
+(1 row)
+
+SELECT dolt_push('-u', 'origin', 'up4') AS pushed;
+         pushed          
+-------------------------
+ {0,"up4 -> origin/up4"}
+(1 row)
+
+UPDATE rm.t SET v = 'u' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'up4')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_merge('up4') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT dolt_branch('-d', 'up4');
+ERROR:  branch "up4" is not fully merged
+HINT:  Delete it anyway with -D.
+SELECT dolt_branch('-D', 'up4');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (an upstream not fetched: into the session's branch)
+SELECT dolt_branch('up5');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT test_refs_set_upstream('up5', 'origin', 'nowhere');
+ test_refs_set_upstream 
+------------------------
+ 
+(1 row)
+
+SELECT dolt_branch('-d', 'up5');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('up6');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT test_refs_set_upstream('up6', 'origin', 'nowhere');
+ test_refs_set_upstream 
+------------------------
+ 
+(1 row)
+
+SELECT dolt_checkout('-b', 'ahead6') IS NOT NULL AS on_ahead6;
+ on_ahead6 
+-----------
+ t
+(1 row)
+
+UPDATE rm.t SET v = 'u' WHERE id = 6;
+SELECT length(dolt_commit('-am', 'ahead6')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('up6') IS NOT NULL AS on_up6;
+ on_up6 
+--------
+ t
+(1 row)
+
+SELECT dolt_merge('ahead6') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-d', 'up6');
+ERROR:  branch "up6" is not fully merged
+HINT:  Delete it anyway with -D.
+SELECT dolt_branch('-D', 'up6');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'ahead6');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 -- a walk from a commit: a chunk that isn't a commit visits nothing, one
 -- the store hasn't is an error (its store isn't whole)
 SELECT test_walk_commit_count(dolt_hashof('main')) > 0 AS walks_a_commit;
