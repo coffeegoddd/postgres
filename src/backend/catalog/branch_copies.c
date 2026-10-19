@@ -187,6 +187,7 @@ lock_versioned_relations(void)
 	SysScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
+	List	   *toasts = NIL;
 	ListCell   *lc;
 
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
@@ -194,12 +195,24 @@ lock_versioned_relations(void)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relbranch == MyBranch)
+		if (c->relbranch != MyBranch)
+			continue;
+		if (c->relkind == RELKIND_TOASTVALUE)
+			toasts = lappend_oid(toasts, c->oid);
+		else
 			relids = lappend_oid(relids, c->oid);
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
+	/*
+	 * TOAST-kind relations (TOAST tables, change logs) after every table,
+	 * in the order a writer takes them: its table first, then those as it
+	 * writes a value out of line or an entry.  In the order of pg_class
+	 * the two could each wait on the other.
+	 */
+	relids = list_concat(relids, toasts);
+	list_free(toasts);
 	foreach(lc, relids)
 		LockRelationOid(lfirst_oid(lc), ShareLock);
 

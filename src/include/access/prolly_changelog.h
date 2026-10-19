@@ -21,8 +21,10 @@
  * hold); then it has no tuple.
  *
  * Contract:
- * - create() makes rel's log; called once, as rel (a new prolly table) is
- *   made, in the transaction that makes it.  Its log is versioned with it:
+ * - create() makes rel's log, if it can (it may make none, as pg_upgrade
+ *   restores rel: identity() then says so); called as rel (a new prolly
+ *   table) is made, or as a table that has none is altered under a lock
+ *   writers wait for, in that transaction.  Its log is versioned with it:
  *   each branch's copy of rel has its own, shared as the table is when the
  *   copy is made, and it is dropped with rel.
  * - note() is told each tuple version a write to rel made (newtid) or
@@ -43,6 +45,11 @@
  *   full: for a table whose rows were replaced without writes to note
  *   (its storage made anew) where no other transaction sees its branch, so
  *   the entries before are of rows it no longer has.
+ * - relid() is the relation holding the log of the prolly table relid, if
+ *   the log is one (InvalidOid if not): it takes the table's owner,
+ *   tablespace and autovacuum settings as its TOAST table does.  Asked by
+ *   autovacuum with only the table's pg_class row, so it opens nothing.
+ *   Optional.
  * - is_log() says whether rel is a change log: its rows are no table's, and
  *   logical decoding passes over them.  Asked of any TOAST-kind relation,
  *   in critical sections too (RelationIsLogicallyLogged), so it is quick
@@ -87,12 +94,14 @@ typedef struct ProllyChangeLogRoutine
 	void		(*consume) (Relation rel, Snapshot snapshot);
 	bool		(*is_log) (Relation rel);
 	void		(*reset) (Relation rel);
+	Oid			(*relid) (Oid relid);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
-	"create", "note", "identity", "read", "consume", "is_log", "reset"
+	"create", "note", "identity", "read", "consume", "is_log", "reset", \
+	"relid"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK reset
+#define PROLLY_CHANGELOG_LAST_CALLBACK relid
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

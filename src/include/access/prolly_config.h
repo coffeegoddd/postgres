@@ -94,5 +94,10 @@ extern const ProllyChangeFinderRoutine *prolly_change_finder(void);
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 							   const ItemPointerData *newtid);
+/*
+ * The relation holding the change log of table relid (of access method
+ * relam), if it is one (else InvalidOid).
+ */
+extern Oid	prolly_change_log_relid(Oid relid, Oid relam);
 
 #endif							/* PROLLY_CONFIG_H */

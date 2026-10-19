@@ -18,12 +18,13 @@
  * An entry is inserted as each tuple version is noted, by the write's own
  * (sub)transaction: it is seen exactly when the write is.  A table with a
  * primary key (checked immediately) gets the version's key columns, their
- * values out of line brought inline, once for an update that kept the key;
- * one without gets the version's tuple as stored, unless a value of it is
- * out of line (the value may be gone by the time the entry is read) or the
- * tuple is too long for a page of the log with the entry around it: then
- * an entry to read the table in full.  A truncation or a rewrite of the
- * table is that too.
+ * values out of line brought inline (compressed ones stay compressed),
+ * once for an update that kept the key; one without gets the version's
+ * tuple as stored, unless a value of it is out of line (the value may be
+ * gone by the time the entry is read).  Either, too long for a page of the
+ * log with the entry around it (a key's compressed values needn't be as
+ * its index holds them), is an entry to read the table in full instead.  A
+ * truncation or a rewrite of the table is that too.
  *
  * Reads and consumption walk the log's pages, judging each entry by the
  * snapshot as a heap scan would, but take no predicate locks: a fold
@@ -82,7 +83,11 @@ log_name(Oid relid, char *name)
 	snprintf(name, NAMEDATALEN, LOG_PREFIX "%u", relid);
 }
 
-/* The log of rel, a prolly table (or materialized view); InvalidOid if none. */
+/*
+ * The log of rel, a prolly table (or materialized view); InvalidOid if none.
+ * A transient heap a rewrite fills (relrewrite set) has none: its table is
+ * told of the rewrite as a whole.
+ */
 static Oid
 log_relid(Relation rel)
 {
@@ -90,7 +95,8 @@ log_relid(Relation rel)
 
 	if (rel->rd_rel->relam != PROLLY_TABLE_AM_OID ||
 		(rel->rd_rel->relkind != RELKIND_RELATION &&
-		 rel->rd_rel->relkind != RELKIND_MATVIEW))
+		 rel->rd_rel->relkind != RELKIND_MATVIEW) ||
+		OidIsValid(rel->rd_rel->relrewrite))
 		return InvalidOid;
 	log_name(RelationGetRelid(rel), name);
 	return get_relname_relid(name, PG_TOAST_NAMESPACE);
@@ -105,6 +111,14 @@ relation_create(Relation rel)
 	ObjectAddress table;
 	ObjectAddress log;
 
+	/*
+	 * (not as pg_upgrade restores the table: it preassigns the relation
+	 * numbers of what it will move, and a log's own, unassigned, could be
+	 * one of them; the table has no log, and is folded in full, until an
+	 * ALTER makes one)
+	 */
+	if (IsBinaryUpgrade)
+		return;
 	log_name(RelationGetRelid(rel), name);
 	desc = CreateTemplateTupleDesc(Natts_log);
 	TupleDescInitEntry(desc, Anum_log_image, "image", BYTEAOID, -1, 0);
@@ -254,6 +268,24 @@ same_image(HeapTuple a, HeapTuple b)
 			   a->t_len - offsetof(HeapTupleHeaderData, t_infomask2)) == 0;
 }
 
+/* A key's entry: its image, unless it can't be kept (it may: see above). */
+static void
+insert_key(Relation log, HeapTuple image)
+{
+	if (image->t_len > MAX_IMAGE_LEN)
+		insert_entry(log, NULL, 0);
+	else
+		insert_entry(log, image, 0);
+}
+
+/*
+ * What a note allocates, freed as it ends: a note is made for each tuple
+ * version written, in the statement's memory (heap writes don't switch to a
+ * per-tuple context), so a statement writing many rows would otherwise
+ * hold copies of each until it ends.
+ */
+static MemoryContext note_cxt = NULL;
+
 static void
 relation_note(Relation rel, const ItemPointerData *oldtid,
 			  const ItemPointerData *newtid)
@@ -262,10 +294,17 @@ relation_note(Relation rel, const ItemPointerData *oldtid,
 	Relation	log;
 	HeapTuple	old = NULL;
 	HeapTuple	new = NULL;
+	MemoryContext caller;
 
 	if (!OidIsValid(logid))
 		return;
+	if (note_cxt == NULL)
+		note_cxt = AllocSetContextCreate(TopMemoryContext, "change log note",
+										 ALLOCSET_SMALL_SIZES);
+	/* (left over by a note an error ended) */
+	MemoryContextReset(note_cxt);
 	log = table_open(logid, RowExclusiveLock);
+	caller = MemoryContextSwitchTo(note_cxt);
 	if (oldtid)
 		old = read_version(rel, oldtid);
 	if (newtid)
@@ -281,10 +320,9 @@ relation_note(Relation rel, const ItemPointerData *oldtid,
 		HeapTuple	newkey = new ? key_image(rel, new, keyattrs) : NULL;
 
 		if (oldkey && !(newkey && same_image(oldkey, newkey)))
-			insert_entry(log, oldkey, 0);
+			insert_key(log, oldkey);
 		if (newkey)
-			insert_entry(log, newkey, 0);
-		bms_free(keyattrs);
+			insert_key(log, newkey);
 	}
 	else
 	{
@@ -293,6 +331,8 @@ relation_note(Relation rel, const ItemPointerData *oldtid,
 		if (new)
 			insert_row(log, new, 1);
 	}
+	MemoryContextSwitchTo(caller);
+	MemoryContextReset(note_cxt);
 	table_close(log, NoLock);
 }
 
@@ -509,11 +549,25 @@ relation_reset(Relation rel)
 
 	if (!OidIsValid(logid))
 		return;
-	log = table_open(logid, AccessExclusiveLock);
+	/*
+	 * (a writer's lock, as the table's copy is given new storage under: the
+	 * log's OID is every branch's, and only the branch being made, which no
+	 * other transaction sees, sees this storage)
+	 */
+	log = table_open(logid, RowExclusiveLock);
 	RelationSetNewRelfilenumber(log, log->rd_rel->relpersistence);
 	CommandCounterIncrement();
 	insert_entry(log, NULL, 0);
 	table_close(log, NoLock);
+}
+
+static Oid
+relation_relid(Oid relid)
+{
+	char		name[NAMEDATALEN];
+
+	log_name(relid, name);
+	return get_relname_relid(name, PG_TOAST_NAMESPACE);
 }
 
 static bool
@@ -541,4 +595,5 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.consume = relation_consume,
 	.is_log = relation_is_log,
 	.reset = relation_reset,
+	.relid = relation_relid,
 };

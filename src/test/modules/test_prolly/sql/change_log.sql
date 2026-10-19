@@ -122,6 +122,49 @@ SELECT dolt_reset('--hard');
 SELECT * FROM pg_temp.entries('cl.keyed');
 SELECT count(*) AS reset_away FROM cl.keyed WHERE id = 10;
 
+-- A key's values out of line are brought inline: the entry holds the
+-- key, not a pointer to a value that may be gone when it is read.
+CREATE TABLE cl.wide (a text, b text, PRIMARY KEY (a, b));
+ALTER TABLE cl.wide ALTER a SET STORAGE EXTERNAL;
+INSERT INTO cl.wide VALUES (repeat('a', 2500), 'b');
+SELECT * FROM pg_temp.entries('cl.wide');
+
+-- INSERT ... ON CONFLICT, and COPY's many rows at a time: an entry for
+-- each.
+SELECT length(dolt_commit('-Am', 'wide')::text) AS committed;
+INSERT INTO cl.keyed VALUES (13, 'm'), (12, 'conflict')
+	ON CONFLICT (id) DO UPDATE SET v = excluded.v;
+INSERT INTO cl.keyed VALUES (13, 'n') ON CONFLICT DO NOTHING;
+SELECT * FROM pg_temp.entries('cl.keyed');
+COPY cl.keyless FROM STDIN;
+20	t
+21	u
+22	v
+\.
+SELECT * FROM pg_temp.entries('cl.keyless');
+SELECT length(dolt_commit('-am', 'conflict and copy')::text) AS committed;
+
+-- CLUSTER and VACUUM FULL change no row, but give the table new storage:
+-- read in full.  So does a materialized view's refresh.
+CLUSTER cl.keyed USING keyed_pkey;
+SELECT * FROM pg_temp.entries('cl.keyed');
+VACUUM FULL cl.keyless;
+SELECT * FROM pg_temp.entries('cl.keyless');
+CREATE MATERIALIZED VIEW cl.mv AS SELECT id FROM cl.keyed;
+SELECT length(dolt_commit('-Am', 'mv')::text) AS committed;
+REFRESH MATERIALIZED VIEW cl.mv;
+SELECT * FROM pg_temp.entries('cl.mv');
+
+-- The log takes its table's owner, as a TOAST table does.
+CREATE ROLE cl_owner;
+ALTER TABLE cl.keyed OWNER TO cl_owner;
+SELECT c.relowner = t.relowner AS same_owner
+FROM pg_class c, pg_class t
+WHERE t.oid = 'cl.keyed'::regclass
+	AND c.relname = 'pg_prolly_log_' || t.oid;
+ALTER TABLE cl.keyed OWNER TO CURRENT_USER;
+DROP ROLE cl_owner;
+
 -- Dropped with its table.
 SELECT 'pg_prolly_log_' || 'cl.keyless'::regclass::oid AS keyless_log \gset
 DROP TABLE cl.keyless;

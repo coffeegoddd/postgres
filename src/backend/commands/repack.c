@@ -2088,7 +2088,10 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	/*
 	 * A prolly table's change log is told every row may have changed: a
 	 * rewrite may change them all (ALTER TABLE's), writing none it notes.
+	 * (CLUSTER and VACUUM FULL change none, but give the table new storage,
+	 * which a fold reads in full anyway.)  A system catalog has no log.
 	 */
+	if (!is_system_catalog)
 	{
 		Relation	oldheap = relation_open(OIDOldHeap, NoLock);
 

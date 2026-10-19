@@ -226,6 +226,16 @@ prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 		PROLLY_CALL(log, note, rel, oldtid, newtid);
 }
 
+Oid
+prolly_change_log_relid(Oid relid, Oid relam)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (relam != PROLLY_TABLE_AM_OID || log == NULL || log->relid == NULL)
+		return InvalidOid;
+	return log->relid(relid);
+}
+
 /* (in critical sections too: no error, no allocation) */
 bool
 prolly_is_change_log(Relation rel)
