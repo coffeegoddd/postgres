@@ -81,10 +81,11 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
 -- Another type, made alike on both sides: boolean to text, numeric to
--- integer.  Neither base value is trusted through the cast: true casts to
--- 'true' but its text form is 't' (which a USING may have meant), and 1.5
--- rounds.  Both are unsure, not refused: as both sides have 2, they
--- agree; theirs' 'yes' against ours' 'true' is a conflict, as on master.
+-- integer.  Base is read as master read it, its text form: true is 't'
+-- (which a USING may have meant, not the cast's 'true'), so theirs' 'yes'
+-- against ours' 'true' is a conflict, as on master.  1.5 isn't an
+-- integer's text: unsure (shown null), not refused, and as both sides
+-- have 2, they agree.
 CREATE TABLE rt.o (id int PRIMARY KEY, b boolean, n numeric);
 INSERT INTO rt.o VALUES (1, true, 1.5);
 SELECT length(dolt_commit('-Am', 'o base')::text) AS committed;
@@ -321,12 +322,14 @@ SELECT * FROM rt.m ORDER BY id;
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 
--- Retyped alike on both sides within char's own type, or between string
--- types, the cast is trusted only where it gives what master compared:
--- base's stored value (the same type), or its text form (another).  A
--- USING that pads or folds differently can't then hide theirs' edit.
--- (A plain char(3) to char(10) on both sides is a conflict on a row a
--- side edited too, as on master: padding changes base's stored value.)
+-- Retyped alike on both sides, base is compared as master compared it:
+-- within one type, the cast trusted only where it gives base's stored
+-- value; across types (strings too), base's text form.  A USING that pads
+-- or folds otherwise than the cast can't then hide theirs' edit back to
+-- the cast's value: code and tags conflict, and name, whose rpad ALTER
+-- made base's text form 'gh   ', takes theirs' 'gh'.  (A plain char(3)
+-- to char(10) on both sides is a conflict on a row a side edited too, as
+-- on master: padding changes base's stored value.)
 CREATE TABLE rt.up (id int PRIMARY KEY, code char(3), tags char(2)[], name char(5));
 INSERT INTO rt.up VALUES (1, 'ab', '{ab}', 'ab'), (2, 'cd', '{ef}', 'cd'),
   (3, 'gh', '{gh}', 'gh');
@@ -349,6 +352,46 @@ SELECT dolt_checkout('main');
 BEGIN;
 SELECT (dolt_merge('feature', '-m', 'merged upper'))[2:4];
 SELECT our_row, their_row FROM dolt_conflicts(NULL::rt.up) ORDER BY 1;
+SELECT id, '"' || name || '"' AS name FROM rt.up ORDER BY id;
+ROLLBACK;
+SELECT dolt_branch('-D', 'feature');
+
+-- Where the cast and the text form differ but the text form reads as the
+-- new type, base is read as its text form, as master read it, not
+-- refused: char(5) key 'cd   ' as text is 'cd   ', a key neither side
+-- has (they trimmed it), so base's rows read as deleted on both sides and
+-- theirs' edited row against ours' is a conflict; keyless, base's rows
+-- are copies neither side has, and both sides' inserts merge.
+CREATE TABLE rt.ck (k char(5) PRIMARY KEY, v int);
+CREATE TABLE rt.cl (c char(5), v int);
+CREATE TABLE rt.bl (f boolean, v int);
+INSERT INTO rt.ck VALUES ('ab', 1), ('cd', 2);
+INSERT INTO rt.cl VALUES ('ab', 1), ('cd', 2);
+INSERT INTO rt.bl VALUES (true, 1), (false, 2);
+SELECT length(dolt_commit('-Am', 'ck base')::text) AS committed;
+SELECT dolt_branch('feature');
+ALTER TABLE rt.ck ALTER COLUMN k TYPE text;
+ALTER TABLE rt.cl ALTER COLUMN c TYPE varchar(10);
+ALTER TABLE rt.bl ALTER COLUMN f TYPE text;
+INSERT INTO rt.ck VALUES ('zz', 9);
+INSERT INTO rt.cl VALUES ('zz', 9);
+INSERT INTO rt.bl VALUES ('zz', 9);
+SELECT length(dolt_commit('-am', 'main: retyped')::text) AS committed;
+SELECT dolt_checkout('feature');
+ALTER TABLE rt.ck ALTER COLUMN k TYPE text;
+ALTER TABLE rt.cl ALTER COLUMN c TYPE varchar(10);
+ALTER TABLE rt.bl ALTER COLUMN f TYPE text;
+UPDATE rt.ck SET v = 20 WHERE k = 'cd';
+INSERT INTO rt.cl VALUES ('yy', 8);
+INSERT INTO rt.bl VALUES ('yy', 8);
+SELECT length(dolt_commit('-am', 'feature: retyped')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('feature', '-m', 'merged retyped keys'))[2:4];
+SELECT '"' || k || '"' AS k, v FROM rt.ck ORDER BY 1;
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::rt.ck);
+SELECT '"' || c || '"' AS c, v FROM rt.cl ORDER BY 1;
+SELECT f, v FROM rt.bl ORDER BY 1;
 ROLLBACK;
 SELECT dolt_branch('-D', 'feature');
 

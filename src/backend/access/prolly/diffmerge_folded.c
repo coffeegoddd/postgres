@@ -2174,16 +2174,16 @@ dup_bytes(const char *data, int len)
  * it (as_defined_now()'s *unsure).  In a key, or a table without one,
  * nothing can say which side changed it: the merge is refused.
  *
- * A column both sides retyped is compared more strictly still: base's cast
- * is trusted only where it gives what master compared, base's stored
- * value for the same type (char(3) to char(10): the padding is a
- * change), its text form read as the new type for another (string types
- * too).  Both ALTERs may have had a USING (upper(code), rpad(name, 5))
- * that the cast misses, and a side's edit back to the cast's value would
- * look like none.  A value of the same type is otherwise kept as stored,
- * which is what master compared; one of another type is unsure, or
- * refused where it can't be.  So a plain char(3) to char(10) made on both
- * sides conflicts on a row a side also edited, as on master.
+ * A column both sides retyped is compared as master compared it: both
+ * ALTERs may have had a USING (upper(code), rpad(name, 5)) that the cast
+ * misses, and a side's edit back to the cast's value would look like
+ * none.  Of the same type, base's cast is trusted only where it gives
+ * the stored value, which is otherwise kept (char(3) to char(10): the
+ * padding is a change, so a plain one made on both sides conflicts on a
+ * row a side also edited, as on master).  Of another type, base's value
+ * is its text form read as the new type, whatever the cast gives; only
+ * where that fails (where master failed) is it unsure, or refused where
+ * it can't be.
  */
 typedef enum ReadFor
 {
@@ -2215,7 +2215,8 @@ typedef struct ColumnRead
 	bool		need_back;		/* not kept without a cast back */
 	bool		match_stored;	/* kept only as the stored value itself */
 	bool		blank_padded;	/* compared back without trailing blanks */
-	bool		by_text;		/* checked against the text form too: */
+	bool		by_text;		/* checked against the text form too, */
+	bool		text_only;		/* or read as the text form alone: */
 	FmgrInfo	out;			/* the old type's output */
 	Oid			in;				/* the new type's input */
 	Oid			in_param;
@@ -2318,6 +2319,45 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
 								  COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
+
+	/*
+	 * (compared, retyped by both sides: as master compared it, base's
+	 * stored value for the same type, the cast trusted only where it gives
+	 * that; for another type its text form read as the new type)
+	 */
+	if (read == READ_COMPARED && both)
+	{
+		if (same)
+		{
+			assign_expr_collations(NULL, e);
+			cr->conv = ExecPrepareExpr((Expr *) e, estate);
+			cr->loss = LOSS_KEEP_STORED;
+			cr->match_stored = true;
+			cr->guarded = !(is_string_type(att->atttypid) ||
+							is_bit_type(att->atttypid));
+		}
+		else
+		{
+			Oid			outf;
+			bool		varlena;
+
+			/*
+			 * (the text form is what master compared, whether or not the
+			 * cast agrees; only where it doesn't read as the new type,
+			 * where master failed, is the value unsure, or refused)
+			 */
+			cr->loss = key || keyless ? LOSS_REFUSE : LOSS_UNSURE;
+			cr->text_only = true;
+			getTypeOutputInfo(xa->atttypid, &outf, &varlena);
+			fmgr_info(outf, &cr->out);
+			getTypeInputInfo(att->atttypid, &cr->in, &cr->in_param);
+			cr->guarded = !(is_string_type(xa->atttypid) &&
+							is_string_type(att->atttypid) &&
+							att->atttypmod < 0);
+		}
+		return;
+	}
+
 	if (e == NULL && read == READ_COMPARED && !key && !keyless)
 	{
 		/* (no cast at all: every value of base's is unsure) */
@@ -2333,35 +2373,6 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 						format_type_with_typemod(att->atttypid, att->atttypmod))));
 	assign_expr_collations(NULL, e);
 	cr->conv = ExecPrepareExpr((Expr *) e, estate);
-
-	/*
-	 * (compared, retyped by both sides: trusted only as it gives what
-	 * master compared, base's stored value for the same type, its text form
-	 * read as the new type for another; else kept as stored, or unsure)
-	 */
-	if (read == READ_COMPARED && both)
-	{
-		if (same)
-		{
-			cr->loss = LOSS_KEEP_STORED;
-			cr->match_stored = true;
-			cr->guarded = !(is_string_type(att->atttypid) ||
-							is_bit_type(att->atttypid));
-		}
-		else
-		{
-			Oid			outf;
-			bool		varlena;
-
-			cr->loss = key || keyless ? LOSS_REFUSE : LOSS_UNSURE;
-			cr->by_text = true;
-			getTypeOutputInfo(xa->atttypid, &outf, &varlena);
-			fmgr_info(outf, &cr->out);
-			getTypeInputInfo(att->atttypid, &cr->in, &cr->in_param);
-			cr->guarded = true;
-		}
-		return;
-	}
 
 	/* (written; or nothing to lose) */
 	if (read == READ_WRITTEN ||
@@ -2430,7 +2441,8 @@ same_but_trailing_blanks(Datum a, Datum b)
 /*
  * Column cr's value of xs's attribute j (att's type before: xatt), read
  * into *d and *isnull, in the current memory context, through cr->conv
- * (evaluated in econtext).  False where the value doesn't come back from
+ * (evaluated in econtext), or as its text form read as the new type
+ * (cr->text_only).  False where the value doesn't come back from
  * it (cr->back; or there's no cast back where one's needed), or differs
  * from the value's text form read as the new type (cr->by_text), or the
  * cast or that read fails with a data exception (value too long,
@@ -2449,7 +2461,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 
 	*isnull = true;
 	*d = (Datum) 0;
-	if (cr->conv == NULL)
+	if (cr->conv == NULL && !cr->text_only)
 		return false;
 	econtext->ecxt_scantuple = xs;
 	if (cr->guarded)
@@ -2460,8 +2472,19 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 	PG_TRY();
 	{
 		bool		n;
-		Datum		v = ExecEvalExprSwitchContext(cr->conv, econtext, &n);
+		Datum		v;
 
+		if (cr->text_only)
+		{
+			char	   *text = OutputFunctionCall((FmgrInfo *) &cr->out,
+												  xs->tts_values[j]);
+
+			*d = OidInputFunctionCall(cr->in, text, cr->in_param,
+									  att->atttypmod);
+			*isnull = false;
+			goto done;
+		}
+		v = ExecEvalExprSwitchContext(cr->conv, econtext, &n);
 		*isnull = n;
 		*d = n ? (Datum) 0 : datumCopy(v, att->attbyval, att->attlen);
 		if (cr->match_stored)
@@ -2488,6 +2511,7 @@ read_value(const ColumnRead *cr, ExprContext *econtext, TupleTableSlot *xs,
 
 			kept = datum_image_eq(t, *d, att->attbyval, att->attlen);
 		}
+done:
 		if (cr->guarded)
 		{
 			ReleaseCurrentSubTransaction();
