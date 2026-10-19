@@ -207,3 +207,20 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- A commit of format 7, whose NaNs kept their own bits (a fold of this
+-- format doesn't match its rows), or of format 6 before it, isn't moved to.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
+	'format 7') AS fl_7 \gset
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '6'),
+	'format 6') AS fl_6 \gset
+SELECT dolt_reset('--hard', :'fl_7');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
+SELECT dolt_reset('--hard', :'fl_6');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+

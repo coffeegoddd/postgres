@@ -107,3 +107,13 @@ SELECT * FROM fl.t;
 SELECT * FROM fl.k;
 SELECT * FROM fl.kl;
 SELECT dolt_checkout('main');
+
+-- A commit of format 7, whose NaNs kept their own bits (a fold of this
+-- format doesn't match its rows), or of format 6 before it, isn't moved to.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
+	'format 7') AS fl_7 \gset
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '6'),
+	'format 6') AS fl_6 \gset
+SELECT dolt_reset('--hard', :'fl_7');
+SELECT dolt_reset('--hard', :'fl_6');
+SELECT * FROM dolt_status;
