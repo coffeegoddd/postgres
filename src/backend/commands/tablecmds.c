@@ -37,6 +37,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
 #include "access/prolly_config.h"
+#include "access/prolly_keying.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_collation.h"
@@ -9890,6 +9891,16 @@ ATExecAddIndexConstraint(AlteredTableInfo *tab, Relation rel,
 									  flags,
 									  allowSystemTableMods,
 									  false);	/* is_internal */
+
+	/*
+	 * A prolly table's rows are keyed by its primary key: written before
+	 * there was one, each is checked now that its key is this.
+	 */
+	if (stmt->primary && rel->rd_rel->relam == PROLLY_TABLE_AM_OID)
+	{
+		CommandCounterIncrement();
+		prolly_check_table_keys(rel);
+	}
 
 	index_close(indexRel, NoLock);
 

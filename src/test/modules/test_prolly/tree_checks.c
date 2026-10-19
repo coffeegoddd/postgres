@@ -1577,7 +1577,8 @@ large_key(int i, int n, StringInfo buf)
 
 /*
  * Keys of many kilobytes (each one ending every node it is in, by the
- * chunker's odds): a tree of one, or of many, still has a root, the same
+ * chunker's odds), and keys of key_max() bytes with the longest values
+ * kept in line: a tree of one, or of many, still has a root, the same
  * however it was made; a key too large for two to fit in a node is
  * refused.  Over chunks only (a page doesn't hold such keys).
  */
@@ -1587,57 +1588,78 @@ tree_large_keys(const ProllyImplInfo *impl)
 	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
 	ProllyTreeEnv env;
 	StringInfoData kbuf;
-	ProllyValue value = {(const uint8 *) "v", 1};
+	StringInfoData vbuf;
 	ProllyNodeRef root;
 	ProllyNodeRef edited;
 	ProllyTreeBuilder *b;
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	bool		refused = false;
+	int			key_lens[2];
+	ProllyValue value;
 
 	make_env(&env);
 	initStringInfo(&kbuf);
+	initStringInfo(&vbuf);
+	key_lens[0] = 10000;
+	key_lens[1] = PROLLY_CALL(tr, key_max, env.chunk_format, env.hash);
+	if (key_lens[1] < 10000 || key_lens[1] > 40000)
+		elog(ERROR, "key_max() is %d bytes", key_lens[1]);
 
-	for (int nkeys = 1; nkeys <= 40; nkeys += 39)
+	for (int l = 0; l < lengthof(key_lens); l++)
 	{
-		ProllyKey	key;
-		StringInfoData got;
+		int			klen = key_lens[l];
 
-		/* built at once */
-		b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
-		for (int i = 0; i < nkeys; i++)
+		/* (2048 bytes: the longest value a leaf keeps in line) */
+		resetStringInfo(&vbuf);
+		appendStringInfoChar(&vbuf, 'v');
+		while (l > 0 && vbuf.len < 2048)
+			appendStringInfoChar(&vbuf, 'v');
+		value.data = (const uint8 *) vbuf.data;
+		value.len = vbuf.len;
+
+		for (int nkeys = 1; nkeys <= 40; nkeys += 39)
 		{
-			key = large_key(i, 10000, &kbuf);
-			PROLLY_CALL(tr, build_add, b, &key, &value);
-		}
-		PROLLY_CALL(tr, build_finish, b, &root);
-		if (PROLLY_CALL(tr, count, &env, &root) != nkeys)
-			elog(ERROR, "a tree of %d large keys counts " UINT64_FORMAT, nkeys,
-				 PROLLY_CALL(tr, count, &env, &root));
-		initStringInfo(&got);
-		key = large_key(nkeys - 1, 10000, &kbuf);
-		if (!PROLLY_CALL(tr, get, &env, &root, &key, &got) ||
-			got.len != 1 || got.data[0] != 'v')
-			elog(ERROR, "a tree of %d large keys lost its last", nkeys);
+			ProllyKey	key;
+			StringInfoData got;
 
-		/* and by edits, one key at a time: the same tree */
-		b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
-		PROLLY_CALL(tr, build_finish, b, &edited);
-		for (int i = nkeys - 1; i >= 0; i--)
-		{
-			ProllyEdit	edit;
-			ProllyNodeRef next;
+			/* built at once */
+			b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+			for (int i = 0; i < nkeys; i++)
+			{
+				key = large_key(i, klen, &kbuf);
+				PROLLY_CALL(tr, build_add, b, &key, &value);
+			}
+			PROLLY_CALL(tr, build_finish, b, &root);
+			if (PROLLY_CALL(tr, count, &env, &root) != nkeys)
+				elog(ERROR, "a tree of %d keys of %d bytes counts " UINT64_FORMAT,
+					 nkeys, klen, PROLLY_CALL(tr, count, &env, &root));
+			initStringInfo(&got);
+			key = large_key(nkeys - 1, klen, &kbuf);
+			if (!PROLLY_CALL(tr, get, &env, &root, &key, &got) ||
+				got.len != value.len || memcmp(got.data, value.data, value.len) != 0)
+				elog(ERROR, "a tree of %d keys of %d bytes lost its last",
+					 nkeys, klen);
 
-			edit.key = large_key(i, 10000, &kbuf);
-			edit.value = value;
-			edit.is_delete = false;
-			PROLLY_CALL(tr, apply, &env, &edited, &edit, 1, &next);
-			edited = next;
+			/* and by edits, one key at a time: the same tree */
+			b = PROLLY_CALL(tr, build_begin, &env, CurrentMemoryContext);
+			PROLLY_CALL(tr, build_finish, b, &edited);
+			for (int i = nkeys - 1; i >= 0; i--)
+			{
+				ProllyEdit	edit;
+				ProllyNodeRef next;
+
+				edit.key = large_key(i, klen, &kbuf);
+				edit.value = value;
+				edit.is_delete = false;
+				PROLLY_CALL(tr, apply, &env, &edited, &edit, 1, &next);
+				edited = next;
+			}
+			if (!same_hash(&root, &edited))
+				elog(ERROR, "a tree of %d keys of %d bytes built at once and by edits differ",
+					 nkeys, klen);
+			pfree(got.data);
 		}
-		if (!same_hash(&root, &edited))
-			elog(ERROR, "a tree of %d large keys built at once and by edits differ",
-				 nkeys);
-		pfree(got.data);
 	}
 
 	/* a key larger than half a node */
@@ -1672,6 +1694,7 @@ tree_large_keys(const ProllyImplInfo *impl)
 	if (!refused)
 		elog(ERROR, "a tree of keys of 40000 bytes was built");
 	pfree(kbuf.data);
+	pfree(vbuf.data);
 }
 
 /*

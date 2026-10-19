@@ -108,6 +108,7 @@ tests += {
       'gc_full',
       'page_sweep',
       'large_values',
+      'large_keys',
       'doltgres_vc',
       'doltgres_objects',
       'doltgres_fks_auth',

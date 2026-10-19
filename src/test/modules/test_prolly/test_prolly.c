@@ -121,7 +121,7 @@ static const ConformanceCase cases[] = {
 	"open keyless encode_row make_value parse_value decode_row close",
 	keying_round_trip},
 	{PROLLY_IFACE_TABLE_KEYING, "keys_and_content",
-	"open encode_row compare close", keying_keys_and_content},
+	"open encode_row compare close encode_key", keying_keys_and_content},
 	{PROLLY_IFACE_TABLE_KEYING, "owns_its_memory",
 	"open encode_row decode_row close", keying_owns_its_memory},
 
@@ -145,7 +145,7 @@ static const ConformanceCase cases[] = {
 	"build_begin build_add build_finish get cursor_open cursor_seek cursor_next cursor_close count",
 	tree_build_and_get},
 	{PROLLY_IFACE_TREE, "large_keys",
-	"build_begin build_add build_finish apply get count",
+	"build_begin build_add build_finish apply get count key_max",
 	tree_large_keys},
 	{PROLLY_IFACE_TREE, "cursor_scans",
 	"build_begin build_add build_finish cursor_open cursor_seek cursor_next cursor_close count",
