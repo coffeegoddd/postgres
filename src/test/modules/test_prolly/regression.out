@@ -1,0 +1,30 @@
+# initializing database system by copying initdb template
+# using temp instance on port 52544 with PID 1216638
+ok 1         - test_prolly                              2362 ms
+ok 2         - prolly_tables                             176 ms
+ok 3         - versioned_schemas                         112 ms
+ok 4         - catalog_branch_column                      38 ms
+ok 5         - branch_catalogs                           129 ms
+ok 6         - bmap_sharing                              136 ms
+ok 7         - bmap_copy_on_write                        137 ms
+ok 8         - bmap_folds                                119 ms
+ok 9         - branches                                  309 ms
+ok 10        - fold                                      190 ms
+ok 11        - commits                                   282 ms
+ok 12        - branch_writes                             167 ms
+ok 13        - writer_modes                             3550 ms
+ok 14        - transaction_commits                       546 ms
+ok 15        - status_diff                              1163 ms
+ok 16        - collations                                309 ms
+ok 17        - applier                                   205 ms
+ok 18        - move_heads                                982 ms
+ok 19        - merge                                    2034 ms
+ok 20        - cell_merges                               390 ms
+ok 21        - conflict_rows                             228 ms
+ok 22        - cherry_pick                               407 ms
+ok 23        - merge_options                             309 ms
+ok 24        - revert_series                             218 ms
+ok 25        - branch_rename                             313 ms
+ok 26        - schema_moves                             1563 ms
+ok 27        - sequences                                 371 ms
+ok 28        - schema_merges                            3797 ms

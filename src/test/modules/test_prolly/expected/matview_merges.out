@@ -544,6 +544,121 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- A series over uncommitted rows its views don't read: each pick merges
+-- into the views as the one before left them, so taking each one's
+-- refresh in turn is no refresh of both.
+INSERT INTO mm.t VALUES (12);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 't 12, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO mm.t VALUES (13);
+REFRESH MATERIALIZED VIEW mm.mv;
+SELECT length(dolt_commit('-am', 't 13, refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT c AS before_revert FROM mm.mv;
+ before_revert 
+---------------
+            71
+(1 row)
+
+INSERT INTO mm.n VALUES (2);
+SELECT (dolt_revert('HEAD', 'HEAD~1'))[2:4];
+ dolt_revert 
+-------------
+ {0,0,0}
+(1 row)
+
+SELECT c AS reverted, (SELECT sum(pk) FROM mm.t) AS t_sum FROM mm.mv;
+ reverted | t_sum 
+----------+-------
+       46 |    46
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY table_name;
+ table_name |  status  
+------------+----------
+ mm.n       | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- A view reading another, both refreshed on both sides: the one read is
+-- refreshed first, so the other reads its merged rows.
+CREATE MATERIALIZED VIEW mm.b AS SELECT coalesce(sum(pk), 0) AS c FROM mm.t;
+CREATE MATERIALIZED VIEW mm.a AS SELECT c * 10 AS c FROM mm.b;
+SELECT length(dolt_commit('-Am', 'a view reading a view')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('mm_other');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'mm_other'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO mm.t VALUES (100);
+REFRESH MATERIALIZED VIEW mm.b;
+REFRESH MATERIALIZED VIEW mm.a;
+SELECT length(dolt_commit('-am', 'theirs: t, both refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO mm.t VALUES (200);
+REFRESH MATERIALIZED VIEW mm.b;
+REFRESH MATERIALIZED VIEW mm.a;
+SELECT length(dolt_commit('-am', 'ours: t, both refreshed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('mm_other', '-m', 'both refreshed both'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT (SELECT c FROM mm.b) AS b, (SELECT c FROM mm.a) AS a,
+	(SELECT sum(pk) FROM mm.t) AS t_sum;
+  b  |  a   | t_sum 
+-----+------+-------
+ 346 | 3460 |   346
+(1 row)
+
+SELECT count(*) AS clean FROM dolt_status;
+ clean 
+-------
+     0
+(1 row)
+
 SELECT dolt_branch('-D', 'mm_other');
  dolt_branch 
 -------------
@@ -551,13 +666,15 @@ SELECT dolt_branch('-D', 'mm_other');
 (1 row)
 
 DROP SCHEMA mm CASCADE;
-NOTICE:  drop cascades to 6 other objects
+NOTICE:  drop cascades to 8 other objects
 DETAIL:  drop cascades to table mm.t
 drop cascades to table mm.o
 drop cascades to materialized view mm.mv
 drop cascades to table mm.n
 drop cascades to table mm.n2
 drop cascades to materialized view mm.mv2
+drop cascades to materialized view mm.b
+drop cascades to materialized view mm.a
 SELECT length(dolt_commit('-Am', 'mm gone')::text) AS committed;
  committed 
 -----------
