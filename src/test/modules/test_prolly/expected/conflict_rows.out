@@ -144,6 +144,127 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- A table renamed since the merge began can't have its conflicts read
+-- (none of the merge's versions has it by its name now): an error, and
+-- the summary lists it with its count unknown, the others' still shown.
+CREATE TABLE cr.a (pk int PRIMARY KEY, col1 int);
+CREATE TABLE cr.b (pk int PRIMARY KEY, col1 int);
+SELECT length(dolt_commit('-Am', 'a, b')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('cr_ab');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cr_ab') IS NOT NULL AS on_ab;
+ on_ab 
+-------
+ t
+(1 row)
+
+INSERT INTO cr.a VALUES (1, 100);
+INSERT INTO cr.b VALUES (1, 100);
+SELECT length(dolt_commit('-am', 'ab')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+INSERT INTO cr.a VALUES (1, -100);
+INSERT INTO cr.b VALUES (1, -100);
+SELECT length(dolt_commit('-am', 'main ab')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT (dolt_merge('cr_ab'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+ALTER TABLE cr.a RENAME TO a2;
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+ table_name | num_conflicts 
+------------+---------------
+ cr.a2      |              
+ cr.b       |             1
+(2 rows)
+
+SELECT * FROM dolt_conflicts(NULL::cr.a2);
+ERROR:  table cr.a2 was renamed or moved since the merge began
+HINT:  Give it its name back to list or resolve its conflicts.
+SELECT dolt_conflicts_resolve('--theirs', 'cr.a2');
+ERROR:  table cr.a2 was renamed or moved since the merge began
+HINT:  Give it its name back to list or resolve its conflicts.
+ALTER TABLE cr.a2 RENAME TO a;
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+ table_name | num_conflicts 
+------------+---------------
+ cr.a       |             1
+ cr.b       |             1
+(2 rows)
+
+-- (one the working set leaves out, a partition whose columns are in
+-- another order than its partitioned table's: walked against ours' rows,
+-- the branch's as committed)
+CREATE TABLE cr.p (col1 int, pk int) PARTITION BY RANGE (pk);
+ALTER TABLE cr.p ATTACH PARTITION cr.a FOR VALUES FROM (0) TO (100);
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+ table_name | num_conflicts 
+------------+---------------
+ cr.a       |             1
+ cr.b       |             1
+(2 rows)
+
+SELECT (our_row).col1 AS ours, (their_row).col1 AS theirs FROM dolt_conflicts(NULL::cr.a);
+ ours | theirs 
+------+--------
+ -100 |    100
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'cr.a');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM cr.a;
+ pk | col1 
+----+------
+  1 |  100
+(1 row)
+
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+ table_name | num_conflicts 
+------------+---------------
+ cr.b       |             1
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'cr_ab');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 RESET dolt.allow_commit_conflicts;
 SELECT dolt_branch('-D', 'cr_other');
  dolt_branch 
@@ -152,7 +273,10 @@ SELECT dolt_branch('-D', 'cr_other');
 (1 row)
 
 DROP SCHEMA cr CASCADE;
-NOTICE:  drop cascades to table cr.t
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table cr.t
+drop cascades to table cr.b
+drop cascades to table cr.a
 SELECT length(dolt_commit('-Am', 'without cr')::text) AS committed;
  committed 
 -----------

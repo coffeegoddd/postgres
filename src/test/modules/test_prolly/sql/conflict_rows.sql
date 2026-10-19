@@ -48,6 +48,41 @@ SELECT dolt_conflicts_resolve('--ours', 'cr.t');
 SELECT count(*) AS rows FROM cr.t;
 SELECT dolt_reset('--hard');
 
+-- A table renamed since the merge began can't have its conflicts read
+-- (none of the merge's versions has it by its name now): an error, and
+-- the summary lists it with its count unknown, the others' still shown.
+CREATE TABLE cr.a (pk int PRIMARY KEY, col1 int);
+CREATE TABLE cr.b (pk int PRIMARY KEY, col1 int);
+SELECT length(dolt_commit('-Am', 'a, b')::text) AS committed;
+SELECT dolt_branch('cr_ab');
+SELECT dolt_checkout('cr_ab') IS NOT NULL AS on_ab;
+INSERT INTO cr.a VALUES (1, 100);
+INSERT INTO cr.b VALUES (1, 100);
+SELECT length(dolt_commit('-am', 'ab')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO cr.a VALUES (1, -100);
+INSERT INTO cr.b VALUES (1, -100);
+SELECT length(dolt_commit('-am', 'main ab')::text) AS committed;
+SELECT (dolt_merge('cr_ab'))[3] AS conflicts;
+ALTER TABLE cr.a RENAME TO a2;
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+SELECT * FROM dolt_conflicts(NULL::cr.a2);
+SELECT dolt_conflicts_resolve('--theirs', 'cr.a2');
+ALTER TABLE cr.a2 RENAME TO a;
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+-- (one the working set leaves out, a partition whose columns are in
+-- another order than its partitioned table's: walked against ours' rows,
+-- the branch's as committed)
+CREATE TABLE cr.p (col1 int, pk int) PARTITION BY RANGE (pk);
+ALTER TABLE cr.p ATTACH PARTITION cr.a FOR VALUES FROM (0) TO (100);
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+SELECT (our_row).col1 AS ours, (their_row).col1 AS theirs FROM dolt_conflicts(NULL::cr.a);
+SELECT dolt_conflicts_resolve('--theirs', 'cr.a');
+SELECT * FROM cr.a;
+SELECT * FROM dolt_conflicts ORDER BY table_name;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'cr_ab');
+
 RESET dolt.allow_commit_conflicts;
 SELECT dolt_branch('-D', 'cr_other');
 DROP SCHEMA cr CASCADE;

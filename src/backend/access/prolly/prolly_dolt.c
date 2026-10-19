@@ -3224,6 +3224,7 @@ typedef struct CountSink
 {
 	ProllyConflictSink sink;	/* must be first */
 	int64		n;
+	bool		unreadable;		/* the count isn't known */
 } CountSink;
 
 static void
@@ -3232,6 +3233,13 @@ count_conflict(ProllyConflictSink *self, const ProllyKey *key,
 			   const ProllyValue *theirs)
 {
 	((CountSink *) self)->n++;
+}
+
+/* (a table whose conflicts can't be read is listed, its count unknown) */
+static void
+count_unreadable(ProllyConflictSink *self, const char *why)
+{
+	((CountSink *) self)->unreadable = true;
 }
 
 Datum
@@ -3245,13 +3253,14 @@ dolt_conflicts_summary(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	for (int i = 0; i < ms.ntables; i++)
 	{
-		CountSink	cs = {{count_conflict}, 0};
+		CountSink	cs = {{count_conflict, count_unreadable}, 0, false};
 		Datum		values[2];
 		bool		nulls[2] = {0};
 
 		PROLLY_CALL(diff_merge(), conflicts, ms.tables[i], &cs.sink);
 		values[0] = CStringGetTextDatum(qualified_name(ms.tables[i]));
 		values[1] = Int64GetDatum(cs.n);
+		nulls[1] = cs.unreadable;
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;

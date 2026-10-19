@@ -86,6 +86,11 @@ var T = []queries.ScriptTest{{Name:"a", SetUpScript:shared}, {Name:"b", SetUpScr
 	if err != nil || len(setups) != 0 || len(computed) != 1 || computed[0] != "shared" {
 		t.Fatalf("computed shared setup: %v %+v %v", err, setups, computed)
 	}
+	// (one declared without a value, set elsewhere, is computed too)
+	setups, computed, err = ScanSetups("fixture.go", []byte("package fixture\nvar shared []string\nvar a, local = []string{}, []string{\"x\"}\n"), names)
+	if err != nil || len(setups) != 0 || len(computed) != 1 || computed[0] != "shared" {
+		t.Fatalf("shared setup without a value: %v %+v %v", err, setups, computed)
+	}
 	gaps := Undeclared(map[string]bool{"shared": true, "local": true, "a": true}, map[string]bool{"shared": true})
 	if len(gaps) != 2 || gaps[0] != (Flag{"a", SetupUndeclared}) || gaps[1] != (Flag{"local", SetupUndeclared}) {
 		t.Fatalf("undeclared: %+v", gaps)

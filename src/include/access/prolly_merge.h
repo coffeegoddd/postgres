@@ -31,6 +31,9 @@
  * - conflicts() reports a table's unresolved conflicts of the merge in
  *   progress, in key order, each row as the common ancestor, the current
  *   branch and the merged branch have it (NULL where it doesn't exist).
+ *   A table it can't read them for as it is now (renamed or moved since
+ *   the merge began) is an error, or, if the sink has unreadable, is
+ *   reported there instead.
  * - resolve() resolves them, keeping the current rows or taking the merged
  *   branch's.
  * - tables() reports each table that differs between two refs (its rows or
@@ -97,6 +100,8 @@ struct ProllyConflictSink
 							 const ProllyValue *base,
 							 const ProllyValue *ours,
 							 const ProllyValue *theirs);
+	/* (if set: why the table's conflicts can't be read, not an error) */
+	void		(*unreadable) (ProllyConflictSink *self, const char *why);
 };
 
 /*

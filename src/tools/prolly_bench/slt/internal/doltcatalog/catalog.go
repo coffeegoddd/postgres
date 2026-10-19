@@ -160,7 +160,7 @@ type Catalog struct {
 
 // The reasons a case-named shared setup is unresolved.
 const (
-	SetupComputed   = "computed, not a []string literal"
+	SetupComputed   = "not a []string literal (computed, or declared without a value)"
 	SetupUndeclared = "not a top-level var of the scanned files"
 )
 
@@ -295,7 +295,8 @@ func literalSQL(e ast.Expr) bool {
 }
 
 // topLevelVars calls fn with each name and value of f's top-level var
-// declarations, stopping at its first error.
+// declarations (a nil value for one declared without), stopping at its
+// first error.
 func topLevelVars(f *ast.File, fn func(name string, val ast.Expr) error) error {
 	for _, decl := range f.Decls {
 		g, ok := decl.(*ast.GenDecl)
@@ -304,8 +305,12 @@ func topLevelVars(f *ast.File, fn func(name string, val ast.Expr) error) error {
 		}
 		for _, spec := range g.Specs {
 			v := spec.(*ast.ValueSpec)
-			for i, val := range v.Values {
-				if err := fn(v.Names[i].Name, val); err != nil {
+			for i, name := range v.Names {
+				var val ast.Expr // (nil: declared without a value)
+				if i < len(v.Values) {
+					val = v.Values[i]
+				}
+				if err := fn(name.Name, val); err != nil {
 					return err
 				}
 			}

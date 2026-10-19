@@ -4063,7 +4063,9 @@ conflicted_table(Oid relid, ProllyMergeState *state)
 
 /*
  * Walk relid's changes in the merge in progress, as mode says, against
- * the branch's rows as they are now.
+ * the branch's rows as they are now.  (A table the working set leaves out,
+ * one the canonical form can't describe as defined now, is walked against
+ * ours' rows, the branch's as last committed.)
  */
 static void
 walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
@@ -4084,15 +4086,6 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	Table		nt;
 	Relation	rel;
 
-	/*
-	 * (a versioned table is always in the working set, and one can't leave
-	 * its versioned schema: never ours' rows standing in for the branch's)
-	 */
-	if (now == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("table %s has merge conflicts but is not in the working set",
-						name)));
 	/* The merge left the head where it was: ours is the head commit. */
 	if (!PROLLY_CALL(components().refs, resolve, "HEAD", &ours))
 		ereport(ERROR,
@@ -4104,6 +4097,26 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	op = as_defined_now(rel, find_table(tables_at(&ours), name), now, false, &o);
 	tp = as_defined_now(rel, find_table(tables_at(&ms->theirs), name), now, false, &t);
 	table_close(rel, AccessShareLock);
+
+	/*
+	 * (none of the merge's versions has the table by its name now: renamed
+	 * or moved since the merge began, its rows there can't be found)
+	 */
+	if (bp == NULL && op == NULL && tp == NULL)
+	{
+		char	   *why = psprintf("table %s was renamed or moved since the merge began",
+								   name);
+
+		if (sink != NULL && sink->unreadable != NULL)
+		{
+			sink->unreadable(sink, why);
+			return;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s", why),
+				 errhint("Give it its name back to list or resolve its conflicts.")));
+	}
 	/* (a version without the table has none of its rows) */
 	if (bp == NULL)
 	{
