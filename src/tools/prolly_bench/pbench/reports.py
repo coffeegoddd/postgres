@@ -8,7 +8,6 @@ from pathlib import Path
 
 from pbench import bcompare, report, table
 from pbench.core import registry
-from pbench.core.stats import summarize
 from pbench.core.validation import cell_problems, compatible, validate_run
 from pbench.presentation import Document, Section, Value, link
 
@@ -90,10 +89,27 @@ class Source:
 
 
 def load(path: Path) -> Source:
-    problems = validate_run(path)
+    try:
+        problems = validate_run(path)
+    except (AttributeError, TypeError, KeyError) as e:
+        problems = [f"invalid result evidence: {e}"]
     run = read_json(path / "run.json", problems)
     config = read_json(path / "config.json", problems)
     env = read_json(path / "environment.json", problems)
+    for obj, fields in ((config, ("run", "postgres")), (env, ("postgres", "repo", "kernel"))):
+        for name in fields:
+            if name in obj and not isinstance(obj[name], dict):
+                problems.append(f"invalid object field: {name}")
+                obj[name] = {}
+    for name in ("suite", "label", "table_am", "started", "build"):
+        if name in run and not isinstance(run[name], str):
+            problems.append(f"invalid run field: {name}")
+            run[name] = str(run[name])
+    for name in ("planned_cells", "warnings", "builds"):
+        expected = dict if name == "planned_cells" else str
+        if name in run and (not isinstance(run[name], list) or any(not isinstance(v, expected) for v in run[name])):
+            problems.append(f"invalid run field: {name}")
+            run[name] = []
     results = []
     try:
         for n, line in enumerate((path / "results.jsonl").read_text().splitlines(), 1):
@@ -103,6 +119,10 @@ def load(path: Path) -> Source:
                 r = json.loads(line)
                 if not isinstance(r, dict) or not isinstance(r.get("key"), dict) or not isinstance(r.get("metrics"), dict):
                     raise ValueError("expected cell key and metrics objects")
+                if not isinstance(r.get("measurement", {}), dict) or not isinstance(r.get("raw_dir", ""), str):
+                    raise ValueError("expected measurement object and raw path string")
+                if any(not isinstance(v, (str, int, float, type(None))) for v in r["key"].values()):
+                    raise ValueError("invalid cell key")
                 results.append(r)
             except (ValueError, TypeError) as e:
                 problems.append(f"results.jsonl line {n}: {e}")
@@ -360,11 +380,14 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
             raw = (s.path / r.get("raw_dir", "raw")).resolve()
             if not raw.is_relative_to(s.path.resolve()):
                 continue
-            path = raw / "benchbase-measure" / "queries.json"
-            if not path.exists():
+            path = (raw / "benchbase-measure" / "queries.json").resolve()
+            if not path.is_relative_to(s.path.resolve()) or not path.exists():
                 continue
             data = read_json(path, queries.notes)
             for name, values in sorted(data.items()):
+                if not isinstance(values, dict) or any(type(v) not in (int, float) for v in values.values()):
+                    queries.notes.append(f"Invalid per-query summary: {name}")
+                    continue
                 queries.rows.append([json.dumps(r["key"], sort_keys=True), name,
                                      str(values.get("count", "?")), _fmt(values.get("mean_ms")),
                                      _fmt(values.get("total_ms")), link(path, output_dir, "queries.json")])

@@ -142,6 +142,28 @@ class ReportsTest(unittest.TestCase):
         self.assertFalse(doc.passed)
         self.assertIn('INVALID', presentation.HtmlRenderer().render(doc))
 
+    def test_wrong_json_shapes_are_diagnostics(self):
+        source = self.source()
+        (source.path / 'run.json').write_text('[]')
+        (source.path / 'environment.json').write_text('{"postgres": "broken"}')
+        source = reports.load(source.path)
+        doc = reports.build([source], self.root)
+        self.assertFalse(doc.passed)
+        self.assertIn('expected an object', presentation.HtmlRenderer().render(doc))
+
+    def test_benchmark_intervals_color_only_metrics_with_a_direction(self):
+        base = self.source('heap', am='heap', reps=5, values={'tps': 100, 'latency_samples': 100})
+        other = self.source(reps=5, values={'tps': 200, 'latency_samples': 200})
+        for s in (base, other):
+            for r in s.results:
+                r['measurement']['quality'] = 'benchmark'
+        doc = reports.build([base, other], self.root)
+        throughput = next(s for s in doc.sections if s.title.startswith('Throughput ('))
+        samples = next(s for s in doc.sections if s.title.startswith('Latency observations'))
+        self.assertEqual(throughput.rows[0][-1].tone, 'good')
+        self.assertIn('95% CI', throughput.rows[0][-1].text)
+        self.assertEqual(samples.rows[0][-1].tone, '')
+
     def test_escaping_and_portable_links(self):
         value = '<script>alert(1)</script>|[link](javascript:bad)\nsecond'
         doc = presentation.Document(value, sections=[presentation.Section(value, ['column'], [[value,
