@@ -909,6 +909,13 @@ force_branch(const char *name, const char *from)
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("branch \"%s\" changed while it was moved", name),
 				 errhint("Try again.")));
+	/* (its uncommitted changes gone: a writer that owned it for them doesn't) */
+	{
+		Oid			oid = get_branch_oid(name, true);
+
+		if (OidIsValid(oid))
+			PROLLY_CALL(writers(), settled, oid);
+	}
 }
 
 /*

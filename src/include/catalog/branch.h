@@ -128,6 +128,9 @@ extern const CatalogBranchInfo *catalog_branch_catalogs(int *n);
 /* a row's branch: its branch column (0 for shared rows) */
 extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
 
+/* the id of the branch called name; InvalidOid if none and missing_ok */
+extern Oid	get_branch_oid(const char *name, bool missing_ok);
+
 /* check out the pg_branch row a connection named; false if there is none */
 extern bool branch_session_init(const char *branch);
 

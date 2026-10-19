@@ -148,6 +148,25 @@ SET dolt.writer = 'erin';
 SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'wm_f');
 
+-- A forced move of a dirty branch (dolt_branch -f) is its owner's, and
+-- takes the claim with the changes it drops.
+SET dolt.writer = 'dave';
+SELECT dolt_checkout('-b', 'wm_g');
+INSERT INTO wm.t VALUES (11, 'dave on g');
+SELECT dolt_checkout('main');
+SET dolt.writer = 'erin';
+SELECT dolt_branch('-f', 'wm_g', 'main');
+SET dolt.writer = 'dave';
+SELECT dolt_branch('-f', 'wm_g', 'main');
+SELECT name, dirty, owner FROM dolt_branches() WHERE name = 'wm_g';
+SET dolt.writer = 'erin';
+SELECT dolt_checkout('wm_g');
+INSERT INTO wm.t VALUES (11, 'erin on g');
+SELECT name, owner FROM dolt_branches() WHERE name = 'wm_g';
+SELECT dolt_reset('--hard');
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'wm_g');
+
 -- Branch-only: main is protected, written only by integrations, which
 -- commit as they change it.
 SELECT dolt_writer_mode('branch-only');
