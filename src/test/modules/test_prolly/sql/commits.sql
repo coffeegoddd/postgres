@@ -157,21 +157,22 @@ SELECT (dolt_merge('--', '-dash'))[4];
 SELECT dolt_reset('--hard', '--', '-dash');
 SELECT dolt_cherry_pick('--', '-dash');
 SELECT dolt_branch('-D', '--', '-dash');
--- "--" is never an option's value: what needs one is refused, and no
--- branch named "--" is made.
+-- An option's value is the argument after it, "--" too (as in Dolt and
+-- git), so "--" ends the options only where it isn't one.  "--" isn't a
+-- branch's name (as in git), however it's given: no branch "--" is made.
 SELECT dolt_checkout('-b', '--', 'main');
 SELECT dolt_checkout('-b', '--');
+SELECT dolt_branch('--', '--');
+SELECT dolt_branch('-c', '--', 'main', '--');
+SELECT dolt_checkout('--', '--');
 SELECT name FROM dolt_branches WHERE name = '--';
 SELECT active_branch();
-SELECT dolt_commit('-m', '--');
-SELECT dolt_commit('-Am', '--', '--allow-empty');
-SELECT dolt_commit('--author', '--', '-m', 'x');
-SELECT dolt_merge('-m', '--', 'main');
-SELECT dolt_integrate('-m', '--', 'main');
-SELECT dolt_revert('--author', '--', 'HEAD');
-SELECT dolt_pull('-m', '--', 'origin');
-SELECT dolt_clone('-b', '--', 'file:///nowhere');
-SELECT dolt_clone('--remote', '--', 'file:///nowhere');
+BEGIN;
+SELECT length(dolt_commit('--allow-empty', '-m', '--')::text) AS committed;
+SELECT length(dolt_commit('--allow-empty', '-Am', '--', '--author', '--')::text) AS committed;
+SELECT message, committer = '--' AS by_dashes FROM dolt_log('main') LIMIT 2;
+SELECT (dolt_merge('-m', '--', '--', 'main'))[4];
+ROLLBACK;
 SELECT dolt_branch('cased');
 SELECT dolt_branch('CASED');
 SELECT dolt_branch('-f', 'Cased');

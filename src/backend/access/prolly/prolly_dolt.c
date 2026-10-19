@@ -333,27 +333,14 @@ text_array(int n, const char *const *vals)
 }
 
 /*
- * Where the options end: the index of the first "--" (what follows it is
- * a branch or ref, even one beginning with "-"), or nargs.
- */
-static int
-options_end(char **args, int nargs)
-{
-	for (int i = 0; i < nargs; i++)
-		if (strcmp(args[i], "--") == 0)
-			return i;
-	return nargs;
-}
-
-/*
- * The argument after option args[*i]. "--" is never one: it ends the
- * options (options_end), so "-b", "--" is a -b with no branch, not a
- * branch named "--".
+ * The argument after option args[*i], whatever it is, "--" too (as Dolt's
+ * argument parser and git's take it): an option's value is never read as
+ * the "--" that ends the options.
  */
 static char *
 option_value(char **args, int nargs, int *i, const char *fn)
 {
-	if (*i + 1 >= nargs || strcmp(args[*i + 1], "--") == 0)
+	if (*i + 1 >= nargs)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("%s: option \"%s\" needs a value", fn, args[*i])));
@@ -1122,7 +1109,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	char	   *branch = NULL;
 	char	   *start = NULL;
 	bool		create = false;
@@ -1132,9 +1119,9 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (i == dashes)
-			continue;
-		if (i > dashes || a[0] != '-')
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
 		{
 			if (branch == NULL)
 				branch = a;
@@ -1552,7 +1539,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	char	   *branch = NULL;
 	char	   *message = NULL;
 	int			flags = 0;
@@ -1570,9 +1557,9 @@ dolt_merge(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (i == dashes)
-			continue;
-		if (i > dashes || a[0] != '-')
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
 		{
 			if (branch == NULL)
 				branch = a;
@@ -2154,7 +2141,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	bool		hard = false;
 	char	   *ref = NULL;
 	const char *result[1] = {"0"};
@@ -2163,9 +2150,9 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (i == dashes)
-			continue;
-		if (i > dashes || a[0] != '-')
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
 		{
 			if (ref == NULL)
 				ref = a;
@@ -2266,7 +2253,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 {
 	char	  **args;
 	int			nargs = text_args(fcinfo, &args);
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	const char *ref = NULL;
 	bool		allow_empty = false;
 	ProllyHash	id;
@@ -2278,9 +2265,9 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (i == dashes)
-			continue;
-		if (i > dashes || args[i][0] != '-')
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || args[i][0] != '-')
 		{
 			if (ref == NULL)
 				ref = args[i];
@@ -2411,16 +2398,16 @@ dolt_revert(PG_FUNCTION_ARGS)
 	const char *result[4] = {"", "0", "0", "0"};
 	const char **refs_given = palloc(sizeof(char *) * Max(nargs, 1));
 	int			nrefs = 0;
-	int			dashes = options_end(args, nargs);
+	bool		options = true;	/* until "--" */
 	bool		abort_revert = false;
 	bool		continue_revert = false;
 	char	   *author = NULL;
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (i == dashes)
-			continue;
-		if (i > dashes || args[i][0] != '-')
+		if (options && strcmp(args[i], "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || args[i][0] != '-')
 			refs_given[nrefs++] = args[i];
 		else if (is_option(args[i], "abort"))
 			abort_revert = true;
