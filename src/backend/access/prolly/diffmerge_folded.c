@@ -864,6 +864,16 @@ static struct Removed *removed = NULL;	/* removed_begin() */
 
 static bool checks_domains(Relation rel);
 
+/* Start a merge or resolution without state from an earlier transaction. */
+static void
+reset_constraints(void)
+{
+	breakable_relid = InvalidOid;
+	breakable_domains = NULL;
+	domain_plans = NULL;
+	removed = NULL;
+}
+
 static void
 note_written(Oid relid)
 {
@@ -889,10 +899,7 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	recording = true;
 	recorded = NIL;
 	written = NIL;
-	breakable_relid = InvalidOid;
-	breakable_domains = NULL;
-	domain_plans = NULL;
-	removed = NULL;
+	reset_constraints();
 	PG_TRY();
 	{
 		conflicts = merge_roots(roots, fail_on_conflict, what, name,
@@ -2991,19 +2998,34 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		kw.put_back = puts_back(rel, keyless);
 
 		/*
-		 * (rows --theirs takes, checked against the columns' typmods
-		 * before any is written)
+		 * Rows --theirs takes are checked against the columns' typmods
+		 * and domains before any is written.  Resolution doesn't run
+		 * inside merge_recording(), so start its constraint state here.
+		 * Compare with the branch's row now: an unchanged value allowed
+		 * by a NOT VALID domain constraint needn't be checked again.
 		 */
 		if (mode == WALK_TAKE_THEIRS)
 		{
+			reset_constraints();
+			note_constraints(rel, keyless);
 			foreach(lt, writes)
 			{
 				KeyWrite   *w = lfirst(lt);
+				TupleTableSlot *was = NULL;
+				ErrorData  *ed;
 
 				if (w->nrow == 0)
 					continue;
 				(void) decode(&tc, w->row, s2);
 				check_fits(&fits, rel, s2, NULL);
+				if (w->nold > 0)
+				{
+					(void) decode(&tc, w->old, s1);
+					was = s1;
+				}
+				ed = row_domain_refusal(rel, s2, NULL, was, NULL);
+				if (ed)
+					ThrowErrorData(ed);
 			}
 		}
 		removed_begin(rel, keyless);

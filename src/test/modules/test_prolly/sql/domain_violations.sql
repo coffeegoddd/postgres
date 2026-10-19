@@ -181,6 +181,101 @@ SELECT pk FROM dv.t ORDER BY pk;
 SELECT pk FROM dv.c ORDER BY pk;
 SELECT pk FROM dv.u ORDER BY pk;
 
+-- Conflict resolution checks domains too, before writing any taken row.
+-- Merge and resolution run in separate transactions, and failed resolutions
+-- leave both the rows and the conflicts intact.
+CREATE DOMAIN dv.rint AS int;
+CREATE DOMAIN dv.rlabel AS text;
+CREATE DOMAIN dv.relem AS int;
+CREATE TYPE dv.rpair AS (a dv.relem);
+CREATE DOMAIN dv.rgrand AS int;
+CREATE TABLE dv.r (pk int PRIMARY KEY, v dv.rint);
+CREATE TABLE dv.ru (pk int PRIMARY KEY, v dv.rint UNIQUE);
+CREATE TABLE dv.rn (pk int PRIMARY KEY, v dv.rlabel);
+CREATE TABLE dv.ra (pk int PRIMARY KEY, v dv.relem[]);
+CREATE TABLE dv.rc (pk int PRIMARY KEY, v dv.rpair);
+CREATE TABLE dv.rg (pk int PRIMARY KEY, v dv.rgrand, w int);
+CREATE TABLE dv.rv (pk int PRIMARY KEY, v dv.rint);
+INSERT INTO dv.rg VALUES (1, -1, 0);
+SELECT length(dolt_commit('-Am', 'resolution base')::text) AS committed;
+SELECT dolt_branch('resolve_domains');
+SELECT dolt_checkout('resolve_domains');
+INSERT INTO dv.r VALUES (1, 3), (2, -2);
+INSERT INTO dv.ru VALUES (1, -1);
+INSERT INTO dv.rn VALUES (1, NULL);
+INSERT INTO dv.ra VALUES (1, '{-1}');
+INSERT INTO dv.rc VALUES (1, '(-1)');
+UPDATE dv.rg SET w = 20;
+INSERT INTO dv.rv VALUES (1, 3), (2, 4);
+SELECT length(dolt_commit('-am', 'theirs: conflicting domain values')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO dv.r VALUES (1, 1), (2, 2);
+INSERT INTO dv.ru VALUES (1, 1);
+INSERT INTO dv.rn VALUES (1, 'ours');
+INSERT INTO dv.ra VALUES (1, '{1}');
+INSERT INTO dv.rc VALUES (1, '(1)');
+UPDATE dv.rg SET w = 10;
+INSERT INTO dv.rv VALUES (1, 1), (2, 2);
+ALTER DOMAIN dv.rint ADD CONSTRAINT positive CHECK (VALUE > 0);
+ALTER DOMAIN dv.rlabel SET NOT NULL;
+ALTER DOMAIN dv.relem ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
+ALTER DOMAIN dv.rgrand ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
+SELECT length(dolt_commit('-am', 'ours: conflicting rows and constraints')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('resolve_domains'))[3] AS conflicts;
+
+-- The first row would fit, but the second must not be written.  Neither
+-- row changes, and the table still has its conflicts after the error.
+SELECT dolt_conflicts_resolve('--theirs', 'dv.r');
+SELECT * FROM dv.r ORDER BY pk;
+SELECT count(*) AS conflicts_left FROM dolt_conflicts(NULL::dv.r);
+-- A row deleted since the merge would be inserted, and is checked too.
+DELETE FROM dv.r WHERE pk = 2;
+SELECT dolt_conflicts_resolve('--theirs', 'dv.r');
+SELECT * FROM dv.r ORDER BY pk;
+SELECT dolt_conflicts_resolve('--ours', 'dv.r');
+
+-- A second unique index makes resolution remove and reinsert the row.
+SELECT dolt_conflicts_resolve('--theirs', 'dv.ru');
+SELECT * FROM dv.ru;
+SELECT dolt_conflicts_resolve('--ours', 'dv.ru');
+SELECT dolt_conflicts_resolve('--theirs', 'dv.rn');
+SELECT * FROM dv.rn;
+SELECT dolt_conflicts_resolve('--ours', 'dv.rn');
+SELECT dolt_conflicts_resolve('--theirs', 'dv.ra');
+SELECT * FROM dv.ra;
+SELECT dolt_conflicts_resolve('--ours', 'dv.ra');
+SELECT dolt_conflicts_resolve('--theirs', 'dv.rc');
+SELECT * FROM dv.rc;
+SELECT dolt_conflicts_resolve('--ours', 'dv.rc');
+
+-- An unchanged value grandfathered by NOT VALID remains allowed.  Compare
+-- with the working row: changing it since the merge makes theirs' old
+-- negative value a new, invalid value.  Rebuild the plans after an error
+-- and a domain constraint change in the same transaction, too.
+BEGIN;
+UPDATE dv.rg SET v = 1;
+SAVEPOINT before_resolution;
+SELECT dolt_conflicts_resolve('--theirs', 'dv.rg');
+ROLLBACK TO before_resolution;
+SELECT * FROM dv.rg;
+ALTER DOMAIN dv.rgrand DROP CONSTRAINT positive;
+SELECT dolt_conflicts_resolve('--theirs', 'dv.rg');
+SELECT * FROM dv.rg;
+ROLLBACK;
+SELECT dolt_conflicts_resolve('--theirs', 'dv.rg');
+SELECT * FROM dv.rg;
+
+-- Valid values still resolve, whether updating or reinserting a row
+-- deleted from the working set, and the conflicts are cleared.
+DELETE FROM dv.rv WHERE pk = 2;
+SELECT dolt_conflicts_resolve('--theirs', 'dv.rv');
+SELECT * FROM dv.rv ORDER BY pk;
+SELECT count(*) AS conflicts_left FROM dolt_conflicts;
+SELECT dolt_reset('--hard');
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('-D', 'resolve_domains');
+
 SELECT dolt_branch('-D', 'other');
 SELECT dolt_branch('-D', 'other2');
 SELECT dolt_branch('-D', 'other3');
