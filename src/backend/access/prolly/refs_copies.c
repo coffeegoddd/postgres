@@ -79,7 +79,6 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
-#include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "catalog/branch.h"
@@ -87,7 +86,6 @@
 #include "catalog/index.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
-#include "catalog/storage.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -97,6 +95,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -776,22 +775,29 @@ holds_unseen(Relation rel, Snapshot snap)
 
 /*
  * Empty a relation of the branch being made, its indexes and its TOAST
- * table: nobody else sees the branch before the transaction commits, and
- * its storage goes with it if the transaction rolls back.  (The locks are
- * what a writer takes: the OIDs are the source branch's relations' too.)
+ * table: each gets new storage, as TRUNCATE gives it, and the copy's goes
+ * when the transaction commits.  (New storage, not the copy's truncated:
+ * that would keep the copy's changes list, by which the next fold would
+ * take the pages it doesn't list for unchanged, rows and all; new storage
+ * isn't of its lineage, and is folded in full.)  Nobody else sees the
+ * branch before the transaction commits, and its storage goes with it if
+ * the transaction rolls back.  (The locks are what a writer takes: the
+ * OIDs are the source branch's relations' too.)
  */
 static void
 empty_copy(Relation rel)
 {
 	Oid			toastrelid = rel->rd_rel->reltoastrelid;
 
-	table_relation_nontransactional_truncate(rel);
+	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+	CommandCounterIncrement();
 	foreach_oid(indexid, RelationGetIndexList(rel))
 	{
 		Relation	index = index_open(indexid, RowExclusiveLock);
 
 		/* (built empty as index_build() would, without its catalog stats) */
-		RelationTruncate(index, 0);
+		RelationSetNewRelfilenumber(index, index->rd_rel->relpersistence);
+		CommandCounterIncrement();
 		(void) index->rd_indam->ambuild(rel, index, BuildDummyIndexInfo(index));
 		index_close(index, NoLock);
 	}

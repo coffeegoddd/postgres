@@ -24,12 +24,22 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 
 # Each branch's head is 1:1, 2:2; main's head is 1:5, 2:2, 3:3.  (Values
 # out of line too, in the TOAST table.)
-my @branches = qw(rr rrs rrn rrd rrw rc conn);
+my @branches = qw(rr rrs rrn rrd rrw rrbig rc conn);
 sql(q{
 	CREATE SCHEMA app VERSIONED;
 	CREATE TABLE app.t (id int PRIMARY KEY, v int, pad text);
 	ALTER TABLE app.t ALTER pad SET STORAGE EXTERNAL;
 	INSERT INTO app.t VALUES (1, 1, repeat('x', 5000)), (2, 2, NULL);
+	CREATE TABLE app.b1 (id int PRIMARY KEY, v int, pad text);
+	CREATE INDEX ON app.b1 (v);
+	ALTER TABLE app.b1 ALTER pad SET STORAGE EXTERNAL;
+	INSERT INTO app.b1 SELECT i, i % 7, CASE WHEN i % 100 = 0
+		THEN repeat('y', 3000) ELSE repeat('z', 50) END
+		FROM generate_series(1, 1000) i;
+	CREATE TABLE app.b20 (LIKE app.b1 INCLUDING ALL);
+	INSERT INTO app.b20 SELECT i, i % 7, CASE WHEN i % 1000 = 0
+		THEN repeat('y', 3000) ELSE NULL END
+		FROM generate_series(1, 20000) i;
 	SELECT dolt_commit('-Am', 'c1');
 } . join('', map { "SELECT dolt_branch('$_');\n" } @branches) . q{
 	UPDATE app.t SET v = 5 WHERE id = 1;
@@ -140,6 +150,36 @@ $user->query_safe(q{SELECT dolt_checkout('main')});
 is(sql($rows), '1:5,2:7,3:3', 'main keeps the writer\'s change');
 sql(q{UPDATE app.t SET v = 2 WHERE id = 2});
 
+# Tables of many pages, with values out of line and a second index, that
+# commits after the snapshot changed: emptied, every row is written again.
+my $big = join(" || ' / ' || ", map { qq{(SELECT format('%s %s %s %s %s',
+	count(*), min(id), max(id), sum(v), sum(length(pad))) FROM app.$_)} } qw(b1 b20));
+$big = "SELECT $big";
+my $big_head = sql($big);
+my $by_index = q{SET enable_seqscan = off; SET enable_bitmapscan = off;
+	SELECT (SELECT count(*) FROM app.b1 WHERE v = 3) || ' ' ||
+	(SELECT count(*) FROM app.b20 WHERE v = 3) || ' ' ||
+	(SELECT count(*) FROM app.b20 WHERE id > 0)};
+my $by_index_head = sql($by_index);
+$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$writer->query_safe(q{INSERT INTO app.b1 VALUES (-1, 3, 'x');
+	DELETE FROM app.b20 WHERE id = 500});
+$user->query_safe(q{SELECT dolt_checkout('rrbig')});
+is($user->query_safe($big), $big_head, 'tables of many pages, every row');
+is($user->query_safe($by_index), $by_index_head, 'and by their indexes');
+is($user->query_safe(q{SELECT count(*) FROM dolt_status}), '0', 'clean');
+$user->query_safe(q{INSERT INTO app.b1 VALUES (5000, 0, 'w');
+	SELECT dolt_commit('-am', 'on rrbig')});
+$user->query_safe('COMMIT');
+$user->query_safe(q{SELECT dolt_reset('--hard')});
+is($user->query_safe(q{SELECT count(*) FROM app.b1}) . ' ' .
+	$user->query_safe(q{SELECT count(*) FROM app.b20}) . ' ' .
+	$user->query_safe(q{SELECT count(*) FROM dolt_status}), '1001 20000 0',
+	'its commit has every row, and one more');
+$user->query_safe(q{SELECT dolt_checkout('main')});
+is(sql(q{SELECT count(*) FROM app.b1}) . ' ' . sql(q{SELECT count(*) FROM app.b20}),
+	'1001 19999', 'main keeps the other session\'s changes');
+
 # Read committed: the first use waits for a writer, whose rows the
 # statement's snapshot, taken before, doesn't see.
 $writer->query_safe(q{BEGIN; INSERT INTO app.t VALUES (101, 101);
@@ -215,5 +255,9 @@ foreach my $b (sort keys %after)
 }
 is($node->safe_psql('postgres/rr', q{SELECT length(pad) FROM app.t WHERE id = 1}),
 	'5000', 'with its values out of line');
+is($node->safe_psql('postgres/rrbig', q{SELECT count(*) FROM app.b1}) . ' ' .
+	$node->safe_psql('postgres/rrbig', $by_index) . ' ' .
+	$node->safe_psql('postgres/rrbig', q{SELECT count(*) FROM dolt_status}),
+	"1001 $by_index_head 0", 'and the tables of many pages');
 
 done_testing();
