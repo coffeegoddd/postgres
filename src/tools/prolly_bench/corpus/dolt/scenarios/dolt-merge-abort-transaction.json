@@ -311,6 +311,15 @@
         ],
         "order": "bag"
       }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
     }
   ]
 }

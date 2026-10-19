@@ -223,6 +223,15 @@
       "expect": {
         "tag": "INSERT 0 1"
       }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
     }
   ]
 }

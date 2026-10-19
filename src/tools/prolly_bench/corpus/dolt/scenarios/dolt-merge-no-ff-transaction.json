@@ -204,7 +204,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT message FROM dolt_log ORDER BY date DESC LIMIT 1",
+      "sql": "SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1",
       "expect": {
         "rows": [
           [
@@ -229,6 +229,15 @@
           ]
         ],
         "order": "bag"
+      }
+    },
+    {
+      "id": "commit",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
       }
     }
   ]

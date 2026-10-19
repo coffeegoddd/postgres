@@ -357,11 +357,13 @@ option_value(char **args, int nargs, int *i, const char *fn)
 }
 
 /*
- * Is arg the long option name, given with two dashes or one ("--no-ff",
- * "-no-ff"), as Dolt's argument parser takes either?
+ * Is arg the option name, a long one or a short one, given with two
+ * dashes or one ("--no-ff", "-no-ff"; "-m", "--m"), as Dolt's argument
+ * parser takes either for either?  (Short flags together, "-am", are
+ * each function's own to take apart.)
  */
 static bool
-long_option(const char *arg, const char *name)
+is_option(const char *arg, const char *name)
 {
 	if (arg[0] != '-')
 		return false;
@@ -749,17 +751,17 @@ dolt_commit(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "--message") == 0)
+		if (is_option(a, "m") || is_option(a, "message"))
 			message = option_value(args, nargs, &i, "dolt_commit");
-		else if (strcmp(a, "--author") == 0)
+		else if (is_option(a, "author"))
 			author = option_value(args, nargs, &i, "dolt_commit");
-		else if (strcmp(a, "--all") == 0 || strcmp(a, "--ALL") == 0)
+		else if (is_option(a, "all") || is_option(a, "ALL"))
 			continue;
-		else if (strcmp(a, "--allow-empty") == 0)
+		else if (is_option(a, "allow-empty"))
 			allow_empty = true;
-		else if (strcmp(a, "--skip-empty") == 0)
+		else if (is_option(a, "skip-empty"))
 			skip_empty = true;
-		else if (strcmp(a, "--force") == 0)
+		else if (is_option(a, "force"))
 			force = true;
 		else if (a[0] == '-' && a[1] != '-' && a[1] != '\0')
 		{
@@ -1122,7 +1124,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			else
 				unexpected("dolt_checkout", a);
 		}
-		else if (strcmp(a, "-b") == 0)
+		else if (is_option(a, "b"))
 		{
 			create = true;
 			branch = option_value(args, nargs, &i, "dolt_checkout");
@@ -1233,19 +1235,19 @@ dolt_branch(PG_FUNCTION_ARGS)
 			names = lappend(names, a);
 		else if (strcmp(a, "--") == 0)
 			options = false;	/* names after it, even ones like flags */
-		else if (strcmp(a, "--delete") == 0)
+		else if (is_option(a, "delete"))
 			delete = true;
-		else if (strcmp(a, "--force") == 0)
+		else if (is_option(a, "force"))
 			force = true;
-		else if (strcmp(a, "--copy") == 0)
+		else if (is_option(a, "copy"))
 			copy = true;
-		else if (strcmp(a, "--take") == 0)
+		else if (is_option(a, "take"))
 			take = true;
-		else if (strcmp(a, "--protect") == 0)
+		else if (is_option(a, "protect"))
 			protection = PROLLY_PROTECT_ON;
-		else if (strcmp(a, "--unprotect") == 0)
+		else if (is_option(a, "unprotect"))
 			protection = PROLLY_PROTECT_OFF;
-		else if (strcmp(a, "--move") == 0)
+		else if (is_option(a, "move"))
 			move = true;
 		else if (a[1] == '-' || a[1] == '\0')
 			unsupported("dolt_branch", a);
@@ -1517,8 +1519,8 @@ refuse_violations(const char *what)
  *	  {commit id, fast_forward, conflicts, message}
  *
  * branch; --no-ff; --ff-only; --squash; --no-commit; -m/--message
- * message; --abort (each long option with one dash or two, as Dolt
- * takes them).  Rows changed differently on both sides leave the
+ * message; --abort (each option, long or short, with one dash or two,
+ * as Dolt takes them; so too every dolt_* function's).  Rows changed differently on both sides leave the
  * merge in progress, with conflicts (dolt_conflicts) to resolve before
  * dolt_commit makes the merge commit; --no-commit leaves it so without
  * them.  As in Dolt, a transaction can't commit with conflicts unless
@@ -1558,19 +1560,19 @@ dolt_merge(PG_FUNCTION_ARGS)
 			else
 				unexpected("dolt_merge", a);
 		}
-		else if (long_option(a, "no-ff"))
+		else if (is_option(a, "no-ff"))
 			flags |= PROLLY_MERGE_NO_FF;
-		else if (long_option(a, "ff-only"))
+		else if (is_option(a, "ff-only"))
 			flags |= PROLLY_MERGE_FF_ONLY;
-		else if (long_option(a, "squash"))
+		else if (is_option(a, "squash"))
 			flags |= PROLLY_MERGE_SQUASH;
-		else if (long_option(a, "no-commit"))
+		else if (is_option(a, "no-commit"))
 			flags |= PROLLY_MERGE_NO_COMMIT;
-		else if (long_option(a, "commit"))
+		else if (is_option(a, "commit"))
 			commit = true;		/* (as without it) */
-		else if (long_option(a, "abort"))
+		else if (is_option(a, "abort"))
 			abort_merge = true;
-		else if (strcmp(a, "-m") == 0 || long_option(a, "message"))
+		else if (is_option(a, "m") || is_option(a, "message"))
 			message = option_value(args, nargs, &i, "dolt_merge");
 		else
 			unsupported("dolt_merge", a);
@@ -2050,7 +2052,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
+		if (is_option(a, "m") || is_option(a, "message"))
 			message = option_value(args, nargs, &i, "dolt_integrate");
 		else if (a[0] == '-')
 			unsupported("dolt_integrate", a);
@@ -2151,7 +2153,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 			else
 				unexpected("dolt_reset", a);
 		}
-		else if (strcmp(a, "--hard") == 0)
+		else if (is_option(a, "hard"))
 			hard = true;
 		else
 			unsupported("dolt_reset", a);
@@ -2266,11 +2268,11 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 			else
 				unexpected("dolt_cherry_pick", args[i]);
 		}
-		else if (strcmp(args[i], "--allow-empty") == 0)
+		else if (is_option(args[i], "allow-empty"))
 			allow_empty = true;
-		else if (strcmp(args[i], "--abort") == 0)
+		else if (is_option(args[i], "abort"))
 			abort_pick = true;
-		else if (strcmp(args[i], "--continue") == 0)
+		else if (is_option(args[i], "continue"))
 			continue_pick = true;
 		else
 			unsupported("dolt_cherry_pick", args[i]);
@@ -2401,11 +2403,11 @@ dolt_revert(PG_FUNCTION_ARGS)
 			continue;
 		if (i > dashes || args[i][0] != '-')
 			refs_given[nrefs++] = args[i];
-		else if (strcmp(args[i], "--abort") == 0)
+		else if (is_option(args[i], "abort"))
 			abort_revert = true;
-		else if (strcmp(args[i], "--continue") == 0)
+		else if (is_option(args[i], "continue"))
 			continue_revert = true;
-		else if (strcmp(args[i], "--author") == 0)
+		else if (is_option(args[i], "author"))
 			author = option_value(args, nargs, &i, "dolt_revert");
 		else
 			unsupported("dolt_revert", args[i]);
@@ -2490,7 +2492,7 @@ dolt_add(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (a[0] == '-' && strcmp(a, "-A") != 0 && strcmp(a, "--all") != 0)
+		if (a[0] == '-' && !is_option(a, "A") && !is_option(a, "all"))
 			unsupported("dolt_add", a);
 	}
 	PG_RETURN_DATUM(text_array(1, result));
@@ -3381,12 +3383,12 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (strcmp(args[i], "--all") == 0)
+		if (is_option(args[i], "all"))
 		{
 			all = true;
 			continue;
 		}
-		if (strcmp(args[i], "--output-only") == 0)
+		if (is_option(args[i], "output-only"))
 		{
 			output_only = true;
 			continue;
@@ -3530,9 +3532,9 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "--ours") == 0)
+		if (is_option(a, "ours"))
 			side = 1;
-		else if (strcmp(a, "--theirs") == 0)
+		else if (is_option(a, "theirs"))
 			side = 2;
 		else if (a[0] == '-')
 			unsupported("dolt_conflicts_resolve", a);
@@ -3937,9 +3939,9 @@ dolt_gc(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < nargs; i++)
 	{
-		if (strcmp(args[i], "--full") == 0)
+		if (is_option(args[i], "full"))
 			full = true;
-		else if (strcmp(args[i], "--shallow") == 0)
+		else if (is_option(args[i], "shallow"))
 			shallow = true;
 		else
 			unsupported("dolt_gc", args[i]);
@@ -4056,9 +4058,9 @@ dolt_push(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "-f") == 0 || strcmp(a, "--force") == 0)
+		if (is_option(a, "f") || is_option(a, "force"))
 			force = true;
-		else if (strcmp(a, "-u") == 0 || strcmp(a, "--set-upstream") == 0)
+		else if (is_option(a, "u") || is_option(a, "set-upstream"))
 			set_upstream = true;
 		else if (a[0] == '-')
 			unsupported("dolt_push", a);
@@ -4162,9 +4164,9 @@ dolt_pull(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "--no-ff") == 0)
+		if (is_option(a, "no-ff"))
 			merge_args = lappend(merge_args, a);
-		else if (strcmp(a, "-m") == 0 || strcmp(a, "--message") == 0)
+		else if (is_option(a, "m") || is_option(a, "message"))
 		{
 			merge_args = lappend(merge_args, a);
 			merge_args = lappend(merge_args, option_value(args, nargs, &i, "dolt_pull"));
@@ -4361,9 +4363,9 @@ dolt_clone(PG_FUNCTION_ARGS)
 	{
 		char	   *a = args[i];
 
-		if (strcmp(a, "--remote") == 0)
+		if (is_option(a, "remote"))
 			remote = option_value(args, nargs, &i, "dolt_clone");
-		else if (strcmp(a, "-b") == 0 || strcmp(a, "--branch") == 0)
+		else if (is_option(a, "b") || is_option(a, "branch"))
 			branch = option_value(args, nargs, &i, "dolt_clone");
 		else if (a[0] == '-')
 			unsupported("dolt_clone", a);

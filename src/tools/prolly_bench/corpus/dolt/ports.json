@@ -20979,7 +20979,7 @@
       "index": 3,
       "name": "CALL DOLT_MERGE ff correctly works with autocommit off",
       "source_sha256": "ab0e22395e1de7b7277ad10522721e89d78760fb0a15b99d4a9aaa35dc39d4ca",
-      "scenario_sha256": "8c0b7d986eccc9943617d25ac22c708813fd562ccf096605f35d097472cbef6b",
+      "scenario_sha256": "51a1771cbf681e1953d070b4facf54cebf3bb376dea7264ac5fdc21e8f738374",
       "setup": [
         {
           "index": 0,
@@ -21099,13 +21099,14 @@
         {
           "index": 6,
           "steps": [
-            "assert-6"
+            "assert-6",
+            "commit"
           ],
-          "note": "Checked by its tag (an OK result's count)."
+          "note": "Checked by its tag (an OK result's count). The transaction block then commits, as Dolt's session commits the insert: nothing the merge left blocks it."
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout outside a transaction block. (D3)",
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') stays dolt_checkout('-b'), called inside the transaction block as a query step. (D3, D5)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
@@ -21233,7 +21234,7 @@
       "index": 6,
       "name": "CALL DOLT_MERGE no-ff correctly works with autocommit off",
       "source_sha256": "f022600a95a67b57757ff6578d4e99e0dde06301966e465d95266ad08675c1d5",
-      "scenario_sha256": "1d24a05b1b02e59db79c40b33a1cbd12cfb18cc0351181d5deb28c7e8f8c94d7",
+      "scenario_sha256": "3cb96452c4bea2d74fbb016e6165ee5f5580040546f76fdd286c8b1faedcb4af",
       "setup": [
         {
           "index": 0,
@@ -21268,7 +21269,7 @@
           "steps": [
             "step1"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date (the commits' own times keep their order)."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time, so the newest commit is found by commit_order, not by date."
         },
         {
           "index": 5,
@@ -21296,7 +21297,7 @@
           "steps": [
             "ff-commit"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date (the commits' own times keep their order)."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time, so the newest commit is found by commit_order, not by date."
         },
         {
           "index": 9,
@@ -21338,18 +21339,19 @@
           "steps": [
             "assert-4"
           ],
-          "note": "Preserved upstream expected rows: the merge commit is the newest."
+          "note": "Preserved upstream expected rows: the merge commit is the newest. Ordered by commit_order (the merge's is the highest), not by date: the three commits share the transaction's start time, where Dolt's test pins distinct dates with --date."
         },
         {
           "index": 5,
           "steps": [
-            "assert-5"
+            "assert-5",
+            "commit"
           ],
-          "note": "dolt_checkout inside the transaction block; returns {status, message}, as Dolt. (D3, D5)"
+          "note": "dolt_checkout inside the transaction block; returns {status, message}, as Dolt. (D3, D5) The transaction block then commits: in Dolt the checkout commits it, so its success shows nothing the merge left blocks a commit."
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout outside a transaction block. (D3)",
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') stays dolt_checkout('-b'), called inside the transaction block as a query step. (D3, D5)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
@@ -21546,7 +21548,7 @@
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout outside a transaction block. (D3)",
+        "CALL becomes SELECT. (D3)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
       ]
@@ -21558,7 +21560,7 @@
       "index": 13,
       "name": "merge conflicts prevent new branch creation",
       "source_sha256": "f64f0cf75d7090f7016253bf5dcf8487e9e333ee9f7f0e493f9cdfdedee25421",
-      "scenario_sha256": "3c899c5292b05308873e06313aa056b4a5680f59e20bc54ea30719b0581e0889",
+      "scenario_sha256": "9bbe6bcf4d8db0cb5216d94a3adaedc58bfe20af8c8a96c3a47b5526a39a8618",
       "setup": [
         {
           "index": 0,
@@ -21593,7 +21595,7 @@
           "steps": [
             "step1"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date (the commits' own times keep their order)."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time; nothing here orders commits by date."
         },
         {
           "index": 5,
@@ -21621,7 +21623,7 @@
           "steps": [
             "feature-commit"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date (the commits' own times keep their order)."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time; nothing here orders commits by date."
         },
         {
           "index": 9,
@@ -21642,7 +21644,7 @@
           "steps": [
             "main-commit"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date (the commits' own times keep their order)."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time; nothing here orders commits by date."
         }
       ],
       "assertions": [
@@ -21669,13 +21671,15 @@
           "index": 3,
           "steps": [
             "assert-3-checkout",
-            "assert-3-commit"
+            "assert-3-commit",
+            "assert-3-no-branch",
+            "assert-3-on-main"
           ],
-          "note": "Dolt's dolt_checkout commits the session's transaction, so it fails there with the unresolved conflicts. Prolly's version-control calls are their transaction's: the checkout is made, and the transaction can't commit with the conflicts (SQLSTATE 40001, a serialization failure, and nothing is kept). (D4, D5)"
+          "note": "Dolt's dolt_checkout commits the session's transaction, so it fails there with the unresolved conflicts and no branch is made. Prolly's version-control calls are their transaction's: the checkout is made within it, and the transaction can't commit with the conflicts (SQLSTATE 40001, a serialization failure), so nothing is kept: as in Dolt, no other-branch exists after, and the session is on main. (D4, D5)"
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout outside a transaction block. (D3)",
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') stays dolt_checkout('-b'), called inside the transaction block as a query step. (D3, D5)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
@@ -21688,7 +21692,7 @@
       "index": 24,
       "name": "CALL DOLT_MERGE with conflicts can be aborted when autocommit is off",
       "source_sha256": "08140b1eab3dc72cd7c3662eadffe3255f43dd77abdbbfae3215d11d6deb05ab",
-      "scenario_sha256": "d074674feea0f08023549516c57ea571dd7d31d0e3399104e2c4c16607b0ffd9",
+      "scenario_sha256": "4c3774cf9f60bc454f8c5b0049744b3126954ed7b8ee86a0d179b9a1ca9a3765",
       "setup": [
         {
           "index": 0,
@@ -21833,13 +21837,14 @@
         {
           "index": 8,
           "steps": [
-            "assert-8"
+            "assert-8",
+            "commit"
           ],
-          "note": "dolt_checkout inside the transaction block; returns {status, message}, as Dolt. (D3, D5) Nothing is left to stop it, as in Dolt."
+          "note": "dolt_checkout inside the transaction block; returns {status, message}, as Dolt. (D3, D5) Nothing is left to stop it, as in Dolt. The transaction block then commits: in Dolt the checkout commits it, so its success shows the abort left no conflicts or merge to block a commit."
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout outside a transaction block. (D3)",
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') stays dolt_checkout('-b'), called inside the transaction block as a query step. (D3, D5)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
@@ -21957,7 +21962,7 @@
         }
       ],
       "adaptations": [
-        "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout outside a transaction block. (D3)",
+        "CALL becomes SELECT; DOLT_CHECKOUT('-b') stays dolt_checkout('-b'), called inside the transaction block as a query step. (D3, D5)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "SET autocommit = 0 becomes BEGIN: the rest runs in one transaction block, so its commits and checkouts are query steps. (D5, D10)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."

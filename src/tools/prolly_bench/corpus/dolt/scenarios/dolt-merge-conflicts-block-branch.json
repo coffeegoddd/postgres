@@ -237,6 +237,40 @@
       "expect": {
         "sqlstate": "40001"
       }
+    },
+    {
+      "id": "assert-3-no-branch",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT count(*) FROM dolt_branches WHERE name = 'other-branch'",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3-on-main",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "bag"
+      }
     }
   ]
 }
