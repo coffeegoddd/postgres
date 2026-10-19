@@ -48,8 +48,9 @@ FROM prolly_implementations();
  value_memo    | stub         |       0 |              0
  writers       | modes        |       1 |              1
  writers       | stub         |       0 |              0
+ change_log    | relation     |       1 |              1
  change_log    | stub         |       0 |              0
-(40 rows)
+(41 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -220,9 +221,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  writers       | modes          | complete                       | pass
  writers       | stub           | identity                       | pass
  writers       | stub           | complete                       | not implemented (10 of 10 callbacks missing)
+ change_log    | relation       | identity                       | pass
+ change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (7 of 7 callbacks missing)
-(165 rows)
+(167 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

@@ -12,12 +12,13 @@
  * consumed.
  *
  * An entry is a heap tuple of the table's row type and a count delta.  For
- * a table with a primary key, the tuple holds the version's key columns
- * (every other column null); for one without, the version's whole row,
- * +1 for a version made and -1 for one replaced.  Its columns are read by
- * the table's descriptor now, as heap reads an old tuple: a column added
- * since reads as its default.  An entry may instead say the table must be
- * read in full (a row it can't hold); then it has no tuple.
+ * a table with a primary key (checked immediately), the tuple holds the
+ * version's key columns (every other column null) and the delta is 0; for
+ * one without, the version's whole row, +1 for a version made and -1 for
+ * one replaced.  Its columns are read by the table's descriptor now, as
+ * heap reads an old tuple: a column added since reads as its default.  An
+ * entry may instead say the table must be read in full (a row it can't
+ * hold); then it has no tuple.
  *
  * Contract:
  * - create() makes rel's log; called once, as rel (a new prolly table) is
@@ -28,11 +29,13 @@
  *   replaced (oldtid), or a speculative insertion took back (oldtid), after
  *   the write, by the (sub)transaction that wrote it, whether or not the
  *   write is the session's own (hushed writes of a version-control call
- *   too).  Either TID may be NULL.  It ignores relations that aren't prolly
- *   tables with a log.  Errors are the write's.
+ *   too).  Either TID may be NULL; both NULL, every row may have changed
+ *   (the table was truncated, or rewritten).  It ignores relations that
+ *   aren't prolly tables with a log.  Errors are the write's.
  * - identity() is rel's log's identity now: 0 if rel has none, and another
- *   value whenever the log is made anew, so entries a baseline was folded
- *   with are known to still be there.
+ *   value whenever the log is made anew (not when a branch's copy of it is
+ *   made, which has its entries), so entries a baseline was folded with
+ *   are known to still be there.
  * - read() visits the entries of rel's log the snapshot sees, in no
  *   particular order: a visit returns false to stop.  False if rel has no
  *   log, an entry says to read the table in full, or a visit stopped.

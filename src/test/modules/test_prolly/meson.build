@@ -73,6 +73,7 @@ tests += {
       'merge_truth',
       'table_files',
       'incremental_folds',
+      'change_log',
       'checkpoints',
       'format_freeze',
       'dirty_merges',

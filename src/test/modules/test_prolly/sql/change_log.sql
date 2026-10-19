@@ -1,0 +1,132 @@
+-- The change log: each prolly table has a log of its own, and every
+-- write to the table puts an entry in it, in the same transaction.  A
+-- table with a primary key gets its changed keys (delta 0); one without
+-- gets each version made (+1) and replaced (-1).  A fold that begins a
+-- baseline consumes the entries it saw.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+
+CREATE SCHEMA cl VERSIONED;
+CREATE TABLE cl.keyed (id int PRIMARY KEY, v text);
+CREATE TABLE cl.keyless (a int, b text);
+
+-- entries(t): the deltas of the entries of t's log this transaction sees,
+-- and how many say to read the table in full.
+CREATE FUNCTION pg_temp.entries(t regclass, OUT n int8, OUT deltas int8[],
+	OUT full_reads int8) AS $$
+BEGIN
+	EXECUTE format('SELECT count(*), coalesce(array_agg(delta ORDER BY delta), ''{}''),
+		count(*) FILTER (WHERE image IS NULL) FROM pg_toast.%I',
+		'pg_prolly_log_' || t::oid)
+	INTO n, deltas, full_reads;
+END $$ LANGUAGE plpgsql;
+
+-- The log is a TOAST-kind relation of the table's access method, part
+-- of its table.
+SELECT c.relkind, a.amname, d.deptype, d.refobjid = 'cl.keyed'::regclass AS of_table
+FROM pg_class c
+JOIN pg_am a ON a.oid = c.relam
+JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = c.oid
+	AND d.refclassid = 'pg_class'::regclass
+WHERE c.relname = 'pg_prolly_log_' || 'cl.keyed'::regclass::oid;
+SELECT * FROM pg_temp.entries('cl.keyed');
+
+-- With a key: each key changed, once for an update that keeps the key.
+INSERT INTO cl.keyed VALUES (1, 'a'), (2, 'b'), (3, 'c');
+SELECT * FROM pg_temp.entries('cl.keyed');
+UPDATE cl.keyed SET v = 'bb' WHERE id = 2;
+SELECT * FROM pg_temp.entries('cl.keyed');
+UPDATE cl.keyed SET id = 30 WHERE id = 3;
+DELETE FROM cl.keyed WHERE id = 1;
+SELECT * FROM pg_temp.entries('cl.keyed');
+
+-- Without one: each version made and replaced.
+INSERT INTO cl.keyless VALUES (1, 'x'), (1, 'x'), (2, 'y');
+UPDATE cl.keyless SET b = 'z' WHERE a = 2;
+DELETE FROM cl.keyless WHERE a = 1;
+SELECT * FROM pg_temp.entries('cl.keyless');
+
+-- A commit's fold consumes them.
+SELECT length(dolt_commit('-Am', 'tables')::text) AS committed;
+SELECT * FROM pg_temp.entries('cl.keyed');
+SELECT * FROM pg_temp.entries('cl.keyless');
+
+-- An entry is the write's: rolled back with it, a savepoint's too.
+BEGIN;
+INSERT INTO cl.keyed VALUES (4, 'd');
+SAVEPOINT s;
+INSERT INTO cl.keyed VALUES (5, 'e');
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK TO s;
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK;
+SELECT * FROM pg_temp.entries('cl.keyed');
+
+-- A commit rolled back leaves the entries it consumed.
+INSERT INTO cl.keyed VALUES (6, 'f');
+BEGIN;
+SELECT length(dolt_commit('-am', 'gone')::text) AS committed;
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK;
+SELECT * FROM pg_temp.entries('cl.keyed');
+SELECT length(dolt_commit('-am', 'six')::text) AS committed;
+
+-- Writes after a commit in its transaction are entries for the next.
+BEGIN;
+INSERT INTO cl.keyed VALUES (7, 'g');
+SELECT length(dolt_commit('-am', 'seven')::text) AS committed;
+INSERT INTO cl.keyed VALUES (8, 'h');
+COMMIT;
+SELECT * FROM pg_temp.entries('cl.keyed');
+SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
+
+-- A keyless row with a value out of line can't be held: read in full.
+INSERT INTO cl.keyless
+SELECT 3, string_agg(md5(g::text), '') FROM generate_series(1, 300) g;
+SELECT * FROM pg_temp.entries('cl.keyless');
+
+-- A truncation changes rows no entry names, made anew or (storage the
+-- transaction made) in place, and so does a rewrite: read in full.
+BEGIN;
+TRUNCATE cl.keyed;
+INSERT INTO cl.keyed VALUES (9, 'i');
+TRUNCATE cl.keyed;
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK;
+BEGIN;
+ALTER TABLE cl.keyed ALTER COLUMN v TYPE varchar(10);
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK;
+SELECT length(dolt_commit('-am', 'long')::text) AS committed;
+
+-- Leaving a branch with changes folds it as its baseline, which consumes
+-- its entries; a branch's first use moves its copy of the table (and of
+-- the log) to its head, and the move's fold consumes the move's.  Then
+-- each branch's log is its own.
+INSERT INTO cl.keyed VALUES (10, 'j');
+SELECT dolt_branch('cl_other');
+SELECT dolt_checkout('cl_other');
+SELECT * FROM pg_temp.entries('cl.keyed');
+INSERT INTO cl.keyed VALUES (11, 'k');
+SELECT * FROM pg_temp.entries('cl.keyed');
+SELECT dolt_checkout('main');
+SELECT * FROM pg_temp.entries('cl.keyed');
+INSERT INTO cl.keyed VALUES (12, 'l');
+SELECT * FROM pg_temp.entries('cl.keyed');
+
+-- A move writes rows on the session's behalf: they are entries too, and
+-- the move's fold consumes them.
+SELECT dolt_reset('--hard');
+SELECT * FROM pg_temp.entries('cl.keyed');
+SELECT count(*) AS reset_away FROM cl.keyed WHERE id = 10;
+
+-- Dropped with its table.
+SELECT 'pg_prolly_log_' || 'cl.keyless'::regclass::oid AS keyless_log \gset
+DROP TABLE cl.keyless;
+SELECT count(*) AS gone FROM pg_class WHERE relname = :'keyless_log';
+
+DROP SCHEMA cl CASCADE;
+SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
+SELECT dolt_branch('-D', 'cl_other');

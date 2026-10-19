@@ -2300,6 +2300,8 @@ ExecuteTruncateGuts(List *explicit_rels,
 							 &reindex_params);
 		}
 
+		/* (a prolly table's change log is told every row may have changed) */
+		prolly_note_change(rel, NULL, NULL);
 		pgstat_count_truncate(rel);
 	}
 

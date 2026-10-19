@@ -61,7 +61,8 @@ SELECT array_agg(value ORDER BY name) = :'first' AS same_counts FROM pg_stat_pro
 SELECT sum(value) = 0 AS nothing_since_reset FROM pg_stat_prolly;
 
 -- A branch shares the table's pages: its first change to one copies it
--- (here both heap pages, and the primary key's leaf).
+-- (here both heap pages, the primary key's leaf, and the change log's
+-- page).
 SELECT dolt_branch('other');
 SELECT dolt_checkout('other');
 UPDATE sp.t SET v = 'y' WHERE id = 1;

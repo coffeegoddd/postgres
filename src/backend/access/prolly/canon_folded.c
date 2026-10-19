@@ -671,6 +671,12 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 	if (cn->advance)
 	{
 		CanonItem  *next = palloc0(sizeof(CanonItem));
+		ProllyComponents c;
+
+		/* (what the fold saw is in the next baseline: its entries are spent) */
+		prolly_components_for_relation(rel, &c);
+		if (c.change_log)
+			PROLLY_CALL(c.change_log, consume, rel, GetActiveSnapshot());
 
 		initStringInfo(&next->key);
 		appendBinaryStringInfo(&next->key, it->key.data, it->key.len);

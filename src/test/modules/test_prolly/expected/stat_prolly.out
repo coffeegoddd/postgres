@@ -175,7 +175,8 @@ SELECT sum(value) = 0 AS nothing_since_reset FROM pg_stat_prolly;
 (1 row)
 
 -- A branch shares the table's pages: its first change to one copies it
--- (here both heap pages, and the primary key's leaf).
+-- (here both heap pages, the primary key's leaf, and the change log's
+-- page).
 SELECT dolt_branch('other');
  dolt_branch 
 -------------
@@ -200,7 +201,7 @@ WHERE name IN ('page_copies_fold', 'page_copies_shared');
         name        | value 
 --------------------+-------
  page_copies_fold   |     0
- page_copies_shared |     3
+ page_copies_shared |     4
 (2 rows)
 
 SELECT dolt_checkout('main');

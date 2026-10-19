@@ -38,6 +38,7 @@ static const char *const history_profile[PROLLY_IFACE_LAST + 1] = {
 	[PROLLY_IFACE_TREE] = "cow",
 	[PROLLY_IFACE_VALUE_MEMO] = "shared",
 	[PROLLY_IFACE_CHANGE_FINDER] = "pages",
+	[PROLLY_IFACE_CHANGE_LOG] = "relation",
 };
 
 /*

@@ -35,6 +35,7 @@
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/prolly_config.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/toast_internals.h"
@@ -2083,6 +2084,17 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 						(OIDOldHeap == RelationRelationId),
 						swap_toast_by_content, is_internal,
 						frozenXid, cutoffMulti, mapped_tables);
+
+	/*
+	 * A prolly table's change log is told every row may have changed: a
+	 * rewrite may change them all (ALTER TABLE's), writing none it notes.
+	 */
+	{
+		Relation	oldheap = relation_open(OIDOldHeap, NoLock);
+
+		prolly_note_change(oldheap, NULL, NULL);
+		relation_close(oldheap, NoLock);
+	}
 
 	/*
 	 * If it's a system catalog, queue a sinval message to flush all catcaches
