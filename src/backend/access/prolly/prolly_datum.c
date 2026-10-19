@@ -10,6 +10,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/htup_details.h"
 #include "access/prolly_datum.h"
 #include "catalog/namespace.h"
@@ -18,10 +20,13 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/geo_decls.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/multirangetypes.h"
 #include "utils/numeric.h"
+#include "utils/rangetypes.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "varatt.h"
@@ -32,6 +37,8 @@ typedef enum CodecKind
 	CODEC_INT4,
 	CODEC_INT8,
 	CODEC_BOOL,
+	CODEC_FLOAT4,
+	CODEC_FLOAT8,
 	CODEC_TEXT,					/* text, varchar, bpchar in a UTF-8 database */
 	CODEC_ARRAY,
 	CODEC_COMPOSITE,
@@ -39,6 +46,18 @@ typedef enum CodecKind
 	CODEC_JSONB,
 	CODEC_SEND,
 } CodecKind;
+
+/*
+ * The floats a CODEC_SEND value holds, whose NaNs are made canonical
+ * before it's sent.
+ */
+typedef enum SendFloats
+{
+	FLOATS_NONE,
+	FLOATS_GEOMETRIC,			/* float8s from floats_from to the end */
+	FLOATS_RANGE,				/* bounds of type floats_type */
+	FLOATS_MULTIRANGE,			/* ranges' bounds of type floats_type */
+} SendFloats;
 
 /* What an array codec needs to know about its element type. */
 typedef struct ElemInfo
@@ -61,6 +80,11 @@ struct ProllyDatumCodec
 	FmgrInfo	send;
 	FmgrInfo	recv;
 	Oid			ioparam;
+	SendFloats	floats;
+	int			floats_from;	/* FLOATS_GEOMETRIC: the first float8's offset */
+	Oid			floats_type;	/* FLOATS_*RANGE: float4 or float8 */
+	TypeCacheEntry *floats_range;	/* FLOATS_*RANGE: the range type's */
+	int16		floats_len;		/* FLOATS_GEOMETRIC: typlen */
 
 	/* CODEC_ARRAY */
 	ElemInfo	elem;
@@ -174,6 +198,210 @@ get_chunk(const char **p, const char *end, int *len)
 }
 
 /* ------------------------------------------------------------------------
+ * Floats
+ *
+ * A float's canonical bytes are its send format, its IEEE 754 bits in
+ * network byte order, except that every NaN is the positive quiet NaN (the
+ * bits 'NaN' has on most platforms).  A NaN's sign and payload are bits no
+ * operator sees: every NaN equals every other and prints as NaN, but
+ * 'NaN' and 'inf' - 'inf' differ in their bits, so without this, equal
+ * rows would have different bytes.  (-0 and 0 are equal too, but print
+ * differently, so they stay different bytes.)  The floats inside a value
+ * sent whole are made so too: geometric values' coordinates, and the
+ * bounds of ranges and multiranges of floats.  A NaN of other bits, as
+ * bytes written before, decodes as it is.
+ * ------------------------------------------------------------------------
+ */
+
+#define CANONICAL_FLOAT4_NAN	0x7fc00000
+#define CANONICAL_FLOAT8_NAN	UINT64CONST(0x7ff8000000000000)
+
+/* f's canonical bits */
+static inline uint32
+float4_bits(float4 f)
+{
+	uint32		bits;
+
+	if (isnan(f))
+		return CANONICAL_FLOAT4_NAN;
+	memcpy(&bits, &f, sizeof(bits));
+	return bits;
+}
+
+static inline uint64
+float8_bits(float8 f)
+{
+	uint64		bits;
+
+	if (isnan(f))
+		return CANONICAL_FLOAT8_NAN;
+	memcpy(&bits, &f, sizeof(bits));
+	return bits;
+}
+
+/*
+ * A float4 or float8 Datum with a NaN made canonical; *changed set when its
+ * bits were others.
+ */
+static Datum
+canonical_float(Oid type, Datum value, bool *changed)
+{
+	if (type == FLOAT4OID)
+	{
+		float4		f = DatumGetFloat4(value);
+		uint32		bits = float4_bits(f);
+
+		if (memcmp(&bits, &f, sizeof(bits)) == 0)
+			return value;
+		memcpy(&f, &bits, sizeof(f));
+		*changed = true;
+		return Float4GetDatum(f);
+	}
+	else
+	{
+		float8		f = DatumGetFloat8(value);
+		uint64		bits = float8_bits(f);
+
+		if (memcmp(&bits, &f, sizeof(bits)) == 0)
+			return value;
+		memcpy(&f, &bits, sizeof(f));
+		*changed = true;
+		return Float8GetDatum(f);
+	}
+}
+
+/* Whether a range bound is a NaN of other bits than the canonical NaN's */
+static bool
+bound_noncanonical(Oid type, const RangeBound *b)
+{
+	bool		changed = false;
+
+	if (!b->infinite)
+		(void) canonical_float(type, b->val, &changed);
+	return changed;
+}
+
+/* r, or a copy with its bounds' NaNs made canonical */
+static RangeType *
+canonical_range(TypeCacheEntry *typcache, RangeType *r, Oid type)
+{
+	RangeBound	lower;
+	RangeBound	upper;
+	bool		empty;
+	bool		changed = false;
+
+	range_deserialize(typcache, r, &lower, &upper, &empty);
+	if (empty)
+		return r;
+	if (!lower.infinite)
+		lower.val = canonical_float(type, lower.val, &changed);
+	if (!upper.infinite)
+		upper.val = canonical_float(type, upper.val, &changed);
+	return changed ? range_serialize(typcache, &lower, &upper, false, NULL) : r;
+}
+
+/*
+ * A CODEC_SEND value, or a copy of it with the NaNs it holds made
+ * canonical, for its send function.
+ */
+static Datum
+send_floats(ProllyDatumCodec *c, Datum value)
+{
+	switch (c->floats)
+	{
+		case FLOATS_NONE:
+			break;
+		case FLOATS_GEOMETRIC:
+			{
+				/* nothing but float8s from floats_from on */
+				char	   *data;
+				Size		size;
+				char	   *copy = NULL;
+
+				if (c->floats_len == -1)
+				{
+					data = (char *) PG_DETOAST_DATUM(value);
+					size = VARSIZE(data);
+				}
+				else
+				{
+					data = DatumGetPointer(value);
+					size = c->floats_len;
+				}
+				for (Size at = c->floats_from; at + sizeof(float8) <= size;
+					 at += sizeof(float8))
+				{
+					float8		f;
+					uint64		bits;
+
+					memcpy(&f, data + at, sizeof(f));
+					bits = float8_bits(f);
+					if (memcmp(&bits, &f, sizeof(bits)) == 0)
+						continue;
+					if (copy == NULL)
+					{
+						copy = palloc(size);
+						memcpy(copy, data, size);
+					}
+					memcpy(copy + at, &bits, sizeof(bits));
+				}
+				if (copy != NULL)
+					return PointerGetDatum(copy);
+				break;
+			}
+		case FLOATS_RANGE:
+			{
+				RangeType  *r = DatumGetRangeTypeP(value);
+				RangeType  *canon = canonical_range(c->floats_range, r,
+													c->floats_type);
+
+				if (canon != r)
+					return RangeTypePGetDatum(canon);
+				break;
+			}
+		case FLOATS_MULTIRANGE:
+			{
+				TypeCacheEntry *rngtyp = c->floats_range;
+				MultirangeType *mr = DatumGetMultirangeTypeP(value);
+				int32		n;
+				RangeType **ranges;
+				bool		changed = false;
+
+				/*
+				 * Its bounds read in place first: a NaN of other bits is
+				 * rare, and only then are its ranges copied out and rebuilt.
+				 */
+				for (uint32 i = 0; i < mr->rangeCount && !changed; i++)
+				{
+					RangeBound	lower;
+					RangeBound	upper;
+
+					multirange_get_bounds(rngtyp, mr, i, &lower, &upper);
+					changed = bound_noncanonical(c->floats_type, &lower) ||
+						bound_noncanonical(c->floats_type, &upper);
+				}
+				if (!changed)
+					break;
+				changed = false;
+				multirange_deserialize(rngtyp, mr, &n, &ranges);
+				for (int i = 0; i < n; i++)
+				{
+					RangeType  *canon = canonical_range(rngtyp, ranges[i],
+													   c->floats_type);
+
+					changed |= canon != ranges[i];
+					ranges[i] = canon;
+				}
+				if (changed)
+					return MultirangeTypePGetDatum(make_multirange(c->type, rngtyp,
+																   n, ranges));
+				break;
+			}
+	}
+	return value;
+}
+
+/* ------------------------------------------------------------------------
  * Send and receive with the client encoding fixed to UTF-8
  * ------------------------------------------------------------------------
  */
@@ -256,6 +484,12 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 		case BOOLOID:
 			c->kind = CODEC_BOOL;
 			return c;
+		case FLOAT4OID:
+			c->kind = CODEC_FLOAT4;
+			return c;
+		case FLOAT8OID:
+			c->kind = CODEC_FLOAT8;
+			return c;
 		case TEXTOID:
 		case VARCHAROID:
 		case BPCHAROID:
@@ -322,6 +556,57 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 		fmgr_info_cxt(send, &c->send, mcxt);
 		fmgr_info_cxt(recv, &c->recv, mcxt);
 	}
+
+	/*
+	 * the floats it holds: for the geometric types, floats_from is where the
+	 * float8s the type's send function sends begin in the value (it sends
+	 * them all from there on, and before them no floats: a count, a flag)
+	 */
+	switch (base)
+	{
+		case POINTOID:
+		case LSEGOID:
+		case BOXOID:
+		case LINEOID:
+		case CIRCLEOID:
+			c->floats = FLOATS_GEOMETRIC;
+			c->floats_from = 0;
+			break;
+		case PATHOID:
+			c->floats = FLOATS_GEOMETRIC;
+			c->floats_from = offsetof(PATH, p);
+			break;
+		case POLYGONOID:
+			c->floats = FLOATS_GEOMETRIC;
+			c->floats_from = offsetof(POLYGON, p);	/* not boundbox: unsent */
+			break;
+		default:
+			{
+				Oid			sub = InvalidOid;
+
+				if (type_is_range(base))
+				{
+					c->floats = FLOATS_RANGE;
+					sub = getBaseType(get_range_subtype(base));
+				}
+				else if (type_is_multirange(base))
+				{
+					c->floats = FLOATS_MULTIRANGE;
+					sub = getBaseType(get_range_subtype(get_multirange_range(base)));
+				}
+				if (sub == FLOAT4OID || sub == FLOAT8OID)
+				{
+					c->floats_type = sub;
+					c->floats_range = c->floats == FLOATS_RANGE ?
+						lookup_type_cache(base, TYPECACHE_RANGE_INFO) :
+						lookup_type_cache(base, TYPECACHE_MULTIRANGE_INFO)->rngtype;
+				}
+				else
+					c->floats = FLOATS_NONE;
+			}
+	}
+	if (c->floats == FLOATS_GEOMETRIC)
+		c->floats_len = get_typlen(base);
 	return c;
 }
 
@@ -855,6 +1140,12 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 		case CODEC_BOOL:
 			appendStringInfoChar(out, DatumGetBool(value) ? 1 : 0);
 			break;
+		case CODEC_FLOAT4:
+			put_be(out, float4_bits(DatumGetFloat4(value)), 4);
+			break;
+		case CODEC_FLOAT8:
+			put_be(out, float8_bits(DatumGetFloat8(value)), 8);
+			break;
 		case CODEC_TEXT:
 			{
 				text	   *t = DatumGetTextPP(value);
@@ -878,10 +1169,13 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 			break;
 		case CODEC_SEND:
 			{
-				bytea	   *b = send_utf8(&c->send, value);
+				Datum		canon = send_floats(c, value);
+				bytea	   *b = send_utf8(&c->send, canon);
 
 				appendBinaryStringInfo(out, VARDATA(b), VARSIZE(b) - VARHDRSZ);
 				pfree(b);
+				if (canon != value)
+					pfree(DatumGetPointer(canon));
 				break;
 			}
 	}
@@ -912,6 +1206,28 @@ prolly_datum_decode(ProllyDatumCodec *c, const char *data, int len)
 			if (len != 1)
 				bad_value("bool is not 1 byte");
 			return BoolGetDatum(data[0] != 0);
+		case CODEC_FLOAT4:
+			{
+				uint32		bits;
+				float4		f;
+
+				if (len != 4)
+					bad_value("float4 is not 4 bytes");
+				bits = (uint32) get_be(data, 4);
+				memcpy(&f, &bits, sizeof(f));
+				return Float4GetDatum(f);
+			}
+		case CODEC_FLOAT8:
+			{
+				uint64		bits;
+				float8		f;
+
+				if (len != 8)
+					bad_value("float8 is not 8 bytes");
+				bits = get_be(data, 8);
+				memcpy(&f, &bits, sizeof(f));
+				return Float8GetDatum(f);
+			}
 		case CODEC_TEXT:
 			return PointerGetDatum(cstring_to_text_with_len(data, len));
 		case CODEC_ARRAY:

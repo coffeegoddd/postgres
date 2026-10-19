@@ -111,6 +111,7 @@ tests += {
       'doltgres_fks_auth',
       'described_properties',
       'jsonb_canonical',
+      'float_canonical',
       'hash_pointers',
       'toast_by_content',
       'toast_folds',

@@ -82,7 +82,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-#define STATE_VERSION		7
+#define STATE_VERSION		8		/* 8: rows encoded with NaNs canonical */
 
 /* carried pages a fold keeps, whatever the table's size (past an eighth of it) */
 #define CARRIED_BLOCKS_MIN	1024

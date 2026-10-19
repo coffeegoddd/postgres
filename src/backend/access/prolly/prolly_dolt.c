@@ -979,7 +979,11 @@ force_branch(const char *name, const char *from)
 				 errmsg("branch \"%s\" is checked out", name),
 				 errhint("Check out another branch first.")));
 
-	/* (another branch's rows written, as a create makes its copies) */
+	/*
+	 * (made, as a create is, though the transaction is read-only for the
+	 * branch it started on: the checks too, and another branch's rows
+	 * written, as a create makes its copies)
+	 */
 	if (XactReadOnlyFromBranch)
 		XactReadOnly = false;
 	PG_TRY();
@@ -1351,6 +1355,15 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (a rename, delete, take or protection makes no branch: not in a
+	 * transaction read-only for the branch it started on either, unlike a
+	 * create, forced or not, which a session on a commit makes to change
+	 * anything)
+	 */
+	if (move || delete || take || protection != PROLLY_PROTECT_DEFAULT)
+		PreventCommandIfReadOnly("dolt_branch()");
 	if (protection != PROLLY_PROTECT_DEFAULT)
 	{
 		ListCell   *lc;
@@ -2315,8 +2328,8 @@ tables_left(int *conflicted, int *violated)
  * [--allow-empty] commit: its changes, committed again on the current
  * branch, with its author.  Rows changed differently on both sides leave
  * the pick in progress, as a merge's conflicts do: resolved, dolt_commit
- * (or [--allow-empty] --continue, with the picked commit's message) makes
- * its commit, with one parent; --abort ends it.  The counts are of tables,
+ * (or [--allow-empty] --continue, with the picked commit's message and
+ * author) makes its commit, with one parent; --abort ends it.  The counts are of tables,
  * as Dolt's.
  */
 Datum
@@ -2361,6 +2374,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	if (abort_pick || continue_pick)
 	{
 		ProllyMergeState ms;
+		ProllyCommitInfo picked;
 
 		if (ref != NULL)
 			unexpected("dolt_cherry_pick", ref);
@@ -2375,10 +2389,29 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 			result[0] = "";
 			PG_RETURN_DATUM(text_array(4, result));
 		}
-		/* a pick resolved to nothing: as a pick of nothing is */
+		/*
+		 * By the picked commit's author, as a pick that doesn't stop is
+		 * (Dolt's ContinueCherryPick): the merge's theirs is that commit.
+		 * A pick resolved to nothing: as a pick of nothing is.
+		 */
+		if (!PROLLY_CALL(refs(), commit_get, &ms.theirs, &picked))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the cherry-pick's commit %s is missing",
+							hash_hex(&ms.theirs))));
 		note_integration();
-		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, ms.message,
-													 allow_empty, &id));
+		author_override = picked.author;
+		PG_TRY();
+		{
+			BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit,
+														 ms.message,
+														 allow_empty, &id));
+		}
+		PG_FINALLY();
+		{
+			author_override = NULL;
+		}
+		PG_END_TRY();
 		if (!committed)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
