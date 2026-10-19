@@ -44,6 +44,7 @@ jobs:
   # The nightly jobs and settings run on a manual dispatch too, unless it
   # unchecks "nightly" (as one meant only for the benchmark runner would).
   sanitizers:
+    # (nightly-email.yml matches this name: a run without it isn't mailed)
     name: nightly address and undefined-behavior checks
     if: github.event_name == 'schedule' || inputs.nightly
     runs-on: ubuntu-24.04
