@@ -97,6 +97,22 @@ FROM dolt_constraint_violations('dv.u');
 SELECT * FROM dv.u ORDER BY pk;
 ROLLBACK;
 
+-- The same incoming check, unvalidated: preserve its state and report
+-- the receiver's violating row through the merge's normal checks.
+SELECT dolt_checkout('other3');
+ALTER DOMAIN dv.ours DROP CONSTRAINT pos;
+ALTER DOMAIN dv.ours ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
+SELECT length(dolt_commit('-am', 'theirs: unvalidated check')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('other3'))[3:4];
+SELECT conname, convalidated FROM pg_constraint
+WHERE contypid = 'dv.ours'::regtype;
+SELECT violation_type, violating_row, violation_info
+FROM dolt_constraint_violations('dv.u');
+SELECT * FROM dv.u ORDER BY pk;
+ROLLBACK;
+
 -- Only the values a write changes are checked: a stored value a NOT VALID
 -- constraint allows stays (as an UPDATE of another column leaves it), with
 -- theirs' change to another column written, the row updated in place or

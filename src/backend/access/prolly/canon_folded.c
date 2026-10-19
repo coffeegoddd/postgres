@@ -180,6 +180,7 @@
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "common/int.h"
+#include "common/string.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -4997,6 +4998,7 @@ create_type_sql(const char *name, const char *def)
 		bool		not_null = false;
 		char	   *collate = NULL;
 		char	   *dflt = NULL;
+		StringInfoData unvalidated;
 
 		/* its base type's line: then not null, collate, default fields */
 		if (f)
@@ -5019,9 +5021,28 @@ create_type_sql(const char *name, const char *def)
 		if (not_null && strstr(def, "\tNOT NULL\n") == NULL &&
 			(strlen(def) < 9 || strcmp(def + strlen(def) - 9, "\tNOT NULL") != 0))
 			appendStringInfoString(&sql, " NOT NULL");
+		initStringInfo(&unvalidated);
 		while ((line = strtok(NULL, "\n")) != NULL)
-			appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
-							 constraint_def(line));
+		{
+			char	   *condef = constraint_def(line);
+
+			/*
+			 * CREATE DOMAIN cannot accept NOT VALID.  Add those checks
+			 * afterward, in the same retryable creation unit, so their state
+			 * is kept and they apply before columns move to the new domain.
+			 * Validated checks stay inline: ALTER would scan existing uses.
+			 * Test the deparser's suffix, not words inside an expression.
+			 */
+			if (pg_str_endswith(condef, " NOT VALID"))
+				appendStringInfo(&unvalidated,
+								 "; ALTER DOMAIN %s ADD CONSTRAINT %s %s",
+								 name, first_field(line), condef);
+			else
+				appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
+								 condef);
+		}
+		appendStringInfoString(&sql, unvalidated.data);
+		pfree(unvalidated.data);
 	}
 	return sql.data;
 }

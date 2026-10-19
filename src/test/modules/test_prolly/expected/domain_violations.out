@@ -268,6 +268,59 @@ SELECT * FROM dv.u ORDER BY pk;
 (4 rows)
 
 ROLLBACK;
+-- The same incoming check, unvalidated: preserve its state and report
+-- the receiver's violating row through the merge's normal checks.
+SELECT dolt_checkout('other3');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'other3'"}
+(1 row)
+
+ALTER DOMAIN dv.ours DROP CONSTRAINT pos;
+ALTER DOMAIN dv.ours ADD CONSTRAINT pos CHECK (VALUE > 0) NOT VALID;
+SELECT length(dolt_commit('-am', 'theirs: unvalidated check')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('other3'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT conname, convalidated FROM pg_constraint
+WHERE contypid = 'dv.ours'::regtype;
+ conname | convalidated 
+---------+--------------
+ pos     | f
+(1 row)
+
+SELECT violation_type, violating_row, violation_info
+FROM dolt_constraint_violations('dv.u');
+  violation_type  |   violating_row    |                violation_info                
+------------------+--------------------+----------------------------------------------
+ check constraint | {"v": -2, "pk": 2} | {"Name": "pos", "Expression": "(VALUE > 0)"}
+(1 row)
+
+SELECT * FROM dv.u ORDER BY pk;
+ pk | v 
+----+---
+  1 | 1
+  2 |  
+  3 | 3
+  4 | 4
+(4 rows)
+
+ROLLBACK;
 -- Only the values a write changes are checked: a stored value a NOT VALID
 -- constraint allows stays (as an UPDATE of another column leaves it), with
 -- theirs' change to another column written, the row updated in place or

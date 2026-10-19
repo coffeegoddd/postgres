@@ -279,3 +279,143 @@ drop cascades to type tm2.calm
 drop cascades to function tm2.f(tm2.mood)
 drop cascades to materialized view tm2.mv1
 drop cascades to materialized view tm2.mv2
+-- Unvalidated domain checks must be added with ALTER DOMAIN, preserving
+-- their validation state.  Mix them with validated checks (including one
+-- whose expression contains NOT VALID), and cover both changed and new
+-- domains, quoted names, dependencies, fast-forward and reset.
+CREATE SCHEMA tm3 VERSIONED;
+CREATE DOMAIN tm3."nv domain" AS int DEFAULT 1
+  CONSTRAINT present NOT NULL
+  CONSTRAINT bounded CHECK (VALUE < 100)
+  CONSTRAINT words CHECK (VALUE::text <> ' NOT VALID');
+CREATE DOMAIN tm3.child AS tm3."nv domain";
+CREATE TABLE tm3.t (pk int PRIMARY KEY, v tm3."nv domain");
+INSERT INTO tm3.t VALUES (1, 2);
+SELECT length(dolt_commit('-Am', 'tm3 base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('not_valid');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('not_valid');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'not_valid'"}
+(1 row)
+
+ALTER DOMAIN tm3."nv domain" ADD CONSTRAINT "positive check" CHECK (VALUE > 0) NOT VALID;
+ALTER DOMAIN tm3."nv domain" ADD CONSTRAINT even CHECK (VALUE % 2 = 0) NOT VALID;
+ALTER DOMAIN tm3.child ADD CONSTRAINT small CHECK (VALUE < 10) NOT VALID;
+CREATE DOMAIN tm3.added AS int;
+ALTER DOMAIN tm3.added ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
+SELECT length(dolt_commit('-am', 'unvalidated checks')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('not_valid'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('not_valid') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT t.typname, c.conname, c.convalidated
+FROM pg_constraint c JOIN pg_type t ON t.oid = c.contypid
+WHERE t.typnamespace = 'tm3'::regnamespace
+ORDER BY t.typname, c.conname;
+  typname  |    conname     | convalidated 
+-----------+----------------+--------------
+ added     | positive       | f
+ child     | small          | f
+ nv domain | bounded        | t
+ nv domain | even           | f
+ nv domain | positive check | f
+ nv domain | present        | t
+ nv domain | words          | t
+(7 rows)
+
+SELECT * FROM tm3.t;
+ pk | v 
+----+---
+  1 | 2
+(1 row)
+
+-- Unvalidated checks still reject new values, as do the inline constraints.
+INSERT INTO tm3.t VALUES (2, 3);
+ERROR:  value for domain tm3."nv domain" violates check constraint "even"
+INSERT INTO tm3.t VALUES (2, -2);
+ERROR:  value for domain tm3."nv domain" violates check constraint "positive check"
+INSERT INTO tm3.t VALUES (2, 100);
+ERROR:  value for domain tm3."nv domain" violates check constraint "bounded"
+INSERT INTO tm3.t VALUES (2, NULL);
+ERROR:  domain tm3."nv domain" does not allow null values
+SELECT 12::tm3.child;
+ERROR:  value for domain tm3.child violates check constraint "small"
+-- Restoring the base and then the constrained commit exercises both ways.
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'not_valid');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('not_valid') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM tm3.t;
+ pk | v 
+----+---
+  1 | 2
+(1 row)
+
+SELECT count(*) AS no_leftovers FROM pg_type WHERE typname LIKE 'prolly_moving_%';
+ no_leftovers 
+--------------
+            0
+(1 row)
+
+SELECT dolt_branch('-D', 'not_valid');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA tm3 CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table tm3.t
+drop cascades to type tm3."nv domain"
+drop cascades to type tm3.child
+drop cascades to type tm3.added
