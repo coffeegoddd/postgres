@@ -14,15 +14,17 @@
  *						   deterministic and its library's version, a line
  *						   each ("default": the database's)
  *	"f:" function(args)	-> its definition
- *	"m:" materialized view -> its data tree (hash length, hash), then its
- *						   query
+ *	"m:" materialized view -> its data tree (hash length, hash), then
+ *						   whether it is unpopulated and its indexes, a
+ *						   line each, then its query
  *	"n:" schema			-> nothing: a versioned schema, there whether or not
  *						   anything is in it
  *	"s:" sequence		-> its definition, then a line of its own, its
  *						   value: the last value, and whether it was given
  *						   out ("t" or "f")
  *	"t:" table			-> its data tree (hash length, hash), then its schema
- *	"v:" view			-> its query
+ *	"v:" view			-> its options (WITH (...) AS), if any, then its
+ *						   query
  *	"x:" source AS target -> a cast: its method (and function), its
  *						   context
  *	"y:" type			-> an enum's labels, a domain's, a composite or
@@ -31,7 +33,10 @@
  * A table's schema lists its live columns in order (name, type, nullness,
  * collation if not the type's, default, identity, generation), then its
  * constraints, indexes, triggers and rules by name, as Postgres's deparser
- * prints them (then its policies and extended statistics, if any).  Names are qualified whatever the session's search path (it
+ * prints them, a trigger or rule that doesn't fire as made with when it
+ * does (then its policies and extended statistics, its partitioning, the
+ * tables it inherits from and a typed table's type, if any).  Names are
+ * qualified whatever the session's search path (it
  * is set to pg_catalog while deparsing), so nothing local, no OID or
  * relfilenumber, and nothing about how the objects came to be (their
  * order, dropped columns) reaches the hash.
@@ -41,8 +46,9 @@
  * or definition in them is escaped (a backslash, tab or newline as \\, \t
  * or \n: append_field()), as a quoted name or a string literal may hold
  * one; so a raw tab or newline is only a separator, and a field is read
- * back (unescape_field()) where it is used.  A function's, view's or
- * materialized view's definition is never split, and is kept as it is.
+ * back (unescape_field()) where it is used.  A function's definition, and
+ * a view's or materialized view's query, is never split, and is kept as it
+ * is (what comes before a query, in lines, never begins as one does).
  *
  * A table's rows are folded
  * into its data tree (keyed by the table keying, sorted, a tree in the
@@ -162,6 +168,7 @@
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
+#include "commands/trigger.h"
 #include "common/int.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -169,6 +176,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -616,9 +624,26 @@ oid_name_cmp(const ListCell *a, const ListCell *b)
 	return strcmp(get_rel_name(lfirst_oid(a)), get_rel_name(lfirst_oid(b)));
 }
 
+/* A trigger's or rule's definition, and when it fires (ev_enabled, tgenabled). */
+typedef struct FiringDef
+{
+	char	   *def;
+	char		enabled;		/* 0: as made (fires on the origin) */
+} FiringDef;
+
+static int
+firing_def_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((FiringDef *) lfirst(a))->def, ((FiringDef *) lfirst(b))->def);
+}
+
 /*
  * The definitions of rel's triggers (internal ones aside) or rules (a
- * view's own aside), sorted, one per line.
+ * view's own aside), sorted, one per line; one that doesn't fire as made
+ * (disabled, or set to fire on a replica or always: ALTER TABLE ... ENABLE
+ * REPLICA TRIGGER) followed by a field of when it does, its pg_trigger
+ * tgenabled or pg_rewrite ev_enabled ('D', 'R' or 'A').  (The definition
+ * ends in a parenthesis or a semicolon: never so.)
  */
 static void
 append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
@@ -637,6 +662,8 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Datum		def;
+		char		enabled;
+		FiringDef  *fd;
 
 		if (catalog == TriggerRelationId)
 		{
@@ -646,6 +673,7 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 			if (trg->tgisinternal || OidIsValid(trg->tgparentid))
 				continue;
 			def = DirectFunctionCall1(pg_get_triggerdef, ObjectIdGetDatum(trg->oid));
+			enabled = trg->tgenabled == TRIGGER_FIRES_ON_ORIGIN ? 0 : trg->tgenabled;
 		}
 		else
 		{
@@ -654,15 +682,23 @@ append_sorted_defs(StringInfo out, Oid catalog, AttrNumber relattr,
 			if (strcmp(NameStr(rw->rulename), ViewSelectRuleName) == 0)
 				continue;
 			def = DirectFunctionCall1(pg_get_ruledef, ObjectIdGetDatum(rw->oid));
+			enabled = rw->ev_enabled == RULE_FIRES_ON_ORIGIN ? 0 : rw->ev_enabled;
 		}
-		defs = lappend(defs, TextDatumGetCString(def));
+		fd = palloc(sizeof(FiringDef));
+		fd->def = TextDatumGetCString(def);
+		fd->enabled = enabled;
+		defs = lappend(defs, fd);
 	}
 	systable_endscan(scan);
 	table_close(crel, AccessShareLock);
-	list_sort(defs, cstring_cmp);
+	list_sort(defs, firing_def_cmp);
 	foreach(lc, defs)
 	{
-		append_field(out, lfirst(lc));
+		FiringDef  *fd = lfirst(lc);
+
+		append_field(out, fd->def);
+		if (fd->enabled)
+			appendStringInfo(out, "\t%c", fd->enabled);
 		appendStringInfoChar(out, '\n');
 	}
 }
@@ -1028,6 +1064,97 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		appendStringInfoChar(out, '\n');
 		ReleaseSysCache(ctup);
 	}
+
+	/*
+	 * The tables it inherits from (not a partition's partitioned table), in
+	 * order; a typed table's type.  (A section only if it has them.)
+	 */
+	if (!rel->rd_rel->relispartition)
+	{
+		Relation	inhrel = table_open(InheritsRelationId, AccessShareLock);
+		bool		any = false;
+
+		ScanKeyInit(&skey, Anum_pg_inherits_inhrelid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
+		scan = systable_beginscan(inhrel, InheritsRelidSeqnoIndexId, true, NULL, 1,
+								  &skey);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Oid			parent = ((Form_pg_inherits) GETSTRUCT(tup))->inhparent;
+
+			if (!any)
+				appendStringInfoString(out, "inherits\n");
+			any = true;
+			append_field(out, qualified(get_rel_namespace(parent), get_rel_name(parent)));
+			appendStringInfoChar(out, '\n');
+		}
+		systable_endscan(scan);
+		table_close(inhrel, AccessShareLock);
+	}
+	if (OidIsValid(rel->rd_rel->reloftype))
+	{
+		appendStringInfoString(out, "of\n");
+		append_field(out, format_type_extended(rel->rd_rel->reloftype, -1,
+											   FORMAT_TYPE_FORCE_QUALIFY));
+		appendStringInfoChar(out, '\n');
+	}
+}
+
+/*
+ * A view's options, if any, before its query: "WITH (...) AS", as CREATE
+ * VIEW takes them, each one set (check_option, security_barrier,
+ * security_invoker), in that order.  (A query as Postgres's deparser
+ * prints it begins with a space or a parenthesis: never so.)
+ */
+static void
+append_view_options(StringInfo out, Oid view)
+{
+	Relation	rel = relation_open(view, AccessShareLock);
+	List	   *opts = NIL;
+	ListCell   *lc;
+
+	if (RelationHasCheckOption(rel))
+		opts = lappend(opts, RelationHasLocalCheckOption(rel) ?
+					   "check_option=local" : "check_option=cascaded");
+	if (RelationIsSecurityView(rel))
+		opts = lappend(opts, "security_barrier=true");
+	if (RelationHasSecurityInvoker(rel))
+		opts = lappend(opts, "security_invoker=true");
+	relation_close(rel, AccessShareLock);
+	if (opts == NIL)
+		return;
+	appendStringInfoString(out, "WITH (");
+	foreach(lc, opts)
+		appendStringInfo(out, "%s%s", foreach_current_index(lc) ? ", " : "",
+						 (char *) lfirst(lc));
+	appendStringInfoString(out, ") AS");
+}
+
+/* A materialized view's line before its query for its being unpopulated. */
+#define MATVIEW_UNPOPULATED "with no data"
+
+/*
+ * What a materialized view has besides its query, a line each before it:
+ * whether it is unpopulated (made WITH NO DATA, not refreshed since), then
+ * its indexes by name, as a table's are.  (Neither begins with a space or
+ * a parenthesis, as the query does.)
+ */
+static void
+append_matview_state(StringInfo out, Form_pg_class form)
+{
+	Relation	rel = relation_open(form->oid, AccessShareLock);
+	List	   *indexes = list_copy(RelationGetIndexList(rel));
+	ListCell   *lc;
+
+	if (!form->relispopulated)
+		appendStringInfoString(out, MATVIEW_UNPOPULATED "\n");
+	list_sort(indexes, oid_name_cmp);
+	foreach(lc, indexes)
+	{
+		append_field(out, pg_get_indexdef_string(lfirst_oid(lc)));
+		appendStringInfoChar(out, '\n');
+	}
+	relation_close(rel, AccessShareLock);
 }
 
 /* ------------------------------------------------------------------------
@@ -1262,6 +1389,30 @@ describe_type(Canon *cn, Form_pg_type typ)
 													  FORMAT_TYPE_FORCE_QUALIFY));
 		if (typ->typnotnull)
 			appendStringInfoString(&it->value, "\tnot null");
+		/* (its collation if not its base type's, its default: if any) */
+		if (OidIsValid(typ->typcollation) &&
+			typ->typcollation != get_typcollation(typ->typbasetype))
+		{
+			appendStringInfoString(&it->value, "\tcollate ");
+			append_field(&it->value, generate_collation_name(typ->typcollation));
+		}
+		{
+			HeapTuple	ttup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typ->oid));
+			bool		isnull;
+			Datum		def;
+
+			if (!HeapTupleIsValid(ttup))
+				elog(ERROR, "cache lookup failed for type %u", typ->oid);
+			def = SysCacheGetAttr(TYPEOID, ttup, Anum_pg_type_typdefaultbin, &isnull);
+			if (!isnull)
+			{
+				appendStringInfoString(&it->value, "\tdefault ");
+				append_field(&it->value,
+							 TextDatumGetCString(DirectFunctionCall2(pg_get_expr, def,
+																	 ObjectIdGetDatum(InvalidOid))));
+			}
+			ReleaseSysCache(ttup);
+		}
 		appendStringInfoChar(&it->value, '\n');
 		{
 			Relation	conrel = table_open(ConstraintRelationId, AccessShareLock);
@@ -1316,6 +1467,13 @@ describe_type(Canon *cn, Form_pg_type typ)
 														  att->atttypmod,
 														  FORMAT_TYPE_TYPEMOD_GIVEN |
 														  FORMAT_TYPE_FORCE_QUALIFY));
+			/* (as a table's column: its collation if not its type's) */
+			if (OidIsValid(att->attcollation) &&
+				att->attcollation != get_typcollation(att->atttypid))
+			{
+				appendStringInfoString(&it->value, "\tcollate ");
+				append_field(&it->value, generate_collation_name(att->attcollation));
+			}
 			appendStringInfoChar(&it->value, '\n');
 		}
 		relation_close(crel, AccessShareLock);
@@ -1928,6 +2086,7 @@ collect(Canon *cn)
 				{
 					CanonItem  *it = add_item(cn, "v:", qualified(form->relnamespace, name));
 
+					append_view_options(&it->value, form->oid);
 					append_utf8(&it->value,
 								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
 																		ObjectIdGetDatum(form->oid),
@@ -1951,6 +2110,7 @@ collect(Canon *cn)
 					}
 					it = add_item(cn, "m:", qualified(form->relnamespace, name));
 					initStringInfo(&query);
+					append_matview_state(&query, form);
 					append_utf8(&query,
 								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
 																		ObjectIdGetDatum(form->oid),
@@ -3251,8 +3411,8 @@ typedef struct TableDef
 	List	   *columns;		/* lines: name, then tab-separated attributes */
 	List	   *constraints;	/* lines: name, a tab, the definition */
 	List	   *indexes;		/* statements */
-	List	   *triggers;		/* statements */
-	List	   *rules;			/* statements */
+	List	   *triggers;		/* statements (firing_statement()) */
+	List	   *rules;			/* statements (likewise) */
 	List	   *policies;		/* statements */
 	List	   *statistics;		/* lines: name, a tab, the statement[, a tab,
 								 * the target] */
@@ -3260,6 +3420,8 @@ typedef struct TableDef
 	bool		forced_row_security;
 	char	   *partition_by;	/* a partitioned table's key, or NULL */
 	char	   *partition_of;	/* a partition's parent and bound (escaped), or NULL */
+	List	   *inherits;		/* the tables it inherits from, in order */
+	char	   *of;				/* a typed table's type, or NULL */
 } TableDef;
 
 typedef struct SchemaMove
@@ -3368,6 +3530,19 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->policies;
 		else if (strcmp(line, "statistics") == 0)
 			section = &td->statistics;
+		else if (strcmp(line, "inherits") == 0)
+			section = &td->inherits;
+		else if (strcmp(line, "of") == 0)
+		{
+			section = NULL;
+			if (next == NULL || *next == '\0')
+				elog(ERROR, "unexpected table definition: \"%s\" ends it", line);
+			line = next;
+			next = strchr(line, '\n');
+			if (next)
+				*next++ = '\0';
+			td->of = unescape_field(line);
+		}
 		else if (section == &td->policies && strcmp(line, ROW_SECURITY) == 0)
 			td->row_security = true;
 		else if (section == &td->policies && strcmp(line, FORCED_ROW_SECURITY) == 0)
@@ -3556,6 +3731,45 @@ object_name(const char *stmt, const char *word)
 	if (p == NULL)
 		elog(ERROR, "unexpected definition \"%s\"", stmt);
 	return leading_identifier(p + strlen(word));
+}
+
+/*
+ * A trigger's or rule's line, as parse_table_def() has it: its statement,
+ * and into *enabled when it fires if not as made (append_sorted_defs()'s
+ * last field; 0 if none).
+ */
+static char *
+firing_statement(const char *line, char *enabled)
+{
+	size_t		len = strlen(line);
+
+	if (len >= 2 && line[len - 2] == '\t' && strchr("DRA", line[len - 1]) != NULL)
+	{
+		*enabled = line[len - 1];
+		return pnstrdup(line, len - 2);
+	}
+	*enabled = 0;
+	return pstrdup(line);
+}
+
+/*
+ * A trigger's or rule's line, made: its statement, then, if it doesn't
+ * fire as made, ALTER TABLE ... DISABLE or ENABLE REPLICA or ALWAYS.
+ */
+static void
+make_firing(List **stmts, const char *table, const char *line, bool trigger)
+{
+	char		enabled;
+	char	   *stmt = firing_statement(line, &enabled);
+
+	*stmts = lappend(*stmts, stmt);
+	if (enabled)
+		*stmts = lappend(*stmts,
+						 psprintf("ALTER TABLE %s %s %s %s", table,
+								  enabled == 'D' ? "DISABLE" :
+								  enabled == 'R' ? "ENABLE REPLICA" : "ENABLE ALWAYS",
+								  trigger ? "TRIGGER" : "RULE",
+								  object_name(stmt, trigger ? " TRIGGER " : "CREATE RULE ")));
 }
 
 /* Where s is in list, or -1. */
@@ -3972,6 +4186,20 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		}
 	}
 
+	/*
+	 * A typed table's type: it stops being one before its columns change
+	 * (first: before its type may go), and is one once they have.  (Its
+	 * inheritance: folded_move_schema()'s.)
+	 */
+	if (!same_strings(from->of, to->of))
+	{
+		if (from->of)
+			sm->before = lcons(psprintf("ALTER TABLE %s NOT OF", name), sm->before);
+		if (to->of)
+			sm->changes = lappend(sm->changes,
+								  psprintf("ALTER TABLE %s OF %s", name, to->of));
+	}
+
 	/* Triggers, rules, constraints and indexes going: before the rows. */
 	foreach(lc, from->triggers)
 		if (!list_has_string(to->triggers, lfirst(lc)))
@@ -4126,10 +4354,10 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	}
 	foreach(lc, to->triggers)
 		if (!list_has_string(from->triggers, lfirst(lc)))
-			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+			make_firing(&sm->after, name, lfirst(lc), true);
 	foreach(lc, to->rules)
 		if (!list_has_string(from->rules, lfirst(lc)))
-			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
+			make_firing(&sm->after, name, lfirst(lc), false);
 	/* Statistics: one changed goes and comes again. */
 	foreach(lc, from->statistics)
 		if (!list_has_string(to->statistics, lfirst(lc)))
@@ -4295,30 +4523,48 @@ create_type_sql(const char *name, const char *def)
 	}
 	else if (strcmp(kind, "composite") == 0)
 	{
-		appendStringInfo(&sql, "CREATE TYPE %s AS (", name);
+		List	   *lines = NIL;
+		ListCell   *lc;
+
+		/* (an attribute's line is a column's: column_type_sql(), which strtoks) */
 		while ((line = strtok(NULL, "\n")) != NULL)
-		{
-			appendStringInfo(&sql, "%s%s %s", first ? "" : ", ",
-							 first_field(line), constraint_def(line));
-			first = false;
-		}
+			lines = lappend(lines, line);
+		appendStringInfo(&sql, "CREATE TYPE %s AS (", name);
+		foreach(lc, lines)
+			appendStringInfo(&sql, "%s%s %s", foreach_current_index(lc) ? ", " : "",
+							 first_field(lfirst(lc)), column_type_sql(lfirst(lc)));
 		appendStringInfoChar(&sql, ')');
 	}
 	else
 	{
 		char	   *base = strtok(NULL, "\n");
-		char	   *tab = strchr(base, '\t');
+		char	   *f = strchr(base, '\t');
+		char	   *fields;
+		bool		not_null = false;
+		char	   *collate = NULL;
+		char	   *dflt = NULL;
 
-		if (tab)
-			*tab = '\0';
+		/* its base type's line: then not null, collate, default fields */
+		if (f)
+			*f++ = '\0';
+		for (f = f ? strtok_r(f, "\t", &fields) : NULL; f; f = strtok_r(NULL, "\t", &fields))
+		{
+			if (strcmp(f, "not null") == 0)
+				not_null = true;
+			else if (strncmp(f, "collate ", 8) == 0)
+				collate = unescape_field(f + 8);
+			else if (strncmp(f, "default ", 8) == 0)
+				dflt = unescape_field(f + 8);
+		}
+		appendStringInfo(&sql, "CREATE DOMAIN %s AS %s", name, unescape_field(base));
+		if (collate)
+			appendStringInfo(&sql, " COLLATE %s", collate);
+		if (dflt)
+			appendStringInfo(&sql, " DEFAULT %s", dflt);
 		/* (a NOT NULL constraint line names it: not said twice) */
-		if (tab && strstr(def, "\tNOT NULL\n") == NULL &&
+		if (not_null && strstr(def, "\tNOT NULL\n") == NULL &&
 			(strlen(def) < 9 || strcmp(def + strlen(def) - 9, "\tNOT NULL") != 0))
-			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s NOT NULL", name,
-							 unescape_field(base));
-		else
-			appendStringInfo(&sql, "CREATE DOMAIN %s AS %s", name,
-							 unescape_field(base));
+			appendStringInfoString(&sql, " NOT NULL");
 		while ((line = strtok(NULL, "\n")) != NULL)
 			appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
 							 constraint_def(line));
@@ -4409,6 +4655,41 @@ make_views(List *views)
 			ReThrowError(last);
 		views = failed;
 	}
+}
+
+/*
+ * A materialized view, as described (append_matview_state()'s lines, then
+ * its query): made, unpopulated if so, then its indexes.
+ */
+static List *
+make_matview_sql(const char *name, const char *def)
+{
+	const char *query = def;
+	bool		populated = true;
+	List	   *indexes = NIL;
+	size_t		len;
+
+	while (*query && *query != ' ' && *query != '(')
+	{
+		const char *nl = strchr(query, '\n');
+		char	   *line;
+
+		if (nl == NULL)
+			elog(ERROR, "unexpected materialized view definition for %s", name);
+		line = pnstrdup(query, nl - query);
+		if (strcmp(line, MATVIEW_UNPOPULATED) == 0)
+			populated = false;
+		else
+			indexes = lappend(indexes, unescape_field(line));
+		query = nl + 1;
+	}
+	/* (the deparsed query ends its statement: WITH NO DATA after it) */
+	len = strlen(query);
+	if (len > 0 && query[len - 1] == ';')
+		len--;
+	return lcons(psprintf("CREATE MATERIALIZED VIEW %s AS %.*s WITH %sDATA", name,
+						  (int) len, query, populated ? "" : "NO "),
+				 indexes);
 }
 
 static void
@@ -5044,10 +5325,21 @@ empty_table(const char *name)
 	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
 	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
 										 RowExclusiveLock, false);
+	List	   *rels;
 	ListCell   *lc;
 
 	CommandCounterIncrement();
-	foreach(lc, find_all_inheritors(relid, RowExclusiveLock, NULL))
+
+	/*
+	 * (A partitioned table's partitions; a table inherited from keeps its
+	 * children's rows: each child is a table of its own, emptied only if it
+	 * is itself.)
+	 */
+	if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+		rels = find_all_inheritors(relid, RowExclusiveLock, NULL);
+	else
+		rels = list_make1_oid(relid);
+	foreach(lc, rels)
 	{
 		Relation	rel = table_open(lfirst_oid(lc), NoLock);
 		ProllyApplier *a;
@@ -5078,6 +5370,34 @@ empty_table(const char *name)
 		table_close(rel, NoLock);
 	}
 	CommandCounterIncrement();
+}
+
+/*
+ * Whether table name's inheritance (td's, as both from and to define it)
+ * stays as it is through a move: its definition the same in both, and the
+ * definitions of the tables it inherits from, and no type moved.
+ */
+static bool
+inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
+				 bool types_move)
+{
+	MoveItem   *f = find_item(from, 't', name);
+	MoveItem   *t = find_item(to, 't', name);
+	ListCell   *lc;
+
+	if (types_move || f == NULL || t == NULL || strcmp(f->def, t->def) != 0)
+		return false;
+	foreach(lc, td->inherits)
+	{
+		MoveItem   *pf = find_item(from, 't', lfirst(lc));
+		MoveItem   *pt = find_item(to, 't', lfirst(lc));
+
+		/* (one of another schema's isn't the move's) */
+		if ((pf == NULL) != (pt == NULL) ||
+			(pf != NULL && strcmp(pf->def, pt->def) != 0))
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -5116,6 +5436,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *collation_drops = NIL;
 	List	   *collation_makes = NIL;
 	List	   *schema_drops = NIL;
+	List	   *unlinks = NIL;		/* inheritance, broken first */
+	List	   *links = NIL;		/* and made last */
 	TypeMoves	tm;
 	bool		matviews_change;
 	ListCell   *lc;
@@ -5273,6 +5595,45 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			}
 		}
 	}
+	/*
+	 * Inheritance: a table's links to the tables it inherits from go first
+	 * and come back last (once the rows are in, and the constraints they
+	 * merge with valid), unless neither its definition nor theirs changes,
+	 * nor any type: what changes either is done to each table alone (an
+	 * ALTER of a parent's column would recurse to its children; an
+	 * inherited column can't be altered alone).
+	 */
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		TableDef	fd;
+		ListCell   *c;
+
+		if (f->kind != 't')
+			continue;
+		parse_table_def(f->def, &fd);
+		if (fd.inherits == NIL || inheritance_kept(from, to, f->name, &fd, tm.any))
+			continue;
+		foreach(c, fd.inherits)
+			unlinks = lappend(unlinks, psprintf("ALTER TABLE %s NO INHERIT %s",
+												f->name, (char *) lfirst(c)));
+	}
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		TableDef	td;
+		ListCell   *c;
+
+		if (t->kind != 't')
+			continue;
+		parse_table_def(t->def, &td);
+		if (td.inherits == NIL || inheritance_kept(from, to, t->name, &td, tm.any))
+			continue;
+		foreach(c, td.inherits)
+			links = lappend(links, psprintf("ALTER TABLE %s INHERIT %s",
+											t->name, (char *) lfirst(c)));
+	}
+
 	/*
 	 * Routines and sequences going: once the tables don't use them; then
 	 * types, each after those using it.
@@ -5475,7 +5836,10 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		MoveItem   *t = lfirst(lc);
 
 		if (t->kind == 'v')
-			views = lappend(views, psprintf("CREATE VIEW %s AS %s", t->name, t->def));
+			views = lappend(views,
+							psprintf(strncmp(t->def, "WITH (", 6) == 0 ?
+									 "CREATE VIEW %s %s" : "CREATE VIEW %s AS %s",
+									 t->name, t->def));
 		/*
 		 * materialized views made again once the rows are in; their rows,
 		 * as to holds them, written after (those of the others are written
@@ -5483,8 +5847,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		 */
 		else if (t->kind == 'm' && matviews_change)
 		{
-			views = lappend(views, psprintf("CREATE MATERIALIZED VIEW %s AS %s",
-											t->name, t->def));
+			views = list_concat(views, make_matview_sql(t->name, t->def));
 			matviews_made = true;
 		}
 	}
@@ -5539,6 +5902,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	foreach(lc, sm.emptied)
 		empty_table(lfirst(lc));
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
+	run_statements(unlinks);
 
 	/*
 	 * Types first, in turn (type_moves()): new schemas made once the types
@@ -5578,6 +5942,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(sm.validations);
 	if (breaking == NULL)
 		run_statements(sm.fk_validations);
+	run_statements(links);
 	make_views(views);
 	run_statements(policy_makes);
 	if (matviews_made)
@@ -5606,7 +5971,7 @@ unsupported:
  */
 static const char *const table_sections[] = {
 	"columns", "constraints", "indexes", "triggers", "rules", "policies",
-	"statistics", "partition by", "partition of"
+	"statistics", "partition by", "partition of", "inherits", "of"
 };
 #define NUM_TABLE_SECTIONS lengthof(table_sections)
 #define ALWAYS_WRITTEN_SECTIONS 5
@@ -5663,6 +6028,7 @@ table_line_key(int s, const char *line)
 			return object_name(unescape_field(line), " POLICY ");
 		case 7:
 		case 8:
+		case 10:
 			return pstrdup("");	/* (one line, the table's) */
 		default:
 			return pnstrdup(line, strcspn(line, "\t"));	/* its first field */
@@ -5731,7 +6097,8 @@ table_lines(int s, List *lines)
  * How a merged section is sorted, as its description has it: constraints
  * and statistics objects by their lines, indexes by name, triggers and
  * rules by their statements, policies by theirs after the row security
- * lines; columns, and the partitioning, as they come.
+ * lines; columns, the partitioning and the tables inherited from (and a
+ * typed table's type), as they come.
  */
 static void
 set_table_line_sort(int s, TableLine *l)
