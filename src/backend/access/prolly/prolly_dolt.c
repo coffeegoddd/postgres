@@ -867,6 +867,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit can't --allow-empty and --skip-empty at once")));
+	PreventCommandIfReadOnly("dolt_commit()");
 	author_override = author;
 	commit_forced = force;
 	PG_TRY();

@@ -17,7 +17,7 @@ SELECT length(dolt_commit('-am', 'second')::text) AS committed;
         66
 (1 row)
 
-SELECT dolt_remote('add', 'dc_remote', 'file:///tmp/dc_remote');
+SELECT dolt_remote('add', 'dc_remote', 'file:///nonexistent/dc_remote');
  dolt_remote 
 -------------
  {0}
@@ -58,7 +58,7 @@ UPDATE dc.t SET v = 'x';
 ERROR:  cannot execute UPDATE in a read-only transaction
 RESET default_transaction_read_only;
 SELECT dolt_commit('--allow-empty', '-m', 'no');
-ERROR:  cannot execute moving a chunk store's root in a read-only transaction
+ERROR:  cannot execute dolt_commit() in a read-only transaction
 CREATE TABLE dc.u (a int);
 ERROR:  cannot execute CREATE TABLE in a read-only transaction
 -- Public commands report their own read-only errors; getters still work.
@@ -70,7 +70,7 @@ SELECT dolt_writer_mode();
 
 SELECT dolt_writer_mode('owned');
 ERROR:  cannot execute dolt_writer_mode() in a read-only transaction
-SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+SELECT dolt_remote('add', 'dc_other', 'file:///nonexistent/dc_other');
 ERROR:  cannot execute dolt_remote() in a read-only transaction
 SELECT dolt_remote('remove', 'dc_remote');
 ERROR:  cannot execute dolt_remote() in a read-only transaction
@@ -284,7 +284,7 @@ SELECT dolt_writer_mode('owned');
 ERROR:  cannot execute dolt_writer_mode() in a read-only transaction
 ROLLBACK;
 BEGIN READ ONLY;
-SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+SELECT dolt_remote('add', 'dc_other', 'file:///nonexistent/dc_other');
 ERROR:  cannot execute dolt_remote() in a read-only transaction
 ROLLBACK;
 BEGIN READ ONLY;

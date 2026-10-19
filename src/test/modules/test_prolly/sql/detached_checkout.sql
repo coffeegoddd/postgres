@@ -14,7 +14,7 @@ SELECT (dolt_commit('-Am', 'first'))[1] AS c1 \gset
 UPDATE dc.t SET v = 'uno' WHERE id = 1;
 INSERT INTO dc.t VALUES (2, 'two');
 SELECT length(dolt_commit('-am', 'second')::text) AS committed;
-SELECT dolt_remote('add', 'dc_remote', 'file:///tmp/dc_remote');
+SELECT dolt_remote('add', 'dc_remote', 'file:///nonexistent/dc_remote');
 
 SELECT (dolt_checkout(:'c1'))[2] = 'HEAD is now at ' || :'c1' || ' (detached, read-only)' AS detached;
 SELECT * FROM dc.t ORDER BY id;
@@ -33,7 +33,7 @@ CREATE TABLE dc.u (a int);
 -- Public commands report their own read-only errors; getters still work.
 SELECT dolt_writer_mode();
 SELECT dolt_writer_mode('owned');
-SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+SELECT dolt_remote('add', 'dc_other', 'file:///nonexistent/dc_other');
 SELECT dolt_remote('remove', 'dc_remote');
 SELECT dolt_reset('--hard', 'main');
 
@@ -110,7 +110,7 @@ SELECT dolt_writer_mode();
 SELECT dolt_writer_mode('owned');
 ROLLBACK;
 BEGIN READ ONLY;
-SELECT dolt_remote('add', 'dc_other', 'file:///tmp/dc_other');
+SELECT dolt_remote('add', 'dc_other', 'file:///nonexistent/dc_other');
 ROLLBACK;
 BEGIN READ ONLY;
 SELECT dolt_remote('rm', 'dc_remote');
