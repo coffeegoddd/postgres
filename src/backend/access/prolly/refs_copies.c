@@ -75,23 +75,28 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
+#include "access/amapi.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/xlog.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
+#include "catalog/index.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
@@ -686,6 +691,196 @@ fold_as_baseline(void *arg)
 }
 
 /*
+ * Has a transaction the snapshot doesn't see (running when it was taken,
+ * or begun since) committed?  Only one such could have written what a
+ * copy holds and the snapshot doesn't see.  True too if too many began
+ * since to ask each.
+ */
+#define UNSEEN_XIDS_ASKED	65536
+
+static bool
+commits_unseen(Snapshot snap)
+{
+	TransactionId next = XidFromFullTransactionId(ReadNextFullTransactionId());
+	TransactionId xid;
+
+	for (uint32 i = 0; i < snap->xcnt; i++)
+		if (TransactionIdDidCommit(snap->xip[i]))
+			return true;
+	if ((uint32) (next - snap->xmax) > UNSEEN_XIDS_ASKED)
+		return true;
+	for (xid = snap->xmax; TransactionIdPrecedes(xid, next);)
+	{
+		if (!TransactionIdIsCurrentTransactionId(xid) &&
+			TransactionIdDidCommit(xid))
+			return true;
+		TransactionIdAdvance(xid);
+	}
+	return false;
+}
+
+/* Did a commit the snapshot doesn't see write xid's part of a tuple? */
+static bool
+xid_unseen(TransactionId xid, Snapshot snap)
+{
+	return TransactionIdIsNormal(xid) &&
+		!TransactionIdIsCurrentTransactionId(xid) &&
+		XidInMVCCSnapshot(xid, snap) && TransactionIdDidCommit(xid);
+}
+
+/*
+ * Does relation rel hold a tuple a commit the snapshot doesn't see
+ * inserted or deleted?  (Every page is read.)
+ */
+static bool
+holds_unseen(Relation rel, Snapshot snap)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
+	bool		found = false;
+
+	for (BlockNumber blk = 0; blk < nblocks && !found; blk++)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber maxoff;
+
+		CHECK_FOR_INTERRUPTS();
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoff = PageIsNew(page) ? InvalidOffsetNumber :
+			PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff && !found;
+			 off = OffsetNumberNext(off))
+		{
+			ItemId		lp = PageGetItemId(page, off);
+			HeapTupleHeader t;
+			uint16		mask;
+
+			if (!ItemIdIsNormal(lp))
+				continue;
+			t = (HeapTupleHeader) PageGetItem(page, lp);
+			mask = t->t_infomask;
+			if (!HeapTupleHeaderXminFrozen(t) && !(mask & HEAP_XMIN_INVALID) &&
+				xid_unseen(HeapTupleHeaderGetRawXmin(t), snap))
+				found = true;
+			else if (!(mask & HEAP_XMAX_INVALID) &&
+					 !HEAP_XMAX_IS_LOCKED_ONLY(mask) &&
+					 xid_unseen(HeapTupleHeaderGetUpdateXid(t), snap))
+				found = true;
+		}
+		UnlockReleaseBuffer(buf);
+	}
+	FreeAccessStrategy(strategy);
+	return found;
+}
+
+/*
+ * Empty a relation of the branch being made, its indexes and its TOAST
+ * table: each gets new storage, as TRUNCATE gives it, and the copy's goes
+ * when the transaction commits.  (New storage, not the copy's truncated:
+ * that would keep the copy's changes list, by which the next fold would
+ * take the pages it doesn't list for unchanged, rows and all; new storage
+ * isn't of its lineage, and is folded in full.)  Nobody else sees the
+ * branch before the transaction commits, and its storage goes with it if
+ * the transaction rolls back.  (The locks are what a writer takes: the
+ * OIDs are the source branch's relations' too.)
+ */
+static void
+empty_copy(Relation rel)
+{
+	Oid			toastrelid = rel->rd_rel->reltoastrelid;
+
+	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+	CommandCounterIncrement();
+	foreach_oid(indexid, RelationGetIndexList(rel))
+	{
+		Relation	index = index_open(indexid, RowExclusiveLock);
+
+		/* (built empty as index_build() would, without its catalog stats) */
+		RelationSetNewRelfilenumber(index, index->rd_rel->relpersistence);
+		CommandCounterIncrement();
+		(void) index->rd_indam->ambuild(rel, index, BuildDummyIndexInfo(index));
+		index_close(index, NoLock);
+	}
+	if (OidIsValid(toastrelid))
+	{
+		Relation	toast = table_open(toastrelid, RowExclusiveLock);
+
+		empty_copy(toast);
+		table_close(toast, NoLock);
+	}
+}
+
+/*
+ * The copies of the branch being made that hold what the active snapshot
+ * doesn't see, emptied: the move to the head writes their rows again.
+ */
+static void
+empty_unseen_copies(void)
+{
+	Snapshot	snap = GetActiveSnapshot();
+	Relation	classes = table_open(RelationRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(classes, InvalidOid, false, NULL, 0,
+										  NULL);
+	HeapTuple	tup;
+	List	   *relids = NIL;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relam == PROLLY_TABLE_AM_OID &&
+			(c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW))
+			relids = lappend_oid(relids, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(classes, AccessShareLock);
+
+	foreach_oid(relid, relids)
+	{
+		Relation	rel = table_open(relid, RowExclusiveLock);
+
+		if (holds_unseen(rel, snap))
+		{
+			empty_copy(rel);
+			CommandCounterIncrement();
+		}
+		table_close(rel, NoLock);
+	}
+	list_free(relids);
+}
+
+/*
+ * A branch's first use's move to its head.  The copy waited for the
+ * session branch's writers, so its pages hold every row they committed,
+ * some after the active snapshot was taken: rows it doesn't see, and the
+ * old versions of rows it sees that they deleted or updated.  A fold by
+ * that snapshot wouldn't see the former, and a move by it wouldn't undo
+ * them; the latter it would see still, while every later snapshot
+ * wouldn't.  Read committed, the move goes by a newer snapshot, which sees
+ * everything the copies hold.  A transaction whose snapshot can't move
+ * (repeatable read, serializable) empties the copies that hold such rows
+ * instead, for the move to write their every row: then what it sees of the
+ * branch is what everyone sees once it commits.
+ */
+static void
+move_copies(void *arg)
+{
+	if (IsolationUsesXactSnapshot())
+	{
+		if (commits_unseen(GetActiveSnapshot()))
+			empty_unseen_copies();
+		move_settled(arg);
+		return;
+	}
+	PushActiveSnapshot(GetLatestSnapshot());
+	move_settled(arg);
+	PopActiveSnapshot();
+}
+
+/*
  * Make the copies of a branch that has only its head: a copy of the
  * session's branch's (which has the same changes since the same
  * baseline), moved to the head's root.
@@ -743,7 +938,7 @@ materialize(const char *name)
 							&baseline : NULL, NULL);
 
 		/* (moved to the head, unless the copies are there already) */
-		branch_ops()->run_on(name, move_settled, &info.root);
+		branch_ops()->run_on(name, move_copies, &info.root);
 done:
 		;
 	}

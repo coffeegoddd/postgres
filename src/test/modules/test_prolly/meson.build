@@ -178,6 +178,7 @@ tests += {
       't/101_index_tablespaces.pl',
       't/103_gc_root_commit.pl',
       't/104_gc_prepared.pl',
+      't/105_branch_first_use.pl',
       't/106_branch_delete_prepared.pl',
       't/107_commit_dates.pl',
       't/109_bmap_incremental_backup.pl',
