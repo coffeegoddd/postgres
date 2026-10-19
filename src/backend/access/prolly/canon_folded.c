@@ -3970,6 +3970,64 @@ partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
 }
 
 /*
+ * Whether move_table() makes a table again, its definition from as to has
+ * it (both): a column added before a kept one, kept ones in another order,
+ * or a kept one's generation or identity changed, which ALTER can't do in
+ * place.  (A partition's columns are its partitioned table's: move_table()
+ * keeps it.)
+ */
+static bool
+table_remade(const TableDef *from, const TableDef *to)
+{
+	bool		remake = false;
+	List	   *from_names = NIL;
+	List	   *to_names = NIL;
+	ListCell   *lc;
+	ListCell   *a;
+	ListCell   *b;
+	List	   *kept_from = NIL;
+	List	   *kept_to = NIL;
+	bool		adding = false;
+
+	foreach(lc, from->columns)
+		from_names = lappend(from_names, first_field(lfirst(lc)));
+	foreach(lc, to->columns)
+		to_names = lappend(to_names, first_field(lfirst(lc)));
+	foreach(lc, from_names)
+		if (list_has_string(to_names, lfirst(lc)))
+			kept_from = lappend(kept_from, lfirst(lc));
+	foreach(lc, to_names)
+	{
+		if (list_has_string(from_names, lfirst(lc)))
+		{
+			kept_to = lappend(kept_to, lfirst(lc));
+			if (adding)
+				remake = true;	/* an added column before a kept one */
+		}
+		else
+			adding = true;
+	}
+	forboth(a, kept_from, b, kept_to)
+		if (strcmp(lfirst(a), lfirst(b)) != 0)
+			remake = true;	/* kept columns in another order */
+	foreach(lc, to->columns)
+	{
+		const char *line = lfirst(lc);
+		char	   *col = first_field(line);
+		int			i = list_member_index_string(from_names, col);
+
+		if (i < 0)
+			continue;
+		if (!same_strings(column_attr(line, "generated "),
+						  column_attr(list_nth(from->columns, i), "generated ")) ||
+			!same_strings(column_attr(line, "identity "),
+						  column_attr(list_nth(from->columns, i), "identity ")))
+			remake = true;
+	}
+	return remake;
+}
+
+/*
  * The statements turning table name's definition from (NULL: none) into to
  * (NULL: dropped): what must go before the rows are written, and what the
  * rows must satisfy, after.  Columns are added and dropped, and changed in
@@ -4028,47 +4086,11 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	}
 	if (from != NULL)
 	{
-		ListCell   *a;
-		ListCell   *b;
-		List	   *kept_from = NIL;
-		List	   *kept_to = NIL;
-		bool		adding = false;
-
 		foreach(lc, from->columns)
 			from_names = lappend(from_names, first_field(lfirst(lc)));
 		foreach(lc, to->columns)
 			to_names = lappend(to_names, first_field(lfirst(lc)));
-		foreach(lc, from_names)
-			if (list_has_string(to_names, lfirst(lc)))
-				kept_from = lappend(kept_from, lfirst(lc));
-		foreach(lc, to_names)
-		{
-			if (list_has_string(from_names, lfirst(lc)))
-			{
-				kept_to = lappend(kept_to, lfirst(lc));
-				if (adding)
-					remake = true;	/* an added column before a kept one */
-			}
-			else
-				adding = true;
-		}
-		forboth(a, kept_from, b, kept_to)
-			if (strcmp(lfirst(a), lfirst(b)) != 0)
-				remake = true;	/* kept columns in another order */
-		foreach(lc, to->columns)
-		{
-			const char *line = lfirst(lc);
-			char	   *col = first_field(line);
-			int			i = list_member_index_string(from_names, col);
-
-			if (i < 0)
-				continue;
-			if (!same_strings(column_attr(line, "generated "),
-							  column_attr(list_nth(from->columns, i), "generated ")) ||
-				!same_strings(column_attr(line, "identity "),
-							  column_attr(list_nth(from->columns, i), "identity ")))
-				remake = true;
-		}
+		remake = table_remade(from, to);
 	}
 	if (from != NULL && (from->partition_of == NULL) != (to->partition_of == NULL))
 		ereport(ERROR,
@@ -5604,7 +5626,20 @@ inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
 				cons = lappend(cons, first_field(lfirst(c)));
 		}
 	}
-	return inheritance_unmoved(from, to, name, types_moved, cols, cons, false);
+	if (!inheritance_unmoved(from, to, name, types_moved, cols, cons, false))
+		return false;
+
+	/* (nor is it made again, which leaves it inheriting from none) */
+	{
+		MoveItem   *f = find_item(from, 't', name);
+		MoveItem   *t = find_item(to, 't', name);
+		TableDef	fd;
+		TableDef	td2;
+
+		parse_table_def(f->def, &fd);
+		parse_table_def(t->def, &td2);
+		return !table_remade(&fd, &td2);
+	}
 }
 
 /* A child's columns and constraints its own, as it was before a move. */
@@ -5976,6 +6011,20 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		parse_table_def(t->def, &td);
 		if (td.inherits == NIL || inheritance_kept(from, to, t->name, &td, tm.tables))
 			continue;
+
+		/*
+		 * A table the move makes is made with all its columns, then linked:
+		 * none of them its own, as CREATE TABLE ... () INHERITS made it
+		 * (restore_locality(), with nothing recorded its own).  One the
+		 * branch has that only gains the link keeps INHERIT's: its own.
+		 */
+		if (find_item(from, 't', t->name) == NULL)
+		{
+			Locality   *l = palloc0_object(Locality);
+
+			l->table = pstrdup(t->name);
+			localities = lappend(localities, l);
+		}
 		foreach(c, td.inherits)
 			links = lappend(links, psprintf("ALTER TABLE %s INHERIT %s",
 											t->name, (char *) lfirst(c)));

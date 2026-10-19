@@ -192,6 +192,31 @@ SELECT * FROM dolt_status();
 SELECT * FROM locality;
 ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
 SELECT * FROM locality;
+
+-- A child the move makes again (its own columns in another order) is
+-- linked again; one the move makes is linked, none of what it inherits its
+-- own, as CREATE TABLE ... () INHERITS makes it.
+SELECT dolt_reset('--hard', :'own');
+ALTER TABLE inh.c DROP COLUMN x;
+ALTER TABLE inh.c ADD COLUMN y int;
+ALTER TABLE inh.c ADD COLUMN x int;
+INSERT INTO inh.c (a, b, y, x) VALUES (1, 2, 3, 4);
+SELECT (dolt_commit('-Am', 'reordered'))[1] AS reordered \gset
+SELECT dolt_reset('--hard', :'own');
+SELECT dolt_reset('--hard', :'reordered');
+SELECT inhrelid::regclass, inhparent::regclass FROM pg_inherits WHERE inhrelid = to_regclass('inh.c');
+SELECT test_fold_root() = prolly_root_hash(:'reordered') AS same_root;
+SELECT * FROM dolt_status();
+SELECT * FROM inh.p;
+SELECT * FROM locality;
+SELECT dolt_reset('--hard', :'parent_changed');
+DROP TABLE inh.c;
+SELECT (dolt_commit('-Am', 'no child'))[1] AS no_child \gset
+SELECT dolt_reset('--hard', :'parent_changed');
+SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
+SELECT * FROM locality;
+ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
+SELECT * FROM locality;
 SELECT dolt_reset('--hard', :'linked');
 DROP VIEW locality;
 

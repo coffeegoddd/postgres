@@ -480,6 +480,99 @@ SELECT * FROM locality;
  column a | f     |         1
 (1 row)
 
+-- A child the move makes again (its own columns in another order) is
+-- linked again; one the move makes is linked, none of what it inherits its
+-- own, as CREATE TABLE ... () INHERITS makes it.
+SELECT dolt_reset('--hard', :'own');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE inh.c DROP COLUMN x;
+ALTER TABLE inh.c ADD COLUMN y int;
+ALTER TABLE inh.c ADD COLUMN x int;
+INSERT INTO inh.c (a, b, y, x) VALUES (1, 2, 3, 4);
+SELECT (dolt_commit('-Am', 'reordered'))[1] AS reordered \gset
+SELECT dolt_reset('--hard', :'own');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'reordered');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT inhrelid::regclass, inhparent::regclass FROM pg_inherits WHERE inhrelid = to_regclass('inh.c');
+ inhrelid | inhparent 
+----------+-----------
+ inh.c    | inh.p
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'reordered') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM inh.p;
+ a | b 
+---+---
+ 1 | 2
+(1 row)
+
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+ column b | f     |         1
+ column x | t     |         0
+ column y | t     |         0
+(4 rows)
+
+SELECT dolt_reset('--hard', :'parent_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP TABLE inh.c;
+SELECT (dolt_commit('-Am', 'no child'))[1] AS no_child \gset
+SELECT dolt_reset('--hard', :'parent_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM locality;
+      what      | local | inherited 
+----------------+-------+-----------
+ column a       | f     |         1
+ column b       | f     |         1
+ constraint p_b | f     |         1
+(3 rows)
+
+ALTER TABLE inh.p DROP COLUMN b;			-- reaches the child, and its check
+SELECT * FROM locality;
+   what   | local | inherited 
+----------+-------+-----------
+ column a | f     |         1
+(1 row)
+
 SELECT dolt_reset('--hard', :'linked');
  dolt_reset 
 ------------
