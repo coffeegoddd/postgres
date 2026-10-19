@@ -129,6 +129,75 @@ SELECT * FROM dolt_status();
 SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
 SELECT * FROM described WHERE what IN ('inherits', 'firing');
 
+-- A commit of an older format, which described none of these, isn't moved
+-- to (nor merged): a fold of this format wouldn't match its descriptions.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '8'),
+	'format 8') AS old8 \gset
+SELECT dolt_reset('--hard', :'old8');
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
+	'format 7') AS old7 \gset
+SELECT dolt_reset('--hard', :'old7');
+
+-- A move that changes neither a child's nor its parent's columns or
+-- constraints, nor a type they use, leaves their link alone: the child's
+-- inherited columns stay inherited, and the parent's DDL still reaches
+-- them.
+CREATE SCHEMA inh VERSIONED;
+CREATE TABLE inh.p (a int, b int);
+CREATE TABLE inh.c () INHERITS (inh.p);
+CREATE TYPE inh.mood AS ENUM ('x', 'y');
+CREATE TABLE inh.other (m inh.mood);
+SELECT (dolt_commit('-Am', 'linked'))[1] AS linked \gset
+ALTER TYPE inh.mood RENAME VALUE 'y' TO 'why';
+CREATE INDEX p_a ON inh.p (a);
+SELECT dolt_commit('-Am', 'unrelated') IS NOT NULL AS committed;
+SELECT dolt_reset('--hard', :'linked');
+SELECT * FROM dolt_status();
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'inh.c'::regclass AND attnum > 0 ORDER BY attnum;
+ALTER TABLE inh.p DROP COLUMN b;
+SELECT attname FROM pg_attribute
+  WHERE attrelid = 'inh.c'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum;
+SELECT dolt_reset('--hard');
+
+-- Merged inheritance or a table's type against the other side's columns:
+-- a schema conflict where the merged definitions can't be made.
+CREATE TABLE inh.q (a int);
+CREATE TABLE inh.d (a int);
+CREATE TYPE inh.ty AS (a int, b text);
+CREATE TABLE inh.tt (a int, b text);
+SELECT (dolt_commit('-Am', 'unlinked'))[1] AS unlinked \gset
+SELECT dolt_branch('parent_grows');
+SELECT dolt_branch('table_grows');
+SELECT dolt_branch('both_grow');
+ALTER TABLE inh.d INHERIT inh.q;
+ALTER TABLE inh.tt OF inh.ty;
+SELECT (dolt_commit('-Am', 'linked'))[1] AS relinked \gset
+SELECT dolt_checkout('parent_grows');
+ALTER TABLE inh.q ADD COLUMN z int;
+SELECT dolt_commit('-Am', 'z') IS NOT NULL AS committed;
+SELECT dolt_checkout('table_grows');
+ALTER TABLE inh.tt ADD COLUMN x int;
+SELECT dolt_commit('-Am', 'x') IS NOT NULL AS committed;
+SELECT dolt_checkout('both_grow');
+ALTER TABLE inh.q ADD COLUMN z int;
+ALTER TABLE inh.d ADD COLUMN z int;
+SELECT dolt_commit('-Am', 'z both') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_merge('parent_grows');
+SELECT dolt_merge('table_grows');
+SELECT * FROM dolt_status();
+SELECT test_fold_root() = prolly_root_hash(:'relinked') AS same_root;
+-- (a child given the parent's new column too merges)
+SELECT (dolt_merge('both_grow'))[2:4];
+SELECT * FROM dolt_status();
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+SELECT attname, attislocal, attinhcount FROM pg_attribute
+  WHERE attrelid = 'inh.d'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT dolt_branch('-D', 'parent_grows');
+SELECT dolt_branch('-D', 'table_grows');
+SELECT dolt_branch('-D', 'both_grow');
+
 DROP VIEW described;
 SELECT dolt_reset('--hard', :'base');
 DROP SCHEMA app CASCADE;

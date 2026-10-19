@@ -204,7 +204,13 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "7", indexes described without their
+ * The format a folded root is in: "9", what changes how a definition
+ * behaves described when it isn't the default (inheritance, typed tables,
+ * trigger and rule firing, domain collations and defaults, composite
+ * attributes' collations, view options, matviews' indexes and being
+ * unpopulated); "8" left those out, and was the first with every float NaN
+ * in rows and keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
+ * own bits, and was the first with indexes described without their
  * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
  * default one, and was the first with definitions' expressions (checks,
  * defaults, generated expressions, policies) as they print read back
@@ -217,7 +223,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions' text isn't this format's.
  */
-#define FOLDED_FORMAT	"7"
+#define FOLDED_FORMAT	"9"
 
 typedef struct Canon
 {
@@ -1160,7 +1166,7 @@ append_matview_state(StringInfo out, Form_pg_class form)
 	list_sort(indexes, oid_name_cmp);
 	foreach(lc, indexes)
 	{
-		append_field(out, pg_get_indexdef_string(lfirst_oid(lc)));
+		append_field(out, pg_get_indexdef_string_notblspc(lfirst_oid(lc)));
 		appendStringInfoChar(out, '\n');
 	}
 	relation_close(rel, AccessShareLock);
@@ -5489,20 +5495,71 @@ empty_table(const char *name)
 	CommandCounterIncrement();
 }
 
+static bool
+same_lines(List *a, List *b)
+{
+	ListCell   *x;
+	ListCell   *y;
+
+	if (list_length(a) != list_length(b))
+		return false;
+	forboth(x, a, y, b)
+		if (strcmp(lfirst(x), lfirst(y)) != 0)
+			return false;
+	return true;
+}
+
+static bool
+same_str(const char *a, const char *b)
+{
+	return (a == NULL) == (b == NULL) && (a == NULL || strcmp(a, b) == 0);
+}
+
 /*
- * Whether table name's inheritance (td's, as both from and to define it)
- * stays as it is through a move: its definition the same in both, and the
- * definitions of the tables it inherits from, and no type moved.
+ * Whether a move leaves what a table shares with the tables it inherits
+ * from, or they with it, as it is: its columns, constraints, parents, type
+ * and partitioning, the same in from and to (table name, in both), and no
+ * column of it changing type in turn (types_moved: type_moves()'s tables).
  */
 static bool
-inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
-				 bool types_move)
+inheritance_unmoved(List *from, List *to, const char *name, List *types_moved)
 {
 	MoveItem   *f = find_item(from, 't', name);
 	MoveItem   *t = find_item(to, 't', name);
+	TableDef	fd;
+	TableDef	td;
+
+	if (f == NULL || t == NULL || list_has_string(types_moved, name))
+		return false;
+	if (strcmp(f->def, t->def) == 0)
+		return true;
+	parse_table_def(f->def, &fd);
+	parse_table_def(t->def, &td);
+	return same_lines(fd.columns, td.columns) &&
+		same_lines(fd.constraints, td.constraints) &&
+		same_lines(fd.inherits, td.inherits) &&
+		same_str(fd.of, td.of) &&
+		same_str(fd.partition_by, td.partition_by) &&
+		same_str(fd.partition_of, td.partition_of);
+}
+
+/*
+ * Whether table name's inheritance (td's, as from or to defines it) stays
+ * as it is through a move: neither it nor the tables it inherits from
+ * change what they share (inheritance_unmoved()).  What changes it is done
+ * to each table alone, unlinked: an ALTER of a parent's column would
+ * recurse to its children, and an inherited column can't be altered alone.
+ * Only these are unlinked and linked again: a link made again leaves the
+ * child's columns and constraints its own (attislocal, conislocal), which
+ * isn't described, so a later change of the parent wouldn't reach them.
+ */
+static bool
+inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
+				 List *types_moved)
+{
 	ListCell   *lc;
 
-	if (types_move || f == NULL || t == NULL || strcmp(f->def, t->def) != 0)
+	if (!inheritance_unmoved(from, to, name, types_moved))
 		return false;
 	foreach(lc, td->inherits)
 	{
@@ -5510,8 +5567,9 @@ inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
 		MoveItem   *pt = find_item(to, 't', lfirst(lc));
 
 		/* (one of another schema's isn't the move's) */
-		if ((pf == NULL) != (pt == NULL) ||
-			(pf != NULL && strcmp(pf->def, pt->def) != 0))
+		if (pf == NULL && pt == NULL)
+			continue;
+		if (!inheritance_unmoved(from, to, lfirst(lc), types_moved))
 			return false;
 	}
 	return true;
@@ -5716,10 +5774,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	/*
 	 * Inheritance: a table's links to the tables it inherits from go first
 	 * and come back last (once the rows are in, and the constraints they
-	 * merge with valid), unless neither its definition nor theirs changes,
-	 * nor any type: what changes either is done to each table alone (an
-	 * ALTER of a parent's column would recurse to its children; an
-	 * inherited column can't be altered alone).
+	 * merge with valid), unless neither it nor they change what they share
+	 * (inheritance_kept()).
 	 */
 	foreach(lc, from)
 	{
@@ -5730,7 +5786,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (f->kind != 't')
 			continue;
 		parse_table_def(f->def, &fd);
-		if (fd.inherits == NIL || inheritance_kept(from, to, f->name, &fd, tm.any))
+		if (fd.inherits == NIL || inheritance_kept(from, to, f->name, &fd, tm.tables))
 			continue;
 		foreach(c, fd.inherits)
 			unlinks = lappend(unlinks, psprintf("ALTER TABLE %s NO INHERIT %s",
@@ -5745,7 +5801,7 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (t->kind != 't')
 			continue;
 		parse_table_def(t->def, &td);
-		if (td.inherits == NIL || inheritance_kept(from, to, t->name, &td, tm.any))
+		if (td.inherits == NIL || inheritance_kept(from, to, t->name, &td, tm.tables))
 			continue;
 		foreach(c, td.inherits)
 			links = lappend(links, psprintf("ALTER TABLE %s INHERIT %s",
@@ -6464,6 +6520,126 @@ check_type_changes(const char *name, const char *base, const char *ours,
 
 
 /*
+ * Whether a merged table's columns (td's) have each of columns' (a
+ * parent's, as a table's lines, or a composite type's) by name and type;
+ * exactly them, in order, if exact (a typed table's).
+ */
+static bool
+columns_cover(const TableDef *td, List *names, List *types, bool exact)
+{
+	ListCell   *n;
+	ListCell   *t;
+	int			i = 0;
+
+	if (exact && list_length(td->columns) != list_length(names))
+		return false;
+	forboth(n, names, t, types)
+	{
+		bool		found = false;
+		ListCell   *lc;
+
+		foreach(lc, td->columns)
+		{
+			const char *line = lfirst(lc);
+
+			if (exact && foreach_current_index(lc) != i)
+				continue;
+			if (strcmp(first_field(line), lfirst(n)) == 0 &&
+				strcmp(column_type(line), lfirst(t)) == 0)
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+		i++;
+	}
+	return true;
+}
+
+/*
+ * What Postgres requires of a merged table's inheritance and type, which
+ * merging its definition and its parents' (or its type's) apart can break:
+ * a table has every column of each table it inherits from, of the same
+ * type, and a typed table exactly its type's attributes; and each is
+ * there, if any side had it.  Otherwise a schema conflict: the move would
+ * fail making it.  tables and types: the merge's, as names, then
+ * definitions; seen: every table's and type's key any side had.
+ */
+static void
+check_merged_inheritance(List *tables, List *table_defs, List *types,
+						 List *type_defs, List *seen)
+{
+	ListCell   *a;
+	ListCell   *b;
+
+	forboth(a, tables, b, table_defs)
+	{
+		const char *name = lfirst(a);
+		TableDef	td;
+		ListCell   *lc;
+
+		parse_table_def(lfirst(b), &td);
+		foreach(lc, td.inherits)
+		{
+			char	   *parent = unescape_field(lfirst(lc));
+			int			at = list_member_index_string(tables, parent);
+			TableDef	pd;
+			List	   *names = NIL;
+			List	   *coltypes = NIL;
+			ListCell   *c;
+
+			if (at < 0)
+			{
+				if (list_has_string(seen, psprintf("t:%s", parent)))
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("schema conflict: %s inherits from %s on one side, and the other side dropped %s",
+									name, parent, parent),
+							 errdetail("A table can't inherit from a table that isn't there.")));
+				continue;		/* (another schema's) */
+			}
+			parse_table_def(list_nth(table_defs, at), &pd);
+			foreach(c, pd.columns)
+			{
+				names = lappend(names, first_field(lfirst(c)));
+				coltypes = lappend(coltypes, column_type(lfirst(c)));
+			}
+			if (!columns_cover(&td, names, coltypes, false))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: %s inherits from %s, whose columns the merge doesn't give it",
+								name, parent),
+						 errdetail("One side changed the inheritance, and the other the columns of either table; a table inheriting from another must have each of its columns, of the same type.")));
+		}
+		if (td.of)
+		{
+			int			at = list_member_index_string(types, td.of);
+
+			if (at < 0)
+			{
+				if (list_has_string(seen, psprintf("y:%s", td.of)))
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("schema conflict: %s is of type %s on one side, and the other side dropped %s",
+									name, td.of, td.of),
+							 errdetail("A typed table's type must be there.")));
+				continue;
+			}
+			if (strncmp(list_nth(type_defs, at), "composite\n", 10) != 0 ||
+				!columns_cover(&td, composite_attributes(list_nth(type_defs, at)),
+							   composite_attribute_types(list_nth(type_defs, at)), true))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: %s is of type %s, whose attributes the merge doesn't give it as its columns",
+								name, td.of),
+						 errdetail("One side made the table typed, and the other changed its columns or the type's attributes; a typed table's columns are exactly its type's.")));
+		}
+	}
+}
+
+/*
  * The definitions of base, ours and theirs merged: each object as the side
  * that changed it since base has it (ours if neither, or both alike); a
  * table both changed, part by part (merge_table_defs()).  An object both
@@ -6487,6 +6663,11 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	ProllyTreeBuilder *b;
 	List	   *dropped = NIL;	/* schemas the merge drops */
 	List	   *kept = NIL;		/* the names of the objects it keeps */
+	List	   *tables = NIL;	/* the tables it keeps, by name */
+	List	   *table_defs = NIL;	/* (their definitions) */
+	List	   *types = NIL;	/* likewise its types */
+	List	   *type_defs = NIL;
+	List	   *seen = NIL;		/* every table's and type's key, any side's */
 	ListCell   *lc;
 
 	memset(&cn, 0, sizeof(cn));
@@ -6564,6 +6745,32 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 #undef CHANGED
 		if (take)
 			PROLLY_CALL(cn.tree, build_add, b, least, take);
+		if (least->data[0] == 't' || least->data[0] == 'y')
+		{
+			seen = lappend(seen, from_utf8(least->data, least->len));
+			if (take)
+			{
+				ProllyValue d;
+				char	   *name = from_utf8(least->data + 2, least->len - 2);
+				char	   *text = merged_def;
+
+				if (text == NULL)
+				{
+					definition_of(least, take, &d);
+					text = pnstrdup((const char *) d.data, d.len);
+				}
+				if (least->data[0] == 't')
+				{
+					tables = lappend(tables, name);
+					table_defs = lappend(table_defs, text);
+				}
+				else
+				{
+					types = lappend(types, name);
+					type_defs = lappend(type_defs, text);
+				}
+			}
+		}
 		if (least->data[0] == 'n' && has[0] && !take)
 			dropped = lappend(dropped, from_utf8(least->data + 2, least->len - 2));
 		else if (take && least->data[0] != 'n' && least->data[0] != 'c')
@@ -6580,6 +6787,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	PROLLY_CALL(cn.tree, build_finish, b, merged);
 	for (int i = 0; i < 3; i++)
 		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
+	check_merged_inheritance(tables, table_defs, types, type_defs, seen);
 
 	/* a schema dropped on one side, given objects on the other */
 	if (dropped != NIL)
