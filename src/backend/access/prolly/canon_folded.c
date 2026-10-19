@@ -139,6 +139,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_ts_parser.h"
@@ -176,6 +177,7 @@
 #include "utils/hsearch.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
+#include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/regproc.h"
@@ -5044,7 +5046,11 @@ type_moves(List *from, List *to)
  * index a move drops and makes again (its definition changed, its table
  * made again, a column under it changing type) goes back where it was,
  * rather than to default_tablespace.  An index the branch didn't have is
- * made where CREATE INDEX makes it.
+ * made where CREATE INDEX makes it.  The rule is by name, so a partition's
+ * index made again for its redefined partitioned index (named afresh) is
+ * left in the default tablespace.  Placement is kept at best: a user
+ * without CREATE on the tablespace leaves an index made again where it was
+ * made, with a warning, rather than failing the move.
  */
 typedef struct IndexPlace
 {
@@ -5124,6 +5130,17 @@ restore_index_places(List *places)
 		spc = get_tablespace_name(p->tablespace);
 		if (spc == NULL)
 			continue;
+		if (p->tablespace != MyDatabaseTableSpace &&
+			object_aclcheck(TableSpaceRelationId, p->tablespace, GetUserId(),
+							ACL_CREATE) != ACLCHECK_OK)
+		{
+			ereport(WARNING,
+					(errmsg("index \"%s.%s\" made again in the default tablespace, not in \"%s\"",
+							p->schema, p->index, spc),
+					 errdetail("Permission to create in tablespace \"%s\" is needed to move it back.",
+							   spc)));
+			continue;
+		}
 		run_statements(list_make1(psprintf("ALTER INDEX %s SET TABLESPACE %s",
 										   quote_qualified_identifier(p->schema, p->index),
 										   quote_identifier(spc))));

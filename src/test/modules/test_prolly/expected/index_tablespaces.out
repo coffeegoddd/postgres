@@ -159,6 +159,110 @@ SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '6'),
 SELECT dolt_reset('--hard', :'tsp_old');
 ERROR:  a commit made in an older format of prolly's history can't be moved to
 HINT:  Commit the branch to write it in the current one.
+-- a user without CREATE on the tablespace: the move goes on, and the index
+-- it makes again stays in the default tablespace, with a warning
+CREATE ROLE regress_tsp_owner;
+CREATE SCHEMA tso VERSIONED;
+GRANT ALL ON SCHEMA tso TO regress_tsp_owner;
+SET ROLE regress_tsp_owner;
+CREATE TABLE tso.t (id int PRIMARY KEY, b int);
+CREATE INDEX t_b ON tso.t (b);
+SELECT length(dolt_commit('-Am', 'tso')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+RESET ROLE;
+SELECT dolt_branch('tso_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SET ROLE regress_tsp_owner;
+DROP INDEX tso.t_b;
+CREATE INDEX t_b ON tso.t (b, id);
+SELECT length(dolt_commit('-Am', 'tso redefined')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+RESET ROLE;
+ALTER INDEX tso.t_b SET TABLESPACE regress_prolly_ts;
+SET ROLE regress_tsp_owner;
+SELECT dolt_reset('--hard', 'HEAD~1');
+WARNING:  index "tso.t_b" made again in the default tablespace, not in "regress_prolly_ts"
+DETAIL:  Permission to create in tablespace "regress_prolly_ts" is needed to move it back.
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT indexname, tablespace, indexdef FROM pg_indexes WHERE schemaname = 'tso'
+  ORDER BY indexname COLLATE "C";
+ indexname | tablespace |                       indexdef                       
+-----------+------------+------------------------------------------------------
+ t_b       |            | CREATE INDEX t_b ON tso.t USING btree (b)
+ t_pkey    |            | CREATE UNIQUE INDEX t_pkey ON tso.t USING btree (id)
+(2 rows)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- (a merge, likewise)
+SELECT dolt_checkout('tso_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'tso_side'"}
+(1 row)
+
+DROP INDEX tso.t_b;
+CREATE INDEX t_b ON tso.t (id, b);
+SELECT length(dolt_commit('-Am', 'tso side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+RESET ROLE;
+ALTER INDEX tso.t_b SET TABLESPACE regress_prolly_ts;
+SET ROLE regress_tsp_owner;
+SELECT (dolt_merge('tso_side'))[2:3] IS NOT NULL AS merged;
+WARNING:  index "tso.t_b" made again in the default tablespace, not in "regress_prolly_ts"
+DETAIL:  Permission to create in tablespace "regress_prolly_ts" is needed to move it back.
+ merged 
+--------
+ t
+(1 row)
+
+SELECT indexname, tablespace, indexdef FROM pg_indexes WHERE schemaname = 'tso'
+  ORDER BY indexname COLLATE "C";
+ indexname | tablespace |                       indexdef                       
+-----------+------------+------------------------------------------------------
+ t_b       |            | CREATE INDEX t_b ON tso.t USING btree (id, b)
+ t_pkey    |            | CREATE UNIQUE INDEX t_pkey ON tso.t USING btree (id)
+(2 rows)
+
+RESET ROLE;
+SELECT dolt_branch('-D', 'tso_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA tso CASCADE;
+NOTICE:  drop cascades to table tso.t
+DROP ROLE regress_tsp_owner;
 SELECT dolt_branch('-D', 'tsp_side');
  dolt_branch 
 -------------

@@ -69,6 +69,45 @@ SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '6'),
 	'format 6') AS tsp_old \gset
 SELECT dolt_reset('--hard', :'tsp_old');
 
+-- a user without CREATE on the tablespace: the move goes on, and the index
+-- it makes again stays in the default tablespace, with a warning
+CREATE ROLE regress_tsp_owner;
+CREATE SCHEMA tso VERSIONED;
+GRANT ALL ON SCHEMA tso TO regress_tsp_owner;
+SET ROLE regress_tsp_owner;
+CREATE TABLE tso.t (id int PRIMARY KEY, b int);
+CREATE INDEX t_b ON tso.t (b);
+SELECT length(dolt_commit('-Am', 'tso')::text) AS committed;
+RESET ROLE;
+SELECT dolt_branch('tso_side');
+SET ROLE regress_tsp_owner;
+DROP INDEX tso.t_b;
+CREATE INDEX t_b ON tso.t (b, id);
+SELECT length(dolt_commit('-Am', 'tso redefined')::text) AS committed;
+RESET ROLE;
+ALTER INDEX tso.t_b SET TABLESPACE regress_prolly_ts;
+SET ROLE regress_tsp_owner;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT indexname, tablespace, indexdef FROM pg_indexes WHERE schemaname = 'tso'
+  ORDER BY indexname COLLATE "C";
+SELECT * FROM dolt_status;
+-- (a merge, likewise)
+SELECT dolt_checkout('tso_side');
+DROP INDEX tso.t_b;
+CREATE INDEX t_b ON tso.t (id, b);
+SELECT length(dolt_commit('-Am', 'tso side')::text) AS committed;
+SELECT dolt_checkout('main');
+RESET ROLE;
+ALTER INDEX tso.t_b SET TABLESPACE regress_prolly_ts;
+SET ROLE regress_tsp_owner;
+SELECT (dolt_merge('tso_side'))[2:3] IS NOT NULL AS merged;
+SELECT indexname, tablespace, indexdef FROM pg_indexes WHERE schemaname = 'tso'
+  ORDER BY indexname COLLATE "C";
+RESET ROLE;
+SELECT dolt_branch('-D', 'tso_side');
+DROP SCHEMA tso CASCADE;
+DROP ROLE regress_tsp_owner;
+
 SELECT dolt_branch('-D', 'tsp_side');
 DROP SCHEMA tsp CASCADE;
 SELECT length(dolt_commit('-Am', 'tsp gone')::text) AS committed;
