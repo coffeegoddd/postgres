@@ -101,8 +101,8 @@ ROLLBACK;
 -- constraint allows stays (as an UPDATE of another column leaves it), with
 -- theirs' change to another column written, the row updated in place or
 -- (a second unique index) removed and inserted again.  A value theirs
--- changes is checked (in dv.n: in dv.nu, its refusal would remove the row,
--- with no put-back of the branch's version on that path yet).  In a keyless
+-- changes is checked: refused, the violation is recorded and the branch's
+-- row kept, in place (dv.n) or put back (dv.nu).  In a keyless
 -- table, a changed row is removed and another inserted: a value a row
 -- removed held isn't checked, theirs' rows written as ours' are kept
 -- (dv.k) or ours changed rows too (dv.k2).
@@ -126,16 +126,17 @@ UPDATE dv.nu SET w = 11 WHERE pk = 1;
 UPDATE dv.k SET w = 11 WHERE v = -1;
 UPDATE dv.k2 SET w = 11 WHERE v = -1;
 UPDATE dv.n SET v = -3 WHERE pk = 2;		-- a change breaking it
+UPDATE dv.nu SET v = -3 WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'theirs: w, v')::text) AS committed;
 SELECT dolt_checkout('main');
 BEGIN;
 SELECT (dolt_merge('other4'))[3:4];
-SELECT violating_row->>'pk' AS pk, violation_type, violation_info
+SELECT 'n' AS t, violating_row->>'pk' AS pk, violation_type, violation_info
 FROM dolt_constraint_violations('dv.n')
 UNION ALL
-SELECT violating_row->>'pk' AS pk, violation_type, violation_info
+SELECT 'nu', violating_row->>'pk' AS pk, violation_type, violation_info
 FROM dolt_constraint_violations('dv.nu')
-ORDER BY pk;
+ORDER BY t, pk;
 SELECT * FROM dv.n ORDER BY pk;
 SELECT * FROM dv.nu ORDER BY pk;
 SELECT count(*) AS none FROM dolt_constraint_violations('dv.k');
