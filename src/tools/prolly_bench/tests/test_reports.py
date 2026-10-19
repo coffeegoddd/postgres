@@ -151,6 +151,19 @@ class ReportsTest(unittest.TestCase):
         self.assertFalse(doc.passed)
         self.assertIn('expected an object', presentation.HtmlRenderer().render(doc))
 
+    def test_recovery_panic_is_visible_and_invalidates_successful_timings(self):
+        source = self.source(suite='V', reps=2, values={'commit_ms': 1})
+        source.results[0]['validation_errors'] = ['collector recovery: PANIC: failed to add new item']
+        (source.path / 'results.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in source.results))
+        seal(source.path)
+        source = reports.load(source.path)
+        doc = reports.build([source], self.root)
+        self.assertFalse(doc.passed)
+        for renderer in presentation.RENDERERS.values():
+            text = renderer.render(doc)
+            self.assertIn('PANIC: failed to add new item', text)
+            self.assertIn('INVALID', text)
+
     def test_benchmark_intervals_color_only_metrics_with_a_direction(self):
         base = self.source('heap', am='heap', reps=5, values={'tps': 100, 'latency_samples': 100})
         other = self.source(reps=5, values={'tps': 200, 'latency_samples': 200})

@@ -75,7 +75,8 @@ th {background:var(--head);position:sticky;top:0;z-index:1;white-space:nowrap;} 
 td.good {background:var(--good)} td.bad {background:var(--bad)}
 .detail {display:block;color:var(--muted);font-size:12px;margin-top:4px;}
 summary {cursor:pointer;} p {max-width:110ch;white-space:pre-wrap;overflow-wrap:anywhere;}
-@media(max-width:600px) {body {padding:12px;} th,td {padding:6px;} h1 {font-size:22px;}}
+@media(max-width:600px) {body {padding:12px;} th,td {padding:6px;} h1 {font-size:22px;}
+ nav {max-height:9rem;overflow:auto;border:1px solid var(--line);padding:8px;}}
 @media print {.wrap {max-height:none;overflow:visible;} details {display:block;}
  th {position:static;} nav {display:none;}}
 """
