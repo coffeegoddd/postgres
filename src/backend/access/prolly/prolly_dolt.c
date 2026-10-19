@@ -925,6 +925,22 @@ reserved_branch_name(const char *name)
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_WRITER_PREFIX)));
 }
 
+/*
+ * A connection doesn't name a hidden branch, as dolt_checkout() doesn't:
+ * on it, it would be writable, and its writes would move the branch off
+ * the commit that the sessions detached there are at.  (A writer's branch
+ * is connected to as any other.)
+ */
+void
+prolly_check_connect_branch(const char *branch)
+{
+	if (detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Check out the commit with dolt_checkout(), read-only.")));
+}
+
 /* Does what's checked out name a commit by its hash (a prefix of it)? */
 static bool
 names_commit(const char *ref)
@@ -1355,6 +1371,18 @@ dolt_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_branch needs a branch")));
+
+	/*
+	 * (nor is a commit's hidden branch renamed: renamed, it would be an
+	 * ordinary, writable branch where the sessions detached at the commit
+	 * are; said before a detached session's read-only transaction is, as
+	 * the more specific)
+	 */
+	if (move && detached_branch(linitial(names)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a commit's hidden branch can't be renamed"),
+				 errhint("Make a branch at the commit with dolt_branch().")));
 
 	/*
 	 * (a rename, delete, take or protection makes no branch: not in a
@@ -4169,6 +4197,12 @@ dolt_push(PG_FUNCTION_ARGS)
 		branch = pstrdup(branch_ops()->current());
 	if (remote_branch == NULL)
 		remote_branch = branch;
+	/* (a commit's hidden branch, a session's, isn't a remote's: as it serves) */
+	if (detached_branch(remote_branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
+				 errhint("Push a branch made at the commit with dolt_branch().")));
 	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -4427,6 +4461,19 @@ check_clone_target(const char *current)
 }
 
 /*
+ * Is a remote's branch made a branch here by a clone?  Not one whose name
+ * this database's rules refuse, made under older ones, nor one named as a
+ * commit's hidden branch (which a served database doesn't list, but a file
+ * remote may hold): made here, it would be where sessions detached at the
+ * commit it names go, though at another commit.
+ */
+static bool
+cloned_as_branch(const char *name)
+{
+	return branch_ops()->name_ok(name) && !detached_branch(name);
+}
+
+/*
  * dolt_clone(VARIADIC args text[]) returns text[]: {status}
  *
  * url, [--remote name] (origin), [--branch branch]: in an empty database
@@ -4479,6 +4526,10 @@ dolt_clone(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("dolt_clone needs the session on a branch")));
+	if (branch != NULL && detached_branch(branch))
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX)));
 	check_clone_target(current);
 
 	/* the remote added as dolt_remote() adds one, and fetched */
@@ -4499,7 +4550,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 		}
 		foreach(lc, h.branches)
 		{
-			if (branch == NULL && branch_ops()->name_ok(lfirst(lc)))
+			if (branch == NULL && cloned_as_branch(lfirst(lc)))
 				branch = lfirst(lc);
 		}
 		if (branch == NULL)
@@ -4543,14 +4594,16 @@ dolt_clone(PG_FUNCTION_ARGS)
 		char	   *tracking = psprintf("%s/%s", remote, b);
 
 		/*
-		 * (a remote branch whose name this database's rules refuse, made
-		 * under older ones: tracked, not made here)
+		 * (a remote branch whose name this database refuses: tracked, not
+		 * made here)
 		 */
-		if (!branch_ops()->name_ok(b))
+		if (!cloned_as_branch(b))
 		{
 			ereport(WARNING,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("remote branch \"%s\" isn't cloned as a branch", b),
+					 detached_branch(b) ?
+					 errdetail("Names beginning \"%s\" are reserved.", PROLLY_DETACHED_PREFIX) :
 					 errdetail("Its name isn't a branch's by this database's rules."),
 					 errhint("Its commits are fetched: dolt_branch(name, '%s') makes a branch of it under another name.",
 							 tracking)));

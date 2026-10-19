@@ -209,6 +209,20 @@ SELECT active_branch() LIKE 'detached/%' AS on_a_hidden_branch;
  t
 (1 row)
 
+-- (nor is its hidden branch renamed, forced or not: it would be a writable
+-- branch where the session is detached)
+SELECT dolt_branch('-m', active_branch(), 'zz');
+ERROR:  a commit's hidden branch can't be renamed
+HINT:  Make a branch at the commit with dolt_branch().
+SELECT dolt_branch('-mf', active_branch(), 'zz');
+ERROR:  a commit's hidden branch can't be renamed
+HINT:  Make a branch at the commit with dolt_branch().
+SELECT active_branch() LIKE 'detached/%' AS on_a_hidden_branch;
+ on_a_hidden_branch 
+--------------------
+ t
+(1 row)
+
 SELECT dolt_checkout('-b', 'main');
 ERROR:  branch "main" already exists
 INSERT INTO dc.t VALUES (6, 'six');
