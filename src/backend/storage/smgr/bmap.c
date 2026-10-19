@@ -996,23 +996,34 @@ lookup_ref(RelFileLocator rel, BlockNumber phys)
 }
 
 /*
+ * Verify map page 'blk' of 'rel'.  A page of zeroes (an extension's whose
+ * record a crash lost) passes if 'new_ok' (returning false), else fails.
+ */
+static bool
+check_node(char *page, uint16 type, RelFileLocator rel,
+		   BlockNumber blk, bool new_ok)
+{
+	if (new_ok && PageIsNew(page))
+		return false;
+	check_page(page, type, rel, BMAP_FORKNUM, blk);
+	return true;
+}
+
+/*
  * Copy map page 'blk' of 'rel', pinned in 'buf', into 'dst' under a share
- * lock.  A page of zeroes (an extension's whose record a crash lost) is
- * copied as such if 'new_ok' (returning false), else fails verification.
+ * lock, verified as in check_node().
  */
 static bool
 copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
 		  uint16 type, bool new_ok)
 {
-	bool		isnew;
+	bool		found;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	isnew = new_ok && PageIsNew(BufferGetPage(buf));
-	if (!isnew)
-		check_page(BufferGetPage(buf), type, rel, BMAP_FORKNUM, blk);
+	found = check_node(BufferGetPage(buf), type, rel, blk, new_ok);
 	memcpy(dst, BufferGetPage(buf), BLCKSZ);
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	return !isnew;
+	return found;
 }
 
 /*
@@ -1027,13 +1038,16 @@ copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
  * a write can need: an entry's block changes only while its logical block
  * can't be written, so a write after the change finds the page cached or
  * written out.  A torn read fails verification and is read again.
+ *
+ * The page is verified as in check_node(); see read_node_ext().
  */
-static void
-read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
-		  uint16 type)
+static bool
+read_node_ext(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
+			  uint16 type, bool new_ok)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		buf;
+	bool		found;
 
 	if (for_write)
 	{
@@ -1055,8 +1069,7 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 							 errmsg("invalid page in block %u of \"%s\"",
 									blk, relpathperm(rel, BMAP_FORKNUM).str)));
 			}
-			check_page(dst, type, rel, BMAP_FORKNUM, blk);
-			return;
+			return check_node(dst, type, rel, blk, new_ok);
 		}
 		buf = r.recent_buffer;
 
@@ -1071,8 +1084,17 @@ read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 	else
 		buf = map_read(rel, blk);
 
-	(void) copy_node(rel, buf, blk, dst, type, false);
+	found = copy_node(rel, buf, blk, dst, type, new_ok);
 	ReleaseBuffer(buf);
+	return found;
+}
+
+/* read_node_ext() of a page that must be initialized */
+static void
+read_node(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
+		  uint16 type)
+{
+	(void) read_node_ext(reln, blk, for_write, dst, type, false);
 }
 
 /*
@@ -1093,8 +1115,15 @@ header_nblocks(SMgrRelation reln, bool for_write, XLogRecPtr *lsn)
 /*
  * The physical block of logical block 'blkno', and in *run how many logical
  * blocks from it (at most 'maxrun') are physically consecutive.  If the
- * block has no entry, returns InvalidBlockNumber when 'missing_ok', else
- * fails.  See read_node() for 'for_write'.
+ * block has no entry, returns InvalidBlockNumber when 'missing_ok', with
+ * *run how many blocks from it have none on its map page, else fails.  See
+ * read_node() for 'for_write'.
+ *
+ * In recovery, a lookup that may miss finds no entries on a map page of
+ * zeroes: the map's header on disk may cover a page an extension added
+ * whose buffer wasn't written out before a crash, until the extension's
+ * record is replayed (see bmapprefetch()).  Outside recovery such a page
+ * under the length is a write that was lost, and fails verification.
  */
 static BlockNumber
 lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
@@ -1106,17 +1135,30 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	BlockNumber phys;
 	BlockNumber n;
 
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
+	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM) ||
+		!read_node_ext(reln, MAP_PAGE(blkno), for_write, copy.data,
+					   BMAP_PAGE_NODE, missing_ok && InRecovery))
+	{
 		phys = InvalidBlockNumber;
+		n = Min(maxrun, BMAP_FANOUT - slot);
+	}
 	else
 	{
-		read_node(reln, MAP_PAGE(blkno), for_write, copy.data, BMAP_PAGE_NODE);
 		phys = entries[slot].block;
+		n = 1;
+		while (!BlockNumberIsValid(phys) && n < maxrun &&
+			   slot + n < BMAP_FANOUT &&
+			   !BlockNumberIsValid(entries[slot + n].block))
+			n++;
 	}
 	if (!BlockNumberIsValid(phys))
 	{
 		if (missing_ok)
+		{
+			if (run)
+				*run = n;
 			return InvalidBlockNumber;
+		}
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("block map of \"%s\" has no page for block %u",
@@ -4707,16 +4749,14 @@ bmapprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		/*
 		 * A block without an entry has nothing to prefetch.  In recovery the
 		 * map's header on disk may be newer than the map page that will have
-		 * the entry, so a block below the length may have none yet; a
-		 * prefetch is only a hint.
+		 * the entry, so a block below the length may have none yet, and its
+		 * map page may still be zeroes (one the same extension added, whose
+		 * buffer wasn't written out before a crash); a prefetch is only a
+		 * hint.  The blocks after it without one on its map page are
+		 * skipped with it.
 		 */
-		if (!BlockNumberIsValid(phys))
-		{
-			blocknum++;
-			nblocks--;
-			continue;
-		}
-		if (!mdprefetch(ssrel, MAIN_FORKNUM, phys, run))
+		if (BlockNumberIsValid(phys) &&
+			!mdprefetch(ssrel, MAIN_FORKNUM, phys, run))
 			return false;
 		blocknum += run;
 		nblocks -= run;

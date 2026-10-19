@@ -2820,11 +2820,14 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	 * A branch with copies: its working set read as of its head (a snapshot
 	 * that sees the transaction that moved it there), refused if it has
 	 * uncommitted changes unless forced, then moved, its rows written, or
-	 * deleted.
+	 * deleted.  Not under a prepared transaction that was on it, refused
+	 * as a deletion is: its rows would be overwritten (or waited on, maybe
+	 * for days), or come back as changes the move dropped.
 	 */
 	oid = branch_oid(name);
 	if (OidIsValid(oid))
 	{
+		lock_branch_unprepared(oid, name);
 		pushed = see_head(name);
 		PG_TRY();
 		{
