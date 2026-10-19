@@ -20,6 +20,7 @@ class FakeServer:
         self.row_bytes = {"t": 100.0}
         self.prolly = {"chunk_bytes_appended": 0, "nodes_written": 0}
         self.checkpoints = 0
+        self.autovacuum = []        # workers running, read one per query
         self.log = []
         self.on_checkpoint = lambda: None
         self.on_prolly_checkpoint = lambda: None
@@ -39,6 +40,8 @@ class FakeServer:
         m = re.search(r"pg_wal_lsn_diff\('0/([0-9A-F]+)', '0/([0-9A-F]+)'\)", sql)
         if m:
             return str(int(m.group(1), 16) - int(m.group(2), 16))
+        if "autovacuum worker" in sql:
+            return str(self.autovacuum.pop(0) if self.autovacuum else 0)
         if "num_requested" in sql:
             return str(self.checkpoints)
         if "backend_type = 'checkpointer'" in sql:
@@ -67,18 +70,27 @@ def context(server, am="heap", suite="S", **params):
 class WriteAmpTest(unittest.TestCase):
     def setUp(self):
         self._wait = write_amp.wait_for_clients
-        write_amp.wait_for_clients = lambda ctx: None
+        self.client_waits = []
+        write_amp.wait_for_clients = lambda ctx: self.client_waits.append(self.phase)
+        self.phase = "setup"
 
     def tearDown(self):
         write_amp.wait_for_clients = self._wait
 
     def run_cell(self, server, ctx, work, outcome):
         c = WriteAmpCollector()
+        self.client_waits.clear()
+        self.phase = "before"
         c.before_window(ctx)
         c.start(ctx)
+        self.phase = "window"
         work()
         c.stop(ctx)
+        self.phase = "after"
         c.after_window(ctx, outcome)
+        # A workload may hold sessions open as the window opens (S6, the
+        # V suite's background S1): only the flush waits for clients.
+        self.assertEqual(self.client_waits, ["after"])
         return c.results(ctx, outcome)
 
     def test_heap_counts_the_flush_checkpoint(self):
@@ -154,6 +166,24 @@ class WriteAmpTest(unittest.TestCase):
         m = self.run_cell(s, context(s), bulk, Outcome(transactions=10, read_only=True))
         self.assertIsNone(m["wa_server"])
 
+    def test_waits_for_autovacuum_at_each_end(self):
+        s = FakeServer()
+        # two polls see a worker before the window, one after the window,
+        # one after the final checkpoint
+        s.autovacuum = [1, 1, 0, 1, 0, 1, 0]
+        def work():
+            s.tuples["t"] = [10, 0, 0]
+        self.run_cell(s, context(s), work, Outcome(transactions=1))
+        self.assertEqual(s.autovacuum, [])
+
+    def test_each_tuple_counter_checked_on_its_own(self):
+        s = FakeServer()
+        s.tuples["t"] = [10, 10, 0]
+        def work():
+            s.tuples["t"] = [5, 20, 0]      # the sum grew; inserts went back
+        with self.assertRaisesRegex(RuntimeError, "went backwards"):
+            self.run_cell(s, context(s), work, Outcome(transactions=1))
+
     def test_counters_going_backwards_fail(self):
         s = FakeServer()
         s.tuples["t"] = [10, 0, 0]
@@ -192,6 +222,70 @@ class WriteAmpTest(unittest.TestCase):
         cfg["run"]["write_amp_materialize"] = "dolt_commit"
         with self.assertRaisesRegex(config.ConfigError, "write_amp_materialize"):
             config.validate(cfg, "S")
+
+
+class RunnerOrderTest(unittest.TestCase):
+    """The runner calls after_window after every stop, and before any
+    results and the post-run checks (which read the tables)."""
+
+    def test_after_window_precedes_results_and_verification(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from pbench.core import runner as runner_mod
+        from pbench.core.interfaces import Workload
+
+        order = []
+
+        class Probe(Collector):
+            name = "probe"
+            def before_window(self, ctx): order.append("before_window")
+            def start(self, ctx): order.append("start")
+            def stop(self, ctx): order.append("stop")
+            def after_window(self, ctx, outcome): order.append("after_window")
+            def results(self, ctx, outcome):
+                order.append("results")
+                return {}
+            def post(self, ctx, outcome):
+                order.append("post")
+                return {}
+
+        class Work(Workload):
+            id, suite, title = "S1", "S", "probe"
+            def prepare(self, ctx): pass
+            def measure(self, ctx, window):
+                with window:
+                    order.append("work")
+                return Outcome(transactions=1)
+            def verify(self, ctx): order.append("workload.verify")
+
+        cluster = mock.MagicMock()
+        cluster.log_since.return_value = ""
+        cluster.scalar.return_value = "[]"
+        target = mock.MagicMock()
+        target.setup_sql.return_value = ""
+        target.wrong_am.return_value = []
+        with tempfile.TemporaryDirectory() as d:
+            r = object.__new__(runner_mod.Runner)
+            r.out_dir, r.table_am, r.build = Path(d), "heap", ""
+            r.cfg = {"sizes": {"tiny": {}}, "tools": {}, "postgres": {},
+                     "run": {"warmup_seconds": 0, "measure_seconds": 1, "quality": "smoke",
+                             "collectors": ["probe"], "required_collectors": []}}
+            r.info = SimpleNamespace(environment={"postgres": {"binary_hashes": {}}})
+            r.keep_failed, r.bin_dir = False, Path(d)
+            r._make_cluster = lambda instance: cluster
+            with mock.patch.object(runner_mod.registry.collectors, "get", lambda name: Probe), \
+                    mock.patch.object(runner_mod.targets, "for_am", lambda am: target), \
+                    mock.patch.object(runner_mod.env_mod, "build_provenance", lambda b: None), \
+                    mock.patch.object(runner_mod.config_mod, "server_settings", lambda c: {}), \
+                    mock.patch.object(runner_mod.correctness, "verify",
+                                      lambda ctx, when: order.append(f"correctness.{when}")):
+                result = r._run_cell(CellKey("S", "S1", "tiny", "", 1, 1), Work(),
+                                     {"seed": 1})
+        self.assertEqual(result.status.value, "ok", result.message)
+        self.assertEqual(order, ["correctness.before", "before_window", "start", "work", "stop",
+                                 "after_window", "results", "correctness.after",
+                                 "workload.verify", "post"])
 
 
 if __name__ == "__main__":

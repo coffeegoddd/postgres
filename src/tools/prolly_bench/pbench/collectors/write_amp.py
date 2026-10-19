@@ -1,9 +1,11 @@
 """Write amplification: the bytes the server wrote for each byte of row
-data the workload wrote (specs/19-write-amplification.md).
+data the workload wrote (specs/20-write-amplification.md).
 
 The collector has its own interval, wider than the window. Before the
 window it checkpoints, so the warm-up's dirty pages aren't charged to the
-window. After the window it waits for the measured clients to exit, and
+window. It doesn't wait for clients there: a workload may connect before
+the window opens (S6's snapshot holder, the V suite's background S1).
+After the window it waits for the measured clients to exit, and
 then has prolly fold the working set into trees (prolly_checkpoint(); plain
 SQL COMMIT writes no chunks). It checkpoints again, so the window's dirty
 pages are written, and then takes its final readings. Deferred writes
@@ -14,6 +16,12 @@ Logical bytes are the new row versions the SQL wrote:
 (rows inserted + rows updated) x the table's average row size, for every
 workload table, from the same statistics for every engine. Deleted rows
 add no bytes and are reported as a count.
+
+Autovacuum workers flush their statistics only when they exit
+(autovacuum.c never reports them sooner), so the collector waits for none
+to be running at each end of the interval.  Otherwise a worker's pages
+(and, on prolly, the files its collection writes) would be charged to
+the interval its exit fell in.
 """
 
 from __future__ import annotations
@@ -48,6 +56,18 @@ def materialize_mode(ctx: Context) -> str:
     if mode == "auto":
         mode = "prolly_checkpoint" if ctx.key.suite == "S" else "none"
     return mode if _is_prolly(ctx) else "none"
+
+
+def wait_for_autovacuum(ctx: Context, timeout_seconds: float = 600.0) -> None:
+    """Wait until no autovacuum worker is running: each has exited, and so
+    flushed what it counted."""
+    sql = ("SELECT count(*) FROM pg_stat_activity "
+           "WHERE backend_type = 'autovacuum worker'")
+    deadline = time.monotonic() + timeout_seconds
+    while int(ctx.cluster.scalar(sql)) > 0:
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"autovacuum workers still running after {timeout_seconds:.0f} s")
+        time.sleep(0.05)
 
 
 def checkpoint(ctx: Context, timeout_seconds: float = 60.0) -> None:
@@ -113,7 +133,7 @@ class WriteAmpCollector(Collector):
     name = "write_amp"
 
     def before_window(self, ctx):
-        wait_for_clients(ctx)
+        wait_for_autovacuum(ctx)
         checkpoint(ctx)
 
     def _snap(self, ctx) -> dict:
@@ -130,12 +150,14 @@ class WriteAmpCollector(Collector):
 
     def after_window(self, ctx, outcome):
         wait_for_clients(ctx)
+        wait_for_autovacuum(ctx)
         self.mode = materialize_mode(ctx)
         self.unmaterialized = None
         if self.mode == "prolly_checkpoint":
             self.unmaterialized = self._snap(ctx)
             ctx.cluster.sql("SELECT prolly_checkpoint()", dbname=ctx.dbname)
         checkpoint(ctx)
+        wait_for_autovacuum(ctx)
         self.after = self._snap(ctx)
 
     def results(self, ctx, outcome):
@@ -147,9 +169,9 @@ class WriteAmpCollector(Collector):
         rows_written = rows_deleted = logical = 0.0
         for t, (ins, upd, dele) in a["tuples"].items():
             ins0, upd0, del0 = b["tuples"].get(t, (0.0, 0.0, 0.0))
-            written = (ins - ins0) + (upd - upd0)
-            if written < 0 or dele < del0:
+            if ins < ins0 or upd < upd0 or dele < del0:
                 raise RuntimeError(f"tuple counters went backwards for {t}")
+            written = (ins - ins0) + (upd - upd0)
             rows_written += written
             rows_deleted += dele - del0
             if written:
