@@ -3967,9 +3967,13 @@ schema_of(const char *qualified_name)
 	return NULL;
 }
 
-/* A column, as CREATE TABLE and ADD COLUMN write it. */
+/*
+ * A column of table, as CREATE TABLE and ADD COLUMN write it; with what
+ * must run right after that statement appended to *after.
+ */
 static char *
-column_sql(const char *line)
+column_sql(const char *table, const char *line, List *constraints,
+		   List **after)
 {
 	char	   *copy = pstrdup(line);
 	char	   *name = strtok(copy, "\t");
@@ -4010,8 +4014,43 @@ column_sql(const char *line)
 	else if (def)
 		appendStringInfo(&sql, " DEFAULT %s", def);
 	if (identity)
+	{
+		char	   *prefix = psprintf("NOT NULL %s", name);
+		size_t		len = strlen(prefix);
+		ListCell   *lc;
+
+		/*
+		 * Give the identity's implicit NOT NULL its recorded name now.
+		 * Automatic naming may choose another name if, for example, a
+		 * child still has the constraint inherited from a remade parent.
+		 * Postgres refuses NO INHERIT beside IDENTITY in a column
+		 * definition, though ALTER can make a table with both: the
+		 * constraint is made inheritable, then made NO INHERIT right after.
+		 */
+		foreach(lc, constraints)
+		{
+			const char *constraint = lfirst(lc);
+			char	   *definition = constraint_def(constraint);
+
+			if (strncmp(definition, prefix, len) == 0 &&
+				(definition[len] == '\0' || definition[len] == ' '))
+			{
+				const char *rest = definition + len;
+
+				appendStringInfo(&sql, " CONSTRAINT %s NOT NULL",
+								 first_field(constraint));
+				if (strcmp(rest, " NO INHERIT") == 0)
+					*after = lappend(*after,
+									 psprintf("ALTER TABLE %s ALTER CONSTRAINT %s NO INHERIT",
+											  table, first_field(constraint)));
+				else
+					appendStringInfoString(&sql, rest);
+				break;
+			}
+		}
 		appendStringInfo(&sql, " GENERATED %s AS IDENTITY",
 						 identity == 'a' ? "ALWAYS" : "BY DEFAULT");
+	}
 	return sql.data;
 }
 
@@ -4250,6 +4289,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	if (from == NULL || remake)
 	{
 		StringInfoData sql;
+		List	   *after_columns = NIL;
 
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
@@ -4265,12 +4305,14 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			appendStringInfo(&sql, "CREATE TABLE %s (", name);
 			foreach(lc, to->columns)
 				appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
-								 column_sql(lfirst(lc)));
+								 column_sql(name, lfirst(lc), to->constraints,
+											&after_columns));
 			appendStringInfoChar(&sql, ')');
 		}
 		if (to->partition_by)
 			appendStringInfo(&sql, " PARTITION BY %s", to->partition_by);
 		sm->changes = lappend(sm->changes, sql.data);
+		sm->changes = list_concat(sm->changes, after_columns);
 
 		/* sequences its defaults draw from, that no column owns: its own */
 		sm->changes = lappend(sm->changes,
@@ -4326,9 +4368,13 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 			if (i < 0)
 			{
+				List	   *after_column = NIL;
+
 				sm->changes = lappend(sm->changes,
 									  psprintf("ALTER TABLE %s ADD COLUMN %s",
-											   name, column_sql(line)));
+											   name, column_sql(name, line, to->constraints,
+																&after_column)));
+				sm->changes = list_concat(sm->changes, after_column);
 				continue;
 			}
 			old = list_nth(from->columns, i);
@@ -4478,7 +4524,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			}
 
 			/*
-			 * (an identity column, or a key, may have made it already; a
+			 * (an identity column, whose column definition gives its NOT
+			 * NULL this recorded name, or a key, may have made it already; a
 			 * partition's partitioned table, its own)
 			 */
 			if (not_null || to->partition_of)
