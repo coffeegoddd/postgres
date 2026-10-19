@@ -1487,14 +1487,201 @@ SELECT dolt_status();
 -------------
 (0 rows)
 
+-- Whether a branch's conflicted table is dropped is up to that branch's
+-- catalog, not the one the session is on when the transaction commits: a
+-- checkout to a branch without dc.a doesn't let its conflicts through ...
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc a a third time')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
 SELECT dolt_branch('-D', 'dc_side');
  dolt_branch 
 -------------
  {0}
 (1 row)
 
+SELECT dolt_branch('dc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('dc_none');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+ on_none 
+---------
+ t
+(1 row)
+
+DROP TABLE dc.a;
+SELECT length(dolt_commit('-Am', 'dc_none without a')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+UPDATE dc.a SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side 3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE dc.a SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main 3')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+ on_none 
+---------
+ t
+(1 row)
+
+COMMIT;
+ERROR:  cannot commit a transaction with unresolved merge conflicts
+DETAIL:  Table "a" has conflicts on branch "main".
+HINT:  Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+-- ... nor does one to a branch that has it hide a drop on the merge's
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+DROP TABLE dc.a;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+SELECT to_regclass('dc.a') AS a;
+ a 
+---
+ 
+(1 row)
+
+SELECT dolt_merge('--abort');
+        dolt_merge        
+--------------------------
+ {"",0,0,"merge aborted"}
+(1 row)
+
+-- and a drop rolled back gives the conflicts back
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SAVEPOINT s;
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+(0 rows)
+
+ROLLBACK TO s;
+SELECT * FROM dolt_conflicts();
+ table_name | num_conflicts 
+------------+---------------
+ dc.a       |             1
+(1 row)
+
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+ on_none 
+---------
+ t
+(1 row)
+
+COMMIT;
+ERROR:  cannot commit a transaction with unresolved merge conflicts
+DETAIL:  Table "a" has conflicts on branch "main".
+HINT:  Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'dc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'dc_none');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA dc CASCADE;
-NOTICE:  drop cascades to table dc.b
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table dc.b
+drop cascades to table dc.a
 SELECT length(dolt_commit('-Am', 'without dc')::text) AS committed;
  committed 
 -----------

@@ -450,6 +450,54 @@ DROP TABLE dc.a;
 SELECT * FROM dolt_conflicts();
 SELECT length(dolt_commit('-Am', 'dc merged after drop')::text) AS committed;
 SELECT dolt_status();
+
+-- Whether a branch's conflicted table is dropped is up to that branch's
+-- catalog, not the one the session is on when the transaction commits: a
+-- checkout to a branch without dc.a doesn't let its conflicts through ...
+CREATE TABLE dc.a (id int PRIMARY KEY, v text);
+INSERT INTO dc.a VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'dc a a third time')::text) AS committed;
 SELECT dolt_branch('-D', 'dc_side');
+SELECT dolt_branch('dc_side');
+SELECT dolt_branch('dc_none');
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+DROP TABLE dc.a;
+SELECT length(dolt_commit('-Am', 'dc_none without a')::text) AS committed;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+UPDATE dc.a SET v = 'side';
+SELECT length(dolt_commit('-am', 'dc side 3')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+UPDATE dc.a SET v = 'main';
+SELECT length(dolt_commit('-am', 'dc main 3')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM dolt_conflicts();
+-- ... nor does one to a branch that has it hide a drop on the merge's
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+DROP TABLE dc.a;
+SELECT dolt_checkout('dc_side') IS NOT NULL AS on_side;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT * FROM dolt_conflicts();
+SELECT to_regclass('dc.a') AS a;
+SELECT dolt_merge('--abort');
+-- and a drop rolled back gives the conflicts back
+SELECT dolt_reset('--hard');
+BEGIN;
+SELECT (dolt_merge('dc_side'))[3] AS conflicts;
+SAVEPOINT s;
+DROP TABLE dc.a;
+SELECT * FROM dolt_conflicts();
+ROLLBACK TO s;
+SELECT * FROM dolt_conflicts();
+SELECT dolt_checkout('dc_none') IS NOT NULL AS on_none;
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('-D', 'dc_side');
+SELECT dolt_branch('-D', 'dc_none');
 DROP SCHEMA dc CASCADE;
 SELECT length(dolt_commit('-Am', 'without dc')::text) AS committed;

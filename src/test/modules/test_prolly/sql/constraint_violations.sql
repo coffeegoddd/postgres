@@ -76,6 +76,11 @@ SELECT length(dolt_commit('-am', 'feature recodes 1')::text) AS committed;
 SELECT dolt_checkout('main');
 INSERT INTO cv.child VALUES (7, 1, 'z');
 SELECT length(dolt_commit('-am', 'main takes z')::text) AS committed;
+SELECT dolt_branch('no_child');
+SELECT dolt_checkout('no_child');
+DROP TABLE cv.child;
+SELECT length(dolt_commit('-am', 'no_child drops cv.child')::text) AS committed;
+SELECT dolt_checkout('main');
 BEGIN;
 SELECT (dolt_merge('feature'))[3:4];
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cv.child');
@@ -85,7 +90,12 @@ DROP TABLE cv.child;
 SELECT * FROM dolt_constraint_violations();
 ROLLBACK TO s;
 SELECT count(*) AS still_listed FROM dolt_constraint_violations();
-ROLLBACK;
+-- (and a checkout to a branch without the table doesn't let them through)
+SELECT dolt_checkout('no_child');
+COMMIT;
+SELECT dolt_checkout('main');
+SELECT count(*) AS none_kept FROM dolt_constraint_violations();
+SELECT dolt_branch('-D', 'no_child');
 
 -- Violations kept stay through later merges that find none of their own.
 SET dolt.allow_commit_conflicts = on;
