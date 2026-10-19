@@ -185,6 +185,7 @@
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "common/int.h"
+#include "common/string.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -5275,9 +5276,15 @@ create_cast_sql(const char *name, const char *def)
 	return sql.data;
 }
 
-/* A type, as described ("enum", "domain", "composite" or "range", then lines). */
+/*
+ * A type, as described ("enum", "domain", "composite" or "range", then
+ * lines).  A domain's unvalidated checks, which CREATE DOMAIN can't make,
+ * are appended to *unvalidated as ALTER DOMAIN, to run once the columns
+ * using it have moved to it: as on a live database, the values those
+ * columns have are then kept.
+ */
 static char *
-create_type_sql(const char *name, const char *def)
+create_type_sql(const char *name, const char *def, List **unvalidated)
 {
 	char	   *copy = pstrdup(def);
 	char	   *kind = strtok(copy, "\n");
@@ -5365,8 +5372,23 @@ create_type_sql(const char *name, const char *def)
 			(strlen(def) < 9 || strcmp(def + strlen(def) - 9, "\tNOT NULL") != 0))
 			appendStringInfoString(&sql, " NOT NULL");
 		while ((line = strtok(NULL, "\n")) != NULL)
-			appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
-							 constraint_def(line));
+		{
+			char	   *condef = constraint_def(line);
+
+			/*
+			 * CREATE DOMAIN cannot accept NOT VALID: those checks come after
+			 * (above).  Validated checks stay inline: ALTER would scan
+			 * existing uses.  Test the deparser's suffix, not words inside
+			 * an expression.
+			 */
+			if (pg_str_endswith(condef, " NOT VALID"))
+				*unvalidated = lappend(*unvalidated,
+									   psprintf("ALTER DOMAIN %s ADD CONSTRAINT %s %s",
+												name, first_field(line), condef));
+			else
+				appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
+								 condef);
+		}
 	}
 	return sql.data;
 }
@@ -5711,6 +5733,7 @@ typedef struct TypeMoves
 	List	   *creates;		/* the types made (these and new ones), in any
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
+	List	   *unvalidated;	/* then the new domains' unvalidated checks */
 	List	   *tables;			/* the tables of those columns */
 	List	   *detached;		/* typed tables detached before their types
 								 * are replaced */
@@ -5908,7 +5931,8 @@ type_moves(List *from, List *to)
 								f->name),
 						 errdetail("A range type in use can't be changed in place; a move can't change one either.")));
 			tm.before = lappend(tm.before, psprintf("DROP TYPE %s", f->name));
-			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def,
+															 &tm.unvalidated));
 			tm.any = true;
 			continue;
 		}
@@ -6191,7 +6215,8 @@ type_moves(List *from, List *to)
 		tm.before = lappend(tm.before,
 							psprintf("ALTER TYPE %s RENAME TO %s", mt->from->name,
 									 strrchr(mt->aside, '.') + 1));
-		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def));
+		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def,
+														 &tm.unvalidated));
 		tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
 	}
 	tm.before = list_concat(list_copy(tm.aggregate_drops), tm.before);
@@ -6874,7 +6899,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			collation_makes = lappend(collation_makes,
 									  create_collation_sql(t->name, t->def));
 		else if (t->kind == 'y' && f == NULL)
-			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def,
+															 &tm.unvalidated));
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
 							   psprintf("ALTER SEQUENCE %s %s", t->name,
@@ -7094,7 +7120,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	/*
 	 * Types first, in turn (type_moves()): new schemas made once the types
 	 * changed are aside, all the types made (each after those it uses), the
-	 * columns using the changed ones moved, the old ones dropped.
+	 * columns using the changed ones moved, the new domains' unvalidated
+	 * checks added, the old ones dropped.
 	 */
 	run_statements(tm.before);
 	run_statements(schemas);
@@ -7102,6 +7129,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(collation_makes);	/* (types and columns may use them) */
 	make_views(tm.creates);
 	run_statements(tm.converts);
+	run_statements(tm.unvalidated);
 	make_views(tm.drops);
 	run_statements(tm.after);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
