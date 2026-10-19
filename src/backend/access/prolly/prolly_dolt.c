@@ -1331,7 +1331,8 @@ dolt_branch(PG_FUNCTION_ARGS)
 					 errmsg("a writer's branch can't be renamed")));
 		was_protected = PROLLY_CALL(writers(), protected, linitial(names));
 		/* (the branch a forced rename replaces) */
-		replaces_protected = strcmp(linitial(names), lsecond(names)) != 0 &&
+		replaces_protected = force &&
+			strcmp(linitial(names), lsecond(names)) != 0 &&
 			PROLLY_CALL(refs(), resolve, lsecond(names), &(ProllyHash) {0}) &&
 			PROLLY_CALL(writers(), protected, lsecond(names));
 		for (int i = 0; i < 2; i++)

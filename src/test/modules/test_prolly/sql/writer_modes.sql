@@ -437,6 +437,11 @@ BEGIN;
 INSERT INTO wm.sp VALUES (12);
 SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
 ROLLBACK;
+-- (and unforced, onto a name that exists, it is no rename)
+BEGIN;
+INSERT INTO wm.sp VALUES (12);
+SELECT dolt_branch('-m', 'wm_sp', 'wm_sp_prot');
+ROLLBACK;
 BEGIN;
 UPDATE wm.sp SET id = id WHERE false;
 SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');

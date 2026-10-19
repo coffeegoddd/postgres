@@ -1339,6 +1339,13 @@ SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
 ERROR:  branch "wm_sp" has uncommitted changes
 HINT:  Commit or reset them before protecting it.
 ROLLBACK;
+-- (and unforced, onto a name that exists, it is no rename)
+BEGIN;
+INSERT INTO wm.sp VALUES (12);
+SELECT dolt_branch('-m', 'wm_sp', 'wm_sp_prot');
+ERROR:  branch "wm_sp_prot" already exists
+HINT:  Replace it with -f.
+ROLLBACK;
 BEGIN;
 UPDATE wm.sp SET id = id WHERE false;
 SELECT dolt_branch('-m', '-f', 'wm_sp', 'wm_sp_prot');
