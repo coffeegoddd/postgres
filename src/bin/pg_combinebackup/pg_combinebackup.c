@@ -39,6 +39,7 @@
 #include "lib/stringinfo.h"
 #include "load_manifest.h"
 #include "reconstruct.h"
+#include "storage/bmap_files.h"
 #include "write_manifest.h"
 
 /* Incremental file naming convention. */
@@ -1043,6 +1044,22 @@ process_directory_recursively(Oid tsoid,
 			strncmp(de->d_name, INCREMENTAL_PREFIX,
 					INCREMENTAL_PREFIX_LENGTH) == 0)
 		{
+			const char *bare_name = de->d_name + INCREMENTAL_PREFIX_LENGTH;
+			const char *store_name = CppAsString2(BMAP_STORE_RELNUMBER);
+			size_t		store_len = strlen(store_name);
+
+			/*
+			 * A block-mapped page store sent incrementally can't be trusted:
+			 * WAL summaries never name its blocks, so a server that sent it
+			 * incrementally sent none of its changes.  The server always
+			 * sends it in full now; refuse an input that doesn't, rather
+			 * than restore the store as an older backup had it.
+			 */
+			if (strncmp(bare_name, store_name, store_len) == 0 &&
+				(bare_name[store_len] == '\0' || bare_name[store_len] == '.'))
+				pg_fatal("file \"%s\" is an incremental copy of a block-mapped page store, which cannot be reconstructed",
+						 ifullpath);
+
 			/* Output path should not include "INCREMENTAL." prefix. */
 			snprintf(ofullpath, MAXPGPATH, "%s/%s", ofulldir,
 					 de->d_name + INCREMENTAL_PREFIX_LENGTH);

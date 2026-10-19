@@ -28,6 +28,7 @@
 #include "common/int.h"
 #include "common/parse_manifest.h"
 #include "postmaster/walsummarizer.h"
+#include "storage/bmap_files.h"
 
 #define	BLOCKS_PER_READ			512
 
@@ -696,6 +697,19 @@ GetFileBackupMethod(IncrementalBackupInfo *ib, const char *path,
 	 * backup the entire file every time.
 	 */
 	if (forknum == FSM_FORKNUM)
+		return BACK_UP_FILE_FULLY;
+
+	/*
+	 * Nor is the block-mapped page store, as far as WAL summaries can tell:
+	 * WAL names the logical blocks of block-mapped relations, never the page
+	 * store's physical blocks holding them, so the summaries have no entry
+	 * for it however much it changed.  Sending it incrementally would send
+	 * none of its blocks, and pg_combinebackup would restore it as it was in
+	 * the prior backup.  Back it up in full every time.  (Its allocator,
+	 * reference counts and the relations' map and changes forks are buffers
+	 * WAL-logged under their own file numbers, so they are summarized.)
+	 */
+	if (relfilenumber == BMAP_STORE_RELNUMBER)
 		return BACK_UP_FILE_FULLY;
 
 	/*
