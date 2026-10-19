@@ -190,6 +190,7 @@ tests += {
       't/110_bmap_recovery_past_length.pl',
       't/111_bmap_prefetch_new_page.pl',
       't/112_bmap_remap_zero_replay.pl',
+      't/113_minimal_wal_remap.pl',
       't/120_log_concurrency.pl',
       't/121_log_unsettled.pl',
     ],
