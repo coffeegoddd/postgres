@@ -1,11 +1,21 @@
-# Write amplification (specs/19-write-amplification.md): the standard
+# Write amplification (specs/20-write-amplification.md): the standard
 # procedure's sizes, workloads and settings, with the write_amp collector,
 # which checkpoints before the window and, after it, has prolly fold its
 # working set (prolly_checkpoint()) and checkpoints again, so the bytes
 # the window's work deferred are counted.  The recovery collector is left
-# out: after that checkpoint it would have nothing to replay.  Fewer
-# client counts than the standard sweep; five repetitions, so it may run
-# at benchmark quality.
+# out: after that checkpoint it would have nothing to replay.  So is
+# vacuum: it would start just after the checkpoint, logging a full-page
+# image of every page it touched.  (space reads after the fold, so its
+# chunk_store_bytes include it.)  Fewer client counts than the standard
+# sweep; five repetitions, so it may run at benchmark quality.
+#
+# The window opens just after a checkpoint, so the full-page images of the
+# pages it first touches are the window's: wa.wal.fpi_bytes shows their
+# share.  Over 600 s with checkpoints every 2 min, those are steady state.
+#
+# A replication slot holds the interval's WAL for write_amp to split: at
+# 64 clients for 600 s, tens of GB in pg_wal (max_wal_size doesn't bound
+# it), read in one pass after the window.
 #
 #   prolly_bench run S --am heap,prolly --config configs/s_write_amp.toml
 #   prolly_bench table
@@ -21,7 +31,7 @@ fio_baseline = true
 fio_seconds = 30
 latency_sampling_rate = 0.1
 collectors = ["environment", "wal", "diskstats", "pg_stat_io", "cpu", "space",
-              "engine_counters", "write_amp", "vacuum"]
+              "engine_counters", "write_amp"]
 required_collectors = ["write_amp"]
 
 [postgres]

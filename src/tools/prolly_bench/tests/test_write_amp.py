@@ -516,11 +516,21 @@ class WriteAmpReportTest(unittest.TestCase):
 
     def test_ratio_under_the_floor_is_na(self):
         from pbench import table
-        rs = [{"status": "ok", "metrics": {"wa_server": None, "tps": 1.0}}]
-        cell = table._cell(rs, "wa_server", None)
-        self.assertEqual((cell.text, cell.detail), ("n/a", "under 64 KiB of logical writes"))
-        cell = table._cell([{"status": "ok", "metrics": {"tps": 1.0}}], "wa_tree", None)
-        self.assertEqual((cell.text, cell.detail), ("n/a", "not measured for this engine"))
+        def cell(metrics, metric, status=None):
+            r = {"status": "ok", "metrics": {"tps": 1.0, **metrics}}
+            if status:
+                r["collector_status"] = {"write_amp": status}
+            c = table._cell([r], metric, None)
+            self.assertEqual(c.text, "n/a")
+            return c.detail
+        self.assertEqual(cell({"wa_server": None, "wa.logical_bytes": 100.0}, "wa_server"),
+                         "under 64 KiB of logical writes")
+        self.assertEqual(cell({"wa.logical_bytes": 1e9}, "wa_tree"),
+                         "not measured for this engine")
+        self.assertEqual(cell({"wa_server": None, "wa.logical_bytes": 1e9}, "wa_server"),
+                         "the build counts no chunk-store file bytes")
+        self.assertEqual(cell({}, "wa_wal", ["unavailable", "pg_walinspect: missing"]),
+                         "write_amp unavailable: pg_walinspect: missing")
 
 
 if __name__ == "__main__":

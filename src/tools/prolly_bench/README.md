@@ -258,7 +258,7 @@ on a reduced workload.
 ## Write amplification
 
 `configs/s_write_amp.toml` runs the standard procedure's workloads with the
-`write_amp` collector (specs/19-write-amplification.md): for heap and
+`write_amp` collector (specs/20-write-amplification.md): for heap and
 prolly alike, the bytes the server wrote per byte of row data the
 workload wrote.
 
@@ -269,33 +269,60 @@ src/tools/prolly_bench/prolly_bench table
 
 Logical bytes are (rows inserted + rows updated) x the table's average row
 size, from `pg_stat_get_tuples_*()` for the workload's tables. Prolly's
-tables run heap's code, so the same counts cover both engines; deletes
-count as rows, not bytes. The collector's interval is wider than the
-window. Before the window it checkpoints, so the warm-up's dirty pages
-aren't the window's. After the window it waits for the clients to exit,
-then (prolly, S suite) runs `prolly_checkpoint()`, since a plain SQL
-`COMMIT` writes no chunks and their bytes would otherwise go uncounted
-(`write_amp_materialize`). It then reads the WAL and checkpoints again,
-so the window's dirty pages are written. It reports, per unit and as
-ratios to the logical bytes:
+tables run heap's code, so the same counts cover both engines. Deletes
+count as rows, not bytes, and rows of aborted transactions count too.
 
-| Ratio | Bytes |
+The collector's interval is wider than the window:
+
+- **Before the window** it waits for autovacuum workers to exit, then
+  checkpoints, so the warm-up's dirty pages aren't the window's. It
+  doesn't wait for clients: S6 and the V suite's background S1 connect
+  before the window.
+- **After the window** it waits for the clients and autovacuum workers to
+  exit. Autovacuum workers report their counts only when they exit. Then,
+  on prolly in the S suite, it runs `prolly_checkpoint()`, because a
+  plain SQL `COMMIT` writes no chunks and their bytes would otherwise go
+  uncounted (`write_amp_materialize`). It then reads the WAL, checkpoints
+  again so the window's dirty pages are written, and waits for
+  autovacuum once more.
+
+It reports each amount per unit, and as a ratio to the logical bytes:
+
+| Ratio | Bytes written (not synced) |
 |---|---|
-| `wa_wal` | WAL, by LSN difference, split by resource manager with pg_walinspect: rows, indexes, full-page images, prolly's `BlockMap` and `ProllyChunks` records, the rest |
-| `wa_pages` | relation pages written and extended by every backend type (`pg_stat_io`), the checkpointer's included |
-| `wa_tree` | prolly only: the chunk store's journal, table files and manifests (`pg_stat_prolly`), with the copies collection and conjoining made |
-| `wa_server` | all three: everything the server handed the kernel |
+| `wa_wal` | WAL generated, by LSN difference, split by resource manager with pg_walinspect: rows, indexes, full-page images, prolly's `BlockMap` and `ProllyChunks` records, the rest |
+| `wa_pages` | relation pages written and extended by every backend type (`pg_stat_io`, the checkpointer's included), plus prolly's copy-on-write remaps (`wa.pages.bmap_store_bytes`) |
+| `wa_tree` | prolly only: the chunk store's journal, table files and metadata (`pg_stat_prolly`), including the copies collection and conjoining made |
+| `wa_server` | all three |
 
-Every chunk is written twice, once in WAL (`ProllyChunks`) and once in
-the journal. The block map's own page-store writes
-(`wa.pages.bmap_store_bytes`) are reported but not added, since shared
-buffers count the same extends. Ratios are omitted under 64 KiB of logical
-bytes. `table` shows the ratios and a table of every component per
-engine, and each result set's `README.md` shows that table too.
-`write_amp` and `recovery` can't share a run, because after the second
-checkpoint recovery has nothing to replay. A replication slot keeps the
-window's WAL where `wal_level` allows one. The counter runs keep
-`minimal` and take no timed checkpoints, so they run it without one.
+Notes on the totals:
+
+- **Chunks are written twice.** Every chunk goes once into WAL
+  (`ProllyChunks`) and once into the journal.
+- **Extends and bulk writes.** The block map's extends for shared buffers
+  (`wa.pages.bmap_extend_bytes`) duplicate `pg_stat_io`'s extends, so
+  they aren't added. Its bulk writes (`wa.pages.bmap_bulk_bytes`: index
+  builds, copies) aren't added either, because heap's equivalent writes
+  count nowhere. Neither engine's `wa_pages` includes bulk writes.
+- **What isn't counted:** SLRU writes, and WAL's partial-page rewrites.
+- **Small intervals.** Ratios are omitted under 64 KiB of logical bytes,
+  and `table` says why for each n/a.
+
+Reports and run constraints:
+
+- **Reports.** `table` shows the ratios and a table of every component per
+  engine. Each result set's `README.md` shows that table too.
+- **No recovery.** `write_amp` and `recovery` can't share a run, because
+  after the second checkpoint recovery has nothing to replay.
+  `s_write_amp.toml` also leaves out `vacuum`, which would start just
+  after that checkpoint.
+- **WAL retention.** A replication slot keeps the window's WAL where
+  `wal_level` allows one. That WAL can be tens of GB on a long window.
+  The counter runs keep `minimal` and run with no slot. The config refuses
+  `minimal` unless `checkpoint_timeout` exceeds the window.
+- **The gate.** In a counter run, `scounters` gates the logical, WAL and
+  chunk-store totals. It doesn't gate the page totals: those sum every
+  backend type, and how they repeat depends on timing.
 
 ## Comparing builds
 

@@ -36,7 +36,7 @@ C_METRICS = [
     "pass_percent", "records", "ok", "not_ok", "not_implemented", "crashed",
     "timeout", "did_not_run", "skipped", "files", "reruns",
 ]
-# The write_amp collector's components (specs/19), as bytes per completed
+# The write_amp collector's components (specs/20), as bytes per completed
 # unit: (metric, heading).  The server total is WAL + pages + chunk store.
 WA_COMPONENTS = [
     ("wa.logical_bytes_per_operation", "logical"),
@@ -144,7 +144,7 @@ def _wa_table(results: list[dict]) -> str:
     out = ["## Write amplification\n",
            "Bytes written per completed unit over the write_amp interval (the window, "
            "then prolly's fold and a checkpoint), medians over repetitions; WA is the "
-           "server total over the logical bytes (specs/19-write-amplification.md).\n",
+           "server total over the logical bytes (specs/20-write-amplification.md).\n",
            "| workload | size | variant | clients | " +
            " | ".join(h for _, h in WA_COMPONENTS) + " |",
            "|" + "---|" * 4 + "---:|" * len(WA_COMPONENTS)]

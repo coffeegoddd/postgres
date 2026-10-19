@@ -8,9 +8,11 @@
 # shared_buffers.  Counters are read once the measured clients have gone
 # (settled_counters), pg_stat_io's for client backends only.  wal_level is
 # minimal so that no standby snapshots are logged on a timer.  write_amp
-# counts write amplification over the same work (specs/19): without a
+# counts write amplification over the same work (specs/20): without a
 # replication slot at minimal, which it doesn't need, as nothing here
-# checkpoints on a timer.
+# checkpoints on a timer.  Its fold and checkpoint come before space's
+# reading: on prolly, chunk_store_bytes includes the fold (since write_amp
+# was added here; earlier history differs).
 #
 # S7's GiST index varies by a few pages between runs: GiST breaks ties
 # between equally good pages at random (gistchoose()), from a seed no

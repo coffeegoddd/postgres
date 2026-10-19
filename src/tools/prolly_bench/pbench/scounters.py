@@ -22,9 +22,12 @@ EXACT = ("wal_bytes", "wal_records", "wal_fpi", "wal_fpi_bytes",
          "io_hits", "io_reads", "io_writes", "io_extends", "io_evictions", "io_fsyncs",
          "io_read_bytes", "io_write_bytes",
          "relation_bytes", "chunk_store_bytes",
-         # write_amp's totals (its ratios follow from them)
-         "wa.logical_bytes", "wa.wal.total_bytes", "wa.pages.write_bytes",
-         "wa.tree.file_bytes", "wa.server_bytes")
+         # write_amp's totals that count work alike every run.  Not its
+         # pages (nor so the server total): they sum every backend type,
+         # and how often the background writer and the checkpointer write
+         # a page dirtied again is timing (specs/17 reads client backends
+         # for pg_stat_io's counters for that reason)
+         "wa.logical_bytes", "wa.wal.total_bytes", "wa.tree.file_bytes")
 # Instruction counts: close, never exact.
 INSTRUCTIONS = ("instructions_user", "instructions_kernel", "cachegrind_instructions")
 # Each counter's unit and floor kind (events, bytes or instructions).
@@ -35,8 +38,7 @@ _BYTES = {"wal_bytes", "wal_fpi_bytes", "relation_bytes", "chunk_store_bytes",
           "engine.manifest_bytes_written", "engine.gc_bytes_copied",
           "engine.conjoin_bytes_copied", "engine.bmap_store_bytes_written",
           "engine.bmap_extend_bytes_written", "engine.bmap_bulk_bytes_written",
-          "wa.logical_bytes", "wa.wal.total_bytes", "wa.pages.write_bytes",
-          "wa.tree.file_bytes", "wa.server_bytes"}
+          "wa.logical_bytes", "wa.wal.total_bytes", "wa.tree.file_bytes"}
 
 
 def is_counter(metric: str) -> bool:

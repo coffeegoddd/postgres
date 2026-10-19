@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from pbench.collectors.write_amp import MIN_LOGICAL_BYTES
 from pbench.core import registry
 from pbench.core.stats import summarize, paired_ratio_interval
 from pbench.report import HIGHER_IS_BETTER, WA_COMPONENTS, load_results
@@ -157,10 +158,8 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
         return Cell(_STATUS_TEXT["not_applicable"], ok=False,
                     detail="read-only workload")
     if metric in _WA_RATIOS and all(_metric(r, metric) is None for r in ok):
-        absent = all(metric not in r["metrics"] for r in ok)
         return Cell(_STATUS_TEXT["not_applicable"], ok=False,
-                    detail="not measured for this engine" if absent
-                    else "under 64 KiB of logical writes")
+                    detail="; ".join(sorted({_wa_reason(r, metric) for r in ok})))
     s = summarize(_metric(r, metric) for r in ok)
     if s["n"] != len(rs):
         return Cell(f"missing {len(rs) - s['n']}/{len(rs)}", ok=False)
@@ -190,6 +189,21 @@ def _cell(rs: list[dict], metric: str, base: Optional[list[dict]]) -> Cell:
                     else:
                         cell.detail += "; inconclusive at 5% practical effect threshold"
     return cell
+
+
+def _wa_reason(r: dict, metric: str) -> str:
+    """Why a cell has no write-amplification ratio."""
+    status = r.get("collector_status", {}).get("write_amp")
+    if status:
+        return f"write_amp {status[0]}: {status[1]}"
+    m = r["metrics"]
+    if "wa.logical_bytes" not in m:
+        return "write_amp didn't run"
+    if metric not in m:
+        return "not measured for this engine"
+    if (m.get("wa.logical_bytes") or 0) < MIN_LOGICAL_BYTES:
+        return f"under {MIN_LOGICAL_BYTES // 1024} KiB of logical writes"
+    return "the build counts no chunk-store file bytes"
 
 
 def _fmt(x: float) -> str:
