@@ -613,7 +613,8 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */
 	PGSTAT_PROLLY_MEMO_MISSES,	/* and those that didn't */
 	PGSTAT_PROLLY_PAGE_COPIES_FOLD, /* pages copied only to keep a fold's */
-	PGSTAT_PROLLY_PAGE_COPIES_SHARED,	/* pages copied from another branch's */
+	PGSTAT_PROLLY_PAGE_COPIES_SHARED,	/* pages copied because another map
+										 * shares them */
 } PgStat_ProllyCounter;
 
 #define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_PAGE_COPIES_SHARED + 1)

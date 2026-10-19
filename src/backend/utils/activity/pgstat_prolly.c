@@ -5,9 +5,9 @@
  *
  * This file contains the implementation of the prolly engine's work
  * counters: tree nodes read and written, chunks appended, bytes hashed,
- * rows folded, commits, head moves, value memo lookups, pages copied.  It is kept
- * separate from pgstat.c to enforce the line between the statistics access
- * / storage implementation and the details about individual types of
+ * rows folded, commits, head moves, value memo lookups, pages copied.  It
+ * is kept separate from pgstat.c to enforce the line between the statistics
+ * access / storage implementation and the details about individual types of
  * statistics.
  *
  * This statistics kind uses a database's OID as the key of its one entry,
