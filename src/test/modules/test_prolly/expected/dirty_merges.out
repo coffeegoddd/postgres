@@ -740,6 +740,12 @@ SELECT nextval('dms.s');
        1
 (1 row)
 
+SELECT nextval('dms.s');
+ nextval 
+---------
+       2
+(1 row)
+
 SELECT length(dolt_commit('-am', 'feature changes t')::text) AS committed;
  committed 
 -----------
@@ -779,10 +785,10 @@ SELECT id, v FROM dms.u ORDER BY id;
   2 | mine
 (2 rows)
 
-SELECT last_value FROM dms.s;
- last_value 
-------------
-          1
+SELECT last_value, is_called FROM dms.s;
+ last_value | is_called 
+------------+-----------
+          2 | t
 (1 row)
 
 SELECT table_name, status FROM dolt_status ORDER BY 1;

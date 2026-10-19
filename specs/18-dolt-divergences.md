@@ -229,25 +229,31 @@ stash, …) is F, ported with the feature (#163).
   lists the row not written, and the table has one row fewer than
   Dolt's (a count of its rows, as `DELETE`'s, is one lower).
 
-## D13. Rows breaking a check or NOT NULL a merge adds
+## D13. Rows breaking a check a merge adds
 
-- **Dolt:** when one side adds a check constraint or a NOT NULL, the
-  merge checks the rows it merges against it (each row added or changed
-  on either side); a row breaking it stays in the table, and is recorded
-  as a violation.
+- **Dolt:** when one side adds a check constraint, the merge checks the
+  rows it merges against it (each row added or changed on either side);
+  a row breaking it is recorded as a violation and stays in the table
+  (`checkValidator` records an artifact and the row is merged as usual).
 - **Prolly:** the merge checks every row of the merged table against
   it, and a row breaking it, the branch's own included, is taken out of
   the table and recorded as a violation; `violating_row` holds the whole
-  row, to put back once fixed. The constraint is validated. (A foreign
-  key the merge adds keeps its breaking rows, as Dolt's does, recorded.)
-- **Why:** a validated check or NOT NULL is Postgres's promise about
-  every row, which the planner uses to prove quals (constraint
-  exclusion, `IS NULL` on a NOT NULL column), so a table can't hold a
-  row breaking one; validated foreign keys are only estimates to it.
-  Left `NOT VALID`, the merged table's definition would be neither
-  side's, and a commit of it would record a constraint theirs didn't
-  have.
-- **Port:** the breaking row is absent from the table and present in
-  `dolt_constraint_violations` (a count of the table's rows is one lower
-  for each); an assertion reading it after resolving reads it back from
-  `violating_row`, or inserts it fixed.
+  row, to put back once fixed. The check is validated.
+- **Not a divergence:** a NOT NULL a merge adds, as Dolt's. Dolt's
+  `nullValidator` doesn't write theirs' rows breaking it and deletes
+  ours' (`patchBuffer.SendKV(key, nil)`), recording each as a violation
+  (its tests "adding a not-null constraint to one side" and "adding a
+  not-null constraint and default value to a column"); prolly takes
+  them out and records them the same way. Nor is a foreign key a merge
+  adds: its breaking rows stay, recorded, in both.
+- **Why:** left `NOT VALID`, the merged table's definition would be
+  neither side's, and a commit of it would record a constraint theirs
+  didn't have (`convalidated` false), so the check must be validated,
+  and Postgres validates a check only over a table every row of which
+  passes it. (The planner trusts a validated check too, but on a plain
+  table only under `constraint_exclusion = on`.)
+- **Port:** the row breaking a check is absent from the table and
+  present in `dolt_constraint_violations` (a count of the table's rows
+  is one lower for each); an assertion reading it after resolving reads
+  it back from `violating_row`, or inserts it fixed. A NOT NULL case
+  ports as is.

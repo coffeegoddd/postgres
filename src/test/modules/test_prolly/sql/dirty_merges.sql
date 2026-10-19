@@ -215,6 +215,7 @@ SELECT dolt_branch('dms_feature');
 SELECT dolt_checkout('dms_feature');
 UPDATE dms.t SET v = 'feature' WHERE id = 1;
 SELECT nextval('dms.s');
+SELECT nextval('dms.s');
 SELECT length(dolt_commit('-am', 'feature changes t')::text) AS committed;
 SELECT dolt_checkout('main');
 INSERT INTO dms.u VALUES (2, 'mine');
@@ -223,7 +224,7 @@ SELECT (dolt_merge('--squash', 'dms_feature'))[2:4];
 SELECT dolt_hashof('HEAD') = :'dms_head' AS head_kept;
 SELECT id, v FROM dms.t;
 SELECT id, v FROM dms.u ORDER BY id;
-SELECT last_value FROM dms.s;
+SELECT last_value, is_called FROM dms.s;
 SELECT table_name, status FROM dolt_status ORDER BY 1;
 -- over changes to a table the merge changes, it is refused
 SELECT dolt_reset('--hard');
