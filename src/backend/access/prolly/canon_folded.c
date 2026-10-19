@@ -218,16 +218,19 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "10", table and TOAST options, replica
- * identity and column storage, compression and statistics targets described
- * (a materialized view's options and column settings too);
- * "9" left those out, and was the first with what changes how a definition
- * behaves described when it isn't the default (inheritance, and which
- * inherited columns and constraints are a child's own too; typed tables,
- * trigger and rule firing, domain collations and defaults, composite
- * attributes' collations, view options, matviews' indexes and being
- * unpopulated); "8" left those out, and was the first with every float NaN
- * in rows and keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
+ * The format a folded root is in: "11", primary keys whose opfamily
+ * compares them as a type they're binary-coercible to (varchar as text,
+ * cidr as inet) ordered by that comparison, rather than rows keyed by
+ * content; "10" described table and TOAST options, replica identity and
+ * column storage, compression and statistics targets (a materialized
+ * view's options and column settings too); "9" left those out, and was
+ * the first with what changes how a definition behaves described when it
+ * isn't the default (inheritance, and which inherited columns and
+ * constraints are a child's own too; typed tables, trigger and rule
+ * firing, domain collations and defaults, composite attributes'
+ * collations, view options, matviews' indexes and being unpopulated);
+ * "8" left those out, and was the first with every float NaN in rows and
+ * keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
  * own bits, and was the first with indexes described without their
  * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
  * default one, and was the first with definitions' expressions (checks,
@@ -239,9 +242,9 @@ typedef struct BaseTable BaseTable;
  * keyless rows keyed by their first bytes and their hash, and a root
  * without the item keyed them by the hash alone.  A root in another has
  * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions' text isn't this format's.
+ * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"10"
+#define FOLDED_FORMAT	"11"
 
 typedef struct Canon
 {
@@ -3408,7 +3411,7 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
 		visit(name, &data, &description,
 			  kind != 't' ? NULL :
-			  !current ? "it was committed in an older format of prolly's history (commit the branch to write it in the current one)" :
+			  !current ? PROLLY_UNREADABLE_OLDER_FORMAT :
 			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
 			  arg);
 		pfree(name);

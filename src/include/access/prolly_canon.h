@@ -103,6 +103,10 @@ typedef void (*ProllyCanonObjectVisit) (const char *name, ProllyDiffKind kind,
  * the database's collations give now): its name, data and description
  * are still the root's.
  */
+/* Why a root in an older format of prolly's history has unreadable rows. */
+#define PROLLY_UNREADABLE_OLDER_FORMAT \
+	"version was committed in an older format of prolly's history"
+
 typedef void (*ProllyCanonTableVisit) (const char *name,
 									   const ProllyNodeRef *data,
 									   const ProllyValue *description,
