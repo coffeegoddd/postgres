@@ -527,8 +527,8 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 -- A narrowing alike on both sides from text, another type: base's row too
--- long for varchar(3) is kept as base had it too (text and varchar store
--- alike), not refused.
+-- long for varchar(3) doesn't read as one (master failed there), so it's
+-- unsure, not refused; both sides deleted it, so it's gone.
 CREATE TABLE rt.t (id int PRIMARY KEY, v text);
 INSERT INTO rt.t VALUES (1, 'a'), (9, 'abcdefghij');
 SELECT length(dolt_commit('-Am', 't base')::text) AS committed;
@@ -784,7 +784,7 @@ SELECT dolt_checkout('main');
 
 SELECT (dolt_merge('feature', '-m', 'merged cents'))[3:4];
 ERROR:  rows of table "xk" can't be merged across column "n" changing type from numeric to integer
-DETAIL:  A value of the merge base's doesn't convert to the new type as both its cast and its text form say, so which side changed it can't be told, and the table's rows have no key.
+DETAIL:  A value of the merge base's doesn't read faithfully as the new type, so which side changed it can't be told, and the table's rows have no key.
 SELECT * FROM rt.xk ORDER BY id;
  id | n 
 ----+---

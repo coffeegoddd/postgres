@@ -2819,7 +2819,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 									format_type_with_typemod(TupleDescAttr(xd, from[a])->atttypid,
 															 TupleDescAttr(xd, from[a])->atttypmod),
 									format_type_with_typemod(att->atttypid, att->atttypmod)),
-							 errdetail("A value of the merge base's doesn't convert to the new type as both its cast and its text form say, so which side changed it can't be told, and the table's %s.",
+							 errdetail("A value of the merge base's doesn't read faithfully as the new type, so which side changed it can't be told, and the table's %s.",
 									   vr.keyed ? "key holds it" : "rows have no key")));
 				else if (reads[a].loss == LOSS_UNSURE && unsure)
 					unsure_cols = bms_add_member(unsure_cols, a);

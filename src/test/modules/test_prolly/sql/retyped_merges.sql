@@ -175,8 +175,8 @@ SELECT * FROM rt.k ORDER BY id;
 SELECT dolt_branch('-D', 'feature');
 
 -- A narrowing alike on both sides from text, another type: base's row too
--- long for varchar(3) is kept as base had it too (text and varchar store
--- alike), not refused.
+-- long for varchar(3) doesn't read as one (master failed there), so it's
+-- unsure, not refused; both sides deleted it, so it's gone.
 CREATE TABLE rt.t (id int PRIMARY KEY, v text);
 INSERT INTO rt.t VALUES (1, 'a'), (9, 'abcdefghij');
 SELECT length(dolt_commit('-Am', 't base')::text) AS committed;
