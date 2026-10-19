@@ -309,7 +309,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
             group = metric.key.split(".", 1)[0] if "." in metric.key else "other collectors"
             section = additional.setdefault(group, Section(f"Additional metrics: {group}",
                 ["Metric", "Workload", "Size", "Variant", "Clients", "Engine/build", "Completed unit", "Value"],
-                notes=["Units are unspecified for these unregistered metrics. No performance ranking is assigned."], folded=True))
+                notes=["Unregistered metrics (unit unspecified). No performance ranking is assigned."], folded=True))
             for key in keys:
                 for s in sources:
                     rows = groups[s.label].get(key, [])
