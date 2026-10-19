@@ -1,6 +1,10 @@
 -- dolt_diff and dolt_conflicts free what they decoded for a row before
--- the next: a diff of 100,000 rows holds the memory of one row, not of
--- 100,000.  (What a row decoded to is in the tuplestore, which spills.)
+-- the next: a diff of 20,000 rows holds the memory of one row, not of
+-- 20,000.  (What a row decoded to is in the tuplestore, which spills.)
+--
+-- Scheduled last: its commits grow the database's chunk journal by about
+-- 7 MB, and a journal past prolly.gc_journal_threshold may be collected
+-- under a test that reads it by name.
 CREATE SCHEMA dm VERSIONED;
 CREATE TABLE dm.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'dm empty')::text) AS committed;
@@ -9,7 +13,7 @@ SELECT length(dolt_commit('-Am', 'dm empty')::text) AS committed;
         66
 (1 row)
 
-INSERT INTO dm.t SELECT g, repeat('x', 100) FROM generate_series(1, 100000) g;
+INSERT INTO dm.t SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'dm rows')::text) AS committed;
  committed 
 -----------
@@ -21,9 +25,10 @@ SELECT length(dolt_commit('-Am', 'dm rows')::text) AS committed;
 CREATE FUNCTION dm.held() RETURNS bigint VOLATILE LANGUAGE sql
 	AS $$SELECT sum(total_bytes)::bigint FROM pg_backend_memory_contexts$$;
 SET work_mem = '64kB';
--- (about 330 bytes a row were kept: 33 MB)
+-- (when every row's decoding was kept, this held 8 to 25 MB; freed, under
+-- half a MB)
 SELECT dm.held() AS before \gset
-SELECT dm.held() - :before < 8000000 AS bounded, diff_type
+SELECT dm.held() - :before < 4000000 AS bounded, diff_type
 FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.t) LIMIT 1;
  bounded | diff_type 
 ---------+-----------
@@ -31,14 +36,14 @@ FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.t) LIMIT 1;
 (1 row)
 
 SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.t);
- count  
---------
- 100000
+ count 
+-------
+ 20000
 (1 row)
 
 UPDATE dm.t SET v = repeat('y', 100);
 SELECT dm.held() AS before \gset
-SELECT dm.held() - :before < 8000000 AS bounded, diff_type
+SELECT dm.held() - :before < 4000000 AS bounded, diff_type
 FROM dolt_diff('HEAD', 'WORKING', NULL::dm.t) LIMIT 1;
  bounded | diff_type 
 ---------+-----------
@@ -46,9 +51,9 @@ FROM dolt_diff('HEAD', 'WORKING', NULL::dm.t) LIMIT 1;
 (1 row)
 
 SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::dm.t);
- count  
---------
- 100000
+ count 
+-------
+ 20000
 (1 row)
 
 -- Every row in conflict.  (Finding them holds both sides' changes, as
@@ -94,11 +99,11 @@ SELECT (dolt_merge('dm_side'))[2:4];
 SELECT * FROM dolt_conflicts();
  table_name | num_conflicts 
 ------------+---------------
- dm.t       |        100000
+ dm.t       |         20000
 (1 row)
 
 SELECT dm.held() AS found FROM dolt_conflicts() \gset
-SELECT dm.held() - :found < 8000000 AS bounded, our_diff_type, their_diff_type
+SELECT dm.held() - :found < 4000000 AS bounded, our_diff_type, their_diff_type
 FROM dolt_conflicts(NULL::dm.t) LIMIT 1;
  bounded | our_diff_type | their_diff_type 
 ---------+---------------+-----------------
@@ -106,9 +111,9 @@ FROM dolt_conflicts(NULL::dm.t) LIMIT 1;
 (1 row)
 
 SELECT count(*) FROM dolt_conflicts(NULL::dm.t);
- count  
---------
- 100000
+ count 
+-------
+ 20000
 (1 row)
 
 ROLLBACK;

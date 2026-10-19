@@ -57,7 +57,6 @@ tests += {
       'transaction_commits',
       'commit_messages',
       'status_diff',
-      'diff_memory',
       'collations',
       'applier',
       'move_heads',
@@ -115,6 +114,7 @@ tests += {
       'toast_by_content',
       'toast_folds',
       'index_tablespaces',
+      'diff_memory',
     ],
   },
   'tap': {

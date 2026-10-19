@@ -3199,7 +3199,10 @@ rows_end(Rows *r)
 	MemoryContextDelete(r->rowcxt);
 }
 
-/* The row a tree value holds, as a composite datum; and its copies. */
+/*
+ * The row a tree value holds, as a composite datum of its own (the slot
+ * is reused for the next value); and its copies.
+ */
 static Datum
 rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
@@ -3595,9 +3598,9 @@ row_conflict(ProllyConflictSink *self, const ProllyKey *key,
 	MemoryContext old = rows_next(&s->rows);
 
 	if (base)
-		values[0] = datumCopy(rows_datum(&s->rows, base, &count), false, -1);
+		values[0] = rows_datum(&s->rows, base, &count);
 	if (ours)
-		values[1] = datumCopy(rows_datum(&s->rows, ours, &count), false, -1);
+		values[1] = rows_datum(&s->rows, ours, &count);
 	if (theirs)
 		values[2] = rows_datum(&s->rows, theirs, &count);
 	values[3] = CStringGetTextDatum(change_kind(base, ours));
