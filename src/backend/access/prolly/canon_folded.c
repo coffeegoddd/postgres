@@ -15,8 +15,9 @@
  *						   each ("default": the database's)
  *	"f:" function(args)	-> its definition
  *	"m:" materialized view -> its data tree (hash length, hash), then
- *						   whether it is unpopulated and its indexes, a
- *						   line each, then its query
+ *						   whether it is unpopulated, its indexes, its
+ *						   explicit options and its columns' nondefault
+ *						   settings, a line each, then its query
  *	"n:" schema			-> nothing: a versioned schema, there whether or not
  *						   anything is in it
  *	"s:" sequence		-> its definition, then a line of its own, its
@@ -31,11 +32,13 @@
  *						   a range type's definition
  *
  * A table's schema lists its live columns in order (name, type, nullness,
- * collation if not the type's, default, identity, generation), then its
+ * collation if not the type's, default, identity, generation, nondefault
+ * storage, compression and statistics target), then its
  * constraints, indexes, triggers and rules by name, as Postgres's deparser
  * prints them, a trigger or rule that doesn't fire as made with when it
  * does (then its policies and extended statistics, its partitioning, the
- * tables it inherits from and a typed table's type, if any).  Names are
+ * tables it inherits from and a typed table's type, explicit table and
+ * TOAST options, and nondefault replica identity, if any).  Names are
  * qualified whatever the session's search path (it
  * is set to pg_catalog while deparsing), so nothing local, no OID or
  * relfilenumber, and nothing about how the objects came to be (their
@@ -123,8 +126,10 @@
 #include "access/prolly_datum.h"
 #include "access/prolly_keying.h"
 #include "access/relation.h"
+#include "access/reloptions.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/toast_compression.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
@@ -180,6 +185,7 @@
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "common/int.h"
+#include "common/string.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -213,13 +219,19 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "9", what changes how a definition
- * behaves described when it isn't the default (inheritance, and which
- * inherited columns and constraints are a child's own too; typed tables,
- * trigger and rule firing, domain collations and defaults, composite
- * attributes' collations, view options, matviews' indexes and being
- * unpopulated); "8" left those out, and was the first with every float NaN
- * in rows and keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
+ * The format a folded root is in: "11", primary keys whose opfamily
+ * compares them as a type they're binary-coercible to (varchar as text,
+ * cidr as inet) ordered by that comparison, rather than rows keyed by
+ * content; "10" described table and TOAST options, replica identity and
+ * column storage, compression and statistics targets (a materialized
+ * view's options and column settings too); "9" left those out, and was
+ * the first with what changes how a definition behaves described when it
+ * isn't the default (inheritance, and which inherited columns and
+ * constraints are a child's own too; typed tables, trigger and rule
+ * firing, domain collations and defaults, composite attributes'
+ * collations, view options, matviews' indexes and being unpopulated);
+ * "8" left those out, and was the first with every float NaN in rows and
+ * keys the one canonical NaN (prolly_datum.c); "7" had a NaN's
  * own bits, and was the first with indexes described without their
  * tablespaces; "6" had an index's TABLESPACE clause when it wasn't in the
  * default one, and was the first with definitions' expressions (checks,
@@ -231,9 +243,9 @@ typedef struct BaseTable BaseTable;
  * keyless rows keyed by their first bytes and their hash, and a root
  * without the item keyed them by the hash alone.  A root in another has
  * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions' text isn't this format's.
+ * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"9"
+#define FOLDED_FORMAT	"11"
 
 typedef struct Canon
 {
@@ -1002,6 +1014,102 @@ foreign_key_clone(Form_pg_constraint con)
 	return clone;
 }
 
+/* Explicit options, by name, independent of the order they were set in. */
+static List *
+table_options(List *options, Oid relid, const char *prefix)
+{
+	HeapTuple	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	bool		isnull;
+	Datum		value;
+	ListCell   *lc;
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	value = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &isnull);
+	if (!isnull)
+	{
+		foreach(lc, untransformRelOptions(value))
+		{
+			DefElem    *def = lfirst_node(DefElem, lc);
+			StringInfoData line;
+
+			initStringInfo(&line);
+			append_field(&line, psprintf("%s%s", prefix, quote_identifier(def->defname)));
+			appendStringInfoChar(&line, '\t');
+			append_field(&line, quote_literal_cstr(defGetString(def)));
+			options = lappend(options, line.data);
+		}
+	}
+	ReleaseSysCache(tuple);
+	return options;
+}
+
+static const char *
+column_storage(char storage)
+{
+	switch (storage)
+	{
+		case TYPSTORAGE_PLAIN:
+			return "PLAIN";
+		case TYPSTORAGE_EXTERNAL:
+			return "EXTERNAL";
+		case TYPSTORAGE_EXTENDED:
+			return "EXTENDED";
+		case TYPSTORAGE_MAIN:
+			return "MAIN";
+		default:
+			elog(ERROR, "unexpected column storage %c", storage);
+	}
+	return NULL;
+}
+
+/*
+ * A column's settings that aren't its type's or the server's defaults, as
+ * fields: storage, compression method, statistics target.
+ */
+static void
+append_column_settings(StringInfo out, Relation rel, Form_pg_attribute att)
+{
+	HeapTuple	atup;
+	bool		isnull;
+	Datum		target;
+
+	if (att->attstorage != get_typstorage(att->atttypid))
+		appendStringInfo(out, "\tstorage %s", column_storage(att->attstorage));
+	if (CompressionMethodIsValid(att->attcompression))
+		appendStringInfo(out, "\tcompression %s", GetCompressionMethodName(att->attcompression));
+	/* (the statistics target is nullable, outside Form_pg_attribute) */
+	atup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(RelationGetRelid(rel)),
+						   Int16GetDatum(att->attnum));
+	if (!HeapTupleIsValid(atup))
+		elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+			 att->attnum, RelationGetRelid(rel));
+	target = SysCacheGetAttr(ATTNUM, atup, Anum_pg_attribute_attstattarget, &isnull);
+	if (!isnull)
+		appendStringInfo(out, "\tstatistics %d", DatumGetInt16(target));
+	ReleaseSysCache(atup);
+}
+
+/* A replica identity by an index: this, then the index's name. */
+#define IDENTITY_BY_INDEX "USING INDEX "
+
+/*
+ * A table's (or materialized view's) explicit options, sorted, its TOAST
+ * table's prefixed "toast.".  Its TOAST table's only if it needs one: one
+ * left over from columns since dropped isn't made again with the table, so
+ * its options wouldn't be either.
+ */
+static List *
+described_options(Relation rel)
+{
+	List	   *options = table_options(NIL, RelationGetRelid(rel), "");
+
+	if (OidIsValid(rel->rd_rel->reltoastrelid) && table_relation_needs_toast_table(rel))
+		options = table_options(options, rel->rd_rel->reltoastrelid, "toast.");
+	list_sort(options, cstring_cmp);
+	return options;
+}
+
 static void
 describe_table(Canon *cn, Relation rel, StringInfo out)
 {
@@ -1053,6 +1161,7 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 			appendStringInfo(out, "\tidentity %c", att->attidentity);
 		if (att->attgenerated)
 			appendStringInfo(out, "\tstored %c", att->attgenerated);
+		append_column_settings(out, rel, att);
 		appendStringInfoChar(out, '\n');
 	}
 
@@ -1235,6 +1344,35 @@ describe_table(Canon *cn, Relation rel, StringInfo out)
 		foreach(lc, local)
 			appendStringInfo(out, "%s\n", (char *) lfirst(lc));
 	}
+
+	/* Local placement is not versioned; explicit tuning options are. */
+	{
+		List	   *options = described_options(rel);
+
+		if (options != NIL)
+			appendStringInfoString(out, "options\n");
+		foreach(lc, options)
+			appendStringInfo(out, "%s\n", (char *) lfirst(lc));
+	}
+	if (rel->rd_rel->relreplident != REPLICA_IDENTITY_DEFAULT)
+	{
+		Oid			index = RelationGetReplicaIndex(rel);
+
+		appendStringInfoString(out, "replica identity\n");
+		if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+			appendStringInfoString(out, "FULL");
+		else if (OidIsValid(index))
+		{
+			appendStringInfoString(out, IDENTITY_BY_INDEX);
+			append_field(out, quote_identifier(get_rel_name(index)));
+		}
+		else
+		{
+			/* A dropped identity index leaves mode i, behaving as NOTHING. */
+			appendStringInfoString(out, "NOTHING");
+		}
+		appendStringInfoChar(out, '\n');
+	}
 }
 
 /*
@@ -1270,17 +1408,25 @@ append_view_options(StringInfo out, Oid view)
 /* A materialized view's line before its query for its being unpopulated. */
 #define MATVIEW_UNPOPULATED "with no data"
 
+/* A materialized view's lines for its options and its columns' settings. */
+#define MATVIEW_OPTION "option\t"
+#define MATVIEW_COLUMN "column\t"
+
 /*
  * What a materialized view has besides its query, a line each before it:
  * whether it is unpopulated (made WITH NO DATA, not refreshed since), then
- * its indexes by name, as a table's are.  (Neither begins with a space or
- * a parenthesis, as the query does.)
+ * its indexes by name, as a table's are, then its explicit options (as a
+ * table's) and the columns with settings that aren't their defaults (each
+ * as a table's column line, its name and those).  (None begins with a
+ * space or a parenthesis, as the query does.)
  */
 static void
 append_matview_state(StringInfo out, Form_pg_class form)
 {
 	Relation	rel = relation_open(form->oid, AccessShareLock);
 	List	   *indexes = list_copy(RelationGetIndexList(rel));
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	StringInfoData settings;
 	ListCell   *lc;
 
 	if (!form->relispopulated)
@@ -1291,6 +1437,24 @@ append_matview_state(StringInfo out, Form_pg_class form)
 		append_field(out, pg_get_indexdef_string_notblspc(lfirst_oid(lc)));
 		appendStringInfoChar(out, '\n');
 	}
+	foreach(lc, described_options(rel))
+		appendStringInfo(out, MATVIEW_OPTION "%s\n", (char *) lfirst(lc));
+	initStringInfo(&settings);
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+		resetStringInfo(&settings);
+		append_column_settings(&settings, rel, att);
+		if (settings.len == 0)
+			continue;
+		appendStringInfoString(out, MATVIEW_COLUMN);
+		append_field(out, quote_identifier(NameStr(att->attname)));
+		appendStringInfo(out, "%s\n", settings.data);
+	}
+	pfree(settings.data);
 	relation_close(rel, AccessShareLock);
 }
 
@@ -3248,12 +3412,90 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
 		visit(name, &data, &description,
 			  kind != 't' ? NULL :
-			  !current ? "it was committed in an older format of prolly's history (commit the branch to write it in the current one)" :
+			  !current ? PROLLY_UNREADABLE_OLDER_FORMAT :
 			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
 			  arg);
 		pfree(name);
 	}
 	PROLLY_CALL(cn.tree, cursor_close, c);
+}
+
+static char *from_utf8(const uint8 *data, int len);
+
+/*
+ * A literal's value, as quote_literal_cstr() wrote it: quotes doubled, and
+ * backslashes too if it begins E.
+ */
+static char *
+literal_value(const char *literal)
+{
+	bool		e = literal[0] == 'E';
+	const char *p = literal + (e ? 1 : 0);
+	StringInfoData out;
+
+	if (*p++ != '\'')
+		elog(ERROR, "invalid canonical literal %s", literal);
+	initStringInfo(&out);
+	for (; *p; p++)
+	{
+		if (*p == '\'' && p[1] == '\'')
+			p++;
+		else if (*p == '\'')
+			break;
+		else if (e && *p == '\\' && p[1] == '\\')
+			p++;
+		appendStringInfoChar(&out, *p);
+	}
+	if (*p != '\'' || p[1] != '\0')
+		elog(ERROR, "invalid canonical literal %s", literal);
+	return out.data;
+}
+
+/* Saved type definitions accompany historical rows; labels are not OIDs. */
+static List *
+folded_type_definitions(const ProllyNodeRef *root)
+{
+	Canon		cn;
+	ProllyTreeCursor *cur;
+	ProllyKey	from = {(const uint8 *) "y:", 2};
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *types = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	if (!root_in_format(&cn, root))
+		return NIL;
+	cur = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, cur, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, cur, &k, &v))
+	{
+		ProllyTypeDefinition *e;
+		char	   *line;
+
+		if (k.len < 2 || memcmp(k.data, "y:", 2) != 0)
+			break;
+		e = palloc0(sizeof(ProllyTypeDefinition));
+		e->name = from_utf8(k.data + 2, k.len - 2);
+		e->definition = from_utf8(v.data, v.len);
+		types = lappend(types, e);
+		if (v.len < 5 || memcmp(v.data, "enum\n", 5) != 0)
+			continue;
+		line = e->definition + 5;
+		while (*line)
+		{
+			char	   *next = strchr(line, '\n');
+			char	   *field;
+
+			if (next == NULL)
+				elog(ERROR, "invalid canonical enum definition");
+			field = unescape_field(pnstrdup(line, next - line));
+			e->labels = lappend(e->labels, makeString(literal_value(field)));
+			line = next + 1;
+		}
+	}
+	PROLLY_CALL(cn.tree, cursor_close, cur);
+	return types;
 }
 
 /* The tables of a folded root: its "t:" items. */
@@ -3273,8 +3515,6 @@ folded_materialized_views(const ProllyNodeRef *root,
 }
 
 /* An item's value without the data tree a table's or view's starts with. */
-static char *from_utf8(const uint8 *data, int len);
-
 /* (and without a sequence's value) */
 static void
 definition_of(const ProllyKey *k, const ProllyValue *v, ProllyValue *def)
@@ -3570,6 +3810,9 @@ typedef struct TableDef
 	char	   *partition_of;	/* a partition's parent and bound (escaped), or NULL */
 	List	   *inherits;		/* the tables it inherits from, in order */
 	char	   *of;				/* a typed table's type, or NULL */
+	List	   *options;		/* lines: option name, a tab, SQL literal */
+	List	   *replica_identity;	/* one statement suffix, or NIL for
+									 * DEFAULT */
 	List	   *local;			/* local_line()s: what it inherits that is
 								 * its own too */
 } TableDef;
@@ -3684,6 +3927,10 @@ parse_table_def(const char *def, TableDef *td)
 			section = &td->inherits;
 		else if (strcmp(line, "local") == 0)
 			section = &td->local;
+		else if (strcmp(line, "options") == 0)
+			section = &td->options;
+		else if (strcmp(line, "replica identity") == 0)
+			section = &td->replica_identity;
 		else if (strcmp(line, "of") == 0)
 		{
 			section = NULL;
@@ -3714,7 +3961,8 @@ parse_table_def(const char *def, TableDef *td)
 			*field = field == &td->partition_by ? unescape_field(line) : pstrdup(line);
 		}
 		else if (section == &td->columns || section == &td->constraints ||
-				 section == &td->statistics || section == &td->local)
+				 section == &td->statistics || section == &td->local ||
+				 section == &td->options)
 			*section = lappend(*section, pstrdup(line));	/* (fields escaped) */
 		else if (section)
 			*section = lappend(*section, unescape_field(line));
@@ -3967,9 +4215,13 @@ schema_of(const char *qualified_name)
 	return NULL;
 }
 
-/* A column, as CREATE TABLE and ADD COLUMN write it. */
+/*
+ * A column of table, as CREATE TABLE and ADD COLUMN write it; with what
+ * must run right after that statement appended to *after.
+ */
 static char *
-column_sql(const char *line)
+column_sql(const char *table, const char *line, List *constraints,
+		   List **after)
 {
 	char	   *copy = pstrdup(line);
 	char	   *name = strtok(copy, "\t");
@@ -4010,8 +4262,43 @@ column_sql(const char *line)
 	else if (def)
 		appendStringInfo(&sql, " DEFAULT %s", def);
 	if (identity)
+	{
+		char	   *prefix = psprintf("NOT NULL %s", name);
+		size_t		len = strlen(prefix);
+		ListCell   *lc;
+
+		/*
+		 * Give the identity's implicit NOT NULL its recorded name now.
+		 * Automatic naming may choose another name if, for example, a
+		 * child still has the constraint inherited from a remade parent.
+		 * Postgres refuses NO INHERIT beside IDENTITY in a column
+		 * definition, though ALTER can make a table with both: the
+		 * constraint is made inheritable, then made NO INHERIT right after.
+		 */
+		foreach(lc, constraints)
+		{
+			const char *constraint = lfirst(lc);
+			char	   *definition = constraint_def(constraint);
+
+			if (strncmp(definition, prefix, len) == 0 &&
+				(definition[len] == '\0' || definition[len] == ' '))
+			{
+				const char *rest = definition + len;
+
+				appendStringInfo(&sql, " CONSTRAINT %s NOT NULL",
+								 first_field(constraint));
+				if (strcmp(rest, " NO INHERIT") == 0)
+					*after = lappend(*after,
+									 psprintf("ALTER TABLE %s ALTER CONSTRAINT %s NO INHERIT",
+											  table, first_field(constraint)));
+				else
+					appendStringInfoString(&sql, rest);
+				break;
+			}
+		}
 		appendStringInfo(&sql, " GENERATED %s AS IDENTITY",
 						 identity == 'a' ? "ALWAYS" : "BY DEFAULT");
+	}
 	return sql.data;
 }
 
@@ -4250,6 +4537,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 	if (from == NULL || remake)
 	{
 		StringInfoData sql;
+		List	   *after_columns = NIL;
 
 		if (from != NULL)
 			(void) move_table(sm, name, from, NULL);
@@ -4265,12 +4553,14 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			appendStringInfo(&sql, "CREATE TABLE %s (", name);
 			foreach(lc, to->columns)
 				appendStringInfo(&sql, "%s%s", foreach_current_index(lc) ? ", " : "",
-								 column_sql(lfirst(lc)));
+								 column_sql(name, lfirst(lc), to->constraints,
+											&after_columns));
 			appendStringInfoChar(&sql, ')');
 		}
 		if (to->partition_by)
 			appendStringInfo(&sql, " PARTITION BY %s", to->partition_by);
 		sm->changes = lappend(sm->changes, sql.data);
+		sm->changes = list_concat(sm->changes, after_columns);
 
 		/* sequences its defaults draw from, that no column owns: its own */
 		sm->changes = lappend(sm->changes,
@@ -4326,9 +4616,13 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 
 			if (i < 0)
 			{
+				List	   *after_column = NIL;
+
 				sm->changes = lappend(sm->changes,
 									  psprintf("ALTER TABLE %s ADD COLUMN %s",
-											   name, column_sql(line)));
+											   name, column_sql(name, line, to->constraints,
+																&after_column)));
+				sm->changes = list_concat(sm->changes, after_column);
 				continue;
 			}
 			old = list_nth(from->columns, i);
@@ -4359,6 +4653,47 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 											   name, col));
 		}
 	}
+
+	/*
+	 * Type changes reset storage and compression; a new partition inherits
+	 * them.  Reapply explicit values even when the column line is unchanged:
+	 * type_moves() may have redefined its named type.  Do not recurse into a
+	 * child whose own description may specify something else.
+	 */
+	foreach(lc, to->columns)
+	{
+		const char *line = lfirst(lc);
+		char	   *col = first_field(line);
+		const char *old = NULL;
+		ListCell   *c;
+		static const char *const fields[] = {"storage ", "compression ", "statistics "};
+		static const char *const defaults[] = {"DEFAULT", "default", "-1"};
+
+		foreach(c, from->columns)
+			if (strcmp(first_field(lfirst(c)), col) == 0)
+				old = lfirst(c);
+		for (int i = 0; i < lengthof(fields); i++)
+		{
+			char	   *value = column_attr(line, fields[i]);
+			char	   *before = old ? column_attr(old, fields[i]) : NULL;
+
+			if (value || before || (to->partition_of && !old))
+				sm->changes = lappend(sm->changes,
+									  psprintf("ALTER TABLE ONLY %s ALTER COLUMN %s SET %s%s",
+											   name, col, fields[i], value ? value : defaults[i]));
+		}
+	}
+
+	/* Reset removed options, then set changed ones, including TOAST's. */
+	foreach(lc, from->options)
+		if (!list_has_string(to->options, lfirst(lc)))
+			sm->changes = lappend(sm->changes,
+								  psprintf("ALTER TABLE ONLY %s RESET (%s)", name, first_field(lfirst(lc))));
+	foreach(lc, to->options)
+		if (!list_has_string(from->options, lfirst(lc)))
+			sm->changes = lappend(sm->changes,
+								  psprintf("ALTER TABLE ONLY %s SET (%s = %s)", name,
+										   first_field(lfirst(lc)), constraint_def(lfirst(lc))));
 
 	/*
 	 * A typed table's type: it stops being one before its columns change
@@ -4478,7 +4813,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			}
 
 			/*
-			 * (an identity column, or a key, may have made it already; a
+			 * (an identity column, whose column definition gives its NOT
+			 * NULL this recorded name, or a key, may have made it already; a
 			 * partition's partitioned table, its own)
 			 */
 			if (not_null || to->partition_of)
@@ -4526,6 +4862,16 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		if (!owned && !list_has_string(from->indexes, lfirst(lc)))
 			sm->after = lappend(sm->after, pstrdup(lfirst(lc)));
 	}
+
+	/*
+	 * The identity index must exist first.  Reapply even an unchanged
+	 * identity: its index may have been dropped and made again above.
+	 */
+	if (to->replica_identity != NIL || from->replica_identity != NIL)
+		sm->after = lappend(sm->after,
+							psprintf("ALTER TABLE ONLY %s REPLICA IDENTITY %s", name,
+									 to->replica_identity ? (char *) linitial(to->replica_identity) : "DEFAULT"));
+
 	foreach(lc, to->triggers)
 		if (!list_has_string(from->triggers, lfirst(lc)))
 			make_firing(&sm->after, name, lfirst(lc), true);
@@ -4930,9 +5276,15 @@ create_cast_sql(const char *name, const char *def)
 	return sql.data;
 }
 
-/* A type, as described ("enum", "domain", "composite" or "range", then lines). */
+/*
+ * A type, as described ("enum", "domain", "composite" or "range", then
+ * lines).  A domain's unvalidated checks, which CREATE DOMAIN can't make,
+ * are appended to *unvalidated as ALTER DOMAIN, to run once the columns
+ * using it have moved to it: as on a live database, the values those
+ * columns have are then kept.
+ */
 static char *
-create_type_sql(const char *name, const char *def)
+create_type_sql(const char *name, const char *def, List **unvalidated)
 {
 	char	   *copy = pstrdup(def);
 	char	   *kind = strtok(copy, "\n");
@@ -5020,8 +5372,23 @@ create_type_sql(const char *name, const char *def)
 			(strlen(def) < 9 || strcmp(def + strlen(def) - 9, "\tNOT NULL") != 0))
 			appendStringInfoString(&sql, " NOT NULL");
 		while ((line = strtok(NULL, "\n")) != NULL)
-			appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
-							 constraint_def(line));
+		{
+			char	   *condef = constraint_def(line);
+
+			/*
+			 * CREATE DOMAIN cannot accept NOT VALID: those checks come after
+			 * (above).  Validated checks stay inline: ALTER would scan
+			 * existing uses.  Test the deparser's suffix, not words inside
+			 * an expression.
+			 */
+			if (pg_str_endswith(condef, " NOT VALID"))
+				*unvalidated = lappend(*unvalidated,
+									   psprintf("ALTER DOMAIN %s ADD CONSTRAINT %s %s",
+												name, first_field(line), condef));
+			else
+				appendStringInfo(&sql, " CONSTRAINT %s %s", first_field(line),
+								 condef);
+		}
 	}
 	return sql.data;
 }
@@ -5121,7 +5488,11 @@ make_matview_sql(const char *name, const char *def)
 	const char *query = def;
 	bool		populated = true;
 	List	   *indexes = NIL;
+	List	   *settings = NIL;
+	StringInfoData with;
 	size_t		len;
+
+	initStringInfo(&with);
 
 	while (*query && *query != ' ' && *query != '(')
 	{
@@ -5133,6 +5504,28 @@ make_matview_sql(const char *name, const char *def)
 		line = pnstrdup(query, nl - query);
 		if (strcmp(line, MATVIEW_UNPOPULATED) == 0)
 			populated = false;
+		else if (strncmp(line, MATVIEW_OPTION, strlen(MATVIEW_OPTION)) == 0)
+		{
+			const char *option = line + strlen(MATVIEW_OPTION);
+
+			appendStringInfo(&with, "%s%s = %s", with.len > 0 ? ", " : "",
+							 first_field(option), constraint_def(option));
+		}
+		else if (strncmp(line, MATVIEW_COLUMN, strlen(MATVIEW_COLUMN)) == 0)
+		{
+			const char *column = line + strlen(MATVIEW_COLUMN);
+			static const char *const fields[] = {"storage ", "compression ", "statistics "};
+
+			for (int i = 0; i < lengthof(fields); i++)
+			{
+				char	   *value = column_attr(column, fields[i]);
+
+				if (value)
+					settings = lappend(settings,
+									   psprintf("ALTER MATERIALIZED VIEW %s ALTER COLUMN %s SET %s%s",
+												name, first_field(column), fields[i], value));
+			}
+		}
 		else
 			indexes = lappend(indexes, unescape_field(line));
 		query = nl + 1;
@@ -5141,9 +5534,10 @@ make_matview_sql(const char *name, const char *def)
 	len = strlen(query);
 	if (len > 0 && query[len - 1] == ';')
 		len--;
-	return lcons(psprintf("CREATE MATERIALIZED VIEW %s AS %.*s WITH %sDATA", name,
+	return lcons(psprintf("CREATE MATERIALIZED VIEW %s%s%s%s AS %.*s WITH %sDATA", name,
+						  with.len > 0 ? " WITH (" : "", with.data, with.len > 0 ? ")" : "",
 						  (int) len, query, populated ? "" : "NO "),
-				 indexes);
+				 list_concat(settings, indexes));
 }
 
 static void
@@ -5339,7 +5733,10 @@ typedef struct TypeMoves
 	List	   *creates;		/* the types made (these and new ones), in any
 								 * order */
 	List	   *converts;		/* the columns using them moved to the new */
+	List	   *unvalidated;	/* then the new domains' unvalidated checks */
 	List	   *tables;			/* the tables of those columns */
+	List	   *detached;		/* typed tables detached before their types
+								 * are replaced */
 	List	   *drops;			/* the old ones, in any order */
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
@@ -5475,18 +5872,34 @@ same_table_line(const MoveItem *f, const MoveItem *t, int section, const char *n
 	return a && b && strcmp(a, b) == 0;
 }
 
+/* Whether a partitioned table's key uses its column attnum. */
+static bool
+in_partition_key(Oid relid, AttrNumber attnum)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	bool		expr;
+	bool		used = has_partition_attrs(rel,
+										   bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber),
+										   &expr);
+
+	table_close(rel, AccessShareLock);
+	return used;
+}
+
 /*
  * The statements that make the types to defines otherwise than from, under
  * their names, and those that use them, in turn: each renamed aside, made
  * anew, the columns of versioned tables using it (or arrays of it)
  * converted, and the old dropped.  What uses one is found through what
  * depends on it: a composite type or a domain the branch has is moved
- * with it (as to defines it); a check constraint, an index or a default of
- * a versioned table, or a routine, is dropped first and made again after
- * (as to defines it, if alike; the table's or routine's own move does the
- * rest).  Anything else using it (a column of another schema's table, an
- * operator) can't be moved with it: refused.  Views and materialized views
- * using them go and come back with the others (folded_move_schema()).
+ * with it (as to defines it); typed tables are detached for move_table()
+ * to attach again once their columns match; a check constraint, an index
+ * or a default of a versioned table, or a routine, is dropped first and
+ * made again after (as to defines it, if alike; the table's or routine's
+ * own move does the rest).  Anything else using it (a column of another
+ * schema's table, an operator) can't be moved with it: refused.  Views and
+ * materialized views using them go and come back with the others
+ * (folded_move_schema()).
  */
 static TypeMoves
 type_moves(List *from, List *to)
@@ -5518,7 +5931,8 @@ type_moves(List *from, List *to)
 								f->name),
 						 errdetail("A range type in use can't be changed in place; a move can't change one either.")));
 			tm.before = lappend(tm.before, psprintf("DROP TYPE %s", f->name));
-			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def,
+															 &tm.unvalidated));
 			tm.any = true;
 			continue;
 		}
@@ -5579,13 +5993,56 @@ type_moves(List *from, List *to)
 							(void) move_type(&moved, from, to, ct, mt->from->name);
 						handled = true;
 					}
-					else if (kind == RELKIND_RELATION && versioned && d->objsubid > 0)
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid == 0 && !array)
+					{
+						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
+						MoveItem   *f = find_item(from, 't', rel);
+						TableDef	fd;
+
+						if (f)
+						{
+							parse_table_def(f->def, &fd);
+							if (same_strings(fd.of, mt->from->name))
+							{
+								tm.before = lappend(tm.before, psprintf("ALTER TABLE %s NOT OF", rel));
+								tm.detached = lappend(tm.detached, rel);
+								handled = true;
+							}
+						}
+					}
+					else if (kind == RELKIND_PARTITIONED_TABLE && versioned &&
+							 d->objsubid > 0 && in_partition_key(d->objid, d->objsubid))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("the branch can't be moved to a commit that defines type %s otherwise",
+										mt->from->name),
+								 errdetail("%s uses it, in the table's partition key, which can't change type.",
+										   getObjectDescription(&obj, false))));
+					else if ((kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE) &&
+							 versioned && d->objsubid > 0)
 					{
 						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
 						const char *col = quote_identifier(get_attname(d->objid, d->objsubid, false));
 						char	   *conv;
+						bool		inherited = false;
 
-						if (array)
+						/*
+						 * (a partition's inherited column is its parent's:
+						 * converting the parent's converts it)
+						 */
+						if (get_rel_relispartition(d->objid))
+						{
+							HeapTuple	at = SearchSysCache2(ATTNUM, ObjectIdGetDatum(d->objid),
+															 Int16GetDatum(d->objsubid));
+
+							if (!HeapTupleIsValid(at))
+								elog(ERROR, "cache lookup failed for attribute %d of relation %u",
+									 d->objsubid, d->objid);
+							inherited = ((Form_pg_attribute) GETSTRUCT(at))->attinhcount > 0;
+							ReleaseSysCache(at);
+						}
+						if (array && !inherited)
 						{
 							/*
 							 * (an array's elements one by one, as a function:
@@ -5608,7 +6065,7 @@ type_moves(List *from, List *to)
 							tm.converts = lappend(tm.converts,
 												  psprintf("DROP FUNCTION %s(%s[])", fn, mt->aside));
 						}
-						else
+						else if (!inherited)
 							tm.converts = lappend(tm.converts,
 												  psprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s",
 														   rel, col, mt->to->name,
@@ -5758,7 +6215,8 @@ type_moves(List *from, List *to)
 		tm.before = lappend(tm.before,
 							psprintf("ALTER TYPE %s RENAME TO %s", mt->from->name,
 									 strrchr(mt->aside, '.') + 1));
-		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def));
+		tm.creates = lappend(tm.creates, create_type_sql(mt->to->name, mt->to->def,
+														 &tm.unvalidated));
 		tm.drops = lappend(tm.drops, psprintf("DROP TYPE %s", mt->aside));
 	}
 	tm.before = list_concat(list_copy(tm.aggregate_drops), tm.before);
@@ -6279,9 +6737,15 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		TableDef	fd;
 		TableDef	td;
 
-		if (f->kind != 't' || (t && strcmp(t->def, f->def) == 0))
+		if (f->kind != 't' ||
+			(t && strcmp(t->def, f->def) == 0 &&
+			 !list_has_string(tm.tables, f->name) &&
+			 !list_has_string(tm.detached, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
+		/* type_moves() detaches it first; move_table() restores to's link. */
+		if (list_has_string(tm.detached, f->name))
+			fd.of = NULL;
 		if (t)
 			parse_table_def(t->def, &td);
 		if (move_table(&sm, f->name, &fd, t ? &td : NULL))
@@ -6435,7 +6899,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			collation_makes = lappend(collation_makes,
 									  create_collation_sql(t->name, t->def));
 		else if (t->kind == 'y' && f == NULL)
-			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def));
+			tm.creates = lappend(tm.creates, create_type_sql(t->name, t->def,
+															 &tm.unvalidated));
 		else if (t->kind == 's' && !f && list_has_string(identities, t->name))
 			sm.after = lappend(sm.after,
 							   psprintf("ALTER SEQUENCE %s %s", t->name,
@@ -6655,7 +7120,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	/*
 	 * Types first, in turn (type_moves()): new schemas made once the types
 	 * changed are aside, all the types made (each after those it uses), the
-	 * columns using the changed ones moved, the old ones dropped.
+	 * columns using the changed ones moved, the new domains' unvalidated
+	 * checks added, the old ones dropped.
 	 */
 	run_statements(tm.before);
 	run_statements(schemas);
@@ -6663,6 +7129,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(collation_makes);	/* (types and columns may use them) */
 	make_views(tm.creates);
 	run_statements(tm.converts);
+	run_statements(tm.unvalidated);
 	make_views(tm.drops);
 	run_statements(tm.after);
 	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
@@ -6746,7 +7213,8 @@ folded_move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
  */
 static const char *const table_sections[] = {
 	"columns", "constraints", "indexes", "triggers", "rules", "policies",
-	"statistics", "partition by", "partition of", "inherits", "of", "local"
+	"statistics", "partition by", "partition of", "inherits", "of", "local",
+	"options", "replica identity"
 };
 #define NUM_TABLE_SECTIONS lengthof(table_sections)
 #define ALWAYS_WRITTEN_SECTIONS 5
@@ -6804,6 +7272,7 @@ table_line_key(int s, const char *line)
 		case 7:
 		case 8:
 		case 10:
+		case 13:
 			return pstrdup("");	/* (one line, the table's) */
 		default:
 			return pnstrdup(line, strcspn(line, "\t"));	/* its first field */
@@ -6883,6 +7352,7 @@ set_table_line_sort(int s, TableLine *l)
 		case 1:
 		case 6:
 		case 11:
+		case 12:
 			l->sort = unconstify(char *, l->line);
 			break;
 		case 2:
@@ -6952,17 +7422,33 @@ same_line(const TableLine *a, const TableLine *b)
  * (and trigger, rule, policy, statistics object; and its partitioning) as
  * the side that changed it has it, both alike as they have it.  Columns
  * come in ours' order, then those only theirs added, in theirs'.  NULL if
- * both changed a part differently: a schema conflict.
+ * both changed a part differently, a merged local marker names a column
+ * or constraint the merge drops, or a drop would discard a part the other
+ * side kept while removing an inheritance parent: a schema conflict.
  */
 static char *
 merge_table_defs(const char *base, const char *ours, const char *theirs)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
+	List	   *indexes = NIL;
+	List	   *local_parts = NIL; /* local markers for the parts kept */
+	bool		detached[3] = {false, false, false};
 	StringInfoData out;
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
 		!split_table_def(theirs, sec[2]))
 		return NULL;
+	for (int side = 1; side < 3; side++)
+	{
+		foreach_ptr(char, parent, sec[0][9])
+		{
+			if (!list_has_string(sec[side][9], parent))
+			{
+				detached[side] = true;
+				break;
+			}
+		}
+	}
 	initStringInfo(&out);
 	for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
 	{
@@ -7002,7 +7488,18 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 			else
 				return NULL;
 			if (m == NULL)
+			{
+				/*
+				 * NO INHERIT can make a retained part local without a
+				 * local marker: it no longer has an inheritance count.
+				 * Don't let the other side's drop silently discard it.
+				 * Both sides dropping the part is still agreement.
+				 */
+				if ((s == 0 || s == 1) &&
+					((x[1] && detached[1]) || (x[2] && detached[2])))
+					return NULL;
 				continue;
+			}
 
 			/* (where it comes: as ours has it, then theirs, then base) */
 			merged[n] = *m;
@@ -7017,11 +7514,37 @@ merge_table_defs(const char *base, const char *ours, const char *theirs)
 			qsort(merged, n, sizeof(TableLine), table_line_sort_cmp);
 		if (s == 1 && !constraints_compatible(merged, n))
 			return NULL;
+		if (s == 2)
+			for (int i = 0; i < n; i++)
+				indexes = lappend(indexes, merged[i].key);
+
+		/*
+		 * (a replica identity by an index one side set, the other dropped:
+		 * neither side's)
+		 */
+		if (s == 13 && n == 1 &&
+			strncmp(merged[0].line, IDENTITY_BY_INDEX, strlen(IDENTITY_BY_INDEX)) == 0 &&
+			!list_has_string(indexes,
+							 unquoted(unescape_field(merged[0].line + strlen(IDENTITY_BY_INDEX)))))
+			return NULL;
 		if (n == 0 && s >= ALWAYS_WRITTEN_SECTIONS)
 			continue;
 		appendStringInfo(&out, "%s\n", table_sections[s]);
 		for (int i = 0; i < n; i++)
+		{
+			if (s == 0 || s == 1)
+				local_parts = lappend(local_parts,
+									 psprintf("%s %s", s == 0 ? "column" : "constraint",
+											  merged[i].key));
+			/*
+			 * Locality and the part's definition merge separately.  One
+			 * side making an inherited part local mustn't lose it to the
+			 * other side's drop from the parent.
+			 */
+			else if (s == 11 && !list_has_string(local_parts, merged[i].line))
+				return NULL;
 			appendStringInfo(&out, "%s\n", merged[i].line);
+		}
 	}
 	return out.data;
 }
@@ -7582,6 +8105,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.merge_schema = folded_merge_schema,
 	.walk_baseline = folded_walk_baseline,
 	.table_columns = folded_table_columns,
+	.type_definitions = folded_type_definitions,
 	.in_format = folded_in_format,
 	.format = folded_format,
 };

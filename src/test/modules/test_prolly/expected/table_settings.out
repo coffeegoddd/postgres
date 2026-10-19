@@ -1,0 +1,895 @@
+-- Explicit table tuning and replication settings are versioned, including
+-- resets to defaults.  Catalog order and physical placement aren't identity.
+-- Keep the remote history independent of other regression tests.
+SELECT current_database() AS settings_home \gset
+CREATE DATABASE regress_table_settings;
+\c regress_table_settings
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA settings VERSIONED;
+CREATE TABLE settings.opts (id int PRIMARY KEY, value text);
+CREATE TABLE settings.repl (id int PRIMARY KEY, value text);
+CREATE TABLE settings.storage (value text);
+CREATE TABLE settings.compression (value text);
+CREATE TABLE settings.stats (value text);
+INSERT INTO settings.opts VALUES (1, 'one');
+SELECT (dolt_commit('-Am', 'defaults'))[1] AS defaults \gset
+ALTER TABLE settings.opts SET (fillfactor = 70, autovacuum_enabled = false,
+  toast.autovacuum_enabled = false, parallel_workers = 2, vacuum_truncate = false);
+ALTER TABLE settings.repl REPLICA IDENTITY FULL;
+ALTER TABLE settings.storage ALTER COLUMN value SET STORAGE EXTERNAL;
+ALTER TABLE settings.compression ALTER COLUMN value SET COMPRESSION pglz;
+ALTER TABLE settings.stats ALTER COLUMN value SET STATISTICS 1000;
+SELECT * FROM dolt_status() ORDER BY table_name;
+      table_name      | staged |  status  
+----------------------+--------+----------
+ settings.compression | t      | modified
+ settings.opts        | t      | modified
+ settings.repl        | t      | modified
+ settings.stats       | t      | modified
+ settings.storage     | t      | modified
+(5 rows)
+
+SELECT (dolt_commit('-Am', 'settings'))[1] AS changed \gset
+SELECT test_fold_root() = prolly_root_hash(:'defaults') AS same_root;
+ same_root 
+-----------
+ f
+(1 row)
+
+SELECT key, substring(value from position(E'columns\n' in value)) AS definition
+  FROM test_fold_items() WHERE key LIKE 't:settings.%' ORDER BY key;
+          key           |                           definition                            
+------------------------+-----------------------------------------------------------------
+ t:settings.compression | columns                                                        +
+                        | value\x09pg_catalog.text\x09compression pglz                   +
+                        | constraints                                                    +
+                        | indexes                                                        +
+                        | triggers                                                       +
+                        | rules                                                          +
+                        | 
+ t:settings.opts        | columns                                                        +
+                        | id\x09integer\x09not null                                      +
+                        | value\x09pg_catalog.text                                       +
+                        | constraints                                                    +
+                        | opts_id_not_null\x09NOT NULL id                                +
+                        | opts_pkey\x09PRIMARY KEY (id)                                  +
+                        | indexes                                                        +
+                        | CREATE UNIQUE INDEX opts_pkey ON settings.opts USING btree (id)+
+                        | triggers                                                       +
+                        | rules                                                          +
+                        | options                                                        +
+                        | autovacuum_enabled\x09'false'                                  +
+                        | fillfactor\x09'70'                                             +
+                        | parallel_workers\x09'2'                                        +
+                        | toast.autovacuum_enabled\x09'false'                            +
+                        | vacuum_truncate\x09'false'                                     +
+                        | 
+ t:settings.repl        | columns                                                        +
+                        | id\x09integer\x09not null                                      +
+                        | value\x09pg_catalog.text                                       +
+                        | constraints                                                    +
+                        | repl_id_not_null\x09NOT NULL id                                +
+                        | repl_pkey\x09PRIMARY KEY (id)                                  +
+                        | indexes                                                        +
+                        | CREATE UNIQUE INDEX repl_pkey ON settings.repl USING btree (id)+
+                        | triggers                                                       +
+                        | rules                                                          +
+                        | replica identity                                               +
+                        | FULL                                                           +
+                        | 
+ t:settings.stats       | columns                                                        +
+                        | value\x09pg_catalog.text\x09statistics 1000                    +
+                        | constraints                                                    +
+                        | indexes                                                        +
+                        | triggers                                                       +
+                        | rules                                                          +
+                        | 
+ t:settings.storage     | columns                                                        +
+                        | value\x09pg_catalog.text\x09storage EXTERNAL                   +
+                        | constraints                                                    +
+                        | indexes                                                        +
+                        | triggers                                                       +
+                        | rules                                                          +
+                        | 
+(5 rows)
+
+-- Option ordering is immaterial, including separately stored TOAST options.
+ALTER TABLE settings.opts RESET (fillfactor, autovacuum_enabled,
+  toast.autovacuum_enabled, parallel_workers, vacuum_truncate);
+ALTER TABLE settings.opts SET (vacuum_truncate = false, parallel_workers = 2,
+  toast.autovacuum_enabled = false, autovacuum_enabled = false, fillfactor = 70);
+SELECT test_fold_root() = prolly_root_hash(:'changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_reset('--hard', :'defaults');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'defaults') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_reset('--hard', :'changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM settings.opts;
+ id | value 
+----+-------
+  1 | one
+(1 row)
+
+-- Creating the table again restores settings too.
+DROP SCHEMA settings CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table settings.opts
+drop cascades to table settings.repl
+drop cascades to table settings.storage
+drop cascades to table settings.compression
+drop cascades to table settings.stats
+SELECT dolt_commit('-Am', 'removed') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- An explicitly set default remains explicit; RESET goes back to inheriting
+-- the server's policy.  A type change resets compression/storage in Postgres.
+ALTER TABLE settings.opts SET (fillfactor = 100);
+ALTER TABLE settings.compression ALTER COLUMN value TYPE varchar(100);
+ALTER TABLE settings.compression ALTER COLUMN value SET COMPRESSION pglz;
+ALTER TABLE settings.storage ALTER COLUMN value TYPE varchar(100);
+ALTER TABLE settings.storage ALTER COLUMN value SET STORAGE EXTERNAL;
+SELECT (dolt_commit('-Am', 'retyped'))[1] AS retyped \gset
+SELECT dolt_reset('--hard', :'changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'retyped');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'retyped') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+-- An identity index is restored after indexes and NOT NULL constraints.
+-- Quoted names exercise field escaping; rebuilding the same named index
+-- must restore its identity marking even though the identity didn't change.
+CREATE UNIQUE INDEX "identity\index" ON settings.repl (id);
+ALTER TABLE settings.repl REPLICA IDENTITY USING INDEX "identity\index";
+SELECT (dolt_commit('-Am', 'index identity'))[1] AS indexed \gset
+DROP TABLE settings.repl;
+SELECT dolt_commit('-Am', 'removed identity table') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'indexed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'indexed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+DROP INDEX settings."identity\index";
+CREATE UNIQUE INDEX "identity\index" ON settings.repl (id) WITH (fillfactor = 80);
+ALTER TABLE settings.repl REPLICA IDENTITY USING INDEX "identity\index";
+SELECT (dolt_commit('-Am', 'rebuilt index'))[1] AS rebuilt \gset
+SELECT dolt_reset('--hard', :'indexed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'indexed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'settings.repl'::regclass AND indisreplident;
+        indexrelid         
+---------------------------
+ settings."identity\index"
+(1 row)
+
+SELECT dolt_reset('--hard', :'rebuilt');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'rebuilt') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+ALTER TABLE settings.repl REPLICA IDENTITY NOTHING;
+SELECT (dolt_commit('-Am', 'nothing identity'))[1] AS nothing \gset
+SELECT dolt_reset('--hard', :'indexed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'nothing');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'nothing') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'defaults');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'defaults') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'indexed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP INDEX settings."identity\index";
+-- With its index gone, INDEX behaves as NOTHING and is described as such.
+SELECT (dolt_commit('-Am', 'dropped identity index'))[1] AS dropped_index \gset
+SELECT dolt_reset('--hard', :'indexed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'dropped_index');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'dropped_index') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+-- A parent's settings must not overwrite a child's explicit defaults.
+CREATE TABLE settings.parent (id int, value text) PARTITION BY RANGE (id);
+ALTER TABLE settings.parent ALTER COLUMN value SET STORAGE EXTERNAL;
+ALTER TABLE settings.parent ALTER COLUMN value SET COMPRESSION pglz;
+ALTER TABLE settings.parent ALTER COLUMN value SET STATISTICS 100;
+CREATE TABLE settings.child PARTITION OF settings.parent FOR VALUES FROM (0) TO (10);
+ALTER TABLE settings.child ALTER COLUMN value SET STORAGE DEFAULT;
+ALTER TABLE settings.child ALTER COLUMN value SET COMPRESSION default;
+ALTER TABLE settings.child ALTER COLUMN value SET STATISTICS -1;
+ALTER TABLE settings.child SET (fillfactor = 80, toast.autovacuum_enabled = false);
+INSERT INTO settings.parent VALUES (1, 'child');
+CREATE TABLE settings.inhparent (value text);
+CREATE TABLE settings.inhchild () INHERITS (settings.inhparent);
+ALTER TABLE ONLY settings.inhparent ALTER COLUMN value SET STORAGE EXTERNAL;
+ALTER TABLE ONLY settings.inhchild ALTER COLUMN value SET COMPRESSION pglz;
+SELECT (dolt_commit('-Am', 'parents'))[1] AS parents \gset
+SELECT dolt_reset('--hard', :'dropped_index');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'parents');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'parents') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM settings.parent;
+ id | value 
+----+-------
+  1 | child
+(1 row)
+
+ALTER TABLE ONLY settings.parent ALTER COLUMN value SET STORAGE MAIN;
+ALTER TABLE ONLY settings.parent ALTER COLUMN value SET COMPRESSION default;
+ALTER TABLE ONLY settings.parent ALTER COLUMN value SET STATISTICS 0;
+SELECT (dolt_commit('-Am', 'parent settings'))[1] AS parent_changed \gset
+SELECT dolt_reset('--hard', :'parents');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'parents') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'parent_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'parent_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+-- Rebuilding a named type resets its columns and can rebuild an identity
+-- index, even when no table definition changed.
+CREATE DOMAIN settings.word AS text;
+CREATE TABLE settings.words (value settings.word NOT NULL);
+CREATE UNIQUE INDEX words_identity ON settings.words (value);
+ALTER TABLE settings.words ALTER COLUMN value SET STORAGE MAIN;
+ALTER TABLE settings.words ALTER COLUMN value SET COMPRESSION pglz;
+ALTER TABLE settings.words ALTER COLUMN value SET STATISTICS 42;
+ALTER TABLE settings.words REPLICA IDENTITY USING INDEX words_identity;
+INSERT INTO settings.words VALUES ('word');
+SELECT (dolt_commit('-Am', 'word type'))[1] AS word_base \gset
+ALTER DOMAIN settings.word ADD CONSTRAINT nonempty CHECK (length(VALUE) > 0);
+SELECT (dolt_commit('-Am', 'word check'))[1] AS word_check \gset
+SELECT dolt_reset('--hard', :'word_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'word_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_reset('--hard', :'word_check');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'word_check') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- Settings merge by option name; column settings merge with that column.
+SELECT dolt_branch('settings_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE settings.opts SET (fillfactor = 60);
+ALTER TABLE settings.storage ALTER COLUMN value SET STORAGE MAIN;
+SELECT dolt_commit('-Am', 'ours') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('settings_side');
+              dolt_checkout               
+------------------------------------------
+ {0,"Switched to branch 'settings_side'"}
+(1 row)
+
+ALTER TABLE settings.opts SET (parallel_workers = 4);
+ALTER TABLE settings.repl REPLICA IDENTITY FULL;
+SELECT dolt_commit('-Am', 'theirs') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('settings_side'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT relname, relreplident, (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(reloptions) o) AS options
+  FROM pg_class WHERE oid IN ('settings.opts'::regclass, 'settings.repl'::regclass) ORDER BY relname;
+ relname | relreplident |                                      options                                       
+---------+--------------+------------------------------------------------------------------------------------
+ opts    | d            | autovacuum_enabled=false, fillfactor=60, parallel_workers=4, vacuum_truncate=false
+ repl    | f            | 
+(2 rows)
+
+SELECT dolt_branch('settings_conflict');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE settings.opts SET (fillfactor = 50);
+SELECT dolt_commit('-Am', 'ours conflict') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('settings_conflict');
+                dolt_checkout                 
+----------------------------------------------
+ {0,"Switched to branch 'settings_conflict'"}
+(1 row)
+
+ALTER TABLE settings.opts SET (fillfactor = 40);
+SELECT dolt_commit('-Am', 'theirs conflict') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('settings_conflict');
+ERROR:  schema conflict: settings.opts was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- Competing replica identity modes are one setting, hence a conflict.
+SELECT dolt_branch('identity_conflict');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE settings.repl REPLICA IDENTITY DEFAULT;
+SELECT dolt_commit('-Am', 'default identity') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('identity_conflict');
+                dolt_checkout                 
+----------------------------------------------
+ {0,"Switched to branch 'identity_conflict'"}
+(1 row)
+
+ALTER TABLE settings.repl REPLICA IDENTITY NOTHING;
+SELECT dolt_commit('-Am', 'nothing identity') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('identity_conflict');
+ERROR:  schema conflict: settings.repl was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_branch('-D', 'identity_conflict');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- An identity by an index one side set while the other dropped the index
+-- is a schema conflict, not a failed move.
+CREATE TABLE settings.ri (id int NOT NULL);
+CREATE UNIQUE INDEX ri_key ON settings.ri (id);
+SELECT dolt_commit('-Am', 'identity base') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('identity_index');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP INDEX settings.ri_key;
+SELECT dolt_commit('-Am', 'index dropped') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('identity_index');
+               dolt_checkout               
+-------------------------------------------
+ {0,"Switched to branch 'identity_index'"}
+(1 row)
+
+ALTER TABLE settings.ri REPLICA IDENTITY USING INDEX ri_key;
+SELECT dolt_commit('-Am', 'identity by index') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('identity_index');
+ERROR:  schema conflict: settings.ri was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_checkout('identity_index');
+               dolt_checkout               
+-------------------------------------------
+ {0,"Switched to branch 'identity_index'"}
+(1 row)
+
+SELECT dolt_merge('main');
+ERROR:  schema conflict: settings.ri was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT test_fold_root() = prolly_root_hash('identity_index') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'identity_index');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- A TOAST table left over from a dropped column isn't made again with its
+-- table: its options aren't described, so the table comes back the same.
+CREATE TABLE settings.leftover (id int, value text);
+ALTER TABLE settings.leftover SET (toast.autovacuum_enabled = false);
+ALTER TABLE settings.leftover DROP COLUMN value;
+SELECT (dolt_commit('-Am', 'leftover TOAST table'))[1] AS leftover \gset
+DROP TABLE settings.leftover;
+SELECT dolt_commit('-Am', 'leftover dropped') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'leftover');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'leftover') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A materialized view's options and column settings are versioned too.
+CREATE MATERIALIZED VIEW settings.mv WITH (fillfactor = 70, toast.autovacuum_enabled = false)
+  AS SELECT id, value FROM settings.opts;
+SELECT (dolt_commit('-Am', 'matview'))[1] AS mv_base \gset
+ALTER MATERIALIZED VIEW settings.mv SET (autovacuum_enabled = false);
+ALTER MATERIALIZED VIEW settings.mv RESET (fillfactor);
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN value SET STORAGE EXTERNAL;
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN value SET COMPRESSION pglz;
+ALTER MATERIALIZED VIEW settings.mv ALTER COLUMN id SET STATISTICS 77;
+SELECT * FROM dolt_status();
+ table_name  | staged |  status  
+-------------+--------+----------
+ settings.mv | t      | modified
+(1 row)
+
+SELECT (dolt_commit('-Am', 'matview settings'))[1] AS mv_changed \gset
+SELECT dolt_reset('--hard', :'mv_base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'mv_base') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT dolt_reset('--hard', :'mv_changed');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash(:'mv_changed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(c.reloptions) o) AS options,
+       (SELECT string_agg(o, ', ' ORDER BY o) FROM unnest(t.reloptions) o) AS toast_options
+  FROM pg_class c LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+  WHERE c.oid = 'settings.mv'::regclass;
+         options          |      toast_options       
+--------------------------+--------------------------
+ autovacuum_enabled=false | autovacuum_enabled=false
+(1 row)
+
+SELECT attname, attstorage, attcompression, attstattarget FROM pg_attribute
+  WHERE attrelid = 'settings.mv'::regclass AND attnum > 0 ORDER BY attnum;
+ attname | attstorage | attcompression | attstattarget 
+---------+------------+----------------+---------------
+ id      | p          |                |            77
+ value   | e          | p              |              
+(2 rows)
+
+SELECT * FROM settings.mv;
+ id | value 
+----+-------
+  1 | one
+(1 row)
+
+-- A clone creates the definitions from scratch in another database.
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/settings-' || txid_current() AS url \gset
+SELECT dolt_remote('add', 'settings_remote', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('settings_remote', 'main');
+             dolt_push              
+------------------------------------
+ {0,"main -> settings_remote/main"}
+(1 row)
+
+CREATE DATABASE regress_settings_clone;
+\c regress_settings_clone
+CREATE EXTENSION test_prolly;
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status();
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM settings.opts;
+ id | value 
+----+-------
+  1 | one
+(1 row)
+
+SELECT * FROM settings.parent;
+ id | value 
+----+-------
+  1 | child
+(1 row)
+
+SELECT * FROM settings.mv;
+ id | value 
+----+-------
+  1 | one
+(1 row)
+
+\c :db
+DROP DATABASE regress_settings_clone;
+SELECT dolt_remote('remove', 'settings_remote');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+-- Format 9 omitted these properties; it cannot be moved to.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '9'), 'format 9') AS old9 \gset
+SELECT dolt_reset('--hard', :'old9');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
+SELECT dolt_branch('-D', 'settings_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'settings_conflict');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA settings CASCADE;
+NOTICE:  drop cascades to 13 other objects
+DETAIL:  drop cascades to table settings.compression
+drop cascades to table settings.opts
+drop cascades to table settings.stats
+drop cascades to table settings.storage
+drop cascades to table settings.repl
+drop cascades to table settings.inhparent
+drop cascades to table settings.inhchild
+drop cascades to table settings.parent
+drop cascades to table settings.words
+drop cascades to type settings.word
+drop cascades to table settings.ri
+drop cascades to table settings.leftover
+drop cascades to materialized view settings.mv
+\c :settings_home
+DROP DATABASE regress_table_settings;

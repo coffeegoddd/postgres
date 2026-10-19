@@ -92,6 +92,9 @@ typedef struct ProllyValueEncoderRoutine
 #define PROLLY_VALENC_FIRST_CALLBACK begin
 #define PROLLY_VALENC_LAST_CALLBACK decode_kept
 
+/* Historical enum decoding for the canonical encoder and nested values. */
+extern bool prolly_canonical_map_enums(ProllyValueEncoder *enc, List *mappings);
+
 static inline const ProllyValueEncoderRoutine *
 prolly_valenc_lookup(const char *name)
 {

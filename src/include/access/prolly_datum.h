@@ -54,8 +54,19 @@
 #define PROLLY_DATUM_H
 
 #include "lib/stringinfo.h"
+#include "nodes/pg_list.h"
 
 typedef struct ProllyDatumCodec ProllyDatumCodec;
+
+/* A named enum read from a historical definition into today's type. */
+typedef struct ProllyEnumMapping
+{
+	Oid			type;
+	List	   *before;			/* String nodes, in sort order */
+	List	   *after;
+} ProllyEnumMapping;
+
+extern bool prolly_datum_map_enums(ProllyDatumCodec *codec, List *mappings);
 
 /* A codec for values of typid/typmod; lives in mcxt. */
 extern ProllyDatumCodec *prolly_datum_codec(Oid typid, int32 typmod,

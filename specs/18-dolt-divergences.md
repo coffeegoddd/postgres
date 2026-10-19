@@ -67,6 +67,19 @@ adapts.
   rows are the table's row type: `dolt_diff(from, to, NULL::t)` returns
   `(diff_type, from_row t, to_row t)`; `dolt_conflicts(NULL::t)` returns
   `(base_row, our_row, their_row, our_diff_type, their_diff_type)`.
+  Historical enum values are translated using the saved type definitions
+  into that current row type (#387). A pure rename preserves each label's
+  position; surviving names must keep their positions. Additions preserve
+  existing labels by name and order, so a type that only gained labels
+  leaves its tables' rows reading as they did (no table changes with it). A label-only rename therefore produces
+  no typed row diff; the enum's definition still changes. Actual row edits,
+  additions, deletions and conflicts use the current labels on both sides.
+  This includes domains, arrays, unchanged composites, enum keys and keyless
+  copy counts. Mixed renames and additions, reordered/reused names, changes
+  to enclosing type definitions, ranges holding renamed enums, and merges
+  that also drop columns are refused with a schema-conflict error rather
+  than guessed. History stores definitions, not the individual rename
+  commands; there is no change to the canonical storage format.
 - **Why:** Postgres functions, not MySQL procedures; row composites keep
   the column types and work for any table without generated column
   names.

@@ -103,6 +103,10 @@ typedef void (*ProllyCanonObjectVisit) (const char *name, ProllyDiffKind kind,
  * the database's collations give now): its name, data and description
  * are still the root's.
  */
+/* Why a root in an older format of prolly's history has unreadable rows. */
+#define PROLLY_UNREADABLE_OLDER_FORMAT \
+	"version was committed in an older format of prolly's history"
+
 typedef void (*ProllyCanonTableVisit) (const char *name,
 									   const ProllyNodeRef *data,
 									   const ProllyValue *description,
@@ -116,6 +120,14 @@ typedef struct ProllyTableColumn
 	char	   *type;			/* as format_type() writes it */
 	char	   *generated;		/* a generated column's expression, or NULL */
 } ProllyTableColumn;
+
+/* A saved named type; enum labels are String nodes in sort order. */
+typedef struct ProllyTypeDefinition
+{
+	char	   *name;
+	char	   *definition;
+	List	   *labels;
+} ProllyTypeDefinition;
 
 /* A transaction's own row changes to a table: its tuple versions' TIDs. */
 typedef struct ProllyRowChanges
@@ -178,6 +190,8 @@ typedef struct ProllyCanonRoutine
 	 * whether a primary key keys its rows.
 	 */
 	List	   *(*table_columns) (const ProllyValue *description, bool *keyed);
+	/* Saved named types (ProllyTypeDefinition *, server encoding). */
+	List	   *(*type_definitions) (const ProllyNodeRef *root);
 
 	/*
 	 * fold() for reading what changed, never for a commit: objects the
@@ -235,7 +249,7 @@ typedef struct ProllyCanonRoutine
 	"walk", "fold", "tables", \
 	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
 	"fold_dependencies", "dependencies", \
-	"merge_schema", "walk_baseline", "table_columns", "read_fold", \
+	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows"
 #define PROLLY_CANON_FIRST_CALLBACK walk
 #define PROLLY_CANON_LAST_CALLBACK fold_rows
