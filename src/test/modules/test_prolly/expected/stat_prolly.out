@@ -55,8 +55,8 @@ SELECT name, value FROM pg_stat_prolly;
  nodes_written        |    14
  value_nodes_written  |     0
  chunks_appended      |    14
- chunk_bytes_appended | 25800
- bytes_hashed         | 44909
+ chunk_bytes_appended | 25801
+ bytes_hashed         | 44910
  fold_rows_read       |  1000
  fold_rows_written    |  1000
  fold_pages           |     0
@@ -101,17 +101,20 @@ SELECT pg_stat_force_next_flush();
 (1 row)
 
 SELECT name, value FROM pg_stat_prolly
-WHERE name IN ('fold_rows_written', 'fold_full_tables', 'commits', 'head_moves',
+WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
+			   'fold_full_tables', 'commits', 'head_moves',
 			   'page_copies_fold', 'page_copies_shared');
         name        | value 
 --------------------+-------
+ fold_rows_read     |     1
  fold_rows_written  |     1
+ fold_candidates    |     1
  fold_full_tables   |     0
  commits            |     1
  head_moves         |     1
  page_copies_fold   |     0
  page_copies_shared |     0
-(6 rows)
+(8 rows)
 
 -- The same commit again, in a database just like it: the same counts.
 SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly \gset

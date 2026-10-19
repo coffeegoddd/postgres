@@ -175,9 +175,11 @@ UPDATE sdo.one SET v = 'b';
 UPDATE sdo.other SET v = 'y';
 SELECT count(*) AS reset FROM test_fold_counters(true);
 SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdo.one);
-SELECT pages < 10 AS only_its_pages, full_tables FROM test_fold_counters(true);
+SELECT pages < 10 AS only_its_pages, candidates < 10 AS only_its_rows,
+	full_tables FROM test_fold_counters(true);
 SELECT count(*) FROM dolt_diff('WORKING', 'WORKING', NULL::sdo.one);
-SELECT pages < 10 AS only_its_pages FROM test_fold_counters(true);
+SELECT pages < 10 AS only_its_pages, candidates < 10 AS only_its_rows
+FROM test_fold_counters(true);
 DROP SCHEMA sdo CASCADE;
 SELECT length(dolt_commit('-Am', 'sdo gone')::text) AS committed;
 

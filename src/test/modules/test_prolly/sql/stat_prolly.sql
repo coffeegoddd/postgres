@@ -34,7 +34,8 @@ UPDATE sp.t SET v = 'x' WHERE id = 500;
 SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 SELECT name, value FROM pg_stat_prolly
-WHERE name IN ('fold_rows_written', 'fold_full_tables', 'commits', 'head_moves',
+WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
+			   'fold_full_tables', 'commits', 'head_moves',
 			   'page_copies_fold', 'page_copies_shared');
 
 -- The same commit again, in a database just like it: the same counts.

@@ -443,10 +443,11 @@ SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::sdo.one);
  modified  | (1,b)
 (1 row)
 
-SELECT pages < 10 AS only_its_pages, full_tables FROM test_fold_counters(true);
- only_its_pages | full_tables 
-----------------+-------------
- t              |           0
+SELECT pages < 10 AS only_its_pages, candidates < 10 AS only_its_rows,
+	full_tables FROM test_fold_counters(true);
+ only_its_pages | only_its_rows | full_tables 
+----------------+---------------+-------------
+ t              | t             |           0
 (1 row)
 
 SELECT count(*) FROM dolt_diff('WORKING', 'WORKING', NULL::sdo.one);
@@ -455,10 +456,11 @@ SELECT count(*) FROM dolt_diff('WORKING', 'WORKING', NULL::sdo.one);
      0
 (1 row)
 
-SELECT pages < 10 AS only_its_pages FROM test_fold_counters(true);
- only_its_pages 
-----------------
- t
+SELECT pages < 10 AS only_its_pages, candidates < 10 AS only_its_rows
+FROM test_fold_counters(true);
+ only_its_pages | only_its_rows 
+----------------+---------------
+ t              | t
 (1 row)
 
 DROP SCHEMA sdo CASCADE;

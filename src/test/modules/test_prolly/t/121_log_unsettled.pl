@@ -36,7 +36,12 @@ $bg->query_safe(q{BEGIN;
 	INSERT INTO lu.k VALUES (-1, 'committed later');
 	UPDATE lu.k SET v = 'committed later' WHERE id = 10;
 	INSERT INTO lu.h VALUES (-1, 'committed later');
-	DELETE FROM lu.h WHERE n = 10});
+	DELETE FROM lu.h WHERE n = 10;
+	SAVEPOINT s;
+	INSERT INTO lu.k VALUES (-3, 'savepoint rolled back');
+	DELETE FROM lu.k WHERE id = 30;
+	INSERT INTO lu.h VALUES (-3, 'savepoint rolled back');
+	ROLLBACK TO s});
 my $bg2 = $node->background_psql('postgres');
 $bg2->query_safe(q{BEGIN;
 	INSERT INTO lu.k VALUES (-2, 'rolled back');
@@ -57,10 +62,15 @@ my @out = split /\n/, sql(q{
 is($out[1], '4 0', 'reading only the entries left, neither table in full');
 is($out[2], 't', 'the fold counts what committed meanwhile');
 
-sql(q{SELECT dolt_commit('-am', 'later')});
-is(sql(q{SELECT count(*) FROM lu.k WHERE v = 'rolled back'}), '0',
-	'what rolled back isn\'t there');
-is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'and the branch is clean');
+# What the next commit holds, read back by a hard reset to it: what
+# committed, and neither what rolled back nor what a savepoint took back.
+sql(q{SELECT dolt_commit('-am', 'later'); SELECT dolt_reset('--hard', 'HEAD')});
+is(sql(q{SELECT string_agg(id::text, ',' ORDER BY id) FROM lu.k
+	WHERE v <> 'base' OR id IN (10, 20, 30)}), '-1,0,10,20,30',
+	'the commit holds what committed, not what rolled back');
+is(sql(q{SELECT string_agg(n::text, ',' ORDER BY n) FROM lu.h
+	WHERE v <> 'base' OR n IN (10, 20)}), '-1,0,20',
+	'and without a key too');
 
 $bg->quit;
 $bg2->quit;
