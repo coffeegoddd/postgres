@@ -320,7 +320,7 @@ SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WHERE to_table_name LIKE 'more
 SELECT length(dolt_commit('-Am', 'before the fork')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('fork');
@@ -333,7 +333,7 @@ CREATE TABLE app.on_main (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('fork');
@@ -346,7 +346,7 @@ CREATE TABLE app.on_fork (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'on fork')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
