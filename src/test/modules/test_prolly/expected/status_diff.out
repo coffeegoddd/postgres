@@ -835,7 +835,7 @@ INSERT INTO r.t VALUES (1, 7), (2, 8);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE r.t RENAME COLUMN x TO y;
@@ -853,7 +853,7 @@ SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::r.t);
 SELECT length(dolt_commit('-am', 'rename')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::r.t);
