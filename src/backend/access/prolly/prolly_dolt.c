@@ -3020,7 +3020,7 @@ typedef struct ReflogRoot
 typedef struct ReflogRoots
 {
 	ReflogRoot *roots;			/* a ring of the newest REFLOG_ROOTS */
-	int			n;				/* roots seen */
+	uint64		n;				/* roots seen */
 } ReflogRoots;
 
 static void
@@ -3132,10 +3132,12 @@ dolt_reflog(PG_FUNCTION_ARGS)
 	bool		all = false;
 	ReflogRoots rr = {0};
 	ReflogScan	rs = {0};
-	int			first;
+	uint64		first;
 
 	for (int i = 0; i < nargs; i++)
 	{
+		if (args[i][0] == '\0')
+			continue;			/* (no ref, as Dolt takes it) */
 		if (strcmp(args[i], "--all") == 0)
 		{
 			if (all)
@@ -3161,8 +3163,8 @@ dolt_reflog(PG_FUNCTION_ARGS)
 	PROLLY_CALL(cs, roots, PROLLY_CALL(cs, open, MyDatabaseId,
 									   MyDatabaseTableSpace),
 				reflog_root, &rr);
-	first = Max(rr.n - REFLOG_ROOTS, 0);
-	for (int i = first; i < rr.n; i++)
+	first = rr.n > REFLOG_ROOTS ? rr.n - REFLOG_ROOTS : 0;
+	for (uint64 i = first; i < rr.n; i++)
 	{
 		ReflogRoot *r = &rr.roots[i % REFLOG_ROOTS];
 

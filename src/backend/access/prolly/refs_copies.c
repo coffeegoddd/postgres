@@ -2465,55 +2465,90 @@ visit_prefix(const char *prefix, int prefixlen,
 	PROLLY_CALL(tree, cursor_close, c);
 }
 
+/* a ref a root named, for copies_root_refs() to sort */
+typedef struct RootRef
+{
+	char	   *name;
+	ProllyHash	commit;
+} RootRef;
+
+static int
+root_ref_cmp(const void *a, const void *b)
+{
+	return strcmp(((const RootRef *) a)->name, ((const RootRef *) b)->name);
+}
+
 /*
  * The refs a root of the store named, whenever it was the store's root:
- * branches' heads and remote-tracking branches' commits.
+ * branches' heads and remote-tracking branches' commits, in the order of
+ * their full names (as Dolt's: a tracking branch's key, remote then
+ * branch, sorts otherwise where one remote's name begins another's).
  */
 static bool
 copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 {
+	static const char tags[] = {TAG_BRANCH, TAG_TRACKING};
 	ProllyNodeRef r;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
 	ProllyValue v;
-	StringInfoData ref;
+	RootRef    *refs;
+	int			nrefs = 0;
+	int			maxrefs = 16;
 
 	refs_init();
 	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, root))
 		return false;
 	ref_of(root, &r);
-	initStringInfo(&ref);
+	refs = palloc(sizeof(RootRef) * maxrefs);
 	c = PROLLY_CALL(tree, cursor_open, &env, &r, CurrentMemoryContext);
-	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
+	for (int t = 0; t < lengthof(tags); t++)
 	{
-		const char *name = (const char *) k.data + 1;
-		int			namelen = k.len - 1;
-		ProllyHash	commit;
+		ProllyKey	from = {(const uint8 *) &tags[t], 1};
 
-		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_TRACKING))
-			continue;
-		resetStringInfo(&ref);
-		if (k.data[0] == TAG_BRANCH)
+		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+			   k.len >= 1 && k.data[0] == tags[t])
 		{
-			appendStringInfoString(&ref, "refs/heads/");
-			appendBinaryStringInfo(&ref, name, namelen);
-		}
-		else
-		{
-			int			rlen = strnlen(name, namelen);
+			const char *name = (const char *) k.data + 1;
+			int			namelen = k.len - 1;
+			StringInfoData ref;
 
-			appendStringInfoString(&ref, "refs/remotes/");
-			appendBinaryStringInfo(&ref, name, rlen);
-			appendStringInfoChar(&ref, '/');
-			if (rlen < namelen)
-				appendBinaryStringInfo(&ref, name + rlen + 1, namelen - rlen - 1);
+			initStringInfo(&ref);
+			if (tags[t] == TAG_BRANCH)
+			{
+				appendStringInfoString(&ref, "refs/heads/");
+				appendBinaryStringInfo(&ref, name, namelen);
+			}
+			else
+			{
+				int			rlen = strnlen(name, namelen);
+
+				appendStringInfoString(&ref, "refs/remotes/");
+				appendBinaryStringInfo(&ref, name, rlen);
+				appendStringInfoChar(&ref, '/');
+				if (rlen < namelen)
+					appendBinaryStringInfo(&ref, name + rlen + 1, namelen - rlen - 1);
+			}
+			if (nrefs == maxrefs)
+			{
+				maxrefs *= 2;
+				refs = repalloc(refs, sizeof(RootRef) * maxrefs);
+			}
+			refs[nrefs].name = ref.data;
+			(void) get_hash((const char *) v.data, (const char *) v.data + v.len,
+							&refs[nrefs].commit);
+			nrefs++;
 		}
-		(void) get_hash((const char *) v.data, (const char *) v.data + v.len,
-						&commit);
-		visit(ref.data, &commit, arg);
 	}
 	PROLLY_CALL(tree, cursor_close, c);
-	pfree(ref.data);
+	qsort(refs, nrefs, sizeof(RootRef), root_ref_cmp);
+	for (int i = 0; i < nrefs; i++)
+	{
+		visit(refs[i].name, &refs[i].commit, arg);
+		pfree(refs[i].name);
+	}
+	pfree(refs);
 	return true;
 }
 

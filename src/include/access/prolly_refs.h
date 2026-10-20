@@ -104,11 +104,11 @@ typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 typedef void (*ProllyRemoteVisit) (const char *name, const char *url,
 								   void *arg);
 
-/* Visits a remote-tracking branch: the remote, its branch, the commit. */
 /* Visits a ref a root named: its full name and its commit. */
 typedef void (*ProllyRootRefVisit) (const char *ref, const ProllyHash *commit,
 									void *arg);
 
+/* Visits a remote-tracking branch: the remote, its branch, the commit. */
 typedef void (*ProllyTrackingVisit) (const char *remote, const char *branch,
 									 const ProllyHash *commit, void *arg);
 

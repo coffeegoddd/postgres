@@ -369,6 +369,8 @@ typedef struct JournalShared
 	CheckedEnd	checked[CHECKED_ENDS];	/* under ProllyJournalLock */
 	int			next_checked;
 	int			inflight;		/* ranges of len > 0 */
+	TimestampTz last_at;		/* the last append's time; under
+								 * ProllyJournalLock */
 
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
@@ -436,6 +438,7 @@ typedef struct Append
 	uint64		offset;
 	Size		len;
 	XLogRecPtr	lsn;
+	TimestampTz at;				/* when reserved: a ROOT record's time */
 } Append;
 
 struct ProllyChunkStore
@@ -1598,6 +1601,14 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 				(errcode_for_file_access(),
 				 errmsg("could not extend file \"%s\": %m", g->path)));
 
+	/*
+	 * (taken under the lock, so a later place in the journal has no earlier
+	 * time: a reflog is newest first by place; nor across a clock stepped
+	 * back)
+	 */
+	a->at = Max(GetCurrentTimestamp(), js->last_at);
+	js->last_at = a->at;
+
 	Assert(r->len == 0);
 	START_CRIT_SECTION();
 	SpinLockAcquire(&js->mutex);
@@ -2170,11 +2181,12 @@ flush_pending(ProllyChunkStore *s)
 }
 
 /*
- * The root a move goes to has its PAD at offset of segment g: keep the
- * ROOT record that takes its place as the append is written (committed()).
+ * The root a move goes to has its PAD at offset of segment g, in an append
+ * reserved at time at: keep the ROOT record that takes its place as the
+ * append is written (committed()).
  */
 static void
-root_padded(ProllyChunkStore *s, Segment *g, uint64 offset)
+root_padded(ProllyChunkStore *s, Segment *g, uint64 offset, TimestampTz at)
 {
 	StringInfoData rec;
 
@@ -2182,7 +2194,7 @@ root_padded(ProllyChunkStore *s, Segment *g, uint64 offset)
 	s->pad_offset = offset;
 	INJECTION_POINT("prolly-root-padded", NULL);
 	initStringInfo(&rec);
-	s->root_at = GetCurrentTimestamp();
+	s->root_at = at;
 	root_record(&rec, &s->new_root, s->root_at, false);
 	Assert(rec.len <= sizeof(s->root_rec));
 	memcpy(s->root_rec, rec.data, rec.len);
@@ -2209,7 +2221,8 @@ reserve_at_commit(ProllyChunkStore *s)
 	s->at_commit = true;
 	INJECTION_POINT("prolly-append-reserved", NULL);
 	if (s->moving)
-		root_padded(s, s->commit_append.g, s->commit_append.offset + pad_at);
+		root_padded(s, s->commit_append.g, s->commit_append.offset + pad_at,
+					s->commit_append.at);
 }
 
 /* Forget the pending chunks from offset len on. */
@@ -2266,7 +2279,7 @@ journal_xact_callback(XactEvent event, void *arg)
 				append_write(&a, s->pending.data);
 				pending_appended(s, a.g, a.offset);
 				if (s->moving)
-					root_padded(s, a.g, a.offset + pad_at);
+					root_padded(s, a.g, a.offset + pad_at, a.at);
 			}
 			break;
 		case XACT_EVENT_PRE_PREPARE:
@@ -4174,11 +4187,19 @@ journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
  * segments named, in their order, up to where this backend has read them
  * (skipping the ranges whose appends were in flight then).  A collection
  * retires the segments it collected, and their ROOT records with them.
+ *
+ * Only each record's length and kind are read (through a buffer) but for
+ * the ROOT records, read whole and checked: the chunks between are passed
+ * over unread.  A ROOT record that doesn't check is one being written over
+ * its PAD (of the same length) as it was read: passed over too, as the
+ * PAD would be.
  */
+#define ROOTS_BUFFER	(64 * 1024)
 static void
 journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
 {
 	ListCell   *lc;
+	char	   *buf = palloc(ROOTS_BUFFER);
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
@@ -4187,14 +4208,17 @@ journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
 	{
 		Segment    *g = lfirst(lc);
 		uint64		offset = JOURNAL_HEADER_SIZE;
-		uint32		len;
+		uint64		buf_at = 0;
+		Size		buf_len = 0;
 
 		if (!open_segment(g))
 			continue;
-		while (offset < g->scanned)
+		while (offset + RECORD_OVERHEAD <= g->scanned)
 		{
 			ListCell   *hc;
 			bool		skipped = false;
+			uint32		len;
+			uint8		kind;
 
 			CHECK_FOR_INTERRUPTS();
 			foreach(hc, g->holes)
@@ -4210,19 +4234,34 @@ journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
 			}
 			if (skipped)
 				continue;
-			if ((len = gc_record(g, offset, g->scanned, &rec, &reclen)) == 0)
+			if (offset < buf_at || offset + sizeof(uint32) + 1 > buf_at + buf_len)
+			{
+				buf_at = offset;
+				buf_len = Min(ROOTS_BUFFER, g->scanned - offset);
+				read_exact(g, buf, buf_len, buf_at);
+			}
+			memcpy(&len, buf + (offset - buf_at), sizeof(len));
+			kind = (uint8) buf[offset - buf_at + sizeof(uint32)];
+			if (len < RECORD_OVERHEAD || offset + len > g->scanned)
 				break;
-			if ((uint8) rec[sizeof(uint32)] == KIND_ROOT)
+			if (kind == KIND_ROOT)
 			{
 				ProllyHash	h;
 				Size		after;
 
-				if (record_hash(rec, len, &h, &after))
+				if (len > reclen)
+				{
+					reclen = Max(len, 256);
+					rec = rec ? repalloc(rec, reclen) : palloc(reclen);
+				}
+				read_exact(g, rec, len, offset);
+				if (record_valid(rec, len) && record_hash(rec, len, &h, &after))
 					visit(&h, record_root_time(rec, len, after), arg);
 			}
 			offset += len;
 		}
 	}
+	pfree(buf);
 	if (rec)
 		pfree(rec);
 }

@@ -40,7 +40,7 @@ Line numbers were read on the dates above.
 | Automatic GC | From commits, at 128 MiB of journal or growth, with time and growth rules (`auto_gc.go`) | None | Autovacuum: GC past 128 MiB and 0.2 growth; a move past 256 MiB (`prolly_autovacuum.c`) |
 | Batched reads | Sorted by prefix, reads 4 KiB apart coalesced, 16 at a time (`table_reader.go`, `store.go`) | Up to 16 adjacent leaves in one read (`chunk_store.c`) | A pread a chunk; batches only in transfers |
 | Transfer | Chunks sent compressed as stored; whole files on clone; files up to 1 GiB (`datas/pull`) | Batches of 256 chunks (`doltlite_remote.c`) | Chunks decoded and written again by the receiver (`remote_file.c`, `remote_serve.c`); clone walks |
-| Reflog | The last 5,000 roots, with their times (`journal.go`) | None | None |
+| Reflog | The last 5,000 roots, with their times (`journal.go`) | None | Each root's time in its ROOT record; `dolt_reflog` (item 4) |
 | Statistics | Latency and size histograms, `StoreSizes` (`stats.go`, `doltdb.go`) | None | `pg_stat_prolly`: appends, bytes hashed, and (since #420) bytes the journal, table files and manifest write and GC and conjoin copy; no sizes; GC results only at DEBUG1 |
 
 ## 2. Where ours is ahead, kept
@@ -115,6 +115,15 @@ Each group is an issue. The numbers are the items the issues use.
    with ordinals, then lengths, then 12-byte suffixes, as Dolt's. That
    is about 40 bytes a chunk in memory, searched by interpolation.
 4. **ROOT records carry a timestamp,** and `dolt_reflog` reads them.
+   As built: journal version 4, a ROOT record's payload its hash and then
+   the move's time (int64 microseconds, as `timestamptz`), carried in the
+   commit's WAL record so redo writes the same bytes. The time is taken
+   as the append is reserved, under the journal's lock and never before
+   the last append's, so a later place in the journal never has an
+   earlier time. `dolt_reflog` reads the ROOT records of the segments
+   named, passing over the chunk records between by their length alone
+   (Dolt keeps the last 5,000 roots in memory instead), and keeps the
+   newest 5,000.
 5. **The manifest records the hash's algorithm and length and the chunk
    format's version.** A store that differs is refused.
 

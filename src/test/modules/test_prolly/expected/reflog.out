@@ -83,6 +83,14 @@ SELECT * FROM pg_temp.reflog('--all');
  refs/heads/main    | creating table t1
 (5 rows)
 
+-- An empty ref is none, as Dolt takes it.
+SELECT (SELECT count(*) FROM dolt_reflog('')) =
+	(SELECT count(*) FROM dolt_reflog()) AS empty_is_none;
+ empty_is_none 
+---------------
+ t
+(1 row)
+
 -- Each entry's commit is the commit its ref was at then, and the times
 -- run back.
 SELECT bool_and(r.commit_hash = l.commit_hash) AS commits_match
@@ -191,6 +199,44 @@ SELECT * FROM pg_temp.reflog('main');
  refs/heads/main | creating table t1
 (3 rows)
 
+-- The refs one move changed, by their full names: remote-tracking
+-- branches of remotes one of whose names begins the other's too.
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/reflog_remotes/' ||
+	txid_current() AS run \gset
+SELECT dolt_remote('add', 'o', :'run' || '/o') IS NOT NULL AS added;
+ added 
+-------
+ t
+(1 row)
+
+SELECT dolt_remote('add', 'o-a', :'run' || '/o-a') IS NOT NULL AS added;
+ added 
+-------
+ t
+(1 row)
+
+BEGIN;
+SELECT dolt_push('o', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_push('o-a', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+COMMIT;
+SELECT ref FROM dolt_reflog('--all') WHERE ref LIKE 'refs/remotes/%';
+          ref          
+-----------------------
+ refs/remotes/o/main
+ refs/remotes/o-a/main
+(2 rows)
+
 -- A garbage collection forgets the moves before it.
 SELECT dolt_gc() IS NOT NULL AS collected;
  collected 
@@ -219,12 +265,14 @@ SELECT length(dolt_commit('-Am', 'after the collection')::text) > 0 AS committed
 (1 row)
 
 SELECT ref, commit_message FROM dolt_reflog();
-         ref         |    commit_message    
----------------------+----------------------
- refs/heads/after_gc | after the collection
- refs/heads/main     | creating table t1
- refs/heads/after_gc | creating table t1
-(3 rows)
+          ref          |    commit_message    
+-----------------------+----------------------
+ refs/heads/after_gc   | after the collection
+ refs/remotes/o/main   | creating table t1
+ refs/remotes/o-a/main | creating table t1
+ refs/heads/main       | creating table t1
+ refs/heads/after_gc   | creating table t1
+(5 rows)
 
 \c postgres
 DROP DATABASE reflog_db;

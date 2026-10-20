@@ -36,6 +36,10 @@ SELECT length(dolt_commit('-Am', 'inserting row 3')::text) > 0 AS committed;
 SELECT * FROM pg_temp.reflog();
 SELECT * FROM pg_temp.reflog('--all');
 
+-- An empty ref is none, as Dolt takes it.
+SELECT (SELECT count(*) FROM dolt_reflog('')) =
+	(SELECT count(*) FROM dolt_reflog()) AS empty_is_none;
+
 -- Each entry's commit is the commit its ref was at then, and the times
 -- run back.
 SELECT bool_and(r.commit_hash = l.commit_hash) AS commits_match
@@ -66,6 +70,19 @@ SELECT * FROM pg_temp.reflog('branch1');
 -- A head moved back is a change too.
 SELECT dolt_reset('--hard', 'HEAD~1') IS NOT NULL AS reset;
 SELECT * FROM pg_temp.reflog('main');
+
+-- The refs one move changed, by their full names: remote-tracking
+-- branches of remotes one of whose names begins the other's too.
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/reflog_remotes/' ||
+	txid_current() AS run \gset
+SELECT dolt_remote('add', 'o', :'run' || '/o') IS NOT NULL AS added;
+SELECT dolt_remote('add', 'o-a', :'run' || '/o-a') IS NOT NULL AS added;
+BEGIN;
+SELECT dolt_push('o', 'main') IS NOT NULL AS pushed;
+SELECT dolt_push('o-a', 'main') IS NOT NULL AS pushed;
+COMMIT;
+SELECT ref FROM dolt_reflog('--all') WHERE ref LIKE 'refs/remotes/%';
 
 -- A garbage collection forgets the moves before it.
 SELECT dolt_gc() IS NOT NULL AS collected;
