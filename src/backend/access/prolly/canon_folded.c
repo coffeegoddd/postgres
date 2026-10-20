@@ -6521,15 +6521,24 @@ type_moves(List *from, List *to)
 						MoveItem   *ft = find_item(from, 't', tname);
 						MoveItem   *tt = find_item(to, 't', tname);
 
+						const char *fl = ft ? table_def_line(ft, 'c', cname) : NULL;
+						const char *tl = tt ? table_def_line(tt, 'c', cname) : NULL;
+						const char *fdef = fl ? column_attr(fl, "default ") : NULL;
+						const char *tdef = tl ? column_attr(tl, "default ") : NULL;
+
 						tm.before = lappend(tm.before,
 											psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
 													 tname, cname));
-						if (same_table_line(ft, tt, 'c', cname) &&
-							column_attr(table_def_line(tt, 'c', cname), "default "))
+
+						/*
+						 * (one the move keeps, put back: move_table() sets only a
+						 * default whose text changed, whatever else of the
+						 * column's line did, its storage or statistics)
+						 */
+						if (fdef && tdef && strcmp(fdef, tdef) == 0)
 							tm.after = lappend(tm.after,
 											   psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
-														tname, cname,
-														column_attr(table_def_line(tt, 'c', cname), "default ")));
+														tname, cname, tdef));
 						handled = true;
 					}
 				}
