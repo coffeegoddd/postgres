@@ -155,6 +155,15 @@ jobs:
             --workloads V1,V2 --config src/tools/prolly_bench/configs/integration.toml \
             --work-dir "$RUNNER_TEMP/v-smoke" --out "$PWD/engine-results/v-smoke"
 
+      - name: V suite per-commit growth gate
+        run: |
+          src/tools/prolly_bench/prolly_bench run V --am prolly \
+            --workloads V7 --config src/tools/prolly_bench/configs/v_counters.toml \
+            --work-dir "$RUNNER_TEMP/v-growth" --out "$PWD/engine-results/v-growth"
+          src/tools/prolly_bench/prolly_bench vgrowth "$PWD"/engine-results/v-growth/*-V-prolly \
+            --accept src/tools/prolly_bench/configs/v_growth_accept.toml \
+            --json "$PWD/engine-results/v-growth/vgrowth.json"
+
       - name: Upload benchmark evidence
         if: always()
         uses: actions/upload-artifact@v5

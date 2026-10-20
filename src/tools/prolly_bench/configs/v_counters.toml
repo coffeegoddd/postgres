@@ -1,0 +1,37 @@
+# The V suite's growth shape (V7, commit per transaction): one client, a
+# fixed number of transactions, each committed, and the counters read after
+# each.  vgrowth gates each counter's last tenth's mean per transaction
+# against its first's: work that grows with the number of commits before it
+# (a quadratic path) shows as about 9x at these sizes, a linear path as
+# about 1x.  Autovacuum is off but in the variants that turn it on.
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["counters"]
+workloads = ["V7"]
+fio_baseline = false
+seed = 1
+collectors = []
+
+[postgres]
+shared_buffers = "512MB"
+autovacuum = "off"
+checkpoint_timeout = "1d"
+max_wal_size = "16GB"
+wal_level = "minimal"
+max_wal_senders = 0
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+max_connections = 32
+
+[sizes.counters]
+v_rows = 100000
+
+[workloads.V7]
+background = ["none"]
+commits = 2000

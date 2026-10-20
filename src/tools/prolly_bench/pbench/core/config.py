@@ -234,7 +234,7 @@ def validate(cfg: dict, suite: str) -> None:
             "S9": {"isolation", "weights"}, "S10": {"tests"}, "S13": {"modes", "weights", "isolation"},
             "V1": {"iterations", "background"}, "V2": {"iterations", "background", "changes"},
             "V3": {"background", "changes", "locality", "conflict_percent"}, "V4": {"background", "changes"},
-            "V6": {"background", "branches", "changes"}}
+            "V6": {"background", "branches", "changes"}, "V7": {"background", "commit_modes", "commits"}}
     keys.update({f"C{i}": {"workers", "sample"} for i in range(1, 5)})
     keys.update({f"S{i}": set() for i in (1, 2, 4, 6, 7)})
     for wid, params in cfg["workloads"].items():
