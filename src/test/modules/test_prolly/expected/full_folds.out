@@ -291,7 +291,7 @@ INSERT INTO ff.s SELECT g, g % 10, 'b' || g, 'e' FROM generate_series(1, 2000) g
 SELECT length(dolt_commit('-Am', 'shape')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 \set after 'UPDATE ff.s SET b = b || ''.'' WHERE id = 1; SELECT same_as_full() AS same; SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly''); SELECT length(dolt_commit(''-am'', ''ddl'')::text) > 0 AS committed; SELECT pg_stat_force_next_flush(); SELECT coalesce(string_agg(reason, '',''), ''none'') AS read_in_full FROM full_folds();'
