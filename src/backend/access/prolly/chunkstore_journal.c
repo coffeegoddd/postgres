@@ -142,6 +142,7 @@
 #include <lz4.h>
 #endif
 
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_hash.h"
@@ -6188,6 +6189,8 @@ typedef struct GcCopy
 	const ProllyHashRoutine *hash;
 	bool		paced;			/* by the cost-based vacuum delay */
 	uint64	   *order;			/* the slots, file by file in offset order */
+	uint64		file_bytes;		/* the chunks' bytes in the file being written */
+	uint64		file_limit;		/* when it is full: another is begun */
 	/* the window of a file last read: its bytes [start, start + buf.len) */
 	GcFile	   *window_file;
 	uint64		window_start;
@@ -6320,6 +6323,8 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 	GcCopy	   *gcc = arg;
 	ProllyChunkGc *gc = gcc->gc;
 
+	if (gcc->file_bytes >= gcc->file_limit)
+		return false;
 	while (gcc->next < gc->nslots)
 	{
 		uint64		slot = gcc->order[gcc->next++];
@@ -6351,15 +6356,19 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("chunk in file \"%s\" doesn't match its hash",
 							f->path)));
+		gcc->file_bytes += data->len;
 		return true;
 	}
 	return false;
 }
 
 /*
- * Write the marked slots not yet written (but kept files') to a new file;
- * paced by the cost-based vacuum delay where one is active (not in the
- * window, where interrupts are held).
+ * Write the marked slots not yet written (but kept files') to new files,
+ * each of them begun once the last holds prolly.gc_file_size of chunks (as
+ * Dolt's collections rotate theirs), so that a store's files are of about
+ * one size, which a remote can be sent whole; paced by the cost-based
+ * vacuum delay where one is active (not in the window, where interrupts
+ * are held).
  */
 static void
 gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
@@ -6375,22 +6384,28 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 	if (gc->read_order == NULL)
 		gc->read_order = gc_read_order(gc);
 	gcc.order = gc->read_order;
+	gcc.file_limit = (uint64) prolly_gc_file_size * 1024;
 	initStringInfo(&gcc.window);
-	wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, &nchunks, &size);
-	pfree(gcc.window.data);
-	if (wrote)
+	do
 	{
-		ManifestFile *f = MemoryContextAlloc(gc->cxt, sizeof(ManifestFile));
-		MemoryContext old = MemoryContextSwitchTo(gc->cxt);
+		gcc.file_bytes = 0;
+		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, &nchunks,
+						   &size);
+		if (wrote)
+		{
+			ManifestFile *f = MemoryContextAlloc(gc->cxt, sizeof(ManifestFile));
+			MemoryContext old = MemoryContextSwitchTo(gc->cxt);
 
-		pgstat_count_prolly(PGSTAT_PROLLY_GC_BYTES_COPIED, size);
-		f->id = gc->next_id++;
-		f->nchunks = nchunks;
-		f->size = size;
-		f->flags = gc->settle ? MANIFEST_FILE_SETTLED : 0;
-		gc->written = lappend(gc->written, f);
-		MemoryContextSwitchTo(old);
-	}
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_BYTES_COPIED, size);
+			f->id = gc->next_id++;
+			f->nchunks = nchunks;
+			f->size = size;
+			f->flags = gc->settle ? MANIFEST_FILE_SETTLED : 0;
+			gc->written = lappend(gc->written, f);
+			MemoryContextSwitchTo(old);
+		}
+	} while (wrote && gcc.file_bytes >= gcc.file_limit);
+	pfree(gcc.window.data);
 }
 
 static int

@@ -118,6 +118,7 @@ tests += {
       'gc_full',
       'gc_spill',
       'gc_declared',
+      'gc_file_size',
       'page_sweep',
       'large_values',
       'large_keys',

@@ -48,6 +48,7 @@ int			prolly_gc_journal_threshold = 128;
 double		prolly_gc_growth_scale_factor = 0.2;
 int			prolly_journal_move_threshold = 256;
 int			prolly_conjoin_max_files = 256;
+int			prolly_gc_file_size = 65536;
 
 /* fewer than two files would be conjoined at every pass: -1 turns it off */
 static bool
@@ -112,6 +113,14 @@ prolly_autovacuum_init(void)
 							PGC_SIGHUP,
 							0,
 							check_conjoin_max_files, NULL, NULL);
+	DefineCustomIntVariable("prolly.gc_file_size",
+							"How large each table file a collection writes grows before it starts another.",
+							"Files of a set size can be sent whole to a remote and conjoined later.",
+							&prolly_gc_file_size,
+							65536, 64, MAX_KILOBYTES,
+							PGC_USERSET,
+							GUC_UNIT_KB,
+							NULL, NULL, NULL);
 	defined = true;
 }
 
