@@ -225,6 +225,7 @@ tests += {
       't/129_fold_verify.pl',
       't/130_keyless_toast_gc.pl',
       't/131_branch_maps_crash.pl',
+      't/132_rr_branch_first_use.pl',
       't/133_stash_concurrency.pl',
       't/140_corrupt_compressed.pl',
       't/141_standby_root_redo.pl',

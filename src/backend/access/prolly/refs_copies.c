@@ -76,6 +76,8 @@
 #include <ctype.h>
 
 #include "access/prolly_builtins.h"
+#include "utils/fmgroids.h"
+#include "catalog/pg_branch.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
@@ -746,6 +748,28 @@ branch_oid(const char *name)
 
 	branch_ops()->branches(find_branch, &fb);
 	return fb.branch;
+}
+
+/*
+ * Was branch name's catalog row (made at its first use, with its copies)
+ * written by a transaction the transaction's snapshot doesn't see?
+ */
+static bool
+branch_made_unseen(const char *name)
+{
+	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		seen;
+
+	ScanKeyInit(&key, Anum_pg_branch_brname, BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum(name));
+	scan = systable_beginscan(brel, BranchNameIndexId, true,
+							  GetTransactionSnapshot(), 1, &key);
+	seen = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(brel, AccessShareLock);
+	return !seen;
 }
 
 /*
@@ -1932,6 +1956,18 @@ copies_checkout(const char *name)
 			PopActiveSnapshot();
 		oid = branch_oid(name);
 	}
+	/*
+	 * (a branch another transaction first used after this one's snapshot,
+	 * which can't move: its copies are rows the snapshot doesn't see, so
+	 * the branch would read as the one they were copied from)
+	 */
+	if (strcmp(current, name) != 0 && OidIsValid(oid) &&
+		IsolationUsesXactSnapshot() && branch_made_unseen(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" was first used since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
 		OidIsValid(oid))
