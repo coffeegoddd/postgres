@@ -198,8 +198,9 @@ adapts.
 - **CLI-only output** (bats tests that check printed text).
 
 Every other Dolt version-control feature is in scope; one prolly lacks
-yet (diff system tables, `dolt_history_<t>`, tags, `AS OF`, rebase,
-stash, …) is F, ported with the feature (#163).
+yet (tags, rebase, stash, ref ranges in diff functions, …) is F, ported
+with the feature (#163). Diff system tables, `dolt_history_<t>` and `AS
+OF` are built in D18's shapes.
 
 ## D11. Branch-qualified databases are connections
 
@@ -367,6 +368,49 @@ stash, …) is F, ported with the feature (#163).
 - **Port:** a case renaming a table and changing its rows in one commit
   expects a `dropped` and an `added` row; one asking by either name
   gets that name's row alone.
+
+## D18. Per-table diff and history tables are functions
+
+- **Dolt:** `dolt_diff_<table>` and `dolt_history_<table>` are system
+  tables, one per table, and `SELECT … AS OF 'ref'` reads a table at a
+  commit; the `dolt_diff` system table lists each commit's changed
+  tables.
+- **Prolly:** Postgres can't make a relation per table on the fly, so
+  each is a function taking the table's row type, as `dolt_diff` does:
+  `dolt_diff_table(NULL::t [, from_ref, to_ref])` (columns `to_row`,
+  `from_row` of `t`'s row type, the commits, their dates, `diff_type`),
+  `dolt_history_table(NULL::t)` (`row`, `commit_hash`, `committer`,
+  `commit_date`) and `dolt_at(ref, NULL::t)` (`SETOF t`). The `dolt_diff`
+  view, over `dolt_diff()`, is the system table, every kind of object
+  listed (D15). Rows of other versions are decoded as the table is
+  defined now.
+- **Why:** Postgres's catalogs; the functions keep a table's own row
+  type.
+- **Port:** `SELECT * FROM dolt_diff_t` becomes `dolt_diff_table(NULL::t)`
+  with `(to_row).col` for `to_col`; `AS OF 'r'` becomes `dolt_at('r',
+  NULL::t)`.
+
+## D19. A primary key changed is a modified table
+
+- **Dolt:** a table whose primary key changed between two refs is
+  refused by `dolt_diff_summary(from, to, t)` and left out, with a
+  warning, by the two-argument form: its row diff can't be read.
+- **Prolly:** it is `modified`, its rows and definition changed: rows
+  are matched by name, not by key tags, and the summary reads no rows.
+- **Why:** nothing in the canonical form makes the change unreadable.
+- **Port:** cases expecting the refusal or the warning expect the row.
+
+## D20. Cells modified count what differs
+
+- **Dolt:** `dolt_diff_stat` counts a column added since as a changed
+  cell of every modified row.
+- **Prolly:** a modified row's cells are compared decoded, as the table
+  is defined now; a column added since differs only where the values
+  do.
+- **Why:** the canonical form records no column tags to tell an added
+  column from a value changed.
+- **Port:** a case adding a column and modifying rows in one commit
+  expects the cells whose values differ.
 
 ## D23. `dolt_gc()` returns a status, not statistics
 

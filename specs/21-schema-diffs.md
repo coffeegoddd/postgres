@@ -1,8 +1,10 @@
 # 21. Schema diffs
 
 **Status: proposed 2026-10-19, on `1c9d57affc`; decided by the user the
-same day, as recommended (part 7). Nothing here is built. Tracked in
-#439; the rename bug it touches is #437.**
+same day, as recommended (part 7). Built 2026-10-19 as stack #520
+(#514–#519 and the layers after them), not merged; part 8 says what each
+built and where it departs. Tracked in #439; the rename bug it touches
+is #437.**
 A versioned schema's definitions are committed, branched, merged and
 moved (spec 11, steps 4–5), but nothing in SQL shows what changed in
 them: `dolt_status` says an object is `modified`, and `dolt_diff` only
@@ -240,3 +242,33 @@ Decided by the user 2026-10-19, as recommended:
    depend on the session's catalogs; not now.
 5. **Order:** before spec 11's step 8. #437 first, then 4.1, then 4.2;
    5's items later, each its own issue.
+
+## 8. As built (2026-10-19)
+
+- **#437 first** (#514): a table whose data trees have the same hash has
+  no row changes in `dolt_diff`, whatever its descriptions say.
+- **4.1, `dolt_diff_summary`** (#515): as designed. The canonicalizer's
+  `changes()` reads the roots' tree diff (4.4's cost); the diff-merge
+  component's `summary()` resolves refs. Renames compare items with
+  each object's own name masked, as a table's description names it in
+  its indexes' statements. From the ports (#517), as Dolt: an empty
+  table added or dropped has no `data_change`, and a renamed object has
+  `schema_change`.
+- **4.2, `dolt_schema_diff`** (#516): rendered by the move's builders
+  (`move_table()` rendering: each constraint whole, nothing read from the
+  catalogs) through the canonicalizer's `render()`. A row is given where
+  the two sides' statements differ, so a rename has one, as in Dolt.
+- **Part 6's ports** (#517): of Dolt's 19 cases, 11 ported whole, 5 in
+  part, 3 deferred (a primary-key change, D19; a computed setup); spec
+  18's D15–D17; Doltgres's cases in `schema_diffs`.
+- **Part 5, built too:**
+  - `dolt_diff_stat` (#518, #496), on the summary and the row diff
+    rather than a new interface callback;
+  - `dolt_diff_table(NULL::t [, from, to])` and the `dolt_diff` view
+    (#519, #497), D18's shapes;
+  - `dolt_at(ref, NULL::t)` and `dolt_history_table(NULL::t)` (#495's
+    SRF, #497's history), read from commits' trees.
+- **Not built:** ref ranges (`a..b`, `a...b`; #521), a name argument
+  folding case (#522), `dolt_at`'s key-range pushdown and the detached
+  checkout cache (#495).
+
