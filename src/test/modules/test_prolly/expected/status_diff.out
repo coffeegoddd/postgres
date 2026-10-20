@@ -894,7 +894,7 @@ INSERT INTO app.t VALUES (1, 'a');
 SELECT length(dolt_commit('-Am', 'one row')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
