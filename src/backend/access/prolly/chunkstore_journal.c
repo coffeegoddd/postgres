@@ -3674,7 +3674,10 @@ typedef struct AheadEntry
 	Size		len;
 } AheadEntry;
 
-/* what the store reads ahead at most: past it, what was is forgotten */
+/*
+ * what the store reads ahead at most: past it, no more is kept until some
+ * is taken
+ */
 #define AHEAD_MAX			(8 * 1024 * 1024)
 
 typedef struct AheadFill
@@ -3693,7 +3696,10 @@ ahead_put(int i, const char *data, Size len, void *arg)
 
 	if (data == NULL)
 		return;
-	if (s->ahead == NULL || s->ahead_bytes + len > AHEAD_MAX)
+	/* (full: what is there is kept, for what asks next; this isn't) */
+	if (s->ahead != NULL && s->ahead_bytes + len > AHEAD_MAX)
+		return;
+	if (s->ahead == NULL)
 	{
 		HASHCTL		ctl;
 
@@ -3785,7 +3791,11 @@ many_locate(ProllyChunkStore *s, const ProllyHash *key, ManyRead *r)
 	{
 		r->g = local_segment(s, segment);
 		r->t = NULL;
-		return open_segment(r->g);
+		/* (as get() takes it: the index names it, its file must be there) */
+		if (!open_segment(r->g))
+			elog(ERROR, "chunk journal segment %llu is missing",
+				 (unsigned long long) segment);
+		return true;
 	}
 	foreach(lc, s->tables)
 	{
@@ -3807,6 +3817,12 @@ many_locate(ProllyChunkStore *s, const ProllyHash *key, ManyRead *r)
  * order, reads close together made as one, each announced to the kernel
  * before any is made.  A table file a conjoin removed meanwhile is read
  * from again by get(), which looks again.
+ *
+ * The reads point at the store's segments and table files, which a
+ * refresh (reading the journal or the files' list again) may free: so
+ * every chunk is located after the last refresh (all again, if some
+ * missed the first time), and once get() has been asked for one (which
+ * may refresh), it is asked for the rest too.
  */
 static void
 journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
@@ -3816,6 +3832,9 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 	int			nreads = 0;
 	int		   *missing = palloc(sizeof(int) * Max(n, 1));
 	int			nmissing = 0;
+	int		   *rest = palloc(sizeof(int) * Max(n, 1));
+	int			nrest = 0;
+	bool		asked = false;
 	StringInfoData buf;
 	StringInfoData out;
 
@@ -3837,28 +3856,28 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 		}
 		else if (ahead_take(s, &key, &out))
 			visit(i, out.data, out.len, arg);
-		else if (many_locate(s, &key, &reads[nreads]))
-			reads[nreads++].i = i;
 		else
-			missing[nmissing++] = i;
+			rest[nrest++] = i;
 	}
-	if (nmissing > 0)
+	for (bool refreshed = false;;)
 	{
-		int			left = 0;
-
-		scan_journal(s);
-		load_tables(s, false);
-		for (int m = 0; m < nmissing; m++)
+		nreads = nmissing = 0;
+		for (int r = 0; r < nrest; r++)
 		{
 			ProllyHash	key;
 
-			hash_key(&key, &hashes[missing[m]]);
+			hash_key(&key, &hashes[rest[r]]);
 			if (many_locate(s, &key, &reads[nreads]))
-				reads[nreads++].i = missing[m];
+				reads[nreads++].i = rest[r];
 			else
-				missing[left++] = missing[m];
+				missing[nmissing++] = rest[r];
 		}
-		nmissing = left;
+		if (nmissing == 0 || refreshed)
+			break;
+		INJECTION_POINT("prolly-get-many-refreshing", NULL);
+		scan_journal(s);
+		load_tables(s, false);
+		refreshed = true;
 	}
 
 	qsort(reads, nreads, sizeof(ManyRead), many_cmp);
@@ -3898,18 +3917,27 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 		}
 		CHECK_FOR_INTERRUPTS();
 		resetStringInfo(&buf);
-		enlargeStringInfo(&buf, (int) (end - start));
-		got = FileRead(file, buf.data, end - start, start, WAIT_EVENT_DATA_FILE_READ);
-		pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_FILE_READS, 1);
+		got = -1;
+		if (!asked)
+		{
+			enlargeStringInfo(&buf, (int) (end - start));
+			got = FileRead(file, buf.data, end - start, start,
+						   WAIT_EVENT_DATA_FILE_READ);
+			pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_FILE_READS, 1);
+		}
 		for (int r = a; r < b; r++)
 		{
 			ManyRead   *mr = &reads[r];
 			const char *bytes = buf.data + (mr->offset - start);
 
 			resetStringInfo(&out);
-			if (got != (ssize_t) (end - start))
+			if (asked || got != (ssize_t) (end - start))
 			{
-				/* (a file gone, or short: asked for alone) */
+				/*
+				 * (a file gone, or short: asked for alone, and from here on
+				 * every one, as get() may have freed what reads[] names)
+				 */
+				asked = true;
 				if (!journal_get(s, &hashes[mr->i], &out))
 				{
 					visit(mr->i, NULL, 0, arg);
@@ -3917,21 +3945,7 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 				}
 			}
 			else if (mr->g != NULL)
-			{
-				ProllyHash	h;
-				Size		after;
-
-				if (!record_valid(bytes, mr->len) ||
-					!record_hash(bytes, mr->len, &h, &after) ||
-					h.len != hashes[mr->i].len ||
-					memcmp(h.bytes, hashes[mr->i].bytes, h.len) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("chunk journal \"%s\" holds no chunk %s at %llu",
-									mr->g->path, prolly_hash_hex(&hashes[mr->i]),
-									(unsigned long long) mr->offset)));
-				chunk_bytes(mr->g->path, bytes, mr->len, &out);
-			}
+				chunk_bytes_of(mr->g->path, bytes, mr->len, &hashes[mr->i], &out);
 			else
 				PROLLY_CALL(table_format(), decode, mr->t->tf, bytes, mr->len, &out);
 			visit(mr->i, out.data, out.len, arg);
@@ -3950,6 +3964,7 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 	pfree(out.data);
 	pfree(reads);
 	pfree(missing);
+	pfree(rest);
 }
 
 static bool
@@ -5066,6 +5081,7 @@ struct ProllyChunkGc
 	int			kept_seen;		/* how many of it gc_kept() visited */
 	uint64		next_id;		/* the next file id to give */
 	uint8	   *copied;			/* slots gc_copy() wrote */
+	uint64	   *read_order;		/* gc_read_order()'s, made once */
 	List	   *written;		/* ManifestFile *, the new files */
 	bool		window;
 	instr_time	window_began;	/* (a monotonic clock) */
@@ -5937,7 +5953,7 @@ slot_at_cmp(const void *a, const void *b)
 static uint64 *
 gc_read_order(ProllyChunkGc *gc)
 {
-	uint64	   *order = MemoryContextAllocHuge(CurrentMemoryContext,
+	uint64	   *order = MemoryContextAllocHuge(gc->cxt,
 											   sizeof(uint64) * Max(gc->nslots, 1));
 	uint64		n = 0;
 
@@ -6004,19 +6020,22 @@ gc_read_windowed(GcCopy *gcc, uint64 slot, StringInfo out)
 	{
 		uint64		want = Max((uint64) len, GC_WINDOW);
 		uint64		size = f->size;
+		ssize_t		got;
 
 		if (size > offset && size - offset < want)
 			want = Max(size - offset, (uint64) len);
 		resetStringInfo(&gcc->window);
 		enlargeStringInfo(&gcc->window, (int) want);
-		if (FileRead(f->segment ? f->file : f->t->file, gcc->window.data, want,
-					 offset, WAIT_EVENT_DATA_FILE_READ) < (ssize_t) len)
+		got = FileRead(f->segment ? f->file : f->t->file, gcc->window.data, want,
+					   offset, WAIT_EVENT_DATA_FILE_READ);
+		if (got < (ssize_t) len)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 							len, (unsigned long long) offset, f->path)));
 		pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_FILE_READS, 1);
-		gcc->window.len = (int) want;
+		/* (what was read: a short read holds less than was asked for) */
+		gcc->window.len = (int) got;
 		gcc->window_file = f;
 		gcc->window_start = offset;
 	}
@@ -6084,10 +6103,12 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 
 	if (gc->copied == NULL)
 		gc->copied = MemoryContextAllocZero(gc->cxt, gc->nslots / 8 + 1);
-	gcc.order = gc_read_order(gc);
+	/* (once for the collection: its files and slots don't change) */
+	if (gc->read_order == NULL)
+		gc->read_order = gc_read_order(gc);
+	gcc.order = gc->read_order;
 	initStringInfo(&gcc.window);
 	wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, &nchunks, &size);
-	pfree(gcc.order);
 	pfree(gcc.window.data);
 	if (wrote)
 	{

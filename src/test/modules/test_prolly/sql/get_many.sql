@@ -37,6 +37,15 @@ SELECT count(*) AS answered, bool_and(visits = 1) AS once,
 	bool_and(g.data IS NOT DISTINCT FROM w.data) AS bytes
 FROM test_chunk_get_many((SELECT array_agg(hash ORDER BY i) FROM wanted)) g
 JOIN wanted w USING (i);
+-- The same chunk asked for twice, from the journal and from the file:
+-- each request answered, with its bytes.
+SELECT count(*) AS answered, bool_and(g.data = w.data) AS bytes
+FROM test_chunk_get_many((SELECT array_agg(hash ORDER BY name)
+						  FROM wanted WHERE name IN ('j1', 't1'))
+						 || (SELECT array_agg(hash ORDER BY name)
+							 FROM wanted WHERE name IN ('j1', 't1'))) g
+JOIN wanted w ON w.name = CASE WHEN g.i % 2 = 1 THEN 'j1' ELSE 't1' END;
+
 -- In a few reads: the journal's 50 and the file's 20 together, not one a
 -- chunk.
 \c many_db

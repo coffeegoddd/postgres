@@ -206,6 +206,7 @@ tests += {
       't/124_journal_index_file.pl',
       't/140_corrupt_compressed.pl',
       't/141_standby_root_redo.pl',
+      't/142_get_many_refresh.pl',
     ],
   },
 }
