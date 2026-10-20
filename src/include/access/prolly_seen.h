@@ -8,9 +8,12 @@
  * run, each run with a filter kept in memory (a Bloom filter, ten bits a
  * hash); a lookup reads memory, then each run whose filter may hold the
  * hash, newest first, by a binary search of the run in the file.  A value
- * found may be changed in place, in memory or in its run.  So a transfer
- * of any size takes about its budget in memory, as a hash join does, and a
- * bit or so a hash more.
+ * found may be changed in place, in memory or in its run.  So a map of any
+ * size takes about its budget in memory, as a hash join does, but as it
+ * writes a run (its sorted copy beside the table: half again) and for its
+ * filters (ten bits a hash it ever held, kept).  A transfer's maps that
+ * live at once share maintenance_work_mem; runs aren't merged, so a map
+ * of many runs reads its file more often for what it doesn't hold.
  *
  * src/include/access/prolly_seen.h
  *

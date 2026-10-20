@@ -55,6 +55,14 @@ SELECT dolt_checkout('-b', 'theirs', 'origin/main') IS NOT NULL AS checked_out;
 SELECT count(*), count(*) FILTER (WHERE b = test_noise('row ' || id, 3000)) AS whole
 FROM sp.t;
 
+-- Served as a libpq remote serves it, in 64 kB: what was sent written out
+-- as runs, and its file closed as the call ends (no resource left open).
+\c spill_from
+SET maintenance_work_mem = '64kB';
+SELECT count(*) > 3000 AS sent_since
+FROM dolt_serve_since(ARRAY[decode(dolt_hashof('main'), 'hex')], '{}');
+RESET maintenance_work_mem;
+
 \c postgres
 DROP DATABASE spill_from;
 DROP DATABASE spill_into;

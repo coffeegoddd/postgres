@@ -58,22 +58,28 @@
 #include "utils/memutils.h"
 
 /*
- * A chunk received: where its bytes are in the spool, and whether the walk
- * visited it.  The spool holds each chunk received after a header (its
- * hash, as a key, and its length), in the order received.
+ * A chunk received: where its bytes are in the spool.  The spool holds
+ * each chunk received after a header (its hash, as a key, its length, and
+ * whether the walk visited it, set in place), in the order received.
  */
 typedef struct Received
 {
 	uint64		offset;
 	uint32		len;
-	bool		visited;
 } Received;
 
 typedef struct SpoolHeader
 {
 	ProllyHash	hash;
 	uint32		len;
+	bool		visited;
 } SpoolHeader;
+
+/*
+ * The budget of each of a transfer's maps: those that live at once share
+ * maintenance_work_mem.
+ */
+#define TRANSFER_BUDGET(n)	((Size) maintenance_work_mem * 1024 / (n))
 
 typedef struct Receiving
 {
@@ -159,14 +165,14 @@ keep_chunk(Receiving *rv, const ProllyHash *hash, const char *data, int len,
 		appendBinaryStringInfo(chunk, decoded.data, decoded.len);
 	pfree(decoded.data);
 
-	if (prolly_seen_find(rv->received, hash, NULL))
-		return;
 	memset(&head, 0, sizeof(head));
 	hash_key(&head.hash, hash);
 	head.len = len;
 	r.offset = rv->spooled + sizeof(head);
 	r.len = len;
-	r.visited = false;
+	/* (entered first: one lookup, and nothing spooled for one kept before) */
+	if (!prolly_seen_enter(rv->received, hash, &r))
+		return;
 
 	/* (at the end: a read since may have left the file elsewhere) */
 	if (BufFileSeek(rv->spool, 0, rv->spooled, SEEK_SET) != 0)
@@ -176,7 +182,6 @@ keep_chunk(Receiving *rv, const ProllyHash *hash, const char *data, int len,
 	BufFileWrite(rv->spool, &head, sizeof(head));
 	BufFileWrite(rv->spool, data, len);
 	rv->spooled += sizeof(head) + len;
-	(void) prolly_seen_enter(rv->received, hash, &r);
 }
 
 /*
@@ -299,12 +304,27 @@ receive_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	Receiving  *rv = arg;
 	Received	r;
+	SpoolHeader head;
+	off_t		at;
 
 	/* (a chunk is read, so received, before it is visited) */
-	if (!prolly_seen_find(rv->received, &node->hash, &r) || r.visited)
-		return false;			/* the store's, or seen */
-	r.visited = true;
-	prolly_seen_set(rv->received, &node->hash, &r);
+	if (!prolly_seen_find(rv->received, &node->hash, &r))
+		return false;			/* the store's */
+	/* (whether it was visited: in its header, set there) */
+	at = r.offset - sizeof(SpoolHeader);
+	if (BufFileSeek(rv->spool, 0, at, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in a transfer's temporary file: %m")));
+	BufFileReadExact(rv->spool, &head, sizeof(head));
+	if (head.visited)
+		return false;			/* seen */
+	head.visited = true;
+	if (BufFileSeek(rv->spool, 0, at, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in a transfer's temporary file: %m")));
+	BufFileWrite(rv->spool, &head, sizeof(head));
 	rv->visited++;
 	return true;
 }
@@ -330,11 +350,10 @@ received_next(void *arg, ProllyHash *hash, StringInfo data)
 					(errcode_for_file_access(),
 					 errmsg("could not seek in a transfer's temporary file: %m")));
 		BufFileReadExact(rv->spool, &head, sizeof(head));
+		r.offset = rv->next + sizeof(head);
+		r.len = head.len;
 		rv->next += sizeof(head) + head.len;
-		if (!prolly_seen_find(rv->received, &head.hash, &r))
-			elog(ERROR, "a spooled chunk %s isn't one received",
-				 prolly_hash_hex(&head.hash));
-	} while (!r.visited);
+	} while (!head.visited);
 	*hash = head.hash;
 	spool_read(rv, &r, data);
 	return true;
@@ -395,7 +414,7 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 	ProllySeen *seen;
 
 	prolly_database_components(&dc);
-	seen = prolly_seen_create("prolly received commits", 0, 0);
+	seen = prolly_seen_create("prolly received commits", 0, TRANSFER_BUDGET(2));
 	for (int i = 0; i < ncommits; i++)
 	{
 		ProllyCommitInfo info;
@@ -454,7 +473,8 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	rv.cs = prolly_chunk_store();
 	rv.store = PROLLY_CALL(rv.cs, open, MyDatabaseId, MyDatabaseTableSpace);
 	rv.hash = prolly_content_hash();
-	rv.received = prolly_seen_create("prolly chunks received", sizeof(Received), 0);
+	rv.received = prolly_seen_create("prolly chunks received", sizeof(Received),
+									 TRANSFER_BUDGET(2));
 	rv.spool = BufFileCreateTemp(false);
 	prolly_database_components(&dc);
 
@@ -777,7 +797,12 @@ typedef struct Sending
 	ProllyChunkStore *store;
 	ProllySeen *seen;			/* visited */
 	ProllySeen *remote_has;		/* bool: has_many()'s answers */
-	BufFile    *order;			/* ProllyHash, to send, in order */
+	/* ProllyHash, to send, in order: the first in memory, past it a file */
+	ProllyHash *mem;
+	uint64		nmem;
+	uint64		capmem;			/* of mem */
+	uint64		maxmem;			/* the budget's worth */
+	BufFile    *order;
 	uint64		norder;
 	uint64		next;			/* the next to send's place in order */
 } Sending;
@@ -824,11 +849,29 @@ send_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 	if (has)
 		return false;
 	hash_key(&key, &node->hash);
-	if (BufFileSeek(sd->order, 0, sd->norder * sizeof(ProllyHash), SEEK_SET) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not seek in a transfer's temporary file: %m")));
-	BufFileWrite(sd->order, &key, sizeof(key));
+	if (sd->nmem < sd->maxmem && sd->order == NULL)
+	{
+		if (sd->nmem == sd->capmem)
+		{
+			sd->capmem = Min(sd->maxmem, Max(sd->capmem * 2, 1024));
+			sd->mem = sd->mem == NULL ?
+				MemoryContextAllocHuge(CurrentMemoryContext,
+									   sizeof(ProllyHash) * sd->capmem) :
+				repalloc_huge(sd->mem, sizeof(ProllyHash) * sd->capmem);
+		}
+		sd->mem[sd->nmem++] = key;
+	}
+	else
+	{
+		if (sd->order == NULL)
+			sd->order = BufFileCreateTemp(false);
+		if (BufFileSeek(sd->order, 0, (sd->norder - sd->nmem) * sizeof(ProllyHash),
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in a transfer's temporary file: %m")));
+		BufFileWrite(sd->order, &key, sizeof(key));
+	}
 	sd->norder++;
 	return true;
 }
@@ -840,11 +883,17 @@ sent_next(void *arg, ProllyHash *hash, StringInfo data)
 
 	if (sd->next >= sd->norder)
 		return false;
-	if (BufFileSeek(sd->order, 0, sd->next * sizeof(ProllyHash), SEEK_SET) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not seek in a transfer's temporary file: %m")));
-	BufFileReadExact(sd->order, hash, sizeof(ProllyHash));
+	if (sd->next < sd->nmem)
+		*hash = sd->mem[sd->next];
+	else
+	{
+		if (BufFileSeek(sd->order, 0, (sd->next - sd->nmem) * sizeof(ProllyHash),
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in a transfer's temporary file: %m")));
+		BufFileReadExact(sd->order, hash, sizeof(ProllyHash));
+	}
 	sd->next++;
 	if (!prolly_chunk_get_stored(sd->cs, sd->store, hash, data))
 		ereport(ERROR,
@@ -865,10 +914,10 @@ chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	sd.remote = remote;
 	sd.cs = prolly_chunk_store();
 	sd.store = PROLLY_CALL(sd.cs, open, MyDatabaseId, MyDatabaseTableSpace);
-	sd.seen = prolly_seen_create("prolly chunks sent", 0, 0);
+	sd.seen = prolly_seen_create("prolly chunks sent", 0, TRANSFER_BUDGET(3));
 	sd.remote_has = prolly_seen_create("prolly chunks the remote has",
-									   sizeof(bool), 0);
-	sd.order = BufFileCreateTemp(false);
+									   sizeof(bool), TRANSFER_BUDGET(3));
+	sd.maxmem = Max(TRANSFER_BUDGET(3) / sizeof(ProllyHash), 1);
 	prolly_database_components(&dc);
 	if (PROLLY_HAS(rr, has_many))
 		PROLLY_CALL(sd.cs, read_through, sd.store, NULL, send_hint, &sd);
@@ -883,7 +932,10 @@ chunks_send(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	}
 	PG_END_TRY();
 	PROLLY_CALL(rr, add_chunks, remote, sent_next, &sd);
-	BufFileClose(sd.order);
+	if (sd.order)
+		BufFileClose(sd.order);
+	if (sd.mem)
+		pfree(sd.mem);
 	prolly_seen_destroy(sd.seen);
 	prolly_seen_destroy(sd.remote_has);
 	return sd.norder;

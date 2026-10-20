@@ -38,6 +38,7 @@ typedef struct Run
 struct ProllySeen
 {
 	MemoryContext cxt;
+	const char *name;			/* the caller's, its table's too */
 	Size		value_size;
 	Size		entry_size;		/* in memory: key, then value */
 	Size		record_size;	/* in the file: the same */
@@ -81,6 +82,7 @@ prolly_seen_create(const char *name, Size value_size, Size budget)
 	s->cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly walk seen",
 								   ALLOCSET_DEFAULT_SIZES);
 	MemoryContextCopyAndSetIdentifier(s->cxt, name);
+	s->name = MemoryContextStrdup(s->cxt, name);
 	s->value_size = value_size;
 	s->entry_size = MAXALIGN(sizeof(ProllyHash) + value_size);
 	s->record_size = sizeof(ProllyHash) + value_size;
@@ -157,7 +159,7 @@ write_run(ProllySeen *s)
 	pfree(records);
 
 	hash_destroy(s->table);
-	s->table = make_table(s, "prolly walk seen");
+	s->table = make_table(s, s->name);
 	s->in_table = 0;
 	MemoryContextSwitchTo(old);
 }

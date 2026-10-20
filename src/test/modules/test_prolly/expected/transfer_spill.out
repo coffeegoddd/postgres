@@ -130,6 +130,18 @@ FROM sp.t;
   3000 |  3000
 (1 row)
 
+-- Served as a libpq remote serves it, in 64 kB: what was sent written out
+-- as runs, and its file closed as the call ends (no resource left open).
+\c spill_from
+SET maintenance_work_mem = '64kB';
+SELECT count(*) > 3000 AS sent_since
+FROM dolt_serve_since(ARRAY[decode(dolt_hashof('main'), 'hex')], '{}');
+ sent_since 
+------------
+ t
+(1 row)
+
+RESET maintenance_work_mem;
 \c postgres
 DROP DATABASE spill_from;
 DROP DATABASE spill_into;

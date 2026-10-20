@@ -706,7 +706,6 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 	sn.store = store();
 	initStringInfo(&sn.data);
 	ctl.keysize = sizeof(ProllyHash);
-	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
 	sn.sent = prolly_seen_create("prolly chunks sent since", 0, 0);
 	ctl.entrysize = sizeof(SinceCommit);
@@ -758,6 +757,8 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(per_commit);
 	}
+	/* (its file, if it spilled, closed: the portal outlives the walk) */
+	prolly_seen_destroy(sn.sent);
 	return (Datum) 0;
 }
 
