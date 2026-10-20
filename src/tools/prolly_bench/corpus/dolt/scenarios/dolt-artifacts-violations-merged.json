@@ -563,7 +563,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-afm', 'update children to new value'))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-afm', 'update children to new value'))[1]) = 40",
       "expect": {
         "rows": [
           [

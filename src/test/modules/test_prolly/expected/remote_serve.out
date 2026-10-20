@@ -14,7 +14,7 @@ INSERT INTO rs.t VALUES (1, 'one');
 SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rs_b');
@@ -27,11 +27,13 @@ INSERT INTO rs.t VALUES (2, 'two');
 SELECT length(dolt_commit('-Am', 'two')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- what a fetch asks
-SELECT dolt_serve_format() = :'fmt' AS same_format;
+-- (the canonical format, then that it sends and takes chunks framed, and
+-- with LZ4 where it can decompress them)
+SELECT dolt_serve_format() LIKE :'fmt' || '/framed%' AS same_format;
  same_format 
 -------------
  t
@@ -193,18 +195,18 @@ NOTICE:  refused: this database holds commits of canonical format N, not 0
 -- nothing moved
 SELECT dolt_hashof('rs_b') AS rs_b \gset
 BEGIN;
-SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920212223242526272829303132'::bytea],
-						  ARRAY['\xdeadbeef'::bytea]);
+SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920'::bytea],
+						  ARRAY[test_chunk_frame('\xdeadbeef'::bytea, false)]);
  dolt_serve_receive 
 --------------------
  
 (1 row)
 
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'),
-							'\x0102030405060708091011121314151617181920212223242526272829303132',
+							'\x0102030405060708091011121314151617181920',
 							:'fmt', false);
-ERROR:  the remote's chunk 0102030405060708091011121314151617181920212223242526272829303132 doesn't match its hash
-DETAIL:  Its bytes hash to 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953.
+ERROR:  the remote's chunk 0102030405060708091011121314151617181920 doesn't match its hash
+DETAIL:  Its bytes hash to 53147f3ce49ed4f60dfa5b9654c36ba6103c11f5.
 ROLLBACK;
 SELECT dolt_hashof('rs_b') = :'rs_b' AS unmoved;
  unmoved 
@@ -222,7 +224,7 @@ SELECT dolt_serve_format();
 ERROR:  permission denied for function dolt_serve_format
 RESET ROLE;
 SET ROLE regress_rs_fetch;
-SELECT dolt_serve_format() = :'fmt' AS fetches;
+SELECT dolt_serve_format() LIKE :'fmt' || '/framed%' AS fetches;
  fetches 
 ---------
  t
@@ -259,7 +261,7 @@ NOTICE:  drop cascades to table rs.t
 SELECT length(dolt_commit('-Am', 'rs gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- what changed since known commits, past a merge: a receiver that has one
@@ -321,7 +323,7 @@ NOTICE:  drop cascades to table rsm.t
 SELECT length(dolt_commit('-Am', 'rsm gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- what changed since known commits, whatever the commits' times: a
@@ -362,14 +364,14 @@ UPDATE rst.t SET v = 'k1' WHERE id = 3;
 SELECT length(dolt_commit('-Am', 'rst k1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE rst.t SET v = 'k2' WHERE id = 4;
 SELECT length(dolt_commit('-Am', 'rst k2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE rst.t SET v = 'k3' WHERE id = 5;
@@ -417,6 +419,6 @@ NOTICE:  drop cascades to table rst.t
 SELECT length(dolt_commit('-Am', 'rst gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

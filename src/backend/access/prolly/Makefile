@@ -27,6 +27,8 @@ OBJS = \
 	chunker_stub.o \
 	chunkstore_journal.o \
 	diffmerge_folded.o \
+	hash_blake3.o \
+	journal_index.o \
 	hash_sha256.o \
 	hash_stub.o \
 	keyenc_ordered.o \
@@ -43,6 +45,7 @@ OBJS = \
 	prolly_datum.o \
 	prolly_deps.o \
 	prolly_registry.o \
+	prolly_seen.o \
 	prolly_shmem.o \
 	prolly_table.o \
 	prolly_dolt.o \

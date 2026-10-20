@@ -41,11 +41,11 @@ SELECT name, chunks, settled FROM test_chunk_table_files();
 
 -- Table files a transfer added, not settled, are collected.
 SELECT test_chunk_table_file(ARRAY['gc tf live'::bytea, 'gc tf dead'::bytea]);
-SELECT test_chunk_put_node(1, ARRAY[:'node2', encode(sha256('gc tf live'), 'hex')]) AS node3 \gset
+SELECT test_chunk_put_node(1, ARRAY[:'node2', test_content_hash('gc tf live')]) AS node3 \gset
 SELECT test_chunk_move_root(:'node2', :'node3');
 SELECT kept, freed FROM test_chunk_gc(false);
-SELECT test_chunk_has(encode(sha256('gc tf live'), 'hex')) AS live,
-	test_chunk_has(encode(sha256('gc tf dead'), 'hex')) AS dead;
+SELECT test_chunk_has(test_content_hash('gc tf live')) AS live,
+	test_chunk_has(test_content_hash('gc tf dead')) AS dead;
 SELECT name, chunks, settled FROM test_chunk_table_files();
 
 -- A collection's files survive a new session and a conjoin.
@@ -106,7 +106,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g');
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g');
 END $$;
 SELECT pg_temp.err(format('SELECT dolt_reset(%L, %L)', '--hard', :'side_head'));	-- collected
 SELECT dolt_reset('--hard', :'kept_head');	-- settled, kept

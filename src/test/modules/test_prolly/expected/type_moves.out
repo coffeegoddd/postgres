@@ -17,7 +17,7 @@ CREATE MATERIALIZED VIEW tm.ids AS SELECT id FROM tm.t;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('feature');
@@ -46,7 +46,7 @@ REFRESH MATERIALIZED VIEW tm.ids;
 SELECT length(dolt_commit('-Am', 'feature types')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -172,7 +172,7 @@ CREATE MATERIALIZED VIEW tm2.mv2 AS SELECT count(*) AS n FROM tm2.mv1;
 SELECT length(dolt_commit('-Am', 'tm2 base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('feature2');
@@ -202,7 +202,7 @@ INSERT INTO tm2.t VALUES (4, 'ok', NULL, NULL, 4, NULL);	-- (the views stale)
 SELECT length(dolt_commit('-Am', 'tm2 feature')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -294,7 +294,7 @@ INSERT INTO tm3.t VALUES (1, 2);
 SELECT length(dolt_commit('-Am', 'tm3 base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('not_valid');
@@ -317,7 +317,7 @@ ALTER DOMAIN tm3.added ADD CONSTRAINT positive CHECK (VALUE > 0) NOT VALID;
 SELECT length(dolt_commit('-am', 'unvalidated checks')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');

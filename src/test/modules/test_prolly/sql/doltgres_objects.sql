@@ -13,7 +13,7 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
 CREATE FUNCTION pg_temp.committed(VARIADIC args text[]) RETURNS bool LANGUAGE sql AS $$
-	SELECT length((dolt_commit(VARIADIC args))[1]) = 64
+	SELECT length((dolt_commit(VARIADIC args))[1]) = 40
 $$;
 
 -- merge_test.go "simple merge"
@@ -321,7 +321,7 @@ SELECT r[2] AS message FROM dolt_checkout('main') r;
 SELECT * FROM dolt_checkout('dgo_newbranch') AS t(a);
 SELECT * FROM dolt_add('.');
 CREATE TABLE dgo_info.t1 (pk int primary key);
-SELECT count(*) FROM dolt_commit('-Am', 'new table') h WHERE length(h[1]) = 64;
+SELECT count(*) FROM dolt_commit('-Am', 'new table') h WHERE length(h[1]) = 40;
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'dgo_newbranch');
 

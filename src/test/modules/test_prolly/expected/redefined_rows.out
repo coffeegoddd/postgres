@@ -18,7 +18,7 @@ INSERT INTO rr.keyless VALUES (1, 10), (1, 10), (2, 20);
 SELECT length(dolt_commit('-Am', 'x')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE rr.keyed DROP COLUMN x;
@@ -41,7 +41,7 @@ SELECT table_name, status FROM dolt_status ORDER BY 1;
 SELECT length(dolt_commit('-Am', 'x again')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rr_again');
@@ -55,7 +55,7 @@ UPDATE rr.keyless SET x = 99;
 SELECT length(dolt_commit('-am', 'x set')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT prolly_root_hash('HEAD') = test_fold_root(true) AS as_working;
@@ -107,7 +107,7 @@ INSERT INTO rr.typed VALUES (1, 'a', '{a,b}', '(1,q)', '(a,"(2,r)")'),
 SELECT length(dolt_commit('-Am', 'typed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TYPE rr.en RENAME VALUE 'a' TO 'z';
@@ -120,7 +120,7 @@ SELECT pg_temp.same_as_full();
 SELECT length(dolt_commit('-Am', 'renamed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE rr.typed SET e = e;				-- (no change)
@@ -152,7 +152,7 @@ SELECT pg_temp.same_as_full();
 SELECT length(dolt_commit('-Am', 'dropped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE rr.typed SET c = c;				-- (no change)

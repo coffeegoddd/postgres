@@ -22,7 +22,7 @@ BEGIN
 	RETURN r;
 END $$;
 PREPARE vs_all AS SELECT * FROM vs ORDER BY id;
-SELECT 'commit', length((dolt_commit('-Am', 'vs base'))[1]) = 64;
+SELECT 'commit', length((dolt_commit('-Am', 'vs base'))[1]) = 40;
 SELECT 'branch', (dolt_branch('vs_feature'))[1] = '0';
 SELECT 'checkout feature', (dolt_checkout('vs_feature'))[1] = '0';
 

@@ -15,7 +15,7 @@ SET client_min_messages = warning;
 CREATE TABLE vb (id int PRIMARY KEY, v text);
 INSERT INTO vb VALUES (1, 'base');
 SELECT (dolt_commit('-Am', 'vb base'))[1] AS vb_base_commit \gset
-SELECT 'commit base', :'vb_base_commit' ~ '^[0-9a-f]{64}$';
+SELECT 'commit base', :'vb_base_commit' ~ '^[0-9a-f]{40}$';
 SELECT 'create branch', (dolt_branch('vb_feature'))[1] = '0';
 SELECT 'checkout feature', (dolt_checkout('vb_feature'))[1] = '0';
 INSERT INTO vb VALUES (2, 'feature');
@@ -28,11 +28,11 @@ INSERT INTO vb VALUES (3, 'main');
 
 SELECT 'back to feature', (dolt_checkout('vb_feature'))[1] = '0';
 SELECT 'feature rows kept', string_agg(id || ':' || v, ',' ORDER BY id) FROM vb;
-SELECT 'commit feature', (dolt_commit('-Am', 'vb feature work'))[1] ~ '^[0-9a-f]{64}$';
+SELECT 'commit feature', (dolt_commit('-Am', 'vb feature work'))[1] ~ '^[0-9a-f]{40}$';
 
 SELECT 'checkout main again', (dolt_checkout('main'))[1] = '0';
 SELECT 'main rows kept', string_agg(id || ':' || v, ',' ORDER BY id) FROM vb;
-SELECT 'commit main', (dolt_commit('-Am', 'vb main work'))[1] ~ '^[0-9a-f]{64}$';
+SELECT 'commit main', (dolt_commit('-Am', 'vb main work'))[1] ~ '^[0-9a-f]{40}$';
 
 -- A branch can start from a commit: an older one than the head.
 SELECT 'branch from commit', (dolt_branch('vb_old', :'vb_base_commit'))[1] = '0';

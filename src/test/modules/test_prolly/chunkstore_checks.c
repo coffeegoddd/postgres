@@ -2,7 +2,7 @@
  *
  * chunkstore_checks.c
  *		Checks of the server's chunk store, from SQL: chunks named by their
- *		SHA-256, as hex text, and the store's root.
+ *		content hash, as hex text, and the store's root.
  *
  * Copyright (c) 2026, PostgreSQL Global Development Group
  *
@@ -23,6 +23,7 @@
 #include "access/prolly_hash.h"
 #include "access/prolly_memo.h"
 #include "access/prolly_remote.h"
+#include "access/prolly_seen.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_tree.h"
 #include "catalog/pg_type_d.h"
@@ -82,13 +83,197 @@ text_hash(text *t, ProllyHash *h)
 }
 
 static void
-sha256(const void *data, Size len, ProllyHash *h)
+hash_with(const ProllyHashRoutine *r, const void *data, Size len,
+		  ProllyHash *h)
 {
-	const ProllyHashRoutine *r = prolly_hash_lookup("sha256");
 	ProllyHashCtx *ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
 
 	PROLLY_CALL(r, update, ctx, data, len);
 	PROLLY_CALL(r, finish, ctx, h);
+}
+
+/* data's name in the store: its hash by the server's content hash */
+static void
+content_hash(const void *data, Size len, ProllyHash *h)
+{
+	hash_with(prolly_content_hash(), data, len, h);
+}
+
+/*
+ * data's content hash, as hex text: by the implementation named (in pieces
+ * of piece bytes, if that is more than 0), or by the server's.
+ */
+PG_FUNCTION_INFO_V1(test_content_hash);
+Datum
+test_content_hash(PG_FUNCTION_ARGS)
+{
+	bytea	   *data;
+	const ProllyHashRoutine *r = prolly_content_hash();
+	int32		piece = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+	const uint8 *p;
+	Size		left;
+	ProllyHashCtx *ctx;
+	ProllyHash	h;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	data = PG_GETARG_BYTEA_PP(0);
+	p = (const uint8 *) VARDATA_ANY(data);
+	left = VARSIZE_ANY_EXHDR(data);
+	if (!PG_ARGISNULL(1))
+	{
+		char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+		r = (const ProllyHashRoutine *)
+			prolly_lookup_impl(PROLLY_IFACE_CONTENT_HASH, name);
+		if (r == NULL)
+			elog(ERROR, "no content hash named \"%s\"", name);
+	}
+	ctx = PROLLY_CALL(r, begin, CurrentMemoryContext);
+	while (left > 0)
+	{
+		Size		n = (piece > 0 && left > (Size) piece) ? (Size) piece : left;
+
+		PROLLY_CALL(r, update, ctx, p, n);
+		p += n;
+		left -= n;
+	}
+	PROLLY_CALL(r, finish, ctx, &h);
+	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
+/*
+ * BLAKE3's SIMD variants, each compiled in (as its build found the
+ * compiler able to) and run by this CPU, against its portable code: the
+ * dispatcher picks only the widest, so the others never run otherwise.
+ * Their functions are weak references: a variant left out of the build is
+ * NULL.
+ */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))
+typedef void (*blake3_hash_many_fn) (const uint8_t *const *inputs,
+									 size_t num_inputs, size_t blocks,
+									 const uint32_t key[8], uint64_t counter,
+									 bool increment_counter, uint8_t flags,
+									 uint8_t flags_start, uint8_t flags_end,
+									 uint8_t *out);
+typedef void (*blake3_compress_fn) (uint32_t cv[8], const uint8_t block[64],
+									uint8_t block_len, uint64_t counter,
+									uint8_t flags);
+
+#define BLAKE3_HASH_MANY(v) \
+	extern void blake3_hash_many_##v(const uint8_t *const *, size_t, size_t, \
+									 const uint32_t[8], uint64_t, bool, \
+									 uint8_t, uint8_t, uint8_t, uint8_t *) \
+		__attribute__((weak))
+#define BLAKE3_COMPRESS(v) \
+	extern void blake3_compress_in_place_##v(uint32_t[8], const uint8_t[64], \
+											 uint8_t, uint64_t, uint8_t) \
+		__attribute__((weak))
+
+BLAKE3_HASH_MANY(portable);
+BLAKE3_COMPRESS(portable);
+#if defined(__aarch64__)
+BLAKE3_HASH_MANY(neon);
+#else
+BLAKE3_HASH_MANY(sse2);
+BLAKE3_COMPRESS(sse2);
+BLAKE3_HASH_MANY(sse41);
+BLAKE3_COMPRESS(sse41);
+BLAKE3_HASH_MANY(avx2);
+BLAKE3_HASH_MANY(avx512);
+BLAKE3_COMPRESS(avx512);
+#endif
+
+#define BLAKE3_CHUNK_START 1
+#define BLAKE3_CHUNK_END 2
+
+/* a variant's results equal the portable code's, for 1 to 16 chunks */
+static bool
+blake3_variant_agrees(const char *name, blake3_hash_many_fn hash_many,
+					  blake3_compress_fn compress)
+{
+	static const uint32_t iv[8] = {
+		0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+		0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+	};
+	uint8_t		input[16 * 1024];
+	const uint8_t *inputs[16];
+	uint8_t		want[16 * 32];
+	uint8_t		got[16 * 32];
+	bool		ok = true;
+
+	for (int i = 0; i < (int) sizeof(input); i++)
+		input[i] = (uint8_t) (i * 7 + (i >> 8));
+	for (int i = 0; i < 16; i++)
+		inputs[i] = input + i * 1024;
+
+	/* (the counter crossing 2^32 as it increments past the first chunks) */
+	for (size_t n = 1; hash_many != NULL && n <= 16; n++)
+	{
+		blake3_hash_many_portable(inputs, n, 16, iv, UINT64CONST(0xfffffffe),
+								  true, 0, BLAKE3_CHUNK_START,
+								  BLAKE3_CHUNK_END, want);
+		hash_many(inputs, n, 16, iv, UINT64CONST(0xfffffffe), true, 0,
+				  BLAKE3_CHUNK_START, BLAKE3_CHUNK_END, got);
+		if (memcmp(want, got, n * 32) != 0)
+		{
+			elog(WARNING, "BLAKE3 %s hash_many differs for %zu chunks",
+				 name, n);
+			ok = false;
+		}
+	}
+	for (int i = 0; compress != NULL && i < 5; i++)
+	{
+		static const uint8_t lens[] = {0, 1, 13, 63, 64};
+		uint8_t		len = lens[i];
+		uint32_t	cv_want[8];
+		uint32_t	cv_got[8];
+
+		memcpy(cv_want, iv, sizeof(iv));
+		memcpy(cv_got, iv, sizeof(iv));
+		blake3_compress_in_place_portable(cv_want, input + len, len,
+										  UINT64CONST(0x100000001),
+										  BLAKE3_CHUNK_START);
+		compress(cv_got, input + len, len, UINT64CONST(0x100000001),
+				 BLAKE3_CHUNK_START);
+		if (memcmp(cv_want, cv_got, sizeof(cv_want)) != 0)
+		{
+			elog(WARNING, "BLAKE3 %s compress differs for a %u-byte block",
+				 name, len);
+			ok = false;
+		}
+	}
+	return ok;
+}
+#endif
+
+/*
+ * Whether every BLAKE3 SIMD variant built and runnable here agrees with
+ * the portable code (true where there are none to check).
+ */
+PG_FUNCTION_INFO_V1(test_blake3_variants);
+Datum
+test_blake3_variants(PG_FUNCTION_ARGS)
+{
+	bool		ok = true;
+
+#if defined(__GNUC__) && defined(__aarch64__)
+	ok &= blake3_variant_agrees("neon", blake3_hash_many_neon, NULL);
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+	__builtin_cpu_init();
+	if (__builtin_cpu_supports("sse2"))
+		ok &= blake3_variant_agrees("sse2", blake3_hash_many_sse2,
+									blake3_compress_in_place_sse2);
+	if (__builtin_cpu_supports("sse4.1"))
+		ok &= blake3_variant_agrees("sse41", blake3_hash_many_sse41,
+									blake3_compress_in_place_sse41);
+	if (__builtin_cpu_supports("avx2"))
+		ok &= blake3_variant_agrees("avx2", blake3_hash_many_avx2, NULL);
+	if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl"))
+		ok &= blake3_variant_agrees("avx512", blake3_hash_many_avx512,
+									blake3_compress_in_place_avx512);
+#endif
+	PG_RETURN_BOOL(ok);
 }
 
 /* Put a chunk; returns its hash. */
@@ -99,7 +284,7 @@ test_chunk_put(PG_FUNCTION_ARGS)
 	bytea	   *data = PG_GETARG_BYTEA_PP(0);
 	ProllyHash	h;
 
-	sha256(VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data), &h);
+	content_hash(VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data), &h);
 	PROLLY_CALL(cs(), put, store(), &h, VARDATA_ANY(data),
 				VARSIZE_ANY_EXHDR(data));
 	PG_RETURN_TEXT_P(hash_text(&h));
@@ -120,7 +305,7 @@ put_at_commit(XactEvent event, void *arg)
 			bytea	   *data = lfirst(lc);
 			ProllyHash	h;
 
-			sha256(VARDATA(data), VARSIZE(data) - VARHDRSZ, &h);
+			content_hash(VARDATA(data), VARSIZE(data) - VARHDRSZ, &h);
 			PROLLY_CALL(cs(), put, store(), &h, VARDATA(data),
 						VARSIZE(data) - VARHDRSZ);
 		}
@@ -175,6 +360,66 @@ test_chunk_get(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, VARHDRSZ + out.len);
 	memcpy(VARDATA(result), out.data, out.len);
 	PG_RETURN_BYTEA_P(result);
+}
+
+/* get_many()'s answers, kept by request */
+typedef struct ManyGot
+{
+	bytea	  **got;
+	int		   *visits;
+} ManyGot;
+
+static void
+many_got(int i, const char *data, Size len, void *arg)
+{
+	ManyGot    *mg = arg;
+
+	mg->visits[i]++;
+	if (data != NULL)
+	{
+		bytea	   *b = palloc(VARHDRSZ + len);
+
+		SET_VARSIZE(b, VARHDRSZ + len);
+		memcpy(VARDATA(b), data, len);
+		mg->got[i] = b;
+	}
+}
+
+/*
+ * Get several chunks at once: each request's (ordinal, bytes, times
+ * visited), bytes NULL if the store has none.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_get_many);
+Datum
+test_chunk_get_many(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	ProllyHash *hashes;
+	ManyGot		mg;
+
+	InitMaterializedSRF(fcinfo, 0);
+	deconstruct_array_builtin(arr, TEXTOID, &elems, &nulls, &n);
+	hashes = palloc(sizeof(ProllyHash) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &hashes[i]);
+	mg.got = palloc0(sizeof(bytea *) * Max(n, 1));
+	mg.visits = palloc0(sizeof(int) * Max(n, 1));
+	PROLLY_CALL(cs(), get_many, store(), hashes, n, many_got, &mg);
+	for (int i = 0; i < n; i++)
+	{
+		Datum		values[3];
+		bool		isnull[3] = {false, mg.got[i] == NULL, false};
+
+		values[0] = Int32GetDatum(i + 1);
+		values[1] = PointerGetDatum(mg.got[i]);
+		values[2] = Int32GetDatum(mg.visits[i]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+	}
+	return (Datum) 0;
 }
 
 PG_FUNCTION_INFO_V1(test_chunk_has);
@@ -238,7 +483,7 @@ array_next(void *arg, ProllyHash *hash, StringInfo data)
 	if (as->i >= as->n)
 		return false;
 	b = DatumGetByteaPP(as->elems[as->i++]);
-	sha256(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), hash);
+	content_hash(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), hash);
 	appendBinaryStringInfo(data, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
 	return true;
 }
@@ -261,7 +506,7 @@ PG_FUNCTION_INFO_V1(test_chunk_conjoin);
 Datum
 test_chunk_conjoin(PG_FUNCTION_ARGS)
 {
-	PROLLY_CALL(cs(), conjoin, store());
+	PROLLY_CALL(cs(), conjoin, store(), PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0));
 	PG_RETURN_VOID();
 }
 
@@ -506,7 +751,7 @@ test_fold_items(PG_FUNCTION_ARGS)
 	memset(&env, 0, sizeof(env));
 	env.chunk_format = prolly_chunkformat_lookup("basic");
 	env.chunker = prolly_chunker_lookup("bytes");
-	env.hash = prolly_hash_lookup("sha256");
+	env.hash = prolly_content_hash();
 	env.chunk_store = cs();
 	env.chunks = store();
 	env.compare = memcmp_order;
@@ -610,11 +855,23 @@ test_refs_value(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(out);
 }
 
+/* len bytes at data, as a bytea */
+static bytea *
+bytes_bytea(const char *data, Size len)
+{
+	bytea	   *b = palloc(VARHDRSZ + len);
+
+	SET_VARSIZE(b, VARHDRSZ + len);
+	memcpy(VARDATA(b), data, len);
+	return b;
+}
+
 typedef struct OneChunk
 {
 	ProllyHash	hash;
 	bytea	   *data;
 	bool		given;
+	bool		stored;			/* data is framed already */
 } OneChunk;
 
 static bool
@@ -626,7 +883,10 @@ one_chunk(void *arg, ProllyHash *hash, StringInfo data)
 		return false;
 	c->given = true;
 	*hash = c->hash;
-	appendBinaryStringInfo(data, VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data));
+	if (c->stored)
+		appendBinaryStringInfo(data, VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data));
+	else
+		prolly_chunk_frame(VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data), data);
 	return true;
 }
 
@@ -649,6 +909,197 @@ test_remote_put(PG_FUNCTION_ARGS)
 	PROLLY_CALL(rr, add_chunks, r, one_chunk, &c);
 	PROLLY_CALL(rr, close, r);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_remote_put_stored(url, hash, frame): the same, the chunk given as
+ * stored (framed), as it is.
+ */
+PG_FUNCTION_INFO_V1(test_remote_put_stored);
+Datum
+test_remote_put_stored(PG_FUNCTION_ARGS)
+{
+	char	   *url = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r = PROLLY_CALL(rr, open, url, true);
+	OneChunk	c;
+
+	memset(&c, 0, sizeof(c));
+	text_hash(PG_GETARG_TEXT_PP(1), &c.hash);
+	c.data = PG_GETARG_BYTEA_PP(2);
+	c.stored = true;
+	PROLLY_CALL(rr, add_chunks, r, one_chunk, &c);
+	PROLLY_CALL(rr, close, r);
+	PG_RETURN_VOID();
+}
+
+/* test_remote_get_stored(url, hash): a remote's chunk as it gives it. */
+PG_FUNCTION_INFO_V1(test_remote_get_stored);
+Datum
+test_remote_get_stored(PG_FUNCTION_ARGS)
+{
+	char	   *url = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r = PROLLY_CALL(rr, open, url, false);
+	ProllyHash	h;
+	StringInfoData out;
+	bool		found;
+
+	text_hash(PG_GETARG_TEXT_PP(1), &h);
+	initStringInfo(&out);
+	found = PROLLY_CALL(rr, get, r, &h, &out);
+	PROLLY_CALL(rr, close, r);
+	if (!found)
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+/*
+ * test_seen_check(n, budget): n hashes entered in a walk's map of budget
+ * bytes, each with a value; each found with it, then changed and found
+ * changed, and as many others not found.  The runs it wrote (an error if
+ * any check fails).
+ */
+PG_FUNCTION_INFO_V1(test_seen_check);
+Datum
+test_seen_check(PG_FUNCTION_ARGS)
+{
+	int			n = PG_GETARG_INT32(0);
+	ProllySeen *seen = prolly_seen_create("test seen", sizeof(int64),
+										  (Size) PG_GETARG_INT32(1));
+	int			runs;
+
+	for (int pass = 0; pass < 4; pass++)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			char		name[32];
+			ProllyHash	h;
+			int64		v = (int64) i * 10 + (pass >= 2 ? 1 : 0);
+			int64		got = -1;
+
+			snprintf(name, sizeof(name), "%s %d", pass == 3 ? "absent" : "seen", i);
+			content_hash(name, strlen(name), &h);
+			if (pass == 0)
+			{
+				if (!prolly_seen_enter(seen, &h, &v))
+					elog(ERROR, "hash %d entered twice", i);
+				continue;
+			}
+			if (pass == 3)
+			{
+				if (prolly_seen_find(seen, &h, NULL))
+					elog(ERROR, "hash %d found, never entered", i);
+				continue;
+			}
+			if (!prolly_seen_find(seen, &h, &got) || got != v)
+				elog(ERROR, "hash %d found with %lld, not %lld", i,
+					 (long long) got, (long long) v);
+			if (prolly_seen_enter(seen, &h, &v))
+				elog(ERROR, "hash %d entered again", i);
+			if (pass == 1)
+			{
+				v++;
+				prolly_seen_set(seen, &h, &v);
+			}
+		}
+	}
+	if (prolly_seen_count(seen) != (uint64) n)
+		elog(ERROR, "the map counts %llu, not %d",
+			 (unsigned long long) prolly_seen_count(seen), n);
+	runs = prolly_seen_runs(seen);
+	prolly_seen_destroy(seen);
+	PG_RETURN_INT32(runs);
+}
+
+/* test_chunk_stored(hash): a chunk of the store as stored (framed). */
+PG_FUNCTION_INFO_V1(test_chunk_stored);
+Datum
+test_chunk_stored(PG_FUNCTION_ARGS)
+{
+	ProllyHash	h;
+	StringInfoData out;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &h);
+	initStringInfo(&out);
+	if (!prolly_chunk_get_stored(cs(), store(), &h, &out))
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+/*
+ * test_chunk_frame(data, compress): a chunk framed as stored, compressed
+ * if that saves (or not at all).
+ */
+PG_FUNCTION_INFO_V1(test_chunk_frame);
+Datum
+test_chunk_frame(PG_FUNCTION_ARGS)
+{
+	bytea	   *data = PG_GETARG_BYTEA_PP(0);
+	uint32		len = VARSIZE_ANY_EXHDR(data);
+	StringInfoData out;
+
+	initStringInfo(&out);
+	if (PG_GETARG_BOOL(1))
+		prolly_chunk_frame(VARDATA_ANY(data), len, &out);
+	else
+	{
+		char		head[PROLLY_FRAME_HEADER] = {PROLLY_CODEC_NONE,
+			len & 0xff, (len >> 8) & 0xff, (len >> 16) & 0xff, (len >> 24) & 0xff};
+
+		appendBinaryStringInfo(&out, head, PROLLY_FRAME_HEADER);
+		appendBinaryStringInfo(&out, VARDATA_ANY(data), len);
+	}
+	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+typedef struct Collected
+{
+	HTAB	   *seen;
+	Tuplestorestate *out;
+	TupleDesc	desc;
+} Collected;
+
+static bool
+collect_node(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Collected  *c = arg;
+	ProllyHash	key = prolly_hash_key(&node->hash);
+	bool		found;
+	Datum		value;
+	bool		null = false;
+
+	(void) hash_search(c->seen, &key, HASH_ENTER, &found);
+	if (found)
+		return false;
+	value = PointerGetDatum(hash_text(&node->hash));
+	tuplestore_putvalues(c->out, c->desc, &value, &null);
+	return true;
+}
+
+/* test_commit_chunks(commit): every chunk the commit's walk reaches, once. */
+PG_FUNCTION_INFO_V1(test_commit_chunks);
+Datum
+test_commit_chunks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	Collected	c;
+	HASHCTL		ctl;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	c.seen = hash_create("test commit chunks", 64, &ctl,
+						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	c.out = rsinfo->setResult;
+	c.desc = rsinfo->setDesc;
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk_commit, &id, collect_node, &c);
+	return (Datum) 0;
 }
 
 /*
@@ -1093,15 +1544,107 @@ test_chunk_put_node(PG_FUNCTION_ARGS)
 		appendStringInfoChar(&v, (char) ref.len);
 		appendBinaryStringInfo(&v, ref.bytes, ref.len);
 		prolly_put_varint(&v, 1);
-		keys[i].data = (const uint8 *) psprintf("k%04d", i);
-		keys[i].len = 5;
+		keys[i].data = (const uint8 *) psprintf("k%06d", i);
+		keys[i].len = strlen((const char *) keys[i].data);
 		values[i].data = (const uint8 *) v.data;
 		values[i].len = v.len;
 		flags[i] = level == 0 ? PROLLY_ITEM_VALUE_REF : 0;
 	}
 	initStringInfo(&node);
 	PROLLY_CALL(fmt, encode, (uint16) level, n, keys, values, flags, &node);
-	sha256(node.data, node.len, &h);
+	content_hash(node.data, node.len, &h);
+	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
+	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
+/* test_chunk_declaring_tree()'s declared references */
+typedef struct DeclaredRefs
+{
+	ProllyHash *hashes;
+	int			n;
+} DeclaredRefs;
+
+static void
+declare_all(const ProllyKey *key, const ProllyValue *value, void *arg,
+			StringInfo refs)
+{
+	DeclaredRefs *d = arg;
+
+	for (int i = 0; i < d->n; i++)
+		PROLLY_CALL(prolly_tree_lookup("cow"), value_reference, &d->hashes[i],
+					0, refs);
+}
+
+/*
+ * A tree of one item ('k' -> 'v') whose item declares every chunk of
+ * hashes, as a commit declares its parents; its root's hash.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_declaring_tree);
+Datum
+test_chunk_declaring_tree(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef ref;
+	DeclaredRefs d;
+	Datum	   *elems;
+	ProllyKey	k = {(const uint8 *) "k", 1};
+	ProllyValue v = {(const uint8 *) "v", 1};
+
+	deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT, &elems, NULL, &d.n);
+	d.hashes = palloc(sizeof(ProllyHash) * Max(d.n, 1));
+	for (int i = 0; i < d.n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &d.hashes[i]);
+	prolly_folded_tree_env(&env);
+	env.chunk_refs = declare_all;
+	env.chunk_refs_arg = &d;
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tree, build_add, b, &k, &v);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	{
+		StringInfoData got;
+
+		initStringInfo(&got);
+		if (!PROLLY_CALL(tree, get, &env, &ref, &k, &got) ||
+			got.len != 1 || got.data[0] != 'v')
+			elog(ERROR, "the declaring tree's item doesn't read back as written");
+		pfree(got.data);
+	}
+	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+}
+
+PG_FUNCTION_INFO_V1(test_chunk_put_leaf);
+Datum
+test_chunk_put_leaf(PG_FUNCTION_ARGS)
+{
+	ArrayType  *vals = PG_GETARG_ARRAYTYPE_P(0);
+	const ProllyChunkFormatRoutine *fmt = prolly_chunkformat_lookup("basic");
+	Datum	   *elems;
+	int			n;
+	ProllyKey  *keys;
+	ProllyValue *values;
+	uint8	   *flags;
+	StringInfoData node;
+	ProllyHash	h;
+
+	deconstruct_array(vals, BYTEAOID, -1, false, TYPALIGN_INT, &elems, NULL, &n);
+	keys = palloc(sizeof(ProllyKey) * Max(n, 1));
+	values = palloc(sizeof(ProllyValue) * Max(n, 1));
+	flags = palloc0(sizeof(uint8) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *v = DatumGetByteaPP(elems[i]);
+
+		keys[i].data = (const uint8 *) psprintf("k%06d", i);
+		keys[i].len = strlen((const char *) keys[i].data);
+		values[i].data = (const uint8 *) VARDATA_ANY(v);
+		values[i].len = VARSIZE_ANY_EXHDR(v);
+	}
+	initStringInfo(&node);
+	PROLLY_CALL(fmt, encode, 0, n, keys, values, flags, &node);
+	content_hash(node.data, node.len, &h);
 	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
 	PG_RETURN_TEXT_P(hash_text(&h));
 }

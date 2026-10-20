@@ -597,7 +597,7 @@
       "index": 5,
       "name": "dolt_revert() --abort restores pre-revert state",
       "source_sha256": "bb323b4a975d945cb448ab784fd4632514762a19f5ceedda5fdd06a813000055",
-      "scenario_sha256": "83fa532b9b58106f628b53e3c6963fbca76086ac97bb984d4bbecc0ebcb035de",
+      "scenario_sha256": "113e2ade404393b0ba2e79d9d3ec8cd4a3e073d92023db836f00fb8a4fbdc025",
       "setup": [
         {
           "index": 0,
@@ -1297,7 +1297,7 @@
       "index": 15,
       "name": "CALL DOLT_MERGE ff & squash with a checkout in between",
       "source_sha256": "efae750cb2ea64598de1680a9e69747d50766f60d5405cdb2940a522318cd100",
-      "scenario_sha256": "3d65ac107d5540444b01a82b77b3205ec4d4f04534ef80542a650467dc0e053b",
+      "scenario_sha256": "d7d33347bee1ef677b1ee7256d5ab9cf29a00d3fa319b84feae441324827857c",
       "setup": [
         {
           "index": 0,
@@ -1415,7 +1415,7 @@
       "index": 14,
       "name": "CALL DOLT_MERGE ff & squash correctly works with autocommit off",
       "source_sha256": "cfb15d0f769b8b26f6e7c299bcf1310d424f9532a4740e1b4a559d2a70ba8578",
-      "scenario_sha256": "12fe132ec81eb31bf17b0b5983a1f6a721eda7468c664e161cc4b254f49936c7",
+      "scenario_sha256": "c2fa858d19b2e8fe2339bfd9b202bc6139d3e5fb0ef53337fdb27d7dec0d8318",
       "setup": [
         {
           "index": 0,
@@ -2134,7 +2134,7 @@
       "index": 2,
       "name": "unique constraint checks do not consider deleted rows",
       "source_sha256": "1ce333ea1e13e5d2d7ba98ec30cf7d03d17dffa3aed26000112bb78ca67688cd",
-      "scenario_sha256": "0bb9c2a51bea11763b580a9ab71fc4099d2f8a4ca1e0feb2faa539f96bc2e192",
+      "scenario_sha256": "dc7ff2d4f3f93793d503f4fc343447a80d0d61f579f6f7818249622c5d767189",
       "setup": [
         {
           "index": 0,
@@ -2257,7 +2257,7 @@
       "index": 25,
       "name": "DOLT_MERGE(--abort) clears staged",
       "source_sha256": "2d98f7a7879b9429040ef2c49fa3be5b93aa6d36e7f8aed92cbe6ea96a5ee336",
-      "scenario_sha256": "f9757058163177fd808896bcc96e8b9d9cc4d57be44683fc5c28d8ba7ad41569",
+      "scenario_sha256": "1bee7fdaaa704a1f0bbc77e4ad26d38dbe9585e306df4d36f3f1ba2c3beaef60",
       "setup": [
         {
           "index": 0,
@@ -2395,7 +2395,7 @@
       "index": 26,
       "name": "Abort merge with table rename and conflict",
       "source_sha256": "cc5f2af736053b4453361d14acf8c158ca88e47a14dac3cebd3af12d6bbf1611",
-      "scenario_sha256": "7fef8968187becde37f0a7966d8880b8ee9c20d900e1184bc695e80a93811c3a",
+      "scenario_sha256": "912800a27617dc5b8a7c6573a90feeca12760b37315fbba876d37a2ecfe065a2",
       "setup": [
         {
           "index": 0,
@@ -7200,7 +7200,7 @@
       "index": 2,
       "name": "violations with an older commit hash are overwritten if the value is the same",
       "source_sha256": "1b1c887f5a11100c91a7129e04c033b6a39c5257d03a71d55b7dd8aca1dab4c2",
-      "scenario_sha256": "aeba06298172cb62ccf3d1fe6acb2d709d02d4027aecdc334a65127e96d64d8a",
+      "scenario_sha256": "a565a66feb8b82f1b56fb5db8aff6685dedb94f7e15ac915580fd5002af80334",
       "setup": [
         {
           "index": 0,
@@ -8556,7 +8556,7 @@
       "index": 10,
       "name": "check constraint violation - simple case, no schema changes",
       "source_sha256": "f87c0a8b4e69001fd8b699884b5a67f4b5e55b4544c8fe4da164b92a73f0a404",
-      "scenario_sha256": "6f8658ff9cb00c1d51f18ebd3f11eee60d6c3358c66f5f78e5b612b8e68d561c",
+      "scenario_sha256": "16fb681a88a6406bcaaa8027a193dd4996625ad7062587bc79b04fe686c1ed2e",
       "setup": [
         {
           "index": 0,
@@ -8643,7 +8643,7 @@
       "index": 11,
       "name": "check constraint - coercion to bool",
       "source_sha256": "c2126131a1449e7ea6c68db78b2c4941d309e1168225c0ba002a1e9e97414271",
-      "scenario_sha256": "3cc64f8b0a3f178ff44b6a64b5a30ea5516eac2f8313ff13b0d557727a92ea8b",
+      "scenario_sha256": "2f59b6498ccd9e37900b67cd992968f1b71727c3be1beff27fa1f2587d0675c8",
       "setup": [
         {
           "index": 0,
@@ -8730,7 +8730,7 @@
       "index": 12,
       "name": "check constraint violation - coercion to bool",
       "source_sha256": "e5da40a2a3fc891d938dec19fd3d2e8b43ad06354a1a54d1286672d511cfe52c",
-      "scenario_sha256": "db94f200bab345ab7b3cbbc09a765db98ffa2945d15370676c52b31efabe3ff1",
+      "scenario_sha256": "fb17c05b8c5ca1e3b4e66e6c6b2ad1bbde546daa3a40210f2c8eb40b4390f0ab",
       "setup": [
         {
           "index": 0,
@@ -8817,7 +8817,7 @@
       "index": 13,
       "name": "check constraint violation - schema change",
       "source_sha256": "cbefd816e85834e59ccbe3d83a288eb6477d1227a224dfaca41be40b36542553",
-      "scenario_sha256": "0762e270fa10c68683e5d0d487831a473679a97a9ff77e9ea43cc456fbc999ff",
+      "scenario_sha256": "c500483875b539da04f8fbc817112e87490202e548b5ae67d8bc502bd9bb8c79",
       "setup": [
         {
           "index": 0,
@@ -8911,7 +8911,7 @@
       "index": 14,
       "name": "check constraint violation - deleting rows",
       "source_sha256": "e075b1dbcb9f6b21c9d5886bae636c25b52481c9914fbdb84087340bfc4a9e83",
-      "scenario_sha256": "9e6f7b8553a71b8b84203321e1ecfd17f29a0c6dd8f5d09b93ed30c08e1265c3",
+      "scenario_sha256": "a6432ddc0f3843e015b7a5b61489c62f896bd2bd1793cf7170529e101e7c150d",
       "setup": [
         {
           "index": 0,
@@ -8984,7 +8984,7 @@
       "index": 15,
       "name": "check constraint violation - divergent edits",
       "source_sha256": "0f0a8a4cb2e69a78a1e1e219a2784fc48e67331d6e010f551b9fb9aebade5ea3",
-      "scenario_sha256": "c8c4648a13fcb1c993b20991ad78ef1d28d01bff708aa01483a055b52a464487",
+      "scenario_sha256": "96966b74d90f40d48c866f07679544aa1c15387618d3598dc472aab837cfaf17",
       "setup": [
         {
           "index": 0,
@@ -9290,7 +9290,7 @@
       "index": 7,
       "name": "unique constraint violation",
       "source_sha256": "2c280c5c7bd4002fa5a9b8d59b02315d277e49c5ef7401e981ab297e17fdbde3",
-      "scenario_sha256": "215810d1f0e479bba75cfee38089d90a7a8c0cb55bbb8986b54c37b4bc4f7118",
+      "scenario_sha256": "4e84aaa7aca1f13ba78b861dd32797214f19ce539fd71b3641fbd478d2383806",
       "setup": [
         {
           "index": 0,
@@ -9401,7 +9401,7 @@
       "index": 0,
       "name": "varchar widening",
       "source_sha256": "c5bf66c906b9974823a4d7a0535019a6e8510141455f1646c426a26932cf51a6",
-      "scenario_sha256": "6e1ef777b06f2a218b24e1e9ba7cd39da732f52d986176e07d1df4dc2925f523",
+      "scenario_sha256": "ce90d2c9691d02dbe5e812ca603d07f4a2ce66bf111c7a1c16371dc4ce873c9e",
       "setup": [
         {
           "index": 0,
@@ -9500,7 +9500,7 @@
       "index": 2,
       "name": "TEXT index without schema change",
       "source_sha256": "d3e8b86142f6b6da8ed9e6f853a7c3c062f319506388e4223573c86d1336936b",
-      "scenario_sha256": "a129b0119ec2efe38c4edbb8c359195bc53c3993a1ea46a46b889efaf421322e",
+      "scenario_sha256": "c6d8d5adb342783d190176c097182e6f5958a5e7dfc6d4030fd76daa44bb2a70",
       "setup": [
         {
           "index": 0,
@@ -9601,7 +9601,7 @@
       "index": 3,
       "name": "VARCHAR to TEXT widening with right side modification",
       "source_sha256": "f9576e2987a6cf9b81b441b0eba4083669b36c8b7bafa0a3690b6bf03ac7f90c",
-      "scenario_sha256": "df9066bd7170e4be0c41c3a15df3c8141452b067615a1c846c1046b3d7abe047",
+      "scenario_sha256": "4a8a5cd213f4c21df0306c5d8a2b30aa6034897a76f59950bb044cfc38391a28",
       "setup": [
         {
           "index": 0,
@@ -9768,7 +9768,7 @@
       "index": 18,
       "name": "check constraint violation - right side violates new check constraint",
       "source_sha256": "e7e9baf8648174acf22e87e2ac658d58e189e8c2690c0ec47911249c41a00abb",
-      "scenario_sha256": "1be2b40293d5e523be3cdf63a1d100ebaaa918d8fe634b7cc36ce1a89661189f",
+      "scenario_sha256": "975f38816be9dfbd2de78c920b8a9941a61d36152164ec6ae05f51228f78285a",
       "setup": [
         {
           "index": 0,
@@ -9869,7 +9869,7 @@
       "index": 19,
       "name": "check constraint violation - keyless table, right side violates new check constraint",
       "source_sha256": "e94232fbf7dd877574a9755d2fbcd9e169bee304c6af8663ae5576df971dcaaa",
-      "scenario_sha256": "ef58846410a324e2e49b45a3fb7d50090e44a40391206a28f17e3f223dec7a63",
+      "scenario_sha256": "4a95c5d3ba2af6a51d0a97373be011c753a7f81e419aa0e43b8926f7cc37da39",
       "setup": [
         {
           "index": 0,
@@ -10891,7 +10891,7 @@
       "index": 15,
       "name": "convergent schema changes",
       "source_sha256": "ae6f50c407ca4ac38d00cbb8d125c4684b5fe311a416b19c1b611997d4daeffd",
-      "scenario_sha256": "55d0170ab7e215ba18802f2140240de263b238de9e32a2c86c5ac586e9c0fb63",
+      "scenario_sha256": "529d61ba229884a985bcf098aaee8ae79102d642acdf40a787dcddc388c58b8e",
       "setup": [
         {
           "index": 0,
@@ -11037,7 +11037,7 @@
       "index": 8,
       "name": "dropping column on right shifts column index between compatible types",
       "source_sha256": "b7f2ea14461bb60d5598ff39db8f48427714cdbbd14a7676bb35777b93585e4a",
-      "scenario_sha256": "3fed4081c1fcdf1b5d03e1e665822e354c086de3bd8449855e109b74d38dd4ef",
+      "scenario_sha256": "11b07084c55d36bb25c15817423951e27c22bbecbba38837f45a9447f75fd758",
       "setup": [
         {
           "index": 0,
@@ -11215,7 +11215,7 @@
       "index": 4,
       "name": "VARCHAR to TEXT widening",
       "source_sha256": "a06fe8aa86ea05f44c9e545ba28672b9d42b3e0b3bf44a688edc7f0656276a81",
-      "scenario_sha256": "67f550b1f4e8d8232fd4df4d5805f7d18ac872cebcae9c18e4cbf6b74ab77ccc",
+      "scenario_sha256": "33a4ab3e458a288cf7b3ba1dae327c994ee4102fe456cbb794228c6d30921463",
       "setup": [
         {
           "index": 0,
@@ -11314,7 +11314,7 @@
       "index": 14,
       "name": "VARCHAR to CHAR widening",
       "source_sha256": "938b103124ade2e51cb7b83274db31547df357e62e00e3032284c7273606c76d",
-      "scenario_sha256": "baca534fe1da521ae3234b048530ae0668a591d8a8555a6ca0e778aa5bfc7266",
+      "scenario_sha256": "2f611585622d258899c5d917d37de570fba3d8137c16837d4b6be277ea22e9b5",
       "setup": [
         {
           "index": 0,
@@ -11622,7 +11622,7 @@
       "index": 7,
       "name": "convergent schema changes with virtual columns",
       "source_sha256": "f26fd2f1d14963a73c2330277b717e1094990fb504ee668c1be504130673ba2a",
-      "scenario_sha256": "b6e8f1ab8a7ed8fd2a7c21be0e01fe6db2bc5072464f567d75acdb6ab63664b8",
+      "scenario_sha256": "3a45e57f579aa05bb10a8a26726329464ec9f793a810c8eb0a600c9b6504d40e",
       "setup": [
         {
           "index": 0,
@@ -11867,7 +11867,7 @@
       "index": 0,
       "name": "data conflict",
       "source_sha256": "a51646e951455790f231ce73da18dec01b831965a67296763a407ee93f4b9eea",
-      "scenario_sha256": "1323ccd855c4479f9e1701ba6e07f7e963700ce5525b263de36786225a6304f8",
+      "scenario_sha256": "082a1beb66bd71bc4ba1832f89ec78f208e47d3f57497633107f4e66caed6e51",
       "setup": [
         {
           "index": 0,
@@ -11977,7 +11977,7 @@
       "index": 1,
       "name": "json merge fails with @@dolt_dont_merge_json",
       "source_sha256": "4d30e88f7e96de26a8f1a7ad48a4d86566999441638b53ca24b1dc81604958e6",
-      "scenario_sha256": "6f235417e0f49349ad54b350691e3d408cfe85270d2e7aa7274e08e432101c12",
+      "scenario_sha256": "66ca3bc154dbc562fabfd96b310f130276f68036057c3eaf251621a5fa4a9820",
       "setup": [
         {
           "index": 0,
@@ -12068,7 +12068,7 @@
       "index": 5,
       "name": "VARCHAR index with prefix narrowing",
       "source_sha256": "df77ab5e11cf00a9bd6dbc4f4f46788c8fb10c64a8620b0eb9779e8d75420431",
-      "scenario_sha256": "aeaa36afe04659caaec764f1489026b689aa0a890b365304be054f648d2aeb5d",
+      "scenario_sha256": "99f7b521b8bf70600b8ceeffc9492ea8e7fc317d574509e09d0a7987ab1bd3ce",
       "setup": [
         {
           "index": 0,
@@ -12169,7 +12169,7 @@
       "index": 6,
       "name": "TEXT index with prefix narrowing",
       "source_sha256": "f99bf9379fb325a979508030fb2d37357f76c1e602f792d1e0ae4133d4d5fa3e",
-      "scenario_sha256": "c8920fec1c112ca4e012232f85791e535ede81a2092bf0b63a0f96ab11b574f8",
+      "scenario_sha256": "49ad7987f4427983edcd7ae8f6920de08198b3a8d292898969fc1166d2867ee9",
       "setup": [
         {
           "index": 0,
@@ -12357,7 +12357,7 @@
       "index": 4,
       "name": "dolt_revert() detects conflicts and returns conflict counts",
       "source_sha256": "64c6fa1acb484296612f3e94bd83b94b54c1d64fb9be712ce15b9669a7577262",
-      "scenario_sha256": "7907dcd5cfba23b1d29a3c9a6e659320742add247d73042bc4ae4343fe28dc3d",
+      "scenario_sha256": "5a6efd659278d38383d20859058adc9044b19263abb5583e4cc7bd3dbf906a1b",
       "setup": [
         {
           "index": 0,
@@ -12452,7 +12452,7 @@
       "index": 12,
       "name": "dolt_revert() multi-commit: stops at first conflict",
       "source_sha256": "1cdba18414413a19ef64a97fbad5629816b1519783efcec9f4bdde839da30070",
-      "scenario_sha256": "0511ebe42d0c53fea946b42a9032656991eb4bf153cc5983eda90bb71e9951a8",
+      "scenario_sha256": "4a4cdac790a6a56c0ce8fbf5bf3166ffce178137c46a54310aecea3186517078",
       "setup": [
         {
           "index": 0,
@@ -12561,7 +12561,7 @@
       "index": 13,
       "name": "dolt_revert() proceeds when dirty table is disjoint from revert target",
       "source_sha256": "50fbcdea1eead518597d56330afb8bbd6024cc1894e37dfa820ce3fb8277b1ca",
-      "scenario_sha256": "2f6975d9119aafc27703cb6102aaf33b672363b1edeec1168861fb144484f3a8",
+      "scenario_sha256": "3eec7bcf05344dafebb52cf022766bcbadabbded4ac1545b545249245e23e312",
       "setup": [
         {
           "index": 0,
@@ -13274,7 +13274,7 @@
       "index": 16,
       "name": "dolt_revert() proceeds with untracked tables disjoint from revert target",
       "source_sha256": "57a1924279d36695077af302698c78f8cf3f0144a29cf092e58a5eb84b76f511",
-      "scenario_sha256": "b5c00f94749ba787f2b036f9eba2699edcb133766fe4ff294382400d354c99d2",
+      "scenario_sha256": "58f8facde643fbf52acdff424e4c127e7ed44edb40fdab33098e70c6e6f43fad",
       "setup": [
         {
           "index": 0,
@@ -13361,7 +13361,7 @@
       "index": 18,
       "name": "dolt_revert() detects constraint violations and returns violation counts",
       "source_sha256": "4b5a9cff8859655c704ab050ecdb80f8eb1596f2dfec8b09ac4c487125c56e5a",
-      "scenario_sha256": "80fea8d7be63cda21b63c6269a25e2eb2c3bca75f75059ad6f2ce5d561037455",
+      "scenario_sha256": "b2cd31aefc4d43e39ddeed43ad4ea5bc33014ea4abe0201097a841976b1cfe91",
       "setup": [
         {
           "index": 0,
@@ -13456,7 +13456,7 @@
       "index": 2,
       "name": "dolt_revert() multi-commit: one commit per revert",
       "source_sha256": "9a1981a80f91d3e40b31618ec04f2b8dc2a9636e865b32c86c65cf26e753d15e",
-      "scenario_sha256": "ae22630f53c2d81fbb717d36bef5e5c660b0c9c56f417f1ccede0d397ec73203",
+      "scenario_sha256": "987b337da87934c6d82c7a2a176fbf9f04375afea9f89da0c0045a623259b05d",
       "setup": [
         {
           "index": 0,
@@ -13557,7 +13557,7 @@
       "index": 8,
       "name": "schema change: ALTER TABLE ADD COLUMN",
       "source_sha256": "4079e917b41aabc17edd851e275426b2e1e1c2f99a91d9df377aa0f3d1dca2dd",
-      "scenario_sha256": "8d31539465608fcd66225999900071f66e52bc98d2e09c62bd7bfbb914c9429e",
+      "scenario_sha256": "99829e2c964471f9744bf7310c84dfc26bed00e12d9d04bcf4788ce42fe5947e",
       "setup": [
         {
           "index": 0,
@@ -13824,7 +13824,7 @@
       "index": 9,
       "name": "schema change: ALTER TABLE DROP COLUMN",
       "source_sha256": "6ba734fa0bc63704320e18938866bde8c3d686c2aa9ffe94f93714ec49ded8ca",
-      "scenario_sha256": "c61c960df7018bdc27f233031d5de544831894340e7a501f25a54fb32084dd9e",
+      "scenario_sha256": "07197271f6feef08013d77a5bedd16063d7a30a93456e51c2b8e6d2a13222558",
       "setup": [
         {
           "index": 0,
@@ -13906,7 +13906,7 @@
       "index": 7,
       "name": "schema change: DROP TABLE",
       "source_sha256": "82b21bfae0e3584ccad80d9ab25e0589847d05137534abe412a8d0215cb0e91a",
-      "scenario_sha256": "a18f92f106ba950e6e97519008a857c0047ac8c3b5bda2d8be49a0e7e837e429",
+      "scenario_sha256": "b9eb2b4453fafae37a9acba044c29bf56108dfec5c806526c6b64ede30b4acf3",
       "setup": [
         {
           "index": 0,
@@ -14002,7 +14002,7 @@
       "index": 5,
       "name": "keyless table",
       "source_sha256": "cc9bafcbd97c766900c353a593e837c8cf8dbc63bff74804fdd5103156bc30e7",
-      "scenario_sha256": "ce58b2345ffdf9dbc446698649a7f419be29ad154da3643854aeeb927f7965c1",
+      "scenario_sha256": "499f6b8caaf79d44638884982f3578428b87f0778b8552caf73ec09bcf0413fc",
       "setup": [
         {
           "index": 0,
@@ -14091,7 +14091,7 @@
       "index": 1,
       "name": "error cases: merge commits cannot be cherry-picked",
       "source_sha256": "a5b3c95587c2f966a065235a76615d142b3139ff0d595ad822000daaa603f447",
-      "scenario_sha256": "86d3f3e1599c957fb1ab324088b9f2c877e9a8ef1f9e944fa629d49f4dd1a1fc",
+      "scenario_sha256": "9737149e8dda9915792bc9a36162cfc5fbde4b0e6578a2a94acc0675c47203ba",
       "setup": [
         {
           "index": 0,
@@ -14173,7 +14173,7 @@
       "index": 10,
       "name": "schema change: ALTER TABLE RENAME COLUMN",
       "source_sha256": "d721fb2bec4b7ae9ea635a1c7b9f22d183f1d22bdfcfed4467f90bc9748e64d2",
-      "scenario_sha256": "3532436ff2d3ae883331a17579f404850975eaa527b030fad19bfbc4612ff258",
+      "scenario_sha256": "97d876c46ab1e8d4747b5ab595b734b003804be853053c9497cafef12bf36500",
       "setup": [
         {
           "index": 0,
@@ -16490,7 +16490,7 @@
       "index": 3,
       "name": "index conflicts: both sides add an index with the same name, same columns, but different type",
       "source_sha256": "09c3374057198709c2c1087dd8f8f84712083f12ad336b7b67fecc801c04a60a",
-      "scenario_sha256": "a6ad0997fc8ce1e6efd29d508cd14e014af593b6ee42fbbedf96f37066635df0",
+      "scenario_sha256": "bcb2790e2fabbb8dfdb675e93cb8d0ce00927413fe86e45788cd5ea095ac29d4",
       "setup": [
         {
           "index": 0,
@@ -16573,7 +16573,7 @@
       "index": 4,
       "name": "modifying a column on one side of a merge, and deleting it on the other",
       "source_sha256": "e71a824e079f618713b19efa45c11d8d9a1796de1f6496a5b2ba5659e6deb3ff",
-      "scenario_sha256": "c1ff7dfcf3531a943107763b01fd25126366deff62b9315601fc87f7f611cb40",
+      "scenario_sha256": "8ce96258e051f227efc0d5cca305244aa562e6071231fab4228a9e43561fa5ac",
       "setup": [
         {
           "index": 0,
@@ -16642,7 +16642,7 @@
       "index": 5,
       "name": "type changes to a column on both sides of a merge",
       "source_sha256": "a1866bb24374e8a9ff045f9d1a57e44c9945ce6baa70017579e0bf02bd23f33f",
-      "scenario_sha256": "1eda53dc3d276f9bc8c9791492feae82211c5351cb491edb4e490ad282e68c6c",
+      "scenario_sha256": "ee09e93292b56978b45707b29a3f5e93c7858413a14c8ebdf6712b0f68bd137d",
       "setup": [
         {
           "index": 0,
@@ -16711,7 +16711,7 @@
       "index": 6,
       "name": "changing the type of a column",
       "source_sha256": "1630635691fee1f75c87aeda6be2b763db10d0cb803abb8ab391b510faa26a2b",
-      "scenario_sha256": "ba3060b05b7c3c37c94ca0fa96942def9dfc5a6aaf0cf3c912432230e45ad072",
+      "scenario_sha256": "234369754089273771d08f4c0f0831c49b1b594648d1838daae975851204ecb5",
       "setup": [
         {
           "index": 0,
@@ -16794,7 +16794,7 @@
       "index": 7,
       "name": "changing the type of a column with an index",
       "source_sha256": "02ae88bbc8cbd935809e90072879a65df02ae74e7779e9fd8a3447aba623a9a4",
-      "scenario_sha256": "c1b53040cd6e7a85cbad54b6340d21099da932d8f5d6ba60af64a8d2bf2574f4",
+      "scenario_sha256": "5986c07b0440e605646fa7d6ffdbd9c848065e05948657339bb41aa3a2e5e589",
       "setup": [
         {
           "index": 0,
@@ -16878,7 +16878,7 @@
       "index": 12,
       "name": "varchar narrowing",
       "source_sha256": "1aec957e69fa2a382784cc4a2d7283a7198753ea206620598163219f55bfcfe7",
-      "scenario_sha256": "4babc30a93dd6e1e0242f8e27b45c4145c755bf05064f79f3ee8003f8b7fe165",
+      "scenario_sha256": "0e1784d027b531804b39ee2e3e73ed7b8872a4085289a44a927c49501051ba62",
       "setup": [
         {
           "index": 0,
@@ -16968,7 +16968,7 @@
       "index": 13,
       "name": "TEXT to VARCHAR narrowing",
       "source_sha256": "d1cd6415fe6b4a0bbef976eaab20b2115ac41cd57fdfe0884a82bbda9f1c2289",
-      "scenario_sha256": "694c29488c5bef4774a436b5de1ed3e60e4ad5d323c2aa6ffe9873fec3b61aa0",
+      "scenario_sha256": "40daf1a811eed93064e3696840f64471c00a8cf74d62ecc7b8a584f4acca009f",
       "setup": [
         {
           "index": 0,
@@ -20979,7 +20979,7 @@
       "index": 3,
       "name": "CALL DOLT_MERGE ff correctly works with autocommit off",
       "source_sha256": "ab0e22395e1de7b7277ad10522721e89d78760fb0a15b99d4a9aaa35dc39d4ca",
-      "scenario_sha256": "51a1771cbf681e1953d070b4facf54cebf3bb376dea7264ac5fdc21e8f738374",
+      "scenario_sha256": "cdc9c6c31326a245cd035522baed11495dfb5f3af0a4a76a507cfc5b77003c56",
       "setup": [
         {
           "index": 0,
@@ -21234,7 +21234,7 @@
       "index": 6,
       "name": "CALL DOLT_MERGE no-ff correctly works with autocommit off",
       "source_sha256": "f022600a95a67b57757ff6578d4e99e0dde06301966e465d95266ad08675c1d5",
-      "scenario_sha256": "3cb96452c4bea2d74fbb016e6165ee5f5580040546f76fdd286c8b1faedcb4af",
+      "scenario_sha256": "b66dff8c62fa4360899b15164b596a1dfcc811b273f22a6c575bbb6a2bef60f9",
       "setup": [
         {
           "index": 0,
@@ -21364,7 +21364,7 @@
       "index": 18,
       "name": "CALL DOLT_MERGE no-ff",
       "source_sha256": "bb152cfe4beb46514d1e27239c1ac5098c0e81dda56a0bf05417535e6ae50cdb",
-      "scenario_sha256": "fd3f8cd2576ad70e3bc6807dd8798cf3d06886142650e3850b408b828d1f4b43",
+      "scenario_sha256": "56b24db8d250f5e347e87fe4c624eb3449fa4d7b86386dd895bfd22d97eaf0f8",
       "setup": [
         {
           "index": 0,
@@ -21560,7 +21560,7 @@
       "index": 13,
       "name": "merge conflicts prevent new branch creation",
       "source_sha256": "f64f0cf75d7090f7016253bf5dcf8487e9e333ee9f7f0e493f9cdfdedee25421",
-      "scenario_sha256": "9bbe6bcf4d8db0cb5216d94a3adaedc58bfe20af8c8a96c3a47b5526a39a8618",
+      "scenario_sha256": "6a65777a4c64666518b4d295b1810813c4524311822dbeb94c50efa6592444b1",
       "setup": [
         {
           "index": 0,
@@ -21692,7 +21692,7 @@
       "index": 24,
       "name": "CALL DOLT_MERGE with conflicts can be aborted when autocommit is off",
       "source_sha256": "08140b1eab3dc72cd7c3662eadffe3255f43dd77abdbbfae3215d11d6deb05ab",
-      "scenario_sha256": "4c3774cf9f60bc454f8c5b0049744b3126954ed7b8ee86a0d179b9a1ca9a3765",
+      "scenario_sha256": "6fd03e16b84376dded2333165dc7c87824e54185ebbd2cbb6fa1be8865ebae86",
       "setup": [
         {
           "index": 0,
@@ -21857,7 +21857,7 @@
       "index": 28,
       "name": "CALL DOLT_MERGE complains when a merge overrides local changes",
       "source_sha256": "e58bf719e6482c202677eecd13605c0fb0e1b9256fc7f12ef0c92b70c674e8c4",
-      "scenario_sha256": "5c4cbebbf8ac2be23254604cbc294e14a8a08e4a90e2e2ebb55a2a39464d594d",
+      "scenario_sha256": "0b15a320058fafd436ac4ed658890e2b77eb0ea6450eea1f9f7363649818baf2",
       "setup": [
         {
           "index": 0,
@@ -22188,6 +22188,169 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_conflicts_<t> becomes dolt_conflicts(NULL::t). (D3)",
         "Assertions on a feature prolly lacks are omitted, each with its note; the case is a partial port."
+      ]
+    },
+    {
+      "id": "dolt-reflog-errors",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltReflogTestScripts",
+      "index": 0,
+      "name": "dolt_reflog: error cases",
+      "source_sha256": "1a44dcc1600e5b10f2db9e2a07f57c4042efbade873307dda18527cf3e736291",
+      "scenario_sha256": "c5041c644dd526e87f818716bcc568c87d28008399f57ed2cf9a19847196fb3c",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text: more than one ref is an invalid argument. (D4)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE: a null argument is refused as a null value not allowed. (D4)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE: dolt_reflog takes text, so an integer argument names no function. (D4)"
+        }
+      ],
+      "adaptations": [
+        "Dolt's argument errors are SQLSTATEs: 22023 (too many refs), 22004 (a null argument), 42883 (an argument not text: no such function). (D4)"
+      ]
+    },
+    {
+      "id": "dolt-reflog-gc-empty",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltReflogTestScripts",
+      "index": 3,
+      "name": "dolt_reflog: garbage collection with no newgen data",
+      "source_sha256": "4973024f3a32a5f72c98d7b49bac02648143e45faddbfbaa2a65a6ce0f8daaca",
+      "scenario_sha256": "e9d9fe9e77cf337977743e47d8dabaa8b4d887955f5749cde95fc0c9790404ca",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; doltCommit is the commit the case makes first, as a prolly database starts with none (Dolt's has 'Initialize data repository'). (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "A new session, as Dolt's NewSession: the collection forgot every root move before it."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "Dolt's doltCommit placeholder is the commit captured as it is made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-reflog-gc-newgen",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltReflogTestScripts",
+      "index": 4,
+      "name": "dolt_reflog: garbage collection with newgen data",
+      "source_sha256": "141919be2c921a9d79c4e3b62ef5b8e70cceb49ff7dec5468f6c3fb7e072d21c",
+      "scenario_sha256": "6d0f314db243b597feb80254d0a6c67330b4150284e4e7b2f4498073202b1151",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commit all current table data; -Am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Commit all current table data; -Am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "dolt_tag is a feature prolly lacks (F tags): not ported, so the case is partial. No assertion reads the tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Commit all current table data; -Am staging flags add nothing: commits take the whole working set. Capture the returned commit ID. (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the commit captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status column. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "A new session, as Dolt's NewSession: the collection forgot every root move before it."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
+        "The tag the setup makes isn't: prolly has no tags (F tags), and nothing reads it.",
+        "Dolt's doltCommit placeholders are the commits captured as they are made. (D7)"
       ]
     }
   ],

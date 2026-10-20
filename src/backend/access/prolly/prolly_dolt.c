@@ -31,6 +31,7 @@
 
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -1272,7 +1273,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("branch or commit \"%s\" does not exist", branch)));
-		/* (a branch name has room for 40 of the hash's 64 digits) */
+		/* (a branch name has room for 40 digits: the whole hash) */
 		hidden = psprintf("%s%.40s", PROLLY_DETACHED_PREFIX, hash_hex(&id));
 		if (!PROLLY_CALL(refs(), branch_lookup, hidden, &(ProllyBranchId) {0}))
 			create_branch(hidden, hash_hex(&id));
@@ -3007,6 +3008,188 @@ dolt_writer_mode_noargs(PG_FUNCTION_ARGS)
 	return dolt_writer_mode(fcinfo);
 }
 
+/* The roots dolt_reflog() reads at most, the newest: as many as Dolt's. */
+#define REFLOG_ROOTS	5000
+
+typedef struct ReflogRoot
+{
+	ProllyHash	root;
+	TimestampTz at;
+} ReflogRoot;
+
+typedef struct ReflogRoots
+{
+	ReflogRoot *roots;			/* a ring of the newest REFLOG_ROOTS */
+	uint64		n;				/* roots seen */
+} ReflogRoots;
+
+static void
+reflog_root(const ProllyHash *root, TimestampTz at, void *arg)
+{
+	ReflogRoots *rr = arg;
+	ReflogRoot *r = &rr->roots[rr->n++ % REFLOG_ROOTS];
+
+	r->root = *root;
+	r->at = at;
+}
+
+/* A ref's last commit, as the roots are read oldest first. */
+typedef struct ReflogRef
+{
+	char	   *ref;
+	ProllyHash	commit;
+} ReflogRef;
+
+typedef struct ReflogScan
+{
+	TimestampTz at;				/* the root's */
+	char	   *target;			/* the ref asked for, or NULL: all */
+	List	   *last;			/* ReflogRef *, a ref's last commit */
+	List	   *rows;			/* ReflogRow *, oldest first */
+} ReflogScan;
+
+typedef struct ReflogRow
+{
+	Datum		values[4];
+	bool		nulls[4];
+} ReflogRow;
+
+static void
+reflog_ref(const char *ref, const ProllyHash *commit, void *arg)
+{
+	ReflogScan *rs = arg;
+	ReflogRef  *last = NULL;
+	ListCell   *lc;
+	ProllyCommitInfo info;
+	ReflogRow  *row;
+
+	/*
+	 * As Dolt does: a branch's name alone stands for the first ref it ends,
+	 * case aside; then only the ref matching it, case aside, is listed.
+	 */
+	if (rs->target != NULL)
+	{
+		size_t		rl = strlen(ref);
+		size_t		tl = strlen(rs->target);
+
+		if (rl > tl && ref[rl - tl - 1] == '/' &&
+			pg_strcasecmp(ref + rl - tl, rs->target) == 0)
+			rs->target = pstrdup(ref);
+		if (pg_strcasecmp(ref, rs->target) != 0)
+			return;
+	}
+	foreach(lc, rs->last)
+	{
+		if (strcmp(((ReflogRef *) lfirst(lc))->ref, ref) == 0)
+		{
+			last = lfirst(lc);
+			break;
+		}
+	}
+	if (last != NULL && same_hash(&last->commit, commit))
+		return;
+	if (last == NULL)
+	{
+		last = palloc(sizeof(ReflogRef));
+		last->ref = pstrdup(ref);
+		rs->last = lappend(rs->last, last);
+	}
+	last->commit = *commit;
+
+	row = palloc0(sizeof(ReflogRow));
+	row->values[0] = CStringGetTextDatum(ref);
+	/* (a time the store didn't record is unknown) */
+	row->values[1] = TimestampTzGetDatum(rs->at);
+	row->nulls[1] = rs->at == 0;
+	row->values[2] = CStringGetTextDatum(hash_hex(commit));
+	memset(&info, 0, sizeof(info));
+	if (PROLLY_CALL(refs(), commit_get, commit, &info))
+		row->values[3] = CStringGetTextDatum(info.message);
+	else
+		row->nulls[3] = true;
+	rs->rows = lappend(rs->rows, row);
+}
+
+/*
+ * dolt_reflog(VARIADIC args text[], OUT ref text,
+ *			   OUT ref_timestamp timestamptz, OUT commit_hash text,
+ *			   OUT commit_message text) returns setof record
+ *
+ * Each change of a ref (a branch's head, a remote-tracking branch's
+ * commit) the chunk store still records, newest first: as Dolt's reflog,
+ * read from the roots the store was moved to, each with its time; a
+ * garbage collection forgets the moves before it.  An argument names one
+ * ref ("main", or "refs/heads/main"); "--all" lists every ref, which they
+ * all are here already.
+ */
+Datum
+dolt_reflog(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		all = false;
+	ReflogRoots rr = {0};
+	ReflogScan	rs = {0};
+	uint64		first;
+
+	for (int i = 0; i < nargs; i++)
+	{
+		if (args[i][0] == '\0')
+			continue;			/* (no ref, as Dolt takes it) */
+		if (strcmp(args[i], "--all") == 0)
+		{
+			if (all)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("multiple values provided for \"--all\"")));
+			all = true;
+		}
+		else if (rs.target != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_reflog takes at most one ref"),
+					 errdetail("It was given \"%s\" and \"%s\".",
+							   rs.target, args[i])));
+		else
+			rs.target = args[i];
+	}
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_HAS(cs, roots))
+		return (Datum) 0;
+	rr.roots = palloc(sizeof(ReflogRoot) * REFLOG_ROOTS);
+	PROLLY_CALL(cs, roots, PROLLY_CALL(cs, open, MyDatabaseId,
+									   MyDatabaseTableSpace),
+				reflog_root, &rr);
+	first = rr.n > REFLOG_ROOTS ? rr.n - REFLOG_ROOTS : 0;
+	for (uint64 i = first; i < rr.n; i++)
+	{
+		ReflogRoot *r = &rr.roots[i % REFLOG_ROOTS];
+
+		CHECK_FOR_INTERRUPTS();
+		rs.at = r->at;
+		(void) PROLLY_CALL(refs(), root_refs, &r->root, reflog_ref, &rs);
+	}
+
+	/* newest first */
+	for (int i = list_length(rs.rows) - 1; i >= 0; i--)
+	{
+		ReflogRow  *row = list_nth(rs.rows, i);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, row->values,
+							 row->nulls);
+	}
+	return (Datum) 0;
+}
+
+Datum
+dolt_reflog_noargs(PG_FUNCTION_ARGS)
+{
+	return dolt_reflog(fcinfo);
+}
+
 /* dolt_status's rows ("name\tstatus") by name, which may hold a tab. */
 static int
 status_cmp(const ListCell *a, const ListCell *b)
@@ -3974,10 +4157,13 @@ check_remote_format(const ProllyRemoteRoutine *rr, ProllyRemote *r,
  * Fetch remote name's branches (NIL: all of them) into its remote-tracking
  * branches, the remote opened and its heads read once; with need, refuse
  * before receiving anything if the remote hasn't that branch.  *got (if
- * not NULL) is what was fetched: the branches and their commits.
+ * not NULL) is what was fetched: the branches and their commits.  A
+ * clone's (into a database with nothing to walk against) copies the
+ * remote's files whole, where the transfer can.
  */
 static void
-fetch_remote(const char *name, List *only, const char *need, Heads *got)
+fetch_remote(const char *name, List *only, const char *need, Heads *got,
+			 bool clone)
 {
 	ProllyDatabaseComponents dc;
 	char	   *url = need_remote(name);
@@ -4043,7 +4229,13 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got)
 		commits = palloc(sizeof(ProllyHash) * Max(list_length(want.commits), 1));
 		foreach(c, want.commits)
 			commits[n++] = *(ProllyHash *) lfirst(c);
-		(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
+		{
+			uint64		count;
+
+			if (!clone || !PROLLY_HAS(dc.transfer, clone) ||
+				!PROLLY_CALL(dc.transfer, clone, rr, r, commits, n, &count))
+				(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
+		}
 	}
 	PG_FINALLY();
 	{
@@ -4085,7 +4277,7 @@ dolt_fetch(PG_FUNCTION_ARGS)
 		else
 			branches = lappend(branches, args[i]);
 	}
-	fetch_remote(remote ? remote : "origin", branches, NULL, NULL);
+	fetch_remote(remote ? remote : "origin", branches, NULL, NULL, false);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -4098,6 +4290,34 @@ may_maintain(void)
 {
 	return object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
 		has_privs_of_role(GetUserId(), ROLE_PG_MAINTAIN);
+}
+
+/*
+ * Collect the current database's chunk store (full: all of it), as the
+ * database's owner or a member of pg_maintain may, as VACUUM asks.
+ */
+static void
+collect(bool full, const char *what, ProllyGcResult *gc)
+{
+	ProllyDatabaseComponents dc;
+
+	if (!may_maintain())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to collect garbage in database \"%s\"",
+						get_database_name(MyDatabaseId)),
+				 errdetail("Only the database's owner or members of the \"%s\" role may.",
+						   "pg_maintain")));
+	PreventCommandIfReadOnly(what);
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.reclamation, collect, full, gc);
+	ereport(DEBUG1,
+			(errmsg_internal("%s: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
+							 what,
+							 (unsigned long long) gc->chunks_kept,
+							 (unsigned long long) gc->chunks_freed,
+							 (unsigned long long) gc->bytes_freed,
+							 (unsigned long long) gc->window_usec)));
 }
 
 /*
@@ -4119,7 +4339,6 @@ dolt_gc(PG_FUNCTION_ARGS)
 	bool		shallow = false;
 	bool		options = true;	/* until "--" */
 	const char *result[1] = {"0"};
-	ProllyDatabaseComponents dc;
 	ProllyGcResult gc;
 
 	for (int i = 0; i < nargs; i++)
@@ -4139,22 +4358,7 @@ dolt_gc(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_gc can't --full and --shallow at once")));
-	if (!may_maintain())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to collect garbage in database \"%s\"",
-						get_database_name(MyDatabaseId)),
-				 errdetail("Only the database's owner or members of the \"%s\" role may.",
-						   "pg_maintain")));
-	PreventCommandIfReadOnly("dolt_gc()");
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.reclamation, collect, full, &gc);
-	ereport(DEBUG1,
-			(errmsg_internal("dolt_gc: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
-							 (unsigned long long) gc.chunks_kept,
-							 (unsigned long long) gc.chunks_freed,
-							 (unsigned long long) gc.bytes_freed,
-							 (unsigned long long) gc.window_usec)));
+	collect(full, "dolt_gc()", &gc);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -4162,6 +4366,109 @@ Datum
 dolt_gc_noargs(PG_FUNCTION_ARGS)
 {
 	return dolt_gc(fcinfo);
+}
+
+/*
+ * prolly_gc(full bool, OUT chunks_kept int8, OUT chunks_freed int8,
+ *			 OUT bytes_freed int8, OUT window_usec int8) returns record
+ *
+ * A collection, as dolt_gc() makes, and what it did: the chunks it kept
+ * and freed, the bytes freed, and how long appends were held off.
+ * (dolt_gc() answers {0}, as Dolt's does.)
+ */
+Datum
+prolly_gc(PG_FUNCTION_ARGS)
+{
+	bool		full = PG_GETARG_BOOL(0);
+	ProllyGcResult gc;
+	TupleDesc	desc;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	collect(full, "prolly_gc()", &gc);
+	values[0] = Int64GetDatum((int64) gc.chunks_kept);
+	values[1] = Int64GetDatum((int64) gc.chunks_freed);
+	values[2] = Int64GetDatum((int64) gc.bytes_freed);
+	values[3] = Int64GetDatum((int64) gc.window_usec);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/* prolly_store_sizes()'s sums */
+typedef struct StoreSizes
+{
+	int64		segments;
+	int64		segment_bytes;
+	int64		files;
+	int64		file_bytes;
+	int64		settled;
+	int64		settled_bytes;
+} StoreSizes;
+
+static void
+size_segment(const char *name, int nchunks, uint64 size, bool settled,
+			 void *arg)
+{
+	StoreSizes *ss = arg;
+
+	Assert(!settled);			/* (only table files are) */
+	ss->segments++;
+	ss->segment_bytes += size;
+}
+
+static void
+size_file(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	StoreSizes *ss = arg;
+
+	ss->files++;
+	ss->file_bytes += size;
+	if (settled)
+	{
+		ss->settled++;
+		ss->settled_bytes += size;
+	}
+}
+
+/*
+ * prolly_store_sizes(OUT journal_segments int8, OUT journal_bytes int8,
+ *					  OUT table_files int8, OUT table_file_bytes int8,
+ *					  OUT settled_files int8, OUT settled_bytes int8)
+ *	 returns record
+ *
+ * The current database's chunk store as it stands, as Dolt's StoreSizes:
+ * its journal (Dolt's journal), its table files, and of those the settled
+ * ones (closed under what they name: Dolt's oldgen; the rest its newgen).
+ * Only sizes are read.  Approximate while the store changes: the segments
+ * and the table files are listed one after the other, so a move or a
+ * collection between may count bytes in both, or neither; a segment whose
+ * file a collection has just removed counts with no bytes.
+ */
+Datum
+prolly_store_sizes(PG_FUNCTION_ARGS)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+	StoreSizes	ss = {0};
+	TupleDesc	desc;
+	Datum		values[6];
+	bool		nulls[6] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	PROLLY_CALL(cs, segments, store, false, size_segment, &ss);
+	PROLLY_CALL(cs, table_files, store, size_file, &ss);
+	values[0] = Int64GetDatum(ss.segments);
+	values[1] = Int64GetDatum(ss.segment_bytes);
+	values[2] = Int64GetDatum(ss.files);
+	values[3] = Int64GetDatum(ss.file_bytes);
+	values[4] = Int64GetDatum(ss.settled);
+	values[5] = Int64GetDatum(ss.settled_bytes);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 /*
@@ -4402,7 +4709,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 		need_upstream("dolt_pull", &remote, &branch);
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
-	fetch_remote(remote, list_make1(branch), NULL, NULL);
+	fetch_remote(remote, list_make1(branch), NULL, NULL, false);
 
 	/* (after "--": a remote's name may begin with "-") */
 	merge_args = lappend(merge_args, "--");
@@ -4577,7 +4884,11 @@ cloned_as_branch(const char *name)
  * Before any branch is made, what every branch's head needs from outside
  * the versioned schemas is checked (prolly_deps.h), and the extensions the
  * database lacks are made.  All in the transaction: a clone that fails
- * leaves nothing.
+ * leaves nothing but the files it copied whole, which a clone tried again
+ * doesn't copy again: out of what the store reads if it failed copying or
+ * checking them, but once they are checked the store takes them at once,
+ * so one that fails after (making its branches) leaves them named, its
+ * garbage until the store's next collection.
  */
 Datum
 dolt_clone(PG_FUNCTION_ARGS)
@@ -4630,7 +4941,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 
 	/* the remote added as dolt_remote() adds one, and fetched */
 	add_remote(remote, url);
-	fetch_remote(remote, NIL, branch, &h);
+	fetch_remote(remote, NIL, branch, &h, true);
 	if (h.branches == NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

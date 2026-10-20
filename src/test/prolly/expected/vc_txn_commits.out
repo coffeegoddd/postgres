@@ -4,7 +4,7 @@ starting permutation: a_begin a_tim b_jim b_dcommit b_head_users a_commit b_stat
 step a_begin: BEGIN;
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
 step b_jim: UPDATE vtc.users SET name = 'jim2' WHERE id = 2;
-step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 64 AS committed;
+step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
@@ -35,13 +35,13 @@ step a_begin: BEGIN;
 step b_begin: BEGIN;
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
 step b_jim: UPDATE vtc.users SET name = 'jim2' WHERE id = 2;
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
 (1 row)
 
-step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 64 AS committed; <waiting ...>
+step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed; <waiting ...>
 step a_commit: COMMIT;
 step b_dcommit: <... completed>
 committed
@@ -74,13 +74,13 @@ step a_begin: BEGIN;
 step b_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
 step b_jim: UPDATE vtc.users SET name = 'jim2' WHERE id = 2;
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
 (1 row)
 
-step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 64 AS committed; <waiting ...>
+step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed; <waiting ...>
 step a_commit: COMMIT;
 step b_dcommit: <... completed>
 ERROR:  could not serialize access: branch "main" moved since this transaction's snapshot
@@ -108,13 +108,13 @@ starting permutation: a_begin a_tim b_jim b_dcommit a_dcommit a_commit a_log b_s
 step a_begin: BEGIN;
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
 step b_jim: UPDATE vtc.users SET name = 'jim2' WHERE id = 2;
-step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 64 AS committed;
+step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
 (1 row)
 
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
@@ -135,7 +135,7 @@ table_name|status
 
 starting permutation: a_tim a_dcommit a_begin a_merge a_conflicts a_commit a_conflicts
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
@@ -164,7 +164,7 @@ table_name|num_conflicts
 
 starting permutation: a_tim a_dcommit a_begin a_allow a_merge a_commit a_conflicts a_status
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
@@ -195,7 +195,7 @@ vtc.users |conflict
 
 starting permutation: a_tim a_dcommit a_begin a_savepoint a_merge a_conflicts a_to_savepoint a_conflicts a_commit a_read
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
@@ -231,7 +231,7 @@ users
 
 starting permutation: a_del_parent2 a_dcommit a_begin a_merge a_violations a_commit a_violations
 step a_del_parent2: DELETE FROM vtc.parent WHERE pk = 2;
-step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 64 AS committed;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
 committed
 ---------
 t        
@@ -267,7 +267,7 @@ dolt_cherry_pick
 (1 row)
 
 step b_jim: UPDATE vtc.users SET name = 'jim2' WHERE id = 2;
-step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 64 AS committed; <waiting ...>
+step b_dcommit: SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed; <waiting ...>
 step a_commit: COMMIT;
 step b_dcommit: <... completed>
 committed

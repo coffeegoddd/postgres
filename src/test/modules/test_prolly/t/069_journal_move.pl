@@ -43,6 +43,25 @@ sub reload_settings
 	  or die 'autovacuum workers did not restart';
 }
 
+# An autovacuum worker's whole visit of the database, from here on: it
+# vacuums a table given a row (its tables come before the stores), then
+# leaves.
+sql(q{CREATE TABLE visits (n int) USING heap WITH
+	(autovacuum_vacuum_insert_threshold = 0,
+	 autovacuum_vacuum_insert_scale_factor = 0)});
+sub autovacuum_visited
+{
+	my $count = q{SELECT coalesce(autovacuum_count, 0) FROM pg_stat_user_tables
+		WHERE relname = 'visits'};
+	my $before = sql($count);
+	sql('INSERT INTO visits VALUES (1)');
+	$node->poll_query_until('mv', "SELECT ($count) > $before")
+	  or die 'autovacuum did not visit';
+	$node->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_stat_activity
+		WHERE backend_type = 'autovacuum worker' AND datname = 'mv'})
+	  or die 'the autovacuum worker did not leave';
+}
+
 my $files = q{SELECT count(*) FROM test_chunk_table_files()};
 is(sql('SHOW prolly.journal_move_threshold'), '1MB', 'the threshold is a setting');
 my ($ret, $out, $err) = $node->psql('mv',
@@ -55,17 +74,32 @@ my $dead = sql(q{SELECT test_chunk_put('garbage, never named')});
 sleep(3);
 is(sql($files), '0', 'below the threshold, no table file');
 
-# Past it, its chunks move, the garbage too.
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 100000), 'UTF8')))
+# Past it, its chunks move, the garbage too.  (Written with autovacuum
+# off: the transaction appends its batches as it goes, and a move between
+# them would leave the rest in the new segment.)
+reload_settings('autovacuum = off');
+sql(q{SELECT count(test_chunk_put(test_noise(g::text, 100000)))
 	FROM generate_series(1, 20) g});
+reload_settings('autovacuum = on');
 ok($node->poll_query_until('mv', "SELECT ($files) > 0"),
 	'past the threshold, the journal moves to a table file');
+ok($node->poll_query_until('mv', q{SELECT value > 0 FROM pg_stat_prolly
+	WHERE name = 'gc_moves'}),
+	'the move is counted, as a move and not a collection');
+is(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'gc_collections'}), '0',
+	'no collection was made');
+is( sql(
+		q{SELECT string_agg(value::text, ',' ORDER BY name) FROM pg_stat_prolly
+	WHERE name IN ('gc_chunks_kept', 'gc_chunks_freed', 'gc_bytes_freed',
+				   'gc_window_usec')}),
+	'0,0,0,0',
+	'... nor in what collections kept and freed');
 is(sql(q{SELECT string_agg(chunks::text, ',') FROM test_chunk_segments()}), '0',
 	'leaving one segment, empty');
 is(sql(q{SELECT string_agg(settled::text, ',') FROM test_chunk_table_files()}), 'false',
 	'a table file not settled');
 my $fresh = q{SELECT count(*) FROM generate_series(1, 20) g
-	WHERE test_chunk_has(encode(sha256(convert_to(repeat(g::text, 100000), 'UTF8')), 'hex'))};
+	WHERE test_chunk_has(test_content_hash(test_noise(g::text, 100000)))};
 is(sql($fresh), '20', 'a new backend reads the chunks moved');
 is(sql("SELECT test_chunk_has('$dead')"), 't', 'and the garbage: nothing is freed');
 
@@ -77,10 +111,10 @@ is($standby->safe_psql('mv', $fresh), '20', 'a standby reads them too');
 # is.
 my $first = sql(q{SELECT name FROM test_chunk_table_files()});
 reload_settings('autovacuum = off');
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 50000) || 's', 'UTF8')))
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 's', 50000)))
 	FROM generate_series(1, 20) g});
 sql('SELECT test_chunk_seal()');
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 50000) || 't', 'UTF8')))
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 't', 50000)))
 	FROM generate_series(1, 20) g});
 is(sql(q{SELECT count(*) FROM test_chunk_segments() WHERE chunks > 0}), '2',
 	'two segments with chunks');
@@ -93,15 +127,35 @@ is(sql(qq{SELECT count(*) FROM test_chunk_table_files() WHERE name = '$first'}),
 # With the threshold -1, it doesn't move.
 reload_settings('prolly.journal_move_threshold = -1');
 my $before = sql($files);
-sql(q{SELECT count(test_chunk_put(convert_to(repeat(g::text, 100000) || 'b', 'UTF8')))
+sql(q{SELECT count(test_chunk_put(test_noise(g::text || 'b', 100000)))
 	FROM generate_series(1, 20) g});
-sleep(3);
+autovacuum_visited();
 is(sql($files), $before, 'with the threshold -1, the journal stays');
 
 # A default collection collects the moved files' garbage.
 sql('SELECT test_chunk_gc(false) IS NOT NULL');
 is(sql("SELECT test_chunk_has('$dead')"), 'f',
 	'a default collection frees the garbage moved');
+
+# Past prolly.conjoin_max_files table files, autovacuum conjoins the
+# smallest, and the files left are no more than that; every chunk reads.
+my $conjoins = q{SELECT value FROM pg_stat_prolly WHERE name = 'conjoins'};
+my $conjoins_before = sql($conjoins);
+reload_settings('prolly.conjoin_max_files = 3');
+my $nfiles = q{SELECT count(*) FROM test_chunk_table_files()};
+sql(qq{SELECT test_chunk_table_file(ARRAY[test_noise('file $_', 100)])}) for 1 .. 5;
+ok($node->poll_query_until('mv', "SELECT ($nfiles) <= 3"),
+	'past the limit, autovacuum conjoins the smallest files');
+is(sql(q{SELECT count(*) FROM generate_series(1, 5) g
+	WHERE test_chunk_has(test_content_hash(test_noise('file ' || g, 100)))}), '5',
+	'every conjoined chunk reads');
+ok($node->poll_query_until('mv', "SELECT ($conjoins) > $conjoins_before"),
+	'the conjoin is counted');
+reload_settings('prolly.conjoin_max_files = -1');
+my $kept = sql($nfiles);
+sql(qq{SELECT test_chunk_table_file(ARRAY[test_noise('more $_', 100)])}) for 1 .. 4;
+autovacuum_visited();
+is(sql($nfiles), $kept + 4, 'with the limit -1, files aren\'t conjoined');
 
 $standby->stop;
 $node->stop;

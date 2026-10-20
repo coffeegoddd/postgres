@@ -68,7 +68,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-am', 'Step 1'))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-am', 'Step 1'))[1]) = 40",
       "expect": {
         "rows": [
           [
@@ -120,7 +120,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-am', 'this is a ff'))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-am', 'this is a ff'))[1]) = 40",
       "expect": {
         "rows": [
           [
@@ -154,7 +154,7 @@
       "requires": [
         "vc.merge"
       ],
-      "sql": "SELECT length(m[1]) = 64, m[2], m[3], m[4] FROM dolt_merge('feature-branch', '--no-ff', '-m', 'this is a no-ff') m",
+      "sql": "SELECT length(m[1]) = 40, m[2], m[3], m[4] FROM dolt_merge('feature-branch', '--no-ff', '-m', 'this is a no-ff') m",
       "expect": {
         "rows": [
           [

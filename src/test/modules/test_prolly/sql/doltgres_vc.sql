@@ -5,7 +5,7 @@
 -- merge, conflict resolution, reset, revert, gc and log.  Each script has
 -- a versioned schema of its own, first on the search path, and branches
 -- named for it.  Where prolly's answer differs from Doltgres's, a comment
--- says why: commit ids are 64 hex digits (Doltgres's 32); there is no
+-- says why: commit ids are 40 hex digits (Doltgres's 32); there is no
 -- staging area (dolt_add changes nothing); a database starts with no
 -- commits (Doltgres's with two of its own).
 
@@ -64,7 +64,7 @@ BEGIN
 END $f$;
 -- (each script's commits, checked to make one)
 CREATE FUNCTION pg_temp.committed(VARIADIC args text[]) RETURNS bool LANGUAGE sql AS $$
-	SELECT length((dolt_commit(VARIADIC args))[1]) = 64
+	SELECT length((dolt_commit(VARIADIC args))[1]) = 40
 $$;
 -- dolt_status's rows for schema s
 CREATE FUNCTION pg_temp.status_of(s text) RETURNS bigint LANGUAGE sql AS $$

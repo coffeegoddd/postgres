@@ -23,7 +23,7 @@ FROM test_fold_items() WHERE key LIKE 'c:app.%' ORDER BY key;
 SELECT length(dolt_commit('-m', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE app.t SET v = 3 WHERE k = 'a';
@@ -77,7 +77,7 @@ SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t
 SELECT length(dolt_commit('-am', 'second')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- The collation dropped (with the table it keyed): the commits before are
@@ -88,7 +88,7 @@ UPDATE app.n SET v = 3;
 SELECT length(dolt_commit('-am', 'third')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::app.n);
@@ -115,7 +115,7 @@ CREATE TABLE mv.base (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'mv')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mv_none');
@@ -141,7 +141,7 @@ FROM test_fold_items() WHERE key LIKE 'l:mv.%' ORDER BY key;
 SELECT length(dolt_commit('-Am', 'collations')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mv_none');
@@ -206,7 +206,7 @@ CREATE COLLATION mv.lone (provider = builtin, locale = 'C');
 SELECT length(dolt_commit('-am', 'lone changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mv_none');
@@ -246,7 +246,7 @@ CREATE TABLE mv.t (k text COLLATE mv.c2 PRIMARY KEY, v text COLLATE mv.c1);
 SELECT length(dolt_commit('-Am', 'c1 changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_reset('--hard', 'HEAD~1');

@@ -15,7 +15,7 @@ t
 (1 row)
 
 step b_change: INSERT INTO vtb.t (v) VALUES (2);
-step b_dcommit: SELECT length((dolt_commit('-am', 'other moves'))[1]) = 64 AS committed;
+step b_dcommit: SELECT length((dolt_commit('-am', 'other moves'))[1]) = 40 AS committed;
 committed
 ---------
 t        

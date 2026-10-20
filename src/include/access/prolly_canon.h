@@ -260,6 +260,12 @@ typedef struct ProllyCanonRoutine
  */
 extern void prolly_folded_tree_env(ProllyTreeEnv *env);
 
+/*
+ * The same, for writing a canonical root: its items declare the data trees
+ * they name, as references its leaves hold.
+ */
+extern void prolly_folded_canon_env(ProllyTreeEnv *env);
+
 static inline const ProllyCanonRoutine *
 prolly_canon_lookup(const char *name)
 {

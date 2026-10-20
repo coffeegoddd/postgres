@@ -22,6 +22,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_remote.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
@@ -47,6 +48,18 @@ struct ProllyRemote
 	char	   *where;			/* host and database, for messages */
 	bool		in_transaction; /* a BEGIN sent, not ended */
 	int			has_since;		/* dolt_serve_since() there: -1 not asked */
+	char	   *format;			/* its canonical format, once read */
+	bool		takes_lz4;		/* it decompresses what it is sent */
+};
+
+static void read_format(ProllyRemote *r);
+
+/* A file being read: its rows, one at a time, as they come. */
+struct ProllyRemoteFile
+{
+	ProllyRemote *r;
+	bool		checked;		/* the rows' description */
+	bool		done;			/* every row read, the query ended */
 };
 
 static uint32 we_connect;
@@ -155,7 +168,7 @@ typedef struct ResultShape
 	int			max_rows;
 	int			format;			/* 0 text, 1 binary */
 	int			ncols;
-	Oid			types[2];
+	Oid			types[4];
 } ResultShape;
 
 static const ResultShape one_text = {1, 1, 0, 1, {TEXTOID}};
@@ -439,14 +452,46 @@ result_hash(ProllyRemote *r, PGresult *res, int row, int col, ProllyHash *h)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * The remote's format, read once, and how it sends and takes chunks (what
+ * follows its canonical format): one that doesn't say it frames them is of
+ * a build before, and its format is given so, that a client refuses it as
+ * of another.  This build without LZ4 asks for frames it can decompress.
+ */
+static void
+read_format(ProllyRemote *r)
+{
+	PGresult   *res;
+	char	   *f;
+	char	   *framed;
+
+	if (r->format != NULL)
+		return;
+	res = run(r, "SELECT pg_catalog.dolt_serve_format()", 0, NULL,
+			  NULL, NULL, NULL, &one_text, "reading the format");
+	f = MemoryContextStrdup(TopTransactionContext, PQgetvalue(res, 0, 0));
+	PQclear(res);
+	framed = strstr(f, PROLLY_SERVE_FRAMED);
+	if (framed == NULL)
+	{
+		r->format = MemoryContextStrdup(TopTransactionContext,
+										psprintf("%s (chunks sent unframed)", f));
+		return;
+	}
+	r->takes_lz4 = strcmp(framed + strlen(PROLLY_SERVE_FRAMED),
+						  PROLLY_SERVE_LZ4) == 0;
+	*framed = '\0';
+	r->format = f;
+#ifndef USE_LZ4
+	run_command(r, "SET prolly_serve_uncompressed = on", "asking for chunks uncompressed");
+#endif
+}
+
 static void
 libpq_format(ProllyRemote *r, StringInfo out)
 {
-	PGresult   *res = run(r, "SELECT pg_catalog.dolt_serve_format()", 0, NULL,
-						  NULL, NULL, NULL, &one_text, "reading the format");
-
-	appendStringInfoString(out, PQgetvalue(res, 0, 0));
-	PQclear(res);
+	read_format(r);
+	appendStringInfoString(out, r->format);
 }
 
 static void
@@ -492,6 +537,7 @@ libpq_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 	PGresult   *res;
 	bool		found;
 
+	read_format(r);
 	res = run_hashes(r, "SELECT chunk FROM pg_catalog.dolt_serve_get($1)", hash, 1,
 					 &shape, "reading a chunk");
 	found = PQntuples(res) > 0;
@@ -520,6 +566,7 @@ libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
 {
 	PGresult   *res;
 
+	read_format(r);
 	res = run_hashes(r, "SELECT hash, chunk FROM pg_catalog.dolt_serve_get($1)",
 					 hashes, n, &chunk_rows, "reading chunks");
 	PG_TRY();
@@ -583,6 +630,7 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 	}
 	if (!r->has_since)
 		return;
+	read_format(r);
 
 	initStringInfo(&w);
 	initStringInfo(&k);
@@ -647,6 +695,152 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 	}
 }
 
+/*
+ * Its files, whole (false: a remote of a build before them, which can't
+ * list them).
+ */
+static bool
+libpq_files(ProllyRemote *r, ProllyRemoteFileVisit visit, void *arg)
+{
+	static const ResultShape shape = {0, -1, 0, 4, {TEXTOID, TEXTOID, TEXTOID, TEXTOID}};
+	PGresult   *res;
+	bool		has;
+
+	read_format(r);
+	res = run(r, "SELECT pg_catalog.to_regprocedure('pg_catalog.dolt_serve_file_chunks(text)') IS NOT NULL",
+			  0, NULL, NULL, NULL, NULL, &one_bool, "asking what it serves");
+	has = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
+	PQclear(res);
+	if (!has)
+		return false;
+	res = run(r, "SELECT key, chunks::text, bytes::text, journal::text "
+			  "FROM pg_catalog.dolt_serve_files()",
+			  0, NULL, NULL, NULL, NULL, &shape, "reading its files");
+	PG_TRY();
+	{
+		for (int i = 0; i < PQntuples(res); i++)
+		{
+			char	   *key = pnstrdup(PQgetvalue(res, i, 0), PQgetlength(res, i, 0));
+			char	   *end;
+			uint64		chunks = strtou64(PQgetvalue(res, i, 1), &end, 10);
+			uint64		bytes;
+
+			if (*end != '\0' || chunks > PG_UINT32_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("remote %s sent a file's chunk count that isn't one",
+								r->where)));
+			bytes = strtou64(PQgetvalue(res, i, 2), &end, 10);
+			if (*end != '\0')
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("remote %s sent a file's size that isn't one", r->where)));
+			visit(key, (uint32) chunks, bytes,
+				  strcmp(PQgetvalue(res, i, 3), "true") == 0, arg);
+			pfree(key);
+		}
+	}
+	PG_FINALLY();
+	{
+		PQclear(res);
+	}
+	PG_END_TRY();
+	return true;
+}
+
+static ProllyRemoteFile *
+libpq_file_open(ProllyRemote *r, const char *key)
+{
+	ProllyRemoteFile *f;
+	const char *values[1] = {key};
+	Oid			types[1] = {TEXTOID};
+
+	/* (the transaction the reads are in, as run() begins it) */
+	if (!r->in_transaction)
+	{
+		r->in_transaction = true;
+		run_command(r, "BEGIN", "beginning");
+	}
+	if (!PQsendQueryParams(r->conn,
+						   "SELECT hash, chunk FROM pg_catalog.dolt_serve_file_chunks($1)",
+						   1, types, values, NULL, NULL, 1) ||
+		!PQsetSingleRowMode(r->conn))
+		remote_error(r, NULL, "reading a file");
+	f = palloc0(sizeof(ProllyRemoteFile));
+	f->r = r;
+	return f;
+}
+
+/* A connection a file was being read on, given up: rows may still come. */
+static void
+file_abandon(ProllyRemoteFile *f)
+{
+	libpqsrv_disconnect(f->r->conn);
+	f->r->conn = NULL;
+	f->done = true;
+}
+
+static bool
+libpq_file_next(ProllyRemoteFile *f, ProllyHash *hash, StringInfo frame)
+{
+	ProllyRemote *r = f->r;
+
+	while (!f->done)
+	{
+		PGresult   *res = libpqsrv_get_result(r->conn, we_result);
+		ExecStatusType status;
+
+		if (res == NULL)
+		{
+			f->done = true;
+			break;
+		}
+		status = PQresultStatus(res);
+		if (status == PGRES_SINGLE_TUPLE)
+		{
+			PG_TRY();
+			{
+				if (!f->checked)
+					result_columns_check(r, res, &chunk_rows, "reading a file");
+				f->checked = true;
+				result_nulls_check(r, res, "reading a file");
+				result_hash(r, res, 0, 0, hash);
+				appendBinaryStringInfo(frame, PQgetvalue(res, 0, 1),
+									   PQgetlength(res, 0, 1));
+			}
+			PG_CATCH();
+			{
+				PQclear(res);
+				file_abandon(f);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			PQclear(res);
+			return true;
+		}
+		if (status != PGRES_TUPLES_OK)
+		{
+			PGresult   *rest;
+
+			while ((rest = libpqsrv_get_result(r->conn, we_result)) != NULL)
+				PQclear(rest);
+			f->done = true;
+			remote_error(r, res, "reading a file");
+		}
+		PQclear(res);
+	}
+	return false;
+}
+
+static void
+libpq_file_close(ProllyRemoteFile *f)
+{
+	/* (closed before its end, on an error: the connection goes) */
+	if (!f->done && f->r->conn != NULL)
+		file_abandon(f);
+	pfree(f);
+}
+
 /* Send a batch of a push's chunks. */
 static void
 send_batch(ProllyRemote *r, const ProllyHash *hashes, StringInfoData **chunks, int n)
@@ -658,6 +852,20 @@ send_batch(ProllyRemote *r, const ProllyHash *hashes, StringInfoData **chunks, i
 	int			formats[2] = {1, 1};
 	Oid			types[2] = {BYTEAARRAYOID, BYTEAARRAYOID};
 
+	/* (a remote that can't decompress is sent every chunk plain) */
+	read_format(r);
+	if (!r->takes_lz4)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			StringInfoData plain;
+
+			initStringInfo(&plain);
+			prolly_chunk_frame_plain(chunks[i]->data, chunks[i]->len, &plain);
+			pfree(chunks[i]->data);
+			*chunks[i] = plain;
+		}
+	}
 	initStringInfo(&h);
 	initStringInfo(&c);
 	hashes_array(&h, hashes, n);
@@ -774,4 +982,8 @@ static const ProllyRemoteRoutine libpq_routine = {
 	.get_many = libpq_get_many,
 	.has_many = libpq_has_many,
 	.get_since = libpq_get_since,
+	.files = libpq_files,
+	.file_open = libpq_file_open,
+	.file_next = libpq_file_next,
+	.file_close = libpq_file_close,
 };

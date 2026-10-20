@@ -48,18 +48,20 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
--- (the block map's bytes in blocks, whatever the block size)
+-- (the block map's bytes in blocks, whatever the block size; the journal's
+-- bytes depend on whether the server compresses its chunks, below)
 SELECT name, CASE WHEN name LIKE 'bmap\_%' THEN value / current_setting('block_size')::bigint
 	ELSE value END AS value
-FROM pg_stat_prolly;
+FROM pg_stat_prolly
+WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
            name            | value 
 ---------------------------+-------
  nodes_read                |    40
  nodes_written             |    14
  value_nodes_written       |     0
  chunks_appended           |    14
- chunk_bytes_appended      | 25835
- bytes_hashed              | 44977
+ chunk_bytes_appended      | 25838
+ bytes_hashed              | 44980
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -71,7 +73,6 @@ FROM pg_stat_prolly;
  memo_misses               |     0
  page_copies_fold          |     0
  page_copies_shared        |     0
- journal_bytes_written     | 26521
  table_file_bytes_written  |     0
  manifest_bytes_written    |     0
  gc_bytes_copied           |     0
@@ -79,7 +80,16 @@ FROM pg_stat_prolly;
  bmap_store_bytes_written  |     0
  bmap_extend_bytes_written |    19
  bmap_bulk_bytes_written   |     0
-(25 rows)
+ journal_scans             |     1
+ gc_collections            |     0
+ gc_moves                  |     0
+ gc_chunks_kept            |     0
+ gc_chunks_freed           |     0
+ gc_bytes_freed            |     0
+ conjoins                  |     0
+ gc_window_usec            |     0
+ chunk_file_reads          |    26
+(33 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
@@ -90,11 +100,14 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
  t                 | t
 (1 row)
 
--- The journal holds each chunk with its record's framing, and the root.
-SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') >
-	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS journal_frames_chunks;
- journal_frames_chunks 
------------------------
+-- The journal holds each chunk with its record's framing, and the root:
+-- compressed, fewer bytes than the chunks, where the server has LZ4.
+SELECT ((SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') <
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended')) =
+	(SELECT 'lz4' = ANY(enumvals) FROM pg_settings
+	 WHERE name = 'default_toast_compression') AS journal_compressed_with_lz4;
+ journal_compressed_with_lz4 
+-----------------------------
  t
 (1 row)
 
@@ -136,7 +149,10 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
 (8 rows)
 
 -- The same commit again, in a database just like it: the same counts.
-SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly \gset
+-- (but the journal's bytes: compressed, a commit's, which holds its time,
+-- may take a byte more or less)
+SELECT json_object_agg(name, value) AS first FROM pg_stat_prolly
+WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned') \gset
 \c :home
 CREATE DATABASE stat_prolly_again;
 \c stat_prolly_again
@@ -181,11 +197,15 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
-SELECT array_agg(value ORDER BY name) = :'first' AS same_counts FROM pg_stat_prolly;
- same_counts 
--------------
- t
-(1 row)
+-- (any that differ, with both counts; not the journal's bytes, which
+-- depend on how its chunks compress, as commit ids and times differ)
+SELECT name, value, (:'first'::json ->> name)::bigint AS first
+FROM pg_stat_prolly
+WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint
+	AND name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
+ name | value | first 
+------+-------+-------
+(0 rows)
 
 -- Per database: the other's work isn't counted here.
 \c stat_prolly

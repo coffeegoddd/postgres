@@ -13,7 +13,7 @@ INSERT INTO ho.t VALUES (1, 'one');
 SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE ho.t SET v = 'uno' WHERE id = 1;	-- uncommitted on main
@@ -92,7 +92,7 @@ INSERT INTO ho.t VALUES (2, 'two');
 SELECT length(dolt_commit('-am', 'on h1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;

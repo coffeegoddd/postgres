@@ -1,9 +1,10 @@
--- The canonical format of table data is frozen: the hash (SHA-256), the
--- key encoding, the row encoding and the node format.  The same rows give
--- these trees, byte for byte, in every database and every later version;
--- a hash here that changes is a change of format, which needs a new format
--- version, not a new expected value.  Keys of each kind of encoding, rows
--- of every kind of value, special and non-ASCII values among them.
+-- The canonical format of table data is frozen: the hash (BLAKE3, its
+-- first 20 bytes), the key encoding, the row encoding and the node format.
+-- The same rows give these trees, byte for byte, in every database and
+-- every later version; a hash here that changes is a change of format,
+-- which needs a new format version, not a new expected value.  Keys of
+-- each kind of encoding, rows of every kind of value, special and
+-- non-ASCII values among them.
 --
 -- (Keys here are ordered by the "C" collation, whose order depends on no
 -- library.  Only data trees are pinned: the canonical root's other items
@@ -16,11 +17,12 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
 -- The hash.
-SELECT test_chunk_put('prolly format') = encode(sha256('prolly format'::bytea), 'hex')
-	AS chunks_named_by_sha256;
- chunks_named_by_sha256 
-------------------------
- t
+SELECT test_chunk_put('prolly format') AS chunk,
+	test_chunk_put('prolly format') = test_content_hash('prolly format', 'blake3')
+	AS named_by_blake3;
+                  chunk                   | named_by_blake3 
+------------------------------------------+-----------------
+ 4fb92a1fa99c6b2ab006d08f167019d2921261c1 | t
 (1 row)
 
 CREATE SCHEMA frozen VERSIONED;
@@ -102,20 +104,20 @@ INSERT INTO frozen.cidr_keys VALUES ('10.0.0.0/8', 1), ('10.0.0.0/16', 2),
   ('192.168.1.0/24', 3), ('2001:db8::/32', 4);
 SELECT name, tree, unreadable FROM test_fold_trees()
 WHERE name LIKE 'frozen.%' ORDER BY name;
-         name          |                               tree                               | unreadable 
------------------------+------------------------------------------------------------------+------------
- frozen.bool_keys      | d04d885b23f1fc97cb3a0b562d78b9e06e3dc27d40f6912859590c77017d37c8 | 
- frozen.cidr_keys      | 5db807cc33fefb7698aefe5a3834c16af760d6f0d4e8c17e1a4c2858e027dbfb | 
- frozen.composite      | a4d2c905661cd61f7d7115c4b97f3c42b106e185a315bd9d169c22c6f9ca9989 | 
- frozen.keyless        | b5ef3d66d0a49c160542af1794d03a1493a4a0256c0181782b3eac7c76ba1d0d | 
- frozen.large          | 0358a81e973ee335bd03364304062146a27611383d5b505807236bb0677739a3 | 
- frozen.non_ascii      | 881042d5598a8757ea1eba578e15b41282775389f9e62d4ec048cf2a80513263 | 
- frozen.scalars        | ee0bd1c0ae4bb95200fa516c1d9f7efc8072488e20466dbd970f822a5c9acf97 | 
- frozen.sent_keys      | 8bb2334d74f996b153d6c002289e2504480ced23f8d7efd0589ff1e0a53a0c7c | 
- frozen.special        | bc3c956bf4a022e9df3bf6399c48a6645ff6b283d1ad54d4e08e5bf07ca910de | 
- frozen.special_n      | ab02342d95270ade28aab540f2ba4b0fc9c170fb176617dec9346f8c5aa47020 | 
- frozen.varchar_domain | d09e6d56e4f3718ebc4027babed2c3480297cf607890eee6ebc956e5aa18d836 | 
- frozen.varchar_keys   | d09e6d56e4f3718ebc4027babed2c3480297cf607890eee6ebc956e5aa18d836 | 
+         name          |                   tree                   | unreadable 
+-----------------------+------------------------------------------+------------
+ frozen.bool_keys      | 063a287f1b30ea061ad569c77252eeae5e32357d | 
+ frozen.cidr_keys      | 1178b39441539109fc47b4dd153a6ca2217d12b9 | 
+ frozen.composite      | ac55e73738d64baaec0b5ad7f600e0d1319fe810 | 
+ frozen.keyless        | d4de1c1132bb5ba60a875eb65605b0f5020e5700 | 
+ frozen.large          | 67c50562281bf2d82a544a466dcb8c3b9eda3d80 | 
+ frozen.non_ascii      | b1c25d60b9ef7c1b5423524ddc78953c31e47c1c | 
+ frozen.scalars        | 2f71110eda0da9d9a1a5761281927de91c9b32b0 | 
+ frozen.sent_keys      | b063188640ebdac315b8995a0276a57ec6950251 | 
+ frozen.special        | 3385dacb0d04da993076a2636385175e232d9291 | 
+ frozen.special_n      | ae13f70455c6614d84083452f7a2d1981a27419a | 
+ frozen.varchar_domain | 7c629b0422809ae307f710d31c09276a5c0a730a | 
+ frozen.varchar_keys   | 7c629b0422809ae307f710d31c09276a5c0a730a | 
 (12 rows)
 
 DROP SCHEMA frozen CASCADE;

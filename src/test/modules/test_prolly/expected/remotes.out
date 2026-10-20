@@ -21,7 +21,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 CREATE SCHEMA rm VERSIONED;
@@ -30,7 +30,7 @@ INSERT INTO rm.t SELECT g, 'v' || g FROM generate_series(1, 500) g;
 SELECT length(dolt_commit('-Am', 'rm 1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- (commits sharing most of their trees: a fetch meets chunks it received
@@ -39,14 +39,14 @@ UPDATE rm.t SET v = 'w' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'rm 2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE rm.t SET v = 'w' WHERE id = 500;
 SELECT length(dolt_commit('-am', 'rm 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- remotes are named, by URL
@@ -149,7 +149,7 @@ UPDATE rm.t SET v = 'b' WHERE id <= 5;
 SELECT length(dolt_commit('-am', 'from b')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_push('origin', 'work') AS pushed;
@@ -240,7 +240,7 @@ UPDATE rm.t SET v = 'f' WHERE id = 2;
 SELECT length(dolt_commit('-am', 'feature')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT test_refs_set_upstream('feature', 'origin', 'feat');
@@ -294,7 +294,7 @@ UPDATE rm.t SET v = 'u' WHERE id = 3;
 SELECT length(dolt_commit('-am', 'up3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_push('-u', 'origin', 'up3') AS pushed;
@@ -338,7 +338,7 @@ UPDATE rm.t SET v = 'u' WHERE id = 4;
 SELECT length(dolt_commit('-am', 'up4')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
@@ -403,7 +403,7 @@ UPDATE rm.t SET v = 'u' WHERE id = 6;
 SELECT length(dolt_commit('-am', 'ahead6')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('up6') IS NOT NULL AS on_up6;
@@ -458,7 +458,7 @@ INSERT INTO rm.t VALUES (9070, 'cur');
 SELECT length(dolt_commit('-am', 'cur')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-d', 'cur');
@@ -541,8 +541,8 @@ SELECT test_walk_commit_count(tree) AS not_a_commit
             0
 (1 row)
 
-SELECT test_walk_commit_count(encode(sha256('no such commit'::bytea), 'hex'));
-ERROR:  commit d1d6fb404b878c9e51f2af8853bdf14de7ffd4df255923322c70be9cee4097d8 is missing from the chunk store
+SELECT test_walk_commit_count(test_content_hash('no such commit'::bytea));
+ERROR:  commit 5fd4f50963466f8a93af39db223415ecfef2efda is missing from the chunk store
 -- a long history pushed and fetched: walked a commit at a time, each
 -- once, however long
 SELECT dolt_checkout('-b', 'long') IS NOT NULL AS on_long;
@@ -617,7 +617,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 SELECT pg_temp.err($$SELECT dolt_fetch()$$);
@@ -653,7 +653,7 @@ SELECT test_remote_put(:'url_bad', dolt_hashof('main'), :'commit_bytes');
  
 (1 row)
 
-SELECT encode(sha256('not a commit'::bytea), 'hex') AS fake \gset
+SELECT test_content_hash('not a commit'::bytea) AS fake \gset
 SELECT test_remote_set_head(:'url_bad', 'main', dolt_hashof('main'), :'fmt');
  test_remote_set_head 
 ----------------------
@@ -671,7 +671,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 SELECT dolt_remote('add', 'bad', :'url_bad');
@@ -750,7 +750,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 CREATE ROLE regress_remote_user;
@@ -850,6 +850,6 @@ NOTICE:  drop cascades to table rm.t
 SELECT length(dolt_commit('-Am', 'rm gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

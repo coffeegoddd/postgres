@@ -3,7 +3,7 @@
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 NOTICE:  extension "test_prolly" already exists, skipping
 SELECT test_chunk_put('ac present') AS present \gset
-SELECT encode(sha256('ac missing'), 'hex') AS missing \gset
+SELECT test_content_hash('ac missing') AS missing \gset
 -- A node naming a chunk the store has, or one put in the same
 -- transaction, is stored.
 SELECT test_chunk_put_node(1, ARRAY[:'present']) AS node1 \gset
@@ -31,7 +31,7 @@ BEGIN;
 SELECT test_chunk_put('ac with dangling') AS with_dangling \gset
 SELECT test_chunk_put_node(1, ARRAY[:'present', :'missing']) AS dangling1 \gset
 COMMIT;
-ERROR:  could not store chunk e7ecadb9fc1b8d7dd44dfb5ba1f859f21d9b5f487c32b9bed02b6cb10385d0ad: chunk a653fd9b93d506d887711bc0f9ec9297d4f92774a940550f82d475425309fe81, which it names, is not in the chunk store
+ERROR:  could not store chunk 548da39caca66e4c92bdc134c745696fd8695d48: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 DETAIL:  A garbage collection may have removed it after the transaction read it.
 HINT:  Try the transaction again.
 \set VERBOSITY terse
@@ -45,7 +45,7 @@ SELECT test_chunk_has(:'dangling1') AS dangling_stored,
 BEGIN;
 SELECT test_chunk_put_node(0, ARRAY[:'missing']) AS dangling0 \gset
 COMMIT;
-ERROR:  could not store chunk 4d53d06ddececf3b23e46c691ad41be60431f18bbb060b78ce4b27c551b4d5f9: chunk a653fd9b93d506d887711bc0f9ec9297d4f92774a940550f82d475425309fe81, which it names, is not in the chunk store
+ERROR:  could not store chunk 88928b73d3e9fa78f68864f7f37d0eb25e8e5dfa: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 SELECT test_chunk_has(:'dangling0');
  test_chunk_has 
 ----------------
@@ -59,8 +59,8 @@ SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
  40001
 (1 row)
 
--- A batch is checked as it is appended (a megabyte of chunks), before the
--- transaction commits.
+-- A batch is checked as it is appended (a megabyte of chunks, which LZ4
+-- can't make smaller), before the transaction commits.
 BEGIN;
 SELECT test_chunk_put_node(1, ARRAY[:'missing']) IS NOT NULL AS put;
  put 
@@ -68,8 +68,9 @@ SELECT test_chunk_put_node(1, ARRAY[:'missing']) IS NOT NULL AS put;
  t
 (1 row)
 
-SELECT test_chunk_put(convert_to(repeat('ac batch', 150000), 'UTF8')) IS NOT NULL AS batch;
-ERROR:  could not store chunk e8a85f6aa9a6c8b8ef91ad98655816fe2bfebe464cd965c9758e6c701171600c: chunk a653fd9b93d506d887711bc0f9ec9297d4f92774a940550f82d475425309fe81, which it names, is not in the chunk store
+SELECT test_chunk_put(decode(string_agg(md5('ac batch ' || g), '' ORDER BY g), 'hex'))
+	IS NOT NULL AS batch FROM generate_series(1, 75000) g;
+ERROR:  could not store chunk b61bbe734f9d913fea0921ee4449c78386789294: chunk 50ec30c4f53f4343e33ccbad73a09255ba8d3232, which it names, is not in the chunk store
 ROLLBACK;
 SELECT :'LAST_ERROR_SQLSTATE' AS sqlstate;
  sqlstate 
@@ -99,7 +100,7 @@ SELECT test_chunk_has(:'dangling1');
 -- A subtransaction that aborts takes the chunks it put with it: one
 -- naming a missing chunk fails nothing once it is rolled back.  What the
 -- transaction put before, or in a subtransaction that committed, stays.
-SELECT encode(sha256('ac missing in savepoint'), 'hex') AS missing_sp \gset
+SELECT test_content_hash('ac missing in savepoint') AS missing_sp \gset
 BEGIN;
 SELECT test_chunk_put('ac before savepoint') AS before_sp \gset
 SAVEPOINT a;
@@ -125,7 +126,8 @@ SELECT test_chunk_has(:'before_sp') AS before_sp, test_chunk_has(:'released') AS
 -- stays, the rest goes.
 BEGIN;
 SAVEPOINT a;
-SELECT test_chunk_put(convert_to(repeat('ac sp batch', 120000), 'UTF8')) AS sp_batch \gset
+SELECT test_chunk_put(decode(string_agg(md5('ac sp batch ' || g), '' ORDER BY g), 'hex'))
+	AS sp_batch FROM generate_series(1, 75000) g \gset
 SELECT test_chunk_put_node(1, ARRAY[:'missing_sp']) AS rolled_back2 \gset
 ROLLBACK TO SAVEPOINT a;
 COMMIT;

@@ -312,16 +312,18 @@ first is deleted. Sharing across rows needs C.
 
 ### C1. The pointer
 
-A new on-disk tag per hash algorithm, `VARTAG_ONDISK_SHA256` (5), next to
+A new on-disk tag per hash algorithm, `VARTAG_ONDISK_BLAKE3` (6; it was
+`VARTAG_ONDISK_SHA256` (5) with SHA-256's 32 bytes until chunks were named
+by BLAKE3), next to
 `VARTAG_ONDISK_OID` (18) and `VARTAG_ONDISK_OID8` (4), added the way
 `6e58d6356f` added oid8 (`VARTAG_SIZE` gets a pointer's size from its tag
 alone, so a tag has one fixed size):
 
     int32  va_rawsize    -- as now: original size, header included
     uint32 va_extinfo    -- as now: stored size and compression method
-    uint8  va_hash[32]   -- the value tree's root, the store's hash
+    uint8  va_hash[20]   -- the value tree's root, the store's hash
 
-42 bytes as a datum. It names no relation: a value is the same value on
+30 bytes as a datum. It names no relation: a value is the same value on
 every branch and in every table.
 
 `VARATT_IS_EXTERNAL_ONDISK` does **not** include it: its 27 uses in 16
@@ -571,6 +573,8 @@ the values' generation subtracted: 2 KB 12.0 (heap), 11.9 (OID), 17.8
   table as built): 81–109% of heap's tps.
 - Where the CPU goes (64 KB, perf): the value chunker's rolling hash about
   32%, SHA-256 22%, the journal's hash-table lookups 15%, CRC 4%.
+  (Spec 22 replaced SHA-256 with BLAKE3 and batched those lookups; this
+  profile is taken again in step 8.)
 - Found on the way: a backend's first chunk-store miss scans the whole
   unsealed journal to index it, about 1 s a GB (3.0 s at 3.2 GB). With C
   the journal grows with the working set's writes, not with commits.
@@ -644,7 +648,7 @@ to decode.
 2. jsonb's on-disk canonical bytes, with a version byte (C7 question 1).
 3. The journal's append (decision 1), gate 3 measured again.
 4. The journal's bound (decision 4).
-5. The pointer (C1): `VARTAG_ONDISK_SHA256`, the fetch hook (whole and by
+5. The pointer (C1): `VARTAG_ONDISK_SHA256` (now `VARTAG_ONDISK_BLAKE3`), the fetch hook (whole and by
    slice), and the audit of `VARATT_IS_EXTERNAL_ONDISK`'s uses.
 6. The collection's roots (C4, decision 3): hash pointers in the page
    store, and the keep set while a collection runs.
@@ -686,8 +690,12 @@ to decode.
   garbage; table files are left as they are. Autovacuum runs it when the
   journal's segments together (sealed ones too) have passed
   `prolly.journal_move_threshold` (256 MB; 0 refused, -1 off), paced by
-  its cost-based delay.
-- **The pointer.** `VARTAG_ONDISK_SHA256` (5); `va_extinfo`'s high bits
+  its cost-based delay. And with more table files than
+  `prolly.conjoin_max_files` (256; at least 2, or -1 off), it conjoins
+  the smallest, as Dolt's conjoiner does, no more in one pass than
+  `maintenance_work_mem` and a gigabyte allow, paced likewise.
+- **The pointer.** `VARTAG_ONDISK_BLAKE3` (6; `VARTAG_ONDISK_SHA256` (5)
+  before chunks were named by BLAKE3); `va_extinfo`'s high bits
   are the form the tree holds the value in: its bytes, a text-like
   value's in UTF-8 (another encoding), or a jsonb document's canonical
   bytes. A destination (`toast_destination.h`) is found by the pointer's

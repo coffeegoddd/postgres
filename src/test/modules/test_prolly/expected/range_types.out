@@ -9,7 +9,7 @@ CREATE TABLE rv.base (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rv_other');
@@ -44,7 +44,7 @@ SELECT * FROM dolt_status ORDER BY table_name;
 SELECT length(dolt_commit('-Am', 'ranges')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_status;
@@ -162,7 +162,7 @@ CREATE TYPE rv.span AS RANGE (subtype = int8);
 SELECT length(dolt_commit('-Am', 'span of int8')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -194,7 +194,7 @@ CREATE TYPE rv.lone AS RANGE (subtype = int4);
 SELECT length(dolt_commit('-Am', 'lone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP TYPE rv.lone;
@@ -222,7 +222,7 @@ CREATE TYPE rv.sspan AS RANGE (subtype = rv.small);
 SELECT length(dolt_commit('-Am', 'over a domain')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('rv_domain');
@@ -244,7 +244,7 @@ CREATE TYPE rv.sspan AS RANGE (subtype = rv.small);
 SELECT length(dolt_commit('-Am', 'a wider domain')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -267,7 +267,7 @@ DROP DOMAIN rv.small;
 SELECT length(dolt_commit('-Am', 'no domain')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a multirange outside the range's versioned schema is refused where made
@@ -316,6 +316,6 @@ drop cascades to type rv.lone
 SELECT length(dolt_commit('-Am', 'rv gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

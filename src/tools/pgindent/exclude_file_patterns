@@ -36,6 +36,11 @@ kwlist_d\.h$
 src/include/common/unicode_norm_hashfunc\.h$
 src/include/common/unicode_normprops_table\.h$
 #
+# BLAKE3's C implementation, imported (src/common/README.blake3), is kept
+# as upstream formats it.
+src/common/blake3[^/]*\.[ch]$
+src/include/common/blake3\.h$
+#
 # Exclude ecpg test files to avoid breaking the ecpg regression tests
 # (but include files at the top level of the ecpg/test/ directory).
 src/interfaces/ecpg/test/.*/

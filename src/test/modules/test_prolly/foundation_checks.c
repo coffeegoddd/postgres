@@ -22,6 +22,7 @@
 #include "access/nbtree.h"
 #include "access/tupdesc_details.h"
 #include "access/prolly_canon.h"
+#include "access/prolly_config.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
 #include "catalog/pg_am_d.h"
@@ -38,10 +39,12 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "nodes/value.h"
+#include "port/pg_crc32c.h"
 #include "test_prolly.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/typcache.h"
 
 /* ------------------------------------------------------------------------
@@ -1265,6 +1268,17 @@ typedef struct MemFile
 	Size		len;
 } MemFile;
 
+/* a file in memory mapped: its bytes themselves */
+static const char *
+memfile_map(void *arg, uint64 offset, Size len)
+{
+	MemFile    *f = arg;
+
+	if (offset > f->len || len > f->len - offset)
+		return NULL;
+	return f->data + offset;
+}
+
 static bool
 memfile_read(void *arg, uint64 offset, char *buf, Size len)
 {
@@ -1280,7 +1294,7 @@ memfile_read(void *arg, uint64 offset, char *buf, Size len)
 static void
 tablefile_chunk(int i, StringInfo out, ProllyHash *hash)
 {
-	const ProllyHashRoutine *h = prolly_hash_lookup("sha256");
+	const ProllyHashRoutine *h = prolly_content_hash();
 	ProllyHashCtx *ctx;
 	uint32		x = 2166136261u ^ (uint32) i;
 
@@ -1363,7 +1377,9 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	/* (mapped, as a chunk store's own files are; read, as a remote's) */
+	f = PROLLY_CALL(tf, open, memfile_read, memfile_map, &mf, a.len,
+					CurrentMemoryContext);
 	if (f == NULL)
 		elog(ERROR, "a table file written doesn't open");
 	if (PROLLY_CALL(tf, count, f) != n)
@@ -1407,14 +1423,124 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 	}
 	PROLLY_CALL(tf, close, f);
 
-	/* and a file of no chunks */
+	/* and a file of no chunks, where nothing is found */
 	resetStringInfo(&a);
 	tablefile_build(tf, 0, &a);
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext);
 	if (f == NULL || PROLLY_CALL(tf, count, f) != 0)
 		elog(ERROR, "an empty table file doesn't read back");
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		tablefile_chunk(0, &chunk, &hash);
+		if (PROLLY_CALL(tf, find, f, &hash, &offset, &len) ||
+			PROLLY_CALL(tf, locate, f, &hash) != -1)
+			elog(ERROR, "a chunk is found in an empty table file");
+	}
+	PROLLY_CALL(tf, close, f);
+
+	/* and of one chunk; a hash of another length isn't found in it */
+	resetStringInfo(&a);
+	tablefile_build(tf, 1, &a);
+	mf.data = a.data;
+	mf.len = a.len;
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext);
+	if (f == NULL || PROLLY_CALL(tf, count, f) != 1)
+		elog(ERROR, "a table file of one chunk doesn't read back");
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		tablefile_chunk(0, &chunk, &hash);
+		if (!PROLLY_CALL(tf, find, f, &hash, &offset, &len) ||
+			PROLLY_CALL(tf, locate, f, &hash) != 0)
+			elog(ERROR, "the chunk of a one-chunk table file isn't found");
+		resetStringInfo(&out);
+		PROLLY_CALL(tf, decode, f, a.data + offset, len, &out);
+		if (out.len != chunk.len || memcmp(out.data, chunk.data, out.len) != 0)
+			elog(ERROR, "the chunk of a one-chunk table file doesn't decode");
+		hash.len--;
+		if (PROLLY_CALL(tf, find, f, &hash, &offset, &len))
+			elog(ERROR, "a hash of another length is found");
+	}
+	PROLLY_CALL(tf, close, f);
+}
+
+/*
+ * A 20-byte hash for shared_prefixes: group g's first 8 bytes (all zero,
+ * all 0xff, or one in between), then member m in its last 12.
+ */
+static void
+prefix_hash(int g, int m, ProllyHash *h)
+{
+	memset(h, 0, sizeof(*h));
+	h->len = 20;
+	memset(h->bytes, g == 0 ? 0x00 : g == 1 ? 0xff : 0x40 + g, 8);
+	h->bytes[18] = (uint8) (m >> 8);
+	h->bytes[19] = (uint8) m;
+}
+
+/*
+ * Chunks whose hashes share their first bytes, at the ends of the hash
+ * space and between: every one is found, and hashes between them (or
+ * past them) that weren't added aren't.
+ */
+void
+tablefile_shared_prefixes(const ProllyImplInfo *impl)
+{
+	const ProllyTableFileRoutine *tf = (const ProllyTableFileRoutine *) impl;
+	ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin, CurrentMemoryContext);
+	StringInfoData file;
+	MemFile		mf;
+	ProllyTableFile *f;
+	int			ngroups = 5;
+	int			nmembers = 40;
+
+	initStringInfo(&file);
+	/* (added out of hash order; members 2, 4, 6, ... only) */
+	for (int m = nmembers; m > 0; m--)
+		for (int g = 0; g < ngroups; g++)
+		{
+			ProllyHash	h;
+			char		data[16];
+
+			prefix_hash(g, m * 2, &h);
+			snprintf(data, sizeof(data), "%d.%d", g, m * 2);
+			PROLLY_CALL(tf, write_add, w, &h, data, strlen(data), &file);
+		}
+	PROLLY_CALL(tf, write_finish, w, &file);
+	mf.data = file.data;
+	mf.len = file.len;
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, file.len, CurrentMemoryContext);
+	if (f == NULL)
+		elog(ERROR, "a table file of shared prefixes doesn't open");
+	for (int g = 0; g < ngroups; g++)
+		for (int m = 0; m <= nmembers * 2 + 1; m++)
+		{
+			ProllyHash	h;
+			uint64		offset;
+			uint32		len;
+			bool		added = m > 0 && m <= nmembers * 2 && m % 2 == 0;
+			StringInfoData out;
+			char		data[16];
+
+			prefix_hash(g, m, &h);
+			if (PROLLY_CALL(tf, find, f, &h, &offset, &len) != added)
+				elog(ERROR, "chunk %d.%d is %sfound", g, m, added ? "not " : "");
+			if (!added)
+				continue;
+			initStringInfo(&out);
+			PROLLY_CALL(tf, decode, f, file.data + offset, len, &out);
+			snprintf(data, sizeof(data), "%d.%d", g, m);
+			if (strcmp(out.data, data) != 0)
+				elog(ERROR, "chunk %d.%d reads as \"%s\"", g, m, out.data);
+			pfree(out.data);
+		}
 	PROLLY_CALL(tf, close, f);
 }
 
@@ -1443,20 +1569,20 @@ tablefile_rejects_other_bytes(const ProllyImplInfo *impl)
 	{
 		mf.data = a.data;
 		mf.len = cut;
-		if (PROLLY_CALL(tf, open, memfile_read, &mf, cut, CurrentMemoryContext))
+		if (PROLLY_CALL(tf, open, memfile_read, NULL, &mf, cut, CurrentMemoryContext))
 			elog(ERROR, "%zu of a table file's %d bytes open as one", cut, a.len);
 	}
 	/* a byte of the index changed */
 	f = NULL;
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext);
 	PROLLY_CALL(tf, entry, f, 0, &hash, &offset, &len);
 	copy = palloc(a.len);
 	memcpy(copy, a.data, a.len);
 	copy[a.len - 40] ^= 1;
 	mf.data = copy;
-	if (PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext))
+	if (PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext))
 		elog(ERROR, "a table file with its index changed opens");
 
 	/* a byte of a chunk changed */
@@ -1475,4 +1601,211 @@ tablefile_rejects_other_bytes(const ProllyImplInfo *impl)
 	if (!failed)
 		elog(ERROR, "a changed chunk decodes");
 	PROLLY_CALL(tf, close, f);
+}
+
+/*
+ * The bytes the "basic" table file format keeps in memory for each chunk
+ * of an open file of n chunks named by 20-byte hashes: its index read, or
+ * (mapped) used where the file has it.
+ */
+PG_FUNCTION_INFO_V1(test_tablefile_bytes_per_chunk);
+Datum
+test_tablefile_bytes_per_chunk(PG_FUNCTION_ARGS)
+{
+	int32		n = PG_GETARG_INT32(0);
+	bool		mapped = PG_GETARG_BOOL(1);
+	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
+	ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin, CurrentMemoryContext);
+	MemoryContext cxt;
+	StringInfoData file;
+	MemFile		mf;
+	ProllyTableFile *f;
+	Size		used;
+
+	initStringInfo(&file);
+	for (int i = 0; i < n; i++)
+	{
+		ProllyHash	h;
+		uint32		x = (uint32) i * 2654435761u;
+
+		memset(&h, 0, sizeof(h));
+		h.len = 20;
+		for (int j = 0; j < 20; j++, x = x * 1103515245u + 12345)
+			h.bytes[j] = (uint8) (x >> 24);
+		PROLLY_CALL(tf, write_add, w, &h, "c", 1, &file);
+	}
+	PROLLY_CALL(tf, write_finish, w, &file);
+	mf.data = file.data;
+	mf.len = file.len;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "table file",
+								ALLOCSET_DEFAULT_SIZES);
+	f = PROLLY_CALL(tf, open, memfile_read, mapped ? memfile_map : NULL, &mf,
+					file.len, cxt);
+	if (f == NULL)
+		elog(ERROR, "the table file doesn't open");
+	used = MemoryContextMemAllocated(cxt, true);
+	PROLLY_CALL(tf, close, f);
+	MemoryContextDelete(cxt);
+	PG_RETURN_FLOAT8((double) used / n);
+}
+
+/* a little-endian uint32 of a table file test's, read or written */
+static uint32
+le32_at(const char *p)
+{
+	return (uint32) (uint8) p[0] | (uint32) (uint8) p[1] << 8 |
+		(uint32) (uint8) p[2] << 16 | (uint32) (uint8) p[3] << 24;
+}
+
+static void
+le32_put(char *p, uint32 v)
+{
+	for (int i = 0; i < 4; i++)
+		p[i] = (char) (v >> (8 * i));
+}
+
+static uint64
+le64_at(const char *p)
+{
+	return le32_at(p) | (uint64) le32_at(p + 4) << 32;
+}
+
+static void
+le64_put(char *p, uint64 v)
+{
+	le32_put(p, (uint32) v);
+	le32_put(p + 4, (uint32) (v >> 32));
+}
+
+/*
+ * Whether a "basic" table file, its index changed by change and its CRC
+ * made again (so only the index's own checks can refuse it), opens.  The
+ * index: n entries of an 8-byte prefix and a uint32 ordinal, then n uint64
+ * offsets, then the suffixes, then the filter; the footer: the index's
+ * offset (uint64),
+ * n (uint32), the hash's length, three zero bytes, the index's CRC-32C,
+ * the version (uint32), the magic.
+ */
+static bool
+basic_opens_changed(const StringInfoData *file, void (*change) (char *index, uint32 n,
+																 char *footer))
+{
+	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
+	char	   *copy = palloc(file->len);
+	char	   *footer = copy + file->len - 32;
+	uint64		index_offset;
+	uint32		n;
+	pg_crc32c	crc;
+	MemFile		mf;
+	ProllyTableFile *f;
+
+	memcpy(copy, file->data, file->len);
+	index_offset = le64_at(footer);
+	n = le32_at(footer + 8);
+	change(copy + index_offset, n, footer);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, copy + index_offset, (footer - copy) - index_offset);
+	FIN_CRC32C(crc);
+	le32_put(footer + 16, crc);
+	mf.data = copy;
+	mf.len = file->len;
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, file->len,
+					CurrentMemoryContext);
+	if (f != NULL)
+		PROLLY_CALL(tf, close, f);
+	pfree(copy);
+	return f != NULL;
+}
+
+static void
+change_nothing(char *index, uint32 n, char *footer)
+{
+}
+
+static void
+change_repeat_ordinal(char *index, uint32 n, char *footer)
+{
+	memcpy(index + 8, index + 12 + 8, 4);
+}
+
+static void
+change_ordinal_past(char *index, uint32 n, char *footer)
+{
+	le32_put(index + 8, n);
+}
+
+static void
+change_short_length(char *index, uint32 n, char *footer)
+{
+	char	   *offsets = index + n * 12;
+
+	le64_put(offsets + 8, le64_at(offsets) + 1);
+}
+
+static void
+change_lengths_sum(char *index, uint32 n, char *footer)
+{
+	le64_put(index + n * 12, 1);
+}
+
+static void
+change_hash_order(char *index, uint32 n, char *footer)
+{
+	char		entry[12];
+
+	memcpy(entry, index, 12);
+	memcpy(index, index + 12, 12);
+	memcpy(index + 12, entry, 12);
+}
+
+static void
+change_version(char *index, uint32 n, char *footer)
+{
+	le32_put(footer + 20, 1);
+}
+
+/*
+ * The "basic" table file format's own checks of an index: each damage
+ * below, its CRC made again, is refused at open; and a file of another
+ * version is told from a damaged one.
+ */
+PG_FUNCTION_INFO_V1(test_tablefile_basic_index);
+Datum
+test_tablefile_basic_index(PG_FUNCTION_ARGS)
+{
+	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
+	static const struct
+	{
+		const char *what;
+		void		(*change) (char *index, uint32 n, char *footer);
+	}			damages[] = {
+		{"an ordinal repeated", change_repeat_ordinal},
+		{"an ordinal past the chunks", change_ordinal_past},
+		{"a length shorter than a chunk's framing", change_short_length},
+		{"lengths not adding up to the index's offset", change_lengths_sum},
+		{"hashes out of order", change_hash_order},
+		{"another version", change_version},
+	};
+	StringInfoData file;
+	MemFile		mf;
+
+	initStringInfo(&file);
+	tablefile_build(tf, 20, &file);
+	if (!basic_opens_changed(&file, change_nothing))
+		elog(ERROR, "a table file with its CRC made again doesn't open");
+	for (int i = 0; i < lengthof(damages); i++)
+		if (basic_opens_changed(&file, damages[i].change))
+			elog(ERROR, "a table file with %s opens", damages[i].what);
+
+	mf.data = file.data;
+	mf.len = file.len;
+	if (tf->version(memfile_read, &mf, file.len) != tf->info.format_version)
+		elog(ERROR, "a table file's version isn't its format's");
+	file.data[file.len - 12] = 1;	/* (the version's low byte) */
+	if (tf->version(memfile_read, &mf, file.len) != 1)
+		elog(ERROR, "a table file of version 1 isn't told as that");
+	file.data[file.len - 1] ^= 1;	/* (the magic) */
+	if (tf->version(memfile_read, &mf, file.len) != 0)
+		elog(ERROR, "bytes that aren't a table file have a version");
+	PG_RETURN_BOOL(true);
 }

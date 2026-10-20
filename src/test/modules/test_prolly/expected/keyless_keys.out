@@ -21,7 +21,7 @@ INSERT INTO kk.k SELECT g, 'v' || g FROM generate_series(1, 50000) g;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- journal(): the chunk journal's size, to see what a commit wrote.
@@ -35,7 +35,7 @@ UPDATE kk.n SET b = 'w' WHERE a BETWEEN 20000 AND 20999;
 SELECT length(dolt_commit('-am', 'keyless run')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT pg_temp.journal() AS j1 \gset
@@ -43,7 +43,7 @@ UPDATE kk.k SET b = 'w' WHERE a BETWEEN 20000 AND 20999;
 SELECT length(dolt_commit('-am', 'keyed run')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT pg_temp.journal() AS j2 \gset
@@ -59,7 +59,7 @@ UPDATE kk.z SET b = 'w' WHERE a BETWEEN 20000 AND 20999;
 SELECT length(dolt_commit('-am', 'keyless run, NULLs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT pg_temp.journal() AS j3 \gset
@@ -94,7 +94,7 @@ SELECT test_fold_root() = test_fold_root(true) AS folds_agree;
 SELECT value AS format FROM test_fold_items() WHERE key = '!:format';
  format 
 --------
- 11
+ 13
 (1 row)
 
 -- a primary key WITHOUT OVERLAPS doesn't key the rows (the key encoder
@@ -104,7 +104,7 @@ INSERT INTO kk.r VALUES ('[1,2)', '[1,5)'), ('[2,3)', '[1,5)');
 SELECT length(dolt_commit('-Am', 'ranges')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE kk.r ADD COLUMN v int;
@@ -119,7 +119,7 @@ SELECT diff_type, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::kk.r) ORDER BY 
 SELECT length(dolt_commit('-am', 'a column')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) AS rows_diffed FROM dolt_diff('HEAD~1', 'HEAD', NULL::kk.r);
@@ -137,6 +137,6 @@ drop cascades to table kk.r
 SELECT length(dolt_commit('-Am', 'kk gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

@@ -66,6 +66,9 @@ extern void prolly_components_for_relation(Relation rel,
 
 extern void prolly_database_components(ProllyDatabaseComponents *components);
 
+/* The content hash every chunk is named by. */
+extern const ProllyHashRoutine *prolly_content_hash(void);
+
 /*
  * The table access method a new relation of relpersistence gets, given
  * amoid: a temporary or unlogged relation is never stored by prolly (it is

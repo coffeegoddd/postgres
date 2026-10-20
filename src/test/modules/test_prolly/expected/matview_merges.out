@@ -12,7 +12,7 @@ CREATE MATERIALIZED VIEW mm.mv AS SELECT coalesce(sum(pk), 0) AS c FROM mm.t;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('mm_other');
@@ -26,7 +26,7 @@ INSERT INTO mm.o VALUES (1);
 SELECT length(dolt_commit('-am', 'ours: o')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mm_other');
@@ -40,7 +40,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -98,7 +98,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mm_other');
@@ -111,7 +111,7 @@ INSERT INTO mm.o VALUES (2);
 SELECT length(dolt_commit('-am', 'theirs: o')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -150,7 +150,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -164,7 +164,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_other', '-m', 'both refreshed'))[3:4];
@@ -203,7 +203,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: a row of t gone, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -217,7 +217,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'ours: others gone, refreshed alike')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_other', '-m', 'refreshed alike'))[3:4];
@@ -251,7 +251,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -264,7 +264,7 @@ CREATE TABLE mm.n (pk int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'ours: a table')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_other', '-m', 'theirs refreshed, ours defined'))[3:4];
@@ -299,7 +299,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-Am', 'theirs: a table, t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -313,7 +313,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_other', '-m', 'both refreshed, theirs defined'))[3:4];
@@ -339,7 +339,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'back to 11')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Ours redefines another materialized view, so the merge makes them all
@@ -349,7 +349,7 @@ CREATE MATERIALIZED VIEW mm.mv2 AS SELECT count(*) AS c FROM mm.o;
 SELECT length(dolt_commit('-Am', 'a second view')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mm_other');
@@ -369,7 +369,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -384,7 +384,7 @@ INSERT INTO mm.t VALUES (8);
 SELECT length(dolt_commit('-Am', 'ours: t, the second view redefined')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT c AS theirs_mv_before FROM mm.mv;
@@ -437,7 +437,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -451,7 +451,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'ours: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO mm.o VALUES (10);
@@ -503,7 +503,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 'theirs: t, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -516,7 +516,7 @@ INSERT INTO mm.n VALUES (1);
 SELECT length(dolt_commit('-am', 'ours: n')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO mm.o VALUES (10);
@@ -552,7 +552,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 't 12, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO mm.t VALUES (13);
@@ -560,7 +560,7 @@ REFRESH MATERIALIZED VIEW mm.mv;
 SELECT length(dolt_commit('-am', 't 13, refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT c AS before_revert FROM mm.mv;
@@ -601,7 +601,7 @@ CREATE MATERIALIZED VIEW mm.a AS SELECT c * 10 AS c FROM mm.b;
 SELECT length(dolt_commit('-Am', 'a view reading a view')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('mm_other');
@@ -622,7 +622,7 @@ REFRESH MATERIALIZED VIEW mm.a;
 SELECT length(dolt_commit('-am', 'theirs: t, both refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -637,7 +637,7 @@ REFRESH MATERIALIZED VIEW mm.a;
 SELECT length(dolt_commit('-am', 'ours: t, both refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_other', '-m', 'both refreshed both'))[3:4];
@@ -673,7 +673,7 @@ CREATE MATERIALIZED VIEW mm.e AS SELECT mm.fsum() * 10 AS c;
 SELECT length(dolt_commit('-Am', 'views reading views through functions')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('-b', 'mm_fn');
@@ -690,7 +690,7 @@ REFRESH MATERIALIZED VIEW mm.e;
 SELECT length(dolt_commit('-am', 'theirs: t, all refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -707,7 +707,7 @@ REFRESH MATERIALIZED VIEW mm.e;
 SELECT length(dolt_commit('-am', 'ours: t, all refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_fn', '-m', 'both refreshed all'))[3:4];
@@ -741,7 +741,7 @@ CREATE MATERIALIZED VIEW mm.oa AS SELECT 10 OPERATOR(mmc.***) 0 AS c;
 SELECT length(dolt_commit('-Am', 'a view reading a view through an operator')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('-b', 'mm_op');
@@ -756,7 +756,7 @@ REFRESH MATERIALIZED VIEW mm.oa;
 SELECT length(dolt_commit('-am', 'theirs: t, both refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -771,7 +771,7 @@ REFRESH MATERIALIZED VIEW mm.oa;
 SELECT length(dolt_commit('-am', 'ours: t, both refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('mm_op', '-m', 'both refreshed both'))[3:4];
@@ -808,7 +808,7 @@ CREATE MATERIALIZED VIEW mm.k4 AS SELECT mmc.tsum() + mmc.tick() AS c;
 SELECT length(dolt_commit('-Am', 'views counting their refreshes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('-b', 'mm_cnt');
@@ -825,7 +825,7 @@ REFRESH MATERIALIZED VIEW mm.k4;
 SELECT length(dolt_commit('-am', 'theirs: t, all refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -842,7 +842,7 @@ REFRESH MATERIALIZED VIEW mm.k4;
 SELECT length(dolt_commit('-am', 'ours: t, all refreshed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT nextval('mmc.s') AS before \gset
@@ -927,6 +927,6 @@ drop cascades to function mmc.tsum()
 SELECT length(dolt_commit('-Am', 'mm gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

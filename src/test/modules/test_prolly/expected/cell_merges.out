@@ -9,7 +9,7 @@ INSERT INTO cm.t VALUES (1, 1, 'one', 1), (2, 2, 'two', 2), (3, 3, 'three', 3),
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('cm_theirs');
@@ -33,7 +33,7 @@ UPDATE cm.t SET c = 60 WHERE pk = 6;			-- ours deletes it
 SELECT length(dolt_commit('-am', 'theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -51,7 +51,7 @@ DELETE FROM cm.t WHERE pk = 6;
 SELECT length(dolt_commit('-am', 'ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 BEGIN;
@@ -101,7 +101,7 @@ SELECT * FROM cm.t ORDER BY pk;
 SELECT length(dolt_commit('-m', 'merged')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 COMMIT;
@@ -155,7 +155,7 @@ INSERT INTO cm.u VALUES (1, 1, 1), (2, NULL, NULL);
 SELECT length(dolt_commit('-Am', 'unique')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('cm_right');
@@ -168,7 +168,7 @@ UPDATE cm.u SET col1 = 1 WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('cm_right');
@@ -181,7 +181,7 @@ UPDATE cm.u SET col2 = 1 WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'right')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -217,7 +217,7 @@ INSERT INTO cm.n VALUES (1, 1, 1), (2, 2, 2);
 SELECT length(dolt_commit('-Am', 'nulls')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('cm_nulls');
@@ -230,7 +230,7 @@ UPDATE cm.n SET v = NULL;
 SELECT length(dolt_commit('-am', 'ours nulls')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('cm_nulls');
@@ -244,7 +244,7 @@ UPDATE cm.n SET v = 20 WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'theirs nulls')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -282,7 +282,7 @@ INSERT INTO cm.g VALUES (1, 1, 1);
 SELECT length(dolt_commit('-Am', 'generated')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('cm_gen');
@@ -295,7 +295,7 @@ UPDATE cm.g SET a = 2;
 SELECT length(dolt_commit('-am', 'ours a')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('cm_gen');
@@ -308,7 +308,7 @@ UPDATE cm.g SET b = 5;
 SELECT length(dolt_commit('-am', 'theirs b')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');

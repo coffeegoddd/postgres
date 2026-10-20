@@ -203,7 +203,7 @@ drop cascades to table mv.u
 SELECT length(dolt_commit('-Am', 'mv gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP SCHEMA mv_util CASCADE;

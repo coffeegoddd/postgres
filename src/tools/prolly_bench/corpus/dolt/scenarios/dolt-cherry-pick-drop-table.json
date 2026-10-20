@@ -107,7 +107,7 @@
       "requires": [
         "vc.cherrypick"
       ],
-      "sql": "SELECT length(r[1]) = 64, r[2], r[3], r[4] FROM dolt_cherry_pick($1) r",
+      "sql": "SELECT length(r[1]) = 40, r[2], r[3], r[4] FROM dolt_cherry_pick($1) r",
       "params": [
         {
           "ref": "commit1"

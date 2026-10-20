@@ -25,7 +25,7 @@ INSERT INTO cp.t SELECT g, 'v' || g FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Changes, then a checkpoint: later folds read only what changed since.
@@ -74,7 +74,7 @@ SELECT pages <= 3 AS reads_the_new_change, full_tables, same_as_full FROM pg_tem
 SELECT length(dolt_commit('-am', 'three changes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT diff_type, (to_row).id FROM dolt_diff('HEAD~1', 'HEAD', NULL::cp.t) ORDER BY 2;
@@ -103,7 +103,7 @@ BEGIN;
 SELECT length(prolly_checkpoint()) AS checkpointed;
  checkpointed 
 --------------
-           64
+           40
 (1 row)
 
 ROLLBACK;
@@ -199,7 +199,7 @@ SELECT test_bmap_epoch(:t) = :e1 AS none_in_a_block;
 SELECT length(dolt_commit('-am', 'four and five')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT test_bmap_epoch(:t) AS e2 \gset

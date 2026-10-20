@@ -176,8 +176,8 @@ CREATE FUNCTION test_bmap_read_old(relnumber oid, blkno int8, old_block int8)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
--- The server's chunk store, from SQL: chunks are named by their SHA-256,
--- in hex.
+-- The server's chunk store, from SQL: chunks are named by the server's
+-- content hash, in hex.
 CREATE FUNCTION test_chunk_put(data bytea)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -187,8 +187,37 @@ CREATE FUNCTION test_chunk_put_at_commit(data bytea)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- data's content hash, as hex: by the implementation named (fed in pieces
+-- of piece bytes, if given), or by the server's, which names chunks.
+CREATE FUNCTION test_content_hash(data bytea, impl text DEFAULT NULL,
+								  piece int DEFAULT NULL)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- Whether every BLAKE3 SIMD variant built and runnable here agrees with
+-- the portable code.
+CREATE FUNCTION test_blake3_variants()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- len bytes no compressor makes smaller, the same for the same seed.
+CREATE FUNCTION test_noise(seed text, len int)
+RETURNS bytea
+LANGUAGE sql IMMUTABLE STRICT
+AS $$
+	SELECT substr(decode(string_agg(md5(seed || ' ' || i), '' ORDER BY i), 'hex'), 1, len)
+	FROM generate_series(0, len / 16) i
+$$;
+
 CREATE FUNCTION test_chunk_get(hash text)
 RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Get several chunks at once (get_many()): each request's bytes (NULL:
+-- none), and how many times it was answered.
+CREATE FUNCTION test_chunk_get_many(hashes text[], OUT i int, OUT data bytea,
+									OUT visits int)
+RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_chunk_has(hash text)
@@ -211,7 +240,9 @@ CREATE FUNCTION test_chunk_table_file(chunks bytea[])
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_chunk_conjoin()
+-- Conjoin the table files: all of them, or (max_files) the smallest of
+-- those past max_files.
+CREATE FUNCTION test_chunk_conjoin(max_files int DEFAULT 0)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
@@ -294,6 +325,34 @@ RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Make a new branch of a remote's at commit, recording format if it has none.
+-- The same, the chunk given as stored (framed), as it is.
+CREATE FUNCTION test_remote_put_stored(url text, hash text, frame bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A remote's chunk as it gives it: as stored, framed (NULL: none).
+CREATE FUNCTION test_remote_get_stored(url text, hash text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A chunk of the store as stored, framed (NULL: none); data framed so.
+CREATE FUNCTION test_chunk_stored(hash text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION test_chunk_frame(data bytea, compress boolean)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A walk's map checked: n hashes in budget bytes; the runs it wrote.
+CREATE FUNCTION test_seen_check(n int, budget int)
+RETURNS int
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Every chunk a commit's walk reaches, once.
+CREATE FUNCTION test_commit_chunks(commit_id text)
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_remote_set_head(url text, branch text, commit_id text,
 	format text)
 RETURNS bool
@@ -359,9 +418,21 @@ CREATE FUNCTION test_chunk_put_node(level int, refs text[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Put a leaf whose values are these bytes, inline, declaring no
+-- references; its hash.
+CREATE FUNCTION test_chunk_put_leaf(vals bytea[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Collect the chunk store's garbage (full: all of it): the chunks kept and
 -- freed of those collected, the bytes freed, and how long (microseconds)
 -- appends were held off.
+-- A tree of one item ('k' -> 'v') whose item declares the chunks named
+-- by hashes; its root's hash.
+CREATE FUNCTION test_chunk_declaring_tree(hashes text[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
 	OUT bytes_freed int8, OUT window_usec int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -381,4 +452,17 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 -- Run a statement with the rows it writes taken as written from a commit:
 -- not refused for their keys' length, as the row applier's aren't.
 CREATE FUNCTION test_write_held_rows(sql text) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The "basic" table file format's checks of an index, each damage with its
+-- CRC made again; and a file of another version told from a damaged one.
+CREATE FUNCTION test_tablefile_basic_index()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+-- The bytes the "basic" table file format keeps in memory for each chunk
+-- of an open file of n chunks named by 20-byte hashes: its index read, or
+-- (mapped) used where the file has it.
+CREATE FUNCTION test_tablefile_bytes_per_chunk(n int, mapped bool DEFAULT false)
+RETURNS float8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -6304,6 +6304,11 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		 * Mark the transaction committed in pg_xact.
 		 */
 		TransactionIdCommitTree(xid, parsed->nsubxacts, parsed->subxacts);
+
+		/* the chunk store's root, if the transaction moved it */
+		if (parsed->xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
+			prolly_chunkstore_commit_redo(parsed->chunk_root,
+										  parsed->chunk_root_len);
 	}
 	else
 	{
@@ -6328,6 +6333,20 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		 * recovered. It's unlikely but it's good to be safe.
 		 */
 		TransactionIdAsyncCommitTree(xid, parsed->nsubxacts, parsed->subxacts, lsn);
+
+		/*
+		 * The chunk store's root, if the transaction moved it, while the
+		 * transaction is still running to standby backends: one reading the
+		 * journal meanwhile keeps the root's PAD as in flight (the root moved
+		 * after) rather than drop it as an ended transaction's, and miss the
+		 * root that takes its place.
+		 */
+		if (parsed->xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
+		{
+			INJECTION_POINT("prolly-commit-root-redo", NULL);
+			prolly_chunkstore_commit_redo(parsed->chunk_root,
+										  parsed->chunk_root_len);
+		}
 
 		/*
 		 * We must mark clog before we update the ProcArray.
@@ -6358,10 +6377,6 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 		replorigin_advance(origin_id, parsed->origin_lsn, lsn,
 						   false /* backward */ , false /* WAL */ );
 	}
-
-	/* the chunk store's root, if the transaction moved it */
-	if (parsed->xinfo & XACT_XINFO_HAS_CHUNK_ROOT)
-		prolly_chunkstore_commit_redo(parsed->chunk_root, parsed->chunk_root_len);
 
 	/* Make sure files supposed to be dropped are dropped */
 	if (parsed->nrels > 0)

@@ -10,14 +10,14 @@ CREATE TABLE dm.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'dm empty')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO dm.t SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'dm rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- The backend's memory, read while a set-returning function's rows are
@@ -61,7 +61,7 @@ SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::dm.t);
 SELECT length(dolt_commit('-Am', 'dm ours')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('dm_side', 'HEAD~1');
@@ -80,7 +80,7 @@ UPDATE dm.t SET v = repeat('z', 100);
 SELECT length(dolt_commit('-Am', 'dm theirs')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -131,6 +131,6 @@ drop cascades to function dm.held()
 SELECT length(dolt_commit('-Am', 'dm gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

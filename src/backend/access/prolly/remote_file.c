@@ -468,7 +468,8 @@ open_table(ProllyRemote *r, RemoteTable *t)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", t->path)));
-	t->tf = PROLLY_CALL(table_format(), open, table_read, t, t->size, r->cxt);
+	t->tf = PROLLY_CALL(table_format(), open, table_read, NULL, t, t->size,
+						 r->cxt);
 	if (t->tf == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -555,7 +556,7 @@ file_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 				(errcode_for_file_access(),
 				 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 						len, (unsigned long long) offset, t->path)));
-	PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
+	prolly_tablefile_read_stored(table_format(), t->tf, bytes, len, out);
 	pfree(bytes);
 	return true;
 }
@@ -571,8 +572,8 @@ file_has(ProllyRemote *r, const ProllyHash *hash)
 }
 
 /*
- * Write the chunks next() gives, the first given already, as table file
- * path, synced; its size.
+ * Write the chunks next() gives as stored (framed), the first given
+ * already, as table file path, synced; its size.
  */
 static uint64
 write_table_file(const char *path, ProllyHash *hash, StringInfo data,
@@ -593,7 +594,7 @@ write_table_file(const char *path, ProllyHash *hash, StringInfo data,
 	initStringInfo(&buf);
 	do
 	{
-		PROLLY_CALL(fmt, write_add, w, hash, data->data, data->len, &buf);
+		prolly_tablefile_add_stored(fmt, w, hash, data->data, data->len, &buf);
 		resetStringInfo(data);
 		if (buf.len >= 1024 * 1024)
 		{
@@ -754,6 +755,82 @@ file_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 {
 }
 
+/* Its table files, whole: each by its name, newest first. */
+static bool
+file_files(ProllyRemote *r, ProllyRemoteFileVisit visit, void *arg)
+{
+	check_privilege(r, false);
+	foreach_ptr(RemoteTable, t, r->m.tables)
+	{
+		char	   *key = table_name(t->id);
+		ProllyTableFile *tf = open_table(r, t);
+
+		visit(key, (uint32) PROLLY_CALL(table_format(), count, tf), t->size,
+			  false, arg);
+		pfree(key);
+	}
+	return true;
+}
+
+struct ProllyRemoteFile
+{
+	RemoteTable *t;
+	int			next;			/* the next chunk's place in the file */
+	int			n;
+};
+
+static ProllyRemoteFile *
+file_file_open(ProllyRemote *r, const char *key)
+{
+	ProllyRemoteFile *f = NULL;
+
+	check_privilege(r, false);
+	foreach_ptr(RemoteTable, t, r->m.tables)
+	{
+		char	   *name = table_name(t->id);
+
+		if (strcmp(name, key) == 0)
+		{
+			f = palloc0(sizeof(ProllyRemoteFile));
+			f->t = t;
+			f->n = PROLLY_CALL(table_format(), count, open_table(r, t));
+		}
+		pfree(name);
+	}
+	if (f == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the remote has no file \"%s\"", key)));
+	return f;
+}
+
+static bool
+file_file_next(ProllyRemoteFile *f, ProllyHash *hash, StringInfo frame)
+{
+	uint64		offset;
+	uint32		len;
+	char	   *bytes;
+
+	if (f->next >= f->n)
+		return false;
+	PROLLY_CALL(table_format(), entry, f->t->tf, f->next++, hash, &offset, &len);
+	bytes = palloc(len);
+	if (!table_read(f->t, offset, bytes, len))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
+						len, (unsigned long long) offset, f->t->path)));
+	PROLLY_CALL(table_format(), read_stored, f->t->tf, bytes, len, frame);
+	pfree(bytes);
+	return true;
+}
+
+static void
+file_file_close(ProllyRemoteFile *f)
+{
+	pfree(f);
+}
+
 const ProllyRemoteRoutine prolly_remote_file = {
 	.info = {
 		.iface = PROLLY_IFACE_REMOTE,
@@ -774,6 +851,10 @@ const ProllyRemoteRoutine prolly_remote_file = {
 	.get_many = file_get_many,
 	.has_many = file_has_many,
 	.get_since = file_get_since,
+	.files = file_files,
+	.file_open = file_file_open,
+	.file_next = file_file_next,
+	.file_close = file_file_close,
 };
 
 const ProllyRemoteRoutine *

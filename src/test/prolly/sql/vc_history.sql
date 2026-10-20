@@ -15,7 +15,7 @@ SET client_min_messages = warning;
 \set vc_setup :abs_srcdir '/sql/vc_versioned_public.sql'
 \i :vc_setup
 
-SELECT 'commit start', length((dolt_commit('-Am', 'vh start', '--allow-empty'))[1]) = 64;
+SELECT 'commit start', length((dolt_commit('-Am', 'vh start', '--allow-empty'))[1]) = 40;
 SELECT 'branch a', (dolt_branch('vh_a'))[1] = '0';
 SELECT 'branch b', (dolt_branch('vh_b'))[1] = '0';
 SELECT 'branch c', (dolt_branch('vh_c'))[1] = '0';
@@ -89,7 +89,7 @@ CREATE TRIGGER t_ins BEFORE INSERT ON vhp.t FOR EACH ROW EXECUTE FUNCTION vhp.tr
 CREATE VIEW vhp.v AS SELECT id, p FROM vhp.t;
 CREATE FUNCTION vhp.f(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1';
 INSERT INTO vhp.t VALUES (1, 1, (1, 'x'));
-SELECT 'commit p1', length((dolt_commit('-Am', 'vh p1'))[1]) = 64;
+SELECT 'commit p1', length((dolt_commit('-Am', 'vh p1'))[1]) = 40;
 
 SELECT 'checkout p2', (dolt_checkout('vh_p2'))[1] = '0';
 CREATE SCHEMA vhp VERSIONED;
@@ -103,7 +103,7 @@ CREATE TABLE t (id int PRIMARY KEY, p pos, q pair);
 CREATE VIEW v AS SELECT id, p FROM t;
 INSERT INTO t VALUES (1, 1, (1, 'x'));
 CREATE TRIGGER t_ins BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg();
-SELECT 'commit p2', length((dolt_commit('-Am', 'vh p2'))[1]) = 64;
+SELECT 'commit p2', length((dolt_commit('-Am', 'vh p2'))[1]) = 40;
 RESET search_path;
 
 SELECT 'checkout p3', (dolt_checkout('vh_p3'))[1] = '0';
@@ -116,7 +116,7 @@ CREATE FUNCTION vhp.trg() RETURNS trigger LANGUAGE plpgsql AS
 CREATE TRIGGER t_ins BEFORE INSERT ON vhp.t FOR EACH ROW EXECUTE FUNCTION vhp.trg();
 CREATE FUNCTION vhp.f(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1';
 INSERT INTO vhp.t VALUES (1, 1, (1, 'x'));
-SELECT 'commit p3', length((dolt_commit('-Am', 'vh p3'))[1]) = 64;
+SELECT 'commit p3', length((dolt_commit('-Am', 'vh p3'))[1]) = 40;
 
 SELECT 'p1 and p2: same root', prolly_root_hash('vh_p1') = prolly_root_hash('vh_p2');
 SELECT 'p3 without the view: another', prolly_root_hash('vh_p3') <> prolly_root_hash('vh_p1');

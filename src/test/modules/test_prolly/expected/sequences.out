@@ -15,7 +15,7 @@ SELECT nextval('app.s');
 SELECT length(dolt_commit('-Am', 'a value taken')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_reset('--hard', :'base');
@@ -47,7 +47,7 @@ INSERT INTO app.t (v) SELECT 'main' FROM generate_series(1, 3);
 SELECT length(dolt_commit('-Am', 'main takes 3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('feature');
@@ -66,7 +66,7 @@ INSERT INTO app.t (v) VALUES ('feature');
 SELECT length(dolt_commit('-Am', 'feature goes to 41')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -116,7 +116,7 @@ SELECT nextval('app.untouched');
 SELECT length(dolt_commit('-Am', 'feature takes untouched')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -134,7 +134,7 @@ SELECT setval('app.s', 1000);
 SELECT length(dolt_commit('-Am', 'main jumps')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -165,7 +165,7 @@ SELECT nextval('app.untouched');
 SELECT length(dolt_commit('-Am', 'just a value')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_commit('-Am', 'nothing');
@@ -211,7 +211,7 @@ SELECT dolt_branch('-D', 'feature');
 SELECT length(dolt_commit('-Am', 'clash checked')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('feature');
@@ -235,7 +235,7 @@ SELECT setval('app.s', 1500);
 SELECT length(dolt_commit('-Am', 'feature at 1500')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -253,7 +253,7 @@ SELECT setval('app.s', 2000, false);
 SELECT length(dolt_commit('-Am', 'main next 2000')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -273,7 +273,7 @@ CREATE SEQUENCE app.down INCREMENT -1 START -1 MINVALUE -1000 MAXVALUE -1;
 SELECT length(dolt_commit('-Am', 'down')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'feature');
@@ -303,7 +303,7 @@ SELECT setval('app.down', -3);
 SELECT length(dolt_commit('-Am', 'feature at -3')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -321,7 +321,7 @@ SELECT setval('app.down', -10);
 SELECT length(dolt_commit('-Am', 'main at -10')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT (dolt_merge('feature'))[2:4];
@@ -352,7 +352,7 @@ SELECT setval('app.s', 5000);
 SELECT length(dolt_commit('-Am', 'feature at 5000')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');

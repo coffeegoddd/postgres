@@ -208,7 +208,13 @@ const ProllyChunkFormatRoutine prolly_chunkformat_basic = {
 	.info = {
 		.iface = PROLLY_IFACE_CHUNK_FORMAT,
 		.impl_id = 1,
-		.format_version = FORMAT_VERSION,
+		/*
+		 * (a store's chunks' version, which a store records and refuses
+		 * another of: 2 since items declare the chunks they name, which a
+		 * collection follows alone, so a store whose chunks don't is
+		 * refused; the node's own byte stays 1, as old nodes read as ever)
+		 */
+		.format_version = 2,
 		.name = "basic",
 		.description = "a version byte, level, item offsets, then keys, "
 		"flags and values",

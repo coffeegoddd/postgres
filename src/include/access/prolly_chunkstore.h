@@ -25,7 +25,10 @@
  *   base backups carry the history, and a database made from another
  *   (CREATE DATABASE) gets a copy of it.
  * - get() appends a chunk's bytes to out; false if the store has none by
- *   that hash.  has() answers without reading the chunk.
+ *   that hash.  has() answers without reading the chunk.  get_many() gets
+ *   several, visiting each (data NULL if the store has none), in any
+ *   order: its reads of the store's files are made in offset order, those
+ *   close together as one.
  * - root() is the root as last committed (or as moved by the calling
  *   transaction); an empty hash if it never was.
  * - move_root() moves the root with the calling transaction, if it is still
@@ -34,14 +37,41 @@
  *   it, until its transaction ends; the move is made durable by the
  *   transaction's commit record, and is gone if the transaction aborts.
  * - A transaction can't be prepared (two-phase) after moving a root.
+ * - get_stored() appends a chunk as the store holds it, framed
+ *   (prolly_chunk_frame()'s), without decoding it; add_stored_table_file()
+ *   is add_table_file() of chunks next() gives framed so, written as they
+ *   are (both optional: prolly_chunk_get_stored() and
+ *   prolly_chunk_add_stored() decode and encode them otherwise).  So a
+ *   transfer moves chunks as stored, compressed once, where they were made.
+ * - file_chunks() visits the chunks of one of the store's files as stored,
+ *   in its order: a table file table_files() names, or (name NULL) the
+ *   journal, each of its chunks once.  A clone's sender reads them so.
+ * - A clone's files (optional, the rest with receive_file()): the files a
+ *   remote sends whole, each under its key.  receive_file() writes the
+ *   chunks next() gives (framed) as the file for key, synced and WAL-logged
+ *   as a table file is, but named by no manifest, so nothing reads it; it
+ *   stays, through a failure too, until adopted or forgotten, so a clone
+ *   tried again receives only what it lacks.  received_file() says
+ *   whether the file for key is there whole (and its chunk count).
+ *   received_get() reads a chunk of the files received (out NULL: whether
+ *   they have it), received_chunks() visits each of their chunks, as
+ *   stored.  adopt_received() names the files received in the manifest, at
+ *   once; forget_received() removes them, but those for the nkeep keys of
+ *   keep.
  * - add_table_file() adds a table file of the chunks next() gives (until it
  *   returns false), at once and for every transaction: the chunks of
  *   another store, received whole, or of a rewrite.  It isn't undone if the
  *   transaction aborts; its chunks are reachable once a root naming them
- *   is.  conjoin() rewrites the table files as one (settled if they all
- *   were).  table_files() visits the store's table files: a settled one is
- *   closed under what its chunks name (they are in it, in another settled
- *   file, or in the journal's segments).
+ *   is.  conjoin() rewrites table files as one, dropping chunks more than
+ *   one of them holds: with max_files 0, all of them (settled if they all
+ *   were); otherwise, if there are more than max_files, the smallest, as
+ *   Dolt's conjoiner takes them (while those taken hold more chunks than
+ *   the next, or leaving it would leave more than max_files), but no more
+ *   in one pass than maintenance_work_mem and a gigabyte allow, settled
+ *   files and the others apart.  Its copying is paced by the cost-based
+ *   delay, where that is on.  table_files() visits the store's table
+ *   files: a settled one is closed under what its chunks name (they are in
+ *   it, in another settled file, or in the journal's segments).
  * - The journal (where put() appends) is in segments: seal() closes the one
  *   appends go to, and they go on to a new one; segments() visits them,
  *   oldest first (with count, each with its chunks counted; without, only
@@ -88,6 +118,10 @@
  *   them, the store's own reasons (a logical replication slot may still
  *   decode a row naming what was appended after its position): roots, as
  *   gc_new()'s.
+ * - sync_file() fsyncs a file of a store a sync request names (one it
+ *   made with SYNC_HANDLER_PROLLY_CHUNKS, its impl_id the tag's forknum),
+ *   for a checkpoint: 0, or -1 with errno set and path the file's.  A file
+ *   gone since (a collection retired it) is no error.
  * - shmem_size() and shmem_init() reserve and set up the shared state of
  *   the server's stores (optional).
  * - read_through() makes this backend's get() and has() ask source for a
@@ -95,10 +129,14 @@
  *   transaction ends: so walks that know what chunks hold can read another
  *   store's (a transfer's) as if it were this one's.  Its hint, if given
  *   (with or without a source), hears what prefetch() is told.
+ * - roots() visits the roots the store was moved to that it still
+ *   records, oldest first, with the time of each move: what a reflog is
+ *   read from.  A collection may forget them.
  * - prefetch() is told the chunks a walk is about to read (a node's
- *   children), so that a read-through source can fetch them at once
- *   (optional): whether a hint heard them, and with none (n 0), whether
- *   one would, so a walk collects them only when it would.
+ *   children), so that a read-through source can fetch them at once, or
+ *   the store read them together (optional): whether it heard them, and
+ *   with none (n 0), whether it would, so a walk collects them only when
+ *   it would.
  *
  * Provisional (v0).
  *
@@ -112,12 +150,19 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "access/xlogreader.h"
+#include "datatype/timestamp.h"
 #include "lib/stringinfo.h"
 
 typedef struct ProllyChunkStore ProllyChunkStore;
+struct FileTag;
 
 /* Visits a chunk another chunk names. */
 typedef void (*ProllyChunkRefVisit) (const ProllyHash *ref, void *arg);
+
+/* Visits a chunk as stored (framed). */
+typedef void (*ProllyChunkStoredVisit) (const ProllyHash *hash,
+										const char *frame, Size len,
+										void *arg);
 
 /* The next chunk to add, in hash and data; false when there are no more. */
 typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
@@ -127,6 +172,16 @@ typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
  * false if it has none by that hash.
  */
 typedef bool (*ProllyChunkGet) (void *arg, const ProllyHash *hash, StringInfo out);
+
+/*
+ * Visits a root the store was moved to, and when (0 if not known).
+ */
+typedef void (*ProllyChunkRootVisit) (const ProllyHash *root, TimestampTz at,
+									  void *arg);
+
+/* Visits chunk i of a get_many(): its bytes (NULL, 0: the store has none). */
+typedef void (*ProllyChunkManyVisit) (int i, const char *data, Size len,
+									  void *arg);
 
 /* Hears the chunks a walk is about to read (prefetch()'s). */
 typedef void (*ProllyChunkHint) (void *arg, const ProllyHash *hashes, int n);
@@ -192,6 +247,8 @@ typedef struct ProllyChunkStoreRoutine
 	bool		(*get) (ProllyChunkStore *store, const ProllyHash *hash,
 						StringInfo out);
 	bool		(*has) (ProllyChunkStore *store, const ProllyHash *hash);
+	void		(*get_many) (ProllyChunkStore *store, const ProllyHash *hashes,
+							 int n, ProllyChunkManyVisit visit, void *arg);
 
 	void		(*root) (ProllyChunkStore *store, ProllyHash *root);
 	bool		(*move_root) (ProllyChunkStore *store, const ProllyHash *expected,
@@ -217,13 +274,20 @@ typedef struct ProllyChunkStoreRoutine
 	/* Make every change before a checkpoint's redo point durable. */
 	void		(*checkpoint) (void);
 
+	/*
+	 * Once crash recovery is over, before anyone reads a store: remove what
+	 * writers and collections a crash cut short left (optional).  WAL may
+	 * be written.
+	 */
+	void		(*recovered) (void);
+
 	/* Replay the store's own records. */
 	void		(*redo) (XLogReaderState *record);
 
 	/* Table files. */
 	void		(*add_table_file) (ProllyChunkStore *store, ProllyChunkNext next,
 								   void *arg);
-	void		(*conjoin) (ProllyChunkStore *store);
+	void		(*conjoin) (ProllyChunkStore *store, int max_files);
 	void		(*table_files) (ProllyChunkStore *store,
 								ProllyChunkFileVisit visit, void *arg);
 
@@ -275,18 +339,60 @@ typedef struct ProllyChunkStoreRoutine
 	 */
 	void		(*gc_retained) (ProllyChunkGc *gc, ProllyChunkGcVisit visit,
 								void *arg);
+
+	/*
+	 * Forget what the store keeps of a dropped database outside its
+	 * directory (optional).
+	 */
+	void		(*drop_database) (Oid dboid);
+
+	/* Checkpoints: a file a sync request names, fsynced (optional). */
+	int			(*sync_file) (const struct FileTag *ftag, char *path);
+
+	/*
+	 * The roots the store was moved to, oldest first, each with when (the
+	 * reflog): those whose moves it still records, which a garbage
+	 * collection may forget (optional).
+	 */
+	void		(*roots) (ProllyChunkStore *store, ProllyChunkRootVisit visit,
+						  void *arg);
+
+	/* Chunks as stored, framed (optional). */
+	bool		(*get_stored) (ProllyChunkStore *store, const ProllyHash *hash,
+							   StringInfo out);
+	void		(*add_stored_table_file) (ProllyChunkStore *store,
+										  ProllyChunkNext next, void *arg);
+
+	/* Whole files: sent, and received (optional). */
+	void		(*file_chunks) (ProllyChunkStore *store, const char *name,
+								ProllyChunkStoredVisit visit, void *arg);
+	void		(*receive_file) (ProllyChunkStore *store, const char *key,
+								 ProllyChunkNext next, void *arg);
+	bool		(*received_file) (ProllyChunkStore *store, const char *key,
+								  uint32 *nchunks);
+	bool		(*received_get) (ProllyChunkStore *store, const ProllyHash *hash,
+								 StringInfo out);
+	void		(*received_chunks) (ProllyChunkStore *store,
+									ProllyChunkStoredVisit visit, void *arg);
+	void		(*adopt_received) (ProllyChunkStore *store);
+	void		(*forget_received) (ProllyChunkStore *store,
+									const char *const *keep, int nkeep);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
-	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
-	"commit_writes", "committed", "commit_redo", "checkpoint", "redo", \
+	"open", "put", "get", "has", "get_many", "root", "move_root", "commit_payload", \
+	"commit_writes", "committed", "commit_redo", "checkpoint", "recovered", \
+	"redo", \
 	"add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
-	"keep", "gc_kept", "gc_retained"
+	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots", \
+	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
+	"received_file", "received_get", "received_chunks", "adopt_received", \
+	"forget_received"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK gc_retained
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK forget_received
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -305,9 +411,76 @@ extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);
+extern void prolly_chunkstore_recovered(void);
+
+/* The sync handler of the stores' files (storage/sync.h). */
+extern int	prolly_chunks_syncfiletag(const struct FileTag *ftag, char *path);
+extern bool prolly_chunks_filetagmatches(const struct FileTag *ftag,
+										 const struct FileTag *candidate);
+
+/*
+ * A chunk as stored, which stores, table files and remotes move without
+ * decoding it: its codec (PROLLY_CODEC_*), its length (4 bytes,
+ * little-endian), then its bytes as the codec left them.
+ * prolly_chunk_frame() appends one of a chunk to out, compressed where that
+ * saves; prolly_chunk_unframe() appends the chunk a frame holds, false if
+ * the bytes aren't one (a codec this server was built without is an
+ * error).  prolly_chunk_frame_len() is the chunk's length a frame gives
+ * (false if it isn't one).
+ */
+#define PROLLY_CODEC_NONE	0
+#define PROLLY_CODEC_LZ4	1
+#define PROLLY_FRAME_HEADER	5
+extern void prolly_chunk_frame(const void *data, Size len, StringInfo out);
+extern void prolly_chunk_frame_plain(const char *frame, Size len,
+									 StringInfo out);
+/*
+ * What a remote's dolt_serve_format() says after the canonical format: it
+ * sends and takes chunks framed, and (with the second) can decompress LZ4.
+ */
+#define PROLLY_SERVE_FRAMED	"/framed"
+#define PROLLY_SERVE_LZ4	"+lz4"
+
+/* (a session's: frames this server sends it, by get_stored, are plain) */
+extern PGDLLIMPORT bool prolly_serve_uncompressed;
+extern bool prolly_chunk_unframe(const char *frame, Size len, StringInfo out);
+extern bool prolly_chunk_frame_len(const char *frame, Size len, uint32 *chunk_len);
+
+/*
+ * A chunk of store as stored (its get_stored(), or its get() framed); a
+ * table file added of chunks next() gives framed (its
+ * add_stored_table_file(), or add_table_file() of them decoded).
+ */
+extern bool prolly_chunk_get_stored(const ProllyChunkStoreRoutine *cs,
+									ProllyChunkStore *store,
+									const ProllyHash *hash, StringInfo out);
+extern void prolly_chunk_add_stored(const ProllyChunkStoreRoutine *cs,
+									ProllyChunkStore *store,
+									ProllyChunkNext next, void *arg);
 
 /* The chunks a chunk names, as the server's trees lay their nodes out. */
 extern void prolly_chunk_references(const void *data, Size len,
 									ProllyChunkRefVisit visit, void *arg);
+
+/*
+ * What a store's chunks are: the content hash that names them (by name, and
+ * its digest's length) and the version of the format the server's trees lay
+ * their nodes out in.  A store records the format it is made in, and a
+ * server of another refuses it.
+ */
+#define PROLLY_STORE_HASH_NAME_LEN	16
+
+typedef struct ProllyStoreFormat
+{
+	char		hash[PROLLY_STORE_HASH_NAME_LEN];	/* zero-padded */
+	uint8		hash_len;
+	uint16		chunk_format;
+} ProllyStoreFormat;
+
+/* The server's (computed once, so first called outside a critical section). */
+extern const ProllyStoreFormat *prolly_store_format(void);
+extern bool prolly_store_format_equal(const ProllyStoreFormat *a,
+									  const ProllyStoreFormat *b);
+extern char *prolly_store_format_text(const ProllyStoreFormat *format);
 
 #endif							/* PROLLY_CHUNKSTORE_H */

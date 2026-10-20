@@ -1,9 +1,10 @@
--- The canonical format of table data is frozen: the hash (SHA-256), the
--- key encoding, the row encoding and the node format.  The same rows give
--- these trees, byte for byte, in every database and every later version;
--- a hash here that changes is a change of format, which needs a new format
--- version, not a new expected value.  Keys of each kind of encoding, rows
--- of every kind of value, special and non-ASCII values among them.
+-- The canonical format of table data is frozen: the hash (BLAKE3, its
+-- first 20 bytes), the key encoding, the row encoding and the node format.
+-- The same rows give these trees, byte for byte, in every database and
+-- every later version; a hash here that changes is a change of format,
+-- which needs a new format version, not a new expected value.  Keys of
+-- each kind of encoding, rows of every kind of value, special and
+-- non-ASCII values among them.
 --
 -- (Keys here are ordered by the "C" collation, whose order depends on no
 -- library.  Only data trees are pinned: the canonical root's other items
@@ -18,8 +19,9 @@ CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
 
 -- The hash.
-SELECT test_chunk_put('prolly format') = encode(sha256('prolly format'::bytea), 'hex')
-	AS chunks_named_by_sha256;
+SELECT test_chunk_put('prolly format') AS chunk,
+	test_chunk_put('prolly format') = test_content_hash('prolly format', 'blake3')
+	AS named_by_blake3;
 
 CREATE SCHEMA frozen VERSIONED;
 CREATE TYPE frozen.pair AS (x int, y text);

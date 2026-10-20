@@ -15,7 +15,7 @@ GRANT SELECT ON po.t TO regress_pol_reader;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('po_reset');
@@ -43,7 +43,7 @@ CREATE RULE "my rule" AS ON DELETE TO po.t WHERE old.id < 0 DO INSTEAD NOTHING;
 SELECT length(dolt_commit('-Am', 'policies')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE FUNCTION pg_temp.show() RETURNS SETOF text LANGUAGE sql AS $$
@@ -161,7 +161,7 @@ CREATE TABLE po.other (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('main') IS NOT NULL AS merged;
@@ -193,7 +193,7 @@ SELECT * FROM dolt_status;
 SELECT length(dolt_commit('-Am', 'odd rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -230,7 +230,7 @@ DROP RULE "my rule" ON po.t;
 SELECT length(dolt_commit('-Am', 'none')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('po_reset');
@@ -274,7 +274,7 @@ CREATE POLICY owned ON po.c USING (owner = 'x');
 SELECT length(dolt_commit('-Am', 'policies over things')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('pc_cases');
@@ -294,7 +294,7 @@ DROP TABLE po.ref;
 SELECT length(dolt_commit('-Am', 'things changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('pc_cases');
@@ -396,7 +396,7 @@ drop cascades to view po.cv
 SELECT length(dolt_commit('-Am', 'po gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP ROLE regress_pol_reader;

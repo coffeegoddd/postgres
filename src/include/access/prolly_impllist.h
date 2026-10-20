@@ -18,6 +18,7 @@
 
 /* foundation implementations */
 PG_PROLLY_IMPL(ProllyHashRoutine, prolly_hash_sha256)
+PG_PROLLY_IMPL(ProllyHashRoutine, prolly_hash_blake3)
 PG_PROLLY_IMPL(ProllyChunkerRoutine, prolly_chunker_bytes)
 PG_PROLLY_IMPL(ProllyChunkFormatRoutine, prolly_chunkformat_basic)
 PG_PROLLY_IMPL(ProllyTableFileRoutine, prolly_tablefile_basic)

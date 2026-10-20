@@ -5,11 +5,13 @@
  *
  * This file contains the implementation of the prolly engine's work
  * counters: tree nodes read and written, chunks appended, bytes hashed,
- * rows folded, commits, head moves, value memo lookups, pages copied, and
- * the bytes the chunk store and the block map write to their files
- * themselves.  It is kept separate from pgstat.c to enforce the line
- * between the statistics access / storage implementation and the details
- * about individual types of statistics.
+ * rows folded, commits, head moves, value memo lookups, pages copied, the
+ * bytes the chunk store and the block map write to their files
+ * themselves, the journal read to index it, and the chunk store's
+ * collections, moves and conjoins with what collections kept and freed.
+ * It is kept separate from pgstat.c to enforce the line between the
+ * statistics access / storage implementation and the details about
+ * individual types of statistics.
  *
  * This statistics kind uses a database's OID as the key of its one entry,
  * with InvalidOid as the object ID.  Backends count in PendingProllyStats,
@@ -63,6 +65,16 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN] = "bmap_store_bytes_written",
 	[PGSTAT_PROLLY_BMAP_EXTEND_BYTES_WRITTEN] = "bmap_extend_bytes_written",
 	[PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN] = "bmap_bulk_bytes_written",
+	[PGSTAT_PROLLY_JOURNAL_SCANS] = "journal_scans",
+	[PGSTAT_PROLLY_JOURNAL_BYTES_SCANNED] = "journal_bytes_scanned",
+	[PGSTAT_PROLLY_GC_COLLECTIONS] = "gc_collections",
+	[PGSTAT_PROLLY_GC_MOVES] = "gc_moves",
+	[PGSTAT_PROLLY_GC_CHUNKS_KEPT] = "gc_chunks_kept",
+	[PGSTAT_PROLLY_GC_CHUNKS_FREED] = "gc_chunks_freed",
+	[PGSTAT_PROLLY_GC_BYTES_FREED] = "gc_bytes_freed",
+	[PGSTAT_PROLLY_CONJOINS] = "conjoins",
+	[PGSTAT_PROLLY_GC_WINDOW_USEC] = "gc_window_usec",
+	[PGSTAT_PROLLY_CHUNK_FILE_READS] = "chunk_file_reads",
 };
 
 /*

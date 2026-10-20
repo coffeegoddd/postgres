@@ -12,9 +12,9 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'table_file_bytes_written'
 	(SELECT value FROM pg_stat_prolly WHERE name = 'manifest_bytes_written') > :mf_before
 		AS manifest_written;
 SELECT name, chunks FROM test_chunk_table_files();
-SELECT convert_from(test_chunk_get(encode(sha256('tf one'::bytea), 'hex')), 'UTF8');
-SELECT test_chunk_has(encode(sha256('tf two'::bytea), 'hex')) AS two,
-	test_chunk_has(encode(sha256('tf three'::bytea), 'hex')) AS three;
+SELECT convert_from(test_chunk_get(test_content_hash('tf one'::bytea)), 'UTF8');
+SELECT test_chunk_has(test_content_hash('tf two'::bytea)) AS two,
+	test_chunk_has(test_content_hash('tf three'::bytea)) AS three;
 
 -- A chunk given twice is written once.
 SELECT test_chunk_table_file(ARRAY['tf dup'::bytea, 'tf dup'::bytea]);
@@ -24,7 +24,7 @@ SELECT chunks FROM test_chunk_table_files() ORDER BY name DESC LIMIT 1;
 BEGIN;
 SELECT test_chunk_table_file(ARRAY['tf three'::bytea]);
 ROLLBACK;
-SELECT test_chunk_has(encode(sha256('tf three'::bytea), 'hex'));
+SELECT test_chunk_has(test_content_hash('tf three'::bytea));
 SELECT name, chunks FROM test_chunk_table_files() ORDER BY name;
 
 -- Chunks are compressed with LZ4 where the server has it.
@@ -37,7 +37,7 @@ SELECT name, chunks,
 	= :'lz4'::bool AS compressed_if_lz4
 FROM test_chunk_table_files() WHERE chunks = 50;
 SELECT count(*) FROM generate_series(1, 50) g
-WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 5000), 'UTF8')), 'hex')), 'UTF8')
+WHERE convert_from(test_chunk_get(test_content_hash(convert_to(repeat(g::text, 5000), 'UTF8'))), 'UTF8')
 	= repeat(g::text, 5000);
 
 -- Conjoining rewrites them as one, which every session reads.
@@ -53,11 +53,11 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'conjoin_bytes_copied') - 
 	AS conjoin_copied;
 SELECT name, chunks FROM test_chunk_table_files();
 SELECT count(*) FROM generate_series(1, 50) g
-WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 5000), 'UTF8')), 'hex')), 'UTF8')
+WHERE convert_from(test_chunk_get(test_content_hash(convert_to(repeat(g::text, 5000), 'UTF8'))), 'UTF8')
 	= repeat(g::text, 5000);
 \c
 SELECT name, chunks FROM test_chunk_table_files();
-SELECT convert_from(test_chunk_get(encode(sha256('tf three'::bytea), 'hex')), 'UTF8');
+SELECT convert_from(test_chunk_get(test_content_hash('tf three'::bytea)), 'UTF8');
 SELECT test_chunk_conjoin();	-- one file: nothing to do
 SELECT name, chunks FROM test_chunk_table_files();
 
@@ -65,3 +65,10 @@ SELECT name, chunks FROM test_chunk_table_files();
 BEGIN READ ONLY;
 SELECT test_chunk_table_file(ARRAY['tf four'::bytea]);
 ROLLBACK;
+
+-- A file's index takes about 34 bytes a chunk read into memory (20-byte
+-- hashes): each hash's 8-byte prefix and ordinal, its 12-byte suffix, its
+-- offset and its filter's bits; mapped, as a store's files are, nothing.
+SELECT test_tablefile_bytes_per_chunk(100000) BETWEEN 28 AND 40 AS compact_index,
+	test_tablefile_bytes_per_chunk(100000, true) < 1 AS mapped_index;
+SELECT test_tablefile_basic_index() AS index_checked;

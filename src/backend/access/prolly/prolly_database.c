@@ -29,3 +29,19 @@ ProllyCopyDatabase(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 	}
 	list_free(impls);
 }
+
+void
+ProllyDropDatabase(Oid dboid)
+{
+	List	   *impls = prolly_list_impls(PROLLY_IFACE_CHUNK_STORE);
+	ListCell   *lc;
+
+	foreach(lc, impls)
+	{
+		const ProllyChunkStoreRoutine *r = lfirst(lc);
+
+		if (PROLLY_HAS(r, drop_database))
+			r->drop_database(dboid);
+	}
+	list_free(impls);
+}

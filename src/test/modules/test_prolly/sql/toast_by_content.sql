@@ -8,6 +8,8 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (the default method differs with whether the server has LZ4)
+SET default_toast_compression = pglz;
 
 CREATE SCHEMA tc VERSIONED;
 CREATE TABLE tc.docs (id int PRIMARY KEY, n int, t text, b bytea, j jsonb);
@@ -74,7 +76,7 @@ INSERT INTO tc.main
 SELECT 2, string_agg(md5(i::text), ''), 'p' FROM generate_series(1, 400) i;
 SELECT id, test_toast_pointer(a) IS NOT NULL AS out_of_line FROM tc.main ORDER BY id;
 
--- A value no bigger than a hash pointer (42 bytes) isn't moved out into
+-- A value no bigger than a hash pointer (30 bytes) isn't moved out into
 -- one, however long its row.
 CREATE TABLE tc.narrow (id int PRIMARY KEY);
 DO $$
@@ -83,7 +85,7 @@ BEGIN
 						   string_agg(format('ADD COLUMN c%s text STORAGE EXTERNAL', g), ', '))
 			 FROM generate_series(1, 150) g);
 	EXECUTE (SELECT format('INSERT INTO tc.narrow VALUES (1, %s)',
-						   string_agg(quote_literal(repeat(chr(64 + g % 26), 40)), ', '))
+						   string_agg(quote_literal(repeat(chr(64 + g % 26), 28)), ', '))
 			 FROM generate_series(1, 150) g);
 END
 $$;

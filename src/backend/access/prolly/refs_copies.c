@@ -49,6 +49,13 @@
  *				   form of the branch's versioned schemas, folded
  *	"time"		-> microseconds since the Postgres epoch, 8 bytes big-endian
  *
+ * The chunks a commit's items and the refs' entries name (its dependencies,
+ * parents and root; a branch's head, baseline and working set, a merge's
+ * commits, a remote branch's head) are declared to the tree as the
+ * references to chunks its leaves hold (commit_chunk_refs(),
+ * refs_chunk_refs()), so
+ * a collection follows them without reading values.
+ *
  * A branch made at a commit starts as a copy of the session's branch,
  * moved to the commit (the rows that differ written, as a reset writes
  * them).
@@ -140,9 +147,93 @@ static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
 									  ProllyNodeRef *root);
 static bool copies_working_set(const char *branch, ProllyNodeRef *root);
+static uint32 get_be32(const char *p);
 static void fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next, bool commit);
 static const ProllyTreeRoutine *tree;
-static ProllyTreeEnv env;
+static ProllyTreeEnv env;		/* the refs' tree, and commits read */
+static ProllyTreeEnv commit_env;	/* commits written */
+
+static const char *get_hash(const char *p, const char *end, ProllyHash *h);
+
+/* Declare each hash at p (a length byte, then the hash), n of them. */
+static const char *
+declare_hashes(const char *p, const char *end, int n, StringInfo refs)
+{
+	for (int i = 0; i < n && p < end; i++)
+	{
+		ProllyHash	h;
+
+		p = get_hash(p, end, &h);
+		if (h.len > 0)
+			PROLLY_CALL(tree, value_reference, &h, 0, refs);
+	}
+	return p;
+}
+
+/* A commit's items: its dependencies, parents and root name chunks. */
+static void
+commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
+				  StringInfo refs)
+{
+	const char *p = (const char *) value->data;
+	const char *end = p + value->len;
+
+#define KEY_IS(name) \
+	(key->len == strlen(name) && memcmp(key->data, name, key->len) == 0)
+	if (KEY_IS("dependencies") || KEY_IS("parents") || KEY_IS("root"))
+		(void) declare_hashes(p, end, INT_MAX, refs);
+#undef KEY_IS
+}
+
+/*
+ * The refs' entries: a branch's head, a remote branch's, a baseline and the
+ * working set its fold made, and a merge's commits (theirs and the base;
+ * a revert's series head and the commits it has left).
+ */
+static void
+refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
+				StringInfo refs)
+{
+	const char *p = (const char *) value->data;
+	const char *end = p + value->len;
+
+	if (key->len < 1)
+		return;
+	switch (key->data[0])
+	{
+		case TAG_BRANCH:
+		case TAG_TRACKING:
+			(void) declare_hashes(p, end, 1, refs);
+			break;
+		case TAG_BASELINE:
+			(void) declare_hashes(p, end, 2, refs);
+			break;
+		case TAG_MERGE:
+			{
+				uint32		n;
+
+				p = declare_hashes(p, end, 2, refs);
+				if (end - p < 4)
+					break;
+				n = get_be32(p);
+				p += 4;
+				if ((uint64) (end - p) < (uint64) n * 4)
+					break;
+				p += (Size) n * 4;
+				if (p < end && *p == 'r')
+				{
+					p = declare_hashes(p + 1, end, 1, refs);
+					if (end - p < 4)
+						break;
+					n = get_be32(p);
+					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
+				}
+			}
+			break;
+		default:
+			break;
+	}
+}
 
 static void
 refs_init(void)
@@ -153,12 +244,15 @@ refs_init(void)
 	memset(&env, 0, sizeof(env));
 	env.chunk_format = prolly_chunkformat_lookup("basic");
 	env.chunker = prolly_chunker_lookup("bytes");
-	env.hash = prolly_hash_lookup("sha256");
+	env.hash = prolly_content_hash();
 	env.chunk_store = prolly_chunk_store();
 	env.chunks = PROLLY_CALL(env.chunk_store, open, MyDatabaseId,
 							 MyDatabaseTableSpace);
 	env.compare = prolly_bytes_compare;
 	env.counters = pgstat_prolly_tree_counters();
+	commit_env = env;
+	env.chunk_refs = refs_chunk_refs;
+	commit_env.chunk_refs = commit_chunk_refs;
 	RegisterXactCallback(refs_xact_callback, NULL);
 	ready = true;
 }
@@ -1058,7 +1152,7 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	}
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
-	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/* Keys in order: author, dependencies, message, parents, root, time. */
 	initStringInfo(&v);
@@ -2465,6 +2559,93 @@ visit_prefix(const char *prefix, int prefixlen,
 	PROLLY_CALL(tree, cursor_close, c);
 }
 
+/* a ref a root named, for copies_root_refs() to sort */
+typedef struct RootRef
+{
+	char	   *name;
+	ProllyHash	commit;
+} RootRef;
+
+static int
+root_ref_cmp(const void *a, const void *b)
+{
+	return strcmp(((const RootRef *) a)->name, ((const RootRef *) b)->name);
+}
+
+/*
+ * The refs a root of the store named, whenever it was the store's root:
+ * branches' heads and remote-tracking branches' commits, in the order of
+ * their full names (as Dolt's: a tracking branch's key, remote then
+ * branch, sorts otherwise where one remote's name begins another's).
+ */
+static bool
+copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
+{
+	static const char tags[] = {TAG_BRANCH, TAG_TRACKING};
+	ProllyNodeRef r;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	RootRef    *refs;
+	int			nrefs = 0;
+	int			maxrefs = 16;
+
+	refs_init();
+	if (!PROLLY_CALL(env.chunk_store, has, env.chunks, root))
+		return false;
+	ref_of(root, &r);
+	refs = palloc(sizeof(RootRef) * maxrefs);
+	c = PROLLY_CALL(tree, cursor_open, &env, &r, CurrentMemoryContext);
+	for (int t = 0; t < lengthof(tags); t++)
+	{
+		ProllyKey	from = {(const uint8 *) &tags[t], 1};
+
+		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+			   k.len >= 1 && k.data[0] == tags[t])
+		{
+			const char *name = (const char *) k.data + 1;
+			int			namelen = k.len - 1;
+			StringInfoData ref;
+
+			initStringInfo(&ref);
+			if (tags[t] == TAG_BRANCH)
+			{
+				appendStringInfoString(&ref, "refs/heads/");
+				appendBinaryStringInfo(&ref, name, namelen);
+			}
+			else
+			{
+				int			rlen = strnlen(name, namelen);
+
+				appendStringInfoString(&ref, "refs/remotes/");
+				appendBinaryStringInfo(&ref, name, rlen);
+				appendStringInfoChar(&ref, '/');
+				if (rlen < namelen)
+					appendBinaryStringInfo(&ref, name + rlen + 1, namelen - rlen - 1);
+			}
+			if (nrefs == maxrefs)
+			{
+				maxrefs *= 2;
+				refs = repalloc(refs, sizeof(RootRef) * maxrefs);
+			}
+			refs[nrefs].name = ref.data;
+			(void) get_hash((const char *) v.data, (const char *) v.data + v.len,
+							&refs[nrefs].commit);
+			nrefs++;
+		}
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	qsort(refs, nrefs, sizeof(RootRef), root_ref_cmp);
+	for (int i = 0; i < nrefs; i++)
+	{
+		visit(refs[i].name, &refs[i].commit, arg);
+		pfree(refs[i].name);
+	}
+	pfree(refs);
+	return true;
+}
+
 static void
 tracking_key(StringInfo key, const char *remote, const char *branch)
 {
@@ -3130,4 +3311,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.open = refs_init,
 	.commit_rows = copies_commit_rows,
 	.branch_rename = copies_branch_rename,
+	.root_refs = copies_root_refs,
 };

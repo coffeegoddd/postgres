@@ -147,7 +147,8 @@ adapts.
 
 - **Dolt:** commit ids are 32-character base32 strings of a 20-byte
   hash.
-- **Prolly:** commit ids are 64 hex digits of SHA-256, canonical: the
+- **Prolly:** commit ids are 40 hex digits of BLAKE3's first 20 bytes
+  (64 hex digits of SHA-256 until spec 22's group A), canonical: the
   same history gives the same ids on every cluster.
 - **Why:** prolly's own format (Built for Postgres, not ported); ids
   are never compared with Dolt's.
@@ -299,3 +300,17 @@ stash, …) is F, ported with the feature (#163).
   branch named `--` could be named only after another `--`.
 - **Port:** a case that makes a branch named `--` expects the
   `invalid branch name` error (SQLSTATE 42602) instead.
+
+## D23. `dolt_gc()` returns a status, not statistics
+
+- **Dolt:** `CALL dolt_gc()` returns a status row (`{0}`), and logs
+  what it kept and freed.
+- **Prolly:** `dolt_gc()` returns `{0}` too; what each collection kept
+  and freed, and how long it held its window, is counted in
+  `pg_stat_prolly` (`gc_collections`, `gc_chunks_kept`,
+  `gc_chunks_freed`, `gc_bytes_freed`, `gc_window_usec`), and a
+  collection's sizes are `prolly_store_sizes()`'s.
+- **Why:** Dolt's return shape, kept; Postgres's statistics views are
+  where work is counted.
+- **Port:** a case reads the counters before and after a collection
+  for what it did, not `dolt_gc()`'s result.

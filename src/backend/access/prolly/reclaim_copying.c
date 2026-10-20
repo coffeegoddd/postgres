@@ -16,13 +16,15 @@
  * where one is active (autovacuum's), a chunk read costing a page missed;
  * never in the window, where interrupts are held.
  *
- * What a chunk names is found without knowing what kind of chunk it is:
- * the store's chunks write every reference as the hash's length, then the
- * hash (a tree's children and values stored out of line, a commit's root,
- * parents and dependencies, the refs' heads and baselines, a canonical
- * root's data trees), so wherever a chunk's bytes hold the length followed
- * by a collected chunk's hash, that chunk is marked.  Bytes that happen to
- * spell one can keep a chunk nothing names; nothing named is ever lost.
+ * What a chunk names is what its format declares (prolly_chunk_references(),
+ * the tree's references()): a node's children, a leaf's values stored out
+ * of line, and the references its items declare (a row's value trees, a
+ * commit's root, parents and dependencies, the refs' heads, baselines and
+ * merges, a canonical root's data trees, a baseline's).  Nothing else in
+ * a chunk's bytes is read as a reference, so bytes that happen to spell a
+ * hash keep nothing.  (Assert-enabled builds check it: a collected chunk
+ * whose hash a chunk's bytes hold, as a reference would, and that the
+ * chunk doesn't declare, is warned of.)
  *
  * Tables are roots too: a versioned table's values out of line are value
  * trees its rows name by hash pointers (prolly_toast.h), which no ref
@@ -32,6 +34,12 @@
  * ended; and every tree a transaction names while it runs (the store's
  * keep set, gc_kept()), before the window and in it.  A keep set too large
  * to remember keeps every chunk collected.
+ *
+ * The chunks marked and not yet read wait in a queue, breadth first, of
+ * at most maintenance_work_mem in memory (a ring, so taking one and adding
+ * one costs the same however full it is); past that it goes on in a
+ * temporary file, read back as the memory empties.  (The marks themselves
+ * are a bit a chunk collected.)
  *
  * A default collection stops at settled files (the store doesn't collect
  * them, so marking ends there): it costs what changed since the last.  A
@@ -54,6 +62,7 @@
 #include "access/prolly_toast.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "storage/buffile.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 
@@ -66,10 +75,14 @@ typedef struct Mark
 	ProllyChunkGc *gc;
 	uint64		nslots;
 	uint8	   *marks;			/* a bit a slot */
-	uint64	   *queue;			/* marked, not yet read */
+	uint64	   *queue;			/* marked, not yet read: a ring, count of
+								 * them from head */
 	uint64		head;
-	uint64		tail;
-	uint64		cap;
+	uint64		count;
+	uint64		cap;			/* of queue: maintenance_work_mem's worth */
+	BufFile    *spill;			/* and the rest, past cap, in order */
+	uint64		spill_read;		/* slots read back from it */
+	uint64		spill_written;	/* and written */
 	uint8		hash_len;
 	StringInfoData buf;
 } Mark;
@@ -80,12 +93,52 @@ mark_slot(Mark *mk, uint64 slot)
 	if (mk->marks[slot / 8] & (1 << (slot % 8)))
 		return;
 	mk->marks[slot / 8] |= 1 << (slot % 8);
-	if (mk->tail == mk->cap)
+	/* (once some are in the file, the rest follow them there, in order) */
+	if (mk->count == mk->cap || mk->spill_written > mk->spill_read)
 	{
-		mk->cap *= 2;
-		mk->queue = repalloc_huge(mk->queue, sizeof(uint64) * mk->cap);
+		if (mk->spill == NULL)
+			mk->spill = BufFileCreateTemp(false);
+		if (BufFileSeek(mk->spill, 0, mk->spill_written * sizeof(uint64),
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in the collection's temporary file: %m")));
+		BufFileWrite(mk->spill, &slot, sizeof(slot));
+		mk->spill_written++;
+		return;
 	}
-	mk->queue[mk->tail++] = slot;
+	mk->queue[(mk->head + mk->count++) % mk->cap] = slot;
+}
+
+/* The next slot marked and not yet read; false if none is left. */
+static bool
+next_marked(Mark *mk, uint64 *slot)
+{
+	if (mk->count == 0)
+	{
+		uint64		n = Min(mk->cap, mk->spill_written - mk->spill_read);
+
+		mk->head = 0;
+		if (n == 0)
+		{
+			mk->spill_read = mk->spill_written = 0;
+			return false;
+		}
+		if (BufFileSeek(mk->spill, 0, mk->spill_read * sizeof(uint64),
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in the collection's temporary file: %m")));
+		BufFileReadExact(mk->spill, mk->queue, n * sizeof(uint64));
+		mk->spill_read += n;
+		mk->count = n;
+		if (mk->spill_read == mk->spill_written)
+			mk->spill_read = mk->spill_written = 0;
+	}
+	*slot = mk->queue[mk->head];
+	mk->head = (mk->head + 1) % mk->cap;
+	mk->count--;
+	return true;
 }
 
 static void
@@ -97,24 +150,109 @@ mark_hash(Mark *mk, const ProllyHash *hash)
 		mark_slot(mk, (uint64) slot);
 }
 
-/* Mark every collected chunk data names. */
+static void
+mark_ref(const ProllyHash *hash, void *arg)
+{
+	Mark	   *mk = arg;
+
+	if (mk->hash_len == 0)
+		mk->hash_len = hash->len;
+	mark_hash(mk, hash);
+}
+
+#ifdef USE_ASSERT_CHECKING
+static int
+hash_cmp(const void *a, const void *b)
+{
+	const ProllyHash *x = a;
+	const ProllyHash *y = b;
+
+	if (x->len != y->len)
+		return x->len < y->len ? -1 : 1;
+	return memcmp(x->bytes, y->bytes, x->len);
+}
+
+typedef struct Declared
+{
+	ProllyHash *hashes;
+	int			n;
+	int			max;
+} Declared;
+
+static void
+note_declared(const ProllyHash *hash, void *arg)
+{
+	Declared   *d = arg;
+
+	if (d->n == d->max)
+	{
+		d->max = Max(16, d->max * 2);
+		d->hashes = d->hashes ? repalloc_array(d->hashes, ProllyHash, d->max) :
+			palloc_array(ProllyHash, d->max);
+	}
+	d->hashes[d->n++] = *hash;
+}
+
+/*
+ * Every collected chunk the values of data's items name as a reference
+ * would (the hash's length, then the hash) is one data declares.  (Keys
+ * are passed over: a keyless row's key holds its content's hash, which
+ * may be a chunk's, naming nothing; and so are a value tree's leaves, with
+ * no keys: what a value stored out of line names, the item that stores it
+ * declares.)
+ */
+static void
+check_declared(Mark *mk, const char *data, Size len)
+{
+	const ProllyChunkFormatRoutine *format = prolly_chunkformat_lookup("basic");
+	ProllyChunkNode node;
+	uint8		hl = mk->hash_len;
+	Declared	d = {0};
+	ProllyHash	h;
+
+	if (hl == 0 || !PROLLY_CALL(format, open, (const uint8 *) data, len, &node))
+		return;
+	prolly_chunk_references(data, len, note_declared, &d);
+	/* (sorted, so each run of bytes is looked up, not compared with all) */
+	if (d.n > 1)
+		qsort(d.hashes, d.n, sizeof(ProllyHash), hash_cmp);
+	memset(&h, 0, sizeof(h));
+	h.len = hl;
+	for (int item = 0; item < node.nitems; item++)
+	{
+		ProllyKey	k;
+		ProllyValue v;
+		uint8		flags;
+
+		PROLLY_CALL(format, item_get, &node, item, &k, &v, &flags);
+		if (node.level == 0 && k.len == 0)
+			continue;
+		for (Size i = 0; i + 1 + hl <= v.len; i++)
+		{
+			if (v.data[i] != hl)
+				continue;
+			memcpy(h.bytes, v.data + i + 1, hl);
+			if (PROLLY_CALL(mk->cs, gc_find, mk->gc, &h) < 0)
+				continue;
+			if (d.n == 0 ||
+				bsearch(&h, d.hashes, d.n, sizeof(ProllyHash), hash_cmp) == NULL)
+				elog(WARNING, "a chunk names chunk %s, which it doesn't declare",
+					 prolly_hash_hex(&h));
+		}
+	}
+	if (d.hashes)
+		pfree(d.hashes);
+}
+#endif
+
+/* Mark every collected chunk data declares. */
 static void
 mark_named(Mark *mk, const char *data, Size len)
 {
-	uint8		hl = mk->hash_len;
-	ProllyHash	h;
-
-	if (hl == 0)
-		return;
-	memset(&h, 0, sizeof(h));
-	h.len = hl;
-	for (Size i = 0; i + 1 + hl <= len; i++)
-	{
-		if ((uint8) data[i] != hl)
-			continue;
-		memcpy(h.bytes, data + i + 1, hl);
-		mark_hash(mk, &h);
-	}
+	prolly_chunk_references(data, len, mark_ref, mk);
+#ifdef USE_ASSERT_CHECKING
+	check_declared(mk, data, len);
+#endif
 }
 
 /*
@@ -143,10 +281,10 @@ mark_all(Mark *mk)
 static void
 drain(Mark *mk)
 {
-	while (mk->head < mk->tail)
-	{
-		uint64		slot = mk->queue[mk->head++];
+	uint64		slot;
 
+	while (next_marked(mk, &slot))
+	{
 		resetStringInfo(&mk->buf);
 		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
 		mark_named(mk, mk->buf.data, mk->buf.len);
@@ -156,7 +294,6 @@ drain(Mark *mk)
 			VacuumCostBalance += VacuumCostPageMiss;
 		vacuum_delay_point(false);
 	}
-	mk->head = mk->tail = 0;
 }
 
 /* What is new since the seal: a root, or a chunk kept whole. */
@@ -242,8 +379,8 @@ copying_collect(bool full, ProllyGcResult *result)
 						&root, &mk.nslots);
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
-	mk.cap = 1024;
-	mk.queue = palloc(sizeof(uint64) * mk.cap);
+	mk.cap = Max((uint64) maintenance_work_mem * 1024 / sizeof(uint64), 1024);
+	mk.queue = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(uint64) * mk.cap);
 	mk.hash_len = root.len;
 	initStringInfo(&mk.buf);
 	PROLLY_CALL(cs, gc_files, mk.gc, count_file, &nfiles);
@@ -298,6 +435,8 @@ copying_collect(bool full, ProllyGcResult *result)
 	drain(&mk);
 	PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
 	PROLLY_CALL(cs, gc_retire, mk.gc);
+	if (mk.spill != NULL)
+		BufFileClose(mk.spill);
 }
 
 /* (nothing to mark: every chunk is) */

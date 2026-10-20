@@ -5704,7 +5704,23 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        extending for bulk writes and copies, which nothing else counts, for
        other relations either.  Extending by
        <function>posix_fallocate</function> counts the bytes allocated, as
-       <structname>pg_stat_io</structname> does).  Bytes are counted when
+       <structname>pg_stat_io</structname> does);
+       <literal>journal_scans</literal> and
+       <literal>journal_bytes_scanned</literal> (ranges of journal records a
+       process read to index them, and their bytes: a segment's records not
+       read yet are a range, and so is one an append was writing when the
+       process last read there);
+       <literal>gc_collections</literal>, <literal>gc_moves</literal> and
+       <literal>conjoins</literal> (the chunk store's collections, moves of
+       its journal into a table file, and table files conjoined into one),
+       with <literal>gc_chunks_kept</literal>,
+       <literal>gc_chunks_freed</literal>,
+       <literal>gc_bytes_freed</literal> and
+       <literal>gc_window_usec</literal> (what collections kept and freed,
+       and the microseconds each held its window, in which commits that
+       move a root wait; a move keeps every chunk, and is counted only in
+       <literal>gc_moves</literal>); <literal>chunk_file_reads</literal> (reads of the chunk store's
+       files for chunks, several chunks close together counting once).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

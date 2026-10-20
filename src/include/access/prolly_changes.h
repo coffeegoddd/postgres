@@ -90,11 +90,20 @@ typedef struct ProllyChangeFinderRoutine
 							  const ProllyNodeRef *data_in,
 							  ItemPointerData *tids, int ntids,
 							  ProllyNodeRef *data);
+
+	/*
+	 * Optional, for a finder whose state (fold()'s next) names chunks:
+	 * appends the references it holds to refs (the tree's
+	 * value_reference()), which a baseline's tree declares.  It passes over
+	 * a state it didn't write.
+	 */
+	void		(*state_refs) (const ProllyValue *state, StringInfo refs);
 } ProllyChangeFinderRoutine;
 
-#define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows"
+#define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
+	"state_refs"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK fold_rows
+#define PROLLY_CHANGES_LAST_CALLBACK state_refs
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

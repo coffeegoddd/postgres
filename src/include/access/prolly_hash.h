@@ -3,10 +3,9 @@
  * prolly_hash.h
  *	  Content hash interface: hashing a node's canonical region.
  *
- * The hash function and its digest length are part of the canonical format
- * (the choice is still to be measured).  Candidates include
- * SHA-256 through src/common/cryptohash.c.  The chunker's boundary hash is a
- * separate concern of the chunker.
+ * The hash function and its digest length are part of the canonical format:
+ * the server names every chunk with one (prolly_content_hash()).  The
+ * chunker's boundary hash is a separate concern of the chunker.
  *
  * Contract:
  * - Deterministic, and identical on every platform.

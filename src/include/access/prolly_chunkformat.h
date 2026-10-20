@@ -37,6 +37,8 @@
 #define PROLLY_ITEM_VALUE_REF	0x01	/* the value refers to a value tree */
 #define PROLLY_ITEM_VALUE_REFS	0x02	/* the value begins with the references
 										 * to value trees it holds */
+#define PROLLY_ITEM_CHUNK_REFS	0x04	/* and before them, with references to
+										 * other chunks it names */
 
 /* A node read from a chunk: points into the chunk's bytes. */
 typedef struct ProllyChunkNode

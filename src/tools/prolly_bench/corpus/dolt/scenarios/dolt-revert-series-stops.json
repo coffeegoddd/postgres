@@ -52,7 +52,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "seed table"
       ],
@@ -81,7 +81,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "insert row 4"
       ],
@@ -110,7 +110,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "change row 2"
       ],
@@ -139,7 +139,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "change row 2 again"
       ],

@@ -28,11 +28,12 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 my $files = q{SELECT string_agg(f || ' ' || md5(pg_read_binary_file(d || '/' || f)), E'\n' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'postgres') db,
 		pg_ls_dir(d) f
-	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'};
+	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'
+		AND f <> 'prolly_index'};	# (each server's own cache)
 my $segments = q{SELECT string_agg(name || ':' || chunks, ' ' ORDER BY name)
 	FROM test_chunk_segments()};
 my $reads = q{SELECT count(*) FROM generate_series(1, 30) g
-	WHERE convert_from(test_chunk_get(encode(sha256(convert_to('s' || g, 'UTF8')), 'hex')), 'UTF8')
+	WHERE convert_from(test_chunk_get(test_content_hash(convert_to('s' || g, 'UTF8'))), 'UTF8')
 		= 's' || g};
 
 # Ten chunks a segment, the root moved in each.
@@ -108,7 +109,7 @@ $node->stop('immediate');
 $node->start;
 is(sql($reads), '30', 'the chunks survive a crash');
 is(sql('SELECT test_chunk_root()'), $root, 'and the root');
-is(sql(q{SELECT test_chunk_has(encode(sha256('after'), 'hex'))}), 't',
+is(sql(q{SELECT test_chunk_has(test_content_hash('after'))}), 't',
 	'and the newest segment\'s');
 
 $standby->stop;

@@ -10,7 +10,7 @@ INSERT INTO ag.t SELECT g, g % 7, 'g' || (g % 3) FROM generate_series(1, 30) g;
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('ag_reset');
@@ -48,7 +48,7 @@ CREATE AGGREGATE ag.rnk(VARIADIC "any" ORDER BY VARIADIC "any") (
 SELECT length(dolt_commit('-Am', 'aggregates')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE FUNCTION pg_temp.show() RETURNS SETOF text LANGUAGE sql AS $$
@@ -130,7 +130,7 @@ CREATE TABLE ag.other (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'other')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_merge('main') IS NOT NULL AS merged;
@@ -162,7 +162,7 @@ SELECT * FROM dolt_status;
 SELECT length(dolt_commit('-Am', 'total from 100')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -190,7 +190,7 @@ DROP FUNCTION ag.done(int8);
 SELECT length(dolt_commit('-Am', 'no norm')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('ag_reset');
@@ -231,7 +231,7 @@ CREATE AGGREGATE ag.stagg(int) (SFUNC = ag.st_step, STYPE = ag.st);
 SELECT length(dolt_commit('-Am', 'before')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('ag_cases');
@@ -263,7 +263,7 @@ REFRESH MATERIALIZED VIEW ag.mv;
 SELECT length(dolt_commit('-Am', 'after')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('ag_cases');
@@ -380,6 +380,6 @@ drop cascades to function ag.stagg(integer)
 SELECT length(dolt_commit('-Am', 'ag gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

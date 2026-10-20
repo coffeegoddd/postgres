@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC0
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC2
 
 typedef struct PgStat_ArchiverStats
 {
@@ -637,9 +637,22 @@ typedef enum PgStat_ProllyCounter
 											 * copies (smgrextend,
 											 * smgrpreextend), which nothing
 											 * else counts, for md either */
+	PGSTAT_PROLLY_JOURNAL_SCANS,	/* ranges of journal records a backend
+									 * read to index them */
+	PGSTAT_PROLLY_JOURNAL_BYTES_SCANNED,	/* and the bytes they read */
+	PGSTAT_PROLLY_GC_COLLECTIONS,	/* chunk store collections */
+	PGSTAT_PROLLY_GC_MOVES, /* moves of the journal into a table file */
+	PGSTAT_PROLLY_GC_CHUNKS_KEPT,	/* chunks a collection kept */
+	PGSTAT_PROLLY_GC_CHUNKS_FREED,	/* and those it freed */
+	PGSTAT_PROLLY_GC_BYTES_FREED,	/* and the bytes of their files */
+	PGSTAT_PROLLY_CONJOINS, /* table files conjoined into one */
+	PGSTAT_PROLLY_GC_WINDOW_USEC,	/* microseconds collections held their
+									 * windows */
+	PGSTAT_PROLLY_CHUNK_FILE_READS, /* reads of the store's files for chunks:
+									 * several chunks close together, one */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BULK_BYTES_WRITTEN + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_CHUNK_FILE_READS + 1)
 
 typedef struct PgStat_ProllyStats
 {

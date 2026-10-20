@@ -1,0 +1,104 @@
+-- The journal holds a chunk compressed with LZ4 where the server is built
+-- with it and that makes the record smaller, as is otherwise; either way
+-- it reads back as it was put, from the transaction's own pending chunks,
+-- from the journal, and from a table file a collection copied it to.
+-- (Every result here is the same whether the server has LZ4.)
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE DATABASE compression_db;
+\c compression_db
+CREATE EXTENSION test_prolly;
+SELECT 'lz4' = ANY(enumvals) AS lz4 FROM pg_settings
+WHERE name = 'default_toast_compression' \gset
+-- A journal's bytes, all segments together.
+CREATE FUNCTION journal_bytes() RETURNS bigint LANGUAGE sql AS $$
+	SELECT sum(bytes)::bigint FROM test_chunk_segments()
+$$;
+-- 100 kB of one byte, and 40 kB of md5 digests' bytes, which LZ4 can't
+-- make smaller.
+CREATE TABLE chunks AS
+SELECT 'repetitive' AS name, convert_to(repeat('x', 100000), 'UTF8') AS data
+UNION ALL
+SELECT 'incompressible', decode(string_agg(md5(i::text), '' ORDER BY i), 'hex')
+FROM generate_series(1, 2500) i;
+-- Read back in the transaction that put them, still pending.
+BEGIN;
+SELECT name, test_chunk_get(test_chunk_put(data)) = data AS pending_reads
+FROM chunks ORDER BY name;
+      name      | pending_reads 
+----------------+---------------
+ incompressible | t
+ repetitive     | t
+(2 rows)
+
+COMMIT;
+-- Each put alone, measured: the repetitive one takes far fewer bytes than
+-- it holds where the server has LZ4; the incompressible one takes its own
+-- bytes and its record's framing.
+SELECT journal_bytes() AS before \gset
+SELECT test_chunk_put(data || '\x01'::bytea) FROM chunks WHERE name = 'repetitive';
+              test_chunk_put              
+------------------------------------------
+ 0f16471f31bd3e2ed52f4ccc5f1a02caeea9c817
+(1 row)
+
+SELECT (journal_bytes() - :before < 2000) = :'lz4'::bool AS repetitive_compressed;
+ repetitive_compressed 
+-----------------------
+ t
+(1 row)
+
+SELECT journal_bytes() AS before \gset
+SELECT test_chunk_put(data || '\x01'::bytea) FROM chunks WHERE name = 'incompressible';
+              test_chunk_put              
+------------------------------------------
+ 778c7055517fc7e9b8645e495188fe13fae2c42d
+(1 row)
+
+SELECT journal_bytes() - :before BETWEEN 40001 AND 40200 AS incompressible_as_is;
+ incompressible_as_is 
+----------------------
+ t
+(1 row)
+
+-- Read back from the journal, in a new session.
+\c compression_db
+SELECT name, test_chunk_get(test_content_hash(data)) = data AS journal_reads,
+	test_chunk_get(test_content_hash(data || '\x01'::bytea)) = data || '\x01'::bytea
+	AS again
+FROM chunks ORDER BY name;
+      name      | journal_reads | again 
+----------------+---------------+-------
+ incompressible | t             | t
+ repetitive     | t             | t
+(2 rows)
+
+-- A collection copies what the root reaches to a table file, decoded and
+-- written in the table file's format: still the same bytes.
+SELECT test_chunk_move_root(NULL, test_content_hash(data))
+FROM chunks WHERE name = 'repetitive';
+ test_chunk_move_root 
+----------------------
+ t
+(1 row)
+
+SELECT kept > 0 AS kept FROM test_chunk_gc(false);
+ kept 
+------
+ t
+(1 row)
+
+\c compression_db
+SELECT name, test_chunk_has(test_content_hash(data)) AS kept,
+	test_chunk_get(test_content_hash(data)) IS NOT DISTINCT FROM
+	CASE WHEN test_chunk_has(test_content_hash(data)) THEN data END AS reads
+FROM chunks ORDER BY name;
+      name      | kept | reads 
+----------------+------+-------
+ incompressible | f    | t
+ repetitive     | t    | t
+(2 rows)
+
+\c postgres
+DROP DATABASE compression_db;

@@ -75,7 +75,7 @@ SELECT * FROM pg_temp.entries('cl.keyless');
 SELECT length(dolt_commit('-Am', 'tables')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
@@ -121,7 +121,7 @@ BEGIN;
 SELECT length(dolt_commit('-am', 'gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
@@ -140,7 +140,7 @@ SELECT * FROM pg_temp.entries('cl.keyed');
 SELECT length(dolt_commit('-am', 'six')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Writes after a commit in its transaction are entries for the next.
@@ -149,7 +149,7 @@ INSERT INTO cl.keyed VALUES (7, 'g');
 SELECT length(dolt_commit('-am', 'seven')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO cl.keyed VALUES (8, 'h');
@@ -163,7 +163,7 @@ SELECT * FROM pg_temp.entries('cl.keyed');
 SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A keyless row with a value out of line can't be held: read in full.
@@ -200,7 +200,7 @@ ROLLBACK;
 SELECT length(dolt_commit('-am', 'long')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Leaving a branch with changes folds it as its baseline, which consumes
@@ -288,7 +288,7 @@ SELECT * FROM pg_temp.entries('cl.wide');
 SELECT length(dolt_commit('-Am', 'wide')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO cl.keyed VALUES (13, 'm'), (12, 'conflict')
@@ -310,7 +310,7 @@ SELECT * FROM pg_temp.entries('cl.keyless');
 SELECT length(dolt_commit('-am', 'conflict and copy')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- CLUSTER and VACUUM FULL change no row, but give the table new storage:
@@ -333,7 +333,7 @@ CREATE MATERIALIZED VIEW cl.mv AS SELECT id FROM cl.keyed;
 SELECT length(dolt_commit('-Am', 'mv')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 REFRESH MATERIALIZED VIEW cl.mv;
@@ -374,7 +374,7 @@ drop cascades to materialized view cl.mv
 SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('-D', 'cl_other');

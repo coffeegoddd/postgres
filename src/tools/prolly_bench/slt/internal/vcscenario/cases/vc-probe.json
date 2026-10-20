@@ -1,8 +1,8 @@
 {
   "version": 1,
   "id": "vc-probe",
-  "description": "Native canary for the version-control capabilities beyond vc.core: a merge base, a merge, a diff, a cherry-pick, a revert, a conflict and a constraint violation, each checked by its effect",
-  "requires": ["sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase"],
+  "description": "Native canary for the version-control capabilities beyond vc.core: a merge base, a merge, a diff, a cherry-pick, a revert, a conflict, a constraint violation, the reflog and a garbage collection, each checked by its effect",
+  "requires": ["sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase", "vc.gc", "vc.reflog"],
   "sessions": ["a", "b"],
   "steps": [
     {"id":"create","session":"a","op":"exec","sql":"CREATE TABLE probe_t (id int PRIMARY KEY, v text)","expect":{"tag":"CREATE TABLE"}},
@@ -44,6 +44,9 @@
     {"id":"violation-begin","session":"a","op":"exec","sql":"BEGIN","expect":{"tag":"BEGIN"}},
     {"id":"violation-merge","session":"a","op":"query","requires":["vc.merge"],"sql":"SELECT (dolt_merge('probe_child'))[3]","expect":{"rows":[["1"]],"order":"ordered"}},
     {"id":"violations","session":"a","op":"query","requires":["vc.violations"],"sql":"SELECT violation_type, violating_row->>'id' FROM dolt_constraint_violations('probe_child')","expect":{"rows":[["foreign key","1"]],"order":"ordered"}},
-    {"id":"violation-rollback","session":"a","op":"exec","sql":"ROLLBACK","expect":{"tag":"ROLLBACK"}}
+    {"id":"violation-rollback","session":"a","op":"exec","sql":"ROLLBACK","expect":{"tag":"ROLLBACK"}},
+    {"id":"reflog","session":"a","op":"query","requires":["vc.reflog"],"sql":"SELECT commit_hash = $1 FROM dolt_reflog('main') LIMIT 1","params":[{"ref":"noparent"}],"expect":{"rows":[["t"]],"order":"ordered"}},
+    {"id":"gc","session":"a","op":"query","requires":["vc.gc"],"sql":"SELECT dolt_gc()","expect":{"rows":[["{0}"]],"order":"ordered"}},
+    {"id":"after-gc","session":"a","op":"query","requires":["vc.core"],"sql":"SELECT dolt_hashof('main') = $1","params":[{"ref":"noparent"}],"expect":{"rows":[["t"]],"order":"ordered"}}
   ]
 }

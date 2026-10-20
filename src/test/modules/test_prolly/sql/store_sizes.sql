@@ -1,0 +1,121 @@
+-- What the chunk store is and does, as Dolt's StoreSizes and GC results
+-- tell it: prolly_store_sizes() gives the journal's and the table files'
+-- sizes (and of those, the settled ones'), prolly_gc() what a collection
+-- did, and pg_stat_prolly counts collections, conjoins, what they kept
+-- and freed, and the journal read to index it.
+\c postgres
+CREATE DATABASE sizes_db;
+\c sizes_db
+CREATE EXTENSION test_prolly;
+CREATE FUNCTION counted(name text) RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE pg_stat_prolly.name = counted.name
+$$;
+
+-- A new store: nothing yet.
+SELECT * FROM prolly_store_sizes();
+
+-- The journal grows with its chunks; a seal adds a segment.
+SELECT count(test_chunk_put(test_noise('size ' || g, 1000)))
+FROM generate_series(1, 20) g;
+SELECT journal_segments, journal_bytes > 20000 AS journal_holds_them,
+	table_files FROM prolly_store_sizes();
+SELECT test_chunk_seal();
+SELECT journal_segments FROM prolly_store_sizes();
+
+-- A table file of chunks received whole isn't settled.
+SELECT test_chunk_table_file(ARRAY[test_noise('received 1', 5000),
+								   test_noise('received 2', 5000)]);
+SELECT table_files, table_file_bytes > 10000 AS file_holds_them,
+	settled_files FROM prolly_store_sizes();
+
+-- A collection: nothing is named, so everything is freed (the journal's
+-- chunks, the file's), and what it wrote is settled.
+SELECT test_chunk_put('live') AS live \gset
+SELECT test_chunk_move_root(NULL, :'live');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+SELECT chunks_kept, chunks_freed, bytes_freed > 30000 AS bytes_freed,
+	window_usec >= 0 AS timed
+FROM prolly_gc();
+SELECT pg_stat_force_next_flush();
+SELECT counted('gc_collections') AS collections,
+	counted('gc_chunks_kept') AS kept, counted('gc_chunks_freed') AS freed,
+	counted('gc_bytes_freed') > 30000 AS bytes_freed, counted('gc_moves') AS moves,
+	counted('gc_window_usec') > 0 AS window_timed;
+SELECT journal_segments, table_files, settled_files,
+	settled_bytes = table_file_bytes AS all_settled FROM prolly_store_sizes();
+
+-- A full one, likewise counted.
+SELECT chunks_kept, chunks_freed FROM prolly_gc(true);
+SELECT pg_stat_force_next_flush();
+SELECT counted('gc_collections') AS collections;
+
+-- Conjoining two files into one counts once.
+SELECT test_chunk_table_file(ARRAY[test_noise('a', 100)]);
+SELECT test_chunk_table_file(ARRAY[test_noise('b', 100)]);
+SELECT table_files FROM prolly_store_sizes();
+SELECT test_chunk_conjoin();
+SELECT table_files FROM prolly_store_sizes();
+SELECT pg_stat_force_next_flush();
+SELECT counted('conjoins') AS conjoins;
+
+-- A conjoin past max_files takes no more than maintenance_work_mem holds
+-- in one pass (the first two files aside): with a file of a few chunks
+-- and three of 4,000, at 1MB (about 10,000 chunks) the small one and two
+-- of the others (unbounded, all four), leaving two files; a later pass
+-- takes the rest.
+SELECT test_chunk_conjoin();
+SELECT count(test_chunk_table_file(ARRAY(
+	SELECT convert_to(f || ' ' || g, 'UTF8') FROM generate_series(1, 4000) g)))
+FROM generate_series(1, 3) f;
+SELECT table_files FROM prolly_store_sizes();
+SET maintenance_work_mem = '1MB';
+SELECT test_chunk_conjoin(2);
+SELECT table_files FROM prolly_store_sizes();
+RESET maintenance_work_mem;
+SELECT test_chunk_conjoin(1);
+SELECT table_files FROM prolly_store_sizes();
+SELECT test_chunk_has(test_content_hash(convert_to('3 4000', 'UTF8'))) AS reads;
+
+-- A backend that hadn't read the journal reads what was appended since
+-- its last collection to index it, once, for every backend.
+SELECT count(test_chunk_put(test_noise('scan ' || g, 1000)))
+FROM generate_series(1, 10) g;
+SELECT pg_stat_force_next_flush();
+\c sizes_db
+SELECT pg_stat_reset_shared('prolly');
+SELECT test_chunk_has(test_content_hash(test_noise('scan 1', 1000))) AS found;
+SELECT test_chunk_has(test_content_hash(test_noise('scan 2', 1000))) AS found;
+SELECT pg_stat_force_next_flush();
+SELECT counted('journal_scans') AS scans,
+	counted('journal_bytes_scanned') > 10000 AS read_them;
+
+-- One that comes after finds them in the index that read made, shared by
+-- every backend: it reads nothing of the journal.
+SELECT pg_stat_reset_shared('prolly');
+\c sizes_db
+SELECT test_chunk_has(test_content_hash(test_noise('scan 3', 1000))) AS found;
+SELECT pg_stat_force_next_flush();
+SELECT counted('journal_scans') AS scans;
+
+-- Sizes are the manifest's: a backend asking doesn't read (or keep) the
+-- table files' indexes, here 100,000 chunks' (some 3 MB).
+SELECT test_chunk_table_file(ARRAY(SELECT convert_to('many ' || g, 'UTF8')
+								   FROM generate_series(1, 100000) g));
+\c sizes_db
+CREATE FUNCTION pg_temp.backend_bytes() RETURNS bigint LANGUAGE sql VOLATILE AS $$
+	SELECT sum(total_bytes)::bigint FROM pg_backend_memory_contexts
+$$;
+SELECT pg_temp.backend_bytes() AS before \gset
+SELECT table_files > 0 AS has_files FROM prolly_store_sizes();
+SELECT pg_temp.backend_bytes() - :before < 1000000 AS indexes_not_read;
+
+-- Collecting takes owning the database, as dolt_gc() does.
+CREATE ROLE sizes_stranger;
+SET ROLE sizes_stranger;
+SELECT * FROM prolly_gc();
+RESET ROLE;
+DROP ROLE sizes_stranger;
+
+\c postgres
+DROP DATABASE sizes_db;

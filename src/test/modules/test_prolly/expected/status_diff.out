@@ -10,7 +10,7 @@ INSERT INTO app.gone VALUES (1);
 SELECT length(dolt_commit('-m', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_status();
@@ -56,7 +56,7 @@ SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'STAGED', NULL::app.t)
 SELECT length(dolt_commit('-m', 'second')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_status();
@@ -124,7 +124,7 @@ UPDATE app.t SET v = 'on f' WHERE id = 1;
 SELECT length(dolt_commit('-m', 'on f', '-a')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -170,7 +170,7 @@ INSERT INTO sdd.t VALUES (1, 'one'), (2, 'two');
 SELECT length(dolt_commit('-Am', 'before the column')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE sdd.t ADD COLUMN c int DEFAULT 5;
@@ -187,7 +187,7 @@ NOTICE:  drop cascades to table sdd.t
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Names in a database whose encoding isn't UTF-8 (the canonical tree's).
@@ -201,7 +201,7 @@ INSERT INTO "appé"."tablé" VALUES (1, 'a');
 SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO "appé"."tablé" VALUES (2, 'b');
@@ -231,7 +231,7 @@ CREATE TABLE app."€" (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'two tables')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP TABLE app."я";
@@ -253,7 +253,7 @@ CREATE TABLE sdu.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- They are changes a commit can't hold: listed as not covered, and the
@@ -301,7 +301,7 @@ drop cascades to foreign table sdu.ft
 SELECT length(dolt_commit('-Am', 'sdu gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A column whose values are local OIDs (oid, a large object's reference
@@ -315,7 +315,7 @@ CREATE TABLE sdl.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'sdl')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE sdl.t ADD COLUMN doc sdl.lo;
@@ -399,7 +399,7 @@ DROP MATERIALIZED VIEW sdl.mv;
 SELECT length(dolt_commit('-Am', 'no oids')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP SCHEMA sdl CASCADE;
@@ -413,7 +413,7 @@ NOTICE:  drop cascades to type sdl_shared.oidrange
 SELECT length(dolt_commit('-Am', 'sdl gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A diff of one table reads that table's changes alone, however many
@@ -426,7 +426,7 @@ INSERT INTO sdo.other SELECT g, 'x' FROM generate_series(1, 5000) g;
 SELECT length(dolt_commit('-Am', 'sdo')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE sdo.one SET v = 'b';
@@ -470,7 +470,7 @@ drop cascades to table sdo.other
 SELECT length(dolt_commit('-Am', 'sdo gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- dolt_diff takes a table's row type; a large value, stored out of line
@@ -490,7 +490,7 @@ SELECT test_toast_pointer(big) IS NOT NULL AS out_of_line FROM sdt.t;
 SELECT length(dolt_commit('-Am', 'sdt')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE sdt.t SET big = repeat('b', 7000);
@@ -519,7 +519,7 @@ NOTICE:  drop cascades to table sdt.t
 SELECT length(dolt_commit('-Am', 'sdt gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- dolt_status lists objects other than tables that changed, by qualified
@@ -535,7 +535,7 @@ CREATE TABLE sdv.t (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'sdv')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_status;
@@ -557,7 +557,7 @@ SELECT * FROM dolt_status ORDER BY table_name;
 SELECT length(dolt_commit('-Am', 'sdv objects')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_status;
@@ -599,7 +599,7 @@ SELECT * FROM dolt_status ORDER BY table_name;
 SELECT length(dolt_commit('-Am', 'sdv gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- A head whose sequences have no values recorded (an older build's, or a
@@ -615,7 +615,7 @@ SELECT nextval('sdq.s');
 SELECT length(dolt_commit('-Am', 'sdq')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS sdq_head \gset
@@ -644,7 +644,7 @@ CREATE FUNCTION sdq.f(int) RETURNS int LANGUAGE sql AS 'SELECT 1';
 SELECT length(dolt_commit('-Am', 'sdq f')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP FUNCTION sdq.f(int);
@@ -662,7 +662,7 @@ drop cascades to function sdq.f(integer)
 SELECT length(dolt_commit('-Am', 'sdq gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP SERVER sd_srv;
@@ -800,7 +800,7 @@ SELECT dolt_checkout('main');
 SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- unborn stays so after main's first commit: still the empty root

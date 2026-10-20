@@ -7,7 +7,7 @@
  * A value TOAST moves out of line goes to the table's TOAST relation, and
  * is named by an OID pointer (VARTAG_ONDISK_OID or VARTAG_ONDISK_OID8): a
  * value ID that one row owns.  A destination names a value by content
- * instead, with a hash pointer (VARTAG_ONDISK_SHA256): any row of any table
+ * instead, with a hash pointer (VARTAG_ONDISK_BLAKE3): any row of any table
  * may hold it, and nothing deletes the value with a row.  A table's access
  * method chooses its destination; the toaster's passes are the same, a
  * value they move out going to the destination rather than to the TOAST

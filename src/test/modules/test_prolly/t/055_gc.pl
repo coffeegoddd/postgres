@@ -40,7 +40,8 @@ sub sql { return $node->safe_psql('gcdb', $_[0]); }
 my $files = q{SELECT string_agg(f || ' ' || md5(pg_read_binary_file(d || '/' || f)), E'\n' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'gcdb') db,
 		pg_ls_dir(d) f
-	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'};
+	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'
+		AND f <> 'prolly_index'};	# (each server's own cache)
 my $on_disk = q{SELECT string_agg(f, ' ' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'gcdb') db,
 		pg_ls_dir(d) f
@@ -58,7 +59,7 @@ sql("SELECT test_chunk_move_root(NULL, '$root')");
 my $dead = sql(q{SELECT test_chunk_put('dead')});
 sql(q{SELECT test_chunk_put(convert_to('dead ' || g, 'UTF8')) FROM generate_series(1, 19) g});
 my $reads = q{SELECT count(*) FROM generate_series(1, 20) g
-	WHERE test_chunk_has(encode(sha256(convert_to('live ' || g, 'UTF8')), 'hex'))};
+	WHERE test_chunk_has(test_content_hash(convert_to('live ' || g, 'UTF8')))};
 
 is(sql('SELECT kept || \' \' || freed FROM test_chunk_gc(false)'), '21 20',
 	'the live chunks kept, the dead freed');
@@ -69,7 +70,7 @@ is(sql($on_disk), sql($named), 'only the files the manifest names are left');
 # A writer running at the swap: what it names that was collected is
 # refused; what it appended before the swap is kept.
 sql("SELECT test_chunk_put('orphan')");
-my $orphan = sql(q{SELECT encode(sha256('orphan'), 'hex')});
+my $orphan = sql(q{SELECT test_content_hash('orphan')});
 my $w = $node->background_psql('gcdb', on_error_stop => 0);
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan')});
 my $g = $node->background_psql('gcdb');
@@ -83,7 +84,7 @@ $g->query_until(qr/started/, q{
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'prolly-gc-sealed'}) or die 'the collection did not stop';
 my $early = $w->query_safe(qq{SELECT test_chunk_put('written before the swap')});
-$w->query_safe(qq{SELECT test_chunk_put(convert_to(repeat('w', 1048576), 'UTF8'))});
+$w->query_safe(qq{SELECT test_chunk_put(test_noise('w', 1048576))});
 sql(q{SELECT injection_points_wakeup('prolly-gc-sealed')});
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
@@ -99,7 +100,7 @@ is(has($early), 't', 'what a writer appended between the seal and the swap is ke
 # The same for a hash a chunk holds otherwise (a commit's parent, a head):
 # found in what the swap dropped.
 sql("SELECT test_chunk_put('orphan 2')");
-my $orphan2 = sql(q{SELECT encode(sha256('orphan 2'), 'hex')});
+my $orphan2 = sql(q{SELECT test_content_hash('orphan 2')});
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan2')});
 $g = $node->background_psql('gcdb');
 $g->query_until(qr/started/, q{
@@ -109,7 +110,7 @@ $g->query_until(qr/started/, q{
 });
 $node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
 	WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
-$w->query(qq{SELECT test_chunk_put('\\x0120'::bytea || '\\x20'::bytea || decode('$orphan2', 'hex')); COMMIT});
+$w->query(qq{SELECT test_chunk_put('\\x0120'::bytea || '\\x14'::bytea || decode('$orphan2', 'hex')); COMMIT});
 like($w->{stderr}, qr/a chunk it names was collected while the transaction ran/,
 	'a writer naming it in a chunk\'s bytes is refused');
 like($w->{stderr}, qr/40001|serializ|Try the transaction again/i, 'to be retried');
@@ -120,7 +121,7 @@ $g->quit;
 # A root moved to (an older one, say), that a swap since the transaction
 # began dropped, is refused, though the transaction puts nothing.
 sql("SELECT test_chunk_put('orphan root')");
-my $orphan3 = sql(q{SELECT encode(sha256('orphan root'), 'hex')});
+my $orphan3 = sql(q{SELECT test_content_hash('orphan root')});
 $w->query_safe(qq{BEGIN; SELECT test_chunk_has('$orphan3')});
 $g = $node->background_psql('gcdb');
 $g->query_until(qr/started/, q{
@@ -231,8 +232,8 @@ ok($standby->poll_query_until('gcdb',
 eval { $s->quit; };	# (the conflict ended its session)
 is($standby->safe_psql('gcdb', $reads), '20', 'and a new one reads the new files');
 
-# A crash at each step of a collection leaves the store whole; the next
-# collection removes what it left.
+# A crash at each step of a collection leaves the store whole; the end of
+# recovery removes what it left, before anyone reads the store.
 for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 	'prolly-gc-swapped', 'prolly-gc-retire')
 {
@@ -249,6 +250,11 @@ for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 	$node->stop('immediate');
 	eval { $c->quit; };
 	$node->start;
+	is(sql($on_disk), sql($named), "a crash at $point: recovery leaves only what is named");
+	is(sql(q{SELECT count(*) FROM (SELECT 'base/' || oid AS d FROM pg_database
+		WHERE datname = 'gcdb') db, pg_ls_dir(d) f
+		WHERE f LIKE 'prolly\_gc\_dropped\_%' OR f = 'prolly_manifest.tmp'}), '0',
+		"a crash at $point: and no dropped list or manifest written aside");
 	is(sql($reads), '20', "a crash at $point: the live chunks read");
 	is(sql('SELECT test_chunk_root()'), $root, "a crash at $point: the root");
 	sql('SELECT test_chunk_gc(false)');
@@ -304,6 +310,38 @@ $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 is($standby->safe_psql('gcdb', $files), sql($files),
 	'the standby\'s files are the primary\'s after it all');
 
+# A crash as a store's first table file is written, before any manifest
+# (and with no journal): recovery removes the file no manifest names, in
+# a directory that holds it alone.
+$node->safe_psql('postgres', 'CREATE DATABASE first_file');
+$node->safe_psql('first_file',
+	'CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points');
+my $ff = $node->data_dir . '/base/'
+  . $node->safe_psql('postgres',
+	q{SELECT oid FROM pg_database WHERE datname = 'first_file'});
+my $store_files = sub {
+	opendir(my $dh, $ff) or die "opendir $ff: $!";
+	my @f = sort grep { /^prolly_/ } readdir($dh);
+	closedir($dh);
+	return join(' ', @f);
+};
+is($store_files->(), '', 'a new database has no store files');
+my $writer = $node->background_psql('first_file');
+$writer->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-table-file-written', 'wait')});
+$writer->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_table_file(ARRAY['first file'::bytea]);
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-table-file-written'})
+  or die 'the writer did not wait';
+like($store_files->(), qr/^prolly_table_\S+$/, 'the file written, alone');
 $standby->stop;
+$node->stop('immediate');
+$writer->{run}->finish;
+$node->start;
+is($store_files->(), '', 'recovery removes it');
+
 $node->stop;
 done_testing();

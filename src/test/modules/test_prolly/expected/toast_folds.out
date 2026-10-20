@@ -87,7 +87,7 @@ FROM tf.by_content \gset
 SELECT length(dolt_commit('-Am', 'folds')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DELETE FROM tf.by_content;

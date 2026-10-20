@@ -1030,6 +1030,12 @@ log_walk(const ProllyTreeEnv *env, const ProllyValue *state,
 {
 }
 
+/* (a log's state names no chunk) */
+static void
+log_state_refs(const ProllyValue *state, StringInfo refs)
+{
+}
+
 static void
 log_counters(ProllyChangeCounters *out, bool reset)
 {
@@ -1073,4 +1079,5 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.walk = log_walk,
 	.counters = log_counters,
 	.fold_rows = log_fold_rows,
+	.state_refs = log_state_refs,
 };

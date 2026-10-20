@@ -26,7 +26,7 @@ ALTER TYPE eh.mood RENAME VALUE 'sad' TO 'blue';
 SELECT length(dolt_commit('-Am', 'rename')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- Typed diffs use the current row type, including its current enum labels.
@@ -63,7 +63,7 @@ INSERT INTO eh.l VALUES ('sad');
 SELECT length(dolt_commit('-am', 'old writer')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -154,7 +154,7 @@ UPDATE eh.t SET m = 'ok' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'ours edit')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('old_writer');
@@ -167,7 +167,7 @@ UPDATE eh.t SET m = 'happy' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'theirs edit')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -226,7 +226,7 @@ SELECT * FROM dolt_status();
 SELECT length(dolt_commit('-Am', 'addition')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) AS changed FROM dolt_diff(:'add_base', 'HEAD', NULL::eh.adds);
@@ -244,7 +244,7 @@ ALTER TYPE eh."odd type" RENAME VALUE E'a\tb' TO E'q\n''u';
 SELECT length(dolt_commit('-Am', 'renamed odd label')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) AS changed FROM dolt_diff(:'odd_base', 'HEAD', NULL::eh.odd);
@@ -270,7 +270,7 @@ ALTER TYPE eh.amb ADD VALUE 'y';
 SELECT length(dolt_commit('-Am', 'rename and add')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) FROM dolt_diff(:'amb_base', 'HEAD', NULL::eh.ambiguous);
@@ -287,7 +287,7 @@ INSERT INTO eh.ambiguous VALUES (2, 'b');
 SELECT length(dolt_commit('-am', 'ambiguous writer')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -335,7 +335,7 @@ ALTER TYPE eh.reused RENAME VALUE 'tmp' TO 'b';
 SELECT length(dolt_commit('-Am', 'swapped names')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) FROM dolt_diff(:'reuse_base', 'HEAD', NULL::eh.reuse);
@@ -354,7 +354,7 @@ ALTER TYPE eh.container DROP ATTRIBUTE n CASCADE;
 SELECT length(dolt_commit('-Am', 'container changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) FROM dolt_diff(:'container_base', 'HEAD', NULL::eh.contained);
@@ -370,7 +370,7 @@ ALTER TYPE eh.range_enum RENAME VALUE 'a' TO 'x';
 SELECT length(dolt_commit('-Am', 'range enum changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT count(*) FROM dolt_diff(:'range_base', 'HEAD', NULL::eh.ranged);
@@ -384,7 +384,7 @@ INSERT INTO eh.dropped VALUES ('a', 1);
 SELECT length(dolt_commit('-Am', 'drop base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('drop_writer');
@@ -397,7 +397,7 @@ ALTER TYPE eh.drop_enum RENAME VALUE 'a' TO 'x';
 SELECT length(dolt_commit('-Am', 'drop rename')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('drop_writer');
@@ -410,7 +410,7 @@ ALTER TABLE eh.dropped DROP COLUMN v;
 SELECT length(dolt_commit('-Am', 'drop column')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');

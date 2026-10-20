@@ -26,6 +26,7 @@
 #include "postgres.h"
 
 #include "access/prolly_config.h"
+#include "access/prolly_seen.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "catalog/branch.h"
@@ -267,7 +268,13 @@ static const ProllyRemoteRoutine spool_remote = {
  * ------------------------------------------------------------------------
  */
 
-/* dolt_serve_format() returns text: the canonical format of the commits. */
+/*
+ * dolt_serve_format() returns text: the canonical format of the commits,
+ * then how this server sends and takes chunks: PROLLY_SERVE_FRAMED (as
+ * stored, framed), and PROLLY_SERVE_LZ4 if it can decompress what is sent
+ * it.  A client of another build, which reads the format before anything
+ * else, refuses a server that doesn't say it frames.
+ */
 Datum
 dolt_serve_format(PG_FUNCTION_ARGS)
 {
@@ -278,6 +285,10 @@ dolt_serve_format(PG_FUNCTION_ARGS)
 	prolly_database_components(&dc);
 	initStringInfo(&f);
 	PROLLY_CALL(dc.canonicalizer, format, &f);
+	appendStringInfoString(&f, PROLLY_SERVE_FRAMED);
+#ifdef USE_LZ4
+	appendStringInfoString(&f, PROLLY_SERVE_LZ4);
+#endif
 	PG_RETURN_TEXT_P(cstring_to_text(f.data));
 }
 
@@ -340,7 +351,8 @@ dolt_serve_has(PG_FUNCTION_ARGS)
 
 /*
  * dolt_serve_get(hashes bytea[], OUT hash bytea, OUT chunk bytea) returns
- * setof record: the chunks the store has of those, each with its hash.
+ * setof record: the chunks the store has of those, as stored (framed),
+ * each with its hash.
  */
 Datum
 dolt_serve_get(PG_FUNCTION_ARGS)
@@ -361,7 +373,7 @@ dolt_serve_get(PG_FUNCTION_ARGS)
 		bool		nulls[2] = {0};
 
 		resetStringInfo(&data);
-		if (!PROLLY_CALL(prolly_chunk_store(), get, cs, &hashes[i], &data))
+		if (!prolly_chunk_get_stored(prolly_chunk_store(), cs, &hashes[i], &data))
 			continue;
 		values[0] = PointerGetDatum(hash_bytea(&hashes[i]));
 		values[1] = PointerGetDatum(bytes_bytea(data.data, data.len));
@@ -371,12 +383,123 @@ dolt_serve_get(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * dolt_serve_files(OUT key text, OUT chunks int4, OUT bytes int8, OUT
+ * journal bool) returns setof record: the store's table files, which a
+ * clone copies whole, and its journal (key "journal", read as one file).
+ */
+typedef struct ServedFiles
+{
+	ReturnSetInfo *rsinfo;
+	uint64		journal_chunks;
+	uint64		journal_bytes;
+} ServedFiles;
+
+static void
+served_file(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	ServedFiles *sf = arg;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = Int32GetDatum(nchunks);
+	values[2] = Int64GetDatum((int64) size);
+	values[3] = BoolGetDatum(false);
+	tuplestore_putvalues(sf->rsinfo->setResult, sf->rsinfo->setDesc, values, nulls);
+}
+
+static void
+served_segment(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	ServedFiles *sf = arg;
+
+	sf->journal_chunks += nchunks;
+	sf->journal_bytes += size;
+}
+
+Datum
+dolt_serve_files(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyChunkStoreRoutine *csr = prolly_chunk_store();
+	ProllyChunkStore *cs = store();
+	ServedFiles sf = {rsinfo, 0, 0};
+
+	check_serving(false);
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_HAS(csr, file_chunks))
+		return (Datum) 0;
+	PROLLY_CALL(csr, table_files, cs, served_file, &sf);
+	PROLLY_CALL(csr, segments, cs, true, served_segment, &sf);
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+
+		values[0] = CStringGetTextDatum("journal");
+		values[1] = Int32GetDatum((int32) Min(sf.journal_chunks, PG_INT32_MAX));
+		values[2] = Int64GetDatum((int64) sf.journal_bytes);
+		values[3] = BoolGetDatum(true);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+typedef struct ServedChunks
+{
+	ReturnSetInfo *rsinfo;
+} ServedChunks;
+
+static void
+served_chunk(const ProllyHash *hash, const char *frame, Size len, void *arg)
+{
+	ServedChunks *sc = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = PointerGetDatum(hash_bytea(hash));
+	/* (to a client that can't decompress, plain, as get_stored sends) */
+	if (prolly_serve_uncompressed)
+	{
+		StringInfoData plain;
+
+		initStringInfo(&plain);
+		prolly_chunk_frame_plain(frame, len, &plain);
+		values[1] = PointerGetDatum(bytes_bytea(plain.data, plain.len));
+		pfree(plain.data);
+	}
+	else
+		values[1] = PointerGetDatum(bytes_bytea(frame, (int) len));
+	tuplestore_putvalues(sc->rsinfo->setResult, sc->rsinfo->setDesc, values, nulls);
+	pfree(DatumGetPointer(values[0]));
+	pfree(DatumGetPointer(values[1]));
+}
+
+/*
+ * dolt_serve_file_chunks(key text, OUT hash bytea, OUT chunk bytea) returns
+ * setof record: the chunks of the file dolt_serve_files() names key, as
+ * stored (framed), in its order.
+ */
+Datum
+dolt_serve_file_chunks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *key = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ServedChunks sc = {rsinfo};
+
+	check_serving(false);
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(prolly_chunk_store(), file_chunks, store(),
+				strcmp(key, "journal") == 0 ? NULL : key, served_chunk, &sc);
+	return (Datum) 0;
+}
+
 /* What dolt_serve_since() sends: each chunk once. */
 typedef struct Since
 {
 	ReturnSetInfo *rsinfo;
 	ProllyChunkStore *store;
-	HTAB	   *sent;
+	ProllySeen *sent;
 	StringInfoData data;
 } Since;
 
@@ -384,16 +507,14 @@ static bool
 send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	Since	   *sn = arg;
-	ProllyHash	key = prolly_hash_key(&node->hash);
-	bool		found;
 	Datum		values[2];
 	bool		nulls[2] = {0};
 
-	(void) hash_search(sn->sent, &key, HASH_ENTER, &found);
-	if (found)
+	if (!prolly_seen_enter(sn->sent, &node->hash, NULL))
 		return false;
 	resetStringInfo(&sn->data);
-	if (!PROLLY_CALL(prolly_chunk_store(), get, sn->store, &node->hash, &sn->data))
+	if (!prolly_chunk_get_stored(prolly_chunk_store(), sn->store, &node->hash,
+								 &sn->data))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("chunk %s is missing from the chunk store",
@@ -585,10 +706,8 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 	sn.store = store();
 	initStringInfo(&sn.data);
 	ctl.keysize = sizeof(ProllyHash);
-	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
-	sn.sent = hash_create("prolly chunks sent since", 1024, &ctl,
-						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	sn.sent = prolly_seen_create("prolly chunks sent since", 0, 0);
 	ctl.entrysize = sizeof(SinceCommit);
 	sw.commits = hash_create("prolly commits since", 64, &ctl,
 							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
@@ -638,12 +757,15 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(per_commit);
 	}
+	/* (its file, if it spilled, closed: the portal outlives the walk) */
+	prolly_seen_destroy(sn.sent);
 	return (Datum) 0;
 }
 
 /*
  * dolt_serve_receive(hashes bytea[], chunks bytea[]) returns void: chunks
- * a push sends, kept for dolt_serve_move_head() in the same transaction.
+ * a push sends, as stored (framed), kept for dolt_serve_move_head() in the
+ * same transaction.
  */
 Datum
 dolt_serve_receive(PG_FUNCTION_ARGS)
@@ -692,20 +814,28 @@ dolt_serve_receive(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* A chunk the push sent, checked against its address. */
+/* A chunk the push sent, as stored, decoded and checked against its address. */
 static void
 check_sent(const ProllyHash *hash)
 {
-	const ProllyHashRoutine *hr = prolly_hash_lookup("sha256");
+	const ProllyHashRoutine *hr = prolly_content_hash();
+	StringInfoData frame;
 	StringInfoData data;
 	ProllyHashCtx *ctx;
 	ProllyHash	actual;
 
+	initStringInfo(&frame);
 	initStringInfo(&data);
-	if (!spool_get(NULL, hash, &data))
+	if (!spool_get(NULL, hash, &frame))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the push didn't send commit %s", prolly_hash_hex(hash))));
+	if (!prolly_chunk_unframe(frame.data, frame.len, &data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	pfree(frame.data);
 	ctx = PROLLY_CALL(hr, begin, CurrentMemoryContext);
 	PROLLY_CALL(hr, update, ctx, (const uint8 *) data.data, data.len);
 	PROLLY_CALL(hr, finish, ctx, &actual);
@@ -765,11 +895,19 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 				 errhint("Only the database's owner pushes to a protected branch.")));
 	initStringInfo(&mine);
 	PROLLY_CALL(dc.canonicalizer, format, &mine);
-	if (strcmp(text_to_cstring(PG_GETARG_TEXT_PP(3)), mine.data) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("this database holds commits of canonical format %s, not %s",
-						mine.data, text_to_cstring(PG_GETARG_TEXT_PP(3)))));
+	{
+		/* (the canonical format, as dolt_serve_format() gives it too) */
+		char	   *theirs = text_to_cstring(PG_GETARG_TEXT_PP(3));
+		char	   *framed = strstr(theirs, PROLLY_SERVE_FRAMED);
+
+		if (framed != NULL)
+			*framed = '\0';
+		if (strcmp(theirs, mine.data) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this database holds commits of canonical format %s, not %s",
+							mine.data, theirs)));
+	}
 	/*
 	 * (a branch already elsewhere than expected: false before anything is
 	 * received, as the move would say after)

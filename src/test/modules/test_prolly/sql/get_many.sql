@@ -1,0 +1,95 @@
+-- Reading chunks together: get_many() finds every chunk first, then reads
+-- each file in offset order, reads close together made as one; a walk, and
+-- a read of a long value, tell the store what they read next (prefetch()),
+-- which it reads that way, ahead of them; and a collection copies each file
+-- in the order its bytes are in.  pg_stat_prolly's chunk_file_reads counts
+-- the reads.
+\c postgres
+CREATE DATABASE many_db;
+\c many_db
+CREATE EXTENSION test_prolly;
+CREATE FUNCTION counted(name text) RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE pg_stat_prolly.name = counted.name
+$$;
+-- (the counts as a backend's statements flush them)
+\set reset 'SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly'');'
+\set flush 'SELECT pg_stat_force_next_flush();'
+
+-- 50 chunks in the journal, 20 in a table file, in a hash order of their
+-- own.
+CREATE TABLE chunks AS
+SELECT 'j' || g AS name, test_noise('journal ' || g, 1000) AS data
+FROM generate_series(1, 50) g
+UNION ALL
+SELECT 't' || g, test_noise('table ' || g, 1000) FROM generate_series(1, 20) g;
+SELECT count(test_chunk_put(data)) FROM chunks WHERE name LIKE 'j%';
+SELECT test_chunk_table_file(array_agg(data)) FROM chunks WHERE name LIKE 't%';
+CREATE TABLE wanted AS
+SELECT row_number() OVER (ORDER BY md5(name)) AS i, name, data,
+	test_content_hash(data) AS hash
+FROM chunks
+UNION ALL
+SELECT 71, 'missing', NULL, test_content_hash('not stored');
+
+-- Each answered once, with its own bytes, the missing one with none.
+\c many_db
+SELECT count(*) AS answered, bool_and(visits = 1) AS once,
+	bool_and(g.data IS NOT DISTINCT FROM w.data) AS bytes
+FROM test_chunk_get_many((SELECT array_agg(hash ORDER BY i) FROM wanted)) g
+JOIN wanted w USING (i);
+-- The same chunk asked for twice, from the journal and from the file:
+-- each request answered, with its bytes.
+SELECT count(*) AS answered, bool_and(g.data = w.data) AS bytes
+FROM test_chunk_get_many((SELECT array_agg(hash ORDER BY name)
+						  FROM wanted WHERE name IN ('j1', 't1'))
+						 || (SELECT array_agg(hash ORDER BY name)
+							 FROM wanted WHERE name IN ('j1', 't1'))) g
+JOIN wanted w ON w.name = CASE WHEN g.i % 2 = 1 THEN 'j1' ELSE 't1' END;
+
+-- In a few reads: the journal's 50 and the file's 20 together, not one a
+-- chunk.
+\c many_db
+:reset
+SELECT count(*) FROM test_chunk_get_many((SELECT array_agg(hash ORDER BY i) FROM wanted));
+:flush
+SELECT counted('chunk_file_reads') BETWEEN 1 AND 6 AS few_reads;
+-- One at a time, a read each.
+\c many_db
+:reset
+SELECT count(test_chunk_get(hash)) FROM wanted;
+:flush
+SELECT counted('chunk_file_reads') >= 70 AS a_read_each;
+
+-- The transaction's own chunks, still pending, too.
+BEGIN;
+SELECT test_chunk_put('pending one') AS pending \gset
+SELECT g.data = 'pending one'::bytea AS pending_read
+FROM test_chunk_get_many(ARRAY[:'pending']) g;
+ROLLBACK;
+
+-- A long value stored by content, read whole: its tree's 4 MB of leaves
+-- (about a thousand) read together, in a few dozen reads.
+CREATE SCHEMA vm VERSIONED;
+CREATE TABLE vm.blobs (id int PRIMARY KEY, b bytea STORAGE EXTERNAL);
+INSERT INTO vm.blobs VALUES (1, test_noise('a long value', 4000000));
+\c many_db
+:reset
+SELECT md5(b) = md5(test_noise('a long value', 4000000)) AS whole FROM vm.blobs;
+:flush
+SELECT counted('chunk_file_reads') < 100 AS few_reads;
+
+-- A collection copies the table file's chunks in the order they are in
+-- it, a window at a time: fewer reads than the 21 it marks (a read each)
+-- and the 20 it copies.
+SELECT test_chunk_put_node(1, (SELECT array_agg(hash) FROM wanted WHERE name LIKE 't%'))
+	AS root \gset
+SELECT test_chunk_move_root(NULL, :'root');
+\c many_db
+:reset
+SELECT kept FROM test_chunk_gc(true);
+:flush
+SELECT counted('chunk_file_reads') < 30 AS copied_together;
+SELECT count(*) AS kept FROM wanted WHERE name LIKE 't%' AND test_chunk_has(hash);
+
+\c postgres
+DROP DATABASE many_db;

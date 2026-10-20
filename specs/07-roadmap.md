@@ -681,7 +681,9 @@ by byte counts are spec 14's B2 (#218), and content-addressed TOAST
 pointers, the next step for large values, are its C
 (`14-large-values-and-toast.md` part 6, #181).
 
-**Status (2026-10-14): 4f.2 built.** `prolly_gc()` reclaims the node
+**Status (2026-10-14): 4f.2 built.** `prolly_gc()` (this one since
+removed with the node store; the name is now the chunk store's
+collection, spec 22's item 13) reclaims the node
 store's unreachable nodes (question 49; decided: explicit, as `dolt gc`).
 A new reclamation implementation, `mark_sweep`, marks every node reachable
 from a root the commit pipeline holds (its new `live_roots`: every

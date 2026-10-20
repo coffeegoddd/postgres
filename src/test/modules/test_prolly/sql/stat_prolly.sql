@@ -21,17 +21,22 @@ SELECT name, value FROM pg_stat_prolly WHERE value <> 0;
 INSERT INTO sp.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-m', '1000 rows')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
--- (the block map's bytes in blocks, whatever the block size)
+-- (the block map's bytes in blocks, whatever the block size; the journal's
+-- bytes depend on whether the server compresses its chunks, below)
 SELECT name, CASE WHEN name LIKE 'bmap\_%' THEN value / current_setting('block_size')::bigint
 	ELSE value END AS value
-FROM pg_stat_prolly;
+FROM pg_stat_prolly
+WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bytes_hashed') >=
 	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS each_chunk_hashed;
--- The journal holds each chunk with its record's framing, and the root.
-SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') >
-	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended') AS journal_frames_chunks;
+-- The journal holds each chunk with its record's framing, and the root:
+-- compressed, fewer bytes than the chunks, where the server has LZ4.
+SELECT ((SELECT value FROM pg_stat_prolly WHERE name = 'journal_bytes_written') <
+	(SELECT value FROM pg_stat_prolly WHERE name = 'chunk_bytes_appended')) =
+	(SELECT 'lz4' = ANY(enumvals) FROM pg_settings
+	 WHERE name = 'default_toast_compression') AS journal_compressed_with_lz4;
 
 -- One row changed: the fold reads the one row the change log names, and
 -- writes it.  No page is kept as the last fold saw it, so none is copied.
@@ -45,7 +50,10 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
 			   'page_copies_fold', 'page_copies_shared');
 
 -- The same commit again, in a database just like it: the same counts.
-SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly \gset
+-- (but the journal's bytes: compressed, a commit's, which holds its time,
+-- may take a byte more or less)
+SELECT json_object_agg(name, value) AS first FROM pg_stat_prolly
+WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned') \gset
 \c :home
 CREATE DATABASE stat_prolly_again;
 \c stat_prolly_again
@@ -60,7 +68,12 @@ SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
 SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
-SELECT array_agg(value ORDER BY name) = :'first' AS same_counts FROM pg_stat_prolly;
+-- (any that differ, with both counts; not the journal's bytes, which
+-- depend on how its chunks compress, as commit ids and times differ)
+SELECT name, value, (:'first'::json ->> name)::bigint AS first
+FROM pg_stat_prolly
+WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint
+	AND name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
 
 -- Per database: the other's work isn't counted here.
 \c stat_prolly

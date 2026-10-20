@@ -9,7 +9,7 @@ CREATE TABLE ud.t (id int PRIMARY KEY, a int, b int);
 SELECT length(dolt_commit('-Am', 'table')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE OPERATOR ud.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = int4eq);
@@ -139,6 +139,6 @@ NOTICE:  drop cascades to table ud.t
 SELECT length(dolt_commit('-Am', 'ud gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 

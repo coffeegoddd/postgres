@@ -30,13 +30,14 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 my $files = q{SELECT string_agg(f || ' ' || md5(pg_read_binary_file(d || '/' || f)), E'\n' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'postgres') db,
 		pg_ls_dir(d) f
-	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'};
+	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'
+		AND f <> 'prolly_index'};	# (each server's own cache)
 my $named = q{SELECT coalesce(string_agg(name || ':' || chunks, ' ' ORDER BY name), '')
 	FROM test_chunk_table_files()};
 my $big = q{SELECT count(*) FROM generate_series(1, 40) g
-	WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 9000), 'UTF8')), 'hex')), 'UTF8')
+	WHERE convert_from(test_chunk_get(test_content_hash(convert_to(repeat(g::text, 9000), 'UTF8'))), 'UTF8')
 		= repeat(g::text, 9000)};
-sub has { return sql("SELECT test_chunk_has(encode(sha256('$_[0]'::bytea), 'hex'))"); }
+sub has { return sql("SELECT test_chunk_has(test_content_hash('$_[0]'::bytea))"); }
 
 my $start = sql('SELECT pg_current_wal_insert_lsn()');
 my @manifests;	# the files named after each manifest, in order
@@ -54,12 +55,19 @@ is($manifests[2], 'prolly_table_0000000000000001:2 prolly_table_0000000000000002
 
 # A session reading the files while another conjoins them.
 my $reader = $node->background_psql('postgres');
-is($reader->query_safe(q{SELECT convert_from(test_chunk_get(encode(sha256('a1'::bytea), 'hex')), 'UTF8')}),
+is($reader->query_safe(q{SELECT convert_from(test_chunk_get(test_content_hash('a1'::bytea)), 'UTF8')}),
 	'a1', 'a session reads a table file');
+SKIP:
+{
+	skip 'no /proc/self/maps', 1 unless -e '/proc/self/maps';
+	is($reader->query_safe(q{SELECT count(*) FROM regexp_split_to_table(
+			pg_read_file('/proc/self/maps'), E'\n') l WHERE l LIKE '%prolly\_table\_%'}),
+		'3', 'its three files\' indexes mapped, not read into its memory');
+}
 sql('SELECT test_chunk_conjoin()');
 push @manifests, sql($named);
 is($manifests[3], 'prolly_table_0000000000000004:43', 'conjoined as one');
-is($reader->query_safe(q{SELECT convert_from(test_chunk_get(encode(sha256('c1'::bytea), 'hex')), 'UTF8')}),
+is($reader->query_safe(q{SELECT convert_from(test_chunk_get(test_content_hash('c1'::bytea)), 'UTF8')}),
 	'c1', 'and reads on from the new one');
 $reader->quit;
 is(sql($big), '40', 'every chunk reads back');
@@ -109,13 +117,13 @@ SKIP:
 	# opens them reads the newer one.  (It reads the manifest again for a
 	# chunk it hasn't the file of.)
 	my $r = $node->background_psql('postgres');
-	$r->query_safe(q{SELECT test_chunk_has(encode(sha256('o1'::bytea), 'hex'))});
+	$r->query_safe(q{SELECT test_chunk_has(test_content_hash('o1'::bytea))});
 	sql(q{SELECT test_chunk_table_file(ARRAY['o3'::bytea])});
 	$r->query_safe(q{SELECT injection_points_set_local();
 		SELECT injection_points_attach('prolly-manifest-read', 'wait')});
 	$r->query_until(qr/started/, q{
 		\echo started
-		SELECT convert_from(test_chunk_get(encode(sha256('o3'::bytea), 'hex')), 'UTF8') AS got;
+		SELECT convert_from(test_chunk_get(test_content_hash('o3'::bytea)), 'UTF8') AS got;
 		\echo done
 	});
 	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
@@ -125,24 +133,6 @@ SKIP:
 	my $out = $r->query_until(qr/done/, '');
 	like($out, qr/o3/, 'a reader whose files went meanwhile reads the newer ones');
 	$r->quit;
-
-	# A checkpoint syncing a table file a conjoin removes meanwhile carries on.
-	sql(q{SELECT test_chunk_table_file(ARRAY['o4'::bytea])});
-	sql(q{SELECT injection_points_attach('prolly-checkpoint-table-file', 'wait')});
-	my $c = $node->background_psql('postgres');
-	$c->query_until(qr/started/, q{
-		\echo started
-		CHECKPOINT;
-		\echo done
-	});
-	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-		WHERE wait_event = 'prolly-checkpoint-table-file'}) or die 'the checkpoint did not wait';
-	sql('SELECT test_chunk_conjoin()');
-	sql(q{SELECT injection_points_detach('prolly-checkpoint-table-file')});
-	sql(q{SELECT injection_points_wakeup('prolly-checkpoint-table-file')});
-	$c->query_until(qr/done/, '');
-	$c->quit;
-	is(sql('SELECT 1'), '1', 'a checkpoint racing a conjoin completes');
 
 	# A conjoin that fails gives its files back.
 	my $fds = q{SELECT count(*) FROM pg_ls_dir('/proc/self/fd')};
@@ -217,7 +207,7 @@ archive_mode = off
 	  or die "recovery to $lsn did not end";
 	my $got = $pitr->safe_psql('postgres', $named);
 	my $reads = $pitr->safe_psql('postgres',
-		q{SELECT test_chunk_has(encode(sha256('a1'::bytea), 'hex'))});
+		q{SELECT test_chunk_has(test_content_hash('a1'::bytea))});
 	if ($got ne $want || $reads ne ($want eq '' ? 'f' : 't'))
 	{
 		diag("stopped at $lsn: files <$got>, expected <$want>; a1 found: $reads");

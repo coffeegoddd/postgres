@@ -6962,6 +6962,14 @@ StartupXLOG(void)
 		ShutdownRecoveryTransactionEnvironment();
 
 	/*
+	 * After crash recovery (not archive recovery, where hot standby readers
+	 * may still read what a store retires), the chunk stores remove what the
+	 * crash left, before connections are let in.
+	 */
+	if (performedWalRecovery && !ArchiveRecoveryRequested)
+		ProllyCrashRecovered();
+
+	/*
 	 * If there were cascading standby servers connected to us, nudge any wal
 	 * sender processes to notice that we've been promoted.
 	 */

@@ -24,7 +24,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 
@@ -170,7 +170,7 @@ SELECT dolt_branch('-D', 'rc');
 SELECT test_walk_commit_count(dolt_hashof('main')) > 0 AS walks_a_commit;
 SELECT test_walk_commit_count(tree) AS not_a_commit
   FROM test_fold_trees() WHERE name = 'rm.t';
-SELECT test_walk_commit_count(encode(sha256('no such commit'::bytea), 'hex'));
+SELECT test_walk_commit_count(test_content_hash('no such commit'::bytea));
 
 -- a long history pushed and fetched: walked a commit at a time, each
 -- once, however long
@@ -197,7 +197,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 SELECT pg_temp.err($$SELECT dolt_fetch()$$);
@@ -209,7 +209,7 @@ SELECT dolt_fetch('origin', 'main');
 SELECT dolt_remote('add', 'bad', :'url_bad');
 SELECT test_chunk_get(dolt_hashof('main')) AS commit_bytes \gset
 SELECT test_remote_put(:'url_bad', dolt_hashof('main'), :'commit_bytes');
-SELECT encode(sha256('not a commit'::bytea), 'hex') AS fake \gset
+SELECT test_content_hash('not a commit'::bytea) AS fake \gset
 SELECT test_remote_set_head(:'url_bad', 'main', dolt_hashof('main'), :'fmt');
 
 -- (fetched into a third database, which has none of the chunks)
@@ -223,7 +223,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 SELECT dolt_remote('add', 'bad', :'url_bad');
@@ -250,7 +250,7 @@ BEGIN
 	EXECUTE q;
 	RETURN 'no error';
 EXCEPTION WHEN OTHERS THEN
-	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{64}', '<hash>', 'g'),
+	RETURN regexp_replace(regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>', 'g'),
 						  '"/[^"]*"', '"<dir>"', 'g');
 END $$;
 CREATE ROLE regress_remote_user;

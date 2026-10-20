@@ -37,7 +37,7 @@ is(sql("SELECT test_chunk_has('$h1')"), 'f', 'others don\'t, before it commits')
 $a->query_safe('COMMIT');
 is(sql("SELECT convert_from(test_chunk_get('$h1'), 'UTF8')"), 'one', 'and do after');
 sql(q{BEGIN; SELECT test_chunk_put('aborted'); ROLLBACK});
-is(sql(q{SELECT test_chunk_has(encode(sha256('aborted'), 'hex'))}), 'f',
+is(sql(q{SELECT test_chunk_has(test_content_hash('aborted'))}), 'f',
 	'an aborted transaction\'s chunk is gone');
 is(sql("SELECT test_chunk_put('one')"), $h1, 'putting a chunk again names it the same');
 
@@ -45,8 +45,8 @@ is(sql("SELECT test_chunk_put('one')"), $h1, 'putting a chunk again names it the
 # commits (a batch, past a megabyte): others don't find them meanwhile.
 # One putting the same chunk then writes its own copy, which is found once
 # it commits, whatever becomes of the first.
-my $batch = q{convert_to(repeat('x', 1048576), 'UTF8')};
-my $hbig = sql("SELECT encode(sha256($batch), 'hex')");
+my $batch = q{test_noise('x', 1048576)};
+my $hbig = sql("SELECT test_content_hash($batch)");
 $a->query_safe("BEGIN; SELECT test_chunk_put($batch)");
 is(sql("SELECT test_chunk_has('$hbig')"), 'f',
 	'others don\'t find a chunk written in a batch, before it commits');
@@ -56,7 +56,7 @@ $a->query_safe('ROLLBACK');
 is(sql("SELECT length(test_chunk_get('$hbig'))"), '1048576',
 	'and still, the first one\'s transaction rolled back');
 $a->query_safe("BEGIN; SELECT test_chunk_put($batch || '\\x01'::bytea)");
-my $hbig1 = sql("SELECT encode(sha256($batch || '\\x01'::bytea), 'hex')");
+my $hbig1 = sql("SELECT test_content_hash($batch || '\\x01'::bytea)");
 is(sql("SELECT test_chunk_has('$hbig1')"), 'f', 'another batch, before its commit');
 $a->query_safe('COMMIT');
 is(sql("SELECT test_chunk_has('$hbig1')"), 't', 'and found after');
@@ -109,17 +109,17 @@ is(sql('SELECT test_chunk_root()'), $h2, 'a released savepoint\'s move commits')
 # Many chunks, more than one append's worth, with a move.
 my $big = sql(q{
 	BEGIN;
-	SELECT count(test_chunk_put(convert_to(repeat(g::text, 20000), 'UTF8')))
+	SELECT count(test_chunk_put(test_noise(g::text, 20000)))
 	  FROM generate_series(1, 120) g;
 	SELECT test_chunk_move_root(test_chunk_root(),
-		test_chunk_put(convert_to(repeat('120', 20000), 'UTF8')));
+		test_chunk_put(test_noise('120', 20000)));
 	COMMIT;
 });
 my $bigroot = sql('SELECT test_chunk_root()');
 push @moves, $bigroot;
 my $all = q{SELECT count(*) FROM generate_series(1, 120) g
-	WHERE convert_from(test_chunk_get(encode(sha256(convert_to(repeat(g::text, 20000),
-		'UTF8')), 'hex')), 'UTF8') = repeat(g::text, 20000)};
+	WHERE test_chunk_get(test_content_hash(test_noise(g::text, 20000)))
+		= test_noise(g::text, 20000)};
 is(sql($all), '120', 'every chunk reads back');
 sql('CHECKPOINT');
 my $after_ckpt = sql(q{SELECT test_chunk_put('after checkpoint')});

@@ -52,7 +52,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "creating table"
       ],
@@ -110,7 +110,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "update two rows"
       ],
@@ -159,7 +159,7 @@
       "requires": [
         "vc.core"
       ],
-      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 64",
+      "sql": "SELECT length((dolt_commit('-Am', $1))[1]) = 40",
       "params": [
         "added row on branch feature"
       ],
