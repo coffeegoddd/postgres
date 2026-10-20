@@ -145,3 +145,13 @@ CheckPointProlly(int flags)
 {
 	prolly_chunkstore_checkpoint();
 }
+
+/*
+ * Called by StartupXLOG() once crash recovery is over, before connections
+ * are let in: the chunk stores remove what a crash cut short left.
+ */
+void
+ProllyCrashRecovered(void)
+{
+	prolly_chunkstore_recovered();
+}

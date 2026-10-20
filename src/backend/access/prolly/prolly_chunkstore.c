@@ -132,6 +132,15 @@ prolly_chunks_filetagmatches(const FileTag *ftag, const FileTag *candidate)
 }
 
 void
+prolly_chunkstore_recovered(void)
+{
+	const ProllyChunkStoreRoutine *store = prolly_chunk_store();
+
+	if (PROLLY_HAS(store, recovered))
+		store->recovered();
+}
+
+void
 prolly_chunks_redo(XLogReaderState *record)
 {
 	xl_prolly_header hdr;

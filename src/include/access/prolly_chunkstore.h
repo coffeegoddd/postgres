@@ -248,6 +248,13 @@ typedef struct ProllyChunkStoreRoutine
 	/* Make every change before a checkpoint's redo point durable. */
 	void		(*checkpoint) (void);
 
+	/*
+	 * Once crash recovery is over, before anyone reads a store: remove what
+	 * writers and collections a crash cut short left (optional).  WAL may
+	 * be written.
+	 */
+	void		(*recovered) (void);
+
 	/* Replay the store's own records. */
 	void		(*redo) (XLogReaderState *record);
 
@@ -327,7 +334,8 @@ typedef struct ProllyChunkStoreRoutine
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
 	"open", "put", "get", "has", "get_many", "root", "move_root", "commit_payload", \
-	"commit_writes", "committed", "commit_redo", "checkpoint", "redo", \
+	"commit_writes", "committed", "commit_redo", "checkpoint", "recovered", \
+	"redo", \
 	"add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
@@ -353,6 +361,7 @@ extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);
+extern void prolly_chunkstore_recovered(void);
 
 /* The sync handler of the stores' files (storage/sync.h). */
 extern int	prolly_chunks_syncfiletag(const struct FileTag *ftag, char *path);

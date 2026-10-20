@@ -11,7 +11,8 @@
  * get theirs too.
  *
  * CheckPointProlly() runs inside every checkpoint and restartpoint, and
- * makes the chunk stores' appends durable.
+ * makes the chunk stores' appends durable; ProllyCrashRecovered() runs
+ * once crash recovery is over, before connections are let in.
  *
  * src/include/access/prolly_shmem.h
  *
@@ -26,5 +27,6 @@
 extern void *prolly_shmem_area(const ProllyImplInfo *impl);
 
 extern void CheckPointProlly(int flags);
+extern void ProllyCrashRecovered(void);
 
 #endif							/* PROLLY_SHMEM_H */

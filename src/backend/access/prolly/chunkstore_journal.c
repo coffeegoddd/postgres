@@ -155,6 +155,7 @@
 #include "access/xloginsert.h"
 #include "journal_index.h"
 #include "commands/vacuum.h"
+#include "catalog/pg_tablespace_d.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -4631,6 +4632,122 @@ journal_sync_file(const FileTag *ftag, char *path)
 	return 0;
 }
 
+/*
+ * What a crash left in database directory dir (of dboid, in spcoid), as
+ * crash recovery ends: the files no manifest names (a writer's or a
+ * collection's, cut short), those retiring (no reader of them is left),
+ * the dropped lists of collections (no transaction that straddled their
+ * swap is left), and files written aside.  Each removal of a store file is
+ * WAL-logged, as a writer's are, so a standby removes its copy too.
+ */
+static void
+remove_leftovers(const char *dir, Oid dboid, Oid spcoid)
+{
+	ProllyChunkStore s;
+	Manifest	m;
+	DIR		   *d;
+	struct dirent *de;
+	char	   *path = dir_file(dir, MANIFEST_FILE);
+	struct stat st;
+	bool		has_store = stat(path, &st) == 0;
+
+	pfree(path);
+	path = dir_file(dir, JOURNAL_FILE);
+	has_store |= stat(path, &st) == 0;
+	pfree(path);
+	if (!has_store)
+		return;
+	memset(&s, 0, sizeof(s));
+	s.dboid = dboid;
+	s.spcoid = spcoid;
+	PG_TRY();
+	{
+		(void) read_manifest(dir, &m);
+	}
+	PG_CATCH();
+	{
+		/* (a store this server refuses is left as it is) */
+		EmitErrorReport();
+		FlushErrorState();
+		return;
+	}
+	PG_END_TRY();
+	remove_unnamed(&s, dir, &m);
+	for (int i = 0; i < m.nretiring; i++)
+	{
+		char	   *table = table_file_path(dir, m.retiring[i]);
+		char	   *segment = segment_path(dboid, spcoid, m.retiring[i]);
+
+		if (stat(table, &st) == 0)
+			table_file_unlink(&s, dir, m.retiring[i], false);
+		if (stat(segment, &st) == 0)
+			table_file_unlink(&s, dir, m.retiring[i], true);
+		pfree(table);
+		pfree(segment);
+	}
+	d = AllocateDir(dir);
+	while ((de = ReadDir(d, dir)) != NULL)
+	{
+		if (strncmp(de->d_name, "prolly_gc_dropped_", 18) == 0 ||
+			strcmp(de->d_name, MANIFEST_TEMP) == 0)
+		{
+			path = dir_file(dir, de->d_name);
+			if (unlink(path) != 0 && errno != ENOENT)
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not remove file \"%s\": %m", path)));
+			pfree(path);
+		}
+	}
+	FreeDir(d);
+}
+
+/* every database directory under parent (of tablespace spcoid) */
+static void
+leftovers_under(const char *parent, Oid spcoid)
+{
+	DIR		   *dir = AllocateDir(parent);
+	struct dirent *de;
+
+	if (dir == NULL)
+		return;
+	while ((de = ReadDir(dir, parent)) != NULL)
+	{
+		char	   *sub;
+
+		if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
+			continue;
+		sub = psprintf("%s/%s", parent, de->d_name);
+		remove_leftovers(sub, (Oid) strtoul(de->d_name, NULL, 10), spcoid);
+		pfree(sub);
+	}
+	FreeDir(dir);
+}
+
+static void
+journal_recovered(void)
+{
+	DIR		   *tsdir;
+	struct dirent *de;
+
+	leftovers_under("base", DEFAULTTABLESPACE_OID);
+	tsdir = AllocateDir(PG_TBLSPC_DIR);
+	if (tsdir == NULL)
+		return;
+	while ((de = ReadDir(tsdir, PG_TBLSPC_DIR)) != NULL)
+	{
+		char	   *sub;
+
+		if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
+			continue;
+		sub = psprintf("%s/%s/%s", PG_TBLSPC_DIR, de->d_name,
+					   TABLESPACE_VERSION_DIRECTORY);
+		leftovers_under(sub, (Oid) strtoul(de->d_name, NULL, 10));
+		pfree(sub);
+	}
+	FreeDir(tsdir);
+}
+
 static void
 journal_read_through(ProllyChunkStore *s, ProllyChunkGet source,
 					 ProllyChunkHint hint, void *arg)
@@ -6838,6 +6955,7 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.committed = journal_committed,
 	.commit_redo = journal_commit_redo,
 	.checkpoint = journal_checkpoint,
+	.recovered = journal_recovered,
 	.redo = journal_redo,
 	.add_table_file = journal_add_table_file,
 	.conjoin = journal_conjoin,

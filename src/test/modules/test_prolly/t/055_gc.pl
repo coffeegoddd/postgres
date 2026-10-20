@@ -232,8 +232,8 @@ ok($standby->poll_query_until('gcdb',
 eval { $s->quit; };	# (the conflict ended its session)
 is($standby->safe_psql('gcdb', $reads), '20', 'and a new one reads the new files');
 
-# A crash at each step of a collection leaves the store whole; the next
-# collection removes what it left.
+# A crash at each step of a collection leaves the store whole; the end of
+# recovery removes what it left, before anyone reads the store.
 for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 	'prolly-gc-swapped', 'prolly-gc-retire')
 {
@@ -250,6 +250,11 @@ for my $point ('prolly-gc-sealed', 'prolly-gc-copied', 'prolly-gc-window',
 	$node->stop('immediate');
 	eval { $c->quit; };
 	$node->start;
+	is(sql($on_disk), sql($named), "a crash at $point: recovery leaves only what is named");
+	is(sql(q{SELECT count(*) FROM (SELECT 'base/' || oid AS d FROM pg_database
+		WHERE datname = 'gcdb') db, pg_ls_dir(d) f
+		WHERE f LIKE 'prolly\_gc\_dropped\_%' OR f = 'prolly_manifest.tmp'}), '0',
+		"a crash at $point: and no dropped list or manifest written aside");
 	is(sql($reads), '20', "a crash at $point: the live chunks read");
 	is(sql('SELECT test_chunk_root()'), $root, "a crash at $point: the root");
 	sql('SELECT test_chunk_gc(false)');
