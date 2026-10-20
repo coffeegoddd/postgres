@@ -143,6 +143,66 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- a primary key given a keyless table, reset away: the key goes before
+-- the NOT NULL it holds its column to
+CREATE TABLE km.given (id int, v text);
+INSERT INTO km.given VALUES (1, 'a'), (2, 'b');
+SELECT length(dolt_commit('-Am', 'given')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE km.given ADD PRIMARY KEY (id);
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT conname, contype FROM pg_constraint
+WHERE conrelid = 'km.given'::regclass ORDER BY 1;
+ conname | contype 
+---------+---------
+(0 rows)
+
+SELECT attnotnull FROM pg_attribute
+WHERE attrelid = 'km.given'::regclass AND attname = 'id';
+ attnotnull 
+------------
+ f
+(1 row)
+
+SELECT * FROM km.given ORDER BY id;
+ id | v 
+----+---
+  1 | a
+  2 | b
+(2 rows)
+
+-- and taken from a keyed one, reset back
+ALTER TABLE km.k DROP CONSTRAINT k_pkey;
+ALTER TABLE km.k ALTER COLUMN id DROP NOT NULL;
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT conname, contype FROM pg_constraint
+WHERE conrelid = 'km.k'::regclass ORDER BY 1;
+    conname    | contype 
+---------------+---------
+ k_id_not_null | n
+ k_pkey        | p
+(2 rows)
+
+SELECT count(*) FROM km.k;
+ count 
+-------
+  2000
+(1 row)
+
 SELECT dolt_branch('-D', 'kb');
  dolt_branch 
 -------------
@@ -150,6 +210,7 @@ SELECT dolt_branch('-D', 'kb');
 (1 row)
 
 DROP SCHEMA km CASCADE;
-NOTICE:  drop cascades to 2 other objects
+NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table km.t
 drop cascades to table km.k
+drop cascades to table km.given
