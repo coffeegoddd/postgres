@@ -70,6 +70,7 @@
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "storage/bufmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -136,6 +137,7 @@ typedef struct Finder
 	bool		compact;		/* entries: kept once per row */
 	int64		limit;			/* more rows than this: fold in full */
 	bool		give_up;
+	ProllyFullFoldReason reason;	/* why, once it gives up */
 	StringInfoData key;			/* reused for each encoding */
 	StringInfoData row;
 	ProllyChangeCounters work;
@@ -330,7 +332,10 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 				get_opfamily_member(opfamily, optype, optype, f->eqstrat[i]);
 			/* a key we can't look up by: fold in full */
 			if (!AttributeNumberIsValid(f->keyattrs[i]) || !OidIsValid(op))
+			{
 				f->give_up = true;
+				f->reason = PROLLY_FULL_UNSUPPORTED_KEY;
+			}
 			else
 				f->eqproc[i] = get_opcode(op);
 		}
@@ -405,6 +410,7 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 			if (f->n > f->limit)
 			{
 				f->give_up = true;
+				f->reason = PROLLY_FULL_TOO_MANY;
 				return;
 			}
 		}
@@ -455,6 +461,7 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 		if (delta == 0)
 		{
 			f->give_up = true;
+			f->reason = PROLLY_FULL_KEYING_CHANGED;
 			return false;
 		}
 		row_copy(f, entry, delta);
@@ -475,6 +482,7 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 			if (f->isnull[a])
 			{
 				f->give_up = true;
+				f->reason = PROLLY_FULL_KEYING_CHANGED;
 				return false;
 			}
 			f->keyslot->tts_values[a] = f->values[a];
@@ -861,9 +869,16 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 			 const ProllyChangeLogRoutine *log, ProllyNodeRef *data)
 {
 	f->compact = true;
-	if (f->give_up ||
-		!PROLLY_CALL(log, read, f->rel, f->snap, entry_visit, f) ||
-		f->give_up)
+	if (f->give_up)
+		return false;
+	if (!PROLLY_CALL(log, read, f->rel, f->snap, entry_visit, f))
+	{
+		/* (an entry said to, unless the visit gave up) */
+		if (!f->give_up)
+			f->reason = PROLLY_FULL_LOG_ENTRY;
+		return false;
+	}
+	if (f->give_up)
 		return false;
 	compact_copies(f);
 	if (!f->keyless)
@@ -871,7 +886,13 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 		fold_keys(f, baseline, data);
 		return true;
 	}
-	return apply_copies(f, &baseline->data, data);
+	if (!apply_copies(f, &baseline->data, data))
+	{
+		/* (a row's count below none: written under another keying) */
+		f->reason = PROLLY_FULL_KEYING_CHANGED;
+		return false;
+	}
+	return true;
 }
 
 /* ----------------------------------------------------------------
@@ -957,8 +978,8 @@ own_copies(Finder *f, ItemPointerData *tids, int ntids)
 
 static void
 log_fold(Relation rel, const ProllyTreeEnv *env,
-		 const ProllyTableFold *baseline, ProllyNodeRef *data,
-		 StringInfo next)
+		 const ProllyTableFold *baseline, ProllyFullFoldReason no_baseline,
+		 ProllyNodeRef *data, StringInfo next)
 {
 	Finder		f;
 	State		st;
@@ -979,18 +1000,46 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 		identity = PROLLY_CALL(c.change_log, identity, rel);
 	have = identity != 0 && baseline != NULL &&
 		parse_state(&baseline->state, &st) && st.log == identity;
+	if (debug_prolly_force_full_fold)
+		f.reason = PROLLY_FULL_FORCED;
+	else if (baseline == NULL)
+		f.reason = no_baseline;
+	else if (identity == 0)
+		f.reason = PROLLY_FULL_NO_LOG;
+	else if (!have)
+		f.reason = PROLLY_FULL_LOG_CHANGED;
 	/* (a snapshot older than the baseline's fold: see the file's header) */
 	stale = have && !sees_fold(f.snap, &st);
-	have = have && !stale && !RecoveryInProgress() &&
-		!(st.flags & STATE_UNSETTLED) && !storage_unseen(rel, f.snap);
+	if (have && f.reason == PROLLY_FULL_NONE)
+	{
+		if (stale)
+			f.reason = PROLLY_FULL_STALE_SNAPSHOT;
+		else if (RecoveryInProgress())
+			f.reason = PROLLY_FULL_RECOVERY;
+		else if (st.flags & STATE_UNSETTLED)
+			f.reason = PROLLY_FULL_UNSETTLED;
+		else if (storage_unseen(rel, f.snap))
+			f.reason = PROLLY_FULL_STORAGE_UNSEEN;
+	}
+	have = have && f.reason == PROLLY_FULL_NONE;
 	if (!have || !fold_changed(&f, baseline, &st, c.change_log, data))
 	{
+		instr_time	start;
+		instr_time	took;
+
 		/* (what the fold from the baseline read is thrown away) */
 		memset(&f.work, 0, sizeof(f.work));
 		MemoryContextReset(f.ccxt);
 		f.c = NULL;
 		f.n = f.max = 0;
+		INSTR_TIME_SET_CURRENT(start);
 		fold_all(&f, data);
+		INSTR_TIME_SET_CURRENT(took);
+		INSTR_TIME_SUBTRACT(took, start);
+		prolly_full_fold_noted(rel, f.reason == PROLLY_FULL_NONE ?
+							   PROLLY_FULL_TOO_MANY : f.reason,
+							   (int64) f.work.rows_read,
+							   INSTR_TIME_GET_MILLISEC(took));
 	}
 	counters.pages += f.work.pages;
 	counters.candidates += f.work.candidates;

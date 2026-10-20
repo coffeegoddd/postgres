@@ -739,6 +739,13 @@
   check_hook => 'check_debug_prolly_change_finder',
 },
 
+{ name => 'debug_prolly_force_full_fold', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Makes every prolly fold read its table in full, for testing that incremental folds match.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'debug_prolly_force_full_fold',
+  boot_val => 'false',
+},
+
 { name => 'debug_raw_expression_coverage_test', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all raw parse trees for DML statements to be scanned by raw_expression_tree_walker(), to facilitate catching errors and omissions in that function.',
   flags => 'GUC_NOT_IN_SAMPLE',

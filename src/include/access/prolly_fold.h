@@ -1,0 +1,60 @@
+/*-------------------------------------------------------------------------
+ *
+ * prolly_fold.h
+ *	  What the change finders share about folding a table in full: why a
+ *	  fold read every row, counted and logged.
+ *
+ * A fold reads a table in full, every row, when it can't fold from the
+ * table's baseline: it has none, or it can't trust what changed since.
+ * Each change finder says why (ProllyFullFoldReason), and
+ * prolly_full_fold_noted() counts it in pg_stat_prolly, under the reason,
+ * and logs it (prolly.log_full_folds) when it read enough rows to matter.
+ *
+ * src/include/access/prolly_fold.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef PROLLY_FOLD_H
+#define PROLLY_FOLD_H
+
+#include "utils/relcache.h"
+
+typedef enum ProllyFullFoldReason
+{
+	PROLLY_FULL_NONE = 0,		/* (a fold from the baseline) */
+	PROLLY_FULL_NO_BASELINE,	/* no baseline: the table's first fold */
+	PROLLY_FULL_SHAPE_CHANGED,	/* its definition changed since */
+	PROLLY_FULL_NO_LOG,			/* nothing tells what changed: no change
+								 * log, or no block map */
+	PROLLY_FULL_LOG_CHANGED,	/* the baseline isn't of the log as it is
+								 * (another finder's, or a log made since) */
+	PROLLY_FULL_STALE_SNAPSHOT, /* the snapshot doesn't see the baseline's
+								 * fold */
+	PROLLY_FULL_UNSETTLED,		/* the baseline's fold was such a fold */
+	PROLLY_FULL_STORAGE_UNSEEN, /* a rewrite or truncation the snapshot
+								 * doesn't see */
+	PROLLY_FULL_RECOVERY,		/* during recovery */
+	PROLLY_FULL_LOG_ENTRY,		/* an entry says to: truncated, rewritten, a
+								 * row the log couldn't hold */
+	PROLLY_FULL_TOO_MANY,		/* more rows changed than the table holds */
+	PROLLY_FULL_KEYING_CHANGED, /* entries written under another keying */
+	PROLLY_FULL_UNSUPPORTED_KEY,	/* a key it can't look rows up by */
+	PROLLY_FULL_FORCED,			/* debug_prolly_force_full_fold */
+} ProllyFullFoldReason;
+
+#define PROLLY_FULL_REASONS (PROLLY_FULL_FORCED + 1)
+
+/* debug_prolly_force_full_fold: every fold reads its table in full. */
+extern PGDLLIMPORT bool debug_prolly_force_full_fold;
+
+/* prolly.log_full_folds: rows past which a full fold is logged (-1: none). */
+extern PGDLLIMPORT int prolly_log_full_folds;
+
+/* A reason's name, as pg_stat_prolly's counters and the log give it. */
+extern const char *prolly_full_fold_reason_name(ProllyFullFoldReason reason);
+
+/* A full fold of rel done: counted under reason, logged if it was large. */
+extern void prolly_full_fold_noted(Relation rel, ProllyFullFoldReason reason,
+								   int64 rows, double ms);
+
+#endif							/* PROLLY_FOLD_H */

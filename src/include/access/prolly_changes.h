@@ -39,6 +39,7 @@
 #ifndef PROLLY_CHANGES_H
 #define PROLLY_CHANGES_H
 
+#include "access/prolly_fold.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
@@ -68,10 +69,14 @@ typedef struct ProllyChangeFinderRoutine
 
 	/*
 	 * env has the chunk store and the tree's components; the finder orders
-	 * keys by the table's keying itself.
+	 * keys by the table's keying itself.  Without a baseline, no_baseline
+	 * is why there is none (the table's first fold, or its definition
+	 * changed).  A fold that reads the table in full counts and logs why
+	 * (prolly_full_fold_noted()).
 	 */
 	void		(*fold) (Relation rel, const ProllyTreeEnv *env,
-						 const ProllyTableFold *baseline, ProllyNodeRef *data,
+						 const ProllyTableFold *baseline,
+						 ProllyFullFoldReason no_baseline, ProllyNodeRef *data,
 						 StringInfo next);
 	void		(*walk) (const ProllyTreeEnv *env, const ProllyValue *state,
 						 ProllyTreeVisitNode visit, void *arg);

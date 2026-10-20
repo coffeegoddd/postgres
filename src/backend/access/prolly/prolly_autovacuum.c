@@ -33,6 +33,7 @@
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
+#include "access/prolly_fold.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
@@ -120,6 +121,14 @@ prolly_autovacuum_init(void)
 							65536, 1024, MAX_KILOBYTES,
 							PGC_SIGHUP,
 							GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.log_full_folds",
+							"Logs each fold that reads its table in full, with why, once it reads at least this many rows.",
+							"-1 logs none; 0 logs every one.",
+							&prolly_log_full_folds,
+							-1, -1, INT_MAX,
+							PGC_SUSET,
+							0,
 							NULL, NULL, NULL);
 	defined = true;
 }

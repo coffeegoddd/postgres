@@ -713,6 +713,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 	ProllyTableFold tf;
 	StringInfoData state;
 	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
+	ProllyFullFoldReason why;
 
 	if (OidIsValid(pkoid))
 	{
@@ -730,6 +731,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 
 	baseline_hash(cn, rel, description, &dh);
 	bt = find_base_table(cn, &it->key);
+	why = bt ? PROLLY_FULL_SHAPE_CHANGED : PROLLY_FULL_NO_BASELINE;
 	if (bt && (bt->description.len != dh.len ||
 			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))
 		bt = NULL;
@@ -750,7 +752,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		return;
 	}
 	initStringInfo(&state);
-	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, root,
+	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, why, root,
 				cn->advance ? &state : NULL);
 	if (cn->advance)
 	{
