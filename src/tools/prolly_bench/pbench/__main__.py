@@ -16,6 +16,7 @@
   prolly_bench scalibrate --counters ... --timing ...   S gate: the noise of A/A runs
   prolly_bench sgate counters|timing RUN ...    S gate: a pull request against its base
   prolly_bench sreport --counters ... --out comment.md   S gate: the pull-request comment
+  prolly_bench vgrowth RUN                      V suite: per-commit work growing with prior commits
 """
 
 from __future__ import annotations
@@ -562,6 +563,14 @@ def main(argv=None) -> int:
     growth.add_argument("--counter", choices=["nodes_read", "nodes_written"], default="nodes_read")
     growth.add_argument("--max-exponent", type=float, required=True)
     growth.set_defaults(fn=complexity.run)
+
+    from pbench import vgrowth
+    vg = sub.add_parser("vgrowth", help="V suite: per-commit work growing with the number of commits before it")
+    vg.add_argument("dir", type=Path, help="a result set of configs/v_counters.toml")
+    vg.add_argument("--bound", type=float, default=vgrowth.DEFAULT_BOUND)
+    vg.add_argument("--accept", type=Path, help="known growth (configs/v_growth_accept.toml)")
+    vg.add_argument("--json", type=Path)
+    vg.set_defaults(fn=vgrowth.run)
 
     from pbench import differential
     diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")

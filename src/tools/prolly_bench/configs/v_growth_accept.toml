@@ -1,0 +1,65 @@
+# Growth V7 shows that is known and has an issue to fix it, one entry each:
+#
+#   [[accept]]
+#   workload = "V7/owned"      # V7/<variant>
+#   engine = "prolly"
+#   counter = "fold_rows_read"
+#   reason = "every transaction folds every entry since the last full fold (#569)"
+#
+# Entries stand until removed (unlike perf_accept.toml's): the change that
+# ends the growth removes its entries, and vgrowth reports an accepted
+# counter that no longer grows, so that it does.
+
+# #569: with dolt.transaction_commit in a writer mode that gives a dirty
+# branch an owner, every transaction folds the working set (to release the
+# owner) from a baseline transaction commits never advance (#568): the
+# fold reads every entry since the last full fold.  "status" adds a
+# dolt_status every 100 transactions, which folds the same gap.
+
+[[accept]]
+workload = "V7/owned-bgnone"
+engine = "prolly"
+counter = "fold_rows_read"
+reason = "every transaction folds every entry since the last full fold (#569)"
+
+[[accept]]
+workload = "V7/owned-bgnone"
+engine = "prolly"
+counter = "fold_candidates"
+reason = "every transaction folds every entry since the last full fold (#569)"
+
+[[accept]]
+workload = "V7/owned-bgnone"
+engine = "prolly"
+counter = "nodes_read"
+reason = "every transaction folds every entry since the last full fold (#569)"
+
+[[accept]]
+workload = "V7/owned-bgnone"
+engine = "prolly"
+counter = "buffer_accesses"
+reason = "every transaction folds every entry since the last full fold (#569)"
+
+[[accept]]
+workload = "V7/status-bgnone"
+engine = "prolly"
+counter = "fold_rows_read"
+reason = "every transaction folds every entry since the last full fold (#569, #568)"
+
+[[accept]]
+workload = "V7/status-bgnone"
+engine = "prolly"
+counter = "fold_candidates"
+reason = "every transaction folds every entry since the last full fold (#569, #568)"
+
+[[accept]]
+workload = "V7/status-bgnone"
+engine = "prolly"
+counter = "nodes_read"
+reason = "every transaction folds every entry since the last full fold (#569, #568)"
+
+[[accept]]
+workload = "V7/status-bgnone"
+engine = "prolly"
+counter = "buffer_accesses"
+reason = "every transaction folds every entry since the last full fold (#569, #568)"

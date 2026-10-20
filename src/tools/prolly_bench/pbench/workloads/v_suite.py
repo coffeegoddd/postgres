@@ -10,13 +10,18 @@ of background pgbench clients; without it, only one client count is run.
 
 from __future__ import annotations
 
-import statistics
+import json
 import math
+import statistics
+import subprocess
+import time
 from contextlib import nullcontext
 from itertools import product
 from typing import Any
 
+from pbench import vgrowth
 from pbench.core import registry, targets
+from pbench.core.sqlerr import raise_for_sql_error
 from pbench.core.interfaces import Context, NotImplementedByEngine, Outcome, Window, Workload
 from pbench.workloads._common import BackgroundPgbench, pgbench_init, timed_session
 
@@ -396,3 +401,110 @@ class V4(VWorkload):
         return Outcome(metrics={"clone_ms": clone[0], "fetch_ms": fetch[0],
                                 "push_ms": push[3]},
                        transactions=3, unit="operation")
+
+
+@registry.workloads.register("V7")
+class V7(VWorkload):
+    """Commit per transaction: K one-row updates, each committed as it is
+    made, and the counters read after each.  The work each commit does
+    should stay flat however many came before it; vgrowth gates the last
+    tenth's mean per transaction against the first's.
+
+    Variants: "shared" and "owned" commit with dolt.transaction_commit in
+    that writer mode; "manual" with a dolt_commit after each transaction,
+    autovacuum on; "pinned" as manual with another session holding a
+    snapshot (the vacuum horizon) for the whole run; "status" as owned
+    with a dolt_status every 100 transactions."""
+
+    id, title = "V7", "Commit per transaction"
+
+    VARIANTS = {
+        "shared": {"mode": "shared", "transaction_commit": True},
+        "owned": {"mode": "owned", "transaction_commit": True},
+        "manual": {"mode": "shared", "transaction_commit": False, "autovacuum": True},
+        "pinned": {"mode": "shared", "transaction_commit": False, "autovacuum": True,
+                   "pin": True},
+        "status": {"mode": "owned", "transaction_commit": True, "status_every": 100},
+    }
+
+    COUNTERS = ("SELECT 'v7|' || json_build_object("
+                "'wal_bytes', (SELECT wal_bytes FROM pg_stat_wal), "
+                "'buffer_accesses', (SELECT sum(hits + reads) FROM pg_stat_io "
+                "WHERE backend_type = 'client backend' AND object = 'relation'), "
+                "'p', (SELECT json_object_agg(name, value) FROM pg_stat_prolly))")
+
+    def own_variants(self, params):
+        return [(v, {"v7": v}) for v in params.get("modes", list(self.VARIANTS))]
+
+    def commits(self, ctx) -> int:
+        return int(ctx.params.get("commits", 2000))
+
+    def prepare(self, ctx):
+        spec = self.VARIANTS[ctx.params["v7"]]
+        super().prepare(ctx)
+        ctx.cluster.sql(f"SELECT dolt_writer_mode('{spec['mode']}')", dbname=ctx.dbname)
+        if spec.get("autovacuum"):
+            ctx.cluster.sql("ALTER SYSTEM SET autovacuum = on; SELECT pg_reload_conf()")
+
+    def _pin(self, ctx):
+        """A session idle in a transaction with a snapshot: the horizon held."""
+        proc = subprocess.Popen(
+            [ctx.cluster.bin("psql"), "-X", "-q", "-d", ctx.dbname],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            text=True, env=ctx.cluster.client_env(ctx.session_options()))
+        assert proc.stdin is not None
+        proc.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT count(*) FROM vc_data;\n")
+        proc.stdin.flush()
+        for _ in range(100):
+            if ctx.cluster.scalar("SELECT count(*) FROM pg_stat_activity WHERE "
+                                  "state = 'idle in transaction' AND backend_xmin IS NOT NULL",
+                                  dbname=ctx.dbname) != "0":
+                return proc
+            time.sleep(0.1)
+        proc.kill()
+        raise RuntimeError("V7's pinning session took no snapshot")
+
+    def operations(self, ctx):
+        spec = self.VARIANTS[ctx.params["v7"]]
+        k, rows = self.commits(ctx), self.rows(ctx)
+        if k < 20:
+            raise ValueError("V7 needs at least 20 transactions to compare tenths")
+        stmts = []
+        if spec["transaction_commit"]:
+            stmts.append("SET dolt.transaction_commit = on")
+        stmts += ["SELECT pg_stat_force_next_flush()", self.COUNTERS]
+        for i in range(k):
+            stmts.append(f"UPDATE vc_data SET payload = md5(payload) "
+                         f"WHERE id = {i * 7919 % rows + 1}")
+            if not spec["transaction_commit"]:
+                stmts.append(VC_SQL.commit(f"v7 {i}"))
+            every = spec.get("status_every")
+            if every and (i + 1) % every == 0:
+                stmts.append("SELECT count(*) FROM dolt_status")
+            stmts += ["SELECT pg_stat_force_next_flush()", self.COUNTERS]
+        script = "\n".join(s + ";" for s in stmts) + "\n"
+        (ctx.raw_dir / "v7.sql").write_text(script)
+        pin = self._pin(ctx) if spec.get("pin") else None
+        try:
+            res = ctx.cluster.sql(script, dbname=ctx.dbname, options=ctx.session_options(),
+                                  check=False)
+        finally:
+            if pin is not None:
+                pin.kill()
+                pin.wait()
+        (ctx.raw_dir / "v7.out").write_text(res.stdout + res.stderr)
+        raise_for_sql_error(res, script)
+        readings = [json.loads(line[3:]) for line in res.stdout.splitlines()
+                    if line.startswith("v7|")]
+        if len(readings) != k + 1:
+            raise RuntimeError(f"V7 expected {k + 1} counter readings, got {len(readings)}")
+        flat = [{c: float(r[c] if c in vgrowth.SERVER_COUNTERS else r["p"].get(c, 0))
+                 for c in vgrowth.FLOORS} for r in readings]
+        series = {c: [b[c] - a[c] for a, b in zip(flat, flat[1:])] for c in vgrowth.FLOORS}
+        (ctx.raw_dir / "v7-series.json").write_text(json.dumps(series) + "\n")
+        metrics = {}
+        for c, s in series.items():
+            first, last = vgrowth.means(s)
+            metrics[f"first_{c}"], metrics[f"last_{c}"] = first, last
+            metrics[f"growth_{c}"] = vgrowth.ratio(first, last)
+        return Outcome(metrics=metrics, transactions=k, unit="transaction")

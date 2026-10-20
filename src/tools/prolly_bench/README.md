@@ -255,6 +255,28 @@ Without hardware counters, `configs/s_cachegrind.toml` counts instructions
 with the server under Cachegrind (the `cachegrind` cluster and collector),
 on a reduced workload.
 
+### Per-commit growth (V7)
+
+`configs/v_counters.toml` runs V7, commit per transaction: 2,000 one-row
+updates of a 100k-row table, each committed as it is made, with the
+counters read after each (`pg_stat_prolly`'s fold, node and chunk counters,
+WAL bytes, and client backends' buffer accesses from `pg_stat_io`).  Its
+variants commit with `dolt.transaction_commit` in shared and owned writer
+modes (`shared`, `owned`), with a `dolt_commit` after each transaction
+(`manual`), as manual with another session holding a snapshot open
+(`pinned`), and as owned with a `dolt_status` every 100 transactions
+(`status`).  `vgrowth` fails a counter whose mean per transaction over the
+last tenth is more than 1.5 times its first tenth's (above a floor): work
+that grows with the number of commits before it.  Known growth, with an
+issue to fix it, is listed in `configs/v_growth_accept.toml`, and stands
+until the fix removes it.  Each cell's series is in its raw directory,
+`v7-series.json`.
+
+```sh
+src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V7 --config src/tools/prolly_bench/configs/v_counters.toml --out G
+src/tools/prolly_bench/prolly_bench vgrowth G/*-V-prolly --accept src/tools/prolly_bench/configs/v_growth_accept.toml
+```
+
 ## Write amplification
 
 `configs/s_write_amp.toml` runs the standard procedure's workloads with the
