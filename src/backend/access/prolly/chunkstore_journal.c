@@ -446,6 +446,7 @@ typedef struct Append
 	Size		len;
 	XLogRecPtr	lsn;
 	TimestampTz at;				/* when reserved: a ROOT record's time */
+	bool		sync_refused;	/* sync_refused() as it was reserved */
 } Append;
 
 struct ProllyChunkStore
@@ -1015,15 +1016,29 @@ open_segment(Segment *g)
 static JournalShared *shared(void);
 
 /*
- * Ask the next checkpoint to fsync a segment (or a table file) about to be
- * written: before the write's WAL record, so a checkpoint whose redo point
- * follows that record has the request; the checkpoint waits for the write
- * (the append's range, or DELAY_CHKPT_START) before the requests are
- * fsynced.  Never waits: a request the queue refuses makes the next
- * checkpoint fsync everything instead.
+ * Whether sync requests are to be taken as refused (by the queue), for a
+ * test: asked outside a critical section, as it may allocate.
+ */
+static bool
+sync_refused(void)
+{
+	return IS_INJECTION_POINT_ATTACHED("prolly-sync-request-refused");
+}
+
+/*
+ * Ask the next checkpoint to fsync a segment (or a table file) just
+ * written: after the write, as md.c asks for a relation's, so a checkpoint
+ * that takes the request fsyncs the bytes (one taking it before them
+ * would fsync the file without them, and no later checkpoint would).
+ * Before the writer lets checkpoints go on (its append's range let go, or
+ * DELAY_CHKPT_START cleared), so a checkpoint whose redo point follows the
+ * write's WAL record, which waits for the writer, has the request.  Never
+ * waits nor allocates (it may run in a critical section): a request the
+ * queue refuses (or refused, sync_refused()'s) makes the next checkpoint
+ * fsync everything instead.
  */
 static void
-request_sync(Oid dboid, Oid spcoid, int kind, uint64 id)
+request_sync(Oid dboid, Oid spcoid, int kind, uint64 id, bool refused)
 {
 	FileTag		tag;
 
@@ -1034,8 +1049,7 @@ request_sync(Oid dboid, Oid spcoid, int kind, uint64 id)
 	tag.rlocator.dbOid = dboid;
 	tag.rlocator.relNumber = kind;
 	tag.segno = id;
-	if (IS_INJECTION_POINT_ATTACHED("prolly-sync-request-refused") ||
-		!RegisterSyncRequest(&tag, SYNC_REQUEST, false))
+	if (refused || !RegisterSyncRequest(&tag, SYNC_REQUEST, false))
 		pg_atomic_write_u32(&shared()->sync_all, 1);
 }
 
@@ -1053,6 +1067,7 @@ logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
 	xl_chunks_append xlrec;
 	XLogRecPtr	lsn;
 	ssize_t		n;
+	bool		refused;
 
 	xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
 	xlrec.dboid = dboid;
@@ -1060,7 +1075,7 @@ logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
 	xlrec.segment = segment;
 	xlrec.offset = offset;
 
-	request_sync(dboid, spcoid, SYNC_SEGMENT, segment);
+	refused = sync_refused();
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
@@ -1083,6 +1098,7 @@ logged_write(Oid dboid, Oid spcoid, uint64 segment, uint64 offset,
 				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
 						len, (unsigned long long) offset, path)));
 	pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN, len);
+	request_sync(dboid, spcoid, SYNC_SEGMENT, segment, refused);
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 }
@@ -1647,7 +1663,8 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 	a->at = Max(GetCurrentTimestamp(), js->last_at);
 	js->last_at = a->at;
 
-	request_sync(s->dboid, s->spcoid, SYNC_SEGMENT, g->id);
+	a->sync_refused = sync_refused();
+	INJECTION_POINT("prolly-append-reserving", NULL);
 	Assert(r->len == 0);
 	START_CRIT_SECTION();
 	SpinLockAcquire(&js->mutex);
@@ -1699,6 +1716,7 @@ append_write(Append *a, const char *data)
 				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
 						a->len, (unsigned long long) a->offset, a->g->path)));
 	pgstat_count_prolly(PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN, a->len);
+	request_sync(r->dboid, r->spcoid, SYNC_SEGMENT, r->segment, a->sync_refused);
 	SpinLockAcquire(&js->mutex);
 	r->len = 0;
 	js->inflight--;
@@ -2865,6 +2883,7 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 {
 	xl_chunks_file xlrec;
 	XLogRecPtr	lsn;
+	bool		refused;
 
 	xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
 	xlrec.dboid = s->dboid;
@@ -2872,7 +2891,7 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 	xlrec.id = id;
 	xlrec.offset = offset;
 
-	request_sync(s->dboid, s->spcoid, SYNC_TABLE_FILE, id);
+	refused = sync_refused();
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
@@ -2889,6 +2908,7 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 						len, (unsigned long long) offset, path)));
 	pgstat_report_wait_end();
 	pgstat_count_prolly(PGSTAT_PROLLY_TABLE_FILE_BYTES_WRITTEN, len);
+	request_sync(s->dboid, s->spcoid, SYNC_TABLE_FILE, id, refused);
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 }
@@ -3734,7 +3754,7 @@ journal_commit_redo(const char *data, Size len)
 	root_record(&rec, &p.root, p.at, false);
 	path = segment_path(p.dboid, p.spcoid, p.segment);
 	write_at(path, rec.data, rec.len, p.offset);
-	request_sync(p.dboid, p.spcoid, SYNC_SEGMENT, p.segment);
+	request_sync(p.dboid, p.spcoid, SYNC_SEGMENT, p.segment, sync_refused());
 	pfree(path);
 	pfree(rec.data);
 }
@@ -3772,7 +3792,8 @@ table_files_redo(XLogReaderState *record)
 		}
 		write_at(path, XLogRecGetData(record) + SizeOfChunksFile,
 				 XLogRecGetDataLen(record) - SizeOfChunksFile, xlrec.offset);
-		request_sync(xlrec.dboid, xlrec.spcoid, SYNC_TABLE_FILE, xlrec.id);
+		request_sync(xlrec.dboid, xlrec.spcoid, SYNC_TABLE_FILE, xlrec.id,
+					 sync_refused());
 		pfree(path);
 	}
 	else if (info != XLOG_CHUNKS_UNLINK)
@@ -3841,7 +3862,8 @@ journal_redo(XLogReaderState *record)
 			path = segment_path(xlrec.dboid, xlrec.spcoid, xlrec.segment);
 			write_at(path, XLogRecGetData(record) + SizeOfChunksAppend,
 					 XLogRecGetDataLen(record) - SizeOfChunksAppend, xlrec.offset);
-			request_sync(xlrec.dboid, xlrec.spcoid, SYNC_SEGMENT, xlrec.segment);
+			request_sync(xlrec.dboid, xlrec.spcoid, SYNC_SEGMENT, xlrec.segment,
+						 sync_refused());
 			pfree(path);
 			break;
 		case XLOG_CHUNKS_FILE:
@@ -3931,23 +3953,32 @@ journal_checkpoint(void)
 	wait_reserved(NULL);
 	if (pg_atomic_exchange_u32(&shared()->sync_all, 0) == 0)
 		return;
-	sync_journals_under("base");
 
-	tsdir = AllocateDir(PG_TBLSPC_DIR);
-	if (tsdir == NULL)
-		return;
-	while ((de = ReadDir(tsdir, PG_TBLSPC_DIR)) != NULL)
+	/* (a scan that fails leaves the next checkpoint to scan again) */
+	PG_TRY();
 	{
-		char	   *sub;
+		sync_journals_under("base");
+		tsdir = AllocateDir(PG_TBLSPC_DIR);
+		while (tsdir != NULL && (de = ReadDir(tsdir, PG_TBLSPC_DIR)) != NULL)
+		{
+			char	   *sub;
 
-		if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
-			continue;
-		sub = psprintf("%s/%s/%s", PG_TBLSPC_DIR, de->d_name,
-					   TABLESPACE_VERSION_DIRECTORY);
-		sync_journals_under(sub);
-		pfree(sub);
+			if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
+				continue;
+			sub = psprintf("%s/%s/%s", PG_TBLSPC_DIR, de->d_name,
+						   TABLESPACE_VERSION_DIRECTORY);
+			sync_journals_under(sub);
+			pfree(sub);
+		}
+		if (tsdir != NULL)
+			FreeDir(tsdir);
 	}
-	FreeDir(tsdir);
+	PG_CATCH();
+	{
+		pg_atomic_write_u32(&shared()->sync_all, 1);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /* fsync the segment or table file a sync request names. */

@@ -73,6 +73,28 @@ sql(q{SELECT injection_points_detach('prolly-sync-request-refused')});
 is(checkpoint_notices('prolly-checkpoint-table-file'), 1,
 	'a refused request: every store\'s files fsynced');
 is(checkpoint_notices('prolly-checkpoint-table-file'), 0, 'then requests again');
+# An append reserving its place as a checkpoint runs (its WAL record
+# after the redo point, so the checkpoint doesn't wait for it): its sync
+# request, made once it is written, is the next checkpoint's.  (One made
+# before the write would be taken by this checkpoint, the segment fsynced
+# without the bytes, and no checkpoint would fsync them.)
+sql(q{SELECT injection_points_attach('prolly-append-reserving', 'wait')});
+my $a = $node->background_psql('one');
+$a->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_put('one held') IS NOT NULL;
+	\echo done
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-append-reserving'}) or die 'the append did not wait';
+is(checkpoint_notices('prolly-checkpoint-chunk-file'), 0,
+	'a checkpoint as an append reserves fsyncs nothing of it');
+sql(q{SELECT injection_points_detach('prolly-append-reserving')});
+sql(q{SELECT injection_points_wakeup('prolly-append-reserving')});
+$a->query_until(qr/done/, '');
+$a->quit;
+is(checkpoint_notices('prolly-checkpoint-chunk-file'), 1,
+	'the next fsyncs its segment, written');
 sql(q{SELECT injection_points_detach('prolly-checkpoint-chunk-file')});
 sql(q{SELECT injection_points_detach('prolly-checkpoint-table-file')});
 
