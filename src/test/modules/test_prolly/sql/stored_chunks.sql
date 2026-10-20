@@ -40,6 +40,23 @@ SELECT count(*) AS chunks,
 	count(*) FILTER (WHERE get_byte(test_chunk_stored(h), 0) = 1) > 0 AS some_compressed
 FROM test_commit_chunks(:'head') h;
 
+-- Served to a client that can't decompress (it sets this on its
+-- connection): every frame plain, the chunk as it is.
+SET prolly_serve_uncompressed = on;
+SELECT count(*) > 0 AS served, bool_and(get_byte(chunk, 0) = 0) AS all_plain,
+	bool_and(chunk = test_chunk_frame(test_chunk_get(encode(hash, 'hex')), false)) AS as_is
+FROM dolt_serve_get((SELECT array_agg(decode(h, 'hex')) FROM test_commit_chunks(:'head') h));
+RESET prolly_serve_uncompressed;
+
+-- A frame claiming a length past what its bytes could decompress to is
+-- refused as it is read, before anything is made for it.
+BEGIN;
+SELECT dolt_serve_receive(ARRAY[decode(test_content_hash('x'), 'hex')],
+	ARRAY['\x01f0ffff3f78'::bytea]);
+SELECT dolt_serve_move_head('bomb', '', decode(test_content_hash('x'), 'hex'),
+	:'fmt', false);
+ROLLBACK;
+
 -- A remote holding the same chunks uncompressed, as a server built
 -- without LZ4 would: fetched, they stay so (encoded again, the receiver
 -- would compress them), and they still read.

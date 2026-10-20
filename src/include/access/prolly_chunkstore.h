@@ -395,6 +395,17 @@ extern bool prolly_chunks_filetagmatches(const struct FileTag *ftag,
 #define PROLLY_CODEC_LZ4	1
 #define PROLLY_FRAME_HEADER	5
 extern void prolly_chunk_frame(const void *data, Size len, StringInfo out);
+extern void prolly_chunk_frame_plain(const char *frame, Size len,
+									 StringInfo out);
+/*
+ * What a remote's dolt_serve_format() says after the canonical format: it
+ * sends and takes chunks framed, and (with the second) can decompress LZ4.
+ */
+#define PROLLY_SERVE_FRAMED	"/framed"
+#define PROLLY_SERVE_LZ4	"+lz4"
+
+/* (a session's: frames this server sends it, by get_stored, are plain) */
+extern PGDLLIMPORT bool prolly_serve_uncompressed;
 extern bool prolly_chunk_unframe(const char *frame, Size len, StringInfo out);
 extern bool prolly_chunk_frame_len(const char *frame, Size len, uint32 *chunk_len);
 

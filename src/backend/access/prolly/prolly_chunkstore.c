@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_tablefile.h"
 #include "access/prolly_config.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_tree.h"
@@ -158,6 +159,45 @@ prolly_chunks_redo(XLogReaderState *record)
 	PROLLY_CALL(store, redo, record);
 }
 
+/* (a session's: a remote serving it sends its chunks uncompressed) */
+bool		prolly_serve_uncompressed = false;
+
+/* A frame of the chunk as it is, uncompressed. */
+static void
+frame_plain(const void *data, Size len, StringInfo out)
+{
+	char		head[PROLLY_FRAME_HEADER];
+
+	if (len > PG_UINT32_MAX)
+		elog(ERROR, "chunk of %zu bytes is too large to frame", len);
+	head[0] = PROLLY_CODEC_NONE;
+	head[1] = len & 0xff;
+	head[2] = (len >> 8) & 0xff;
+	head[3] = (len >> 16) & 0xff;
+	head[4] = (len >> 24) & 0xff;
+	appendBinaryStringInfo(out, head, PROLLY_FRAME_HEADER);
+	appendBinaryStringInfo(out, data, len);
+}
+
+void
+prolly_chunk_frame_plain(const char *frame, Size len, StringInfo out)
+{
+	StringInfoData chunk;
+
+	if (len >= 1 && (uint8) frame[0] == PROLLY_CODEC_NONE)
+	{
+		appendBinaryStringInfo(out, frame, len);
+		return;
+	}
+	initStringInfo(&chunk);
+	if (!prolly_chunk_unframe(frame, len, &chunk))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a stored chunk's frame doesn't decode")));
+	frame_plain(chunk.data, chunk.len, out);
+	pfree(chunk.data);
+}
+
 void
 prolly_chunk_frame(const void *data, Size len, StringInfo out)
 {
@@ -170,7 +210,10 @@ prolly_chunk_frame(const void *data, Size len, StringInfo out)
 	head[3] = (len >> 16) & 0xff;
 	head[4] = (len >> 24) & 0xff;
 #ifdef USE_LZ4
-	if (len > 0 && len <= LZ4_MAX_INPUT_SIZE)
+	/* (one whose bound is past what a buffer takes is framed as it is) */
+	if (len > 0 && len <= LZ4_MAX_INPUT_SIZE &&
+		(Size) LZ4_compressBound((int) len) + PROLLY_FRAME_HEADER <
+		MaxAllocSize - (Size) out->len)
 	{
 		int			bound = LZ4_compressBound((int) len);
 		int			n;
@@ -222,7 +265,12 @@ prolly_chunk_unframe(const char *frame, Size len, StringInfo out)
 	{
 		int			n;
 
-		if (chunk_len > MaxAllocSize - 1 - (Size) out->len)
+		/*
+		 * (LZ4 makes nothing smaller than about a 255th of itself: a length
+		 * past that, from a remote, isn't allocated for)
+		 */
+		if (chunk_len > MaxAllocSize - 1 - (Size) out->len ||
+			chunk_len > (uint64) (len - PROLLY_FRAME_HEADER) * 255 + 16)
 			return false;
 		enlargeStringInfo(out, (int) chunk_len);
 		n = LZ4_decompress_safe(frame + PROLLY_FRAME_HEADER, out->data + out->len,
@@ -241,6 +289,45 @@ prolly_chunk_unframe(const char *frame, Size len, StringInfo out)
 #endif
 }
 
+void
+prolly_tablefile_read_stored(const ProllyTableFileRoutine *fmt, ProllyTableFile *tf,
+							 const char *bytes, uint32 len, StringInfo out)
+{
+	StringInfoData data;
+
+	if (PROLLY_HAS(fmt, read_stored))
+	{
+		PROLLY_CALL(fmt, read_stored, tf, bytes, len, out);
+		return;
+	}
+	initStringInfo(&data);
+	PROLLY_CALL(fmt, decode, tf, bytes, len, &data);
+	prolly_chunk_frame(data.data, data.len, out);
+	pfree(data.data);
+}
+
+void
+prolly_tablefile_add_stored(const ProllyTableFileRoutine *fmt,
+							ProllyTableFileWriter *w, const ProllyHash *hash,
+							const char *frame, Size len, StringInfo out)
+{
+	StringInfoData chunk;
+
+	if (PROLLY_HAS(fmt, write_add_stored))
+	{
+		PROLLY_CALL(fmt, write_add_stored, w, hash, frame, len, out);
+		return;
+	}
+	initStringInfo(&chunk);
+	if (!prolly_chunk_unframe(frame, len, &chunk))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	PROLLY_CALL(fmt, write_add, w, hash, chunk.data, chunk.len, out);
+	pfree(chunk.data);
+}
+
 bool
 prolly_chunk_get_stored(const ProllyChunkStoreRoutine *cs, ProllyChunkStore *store,
 						const ProllyHash *hash, StringInfo out)
@@ -248,6 +335,16 @@ prolly_chunk_get_stored(const ProllyChunkStoreRoutine *cs, ProllyChunkStore *sto
 	StringInfoData data;
 	bool		found;
 
+	if (prolly_serve_uncompressed)
+	{
+		/* (for a receiver that can't decompress: every frame plain) */
+		initStringInfo(&data);
+		found = PROLLY_CALL(cs, get, store, hash, &data);
+		if (found)
+			frame_plain(data.data, data.len, out);
+		pfree(data.data);
+		return found;
+	}
 	if (PROLLY_HAS(cs, get_stored))
 		return PROLLY_CALL(cs, get_stored, store, hash, out);
 	initStringInfo(&data);

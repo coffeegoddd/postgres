@@ -31,7 +31,9 @@ SELECT length(dolt_commit('-Am', 'two')::text) AS committed;
 (1 row)
 
 -- what a fetch asks
-SELECT dolt_serve_format() = :'fmt' AS same_format;
+-- (the canonical format, then that it sends and takes chunks framed, and
+-- with LZ4 where it can decompress them)
+SELECT dolt_serve_format() LIKE :'fmt' || '/framed%' AS same_format;
  same_format 
 -------------
  t
@@ -222,7 +224,7 @@ SELECT dolt_serve_format();
 ERROR:  permission denied for function dolt_serve_format
 RESET ROLE;
 SET ROLE regress_rs_fetch;
-SELECT dolt_serve_format() = :'fmt' AS fetches;
+SELECT dolt_serve_format() LIKE :'fmt' || '/framed%' AS fetches;
  fetches 
 ---------
  t

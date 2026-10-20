@@ -267,7 +267,13 @@ static const ProllyRemoteRoutine spool_remote = {
  * ------------------------------------------------------------------------
  */
 
-/* dolt_serve_format() returns text: the canonical format of the commits. */
+/*
+ * dolt_serve_format() returns text: the canonical format of the commits,
+ * then how this server sends and takes chunks: PROLLY_SERVE_FRAMED (as
+ * stored, framed), and PROLLY_SERVE_LZ4 if it can decompress what is sent
+ * it.  A client of another build, which reads the format before anything
+ * else, refuses a server that doesn't say it frames.
+ */
 Datum
 dolt_serve_format(PG_FUNCTION_ARGS)
 {
@@ -278,6 +284,10 @@ dolt_serve_format(PG_FUNCTION_ARGS)
 	prolly_database_components(&dc);
 	initStringInfo(&f);
 	PROLLY_CALL(dc.canonicalizer, format, &f);
+	appendStringInfoString(&f, PROLLY_SERVE_FRAMED);
+#ifdef USE_LZ4
+	appendStringInfoString(&f, PROLLY_SERVE_LZ4);
+#endif
 	PG_RETURN_TEXT_P(cstring_to_text(f.data));
 }
 
@@ -776,11 +786,19 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 				 errhint("Only the database's owner pushes to a protected branch.")));
 	initStringInfo(&mine);
 	PROLLY_CALL(dc.canonicalizer, format, &mine);
-	if (strcmp(text_to_cstring(PG_GETARG_TEXT_PP(3)), mine.data) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("this database holds commits of canonical format %s, not %s",
-						mine.data, text_to_cstring(PG_GETARG_TEXT_PP(3)))));
+	{
+		/* (the canonical format, as dolt_serve_format() gives it too) */
+		char	   *theirs = text_to_cstring(PG_GETARG_TEXT_PP(3));
+		char	   *framed = strstr(theirs, PROLLY_SERVE_FRAMED);
+
+		if (framed != NULL)
+			*framed = '\0';
+		if (strcmp(theirs, mine.data) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("this database holds commits of canonical format %s, not %s",
+							mine.data, theirs)));
+	}
 	/*
 	 * (a branch already elsewhere than expected: false before anything is
 	 * received, as the move would say after)

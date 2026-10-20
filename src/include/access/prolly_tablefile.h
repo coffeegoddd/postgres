@@ -97,6 +97,21 @@ typedef struct ProllyTableFileRoutine
 #define PROLLY_TABLEFILE_FIRST_CALLBACK write_begin
 #define PROLLY_TABLEFILE_LAST_CALLBACK write_add_stored
 
+/*
+ * A chunk as a format's file holds it (bytes, len, as find() locates them),
+ * framed as stored, appended to out: by read_stored() where the format has
+ * it, else decoded and framed again.  And a chunk given framed (frame, len)
+ * added to w: by write_add_stored(), else unframed and added (an error if
+ * it isn't a frame).
+ */
+extern void prolly_tablefile_read_stored(const ProllyTableFileRoutine *fmt,
+										 ProllyTableFile *tf, const char *bytes,
+										 uint32 len, StringInfo out);
+extern void prolly_tablefile_add_stored(const ProllyTableFileRoutine *fmt,
+										ProllyTableFileWriter *w,
+										const ProllyHash *hash, const char *frame,
+										Size len, StringInfo out);
+
 static inline const ProllyTableFileRoutine *
 prolly_tablefile_lookup(const char *name)
 {

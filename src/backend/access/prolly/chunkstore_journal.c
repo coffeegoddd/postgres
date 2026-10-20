@@ -3374,17 +3374,8 @@ tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 						 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 								len, (unsigned long long) offset, t->path)));
 			}
-			if (stored && PROLLY_HAS(table_format(), read_stored))
-				PROLLY_CALL(table_format(), read_stored, t->tf, bytes, len, out);
-			else if (stored)
-			{
-				StringInfoData data;
-
-				initStringInfo(&data);
-				PROLLY_CALL(table_format(), decode, t->tf, bytes, len, &data);
-				prolly_chunk_frame(data.data, data.len, out);
-				pfree(data.data);
-			}
+			if (stored)
+				prolly_tablefile_read_stored(table_format(), t->tf, bytes, len, out);
 			else
 				PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
 			pfree(bytes);
@@ -3456,21 +3447,8 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 			resetStringInfo(&data);
 			continue;
 		}
-		if (stored && PROLLY_HAS(fmt, write_add_stored))
-			PROLLY_CALL(fmt, write_add_stored, w, &hash, data.data, data.len, &buf);
-		else if (stored)
-		{
-			StringInfoData chunk;
-
-			initStringInfo(&chunk);
-			if (!prolly_chunk_unframe(data.data, data.len, &chunk))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("chunk %s isn't framed as stored chunks are",
-								prolly_hash_hex(&hash))));
-			PROLLY_CALL(fmt, write_add, w, &hash, chunk.data, chunk.len, &buf);
-			pfree(chunk.data);
-		}
+		if (stored)
+			prolly_tablefile_add_stored(fmt, w, &hash, data.data, data.len, &buf);
 		else
 			PROLLY_CALL(fmt, write_add, w, &hash, data.data, data.len, &buf);
 		nchunks++;
@@ -3877,8 +3855,11 @@ record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
 	const char *end = rec + len - sizeof(uint32);
 	char		head[PROLLY_FRAME_HEADER];
 	uint32		chunk_len;
+	uint8		kind = len > sizeof(uint32) ? (uint8) rec[sizeof(uint32)] : 0;
 
-	if (!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
+	/* (a chunk's record, as chunk_bytes_of() asks: not a ROOT's, nor a PAD's) */
+	if ((kind != KIND_CHUNK && kind != KIND_XCHUNK) ||
+		!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
 		(p = rec + after) >= end)
 		goto corrupt;
 	if ((uint8) *p == CODEC_NONE)
@@ -4256,6 +4237,20 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	}
 	if (!stored && ahead_take(s, &key, out))
 		return true;
+	if (stored)
+	{
+		StringInfoData ahead;
+
+		/* (read ahead, decoded: framed again rather than read again) */
+		initStringInfo(&ahead);
+		if (ahead_take(s, &key, &ahead))
+		{
+			prolly_chunk_frame(ahead.data, ahead.len, out);
+			pfree(ahead.data);
+			return true;
+		}
+		pfree(ahead.data);
+	}
 	refresh_segments(s);
 	xact_note(s);
 	if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))

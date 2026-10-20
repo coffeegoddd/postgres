@@ -22,6 +22,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_remote.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
@@ -47,7 +48,11 @@ struct ProllyRemote
 	char	   *where;			/* host and database, for messages */
 	bool		in_transaction; /* a BEGIN sent, not ended */
 	int			has_since;		/* dolt_serve_since() there: -1 not asked */
+	char	   *format;			/* its canonical format, once read */
+	bool		takes_lz4;		/* it decompresses what it is sent */
 };
+
+static void read_format(ProllyRemote *r);
 
 static uint32 we_connect;
 static uint32 we_result;
@@ -439,14 +444,46 @@ result_hash(ProllyRemote *r, PGresult *res, int row, int col, ProllyHash *h)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * The remote's format, read once, and how it sends and takes chunks (what
+ * follows its canonical format): one that doesn't say it frames them is of
+ * a build before, and its format is given so, that a client refuses it as
+ * of another.  This build without LZ4 asks for frames it can decompress.
+ */
+static void
+read_format(ProllyRemote *r)
+{
+	PGresult   *res;
+	char	   *f;
+	char	   *framed;
+
+	if (r->format != NULL)
+		return;
+	res = run(r, "SELECT pg_catalog.dolt_serve_format()", 0, NULL,
+			  NULL, NULL, NULL, &one_text, "reading the format");
+	f = MemoryContextStrdup(TopTransactionContext, PQgetvalue(res, 0, 0));
+	PQclear(res);
+	framed = strstr(f, PROLLY_SERVE_FRAMED);
+	if (framed == NULL)
+	{
+		r->format = MemoryContextStrdup(TopTransactionContext,
+										psprintf("%s (chunks sent unframed)", f));
+		return;
+	}
+	r->takes_lz4 = strcmp(framed + strlen(PROLLY_SERVE_FRAMED),
+						  PROLLY_SERVE_LZ4) == 0;
+	*framed = '\0';
+	r->format = f;
+#ifndef USE_LZ4
+	run_command(r, "SET prolly_serve_uncompressed = on", "asking for chunks uncompressed");
+#endif
+}
+
 static void
 libpq_format(ProllyRemote *r, StringInfo out)
 {
-	PGresult   *res = run(r, "SELECT pg_catalog.dolt_serve_format()", 0, NULL,
-						  NULL, NULL, NULL, &one_text, "reading the format");
-
-	appendStringInfoString(out, PQgetvalue(res, 0, 0));
-	PQclear(res);
+	read_format(r);
+	appendStringInfoString(out, r->format);
 }
 
 static void
@@ -492,6 +529,7 @@ libpq_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 	PGresult   *res;
 	bool		found;
 
+	read_format(r);
 	res = run_hashes(r, "SELECT chunk FROM pg_catalog.dolt_serve_get($1)", hash, 1,
 					 &shape, "reading a chunk");
 	found = PQntuples(res) > 0;
@@ -520,6 +558,7 @@ libpq_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
 {
 	PGresult   *res;
 
+	read_format(r);
 	res = run_hashes(r, "SELECT hash, chunk FROM pg_catalog.dolt_serve_get($1)",
 					 hashes, n, &chunk_rows, "reading chunks");
 	PG_TRY();
@@ -583,6 +622,7 @@ libpq_get_since(ProllyRemote *r, const ProllyHash *wanted, int nwanted,
 	}
 	if (!r->has_since)
 		return;
+	read_format(r);
 
 	initStringInfo(&w);
 	initStringInfo(&k);
@@ -658,6 +698,20 @@ send_batch(ProllyRemote *r, const ProllyHash *hashes, StringInfoData **chunks, i
 	int			formats[2] = {1, 1};
 	Oid			types[2] = {BYTEAARRAYOID, BYTEAARRAYOID};
 
+	/* (a remote that can't decompress is sent every chunk plain) */
+	read_format(r);
+	if (!r->takes_lz4)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			StringInfoData plain;
+
+			initStringInfo(&plain);
+			prolly_chunk_frame_plain(chunks[i]->data, chunks[i]->len, &plain);
+			pfree(chunks[i]->data);
+			*chunks[i] = plain;
+		}
+	}
 	initStringInfo(&h);
 	initStringInfo(&c);
 	hashes_array(&h, hashes, n);

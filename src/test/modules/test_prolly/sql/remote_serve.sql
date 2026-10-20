@@ -20,7 +20,9 @@ INSERT INTO rs.t VALUES (2, 'two');
 SELECT length(dolt_commit('-Am', 'two')::text) AS committed;
 
 -- what a fetch asks
-SELECT dolt_serve_format() = :'fmt' AS same_format;
+-- (the canonical format, then that it sends and takes chunks framed, and
+-- with LZ4 where it can decompress them)
+SELECT dolt_serve_format() LIKE :'fmt' || '/framed%' AS same_format;
 SELECT branch, commit_id = pg_temp.h(branch) AS at_head FROM dolt_serve_heads()
   WHERE branch IN ('main', 'rs_b') ORDER BY branch;
 SELECT dolt_serve_has(ARRAY[pg_temp.h('main'), '\x00ff'::bytea]);
@@ -93,7 +95,7 @@ SET ROLE regress_rs_none;
 SELECT dolt_serve_format();
 RESET ROLE;
 SET ROLE regress_rs_fetch;
-SELECT dolt_serve_format() = :'fmt' AS fetches;
+SELECT dolt_serve_format() LIKE :'fmt' || '/framed%' AS fetches;
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'), pg_temp.h('rs_b'), :'fmt', false);
 RESET ROLE;
 SET ROLE regress_rs_push;
