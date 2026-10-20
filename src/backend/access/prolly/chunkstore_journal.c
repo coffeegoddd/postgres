@@ -4655,6 +4655,19 @@ remove_leftovers(const char *dir, Oid dboid, Oid spcoid)
 	path = dir_file(dir, JOURNAL_FILE);
 	has_store |= stat(path, &st) == 0;
 	pfree(path);
+
+	/*
+	 * (or a store's file alone: a store's first table file is written
+	 * before its first manifest, and needs no journal)
+	 */
+	if (!has_store)
+	{
+		d = AllocateDir(dir);
+		while (!has_store && (de = ReadDir(d, dir)) != NULL)
+			has_store = strncmp(de->d_name, "prolly_table_", 13) == 0 ||
+				strncmp(de->d_name, SEGMENT_PREFIX, strlen(SEGMENT_PREFIX)) == 0;
+		FreeDir(d);
+	}
 	if (!has_store)
 		return;
 	memset(&s, 0, sizeof(s));

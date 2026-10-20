@@ -310,6 +310,38 @@ $node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
 is($standby->safe_psql('gcdb', $files), sql($files),
 	'the standby\'s files are the primary\'s after it all');
 
+# A crash as a store's first table file is written, before any manifest
+# (and with no journal): recovery removes the file no manifest names, in
+# a directory that holds it alone.
+$node->safe_psql('postgres', 'CREATE DATABASE first_file');
+$node->safe_psql('first_file',
+	'CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points');
+my $ff = $node->data_dir . '/base/'
+  . $node->safe_psql('postgres',
+	q{SELECT oid FROM pg_database WHERE datname = 'first_file'});
+my $store_files = sub {
+	opendir(my $dh, $ff) or die "opendir $ff: $!";
+	my @f = sort grep { /^prolly_/ } readdir($dh);
+	closedir($dh);
+	return join(' ', @f);
+};
+is($store_files->(), '', 'a new database has no store files');
+my $writer = $node->background_psql('first_file');
+$writer->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-table-file-written', 'wait')});
+$writer->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_table_file(ARRAY['first file'::bytea]);
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'prolly-table-file-written'})
+  or die 'the writer did not wait';
+like($store_files->(), qr/^prolly_table_\S+$/, 'the file written, alone');
 $standby->stop;
+$node->stop('immediate');
+$writer->{run}->finish;
+$node->start;
+is($store_files->(), '', 'recovery removes it');
+
 $node->stop;
 done_testing();
