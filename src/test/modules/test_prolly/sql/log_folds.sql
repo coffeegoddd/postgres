@@ -193,8 +193,9 @@ DELETE FROM inc.keyless WHERE a = 5000;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'out of line gone')::text) AS committed;
 
--- A value stored by content stays, but the log can't tell: read in full
--- too ("pages" doesn't give up here; the spec's known limit).
+-- A value stored by content stays (nothing deletes it with the row, and a
+-- collection keeps what the log's pages name): its entry holds the
+-- pointer, and the fold reads from the baseline.
 INSERT INTO inc.keyless
   SELECT 5001, string_agg(md5(g::text), '') FROM generate_series(1, 400) g;
 SELECT length(dolt_commit('-am', 'by content')::text) AS committed;

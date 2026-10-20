@@ -70,8 +70,11 @@ Two interfaces, each selected by the table AM's profile
   tuple (other columns null, values out of line inlined, compressed ones
   still compressed), one entry for an update that kept its key; without
   one, the version as stored, with +1 for a version made and −1 for one
-  replaced. A keyless version with a value out of line, or either image
-  too large for the log's page (a key's compressed values needn't be as
+  replaced, its values out of line as their hash pointers: by content in
+  the chunk store, where nothing deletes them with the row, and a
+  collection keeps every tree a pointer on the log's pages names (#508).
+  A keyless version with a value out of line otherwise (not a versioned
+  table's), or either image too large for the log's page (a key's compressed values needn't be as
   its index holds them), is recorded as "fold in full" instead (no
   image). So is a truncation (made anew or in place) and a rewrite that
   may change rows (`ALTER TABLE`'s heap swap, a materialized view's
@@ -184,8 +187,9 @@ made passed in hand.
 
 - **Bulk writes to keyless tables** log each row whole until the next
   fold: a load of N rows writes N entries of the row's size.
-- **Keyless rows with values out of line** (by content too) are entries
-  to fold in full; `pages` reads values stored by content again.
+- **Keyless rows with values out of line** other than by content (not a
+  versioned table's) are entries to fold in full; `pages` reads values
+  stored by content again.
 - **The log grows between baselines**, as the changed-page list did: with
   `dolt.transaction_commit` and no other fold (spec 15 doesn't advance
   the baseline), until the next commit, checkpoint or move.

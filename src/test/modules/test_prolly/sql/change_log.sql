@@ -82,7 +82,8 @@ COMMIT;
 SELECT * FROM pg_temp.entries('cl.keyed');
 SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
 
--- A keyless row with a value out of line can't be held: read in full.
+-- A keyless row with a value out of line by content (its hash pointer):
+-- held, the pointer in the entry.
 INSERT INTO cl.keyless
 SELECT 3, string_agg(md5(g::text), '') FROM generate_series(1, 300) g;
 SELECT * FROM pg_temp.entries('cl.keyless');
