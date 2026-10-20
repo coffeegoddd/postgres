@@ -110,6 +110,7 @@ tests += {
       'stat_prolly',
       'store_sizes',
       'get_many',
+      'put_batches',
       'append_check',
       'journal_segments',
       'journal_compression',

@@ -420,6 +420,7 @@ typedef struct IndexEntry
 	TransactionId xid;			/* its transaction, while not known to have
 								 * ended; invalid: everyone's */
 	struct IndexEntry *other;	/* another copy, while this one isn't */
+	uint32		raw_len;		/* (pending) the chunk's own length */
 } IndexEntry;
 
 /*
@@ -2235,12 +2236,126 @@ reserve_pending(ProllyChunkStore *s, Append *a, int *pad_at)
 	}
 }
 
+static const ProllyTableFileRoutine *table_format(void);
+
+static int
+pending_hash_cmp(const void *a, const void *b)
+{
+	const IndexEntry *x = *(IndexEntry *const *) a;
+	const IndexEntry *y = *(IndexEntry *const *) b;
+	int			c = memcmp(x->hash.bytes, y->hash.bytes, Min(x->hash.len, y->hash.len));
+
+	return c != 0 ? c : (int) x->hash.len - (int) y->hash.len;
+}
+
+static int
+pending_offset_cmp(const void *a, const void *b)
+{
+	const IndexEntry *x = *(IndexEntry *const *) a;
+	const IndexEntry *y = *(IndexEntry *const *) b;
+
+	return x->offset < y->offset ? -1 : x->offset > y->offset ? 1 : 0;
+}
+
+/*
+ * Before the pending chunks are appended: those the store has already
+ * dropped, asked all at once, in hash order (the shared index, then each
+ * table file, its filter first), rather than as each was put; what is left
+ * is counted as appended.  Only before a root's PAD is added to pending.
+ */
+static void
+drop_stored(ProllyChunkStore *s)
+{
+	long		n = hash_get_num_entries(s->pending_index);
+	IndexEntry **es;
+	bool	   *stored;
+	int			nstored = 0;
+	HASH_SEQ_STATUS status;
+	IndexEntry *e;
+	int			k = 0;
+	ListCell   *lc;
+
+	if (n == 0)
+		return;
+	refresh_segments(s);
+	load_tables(s, false);
+	es = palloc(sizeof(IndexEntry *) * n);
+	stored = palloc0(sizeof(bool) * n);
+	hash_seq_init(&status, s->pending_index);
+	while ((e = hash_seq_search(&status)) != NULL)
+		es[k++] = e;
+	qsort(es, n, sizeof(IndexEntry *), pending_hash_cmp);
+	for (int i = 0; i < n; i++)
+	{
+		stored[i] = jindex_has(s->ix, &es[i]->hash);
+		nstored += stored[i];
+	}
+	foreach(lc, s->tables)
+	{
+		TableFile  *t = lfirst(lc);
+
+		for (int i = 0; i < n; i++)
+		{
+			uint64		offset;
+			uint32		len;
+
+			if (!stored[i] &&
+				PROLLY_CALL(table_format(), find, t->tf, &es[i]->hash, &offset, &len))
+			{
+				stored[i] = true;
+				nstored++;
+			}
+		}
+	}
+	for (int i = 0; i < n; i++)
+	{
+		if (stored[i])
+			continue;
+		pgstat_count_prolly(PGSTAT_PROLLY_CHUNKS_APPENDED, 1);
+		pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_BYTES_APPENDED, es[i]->raw_len);
+	}
+	if (nstored > 0)
+	{
+		StringInfoData kept;
+		ProllyHash *gone = palloc(sizeof(ProllyHash) * nstored);
+		int			ngone = 0;
+
+		/* (the rest as they were, in their order) */
+		for (int i = 0; i < n; i++)
+			if (stored[i])
+				gone[ngone++] = es[i]->hash;
+		k = 0;
+		for (int i = 0; i < n; i++)
+			if (!stored[i])
+				es[k++] = es[i];
+		qsort(es, k, sizeof(IndexEntry *), pending_offset_cmp);
+		initStringInfo(&kept);
+		for (int i = 0; i < k; i++)
+		{
+			int			at = kept.len;
+
+			appendBinaryStringInfo(&kept, s->pending.data + es[i]->offset,
+								   es[i]->len);
+			es[i]->offset = at;
+		}
+		for (int i = 0; i < ngone; i++)
+			hash_search(s->pending_index, &gone[i], HASH_REMOVE, NULL);
+		resetStringInfo(&s->pending);
+		appendBinaryStringInfo(&s->pending, kept.data, kept.len);
+		pfree(kept.data);
+		pfree(gone);
+	}
+	pfree(es);
+	pfree(stored);
+}
+
 /* Append the transaction's pending chunks. */
 static void
 flush_pending(ProllyChunkStore *s)
 {
 	Append		a;
 
+	drop_stored(s);
 	if (s->pending.len == 0)
 		return;
 	reserve_pending(s, &a, NULL);
@@ -2283,6 +2398,7 @@ reserve_at_commit(ProllyChunkStore *s)
 {
 	int			pad_at = -1;
 
+	drop_stored(s);
 	if (s->pending.len == 0 && !s->moving)
 		return;
 	reserve_pending(s, &s->commit_append, s->moving ? &pad_at : NULL);
@@ -2340,6 +2456,7 @@ journal_xact_callback(XactEvent event, void *arg)
 			break;
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 			/* a parallel worker's commit has no record: written now */
+			drop_stored(s);
 			if (s->pending.len > 0 || s->moving)
 			{
 				Append		a;
@@ -3575,10 +3692,9 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 		elog(ERROR, "cannot put a chunk after the transaction's chunks are appended");
 	xact_note(s);
 
+	/* (whether the store has it is asked of all pending at once, later) */
 	hash_key(&key, hash);
-	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		jindex_has(s->ix, &key) ||
-		tables_get(s, &key, NULL))
+	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL)
 		return;
 
 	/* pending as it was, if a subtransaction puts its first */
@@ -3613,8 +3729,7 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	e->len = s->pending.len - at;
 	e->xid = xid;
 	e->other = NULL;
-	pgstat_count_prolly(PGSTAT_PROLLY_CHUNKS_APPENDED, 1);
-	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_BYTES_APPENDED, len);
+	e->raw_len = (uint32) len;
 
 	if (s->pending.len >= APPEND_BATCH)
 		flush_pending(s);
