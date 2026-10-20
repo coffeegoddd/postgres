@@ -201,7 +201,7 @@ INSERT INTO ds.coll SELECT chr(65 + g % 26) || chr(97 + g % 26) || g, g FROM gen
 SELECT length(dolt_commit('-Am', 'left')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE ds.gone2 SET v = 'changed' WHERE id % 50 = 0;
@@ -213,7 +213,7 @@ INSERT INTO ds.coll VALUES ('aa', 0), ('ZZ', 0), ('Ab', 0);
 SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.gone2') AS here \gset here_
@@ -222,7 +222,7 @@ DROP TABLE ds.gone2, ds.coll;
 SELECT length(dolt_commit('-am', 'dropped')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT table_name, rows_unmodified, rows_added, rows_deleted, rows_modified,
