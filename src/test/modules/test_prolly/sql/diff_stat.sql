@@ -67,6 +67,12 @@ SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'doesnotexist');
 SELECT * FROM dolt_diff_stat('HEAD~1..HEAD', 'ds.nope');
 SELECT count(*) FROM dolt_diff_stat('HEAD', 'WORKING', 'ds.t');
 SELECT count(*) FROM dolt_diff_summary('HEAD~1', 'HEAD', 'doesnotexist');
+-- a name whose changes are a view's, not a table's: refused too
+CREATE VIEW ds.justview AS SELECT 1 AS one;
+SELECT * FROM dolt_diff_stat('HEAD', 'WORKING', 'ds.justview');
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', 'ds.justview');
+DROP VIEW ds.justview;
 
 \c contrib_regression
 DROP DATABASE regress_diff_stat;

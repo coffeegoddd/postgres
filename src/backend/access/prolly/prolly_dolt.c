@@ -3511,6 +3511,18 @@ row_name_wanted(List *rows, const char *name)
 	return want;
 }
 
+/* Is one of rows a table's? */
+static bool
+rows_have_table(List *rows)
+{
+	ListCell   *lc;
+
+	foreach(lc, rows)
+		if (((SummaryRow *) lfirst(lc))->object == PROLLY_OBJECT_TABLE)
+			return true;
+	return false;
+}
+
 /*
  * Does name name a table ref has?  Its objects are what differs from the
  * empty root to it.
@@ -4500,8 +4512,11 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 	diff_refs("dolt_diff_stat", &from_ref, &to_ref, &name);
 	stats = summary_rows(from_ref, to_ref, name, false);
 
-	/* (as Dolt's: a table neither version has is refused, not none) */
-	if (name != NULL && stats == NIL &&
+	/*
+	 * (as Dolt's: a table neither version has is refused, not none; the
+	 * name's changes may be another object's, a view's or a routine's)
+	 */
+	if (name != NULL && !rows_have_table(stats) &&
 		!version_has_table(from_ref, name) && !version_has_table(to_ref, name))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
