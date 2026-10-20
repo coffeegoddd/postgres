@@ -14,8 +14,9 @@
  *
  * Other forks (the free space map and visibility map) are md.c files of the
  * relation.  They are extended during recovery without WAL records of their
- * own, so a standby couldn't follow the primary's allocations for them; and
- * they are hints or rebuildable, so they need no sharing.
+ * own, so a standby couldn't follow the primary's allocations for them, so
+ * they aren't shared: a relation made as a share of another gets copies of
+ * them (RelationCreateStorageShared()), as they are small.
  *
  * The map fork.  Block 0 is a header holding the relation's logical length
  * and epoch.  Logical block L's entry is at slot L % BMAP_FANOUT of map page
