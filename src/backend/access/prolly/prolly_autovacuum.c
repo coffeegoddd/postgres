@@ -117,8 +117,8 @@ prolly_autovacuum_init(void)
 							"How large each table file a collection writes grows before it starts another.",
 							"Files of a set size can be sent whole to a remote and conjoined later.",
 							&prolly_gc_file_size,
-							65536, 64, MAX_KILOBYTES,
-							PGC_USERSET,
+							65536, 1024, MAX_KILOBYTES,
+							PGC_SIGHUP,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 	defined = true;

@@ -3377,11 +3377,13 @@ tables_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 
 /*
  * Write table file id of the chunks next() gives (a chunk given twice
- * once), and sync it; false, writing nothing, if it gives none.
+ * once), and sync it; false, writing nothing, if it gives none.  With a
+ * limit, no more is asked of next() once the file's bytes reach it (*full
+ * set): the caller begins another.
  */
 static bool
 write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
-		   uint32 *nchunks_out, uint64 *size_out)
+		   uint64 limit, bool *full, uint32 *nchunks_out, uint64 *size_out)
 {
 	const ProllyTableFileRoutine *fmt = table_format();
 	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -3396,6 +3398,7 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 	HASHCTL		ctl;
 	HTAB	   *seen;
 
+	*full = false;
 	initStringInfo(&data);
 	if (!next(arg, &hash, &data))
 	{
@@ -3440,7 +3443,9 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 		}
 		resetStringInfo(&data);
 		CHECK_FOR_INTERRUPTS();
-	} while (next(arg, &hash, &data));
+		/* (the bytes as written: compressed, framed) */
+		*full = limit > 0 && offset + buf.len >= limit;
+	} while (!*full && next(arg, &hash, &data));
 	PROLLY_CALL(fmt, write_finish, w, &buf);
 	table_file_write(s, fd, path, id, offset, buf.data, buf.len);
 	offset += buf.len;
@@ -3471,37 +3476,52 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
  */
 static void
 write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
-				 ProllyChunkNext next, void *arg, bool copies)
+				 ProllyChunkNext next, void *arg, bool copies, uint64 limit)
 {
 	char	   *dir;
 	uint64		id = m->last_id + 1;
 	uint64		size;
 	uint32		nchunks;
 	Manifest	nm;
-
-	if (!write_file(s, id, next, arg, &nchunks, &size))
-		return;
-	if (copies)
-		pgstat_count_prolly(PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, size);
-	INJECTION_POINT("prolly-table-file-written", NULL);
+	bool		full;
+	int			max = 4;
 
 	nm = *m;
-	nm.last_id = id;
-	/* (the committed root: one the transaction moves to may roll back) */
-	scan_journal(s);
-	nm.root = s->root;
 	nm.nfiles = 0;
-	nm.files = palloc(sizeof(ManifestFile) * (m->nfiles + 1));
+	nm.files = palloc(sizeof(ManifestFile) * (m->nfiles + max));
 	for (int i = 0; i < m->nfiles; i++)
 	{
 		if (keep[i])
 			nm.files[nm.nfiles++] = m->files[i];
 	}
-	nm.files[nm.nfiles].id = id;
-	nm.files[nm.nfiles].nchunks = nchunks;
-	nm.files[nm.nfiles].size = size;
-	nm.files[nm.nfiles].flags = flags;
-	nm.nfiles++;
+	/* (with a limit, as many files as it takes, each begun as the last fills) */
+	do
+	{
+		if (!write_file(s, id, next, arg, limit, &full, &nchunks, &size))
+			break;
+		if (copies)
+			pgstat_count_prolly(PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, size);
+		INJECTION_POINT("prolly-table-file-written", NULL);
+		if (nm.nfiles == m->nfiles + max)
+		{
+			max *= 2;
+			nm.files = repalloc(nm.files, sizeof(ManifestFile) * (m->nfiles + max));
+		}
+		nm.files[nm.nfiles].id = id;
+		nm.files[nm.nfiles].nchunks = nchunks;
+		nm.files[nm.nfiles].size = size;
+		nm.files[nm.nfiles].flags = flags;
+		nm.nfiles++;
+		nm.last_id = id++;
+	} while (full);
+	if (nm.last_id == m->last_id)
+	{
+		pfree(nm.files);
+		return;
+	}
+	/* (the committed root: one the transaction moves to may roll back) */
+	scan_journal(s);
+	nm.root = s->root;
 	replace_manifest(s, &nm, XLOG_CHUNKS_MANIFEST);
 	INJECTION_POINT("prolly-manifest-replaced", NULL);
 
@@ -4828,7 +4848,7 @@ journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
 	for (int i = 0; i < m.nfiles; i++)
 		keep[i] = true;
-	write_table_file(s, &m, keep, 0, next, arg, false);
+	write_table_file(s, &m, keep, 0, next, arg, false, 0);
 	pfree(keep);
 }
 
@@ -5052,7 +5072,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true);
+		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true,
+						 (uint64) prolly_gc_file_size * 1024);
 	}
 	PG_FINALLY();
 	{
@@ -6189,8 +6210,6 @@ typedef struct GcCopy
 	const ProllyHashRoutine *hash;
 	bool		paced;			/* by the cost-based vacuum delay */
 	uint64	   *order;			/* the slots, file by file in offset order */
-	uint64		file_bytes;		/* the chunks' bytes in the file being written */
-	uint64		file_limit;		/* when it is full: another is begun */
 	/* the window of a file last read: its bytes [start, start + buf.len) */
 	GcFile	   *window_file;
 	uint64		window_start;
@@ -6323,8 +6342,6 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 	GcCopy	   *gcc = arg;
 	ProllyChunkGc *gc = gcc->gc;
 
-	if (gcc->file_bytes >= gcc->file_limit)
-		return false;
 	while (gcc->next < gc->nslots)
 	{
 		uint64		slot = gcc->order[gcc->next++];
@@ -6356,7 +6373,6 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("chunk in file \"%s\" doesn't match its hash",
 							f->path)));
-		gcc->file_bytes += data->len;
 		return true;
 	}
 	return false;
@@ -6377,6 +6393,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 	uint32		nchunks;
 	uint64		size;
 	bool		wrote;
+	bool		full;
 
 	if (gc->copied == NULL)
 		gc->copied = MemoryContextAllocZero(gc->cxt, gc->nslots / 8 + 1);
@@ -6384,13 +6401,16 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 	if (gc->read_order == NULL)
 		gc->read_order = gc_read_order(gc);
 	gcc.order = gc->read_order;
-	gcc.file_limit = (uint64) prolly_gc_file_size * 1024;
 	initStringInfo(&gcc.window);
 	do
 	{
-		gcc.file_bytes = 0;
-		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, &nchunks,
-						   &size);
+		/*
+		 * (not in the window, where appends wait: what came since is few
+		 * chunks, written as one file, fsynced once)
+		 */
+		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc,
+						   paced ? (uint64) prolly_gc_file_size * 1024 : 0,
+						   &full, &nchunks, &size);
 		if (wrote)
 		{
 			ManifestFile *f = MemoryContextAlloc(gc->cxt, sizeof(ManifestFile));
@@ -6404,7 +6424,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 			gc->written = lappend(gc->written, f);
 			MemoryContextSwitchTo(old);
 		}
-	} while (wrote && gcc.file_bytes >= gcc.file_limit);
+	} while (wrote && full);
 	pfree(gcc.window.data);
 }
 
