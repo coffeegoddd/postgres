@@ -442,6 +442,8 @@ static int	lazy_scan_prune(LVRelState *vacrel, Buffer buf,
 static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 							  BlockNumber blkno, Page page,
 							  bool *has_lpdead_items);
+static bool lazy_scan_reclaimable(LVRelState *vacrel, Buffer buf,
+								  BlockNumber blkno, Page page);
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
@@ -1335,6 +1337,7 @@ lazy_scan_heap(LVRelState *vacrel)
 		void	   *per_buffer_data = NULL;
 		bool		vm_page_frozen = false;
 		bool		got_cleanup_lock = false;
+		bool		left_shared = false;
 
 		vacuum_delay_point(false);
 
@@ -1457,16 +1460,20 @@ lazy_scan_heap(LVRelState *vacrel)
 
 		/*
 		 * A page another relation shares (a branch's, copy-on-write) is left
-		 * as it is unless it must be frozen: pruning it, freezing it or
+		 * as it is when there's nothing on it to reclaim: freezing it or
 		 * setting it all-visible would copy it, undoing the sharing for
-		 * nothing the relations need.  It is counted, as a page whose cleanup
-		 * lock wasn't obtained is, and an aggressive VACUUM that must freeze
-		 * a tuple of it still does (lazy_scan_noprune() says so).
+		 * nothing the relations need.  Its tuples are counted, as a page's
+		 * whose cleanup lock wasn't obtained are.  One with dead tuples or
+		 * dead line pointers is pruned as any (copied: the space it frees is
+		 * real, and left, its dead would be counted at every VACUUM and
+		 * never removed), and an aggressive VACUUM that must freeze a tuple
+		 * of it still does (lazy_scan_noprune() says so).
 		 */
-		if (got_cleanup_lock && BufferPageIsShared(buf))
+		if (got_cleanup_lock && BufferPageIsShared(buf) &&
+			!lazy_scan_reclaimable(vacrel, buf, blkno, page))
 		{
 			got_cleanup_lock = false;
-			vacrel->shared_pages++;
+			left_shared = true;
 		}
 
 		/*
@@ -1488,6 +1495,19 @@ lazy_scan_heap(LVRelState *vacrel)
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			LockBufferForCleanupUnprepared(buf);
 			got_cleanup_lock = true;
+			left_shared = false;
+		}
+
+		/*
+		 * A shared page left as it is counts as an eager scan's failure: it
+		 * wasn't frozen, and shared pages can be most of a table, so leaving
+		 * them out of the cap would have every region read in full.
+		 */
+		if (left_shared)
+		{
+			vacrel->shared_pages++;
+			if (was_eager_scanned && vacrel->eager_scan_remaining_fails > 0)
+				vacrel->eager_scan_remaining_fails--;
 		}
 
 		/*
@@ -2172,6 +2192,40 @@ lazy_scan_prune(LVRelState *vacrel,
 	*has_lpdead_items = (presult.lpdead_items > 0);
 
 	return presult.ndeleted;
+}
+
+/*
+ *	lazy_scan_reclaimable() -- does the page hold anything VACUUM would free?
+ *
+ * Dead line pointers, or tuples dead to every snapshot (as lazy_scan_noprune()
+ * tells them), which pruning would remove.  Caller holds a lock on the
+ * buffer.
+ */
+static bool
+lazy_scan_reclaimable(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
+					  Page page)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	for (OffsetNumber offnum = FirstOffsetNumber; offnum <= maxoff;
+		 offnum = OffsetNumberNext(offnum))
+	{
+		ItemId		itemid = PageGetItemId(page, offnum);
+		HeapTupleData tuple;
+
+		if (ItemIdIsDead(itemid))
+			return true;
+		if (!ItemIdIsNormal(itemid))
+			continue;
+		ItemPointerSet(&(tuple.t_self), blkno, offnum);
+		tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
+		tuple.t_len = ItemIdGetLength(itemid);
+		tuple.t_tableOid = RelationGetRelid(vacrel->rel);
+		if (HeapTupleSatisfiesVacuum(&tuple, vacrel->cutoffs.OldestXmin,
+									 buf) == HEAPTUPLE_DEAD)
+			return true;
+	}
+	return false;
 }
 
 /*
