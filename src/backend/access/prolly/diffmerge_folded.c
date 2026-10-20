@@ -6934,8 +6934,13 @@ fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
 	ms->base = *base;
 	ms->ntables = list_length(conflicted);
 	ms->tables = palloc(sizeof(Oid) * Max(ms->ntables, 1));
+	ms->table_names = palloc(sizeof(char *) * Max(ms->ntables, 1));
 	foreach(lc, conflicted)
+	{
+		/* (its name too: the versions are found by it) */
+		ms->table_names[i] = table_name(lfirst_oid(lc));
 		ms->tables[i++] = lfirst_oid(lc);
+	}
 	ms->pick = pick_message != NULL;
 	ms->message = unconstify(char *, pick_message);
 }
@@ -7410,6 +7415,16 @@ conflicted_table(Oid relid, ProllyMergeState *state)
 	return -1;
 }
 
+/* Has relid the name the merge recorded for it (if it recorded one)? */
+static bool
+named_as_recorded(Oid relid, const ProllyMergeState *ms, const char *name)
+{
+	for (int i = 0; ms->table_names && i < ms->ntables; i++)
+		if (ms->tables[i] == relid && ms->table_names[i])
+			return strcmp(ms->table_names[i], name) == 0;
+	return true;
+}
+
 /*
  * Walk relid's changes in the merge in progress, as mode says, against
  * the branch's rows as they are now.  (A table the working set leaves out,
@@ -7455,6 +7470,25 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	 * theirs' rows checked as they're taken.  Nothing refused, as a merge
 	 * would: rows are listed whatever happened to the table since.)
 	 */
+	/*
+	 * (a name other than the one the merge recorded for it, as when two
+	 * tables swapped names: its versions found by name would be another's)
+	 */
+	if (!named_as_recorded(relid, ms, name))
+	{
+		char	   *why = psprintf("table %s was renamed or moved since the merge began",
+								   name);
+
+		if (sink != NULL && sink->unreadable != NULL)
+		{
+			sink->unreadable(sink, why);
+			return;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s", why),
+				 errhint("Give it its name back to list or resolve its conflicts.")));
+	}
 	bt = find_table(tables_at(&ms->base), name);
 	ot = find_table(tables_at(&ours), name);
 	tt = find_table(tables_at(&ms->theirs), name);
@@ -7527,6 +7561,8 @@ folded_resolve(Oid relid, bool theirs)
 	if (theirs)
 		walk_conflicts(relid, &ms, WALK_TAKE_THEIRS, NULL);
 	ms.tables[i] = ms.tables[--ms.ntables];
+	if (ms.table_names)
+		ms.table_names[i] = ms.table_names[ms.ntables];
 	PROLLY_CALL(components().refs, set_merge_state, &ms);
 }
 

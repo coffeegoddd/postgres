@@ -119,6 +119,7 @@
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 #define TAG_CONFIG		'C'	/* a database setting */
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
+#define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
 #define TAG_STASH		'Z'	/* a list of stashes, by name */
 
 static bool ready = false;
@@ -138,6 +139,8 @@ static List *violations_left(const char *branch, List *violations,
 							 char **name);
 static Oid	branch_oid(const char *name);
 static void merge_key(StringInfo key, const char *branch);
+static void merge_names_put(const char *branch, const ProllyMergeState *state);
+static void merge_names_get(const char *branch, ProllyMergeState *state);
 static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
@@ -1765,7 +1768,10 @@ copies_branch_delete(const char *name, bool force)
 		initStringInfo(&key);
 		merge_key(&key, name);
 		if (merge_state_of(name, &ms))
+		{
 			refs_put(key.data, key.len, NULL);
+			merge_names_put(name, NULL);
+		}
 		if (violations_of(name) != NIL)
 		{
 			resetStringInfo(&key);
@@ -1788,7 +1794,7 @@ static void
 copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
-	TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
+	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
 	ListCell   *lc;
 
 	lock_refs();
@@ -2259,6 +2265,86 @@ merge_key(StringInfo key, const char *branch)
 }
 
 /*
+ * A branch's merge's conflicted tables' names, as the merge recorded them,
+ * under a key of their own (the merge state's value ends with a message):
+ * each table's OID, then its name's length (a varint) and bytes.
+ */
+static void
+merge_names_key(StringInfo key, const char *branch)
+{
+	appendStringInfoChar(key, TAG_MERGE_NAMES);
+	appendStringInfoString(key, branch);
+}
+
+static void
+merge_names_put(const char *branch, const ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		any = false;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	merge_names_key(&key, branch);
+	for (int i = 0; state && state->table_names && i < state->ntables; i++)
+		if (state->table_names[i])
+		{
+			put_be32(&v, state->tables[i]);
+			prolly_put_varint(&v, strlen(state->table_names[i]));
+			appendStringInfoString(&v, state->table_names[i]);
+			any = true;
+		}
+	{
+		StringInfoData had;
+
+		initStringInfo(&had);
+		if (any || refs_get(key.data, key.len, &had))
+			refs_put(key.data, key.len, any ? &v : NULL);
+		pfree(had.data);
+	}
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* state's table_names, from the key above (none recorded: NULL) */
+static void
+merge_names_get(const char *branch, ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	merge_names_key(&key, branch);
+	state->table_names = NULL;
+	if (refs_get(key.data, key.len, &v))
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+
+		state->table_names = palloc0(sizeof(char *) * Max(state->ntables, 1));
+		while (end - p >= 4)
+		{
+			Oid			oid = get_be32(p);
+			uint64		len;
+
+			p += 4;
+			len = prolly_get_varint(&p, end);
+			if (len > (uint64) (end - p))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly refs hold an invalid merge state")));
+			for (int i = 0; i < state->ntables; i++)
+				if (state->tables[i] == oid)
+					state->table_names[i] = pnstrdup(p, len);
+			p += len;
+		}
+	}
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
  * The merge in progress on branch, if there is one, as the refs hold it:
  * its conflicted tables, as merge_tables_left() has them, may include some
  * since dropped.
@@ -2316,6 +2402,8 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 		else
 			state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
 	}
+	if (found)
+		merge_names_get(branch, state);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
@@ -2335,7 +2423,11 @@ merge_tables_left(const char *branch, ProllyMergeState *state, char **name)
 	tables_exist_on(branch, state->ntables, state->tables, exists, name);
 	for (int i = 0; i < state->ntables; i++)
 		if (exists[i])
+		{
+			if (state->table_names)
+				state->table_names[n] = state->table_names[i];
 			state->tables[n++] = state->tables[i];
+		}
 	state->ntables = n;
 	pfree(exists);
 }
@@ -2369,6 +2461,7 @@ copies_set_merge_state(const ProllyMergeState *state)
 	{
 		if (had)
 			refs_put(key.data, key.len, NULL);
+		merge_names_put(branch, NULL);
 	}
 	else
 	{
@@ -2394,6 +2487,7 @@ copies_set_merge_state(const ProllyMergeState *state)
 		}
 		refs_put(key.data, key.len, &v);
 		pfree(v.data);
+		merge_names_put(branch, state);
 		note_merge_changed(branch);
 	}
 	pfree(key.data);
@@ -3194,6 +3288,7 @@ end_merge(const char *name)
 	{
 		merge_key(&key, name);
 		refs_put(key.data, key.len, NULL);
+		merge_names_put(name, NULL);
 	}
 	if (violations_of(name) != NIL)
 	{

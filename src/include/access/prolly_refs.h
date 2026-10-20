@@ -68,6 +68,9 @@ typedef struct ProllyMergeState
 	ProllyHash	base;			/* the common ancestor */
 	int			ntables;
 	Oid		   *tables;			/* with unresolved conflicts (palloc'd) */
+	char	  **table_names;	/* each one's name (qualified) when the merge
+								 * recorded it, as tables[] (NULL, or an
+								 * entry NULL: not known) */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 

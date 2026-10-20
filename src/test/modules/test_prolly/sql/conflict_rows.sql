@@ -87,3 +87,39 @@ RESET dolt.allow_commit_conflicts;
 SELECT dolt_branch('-D', 'cr_other');
 DROP SCHEMA cr CASCADE;
 SELECT length(dolt_commit('-Am', 'without cr')::text) AS committed;
+
+-- A conflicted table's versions are found by the name it had as the merge
+-- recorded it: two tables' names swapped mid-merge are refused, not read
+-- as each other's, until their names are back.
+CREATE DATABASE regress_conflict_swap;
+\c regress_conflict_swap
+CREATE SCHEMA cs VERSIONED;
+CREATE TABLE cs.a (pk int PRIMARY KEY, v text);
+CREATE TABLE cs.b (pk int PRIMARY KEY, v text);
+INSERT INTO cs.a VALUES (1, 'base'); INSERT INTO cs.b VALUES (1, 'b');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+SELECT dolt_branch('side');
+SELECT dolt_checkout('side');
+UPDATE cs.a SET v = 'theirs';
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE cs.a SET v = 'ours';
+SELECT length(dolt_commit('-am', 'main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('side') IS NOT NULL AS merging;
+SELECT * FROM dolt_conflicts;
+ALTER TABLE cs.a RENAME TO tmp;
+ALTER TABLE cs.b RENAME TO a;
+ALTER TABLE cs.tmp RENAME TO b;
+SELECT count(*) FROM dolt_conflicts(NULL::cs.b);
+SELECT dolt_conflicts_resolve('--theirs', 'cs.b');
+SELECT dolt_conflicts_resolve('--theirs', 'cs.a');
+ALTER TABLE cs.b RENAME TO tmp;
+ALTER TABLE cs.a RENAME TO b;
+ALTER TABLE cs.tmp RENAME TO a;
+SELECT our_diff_type, their_diff_type FROM dolt_conflicts(NULL::cs.a);
+SELECT dolt_conflicts_resolve('--theirs', 'cs.a');
+SELECT * FROM cs.a;
+SELECT * FROM cs.b;
+\c contrib_regression
+DROP DATABASE regress_conflict_swap;
