@@ -8745,7 +8745,7 @@ folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
 		PROLLY_CALL(cn.tree, cursor_seek, cur[i], NULL, ForwardScanDirection);
 		more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
 	}
-	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.root_env, CurrentMemoryContext);
 	while (more[0] || more[1])
 	{
 		int			c = !more[0] ? 1 : !more[1] ? -1 :
