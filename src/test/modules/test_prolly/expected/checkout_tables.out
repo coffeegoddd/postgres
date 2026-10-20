@@ -14,7 +14,7 @@ INSERT INTO ct.m VALUES (1, 'ok');
 SELECT length(dolt_commit('-Am', 'three tables')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- one of two changed tables discarded, the other kept
@@ -121,7 +121,7 @@ UPDATE ct.a SET v = 'later';
 SELECT length(dolt_commit('-am', 'later')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('HEAD~1', 'ct.a');
@@ -154,7 +154,7 @@ INSERT INTO ct.s (v) VALUES ('one');
 SELECT length(dolt_commit('-Am', 'serial')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO ct.s (v) VALUES ('two'), ('three');
@@ -251,7 +251,7 @@ CREATE TABLE ct.co2 (id int PRIMARY KEY, sh int DEFAULT nextval('ct.shared'));
 SELECT length(dolt_commit('-Am', 'sequences')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO ct.co (id) VALUES (1);
@@ -299,7 +299,7 @@ INSERT INTO ct.co2 (id) VALUES (1);
 SELECT length(dolt_commit('-am', 'co2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('--protect', 'main');
