@@ -447,7 +447,10 @@ OF` are built in D18's shapes.
   they diff as any rows do: the key's change itself changes no row.
   Rows of a version that share a key as it is defined now are shown
   once, with a warning counting the rest. A merge across such a change
-  is still refused.
+  is still refused. `dolt_diff_stat` doesn't read versions so: it
+  counts rows only where the versions are keyed as the table is now,
+  as a keyless table's copies and a keyed one's modified rows aren't
+  the same counts.
 - **Why:** a diff reads versions as the table is defined now (D20, D21),
   and the canonical form keys rows by their values, not column tags.
 - **Port:** the key-change cases expect the rows as keyed now: fewer

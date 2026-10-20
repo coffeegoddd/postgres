@@ -4421,6 +4421,27 @@ stat_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	}
 }
 
+/*
+ * Whether relid's rows are keyed by a primary key now.  A diff through it
+ * reads each version's rows keyed so, whatever key the version had: a
+ * keyless version's copies of a row become one keyed row.
+ */
+static bool
+keyed_now(Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	ProllyComponents c;
+	ProllyKeying *k;
+	bool		keyless;
+
+	prolly_components_for_relation(rel, &c);
+	k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+	keyless = PROLLY_CALL(c.keying, keyless, k);
+	PROLLY_CALL(c.keying, close, k);
+	table_close(rel, AccessShareLock);
+	return !keyless;
+}
+
 /* A version of a table: its rows (a count of its tree's items), its columns. */
 static void
 table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed)
@@ -4488,9 +4509,10 @@ cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
  * modified ones that differ (each decoded as the table is defined now),
  * and the rows and cells each side has; cells added and deleted as Dolt
  * counts them.  A keyless table's rows added and deleted are copies, the
- * rest NULL, as in Dolt.  A table the session's branch hasn't, changed on
- * both sides, can't have its rows diffed here (as dolt_diff can't): only
- * its row and cell counts.  With name, that table's alone: one neither
+ * rest NULL, as in Dolt.  A table the session's branch hasn't, or has
+ * keyed otherwise than the versions are (a primary key made or dropped
+ * since), changed on both sides, can't have its rows diffed here: only its
+ * row and cell counts.  With name, that table's alone: one neither
  * version has is refused (as Dolt's; dolt_diff_summary gives none).
  */
 Datum
@@ -4549,11 +4571,14 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		s.sink.change = stat_change;
 		s.keyless = !keyed;
 
-		/* (rows diffed where the branch has the table; one side's: counted) */
+		/*
+		 * (rows diffed where the branch has the table, keyed as the versions
+		 * are: the rows are read keyed as it is now; one side's: counted)
+		 */
 		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(table, NULL)),
 								 NoLock, true);
 		if (OidIsValid(relid) && get_rel_relam(relid) == PROLLY_TABLE_AM_OID &&
-			(r->data_change || !keyed))
+			(r->data_change || !keyed) && keyed_now(relid) == keyed)
 		{
 			Relation	rel = table_open(relid, AccessShareLock);
 

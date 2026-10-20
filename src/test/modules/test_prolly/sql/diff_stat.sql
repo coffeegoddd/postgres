@@ -74,5 +74,20 @@ SELECT to_table_name, diff_type
 FROM dolt_diff_summary('HEAD', 'WORKING', 'ds.justview');
 DROP VIEW ds.justview;
 
+-- a keyless table given a key since: its versions' rows aren't diffed
+-- keyed by it (copies of a row would be one; a changed row, modified),
+-- so the stat between them isn't counted through it
+CREATE TABLE ds.nokey (id int, v text);
+INSERT INTO ds.nokey VALUES (1, 'a'), (2, 'b');
+SELECT length(dolt_commit('-Am', 'nokey')::text) AS committed;
+UPDATE ds.nokey SET v = 'c' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'nokey changed')::text) AS committed;
+SELECT table_name, rows_added, rows_deleted, rows_modified
+FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.nokey');
+ALTER TABLE ds.nokey ADD PRIMARY KEY (id);
+SELECT table_name, rows_added, rows_deleted, rows_modified
+FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.nokey');
+DROP TABLE ds.nokey;
+
 \c contrib_regression
 DROP DATABASE regress_diff_stat;
