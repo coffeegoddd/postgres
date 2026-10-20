@@ -101,6 +101,10 @@ SKIP:
 	$gc->query_until(qr/collected/, '');
 	$gc->quit;
 }
+# (without injection points, the row is deleted all the same: what follows
+# counts on it)
+sql('DELETE FROM a.big WHERE id = 1; VACUUM a.big')
+  if $ENV{enable_injection_points} ne 'yes';
 
 # A standby reads them, through a collection on the primary.
 $node->backup('base');
