@@ -1039,6 +1039,146 @@ tree_diff_across_heights(const ProllyImplInfo *impl)
 	}
 }
 
+/* An order the trees weren't built in: a diff without one mustn't use it. */
+static int
+reversed_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	return -prolly_bytes_compare(a, b, arg);
+}
+
+/*
+ * diff_unordered() finds what diff() does, with no order to go by (the
+ * env's, reversed here, must go unused): after random edits, across
+ * heights, of unrelated trees and of a tree with itself; and reads only
+ * a few root-to-leaf paths per change, as diff() does.  The keys' bytes
+ * sort as their order here, so the changes come in key order too.
+ */
+void
+tree_diff_unordered_matches(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	ProllyTreeEnv blind;
+	Ref		   *from = palloc(sizeof(Ref));
+	Ref		   *to = palloc(sizeof(Ref));
+	Ref		   *small = palloc(sizeof(Ref));
+	Ref		   *odd = palloc(sizeof(Ref));
+	ProllyNodeRef rfrom;
+	ProllyNodeRef rto;
+	ProllyNodeRef rsmall;
+	ProllyNodeRef rodd;
+	pg_prng_state rng;
+	int		   *keys = palloc(sizeof(int) * MAX_KEY);
+	int		   *versions = palloc(sizeof(int) * MAX_KEY);
+	HashSet		nodes = {0};
+	ProllyNodeCounters cnt = {0};
+
+	make_env(&env);
+	fill_ref(from, 2, 1);
+	build_ref(tr, &env, from, &rfrom);
+	PROLLY_CALL(tr, walk, &env, &rfrom, collect_node, &nodes);
+	memcpy(to, from, sizeof(Ref));
+	rto = rfrom;
+	blind = env;
+	blind.compare = reversed_compare;
+	pg_prng_seed(&rng, 11);
+
+	for (int round = 0; round < 5; round++)
+	{
+		int			n = random_batch(&rng, 60, MAX_KEY, 10 + round, keys, versions);
+		DiffSeen	seen = {from, to, -1, 0};
+		int			want = 0;
+
+		apply_batch(tr, &env, to, keys, versions, n, &rto);
+		for (int k = 0; k < MAX_KEY; k++)
+			if (from->version[k] != to->version[k])
+				want++;
+		PROLLY_CALL(tr, diff_unordered, &blind, &rfrom, &rto, check_change, &seen);
+		if (seen.changes != want)
+			elog(ERROR, "unordered diff reported %d changes, expected %d", seen.changes, want);
+	}
+
+	/* a few changes: a few paths read */
+	memcpy(to, from, sizeof(Ref));
+	rto = rfrom;
+	for (int i = 0; i < 4; i++)
+	{
+		keys[i] = i * (MAX_KEY / 4) + 17;
+		versions[i] = i % 2 == 0 ? 5 : ABSENT;
+	}
+	apply_batch(tr, &env, to, keys, versions, 4, &rto);
+	{
+		DiffSeen	seen = {from, to, -1, 0};
+		uint64		bound = 4 * (4 * nodes.levels + 4);
+		int			want = 0;
+
+		for (int k = 0; k < MAX_KEY; k++)
+			if (from->version[k] != to->version[k])
+				want++;
+		blind.counters = &cnt;
+		PROLLY_CALL(tr, diff_unordered, &blind, &rfrom, &rto, check_change, &seen);
+		blind.counters = NULL;
+		if (seen.changes != want || want == 0)
+			elog(ERROR, "unordered diff reported %d changes, expected %d", seen.changes, want);
+		if (cnt.nodes_read > bound)
+			elog(ERROR, "unordered diff of 4 changes in a %d-level tree read %llu nodes, more than %llu",
+				 nodes.levels, (unsigned long long) cnt.nodes_read,
+				 (unsigned long long) bound);
+	}
+
+	/* itself: nothing */
+	{
+		DiffSeen	seen = {from, from, -1, 0};
+
+		memset(&cnt, 0, sizeof(cnt));
+		blind.counters = &cnt;
+		PROLLY_CALL(tr, diff_unordered, &blind, &rfrom, &rfrom, check_change, &seen);
+		blind.counters = NULL;
+		if (seen.changes != 0 || cnt.nodes_read != 0)
+			elog(ERROR, "a tree diffed unordered against itself reported %d changes and read %llu nodes",
+				 seen.changes, (unsigned long long) cnt.nodes_read);
+	}
+
+	/* across heights, both ways */
+	fill_ref(small, 1, ABSENT);
+	for (int k = 0; k < MAX_KEY; k += 997)
+		small->version[k] = (k / 997) % 2 == 0 ? 2 : 3;
+	build_ref(tr, &env, small, &rsmall);
+	for (int way = 0; way < 2; way++)
+	{
+		Ref		   *rf = way == 0 ? small : from;
+		Ref		   *rt = way == 0 ? from : small;
+		DiffSeen	seen = {rf, rt, -1, 0};
+		int			want = 0;
+
+		for (int k = 0; k < MAX_KEY; k++)
+			if (rf->version[k] != rt->version[k])
+				want++;
+		PROLLY_CALL(tr, diff_unordered, &blind, way == 0 ? &rsmall : &rfrom,
+					way == 0 ? &rfrom : &rsmall, check_change, &seen);
+		if (seen.changes != want)
+			elog(ERROR, "unordered diff across heights reported %d changes, expected %d",
+				 seen.changes, want);
+	}
+
+	/* unrelated: every key of both */
+	for (int k = 0; k < MAX_KEY; k++)
+		odd->version[k] = k % 2 == 1 ? 7 : ABSENT;
+	build_ref(tr, &env, odd, &rodd);
+	{
+		DiffSeen	seen = {from, odd, -1, 0};
+		int			want = 0;
+
+		for (int k = 0; k < MAX_KEY; k++)
+			if (from->version[k] != odd->version[k])
+				want++;
+		PROLLY_CALL(tr, diff_unordered, &blind, &rfrom, &rodd, check_change, &seen);
+		if (seen.changes != want)
+			elog(ERROR, "unordered diff of unrelated trees reported %d changes, expected %d",
+				 seen.changes, want);
+	}
+}
+
 /*
  * Keys of five bytes whose order ignores the last (a "spelling"), as a
  * collation can find 'a' and 'A' equal.

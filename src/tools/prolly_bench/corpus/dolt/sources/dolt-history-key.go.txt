@@ -1,0 +1,86 @@
+{
+		Name: "index by primary key",
+		SetUpScript: []string{
+			"create table t1 (pk int primary key, c int);",
+			"call dolt_add('.')",
+			"insert into t1 values (1,2), (3,4)",
+			"call dolt_commit('-am', 'initial table');",
+			"set @Commit1 = (select hashof('HEAD'));",
+
+			"insert into t1 values (5,6), (7,8)",
+			"call dolt_commit('-am', 'two more rows');",
+			"set @Commit2 = (select hashof('HEAD'));",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select pk, c, commit_hash = @Commit1, commit_hash = @Commit2 from dolt_history_t1",
+				Expected: []sql.Row{
+					{1, 2, false, true},
+					{3, 4, false, true},
+					{5, 6, false, true},
+					{7, 8, false, true},
+					{1, 2, true, false},
+					{3, 4, true, false},
+				},
+			},
+			{
+				Query: "select pk, c from dolt_history_t1 order by pk",
+				Expected: []sql.Row{
+					{1, 2},
+					{1, 2},
+					{3, 4},
+					{3, 4},
+					{5, 6},
+					{7, 8},
+				},
+			},
+			{
+				Query: "select pk, c from dolt_history_t1 order by pk, c",
+				Expected: []sql.Row{
+					{1, 2},
+					{1, 2},
+					{3, 4},
+					{3, 4},
+					{5, 6},
+					{7, 8},
+				},
+			},
+			{
+				Query: "select pk, c from dolt_history_t1 where pk = 3",
+				Expected: []sql.Row{
+					{3, 4},
+					{3, 4},
+				},
+			},
+			{
+				Query: "select pk, c from dolt_history_t1 where pk = 3 and commit_hash = @Commit2",
+				Expected: []sql.Row{
+					{3, 4},
+				},
+			},
+			{
+				Query: "explain plan select pk, c from dolt_history_t1 where pk = 3",
+				Expected: []sql.Row{
+					{"Filter"},
+					{" ├─ (dolt_history_t1.pk = 3)"},
+					{" └─ IndexedTableAccess(dolt_history_t1)"},
+					{"     ├─ index: [dolt_history_t1.pk]"},
+					{"     ├─ filters: [{[3, 3]}]"},
+					{"     └─ columns: [pk c]"},
+				},
+			},
+			{
+				Query: "explain plan select pk, c from dolt_history_t1 where pk = 3 and committer = 'someguy'",
+				Expected: []sql.Row{
+					{"Project"},
+					{" ├─ columns: [dolt_history_t1.pk, dolt_history_t1.c]"},
+					{" └─ Filter"},
+					{"     ├─ ((dolt_history_t1.pk = 3) AND (dolt_history_t1.committer = 'someguy'))"},
+					{"     └─ IndexedTableAccess(dolt_history_t1)"},
+					{"         ├─ index: [dolt_history_t1.pk]"},
+					{"         ├─ filters: [{[3, 3]}]"},
+					{"         └─ columns: [pk c committer]"},
+				},
+			},
+		},
+	}

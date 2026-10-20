@@ -1,0 +1,951 @@
+{
+  "version": 1,
+  "id": "dolt-schema-diff-basic",
+  "description": "Reviewed Dolt port: basic schema changes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "SchemaDiffTableFunctionScriptTests: basic schema changes"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create-employees",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE employees (pk int PRIMARY KEY, name varchar(50))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-vacations",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE vacations (pk int PRIMARY KEY, name varchar(50))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit0",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 0"
+      ],
+      "save": "commit0"
+    },
+    {
+      "id": "branch1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "create-inventory",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE inventory (pk int PRIMARY KEY, name varchar(50), quantity int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "drop-employees",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE employees",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "rename-vacations",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE vacations RENAME TO trips",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "branch2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "checkout-branch2",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "alter-inventory",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE inventory DROP COLUMN quantity, ADD COLUMN color varchar(10)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 2"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "branch3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch3"
+      ]
+    },
+    {
+      "id": "checkout-branch3",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch3"
+      ]
+    },
+    {
+      "id": "insert-inventory",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO inventory VALUES (1, 2, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 3"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff()",
+      "expect": {
+        "sqlstate": "42883"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('HEAD')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1)",
+      "expect": {
+        "sqlstate": "22023"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branc1')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('tag1')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('HEAD', '')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('HEAD', 'inventory')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('inventory')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('HEAD', 'HEAD')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $1)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1', 'branch1')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-15",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'fake-table')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-17",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1', 'branch2', 'fake-table')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-18",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-19",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'inventory')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-22",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch2', 'branch3')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-23",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch2', 'branch3', 'inventory')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-24",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2)",
+      "expect": {
+        "rows": [
+          [
+            "public.employees",
+            "",
+            "CREATE TABLE public.employees (pk integer, name character varying(50));\nALTER TABLE public.employees ADD CONSTRAINT employees_pk_not_null NOT NULL pk;\nALTER TABLE public.employees ADD CONSTRAINT employees_pkey PRIMARY KEY (pk);",
+            ""
+          ],
+          [
+            "",
+            "public.inventory",
+            "",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ],
+          [
+            "public.vacations",
+            "public.trips",
+            "CREATE TABLE public.vacations (pk integer, name character varying(50));\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.trips (pk integer, name character varying(50));\nALTER TABLE public.trips ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.trips ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit0"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-25",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2)",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            ""
+          ],
+          [
+            "",
+            "public.employees",
+            "",
+            "CREATE TABLE public.employees (pk integer, name character varying(50));\nALTER TABLE public.employees ADD CONSTRAINT employees_pk_not_null NOT NULL pk;\nALTER TABLE public.employees ADD CONSTRAINT employees_pkey PRIMARY KEY (pk);"
+          ],
+          [
+            "public.trips",
+            "public.vacations",
+            "CREATE TABLE public.trips (pk integer, name character varying(50));\nALTER TABLE public.trips ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.trips ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.vacations (pk integer, name character varying(50));\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit0"
+        }
+      ]
+    },
+    {
+      "id": "assert-26",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'employees')",
+      "expect": {
+        "rows": [
+          [
+            "public.employees",
+            "",
+            "CREATE TABLE public.employees (pk integer, name character varying(50));\nALTER TABLE public.employees ADD CONSTRAINT employees_pk_not_null NOT NULL pk;\nALTER TABLE public.employees ADD CONSTRAINT employees_pkey PRIMARY KEY (pk);",
+            ""
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit0"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-27",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'employees')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.employees",
+            "",
+            "CREATE TABLE public.employees (pk integer, name character varying(50));\nALTER TABLE public.employees ADD CONSTRAINT employees_pk_not_null NOT NULL pk;\nALTER TABLE public.employees ADD CONSTRAINT employees_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit0"
+        }
+      ]
+    },
+    {
+      "id": "assert-28",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'inventory')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.inventory",
+            "",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit0"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-29",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'inventory')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            ""
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit0"
+        }
+      ]
+    },
+    {
+      "id": "assert-30",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'trips')",
+      "expect": {
+        "rows": [
+          [
+            "public.vacations",
+            "public.trips",
+            "CREATE TABLE public.vacations (pk integer, name character varying(50));\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.trips (pk integer, name character varying(50));\nALTER TABLE public.trips ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.trips ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit0"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-31",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'trips')",
+      "expect": {
+        "rows": [
+          [
+            "public.trips",
+            "public.vacations",
+            "CREATE TABLE public.trips (pk integer, name character varying(50));\nALTER TABLE public.trips ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.trips ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.vacations (pk integer, name character varying(50));\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit0"
+        }
+      ]
+    },
+    {
+      "id": "assert-32",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'vacations')",
+      "expect": {
+        "rows": [
+          [
+            "public.vacations",
+            "public.trips",
+            "CREATE TABLE public.vacations (pk integer, name character varying(50));\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.trips (pk integer, name character varying(50));\nALTER TABLE public.trips ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.trips ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit0"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-33",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'vacations')",
+      "expect": {
+        "rows": [
+          [
+            "public.trips",
+            "public.vacations",
+            "CREATE TABLE public.trips (pk integer, name character varying(50));\nALTER TABLE public.trips ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.trips ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.vacations (pk integer, name character varying(50));\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pk_not_null NOT NULL pk;\nALTER TABLE public.vacations ADD CONSTRAINT vacations_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit0"
+        }
+      ]
+    },
+    {
+      "id": "assert-34",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2)",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-35",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'inventory')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-36",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1', 'branch2')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-37",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1..branch2')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-38",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1...branch2')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-39",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1', 'branch2', 'inventory')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-44",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2)",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-45",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff($1, $2, 'inventory')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-46",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch2', 'branch1')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-47",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch2', 'branch1', 'inventory')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

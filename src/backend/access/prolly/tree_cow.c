@@ -2383,6 +2383,271 @@ cow_diff(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 	pfree(bufb.data);
 }
 
+/* A leaf item a diff without an order found on one side, its bytes copied. */
+typedef struct LooseItem
+{
+	ProllyKey	key;
+	ProllyValue value;
+	uint8		flags;
+} LooseItem;
+
+static int
+loose_item_cmp(const void *a, const void *b)
+{
+	const LooseItem *x = a;
+	const LooseItem *y = b;
+	int			r = memcmp(x->key.data, y->key.data, Min(x->key.len, y->key.len));
+
+	return r != 0 ? r : (x->key.len > y->key.len) - (x->key.len < y->key.len);
+}
+
+/* The nodes of a side not yet matched or read, and its leaf items. */
+typedef struct LooseSide
+{
+	ProllyNodeRef *nodes;
+	uint16	   *levels;
+	int			n;
+	int			max;
+	LooseItem  *items;
+	int			nitems;
+	int			maxitems;
+} LooseSide;
+
+static void
+loose_add_node(LooseSide *s, const ProllyNodeRef *ref, uint16 level)
+{
+	if (s->n == s->max)
+	{
+		s->max = Max(16, s->max * 2);
+		s->nodes = s->nodes ? repalloc_array(s->nodes, ProllyNodeRef, s->max) :
+			palloc_array(ProllyNodeRef, s->max);
+		s->levels = s->levels ? repalloc_array(s->levels, uint16, s->max) :
+			palloc_array(uint16, s->max);
+	}
+	s->nodes[s->n] = *ref;
+	s->levels[s->n++] = level;
+}
+
+#define LOOSE_GONE		UINT16_MAX	/* a node both trees hold, dropped */
+
+static int
+loose_node_cmp(const ProllyNodeRef *a, const ProllyNodeRef *b)
+{
+	int			r = memcmp(a->hash.bytes, b->hash.bytes,
+						   Min(a->hash.len, b->hash.len));
+
+	return r != 0 ? r : (int) a->hash.len - (int) b->hash.len;
+}
+
+typedef struct LoosePair
+{
+	ProllyNodeRef ref;
+	uint16		level;
+} LoosePair;
+
+static int
+loose_pair_cmp(const void *a, const void *b)
+{
+	return loose_node_cmp(&((const LoosePair *) a)->ref,
+						  &((const LoosePair *) b)->ref);
+}
+
+/* s's nodes in order of their hashes, their levels with them. */
+static void
+loose_sort(LooseSide *s)
+{
+	LoosePair  *p;
+
+	if (s->n < 2)
+		return;
+	p = palloc_array(LoosePair, s->n);
+	for (int i = 0; i < s->n; i++)
+	{
+		p[i].ref = s->nodes[i];
+		p[i].level = s->levels[i];
+	}
+	qsort(p, s->n, sizeof(LoosePair), loose_pair_cmp);
+	for (int i = 0; i < s->n; i++)
+	{
+		s->nodes[i] = p[i].ref;
+		s->levels[i] = p[i].level;
+	}
+	pfree(p);
+}
+
+/* Read node i of s: its children become s's nodes, or its items its items. */
+static void
+loose_expand(const ProllyTreeEnv *env, LooseSide *s, int i)
+{
+	TNode		node;
+	ProllyNodeRef ref = s->nodes[i];
+
+	s->nodes[i] = s->nodes[--s->n];
+	s->levels[i] = s->levels[s->n];
+	node_read(env, &ref, &node);
+	for (int j = 0; j < node.nitems; j++)
+	{
+		if (node.level > 0)
+		{
+			ProllyNodeRef child;
+			uint64		count;
+
+			node_child(env, &node, j, &child, &count);
+			loose_add_node(s, &child, node.level - 1);
+		}
+		else
+		{
+			LooseItem  *it;
+			ProllyKey	k;
+			ProllyValue v;
+			uint8		flags;
+
+			if (s->nitems == s->maxitems)
+			{
+				s->maxitems = Max(64, s->maxitems * 2);
+				s->items = s->items ?
+					repalloc_huge(s->items, sizeof(LooseItem) * s->maxitems) :
+					MemoryContextAllocHuge(CurrentMemoryContext,
+										   sizeof(LooseItem) * s->maxitems);
+			}
+			node_item(env, &node, j, &k, &v, &flags);
+			it = &s->items[s->nitems++];
+			it->key.data = (const uint8 *) memcpy(palloc(Max(k.len, 1)), k.data, k.len);
+			it->key.len = k.len;
+			it->value.data = (const uint8 *) memcpy(palloc(Max(v.len, 1)), v.data, v.len);
+			it->value.len = v.len;
+			it->flags = flags;
+		}
+	}
+	node_release(&node);
+}
+
+/*
+ * diff(), where env->compare can't order the trees' keys (they were built
+ * in an order this session can't give): by the nodes' hashes, from the
+ * top level down, a node both trees hold is skipped, the rest read; their
+ * leaf items matched by their keys' bytes.  As diff, it reads O((d + 1)
+ * log n) nodes for d changed keys (a key is in one node of a tree, so one
+ * a node both hold has isn't elsewhere in either); its changes come in the
+ * order of the keys' bytes.
+ */
+static void
+cow_diff_unordered(const ProllyTreeEnv *env, const ProllyNodeRef *from,
+				   const ProllyNodeRef *to, ProllyTreeVisitChange visit,
+				   void *arg)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "prolly unordered diff",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	LooseSide	sides[2] = {0};
+	StringInfoData bufa;
+	StringInfoData bufb;
+	int			ia = 0;
+	int			ib = 0;
+
+	if (same_hash(&from->hash, &to->hash))
+	{
+		MemoryContextSwitchTo(old);
+		MemoryContextDelete(cxt);
+		return;
+	}
+	for (int side = 0; side < 2; side++)
+	{
+		TNode		root;
+
+		node_read(env, side == 0 ? from : to, &root);
+		loose_add_node(&sides[side], side == 0 ? from : to, root.level);
+		node_release(&root);
+	}
+
+	/* the highest level's nodes, those not both trees', read, till leaves */
+	for (;;)
+	{
+		int			top = -1;
+
+		CHECK_FOR_INTERRUPTS();
+		for (int side = 0; side < 2; side++)
+			for (int i = 0; i < sides[side].n; i++)
+				top = Max(top, sides[side].levels[i]);
+		if (top < 0)
+			break;
+
+		/* (one both hold at this level: in neither, unread) */
+		for (int side = 0; side < 2; side++)
+			loose_sort(&sides[side]);
+		for (int i = 0, j = 0; i < sides[0].n && j < sides[1].n;)
+		{
+			int			r = loose_node_cmp(&sides[0].nodes[i], &sides[1].nodes[j]);
+
+			if (r == 0 && sides[0].levels[i] == top && sides[1].levels[j] == top)
+			{
+				sides[0].levels[i] = sides[1].levels[j] = LOOSE_GONE;
+				i++;
+				j++;
+			}
+			else if (r <= 0)
+				i++;
+			else
+				j++;
+		}
+		for (int side = 0; side < 2; side++)
+			for (int i = sides[side].n - 1; i >= 0; i--)
+				if (sides[side].levels[i] == LOOSE_GONE)
+				{
+					sides[side].nodes[i] = sides[side].nodes[--sides[side].n];
+					sides[side].levels[i] = sides[side].levels[sides[side].n];
+				}
+				else if (sides[side].levels[i] == top)
+					loose_expand(env, &sides[side], i);
+	}
+
+	for (int side = 0; side < 2; side++)
+		if (sides[side].nitems > 1)
+			qsort(sides[side].items, sides[side].nitems, sizeof(LooseItem),
+				  loose_item_cmp);
+	initStringInfo(&bufa);
+	initStringInfo(&bufb);
+	while (ia < sides[0].nitems || ib < sides[1].nitems)
+	{
+		LooseItem  *a = ia < sides[0].nitems ? &sides[0].items[ia] : NULL;
+		LooseItem  *b = ib < sides[1].nitems ? &sides[1].items[ib] : NULL;
+		int			r = a == NULL ? 1 : b == NULL ? -1 : loose_item_cmp(a, b);
+		ProllyValue va;
+		ProllyValue vb;
+
+		CHECK_FOR_INTERRUPTS();
+		if (a)
+			va = a->value;
+		if (b)
+			vb = b->value;
+		if (r < 0)
+		{
+			visit(PROLLY_DIFF_REMOVED, &a->key, reported(env, &va, a->flags, &bufa),
+				  NULL, arg);
+			ia++;
+		}
+		else if (r > 0)
+		{
+			visit(PROLLY_DIFF_ADDED, &b->key, NULL, reported(env, &vb, b->flags, &bufb),
+				  arg);
+			ib++;
+		}
+		else
+		{
+			/* (values out of line are equal exactly when their references are) */
+			if (a->flags != b->flags || va.len != vb.len ||
+				memcmp(va.data, vb.data, va.len) != 0)
+				visit(PROLLY_DIFF_MODIFIED, &b->key, reported(env, &va, a->flags, &bufa),
+					  reported(env, &vb, b->flags, &bufb), arg);
+			ia++;
+			ib++;
+		}
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+}
+
 /*
  * Visit the nodes of to that from may not have, as the diff finds them:
  * subtrees with equal hashes skipped without being read, a subtree only to
@@ -2600,6 +2865,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.walk = cow_walk,
 	.diff = cow_diff,
 	.diff_nodes = cow_diff_nodes,
+	.diff_unordered = cow_diff_unordered,
 	.references = cow_references,
 	.value_write = write_value_tree,
 	.value_read = read_value,

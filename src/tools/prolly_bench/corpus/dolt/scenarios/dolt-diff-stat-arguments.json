@@ -1,0 +1,357 @@
+{
+  "version": 1,
+  "id": "dolt-diff-stat-arguments",
+  "description": "Reviewed Dolt port: invalid arguments",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffStatTableFunctionScriptTests: invalid arguments"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20), c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one', 'two'), (2, 'two', 'three')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into t"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat()",
+      "expect": {
+        "sqlstate": "42883"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('t')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('t', $1, $2, 'extra')",
+      "expect": {
+        "sqlstate": "42883"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat(NULL, NULL, NULL)",
+      "expect": {
+        "sqlstate": "22004"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat(123, $1, $2)",
+      "expect": {
+        "sqlstate": "42883"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('t', 123, $1)",
+      "expect": {
+        "sqlstate": "42883"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('t', $1, 123)",
+      "expect": {
+        "sqlstate": "42883"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('fake-branch', $1, 't')",
+      "expect": {
+        "sqlstate": "42704"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('fake-branch..main', 't')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-9",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, 'fake-branch', 't')",
+      "expect": {
+        "sqlstate": "42704"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-10",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('main..fake-branch', 't')",
+      "expect": {
+        "sqlstate": "42704"
+      }
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 'doesnotexist')",
+      "expect": {
+        "sqlstate": "42P01"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('main^..main', 'doesnotexist')",
+      "expect": {
+        "sqlstate": "42P01"
+      }
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, concat('fake', '-', 'branch'), 't')",
+      "expect": {
+        "sqlstate": "42704"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-14",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat(dolt_hashof('main'), $1, 't')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-15",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, lower('T'))",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "0",
+            "2",
+            "0",
+            "0",
+            "6",
+            "0",
+            "0",
+            "0",
+            "2",
+            "0",
+            "6"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-16",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('main..main~', lower('T'))",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "0",
+            "0",
+            "2",
+            "0",
+            "0",
+            "6",
+            "0",
+            "2",
+            "0",
+            "6",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

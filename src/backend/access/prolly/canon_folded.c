@@ -196,6 +196,7 @@
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "common/hashfn.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/fmgrprotos.h"
@@ -3854,6 +3855,282 @@ folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	merge_items(&cn, from, to, true, object_pair, &w);
 }
 
+/* An object's change, as the roots' tree diff gives it, copied. */
+typedef struct Changed
+{
+	char		object;
+	char	   *from_name;		/* NULL: not in from */
+	char	   *to_name;		/* NULL: not in to */
+	ProllyValue from;			/* the items (copied) */
+	ProllyValue to;
+	bool		data_change;
+	bool		schema_change;
+	uint64		content;		/* an added or dropped one's: its item's hash,
+								 * its own name in it masked */
+	ProllyValue masked;			/* and that item */
+} Changed;
+
+typedef struct ChangesWalk
+{
+	List	   *changed;		/* Changed * */
+	bool		same_format;
+} ChangesWalk;
+
+static ProllyValue
+copy_value(const ProllyValue *v)
+{
+	ProllyValue c;
+	uint8	   *data = palloc(Max(v->len, 1));
+
+	memcpy(data, v->data, v->len);
+	c.data = data;
+	c.len = v->len;
+	return c;
+}
+
+/*
+ * An item with its object's own name masked: a table's description names
+ * the table (its indexes are made ON it), so a renamed one's items differ
+ * by that alone.  (A longer name holding it is masked in part, which can
+ * only keep two items apart, never make them alike.)
+ */
+static ProllyValue
+masked_item(const ProllyValue *v, const char *name)
+{
+	StringInfoData out;
+	char	   *utf8 = pg_server_to_any(name, strlen(name), PG_UTF8);
+	size_t		n = strlen(utf8);
+	const char *p = (const char *) v->data;
+	const char *end = p + v->len;
+	ProllyValue m;
+
+	initStringInfo(&out);
+	while (p < end)
+	{
+		if (n > 0 && (size_t) (end - p) >= n && memcmp(p, utf8, n) == 0)
+		{
+			appendStringInfoChar(&out, '\x01');
+			p += n;
+		}
+		else
+			appendStringInfoChar(&out, *p++);
+	}
+	m.data = (const uint8 *) out.data;
+	m.len = out.len;
+	return m;
+}
+
+/*
+ * Whether an object holds data: a table or materialized view any rows (its
+ * data tree isn't empty), a sequence its value.  An empty table added or
+ * dropped changes no data, as in Dolt.
+ */
+static bool
+holds_data(const ProllyKey *key, const ProllyValue *item)
+{
+	Canon		cn;
+	ProllyNodeRef root;
+	ProllyValue def;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		any;
+
+	if (key->data[0] == 's')
+		return true;
+	if (!tree_item(key, item, &root, &def))
+		return false;
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, &root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	any = PROLLY_CALL(cn.tree, cursor_next, c, &k, &v);
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	return any;
+}
+
+static void
+note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
+			const ProllyValue *after, void *arg)
+{
+	ChangesWalk *w = arg;
+	Changed    *c;
+	char	   *name;
+
+	/* (the format, and collations, aren't objects) */
+	if (key->len < 2 || key->data[1] != ':' || key->data[0] == '!' ||
+		key->data[0] == 'c')
+		return;
+	c = palloc0(sizeof(Changed));
+	c->object = (char) key->data[0];
+	name = from_utf8(key->data + 2, key->len - 2);
+	if (before)
+	{
+		c->from_name = name;
+		c->from = copy_value(before);
+	}
+	if (after)
+	{
+		c->to_name = name;
+		c->to = copy_value(after);
+	}
+	if (before && after)
+	{
+		ProllyValue da,
+					db;
+		ProllyNodeRef ra,
+					rb;
+
+		definition_of(key, before, &da);
+		definition_of(key, after, &db);
+		c->schema_change = !same_values(&da, &db);
+		if (c->object == 't' ||
+			(c->object == 'm' && w->same_format))
+		{
+			(void) tree_item(key, before, &ra, &da);
+			(void) tree_item(key, after, &rb, &db);
+			c->data_change = !(ra.hash.len == rb.hash.len &&
+							   memcmp(ra.hash.bytes, rb.hash.bytes, ra.hash.len) == 0);
+		}
+		else if (c->object == 's')
+		{
+			ProllyValue sa,
+						sb;
+
+			c->data_change = sequence_value(key, before, &sa) &&
+				sequence_value(key, after, &sb) && !same_values(&sa, &sb);
+		}
+		if (!c->data_change && !c->schema_change)
+		{
+			pfree(c);
+			return;
+		}
+	}
+	else
+	{
+		const ProllyValue *v = before ? before : after;
+
+		c->data_change = holds_data(key, v);
+		c->schema_change = true;
+		c->masked = masked_item(v, name);
+		c->content = hash_bytes_extended(c->masked.data, c->masked.len,
+										 (uint64) c->object);
+	}
+	w->changed = lappend(w->changed, c);
+}
+
+static int
+changed_cmp(const ListCell *a, const ListCell *b)
+{
+	const Changed *x = lfirst(a);
+	const Changed *y = lfirst(b);
+
+	return strcmp(x->from_name ? x->from_name : x->to_name,
+				  y->from_name ? y->from_name : y->to_name);
+}
+
+/* the dropped and added objects of an item's content, and how many */
+typedef struct ContentMatch
+{
+	uint64		content;		/* key */
+	int			ndropped;
+	int			nadded;
+	Changed    *dropped;
+	Changed    *added;
+} ContentMatch;
+
+/*
+ * Each object from and to hold differently, by name: what the roots' tree
+ * diff gives (equal subtrees skipped), objects of a kind dropped and added
+ * with the same item (but for their own names), and the only such pair,
+ * made one renamed.
+ */
+static void folded_render(char object, const char *name, const ProllyValue *item,
+						  StringInfo out);
+
+static void
+folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
+			   ProllyCanonChangeVisit visit, void *arg)
+{
+	Canon		cn;
+	ChangesWalk w = {NIL, false};
+	HTAB	   *matches;
+	HASHCTL		ctl;
+	HASH_SEQ_STATUS status;
+	ContentMatch *m;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
+	PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_change, &w);
+
+	/* renames: a dropped and an added object of one content, alone */
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(ContentMatch);
+	ctl.hcxt = CurrentMemoryContext;
+	matches = hash_create("prolly renames", 64, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	foreach(lc, w.changed)
+	{
+		Changed    *c = lfirst(lc);
+		bool		found;
+
+		if (c->from_name && c->to_name)
+			continue;
+		m = hash_search(matches, &c->content, HASH_ENTER, &found);
+		if (!found)
+		{
+			m->ndropped = m->nadded = 0;
+			m->dropped = m->added = NULL;
+		}
+		if (c->from_name)
+		{
+			m->ndropped++;
+			m->dropped = c;
+		}
+		else
+		{
+			m->nadded++;
+			m->added = c;
+		}
+	}
+	hash_seq_init(&status, matches);
+	while ((m = hash_seq_search(&status)) != NULL)
+	{
+		if (m->ndropped != 1 || m->nadded != 1 ||
+			m->dropped->object != m->added->object ||
+			!same_values(&m->dropped->masked, &m->added->masked))
+			continue;
+		/*
+		 * (one row: the dropped one, its new name, its rows as they were; a
+		 * new name is a change of definition, as in Dolt)
+		 */
+		m->dropped->to_name = m->added->to_name;
+		m->dropped->to = m->added->to;
+		m->dropped->data_change = false;
+		m->dropped->schema_change = true;
+		w.changed = list_delete_ptr(w.changed, m->added);
+	}
+	hash_destroy(matches);
+
+	list_sort(w.changed, changed_cmp);
+	foreach(lc, w.changed)
+	{
+		Changed    *c = lfirst(lc);
+		ProllyObjectChange oc = {0};
+
+		oc.from_name = c->from_name;
+		oc.to_name = c->to_name;
+		oc.object = c->object;
+		oc.data_change = c->data_change;
+		oc.schema_change = c->schema_change;
+		oc.from_item = c->from_name ? &c->from : NULL;
+		oc.to_item = c->to_name ? &c->to : NULL;
+		visit(&oc, arg);
+	}
+}
+
 /* ------------------------------------------------------------------------
  * Moving definitions (folded)
  * ------------------------------------------------------------------------
@@ -3913,6 +4190,9 @@ typedef struct SchemaMove
 								 * against a table emptied) */
 	bool		rewritten;		/* the rows written are all to's: those
 								 * the tables have needn't convert */
+	bool		render;			/* statements to show, not to run: each
+								 * constraint whole, nothing read from the
+								 * catalogs */
 } SchemaMove;
 
 static char *
@@ -4638,7 +4918,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		sm->changes = list_concat(sm->changes, after_columns);
 
 		/* sequences its defaults draw from, that no column owns: its own */
-		sm->changes = lappend(sm->changes,
+		if (!sm->render)
+			sm->changes = lappend(sm->changes,
 							  psprintf("DO $move$ DECLARE r record; BEGIN "
 									   "FOR r IN SELECT d.refobjid::pg_catalog.regclass AS seq, a.attname "
 									   "FROM pg_catalog.pg_attrdef ad "
@@ -4871,7 +5152,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			 * partitioned table's or a partition's, which its partitions'
 			 * or parent's validation would reach).
 			 */
-			if ((strstr(line, "\tCHECK ") != NULL || after_rows) &&
+			if (!sm->render &&
+				(strstr(line, "\tCHECK ") != NULL || after_rows) &&
 				strstr(constraint_def(line), "NOT VALID") == NULL &&
 				to->partition_by == NULL && to->partition_of == NULL)
 			{
@@ -4892,7 +5174,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			 * NULL this recorded name, or a key, may have made it already; a
 			 * partition's partitioned table, its own)
 			 */
-			if (not_null || to->partition_of)
+			if (!sm->render && (not_null || to->partition_of))
 				sql = psprintf("DO $move$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_constraint "
 							   "WHERE conrelid = %s::pg_catalog.regclass AND "
 							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
@@ -4905,7 +5187,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			else if (strstr(line, "\tFOREIGN KEY ") != NULL)
 			{
 				/* (likewise a foreign key, which the rows may break too) */
-				if (strstr(constraint_def(line), "NOT VALID") == NULL &&
+				if (!sm->render &&
+					strstr(constraint_def(line), "NOT VALID") == NULL &&
 					to->partition_by == NULL && to->partition_of == NULL)
 				{
 					ProllyAddedConstraint *ac = palloc(sizeof(ProllyAddedConstraint));
@@ -8154,6 +8437,119 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 	return true;
 }
 
+/* A statement, its trailing space and ";" trimmed, ended by one. */
+static void
+append_statement(StringInfo out, const char *stmt)
+{
+	int			len = strlen(stmt);
+
+	while (len > 0 && (isspace((unsigned char) stmt[len - 1]) || stmt[len - 1] == ';'))
+		len--;
+	if (len == 0)
+		return;
+	if (out->len > 0)
+		appendStringInfoChar(out, '\n');
+	appendBinaryStringInfo(out, stmt, len);
+	appendStringInfoChar(out, ';');
+}
+
+static void
+append_statements(StringInfo out, List *stmts)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmts)
+		append_statement(out, lfirst(lc));
+}
+
+/*
+ * A table as made from nothing: its CREATE TABLE, then its columns' and
+ * constraints' statements, its indexes, triggers, rules, statistics and
+ * row security, its foreign keys, its policies and the tables it inherits
+ * from: what a move to it runs (move_table(), rendering), each constraint
+ * whole.
+ */
+static void
+render_table(const char *name, const char *def, StringInfo out)
+{
+	TableDef	td;
+	SchemaMove	sm;
+	ListCell   *lc;
+
+	parse_table_def(def, &td);
+	memset(&sm, 0, sizeof(sm));
+	sm.render = true;
+	(void) move_table(&sm, name, NULL, &td);
+	append_statements(out, sm.changes);
+	append_statements(out, sm.after);
+	append_statements(out, sm.foreign_keys);
+	append_statements(out, td.policies);
+	foreach(lc, td.inherits)
+		append_statement(out, psprintf("ALTER TABLE %s INHERIT %s", name,
+									   (char *) lfirst(lc)));
+}
+
+static void
+folded_render(char object, const char *name, const ProllyValue *item,
+			  StringInfo out)
+{
+	char	   *utf8 = pg_server_to_any(name, strlen(name), PG_UTF8);
+	StringInfoData key;
+	ProllyKey	k;
+	ProllyValue d;
+	char	   *def;
+
+	initStringInfo(&key);
+	appendStringInfoChar(&key, object);
+	appendStringInfoChar(&key, ':');
+	appendStringInfoString(&key, utf8);
+	k.data = (const uint8 *) key.data;
+	k.len = key.len;
+	definition_of(&k, item, &d);
+	def = from_utf8(d.data, d.len);
+	switch (object)
+	{
+		case 't':
+			render_table(name, def, out);
+			break;
+		case 'v':
+			append_statement(out, psprintf(strncmp(def, "WITH (", 6) == 0 ?
+										   "CREATE VIEW %s %s" : "CREATE VIEW %s AS %s",
+										   name, def));
+			break;
+		case 'm':
+			append_statements(out, make_matview_sql(name, def));
+			break;
+		case 'f':
+			append_statement(out, def);
+			break;
+		case 'y':
+			{
+				List	   *unvalidated = NIL;
+
+				append_statement(out, create_type_sql(name, def, &unvalidated));
+				append_statements(out, unvalidated);
+			}
+			break;
+		case 's':
+			append_statement(out, psprintf("CREATE SEQUENCE %s %s", name,
+										   sequence_options_sql(def)));
+			break;
+		case 'n':
+			append_statement(out, psprintf("CREATE SCHEMA %s VERSIONED", name));
+			break;
+		case 'x':
+			append_statement(out, create_cast_sql(name, def));
+			break;
+		case 'l':
+			append_statement(out, create_collation_sql(name, def));
+			break;
+		default:
+			elog(ERROR, "can't render an object of kind '%c'", object);
+	}
+	pfree(key.data);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -8173,6 +8569,8 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
 	.objects = folded_objects,
+	.changes = folded_changes,
+	.render = folded_render,
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,

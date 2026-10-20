@@ -110,15 +110,15 @@ adapts.
   nothing commits the transaction early. A merge's unresolved conflicts
   or constraint violations fail the SQL `COMMIT` unless
   `dolt.allow_commit_conflicts` is set. `WORKING` in `dolt_status` and
-  `dolt_diff` is the branch's working set as committed by SQL
-  transactions, so neither shows the current transaction's own
-  uncommitted writes (`dolt_commit` does fold them).
+  `dolt_diff` is the branch's working set as the current transaction
+  sees it, its own uncommitted writes included, as a Dolt session's
+  working root includes its own (#501).
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is
   deferred with this ID (`ports.json` has one); add an explicit `COMMIT`
   only where the assertion isn't about that. Reads of `WORKING` after
-  writes in the same transaction move after its `COMMIT`.
+  writes in the same transaction stay where they are.
 
 ## D6. Merges
 
@@ -198,8 +198,9 @@ adapts.
 - **CLI-only output** (bats tests that check printed text).
 
 Every other Dolt version-control feature is in scope; one prolly lacks
-yet (diff system tables, `dolt_history_<t>`, tags, `AS OF`, rebase,
-stash, …) is F, ported with the feature (#163).
+yet (tags, rebase, stash, ref ranges in diff functions, …) is F, ported
+with the feature (#163). Diff system tables, `dolt_history_<t>` and `AS
+OF` are built in D18's shapes.
 
 ## D11. Branch-qualified databases are connections
 
@@ -300,6 +301,160 @@ stash, …) is F, ported with the feature (#163).
   branch named `--` could be named only after another `--`.
 - **Port:** a case that makes a branch named `--` expects the
   `invalid branch name` error (SQLSTATE 42602) instead.
+
+## D15. Schema diffs cover every versioned object
+
+- **Dolt:** `dolt_diff_summary` and `dolt_schema_diff` list tables, by
+  their unqualified names, `''` for the side a table isn't on. Their
+  arguments must be literals (or bind variables): `concat(...)`,
+  `hashof(...)` or `lower(...)` as an argument is an error. A table
+  whose primary key changed is refused by the three-argument summary
+  and skipped, with a warning, by the two-argument one. An
+  `AUTO_INCREMENT` counter is part of its table's schema, so raising it
+  changes the table's schema.
+- **Prolly:** both functions list every kind a commit holds (tables,
+  views, materialized views, routines as `schema.f(args)`, types,
+  sequences, versioned schemas), named qualified as `dolt_status` names
+  them (`public.t`, as Doltgres does), `''` for a missing side. A
+  serial's or identity column's sequence is an object of its own, so a
+  key handed out changes the sequence's data (its value), not the
+  table (D6). A name argument is qualified or found on the search path
+  (Doltgres finds an unqualified name in any schema). Arguments are any
+  expressions of type text, as for any Postgres function; a wrong count
+  or type is `42883` (no such function), a NULL ref `22004`.
+- **Why:** spec 21's decision (user, 2026-10-19): the other kinds are
+  versioned too, and leaving them out would hide changes `dolt_status`
+  shows. Functions resolve by argument types in Postgres.
+- **Port:** expect qualified names, and the rows of the other objects a
+  case's statements change (a versioned schema made, a sequence moved);
+  an argument Dolt refuses as not a literal is evaluated, and the
+  assertion expects the result. A primary-key-change case is deferred
+  until it is decided whether prolly should refuse it too (its summary
+  reads no rows, so it can list the table as modified).
+
+## D16. Schema diffs give Postgres DDL
+
+- **Dolt:** `dolt_schema_diff`'s statements are MySQL's `SHOW CREATE
+  TABLE` (backquoted names, `ENGINE=InnoDB ...`); Doltgres's are a
+  Postgres-like `CREATE TABLE` with the key inline.
+- **Prolly:** each side is rendered from that version's canonical
+  description, never the catalogs, as the statements a move would run,
+  one per line: a table is `CREATE TABLE schema.t (cols);` with the
+  columns' defaults and collations, then `ALTER TABLE ... ADD CONSTRAINT
+  ...;` for each NOT NULL, key, check and foreign key, then its indexes
+  (`CREATE INDEX ... USING btree (...)`), row security, policies,
+  triggers, rules and statistics; other kinds the statement that makes
+  them.
+- **Why:** Postgres's DDL, from what the commit holds (spec 21, 4.2);
+  constraints are named objects in Postgres, so they are statements of
+  their own.
+- **Port:** expected statements are prolly's rendering of the case's
+  tables; which rows appear, and which side is empty, are Dolt's.
+
+## D17. Renames are matched by content
+
+- **Dolt:** a table renamed is matched by its columns' tags, which
+  survive renames, so a table renamed and changed in one commit (rows
+  added, say) is one `renamed` row.
+- **Prolly:** the canonical form has no tags. A dropped and an added
+  object of one kind whose definitions (but for their own names) and
+  data are equal, and the only such pair, are one `renamed` row
+  (`data_change` false, `schema_change` true, as Dolt's); a rename that
+  also changes rows or definition is a drop and an add. A name argument
+  naming either side gives the one row, as in Dolt.
+- **Why:** spec 09's rule, a rename is a removal and an addition of
+  identical content (spec 21, 4.3); nothing else in a commit says two
+  objects are one.
+- **Port:** a case renaming a table and changing its rows in one commit
+  expects a `dropped` and an `added` row; one asking by either name
+  gets that name's row alone.
+
+## D18. Per-table diff and history tables are functions
+
+- **Dolt:** `dolt_diff_<table>` and `dolt_history_<table>` are system
+  tables, one per table, and `SELECT … AS OF 'ref'` reads a table at a
+  commit; the `dolt_diff` system table lists each commit's changed
+  tables.
+- **Prolly:** Postgres can't make a relation per table on the fly, so
+  each is a function taking the table's row type, as `dolt_diff` does:
+  `dolt_diff_table(NULL::t [, from_ref, to_ref])` (columns `to_row`,
+  `from_row` of `t`'s row type, the commits, their dates, `diff_type`),
+  `dolt_history_table(NULL::t)` (`row`, `commit_hash`, `committer`,
+  `commit_date`) and `dolt_at(ref, NULL::t)` (`SETOF t`). The `dolt_diff`
+  view, over `dolt_diff()`, is the system table, every kind of object
+  listed (D15). Rows of other versions are decoded as the table is
+  defined now, by column name (spec 21, decision 3), where Dolt follows
+  column tags: a column dropped changes no row (the rows read the
+  same); a column renamed reads as NULL in versions before the rename,
+  so a row diff across it shows the row modified (or a stat counts the
+  cell); a column of another type in an older version is converted to
+  today's type (text `'3'` reads as integer 3, where Dolt gives NULL).
+  A table's history is followed by its name: one dropped and made again
+  has both tables' rows.
+- **Why:** Postgres's catalogs; the functions keep a table's own row
+  type. The canonical form records no column tags.
+- **Port:** `SELECT * FROM dolt_diff_t` becomes `dolt_diff_table(NULL::t)`
+  with `(to_row).col` for `to_col`; `AS OF 'r'` becomes `dolt_at('r',
+  NULL::t)`; `dolt_history_t` becomes `dolt_history_table(NULL::t)` with
+  `(row).col`. Expected rows follow the reading by name.
+
+## D19. A primary key changed is a modified table
+
+- **Dolt:** a table whose primary key changed between two refs is
+  refused by `dolt_diff_summary(from, to, t)` and left out, with a
+  warning, by the two-argument form: its row diff can't be read.
+- **Prolly:** it is `modified`, its rows and definition changed: rows
+  are matched by name, not by key tags, and the summary reads no rows.
+- **Why:** nothing in the canonical form makes the change unreadable.
+- **Port:** cases expecting the refusal or the warning expect the row.
+
+## D20. Cells modified count what differs
+
+- **Dolt:** `dolt_diff_stat` counts a column added since as a changed
+  cell of every modified row.
+- **Prolly:** a modified row's cells are compared decoded, as the table
+  is defined now; a column added since differs only where the values
+  do.
+- **Why:** the canonical form records no column tags to tell an added
+  column from a value changed.
+- **Port:** a case adding a column and modifying rows in one commit
+  expects the cells whose values differ.
+
+
+## D21. A value that doesn't convert is shown null, and compared so
+
+- **Dolt:** an old value that doesn't convert to its column's type now
+  is shown null with a warning per value; a row whose stored value
+  changed is modified even where both sides show null.
+- **Prolly:** the value is shown null too, with one warning per column
+  and version counting them (a key column's refuses the read, naming
+  it). Rows are compared as the table is defined now, so a row whose
+  only change is to such a value (a column dropped, its old values not
+  converting to the type it was added back as) isn't modified.
+- **Why:** a diff reads each version as the table is defined now,
+  through its casts (D20); what didn't convert has no value left to
+  compare.
+- **Port:** the drop-and-recreate case whose old values don't convert
+  expects no rows for the drop's commit, and the count without them.
+
+## D22. Across a primary key change, rows are read as keyed now
+
+- **Dolt:** a row diff across a change of a table's primary key columns
+  warns that it can't render the full diff and shows what it can
+  (rows added and removed under the old and new column tags).
+- **Prolly:** each version's rows are read as the table is keyed now,
+  a keyless version's as keyed rows and a keyed one's as keyless, so
+  they diff as any rows do: the key's change itself changes no row.
+  Rows of a version that share a key as it is defined now are shown
+  once, with a warning counting the rest. A merge across such a change
+  is still refused. `dolt_diff_stat` doesn't read versions so: it
+  counts rows only where the versions are keyed as the table is now,
+  as a keyless table's copies and a keyed one's modified rows aren't
+  the same counts.
+- **Why:** a diff reads versions as the table is defined now (D20, D21),
+  and the canonical form keys rows by their values, not column tags.
+- **Port:** the key-change cases expect the rows as keyed now: fewer
+  than Dolt's, and none for the key's own commit.
 
 ## D23. `dolt_gc()` returns a status, not statistics
 

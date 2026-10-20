@@ -1,8 +1,10 @@
 # 21. Schema diffs
 
 **Status: proposed 2026-10-19, on `1c9d57affc`; decided by the user the
-same day, as recommended (part 7). Nothing here is built. Tracked in
-#439; the rename bug it touches is #437.**
+same day, as recommended (part 7). Built 2026-10-19 as stack #520
+(#514–#519 and the layers after them), not merged; part 8 says what each
+built and where it departs. Tracked in #439; the rename bug it touches
+is #437.**
 A versioned schema's definitions are committed, branched, merged and
 moved (spec 11, steps 4–5), but nothing in SQL shows what changed in
 them: `dolt_status` says an object is `modified`, and `dolt_diff` only
@@ -108,7 +110,9 @@ a Postgres `CREATE TABLE`:
   differs, or a sequence's value. `false` for kinds without data.
 - `schema_change`: the description (definition) differs. Added and
   dropped objects have both flags `true` if they hold data, otherwise
-  `schema_change` alone.
+  `schema_change` alone: a table or materialized view holds data when
+  it has rows (an empty table added is `false`, `true`, as in Dolt's
+  `HasDataChanged`), a sequence always (its value).
 - `WORKING` and `STAGED` read as `dolt_diff` reads them. Objects a read
   leaves out are listed as `dolt_status` lists them: `diff_type` `not
   covered`, both flags NULL.
@@ -148,7 +152,12 @@ add. Proposed for diffs:
   description and data tree hash are equal are reported as one
   `renamed` row, both names given. Matched in a hash table, O(u + v)
   for u dropped and v added (spec 10, status row). Only one-to-one
-  matches count; several equal candidates stay dropped and added.
+  matches count; several equal candidates stay dropped and added. Its
+  flags are Dolt's for a rename: `data_change` `false` (the rows are
+  equal), `schema_change` `true` (the name is part of the definition;
+  `dolt_schema_diff` gives the row too). A rename that also changes rows
+  or definition is a drop and an add, where Dolt, matching by column
+  tags, reports `renamed` (spec 18, D17).
 - **Columns.** The canonical form doesn't record dropped columns, so a
   rename and a drop plus an add at the end are the same description; the
   schema diff shows both statements and doesn't call it a rename.
@@ -203,6 +212,41 @@ database's history, which `dolt_log` already shows anyone.
 - Spec 18 gains entries: other kinds than tables in both functions;
   Postgres DDL in statements; renames matched by content, not tags.
 
+**As ported:** of the 19 Dolt cases, 11 summary cases are ported whole
+(now P, area `diff-tables`), and 5 in part: `WORKING and STAGED` (its
+STAGED-versus-WORKING assertions are about the staging area, D1), two
+summary cases left F on `diff-ranges` (Dolt's `a..b` and `a...b`
+arguments, which prolly lacks), `basic schema changes` F on `tags`
+(and ranges), and `prepared table functions` F on `diff-tables`
+(`dolt_diff_stat`). Three are deferred: the two primary-key-change
+cases (Dolt refuses or skips such a table; prolly lists it as modified,
+to be decided, D15) and the drop-and-recreate case, whose setup is
+computed and is checked in `schema_diffs` instead. Spec 18's D15–D17
+are the entries. Porting found two differences from Dolt, fixed to
+match it: an empty table added or dropped had `data_change` true, and
+a renamed object `schema_change` false. Doltgres's cases are in
+`schema_diffs`.
+
+**Ported with the later functions** (ranges, `dolt_diff_stat`, the
+per-table functions, the view): the range assertions are ported, so
+`diff with branch refs`, `renamed table` and `prepared table
+functions` are whole (P); the primary-key-change cases are ported with
+D19 (of the 17 summary cases, 15 whole, `WORKING and STAGED` in part,
+drop-and-recreate deferred). Of `DiffStatTableFunctionScriptTests`, 13
+cases are ported, 11 whole and 2 in part (staging, as above; and
+`basic case with single table`, but for its AS OF join, as its table is
+dropped before the assertions: the stat reads such a table from the
+commits' trees, #528, #537), with the keyless one whole; the computed one
+is deferred. Of `DiffSystemTableScriptTests`, 17
+(the `dolt_diff_<t>` cases and one of the view; one without its SHOW
+INDEX), and the case whose column's old values don't convert to its
+new type in part (D21: they show null, with a warning, #531), and the
+two primary-key changes, read as the table is keyed now (D22, #530):
+one whole, one in part (its warning left out). Of `HistorySystemTableScriptTests`, cases
+0–8 (two without their EXPLAIN assertions); of
+`UnscopedDiffSystemTableScriptTests`, cases 1–5. Differences follow
+D15–D20; D18 says how rows of other versions are read.
+
 ## 7. Decisions
 
 Decided by the user 2026-10-19, as recommended:
@@ -218,3 +262,48 @@ Decided by the user 2026-10-19, as recommended:
    depend on the session's catalogs; not now.
 5. **Order:** before spec 11's step 8. #437 first, then 4.1, then 4.2;
    5's items later, each its own issue.
+
+## 8. As built (2026-10-19)
+
+- **#437 first** (#514): a table whose data trees have the same hash has
+  no row changes in `dolt_diff`, whatever its descriptions say.
+- **4.1, `dolt_diff_summary`** (#515): as designed. The canonicalizer's
+  `changes()` reads the roots' tree diff (4.4's cost); the diff-merge
+  component's `summary()` resolves refs. Renames compare items with
+  each object's own name masked, as a table's description names it in
+  its indexes' statements. From the ports (#517), as Dolt: an empty
+  table added or dropped has no `data_change`, and a renamed object has
+  `schema_change`.
+- **4.2, `dolt_schema_diff`** (#516): rendered by the move's builders
+  (`move_table()` rendering: each constraint whole, nothing read from the
+  catalogs) through the canonicalizer's `render()`. A row is given where
+  the two sides' statements differ, so a rename has one, as in Dolt.
+- **Part 6's ports** (#517): of Dolt's 19 cases, 11 ported whole, 5 in
+  part, 3 deferred (a primary-key change, D19; a computed setup); spec
+  18's D15–D17; Doltgres's cases in `schema_diffs`.
+- **Part 5, built too:**
+  - `dolt_diff_stat` (#518, #496), on the summary and the row diff
+    rather than a new interface callback;
+  - `dolt_diff_table(NULL::t [, from, to])` and the `dolt_diff` view
+    (#519, #497), D18's shapes;
+  - `dolt_at(ref, NULL::t)` and `dolt_history_table(NULL::t)` (#495's
+    SRF, #497's history), read from commits' trees.
+- **A name argument** is read as Postgres reads identifiers, case folded
+  and quotes kept (#522). One naming a table neither version has makes
+  `dolt_diff_stat` refuse (42P01), as Dolt's does; `dolt_diff_summary`
+  gives no rows for it, as Dolt's does too (#529).
+- **A table the branch doesn't have** is read by `dolt_diff_stat` from
+  the commits' trees (#528, #537): the tree interface's `diff_unordered`
+  diffs them by node hashes and key bytes, as no relation orders their
+  keys, and each version's rows are decoded by its own description,
+  through the keying's `open_described` (a keyless keying of the
+  version's columns, opened without a relation) and `parse_value_as`;
+  cells are compared by column name.
+- **Ref ranges** (#521), as Dolt takes them: `dolt_diff_summary`,
+  `dolt_schema_diff` and `dolt_diff_stat` take `'a..b'` (a to b) or
+  `'a...b'` (from their merge base to b) in place of two refs, the next
+  argument then the name. `dolt_diff`'s row type argument comes third, so
+  it keeps two refs.
+- **Not built:** `dolt_at`'s key-range pushdown and the detached checkout
+  cache (#495).
+

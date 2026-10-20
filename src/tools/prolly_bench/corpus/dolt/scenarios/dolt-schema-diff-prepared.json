@@ -1,0 +1,278 @@
+{
+  "version": 1,
+  "id": "dolt-schema-diff-prepared",
+  "description": "Reviewed Dolt port: prepared table functions",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "SchemaDiffTableFunctionScriptTests: prepared table functions"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create-t1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (a int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert-t1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (0), (1)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit0",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 0"
+      ],
+      "save": "commit0"
+    },
+    {
+      "id": "save-commit0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT set_config('vars.commit0', $1, false)",
+      "expect": {
+        "rows": [
+          [
+            {
+              "ref": "commit0"
+            }
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit0"
+        }
+      ]
+    },
+    {
+      "id": "add-b",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 ADD COLUMN b int DEFAULT 1",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "save-commit1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT set_config('vars.commit1', $1, false)",
+      "expect": {
+        "rows": [
+          [
+            {
+              "ref": "commit1"
+            }
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "create-t2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t2 (a int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert-t2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (0), (1)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "insert-t1-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (2, 2), (3, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 2"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "save-commit2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT set_config('vars.commit2', $1, false)",
+      "expect": {
+        "rows": [
+          [
+            {
+              "ref": "commit2"
+            }
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "prepare-sch-diff",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "PREPARE sch_diff(text, text, text) AS SELECT count(*) FROM dolt_schema_diff($1, $2, $3)",
+      "expect": {
+        "tag": "PREPARE"
+      }
+    },
+    {
+      "id": "prepare-diff-stat",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "PREPARE diff_stat(text, text, text) AS SELECT count(*) FROM dolt_diff_stat($1, $2, $3)",
+      "expect": {
+        "tag": "PREPARE"
+      }
+    },
+    {
+      "id": "prepare-diff-sum",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "PREPARE diff_sum(text, text, text) AS SELECT count(*) FROM dolt_diff_summary($1, $2, $3)",
+      "expect": {
+        "tag": "PREPARE"
+      }
+    },
+    {
+      "id": "prepare-patch",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "PREPARE patch(text, text, text) AS SELECT count(*) FROM dolt_schema_diff($1, $2, $3)",
+      "expect": {
+        "tag": "PREPARE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET vars.t1_name = 't1'",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "EXECUTE sch_diff(current_setting('vars.commit0'), current_setting('vars.commit1'), current_setting('vars.t1_name'))",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "EXECUTE diff_stat(current_setting('vars.commit1'), current_setting('vars.commit2'), current_setting('vars.t1_name'))",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "EXECUTE diff_sum(current_setting('vars.commit1'), current_setting('vars.commit2'), current_setting('vars.t1_name'))",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "EXECUTE patch(current_setting('vars.commit0'), current_setting('vars.commit1'), current_setting('vars.t1_name'))",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

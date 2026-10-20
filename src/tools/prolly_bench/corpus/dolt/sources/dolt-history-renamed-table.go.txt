@@ -1,0 +1,30 @@
+{
+		Name: "primary key table: rename table",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int, c2 varchar(20));",
+			"call dolt_add('.')",
+			"insert into t values (1, 2, '3'), (4, 5, '6');",
+
+			"CALL DOLT_COMMIT('-am', 'creating table t');",
+			"set @Commit1 = dolt_hashof('HEAD');",
+
+			"alter table t rename to t2;",
+			"call dolt_add('.')",
+			"CALL DOLT_COMMIT('-am', 'renaming table to t2');",
+			"set @commit2 = dolt_hashof('HEAD');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "select count(*) from dolt_history_t;",
+				ExpectedErr: sql.ErrTableNotFound,
+			},
+			{
+				Query:    "select count(*) from dolt_history_T2;",
+				Expected: []sql.Row{{2}},
+			},
+			{
+				Query:    "select pk, c1, c2 from dolt_history_t2 where commit_hash != @Commit1;",
+				Expected: []sql.Row{{1, 2, "3"}, {4, 5, "6"}},
+			},
+		},
+	}

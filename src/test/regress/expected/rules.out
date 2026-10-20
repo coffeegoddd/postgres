@@ -1302,6 +1302,15 @@ dolt_branches| SELECT name,
 dolt_conflicts| SELECT table_name,
     num_conflicts
    FROM dolt_conflicts() dolt_conflicts(table_name, num_conflicts);
+dolt_diff| SELECT commit_hash,
+    table_name,
+    committer,
+    email,
+    date,
+    message,
+    data_change,
+    schema_change
+   FROM dolt_diff() dolt_diff(commit_hash, table_name, committer, email, date, message, data_change, schema_change);
 dolt_log| SELECT commit_hash,
     committer,
     email,

@@ -1,0 +1,431 @@
+{
+  "version": 1,
+  "id": "dolt-history-basic",
+  "description": "Reviewed Dolt port: primary key table: basic cases",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: primary key table: basic cases"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (n int PRIMARY KEY, de varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 'Eins'), (2, 'Zwei'), (3, 'Drei')",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into t1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 ADD COLUMN fr varchar(20)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (4, 'Vier', 'Quatre')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "adding column and inserting data in t1"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t1 SET fr = 'Un' WHERE n = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t1 SET fr = 'Deux' WHERE n = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "updating data in t1"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t1 SET de = concat(de, ', meine herren') WHERE n > 1",
+      "expect": {
+        "tag": "UPDATE 3"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "be polite when you address a gentleman"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "setup-16",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t1 WHERE n = 2",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "commit5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "we don't need the number 2"
+      ],
+      "save": "commit5"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_history_table(NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "18"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de, (row).fr FROM dolt_history_table(NULL::T1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins",
+            null
+          ],
+          [
+            "2",
+            "Zwei",
+            null
+          ],
+          [
+            "3",
+            "Drei",
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).de, (row).fr FROM dolt_history_table(NULL::T1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "Eins",
+            null
+          ],
+          [
+            "Zwei",
+            null
+          ],
+          [
+            "Drei",
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de, (row).fr FROM dolt_history_table(NULL::T1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins",
+            null
+          ],
+          [
+            "2",
+            "Zwei",
+            null
+          ],
+          [
+            "3",
+            "Drei",
+            null
+          ],
+          [
+            "4",
+            "Vier",
+            "Quatre"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de, (row).fr FROM dolt_history_table(NULL::T1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins",
+            "Un"
+          ],
+          [
+            "2",
+            "Zwei",
+            "Deux"
+          ],
+          [
+            "3",
+            "Drei",
+            null
+          ],
+          [
+            "4",
+            "Vier",
+            "Quatre"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de, (row).fr FROM dolt_history_table(NULL::T1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins",
+            "Un"
+          ],
+          [
+            "2",
+            "Zwei, meine herren",
+            "Deux"
+          ],
+          [
+            "3",
+            "Drei, meine herren",
+            null
+          ],
+          [
+            "4",
+            "Vier, meine herren",
+            "Quatre"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de, (row).fr FROM dolt_history_table(NULL::T1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins",
+            "Un"
+          ],
+          [
+            "3",
+            "Drei, meine herren",
+            null
+          ],
+          [
+            "4",
+            "Vier, meine herren",
+            "Quatre"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit5"
+        }
+      ]
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).de, (row).fr, commit_hash = $1, commit_hash = $2, commit_hash = $3, commit_hash = $4 FROM dolt_history_table(NULL::T1) WHERE (row).n = 2 ORDER BY commit_date",
+      "expect": {
+        "rows": [
+          [
+            "Zwei",
+            null,
+            "t",
+            "f",
+            "f",
+            "f"
+          ],
+          [
+            "Zwei",
+            null,
+            "f",
+            "t",
+            "f",
+            "f"
+          ],
+          [
+            "Zwei",
+            "Deux",
+            "f",
+            "f",
+            "t",
+            "f"
+          ],
+          [
+            "Zwei, meine herren",
+            "Deux",
+            "f",
+            "f",
+            "f",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    }
+  ]
+}

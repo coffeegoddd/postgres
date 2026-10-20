@@ -1,0 +1,68 @@
+{
+		Name: "basic case with single table",
+		SetUpScript: []string{
+			"set @Commit0 = HashOf('HEAD');",
+			"set @Commit1 = '';",
+			"call dolt_commit_hash_out(@Commit1, '--allow-empty', '-m', 'creating table t');",
+
+			// create table t only
+			"create table t (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"call dolt_add('.')",
+			"set @Commit2 = '';",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'creating table t');",
+
+			// insert 1 row into t
+			"insert into t values(1, 'one', 'two');",
+			"set @Commit3 = '';",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'inserting 1 into table t');",
+
+			// insert 2 rows into t and update two cells
+			"insert into t values(2, 'two', 'three'), (3, 'three', 'four');",
+			"update t set c1='uno', c2='dos' where pk=1;",
+			"set @Commit4 = '';",
+			"call dolt_commit_hash_out(@Commit4, '-am', 'inserting 2 into table t');",
+
+			// drop table t only
+			"drop table t;",
+			"set @Commit5 = '';",
+			"call dolt_commit_hash_out(@Commit5, '-am', 'drop table t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// table does not exist, empty result
+				Query:    "SELECT * from dolt_diff_summary(@Commit1, @Commit2, 'doesnotexist');",
+				Expected: []sql.Row{},
+			},
+			{
+				// table is added, no data changes
+				Query:    "SELECT * from dolt_diff_summary(@Commit1, @Commit2, 't');",
+				Expected: []sql.Row{{"", "t", "added", false, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary(@Commit2, @Commit3, 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, false}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary(@Commit3, @Commit4, 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, false}},
+			},
+			{
+				// change from and to commits
+				Query:    "SELECT * from dolt_diff_summary(@Commit4, @Commit3, 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, false}},
+			},
+			{
+				// table is dropped
+				Query:    "SELECT * from dolt_diff_summary(@Commit4, @Commit5, 't');",
+				Expected: []sql.Row{{"t", "", "dropped", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary(@Commit1, @Commit4, 't');",
+				Expected: []sql.Row{{"", "t", "added", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary(@Commit1, @Commit5, 't');",
+				Expected: []sql.Row{},
+			},
+		},
+	}

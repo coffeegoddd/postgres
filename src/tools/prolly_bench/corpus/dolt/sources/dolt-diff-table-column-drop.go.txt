@@ -1,0 +1,35 @@
+{
+		// When a column is dropped we should see the column's value set to null in that commit
+		Name: "column drop",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int, c2 int);",
+			"call dolt_add('.')",
+			"insert into t values (1, 2, 3), (4, 5, 6);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+
+			"alter table t drop column c1;",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'dropping column c');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t;",
+				Expected: []sql.Row{{4}},
+			},
+			{
+				Query: "SELECT to_pk, to_c2, from_pk, from_c2 FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit1 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, 3, nil, nil},
+					{4, 6, nil, nil},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c2, from_pk, from_c2 FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit2 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, 3, 1, 3},
+					{4, 6, 4, 6},
+				},
+			},
+		},
+	}

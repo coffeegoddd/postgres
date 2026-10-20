@@ -18,9 +18,9 @@
  * nothing to do, dolt_commit accepts -a and -A and needs neither,
  * dolt_status shows every change as staged, and dolt_reset only does hard
  * resets.  WORKING
- * means the session branch's working set as last committed by any
- * transaction, so dolt_status and dolt_diff don't see the current
- * transaction's own uncommitted writes.
+ * means the session branch's working set as the current transaction sees
+ * it: dolt_status and dolt_diff see its own uncommitted writes, as a Dolt
+ * session's working root has its own.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_dolt.c
@@ -54,7 +54,9 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "parser/analyze.h"
+#include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "tcop/utility.h"
@@ -66,6 +68,7 @@
 #include "utils/resowner.h"
 #include "nodes/makefuncs.h"
 #include "utils/datum.h"
+#include "utils/varlena.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -458,6 +461,15 @@ diff_merge(void)
 
 	prolly_database_components(&dc);
 	return dc.diff_merge;
+}
+
+static const ProllyCanonRoutine *
+canonicalizer(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	return dc.canonicalizer;
 }
 
 static const ProllyWritersRoutine *
@@ -2759,18 +2771,12 @@ log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 }
 
 /*
- * dolt_log(ref text, OUT commit_hash text, OUT committer text,
- *			OUT email text, OUT date timestamptz, OUT message text,
- *			OUT commit_order int8) returns setof record
- *
- * Every commit ref reaches, highest commit order (height) first, then
- * newest.
+ * Every commit ref reaches (LogEntry *), highest commit order (height)
+ * first, then newest; NIL for HEAD before a first commit.
  */
-Datum
-dolt_log(PG_FUNCTION_ARGS)
+static List *
+log_entries(const char *ref)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ProllyHash	start;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
@@ -2780,11 +2786,10 @@ dolt_log(PG_FUNCTION_ARGS)
 	ProllyHash	key;
 	bool		found;
 
-	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, ref, &start))
 	{
 		if (pg_strcasecmp(ref, "HEAD") == 0)
-			return (Datum) 0;	/* nothing committed yet */
+			return NIL;			/* nothing committed yet */
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
@@ -2832,7 +2837,26 @@ dolt_log(PG_FUNCTION_ARGS)
 	}
 	hash_destroy(heights);
 	list_sort(entries, log_cmp);
-	foreach(lc, entries)
+	return entries;
+}
+
+/*
+ * dolt_log(ref text, OUT commit_hash text, OUT committer text,
+ *			OUT email text, OUT date timestamptz, OUT message text,
+ *			OUT commit_order int8) returns setof record
+ *
+ * Every commit ref reaches, highest commit order (height) first, then
+ * newest.
+ */
+Datum
+dolt_log(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, log_entries(ref))
 	{
 		LogEntry   *e = lfirst(lc);
 		Datum		values[6];
@@ -3243,6 +3267,492 @@ status_table(const char *name, ProllyDiffKind kind, char object, void *arg)
 }
 
 /*
+ * A diff function's refs, as Dolt's take them: two refs; or one range,
+ * "a..b" (from a to b) or "a...b" (from a's and b's merge base to b), the
+ * argument after it then the object's name.  *from_ref, *to_ref and
+ * *name are set from the arguments given (to_ref and name NULL if not).
+ */
+static void
+diff_refs(const char *fn, char **from_ref, char **to_ref, char **name)
+{
+	char	   *dots = strstr(*from_ref, "..");
+	bool		three;
+	char	   *a;
+	char	   *b;
+
+	if (dots == NULL)
+	{
+		if (*to_ref == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s needs two refs, or a range of them (a..b, a...b)", fn)));
+		return;
+	}
+	three = dots[2] == '.';
+	a = pnstrdup(*from_ref, dots - *from_ref);
+	b = pstrdup(dots + (three ? 3 : 2));
+	if (*a == '\0' || *b == '\0' || strstr(b, "..") != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a range of refs", *from_ref),
+				 errhint("A range is a..b, or a...b from their merge base.")));
+	if (*to_ref != NULL)
+	{
+		if (*name != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s takes a range and a name, or two refs and a name", fn)));
+		*name = *to_ref;
+	}
+	if (three)
+	{
+		ProllyHash	ha;
+		ProllyHash	hb;
+		ProllyHash	base;
+
+		if (!PROLLY_CALL(refs(), resolve, a, &ha))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", a)));
+		if (!PROLLY_CALL(refs(), resolve, b, &hb))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", b)));
+		if (!PROLLY_CALL(refs(), merge_base, &ha, &hb, &base))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("refs \"%s\" and \"%s\" have no merge base", a, b)));
+		a = hash_hex(&base);
+	}
+	*from_ref = a;
+	*to_ref = b;
+}
+
+/* What dolt_diff_summary() and dolt_schema_diff() list: each change, copied. */
+typedef struct SummaryRow
+{
+	char	   *from_name;		/* NULL: none */
+	char	   *to_name;
+	char		object;
+	bool		data_change;
+	bool		schema_change;
+	bool		not_covered;
+	char	   *from_item;		/* the items (NULL: none) */
+	int			from_len;
+	char	   *to_item;
+	int			to_len;
+} SummaryRow;
+
+/*
+ * A copy of an item's bytes: they begin with its data tree's hash, which
+ * can hold zero bytes, so it isn't copied as a string.
+ */
+static char *
+copy_item(const ProllyValue *v)
+{
+	char	   *c = palloc(v->len + 1);
+
+	memcpy(c, v->data, v->len);
+	c[v->len] = '\0';
+	return c;
+}
+
+static void
+collect_change(const ProllyObjectChange *c, void *arg)
+{
+	List	  **rows = arg;
+	SummaryRow *r = palloc0(sizeof(SummaryRow));
+
+	r->from_name = c->from_name ? pstrdup(c->from_name) : NULL;
+	r->to_name = c->to_name ? pstrdup(c->to_name) : NULL;
+	r->object = c->object;
+	r->data_change = c->data_change;
+	r->schema_change = c->schema_change;
+	r->not_covered = c->not_covered;
+	if (c->from_item)
+	{
+		r->from_item = copy_item(c->from_item);
+		r->from_len = c->from_item->len;
+	}
+	if (c->to_item)
+	{
+		r->to_item = copy_item(c->to_item);
+		r->to_len = c->to_item->len;
+	}
+	*rows = lappend(*rows, r);
+}
+
+/* Whether name is a change's, on either side. */
+static bool
+row_named(const SummaryRow *r, const char *name)
+{
+	return (r->from_name && strcmp(r->from_name, name) == 0) ||
+		(r->to_name && strcmp(r->to_name, name) == 0);
+}
+
+/*
+ * A name as an object's name is written in a summary: its identifiers
+ * parsed as Postgres parses them (case folded, quotes honored) and quoted
+ * as needed, a routine's argument list after them as given; *schema
+ * whether it names its schema.  NULL if it isn't a name.
+ */
+static char *
+normalized_name(const char *name, bool *schema)
+{
+	const char *paren = NULL;
+	bool		quoted = false;
+	char	   *ident;
+	List	   *parts;
+	StringInfoData out;
+	ListCell   *lc;
+
+	/* a routine's argument list begins at the first '(' outside quotes */
+	for (const char *p = name; *p && paren == NULL; p++)
+	{
+		if (*p == '"')
+			quoted = !quoted;
+		else if (*p == '(' && !quoted)
+			paren = p;
+	}
+	ident = paren ? pnstrdup(name, paren - name) : pstrdup(name);
+	if (!SplitIdentifierString(ident, '.', &parts) || parts == NIL ||
+		list_length(parts) > 2)
+		return NULL;
+	initStringInfo(&out);
+	foreach(lc, parts)
+	{
+		if (foreach_current_index(lc) > 0)
+			appendStringInfoChar(&out, '.');
+		appendStringInfoString(&out, quote_identifier(lfirst(lc)));
+	}
+	if (paren)
+		appendStringInfoString(&out, paren);
+	*schema = list_length(parts) == 2;
+	return out.data;
+}
+
+/*
+ * The changes between two refs, every one, or (name not NULL) the object
+ * name names in either version, its identifiers read as Postgres reads
+ * them: as qualified, or, a name without its schema, in the first schema
+ * of the search path that has one of that name changed (it need not exist
+ * now).
+ */
+static char *row_name_wanted(List *rows, const char *name);
+
+static List *
+summary_rows(const char *from_ref, const char *to_ref, const char *name,
+			 bool definitions)
+{
+	List	   *rows = NIL;
+	List	   *kept = NIL;
+	char	   *want;
+	ListCell   *lc;
+
+	if (!PROLLY_HAS(diff_merge(), summary))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't summarize a diff")));
+	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, definitions,
+				collect_change, &rows);
+	if (name == NULL)
+		return rows;
+	want = row_name_wanted(rows, name);
+	if (want == NULL)
+		return NIL;
+	foreach(lc, rows)
+		if (row_named(lfirst(lc), want))
+			kept = lappend(kept, lfirst(lc));
+	return kept;
+}
+
+/*
+ * The name of rows' object name names, as summary_rows() reads it: as
+ * qualified, or in the first schema of the search path that has one of
+ * that name among rows.  NULL if none.
+ */
+static char *
+row_name_wanted(List *rows, const char *name)
+{
+	char	   *want = NULL;
+	ListCell   *lc;
+	bool		qualified = false;
+	char	   *normal;
+
+	/* qualified, or found by the search path */
+	normal = normalized_name(name, &qualified);
+	if (normal == NULL)
+		return NULL;
+	name = normal;
+	foreach(lc, rows)
+		if (row_named(lfirst(lc), name))
+			want = pstrdup(name);
+	if (want == NULL)
+	{
+		if (!qualified)
+		{
+			List	   *path = fetch_search_path(false);
+			ListCell   *nc;
+
+			foreach(nc, path)
+			{
+				char	   *nsp = get_namespace_name(lfirst_oid(nc));
+				char	   *q;
+
+				if (nsp == NULL)
+					continue;
+				q = psprintf("%s.%s", quote_identifier(nsp), name);
+				foreach(lc, rows)
+					if (row_named(lfirst(lc), q))
+						want = q;
+				if (want)
+					break;
+			}
+		}
+	}
+	return want;
+}
+
+/* Is one of rows a table's? */
+static bool
+rows_have_table(List *rows)
+{
+	ListCell   *lc;
+
+	foreach(lc, rows)
+		if (((SummaryRow *) lfirst(lc))->object == PROLLY_OBJECT_TABLE)
+			return true;
+	return false;
+}
+
+/*
+ * Does name name a table ref has?  Its objects are what differs from the
+ * empty root to it.
+ */
+static bool
+version_has_table(const char *ref, const char *name)
+{
+	List	   *rows = NIL;
+	char	   *want;
+	ListCell   *lc;
+
+	PROLLY_CALL(diff_merge(), summary, NULL, ref, false, collect_change, &rows);
+	want = row_name_wanted(rows, name);
+	if (want != NULL)
+		foreach(lc, rows)
+		{
+			SummaryRow *r = lfirst(lc);
+
+			if (row_named(r, want) && r->object == PROLLY_OBJECT_TABLE)
+				return true;
+		}
+	return false;
+}
+
+/*
+ * dolt_diff_summary(from_ref text, to_ref text [, name text], OUT
+ * from_table_name text, OUT to_table_name text, OUT diff_type text, OUT
+ * data_change bool, OUT schema_change bool) returns setof record
+ *
+ * Each object that differs between two refs (WORKING and STAGED as
+ * dolt_diff reads them), tables and the rest, named as dolt_status names
+ * them, by name: added, dropped, modified, or renamed (dropped and added
+ * with the same definition and rows, alone of their content), '' for the
+ * side it isn't on; whether its rows (a sequence's value) and its
+ * definition differ (a new name is a change of definition; an empty table
+ * added or dropped changes no rows, as in Dolt).  Objects a read of a working set left out are "not
+ * covered", their flags NULL.  With name, that object's alone.
+ */
+Datum
+dolt_diff_summary(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name = NULL;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff_summary needs two refs")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
+		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_refs("dolt_diff_summary", &from_ref, &to_ref, &name);
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, summary_rows(from_ref, to_ref, name, false))
+	{
+		SummaryRow *r = lfirst(lc);
+		Datum		values[5];
+		bool		nulls[5] = {0};
+		const char *type;
+
+		if (r->not_covered)
+			type = "not covered";
+		else if (r->from_name && r->to_name)
+			type = strcmp(r->from_name, r->to_name) == 0 ? "modified" : "renamed";
+		else
+			type = r->to_name ? "added" : "dropped";
+		values[0] = CStringGetTextDatum(r->from_name ? r->from_name : "");
+		values[1] = CStringGetTextDatum(r->not_covered ? r->from_name :
+										r->to_name ? r->to_name : "");
+		values[2] = CStringGetTextDatum(type);
+		values[3] = BoolGetDatum(r->data_change);
+		values[4] = BoolGetDatum(r->schema_change);
+		nulls[3] = nulls[4] = r->not_covered;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* One dolt_diff() row: a commit's (or the working set's) object that changed. */
+static void
+put_commit_changes(ReturnSetInfo *rsinfo, const char *hash,
+				   const ProllyCommitInfo *info, List *rows)
+{
+	ListCell   *lc;
+	char	   *name = NULL;
+	char	   *email = NULL;
+
+	if (info)
+		split_author(info->author, &name, &email);
+	foreach(lc, rows)
+	{
+		SummaryRow *r = lfirst(lc);
+		Datum		values[8];
+		bool		nulls[8] = {0};
+
+		if (r->not_covered)
+			continue;
+		values[0] = CStringGetTextDatum(hash);
+		values[1] = CStringGetTextDatum(r->to_name ? r->to_name : r->from_name);
+		if (info)
+		{
+			values[2] = CStringGetTextDatum(name);
+			values[3] = CStringGetTextDatum(email);
+			values[4] = TimestampTzGetDatum(info->committed_at);
+			values[5] = CStringGetTextDatum(info->message);
+		}
+		else
+			nulls[2] = nulls[3] = nulls[4] = nulls[5] = true;
+		values[6] = BoolGetDatum(r->data_change);
+		values[7] = BoolGetDatum(r->schema_change);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+}
+
+/*
+ * dolt_diff(OUT commit_hash text, OUT table_name text, OUT committer text,
+ *			 OUT email text, OUT date timestamptz, OUT message text, OUT
+ *			 data_change bool, OUT schema_change bool) returns setof record
+ *
+ * What each commit the head reaches changed, against its first parent (a
+ * first commit, against nothing), object by object as dolt_diff_summary
+ * names them, with the commit's metadata; the working set's changes first,
+ * as commit WORKING (its metadata NULL).  As Dolt's dolt_diff system
+ * table, but for every kind of object.
+ */
+Datum
+dolt_diff_commits(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	List	   *entries = log_entries("HEAD");
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	put_commit_changes(rsinfo, "WORKING", NULL,
+					   summary_rows(entries ? "HEAD" : NULL, "WORKING", NULL, false));
+	foreach(lc, entries)
+	{
+		LogEntry   *e = lfirst(lc);
+		char	   *to = hash_hex(&e->info.id);
+		char	   *from = e->info.nparents > 0 ? hash_hex(&e->info.parents[0]) : NULL;
+
+		CHECK_FOR_INTERRUPTS();
+		put_commit_changes(rsinfo, to, &e->info, summary_rows(from, to, NULL, false));
+	}
+	return (Datum) 0;
+}
+
+/* The statements that make an object, from its item ('' for none). */
+static char *
+render_item(char object, const char *name, const char *item, int len)
+{
+	StringInfoData out;
+	ProllyValue v;
+
+	initStringInfo(&out);
+	if (item == NULL)
+		return out.data;
+	v.data = (const uint8 *) item;
+	v.len = len;
+	PROLLY_CALL(canonicalizer(), render, object, name, &v, &out);
+	return out.data;
+}
+
+/*
+ * dolt_schema_diff(from_ref text, to_ref text [, name text], OUT
+ * from_table_name text, OUT to_table_name text, OUT from_create_statement
+ * text, OUT to_create_statement text) returns setof record
+ *
+ * Each object whose statements differ between two refs (its definition
+ * changed, or it was added, dropped or renamed; a change of rows alone
+ * gives none, as in Dolt), as dolt_diff_summary() lists them: each side's
+ * statements, rendered from that version's description (never from the
+ * catalogs: any two refs, whatever the session's branch holds), '' for
+ * the side it isn't on.  A table's is its CREATE TABLE, then its
+ * constraints, indexes, triggers, rules, statistics, row security, foreign
+ * keys, policies and parents, a statement a line.
+ */
+Datum
+dolt_schema_diff(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name = NULL;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_schema_diff needs two refs")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
+		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_refs("dolt_schema_diff", &from_ref, &to_ref, &name);
+	if (!PROLLY_HAS(canonicalizer(), render))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's canonical form can't be shown as statements")));
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, summary_rows(from_ref, to_ref, name, true))
+	{
+		SummaryRow *r = lfirst(lc);
+		Datum		values[4];
+		bool		nulls[4] = {0};
+		char	   *from_sql;
+		char	   *to_sql;
+
+		if (r->not_covered)
+			continue;
+		from_sql = render_item(r->object, r->from_name, r->from_item, r->from_len);
+		to_sql = render_item(r->object, r->to_name, r->to_item, r->to_len);
+		if (strcmp(from_sql, to_sql) == 0)
+			continue;
+		values[0] = CStringGetTextDatum(r->from_name ? r->from_name : "");
+		values[1] = CStringGetTextDatum(r->to_name ? r->to_name : "");
+		values[2] = CStringGetTextDatum(from_sql);
+		values[3] = CStringGetTextDatum(to_sql);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
  * names ("name<tab>status") with table relid's status status, in place of
  * any it had (none for a table dropped)
  */
@@ -3377,6 +3887,8 @@ typedef struct Rows
 	ProllyTreeEnv env;			/* where values out of line are read */
 	ProllyKeyingRefs refs;
 	MemoryContext rowcxt;		/* a row's decoding, reset for the next */
+	bool		described;		/* a version's, by its description: its
+								 * values parsed as keyless says */
 } Rows;
 
 static void
@@ -3391,6 +3903,82 @@ rows_begin(Rows *r, Relation rel)
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
 									  ALLOCSET_DEFAULT_SIZES);
+}
+
+/* A canonical table item's data tree. */
+static void
+table_item_data(const char *item, int len, ProllyNodeRef *data)
+{
+	memset(data, 0, sizeof(*data));
+	if (len < 1 || (uint8) item[0] > PROLLY_HASH_MAX_LEN || len < 1 + (uint8) item[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a canonical table item without its rows")));
+	data->hash.len = (uint8) item[0];
+	memcpy(data->hash.bytes, item + 1, data->hash.len);
+}
+
+/*
+ * rows_begin() of a version of a table only its commits describe (its
+ * item, item bytes): its columns as described, read without a relation.
+ * False if they can't be: a column's type isn't one this database has, or
+ * the keying can't open rows so.
+ */
+static bool
+rows_begin_described(Rows *r, const char *item, int len)
+{
+	ProllyValue v = {(const uint8 *) item, len};
+	ProllyNodeRef data;
+	ProllyValue d;
+	List	   *cols;
+	TupleDesc	desc;
+	bool		keyed;
+	int			i = 1;
+	ListCell   *lc;
+
+	memset(r, 0, sizeof(*r));
+	prolly_history_components(&r->c);
+	if (!PROLLY_HAS(r->c.keying, open_described) ||
+		!PROLLY_HAS(r->c.keying, parse_value_as))
+		return false;
+	table_item_data(item, len, &data);
+	d.data = v.data + 1 + data.hash.len;
+	d.len = v.len - 1 - data.hash.len;
+	cols = PROLLY_CALL(canonicalizer(), table_columns, &d, &keyed);
+	desc = CreateTemplateTupleDesc(list_length(cols));
+	foreach(lc, cols)
+	{
+		ProllyTableColumn *c = lfirst(lc);
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
+		Oid			type;
+		int32		typmod;
+
+		if (!parseTypeString(c->type, &type, &typmod, (Node *) &escontext) ||
+			!OidIsValid(type))
+			return false;
+		TupleDescInitEntry(desc, i++, c->name, type, typmod, 0);
+	}
+	TupleDescFinalize(desc);
+	r->keying = PROLLY_CALL(r->c.keying, open_described, desc, CurrentMemoryContext);
+	r->keyless = !keyed;
+	r->described = true;
+	prolly_folded_tree_env(&r->env);
+	prolly_keying_use_env(&r->refs, r->c.keying, r->keying, r->c.tree, &r->env);
+	r->slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
+									  ALLOCSET_DEFAULT_SIZES);
+	return true;
+}
+
+/* A tree value's row and copies, as the rows' version keyed them. */
+static void
+rows_parse(Rows *r, const ProllyValue *value, ProllyValue *row, uint64 *count)
+{
+	if (r->described)
+		PROLLY_CALL(r->c.keying, parse_value_as, r->keying, r->keyless, value,
+					row, count);
+	else
+		PROLLY_CALL(r->c.keying, parse_value, r->keying, value, row, count);
 }
 
 /*
@@ -3423,7 +4011,7 @@ rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
 	ProllyValue row;
 
-	PROLLY_CALL(r->c.keying, parse_value, r->keying, value, &row, count);
+	rows_parse(r, value, &row, count);
 	ExecClearTuple(r->slot);
 	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
 	return ExecFetchSlotHeapTupleDatum(r->slot);
@@ -3477,18 +4065,49 @@ typedef struct RowDiffSink
 	ProllyDiffSink sink;		/* must be first */
 	ReturnSetInfo *rsinfo;
 	Rows		rows;
+
+	/*
+	 * dolt_diff_table()'s: each row with the commits it is between, and
+	 * their dates (to_commit NULL: dolt_diff()'s row, without them)
+	 */
+	const char *to_commit;
+	const char *from_commit;
+	TimestampTz to_date;
+	TimestampTz from_date;
+	bool		to_dated;
+	bool		from_dated;
 } RowDiffSink;
 
 static void
 put_diff(RowDiffSink *s, const char *kind, Datum from, bool from_null,
 		 Datum to, bool to_null, uint64 times)
 {
-	Datum		values[3];
-	bool		nulls[3] = {false, from_null, to_null};
+	Datum		values[7];
+	bool		nulls[7] = {0};
 
-	values[0] = CStringGetTextDatum(kind);
-	values[1] = from;
-	values[2] = to;
+	if (s->to_commit)
+	{
+		values[0] = to;
+		nulls[0] = to_null;
+		values[1] = from;
+		nulls[1] = from_null;
+		values[2] = CStringGetTextDatum(s->to_commit);
+		values[3] = s->from_commit ? CStringGetTextDatum(s->from_commit) : (Datum) 0;
+		nulls[3] = s->from_commit == NULL;
+		values[4] = TimestampTzGetDatum(s->to_date);
+		nulls[4] = !s->to_dated;
+		values[5] = TimestampTzGetDatum(s->from_date);
+		nulls[5] = !s->from_dated;
+		values[6] = CStringGetTextDatum(kind);
+	}
+	else
+	{
+		values[0] = CStringGetTextDatum(kind);
+		values[1] = from;
+		nulls[1] = from_null;
+		values[2] = to;
+		nulls[2] = to_null;
+	}
 	for (uint64 i = 0; i < times; i++)
 		tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc, values,
 							 nulls);
@@ -3565,6 +4184,687 @@ dolt_diff(PG_FUNCTION_ARGS)
 	PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s.sink);
 	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_diff_table(tbl anyelement, from_ref text DEFAULT NULL, to_ref text
+ *				   DEFAULT NULL, OUT to_row anyelement, OUT from_row
+ *				   anyelement, OUT to_commit text, OUT from_commit text, OUT
+ *				   to_commit_date timestamptz, OUT from_commit_date
+ *				   timestamptz, OUT diff_type text) returns setof record
+ *
+ * tbl's table's changes over its history, a commit at a time, as Dolt's
+ * dolt_diff_<table> system tables have them: from to_ref (the working set,
+ * if NULL: its changes against the head first, to_commit WORKING) back
+ * along first parents to from_ref (not its changes; the first commit's,
+ * against nothing, if NULL), each row as it was and is, decoded as the
+ * table is defined now, with the commits it is between and their dates:
+ * keyed as it is now (across a change of its primary key too), an old
+ * value that doesn't convert to its column's type now shown null, with a
+ * warning.  A commit that didn't change the table's rows costs a lookup
+ * of it, no more.
+ */
+Datum
+dolt_diff_table(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	char	   *from_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *to_ref = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	ProllyHash	stop;
+	bool		stopping = false;
+	ProllyHash	at;
+	bool		more;
+	Relation	rel;
+	RowDiffSink s;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rel = open_row_type_table(relid, "dolt_diff_table", ACL_SELECT);
+	if (from_ref)
+	{
+		if (!PROLLY_CALL(refs(), resolve, from_ref, &stop))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", from_ref)));
+		stopping = true;
+	}
+	memset(&s, 0, sizeof(s));
+	s.sink.change = row_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	rows_begin(&s.rows, rel);
+
+	/* the working set's changes first, against the head (or nothing) */
+	more = PROLLY_CALL(refs(), resolve, "HEAD", &at);
+	if (to_ref == NULL || pg_strcasecmp(to_ref, "WORKING") == 0)
+	{
+		ProllyCommitInfo head;
+
+		s.to_commit = "WORKING";
+		s.from_commit = more ? hash_hex(&at) : NULL;
+		s.to_dated = false;
+		s.from_dated = more && PROLLY_CALL(refs(), commit_get, &at, &head);
+		if (s.from_dated)
+			s.from_date = head.committed_at;
+		PROLLY_CALL(diff_merge(), diff, s.from_commit, "WORKING", relid, &s.sink);
+	}
+	else
+	{
+		more = PROLLY_CALL(refs(), resolve, to_ref, &at);
+		if (!more)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", to_ref)));
+	}
+
+	/* then each commit's, against its first parent */
+	while (more && !(stopping && (at.len == stop.len && memcmp(at.bytes, stop.bytes, at.len) == 0)))
+	{
+		ProllyCommitInfo info;
+		ProllyCommitInfo parent;
+		char	   *to = hash_hex(&at);
+
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(refs(), commit_get, &at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", to)));
+		s.to_commit = to;
+		s.to_date = info.committed_at;
+		s.to_dated = true;
+		s.from_commit = info.nparents > 0 ? hash_hex(&info.parents[0]) : NULL;
+		s.from_dated = info.nparents > 0 &&
+			PROLLY_CALL(refs(), commit_get, &info.parents[0], &parent);
+		if (s.from_dated)
+			s.from_date = parent.committed_at;
+		PROLLY_CALL(diff_merge(), diff, s.from_commit, to, relid, &s.sink);
+		more = info.nparents > 0;
+		if (more)
+			at = info.parents[0];
+	}
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/* ------------------------------------------------------------------------
+ * A commit's rows
+ * ------------------------------------------------------------------------
+ */
+
+/* What dolt_at() and dolt_history_table() put of a version's rows. */
+typedef struct AtSink
+{
+	ProllyDiffSink sink;		/* must be first */
+	ReturnSetInfo *rsinfo;
+	Rows		rows;
+	bool		history;		/* each row a column, with the commit's */
+	const ProllyCommitInfo *commit;
+	char	   *hash;
+	char	   *committer;
+} AtSink;
+
+static void
+at_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+		  const ProllyKey *key, const ProllyValue *before,
+		  const ProllyValue *after)
+{
+	AtSink	   *s = (AtSink *) self;
+	uint64		copies = 1;
+	MemoryContext old;
+	Datum		row;
+
+	/* (a diff from nothing: every row added) */
+	if (after == NULL)
+		return;
+	old = rows_next(&s->rows);
+	row = rows_datum(&s->rows, after, &copies);
+	if (!s->rows.keyless)
+		copies = 1;
+	for (uint64 i = 0; i < copies; i++)
+	{
+		if (s->history)
+		{
+			Datum		values[4];
+			bool		nulls[4] = {0};
+
+			values[0] = row;
+			values[1] = CStringGetTextDatum(s->hash);
+			values[2] = CStringGetTextDatum(s->committer);
+			values[3] = TimestampTzGetDatum(s->commit->committed_at);
+			tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc,
+								 values, nulls);
+		}
+		else
+			tuplestore_puttupleslot(s->rsinfo->setResult, s->rows.slot);
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * dolt_at(ref text, tbl anyelement) returns setof anyelement
+ *
+ * tbl's table's rows (its row type, as in NULL::t) as ref has them (any
+ * commit, branch or WORKING), read from ref's tree, never written to
+ * pages: as Dolt's AS OF.  Decoded as the table is defined now, as
+ * dolt_diff decodes them; a keyless row once a copy.
+ */
+Datum
+dolt_at(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	char	   *ref;
+	Relation	rel;
+	AtSink		s;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_at's ref can't be null")));
+	ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	rel = open_row_type_table(relid, "dolt_at", ACL_SELECT);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	rows_begin(&s.rows, rel);
+	PROLLY_CALL(diff_merge(), diff, NULL, ref, relid, &s.sink);
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_history_table(tbl anyelement, OUT row anyelement, OUT commit_hash
+ *					  text, OUT committer text, OUT commit_date timestamptz)
+ *	  returns setof record
+ *
+ * tbl's table's rows at each commit the head reaches (that has the table),
+ * with the commit, as Dolt's dolt_history_<table>: each read from the
+ * commit's tree, as dolt_at() reads it.
+ */
+Datum
+dolt_history_table(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	Relation	rel;
+	AtSink		s;
+	ListCell   *lc;
+
+	rel = open_row_type_table(relid, "dolt_history_table", ACL_SELECT);
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.history = true;
+	rows_begin(&s.rows, rel);
+	foreach(lc, log_entries("HEAD"))
+	{
+		LogEntry   *e = lfirst(lc);
+		char	   *email;
+
+		CHECK_FOR_INTERRUPTS();
+		s.commit = &e->info;
+		s.hash = hash_hex(&e->info.id);
+		split_author(e->info.author, &s.committer, &email);
+		PROLLY_CALL(diff_merge(), diff, NULL, s.hash, relid, &s.sink);
+	}
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Diff stats
+ * ------------------------------------------------------------------------
+ */
+
+/* What dolt_diff_stat() counts of one table's rows. */
+typedef struct StatSink
+{
+	ProllyDiffSink sink;		/* must be first */
+	Rows		from;			/* (two, as a modified row decodes both) */
+	Rows		to;
+	bool		keyless;
+	uint64		added;
+	uint64		deleted;
+	uint64		modified;
+	uint64		cells_modified;
+	bool		cells_unknown;	/* a modified row's cells aren't compared */
+	int		   *from_of;		/* described versions: each of to's columns'
+								 * of from's, by name (-1: none) */
+} StatSink;
+
+/* The columns of a modified row that differ, as the table is defined now. */
+static uint64
+cells_differing(StatSink *s, const ProllyValue *before, const ProllyValue *after)
+{
+	TupleDesc	desc = s->from.slot->tts_tupleDescriptor;
+	uint64		count;
+	uint64		n = 0;
+	MemoryContext old = rows_next(&s->from);
+
+	(void) rows_next(&s->to);
+	(void) rows_datum(&s->from, before, &count);
+	(void) rows_datum(&s->to, after, &count);
+	slot_getallattrs(s->from.slot);
+	slot_getallattrs(s->to.slot);
+	if (s->from_of)
+		desc = s->to.slot->tts_tupleDescriptor;
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		int			j = s->from_of ? s->from_of[i] : i;
+		bool		fnull = j < 0 || s->from.slot->tts_isnull[j];
+		bool		tnull = s->to.slot->tts_isnull[i];
+
+		if (att->attisdropped)
+			continue;
+		if (j >= 0 && s->from_of &&
+			TupleDescAttr(s->from.slot->tts_tupleDescriptor, j)->atttypid != att->atttypid)
+		{
+			/* (a column retyped between the versions: by its text) */
+			Oid			fout;
+			Oid			tout;
+			bool		varlena;
+
+			if (fnull != tnull)
+				n++;
+			else if (!fnull)
+			{
+				getTypeOutputInfo(TupleDescAttr(s->from.slot->tts_tupleDescriptor, j)->atttypid,
+								  &fout, &varlena);
+				getTypeOutputInfo(att->atttypid, &tout, &varlena);
+				if (strcmp(OidOutputFunctionCall(fout, s->from.slot->tts_values[j]),
+						   OidOutputFunctionCall(tout, s->to.slot->tts_values[i])) != 0)
+					n++;
+			}
+			continue;
+		}
+		if (fnull != tnull ||
+			(!fnull && !datum_image_eq(s->from.slot->tts_values[j],
+									   s->to.slot->tts_values[i],
+									   att->attbyval, att->attlen)))
+			n++;
+	}
+	MemoryContextSwitchTo(old);
+	return n;
+}
+
+static void
+stat_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+			const ProllyKey *key, const ProllyValue *before,
+			const ProllyValue *after)
+{
+	StatSink   *s = (StatSink *) self;
+
+	if (s->keyless)
+	{
+		ProllyValue row;
+		uint64		was = 0;
+		uint64		is = 0;
+
+		/* (a keyless row's copies: those added or taken away) */
+		if (before)
+			rows_parse(&s->from, before, &row, &was);
+		if (after)
+			rows_parse(s->from_of ? &s->to : &s->from, after, &row, &is);
+		if (is > was)
+			s->added += is - was;
+		else
+			s->deleted += was - is;
+		return;
+	}
+	if (kind == PROLLY_DIFF_ADDED)
+		s->added++;
+	else if (kind == PROLLY_DIFF_REMOVED)
+		s->deleted++;
+	else
+	{
+		s->modified++;
+		if (!s->cells_unknown)
+			s->cells_modified += cells_differing(s, before, after);
+	}
+}
+
+/*
+ * Whether relid's rows are keyed by a primary key now.  A diff through it
+ * reads each version's rows keyed so, whatever key the version had: a
+ * keyless version's copies of a row become one keyed row.
+ */
+static bool
+keyed_now(Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	ProllyComponents c;
+	ProllyKeying *k;
+	bool		keyless;
+
+	prolly_components_for_relation(rel, &c);
+	k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+	keyless = PROLLY_CALL(c.keying, keyless, k);
+	PROLLY_CALL(c.keying, close, k);
+	table_close(rel, AccessShareLock);
+	return !keyless;
+}
+
+/* A version of a table: its rows (a count of its tree's items), its columns. */
+static void
+table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed)
+{
+	ProllyValue v = {(const uint8 *) item, len};
+	ProllyValue desc;
+	ProllyNodeRef data;
+	ProllyTreeEnv env;
+
+	table_item_data(item, len, &data);
+	desc.data = v.data + 1 + data.hash.len;
+	desc.len = v.len - 1 - data.hash.len;
+	*columns = list_length(PROLLY_CALL(canonicalizer(), table_columns, &desc, keyed));
+	prolly_folded_tree_env(&env);
+	*rows = PROLLY_CALL(prolly_tree_lookup("cow"), count, &env, &data);
+}
+
+/* A change an unordered diff finds, to the sink. */
+static void
+stat_tree_change(ProllyDiffKind kind, const ProllyKey *key,
+				 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	stat_change(arg, InvalidOid, kind, key, before, after);
+}
+
+/*
+ * A table the session's branch hasn't, or has keyed otherwise than its
+ * versions are: its rows diffed from the trees, by their keys' bytes (as
+ * no relation orders them), each decoded by its version's description (a
+ * side without the table, as the empty tree of the other's).  False if
+ * they can't be read so.
+ */
+static bool
+stat_described(StatSink *s, const SummaryRow *r)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	const char *fitem = r->from_item ? r->from_item : r->to_item;
+	int			flen = r->from_item ? r->from_len : r->to_len;
+	const char *titem = r->to_item ? r->to_item : r->from_item;
+	int			tlen = r->to_item ? r->to_len : r->from_len;
+	ProllyNodeRef fd;
+	ProllyNodeRef td;
+	TupleDesc	fdesc;
+	TupleDesc	tdesc;
+
+	if (!PROLLY_HAS(tree, diff_unordered) ||
+		!rows_begin_described(&s->from, fitem, flen))
+		return false;
+	if (!rows_begin_described(&s->to, titem, tlen))
+	{
+		rows_end(&s->from);
+		return false;
+	}
+	fdesc = s->from.slot->tts_tupleDescriptor;
+	tdesc = s->to.slot->tts_tupleDescriptor;
+	s->from_of = palloc_array(int, Max(tdesc->natts, 1));
+	for (int i = 0; i < tdesc->natts; i++)
+	{
+		s->from_of[i] = -1;
+		for (int j = 0; j < fdesc->natts; j++)
+			if (strcmp(NameStr(TupleDescAttr(tdesc, i)->attname),
+					   NameStr(TupleDescAttr(fdesc, j)->attname)) == 0)
+				s->from_of[i] = j;
+	}
+	table_item_data(fitem, flen, &fd);
+	table_item_data(titem, tlen, &td);
+	if (r->from_item == NULL || r->to_item == NULL)
+	{
+		ProllyNodeRef empty;
+
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &s->from.env, CurrentMemoryContext),
+					&empty);
+		if (r->from_item == NULL)
+			fd = empty;
+		else
+			td = empty;
+	}
+	PROLLY_CALL(tree, diff_unordered, &s->from.env, &fd, &td, stat_tree_change, s);
+	rows_end(&s->from);
+	rows_end(&s->to);
+	return true;
+}
+
+/*
+ * stat_described(), its modified rows' cells compared where its values
+ * decode.  The columns' types are found by name as they're defined now, and
+ * a version's value may not read as one (an enum's label renamed since):
+ * then its rows are counted again, their cells modified unknown.
+ */
+static bool
+stat_described_or_counted(StatSink *s, const SummaryRow *r)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	StatSink	start = *s;
+	volatile bool read = false;
+	volatile bool decoded = false;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		read = stat_described(s, r);
+		decoded = true;
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		/* (a cancel, or anything else, isn't a value that doesn't decode) */
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION)
+			ReThrowError(ed);
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	if (decoded)
+		return read;
+	*s = start;
+	s->cells_unknown = true;
+	return stat_described(s, r);
+}
+
+/*
+ * Dolt's cells added and deleted, from the rows added and deleted and the
+ * cells before and after (its GetCellsAddedAndDeleted, as it counts them).
+ */
+static void
+cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
+					uint64 old_cells, uint64 new_cells,
+					uint64 *cells_added, uint64 *cells_deleted)
+{
+	double		inserts = (double) added * new_columns;
+	double		deletes = (double) deleted * new_columns;
+	double		diff = (double) new_cells - (double) old_cells;
+
+	if (diff > 0)
+	{
+		*cells_added = (uint64) (diff + deletes);
+		*cells_deleted = (uint64) deletes;
+	}
+	else if (diff < 0)
+	{
+		*cells_added = (uint64) inserts;
+		*cells_deleted = (uint64) (-diff + inserts);
+	}
+	else
+	{
+		*cells_added = (uint64) Max(inserts, deletes);
+		*cells_deleted = (uint64) Max(inserts, deletes);
+	}
+}
+
+/*
+ * dolt_diff_stat(from_ref text, to_ref text [, name text], OUT table_name
+ * text, OUT rows_unmodified int8, OUT rows_added int8, OUT rows_deleted
+ * int8, OUT rows_modified int8, OUT cells_added int8, OUT cells_deleted
+ * int8, OUT cells_modified int8, OUT old_row_count int8, OUT new_row_count
+ * int8, OUT old_cell_count int8, OUT new_cell_count int8) returns setof
+ * record
+ *
+ * For each table whose rows (or whose cells' count) differ between two
+ * refs, as Dolt's: the rows added, deleted and modified, found by the tree
+ * diff of its rows (what both sides share is skipped), the cells of the
+ * modified ones that differ (each decoded as the table is defined now),
+ * and the rows and cells each side has; cells added and deleted as Dolt
+ * counts them.  A keyless table's rows added and deleted are copies, the
+ * rest NULL, as in Dolt.  A table the session's branch hasn't, or has
+ * keyed otherwise than the versions are (a primary key made or dropped
+ * since), changed on both sides, has its rows diffed from the trees, by
+ * their keys' bytes (as no relation orders them), each version's decoded
+ * by its own description, cells compared by column name (unknown, NULL,
+ * where a version's values don't decode as its columns' types are defined
+ * now).  With name, that table's alone: one neither version has is
+ * refused (as Dolt's; dolt_diff_summary gives none).
+ */
+Datum
+dolt_diff_stat(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name = NULL;
+	List	   *stats;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff_stat needs two refs")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
+		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_refs("dolt_diff_stat", &from_ref, &to_ref, &name);
+	stats = summary_rows(from_ref, to_ref, name, false);
+
+	/*
+	 * (as Dolt's: a table neither version has is refused, not none; the
+	 * name's changes may be another object's, a view's or a routine's)
+	 */
+	if (name != NULL && !rows_have_table(stats) &&
+		!version_has_table(from_ref, name) && !version_has_table(to_ref, name))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" is in neither version", name)));
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, stats)
+	{
+		SummaryRow *r = lfirst(lc);
+		const char *table = r->to_name ? r->to_name : r->from_name;
+		uint64		old_rows = 0;
+		uint64		new_rows = 0;
+		int			old_columns = 0;
+		int			new_columns = 0;
+		bool		keyed = true;
+		bool		counted = false;
+		StatSink	s;
+		Oid			relid;
+		Datum		values[12];
+		bool		nulls[12] = {0};
+
+		if (r->not_covered || r->object != PROLLY_OBJECT_TABLE)
+			continue;
+		if (r->from_item)
+			table_version(r->from_item, r->from_len, &old_rows, &old_columns, &keyed);
+		if (r->to_item)
+			table_version(r->to_item, r->to_len, &new_rows, &new_columns, &keyed);
+		memset(&s, 0, sizeof(s));
+		s.sink.change = stat_change;
+		s.keyless = !keyed;
+
+		/*
+		 * (rows diffed where the branch has the table, keyed as the versions
+		 * are: the rows are read keyed as it is now; one side's: counted)
+		 */
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(table, NULL)),
+								 NoLock, true);
+		if (OidIsValid(relid) && get_rel_relam(relid) == PROLLY_TABLE_AM_OID &&
+			(r->data_change || !keyed) && keyed_now(relid) == keyed)
+		{
+			Relation	rel = table_open(relid, AccessShareLock);
+
+			check_history_rls(relid, "dolt_diff_stat");
+			rows_begin(&s.from, rel);
+			rows_begin(&s.to, rel);
+			table_close(rel, AccessShareLock);
+			PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s.sink);
+			rows_end(&s.from);
+			rows_end(&s.to);
+			counted = true;
+		}
+		else if (keyed && (r->from_item == NULL || r->to_item == NULL))
+		{
+			s.added = new_rows;
+			s.deleted = old_rows;
+			counted = true;
+		}
+		else if ((r->data_change || !keyed) && stat_described_or_counted(&s, r))
+			counted = true;
+		else if (keyed && !r->data_change)
+			counted = true;
+
+		/* (as Dolt: a table whose rows and cells' count are the same, none) */
+		if (counted && s.added + s.deleted + s.modified == 0 &&
+			old_rows * old_columns == new_rows * new_columns)
+			continue;
+
+		values[0] = CStringGetTextDatum(table);
+		for (int i = 1; i < 12; i++)
+			nulls[i] = true;
+		if (counted && keyed)
+		{
+			uint64		cells_added;
+			uint64		cells_deleted;
+
+			cells_added_deleted(s.added, s.deleted, new_columns,
+								old_rows * old_columns, new_rows * new_columns,
+								&cells_added, &cells_deleted);
+			values[1] = Int64GetDatum((int64) (old_rows - s.modified - s.deleted));
+			values[2] = Int64GetDatum((int64) s.added);
+			values[3] = Int64GetDatum((int64) s.deleted);
+			values[4] = Int64GetDatum((int64) s.modified);
+			values[5] = Int64GetDatum((int64) cells_added);
+			values[6] = Int64GetDatum((int64) cells_deleted);
+			values[7] = Int64GetDatum((int64) s.cells_modified);
+			for (int i = 1; i <= 7; i++)
+				nulls[i] = false;
+			nulls[7] = s.cells_unknown && s.modified > 0;
+		}
+		else if (counted)
+		{
+			values[2] = Int64GetDatum((int64) s.added);
+			values[3] = Int64GetDatum((int64) s.deleted);
+			nulls[2] = nulls[3] = false;
+		}
+		if (keyed)
+		{
+			values[8] = Int64GetDatum((int64) old_rows);
+			values[9] = Int64GetDatum((int64) new_rows);
+			values[10] = Int64GetDatum((int64) (old_rows * old_columns));
+			values[11] = Int64GetDatum((int64) (new_rows * new_columns));
+			nulls[8] = nulls[9] = nulls[10] = nulls[11] = false;
+		}
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
 	return (Datum) 0;
 }
 

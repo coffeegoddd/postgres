@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-foreign-key",
+  "description": "Reviewed Dolt port: foreign key change",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: foreign key change"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create-test",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (id int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert-test",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "create table test"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "create-test2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test2 (pk int PRIMARY KEY, test_id int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "add-fk",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE test2 ADD CONSTRAINT fk_test_id FOREIGN KEY (test_id) REFERENCES test(id)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "insert-test2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test2 VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "table with foreign key and row"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "drop-fk",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE test2 DROP CONSTRAINT fk_test_id",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary($1, $2)",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.test2",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD', 'WORKING')",
+      "expect": {
+        "rows": [
+          [
+            "public.test2",
+            "public.test2",
+            "modified",
+            "f",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary($1, 'WORKING')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.test2",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    }
+  ]
+}

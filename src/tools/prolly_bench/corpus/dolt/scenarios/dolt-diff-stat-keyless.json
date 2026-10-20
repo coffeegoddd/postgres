@@ -1,0 +1,343 @@
+{
+  "version": 1,
+  "id": "dolt-diff-stat-keyless",
+  "description": "Reviewed Dolt port: basic case with single keyless table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffStatTableFunctionScriptTests: basic case with single keyless table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "commit0"
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "--allow-empty"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (id int, c1 varchar(20), c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one', 'two')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting 1 into table t"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 'two', 'three'), (3, 'three', 'four')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET c1 = 'uno', c2 = 'dos' WHERE id = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting 2 into table t"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "setup-14",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE t",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "commit5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "drop table t"
+      ],
+      "save": "commit5"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            null,
+            "1",
+            "0",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            null,
+            "3",
+            "1",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            null,
+            "1",
+            "3",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            null,
+            "0",
+            "3",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit5"
+        }
+      ]
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            null,
+            "3",
+            "0",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "sqlstate": "42P01"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit5"
+        }
+      ]
+    }
+  ]
+}

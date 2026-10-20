@@ -232,6 +232,7 @@ typedef struct ProllyTreeRoutine
 							   const ProllyNodeRef *to,
 							   ProllyTreeVisitNode visit, void *arg);
 
+
 	/* The chunks a node's chunk names, in the chunk format. */
 	void		(*references) (const ProllyChunkFormatRoutine *format,
 							   const void *data, Size len,
@@ -274,15 +275,29 @@ typedef struct ProllyTreeRoutine
 	 */
 	Size		(*key_max) (const ProllyChunkFormatRoutine *format,
 							const ProllyHashRoutine *hash);
+
+	/*
+	 * Optional: diff() of trees whose keys env->compare can't order (a
+	 * table's, ordered by collations only its relation gives, where the
+	 * session has none): the same changes, found by the nodes' hashes and
+	 * matched by the keys' bytes (keys equal only by the tree's order, not
+	 * as bytes, are a removal and an addition), reported in the order of
+	 * those bytes.  It reads O((d + 1) log n) nodes too.
+	 */
+	void		(*diff_unordered) (const ProllyTreeEnv *env,
+								   const ProllyNodeRef *from,
+								   const ProllyNodeRef *to,
+								   ProllyTreeVisitChange visit, void *arg);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
 	"build_begin", "build_add", "build_finish", "get", "cursor_open", \
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
-	"value_present", "value_reference", "value_root", "key_max"
+	"value_present", "value_reference", "value_root", "key_max", \
+	"diff_unordered"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK key_max
+#define PROLLY_TREE_LAST_CALLBACK diff_unordered
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "id": "dolt-diff-stat-renamed-table",
+  "description": "Reviewed Dolt port: renamed table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffStatTableFunctionScriptTests: renamed table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (a int PRIMARY KEY, b int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new table"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 RENAME TO t2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renamed table"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('HEAD~', 'HEAD', 't2')",
+      "expect": {
+        "rows": [
+          [
+            "public.t2",
+            "0",
+            "2",
+            "0",
+            "0",
+            "4",
+            "0",
+            "0",
+            "0",
+            "2",
+            "0",
+            "4"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('HEAD~..HEAD', 't2')",
+      "expect": {
+        "rows": [
+          [
+            "public.t2",
+            "0",
+            "2",
+            "0",
+            "0",
+            "4",
+            "0",
+            "0",
+            "0",
+            "2",
+            "0",
+            "4"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('HEAD~', 'HEAD', 't1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "0",
+            "0",
+            "1",
+            "0",
+            "0",
+            "2",
+            "0",
+            "1",
+            "0",
+            "2",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat('HEAD~..HEAD', 't1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "0",
+            "0",
+            "1",
+            "0",
+            "0",
+            "2",
+            "0",
+            "1",
+            "0",
+            "2",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

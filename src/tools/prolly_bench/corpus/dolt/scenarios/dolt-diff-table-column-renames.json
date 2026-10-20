@@ -1,0 +1,255 @@
+{
+  "version": 1,
+  "id": "dolt-diff-table-column-renames",
+  "description": "Reviewed Dolt port: multiple column renames",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSystemTableScriptTests: multiple column renames"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t RENAME COLUMN c1 TO c2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renaming c1 to c2"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP COLUMN c2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "dropping column c2"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN c2 int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (100, '101')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "recreating column c2"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_diff_table(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "6"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c2, (from_row).pk, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE to_commit = $1 ORDER BY (to_row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c2, (from_row).pk, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE to_commit = $1 ORDER BY (to_row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "1",
+            null,
+            "modified"
+          ],
+          [
+            "3",
+            "4",
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c2, (from_row).pk, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE to_commit = $1 ORDER BY (to_row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            null,
+            "1",
+            "2",
+            "modified"
+          ],
+          [
+            "3",
+            null,
+            "3",
+            "4",
+            "modified"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c2, (from_row).pk, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE to_commit = $1 ORDER BY (to_row).pk",
+      "expect": {
+        "rows": [
+          [
+            "100",
+            "101",
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+		Name: "primary key change",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int);",
+			"call dolt_add('.')",
+			"insert into t values (1, 2), (3, 4);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+
+			"alter table t drop primary key;",
+			"insert into t values (5, 6);",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'dropping primary key');",
+
+			"alter table t add primary key (c1);",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'adding primary key');",
+
+			"insert into t values (7, 8);",
+			"set @Commit4 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit4, '-am', 'adding more data');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:                           "select * from dolt_diff_t;",
+				ExpectedWarning:                 1105,
+				ExpectedWarningsCount:           1,
+				ExpectedWarningMessageSubstring: "cannot render full diff between commits",
+				SkipResultsCheck:                true,
+			},
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t;",
+				Expected: []sql.Row{{7}},
+			},
+			{
+				Query:    "SELECT to_pk, to_c1, from_pk, from_c1, diff_type FROM DOLT_DIFF_t where to_commit=@Commit4;",
+				Expected: []sql.Row{{7, 8, nil, nil, "added"}},
+			},
+		},
+	}

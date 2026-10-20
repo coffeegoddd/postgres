@@ -1,0 +1,62 @@
+{
+		Name: "basic case with multiple tables",
+		SetUpScript: []string{
+			"set @Commit0 = HashOf('HEAD');",
+
+			// add table t with 1 row
+			"create table t (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"insert into t values(1, 'one', 'two');",
+			"call dolt_add('.')",
+			"set @Commit1 = '';",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'inserting into table t');",
+
+			// add table t2 with 1 row
+			"create table t2 (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"insert into t2 values(100, 'hundred', 'hundert');",
+			"call dolt_add('.')",
+			"set @Commit2 = '';",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'inserting into table t2');",
+
+			// changes on both tables
+			"insert into t values(2, 'two', 'three'), (3, 'three', 'four'), (4, 'four', 'five');",
+			"update t set c1='uno', c2='dos' where pk=1;",
+			"insert into t2 values(101, 'hundred one', 'one');",
+			"set @Commit3 = '';",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'inserting into table t');",
+
+			// changes on both tables
+			"delete from t where c2 = 'four';",
+			"update t2 set c2='zero' where pk=100;",
+			"set @Commit4 = '';",
+			"call dolt_commit_hash_out(@Commit4, '-am', 'inserting into table t');",
+
+			// create keyless table
+			"create table keyless (id int);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * from dolt_diff_stat(@Commit0, @Commit1);",
+				Expected: []sql.Row{{"t", 0, 1, 0, 0, 3, 0, 0, 0, 1, 0, 3}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_stat(@Commit1, @Commit2);",
+				Expected: []sql.Row{{"t2", 0, 1, 0, 0, 3, 0, 0, 0, 1, 0, 3}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_stat(@Commit2, @Commit3);",
+				Expected: []sql.Row{{"t", 0, 3, 0, 1, 9, 0, 2, 1, 4, 3, 12}, {"t2", 1, 1, 0, 0, 3, 0, 0, 1, 2, 3, 6}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_stat(@Commit3, @Commit4);",
+				Expected: []sql.Row{{"t", 3, 0, 1, 0, 0, 3, 0, 4, 3, 12, 9}, {"t2", 1, 0, 0, 1, 0, 0, 1, 2, 2, 6, 6}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_stat(@Commit4, @Commit2);",
+				Expected: []sql.Row{{"t", 0, 0, 2, 1, 0, 6, 2, 3, 1, 9, 3}, {"t2", 0, 0, 1, 1, 0, 3, 1, 2, 1, 6, 3}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_stat(@Commit3, 'WORKING');",
+				Expected: []sql.Row{{"t", 3, 0, 1, 0, 0, 3, 0, 4, 3, 12, 9}, {"t2", 1, 0, 0, 1, 0, 0, 1, 2, 2, 6, 6}},
+			},
+		},
+	}

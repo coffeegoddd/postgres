@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "id": "dolt-diff-table-count",
+  "description": "Reviewed Dolt port: dolt_diff_ table to_commit and from_commit indexes are non-unique",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSystemTableScriptTests: dolt_diff_ table to_commit and from_commit indexes are non-unique"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE foo (id int PRIMARY KEY, v int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO foo VALUES (1, 1), (2, 1), (3, 1), (4, 1)",
+      "expect": {
+        "tag": "INSERT 0 4"
+      }
+    },
+    {
+      "id": "seed",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "seed"
+      ],
+      "save": "seed"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_diff_table(NULL::foo)",
+      "expect": {
+        "rows": [
+          [
+            "4"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

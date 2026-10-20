@@ -93,6 +93,30 @@ typedef void (*ProllyCanonSequenceVisit) (const char *name, int64 last,
 typedef void (*ProllyCanonObjectVisit) (const char *name, ProllyDiffKind kind,
 										char object, void *arg);
 
+/*
+ * An object two canonical roots hold differently, as a summary of what
+ * changed tells it: its name on each side (NULL where it isn't there;
+ * both, and different, for one renamed), its kind (PROLLY_OBJECT_*),
+ * whether its rows differ (a table's or materialized view's, a sequence's
+ * value) and whether its definition does, and its item on each side (NULL
+ * where it isn't there), for its definitions.  not_covered: an object a
+ * read of a working set left out (from_name its name, the rest unknown).
+ */
+typedef struct ProllyObjectChange
+{
+	const char *from_name;
+	const char *to_name;
+	char		object;
+	bool		data_change;
+	bool		schema_change;
+	const ProllyValue *from_item;
+	const ProllyValue *to_item;
+	bool		not_covered;
+} ProllyObjectChange;
+
+typedef void (*ProllyCanonChangeVisit) (const ProllyObjectChange *change,
+										void *arg);
+
 #define PROLLY_OBJECT_TABLE		't'
 #define PROLLY_OBJECT_SCHEMA	'n'
 #define PROLLY_OBJECT_UNKNOWN	'\0'	/* (one a read left out) */
@@ -243,6 +267,24 @@ typedef struct ProllyCanonRoutine
 							  const ProllyRowChanges *changes, int nchanges,
 							  const Oid *sequences, int nsequences,
 							  ProllyNodeRef *root);
+
+	/*
+	 * Optional: each object from and to hold differently, tables and the
+	 * rest, by name; a dropped and an added object of a kind whose items
+	 * are the same (definition and rows), and the only such pair, as one
+	 * renamed.  Read from the roots' tree diff: equal subtrees skipped.
+	 */
+	void		(*changes) (const ProllyNodeRef *from, const ProllyNodeRef *to,
+							ProllyCanonChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: the statements that make the object of kind object named
+	 * name, from its item (changes()'s), appended to out: each ending in
+	 * ";", a line each, rendered from the item alone (no catalog read,
+	 * nothing run).  The item must be of a root of this build's format.
+	 */
+	void		(*render) (char object, const char *name, const ProllyValue *item,
+						   StringInfo out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -250,9 +292,10 @@ typedef struct ProllyCanonRoutine
 	"materialized_views", "same_schema", "objects", "move_schema", "sequences", \
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
-	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows"
+	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
+	"changes", "render"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK fold_rows
+#define PROLLY_CANON_LAST_CALLBACK render
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "id": "dolt-diff-table-from-key",
+  "description": "Reviewed Dolt port: selecting from_pk columns",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSystemTableScriptTests: selecting from_pk columns"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 int, c2 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 2, 3), (4, 5, 6)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "first commit"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (7, 8, 9)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "second commit"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET c1 = 0 WHERE pk > 5",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t WHERE pk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "third commit"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_diff_table(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "5"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE (from_row).pk = 1 ORDER BY 1, 2, 3, 4, 5, 6, 7",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            "1",
+            "2",
+            "3",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE (from_row).pk IS NULL ORDER BY 1, 2, 3, 4, 5, 6, 7",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "4",
+            "5",
+            "6",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "7",
+            "8",
+            "9",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE (from_row).pk IS NOT NULL ORDER BY 1, 2, 3, 4, 5, 6, 7",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            "1",
+            "2",
+            "3",
+            "removed"
+          ],
+          [
+            "7",
+            "0",
+            "9",
+            "7",
+            "8",
+            "9",
+            "modified"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE (from_row).pk > 1 ORDER BY 1, 2, 3, 4, 5, 6, 7",
+      "expect": {
+        "rows": [
+          [
+            "7",
+            "0",
+            "9",
+            "7",
+            "8",
+            "9",
+            "modified"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

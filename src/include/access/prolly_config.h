@@ -70,6 +70,12 @@ extern void prolly_database_components(ProllyDatabaseComponents *components);
 extern const ProllyHashRoutine *prolly_content_hash(void);
 
 /*
+ * The components a table's committed versions are written with, without
+ * the table: for reading a version only its commits describe.
+ */
+extern void prolly_history_components(ProllyComponents *components);
+
+/*
  * The table access method a new relation of relpersistence gets, given
  * amoid: a temporary or unlogged relation is never stored by prolly (it is
  * never part of a commit), so it gets heap; asking for prolly explicitly

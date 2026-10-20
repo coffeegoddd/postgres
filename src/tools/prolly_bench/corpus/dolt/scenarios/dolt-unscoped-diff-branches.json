@@ -1,0 +1,252 @@
+{
+  "version": 1,
+  "id": "dolt-unscoped-diff-branches",
+  "description": "Reviewed Dolt port: includes commits from all branches",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "UnscopedDiffSystemTableScriptTests: includes commits from all branches"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "commit0"
+    },
+    {
+      "id": "branch-branch1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE x (a int PRIMARY KEY, b int, c int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE y (a int PRIMARY KEY, b int, c int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO x VALUES (1, 2, 3), (2, 3, 4)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Creating tables x and y"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "branch-branch2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "checkout-branch2",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE z (a int PRIMARY KEY, b int, c int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO z VALUES (100, 101, 102)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Creating tables z"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO y VALUES (-1, -2, -3), (-2, -3, -4)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-14",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO z VALUES (101, 102, 103)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Inserting into tables y and z"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_diff",
+      "expect": {
+        "rows": [
+          [
+            "6"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name, schema_change, data_change FROM dolt_diff WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "public.x",
+            "t",
+            "t"
+          ],
+          [
+            "public.y",
+            "t",
+            "f"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name, schema_change, data_change FROM dolt_diff WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "public.z",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name, schema_change, data_change FROM dolt_diff WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "public.y",
+            "f",
+            "t"
+          ],
+          [
+            "public.z",
+            "f",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        }
+      ]
+    }
+  ]
+}

@@ -193,7 +193,8 @@ keying_of(Relation rel)
 static bool
 is_working(const char *ref)
 {
-	return strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0;
+	return ref != NULL &&
+		(strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0);
 }
 
 /*
@@ -232,6 +233,18 @@ root_of(const char *ref, ProllyNodeRef *root)
 	ProllyCommitInfo info;
 	bool		found;
 
+	/* (NULL: the empty root, what is before a first commit) */
+	if (ref == NULL)
+	{
+		const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+		ProllyTreeEnv env;
+
+		chunk_env(&env);
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext),
+					root);
+		return;
+	}
 	if (is_working(ref))
 	{
 		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);
@@ -721,6 +734,87 @@ folded_tables(const char *from_ref, const char *to_ref,
 		if (foreach_current_index(lc) == 0 ||
 			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
 			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, PROLLY_OBJECT_UNKNOWN, arg);
+	}
+}
+
+typedef struct SummaryChanges
+{
+	ProllyCanonChangeVisit visit;
+	void	   *arg;
+	List	   *left_out;
+} SummaryChanges;
+
+static bool
+left_out_named(List *left_out, const char *name)
+{
+	ListCell   *lc;
+
+	if (name == NULL)
+		return false;
+	foreach(lc, left_out)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/* (an object a read left out is listed as that, not as changed) */
+static void
+summary_change(const ProllyObjectChange *change, void *arg)
+{
+	SummaryChanges *sc = arg;
+
+	if (left_out_named(sc->left_out, change->from_name) ||
+		left_out_named(sc->left_out, change->to_name))
+		return;
+	sc->visit(change, sc->arg);
+}
+
+/*
+ * What differs between two refs, object by object: the roots' changes, as
+ * the canonicalizer tells them, then what the reads left out.
+ */
+static void
+folded_summary(const char *from_ref, const char *to_ref, bool definitions,
+			   ProllyCanonChangeVisit visit, void *arg)
+{
+	List	   *left_out = NIL;
+	ListCell   *lc;
+	ProllyNodeRef from_root;
+	ProllyNodeRef to_root;
+	SummaryChanges sc;
+
+	(void) tables_of_reading(from_ref, InvalidOid, &left_out, &from_root);
+	if (is_working(to_ref) && is_working(from_ref))
+		to_root = from_root;
+	else
+		(void) tables_of_reading(to_ref, InvalidOid, &left_out, &to_root);
+	if (definitions &&
+		(!PROLLY_CALL(components().canonicalizer, in_format, &from_root) ||
+		 !PROLLY_CALL(components().canonicalizer, in_format, &to_root)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a commit made in an older format of prolly's history can't be shown as statements"),
+				 errhint("Commit the branch to write it in the current one.")));
+	sc.visit = visit;
+	sc.arg = arg;
+	sc.left_out = left_out;
+	if (!same_hash(&from_root.hash, &to_root.hash))
+		PROLLY_CALL(components().canonicalizer, changes, &from_root, &to_root,
+					summary_change, &sc);
+
+	list_sort(left_out, string_cmp);
+	foreach(lc, left_out)
+	{
+		if (foreach_current_index(lc) == 0 ||
+			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
+		{
+			ProllyObjectChange oc = {0};
+
+			oc.from_name = lfirst(lc);
+			oc.object = PROLLY_OBJECT_UNKNOWN;
+			oc.not_covered = true;
+			visit(&oc, arg);
+		}
 	}
 }
 
@@ -3894,7 +3988,17 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		}
 	}
 	else
-		return;					/* (shown: as the cast has it) */
+	{
+		/*
+		 * (shown: as the cast has it; a non-key value it fails on, as
+		 * null, which the read counts and warns of, as Dolt shows it; a
+		 * key's, refused, naming the column)
+		 */
+		cr->guarded =
+			!((is_string_type(xa->atttypid) && is_string_type(att->atttypid)) ||
+			  (is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
+		return;
+	}
 
 	back = coerce_to_target_type(NULL, copyObject(e), att->atttypid,
 								 xa->atttypid, xa->atttypmod,
@@ -4165,6 +4269,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	int		   *from;
 	ColumnRead *reads;
 	bool	   *converted;
+	uint64	   *nulled;			/* values shown null: their cast failed */
+	uint64		shared = 0;		/* rows shown once: their key is another's */
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
@@ -4228,9 +4334,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	/*
 	 * (a version with a primary key where the table has none now, or the
 	 * other way: its rows are keyed otherwise; one whose key the encoder
-	 * can't order is keyed by content as the table is)
+	 * can't order is keyed by content as the table is.  Shown, they're
+	 * read as the table is keyed now; merged, refused)
 	 */
-	if (vr.keyed != keyed_now)
+	if (vr.keyed != keyed_now &&
+		(refuse || read != READ_SHOWN || !PROLLY_HAS(rd.kr, parse_value_as)))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("rows of table \"%s\" can't be merged across a change of its primary key",
@@ -4244,6 +4352,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	from = palloc_array(int, md->natts);
 	reads = palloc0_array(ColumnRead, md->natts);
 	converted = palloc0_array(bool, md->natts);
+	nulled = palloc0_array(uint64, md->natts);
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	for (int a = 0; a < md->natts; a++)
 	{
@@ -4305,7 +4414,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	 * order: the rows go straight into the tree.  Otherwise they're sorted
 	 * first.
 	 */
-	keys_kept = vr.keyed;
+	keys_kept = vr.keyed && keyed_now;
 	for (int a = 0; a < md->natts && keys_kept; a++)
 		if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
 			keys_kept = from[a] >= 0 && !converted[a] &&
@@ -4327,7 +4436,10 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		Bitmapset  *unsure_cols = NULL;
 
 		outer = MemoryContextSwitchTo(rowcxt);
-		PROLLY_CALL(rd.kr, parse_value, rd.k, &v, &row, &count);
+		if (vr.keyed != keyed_now)
+			PROLLY_CALL(rd.kr, parse_value_as, rd.k, !vr.keyed, &v, &row, &count);
+		else
+			PROLLY_CALL(rd.kr, parse_value, rd.k, &v, &row, &count);
 		ExecClearTuple(xs);
 		PROLLY_CALL(ve, decode, vr.enc, &row, xs);
 		slot_getallattrs(xs);
@@ -4372,6 +4484,18 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 									   vr.keyed ? "key holds it" : "rows have no key")));
 				else if (reads[a].loss == LOSS_UNSURE && unsure)
 					unsure_cols = bms_add_member(unsure_cols, a);
+				else if (read == READ_SHOWN && reads[a].loss == LOSS_UNCHECKED &&
+						 bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("rows of table \"%s\" can't be read across key column \"%s\" changing type from %s to %s",
+									RelationGetRelationName(rel), NameStr(att->attname),
+									format_type_with_typemod(TupleDescAttr(xd, from[a])->atttypid,
+															 TupleDescAttr(xd, from[a])->atttypmod),
+									format_type_with_typemod(att->atttypid, att->atttypmod)),
+							 errdetail("A key value of the version's doesn't convert to the new type.")));
+				else if (read == READ_SHOWN && reads[a].loss == LOSS_UNCHECKED)
+					nulled[a]++;
 			}
 			else if (!converted[a])
 				ms->tts_values[a] = xs->tts_values[from[a]];
@@ -4457,6 +4581,19 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		CHECK_FOR_INTERRUPTS();
 	}
 	PROLLY_CALL(tree, cursor_close, cur);
+	for (int a = 0; a < md->natts; a++)
+		if (nulled[a] > 0)
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg_plural("%llu value of column \"%s\" of table \"%s\" doesn't convert from %s to %s: shown as null",
+								   "%llu values of column \"%s\" of table \"%s\" don't convert from %s to %s: shown as null",
+								   nulled[a], (unsigned long long) nulled[a],
+								   NameStr(TupleDescAttr(md, a)->attname),
+								   RelationGetRelationName(rel),
+								   format_type_with_typemod(TupleDescAttr(xd, from[a])->atttypid,
+															TupleDescAttr(xd, from[a])->atttypmod),
+								   format_type_with_typemod(TupleDescAttr(md, a)->atttypid,
+															TupleDescAttr(md, a)->atttypmod))));
 	if (estate)
 		FreeExecutorState(estate);
 	if (n > 1)
@@ -4469,15 +4606,34 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		StringInfoData value;
 		ProllyValue val;
 
-		/* (rows that become the same: copies of one, or a key twice) */
+		/*
+		 * (rows that become the same: copies of one, or a key twice: shown,
+		 * the first of those, the rest counted and warned of)
+		 */
 		while (j < n && conv_row_cmp(&rows[i], &rows[j], &rd) == 0)
 		{
-			if (vr.keyed)
+			if (keyed_now && read == READ_SHOWN && !refuse)
+				shared += rows[j]->count;
+			else if (keyed_now)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
 						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
 								RelationGetRelationName(rel))));
-			count += rows[j++]->count;
+			else
+				count += rows[j]->count;
+			j++;
+		}
+		/* (a keyless version's copies of a row, one row keyed) */
+		if (keyed_now && count > 1)
+		{
+			if (read == READ_SHOWN && !refuse)
+				shared += count - 1;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
+								RelationGetRelationName(rel))));
+			count = 1;
 		}
 		initStringInfo(&value);
 		PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->row, count, &value);
@@ -4488,6 +4644,13 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		i = j;
 	}
 	PROLLY_CALL(tree, build_finish, b, &out->data);
+	if (shared > 0)
+		ereport(WARNING,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg_plural("%llu row of a version of table \"%s\" shares a primary key with another as the key is defined now: shown once",
+							   "%llu rows of a version of table \"%s\" share a primary key with others as the key is defined now: each key shown once",
+							   shared, (unsigned long long) shared,
+							   RelationGetRelationName(rel))));
 	if (nunsure > 1)
 		qsort_arg(unsure->rows, nunsure, sizeof(UnsureRow *), unsure_row_cmp, &rd);
 	if (unsure)
@@ -4707,9 +4870,12 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	const Table *fp;
 	const Table *tp;
 
-	/* (nothing changed: nothing to convert) */
-	if (from && to && same_hash(&from->data.hash, &to->data.hash) &&
-		same_description(from, to))
+	/*
+	 * (the same rows: none changed, whatever the definitions say, as rows
+	 * are encoded by column position; a column renamed, or a constraint or
+	 * an index added, changes no row)
+	 */
+	if (from && to && same_hash(&from->data.hash, &to->data.hash))
 		return;
 	if (now == NULL || ((from == NULL || same_description(from, now)) &&
 						(to == NULL || same_description(to, now))))
@@ -7388,6 +7554,7 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.conflicts = folded_conflicts,
 	.resolve = folded_resolve,
 	.tables = folded_tables,
+	.summary = folded_summary,
 	.move_to = folded_move_to,
 	.cherry_pick = folded_cherry_pick,
 	.revert = folded_revert,

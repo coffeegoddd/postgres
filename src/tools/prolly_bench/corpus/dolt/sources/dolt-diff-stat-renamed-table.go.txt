@@ -1,0 +1,33 @@
+{
+		Name: "renamed table",
+		SetUpScript: []string{
+			"create table t1 (a int primary key, b int)",
+			"call dolt_add('.')",
+			"insert into t1 values (1,2)",
+			"call dolt_commit('-am', 'new table')",
+			"alter table t1 rename to t2",
+			"call dolt_add('.')",
+			"insert into t2 values (3,4)",
+			"call dolt_commit('-am', 'renamed table')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_diff_stat('HEAD~', 'HEAD', 't2')",
+				Expected: []sql.Row{{"t2", 1, 1, 0, 0, 2, 0, 0, 1, 2, 2, 4}},
+			},
+			{
+				Query:    "select * from dolt_diff_stat('HEAD~..HEAD', 't2')",
+				Expected: []sql.Row{{"t2", 1, 1, 0, 0, 2, 0, 0, 1, 2, 2, 4}},
+			},
+			{
+				// Old table name can be matched as well
+				Query:    "select * from dolt_diff_stat('HEAD~', 'HEAD', 't1')",
+				Expected: []sql.Row{{"t1", 1, 1, 0, 0, 2, 0, 0, 1, 2, 2, 4}},
+			},
+			{
+				// Old table name can be matched as well
+				Query:    "select * from dolt_diff_stat('HEAD~..HEAD', 't1')",
+				Expected: []sql.Row{{"t1", 1, 1, 0, 0, 2, 0, 0, 1, 2, 2, 4}},
+			},
+		},
+	}

@@ -1,0 +1,32 @@
+{
+		Name: "primary key table: delete and recreate table",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int, c2 varchar(20));",
+			"call dolt_add('.')",
+			"insert into t values (1, 2, '3'), (4, 5, '6');",
+			"CALL DOLT_COMMIT('-am', 'creating table t');",
+			"set @Commit1 = dolt_hashof('HEAD');",
+
+			"drop table t;",
+			"CALL DOLT_COMMIT('-am', 'dropping table t');",
+			"SET @Commit2 = dolt_hashof('HEAD');",
+
+			"create table t (pk int primary key, c1 int);",
+			"call dolt_add('.')",
+			"CALL DOLT_COMMIT('-am', 'recreating table t');",
+			"SET @Commit3 = dolt_hashof('HEAD');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// TODO: The history system table processes history in parallel and pulls the rows for the
+				//       user table at all commits. This means we can't currently detect when a table was dropped
+				//       and if a different table with the same name exists at earlier commits, those results will
+				//       be included in the history table. It may make more sense to have history scoped only
+				//       to the current instance of the table, which would require changing the history system table
+				//       to use something like an iterator approach where it goes back sequentially until it detects
+				//       the current table doesn't exist any more and then stop.
+				Query:    "select count(*) from dolt_history_t;",
+				Expected: []sql.Row{{2}},
+			},
+		},
+	}

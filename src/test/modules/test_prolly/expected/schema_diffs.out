@@ -1,0 +1,638 @@
+-- dolt_diff_summary: each object that differs between two refs, tables
+-- and the rest, named as dolt_status names them: added, dropped,
+-- modified or renamed, with whether its rows and its definition differ.
+CREATE DATABASE regress_schema_diffs;
+\c regress_schema_diffs
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'a'), (2, 'b');
+CREATE TABLE app.keep (id int PRIMARY KEY);
+INSERT INTO app.keep VALUES (1);
+CREATE TABLE app.old_name (id int PRIMARY KEY, v text);
+INSERT INTO app.old_name VALUES (1, 'moved');
+CREATE TABLE app.gone (id int PRIMARY KEY);
+CREATE VIEW app.vw AS SELECT id FROM app.t;
+CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE SEQUENCE app.seq;
+CREATE TYPE app.mood AS ENUM ('sad', 'ok');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- nothing changed: nothing
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+(0 rows)
+
+-- rows only, definition only, both; added, dropped, renamed (an empty
+-- table added or dropped changes no rows, and a new name is a change of
+-- definition, as in Dolt)
+UPDATE app.t SET v = 'z' WHERE id = 1;
+ALTER TABLE app.keep ADD COLUMN note text;
+ALTER TABLE app.old_name RENAME TO new_name;
+DROP TABLE app.gone;
+CREATE TABLE app.fresh (id int PRIMARY KEY);
+CREATE OR REPLACE VIEW app.vw AS SELECT id, v FROM app.t;
+CREATE OR REPLACE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 2';
+SELECT nextval('app.seq');
+ nextval 
+---------
+       1
+(1 row)
+
+ALTER TYPE app.mood ADD VALUE 'happy';
+CREATE FUNCTION app.g(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+ from_table_name | to_table_name  | diff_type | data_change | schema_change 
+-----------------+----------------+-----------+-------------+---------------
+ app.f()         | app.f()        | modified  | f           | t
+                 | app.fresh      | added     | f           | t
+                 | app.g(integer) | added     | f           | t
+ app.gone        |                | dropped   | f           | t
+ app.keep        | app.keep       | modified  | f           | t
+ app.mood        | app.mood       | modified  | f           | t
+ app.old_name    | app.new_name   | renamed   | f           | t
+ app.seq         | app.seq        | modified  | t           | f
+ app.t           | app.t          | modified  | t           | f
+ app.vw          | app.vw         | modified  | f           | t
+(10 rows)
+
+-- between commits the same; and the other way round
+SELECT length(dolt_commit('-Am', 'changes')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD');
+ from_table_name | to_table_name  | diff_type | data_change | schema_change 
+-----------------+----------------+-----------+-------------+---------------
+ app.f()         | app.f()        | modified  | f           | t
+                 | app.fresh      | added     | f           | t
+                 | app.g(integer) | added     | f           | t
+ app.gone        |                | dropped   | f           | t
+ app.keep        | app.keep       | modified  | f           | t
+ app.mood        | app.mood       | modified  | f           | t
+ app.old_name    | app.new_name   | renamed   | f           | t
+ app.seq         | app.seq        | modified  | t           | f
+ app.t           | app.t          | modified  | t           | f
+ app.vw          | app.vw         | modified  | f           | t
+(10 rows)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('HEAD', 'HEAD~1');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+ app.f()         | app.f()       | modified
+ app.fresh       |               | dropped
+ app.g(integer)  |               | dropped
+                 | app.gone      | added
+ app.keep        | app.keep      | modified
+ app.mood        | app.mood      | modified
+ app.new_name    | app.old_name  | renamed
+ app.seq         | app.seq       | modified
+ app.t           | app.t         | modified
+ app.vw          | app.vw        | modified
+(10 rows)
+
+-- one object, by its name qualified or on the search path, either version's
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'app.t');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.t           | app.t         | modified  | t           | f
+(1 row)
+
+SET search_path = app, public;
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'f()');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.f()         | app.f()       | modified  | f           | t
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'gone');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.gone        |               | dropped   | f           | t
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'old_name');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.old_name    | app.new_name  | renamed   | f           | t
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'nothing_by_this_name');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+(0 rows)
+
+-- names read as identifiers: case folded, quotes kept
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'APP.T');
+ from_table_name 
+-----------------
+ app.t
+(1 row)
+
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'T');
+ from_table_name 
+-----------------
+ app.t
+(1 row)
+
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', '"T"');
+ from_table_name 
+-----------------
+(0 rows)
+
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'F()');
+ from_table_name 
+-----------------
+ app.f()
+(1 row)
+
+RESET search_path;
+-- a rename that changed the rows too is a drop and an add
+ALTER TABLE app.new_name RENAME TO newer_name;
+UPDATE app.newer_name SET v = 'changed';
+CREATE TABLE app.twin_a (id int PRIMARY KEY);
+CREATE TABLE app.twin_b (id int PRIMARY KEY);
+CREATE TABLE app.same_a (v int);
+CREATE TABLE app.same_b (v int);
+SELECT length(dolt_commit('-Am', 'twins')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD');
+ from_table_name | to_table_name  | diff_type | data_change | schema_change 
+-----------------+----------------+-----------+-------------+---------------
+ app.new_name    |                | dropped   | t           | t
+                 | app.newer_name | added     | t           | t
+                 | app.same_a     | added     | f           | t
+                 | app.same_b     | added     | f           | t
+                 | app.twin_a     | added     | f           | t
+                 | app.twin_b     | added     | f           | t
+(6 rows)
+
+-- two renamed at once, told apart by what else names them (their keys'
+-- indexes keep their names); two of one content renamed can't be told
+-- apart, so they stay dropped and added
+ALTER TABLE app.twin_a RENAME TO twin_c;
+ALTER TABLE app.twin_b RENAME TO twin_d;
+ALTER TABLE app.same_a RENAME TO same_c;
+ALTER TABLE app.same_b RENAME TO same_d;
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.same_a      |               | dropped   | f           | t
+ app.same_b      |               | dropped   | f           | t
+                 | app.same_c    | added     | f           | t
+                 | app.same_d    | added     | f           | t
+ app.twin_a      | app.twin_c    | renamed   | f           | t
+ app.twin_b      | app.twin_d    | renamed   | f           | t
+(6 rows)
+
+-- a view renamed is one too
+ALTER VIEW app.vw RENAME TO vw2;
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 'app.vw2');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.vw          | app.vw2       | renamed   | f           | t
+(1 row)
+
+-- what a commit can't hold, in the working set: not covered, flags unknown
+CREATE FOREIGN DATA WRAPPER sdiff_fdw;
+CREATE SERVER sdiff_srv FOREIGN DATA WRAPPER sdiff_fdw;
+CREATE FOREIGN TABLE app.ft (id int) SERVER sdiff_srv;
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING') WHERE diff_type = 'not covered';
+ from_table_name | to_table_name |  diff_type  | data_change | schema_change 
+-----------------+---------------+-------------+-------------+---------------
+ app.ft          | app.ft        | not covered |             | 
+(1 row)
+
+DROP FOREIGN TABLE app.ft;
+-- refs that aren't
+SELECT * FROM dolt_diff_summary('HEAD', 'no_such_ref');
+ERROR:  prolly ref "no_such_ref" does not exist
+SELECT * FROM dolt_diff_summary(NULL, 'HEAD');
+ERROR:  dolt_diff_summary needs two refs
+-- dolt_schema_diff: each object whose statements differ, each side's
+-- rendered from that version's description, never the catalogs.
+CREATE TABLE app.orders (id int PRIMARY KEY, qty int NOT NULL DEFAULT 1,
+	note text COLLATE "C", CONSTRAINT qty_positive CHECK (qty > 0));
+CREATE INDEX orders_qty ON app.orders (qty);
+CREATE TABLE app.lines (id int PRIMARY KEY, order_id int REFERENCES app.orders);
+ALTER TABLE app.orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_orders ON app.orders USING (qty < 100);
+SELECT length(dolt_commit('-Am', 'orders')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT * FROM dolt_schema_diff('HEAD~1', 'HEAD');
+ from_table_name | to_table_name |                         from_create_statement                         |                                            to_create_statement                                             
+-----------------+---------------+-----------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------
+                 | app.lines     |                                                                       | CREATE TABLE app.lines (id integer, order_id integer);                                                    +
+                 |               |                                                                       | ALTER TABLE app.lines ADD CONSTRAINT lines_id_not_null NOT NULL id;                                       +
+                 |               |                                                                       | ALTER TABLE app.lines ADD CONSTRAINT lines_pkey PRIMARY KEY (id);                                         +
+                 |               |                                                                       | ALTER TABLE app.lines ADD CONSTRAINT lines_order_id_fkey FOREIGN KEY (order_id) REFERENCES app.orders(id);
+                 | app.orders    |                                                                       | CREATE TABLE app.orders (id integer, qty integer DEFAULT 1, note pg_catalog.text COLLATE "C");            +
+                 |               |                                                                       | ALTER TABLE app.orders ADD CONSTRAINT orders_id_not_null NOT NULL id;                                     +
+                 |               |                                                                       | ALTER TABLE app.orders ADD CONSTRAINT orders_qty_not_null NOT NULL qty;                                   +
+                 |               |                                                                       | ALTER TABLE app.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (id);                                       +
+                 |               |                                                                       | ALTER TABLE app.orders ADD CONSTRAINT qty_positive CHECK ((qty > 0));                                     +
+                 |               |                                                                       | CREATE INDEX orders_qty ON app.orders USING btree (qty);                                                  +
+                 |               |                                                                       | ALTER TABLE app.orders ENABLE ROW LEVEL SECURITY;                                                         +
+                 |               |                                                                       | CREATE POLICY own_orders ON app.orders AS PERMISSIVE FOR ALL TO PUBLIC USING ((qty < 100));
+ app.same_a      |               | CREATE TABLE app.same_a (v integer);                                  | 
+ app.same_b      |               | CREATE TABLE app.same_b (v integer);                                  | 
+                 | app.same_c    |                                                                       | CREATE TABLE app.same_c (v integer);
+                 | app.same_d    |                                                                       | CREATE TABLE app.same_d (v integer);
+ app.twin_a      | app.twin_c    | CREATE TABLE app.twin_a (id integer);                                +| CREATE TABLE app.twin_c (id integer);                                                                     +
+                 |               | ALTER TABLE app.twin_a ADD CONSTRAINT twin_a_id_not_null NOT NULL id;+| ALTER TABLE app.twin_c ADD CONSTRAINT twin_a_id_not_null NOT NULL id;                                     +
+                 |               | ALTER TABLE app.twin_a ADD CONSTRAINT twin_a_pkey PRIMARY KEY (id);   | ALTER TABLE app.twin_c ADD CONSTRAINT twin_a_pkey PRIMARY KEY (id);
+ app.twin_b      | app.twin_d    | CREATE TABLE app.twin_b (id integer);                                +| CREATE TABLE app.twin_d (id integer);                                                                     +
+                 |               | ALTER TABLE app.twin_b ADD CONSTRAINT twin_b_id_not_null NOT NULL id;+| ALTER TABLE app.twin_d ADD CONSTRAINT twin_b_id_not_null NOT NULL id;                                     +
+                 |               | ALTER TABLE app.twin_b ADD CONSTRAINT twin_b_pkey PRIMARY KEY (id);   | ALTER TABLE app.twin_d ADD CONSTRAINT twin_b_pkey PRIMARY KEY (id);
+ app.vw          | app.vw2       | CREATE VIEW app.vw AS  SELECT id,                                    +| CREATE VIEW app.vw2 AS  SELECT id,                                                                        +
+                 |               |     v                                                                +|     v                                                                                                     +
+                 |               |    FROM app.t;                                                        |    FROM app.t;
+(9 rows)
+
+-- changed, renamed, dropped; a change of rows alone gives none
+ALTER TABLE app.orders ADD COLUMN placed date;
+DROP INDEX app.orders_qty;
+INSERT INTO app.orders VALUES (1, 2, 'x', NULL);
+ALTER TABLE app.lines RENAME TO order_lines;
+CREATE OR REPLACE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 3';
+DROP TYPE app.mood;
+UPDATE app.t SET v = 'only rows' WHERE id = 2;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING');
+ from_table_name |  to_table_name  |                                           from_create_statement                                            |                                                  to_create_statement                                                   
+-----------------+-----------------+------------------------------------------------------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------
+ app.f()         | app.f()         | CREATE OR REPLACE FUNCTION app.f()                                                                        +| CREATE OR REPLACE FUNCTION app.f()                                                                                    +
+                 |                 |  RETURNS integer                                                                                          +|  RETURNS integer                                                                                                      +
+                 |                 |  LANGUAGE sql                                                                                             +|  LANGUAGE sql                                                                                                         +
+                 |                 | AS $function$SELECT 2$function$;                                                                           | AS $function$SELECT 3$function$;
+ app.lines       | app.order_lines | CREATE TABLE app.lines (id integer, order_id integer);                                                    +| CREATE TABLE app.order_lines (id integer, order_id integer);                                                          +
+                 |                 | ALTER TABLE app.lines ADD CONSTRAINT lines_id_not_null NOT NULL id;                                       +| ALTER TABLE app.order_lines ADD CONSTRAINT lines_id_not_null NOT NULL id;                                             +
+                 |                 | ALTER TABLE app.lines ADD CONSTRAINT lines_pkey PRIMARY KEY (id);                                         +| ALTER TABLE app.order_lines ADD CONSTRAINT lines_pkey PRIMARY KEY (id);                                               +
+                 |                 | ALTER TABLE app.lines ADD CONSTRAINT lines_order_id_fkey FOREIGN KEY (order_id) REFERENCES app.orders(id); | ALTER TABLE app.order_lines ADD CONSTRAINT lines_order_id_fkey FOREIGN KEY (order_id) REFERENCES app.orders(id);
+ app.mood        |                 | CREATE TYPE app.mood AS ENUM ('sad', 'ok', 'happy');                                                       | 
+ app.orders      | app.orders      | CREATE TABLE app.orders (id integer, qty integer DEFAULT 1, note pg_catalog.text COLLATE "C");            +| CREATE TABLE app.orders (id integer, qty integer DEFAULT 1, note pg_catalog.text COLLATE "C", placed pg_catalog.date);+
+                 |                 | ALTER TABLE app.orders ADD CONSTRAINT orders_id_not_null NOT NULL id;                                     +| ALTER TABLE app.orders ADD CONSTRAINT orders_id_not_null NOT NULL id;                                                 +
+                 |                 | ALTER TABLE app.orders ADD CONSTRAINT orders_qty_not_null NOT NULL qty;                                   +| ALTER TABLE app.orders ADD CONSTRAINT orders_qty_not_null NOT NULL qty;                                               +
+                 |                 | ALTER TABLE app.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (id);                                       +| ALTER TABLE app.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (id);                                                   +
+                 |                 | ALTER TABLE app.orders ADD CONSTRAINT qty_positive CHECK ((qty > 0));                                     +| ALTER TABLE app.orders ADD CONSTRAINT qty_positive CHECK ((qty > 0));                                                 +
+                 |                 | CREATE INDEX orders_qty ON app.orders USING btree (qty);                                                  +| ALTER TABLE app.orders ENABLE ROW LEVEL SECURITY;                                                                     +
+                 |                 | ALTER TABLE app.orders ENABLE ROW LEVEL SECURITY;                                                         +| CREATE POLICY own_orders ON app.orders AS PERMISSIVE FOR ALL TO PUBLIC USING ((qty < 100));
+                 |                 | CREATE POLICY own_orders ON app.orders AS PERMISSIVE FOR ALL TO PUBLIC USING ((qty < 100));                | 
+(4 rows)
+
+SELECT from_table_name, to_table_name FROM dolt_schema_diff('HEAD', 'WORKING', 'app.t');
+ from_table_name | to_table_name 
+-----------------+---------------
+(0 rows)
+
+-- views, sequences, types, schemas made
+CREATE SCHEMA more VERSIONED;
+CREATE SEQUENCE more.counter START 10 INCREMENT 5;
+CREATE TYPE more.pair AS (a int, b text);
+CREATE VIEW more.big AS SELECT id FROM app.orders WHERE qty > 10;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WHERE to_table_name LIKE 'more%';
+ from_table_name | to_table_name | from_create_statement |                                                  to_create_statement                                                  
+-----------------+---------------+-----------------------+-----------------------------------------------------------------------------------------------------------------------
+                 | more          |                       | CREATE SCHEMA more VERSIONED;
+                 | more.big      |                       | CREATE VIEW more.big AS  SELECT id                                                                                   +
+                 |               |                       |    FROM app.orders                                                                                                   +
+                 |               |                       |   WHERE (qty > 10);
+                 | more.counter  |                       | CREATE SEQUENCE more.counter AS bigint START 10 INCREMENT 5 MAXVALUE 9223372036854775807 MINVALUE 1 CACHE 1 NO CYCLE;
+                 | more.pair     |                       | CREATE TYPE more.pair AS (a integer, b pg_catalog.text);
+(4 rows)
+
+-- ranges, as Dolt takes them: a..b is a to b; a...b from their merge base
+-- to b; the argument after a range names the object
+SELECT length(dolt_commit('-Am', 'before the fork')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('fork');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE TABLE app.on_main (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('fork');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'fork'"}
+(1 row)
+
+CREATE TABLE app.on_fork (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'on fork')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main..fork');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+                 | app.on_fork   | added
+ app.on_main     |               | dropped
+(2 rows)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main', 'fork');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+                 | app.on_fork   | added
+ app.on_main     |               | dropped
+(2 rows)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main...fork');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+                 | app.on_fork   | added
+(1 row)
+
+SELECT from_table_name, to_table_name FROM dolt_diff_summary('main...fork', 'app.on_fork');
+ from_table_name | to_table_name 
+-----------------+---------------
+                 | app.on_fork
+(1 row)
+
+SELECT to_table_name FROM dolt_schema_diff('main...fork');
+ to_table_name 
+---------------
+ app.on_fork
+(1 row)
+
+SELECT table_name, rows_added FROM dolt_diff_stat('fork...main');
+ table_name | rows_added 
+------------+------------
+(0 rows)
+
+SELECT * FROM dolt_diff_summary('main..');
+ERROR:  "main.." isn't a range of refs
+HINT:  A range is a..b, or a...b from their merge base.
+SELECT * FROM dolt_diff_summary('main..fork', 'app.on_fork', 'app.on_main');
+ERROR:  dolt_diff_summary takes a range and a name, or two refs and a name
+SELECT * FROM dolt_diff_summary('main');
+ERROR:  dolt_diff_summary needs two refs, or a range of them (a..b, a...b)
+SELECT * FROM dolt_diff_summary('main...nowhere');
+ERROR:  prolly ref "nowhere" does not exist
+-- a commit of an older format: refused, as moves refuse it
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
+	'format 7') AS old \gset
+SELECT * FROM dolt_schema_diff(:'old', 'HEAD');
+ERROR:  a commit made in an older format of prolly's history can't be shown as statements
+HINT:  Commit the branch to write it in the current one.
+SELECT count(*) > 0 AS summarized FROM dolt_diff_summary(:'old', 'HEAD');
+ summarized 
+------------
+ f
+(1 row)
+
+SELECT * FROM dolt_schema_diff(NULL, 'HEAD');
+ERROR:  dolt_schema_diff needs two refs
+-- a table dropped and made again under its name, with other rows, is
+-- modified (Dolt's "table drop and recreate with identical primary key");
+-- its key's index keeps the name it was made with, so its definition
+-- differs too
+CREATE TABLE app.t1 (id int PRIMARY KEY, name varchar(10));
+INSERT INTO app.t1 VALUES (1, 'dolt');
+SELECT length(dolt_commit('-Am', 'create_table')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE app.t1 SET name = 'doltgres' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'update_value')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE TABLE app.temp__t1 (id int PRIMARY KEY, name varchar(10));
+INSERT INTO app.temp__t1 VALUES (1, 'dolt');
+DROP TABLE app.t1;
+ALTER TABLE app.temp__t1 RENAME TO t1;
+SELECT length(dolt_commit('-Am', 'drop and recreate')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'app.t1');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+ app.t1          | app.t1        | modified  | t           | t
+(1 row)
+
+-- a parenthesis inside a quoted identifier isn't a routine's arguments
+CREATE SCHEMA "s(x" VERSIONED;
+CREATE TABLE "s(x"."a(b" (id int PRIMARY KEY);
+INSERT INTO "s(x"."a(b" VALUES (1);
+CREATE FUNCTION "s(x"."f(n"(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"s(x"."a(b"');
+ to_table_name | diff_type 
+---------------+-----------
+ "s(x"."a(b"   | added
+(1 row)
+
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"s(x"."f(n"(integer)');
+    to_table_name     | diff_type 
+----------------------+-----------
+ "s(x"."f(n"(integer) | added
+(1 row)
+
+SET search_path = "s(x", public;
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"a(b"');
+ to_table_name | diff_type 
+---------------+-----------
+ "s(x"."a(b"   | added
+(1 row)
+
+RESET search_path;
+SELECT table_name, rows_added
+FROM dolt_diff_stat('HEAD', 'WORKING', '"s(x"."a(b"');
+ table_name  | rows_added 
+-------------+------------
+ "s(x"."a(b" |          1
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_schema_diffs;
+-- Doltgres's diff function scripts (testing/go/dolt_functions_test.go at
+-- doltgresql d5e05f46: "smoke test select dolt diff functions and tables",
+-- the same "for multiple schemas", and the summary and schema diff of
+-- "dolt table functions WITH ORDINALITY"), their dolt_diff_summary and
+-- dolt_schema_diff assertions.  Where prolly's answer differs from
+-- Doltgres's: statements are Postgres's DDL, rendered from the commit's
+-- description (a table's NOT NULLs and key as ALTER TABLE statements);
+-- other kinds of objects than tables are listed too (a versioned schema
+-- made); a name not qualified is found on the search path, where Doltgres
+-- finds it in any schema; a database starts with no commits (Doltgres's
+-- with its own), so one is made first.
+CREATE DATABASE regress_doltgres_diffs;
+\c regress_doltgres_diffs
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+SELECT length(dolt_commit('--allow-empty', '-m', 'initial')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- smoke test select dolt diff functions and tables
+CREATE TABLE t1 (pk int primary key);
+INSERT INTO t1 VALUES (1);
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+                 | public.t1     | added     | t           | t
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't1');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+                 | public.t1     | added     | t           | t
+(1 row)
+
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING');
+ from_table_name | to_table_name | from_create_statement |                       to_create_statement                        
+-----------------+---------------+-----------------------+------------------------------------------------------------------
+                 | public.t1     |                       | CREATE TABLE public.t1 (pk integer);                            +
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pk_not_null NOT NULL pk;+
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pkey PRIMARY KEY (pk);
+(1 row)
+
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING', 't1');
+ from_table_name | to_table_name | from_create_statement |                       to_create_statement                        
+-----------------+---------------+-----------------------+------------------------------------------------------------------
+                 | public.t1     |                       | CREATE TABLE public.t1 (pk integer);                            +
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pk_not_null NOT NULL pk;+
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pkey PRIMARY KEY (pk);
+(1 row)
+
+-- ... for multiple schemas
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+CREATE TABLE t1 (pk int primary key);
+INSERT INTO t1 VALUES (1);
+CREATE SCHEMA testschema VERSIONED;
+CREATE TABLE testschema.t2 (pk int primary key);
+INSERT INTO testschema.t2 VALUES (1);
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+                 | public.t1     | added     | t           | t
+                 | testschema    | added     | f           | t
+                 | testschema.t2 | added     | t           | t
+(3 rows)
+
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't1');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+                 | public.t1     | added     | t           | t
+(1 row)
+
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't2');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+(0 rows)
+
+SET search_path = public, testschema;
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't2');
+ from_table_name | to_table_name | diff_type | data_change | schema_change 
+-----------------+---------------+-----------+-------------+---------------
+                 | testschema.t2 | added     | t           | t
+(1 row)
+
+RESET search_path;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING');
+ from_table_name | to_table_name | from_create_statement |                         to_create_statement                          
+-----------------+---------------+-----------------------+----------------------------------------------------------------------
+                 | public.t1     |                       | CREATE TABLE public.t1 (pk integer);                                +
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pk_not_null NOT NULL pk;    +
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pkey PRIMARY KEY (pk);
+                 | testschema    |                       | CREATE SCHEMA testschema VERSIONED;
+                 | testschema.t2 |                       | CREATE TABLE testschema.t2 (pk integer);                            +
+                 |               |                       | ALTER TABLE testschema.t2 ADD CONSTRAINT t2_pk_not_null NOT NULL pk;+
+                 |               |                       | ALTER TABLE testschema.t2 ADD CONSTRAINT t2_pkey PRIMARY KEY (pk);
+(3 rows)
+
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING', 't1');
+ from_table_name | to_table_name | from_create_statement |                       to_create_statement                        
+-----------------+---------------+-----------------------+------------------------------------------------------------------
+                 | public.t1     |                       | CREATE TABLE public.t1 (pk integer);                            +
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pk_not_null NOT NULL pk;+
+                 |               |                       | ALTER TABLE public.t1 ADD CONSTRAINT t1_pkey PRIMARY KEY (pk);
+(1 row)
+
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING', 'testschema.t2');
+ from_table_name | to_table_name | from_create_statement |                         to_create_statement                          
+-----------------+---------------+-----------------------+----------------------------------------------------------------------
+                 | testschema.t2 |                       | CREATE TABLE testschema.t2 (pk integer);                            +
+                 |               |                       | ALTER TABLE testschema.t2 ADD CONSTRAINT t2_pk_not_null NOT NULL pk;+
+                 |               |                       | ALTER TABLE testschema.t2 ADD CONSTRAINT t2_pkey PRIMARY KEY (pk);
+(1 row)
+
+-- WITH ORDINALITY (skipped in Doltgres, where these are table functions
+-- of its engine; Postgres's set-returning functions take it)
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+CREATE TABLE t1 (pk INT4 PRIMARY KEY, v1 TEXT);
+SELECT length(dolt_commit('-A', '-m', 'initial')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+SELECT to_table_name, diff_type, ordinality
+	FROM dolt_diff_summary('HEAD', 'WORKING') WITH ORDINALITY;
+ to_table_name | diff_type | ordinality 
+---------------+-----------+------------
+ public.t1     | modified  |          1
+(1 row)
+
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WITH ORDINALITY;
+ from_table_name | to_table_name | from_create_statement | to_create_statement | ordinality 
+-----------------+---------------+-----------------------+---------------------+------------
+(0 rows)
+
+\c contrib_regression
+DROP DATABASE regress_doltgres_diffs;

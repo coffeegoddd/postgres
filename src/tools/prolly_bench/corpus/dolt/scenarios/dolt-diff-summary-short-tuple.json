@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-short-tuple",
+  "description": "Reviewed Dolt port: add multiple columns, then set and unset a value. Should not show a diff",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: add multiple columns, then set and unset a value. Should not show a diff"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "setup"
+      ],
+      "save": "setup"
+    },
+    {
+      "id": "add-col1",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN col1 int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "add-col2",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN col2 int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "add-columns",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add columns"
+      ],
+      "save": "addcolumns"
+    },
+    {
+      "id": "set",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = 1 WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "unset",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = NULL WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "fix",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "fix short tuple",
+        "--allow-empty"
+      ],
+      "save": "fix"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~2', 'HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "f",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    }
+  ]
+}

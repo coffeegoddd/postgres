@@ -1,0 +1,42 @@
+{
+		Name: "includes commits from all branches",
+		SetUpScript: []string{
+			"CALL DOLT_checkout('-b', 'branch1')",
+			"create table x (a int primary key, b int, c int)",
+			"create table y (a int primary key, b int, c int)",
+			"call dolt_add('.')",
+			"insert into x values (1, 2, 3), (2, 3, 4)",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'Creating tables x and y')",
+
+			"CALL DOLT_checkout('-b', 'branch2')",
+			"create table z (a int primary key, b int, c int)",
+			"call dolt_add('.')",
+			"insert into z values (100, 101, 102)",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'Creating tables z')",
+
+			"insert into y values (-1, -2, -3), (-2, -3, -4)",
+			"insert into z values (101, 102, 103)",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'Inserting into tables y and z')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF",
+				Expected: []sql.Row{{5}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit1)",
+				Expected: []sql.Row{{"x", true, true}, {"y", true, false}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit2)",
+				Expected: []sql.Row{{"z", true, true}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit3)",
+				Expected: []sql.Row{{"y", false, true}, {"z", false, true}},
+			},
+		},
+	}

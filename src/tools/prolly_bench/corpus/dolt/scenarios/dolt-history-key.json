@@ -1,0 +1,245 @@
+{
+  "version": 1,
+  "id": "dolt-history-key",
+  "description": "Reviewed Dolt port: index by primary key",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: index by primary key"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (pk int PRIMARY KEY, c int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 2), (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial table"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (5, 6), (7, 8)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "two more rows"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c, commit_hash = $1, commit_hash = $2 FROM dolt_history_table(NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "f",
+            "t"
+          ],
+          [
+            "3",
+            "4",
+            "f",
+            "t"
+          ],
+          [
+            "5",
+            "6",
+            "f",
+            "t"
+          ],
+          [
+            "7",
+            "8",
+            "f",
+            "t"
+          ],
+          [
+            "1",
+            "2",
+            "t",
+            "f"
+          ],
+          [
+            "3",
+            "4",
+            "t",
+            "f"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2"
+          ],
+          [
+            "1",
+            "2"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "5",
+            "6"
+          ],
+          [
+            "7",
+            "8"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) ORDER BY (row).pk, (row).c",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2"
+          ],
+          [
+            "1",
+            "2"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "5",
+            "6"
+          ],
+          [
+            "7",
+            "8"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) WHERE (row).pk = 3",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) WHERE (row).pk = 3 AND commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "4"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+		Name: "renamed table",
+		SetUpScript: []string{
+			"create table x (a int primary key, b int, c int)",
+			"create table y (a int primary key, b int, c int)",
+			"call dolt_add('.')",
+			"insert into x values (1, 2, 3), (2, 3, 4)",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'Creating tables x and y')",
+
+			"create table z (a int primary key, b int, c int)",
+			"call dolt_add('.')",
+			"insert into z values (100, 101, 102)",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'Creating tables z')",
+
+			"rename table x to x1",
+			"call dolt_add('.')",
+			"insert into x1 values (1000, 1001, 1002);",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'Renaming table x to x1 and inserting data')",
+
+			"rename table x1 to x2",
+			"call dolt_add('.')",
+			"set @Commit4 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit4, '-am', 'Renaming table x1 to x2')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF",
+				Expected: []sql.Row{{5}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit1)",
+				Expected: []sql.Row{{"x", true, true}, {"y", true, false}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit2)",
+				Expected: []sql.Row{{"z", true, true}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit3)",
+				Expected: []sql.Row{{"x1", true, true}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit4)",
+				Expected: []sql.Row{{"x2", true, false}},
+			},
+		},
+	}

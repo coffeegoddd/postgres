@@ -1,0 +1,26 @@
+{
+		Name: "add multiple columns, then set and unset a value. Should not show a diff",
+		SetUpScript: []string{
+			"CREATE table t (pk int primary key);",
+			"Insert into t values (1);",
+			"CALL DOLT_ADD('.');",
+			"CALL DOLT_COMMIT('-am', 'setup');",
+			"alter table t add column col1 int;",
+			"alter table t add column col2 int;",
+			"CALL DOLT_ADD('.');",
+			"CALL DOLT_COMMIT('-am', 'add columns');",
+			"UPDATE t set col1 = 1 where pk = 1;",
+			"UPDATE t set col1 = null where pk = 1;",
+			"CALL DOLT_COMMIT('--allow-empty', '-am', 'fix short tuple');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * from dolt_diff_stat('HEAD~2', 'HEAD');",
+				Expected: []sql.Row{{"t", 1, 0, 0, 0, 2, 0, 0, 1, 1, 1, 3}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_stat('HEAD~', 'HEAD');",
+				Expected: []sql.Row{},
+			},
+		},
+	}

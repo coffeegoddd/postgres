@@ -1,0 +1,52 @@
+{
+		Name: "column drop and recreate with different type that can NOT be coerced (string -> int)",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c varchar(20));",
+			"call dolt_add('.')",
+			"insert into t values (1, 'two'), (3, 'four');",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+
+			"alter table t drop column c;",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'dropping column c');",
+
+			"alter table t add column c int;",
+			"insert into t values (100, 101);",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 're-adding column c');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t;",
+				Expected: []sql.Row{{5}},
+			},
+			{
+				Query: "SELECT to_pk, to_c, from_pk, from_c, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit1 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, nil, nil, nil, "added"},
+					{3, nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c, from_pk, from_c, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit2 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, nil, 1, nil, "modified"},
+					{3, nil, 3, nil, "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c, from_pk, from_c, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit3 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{100, 101, nil, nil, "added"},
+				},
+			},
+			{
+				Query:                           "select * from dolt_diff_t;",
+				ExpectedWarning:                 1105,
+				ExpectedWarningsCount:           4,
+				ExpectedWarningMessageSubstring: "unable to coerce value from field",
+				SkipResultsCheck:                true,
+			},
+		},
+	}

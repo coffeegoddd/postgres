@@ -1,0 +1,109 @@
+{
+		Name: "diff with branch refs",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"call dolt_add('.')",
+			"set @Commit1 = '';",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'creating table t');",
+
+			"insert into t values(1, 'one', 'two');",
+			"set @Commit2 = '';",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'inserting row 1 into t in main');",
+
+			"CALL DOLT_checkout('-b', 'branch1');",
+			"alter table t drop column c2;",
+			"set @Commit3 = '';",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'dropping column c2 in branch1');",
+
+			"delete from t where pk=1;",
+			"set @Commit4 = '';",
+			"call dolt_commit_hash_out(@Commit4, '-am', 'deleting row 1 in branch1');",
+
+			"insert into t values (2, 'two');",
+			"set @Commit5 = '';",
+			"call dolt_commit_hash_out(@Commit5, '-am', 'inserting row 2 in branch1');",
+
+			"CALL DOLT_checkout('main');",
+			"insert into t values (2, 'two', 'three');",
+			"set @Commit6 = '';",
+			"call dolt_commit_hash_out(@Commit6, '-am', 'inserting row 2 in main');",
+
+			"create table newtable (pk int primary key);",
+			"insert into newtable values (1), (2);",
+			"set @Commit7 = '';",
+			"call dolt_commit_hash_out(@Commit7, '-Am', 'new table newtable');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * from dolt_diff_summary('main', 'branch1', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('main..branch1', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query: "SELECT * from dolt_diff_summary('main', 'branch1');",
+				Expected: []sql.Row{
+					{"t", "t", "modified", true, true},
+					{"newtable", "", "dropped", true, true},
+				},
+			},
+			{
+				Query: "SELECT * from dolt_diff_summary('main..branch1');",
+				Expected: []sql.Row{
+					{"t", "t", "modified", true, true},
+					{"newtable", "", "dropped", true, true},
+				},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('branch1', 'main', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('branch1..main', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('main~2', 'branch1', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('main~2..branch1', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+
+			// Three dot
+			{
+				Query:    "SELECT * from dolt_diff_summary('main...branch1', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('main...branch1');",
+				Expected: []sql.Row{{"t", "t", "modified", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('branch1...main', 't');",
+				Expected: []sql.Row{{"t", "t", "modified", true, false}},
+			},
+			{
+				Query: "SELECT * from dolt_diff_summary('branch1...main');",
+				Expected: []sql.Row{
+					{"t", "t", "modified", true, false},
+					{"", "newtable", "added", true, true},
+				},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('branch1...main^');",
+				Expected: []sql.Row{{"t", "t", "modified", true, false}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('branch1...main', 'newtable');",
+				Expected: []sql.Row{{"", "newtable", "added", true, true}},
+			},
+			{
+				Query:    "SELECT * from dolt_diff_summary('main...main', 'newtable');",
+				Expected: []sql.Row{},
+			},
+		},
+	}
