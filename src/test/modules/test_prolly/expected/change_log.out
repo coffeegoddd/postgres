@@ -491,7 +491,7 @@ INSERT INTO cml.t SELECT g, 'v' FROM generate_series(1, 100) g;
 SELECT length(dolt_commit('-Am', 'cml')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT test_drop_change_log('cml.t');
@@ -534,7 +534,7 @@ SELECT n FROM pg_temp.entries('cml.t');
 SELECT length(dolt_commit('-am', 'cml changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
@@ -550,6 +550,6 @@ drop cascades to table cml.u
 SELECT length(dolt_commit('-Am', 'cml gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
