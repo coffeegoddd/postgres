@@ -4023,6 +4023,9 @@ typedef struct ContentMatch
  * with the same item (but for their own names), and the only such pair,
  * made one renamed.
  */
+static void folded_render(char object, const char *name, const ProllyValue *item,
+						  StringInfo out);
+
 static void
 folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 			   ProllyCanonChangeVisit visit, void *arg)
@@ -4162,6 +4165,9 @@ typedef struct SchemaMove
 								 * against a table emptied) */
 	bool		rewritten;		/* the rows written are all to's: those
 								 * the tables have needn't convert */
+	bool		render;			/* statements to show, not to run: each
+								 * constraint whole, nothing read from the
+								 * catalogs */
 } SchemaMove;
 
 static char *
@@ -4887,7 +4893,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		sm->changes = list_concat(sm->changes, after_columns);
 
 		/* sequences its defaults draw from, that no column owns: its own */
-		sm->changes = lappend(sm->changes,
+		if (!sm->render)
+			sm->changes = lappend(sm->changes,
 							  psprintf("DO $move$ DECLARE r record; BEGIN "
 									   "FOR r IN SELECT d.refobjid::pg_catalog.regclass AS seq, a.attname "
 									   "FROM pg_catalog.pg_attrdef ad "
@@ -5120,7 +5127,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			 * partitioned table's or a partition's, which its partitions'
 			 * or parent's validation would reach).
 			 */
-			if ((strstr(line, "\tCHECK ") != NULL || after_rows) &&
+			if (!sm->render &&
+				(strstr(line, "\tCHECK ") != NULL || after_rows) &&
 				strstr(constraint_def(line), "NOT VALID") == NULL &&
 				to->partition_by == NULL && to->partition_of == NULL)
 			{
@@ -5141,7 +5149,7 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			 * NULL this recorded name, or a key, may have made it already; a
 			 * partition's partitioned table, its own)
 			 */
-			if (not_null || to->partition_of)
+			if (!sm->render && (not_null || to->partition_of))
 				sql = psprintf("DO $move$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_constraint "
 							   "WHERE conrelid = %s::pg_catalog.regclass AND "
 							   "pg_catalog.quote_ident(conname) = %s) THEN EXECUTE %s; END IF; END $move$",
@@ -5154,7 +5162,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			else if (strstr(line, "\tFOREIGN KEY ") != NULL)
 			{
 				/* (likewise a foreign key, which the rows may break too) */
-				if (strstr(constraint_def(line), "NOT VALID") == NULL &&
+				if (!sm->render &&
+					strstr(constraint_def(line), "NOT VALID") == NULL &&
 					to->partition_by == NULL && to->partition_of == NULL)
 				{
 					ProllyAddedConstraint *ac = palloc(sizeof(ProllyAddedConstraint));
@@ -8403,6 +8412,119 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 	return true;
 }
 
+/* A statement, its trailing space and ";" trimmed, ended by one. */
+static void
+append_statement(StringInfo out, const char *stmt)
+{
+	int			len = strlen(stmt);
+
+	while (len > 0 && (isspace((unsigned char) stmt[len - 1]) || stmt[len - 1] == ';'))
+		len--;
+	if (len == 0)
+		return;
+	if (out->len > 0)
+		appendStringInfoChar(out, '\n');
+	appendBinaryStringInfo(out, stmt, len);
+	appendStringInfoChar(out, ';');
+}
+
+static void
+append_statements(StringInfo out, List *stmts)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmts)
+		append_statement(out, lfirst(lc));
+}
+
+/*
+ * A table as made from nothing: its CREATE TABLE, then its columns' and
+ * constraints' statements, its indexes, triggers, rules, statistics and
+ * row security, its foreign keys, its policies and the tables it inherits
+ * from: what a move to it runs (move_table(), rendering), each constraint
+ * whole.
+ */
+static void
+render_table(const char *name, const char *def, StringInfo out)
+{
+	TableDef	td;
+	SchemaMove	sm;
+	ListCell   *lc;
+
+	parse_table_def(def, &td);
+	memset(&sm, 0, sizeof(sm));
+	sm.render = true;
+	(void) move_table(&sm, name, NULL, &td);
+	append_statements(out, sm.changes);
+	append_statements(out, sm.after);
+	append_statements(out, sm.foreign_keys);
+	append_statements(out, td.policies);
+	foreach(lc, td.inherits)
+		append_statement(out, psprintf("ALTER TABLE %s INHERIT %s", name,
+									   (char *) lfirst(lc)));
+}
+
+static void
+folded_render(char object, const char *name, const ProllyValue *item,
+			  StringInfo out)
+{
+	char	   *utf8 = pg_server_to_any(name, strlen(name), PG_UTF8);
+	StringInfoData key;
+	ProllyKey	k;
+	ProllyValue d;
+	char	   *def;
+
+	initStringInfo(&key);
+	appendStringInfoChar(&key, object);
+	appendStringInfoChar(&key, ':');
+	appendStringInfoString(&key, utf8);
+	k.data = (const uint8 *) key.data;
+	k.len = key.len;
+	definition_of(&k, item, &d);
+	def = from_utf8(d.data, d.len);
+	switch (object)
+	{
+		case 't':
+			render_table(name, def, out);
+			break;
+		case 'v':
+			append_statement(out, psprintf(strncmp(def, "WITH (", 6) == 0 ?
+										   "CREATE VIEW %s %s" : "CREATE VIEW %s AS %s",
+										   name, def));
+			break;
+		case 'm':
+			append_statements(out, make_matview_sql(name, def));
+			break;
+		case 'f':
+			append_statement(out, def);
+			break;
+		case 'y':
+			{
+				List	   *unvalidated = NIL;
+
+				append_statement(out, create_type_sql(name, def, &unvalidated));
+				append_statements(out, unvalidated);
+			}
+			break;
+		case 's':
+			append_statement(out, psprintf("CREATE SEQUENCE %s %s", name,
+										   sequence_options_sql(def)));
+			break;
+		case 'n':
+			append_statement(out, psprintf("CREATE SCHEMA %s VERSIONED", name));
+			break;
+		case 'x':
+			append_statement(out, create_cast_sql(name, def));
+			break;
+		case 'l':
+			append_statement(out, create_collation_sql(name, def));
+			break;
+		default:
+			elog(ERROR, "can't render an object of kind '%c'", object);
+	}
+	pfree(key.data);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -8423,6 +8545,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.same_schema = folded_same_schema,
 	.objects = folded_objects,
 	.changes = folded_changes,
+	.render = folded_render,
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,

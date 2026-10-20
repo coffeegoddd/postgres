@@ -460,6 +460,15 @@ diff_merge(void)
 	return dc.diff_merge;
 }
 
+static const ProllyCanonRoutine *
+canonicalizer(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	return dc.canonicalizer;
+}
+
 static const ProllyWritersRoutine *
 writers(void)
 {
@@ -3311,7 +3320,8 @@ row_named(const SummaryRow *r, const char *name)
  * name changed (it need not exist now).
  */
 static List *
-summary_rows(const char *from_ref, const char *to_ref, const char *name)
+summary_rows(const char *from_ref, const char *to_ref, const char *name,
+			 bool definitions)
 {
 	List	   *rows = NIL;
 	List	   *kept = NIL;
@@ -3322,7 +3332,8 @@ summary_rows(const char *from_ref, const char *to_ref, const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the database's version control can't summarize a diff")));
-	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, collect_change, &rows);
+	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, definitions,
+				collect_change, &rows);
 	if (name == NULL)
 		return rows;
 
@@ -3395,7 +3406,7 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
 		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	InitMaterializedSRF(fcinfo, 0);
-	foreach(lc, summary_rows(from_ref, to_ref, name))
+	foreach(lc, summary_rows(from_ref, to_ref, name, false))
 	{
 		SummaryRow *r = lfirst(lc);
 		Datum		values[5];
@@ -3415,6 +3426,81 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 		values[3] = BoolGetDatum(r->data_change);
 		values[4] = BoolGetDatum(r->schema_change);
 		nulls[3] = nulls[4] = r->not_covered;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* The statements that make an object, from its item ('' for none). */
+static char *
+render_item(char object, const char *name, const char *item, int len)
+{
+	StringInfoData out;
+	ProllyValue v;
+
+	initStringInfo(&out);
+	if (item == NULL)
+		return out.data;
+	v.data = (const uint8 *) item;
+	v.len = len;
+	PROLLY_CALL(canonicalizer(), render, object, name, &v, &out);
+	return out.data;
+}
+
+/*
+ * dolt_schema_diff(from_ref text, to_ref text [, name text], OUT
+ * from_table_name text, OUT to_table_name text, OUT from_create_statement
+ * text, OUT to_create_statement text) returns setof record
+ *
+ * Each object whose statements differ between two refs (its definition
+ * changed, or it was added, dropped or renamed; a change of rows alone
+ * gives none, as in Dolt), as dolt_diff_summary() lists them: each side's
+ * statements, rendered from that version's description (never from the
+ * catalogs: any two refs, whatever the session's branch holds), '' for
+ * the side it isn't on.  A table's is its CREATE TABLE, then its
+ * constraints, indexes, triggers, rules, statistics, row security, foreign
+ * keys, policies and parents, a statement a line.
+ */
+Datum
+dolt_schema_diff(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name = NULL;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_schema_diff needs two refs")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
+		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	if (!PROLLY_HAS(canonicalizer(), render))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's canonical form can't be shown as statements")));
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, summary_rows(from_ref, to_ref, name, true))
+	{
+		SummaryRow *r = lfirst(lc);
+		Datum		values[4];
+		bool		nulls[4] = {0};
+		char	   *from_sql;
+		char	   *to_sql;
+
+		if (r->not_covered)
+			continue;
+		from_sql = render_item(r->object, r->from_name, r->from_item, r->from_len);
+		to_sql = render_item(r->object, r->to_name, r->to_item, r->to_len);
+		if (strcmp(from_sql, to_sql) == 0)
+			continue;
+		values[0] = CStringGetTextDatum(r->from_name ? r->from_name : "");
+		values[1] = CStringGetTextDatum(r->to_name ? r->to_name : "");
+		values[2] = CStringGetTextDatum(from_sql);
+		values[3] = CStringGetTextDatum(to_sql);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 	return (Datum) 0;

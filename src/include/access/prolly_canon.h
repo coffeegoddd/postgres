@@ -276,6 +276,15 @@ typedef struct ProllyCanonRoutine
 	 */
 	void		(*changes) (const ProllyNodeRef *from, const ProllyNodeRef *to,
 							ProllyCanonChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: the statements that make the object of kind object named
+	 * name, from its item (changes()'s), appended to out: each ending in
+	 * ";", a line each, rendered from the item alone (no catalog read,
+	 * nothing run).  The item must be of a root of this build's format.
+	 */
+	void		(*render) (char object, const char *name, const ProllyValue *item,
+						   StringInfo out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -284,9 +293,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"changes"
+	"changes", "render"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK changes
+#define PROLLY_CANON_LAST_CALLBACK render
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

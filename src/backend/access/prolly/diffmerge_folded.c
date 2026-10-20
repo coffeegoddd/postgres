@@ -761,7 +761,7 @@ summary_change(const ProllyObjectChange *change, void *arg)
  * the canonicalizer tells them, then what the reads left out.
  */
 static void
-folded_summary(const char *from_ref, const char *to_ref,
+folded_summary(const char *from_ref, const char *to_ref, bool definitions,
 			   ProllyCanonChangeVisit visit, void *arg)
 {
 	List	   *left_out = NIL;
@@ -775,6 +775,13 @@ folded_summary(const char *from_ref, const char *to_ref,
 		to_root = from_root;
 	else
 		(void) tables_of_reading(to_ref, InvalidOid, &left_out, &to_root);
+	if (definitions &&
+		(!PROLLY_CALL(components().canonicalizer, in_format, &from_root) ||
+		 !PROLLY_CALL(components().canonicalizer, in_format, &to_root)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a commit made in an older format of prolly's history can't be shown as statements"),
+				 errhint("Commit the branch to write it in the current one.")));
 	sc.visit = visit;
 	sc.arg = arg;
 	sc.left_out = left_out;

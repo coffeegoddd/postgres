@@ -133,10 +133,12 @@ typedef struct ProllyMergeRoutine
 	/*
 	 * Optional: what differs between two refs, object by object, as the
 	 * canonicalizer's changes() tells it, with the objects a read of a
-	 * working set left out (not_covered) after them.
+	 * working set left out (not_covered) after them.  With definitions,
+	 * for their definitions' text: a ref of an older format is refused.
 	 */
 	void		(*summary) (const char *from_ref, const char *to_ref,
-							ProllyCanonChangeVisit visit, void *arg);
+							bool definitions, ProllyCanonChangeVisit visit,
+							void *arg);
 	/*
 	 * Move the session's branch to a canonical root: its rows (and
 	 * definitions) written.  working is its working set folded already, or

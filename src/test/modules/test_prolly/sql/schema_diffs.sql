@@ -3,6 +3,7 @@
 -- modified or renamed, with whether its rows and its definition differ.
 CREATE DATABASE regress_schema_diffs;
 \c regress_schema_diffs
+CREATE EXTENSION test_prolly;
 CREATE SCHEMA app VERSIONED;
 CREATE TABLE app.t (id int PRIMARY KEY, v text);
 INSERT INTO app.t VALUES (1, 'a'), (2, 'b');
@@ -78,6 +79,42 @@ DROP FOREIGN TABLE app.ft;
 -- refs that aren't
 SELECT * FROM dolt_diff_summary('HEAD', 'no_such_ref');
 SELECT * FROM dolt_diff_summary(NULL, 'HEAD');
+
+-- dolt_schema_diff: each object whose statements differ, each side's
+-- rendered from that version's description, never the catalogs.
+CREATE TABLE app.orders (id int PRIMARY KEY, qty int NOT NULL DEFAULT 1,
+	note text COLLATE "C", CONSTRAINT qty_positive CHECK (qty > 0));
+CREATE INDEX orders_qty ON app.orders (qty);
+CREATE TABLE app.lines (id int PRIMARY KEY, order_id int REFERENCES app.orders);
+ALTER TABLE app.orders ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_orders ON app.orders USING (qty < 100);
+SELECT length(dolt_commit('-Am', 'orders')::text) AS committed;
+SELECT * FROM dolt_schema_diff('HEAD~1', 'HEAD');
+
+-- changed, renamed, dropped; a change of rows alone gives none
+ALTER TABLE app.orders ADD COLUMN placed date;
+DROP INDEX app.orders_qty;
+INSERT INTO app.orders VALUES (1, 2, 'x', NULL);
+ALTER TABLE app.lines RENAME TO order_lines;
+CREATE OR REPLACE FUNCTION app.f() RETURNS int LANGUAGE sql AS 'SELECT 3';
+DROP TYPE app.mood;
+UPDATE app.t SET v = 'only rows' WHERE id = 2;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING');
+SELECT from_table_name, to_table_name FROM dolt_schema_diff('HEAD', 'WORKING', 'app.t');
+
+-- views, sequences, types, schemas made
+CREATE SCHEMA more VERSIONED;
+CREATE SEQUENCE more.counter START 10 INCREMENT 5;
+CREATE TYPE more.pair AS (a int, b text);
+CREATE VIEW more.big AS SELECT id FROM app.orders WHERE qty > 10;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WHERE to_table_name LIKE 'more%';
+
+-- a commit of an older format: refused, as moves refuse it
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
+	'format 7') AS old \gset
+SELECT * FROM dolt_schema_diff(:'old', 'HEAD');
+SELECT count(*) > 0 AS summarized FROM dolt_diff_summary(:'old', 'HEAD');
+SELECT * FROM dolt_schema_diff(NULL, 'HEAD');
 
 \c contrib_regression
 DROP DATABASE regress_schema_diffs;
