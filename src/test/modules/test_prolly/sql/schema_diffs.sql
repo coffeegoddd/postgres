@@ -48,6 +48,11 @@ SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'f()');
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'gone');
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'old_name');
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'nothing_by_this_name');
+-- names read as identifiers: case folded, quotes kept
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'APP.T');
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'T');
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', '"T"');
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'F()');
 RESET search_path;
 
 -- a rename that changed the rows too is a drop and an add

@@ -66,6 +66,7 @@
 #include "utils/resowner.h"
 #include "nodes/makefuncs.h"
 #include "utils/datum.h"
+#include "utils/varlena.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -3326,10 +3327,42 @@ row_named(const SummaryRow *r, const char *name)
 }
 
 /*
+ * A name as an object's name is written in a summary: its identifiers
+ * parsed as Postgres parses them (case folded, quotes honored) and quoted
+ * as needed, a routine's argument list after them as given; *schema
+ * whether it names its schema.  NULL if it isn't a name.
+ */
+static char *
+normalized_name(const char *name, bool *schema)
+{
+	const char *paren = strchr(name, '(');
+	char	   *ident = paren ? pnstrdup(name, paren - name) : pstrdup(name);
+	List	   *parts;
+	StringInfoData out;
+	ListCell   *lc;
+
+	if (!SplitIdentifierString(ident, '.', &parts) || parts == NIL ||
+		list_length(parts) > 2)
+		return NULL;
+	initStringInfo(&out);
+	foreach(lc, parts)
+	{
+		if (foreach_current_index(lc) > 0)
+			appendStringInfoChar(&out, '.');
+		appendStringInfoString(&out, quote_identifier(lfirst(lc)));
+	}
+	if (paren)
+		appendStringInfoString(&out, paren);
+	*schema = list_length(parts) == 2;
+	return out.data;
+}
+
+/*
  * The changes between two refs, every one, or (name not NULL) the object
- * name names in either version: as qualified, or, a name without its
- * schema, in the first schema of the search path that has one of that
- * name changed (it need not exist now).
+ * name names in either version, its identifiers read as Postgres reads
+ * them: as qualified, or, a name without its schema, in the first schema
+ * of the search path that has one of that name changed (it need not exist
+ * now).
  */
 static List *
 summary_rows(const char *from_ref, const char *to_ref, const char *name,
@@ -3339,6 +3372,8 @@ summary_rows(const char *from_ref, const char *to_ref, const char *name,
 	List	   *kept = NIL;
 	char	   *want = NULL;
 	ListCell   *lc;
+	bool		qualified = false;
+	char	   *normal;
 
 	if (!PROLLY_HAS(diff_merge(), summary))
 		ereport(ERROR,
@@ -3350,15 +3385,16 @@ summary_rows(const char *from_ref, const char *to_ref, const char *name,
 		return rows;
 
 	/* qualified, or found by the search path */
+	normal = normalized_name(name, &qualified);
+	if (normal == NULL)
+		return NIL;
+	name = normal;
 	foreach(lc, rows)
 		if (row_named(lfirst(lc), name))
 			want = pstrdup(name);
 	if (want == NULL)
 	{
-		const char *paren = strchr(name, '(');
-		const char *dot = strchr(name, '.');
-
-		if (dot == NULL || (paren && dot > paren))
+		if (!qualified)
 		{
 			List	   *path = fetch_search_path(false);
 			ListCell   *nc;

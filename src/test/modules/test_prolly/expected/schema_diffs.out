@@ -129,6 +129,30 @@ SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'nothing_by_this_name');
 -----------------+---------------+-----------+-------------+---------------
 (0 rows)
 
+-- names read as identifiers: case folded, quotes kept
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'APP.T');
+ from_table_name 
+-----------------
+ app.t
+(1 row)
+
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'T');
+ from_table_name 
+-----------------
+ app.t
+(1 row)
+
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', '"T"');
+ from_table_name 
+-----------------
+(0 rows)
+
+SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'F()');
+ from_table_name 
+-----------------
+ app.f()
+(1 row)
+
 RESET search_path;
 -- a rename that changed the rows too is a drop and an add
 ALTER TABLE app.new_name RENAME TO newer_name;

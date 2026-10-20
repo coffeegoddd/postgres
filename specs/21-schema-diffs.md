@@ -268,7 +268,8 @@ Decided by the user 2026-10-19, as recommended:
     (#519, #497), D18's shapes;
   - `dolt_at(ref, NULL::t)` and `dolt_history_table(NULL::t)` (#495's
     SRF, #497's history), read from commits' trees.
-- **Not built:** ref ranges (`a..b`, `a...b`; #521), a name argument
-  folding case (#522), `dolt_at`'s key-range pushdown and the detached
-  checkout cache (#495).
+- **A name argument** is read as Postgres reads identifiers, case folded
+  and quotes kept (#522).
+- **Not built:** ref ranges (`a..b`, `a...b`; #521), `dolt_at`'s
+  key-range pushdown and the detached checkout cache (#495).
 
