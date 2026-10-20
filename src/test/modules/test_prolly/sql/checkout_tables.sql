@@ -80,5 +80,39 @@ SELECT active_branch();
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'ct.a');
 
+-- the sequences a table draws from come with it, found by its defaults:
+-- not one a text literal names, nor one whose name begins another's; one
+-- quoted, and one two tables share, do
+CREATE SEQUENCE ct.unrelated;
+CREATE SEQUENCE ct.seq;
+CREATE SEQUENCE ct.seq2;
+CREATE SEQUENCE ct."Quoted Seq";
+CREATE SEQUENCE ct.shared;
+CREATE TABLE ct.co (id int PRIMARY KEY, label text DEFAULT 'ct.unrelated',
+	n int DEFAULT nextval('ct.seq2'), q int DEFAULT nextval('ct."Quoted Seq"'),
+	sh int DEFAULT nextval('ct.shared'));
+CREATE TABLE ct.co2 (id int PRIMARY KEY, sh int DEFAULT nextval('ct.shared'));
+SELECT length(dolt_commit('-Am', 'sequences')::text) AS committed;
+INSERT INTO ct.co (id) VALUES (1);
+SELECT nextval('ct.unrelated') AS unrelated, nextval('ct.seq') AS seq;
+SELECT dolt_checkout('--', 'ct.co');
+SELECT count(*) AS co_rows FROM ct.co;
+SELECT 'unrelated' AS seq, last_value, is_called FROM ct.unrelated
+UNION ALL SELECT 'seq', last_value, is_called FROM ct.seq
+UNION ALL SELECT 'seq2', last_value, is_called FROM ct.seq2
+UNION ALL SELECT 'Quoted Seq', last_value, is_called FROM ct."Quoted Seq"
+UNION ALL SELECT 'shared', last_value, is_called FROM ct.shared;
+SELECT dolt_reset('--hard');
+
+-- on a protected branch, a checkout that would leave it changed is
+-- refused, as a write is; one that changes nothing isn't
+INSERT INTO ct.co2 (id) VALUES (1);
+SELECT length(dolt_commit('-am', 'co2')::text) AS committed;
+SELECT dolt_branch('--protect', 'main');
+SELECT dolt_checkout('HEAD~1', 'ct.co2');
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_checkout('--', 'ct.co2');
+SELECT dolt_branch('--unprotect', 'main');
+
 \c contrib_regression
 DROP DATABASE regress_checkout_tables;

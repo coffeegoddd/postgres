@@ -1303,9 +1303,24 @@ checkout_tables(const char *ref, char **names, int nnames)
 			strs = lappend(strs, strVal(lfirst(lc)));
 		PROLLY_CALL(canonicalizer(), splice, &working, &from, strs, &target);
 	}
-	note_integration();
+	if (same_hash(&target.hash, &working.hash))
+		return;
+
+	/*
+	 * (a write, as any: it makes no commit, so a protected branch refuses
+	 * it; the branch may be its head's again, its changes all put back)
+	 */
+	branch_note_write(MyBranch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), move_to, &target, &working));
-	settled();
+	{
+		ProllyHash	head;
+		ProllyNodeRef head_root;
+
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+			PROLLY_CALL(refs(), commit_working_set, &head, &head_root) &&
+			same_hash(&target.hash, &head_root.hash))
+			settled();
+	}
 }
 
 /*

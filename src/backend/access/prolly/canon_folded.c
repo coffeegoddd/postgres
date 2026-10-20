@@ -112,6 +112,7 @@
 #include "access/genam.h"
 #include "nodes/makefuncs.h"
 #include "nodes/miscnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "catalog/pg_attribute.h"
 #include "parser/parse_type.h"
 #include "parser/parse_coerce.h"
@@ -8598,6 +8599,88 @@ defs_name(List *defs, const ProllyKey *k)
 	return false;
 }
 
+/* sequences_drawn()'s walk: string constants cast to regclass */
+static bool
+regclass_names(Node *node, List **names)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, TypeCast))
+	{
+		TypeCast   *tc = (TypeCast *) node;
+
+		if (tc->arg && IsA(tc->arg, A_Const) &&
+			!((A_Const *) tc->arg)->isnull &&
+			IsA(&((A_Const *) tc->arg)->val, String) &&
+			strcmp(strVal(llast(tc->typeName->names)), "regclass") == 0)
+			*names = lappend(*names, strVal(&((A_Const *) tc->arg)->val));
+	}
+	return raw_expression_tree_walker(node, regclass_names, names);
+}
+
+/*
+ * The sequences table (qualified) draws from as def (its definition)
+ * describes it: the relations its columns' defaults name as regclass
+ * constants (nextval('s'::regclass)), parsed, each qualified as an item's
+ * key names it (a bare name in the table's schema).  Not a name's text
+ * found anywhere: a literal, or a longer name, isn't one.
+ */
+static List *
+sequences_drawn(const char *table, const char *def)
+{
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	List	   *tparts = stringToQualifiedNameList(table, (Node *) &escontext);
+	TableDef	td;
+	List	   *seqs = NIL;
+	ListCell   *lc;
+
+	if (list_length(tparts) != 2)
+		return NIL;
+	parse_table_def(def, &td);
+	foreach(lc, td.columns)
+	{
+		const char *d = strstr(lfirst(lc), "\tdefault ");
+		List	   *raw;
+		List	   *names = NIL;
+		ListCell   *nc;
+
+		if (d == NULL)
+			continue;
+		raw = raw_parser(psprintf("SELECT %s", first_field(d + 9)),
+						 RAW_PARSE_DEFAULT);
+		(void) regclass_names(linitial_node(ResTarget,
+											castNode(SelectStmt,
+													 linitial_node(RawStmt, raw)->stmt)->targetList)->val,
+							  &names);
+		foreach(nc, names)
+		{
+			List	   *parts = stringToQualifiedNameList(lfirst(nc),
+														 (Node *) &escontext);
+
+			if (list_length(parts) == 1)
+				seqs = lappend(seqs, quote_qualified_identifier(strVal(linitial(tparts)),
+																strVal(linitial(parts))));
+			else if (list_length(parts) == 2)
+				seqs = lappend(seqs, quote_qualified_identifier(strVal(linitial(parts)),
+																strVal(lsecond(parts))));
+		}
+	}
+	return seqs;
+}
+
+/* Is the object key names (its kind's tag, a colon, its name) one of names? */
+static bool
+key_named(const ProllyKey *k, List *names)
+{
+	char	   *name = from_utf8(k->data + 2, k->len - 2);
+	ListCell   *lc;
+
+	foreach(lc, names)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
 /*
  * into, but for the tables named, as from has them, into *out: a merge of
  * the two roots' items in key order, each table named taken from from (or
@@ -8618,6 +8701,7 @@ folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
 	ProllyTreeBuilder *b;
 	const ProllyNodeRef *roots[2] = {into, from};
 	List	   *defs = NIL;		/* the tables' definitions, both sides' */
+	List	   *seqs = NIL;		/* the sequences they draw from */
 	List	   *refused = NIL;
 	ListCell   *lc;
 
@@ -8647,6 +8731,9 @@ folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
 
 				definition_of(&tk, &iv, &def);
 				defs = lappend(defs, pnstrdup((const char *) def.data, def.len));
+				seqs = list_concat(seqs,
+								   sequences_drawn(lfirst(lc),
+												   from_utf8(def.data, def.len)));
 			}
 		}
 	}
@@ -8671,7 +8758,7 @@ folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
 
 		if (names_table(key, tables) ||
 			(differ && key->len >= 2 && key->data[0] == 's' &&
-			 key->data[1] == ':' && defs_name(defs, key)))
+			 key->data[1] == ':' && key_named(key, seqs)))
 			take = has[1] ? 1 : -1;
 		else if (differ && key->len >= 2 && key->data[0] == 'y' &&
 				 key->data[1] == ':' && defs_name(defs, key))
