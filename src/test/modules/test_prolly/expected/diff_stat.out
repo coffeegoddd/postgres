@@ -16,7 +16,7 @@ INSERT INTO ds.gone VALUES (1), (2);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- nothing changed
@@ -53,7 +53,7 @@ SELECT * FROM dolt_diff_stat('HEAD', 'WORKING');
 SELECT length(dolt_commit('-Am', 'changes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD');
@@ -102,14 +102,14 @@ ERROR:  dolt_diff_stat needs two refs
 SELECT length(dolt_commit('-Am', 'renamed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE ds.zero (id int, c1 varchar(20));
 SELECT length(dolt_commit('-Am', 'zero')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO ds.zero VALUES (1, 'one');
