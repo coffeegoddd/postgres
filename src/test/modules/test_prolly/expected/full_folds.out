@@ -30,7 +30,7 @@ INSERT INTO ff.t SELECT g, 'v' || g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 :flush
@@ -61,7 +61,7 @@ UPDATE ff.t SET v = 'x' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'one row')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 :flush
@@ -91,7 +91,7 @@ ALTER TABLE ff.t ADD COLUMN w int DEFAULT 7;
 SELECT length(dolt_commit('-am', 'w added')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 :flush
@@ -123,7 +123,7 @@ INSERT INTO ff.t SELECT g, 'again', 1 FROM generate_series(1, 500) g;
 SELECT length(dolt_commit('-am', 'reloaded')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 :flush
@@ -187,7 +187,7 @@ INSERT INTO ff.m SELECT g, g % 10, 'b' || g FROM generate_series(1, 2000) g;
 SELECT length(dolt_commit('-Am', 'matrix')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE INDEX m_a ON ff.m (a);
@@ -256,7 +256,7 @@ SELECT same_as_full() AS delete_rows;
 SELECT length(dolt_commit('-am', 'matrix changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 VACUUM FULL ff.m;
