@@ -66,6 +66,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_FOLD_FULL_MEMORY_BUDGET] = "fold_full_memory_budget",
 	[PGSTAT_PROLLY_FOLD_FULL_FORCED] = "fold_full_forced",
 	[PGSTAT_PROLLY_FOLD_FULL_SPILLED] = "fold_full_spilled",
+	[PGSTAT_PROLLY_FOLD_MERGE_BUILDS] = "fold_merge_builds",
 	[PGSTAT_PROLLY_COMMITS] = "commits",
 	[PGSTAT_PROLLY_HEAD_MOVES] = "head_moves",
 	[PGSTAT_PROLLY_MEMO_HITS] = "memo_hits",

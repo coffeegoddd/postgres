@@ -624,6 +624,8 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_FULL_MEMORY_BUDGET,
 	PGSTAT_PROLLY_FOLD_FULL_FORCED,
 	PGSTAT_PROLLY_FOLD_FULL_SPILLED,	/* full folds whose sort spilled to disk */
+	PGSTAT_PROLLY_FOLD_MERGE_BUILDS,	/* folds that merged many changes with
+										 * the baseline in one pass */
 	PGSTAT_PROLLY_COMMITS,		/* commits written */
 	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads set (to the same commit too) */
 	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */

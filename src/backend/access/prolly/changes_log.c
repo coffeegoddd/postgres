@@ -88,6 +88,9 @@
 /* Entries kept before they are first made one per row. */
 #define COMPACT_AT			65536
 
+/* edits past a tenth of the baseline's rows: merged with it, not applied */
+#define MERGE_FRACTION		10
+
 typedef struct State
 {
 	uint8		flags;
@@ -135,7 +138,9 @@ typedef struct Finder
 	int64		max;
 	MemoryContext ccxt;			/* the copies' keys and rows */
 	bool		compact;		/* entries: kept once per row */
-	int64		limit;			/* more rows than this: fold in full */
+	int64		limit;			/* more rows than this: merged, keyed;
+								 * folded in full, keyless */
+	bool		merge;			/* merge the changes with the baseline */
 	Size		bytes;			/* what the copies take */
 	bool		give_up;
 	ProllyFullFoldReason reason;	/* why, once it gives up */
@@ -410,9 +415,15 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 			compact_copies(f);
 			if (f->n > f->limit)
 			{
-				f->give_up = true;
-				f->reason = PROLLY_FULL_TOO_MANY;
-				return;
+				/* (keyed: merged with the baseline, a pass over each) */
+				if (!f->keyless)
+					f->merge = true;
+				else
+				{
+					f->give_up = true;
+					f->reason = PROLLY_FULL_TOO_MANY;
+					return;
+				}
 			}
 		}
 		/* (grown only if compacting left it more than half full) */
@@ -561,6 +572,49 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
 	return true;
 }
 
+/*
+ * The baseline's rows and the edits (in key order), merged into a new tree
+ * in one pass over each: a row the edits name, as they have it (or not, a
+ * delete), the rest as the baseline has them.  Many edits cost a pass over
+ * the baseline, not a lookup into it each.
+ */
+static void
+merge_build(Finder *f, const ProllyTableFold *baseline, const ProllyEdit *edits,
+			int nedits, ProllyNodeRef *data)
+{
+	ProllyTreeBuilder *b = PROLLY_CALL(f->tree, build_begin, &f->env,
+									   CurrentMemoryContext);
+	ProllyTreeCursor *cur = PROLLY_CALL(f->tree, cursor_open, &f->env,
+										&baseline->data, CurrentMemoryContext);
+	ProllyKey	k;
+	ProllyValue v;
+	bool		more;
+	int			e = 0;
+
+	PROLLY_CALL(f->tree, cursor_seek, cur, NULL, ForwardScanDirection);
+	more = PROLLY_CALL(f->tree, cursor_next, cur, &k, &v);
+	while (more || e < nedits)
+	{
+		int			c = !more ? 1 : e >= nedits ? -1 :
+			keying_compare(&k, &edits[e].key, f);
+
+		if (c < 0)
+			PROLLY_CALL(f->tree, build_add, b, &k, &v);
+		else
+		{
+			if (!edits[e].is_delete)
+				PROLLY_CALL(f->tree, build_add, b, &edits[e].key, &edits[e].value);
+			e++;
+		}
+		if (c <= 0)
+			more = PROLLY_CALL(f->tree, cursor_next, cur, &k, &v);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(f->tree, cursor_close, cur);
+	PROLLY_CALL(f->tree, build_finish, b, data);
+	f->work.merges++;
+}
+
 /* Each candidate's old and new rows; the pairs that differ are edits. */
 static void
 fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
@@ -645,7 +699,13 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	index_endscan(scan);
 	PROLLY_CALL(f->tree, cursor_close, cur);
 	f->work.rows_written += nedits;
-	if (nedits > 0)
+	/* (many edits: merged, a pass over the baseline; else each applied) */
+	if (nedits > 0 &&
+		(f->merge ||
+		 (uint64) nedits * MERGE_FRACTION >
+		 PROLLY_CALL(f->tree, count, &f->env, &baseline->data)))
+		merge_build(f, baseline, edits, nedits, data);
+	else if (nedits > 0)
 		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
 	else
 		*data = baseline->data;
@@ -977,6 +1037,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f.work.full);
 	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_READ, f.work.rows_read);
 	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_WRITTEN, f.work.rows_written);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MERGE_BUILDS, f.work.merges);
 	if (next)
 	{
 		State		ns = {0};

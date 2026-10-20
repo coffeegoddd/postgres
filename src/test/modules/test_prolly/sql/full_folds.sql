@@ -122,5 +122,37 @@ RESET maintenance_work_mem;
 :flush
 SELECT * FROM full_folds();
 
+-- many rows changed: merged with the baseline in one pass, not applied a
+-- row at a time, nor read in full; the same tree as a full fold
+CREATE TABLE ff.wide (id int PRIMARY KEY, v int);
+INSERT INTO ff.wide SELECT g, 0 FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'wide')::text) AS committed;
+-- (full reads but those same_as_full() forces)
+CREATE FUNCTION merged() RETURNS TABLE (merges bigint, full_reads bigint) LANGUAGE sql AS $$
+	SELECT max(value) FILTER (WHERE name = 'fold_merge_builds'),
+		max(value) FILTER (WHERE name = 'fold_full_tables') -
+		max(value) FILTER (WHERE name = 'fold_full_forced')
+	FROM pg_stat_prolly
+$$;
+UPDATE ff.wide SET v = 1 WHERE id % 100 = 0;
+:reset
+SELECT same_as_full() AS one_percent;
+:flush
+SELECT * FROM merged();
+SELECT length(dolt_commit('-am', '1%')::text) AS committed;
+UPDATE ff.wide SET v = 2 WHERE id % 100 < 15;
+DELETE FROM ff.wide WHERE id % 100 = 99;
+:reset
+SELECT same_as_full() AS fifteen_percent;
+:flush
+SELECT * FROM merged();
+SELECT length(dolt_commit('-am', '15%')::text) AS committed;
+UPDATE ff.wide SET v = 3 WHERE id % 100 < 60;
+INSERT INTO ff.wide SELECT g, 3 FROM generate_series(20001, 25000) g;
+:reset
+SELECT same_as_full() AS sixty_percent;
+:flush
+SELECT * FROM merged();
+
 \c contrib_regression
 DROP DATABASE regress_full_folds;
