@@ -190,5 +190,66 @@ FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.nokey');
 (1 row)
 
 DROP TABLE ds.nokey;
+-- a table changed on both sides but gone from the branch: its rows
+-- counted from the commits' trees (its cells modified unknown, as they'd
+-- need its rows decoded); with a text key in a collation, too, whose
+-- order isn't its bytes'
+CREATE TABLE ds.gone2 (id int PRIMARY KEY, v text);
+INSERT INTO ds.gone2 SELECT g, 'v' || g FROM generate_series(1, 500) g;
+CREATE TABLE ds.coll (k text COLLATE "en-x-icu" PRIMARY KEY, v int);
+INSERT INTO ds.coll SELECT chr(65 + g % 26) || chr(97 + g % 26) || g, g FROM generate_series(1, 400) g;
+SELECT length(dolt_commit('-Am', 'left')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE ds.gone2 SET v = 'changed' WHERE id % 50 = 0;
+DELETE FROM ds.gone2 WHERE id > 490;
+INSERT INTO ds.gone2 VALUES (1000, 'new'), (1001, 'new');
+UPDATE ds.coll SET v = -v WHERE v % 40 = 0;
+DELETE FROM ds.coll WHERE v BETWEEN 1 AND 5;
+INSERT INTO ds.coll VALUES ('aa', 0), ('ZZ', 0), ('Ab', 0);
+SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.gone2') AS here \gset here_
+SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.coll') AS here \gset coll_
+DROP TABLE ds.gone2, ds.coll;
+SELECT length(dolt_commit('-am', 'dropped')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT table_name, rows_unmodified, rows_added, rows_deleted, rows_modified,
+	cells_added, cells_deleted, cells_modified, old_row_count, new_row_count
+FROM dolt_diff_stat('HEAD~2', 'HEAD~1') WHERE table_name IN ('ds.gone2', 'ds.coll')
+ORDER BY 1;
+ table_name | rows_unmodified | rows_added | rows_deleted | rows_modified | cells_added | cells_deleted | cells_modified | old_row_count | new_row_count 
+------------+-----------------+------------+--------------+---------------+-------------+---------------+----------------+---------------+---------------
+ ds.coll    |             385 |          3 |            5 |            10 |           6 |            10 |                |           400 |           398
+ ds.gone2   |             481 |          2 |           10 |             9 |           4 |            20 |                |           500 |           492
+(2 rows)
+
+SELECT rows_added = :here_rows_added AND rows_deleted = :here_rows_deleted AND
+	rows_modified = :here_rows_modified AS gone2_as_on_the_branch
+FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.gone2');
+ gone2_as_on_the_branch 
+------------------------
+ t
+(1 row)
+
+SELECT rows_added = :coll_rows_added AND rows_deleted = :coll_rows_deleted AND
+	rows_modified = :coll_rows_modified AS coll_as_on_the_branch
+FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.coll');
+ coll_as_on_the_branch 
+-----------------------
+ t
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_diff_stat;

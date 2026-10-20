@@ -24853,7 +24853,7 @@
       "index": 1,
       "name": "basic case with single table",
       "source_sha256": "46edd047deb7d47e0eb9ac442f0ef05f402022768f910fb3d950293d0eba1b7e",
-      "scenario_sha256": "9dedf3cabcef3e2be88d8f7589a2ec4e33e689ecb2488488b81abe9a665a1c36",
+      "scenario_sha256": "d6230f5eded5736d908f6822b75cbc0377829195567162d1af0af361654d1ea1",
       "setup": [
         {
           "index": 0,
@@ -24985,18 +24985,20 @@
         },
         {
           "index": 1,
-          "steps": [],
-          "note": "Left out: the table is gone from the session's branch (the setup drops it), and dolt_diff_stat counts a changed table's rows only where the session's branch has it, giving NULLs otherwise; Dolt counts them from the commits. A gap in prolly, reported."
+          "steps": [
+            "assert-1"
+          ],
+          "note": "The table is gone from the session's branch (the setup drops it): its rows are counted from the commits' trees. Preserved counts; the table is named schema-qualified. (D4)"
         },
         {
           "index": 2,
           "steps": [],
-          "note": "Left out: the table is gone from the session's branch (the setup drops it), and dolt_diff_stat counts a changed table's rows only where the session's branch has it, giving NULLs otherwise; Dolt counts them from the commits. A gap in prolly, reported."
+          "note": "Left out: the table is gone from the session's branch (the setup drops it); its rows are counted from the commits' trees, but its cells modified, which need its rows decoded, are NULL where Dolt counts 2."
         },
         {
           "index": 3,
           "steps": [],
-          "note": "Left out: the table is gone from the session's branch (the setup drops it), and dolt_diff_stat counts a changed table's rows only where the session's branch has it, giving NULLs otherwise; Dolt counts them from the commits. A gap in prolly, reported."
+          "note": "Left out: the table is gone from the session's branch (the setup drops it); its rows are counted from the commits' trees, but its cells modified, which need its rows decoded, are NULL where Dolt counts 2."
         },
         {
           "index": 4,
@@ -25014,8 +25016,10 @@
         },
         {
           "index": 6,
-          "steps": [],
-          "note": "Left out: Dolt's stat refuses a table neither ref has (ErrTableNotFound); prolly's gives no rows, as its summary does (and Dolt's summary). A difference to decide, reported."
+          "steps": [
+            "assert-6"
+          ],
+          "note": "A table neither ref has: refused, SQLSTATE 42P01 (undefined table), Dolt's ErrTableNotFound."
         },
         {
           "index": 7,

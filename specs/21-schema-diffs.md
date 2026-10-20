@@ -235,9 +235,10 @@ D19 (of the 17 summary cases, 15 whole, `WORKING and STAGED` in part,
 drop-and-recreate deferred). Of `DiffStatTableFunctionScriptTests`, 13
 cases are ported, 11 whole and 2 in part (staging, as above; and
 `basic case with single table`, whose table is dropped before the
-assertions: the stat counts a changed table's rows only where the
-session's branch has it), and the keyless one (for that reason) and
-the computed one are deferred. Of `DiffSystemTableScriptTests`, 17
+assertions: the stat counts such a table's rows from the commits' trees
+(#528) but not its cells modified, which need its rows decoded, #537),
+and the keyless one (for that reason) and the computed one are
+deferred. Of `DiffSystemTableScriptTests`, 17
 (the `dolt_diff_<t>` cases and one of the view; one without its SHOW
 INDEX), and the case whose column's old values don't convert to its
 new type in part (D21: they show null, with a warning, #531), and the
@@ -292,6 +293,11 @@ Decided by the user 2026-10-19, as recommended:
   and quotes kept (#522). One naming a table neither version has makes
   `dolt_diff_stat` refuse (42P01), as Dolt's does; `dolt_diff_summary`
   gives no rows for it, as Dolt's does too (#529).
+- **A table the branch doesn't have** has its rows counted by
+  `dolt_diff_stat` from the commits' trees (#528): the tree interface's
+  `diff_unordered` diffs them by node hashes and key bytes, as no
+  relation orders their keys. Its cells modified, and a keyless one's
+  counts, need its rows decoded: still NULL (#537).
 - **Ref ranges** (#521), as Dolt takes them: `dolt_diff_summary`,
   `dolt_schema_diff` and `dolt_diff_stat` take `'a..b'` (a to b) or
   `'a...b'` (from their merge base to b) in place of two refs, the next

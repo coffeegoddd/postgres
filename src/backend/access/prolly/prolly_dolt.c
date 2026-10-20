@@ -4442,6 +4442,19 @@ keyed_now(Oid relid)
 	return !keyless;
 }
 
+/* A canonical table item's data tree. */
+static void
+table_item_data(const char *item, int len, ProllyNodeRef *data)
+{
+	memset(data, 0, sizeof(*data));
+	if (len < 1 || (uint8) item[0] > PROLLY_HASH_MAX_LEN || len < 1 + (uint8) item[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a canonical table item without its rows")));
+	data->hash.len = (uint8) item[0];
+	memcpy(data->hash.bytes, item + 1, data->hash.len);
+}
+
 /* A version of a table: its rows (a count of its tree's items), its columns. */
 static void
 table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed)
@@ -4451,18 +4464,27 @@ table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed
 	ProllyNodeRef data;
 	ProllyTreeEnv env;
 
-	memset(&data, 0, sizeof(data));
-	if (len < 1 || (uint8) item[0] > PROLLY_HASH_MAX_LEN || len < 1 + (uint8) item[0])
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("a canonical table item without its rows")));
-	data.hash.len = (uint8) item[0];
-	memcpy(data.hash.bytes, item + 1, data.hash.len);
+	table_item_data(item, len, &data);
 	desc.data = v.data + 1 + data.hash.len;
 	desc.len = v.len - 1 - data.hash.len;
 	*columns = list_length(PROLLY_CALL(canonicalizer(), table_columns, &desc, keyed));
 	prolly_folded_tree_env(&env);
 	*rows = PROLLY_CALL(prolly_tree_lookup("cow"), count, &env, &data);
+}
+
+/* A keyed table's rows added, deleted or modified, as an unordered diff finds them. */
+static void
+stat_tree_change(ProllyDiffKind kind, const ProllyKey *key,
+				 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	StatSink   *s = arg;
+
+	if (kind == PROLLY_DIFF_ADDED)
+		s->added++;
+	else if (kind == PROLLY_DIFF_REMOVED)
+		s->deleted++;
+	else
+		s->modified++;
 }
 
 /*
@@ -4511,8 +4533,10 @@ cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
  * counts them.  A keyless table's rows added and deleted are copies, the
  * rest NULL, as in Dolt.  A table the session's branch hasn't, or has
  * keyed otherwise than the versions are (a primary key made or dropped
- * since), changed on both sides, can't have its rows diffed here: only its
- * row and cell counts.  With name, that table's alone: one neither
+ * since), changed on both sides, has its rows counted from the trees, by
+ * their keys' bytes (as no relation orders them), but not its cells
+ * modified, which need the rows decoded; a keyless one, its row and cell
+ * counts only.  With name, that table's alone: one neither
  * version has is refused (as Dolt's; dolt_diff_summary gives none).
  */
 Datum
@@ -4556,6 +4580,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		int			new_columns = 0;
 		bool		keyed = true;
 		bool		counted = false;
+		bool		cells_unknown = false;
 		StatSink	s;
 		Oid			relid;
 		Datum		values[12];
@@ -4597,6 +4622,27 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			s.deleted = old_rows;
 			counted = true;
 		}
+		else if (keyed && r->data_change &&
+				 PROLLY_HAS(prolly_tree_lookup("cow"), diff_unordered))
+		{
+			/*
+			 * (a table the branch hasn't, or has keyed otherwise: its rows'
+			 * keys and values compared from the trees, by bytes, as no
+			 * relation orders them; its cells aren't decoded, so those
+			 * modified aren't known)
+			 */
+			ProllyNodeRef fd;
+			ProllyNodeRef td;
+			ProllyTreeEnv env;
+
+			table_item_data(r->from_item, r->from_len, &fd);
+			table_item_data(r->to_item, r->to_len, &td);
+			prolly_folded_tree_env(&env);
+			PROLLY_CALL(prolly_tree_lookup("cow"), diff_unordered, &env, &fd, &td,
+						stat_tree_change, &s);
+			counted = true;
+			cells_unknown = s.modified > 0;
+		}
 		else if (keyed && !r->data_change)
 			counted = true;
 
@@ -4625,6 +4671,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			values[7] = Int64GetDatum((int64) s.cells_modified);
 			for (int i = 1; i <= 7; i++)
 				nulls[i] = false;
+			nulls[7] = cells_unknown;
 		}
 		else if (counted)
 		{

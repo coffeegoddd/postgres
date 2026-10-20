@@ -140,6 +140,42 @@
       ]
     },
     {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "0",
+            "1",
+            "0",
+            "0",
+            "3",
+            "0",
+            "0",
+            "0",
+            "1",
+            "0",
+            "3"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
       "id": "assert-4",
       "session": "a",
       "op": "query",
@@ -208,6 +244,26 @@
         },
         {
           "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "sqlstate": "42P01"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit5"
         }
       ]
     }
