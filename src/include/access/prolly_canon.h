@@ -285,6 +285,16 @@ typedef struct ProllyCanonRoutine
 	 */
 	void		(*render) (char object, const char *name, const ProllyValue *item,
 						   StringInfo out);
+
+	/*
+	 * Optional: into, but for the tables named (qualified, as tables()
+	 * names them), which are as from has them (their definitions and
+	 * rows), or gone where from hasn't them, into *out.  Refused where a
+	 * table named needs an object (a type, a sequence) the two roots hold
+	 * differently: the error names them.
+	 */
+	void		(*splice) (const ProllyNodeRef *into, const ProllyNodeRef *from,
+						   List *tables, ProllyNodeRef *out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -293,9 +303,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"changes", "render"
+	"changes", "render", "splice"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK render
+#define PROLLY_CANON_LAST_CALLBACK splice
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

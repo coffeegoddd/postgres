@@ -308,6 +308,10 @@ OF` are built in D18's shapes.
   branch named `--` could be named only after another `--`.
 - **Port:** a case that makes a branch named `--` expects the
   `invalid branch name` error (SQLSTATE 42602) instead.
+- **Tables after `--`** (#494): `dolt_checkout('--', ...)` names tables,
+  as Dolt's does, their uncommitted changes discarded; one name there
+  that is a branch and no table checks out the branch, so a branch named
+  like an option (`-dash`) can still be checked out.
 
 ## D15. Schema diffs cover every versioned object
 

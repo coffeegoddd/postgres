@@ -1199,10 +1199,123 @@ sweep_detached(char *current)
 }
 
 
+/* A root's tables' qualified names, appended to *names (each once). */
+static void
+collect_table_name(const char *name, const ProllyNodeRef *data,
+				   const ProllyValue *description, const char *unreadable,
+				   void *arg)
+{
+	List	  **names = arg;
+
+	*names = list_append_unique(*names, makeString(pstrdup(name)));
+}
+
+/*
+ * A table named as a user names it, qualified as roots name tables: the
+ * relation it names now, or (one gone since) the first of from's tables
+ * of that name in the search path.  NULL if neither.
+ */
+static char *
+checkout_table_name(const char *name, List *from_tables)
+{
+	List	   *parts = stringToQualifiedNameList(name, NULL);
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(parts), NoLock, true);
+	ListCell   *lc;
+
+	if (OidIsValid(relid))
+		return quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+										  get_rel_name(relid));
+	if (list_length(parts) == 2)
+	{
+		char	   *q = quote_qualified_identifier(strVal(linitial(parts)),
+												   strVal(lsecond(parts)));
+
+		return list_member(from_tables, makeString(q)) ? q : NULL;
+	}
+	foreach(lc, fetch_search_path(false))
+	{
+		char	   *nsp = get_namespace_name(lfirst_oid(lc));
+		char	   *q;
+
+		if (nsp == NULL)
+			continue;
+		q = quote_qualified_identifier(nsp, strVal(llast(parts)));
+		if (list_member(from_tables, makeString(q)))
+			return q;
+	}
+	return NULL;
+}
+
+/*
+ * The tables named (".": every one) put back as ref's commit has them,
+ * the rest of the working set as it is: their uncommitted changes
+ * discarded, as Dolt's dolt_checkout -- tables.
+ */
+static void
+checkout_tables(const char *ref, char **names, int nnames)
+{
+	ProllyHash	commit;
+	ProllyNodeRef from;
+	ProllyNodeRef working;
+	ProllyNodeRef target;
+	List	   *from_tables = NIL;
+	List	   *working_tables = NIL;
+	List	   *tables = NIL;
+
+	if (!PROLLY_HAS(canonicalizer(), splice))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't check out tables")));
+	PreventCommandIfReadOnly("dolt_checkout()");
+	if (!PROLLY_CALL(refs(), resolve, ref, &commit) ||
+		!PROLLY_CALL(refs(), commit_working_set, &commit, &from))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	if (!PROLLY_CALL(refs(), working_set, NULL, &working))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch has no working set")));
+	PROLLY_CALL(canonicalizer(), tables, &from, collect_table_name, &from_tables);
+	PROLLY_CALL(canonicalizer(), tables, &working, collect_table_name, &working_tables);
+	for (int i = 0; i < nnames; i++)
+	{
+		char	   *q;
+
+		if (strcmp(names[i], ".") == 0)
+		{
+			tables = list_concat_unique(tables, from_tables);
+			tables = list_concat_unique(tables, working_tables);
+			continue;
+		}
+		q = checkout_table_name(names[i], from_tables);
+		if (q == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("table \"%s\" does not exist", names[i])));
+		tables = list_append_unique(tables, makeString(q));
+	}
+	{
+		List	   *strs = NIL;
+		ListCell   *lc;
+
+		foreach(lc, tables)
+			strs = lappend(strs, strVal(lfirst(lc)));
+		PROLLY_CALL(canonicalizer(), splice, &working, &from, strs, &target);
+	}
+	note_integration();
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), move_to, &target, &working));
+	settled();
+}
+
 /*
  * dolt_checkout(VARIADIC args text[]) returns text[]: {status, message}
  *
- * branch, or -b branch [start point] to create it first.
+ * branch, or -b branch [start point] to create it first.  Tables, as
+ * Dolt's: -- tables (or "."), or a name that is no branch but a table
+ * (with more after it), put back as the head has them; ref tables (ref
+ * no table), as ref has them.  After --, one name that is a branch and no
+ * table is the branch.
  */
 Datum
 dolt_checkout(PG_FUNCTION_ARGS)
@@ -1215,19 +1328,24 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	char	   *named = NULL;	/* the one name given apart from -b's */
 	bool		create = false;
 	const char *result[2];
+	char	  **names = palloc_array(char *, Max(nargs, 1));
+	int			nnames = 0;
+	int			dashes = -1;	/* names before "--" */
 
 	for (int i = 0; i < nargs; i++)
 	{
 		char	   *a = args[i];
 
 		if (options && strcmp(a, "--") == 0)
+		{
 			options = false;	/* names after it, even ones like flags */
+			dashes = nnames;
+		}
 		else if (!options || a[0] != '-')
 		{
 			if (named == NULL)
 				named = a;
-			else
-				unexpected("dolt_checkout", a);
+			names[nnames++] = a;
 		}
 		else if (is_option(a, "b"))
 		{
@@ -1241,6 +1359,42 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_checkout", a);
 	}
+	/* tables: after "--", or names that aren't one branch */
+	if (!create && nnames > 0)
+	{
+		bool		is_branch = PROLLY_CALL(refs(), branch_lookup, names[0],
+											&(ProllyBranchId) {0});
+		bool		is_table = strcmp(names[0], ".") == 0 ||
+			OidIsValid(RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(names[0], NULL)),
+										NoLock, true));
+
+		if (dashes == 0 && !(nnames == 1 && is_branch && !is_table))
+		{
+			checkout_tables("HEAD", names, nnames);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (dashes != 0 && nnames > 1 && !is_table)
+		{
+			checkout_tables(names[0], names + 1, nnames - 1);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (dashes != 0 && !is_branch && !names_commit(names[0]) &&
+			(is_table || nnames > 1))
+		{
+			checkout_tables("HEAD", names, nnames);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (nnames > 1)
+			unexpected("dolt_checkout", names[1]);
+	}
+	else if (create && nnames > 1)
+		unexpected("dolt_checkout", names[1]);
 	/* (-b's start point, before or after it, as in Dolt and git) */
 	if (create)
 		start = named;

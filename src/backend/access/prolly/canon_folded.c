@@ -8569,6 +8569,139 @@ folded_render(char object, const char *name, const ProllyValue *item,
 	pfree(key.data);
 }
 
+/* Does key name one of tables (qualified, server encoding)? */
+static bool
+names_table(const ProllyKey *k, List *tables)
+{
+	char	   *name;
+	ListCell   *lc;
+
+	if (k->len < 2 || k->data[0] != 't' || k->data[1] != ':')
+		return false;
+	name = from_utf8(k->data + 2, k->len - 2);
+	foreach(lc, tables)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/* Does one of defs (tables' definitions) name the object a key names? */
+static bool
+defs_name(List *defs, const ProllyKey *k)
+{
+	char	   *name = from_utf8(k->data + 2, k->len - 2);
+	ListCell   *lc;
+
+	foreach(lc, defs)
+		if (strstr(lfirst(lc), name) != NULL)
+			return true;
+	return false;
+}
+
+/*
+ * into, but for the tables named, as from has them, into *out: a merge of
+ * the two roots' items in key order, each table named taken from from (or
+ * left out where from hasn't it), with the sequences it names (as from
+ * has them: its values' series goes with it), every other from into.  A
+ * type the two hold differently that a table named (as either has it)
+ * names is refused: other tables may use it as into has it.
+ */
+static void
+folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
+			  List *tables, ProllyNodeRef *out)
+{
+	Canon		cn;
+	ProllyTreeCursor *cur[2];
+	bool		more[2];
+	ProllyKey	k[2];
+	ProllyValue v[2];
+	ProllyTreeBuilder *b;
+	const ProllyNodeRef *roots[2] = {into, from};
+	List	   *defs = NIL;		/* the tables' definitions, both sides' */
+	List	   *refused = NIL;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	check_format(&cn, into, "spliced");
+	check_format(&cn, from, "spliced");
+
+	/* the tables' definitions first: what they name, both sides' */
+	foreach(lc, tables)
+	{
+		StringInfoData key;
+
+		initStringInfo(&key);
+		appendStringInfoString(&key, "t:");
+		append_utf8(&key, lfirst(lc));
+		for (int i = 0; i < 2; i++)
+		{
+			StringInfoData item;
+			ProllyKey	tk = {(const uint8 *) key.data, key.len};
+
+			initStringInfo(&item);
+			if (PROLLY_CALL(cn.tree, get, &cn.env, roots[i], &tk, &item))
+			{
+				ProllyValue iv = {(const uint8 *) item.data, item.len};
+				ProllyValue def;
+
+				definition_of(&tk, &iv, &def);
+				defs = lappend(defs, pnstrdup((const char *) def.data, def.len));
+			}
+		}
+	}
+
+	cur[0] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, into, CurrentMemoryContext);
+	cur[1] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, from, CurrentMemoryContext);
+	for (int i = 0; i < 2; i++)
+	{
+		PROLLY_CALL(cn.tree, cursor_seek, cur[i], NULL, ForwardScanDirection);
+		more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+	}
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
+	while (more[0] || more[1])
+	{
+		int			c = !more[0] ? 1 : !more[1] ? -1 :
+			prolly_bytes_compare(&k[0], &k[1], NULL);
+		const ProllyKey *key = c <= 0 ? &k[0] : &k[1];
+		bool		has[2] = {c <= 0, c >= 0};
+		bool		differ = !has[0] || !has[1] || v[0].len != v[1].len ||
+			memcmp(v[0].data, v[1].data, v[0].len) != 0;
+		int			take = has[0] ? 0 : -1;
+
+		if (names_table(key, tables) ||
+			(differ && key->len >= 2 && key->data[0] == 's' &&
+			 key->data[1] == ':' && defs_name(defs, key)))
+			take = has[1] ? 1 : -1;
+		else if (differ && key->len >= 2 && key->data[0] == 'y' &&
+				 key->data[1] == ':' && defs_name(defs, key))
+			refused = lappend(refused, from_utf8(key->data + 2, key->len - 2));
+		if (take >= 0)
+			PROLLY_CALL(cn.tree, build_add, b, &k[take], &v[take]);
+		for (int i = 0; i < 2; i++)
+			if (has[i])
+				more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+		CHECK_FOR_INTERRUPTS();
+	}
+	for (int i = 0; i < 2; i++)
+		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
+	if (refused != NIL)
+	{
+		StringInfoData names;
+
+		initStringInfo(&names);
+		foreach(lc, refused)
+			appendStringInfo(&names, "%s%s", foreach_current_index(lc) ? ", " : "",
+							 (char *) lfirst(lc));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the tables named use types the two versions define differently"),
+				 errdetail("They use %s.", names.data),
+				 errhint("Commit or reset the changes to those types first.")));
+	}
+	PROLLY_CALL(cn.tree, build_finish, b, out);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -8584,6 +8717,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
+	.splice = folded_splice,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,

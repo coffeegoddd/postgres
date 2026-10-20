@@ -77,7 +77,7 @@ provisional.
 | **Transfer** | Moving commits between stores: what to send, checking what is received | The chunks a commit reaches that the other side lacks (**chunks**) |
 | **Remote** | Where a remote's chunks and heads live | A directory (**file**); network and object storage later |
 | **Diff / merge** | Row diff and three-way merge between commits, over canonical trees | **folded** |
-| **Schema canonicalizer** | Deriving the canonical, OID-free schema from catalog rows, folding tables' rows, and moving definitions back | **folded** (`09-versioned-catalogs.md`, `11-pages-and-dolt-snapshots.md`) |
+| **Schema canonicalizer** | Deriving the canonical, OID-free schema from catalog rows, folding tables' rows, moving definitions back, and splicing one root's tables into another (`dolt_checkout` of tables, #494) | **folded** (`09-versioned-catalogs.md`, `11-pages-and-dolt-snapshots.md`) |
 | **Reclamation** | Deciding what is garbage and freeing it | Online GC of the chunk store (step 7) |
 | **Benchmark workload** | One S or V workload | S1–S9, V1–V4 |
 | **Metric collector** | One metric source | WAL, diskstats, `pg_stat_io`, perf, engine counters |
