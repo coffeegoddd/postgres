@@ -26,6 +26,7 @@
 #include "postgres.h"
 
 #include "access/prolly_config.h"
+#include "access/prolly_seen.h"
 #include "access/xact.h"
 #include "catalog/pg_authid.h"
 #include "catalog/branch.h"
@@ -498,7 +499,7 @@ typedef struct Since
 {
 	ReturnSetInfo *rsinfo;
 	ProllyChunkStore *store;
-	HTAB	   *sent;
+	ProllySeen *sent;
 	StringInfoData data;
 } Since;
 
@@ -506,13 +507,10 @@ static bool
 send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 {
 	Since	   *sn = arg;
-	ProllyHash	key = prolly_hash_key(&node->hash);
-	bool		found;
 	Datum		values[2];
 	bool		nulls[2] = {0};
 
-	(void) hash_search(sn->sent, &key, HASH_ENTER, &found);
-	if (found)
+	if (!prolly_seen_enter(sn->sent, &node->hash, NULL))
 		return false;
 	resetStringInfo(&sn->data);
 	if (!prolly_chunk_get_stored(prolly_chunk_store(), sn->store, &node->hash,
@@ -710,8 +708,7 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
-	sn.sent = hash_create("prolly chunks sent since", 1024, &ctl,
-						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	sn.sent = prolly_seen_create("prolly chunks sent since", 0, 0);
 	ctl.entrysize = sizeof(SinceCommit);
 	sw.commits = hash_create("prolly commits since", 64, &ctl,
 							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);

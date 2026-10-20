@@ -23,6 +23,7 @@
 #include "access/prolly_hash.h"
 #include "access/prolly_memo.h"
 #include "access/prolly_remote.h"
+#include "access/prolly_seen.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_tree.h"
 #include "catalog/pg_type_d.h"
@@ -951,6 +952,64 @@ test_remote_get_stored(PG_FUNCTION_ARGS)
 	if (!found)
 		PG_RETURN_NULL();
 	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+/*
+ * test_seen_check(n, budget): n hashes entered in a walk's map of budget
+ * bytes, each with a value; each found with it, then changed and found
+ * changed, and as many others not found.  The runs it wrote (an error if
+ * any check fails).
+ */
+PG_FUNCTION_INFO_V1(test_seen_check);
+Datum
+test_seen_check(PG_FUNCTION_ARGS)
+{
+	int			n = PG_GETARG_INT32(0);
+	ProllySeen *seen = prolly_seen_create("test seen", sizeof(int64),
+										  (Size) PG_GETARG_INT32(1));
+	int			runs;
+
+	for (int pass = 0; pass < 4; pass++)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			char		name[32];
+			ProllyHash	h;
+			int64		v = (int64) i * 10 + (pass >= 2 ? 1 : 0);
+			int64		got = -1;
+
+			snprintf(name, sizeof(name), "%s %d", pass == 3 ? "absent" : "seen", i);
+			content_hash(name, strlen(name), &h);
+			if (pass == 0)
+			{
+				if (!prolly_seen_enter(seen, &h, &v))
+					elog(ERROR, "hash %d entered twice", i);
+				continue;
+			}
+			if (pass == 3)
+			{
+				if (prolly_seen_find(seen, &h, NULL))
+					elog(ERROR, "hash %d found, never entered", i);
+				continue;
+			}
+			if (!prolly_seen_find(seen, &h, &got) || got != v)
+				elog(ERROR, "hash %d found with %lld, not %lld", i,
+					 (long long) got, (long long) v);
+			if (prolly_seen_enter(seen, &h, &v))
+				elog(ERROR, "hash %d entered again", i);
+			if (pass == 1)
+			{
+				v++;
+				prolly_seen_set(seen, &h, &v);
+			}
+		}
+	}
+	if (prolly_seen_count(seen) != (uint64) n)
+		elog(ERROR, "the map counts %llu, not %d",
+			 (unsigned long long) prolly_seen_count(seen), n);
+	runs = prolly_seen_runs(seen);
+	prolly_seen_destroy(seen);
+	PG_RETURN_INT32(runs);
 }
 
 /* test_chunk_stored(hash): a chunk of the store as stored (framed). */

@@ -45,6 +45,7 @@ OBJS = \
 	prolly_datum.o \
 	prolly_deps.o \
 	prolly_registry.o \
+	prolly_seen.o \
 	prolly_shmem.o \
 	prolly_table.o \
 	prolly_dolt.o \

@@ -343,6 +343,11 @@ CREATE FUNCTION test_chunk_frame(data bytea, compress boolean)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A walk's map checked: n hashes in budget bytes; the runs it wrote.
+CREATE FUNCTION test_seen_check(n int, budget int)
+RETURNS int
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Every chunk a commit's walk reaches, once.
 CREATE FUNCTION test_commit_chunks(commit_id text)
 RETURNS SETOF text

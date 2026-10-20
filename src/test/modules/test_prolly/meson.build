@@ -99,6 +99,7 @@ tests += {
       'stored_chunks',
       'remote_clone',
       'clone_whole',
+      'transfer_spill',
       'remote_serve',
       'dependencies',
       'dependency_moves',
