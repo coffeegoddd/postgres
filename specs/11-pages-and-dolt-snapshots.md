@@ -1906,8 +1906,10 @@ Not as designed, or not yet:
   by node, not overlapped).
 - **Clone walks** rather than copying the remote's files whole and then
   checking them (7.4): the same bound, O(B); the whole-file copy waits for
-  V4 to say what it saves. (Since spec 22's item 20, it copies them
-  whole, and resumes.)
+  V4 to say what it saves. (Since spec 22's item 20, a clone into a
+  database with nothing to walk against copies them whole and resumes,
+  unless the remote can't list its files or its journal is a fifth of it
+  or more: those still walk.)
 - **The store's own chunks are trusted.** A commit or chunk the store
   has is declined without reading what it references: the receive check
   resolves references through the store's closure, which it assumes, as
@@ -2403,11 +2405,12 @@ Not as designed, or not yet:
   retire's wait.
 - **The window holds `ProllyJournal`**, which is the server's, not the
   database's: every database's appends wait for it. (Since spec 22's
-  item 14, the database's own append lock.)
+  item 14, the database's own append lock; the server's lock is gone.)
 - **Files a crash leaves** (a collection's unnamed new files, segments
   retiring) are removed by the next writer or collection, not at the end
   of recovery. The collection isn't resumed. (Since spec 22's item 16,
-  removed as crash recovery ends.)
+  removed as crash recovery ends; not after archive recovery or a
+  promotion, whose readers may still read what is retiring.)
 - **The standby conflict** covers every query running in the database
   when the swap was replayed.
 - **The mark's frontier** is an array in memory, not bounded by

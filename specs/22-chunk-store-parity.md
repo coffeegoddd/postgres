@@ -3,7 +3,8 @@
 **Status: proposed and decided by the user 2026-10-19, as recommended
 but for the hash's length (20 bytes, the user's choice; item 1), on
 `cf49764a49`. Groups A–E built 2026-10-19 as one stack of pull requests
-(#460–#465, #467–#479, #502–#504, stack #466), not merged;
+(#460–#465, #467–#479, #502–#503, and this spec as built, #504; stack
+#466), not merged;
 part 6 says what each built and where it departs. F (#447) waits for
 step 8. Tracked in #442–#447, one issue for each group of part 4.**
 
@@ -115,7 +116,9 @@ Each group is an issue. The numbers are the items the issues use.
    names unmarked.
 3. **Table files' index laid out as Dolt's:** 8-byte prefixes sorted
    with ordinals, then lengths, then 12-byte suffixes, as Dolt's. That
-   is about 40 bytes a chunk in memory, searched by interpolation.
+   is about 40 bytes a chunk in memory, searched by interpolation (as
+   built, 32 bytes, then 34 with #469's offsets and filter: item 3 of
+   part 6).
 4. **ROOT records carry a timestamp,** and `dolt_reflog` reads them.
    As built: journal version 4, a ROOT record's payload its hash and then
    the move's time (int64 microseconds, as `timestamptz`), carried in the
@@ -225,7 +228,8 @@ each other.
 ## 6. As built (2026-10-19)
 
 One linear stack, a pull request a layer, in part 5's order. Part 1's
-"Ours" column is as decided, not as built.
+"Ours" column is the store before group A, but for a few rows rewritten
+as decided (conjoin, reflog, statistics); this part says what was built.
 
 ### A. One clean break of format
 
@@ -239,8 +243,10 @@ One linear stack, a pull request a layer, in part 5's order. Part 1's
 - **2. Journal chunks compressed with LZ4** (#462), when that makes them
   smaller; a codec byte in each record. Journal v3.
 - **3. Table files' index laid out as Dolt's** (#463): prefixes with
-  ordinals, lengths, suffixes; interpolation search; about 32 bytes a
-  chunk. B's #469 adds u64 offsets and a Bloom filter (format v3).
+  ordinals, lengths, suffixes; interpolation search, every other step a
+  bisection; about 32 bytes a chunk. B's #469 replaces the lengths with
+  u64 offsets (nothing is computed from them) and adds a blocked Bloom
+  filter (format v3): about 34 bytes a chunk for 20-byte hashes.
 - **4. ROOT records carry a timestamp; `dolt_reflog`** (#464). Dolt's
   reflog scripts ported (one GC case partial: it tags a commit, and
   there are no tags).
