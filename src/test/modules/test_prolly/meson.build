@@ -205,6 +205,7 @@ tests += {
       't/122_store_format.pl',
       't/123_checkpoint_sync.pl',
       't/124_journal_index_file.pl',
+      't/125_gc_window_per_db.pl',
       't/140_corrupt_compressed.pl',
       't/141_standby_root_redo.pl',
       't/142_get_many_refresh.pl',

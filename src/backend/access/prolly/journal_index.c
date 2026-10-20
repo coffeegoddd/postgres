@@ -90,6 +90,7 @@ typedef struct IndexShared
 	pg_atomic_uint64 changes;	/* chunks and segments changed */
 	uint64		saved;			/* changes as of the file last written */
 	LWLock		lock;			/* the scan state's */
+	LWLock		appends;		/* the database's appends' */
 	dshash_table_handle chunks;
 	int			capacity;		/* PADs and holes a segment may have */
 	JournalScan scan;
@@ -222,6 +223,7 @@ jindex_attach(Oid dboid, Oid spcoid, int capacity, bool *made)
 			db->spcoid = spcoid;
 			pg_atomic_init_u64(&db->changes, 0);
 			LWLockInitialize(&db->lock, tranche);
+			LWLockInitialize(&db->appends, tranche);
 			db->capacity = capacity;
 			t = dshash_create(area, &params, NULL);
 			db->chunks = dshash_get_hash_table_handle(t);
@@ -296,6 +298,24 @@ jindex_forget(Oid dboid)
 		dsa_free(area, db->segs);
 	dsa_free(area, r->db);
 	dshash_delete_entry(registry, r);
+}
+
+void
+jindex_append_lock(JournalIndex *ix, bool exclusive)
+{
+	LWLockAcquire(&ix->db->appends, exclusive ? LW_EXCLUSIVE : LW_SHARED);
+}
+
+void
+jindex_append_unlock(JournalIndex *ix)
+{
+	LWLockRelease(&ix->db->appends);
+}
+
+bool
+jindex_append_lock_held(JournalIndex *ix)
+{
+	return LWLockHeldByMe(&ix->db->appends);
 }
 
 void

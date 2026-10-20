@@ -29,7 +29,7 @@
  * were), then prolly_journal_<id> (id in hex, from the ids table files are
  * given); a store without a manifest has segment 0 alone.  Appends go to
  * the last.  seal() makes a new one, its header written, and a manifest
- * naming it, both under ProllyJournal, so every append after goes to it: a
+ * naming it, both under the database's append lock, so every append after goes to it: a
  * backend reads the segments again, if a manifest was written since, before
  * it appends.  Every segment named is read; a backend notices a manifest
  * that drops one (a collection's) at its next lookup, and forgets the
@@ -37,7 +37,7 @@
  *
  * Appending.  A backend gathers its transaction's chunks and appends them
  * in batches, and the rest when it commits.  An append reserves its range
- * at the segment's end and WAL-logs its bytes under ProllyJournal, and
+ * at the segment's end and WAL-logs its bytes under the database's append lock, and
  * writes them outside it once the log is flushed: a batch at once (a flush
  * concurrent appends and commits share), a transaction's last append (its
  * remaining chunks and its PAD) once its commit record is flushed, so a
@@ -109,7 +109,7 @@
  * progress at the seal are waited for before anything new is read: then
  * their PADs are ROOTs or not, for good, and their chunks committed or
  * not.  The marked chunks are copied, each re-hashed, to a new settled
- * table file before the window; the window takes ProllyJournal, so no
+ * table file before the window; the window takes the database's append lock, so no
  * append is reserved, and waits for those in flight to be written, while
  * the last new chunks are marked and copied and the
  * manifest swapped (a SWAP record): the new files and those kept, the
@@ -373,7 +373,7 @@ typedef struct JournalShared
 	/* appends reserved and not written yet; under mutex */
 	slock_t		mutex;
 	ConditionVariable written;	/* an append's bytes were written */
-	CheckedEnd	checked[CHECKED_ENDS];	/* under ProllyJournalLock */
+	CheckedEnd	checked[CHECKED_ENDS];	/* under mutex */
 	int			next_checked;
 	int			inflight;		/* ranges of len > 0 */
 	TimestampTz last_at;		/* the last append's time; under
@@ -1131,7 +1131,7 @@ check_header(const char *header, Size len, const char *path)
 
 /*
  * Give segment id its header, if it has none, logged as any append.  The
- * caller holds ProllyJournalLock.
+ * caller holds the database's append lock.
  */
 static void
 segment_header(Oid dboid, Oid spcoid, uint64 id)
@@ -1226,7 +1226,7 @@ appends_in_flight(ProllyChunkStore *s, uint64 before)
 /*
  * Wait for every append reserved in this database's store, in a segment
  * before the one given, to be written (s NULL: every store's).  None is
- * reserved there meanwhile: the caller holds ProllyJournalLock, or those
+ * reserved there meanwhile: the caller holds the database's append lock, or those
  * segments are sealed.  An append in flight needs nothing to finish but
  * its own flush.
  */
@@ -1300,7 +1300,7 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 	if (found)
 		return;
 
-	LWLockAcquire(ProllyJournalLock, LW_SHARED);
+	jindex_append_lock(s->ix, false);
 	SpinLockAcquire(&js->mutex);
 	if (!TransactionIdIsValid(t->xid))
 	{
@@ -1320,7 +1320,7 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 			k->overflow = true;
 	}
 	SpinLockRelease(&js->mutex);
-	LWLockRelease(ProllyJournalLock);
+	jindex_append_unlock(s->ix);
 	if (!journal_has(s, hash))
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -1462,16 +1462,18 @@ static bool
 end_checked(ProllyChunkStore *s, Segment *g)
 {
 	JournalShared *js = shared();
+	bool		checked = false;
 
-	for (int i = 0; i < CHECKED_ENDS; i++)
+	SpinLockAcquire(&js->mutex);
+	for (int i = 0; i < CHECKED_ENDS && !checked; i++)
 	{
 		CheckedEnd *c = &js->checked[i];
 
-		if (c->segment == g->id && c->dboid == s->dboid &&
-			c->spcoid == s->spcoid)
-			return true;
+		checked = c->segment == g->id && c->dboid == s->dboid &&
+			c->spcoid == s->spcoid;
 	}
-	return false;
+	SpinLockRelease(&js->mutex);
+	return checked;
 }
 
 /* The end of the last range in flight in a segment (0: none). */
@@ -1494,7 +1496,7 @@ in_flight_end(ProllyChunkStore *s, uint64 segment)
 }
 
 /*
- * The segment's end, where the next append goes, under ProllyJournalLock.
+ * The segment's end, where the next append goes, under the database's append lock.
  * A crash can leave a range reserved at the end whose bytes the WAL never
  * had (reserved after the last flush): zeros a reader stops at, which would
  * hide whatever came after them.  So the first append to a segment after
@@ -1528,16 +1530,18 @@ segment_end(ProllyChunkStore *s, Segment *g)
 					 errmsg("could not truncate file \"%s\": %m", g->path)));
 		size = end;
 	}
+	SpinLockAcquire(&js->mutex);
 	js->checked[js->next_checked].dboid = s->dboid;
 	js->checked[js->next_checked].spcoid = s->spcoid;
 	js->checked[js->next_checked].segment = g->id;
 	js->next_checked = (js->next_checked + 1) % CHECKED_ENDS;
+	SpinLockRelease(&js->mutex);
 	return size;
 }
 
 /*
  * Reserve len bytes at the end of the segment appends go to, and WAL-log
- * data for them, under ProllyJournalLock; the bytes are written by
+ * data for them, under the database's append lock; the bytes are written by
  * append_write(), outside it, once the log is flushed.  The segments are
  * read again first if a manifest was written since (a seal takes the same
  * lock), so nothing is appended to a segment that was sealed: before the
@@ -1572,11 +1576,11 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 		scan_segment(s, g);
 		jindex_unlock(s->ix);
 	}
-	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	jindex_append_lock(s->ix, true);
 	refresh_segments(s);
 	if (checked != NULL && s->gc_generation != *checked)
 	{
-		LWLockRelease(ProllyJournalLock);
+		jindex_append_unlock(s->ix);
 		return false;
 	}
 	g = current_segment(s);
@@ -1618,7 +1622,7 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 	XLogRegisterData(data, len);
 	a->lsn = XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_APPEND);
 	END_CRIT_SECTION();
-	LWLockRelease(ProllyJournalLock);
+	jindex_append_unlock(s->ix);
 
 	a->g = g;
 	a->offset = size;
@@ -2630,9 +2634,9 @@ ensure_journal(ProllyChunkStore *s, bool create)
 				 errmsg("cannot change a chunk store during recovery")));
 	if (create)
 	{
-		LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+		jindex_append_lock(s->ix, true);
 		segment_header(s->dboid, s->spcoid, g->id);
-		LWLockRelease(ProllyJournalLock);
+		jindex_append_unlock(s->ix);
 	}
 	/* (open_segment() checks the header) */
 	if (!open_segment(g) || FileSize(g->file) < JOURNAL_HEADER_SIZE)
@@ -4575,13 +4579,13 @@ journal_drop_database(Oid dboid)
 	FileTag		tag;
 
 	jindex_forget(dboid);
-	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	SpinLockAcquire(&js->mutex);
 	for (int i = 0; i < CHECKED_ENDS; i++)
 	{
 		if (js->checked[i].dboid == dboid)
 			memset(&js->checked[i], 0, sizeof(CheckedEnd));
 	}
-	LWLockRelease(ProllyJournalLock);
+	SpinLockRelease(&js->mutex);
 	memset(&tag, 0, sizeof(tag));
 	tag.handler = SYNC_HANDLER_PROLLY_CHUNKS;
 	tag.forknum = (int16) prolly_chunkstore_journal.info.impl_id;
@@ -4976,13 +4980,13 @@ seal_segment(ProllyChunkStore *s, Manifest *m)
 	m->segments = segs;
 	m->sealed_at = sealed;
 	m->nsegments++;
-	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	jindex_append_lock(s->ix, true);
 	/* after every append to it: each reserved its range under this lock */
 	sealed[m->nsegments - 2] = GetXLogInsertRecPtr();
 	segment_header(s->dboid, s->spcoid, id);
 	INJECTION_POINT("prolly-segment-made", NULL);
 	replace_manifest(s, m, XLOG_CHUNKS_SEAL);
-	LWLockRelease(ProllyJournalLock);
+	jindex_append_unlock(s->ix);
 	return id;
 }
 
@@ -6000,7 +6004,7 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		 * what was reserved in between) is only for their writes.
 		 */
 		wait_reserved(s);
-		LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+		jindex_append_lock(s->ix, true);
 		wait_appends(s, PG_UINT64_MAX);
 		gc->window = true;
 		INSTR_TIME_SET_CURRENT(gc->window_began);
@@ -6418,7 +6422,7 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	scan_journal(s);
 	nm.root = s->root;
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
-	LWLockRelease(ProllyJournalLock);
+	jindex_append_unlock(s->ix);
 	gc->window = false;
 	{
 		instr_time	now;

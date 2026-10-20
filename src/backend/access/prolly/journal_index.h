@@ -78,6 +78,15 @@ extern bool jindex_load(JournalIndex *ix, const char *format, int format_len,
 /* Forget database dboid's index (dropped: an OID used again starts anew). */
 extern void jindex_forget(Oid dboid);
 
+/*
+ * The database's appends: a reservation holds this lock, as does a seal
+ * and a collection's window, so a window holds off only this
+ * database's appends.
+ */
+extern void jindex_append_lock(JournalIndex *ix, bool exclusive);
+extern void jindex_append_unlock(JournalIndex *ix);
+extern bool jindex_append_lock_held(JournalIndex *ix);
+
 /* The scan state, under the index's lock (exclusive: to change it). */
 extern void jindex_lock(JournalIndex *ix, bool exclusive);
 extern void jindex_unlock(JournalIndex *ix);
