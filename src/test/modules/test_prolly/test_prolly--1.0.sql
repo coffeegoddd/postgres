@@ -414,7 +414,8 @@ RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- The bytes the "basic" table file format keeps in memory for each chunk
--- of an open file of n chunks named by 20-byte hashes.
-CREATE FUNCTION test_tablefile_bytes_per_chunk(n int)
+-- of an open file of n chunks named by 20-byte hashes: its index read, or
+-- (mapped) used where the file has it.
+CREATE FUNCTION test_tablefile_bytes_per_chunk(n int, mapped bool DEFAULT false)
 RETURNS float8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

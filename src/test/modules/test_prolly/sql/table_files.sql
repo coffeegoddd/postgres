@@ -66,7 +66,9 @@ BEGIN READ ONLY;
 SELECT test_chunk_table_file(ARRAY['tf four'::bytea]);
 ROLLBACK;
 
--- A file's index takes about 32 bytes a chunk in memory (20-byte hashes):
--- each hash's 8-byte prefix and ordinal, its 12-byte suffix, its offset.
-SELECT test_tablefile_bytes_per_chunk(100000) BETWEEN 28 AND 40 AS compact_index;
+-- A file's index takes about 34 bytes a chunk read into memory (20-byte
+-- hashes): each hash's 8-byte prefix and ordinal, its 12-byte suffix, its
+-- offset and its filter's bits; mapped, as a store's files are, nothing.
+SELECT test_tablefile_bytes_per_chunk(100000) BETWEEN 28 AND 40 AS compact_index,
+	test_tablefile_bytes_per_chunk(100000, true) < 1 AS mapped_index;
 SELECT test_tablefile_basic_index() AS index_checked;

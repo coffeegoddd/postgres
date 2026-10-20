@@ -56,6 +56,13 @@ is($manifests[2], 'prolly_table_0000000000000001:2 prolly_table_0000000000000002
 my $reader = $node->background_psql('postgres');
 is($reader->query_safe(q{SELECT convert_from(test_chunk_get(test_content_hash('a1'::bytea)), 'UTF8')}),
 	'a1', 'a session reads a table file');
+SKIP:
+{
+	skip 'no /proc/self/maps', 1 unless -e '/proc/self/maps';
+	is($reader->query_safe(q{SELECT count(*) FROM regexp_split_to_table(
+			pg_read_file('/proc/self/maps'), E'\n') l WHERE l LIKE '%prolly\_table\_%'}),
+		'3', 'its three files\' indexes mapped, not read into its memory');
+}
 sql('SELECT test_chunk_conjoin()');
 push @manifests, sql($named);
 is($manifests[3], 'prolly_table_0000000000000004:43', 'conjoined as one');

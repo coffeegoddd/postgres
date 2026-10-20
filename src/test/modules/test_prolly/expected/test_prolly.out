@@ -38,7 +38,7 @@ FROM prolly_implementations();
  chunk_format  | basic        |       1 |              1
  row_applier   | replication  |       1 |              1
  row_applier   | stub         |       0 |              0
- table_file    | basic        |       1 |              2
+ table_file    | basic        |       1 |              3
  table_file    | stub         |       0 |              0
  change_finder | pages        |       1 |              8
  change_finder | log          |       2 |              2

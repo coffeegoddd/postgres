@@ -468,7 +468,8 @@ open_table(ProllyRemote *r, RemoteTable *t)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", t->path)));
-	t->tf = PROLLY_CALL(table_format(), open, table_read, t, t->size, r->cxt);
+	t->tf = PROLLY_CALL(table_format(), open, table_read, NULL, t, t->size,
+						 r->cxt);
 	if (t->tf == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),

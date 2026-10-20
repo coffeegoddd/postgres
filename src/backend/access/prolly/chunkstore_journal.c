@@ -135,6 +135,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifndef WIN32
+#include <sys/mman.h>
+#endif
 #ifdef USE_LZ4
 #include <lz4.h>
 #endif
@@ -304,6 +307,8 @@ typedef struct TableFile
 	uint64		size;
 	bool		settled;
 	ProllyTableFile *tf;
+	void	   *mapped;			/* its index, mapped (NULL: read) */
+	Size		mapped_len;
 } TableFile;
 
 /*
@@ -2945,13 +2950,56 @@ table_file_read(void *arg, uint64 offset, char *buf, Size len)
 	return FileRead(t->file, buf, len, offset, WAIT_EVENT_DATA_FILE_READ) == len;
 }
 
+/*
+ * Map len bytes of a table file at offset for its format to read in place:
+ * every process that has the file open shares the one copy in the page
+ * cache.  A table file is never written again (nor truncated) once
+ * written; one a conjoin or collection removes stays mapped until closed.
+ */
+static const char *
+table_file_map(void *arg, uint64 offset, Size len)
+{
+#ifndef WIN32
+	TableFile  *t = arg;
+	uint64		page = (uint64) sysconf(_SC_PAGESIZE);
+	uint64		start = offset - offset % page;
+	void	   *p;
+
+	if (len == 0 || t->mapped != NULL)
+		return NULL;
+	p = mmap(NULL, len + (offset - start), PROT_READ, MAP_SHARED,
+			 FileGetRawDesc(t->file), (off_t) start);
+	if (p == MAP_FAILED)
+		return NULL;
+	t->mapped = p;
+	t->mapped_len = len + (offset - start);
+	return (const char *) p + (offset - start);
+#else
+	return NULL;
+#endif
+}
+
+/* Close a table file's format, mapping and file (not its memory). */
 static void
-close_table(TableFile *t)
+release_table(TableFile *t)
 {
 	if (t->tf)
 		PROLLY_CALL(table_format(), close, t->tf);
+	t->tf = NULL;
+#ifndef WIN32
+	if (t->mapped)
+		munmap(t->mapped, t->mapped_len);
+#endif
+	t->mapped = NULL;
 	if (t->file >= 0)
 		FileClose(t->file);
+	t->file = -1;
+}
+
+static void
+close_table(TableFile *t)
+{
+	release_table(t);
 	pfree(t->path);
 	pfree(t);
 }
@@ -2984,13 +3032,18 @@ open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", t->path)));
 	}
-	t->tf = PROLLY_CALL(table_format(), open, table_file_read, t, t->size, cxt);
+	t->tf = PROLLY_CALL(table_format(), open, table_file_read, table_file_map, t,
+						t->size, cxt);
 	if (t->tf == NULL)
 	{
 		const ProllyTableFileRoutine *format = table_format();
 		uint32		version = format->version == NULL ? 0 :
 			format->version(table_file_read, t, t->size);
 
+#ifndef WIN32
+		if (t->mapped)
+			munmap(t->mapped, t->mapped_len);
+#endif
 		FileClose(t->file);
 		if (version != 0 && version != format->info.format_version)
 			check_format(t->path, "table file", version,
@@ -4284,10 +4337,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	{
 		foreach(lc, cs.tables)
 		{
-			TableFile  *t = lfirst(lc);
-
-			PROLLY_CALL(table_format(), close, t->tf);
-			FileClose(t->file);
+			release_table(lfirst(lc));
 		}
 	}
 	PG_END_TRY();
@@ -5741,11 +5791,7 @@ gc_abort(ProllyChunkGc *gc)
 		if (gc->files[i].segment && gc->files[i].file >= 0)
 			FileClose(gc->files[i].file);
 		else if (gc->files[i].t != NULL)
-		{
-			if (gc->files[i].t->tf)
-				PROLLY_CALL(table_format(), close, gc->files[i].t->tf);
-			FileClose(gc->files[i].t->file);
-		}
+			release_table(gc->files[i].t);
 	}
 	if (gc->appended != NULL && gc->appended->file >= 0)
 		FileClose(gc->appended->file);

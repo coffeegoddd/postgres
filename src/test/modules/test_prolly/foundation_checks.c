@@ -1268,6 +1268,17 @@ typedef struct MemFile
 	Size		len;
 } MemFile;
 
+/* a file in memory mapped: its bytes themselves */
+static const char *
+memfile_map(void *arg, uint64 offset, Size len)
+{
+	MemFile    *f = arg;
+
+	if (offset > f->len || len > f->len - offset)
+		return NULL;
+	return f->data + offset;
+}
+
 static bool
 memfile_read(void *arg, uint64 offset, char *buf, Size len)
 {
@@ -1366,7 +1377,9 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	/* (mapped, as a chunk store's own files are; read, as a remote's) */
+	f = PROLLY_CALL(tf, open, memfile_read, memfile_map, &mf, a.len,
+					CurrentMemoryContext);
 	if (f == NULL)
 		elog(ERROR, "a table file written doesn't open");
 	if (PROLLY_CALL(tf, count, f) != n)
@@ -1415,7 +1428,7 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 	tablefile_build(tf, 0, &a);
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext);
 	if (f == NULL || PROLLY_CALL(tf, count, f) != 0)
 		elog(ERROR, "an empty table file doesn't read back");
 	{
@@ -1503,7 +1516,7 @@ tablefile_shared_prefixes(const ProllyImplInfo *impl)
 	PROLLY_CALL(tf, write_finish, w, &file);
 	mf.data = file.data;
 	mf.len = file.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, file.len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, file.len, CurrentMemoryContext);
 	if (f == NULL)
 		elog(ERROR, "a table file of shared prefixes doesn't open");
 	for (int g = 0; g < ngroups; g++)
@@ -1556,20 +1569,20 @@ tablefile_rejects_other_bytes(const ProllyImplInfo *impl)
 	{
 		mf.data = a.data;
 		mf.len = cut;
-		if (PROLLY_CALL(tf, open, memfile_read, &mf, cut, CurrentMemoryContext))
+		if (PROLLY_CALL(tf, open, memfile_read, NULL, &mf, cut, CurrentMemoryContext))
 			elog(ERROR, "%zu of a table file's %d bytes open as one", cut, a.len);
 	}
 	/* a byte of the index changed */
 	f = NULL;
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext);
 	PROLLY_CALL(tf, entry, f, 0, &hash, &offset, &len);
 	copy = palloc(a.len);
 	memcpy(copy, a.data, a.len);
 	copy[a.len - 40] ^= 1;
 	mf.data = copy;
-	if (PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext))
+	if (PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext))
 		elog(ERROR, "a table file with its index changed opens");
 
 	/* a byte of a chunk changed */
@@ -1592,13 +1605,15 @@ tablefile_rejects_other_bytes(const ProllyImplInfo *impl)
 
 /*
  * The bytes the "basic" table file format keeps in memory for each chunk
- * of an open file of n chunks named by 20-byte hashes.
+ * of an open file of n chunks named by 20-byte hashes: its index read, or
+ * (mapped) used where the file has it.
  */
 PG_FUNCTION_INFO_V1(test_tablefile_bytes_per_chunk);
 Datum
 test_tablefile_bytes_per_chunk(PG_FUNCTION_ARGS)
 {
 	int32		n = PG_GETARG_INT32(0);
+	bool		mapped = PG_GETARG_BOOL(1);
 	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
 	ProllyTableFileWriter *w = PROLLY_CALL(tf, write_begin, CurrentMemoryContext);
 	MemoryContext cxt;
@@ -1624,7 +1639,8 @@ test_tablefile_bytes_per_chunk(PG_FUNCTION_ARGS)
 	mf.len = file.len;
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "table file",
 								ALLOCSET_DEFAULT_SIZES);
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, file.len, cxt);
+	f = PROLLY_CALL(tf, open, memfile_read, mapped ? memfile_map : NULL, &mf,
+					file.len, cxt);
 	if (f == NULL)
 		elog(ERROR, "the table file doesn't open");
 	used = MemoryContextMemAllocated(cxt, true);

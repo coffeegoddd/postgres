@@ -18,7 +18,10 @@
  *   chunks added in the same order give the same bytes.
  * - open() reads a file's index, from its end, through read (which reads
  *   len bytes at offset into buf, or fails); NULL if the bytes aren't a
- *   whole file of the format.  find() says where a chunk's bytes are in the
+ *   whole file of the format.  If map is given, the format may use the
+ *   bytes it gives (len bytes at offset, valid until the caller is done with
+ *   the file, after close()) instead of reading them into memory; map
+ *   returns NULL when it can't.  find() says where a chunk's bytes are in the
  *   file (false: not in it); decode() turns those bytes back into the chunk,
  *   appended to out, failing on corruption.
  * - count() and entry() list the file's chunks, in hash order; locate()
@@ -47,6 +50,9 @@ typedef struct ProllyTableFile ProllyTableFile;
 typedef bool (*ProllyTableFileRead) (void *arg, uint64 offset, char *buf,
 									 Size len);
 
+/* The file's len bytes at offset, mapped into memory; NULL if they can't be. */
+typedef const char *(*ProllyTableFileMap) (void *arg, uint64 offset, Size len);
+
 typedef struct ProllyTableFileRoutine
 {
 	ProllyImplInfo info;
@@ -56,8 +62,8 @@ typedef struct ProllyTableFileRoutine
 							  const void *data, Size len, StringInfo out);
 	void		(*write_finish) (ProllyTableFileWriter *w, StringInfo out);
 
-	ProllyTableFile *(*open) (ProllyTableFileRead read, void *arg,
-							  uint64 size, MemoryContext cxt);
+	ProllyTableFile *(*open) (ProllyTableFileRead read, ProllyTableFileMap map,
+							  void *arg, uint64 size, MemoryContext cxt);
 	bool		(*find) (ProllyTableFile *tf, const ProllyHash *hash,
 						 uint64 *offset, uint32 *len);
 	void		(*decode) (ProllyTableFile *tf, const char *bytes, uint32 len,
