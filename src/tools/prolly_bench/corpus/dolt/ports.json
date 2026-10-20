@@ -22360,7 +22360,7 @@
       "index": 0,
       "name": "invalid arguments",
       "source_sha256": "07bf5f458e45785700071edd25135a7b40160fa1ebc102cebad1b3c49862eefc",
-      "scenario_sha256": "6a352eb5654398d8a88eb1b757da0cc2055f8cc7cded7b543f136361a8cb7b96",
+      "scenario_sha256": "12f308fcc7d164bcd8389c5b7b2308c80dbaa625ea216a02a188976e5e393b5c",
       "setup": [
         {
           "index": 0,
@@ -22425,7 +22425,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "No dolt_diff_summary takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4, D15)"
+          "note": "One argument that isn't a range: refused, SQLSTATE 22023 (invalid parameter value), Dolt's ErrInvalidArgumentNumber. (D4)"
         },
         {
           "index": 2,
@@ -24459,7 +24459,7 @@
       "index": 0,
       "name": "basic schema changes",
       "source_sha256": "449fe6530d0ea8cc5dc13e107d7981ecffd31d4eb7a3fa1675daf53357636685",
-      "scenario_sha256": "9ff91a9e422ffede1866bbc416b3d2f91ad01b886cadf42a7f4b03e2754543cb",
+      "scenario_sha256": "3e4f0192dcfff40a8f5b9ef911ad390289d4ce70fd1c1b36e6a9b0eec816e308",
       "setup": [
         {
           "index": 0,
@@ -24647,28 +24647,28 @@
           "steps": [
             "assert-1"
           ],
-          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+          "note": "One argument that isn't a range: refused, as Dolt refuses it ('the first does not contain ..'), SQLSTATE 22023. (D4)"
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+          "note": "One argument that isn't a range: refused, as Dolt refuses it ('the first does not contain ..'), SQLSTATE 22023. (D4)"
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+          "note": "One argument that isn't a range: refused, as Dolt refuses it ('the first does not contain ..'), SQLSTATE 22023. (D4)"
         },
         {
           "index": 4,
           "steps": [
             "assert-4"
           ],
-          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15) (The tag doesn't matter: one argument is refused.)"
+          "note": "One argument that isn't a range: refused, as Dolt refuses it ('the first does not contain ..'), SQLSTATE 22023. (D4) (The tag doesn't matter: one argument that isn't a range is refused.)"
         },
         {
           "index": 5,
@@ -24694,7 +24694,7 @@
           "steps": [
             "assert-8"
           ],
-          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+          "note": "One argument that isn't a range: refused, as Dolt refuses it ('the first does not contain ..'), SQLSTATE 22023. (D4)"
         },
         {
           "index": 9,
