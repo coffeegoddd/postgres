@@ -74,7 +74,7 @@
       ],
       "sql": "SELECT * FROM dolt_diff_summary('t')",
       "expect": {
-        "sqlstate": "42883"
+        "sqlstate": "22023"
       }
     },
     {

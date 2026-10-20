@@ -185,7 +185,7 @@
       ],
       "sql": "SELECT * FROM dolt_schema_diff('HEAD')",
       "expect": {
-        "sqlstate": "42883"
+        "sqlstate": "22023"
       }
     },
     {
@@ -197,7 +197,7 @@
       ],
       "sql": "SELECT * FROM dolt_schema_diff($1)",
       "expect": {
-        "sqlstate": "42883"
+        "sqlstate": "22023"
       },
       "params": [
         {
@@ -214,7 +214,7 @@
       ],
       "sql": "SELECT * FROM dolt_schema_diff('branc1')",
       "expect": {
-        "sqlstate": "42883"
+        "sqlstate": "22023"
       }
     },
     {
@@ -226,7 +226,7 @@
       ],
       "sql": "SELECT * FROM dolt_schema_diff('tag1')",
       "expect": {
-        "sqlstate": "42883"
+        "sqlstate": "22023"
       }
     },
     {
@@ -262,7 +262,7 @@
       ],
       "sql": "SELECT * FROM dolt_schema_diff('inventory')",
       "expect": {
-        "sqlstate": "42883"
+        "sqlstate": "22023"
       }
     },
     {
