@@ -133,6 +133,33 @@ libpq_get_since(ProllyRemote *remote, const ProllyHash *wanted, int nwanted,
 				visit, arg);
 }
 
+/* (a module without them: none, and a clone walks) */
+static bool
+libpq_files(ProllyRemote *remote, ProllyRemoteFileVisit visit, void *arg)
+{
+	if (!PROLLY_HAS(libpq(), files))
+		return false;
+	return PROLLY_CALL(libpq(), files, remote, visit, arg);
+}
+
+static ProllyRemoteFile *
+libpq_file_open(ProllyRemote *remote, const char *key)
+{
+	return PROLLY_CALL(libpq(), file_open, remote, key);
+}
+
+static bool
+libpq_file_next(ProllyRemoteFile *file, ProllyHash *hash, StringInfo frame)
+{
+	return PROLLY_CALL(libpq(), file_next, file, hash, frame);
+}
+
+static void
+libpq_file_close(ProllyRemoteFile *file)
+{
+	PROLLY_CALL(libpq(), file_close, file);
+}
+
 #define LIBPQ_CALLBACKS \
 	.check_url = libpq_check_url, \
 	.open = libpq_open, \
@@ -145,7 +172,11 @@ libpq_get_since(ProllyRemote *remote, const ProllyHash *wanted, int nwanted,
 	.move_head = libpq_move_head, \
 	.get_many = libpq_get_many, \
 	.has_many = libpq_has_many, \
-	.get_since = libpq_get_since
+	.get_since = libpq_get_since, \
+	.files = libpq_files, \
+	.file_open = libpq_file_open, \
+	.file_next = libpq_file_next, \
+	.file_close = libpq_file_close
 
 const ProllyRemoteRoutine prolly_remote_postgresql = {
 	.info = {

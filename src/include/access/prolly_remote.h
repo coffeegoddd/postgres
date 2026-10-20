@@ -33,6 +33,13 @@
  *   commits lacks of the wanted ones, as the remote can tell (optional, for
  *   a remote that runs this code): a guess the caller checks, and
  *   completes, as it would without it.
+ * - files() visits the remote's files, which a clone copies whole: each
+ *   by the key it names it by, with its chunk count and size, and whether
+ *   it is a journal (a file made as it is read, which grows); false, having
+ *   visited none, if the remote can't list them (optional: a clone walks
+ *   otherwise).  file_open() starts reading a file's chunks, as stored, in
+ *   its order; file_next() gives the next (false at its end);
+ *   file_close() ends it.
  * - move_head() moves branch from expected (an empty hash: the branch
  *   doesn't exist) to head (NULL: delete it), durably, as a compare-and-
  *   swap: false, changing nothing, if the branch isn't at expected.  The
@@ -59,6 +66,12 @@ typedef struct ProllyRemote ProllyRemote;
 /* Visits a chunk a remote gave: its hash and the chunk as stored (framed). */
 typedef void (*ProllyRemoteChunkVisit) (const ProllyHash *hash,
 										const char *data, int len, void *arg);
+
+/* Visits a remote's file: its key, chunk count and size; a journal? */
+typedef void (*ProllyRemoteFileVisit) (const char *key, uint32 nchunks,
+									   uint64 size, bool journal, void *arg);
+
+typedef struct ProllyRemoteFile ProllyRemoteFile;
 
 /* Visits a remote's branch and the commit it is at. */
 typedef void (*ProllyRemoteHeadVisit) (const char *branch,
@@ -94,13 +107,22 @@ typedef struct ProllyRemoteRoutine
 	void		(*get_since) (ProllyRemote *remote, const ProllyHash *wanted,
 							  int nwanted, const ProllyHash *known, int nknown,
 							  ProllyRemoteChunkVisit visit, void *arg);
+
+	/* Whole files (optional). */
+	bool		(*files) (ProllyRemote *remote, ProllyRemoteFileVisit visit,
+						  void *arg);
+	ProllyRemoteFile *(*file_open) (ProllyRemote *remote, const char *key);
+	bool		(*file_next) (ProllyRemoteFile *file, ProllyHash *hash,
+							  StringInfo frame);
+	void		(*file_close) (ProllyRemoteFile *file);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \
 	"check_url", "open", "close", "format", "heads", "get", "has", \
-	"add_chunks", "move_head", "get_many", "has_many", "get_since"
+	"add_chunks", "move_head", "get_many", "has_many", "get_since", \
+	"files", "file_open", "file_next", "file_close"
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
-#define PROLLY_REMOTE_LAST_CALLBACK get_since
+#define PROLLY_REMOTE_LAST_CALLBACK file_close
 
 /*
  * The implementation of remotes over a libpq connection, which the loadable

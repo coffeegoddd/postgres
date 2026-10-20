@@ -4157,10 +4157,13 @@ check_remote_format(const ProllyRemoteRoutine *rr, ProllyRemote *r,
  * Fetch remote name's branches (NIL: all of them) into its remote-tracking
  * branches, the remote opened and its heads read once; with need, refuse
  * before receiving anything if the remote hasn't that branch.  *got (if
- * not NULL) is what was fetched: the branches and their commits.
+ * not NULL) is what was fetched: the branches and their commits.  A
+ * clone's (into a database with nothing to walk against) copies the
+ * remote's files whole, where the transfer can.
  */
 static void
-fetch_remote(const char *name, List *only, const char *need, Heads *got)
+fetch_remote(const char *name, List *only, const char *need, Heads *got,
+			 bool clone)
 {
 	ProllyDatabaseComponents dc;
 	char	   *url = need_remote(name);
@@ -4226,7 +4229,13 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got)
 		commits = palloc(sizeof(ProllyHash) * Max(list_length(want.commits), 1));
 		foreach(c, want.commits)
 			commits[n++] = *(ProllyHash *) lfirst(c);
-		(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
+		{
+			uint64		count;
+
+			if (!clone || !PROLLY_HAS(dc.transfer, clone) ||
+				!PROLLY_CALL(dc.transfer, clone, rr, r, commits, n, &count))
+				(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
+		}
 	}
 	PG_FINALLY();
 	{
@@ -4268,7 +4277,7 @@ dolt_fetch(PG_FUNCTION_ARGS)
 		else
 			branches = lappend(branches, args[i]);
 	}
-	fetch_remote(remote ? remote : "origin", branches, NULL, NULL);
+	fetch_remote(remote ? remote : "origin", branches, NULL, NULL, false);
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
@@ -4700,7 +4709,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 		need_upstream("dolt_pull", &remote, &branch);
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
-	fetch_remote(remote, list_make1(branch), NULL, NULL);
+	fetch_remote(remote, list_make1(branch), NULL, NULL, false);
 
 	/* (after "--": a remote's name may begin with "-") */
 	merge_args = lappend(merge_args, "--");
@@ -4875,7 +4884,8 @@ cloned_as_branch(const char *name)
  * Before any branch is made, what every branch's head needs from outside
  * the versioned schemas is checked (prolly_deps.h), and the extensions the
  * database lacks are made.  All in the transaction: a clone that fails
- * leaves nothing.
+ * leaves nothing but the files it copied whole, out of what the store
+ * reads, which a clone tried again doesn't copy again.
  */
 Datum
 dolt_clone(PG_FUNCTION_ARGS)
@@ -4928,7 +4938,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 
 	/* the remote added as dolt_remote() adds one, and fetched */
 	add_remote(remote, url);
-	fetch_remote(remote, NIL, branch, &h);
+	fetch_remote(remote, NIL, branch, &h, true);
 	if (h.branches == NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

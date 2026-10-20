@@ -129,7 +129,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  transfer      | chunks         | complete                       | pass
  transfer      | stub           | identity                       | pass
  transfer      | stub           | receive_then_send              | not implemented (missing receive, send)
- transfer      | stub           | complete                       | not implemented (2 of 2 callbacks missing)
+ transfer      | stub           | complete                       | not implemented (3 of 3 callbacks missing)
  diff_merge    | folded         | identity                       | pass
  diff_merge    | folded         | diff_reports_each_change_once  | no checks yet
  diff_merge    | folded         | merge                          | no checks yet

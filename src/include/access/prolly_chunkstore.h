@@ -43,6 +43,20 @@
  *   are (both optional: prolly_chunk_get_stored() and
  *   prolly_chunk_add_stored() decode and encode them otherwise).  So a
  *   transfer moves chunks as stored, compressed once, where they were made.
+ * - file_chunks() visits the chunks of one of the store's files as stored,
+ *   in its order: a table file table_files() names, or (name NULL) the
+ *   journal, each of its chunks once.  A clone's sender reads them so.
+ * - A clone's files (optional, the rest with receive_file()): the files a
+ *   remote sends whole, each under its key.  receive_file() writes the
+ *   chunks next() gives (framed) as the file for key, synced and WAL-logged
+ *   as a table file is, but named by no manifest, so nothing reads it; it
+ *   stays, through a failure too, until adopted or forgotten, so a clone
+ *   tried again receives only what it lacks.  received_file() says
+ *   whether the file for key is there whole (and its chunk count).
+ *   received_get() reads a chunk of the files received (out NULL: whether
+ *   they have it), received_chunks() visits each of their chunks, as
+ *   stored.  adopt_received() names the files received in the manifest, at
+ *   once; forget_received() removes them.
  * - add_table_file() adds a table file of the chunks next() gives (until it
  *   returns false), at once and for every transaction: the chunks of
  *   another store, received whole, or of a rewrite.  It isn't undone if the
@@ -143,6 +157,11 @@ struct FileTag;
 
 /* Visits a chunk another chunk names. */
 typedef void (*ProllyChunkRefVisit) (const ProllyHash *ref, void *arg);
+
+/* Visits a chunk as stored (framed). */
+typedef void (*ProllyChunkStoredVisit) (const ProllyHash *hash,
+										const char *frame, Size len,
+										void *arg);
 
 /* The next chunk to add, in hash and data; false when there are no more. */
 typedef bool (*ProllyChunkNext) (void *arg, ProllyHash *hash, StringInfo data);
@@ -342,6 +361,20 @@ typedef struct ProllyChunkStoreRoutine
 							   StringInfo out);
 	void		(*add_stored_table_file) (ProllyChunkStore *store,
 										  ProllyChunkNext next, void *arg);
+
+	/* Whole files: sent, and received (optional). */
+	void		(*file_chunks) (ProllyChunkStore *store, const char *name,
+								ProllyChunkStoredVisit visit, void *arg);
+	void		(*receive_file) (ProllyChunkStore *store, const char *key,
+								 ProllyChunkNext next, void *arg);
+	bool		(*received_file) (ProllyChunkStore *store, const char *key,
+								  uint32 *nchunks);
+	bool		(*received_get) (ProllyChunkStore *store, const ProllyHash *hash,
+								 StringInfo out);
+	void		(*received_chunks) (ProllyChunkStore *store,
+									ProllyChunkStoredVisit visit, void *arg);
+	void		(*adopt_received) (ProllyChunkStore *store);
+	void		(*forget_received) (ProllyChunkStore *store);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -353,9 +386,11 @@ typedef struct ProllyChunkStoreRoutine
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
 	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots", \
-	"get_stored", "add_stored_table_file"
+	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
+	"received_file", "received_get", "received_chunks", "adopt_received", \
+	"forget_received"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK add_stored_table_file
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK forget_received
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

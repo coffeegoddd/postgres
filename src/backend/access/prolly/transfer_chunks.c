@@ -25,6 +25,17 @@
  * store, as one table file: nothing is found before the whole is checked,
  * and an error before leaves the store as it was.
  *
+ * Cloning.  A database with nothing to walk against copies the remote's
+ * files whole instead (as Dolt's clone does), a file at a time, each chunk
+ * re-hashed as it comes; each kept whole, out of what the store reads, so
+ * a clone that fails and is tried again copies only the files it lacks.
+ * Then every reference in them is resolved, in them or the store, and each
+ * commit the heads reach checked to be of this build's format, before the
+ * store takes them all at once.  A remote that can't list its files, or
+ * whose journal (which grows as it is read) is a fifth of it or more, is
+ * walked instead.  A clone brings the remote's garbage too, until the
+ * store's next collection.
+ *
  * Sending.  The walk reads this store; a chunk the remote has is declined.
  * What it took is sent at once (the remote's add_chunks()).
  *
@@ -38,6 +49,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "miscadmin.h"
+#include "utils/injection_point.h"
 #include "storage/buffile.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -501,6 +513,231 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	return count;
 }
 
+/* Cloning */
+
+typedef struct RemoteFiles
+{
+	List	   *keys;			/* char * */
+	List	   *counts;			/* their chunk counts */
+	uint64		table_bytes;
+	uint64		journal_bytes;
+} RemoteFiles;
+
+static void
+note_file(const char *key, uint32 nchunks, uint64 size, bool journal, void *arg)
+{
+	RemoteFiles *rf = arg;
+
+	rf->keys = lappend(rf->keys, pstrdup(key));
+	rf->counts = lappend_int(rf->counts, (int) nchunks);
+	if (journal)
+		rf->journal_bytes += size;
+	else
+		rf->table_bytes += size;
+}
+
+/* A remote file's chunks, as stored, each checked against its hash. */
+typedef struct Copying
+{
+	const ProllyRemoteRoutine *rr;
+	ProllyRemoteFile *file;
+	const ProllyHashRoutine *hash;
+	StringInfoData chunk;
+	uint64		count;
+} Copying;
+
+static bool
+copied_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	Copying    *cp = arg;
+	ProllyHashCtx *ctx;
+	ProllyHash	actual;
+
+	if (!PROLLY_CALL(cp->rr, file_next, cp->file, hash, data))
+		return false;
+	resetStringInfo(&cp->chunk);
+	if (!prolly_chunk_unframe(data->data, data->len, &cp->chunk))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	ctx = PROLLY_CALL(cp->hash, begin, CurrentMemoryContext);
+	PROLLY_CALL(cp->hash, update, ctx, (const uint8 *) cp->chunk.data, cp->chunk.len);
+	PROLLY_CALL(cp->hash, finish, ctx, &actual);
+	if (actual.len != hash->len || memcmp(actual.bytes, hash->bytes, hash->len) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s doesn't match its hash",
+						prolly_hash_hex(hash)),
+				 errdetail("Its bytes hash to %s.", prolly_hash_hex(&actual))));
+	cp->count++;
+	return true;
+}
+
+/* What the received files are checked with. */
+typedef struct CloneCheck
+{
+	const ProllyChunkStoreRoutine *cs;
+	ProllyChunkStore *store;
+	StringInfoData chunk;
+	const ProllyHash *from;		/* the chunk whose references are checked */
+	uint64		count;
+} CloneCheck;
+
+static void
+check_reference(const ProllyHash *ref, void *arg)
+{
+	CloneCheck *cc = arg;
+
+	if (!PROLLY_CALL(cc->cs, received_get, cc->store, ref, NULL) &&
+		!PROLLY_CALL(cc->cs, has, cc->store, ref))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s names chunk %s, which it lacks",
+						prolly_hash_hex(cc->from), prolly_hash_hex(ref))));
+}
+
+static void
+check_received(const ProllyHash *hash, const char *frame, Size len, void *arg)
+{
+	CloneCheck *cc = arg;
+
+	resetStringInfo(&cc->chunk);
+	if (!prolly_chunk_unframe(frame, len, &cc->chunk))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a received chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	cc->from = hash;
+	prolly_chunk_references(cc->chunk.data, cc->chunk.len, check_reference, cc);
+	cc->count++;
+}
+
+/* The store's read_through() source while cloning: the files received. */
+static bool
+received_source(void *arg, const ProllyHash *hash, StringInfo out)
+{
+	CloneCheck *cc = arg;
+
+	return PROLLY_CALL(cc->cs, received_get, cc->store, hash, out);
+}
+
+/* Every commit the heads reach: one, of this build's format. */
+static void
+check_cloned_commits(const ProllyHash *commits, int ncommits)
+{
+	ProllyDatabaseComponents dc;
+	List	   *queue = NIL;
+	HTAB	   *seen;
+	HASHCTL		ctl;
+
+	prolly_database_components(&dc);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly cloned commits", 64, &ctl,
+					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < ncommits; i++)
+		queue = lappend(queue, (void *) &commits[i]);
+	while (queue != NIL)
+	{
+		ProllyHash *id = linitial(queue);
+		ProllyHash	key;
+		bool		found;
+		ProllyCommitInfo info;
+
+		queue = list_delete_first(queue);
+		hash_key(&key, id);
+		(void) hash_search(seen, &key, HASH_ENTER, &found);
+		if (found)
+			continue;
+		if (!PROLLY_CALL(dc.refs, commit_get, id, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the remote's commit %s isn't in its files",
+							prolly_hash_hex(id))));
+		if (!PROLLY_CALL(dc.canonicalizer, in_format, &info.root))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the remote's commit %s is of another canonical format",
+							prolly_hash_hex(id)),
+					 errdetail("A database takes only commits of the format it makes.")));
+		for (int i = 0; i < info.nparents; i++)
+		{
+			ProllyHash *p = palloc(sizeof(ProllyHash));
+
+			*p = info.parents[i];
+			queue = lappend(queue, p);
+		}
+	}
+	hash_destroy(seen);
+}
+
+static bool
+chunks_clone(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+			 const ProllyHash *commits, int ncommits, uint64 *count)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store;
+	RemoteFiles rf = {NIL, NIL, 0, 0};
+	ListCell   *k;
+	ListCell   *n;
+	CloneCheck	cc;
+
+	if (!PROLLY_HAS(rr, files) || !PROLLY_HAS(cs, receive_file) ||
+		!PROLLY_CALL(rr, files, remote, note_file, &rf))
+		return false;
+	/* (a journal a fifth of the remote or more: the walk reads less) */
+	if (rf.journal_bytes * 5 >= rf.table_bytes + rf.journal_bytes &&
+		rf.journal_bytes > 0)
+		return false;
+	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
+
+	forboth(k, rf.keys, n, rf.counts)
+	{
+		uint32		have;
+		Copying		cp = {rr, NULL, prolly_content_hash()};
+
+		/* (one whole from a clone tried before: checked as it came) */
+		if (PROLLY_CALL(cs, received_file, store, lfirst(k), &have) &&
+			have == (uint32) lfirst_int(n))
+			continue;
+		initStringInfo(&cp.chunk);
+		cp.file = PROLLY_CALL(rr, file_open, remote, lfirst(k));
+		PG_TRY();
+		{
+			PROLLY_CALL(cs, receive_file, store, lfirst(k), copied_next, &cp);
+		}
+		PG_FINALLY();
+		{
+			PROLLY_CALL(rr, file_close, cp.file);
+		}
+		PG_END_TRY();
+		pfree(cp.chunk.data);
+		INJECTION_POINT("prolly-clone-file-received", NULL);
+	}
+
+	/* every reference resolved, every commit of this format: then taken */
+	memset(&cc, 0, sizeof(cc));
+	cc.cs = cs;
+	cc.store = store;
+	initStringInfo(&cc.chunk);
+	PROLLY_CALL(cs, received_chunks, store, check_received, &cc);
+	PROLLY_CALL(cs, read_through, store, received_source, NULL, &cc);
+	PG_TRY();
+	{
+		check_cloned_commits(commits, ncommits);
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(cs, read_through, store, NULL, NULL, NULL);
+	}
+	PG_END_TRY();
+	PROLLY_CALL(cs, adopt_received, store);
+	*count = cc.count;
+	return true;
+}
+
 /* Sending */
 
 typedef struct Sending
@@ -647,5 +884,6 @@ const ProllyTransferRoutine prolly_transfer_chunks = {
 		"other side lacks, checked on receipt",
 	},
 	.receive = chunks_receive,
+	.clone = chunks_clone,
 	.send = chunks_send,
 };

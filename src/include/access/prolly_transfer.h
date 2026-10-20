@@ -45,10 +45,21 @@ typedef struct ProllyTransferRoutine
 	 */
 	uint64		(*send) (const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 						 const ProllyHash *commits, int ncommits);
+
+	/*
+	 * Optional, for a database with nothing to walk against (a clone's):
+	 * receive the remote's files whole, then check them as receive() checks
+	 * what it receives, before any is added; false, having added nothing,
+	 * if it can't (the remote can't list them, or its journal is a large
+	 * part of it: receive() then).  *count is the chunks received.
+	 */
+	bool		(*clone) (const ProllyRemoteRoutine *rr, ProllyRemote *remote,
+						  const ProllyHash *commits, int ncommits,
+						  uint64 *count);
 } ProllyTransferRoutine;
 
-#define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send"
+#define PROLLY_TRANSFER_CALLBACK_NAMES "receive", "send", "clone"
 #define PROLLY_TRANSFER_FIRST_CALLBACK receive
-#define PROLLY_TRANSFER_LAST_CALLBACK send
+#define PROLLY_TRANSFER_LAST_CALLBACK clone
 
 #endif							/* PROLLY_TRANSFER_H */

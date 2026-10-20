@@ -382,6 +382,106 @@ dolt_serve_get(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * dolt_serve_files(OUT key text, OUT chunks int4, OUT bytes int8, OUT
+ * journal bool) returns setof record: the store's table files, which a
+ * clone copies whole, and its journal (key "journal", read as one file).
+ */
+typedef struct ServedFiles
+{
+	ReturnSetInfo *rsinfo;
+	uint64		journal_chunks;
+	uint64		journal_bytes;
+} ServedFiles;
+
+static void
+served_file(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	ServedFiles *sf = arg;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = Int32GetDatum(nchunks);
+	values[2] = Int64GetDatum((int64) size);
+	values[3] = BoolGetDatum(false);
+	tuplestore_putvalues(sf->rsinfo->setResult, sf->rsinfo->setDesc, values, nulls);
+}
+
+static void
+served_segment(const char *name, int nchunks, uint64 size, bool settled, void *arg)
+{
+	ServedFiles *sf = arg;
+
+	sf->journal_chunks += nchunks;
+	sf->journal_bytes += size;
+}
+
+Datum
+dolt_serve_files(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	const ProllyChunkStoreRoutine *csr = prolly_chunk_store();
+	ProllyChunkStore *cs = store();
+	ServedFiles sf = {rsinfo, 0, 0};
+
+	check_serving(false);
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_HAS(csr, file_chunks))
+		return (Datum) 0;
+	PROLLY_CALL(csr, table_files, cs, served_file, &sf);
+	PROLLY_CALL(csr, segments, cs, true, served_segment, &sf);
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+
+		values[0] = CStringGetTextDatum("journal");
+		values[1] = Int32GetDatum((int32) Min(sf.journal_chunks, PG_INT32_MAX));
+		values[2] = Int64GetDatum((int64) sf.journal_bytes);
+		values[3] = BoolGetDatum(true);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+typedef struct ServedChunks
+{
+	ReturnSetInfo *rsinfo;
+} ServedChunks;
+
+static void
+served_chunk(const ProllyHash *hash, const char *frame, Size len, void *arg)
+{
+	ServedChunks *sc = arg;
+	Datum		values[2];
+	bool		nulls[2] = {0};
+
+	values[0] = PointerGetDatum(hash_bytea(hash));
+	values[1] = PointerGetDatum(bytes_bytea(frame, (int) len));
+	tuplestore_putvalues(sc->rsinfo->setResult, sc->rsinfo->setDesc, values, nulls);
+	pfree(DatumGetPointer(values[0]));
+	pfree(DatumGetPointer(values[1]));
+}
+
+/*
+ * dolt_serve_file_chunks(key text, OUT hash bytea, OUT chunk bytea) returns
+ * setof record: the chunks of the file dolt_serve_files() names key, as
+ * stored (framed), in its order.
+ */
+Datum
+dolt_serve_file_chunks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *key = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ServedChunks sc = {rsinfo};
+
+	check_serving(false);
+	InitMaterializedSRF(fcinfo, 0);
+	PROLLY_CALL(prolly_chunk_store(), file_chunks, store(),
+				strcmp(key, "journal") == 0 ? NULL : key, served_chunk, &sc);
+	return (Datum) 0;
+}
+
 /* What dolt_serve_since() sends: each chunk once. */
 typedef struct Since
 {

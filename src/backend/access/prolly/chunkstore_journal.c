@@ -157,6 +157,7 @@
 #include "journal_index.h"
 #include "commands/vacuum.h"
 #include "catalog/pg_tablespace_d.h"
+#include "common/hashfn.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -184,6 +185,15 @@
 #define SEGMENT_PREFIX		"prolly_journal_"	/* the others', id in hex */
 #define MANIFEST_FILE		"prolly_manifest"
 #define MANIFEST_TEMP		"prolly_manifest.tmp"
+
+/*
+ * A clone's files, received whole: table files whose ids have this bit
+ * (from the key the remote names the file by), named apart from the
+ * store's own (RECEIVED_PREFIX), so nothing that tidies unnamed files
+ * removes them before they are adopted or forgotten.
+ */
+#define RECEIVED_ID			(UINT64CONST(1) << 63)
+#define RECEIVED_PREFIX		"prolly_received_"
 #define MANIFEST_MAGIC		"PRLYMAN1"
 #define MANIFEST_VERSION	4
 #define TABLE_FILE_FORMAT	"basic"
@@ -471,6 +481,8 @@ struct ProllyChunkStore
 	uint64		root_offset;	/* the manifest's root, or none */
 
 	List	   *tables;			/* TableFile *, as the manifest last read named */
+	List	   *received;		/* TableFile *, a clone's files, whole */
+	bool		received_open;	/* received is those on disk */
 	uint64		manifests_seen; /* the shared count when it was read */
 	uint64		segments_seen;	/* likewise, for the segments */
 	uint32		gc_generation;	/* the manifest's, as last read */
@@ -2688,6 +2700,9 @@ dir_file(const char *dir, const char *name)
 static char *
 table_file_name(uint64 id)
 {
+	if (id & RECEIVED_ID)
+		return psprintf(RECEIVED_PREFIX "%016llx",
+						(unsigned long long) (id & ~RECEIVED_ID));
 	return psprintf("prolly_table_%016llx", (unsigned long long) id);
 }
 
@@ -4645,7 +4660,8 @@ sync_journal_in(const char *dir)
 			pfree(path);
 			continue;
 		}
-		if (strncmp(de->d_name, "prolly_table_", 13) != 0)
+		if (strncmp(de->d_name, "prolly_table_", 13) != 0 &&
+			strncmp(de->d_name, RECEIVED_PREFIX, strlen(RECEIVED_PREFIX)) != 0)
 			continue;
 		INJECTION_POINT("prolly-checkpoint-table-file", NULL);
 		path = dir_file(dir, de->d_name);
@@ -4998,6 +5014,389 @@ journal_add_stored_table_file(ProllyChunkStore *s, ProllyChunkNext next,
 							  void *arg)
 {
 	add_table_file(s, next, arg, true);
+}
+
+/* ------------------------------------------------------------------------
+ * Whole files: a clone's
+ * ------------------------------------------------------------------------
+ */
+
+/* The id of the file received for key. */
+static uint64
+received_id(const char *key)
+{
+	uint64		h = hash_bytes_extended((const unsigned char *) key, strlen(key), 0);
+
+	return h | RECEIVED_ID;
+}
+
+/*
+ * The received file id of database directory dir, opened in cxt: NULL if
+ * it isn't there whole (missing, or cut short).
+ */
+static TableFile *
+open_received(const char *dir, uint64 id, MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	TableFile  *t = palloc0(sizeof(TableFile));
+	struct stat st;
+
+	t->id = id;
+	t->path = table_file_path(dir, id);
+	t->file = -1;
+	MemoryContextSwitchTo(old);
+	if (stat(t->path, &st) != 0)
+	{
+		close_table(t);
+		return NULL;
+	}
+	t->size = st.st_size;
+	t->file = PathNameOpenFile(t->path, O_RDONLY | PG_BINARY);
+	if (t->file < 0)
+	{
+		close_table(t);
+		return NULL;
+	}
+	t->tf = PROLLY_CALL(table_format(), open, table_file_read, table_file_map, t,
+						t->size, cxt);
+	if (t->tf == NULL)
+	{
+		close_table(t);
+		return NULL;
+	}
+	return t;
+}
+
+/* The ids of the received files in database directory dir. */
+static List *
+received_ids(const char *dir)
+{
+	DIR		   *d = AllocateDir(dir);
+	struct dirent *de;
+	List	   *ids = NIL;
+
+	while ((de = ReadDir(d, dir)) != NULL)
+	{
+		char	   *end;
+		uint64		id;
+
+		if (strncmp(de->d_name, RECEIVED_PREFIX, strlen(RECEIVED_PREFIX)) != 0)
+			continue;
+		id = strtou64(de->d_name + strlen(RECEIVED_PREFIX), &end, 16);
+		if (*end != '\0')
+			continue;
+		ids = lappend(ids, (void *) palloc(sizeof(uint64)));
+		*(uint64 *) llast(ids) = id | RECEIVED_ID;
+	}
+	FreeDir(d);
+	return ids;
+}
+
+/* Forget the received files opened: what is on disk changed. */
+static void
+received_changed(ProllyChunkStore *s)
+{
+	close_tables(s->received);
+	s->received = NIL;
+	s->received_open = false;
+}
+
+/* The received files on disk, whole, opened. */
+static List *
+received_tables(ProllyChunkStore *s)
+{
+	char	   *dir;
+	List	   *ids;
+
+	if (s->received_open)
+		return s->received;
+	dir = GetDatabasePath(s->dboid, s->spcoid);
+	ids = received_ids(dir);
+	foreach_ptr(uint64, id, ids)
+	{
+		TableFile  *t = open_received(dir, *id, TopMemoryContext);
+
+		if (t)
+		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+			s->received = lappend(s->received, t);
+			MemoryContextSwitchTo(old);
+		}
+	}
+	list_free_deep(ids);
+	pfree(dir);
+	s->received_open = true;
+	return s->received;
+}
+
+static void
+journal_receive_file(ProllyChunkStore *s, const char *key, ProllyChunkNext next,
+					 void *arg)
+{
+	uint32		nchunks;
+	uint64		size;
+
+	received_changed(s);
+	(void) write_file(s, received_id(key), next, arg, true, &nchunks, &size);
+}
+
+static bool
+journal_received_file(ProllyChunkStore *s, const char *key, uint32 *nchunks)
+{
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	TableFile  *t = open_received(dir, received_id(key), CurrentMemoryContext);
+
+	pfree(dir);
+	if (t == NULL)
+		return false;
+	*nchunks = (uint32) PROLLY_CALL(table_format(), count, t->tf);
+	close_table(t);
+	return true;
+}
+
+/* A chunk's bytes in a table file: read, decoded or (stored) as stored. */
+static void
+table_chunk(TableFile *t, uint64 offset, uint32 len, bool stored, StringInfo out)
+{
+	char	   *bytes = palloc(len);
+
+	if (!table_file_read(t, offset, bytes, len))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
+						len, (unsigned long long) offset, t->path)));
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_FILE_READS, 1);
+	if (stored)
+		PROLLY_CALL(table_format(), read_stored, t->tf, bytes, len, out);
+	else
+		PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
+	pfree(bytes);
+}
+
+static bool
+journal_received_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
+{
+	ProllyHash	key;
+
+	hash_key(&key, hash);
+	foreach_ptr(TableFile, t, received_tables(s))
+	{
+		uint64		offset;
+		uint32		len;
+
+		if (!PROLLY_CALL(table_format(), find, t->tf, &key, &offset, &len))
+			continue;
+		if (out)
+			table_chunk(t, offset, len, false, out);
+		return true;
+	}
+	return false;
+}
+
+static void
+journal_received_chunks(ProllyChunkStore *s, ProllyChunkStoredVisit visit,
+						void *arg)
+{
+	StringInfoData frame;
+
+	initStringInfo(&frame);
+	foreach_ptr(TableFile, t, received_tables(s))
+	{
+		int			n = PROLLY_CALL(table_format(), count, t->tf);
+
+		for (int i = 0; i < n; i++)
+		{
+			ProllyHash	h;
+			uint64		offset;
+			uint32		len;
+
+			PROLLY_CALL(table_format(), entry, t->tf, i, &h, &offset, &len);
+			resetStringInfo(&frame);
+			table_chunk(t, offset, len, true, &frame);
+			visit(&h, frame.data, frame.len, arg);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	pfree(frame.data);
+}
+
+/*
+ * Name the received files in the manifest, beside those it names, at
+ * once; the received files not whole removed.  The manifest's lock is
+ * held until the transaction ends.
+ */
+static void
+journal_adopt_received(ProllyChunkStore *s)
+{
+	Manifest	m;
+	Manifest	nm;
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	List	   *ids;
+	List	   *tables = received_tables(s);
+
+	xact_note(s);
+	lock_manifest(s, &m);
+	if (m.gc_generation != s->xact_generation)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("the chunk store was collected while the transaction ran"),
+				 errhint("Try the transaction again.")));
+	nm = m;
+	scan_journal(s);
+	nm.root = s->root;
+	nm.files = palloc(sizeof(ManifestFile) * (m.nfiles + list_length(tables) + 1));
+	memcpy(nm.files, m.files, sizeof(ManifestFile) * m.nfiles);
+	foreach_ptr(TableFile, t, tables)
+	{
+		bool		named = false;
+
+		for (int i = 0; i < m.nfiles; i++)
+			named |= m.files[i].id == t->id;
+		if (named)
+			continue;
+		nm.files[nm.nfiles].id = t->id;
+		nm.files[nm.nfiles].nchunks = PROLLY_CALL(table_format(), count, t->tf);
+		nm.files[nm.nfiles].size = t->size;
+		nm.files[nm.nfiles].flags = 0;
+		nm.nfiles++;
+	}
+	replace_manifest(s, &nm, XLOG_CHUNKS_MANIFEST);
+
+	/* (those not whole: never to be adopted) */
+	ids = received_ids(dir);
+	foreach_ptr(uint64, id, ids)
+	{
+		bool		named = false;
+
+		for (int i = 0; i < nm.nfiles; i++)
+			named |= nm.files[i].id == *id;
+		if (!named)
+			table_file_unlink(s, dir, *id, false);
+	}
+	list_free_deep(ids);
+	received_changed(s);
+	load_tables(s, true);
+	pfree(nm.files);
+	pfree(dir);
+}
+
+/* Remove the received files the manifest doesn't name. */
+static void
+journal_forget_received(ProllyChunkStore *s)
+{
+	Manifest	m;
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	List	   *ids;
+
+	received_changed(s);
+	lock_manifest(s, &m);
+	ids = received_ids(dir);
+	foreach_ptr(uint64, id, ids)
+	{
+		bool		named = false;
+
+		for (int i = 0; i < m.nfiles; i++)
+			named |= m.files[i].id == *id;
+		if (!named)
+			table_file_unlink(s, dir, *id, false);
+	}
+	list_free_deep(ids);
+	pfree(dir);
+}
+
+static int
+hash_cmp(const void *a, const void *b)
+{
+	return memcmp(a, b, sizeof(ProllyHash));
+}
+
+/* the journal's chunks, as file_chunks() reads them: their hashes first */
+typedef struct JournalChunks
+{
+	ProllyHash *hashes;
+	int			n;
+	int			max;
+} JournalChunks;
+
+static void
+note_journal_chunk(const ProllyHash *hash, uint64 segment, int ordinal, void *arg)
+{
+	JournalChunks *jc = arg;
+
+	if (jc->n == jc->max)
+	{
+		jc->max = Max(64, jc->max * 2);
+		jc->hashes = jc->hashes ? repalloc_huge(jc->hashes, sizeof(ProllyHash) * jc->max) :
+			MemoryContextAllocHuge(CurrentMemoryContext, sizeof(ProllyHash) * jc->max);
+	}
+	jc->hashes[jc->n++] = *hash;
+}
+
+/*
+ * The chunks of table file name (or, NULL, of the journal: each chunk
+ * once), as stored, in the file's order (the journal's: its index's).
+ */
+static void
+journal_file_chunks(ProllyChunkStore *s, const char *name,
+					ProllyChunkStoredVisit visit, void *arg)
+{
+	StringInfoData frame;
+
+	initStringInfo(&frame);
+	if (name == NULL)
+	{
+		JournalChunks jc = {0};
+		ProllyHash	prev = {0};
+
+		scan_journal(s);
+		jindex_visit(s->ix, note_journal_chunk, &jc);
+		qsort(jc.hashes, jc.n, sizeof(ProllyHash), hash_cmp);
+		for (int i = 0; i < jc.n; i++)
+		{
+			if (i > 0 && memcmp(&jc.hashes[i], &prev, sizeof(ProllyHash)) == 0)
+				continue;
+			prev = jc.hashes[i];
+			resetStringInfo(&frame);
+			if (!journal_get_stored(s, &jc.hashes[i], &frame))
+				continue;		/* (collected since) */
+			visit(&jc.hashes[i], frame.data, frame.len, arg);
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (jc.hashes)
+			pfree(jc.hashes);
+	}
+	else
+	{
+		TableFile  *found = NULL;
+
+		load_tables(s, false);
+		foreach_ptr(TableFile, t, s->tables)
+		{
+			char	   *n = table_file_name(t->id);
+
+			if (strcmp(n, name) == 0)
+				found = t;
+			pfree(n);
+		}
+		if (found == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("the chunk store has no table file \"%s\"", name)));
+		for (int i = 0; i < PROLLY_CALL(table_format(), count, found->tf); i++)
+		{
+			ProllyHash	h;
+			uint64		offset;
+			uint32		len;
+
+			PROLLY_CALL(table_format(), entry, found->tf, i, &h, &offset, &len);
+			resetStringInfo(&frame);
+			table_chunk(found, offset, len, true, &frame);
+			visit(&h, frame.data, frame.len, arg);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	pfree(frame.data);
 }
 
 /* conjoin()'s source: every chunk of the table files, once */
@@ -7156,6 +7555,13 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.add_table_file = journal_add_table_file,
 	.get_stored = journal_get_stored,
 	.add_stored_table_file = journal_add_stored_table_file,
+	.file_chunks = journal_file_chunks,
+	.receive_file = journal_receive_file,
+	.received_file = journal_received_file,
+	.received_get = journal_received_get,
+	.received_chunks = journal_received_chunks,
+	.adopt_received = journal_adopt_received,
+	.forget_received = journal_forget_received,
 	.conjoin = journal_conjoin,
 	.table_files = journal_table_files,
 	.shmem_size = journal_shmem_size,
