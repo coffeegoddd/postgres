@@ -2893,6 +2893,12 @@ remember_change_log_options(HTAB *table_toast_map, Form_pg_class classForm,
 	hentry = hash_search(table_toast_map, &key, HASH_ENTER, &found);
 	Assert(!found);				/* a log is one table's */
 	memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
+
+	/* (vacuumed soon after entries die, unless the table says otherwise) */
+	if (hentry->ar_reloptions.autovacuum.vacuum_threshold < 0)
+		hentry->ar_reloptions.autovacuum.vacuum_threshold = 1000;
+	if (hentry->ar_reloptions.autovacuum.vacuum_scale_factor < 0)
+		hentry->ar_reloptions.autovacuum.vacuum_scale_factor = 0;
 }
 
 /*

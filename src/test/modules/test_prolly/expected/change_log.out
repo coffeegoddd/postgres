@@ -385,3 +385,70 @@ SELECT dolt_branch('-D', 'cl_other');
  {0}
 (1 row)
 
+-- VACUUM of a table vacuums its change log too, as it does its TOAST
+-- table: the entries a fold consumed, dead (each fold walking them till
+-- then), are gone, and the log truncated.  A log is made to be vacuumed soon after entries die.
+-- (a database of its own: no other session's snapshot keeps the dead)
+CREATE DATABASE regress_log_vacuum;
+\c regress_log_vacuum
+CREATE SCHEMA clv VERSIONED;
+CREATE TABLE clv.vac (id int PRIMARY KEY, v text);
+INSERT INTO clv.vac SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT c.reloptions FROM pg_class c
+WHERE c.relname = 'pg_prolly_log_' || 'clv.vac'::regclass::oid;
+                             reloptions                              
+---------------------------------------------------------------------
+ {autovacuum_vacuum_scale_factor=0,autovacuum_vacuum_threshold=1000}
+(1 row)
+
+SELECT pg_relation_size('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid) > 0 AS log_has_pages;
+ log_has_pages 
+---------------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'empty')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value > 50 AS walked_dead FROM pg_stat_prolly WHERE name = 'log_pages_read';
+ walked_dead 
+-------------
+ t
+(1 row)
+
+VACUUM clv.vac;
+SELECT pg_relation_size('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid) AS log_bytes;
+ log_bytes 
+-----------
+         0
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_log_vacuum;

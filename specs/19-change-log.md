@@ -200,6 +200,11 @@ made passed in hand.
   under `log` they fold in full on every commit, which is correct but a
   performance cliff after an upgrade.
 - **Consumed entries are freed only by vacuuming the log**, which takes
-  its table's autovacuum settings.
+  its table's autovacuum settings, else its own (made with a vacuum
+  threshold of 1000 dead entries and no scale factor, so it's vacuumed
+  soon after a fold consumes a load's entries); `VACUUM` of the table
+  vacuums its log too, as its TOAST table (#480). Until then each fold
+  walks the dead entries (`pg_stat_prolly`'s `log_pages_read`), and a
+  long-running transaction holding back the horizon keeps them.
 - **An update's or delete's old version** is read again by its TID to
   make its entry (heap has let go of its page by then).

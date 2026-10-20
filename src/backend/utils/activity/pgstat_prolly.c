@@ -68,6 +68,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_FOLD_FULL_VERIFY] = "fold_full_verify",
 	[PGSTAT_PROLLY_FOLD_FULL_SPILLED] = "fold_full_spilled",
 	[PGSTAT_PROLLY_FOLD_MERGE_BUILDS] = "fold_merge_builds",
+	[PGSTAT_PROLLY_LOG_PAGES_READ] = "log_pages_read",
 	[PGSTAT_PROLLY_FOLD_VERIFIED] = "fold_verified",
 	[PGSTAT_PROLLY_FOLD_VERIFY_MISMATCHES] = "fold_verify_mismatches",
 	[PGSTAT_PROLLY_COMMITS] = "commits",
