@@ -929,7 +929,7 @@ SET debug_prolly_change_finder = 'pages';
 SELECT length(dolt_commit('-Am', 'pages fold')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT pg_stat_force_next_flush();
@@ -961,7 +961,7 @@ RESET debug_prolly_change_finder;
 SELECT length(dolt_commit('-am', 'log fold')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT pg_stat_reset_shared('prolly');
@@ -992,7 +992,7 @@ SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
 SELECT length(dolt_commit('-am', 'after')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP SCHEMA pf CASCADE;
@@ -1000,6 +1000,6 @@ NOTICE:  drop cascades to table pf.t
 SELECT length(dolt_commit('-am', 'gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
