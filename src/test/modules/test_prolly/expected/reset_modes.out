@@ -1,0 +1,161 @@
+-- dolt_reset('--soft', ref), and dolt_reset(ref) alone: the head moves to
+-- ref, the working set stays as it is (there is no staging area, so soft
+-- and mixed resets are one), and what differs from the new head shows as
+-- changes, which a commit takes.
+CREATE DATABASE regress_reset_modes;
+\c regress_reset_modes
+CREATE SCHEMA rm VERSIONED;
+CREATE TABLE rm.t (pk int PRIMARY KEY, v text);
+INSERT INTO rm.t VALUES (1, 'a');
+SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO rm.t VALUES (2, 'b');
+UPDATE rm.t SET v = 'z' WHERE pk = 1;
+SELECT length(dolt_commit('-am', 'two')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS two \gset
+-- undo the last commit, keeping its changes
+SELECT dolt_reset('--soft', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT message FROM dolt_log LIMIT 1;
+ message 
+---------
+ one
+(1 row)
+
+SELECT table_name, status FROM dolt_status;
+ table_name |  status  
+------------+----------
+ rm.t       | modified
+(1 row)
+
+SELECT diff_type, (from_row).v AS was, (to_row).v AS is
+FROM dolt_diff('HEAD', 'WORKING', NULL::rm.t) ORDER BY coalesce((to_row).pk, (from_row).pk);
+ diff_type | was | is 
+-----------+-----+----
+ modified  | a   | z
+ added     |     | b
+(2 rows)
+
+SELECT * FROM rm.t ORDER BY pk;
+ pk | v 
+----+---
+  1 | z
+  2 | b
+(2 rows)
+
+-- committed again: the same rows as the commit undone
+SELECT length(dolt_commit('-am', 'two again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) AS differs FROM dolt_diff(:'two', 'HEAD', NULL::rm.t);
+ differs 
+---------
+       0
+(1 row)
+
+-- the plain form is the same; to a commit on no path from the head too
+SELECT dolt_reset('HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       1
+(1 row)
+
+SELECT dolt_reset(:'two');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_hashof('HEAD') = :'two' AS at_two;
+ at_two 
+--------
+ t
+(1 row)
+
+-- refused during a merge in progress; and for a ref that isn't one
+SELECT dolt_reset('--soft', 'no_such_ref');
+ERROR:  prolly ref "no_such_ref" does not exist
+HINT:  A soft reset moves the head to a commit; there is no staging area to reset a table in.
+SELECT dolt_reset('rm.t');
+ERROR:  prolly ref "rm.t" does not exist
+HINT:  A soft reset moves the head to a commit; there is no staging area to reset a table in.
+SELECT dolt_reset('--hard', '--soft');
+ERROR:  dolt_reset can't be --hard and --soft at once
+SELECT dolt_checkout('-b', 'side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+UPDATE rm.t SET v = 'side' WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE rm.t SET v = 'main' WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('side') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT dolt_reset('--soft', 'HEAD~1');
+ERROR:  a merge is in progress on the current branch
+HINT:  Resolve its conflicts and commit, or reset it with --hard.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_reset_modes;

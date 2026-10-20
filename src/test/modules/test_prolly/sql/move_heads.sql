@@ -197,7 +197,7 @@ DROP SCHEMA mhm CASCADE;
 DROP ROLE mhm_writer;
 SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
 
--- A reset is hard: there is no staging area to reset to.
+-- A reset that isn't hard moves only the head: to HEAD, nothing.
 SELECT dolt_reset('HEAD');
 
 -- A hard reset restores a sequence to the commit's value: a versioned

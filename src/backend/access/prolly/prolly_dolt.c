@@ -2273,6 +2273,9 @@ dolt_integrate(PG_FUNCTION_ARGS)
  *
  * --hard [ref]: the session branch's head commit and working set become
  * ref's (HEAD: drops the changes since the last commit).
+ * --soft [ref], or [ref] alone: ref's commit becomes the head, the working
+ * set as it is (with no staging area, Dolt's soft and mixed resets are
+ * one): what differs from it shows as changes, which a commit takes.
  */
 Datum
 dolt_reset(PG_FUNCTION_ARGS)
@@ -2281,6 +2284,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	bool		options = true;	/* until "--" */
 	bool		hard = false;
+	bool		soft = false;
 	char	   *ref = NULL;
 	const char *result[1] = {"0"};
 
@@ -2299,21 +2303,37 @@ dolt_reset(PG_FUNCTION_ARGS)
 		}
 		else if (is_option(a, "hard"))
 			hard = true;
+		else if (is_option(a, "soft"))
+			soft = true;
 		else
 			unsupported("dolt_reset", a);
 	}
-	if (!hard)
+	if (hard && soft)
 		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("dolt_reset only does hard resets"),
-				 errdetail("Prolly branches have no staging area to reset."),
-				 errhint("Pass --hard.")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_reset can't be --hard and --soft at once")));
 	PreventCommandIfReadOnly("dolt_reset()");
+	if (!hard)
+	{
+		ProllyMergeState ms;
+		ProllyHash	target;
+
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a merge is in progress on the current branch"),
+					 errhint("Resolve its conflicts and commit, or reset it with --hard.")));
+		if (!PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", ref ? ref : "HEAD"),
+					 errhint("A soft reset moves the head to a commit; there is no staging area to reset a table in.")));
+	}
 	/*
 	 * What the target needs that the head doesn't, checked (a reset to the
-	 * head moves nothing new in, as an abort's doesn't).
+	 * head moves nothing new in, as an abort's doesn't; a soft one, none).
 	 */
-	if (ref)
+	if (ref && hard)
 	{
 		ProllyHash	head;
 		ProllyHash	target;
@@ -2347,6 +2367,17 @@ dolt_reset(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("branch \"%s\" is protected", branch_ops()->current()),
 					 errhint("Only the database's owner resets a protected branch to another commit.")));
+	}
+	/* (soft: the head moved, nothing of the working set) */
+	if (!hard)
+	{
+		ProllyHash	target;
+
+		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
+		note_integration();
+		PROLLY_CALL(refs(), set_head, &target);
+		settled();
+		PG_RETURN_DATUM(text_array(1, result));
 	}
 	/* (the database's owner discards whoever's changes they are) */
 	if (PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_SHARED &&
