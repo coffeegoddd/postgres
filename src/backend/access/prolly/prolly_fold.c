@@ -40,10 +40,11 @@ static const char *const reason_names[PROLLY_FULL_REASONS] = {
 	[PROLLY_FULL_UNSUPPORTED_KEY] = "unsupported_key",
 	[PROLLY_FULL_MEMORY_BUDGET] = "memory_budget",
 	[PROLLY_FULL_FORCED] = "forced",
+	[PROLLY_FULL_VERIFY] = "verify",
 };
 
-StaticAssertDecl(PGSTAT_PROLLY_FOLD_FULL_FORCED - PGSTAT_PROLLY_FOLD_FULL_NO_BASELINE ==
-				 PROLLY_FULL_FORCED - PROLLY_FULL_NO_BASELINE,
+StaticAssertDecl(PGSTAT_PROLLY_FOLD_FULL_VERIFY - PGSTAT_PROLLY_FOLD_FULL_NO_BASELINE ==
+				 PROLLY_FULL_VERIFY - PROLLY_FULL_NO_BASELINE,
 				 "a counter for each full fold's reason, in the reasons' order");
 
 const char *

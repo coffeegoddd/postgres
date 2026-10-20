@@ -25,7 +25,7 @@ SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
 (1 row)
 
 -- fold(): fold the working set from the baseline, say what it read, and
--- check it against a fold of every row.
+-- check it against a fold of every row, and the verifier's checks too.
 CREATE FUNCTION pg_temp.fold(OUT pages int8, OUT candidates int8,
 	OUT full_tables int8, OUT same_as_full bool) AS $$
 DECLARE
@@ -35,7 +35,8 @@ BEGIN
 	inc := test_fold_root();
 	SELECT c.pages, c.candidates, c.full_tables
 	  INTO pages, candidates, full_tables FROM test_fold_counters(true) c;
-	same_as_full := inc = test_fold_root(true);
+	same_as_full := inc = test_fold_root(true) AND
+		(SELECT bool_and(matches) FROM dolt_verify_folds());
 END $$ LANGUAGE plpgsql;
 -- Nothing changed: nothing read.
 SELECT * FROM pg_temp.fold();

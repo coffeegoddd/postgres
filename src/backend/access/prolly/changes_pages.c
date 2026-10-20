@@ -1806,8 +1806,8 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 	mapped = RelationGetSmgr(rel)->smgr_which == SMGR_BMAP &&
 		!RecoveryInProgress();
 	have = mapped && baseline != NULL && parse_state(&baseline->state, &st);
-	if (debug_prolly_force_full_fold)
-		f.reason = PROLLY_FULL_FORCED;
+	if (prolly_full_fold_wanted(&f.reason))
+		;
 	else if (!mapped)
 		f.reason = RecoveryInProgress() ? PROLLY_FULL_RECOVERY : PROLLY_FULL_NO_LOG;
 	else if (baseline == NULL)

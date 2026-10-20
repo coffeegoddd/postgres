@@ -16,7 +16,11 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/prolly_canon.h"
+#include "access/prolly_changelog.h"
 #include "access/prolly_config.h"
+#include "access/table.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_fold.h"
@@ -700,6 +704,26 @@ test_fold_trees(PG_FUNCTION_ARGS)
 	fold_in_full(&root);
 	PROLLY_CALL(prolly_canon_lookup("folded"), tables, &root, tree_row, rsinfo);
 	return (Datum) 0;
+}
+
+/*
+ * Lose rel's change-log entries the snapshot sees, as if folded, without
+ * its baseline moving: a fold from the baseline then misses those rows'
+ * changes, as a bug in a finder might.
+ */
+PG_FUNCTION_INFO_V1(test_lose_change_log);
+Datum
+test_lose_change_log(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), RowExclusiveLock);
+	ProllyComponents c;
+
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log == NULL)
+		elog(ERROR, "\"%s\" has no change log", RelationGetRelationName(rel));
+	PROLLY_CALL(c.change_log, consume, rel, GetActiveSnapshot());
+	table_close(rel, RowExclusiveLock);
+	PG_RETURN_VOID();
 }
 
 /* The session's last full fold: rows read, whether it spilled, its sort's kB. */

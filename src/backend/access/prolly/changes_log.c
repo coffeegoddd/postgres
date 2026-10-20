@@ -1001,8 +1001,8 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 		identity = PROLLY_CALL(c.change_log, identity, rel);
 	have = identity != 0 && baseline != NULL &&
 		parse_state(&baseline->state, &st) && st.log == identity;
-	if (debug_prolly_force_full_fold)
-		f.reason = PROLLY_FULL_FORCED;
+	if (prolly_full_fold_wanted(&f.reason))
+		;
 	else if (baseline == NULL)
 		f.reason = no_baseline;
 	else if (identity == 0)

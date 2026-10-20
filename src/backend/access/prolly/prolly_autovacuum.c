@@ -130,6 +130,22 @@ prolly_autovacuum_init(void)
 							PGC_SUSET,
 							0,
 							NULL, NULL, NULL);
+	DefineCustomRealVariable("prolly.fold_verify_rate",
+							 "The fraction of a database's versioned tables autovacuum folds in full at a pass, to check their folds from their baselines.",
+							 "0 checks none.",
+							 &prolly_fold_verify_rate,
+							 0, 0, 1,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("prolly.fold_verify_fatal",
+							 "Makes a fold the verifier finds wrong a PANIC, for testing.",
+							 NULL,
+							 &prolly_fold_verify_fatal,
+							 false,
+							 PGC_SUSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 	defined = true;
 }
 
@@ -312,10 +328,24 @@ sweep(void)
 							 (unsigned long long) r.truncated)));
 }
 
+/* The default branch's folds checked against full ones, a sample of tables. */
+static void
+verify(void)
+{
+	int			mismatches;
+
+	if (prolly_fold_verify_rate <= 0)
+		return;
+	mismatches = prolly_verify_folds(prolly_fold_verify_rate, NULL, NULL);
+	ereport(DEBUG1,
+			(errmsg_internal("automatic fold verification of database \"%s\": %d mismatches",
+							 get_database_name(MyDatabaseId), mismatches)));
+}
+
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {collect, move, conjoin, sweep};
+	void		(*steps[]) (void) = {collect, move, conjoin, sweep, verify};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{

@@ -5693,12 +5693,21 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        be looked up by), <literal>memory_budget</literal> (the changes it
        held passed <varname>maintenance_work_mem</varname>) and
        <literal>forced</literal>
-       (<varname>debug_prolly_force_full_fold</varname>), with
+       (<varname>debug_prolly_force_full_fold</varname>) and
+       <literal>verify</literal> (the fold verifier's), with
        <literal>fold_full_spilled</literal> those whose sort of the table's
        rows (in <varname>maintenance_work_mem</varname>) spilled to disk; a
        fold that reads
        at least <varname>prolly.log_full_folds</varname> rows so is logged,
-       with why,
+       with why;
+       <literal>fold_merge_builds</literal> (folds that merged many changes
+       with the table's baseline in one pass),
+       <literal>fold_verified</literal> and
+       <literal>fold_verify_mismatches</literal> (tables the fold verifier
+       folded from their baselines and in full, at
+       <varname>prolly.fold_verify_rate</varname> in autovacuum or by
+       <function>dolt_verify_folds</function>, and those whose trees
+       differed: each warned of, and read in full at its next fold),
        <literal>commits</literal> (commits written),
        <literal>head_moves</literal> (branch heads set),
        <literal>memo_hits</literal> and <literal>memo_misses</literal>

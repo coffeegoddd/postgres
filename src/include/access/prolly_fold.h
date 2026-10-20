@@ -46,12 +46,51 @@ typedef enum ProllyFullFoldReason
 	PROLLY_FULL_MEMORY_BUDGET,	/* the changes held passed
 								 * maintenance_work_mem */
 	PROLLY_FULL_FORCED,			/* debug_prolly_force_full_fold */
+	PROLLY_FULL_VERIFY,			/* the verifier's, to compare with */
 } ProllyFullFoldReason;
 
-#define PROLLY_FULL_REASONS (PROLLY_FULL_FORCED + 1)
+#define PROLLY_FULL_REASONS (PROLLY_FULL_VERIFY + 1)
 
 /* debug_prolly_force_full_fold: every fold reads its table in full. */
 extern PGDLLIMPORT bool debug_prolly_force_full_fold;
+
+/* Set while the verifier folds a table in full (fold_verify.c). */
+extern PGDLLIMPORT bool prolly_fold_verifying;
+
+/* prolly.fold_verify_rate: tables autovacuum's verifier checks a pass. */
+extern PGDLLIMPORT double prolly_fold_verify_rate;
+
+/* prolly.fold_verify_fatal: a verifier's mismatch is a PANIC. */
+extern PGDLLIMPORT bool prolly_fold_verify_fatal;
+
+/*
+ * Must a fold read its table in full, whatever its baseline?  Forced, or
+ * the verifier's; *reason says which.
+ */
+static inline bool
+prolly_full_fold_wanted(ProllyFullFoldReason *reason)
+{
+	if (prolly_fold_verifying)
+		*reason = PROLLY_FULL_VERIFY;
+	else if (debug_prolly_force_full_fold)
+		*reason = PROLLY_FULL_FORCED;
+	else
+		return false;
+	return true;
+}
+
+/* A table the verifier checked, and whether its folds matched. */
+typedef void (*ProllyFoldVerifyVisit) (const char *name, bool matches,
+									   void *arg);
+
+/*
+ * The session branch's tables (rate: the fraction of them sampled), each
+ * folded from its baseline and in full by one snapshot, the trees
+ * compared: a mismatch warned of, counted, and its table read in full at
+ * its next fold.  The mismatches.
+ */
+extern int	prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit,
+								void *arg);
 
 /* prolly.log_full_folds: rows past which a full fold is logged (-1: none). */
 extern PGDLLIMPORT int prolly_log_full_folds;
