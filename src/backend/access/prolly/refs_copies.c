@@ -119,6 +119,7 @@
 #define TAG_TRACKING	'R'
 #define TAG_UPSTREAM	'U'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
+#define TAG_BASELINE_MOVER 'Y'	/* and a baseline (a fold, a checkpoint) */
 #define TAG_CONFIG		'C'	/* a database setting */
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
@@ -606,11 +607,13 @@ branch_set_head(const char *name, const ProllyHash *head)
 
 /*
  * Did a transaction the active snapshot doesn't see move branch name's
- * head?  (A committer that waited for the refs finds the head another
- * moved, while its snapshot, taken before, lacks that one's rows.)
+ * head (or, with tag TAG_BASELINE_MOVER, its baseline)?  (A committer that
+ * waited for the refs finds the head another moved, while its snapshot,
+ * taken before, lacks that one's rows; or a baseline another's fold or
+ * checkpoint wrote, which its snapshot can't fold from.)
  */
 static bool
-head_moved_unseen(const char *name)
+moved_unseen(char tag, const char *name)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -618,7 +621,7 @@ head_moved_unseen(const char *name)
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	appendStringInfoChar(&key, TAG_MOVER);
+	appendStringInfoChar(&key, tag);
 	appendStringInfoString(&key, name);
 	if (refs_get(key.data, key.len, &v) && v.len == sizeof(xid))
 		memcpy(&xid, v.data, sizeof(xid));
@@ -628,17 +631,32 @@ head_moved_unseen(const char *name)
 		XidInMVCCSnapshot(xid, GetActiveSnapshot());
 }
 
+static bool
+head_moved_unseen(const char *name)
+{
+	return moved_unseen(TAG_MOVER, name);
+}
+
 /*
  * With the refs held, a snapshot that sees the head's commit: the active
  * one, or (read committed) a newer one, pushed (true; the caller pops it).
  * A transaction whose snapshot can't move fails instead, to be retried,
  * as a commit on top of a head it can't see would undo that head's rows.
+ * Read committed takes a newer one too when only the baseline moved since
+ * its snapshot (another's checkpoint): the old one would see none of that
+ * fold, and read every table in full, and leave each unsettled.
  */
 static bool
 see_head(const char *name)
 {
 	if (!head_moved_unseen(name))
-		return false;
+	{
+		if (IsolationUsesXactSnapshot() ||
+			!moved_unseen(TAG_BASELINE_MOVER, name))
+			return false;
+		PushActiveSnapshot(GetLatestSnapshot());
+		return true;
+	}
 	if (IsolationUsesXactSnapshot())
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -703,7 +721,8 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 
 /*
  * Make baseline (NULL: none) branch name's baseline; 'root' (NULL: not
- * known) is the working set's root its fold made.
+ * known) is the working set's root its fold made.  The transaction that
+ * moved it is noted (see_head()).
  */
 static void
 branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
@@ -711,6 +730,7 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 {
 	StringInfoData key;
 	StringInfoData v;
+	TransactionId xid = baseline ? GetTopTransactionId() : InvalidTransactionId;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -720,6 +740,13 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 		put_hash(&v, &baseline->hash);
 	if (baseline && root)
 		put_hash(&v, &root->hash);
+	refs_put(key.data, key.len, baseline ? &v : NULL);
+
+	resetStringInfo(&key);
+	resetStringInfo(&v);
+	appendStringInfoChar(&key, TAG_BASELINE_MOVER);
+	appendStringInfoString(&key, name);
+	appendBinaryStringInfo(&v, &xid, sizeof(xid));
 	refs_put(key.data, key.len, baseline ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
@@ -1818,7 +1845,8 @@ static void
 copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
-	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
+	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
+	TAG_NAMES};
 	ListCell   *lc;
 
 	lock_refs();

@@ -7,3 +7,4 @@ test: vc_transaction_commits
 test: vc_txn_rows
 test: vc_txn_commits
 test: vc_txn_branches
+test: vc_checkpoint_mover

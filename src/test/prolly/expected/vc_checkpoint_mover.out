@@ -1,0 +1,51 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_write b_begin b_write b_ckpt a_reset a_dcommit b_commit b_flush a_write2 a_dcommit2 a_flush a_full
+step a_write: UPDATE vcm.t2 SET v = 'a' WHERE id = 1;
+step b_begin: BEGIN;
+step b_write: UPDATE vcm.t1 SET v = 'b' WHERE id = 1;
+step b_ckpt: SELECT prolly_checkpoint() IS NOT NULL AS checkpointed;
+checkpointed
+------------
+t           
+(1 row)
+
+step a_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_dcommit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed; <waiting ...>
+step b_commit: COMMIT;
+step a_dcommit: <... completed>
+committed
+---------
+t        
+(1 row)
+
+step b_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step a_write2: UPDATE vcm.t2 SET v = 'a2' WHERE id = 2;
+step a_dcommit2: SELECT (dolt_commit('-am', 'a again'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step a_full: SELECT value AS full_folds FROM pg_stat_prolly WHERE name = 'fold_full_tables';
+full_folds
+----------
+         0
+(1 row)
+
