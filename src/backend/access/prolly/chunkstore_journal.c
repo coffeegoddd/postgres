@@ -656,7 +656,9 @@ chunk_encode(const void *data, Size len, uint8 *head, Size *headlen,
 	*stored = data;
 	*stored_len = len;
 #ifdef USE_LZ4
-	if (len > 0 && len <= LZ4_MAX_INPUT_SIZE)
+	/* (one whose bound is past what palloc gives is stored as is) */
+	if (len > 0 && len <= LZ4_MAX_INPUT_SIZE &&
+		(Size) LZ4_compressBound((int) len) <= MaxAllocSize)
 	{
 		int			bound = LZ4_compressBound((int) len);
 		char	   *compressed = palloc(bound);
@@ -705,7 +707,9 @@ record_chunk(const char *rec, uint32 len, Size after, StringInfo scratch,
 		int			n;
 
 		memcpy(&rawlen, p + 1, sizeof(rawlen));
-		if (rawlen > MaxAllocSize - 1)
+		/* (LZ4 makes nothing smaller than about a 255th of itself) */
+		if (rawlen > MaxAllocSize - 1 ||
+			rawlen > (uint64) (end - (p + CODEC_HEAD_MAX)) * 255 + 16)
 			return NULL;
 		resetStringInfo(scratch);
 		enlargeStringInfo(scratch, (int) rawlen);
@@ -727,12 +731,22 @@ record_chunk(const char *rec, uint32 len, Size after, StringInfo scratch,
 	return NULL;
 }
 
-/* A scratch buffer for record_chunk(), in TopMemoryContext. */
+/*
+ * A scratch buffer for record_chunk(), in TopMemoryContext: what the last
+ * call decoded into it is done with by the next.  One a large chunk grew
+ * is made small again.
+ */
+#define CHUNK_SCRATCH_KEEP	(1024 * 1024)
 static StringInfo
 chunk_scratch(void)
 {
 	static StringInfo scratch = NULL;
 
+	if (scratch != NULL && scratch->maxlen > CHUNK_SCRATCH_KEEP)
+	{
+		destroyStringInfo(scratch);
+		scratch = NULL;
+	}
 	if (scratch == NULL)
 	{
 		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
@@ -741,6 +755,24 @@ chunk_scratch(void)
 		MemoryContextSwitchTo(old);
 	}
 	return scratch;
+}
+
+/*
+ * record_chunk() of a record whose hash was read: one that doesn't decode
+ * is corrupt (in where), not skipped, as what it holds may be reachable.
+ */
+static const char *
+decoded_chunk(const char *rec, uint32 len, Size after, const char *where,
+			  Size *chunk_len)
+{
+	const char *chunk = record_chunk(rec, len, after, chunk_scratch(),
+									 chunk_len);
+
+	if (chunk == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupt chunk record in %s", where)));
+	return chunk;
 }
 
 /*
@@ -3383,13 +3415,16 @@ chunk_bytes(const char *path, const char *rec, uint32 len, StringInfo out)
 	const char *chunk = NULL;
 	Size		chunk_len;
 
+	/* (decompressed straight into out, if it holds nothing yet) */
 	if (record_valid(rec, len) && record_hash(rec, len, &h, &after))
-		chunk = record_chunk(rec, len, after, chunk_scratch(), &chunk_len);
+		chunk = record_chunk(rec, len, after,
+							 out->len == 0 ? out : chunk_scratch(), &chunk_len);
 	if (chunk == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupt chunk record in file \"%s\"", path)));
-	appendBinaryStringInfo(out, chunk, chunk_len);
+	if (chunk != out->data)
+		appendBinaryStringInfo(out, chunk, chunk_len);
 }
 
 static bool
@@ -4832,10 +4867,11 @@ journal_gc_retained(ProllyChunkGc *gc, ProllyChunkGcVisit visit, void *arg)
 			CHECK_FOR_INTERRUPTS();
 			if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
 				record_hash_xid(rec, len, &h, &after, &xid) &&
-				!(TransactionIdIsValid(xid) && TransactionIdDidAbort(xid)) &&
-				(chunk = record_chunk(rec, len, after, chunk_scratch(),
-									  &chunk_len)) != NULL)
+				!(TransactionIdIsValid(xid) && TransactionIdDidAbort(xid)))
+			{
+				chunk = decoded_chunk(rec, len, after, g.path, &chunk_len);
 				visit(&h, chunk, chunk_len, arg);
+			}
 			offset += len;
 		}
 		FileClose(g.file);
@@ -4961,15 +4997,15 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		ProllyHash	h;
 		Size		after;
 		TransactionId xid;
-
 		const char *chunk;
 		Size		chunk_len;
 
 		if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
-			record_hash_xid(rec, len, &h, &after, &xid) &&
-			(chunk = record_chunk(rec, len, after, chunk_scratch(),
-								  &chunk_len)) != NULL)
+			record_hash_xid(rec, len, &h, &after, &xid))
+		{
+			chunk = decoded_chunk(rec, len, after, g->path, &chunk_len);
 			visit(&h, chunk, chunk_len, arg);
+		}
 		else if (kind == KIND_ROOT && record_hash(rec, len, &h, &after))
 			visit(&h, NULL, 0, arg);
 		offset += len;
@@ -5409,10 +5445,10 @@ check_dropped(ProllyChunkStore *s, const ProllyHash *root)
 			const char *end;
 			Size		chunk_len;
 
-			if (!record_hash(rec, e->len, &h, &after) ||
-				(p = record_chunk(rec, e->len, after, chunk_scratch(),
-								  &chunk_len)) == NULL)
+			if (!record_hash(rec, e->len, &h, &after))
 				continue;
+			p = decoded_chunk(rec, e->len, after, "the transaction's pending chunks",
+							  &chunk_len);
 			end = p + chunk_len;
 			for (; n > 0 && p + 1 + hlen <= end; p++)
 			{

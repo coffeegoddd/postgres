@@ -104,7 +104,13 @@ Each group is an issue. The numbers are the items the issues use.
      and gate 3 are measured again.
 2. **Journal chunks compressed with LZ4** before `XLogInsert`, as table
    files' chunks are. Both WAL and the journal shrink. Dolt compresses
-   its journal with snappy.
+   its journal with snappy. A store's files don't say whether they hold
+   compressed chunks, so a server built without LZ4 opens a store written
+   with it and fails at the first compressed chunk it reads (a read, a
+   collection partway through, a standby's replay), as it does for table
+   files. A record that passes its CRC but doesn't decode is corrupt
+   everywhere, collections included: one skipped could leave what it
+   names unmarked.
 3. **Table files' index laid out as Dolt's:** 8-byte prefixes sorted
    with ordinals, then lengths, then 12-byte suffixes, as Dolt's. That
    is about 40 bytes a chunk in memory, searched by interpolation.

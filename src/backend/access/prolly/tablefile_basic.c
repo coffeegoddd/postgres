@@ -30,6 +30,7 @@
 
 #include "access/prolly_builtins.h"
 #include "port/pg_crc32c.h"
+#include "utils/memutils.h"
 
 #define FORMAT_VERSION	1
 #define MAGIC			"PRLYTBL1"
@@ -137,7 +138,9 @@ basic_write_add(ProllyTableFileWriter *w, const ProllyHash *hash,
 	w->hash_len = hash->len;
 
 #ifdef USE_LZ4
-	if (len > 0)
+	/* (one whose bound is past what palloc gives is stored as is) */
+	if (len > 0 && len <= LZ4_MAX_INPUT_SIZE &&
+		(Size) LZ4_compressBound((int) len) <= MaxAllocSize)
 	{
 		int			bound = LZ4_compressBound((int) len);
 		int			n;
