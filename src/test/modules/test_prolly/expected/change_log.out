@@ -399,7 +399,7 @@ INSERT INTO clv.vac SELECT g, 'v' || g FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT c.reloptions FROM pg_class c
@@ -435,7 +435,7 @@ SELECT pg_stat_reset_shared('prolly');
 SELECT length(dolt_commit('--allow-empty', '-m', 'empty')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT pg_stat_force_next_flush();
