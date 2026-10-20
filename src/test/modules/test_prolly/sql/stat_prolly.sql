@@ -68,7 +68,8 @@ SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
 SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
--- (any that differ, with both counts)
+-- (any that differ, with both counts; not the journal's bytes, which
+-- depend on how its chunks compress, as commit ids and times differ)
 SELECT name, value, (:'first'::json ->> name)::bigint AS first
 FROM pg_stat_prolly
 WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint

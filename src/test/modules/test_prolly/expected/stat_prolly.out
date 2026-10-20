@@ -197,7 +197,8 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
--- (any that differ, with both counts)
+-- (any that differ, with both counts; not the journal's bytes, which
+-- depend on how its chunks compress, as commit ids and times differ)
 SELECT name, value, (:'first'::json ->> name)::bigint AS first
 FROM pg_stat_prolly
 WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint
