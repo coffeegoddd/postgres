@@ -123,3 +123,34 @@ SELECT * FROM cs.a;
 SELECT * FROM cs.b;
 \c contrib_regression
 DROP DATABASE regress_conflict_swap;
+
+-- A conflicted partition detached and its partitioned table dropped: its
+-- versions in the merge are a partition's, keyed by its parent's key, and
+-- it now has a key of its own.  The summary lists it (its count unknown),
+-- its rows are refused with why, and attached again they're there.
+CREATE DATABASE regress_conflict_detached;
+\c regress_conflict_detached
+CREATE SCHEMA pt VERSIONED;
+CREATE TABLE pt.p (id int PRIMARY KEY, v text) PARTITION BY RANGE (id);
+CREATE TABLE pt.p1 PARTITION OF pt.p FOR VALUES FROM (0) TO (100);
+CREATE TABLE pt.q (id int PRIMARY KEY, v text);
+INSERT INTO pt.p VALUES (1, 'base'); INSERT INTO pt.q VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+SELECT dolt_branch('side');
+SELECT dolt_checkout('side');
+UPDATE pt.p SET v = 'theirs'; UPDATE pt.q SET v = 'theirs';
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE pt.p SET v = 'ours'; UPDATE pt.q SET v = 'ours';
+SELECT length(dolt_commit('-am', 'main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('side') IS NOT NULL AS merging;
+SELECT * FROM dolt_conflicts ORDER BY 1;
+ALTER TABLE pt.p DETACH PARTITION pt.p1;
+DROP TABLE pt.p;
+SELECT * FROM dolt_conflicts ORDER BY 1;
+SELECT count(*) FROM dolt_conflicts(NULL::pt.p1);
+SELECT dolt_conflicts_resolve('--theirs', 'pt.q');
+SELECT * FROM pt.q;
+\c contrib_regression
+DROP DATABASE regress_conflict_detached;

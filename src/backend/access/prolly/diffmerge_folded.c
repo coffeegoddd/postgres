@@ -7415,6 +7415,20 @@ conflicted_table(Oid relid, ProllyMergeState *state)
 	return -1;
 }
 
+/* Is a version (if any) keyed otherwise, by its description, than now? */
+static bool
+keyed_otherwise(const Table *x, const Table *now)
+{
+	bool		kx;
+	bool		know;
+
+	if (x == NULL || same_description(x, now))
+		return false;
+	(void) version_columns(x, &kx);
+	(void) version_columns(now, &know);
+	return kx != know;
+}
+
 /* Has relid the name the merge recorded for it (if it recorded one)? */
 static bool
 named_as_recorded(Oid relid, const ProllyMergeState *ms, const char *name)
@@ -7492,6 +7506,30 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	bt = find_table(tables_at(&ms->base), name);
 	ot = find_table(tables_at(&ours), name);
 	tt = find_table(tables_at(&ms->theirs), name);
+
+	/*
+	 * (a version keyed otherwise than the table is now, as a partition the
+	 * merge saw, keyed by its partitioned table's key, detached since:
+	 * its rows can't be read as the table's now; the summary still lists
+	 * the table, its count unknown)
+	 */
+	if (now != NULL && (keyed_otherwise(bt, now) || keyed_otherwise(ot, now) ||
+						keyed_otherwise(tt, now)))
+	{
+		char	   *why = psprintf("table %s is keyed otherwise than when the merge began",
+								   name);
+
+		if (sink != NULL && sink->unreadable != NULL)
+		{
+			sink->unreadable(sink, why);
+			return;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s", why),
+				 errdetail("Its versions in the merge have a primary key where it has none now, or the other way (a partition's is its partitioned table's)."),
+				 errhint("Put the table back as it was (attach the partition again) to list or resolve its conflicts, or abort the merge.")));
+	}
 	rel = table_open(relid, AccessShareLock);
 	retyped_columns(bt, ot, tt, &retyped, &both_retyped);
 	bp = as_defined_now(rel, bt, now, READ_COMPARED, retyped, both_retyped,

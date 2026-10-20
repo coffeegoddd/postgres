@@ -383,3 +383,93 @@ SELECT * FROM cs.b;
 
 \c contrib_regression
 DROP DATABASE regress_conflict_swap;
+-- A conflicted partition detached and its partitioned table dropped: its
+-- versions in the merge are a partition's, keyed by its parent's key, and
+-- it now has a key of its own.  The summary lists it (its count unknown),
+-- its rows are refused with why, and attached again they're there.
+CREATE DATABASE regress_conflict_detached;
+\c regress_conflict_detached
+CREATE SCHEMA pt VERSIONED;
+CREATE TABLE pt.p (id int PRIMARY KEY, v text) PARTITION BY RANGE (id);
+CREATE TABLE pt.p1 PARTITION OF pt.p FOR VALUES FROM (0) TO (100);
+CREATE TABLE pt.q (id int PRIMARY KEY, v text);
+INSERT INTO pt.p VALUES (1, 'base'); INSERT INTO pt.q VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+UPDATE pt.p SET v = 'theirs'; UPDATE pt.q SET v = 'theirs';
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE pt.p SET v = 'ours'; UPDATE pt.q SET v = 'ours';
+SELECT length(dolt_commit('-am', 'main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('side') IS NOT NULL AS merging;
+ merging 
+---------
+ t
+(1 row)
+
+SELECT * FROM dolt_conflicts ORDER BY 1;
+ table_name | num_conflicts 
+------------+---------------
+ pt.p1      |             1
+ pt.q       |             1
+(2 rows)
+
+ALTER TABLE pt.p DETACH PARTITION pt.p1;
+DROP TABLE pt.p;
+SELECT * FROM dolt_conflicts ORDER BY 1;
+ table_name | num_conflicts 
+------------+---------------
+ pt.p1      |              
+ pt.q       |             1
+(2 rows)
+
+SELECT count(*) FROM dolt_conflicts(NULL::pt.p1);
+ERROR:  table pt.p1 is keyed otherwise than when the merge began
+DETAIL:  Its versions in the merge have a primary key where it has none now, or the other way (a partition's is its partitioned table's).
+HINT:  Put the table back as it was (attach the partition again) to list or resolve its conflicts, or abort the merge.
+SELECT dolt_conflicts_resolve('--theirs', 'pt.q');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM pt.q;
+ id |   v    
+----+--------
+  1 | theirs
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_conflict_detached;
