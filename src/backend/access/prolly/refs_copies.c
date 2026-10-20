@@ -3424,6 +3424,19 @@ copies_stashes(ProllyStashVisit visit, void *arg)
 }
 
 static bool
+copies_stash_select(const char *name, int n, ProllyHash *stash)
+{
+	List	   *entries;
+
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return false;
+	*stash = ((StashEntry *) list_nth(entries, n))->stash;
+	return true;
+}
+
+static bool
 copies_stash_drop(const char *name, int n)
 {
 	List	   *entries;
@@ -3491,6 +3504,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.root_refs = copies_root_refs,
 	.stash_push = copies_stash_push,
 	.stashes = copies_stashes,
+	.stash_select = copies_stash_select,
 	.stash_drop = copies_stash_drop,
 	.stash_clear = copies_stash_clear,
 };

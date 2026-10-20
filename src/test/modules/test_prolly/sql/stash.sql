@@ -104,5 +104,18 @@ ROLLBACK;
 SELECT count(*) AS stashes FROM dolt_stashes;
 SELECT pk FROM st.t WHERE pk = 9;
 
+-- on a protected branch, an apply or pop, which commits nothing, is
+-- refused as a write is (the stash kept)
+SELECT dolt_stash('push', 's');
+SELECT dolt_branch('--protect', 'main');
+UPDATE st.t SET v = 'protected' WHERE pk = 1;
+SELECT dolt_stash('apply', 's');
+SELECT dolt_stash('pop', 's');
+SELECT count(*) AS changed FROM dolt_status;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_branch('--unprotect', 'main');
+SELECT dolt_stash('pop', 's');
+SELECT pk FROM st.t WHERE pk = 9;
+
 \c contrib_regression
 DROP DATABASE regress_stash;

@@ -224,6 +224,7 @@ tests += {
       't/128_standby_folds.pl',
       't/129_fold_verify.pl',
       't/130_keyless_toast_gc.pl',
+      't/133_stash_concurrency.pl',
       't/140_corrupt_compressed.pl',
       't/141_standby_root_redo.pl',
       't/142_get_many_refresh.pl',

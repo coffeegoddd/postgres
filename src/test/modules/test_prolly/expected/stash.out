@@ -362,5 +362,61 @@ SELECT pk FROM st.t WHERE pk = 9;
   9
 (1 row)
 
+-- on a protected branch, an apply or pop, which commits nothing, is
+-- refused as a write is (the stash kept)
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('--protect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE st.t SET v = 'protected' WHERE pk = 1;
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+SELECT dolt_stash('apply', 's');
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+SELECT dolt_stash('pop', 's');
+ERROR:  branch "main" is protected
+DETAIL:  A protected branch changes only by a merge, cherry-pick, revert or reset that commits.
+HINT:  Write on a branch of your own, as with dolt_checkout('-b', ...), and integrate it with dolt_integrate('main', ...).
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       1
+(1 row)
+
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('pop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT pk FROM st.t WHERE pk = 9;
+ pk 
+----
+  9
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_stash;

@@ -351,13 +351,16 @@ typedef struct ProllyRefsRoutine
 	 * whose parent is its head, as the newest of name's list, and sets
 	 * *stash to it; stashes() visits every list's entries, by name, then
 	 * newest first (n: from 0), with the branch each was pushed from;
-	 * stash_drop() forgets name's nth (false: it has none); stash_clear()
-	 * every one of name's.  The walk keeps each one's commit.  With the
+	 * stash_select() sets *stash to name's nth (false: it has none), the
+	 * refs locked first, so that no other session's push or drop moves it
+	 * until the transaction ends; stash_drop() forgets name's nth (false:
+	 * it has none); stash_clear() every one of name's.  The walk keeps each one's commit.  With the
 	 * transaction; never pushed to a remote.
 	 */
 	void		(*stash_push) (const char *name, const ProllyNodeRef *root,
 							   ProllyHash *stash);
 	void		(*stashes) (ProllyStashVisit visit, void *arg);
+	bool		(*stash_select) (const char *name, int n, ProllyHash *stash);
 	bool		(*stash_drop) (const char *name, int n);
 	void		(*stash_clear) (const char *name);
 } ProllyRefsRoutine;
@@ -380,7 +383,7 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
-	"stash_clear"
+	"stash_clear", "stash_select"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK stash_clear
 

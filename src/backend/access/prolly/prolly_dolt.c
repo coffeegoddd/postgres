@@ -2363,32 +2363,6 @@ dolt_reset(PG_FUNCTION_ARGS)
  * ------------------------------------------------------------------------
  */
 
-/* name's nth stash (from "stash@{n}", or n; NULL: the newest), or none */
-typedef struct StashFind
-{
-	const char *name;
-	int			n;
-	bool		found;
-	ProllyHash	stash;
-	int			count;			/* name's stashes */
-} StashFind;
-
-static void
-find_stash(const char *name, int n, const char *branch, const ProllyHash *stash,
-		   void *arg)
-{
-	StashFind  *f = arg;
-
-	if (strcmp(name, f->name) != 0)
-		return;
-	f->count++;
-	if (n == f->n)
-	{
-		f->found = true;
-		f->stash = *stash;
-	}
-}
-
 static int
 stash_index(const char *arg)
 {
@@ -2509,19 +2483,26 @@ dolt_stash(PG_FUNCTION_ARGS)
 	}
 	else if (strcmp(cmd, "pop") == 0 || strcmp(cmd, "apply") == 0)
 	{
-		StashFind	f = {name, stash_index(which)};
-		const char *ref;
+		int			n = stash_index(which);
+		ProllyHash	stash;
 
-		PROLLY_CALL(refs(), stashes, find_stash, &f);
-		if (!f.found)
+		/*
+		 * (chosen with the refs locked: no other session's push or drop
+		 * moves it before it's applied and, popped, dropped)
+		 */
+		if (!PROLLY_CALL(refs(), stash_select, name, n, &stash))
 			no_stashes();
 		refuse_violations("stash");
-		ref = hash_hex(&f.stash);
-		note_integration();
-		BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), apply, ref, "dolt_stash"));
-		settled();
+
+		/*
+		 * (a write, as any: it makes no commit, so a protected branch
+		 * refuses it, and the branch is left with its changes)
+		 */
+		branch_note_write(MyBranch);
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), apply, hash_hex(&stash),
+										 "dolt_stash"));
 		if (strcmp(cmd, "pop") == 0)
-			(void) PROLLY_CALL(refs(), stash_drop, name, f.n);
+			(void) PROLLY_CALL(refs(), stash_drop, name, n);
 	}
 	else if (strcmp(cmd, "drop") == 0)
 	{
