@@ -228,7 +228,7 @@ INSERT INTO dh.pkc VALUES (1, 2), (3, 4);
 SELECT length(dolt_commit('-Am', 'pkc')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE dh.pkc DROP CONSTRAINT pkc_pkey;
@@ -236,21 +236,21 @@ INSERT INTO dh.pkc VALUES (5, 6);
 SELECT length(dolt_commit('-am', 'pkc dropped the key')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 ALTER TABLE dh.pkc ADD PRIMARY KEY (c1);
 SELECT length(dolt_commit('-am', 'pkc keyed by c1')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO dh.pkc VALUES (7, 8);
 SELECT length(dolt_commit('-am', 'pkc more')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.pkc)
@@ -289,7 +289,7 @@ INSERT INTO dh.kl VALUES (42, 23), (1, 1), (1, 1);
 SELECT length(dolt_commit('-Am', 'kl')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DELETE FROM dh.kl WHERE i = 1;
@@ -298,7 +298,7 @@ ALTER TABLE dh.kl ADD PRIMARY KEY (i);
 SELECT length(dolt_commit('-am', 'kl keyed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.kl, 'HEAD~1', 'HEAD');

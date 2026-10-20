@@ -164,14 +164,14 @@ INSERT INTO ds.nokey VALUES (1, 'a'), (2, 'b');
 SELECT length(dolt_commit('-Am', 'nokey')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE ds.nokey SET v = 'c' WHERE id = 2;
 SELECT length(dolt_commit('-am', 'nokey changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT table_name, rows_added, rows_deleted, rows_modified
