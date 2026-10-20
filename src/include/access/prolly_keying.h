@@ -129,14 +129,27 @@ typedef struct ProllyKeyingRoutine
 	 * values either way they were keyed.
 	 */
 	ProllyKeying *(*open_described) (TupleDesc desc, MemoryContext mcxt);
+
+	/*
+	 * Optional: append what rel's rows' keys and canonical bytes depend on,
+	 * beyond the rows themselves, to out: whether it keys rows by content,
+	 * its key's columns and their order, and its live columns' numbers,
+	 * types and missing values.  Two states of rel that append the same
+	 * bytes encode every row alike, so a baseline folded under one holds
+	 * for the other (DDL that changes neither, as CREATE INDEX or a
+	 * constraint added, needs no fold of every row).  Without it, the
+	 * table's whole description stands for it.
+	 */
+	void		(*row_shape) (ProllyKeying *k, Relation rel, StringInfo out);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
 	"decode_row", "compare", "close", "set_values", "row_refs", \
-	"decode_row_kept", "encode_key", "parse_value_as", "open_described"
+	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
+	"row_shape"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK open_described
+#define PROLLY_KEYING_LAST_CALLBACK row_shape
 
 /*
  * Set up a data tree's environment and k's value store for each other:

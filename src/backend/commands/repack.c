@@ -1255,6 +1255,7 @@ rebuild_relation(Relation OldHeap, Relation index, bool verbose,
 						 swap_toast_by_content, false, true,
 						 true,	/* reindex */
 						 frozenXid, cutoffMulti,
+						 false, /* rows_changed */
 						 relpersistence);
 	}
 }
@@ -2063,6 +2064,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool reindex,
 				 TransactionId frozenXid,
 				 MultiXactId cutoffMulti,
+				 bool rows_changed,
 				 char newrelpersistence)
 {
 	ObjectAddress object;
@@ -2086,12 +2088,13 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 						frozenXid, cutoffMulti, mapped_tables);
 
 	/*
-	 * A prolly table's change log is told every row may have changed: a
-	 * rewrite may change them all (ALTER TABLE's), writing none it notes.
-	 * (CLUSTER and VACUUM FULL change none, but give the table new storage,
-	 * which a fold reads in full anyway.)  A system catalog has no log.
+	 * A prolly table's change log is told every row may have changed by a
+	 * rewrite that may change them all (ALTER TABLE's), writing none it
+	 * notes.  CLUSTER and VACUUM FULL change none: the log's entries name
+	 * rows by key or image, not by where they were, so they still hold.  A
+	 * system catalog has no log.
 	 */
-	if (!is_system_catalog)
+	if (!is_system_catalog && rows_changed)
 	{
 		Relation	oldheap = relation_open(OIDOldHeap, NoLock);
 
@@ -3620,6 +3623,7 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 					 true,
 					 false,		/* reindex */
 					 frozenXid, cutoffMulti,
+					 true,		/* rows_changed: concurrent changes, replayed */
 					 relpersistence);
 }
 

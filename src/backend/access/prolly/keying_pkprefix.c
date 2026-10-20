@@ -34,8 +34,10 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
+#include "utils/datum.h"
 #include "utils/rel.h"
 
 /* How much of a row without a primary key begins its key. */
@@ -214,6 +216,62 @@ pkprefix_open_described(TupleDesc desc, MemoryContext mcxt)
 	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
 	MemoryContextSwitchTo(old);
 	return k;
+}
+
+/*
+ * What rel's rows' keys and bytes depend on (see the interface): keyed by
+ * content or not; the key's columns, operator families, collations and
+ * options, in order; each live column's number, type and typmod, its
+ * missing value (a default added without a rewrite is stored in the rows
+ * that predate it), and a virtual generated column's expression.
+ */
+static void
+pkprefix_row_shape(ProllyKeying *k, Relation rel, StringInfo out)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	appendStringInfoChar(out, k->keyless ? 'c' : 'k');
+	for (int i = 0; !k->keyless && i < k->nkeys; i++)
+	{
+		appendBinaryStringInfo(out, (const char *) &k->key_attnos[i], sizeof(AttrNumber));
+		appendBinaryStringInfo(out, (const char *) &k->opfamilies[i], sizeof(Oid));
+		appendBinaryStringInfo(out, (const char *) &k->collations[i], sizeof(Oid));
+		appendBinaryStringInfo(out, (const char *) &k->options[i], sizeof(int16));
+	}
+	appendStringInfoChar(out, '|');
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		appendBinaryStringInfo(out, (const char *) &att->attnum, sizeof(att->attnum));
+		appendBinaryStringInfo(out, (const char *) &att->atttypid, sizeof(Oid));
+		appendBinaryStringInfo(out, (const char *) &att->atttypmod, sizeof(int32));
+		if (att->atthasmissing)
+		{
+			bool		isnull;
+			Datum		d = getmissingattr(desc, att->attnum, &isnull);
+
+			appendStringInfoChar(out, isnull ? 'N' : 'M');
+			if (!isnull && att->attbyval)
+				appendBinaryStringInfo(out, (const char *) &d, sizeof(Datum));
+			else if (!isnull)
+			{
+				Size		len = datumGetSize(d, false, att->attlen);
+
+				appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
+				appendBinaryStringInfo(out, DatumGetPointer(d), len);
+			}
+		}
+		if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL && desc->constr)
+		{
+			for (int j = 0; j < desc->constr->num_defval; j++)
+				if (desc->constr->defval[j].adnum == att->attnum)
+					appendStringInfoString(out, desc->constr->defval[j].adbin);
+		}
+		appendStringInfoChar(out, ';');
+	}
 }
 
 static bool
@@ -433,4 +491,5 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.row_refs = pkprefix_row_refs,
 	.decode_row_kept = pkprefix_decode_row_kept,
 	.encode_key = pkprefix_encode_key,
+	.row_shape = pkprefix_row_shape,
 };

@@ -144,8 +144,9 @@ COPY cl.keyless FROM STDIN;
 SELECT * FROM pg_temp.entries('cl.keyless');
 SELECT length(dolt_commit('-am', 'conflict and copy')::text) AS committed;
 
--- CLUSTER and VACUUM FULL change no row, but give the table new storage:
--- read in full.  So does a materialized view's refresh.
+-- CLUSTER and VACUUM FULL change no row: no entry, the log's entries (by
+-- key or image) still hold.  A materialized view's refresh may change
+-- them all: read in full.
 CLUSTER cl.keyed USING keyed_pkey;
 SELECT * FROM pg_temp.entries('cl.keyed');
 VACUUM FULL cl.keyless;

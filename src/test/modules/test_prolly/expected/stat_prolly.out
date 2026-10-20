@@ -60,8 +60,13 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written             |    14
  value_nodes_written       |     0
  chunks_appended           |    14
+<<<<<<< HEAD
  chunk_bytes_appended      | 25838
  bytes_hashed              | 44980
+=======
+ chunk_bytes_appended      | 25835
+ bytes_hashed              | 44798
+>>>>>>> c316c64749b (prolly: DDL that changes no row's bytes keeps the fold's baseline (#485))
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0

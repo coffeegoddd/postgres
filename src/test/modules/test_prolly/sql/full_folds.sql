@@ -94,6 +94,68 @@ TRUNCATE ff.m;
 INSERT INTO ff.m (id, a, b) SELECT g, 1, 'r' FROM generate_series(1, 300) g;
 SELECT same_as_full() AS truncate_reload;
 
+-- DDL that changes no row's bytes keeps the baseline: a row changed after
+-- it, committed, folds from the baseline, not every row; DDL that changes
+-- rows' bytes reads them all
+CREATE TABLE ff.p (id int PRIMARY KEY);
+INSERT INTO ff.p SELECT g FROM generate_series(1, 10) g;
+CREATE TABLE ff.s (id int PRIMARY KEY, a int, b text, e text);
+INSERT INTO ff.s SELECT g, g % 10, 'b' || g, 'e' FROM generate_series(1, 2000) g;
+SELECT length(dolt_commit('-Am', 'shape')::text) AS committed;
+\set after 'UPDATE ff.s SET b = b || ''.'' WHERE id = 1; SELECT same_as_full() AS same; SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly''); SELECT length(dolt_commit(''-am'', ''ddl'')::text) > 0 AS committed; SELECT pg_stat_force_next_flush(); SELECT coalesce(string_agg(reason, '',''), ''none'') AS read_in_full FROM full_folds();'
+CREATE INDEX s_a ON ff.s (a);
+:after
+DROP INDEX ff.s_a;
+:after
+ALTER TABLE ff.s ADD CONSTRAINT s_small CHECK (a < 100);
+:after
+ALTER TABLE ff.s ADD CONSTRAINT s_p FOREIGN KEY (a) REFERENCES ff.p (id) NOT VALID;
+:after
+ALTER TABLE ff.s ALTER COLUMN e SET DEFAULT 'd';
+:after
+ALTER TABLE ff.s SET (fillfactor = 70);
+:after
+ALTER TABLE ff.s REPLICA IDENTITY FULL;
+:after
+ALTER TABLE ff.s ALTER COLUMN a SET STATISTICS 50;
+:after
+ALTER TABLE ff.s ALTER COLUMN b SET STORAGE EXTERNAL;
+:after
+ALTER TABLE ff.s ALTER COLUMN b SET COMPRESSION pglz;
+:after
+CREATE STATISTICS ff.s_ab ON a, b FROM ff.s;
+:after
+CREATE FUNCTION ff.touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+CREATE TRIGGER s_touch BEFORE UPDATE ON ff.s FOR EACH ROW EXECUTE FUNCTION ff.touch();
+:after
+CREATE POLICY s_all ON ff.s USING (true);
+:after
+COMMENT ON TABLE ff.s IS 'shaped';
+:after
+VACUUM FULL ff.s;
+:after
+CLUSTER ff.s USING s_pkey;
+:after
+ALTER TABLE ff.s ADD COLUMN n int;
+:after
+ALTER TABLE ff.s ADD COLUMN d int DEFAULT 3;
+:after
+ALTER TABLE ff.s DROP COLUMN n;
+:after
+ALTER TABLE ff.s ALTER COLUMN a TYPE bigint;
+:after
+CREATE TYPE ff.mood AS ENUM ('sad', 'ok');
+CREATE TABLE ff.moods (id int PRIMARY KEY, m ff.mood);
+INSERT INTO ff.moods SELECT g, 'ok' FROM generate_series(1, 100) g;
+SELECT length(dolt_commit('-Am', 'moods')::text) > 0 AS committed;
+ALTER TYPE ff.mood ADD VALUE 'happy';
+UPDATE ff.moods SET m = 'sad' WHERE id = 1;
+SELECT same_as_full() AS same;
+:reset
+SELECT length(dolt_commit('-am', 'enum')::text) > 0 AS committed;
+:flush
+SELECT coalesce(string_agg(reason, ','), 'none') AS read_in_full FROM full_folds();
+
 -- a full fold's rows are sorted in maintenance_work_mem, spilling past it:
 -- the same tree either way
 CREATE TABLE ff.big (id int PRIMARY KEY, v text);
