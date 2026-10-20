@@ -10,10 +10,9 @@
 
 name: correctness
 
+# Off on pull requests and pushes to master for now (the full corpus takes
+# too long on every push); nightly and by hand only, until it is re-enabled.
 on:
-  pull_request:
-  push:
-    branches: [master]
   schedule:
     - cron: '41 6 * * *'
   workflow_dispatch:
