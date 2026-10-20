@@ -198,6 +198,27 @@
       }
     },
     {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main..branch1', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-2",
       "session": "a",
       "op": "query",
@@ -205,6 +226,34 @@
         "vc.diff"
       ],
       "sql": "SELECT * FROM dolt_diff_summary('main', 'branch1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ],
+          [
+            "public.newtable",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main..branch1')",
       "expect": {
         "rows": [
           [
@@ -247,6 +296,27 @@
       }
     },
     {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('branch1..main', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-6",
       "session": "a",
       "op": "query",
@@ -264,6 +334,173 @@
             "t"
           ]
         ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main~2..branch1', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main...branch1', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-9",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main...branch1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-10",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('branch1...main', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "f"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('branch1...main')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "f"
+          ],
+          [
+            "",
+            "public.newtable",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('branch1...main^')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "f"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('branch1...main', 'newtable')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.newtable",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-14",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main...main', 'newtable')",
+      "expect": {
+        "rows": [],
         "order": "bag"
       }
     }

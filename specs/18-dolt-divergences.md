@@ -383,12 +383,20 @@ OF` are built in D18's shapes.
   `commit_date`) and `dolt_at(ref, NULL::t)` (`SETOF t`). The `dolt_diff`
   view, over `dolt_diff()`, is the system table, every kind of object
   listed (D15). Rows of other versions are decoded as the table is
-  defined now.
+  defined now, by column name (spec 21, decision 3), where Dolt follows
+  column tags: a column dropped changes no row (the rows read the
+  same); a column renamed reads as NULL in versions before the rename,
+  so a row diff across it shows the row modified (or a stat counts the
+  cell); a column of another type in an older version is converted to
+  today's type (text `'3'` reads as integer 3, where Dolt gives NULL).
+  A table's history is followed by its name: one dropped and made again
+  has both tables' rows.
 - **Why:** Postgres's catalogs; the functions keep a table's own row
-  type.
+  type. The canonical form records no column tags.
 - **Port:** `SELECT * FROM dolt_diff_t` becomes `dolt_diff_table(NULL::t)`
   with `(to_row).col` for `to_col`; `AS OF 'r'` becomes `dolt_at('r',
-  NULL::t)`.
+  NULL::t)`; `dolt_history_t` becomes `dolt_history_table(NULL::t)` with
+  `(row).col`. Expected rows follow the reading by name.
 
 ## D19. A primary key changed is a modified table
 

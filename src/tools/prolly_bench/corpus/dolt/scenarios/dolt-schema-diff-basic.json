@@ -792,6 +792,46 @@
       }
     },
     {
+      "id": "assert-37",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1..branch2')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-38",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_schema_diff('branch1...branch2')",
+      "expect": {
+        "rows": [
+          [
+            "public.inventory",
+            "public.inventory",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), quantity integer);\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);",
+            "CREATE TABLE public.inventory (pk integer, name character varying(50), color character varying(10));\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pk_not_null NOT NULL pk;\nALTER TABLE public.inventory ADD CONSTRAINT inventory_pkey PRIMARY KEY (pk);"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-39",
       "session": "a",
       "op": "query",

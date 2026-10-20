@@ -1,0 +1,14 @@
+{
+		Name: "empty table",
+		SetUpScript: []string{
+			"create table t (n int, c varchar(20));",
+			"call dolt_add('.')",
+			"call dolt_commit('-am', 'creating table t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select count(*) from DOLT_HISTORY_t;",
+				Expected: []sql.Row{{0}},
+			},
+		},
+	}

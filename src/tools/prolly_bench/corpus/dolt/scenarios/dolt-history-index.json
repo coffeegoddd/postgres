@@ -1,0 +1,199 @@
+{
+  "version": 1,
+  "id": "dolt-history-index",
+  "description": "Reviewed Dolt port: adding an index",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: adding an index"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (pk int PRIMARY KEY, c int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 2), (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial table"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (5, 6), (7, 8)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "two more rows"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (9, 10), (11, 12)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX t1_c ON t1 (c)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "two more rows and an index"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2"
+          ],
+          [
+            "1",
+            "2"
+          ],
+          [
+            "1",
+            "2"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "5",
+            "6"
+          ],
+          [
+            "5",
+            "6"
+          ],
+          [
+            "7",
+            "8"
+          ],
+          [
+            "7",
+            "8"
+          ],
+          [
+            "9",
+            "10"
+          ],
+          [
+            "11",
+            "12"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) WHERE (row).c = 4 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ],
+          [
+            "3",
+            "4"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c FROM dolt_history_table(NULL::t1) WHERE (row).c = 10 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "9",
+            "10"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

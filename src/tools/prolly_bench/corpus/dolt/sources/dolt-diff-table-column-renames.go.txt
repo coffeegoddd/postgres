@@ -1,0 +1,55 @@
+{
+		Name: "multiple column renames",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int);",
+			"call dolt_add('.')",
+			"insert into t values (1, 2);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+
+			"alter table t rename column c1 to c2;",
+			"insert into t values (3, 4);",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'renaming c1 to c2');",
+
+			"alter table t drop column c2;",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'dropping column c2');",
+
+			"alter table t add column c2 int;",
+			"insert into t values (100, '101');",
+			"set @Commit4 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit4, '-am', 'recreating column c2');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t;",
+				Expected: []sql.Row{{5}},
+			},
+			{
+				Query: "SELECT to_pk, to_c2, from_pk, from_c2, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit1 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c2, from_pk, from_c2, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit2 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{3, 4, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c2, from_pk, from_c2, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit3 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, nil, 1, 2, "modified"},
+					{3, nil, 3, 4, "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c2, from_pk, from_c2, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit4 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{100, 101, nil, nil, "added"},
+				},
+			},
+		},
+	}

@@ -1,0 +1,75 @@
+{
+		Name: "adding an index",
+		SetUpScript: []string{
+			"create table t1 (pk int primary key, c int);",
+			"call dolt_add('.')",
+			"insert into t1 values (1,2), (3,4)",
+			"call dolt_commit('-am', 'initial table');",
+			"set @Commit1 = (select hashof('HEAD'));",
+
+			"insert into t1 values (5,6), (7,8)",
+			"call dolt_commit('-am', 'two more rows');",
+
+			"insert into t1 values (9,10), (11,12)",
+			"create index t1_c on t1(c)",
+			"call dolt_commit('-am', 'two more rows and an index');",
+			"set @Commit2 = (select hashof('HEAD'));",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "select pk, c from dolt_history_t1 order by pk",
+				Expected: []sql.Row{
+					{1, 2},
+					{1, 2},
+					{1, 2},
+					{3, 4},
+					{3, 4},
+					{3, 4},
+					{5, 6},
+					{5, 6},
+					{7, 8},
+					{7, 8},
+					{9, 10},
+					{11, 12},
+				},
+			},
+			{
+				Query: "select pk, c from dolt_history_t1 where c = 4 order by pk",
+				Expected: []sql.Row{
+					{3, 4},
+					{3, 4},
+					{3, 4},
+				},
+			},
+			{
+				Query: "select pk, c from dolt_history_t1 where c = 10 order by pk",
+				Expected: []sql.Row{
+					{9, 10},
+				},
+			},
+			{
+				Query: "explain plan select pk, c from dolt_history_t1 where c = 4",
+				Expected: []sql.Row{
+					{"Filter"},
+					{" ├─ (dolt_history_t1.c = 4)"},
+					{" └─ IndexedTableAccess(dolt_history_t1)"},
+					{"     ├─ index: [dolt_history_t1.c]"},
+					{"     ├─ filters: [{[4, 4]}]"},
+					{"     └─ columns: [pk c]"},
+				},
+			},
+			{
+				Query: "explain plan select pk, c from dolt_history_t1 where c = 10 and committer = 'someguy'",
+				Expected: []sql.Row{
+					{"Project"},
+					{" ├─ columns: [dolt_history_t1.pk, dolt_history_t1.c]"},
+					{" └─ Filter"},
+					{"     ├─ ((dolt_history_t1.c = 10) AND (dolt_history_t1.committer = 'someguy'))"},
+					{"     └─ IndexedTableAccess(dolt_history_t1)"},
+					{"         ├─ index: [dolt_history_t1.c]"},
+					{"         ├─ filters: [{[10, 10]}]"},
+					{"         └─ columns: [pk c committer]"},
+				},
+			},
+		},
+	}

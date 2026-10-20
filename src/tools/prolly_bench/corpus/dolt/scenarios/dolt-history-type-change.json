@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "id": "dolt-history-type-change",
+  "description": "Reviewed Dolt port: primary key table: non-pk column type changes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: primary key table: non-pk column type changes"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 int, c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 2, '3'), (4, 5, '6')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting two rows"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "empty commit",
+        "--allow-empty"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ALTER COLUMN c2 TYPE int USING c2::int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "changed type of c2"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_history_table(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "6"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c2 FROM dolt_history_table(NULL::t) WHERE commit_hash = $1 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "3"
+          ],
+          [
+            "4",
+            "6"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c2 FROM dolt_history_table(NULL::t) WHERE commit_hash = $1 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "3"
+          ],
+          [
+            "4",
+            "6"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c1, (row).c2 FROM dolt_history_table(NULL::t) WHERE (row).pk = 4",
+      "expect": {
+        "rows": [
+          [
+            "4",
+            "5",
+            "6"
+          ],
+          [
+            "4",
+            "5",
+            "6"
+          ],
+          [
+            "4",
+            "5",
+            "6"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

@@ -93,6 +93,27 @@
       }
     },
     {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~..HEAD', 't2')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.t2",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-2",
       "session": "a",
       "op": "query",
@@ -121,6 +142,34 @@
       }
     },
     {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~..HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ],
+          [
+            "",
+            "public.t2",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-4",
       "session": "a",
       "op": "query",
@@ -128,6 +177,27 @@
         "vc.diff"
       ],
       "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD', 't1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~..HEAD', 't1')",
       "expect": {
         "rows": [
           [

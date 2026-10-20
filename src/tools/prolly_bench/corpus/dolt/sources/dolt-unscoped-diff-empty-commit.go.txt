@@ -1,0 +1,34 @@
+{
+		Name: "empty commit handling",
+		SetUpScript: []string{
+			"create table x (a int primary key, b int, c int)",
+			"create table y (a int primary key, b int, c int)",
+			"call dolt_add('.')",
+			"insert into x values (1, 2, 3), (2, 3, 4)",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'Creating tables x and y')",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '--allow-empty', '-m', 'Empty!')",
+			"insert into y values (-1, -2, -3), (-2, -3, -4)",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'Inserting into table y')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF",
+				Expected: []sql.Row{{3}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit1)",
+				Expected: []sql.Row{{"x", true, true}, {"y", true, false}},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit2)",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select table_name, schema_change, data_change from DOLT_DIFF where commit_hash in (@Commit3)",
+				Expected: []sql.Row{{"y", false, true}},
+			},
+		},
+	}

@@ -1,0 +1,18 @@
+{
+		Name: "pk set change should throw an error for 3 argument dolt_diff_stat",
+		SetUpScript: []string{
+			"CREATE table t (pk int primary key);",
+			"INSERT INTO t values (1);",
+			"CALL DOLT_COMMIT('-Am', 'table with row');",
+			"ALTER TABLE t ADD col1 int not null default 0;",
+			"ALTER TABLE t drop primary key;",
+			"ALTER TABLE t add primary key (pk, col1);",
+			"CALL DOLT_COMMIT('-am', 'add secondary column with primary key');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "SELECT * from dolt_diff_stat('HEAD~', 'HEAD', 't');",
+				ExpectedErrStr: "failed to compute diff stat for table t: primary key set changed",
+			},
+		},
+	}

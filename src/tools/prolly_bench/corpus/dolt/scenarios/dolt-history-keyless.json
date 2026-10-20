@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "id": "dolt-history-keyless",
+  "description": "Reviewed Dolt port: keyless table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: keyless table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE foo1 (n int, de varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO foo1 VALUES (1, 'Ein'), (2, 'Zwei'), (3, 'Drei')",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into foo1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE foo1 SET de = 'Eins' WHERE n = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "updating data in foo1"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO foo1 VALUES (4, 'Vier')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting data in foo1"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_history_table(NULL::foO1)",
+      "expect": {
+        "rows": [
+          [
+            "10"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de FROM dolt_history_table(NULL::foo1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Ein"
+          ],
+          [
+            "2",
+            "Zwei"
+          ],
+          [
+            "3",
+            "Drei"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de FROM dolt_history_table(NULL::Foo1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins"
+          ],
+          [
+            "2",
+            "Zwei"
+          ],
+          [
+            "3",
+            "Drei"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).n, (row).de FROM dolt_history_table(NULL::foo1) WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "Eins"
+          ],
+          [
+            "2",
+            "Zwei"
+          ],
+          [
+            "3",
+            "Drei"
+          ],
+          [
+            "4",
+            "Vier"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "id": "dolt-diff-view-commit",
+  "description": "Reviewed Dolt port: duplicate commit_hash",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSystemTableScriptTests: duplicate commit_hash"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "commit0"
+    },
+    {
+      "id": "create-t1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (x int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "create-t2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t2 (x int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name FROM dolt_diff WHERE commit_hash = $1",
+      "expect": {
+        "rows": [
+          [
+            "public.t1"
+          ],
+          [
+            "public.t2"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    }
+  ]
+}

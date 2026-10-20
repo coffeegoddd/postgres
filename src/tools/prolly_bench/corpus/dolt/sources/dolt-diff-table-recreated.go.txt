@@ -1,0 +1,34 @@
+{
+		// In this case, we do not expect to see the old/dropped table included in the dolt_diff_table output
+		Name: "table drop and recreate with overlapping schema",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c int);",
+			"call dolt_add('.')",
+			"insert into t values (1, 2), (3, 4);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+
+			"drop table t;",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'dropping table t');",
+
+			"create table t (pk int primary key, c int);",
+			"call dolt_add('.')",
+			"insert into t values (100, 200), (300, 400);",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'recreating table t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT COUNT(*) FROM DOLT_DIFF_t",
+				Expected: []sql.Row{{2}},
+			},
+			{
+				Query: "SELECT to_pk, to_c, from_pk, from_c, diff_type FROM DOLT_DIFF_t WHERE TO_COMMIT=@Commit3 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{100, 200, nil, nil, "added"},
+					{300, 400, nil, nil, "added"},
+				},
+			},
+		},
+	}

@@ -121,6 +121,19 @@
       }
     },
     {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('WORKING..WORKING', 't')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-6",
       "session": "a",
       "op": "query",

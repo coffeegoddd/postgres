@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-key-change-all",
+  "description": "Reviewed Dolt port: pk set change should report warning for 2 argument dolt_diff_summary",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: pk set change should report warning for 2 argument dolt_diff_summary"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t2 (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "multiple tables"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD col1 int NOT NULL DEFAULT 0",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP CONSTRAINT t_pkey",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD PRIMARY KEY (pk, col1)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (3), (4), (5)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add secondary column with primary key to t"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ],
+          [
+            "public.t2",
+            "public.t2",
+            "modified",
+            "t",
+            "f"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

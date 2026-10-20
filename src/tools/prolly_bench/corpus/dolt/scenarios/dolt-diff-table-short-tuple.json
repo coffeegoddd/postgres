@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "id": "dolt-diff-table-short-tuple",
+  "description": "Reviewed Dolt port: add multiple columns, then set and unset a value. Should not show a diff",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSystemTableScriptTests: add multiple columns, then set and unset a value. Should not show a diff"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN col1 int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t ADD COLUMN col2 int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "setup"
+      ],
+      "save": "setup"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = 1 WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET col1 = NULL WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "fix",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "fix short tuple",
+        "--allow-empty"
+      ],
+      "save": "fix"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).col1, (from_row).pk, (from_row).col1, diff_type FROM dolt_diff_table(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

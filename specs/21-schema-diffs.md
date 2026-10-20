@@ -227,6 +227,26 @@ match it: an empty table added or dropped had `data_change` true, and
 a renamed object `schema_change` false. Doltgres's cases are in
 `schema_diffs`.
 
+**Ported with the later functions** (ranges, `dolt_diff_stat`, the
+per-table functions, the view): the range assertions are ported, so
+`diff with branch refs`, `renamed table` and `prepared table
+functions` are whole (P); the primary-key-change cases are ported with
+D19 (of the 17 summary cases, 15 whole, `WORKING and STAGED` in part,
+drop-and-recreate deferred). Of `DiffStatTableFunctionScriptTests`, 13
+cases are ported, 10 whole and 3 in part (staging, as above; a table
+neither ref has, which Dolt refuses and prolly answers with no rows;
+and `basic case with single table`, whose table is dropped before the
+assertions: the stat counts a changed table's rows only where the
+session's branch has it), and the keyless one (for that reason) and
+the computed one are deferred. Of `DiffSystemTableScriptTests`, 17
+(the `dolt_diff_<t>` cases and one of the view; one without its SHOW
+INDEX); three are deferred (a column's old values that don't
+convert to its new type, and two primary-key changes, which
+`dolt_diff_table` refuses). Of `HistorySystemTableScriptTests`, cases
+0–8 (two without their EXPLAIN assertions); of
+`UnscopedDiffSystemTableScriptTests`, cases 1–5. Differences follow
+D15–D20; D18 says how rows of other versions are read.
+
 ## 7. Decisions
 
 Decided by the user 2026-10-19, as recommended:

@@ -787,7 +787,7 @@ Before running a case, the adapter creates and drops a separate probe
 database. It verifies the actual AM (and prolly's table/index/TOAST block-map
 forks); for any version-control capability, it runs the built-in history scenario, including
 branch isolation and restoration, and for any beyond `vc.core` a second
-one (`cases/vc-probe.json`) that finds a merge base, merges, diffs (rows, a summary, statements), picks, reverts, and reads a
+one (`cases/vc-probe.json`) that finds a merge base, merges, diffs (rows, a summary, statements, a stat, a table's history and rows at a commit), picks, reverts, and reads a
 conflict and a constraint violation, each checked by its effect: a claimed
 capability that doesn't work fails targeting, not the case. Case fixtures therefore start with fresh
 history. The adapter also checks public tables' AMs after steps, deferring

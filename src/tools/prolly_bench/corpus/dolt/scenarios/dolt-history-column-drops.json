@@ -1,0 +1,194 @@
+{
+  "version": 1,
+  "id": "dolt-history-column-drops",
+  "description": "Reviewed Dolt port: primary key table: non-pk column drops and adds",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: primary key table: non-pk column drops and adds"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 int, c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 2, '3'), (4, 5, '6')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP COLUMN c2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "dropping column c2"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t RENAME COLUMN c1 TO c2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renaming c1 to c2"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_history_table(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "6"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).c1 FROM dolt_history_table(NULL::t)",
+      "expect": {
+        "sqlstate": "42703"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c2 FROM dolt_history_table(NULL::t) WHERE commit_hash = $1 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "3"
+          ],
+          [
+            "4",
+            "6"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c2 FROM dolt_history_table(NULL::t) WHERE commit_hash = $1 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            null
+          ],
+          [
+            "4",
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).pk, (row).c2 FROM dolt_history_table(NULL::t) WHERE commit_hash = $1 ORDER BY (row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2"
+          ],
+          [
+            "4",
+            "5"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        }
+      ]
+    }
+  ]
+}

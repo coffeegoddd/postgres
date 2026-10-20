@@ -1,0 +1,43 @@
+{
+		Name: "primary key table: non-pk column drops and adds",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int, c2 varchar(20));",
+			"call dolt_add('.')",
+			"insert into t values (1, 2, '3'), (4, 5, '6');",
+			"CALL DOLT_COMMIT('-am', 'creating table t');",
+			"set @Commit1 = (select hashof('HEAD'));",
+
+			"alter table t drop column c2;",
+			"CALL DOLT_COMMIT('-am', 'dropping column c2');",
+			"set @Commit2 = (select hashof('HEAD'));",
+
+			"alter table t rename column c1 to c2;",
+			"CALL DOLT_COMMIT('-am', 'renaming c1 to c2');",
+			"set @Commit3 = (select hashof('HEAD'));",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select count(*) from dolt_history_t;",
+				Expected: []sql.Row{{6}},
+			},
+			{
+				// TODO: Instead of just spot checking the non-existence of c1, it would be useful to be able to
+				//       assert the full schema of the result set. ScriptTestAssertion doesn't support that currently,
+				//       but the code from QueryTest could be ported over to ScriptTestAssertion.
+				Query:       "select c1 from dolt_history_t;",
+				ExpectedErr: sql.ErrColumnNotFound,
+			},
+			{
+				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit1 order by pk;",
+				Expected: []sql.Row{{1, nil}, {4, nil}},
+			},
+			{
+				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit2 order by pk;",
+				Expected: []sql.Row{{1, nil}, {4, nil}},
+			},
+			{
+				Query:    "select pk, c2 from dolt_history_t where commit_hash=@Commit3 order by pk;",
+				Expected: []sql.Row{{1, 2}, {4, 5}},
+			},
+		},
+	}
