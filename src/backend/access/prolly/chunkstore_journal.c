@@ -5057,8 +5057,20 @@ open_received(const char *dir, uint64 id, MemoryContext cxt)
 		close_table(t);
 		return NULL;
 	}
-	t->tf = PROLLY_CALL(table_format(), open, table_file_read, table_file_map, t,
-						t->size, cxt);
+	/* (a format raising an error on a damaged file: not whole, either) */
+	old = CurrentMemoryContext;
+	PG_TRY();
+	{
+		t->tf = PROLLY_CALL(table_format(), open, table_file_read,
+							table_file_map, t, t->size, cxt);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(old);
+		FlushErrorState();
+		t->tf = NULL;
+	}
+	PG_END_TRY();
 	if (t->tf == NULL)
 	{
 		close_table(t);
@@ -5286,7 +5298,7 @@ journal_adopt_received(ProllyChunkStore *s)
 
 /* Remove the received files the manifest doesn't name. */
 static void
-journal_forget_received(ProllyChunkStore *s)
+journal_forget_received(ProllyChunkStore *s, const char *const *keep, int nkeep)
 {
 	Manifest	m;
 	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -5301,6 +5313,8 @@ journal_forget_received(ProllyChunkStore *s)
 
 		for (int i = 0; i < m.nfiles; i++)
 			named |= m.files[i].id == *id;
+		for (int i = 0; i < nkeep && !named; i++)
+			named = received_id(keep[i]) == *id;
 		if (!named)
 			table_file_unlink(s, dir, *id, false);
 	}

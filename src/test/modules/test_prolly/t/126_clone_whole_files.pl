@@ -99,6 +99,30 @@ is(l('resumed', $received), $files, 'and takes them all');
 is(l('resumed', q{SELECT count(*), sum(length(v)) FROM w.t}), '60000|3840000',
 	'with its rows');
 
+# Failed after its first file, then the remote changed (a commit and a
+# collection: its files written again): tried again, the file kept from
+# before isn't taken, nor checked, and the clone is of the remote now.
+l('postgres', 'CREATE DATABASE stale');
+l('stale', 'CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points');
+($ret, $out, $err) = $local->psql('stale', qq{
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-clone-file-received', 'error');
+	SELECT dolt_clone('$url')});
+like($err, qr/error triggered for injection point prolly-clone-file-received/,
+	'a clone fails after its first file');
+o(q{UPDATE w.t SET v = 'changed ' || id;
+	SELECT dolt_commit('-am', 'two');
+	SELECT test_chunk_gc(true)});
+my $head2 = o(q{SELECT dolt_hashof('main')});
+my $files2 = o(q{SELECT count(*) FROM test_chunk_table_files()});
+l('stale', qq{SELECT dolt_clone('$url')});
+is(l('stale', q{SELECT dolt_hashof('main')}), $head2,
+	'tried again after the remote changed, it clones the remote as it is');
+is(l('stale', q{SELECT count(*) FILTER (WHERE v = 'changed ' || id) FROM w.t}), '60000',
+	'with its rows now');
+is(l('stale', $received), $files2,
+	'taking the remote\'s files as they are now, not the one kept from before');
+
 $origin->stop;
 $local->stop;
 done_testing();

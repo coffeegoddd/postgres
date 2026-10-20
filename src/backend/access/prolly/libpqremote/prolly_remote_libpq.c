@@ -706,6 +706,7 @@ libpq_files(ProllyRemote *r, ProllyRemoteFileVisit visit, void *arg)
 	PGresult   *res;
 	bool		has;
 
+	read_format(r);
 	res = run(r, "SELECT pg_catalog.to_regprocedure('pg_catalog.dolt_serve_file_chunks(text)') IS NOT NULL",
 			  0, NULL, NULL, NULL, NULL, &one_bool, "asking what it serves");
 	has = strcmp(PQgetvalue(res, 0, 0), "t") == 0;

@@ -4884,8 +4884,11 @@ cloned_as_branch(const char *name)
  * Before any branch is made, what every branch's head needs from outside
  * the versioned schemas is checked (prolly_deps.h), and the extensions the
  * database lacks are made.  All in the transaction: a clone that fails
- * leaves nothing but the files it copied whole, out of what the store
- * reads, which a clone tried again doesn't copy again.
+ * leaves nothing but the files it copied whole, which a clone tried again
+ * doesn't copy again: out of what the store reads if it failed copying or
+ * checking them, but once they are checked the store takes them at once,
+ * so one that fails after (making its branches) leaves them named, its
+ * garbage until the store's next collection.
  */
 Datum
 dolt_clone(PG_FUNCTION_ARGS)

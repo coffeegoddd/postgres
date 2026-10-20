@@ -457,7 +457,18 @@ served_chunk(const ProllyHash *hash, const char *frame, Size len, void *arg)
 	bool		nulls[2] = {0};
 
 	values[0] = PointerGetDatum(hash_bytea(hash));
-	values[1] = PointerGetDatum(bytes_bytea(frame, (int) len));
+	/* (to a client that can't decompress, plain, as get_stored sends) */
+	if (prolly_serve_uncompressed)
+	{
+		StringInfoData plain;
+
+		initStringInfo(&plain);
+		prolly_chunk_frame_plain(frame, len, &plain);
+		values[1] = PointerGetDatum(bytes_bytea(plain.data, plain.len));
+		pfree(plain.data);
+	}
+	else
+		values[1] = PointerGetDatum(bytes_bytea(frame, (int) len));
 	tuplestore_putvalues(sc->rsinfo->setResult, sc->rsinfo->setDesc, values, nulls);
 	pfree(DatumGetPointer(values[0]));
 	pfree(DatumGetPointer(values[1]));

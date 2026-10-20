@@ -48,9 +48,11 @@
 
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
+#include "catalog/pg_database.h"
 #include "miscadmin.h"
 #include "utils/injection_point.h"
 #include "storage/buffile.h"
+#include "storage/lmgr.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
@@ -519,6 +521,9 @@ typedef struct RemoteFiles
 {
 	List	   *keys;			/* char * */
 	List	   *counts;			/* their chunk counts */
+	List	   *sizes;			/* uint64 *: their sizes */
+	List	   *journal;		/* int: the journal's (its counts are of
+								 * copies, which a copy of it doesn't keep) */
 	uint64		table_bytes;
 	uint64		journal_bytes;
 } RemoteFiles;
@@ -527,13 +532,30 @@ static void
 note_file(const char *key, uint32 nchunks, uint64 size, bool journal, void *arg)
 {
 	RemoteFiles *rf = arg;
+	uint64	   *sz = palloc(sizeof(uint64));
 
+	*sz = size;
 	rf->keys = lappend(rf->keys, pstrdup(key));
 	rf->counts = lappend_int(rf->counts, (int) nchunks);
+	rf->sizes = lappend(rf->sizes, sz);
+	rf->journal = lappend_int(rf->journal, journal);
 	if (journal)
 		rf->journal_bytes += size;
 	else
 		rf->table_bytes += size;
+}
+
+/*
+ * The key a remote's file is received under: its key there, its size, and
+ * the first commit cloned (the remote's, as of this clone), so a file kept
+ * from a clone of another remote, or of this one before it changed, isn't
+ * taken for it.
+ */
+static char *
+received_key(const char *key, uint64 size, const ProllyHash *first)
+{
+	return psprintf("%s %llu %s", key, (unsigned long long) size,
+					first ? prolly_hash_hex(first) : "-");
 }
 
 /* A remote file's chunks, as stored, each checked against its hash. */
@@ -679,13 +701,16 @@ chunks_clone(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 {
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store;
-	RemoteFiles rf = {NIL, NIL, 0, 0};
-	ListCell   *k;
-	ListCell   *n;
+	RemoteFiles rf = {0};
 	CloneCheck	cc;
+	const char **keys;
+	int			nkeys;
 
 	if (!PROLLY_HAS(rr, files) || !PROLLY_HAS(cs, receive_file) ||
 		!PROLLY_CALL(rr, files, remote, note_file, &rf))
+		return false;
+	/* (a remote that lists no files, but has commits, can't serve them) */
+	if (rf.keys == NIL)
 		return false;
 	/* (a journal a fifth of the remote or more: the walk reads less) */
 	if (rf.journal_bytes * 5 >= rf.table_bytes + rf.journal_bytes &&
@@ -693,20 +718,39 @@ chunks_clone(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 		return false;
 	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
 
-	forboth(k, rf.keys, n, rf.counts)
+	/*
+	 * (one clone of the database at a time: another's files, being written
+	 * or kept, are this one's to remove or take)
+	 */
+	LockDatabaseObject(DatabaseRelationId, MyDatabaseId, 1, ExclusiveLock);
+
+	/* the files kept from a clone before that this one doesn't name: gone */
+	nkeys = list_length(rf.keys);
+	keys = palloc(sizeof(char *) * nkeys);
+	for (int i = 0; i < nkeys; i++)
+		keys[i] = received_key(list_nth(rf.keys, i),
+							   *(uint64 *) list_nth(rf.sizes, i),
+							   ncommits > 0 ? &commits[0] : NULL);
+	PROLLY_CALL(cs, forget_received, store, keys, nkeys);
+
+	for (int i = 0; i < nkeys; i++)
 	{
 		uint32		have;
 		Copying		cp = {rr, NULL, prolly_content_hash()};
 
-		/* (one whole from a clone tried before: checked as it came) */
-		if (PROLLY_CALL(cs, received_file, store, lfirst(k), &have) &&
-			have == (uint32) lfirst_int(n))
+		/*
+		 * (one whole from a clone tried before: checked as it came; never
+		 * the journal, whose count of copies a copy of it doesn't keep)
+		 */
+		if (!list_nth_int(rf.journal, i) &&
+			PROLLY_CALL(cs, received_file, store, keys[i], &have) &&
+			have == (uint32) list_nth_int(rf.counts, i))
 			continue;
 		initStringInfo(&cp.chunk);
-		cp.file = PROLLY_CALL(rr, file_open, remote, lfirst(k));
+		cp.file = PROLLY_CALL(rr, file_open, remote, list_nth(rf.keys, i));
 		PG_TRY();
 		{
-			PROLLY_CALL(cs, receive_file, store, lfirst(k), copied_next, &cp);
+			PROLLY_CALL(cs, receive_file, store, keys[i], copied_next, &cp);
 		}
 		PG_FINALLY();
 		{

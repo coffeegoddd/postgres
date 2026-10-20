@@ -56,7 +56,8 @@
  *   received_get() reads a chunk of the files received (out NULL: whether
  *   they have it), received_chunks() visits each of their chunks, as
  *   stored.  adopt_received() names the files received in the manifest, at
- *   once; forget_received() removes them.
+ *   once; forget_received() removes them, but those for the nkeep keys of
+ *   keep.
  * - add_table_file() adds a table file of the chunks next() gives (until it
  *   returns false), at once and for every transaction: the chunks of
  *   another store, received whole, or of a rewrite.  It isn't undone if the
@@ -374,7 +375,8 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*received_chunks) (ProllyChunkStore *store,
 									ProllyChunkStoredVisit visit, void *arg);
 	void		(*adopt_received) (ProllyChunkStore *store);
-	void		(*forget_received) (ProllyChunkStore *store);
+	void		(*forget_received) (ProllyChunkStore *store,
+									const char *const *keep, int nkeep);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
