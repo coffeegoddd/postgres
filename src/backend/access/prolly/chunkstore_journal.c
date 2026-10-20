@@ -376,8 +376,7 @@ typedef struct JournalShared
 	CheckedEnd	checked[CHECKED_ENDS];	/* under mutex */
 	int			next_checked;
 	int			inflight;		/* ranges of len > 0 */
-	TimestampTz last_at;		/* the last append's time; under
-								 * ProllyJournalLock */
+	TimestampTz last_at;		/* the last append's time; under mutex */
 
 	/* under mutex */
 	KeepSet		keeps[KEEP_COLLECTIONS];
@@ -1591,12 +1590,19 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 				 errmsg("could not extend file \"%s\": %m", g->path)));
 
 	/*
-	 * (taken under the lock, so a later place in the journal has no earlier
-	 * time: a reflog is newest first by place; nor across a clock stepped
-	 * back)
+	 * (taken under the database's append lock, so a later place in its
+	 * journal has no earlier time: a reflog is newest first by place; and
+	 * never before the last append's, any database's, under the mutex, so
+	 * not across a clock stepped back either)
 	 */
-	a->at = Max(GetCurrentTimestamp(), js->last_at);
-	js->last_at = a->at;
+	{
+		TimestampTz now = GetCurrentTimestamp();
+
+		SpinLockAcquire(&js->mutex);
+		a->at = Max(now, js->last_at);
+		js->last_at = a->at;
+		SpinLockRelease(&js->mutex);
+	}
 
 	a->sync_refused = sync_refused();
 	INJECTION_POINT("prolly-append-reserving", NULL);
