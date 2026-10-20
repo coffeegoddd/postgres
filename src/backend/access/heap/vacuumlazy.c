@@ -332,6 +332,8 @@ typedef struct LVRelState
 
 	BlockNumber lpdead_item_pages;	/* # pages with LP_DEAD items */
 	BlockNumber missed_dead_pages;	/* # pages with missed dead tuples */
+	BlockNumber shared_pages;	/* # pages another relation shares, left
+								 * as they are */
 	BlockNumber nonempty_pages; /* actually, last nonempty page + 1 */
 
 	/* Statistics output by us, for table */
@@ -745,6 +747,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	vacrel->new_frozen_tuple_pages = 0;
 	vacrel->lpdead_item_pages = 0;
 	vacrel->missed_dead_pages = 0;
+	vacrel->shared_pages = 0;
 	vacrel->nonempty_pages = 0;
 	/* dead_items_alloc allocates vacrel->dead_items later on */
 
@@ -1069,6 +1072,10 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 								 _("tuples missed: %" PRId64 " dead from %u pages not removed due to cleanup lock contention\n"),
 								 vacrel->missed_dead_tuples,
 								 vacrel->missed_dead_pages);
+			if (vacrel->shared_pages > 0)
+				appendStringInfo(&buf,
+								 _("pages shared: %u shared with another relation, left as they are\n"),
+								 vacrel->shared_pages);
 			diff = (int32) (ReadNextTransactionId() -
 							vacrel->cutoffs.OldestXmin);
 			appendStringInfo(&buf,
@@ -1446,6 +1453,20 @@ lazy_scan_heap(LVRelState *vacrel)
 		{
 			/* Processed as new/empty page (lock and pin released) */
 			continue;
+		}
+
+		/*
+		 * A page another relation shares (a branch's, copy-on-write) is left
+		 * as it is unless it must be frozen: pruning it, freezing it or
+		 * setting it all-visible would copy it, undoing the sharing for
+		 * nothing the relations need.  It is counted, as a page whose cleanup
+		 * lock wasn't obtained is, and an aggressive VACUUM that must freeze
+		 * a tuple of it still does (lazy_scan_noprune() says so).
+		 */
+		if (got_cleanup_lock && BufferPageIsShared(buf))
+		{
+			got_cleanup_lock = false;
+			vacrel->shared_pages++;
 		}
 
 		/*

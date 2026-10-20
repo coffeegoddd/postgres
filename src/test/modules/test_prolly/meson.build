@@ -121,6 +121,7 @@ tests += {
       'full_folds',
       'fold_verify',
       'keyless_toast_folds',
+      'vacuum_shared',
       'append_check',
       'journal_segments',
       'journal_compression',
