@@ -101,29 +101,42 @@ OBJS_COMMON += \
 endif
 
 # BLAKE3, imported (README.blake3): its SIMD variants are built with the
-# instructions they use enabled, and chosen at run time.
+# instructions they use enabled, and chosen at run time.  A variant whose
+# intrinsics the compiler can't build with its flags is left out, and the
+# dispatcher told so (BLAKE3_NO_*).
 BLAKE3_OBJS = \
 	blake3.o \
 	blake3_dispatch.o \
 	blake3_portable.o
+BLAKE3_CFLAGS =
+
+comma := ,
+# $(call blake3_probe,flags,header,expression): yes if it compiles
+blake3_probe = $(shell printf '\043include <%s>\nint f(void);\nint f(void) { %s; return 0; }\n' '$(2)' '$(3)' | \
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(1) -x c -c -o /dev/null - >/dev/null 2>&1 && echo yes)
+# $(call blake3_variant,name,flags,header,expression,macro)
+define blake3_variant
+ifeq (yes,$$(call blake3_probe,$(2),$(3),$(4)))
+BLAKE3_OBJS += blake3_$(1).o
+$$(call blake3_variants,blake3_$(1)): CFLAGS += $(2)
+else
+BLAKE3_CFLAGS += -D$(5)
+endif
+endef
+blake3_variants = $(1).o $(1)_shlib.o $(1)_srv.o
+
 ifneq (,$(filter x86_64 i386 i486 i586 i686,$(host_cpu)))
-BLAKE3_OBJS += \
-	blake3_avx2.o \
-	blake3_avx512.o \
-	blake3_sse2.o \
-	blake3_sse41.o
+$(eval $(call blake3_variant,sse2,-msse2,emmintrin.h,__m128i a = _mm_setzero_si128(); a = _mm_add_epi32(a$(comma) a),BLAKE3_NO_SSE2))
+$(eval $(call blake3_variant,sse41,-msse4.1,smmintrin.h,__m128i a = _mm_setzero_si128(); a = _mm_blend_epi16(a$(comma) a$(comma) 0),BLAKE3_NO_SSE41))
+$(eval $(call blake3_variant,avx2,-mavx2,immintrin.h,__m256i a = _mm256_setzero_si256(); a = _mm256_add_epi32(a$(comma) a),BLAKE3_NO_AVX2))
+$(eval $(call blake3_variant,avx512,-mavx512f -mavx512vl,immintrin.h,__m512i a = _mm512_setzero_si512(); __m256i b = _mm256_setzero_si256(); a = _mm512_add_epi32(a$(comma) a); b = _mm256_ror_epi32(b$(comma) 7),BLAKE3_NO_AVX512))
 endif
 ifeq ($(host_cpu),aarch64)
 BLAKE3_OBJS += blake3_neon.o
 endif
 OBJS_COMMON += $(BLAKE3_OBJS)
 
-blake3_variants = $(1).o $(1)_shlib.o $(1)_srv.o
-$(foreach o,$(BLAKE3_OBJS:.o=),$(call blake3_variants,$(o))): CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT)
-$(call blake3_variants,blake3_sse2): CFLAGS += -msse2
-$(call blake3_variants,blake3_sse41): CFLAGS += -msse4.1
-$(call blake3_variants,blake3_avx2): CFLAGS += -mavx2
-$(call blake3_variants,blake3_avx512): CFLAGS += -mavx512f -mavx512vl
+$(foreach o,$(BLAKE3_OBJS:.o=),$(call blake3_variants,$(o))): CFLAGS += $(PERMIT_DECLARATION_AFTER_STATEMENT) $(BLAKE3_CFLAGS)
 
 # A few files are currently only built for frontend, not server.
 # logging.c is excluded from OBJS_FRONTEND_SHLIB (shared library) as

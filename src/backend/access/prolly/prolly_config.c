@@ -109,8 +109,7 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 						RelationGetRelationName(rel))));
 	components->chunker = (const ProllyChunkerRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_CHUNKER);
-	components->hash = (const ProllyHashRoutine *)
-		profile_impl(history_profile, PROLLY_IFACE_CONTENT_HASH);
+	components->hash = prolly_content_hash();
 	components->key_encoder = (const ProllyKeyEncoderRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_KEY_ENCODER);
 	components->value_encoder = (const ProllyValueEncoderRoutine *)
@@ -263,6 +262,9 @@ prolly_is_change_log(Relation rel)
 /*
  * The content hash chunks are named by: the profile's, the one hash every
  * chunk store, tree, transfer and canonical form of this server shares.
+ * Not one to change on its own yet: a TOAST pointer to a tree (va_hash)
+ * holds a hash of 32 bytes, so one of another length would be copied
+ * short or long.
  */
 const ProllyHashRoutine *
 prolly_content_hash(void)

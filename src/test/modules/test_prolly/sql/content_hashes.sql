@@ -2,9 +2,10 @@
 -- Content hashes.  BLAKE3 against the official test vectors
 -- (test_vectors/test_vectors.json of BLAKE3 1.8.2, each digest's first 20
 -- bytes): every input length there, each input the bytes 0, 1, ..., 250
--- repeated, so the lengths past 1 KiB take the SIMD paths the CPU has.
--- Each is hashed whole, and fed in pieces that split its 1 KiB chunks and
--- 64-byte blocks unevenly.
+-- repeated, so they take the widest SIMD variant the CPU has (lengths past
+-- 1 KiB its many-chunk path too).  Each is hashed whole, and fed in pieces
+-- that split its 1 KiB chunks and 64-byte blocks unevenly.  Then every
+-- narrower variant built and runnable here, against the portable code.
 --
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -70,3 +71,5 @@ SELECT test_content_hash('abc', 'sha256') = encode(sha256('abc'), 'hex') AS sha2
 -- The hash chunks are named by.
 SELECT length(test_content_hash('')) / 2 AS digest_bytes;
 SELECT test_content_hash('x', 'no such hash');
+
+SELECT test_blake3_variants() AS variants_agree;

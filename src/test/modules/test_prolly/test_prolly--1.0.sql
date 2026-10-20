@@ -194,6 +194,12 @@ CREATE FUNCTION test_content_hash(data bytea, impl text DEFAULT NULL,
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- Whether every BLAKE3 SIMD variant built and runnable here agrees with
+-- the portable code.
+CREATE FUNCTION test_blake3_variants()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_chunk_get(hash text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -76,30 +76,48 @@ ryu_cflags = []
 ryu_cflags += cflags_no_decl_after_statement
 
 # BLAKE3, imported (README.blake3), likewise; its SIMD variants are built
-# with the instructions they use enabled, and chosen at run time.
+# with the instructions they use enabled, and chosen at run time.  A variant
+# whose intrinsics the compiler can't build with its flags is left out, and
+# the dispatcher told so (BLAKE3_NO_*).
 blake3_sources = files(
   'blake3.c',
   'blake3_dispatch.c',
   'blake3_portable.c',
 )
+blake3_simd = {}
 blake3_cflags = cflags_no_decl_after_statement
-blake3_simd_sources = {}
-blake3_simd_cflags = {}
 if host_cpu == 'x86' or host_cpu == 'x86_64'
-  foreach variant, flags : {
-      'sse2': ['-msse2'],
-      'sse41': ['-msse4.1'],
-      'avx2': ['-mavx2'],
-      'avx512': ['-mavx512f', '-mavx512vl'],
+  foreach variant, probe : {
+      'sse2': [['-msse2'], 'emmintrin.h',
+        '__m128i a = _mm_setzero_si128(); a = _mm_add_epi32(a, a);'],
+      'sse41': [['-msse4.1'], 'smmintrin.h',
+        '__m128i a = _mm_setzero_si128(); a = _mm_blend_epi16(a, a, 0);'],
+      'avx2': [['-mavx2'], 'immintrin.h',
+        '__m256i a = _mm256_setzero_si256(); a = _mm256_add_epi32(a, a);'],
+      'avx512': [['-mavx512f', '-mavx512vl'], 'immintrin.h',
+        '''__m512i a = _mm512_setzero_si512(); __m256i b = _mm256_setzero_si256();
+        a = _mm512_add_epi32(a, a); b = _mm256_ror_epi32(b, 7);'''],
     }
-    blake3_simd_sources += {'blake3_' + variant: files('blake3_@0@.c'.format(variant))}
-    blake3_simd_cflags += {'blake3_' + variant:
-      blake3_cflags + (cc.get_id() == 'msvc' ? [] : flags)}
+    flags = cc.get_id() == 'msvc' ? [] : probe[0]
+    code = '''#include <@0@>
+int f(void);
+int f(void) { @1@ return 0; }
+'''.format(probe[1], probe[2])
+    if cc.compiles(code, args: flags, name: 'BLAKE3 ' + variant + ' intrinsics')
+      blake3_simd += {'blake3_' + variant: flags}
+    else
+      blake3_cflags += '-DBLAKE3_NO_@0@'.format(variant.to_upper())
+    endif
   endforeach
 elif host_cpu == 'aarch64'
-  blake3_simd_sources += {'blake3_neon': files('blake3_neon.c')}
-  blake3_simd_cflags += {'blake3_neon': blake3_cflags}
+  blake3_simd += {'blake3_neon': []}
 endif
+blake3_simd_sources = {}
+blake3_simd_cflags = {}
+foreach name, flags : blake3_simd
+  blake3_simd_sources += {name: files(name + '.c')}
+  blake3_simd_cflags += {name: blake3_cflags + flags}
+endforeach
 
 config_info_sources = files('config_info.c',)
 config_info_cflags = [

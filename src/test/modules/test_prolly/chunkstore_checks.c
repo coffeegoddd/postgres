@@ -141,6 +141,140 @@ test_content_hash(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&h));
 }
 
+/*
+ * BLAKE3's SIMD variants, each compiled in (as its build found the
+ * compiler able to) and run by this CPU, against its portable code: the
+ * dispatcher picks only the widest, so the others never run otherwise.
+ * Their functions are weak references: a variant left out of the build is
+ * NULL.
+ */
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))
+typedef void (*blake3_hash_many_fn) (const uint8_t *const *inputs,
+									 size_t num_inputs, size_t blocks,
+									 const uint32_t key[8], uint64_t counter,
+									 bool increment_counter, uint8_t flags,
+									 uint8_t flags_start, uint8_t flags_end,
+									 uint8_t *out);
+typedef void (*blake3_compress_fn) (uint32_t cv[8], const uint8_t block[64],
+									uint8_t block_len, uint64_t counter,
+									uint8_t flags);
+
+#define BLAKE3_HASH_MANY(v) \
+	extern void blake3_hash_many_##v(const uint8_t *const *, size_t, size_t, \
+									 const uint32_t[8], uint64_t, bool, \
+									 uint8_t, uint8_t, uint8_t, uint8_t *) \
+		__attribute__((weak))
+#define BLAKE3_COMPRESS(v) \
+	extern void blake3_compress_in_place_##v(uint32_t[8], const uint8_t[64], \
+											 uint8_t, uint64_t, uint8_t) \
+		__attribute__((weak))
+
+BLAKE3_HASH_MANY(portable);
+BLAKE3_COMPRESS(portable);
+#if defined(__aarch64__)
+BLAKE3_HASH_MANY(neon);
+#else
+BLAKE3_HASH_MANY(sse2);
+BLAKE3_COMPRESS(sse2);
+BLAKE3_HASH_MANY(sse41);
+BLAKE3_COMPRESS(sse41);
+BLAKE3_HASH_MANY(avx2);
+BLAKE3_HASH_MANY(avx512);
+BLAKE3_COMPRESS(avx512);
+#endif
+
+#define BLAKE3_CHUNK_START 1
+#define BLAKE3_CHUNK_END 2
+
+/* a variant's results equal the portable code's, for 1 to 16 chunks */
+static bool
+blake3_variant_agrees(const char *name, blake3_hash_many_fn hash_many,
+					  blake3_compress_fn compress)
+{
+	static const uint32_t iv[8] = {
+		0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+		0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+	};
+	uint8_t		input[16 * 1024];
+	const uint8_t *inputs[16];
+	uint8_t		want[16 * 32];
+	uint8_t		got[16 * 32];
+	bool		ok = true;
+
+	for (int i = 0; i < (int) sizeof(input); i++)
+		input[i] = (uint8_t) (i * 7 + (i >> 8));
+	for (int i = 0; i < 16; i++)
+		inputs[i] = input + i * 1024;
+
+	/* (the counter crossing 2^32 as it increments past the first chunks) */
+	for (size_t n = 1; hash_many != NULL && n <= 16; n++)
+	{
+		blake3_hash_many_portable(inputs, n, 16, iv, UINT64CONST(0xfffffffe),
+								  true, 0, BLAKE3_CHUNK_START,
+								  BLAKE3_CHUNK_END, want);
+		hash_many(inputs, n, 16, iv, UINT64CONST(0xfffffffe), true, 0,
+				  BLAKE3_CHUNK_START, BLAKE3_CHUNK_END, got);
+		if (memcmp(want, got, n * 32) != 0)
+		{
+			elog(WARNING, "BLAKE3 %s hash_many differs for %zu chunks",
+				 name, n);
+			ok = false;
+		}
+	}
+	for (int i = 0; compress != NULL && i < 5; i++)
+	{
+		static const uint8_t lens[] = {0, 1, 13, 63, 64};
+		uint8_t		len = lens[i];
+		uint32_t	cv_want[8];
+		uint32_t	cv_got[8];
+
+		memcpy(cv_want, iv, sizeof(iv));
+		memcpy(cv_got, iv, sizeof(iv));
+		blake3_compress_in_place_portable(cv_want, input + len, len,
+										  UINT64CONST(0x100000001),
+										  BLAKE3_CHUNK_START);
+		compress(cv_got, input + len, len, UINT64CONST(0x100000001),
+				 BLAKE3_CHUNK_START);
+		if (memcmp(cv_want, cv_got, sizeof(cv_want)) != 0)
+		{
+			elog(WARNING, "BLAKE3 %s compress differs for a %u-byte block",
+				 name, len);
+			ok = false;
+		}
+	}
+	return ok;
+}
+#endif
+
+/*
+ * Whether every BLAKE3 SIMD variant built and runnable here agrees with
+ * the portable code (true where there are none to check).
+ */
+PG_FUNCTION_INFO_V1(test_blake3_variants);
+Datum
+test_blake3_variants(PG_FUNCTION_ARGS)
+{
+	bool		ok = true;
+
+#if defined(__GNUC__) && defined(__aarch64__)
+	ok &= blake3_variant_agrees("neon", blake3_hash_many_neon, NULL);
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+	__builtin_cpu_init();
+	if (__builtin_cpu_supports("sse2"))
+		ok &= blake3_variant_agrees("sse2", blake3_hash_many_sse2,
+									blake3_compress_in_place_sse2);
+	if (__builtin_cpu_supports("sse4.1"))
+		ok &= blake3_variant_agrees("sse41", blake3_hash_many_sse41,
+									blake3_compress_in_place_sse41);
+	if (__builtin_cpu_supports("avx2"))
+		ok &= blake3_variant_agrees("avx2", blake3_hash_many_avx2, NULL);
+	if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl"))
+		ok &= blake3_variant_agrees("avx512", blake3_hash_many_avx512,
+									blake3_compress_in_place_avx512);
+#endif
+	PG_RETURN_BOOL(ok);
+}
+
 /* Put a chunk; returns its hash. */
 PG_FUNCTION_INFO_V1(test_chunk_put);
 Datum
