@@ -196,6 +196,7 @@
 #include "rewrite/rewriteSupport.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "common/hashfn.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/fmgrprotos.h"
@@ -3852,6 +3853,254 @@ folded_objects(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	canon_env(&cn);
 	w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
 	merge_items(&cn, from, to, true, object_pair, &w);
+}
+
+/* An object's change, as the roots' tree diff gives it, copied. */
+typedef struct Changed
+{
+	char		object;
+	char	   *from_name;		/* NULL: not in from */
+	char	   *to_name;		/* NULL: not in to */
+	ProllyValue from;			/* the items (copied) */
+	ProllyValue to;
+	bool		data_change;
+	bool		schema_change;
+	uint64		content;		/* an added or dropped one's: its item's hash,
+								 * its own name in it masked */
+	ProllyValue masked;			/* and that item */
+} Changed;
+
+typedef struct ChangesWalk
+{
+	List	   *changed;		/* Changed * */
+	bool		same_format;
+} ChangesWalk;
+
+static ProllyValue
+copy_value(const ProllyValue *v)
+{
+	ProllyValue c;
+	uint8	   *data = palloc(Max(v->len, 1));
+
+	memcpy(data, v->data, v->len);
+	c.data = data;
+	c.len = v->len;
+	return c;
+}
+
+/*
+ * An item with its object's own name masked: a table's description names
+ * the table (its indexes are made ON it), so a renamed one's items differ
+ * by that alone.  (A longer name holding it is masked in part, which can
+ * only keep two items apart, never make them alike.)
+ */
+static ProllyValue
+masked_item(const ProllyValue *v, const char *name)
+{
+	StringInfoData out;
+	char	   *utf8 = pg_server_to_any(name, strlen(name), PG_UTF8);
+	size_t		n = strlen(utf8);
+	const char *p = (const char *) v->data;
+	const char *end = p + v->len;
+	ProllyValue m;
+
+	initStringInfo(&out);
+	while (p < end)
+	{
+		if (n > 0 && (size_t) (end - p) >= n && memcmp(p, utf8, n) == 0)
+		{
+			appendStringInfoChar(&out, '\x01');
+			p += n;
+		}
+		else
+			appendStringInfoChar(&out, *p++);
+	}
+	m.data = (const uint8 *) out.data;
+	m.len = out.len;
+	return m;
+}
+
+/* Whether an object holds rows, or a value: a table's, a sequence's. */
+static bool
+holds_data(char object)
+{
+	return object == 't' || object == 'm' || object == 's';
+}
+
+static void
+note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
+			const ProllyValue *after, void *arg)
+{
+	ChangesWalk *w = arg;
+	Changed    *c;
+	char	   *name;
+
+	/* (the format, and collations, aren't objects) */
+	if (key->len < 2 || key->data[1] != ':' || key->data[0] == '!' ||
+		key->data[0] == 'c')
+		return;
+	c = palloc0(sizeof(Changed));
+	c->object = (char) key->data[0];
+	name = from_utf8(key->data + 2, key->len - 2);
+	if (before)
+	{
+		c->from_name = name;
+		c->from = copy_value(before);
+	}
+	if (after)
+	{
+		c->to_name = name;
+		c->to = copy_value(after);
+	}
+	if (before && after)
+	{
+		ProllyValue da,
+					db;
+		ProllyNodeRef ra,
+					rb;
+
+		definition_of(key, before, &da);
+		definition_of(key, after, &db);
+		c->schema_change = !same_values(&da, &db);
+		if (c->object == 't' ||
+			(c->object == 'm' && w->same_format))
+		{
+			(void) tree_item(key, before, &ra, &da);
+			(void) tree_item(key, after, &rb, &db);
+			c->data_change = !(ra.hash.len == rb.hash.len &&
+							   memcmp(ra.hash.bytes, rb.hash.bytes, ra.hash.len) == 0);
+		}
+		else if (c->object == 's')
+		{
+			ProllyValue sa,
+						sb;
+
+			c->data_change = sequence_value(key, before, &sa) &&
+				sequence_value(key, after, &sb) && !same_values(&sa, &sb);
+		}
+		if (!c->data_change && !c->schema_change)
+		{
+			pfree(c);
+			return;
+		}
+	}
+	else
+	{
+		const ProllyValue *v = before ? before : after;
+
+		c->data_change = holds_data(c->object);
+		c->schema_change = true;
+		c->masked = masked_item(v, name);
+		c->content = hash_bytes_extended(c->masked.data, c->masked.len,
+										 (uint64) c->object);
+	}
+	w->changed = lappend(w->changed, c);
+}
+
+static int
+changed_cmp(const ListCell *a, const ListCell *b)
+{
+	const Changed *x = lfirst(a);
+	const Changed *y = lfirst(b);
+
+	return strcmp(x->from_name ? x->from_name : x->to_name,
+				  y->from_name ? y->from_name : y->to_name);
+}
+
+/* the dropped and added objects of an item's content, and how many */
+typedef struct ContentMatch
+{
+	uint64		content;		/* key */
+	int			ndropped;
+	int			nadded;
+	Changed    *dropped;
+	Changed    *added;
+} ContentMatch;
+
+/*
+ * Each object from and to hold differently, by name: what the roots' tree
+ * diff gives (equal subtrees skipped), objects of a kind dropped and added
+ * with the same item (but for their own names), and the only such pair,
+ * made one renamed.
+ */
+static void
+folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
+			   ProllyCanonChangeVisit visit, void *arg)
+{
+	Canon		cn;
+	ChangesWalk w = {NIL, false};
+	HTAB	   *matches;
+	HASHCTL		ctl;
+	HASH_SEQ_STATUS status;
+	ContentMatch *m;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
+	PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_change, &w);
+
+	/* renames: a dropped and an added object of one content, alone */
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(ContentMatch);
+	ctl.hcxt = CurrentMemoryContext;
+	matches = hash_create("prolly renames", 64, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	foreach(lc, w.changed)
+	{
+		Changed    *c = lfirst(lc);
+		bool		found;
+
+		if (c->from_name && c->to_name)
+			continue;
+		m = hash_search(matches, &c->content, HASH_ENTER, &found);
+		if (!found)
+		{
+			m->ndropped = m->nadded = 0;
+			m->dropped = m->added = NULL;
+		}
+		if (c->from_name)
+		{
+			m->ndropped++;
+			m->dropped = c;
+		}
+		else
+		{
+			m->nadded++;
+			m->added = c;
+		}
+	}
+	hash_seq_init(&status, matches);
+	while ((m = hash_seq_search(&status)) != NULL)
+	{
+		if (m->ndropped != 1 || m->nadded != 1 ||
+			m->dropped->object != m->added->object ||
+			!same_values(&m->dropped->masked, &m->added->masked))
+			continue;
+		/* (one row: the dropped one, its new name, its rows as they were) */
+		m->dropped->to_name = m->added->to_name;
+		m->dropped->to = m->added->to;
+		m->dropped->data_change = false;
+		m->dropped->schema_change = false;
+		w.changed = list_delete_ptr(w.changed, m->added);
+	}
+	hash_destroy(matches);
+
+	list_sort(w.changed, changed_cmp);
+	foreach(lc, w.changed)
+	{
+		Changed    *c = lfirst(lc);
+		ProllyObjectChange oc = {0};
+
+		oc.from_name = c->from_name;
+		oc.to_name = c->to_name;
+		oc.object = c->object;
+		oc.data_change = c->data_change;
+		oc.schema_change = c->schema_change;
+		oc.from_item = c->from_name ? &c->from : NULL;
+		oc.to_item = c->to_name ? &c->to : NULL;
+		visit(&oc, arg);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -8173,6 +8422,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,
 	.objects = folded_objects,
+	.changes = folded_changes,
 	.move_schema = folded_move_schema,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,

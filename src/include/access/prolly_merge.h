@@ -81,6 +81,7 @@
 #ifndef PROLLY_MERGE_H
 #define PROLLY_MERGE_H
 
+#include "access/prolly_canon.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "nodes/pg_list.h"
@@ -128,6 +129,14 @@ typedef struct ProllyMergeRoutine
 	void		(*resolve) (Oid relid, bool theirs);
 	void		(*tables) (const char *from_ref, const char *to_ref,
 						   ProllyTableChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: what differs between two refs, object by object, as the
+	 * canonicalizer's changes() tells it, with the objects a read of a
+	 * working set left out (not_covered) after them.
+	 */
+	void		(*summary) (const char *from_ref, const char *to_ref,
+							ProllyCanonChangeVisit visit, void *arg);
 	/*
 	 * Move the session's branch to a canonical root: its rows (and
 	 * definitions) written.  working is its working set folded already, or
@@ -143,7 +152,7 @@ typedef struct ProllyMergeRoutine
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
-	"diff", "merge", "conflicts", "resolve", "tables", "move_to", \
+	"diff", "merge", "conflicts", "resolve", "tables", "summary", "move_to", \
 	"cherry_pick", "verify", "revert"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
 #define PROLLY_MERGE_LAST_CALLBACK revert

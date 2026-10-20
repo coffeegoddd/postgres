@@ -3242,6 +3242,170 @@ status_table(const char *name, ProllyDiffKind kind, char object, void *arg)
 	*names = lappend(*names, psprintf("%s\t%s", name, status));
 }
 
+/* What dolt_diff_summary() and dolt_schema_diff() list: each change, copied. */
+typedef struct SummaryRow
+{
+	char	   *from_name;		/* NULL: none */
+	char	   *to_name;
+	char		object;
+	bool		data_change;
+	bool		schema_change;
+	bool		not_covered;
+	char	   *from_item;		/* the items (NULL: none) */
+	int			from_len;
+	char	   *to_item;
+	int			to_len;
+} SummaryRow;
+
+static void
+collect_change(const ProllyObjectChange *c, void *arg)
+{
+	List	  **rows = arg;
+	SummaryRow *r = palloc0(sizeof(SummaryRow));
+
+	r->from_name = c->from_name ? pstrdup(c->from_name) : NULL;
+	r->to_name = c->to_name ? pstrdup(c->to_name) : NULL;
+	r->object = c->object;
+	r->data_change = c->data_change;
+	r->schema_change = c->schema_change;
+	r->not_covered = c->not_covered;
+	if (c->from_item)
+	{
+		r->from_item = pnstrdup((const char *) c->from_item->data, c->from_item->len);
+		r->from_len = c->from_item->len;
+	}
+	if (c->to_item)
+	{
+		r->to_item = pnstrdup((const char *) c->to_item->data, c->to_item->len);
+		r->to_len = c->to_item->len;
+	}
+	*rows = lappend(*rows, r);
+}
+
+/* Whether name is a change's, on either side. */
+static bool
+row_named(const SummaryRow *r, const char *name)
+{
+	return (r->from_name && strcmp(r->from_name, name) == 0) ||
+		(r->to_name && strcmp(r->to_name, name) == 0);
+}
+
+/*
+ * The changes between two refs, every one, or (name not NULL) the object
+ * name names in either version: as qualified, or, a name without its
+ * schema, in the first schema of the search path that has one of that
+ * name changed (it need not exist now).
+ */
+static List *
+summary_rows(const char *from_ref, const char *to_ref, const char *name)
+{
+	List	   *rows = NIL;
+	List	   *kept = NIL;
+	char	   *want = NULL;
+	ListCell   *lc;
+
+	if (!PROLLY_HAS(diff_merge(), summary))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't summarize a diff")));
+	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, collect_change, &rows);
+	if (name == NULL)
+		return rows;
+
+	/* qualified, or found by the search path */
+	foreach(lc, rows)
+		if (row_named(lfirst(lc), name))
+			want = pstrdup(name);
+	if (want == NULL)
+	{
+		const char *paren = strchr(name, '(');
+		const char *dot = strchr(name, '.');
+
+		if (dot == NULL || (paren && dot > paren))
+		{
+			List	   *path = fetch_search_path(false);
+			ListCell   *nc;
+
+			foreach(nc, path)
+			{
+				char	   *nsp = get_namespace_name(lfirst_oid(nc));
+				char	   *q;
+
+				if (nsp == NULL)
+					continue;
+				q = psprintf("%s.%s", quote_identifier(nsp), name);
+				foreach(lc, rows)
+					if (row_named(lfirst(lc), q))
+						want = q;
+				if (want)
+					break;
+			}
+		}
+	}
+	if (want == NULL)
+		return NIL;
+	foreach(lc, rows)
+		if (row_named(lfirst(lc), want))
+			kept = lappend(kept, lfirst(lc));
+	return kept;
+}
+
+/*
+ * dolt_diff_summary(from_ref text, to_ref text [, name text], OUT
+ * from_table_name text, OUT to_table_name text, OUT diff_type text, OUT
+ * data_change bool, OUT schema_change bool) returns setof record
+ *
+ * Each object that differs between two refs (WORKING and STAGED as
+ * dolt_diff reads them), tables and the rest, named as dolt_status names
+ * them, by name: added, dropped, modified, or renamed (dropped and added
+ * with the same definition and rows, alone of their content), '' for the
+ * side it isn't on; whether its rows (a sequence's value) and its
+ * definition differ.  Objects a read of a working set left out are "not
+ * covered", their flags NULL.  With name, that object's alone.
+ */
+Datum
+dolt_diff_summary(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name = NULL;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff_summary needs two refs")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
+		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, summary_rows(from_ref, to_ref, name))
+	{
+		SummaryRow *r = lfirst(lc);
+		Datum		values[5];
+		bool		nulls[5] = {0};
+		const char *type;
+
+		if (r->not_covered)
+			type = "not covered";
+		else if (r->from_name && r->to_name)
+			type = strcmp(r->from_name, r->to_name) == 0 ? "modified" : "renamed";
+		else
+			type = r->to_name ? "added" : "dropped";
+		values[0] = CStringGetTextDatum(r->from_name ? r->from_name : "");
+		values[1] = CStringGetTextDatum(r->not_covered ? r->from_name :
+										r->to_name ? r->to_name : "");
+		values[2] = CStringGetTextDatum(type);
+		values[3] = BoolGetDatum(r->data_change);
+		values[4] = BoolGetDatum(r->schema_change);
+		nulls[3] = nulls[4] = r->not_covered;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
 /*
  * names ("name<tab>status") with table relid's status status, in place of
  * any it had (none for a table dropped)

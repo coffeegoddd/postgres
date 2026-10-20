@@ -724,6 +724,80 @@ folded_tables(const char *from_ref, const char *to_ref,
 	}
 }
 
+typedef struct SummaryChanges
+{
+	ProllyCanonChangeVisit visit;
+	void	   *arg;
+	List	   *left_out;
+} SummaryChanges;
+
+static bool
+left_out_named(List *left_out, const char *name)
+{
+	ListCell   *lc;
+
+	if (name == NULL)
+		return false;
+	foreach(lc, left_out)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/* (an object a read left out is listed as that, not as changed) */
+static void
+summary_change(const ProllyObjectChange *change, void *arg)
+{
+	SummaryChanges *sc = arg;
+
+	if (left_out_named(sc->left_out, change->from_name) ||
+		left_out_named(sc->left_out, change->to_name))
+		return;
+	sc->visit(change, sc->arg);
+}
+
+/*
+ * What differs between two refs, object by object: the roots' changes, as
+ * the canonicalizer tells them, then what the reads left out.
+ */
+static void
+folded_summary(const char *from_ref, const char *to_ref,
+			   ProllyCanonChangeVisit visit, void *arg)
+{
+	List	   *left_out = NIL;
+	ListCell   *lc;
+	ProllyNodeRef from_root;
+	ProllyNodeRef to_root;
+	SummaryChanges sc;
+
+	(void) tables_of_reading(from_ref, InvalidOid, &left_out, &from_root);
+	if (is_working(to_ref) && is_working(from_ref))
+		to_root = from_root;
+	else
+		(void) tables_of_reading(to_ref, InvalidOid, &left_out, &to_root);
+	sc.visit = visit;
+	sc.arg = arg;
+	sc.left_out = left_out;
+	if (!same_hash(&from_root.hash, &to_root.hash))
+		PROLLY_CALL(components().canonicalizer, changes, &from_root, &to_root,
+					summary_change, &sc);
+
+	list_sort(left_out, string_cmp);
+	foreach(lc, left_out)
+	{
+		if (foreach_current_index(lc) == 0 ||
+			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
+		{
+			ProllyObjectChange oc = {0};
+
+			oc.from_name = lfirst(lc);
+			oc.object = PROLLY_OBJECT_UNKNOWN;
+			oc.not_covered = true;
+			visit(&oc, arg);
+		}
+	}
+}
+
 /* ------------------------------------------------------------------------
  * Moving the branch
  * ------------------------------------------------------------------------
@@ -7391,6 +7465,7 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.conflicts = folded_conflicts,
 	.resolve = folded_resolve,
 	.tables = folded_tables,
+	.summary = folded_summary,
 	.move_to = folded_move_to,
 	.cherry_pick = folded_cherry_pick,
 	.revert = folded_revert,

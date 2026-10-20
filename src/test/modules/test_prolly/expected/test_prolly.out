@@ -137,7 +137,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge    | stub           | identity                       | pass
  diff_merge    | stub           | diff_reports_each_change_once  | not implemented (missing diff)
  diff_merge    | stub           | merge                          | not implemented (missing merge)
- diff_merge    | stub           | complete                       | not implemented (9 of 9 callbacks missing)
+ diff_merge    | stub           | complete                       | not implemented (10 of 10 callbacks missing)
  tree          | cow            | identity                       | pass
  tree          | cow            | build_and_get                  | pass
  tree          | cow            | large_keys                     | pass
@@ -187,7 +187,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
- canonicalizer | stub           | complete                       | not implemented (20 of 20 callbacks missing)
+ canonicalizer | stub           | complete                       | not implemented (21 of 21 callbacks missing)
  chunk_store   | journal        | identity                       | pass
  chunk_store   | journal        | complete                       | pass
  chunk_format  | basic          | identity                       | pass
