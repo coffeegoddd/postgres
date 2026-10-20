@@ -96,8 +96,35 @@ $node->start;
 like($stderr, qr/is a chunk store journal of version 1, not \d+/,
 	'a journal of an older version is refused');
 
+# A hash's name equal to this server's up to its zero, but not past it: a
+# damaged header, refused (not read as if the file were open).
 $node->stop;
 patch($journal, 8, $version);
+$was = patch($journal, 12, pack('a16', "blake3\0x"));
+$node->start;
+($ret, $stdout, $stderr) = $node->psql('journal_only', $read);
+like($stderr, qr/has a damaged chunk journal header/,
+	'a header with bytes past the hash name is refused');
+($ret, $stdout, $stderr) = $node->psql('journal_only', $read);
+like($stderr, qr/has a damaged chunk journal header/, '... each time');
+
+# An older version's header shorter than this one's, holding no records:
+# refused as that version, not read as an empty journal.
+$node->stop;
+patch($journal, 12, $was);
+my $whole = slurp_file($journal);
+open(my $fh, '>:raw', $journal) or die "open $journal: $!";
+print $fh substr($whole, 0, 8) . pack('V V', 1, 0);
+close($fh);
+$node->start;
+($ret, $stdout, $stderr) = $node->psql('journal_only', $read);
+like($stderr, qr/is a chunk store journal of version 1, not \d+/,
+	'a short journal of an older version is refused');
+
+$node->stop;
+open($fh, '>:raw', $journal) or die "open $journal: $!";
+print $fh $whole;
+close($fh);
 $node->start;
 is($node->safe_psql('journal_only', $read), 'format check',
 	'put back, the journal reads again');
@@ -119,8 +146,24 @@ $node->start;
 like($stderr, qr/is a chunk store manifest of version 3, not \d+/,
 	'a manifest of an older version is refused');
 
+# An older version's manifest smaller than this version's least: refused
+# as that version, not as no manifest.
 $node->stop;
 patch_manifest($manifest, 8, $version);
+$whole = slurp_file($manifest);
+open($fh, '>:raw', $manifest) or die "open $manifest: $!";
+print $fh substr($whole, 0, 8) . pack('V', 3) . ("\0" x 45);
+close($fh);
+$node->start;
+($ret, $stdout, $stderr) = $node->psql('manifested', $read);
+like($stderr, qr/is a chunk store manifest of version 3, not \d+/,
+	'a small manifest of an older version is refused as that version');
+like($stderr, qr/HINT:  There is no conversion/, '... with no way to convert it');
+
+$node->stop;
+open($fh, '>:raw', $manifest) or die "open $manifest: $!";
+print $fh $whole;
+close($fh);
 $node->start;
 is($node->safe_psql('manifested', $read), 'format check',
 	'put back, the manifest reads again');

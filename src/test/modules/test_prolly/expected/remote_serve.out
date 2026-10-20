@@ -193,7 +193,7 @@ NOTICE:  refused: this database holds commits of canonical format N, not 0
 -- nothing moved
 SELECT dolt_hashof('rs_b') AS rs_b \gset
 BEGIN;
-SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920212223242526272829303132'::bytea],
+SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920'::bytea],
 						  ARRAY['\xdeadbeef'::bytea]);
  dolt_serve_receive 
 --------------------
@@ -201,9 +201,9 @@ SELECT dolt_serve_receive(ARRAY['\x010203040506070809101112131415161718192021222
 (1 row)
 
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'),
-							'\x0102030405060708091011121314151617181920212223242526272829303132',
+							'\x0102030405060708091011121314151617181920',
 							:'fmt', false);
-ERROR:  the remote's chunk 0102030405060708091011121314151617181920212223242526272829303132 doesn't match its hash
+ERROR:  the remote's chunk 0102030405060708091011121314151617181920 doesn't match its hash
 DETAIL:  Its bytes hash to 53147f3ce49ed4f60dfa5b9654c36ba6103c11f5.
 ROLLBACK;
 SELECT dolt_hashof('rs_b') = :'rs_b' AS unmoved;

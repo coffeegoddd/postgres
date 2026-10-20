@@ -1272,7 +1272,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("branch or commit \"%s\" does not exist", branch)));
-		/* (a branch name has room for 40 of the hash's 64 digits) */
+		/* (a branch name has room for 40 digits: the whole hash) */
 		hidden = psprintf("%s%.40s", PROLLY_DETACHED_PREFIX, hash_hex(&id));
 		if (!PROLLY_CALL(refs(), branch_lookup, hidden, &(ProllyBranchId) {0}))
 			create_branch(hidden, hash_hex(&id));

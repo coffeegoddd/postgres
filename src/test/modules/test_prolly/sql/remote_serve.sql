@@ -76,10 +76,10 @@ END $$;
 -- nothing moved
 SELECT dolt_hashof('rs_b') AS rs_b \gset
 BEGIN;
-SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920212223242526272829303132'::bytea],
+SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920'::bytea],
 						  ARRAY['\xdeadbeef'::bytea]);
 SELECT dolt_serve_move_head('rs_b', pg_temp.h('rs_b'),
-							'\x0102030405060708091011121314151617181920212223242526272829303132',
+							'\x0102030405060708091011121314151617181920',
 							:'fmt', false);
 ROLLBACK;
 SELECT dolt_hashof('rs_b') = :'rs_b' AS unmoved;

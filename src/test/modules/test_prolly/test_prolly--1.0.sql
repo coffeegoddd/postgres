@@ -176,8 +176,8 @@ CREATE FUNCTION test_bmap_read_old(relnumber oid, blkno int8, old_block int8)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
--- The server's chunk store, from SQL: chunks are named by their SHA-256,
--- in hex.
+-- The server's chunk store, from SQL: chunks are named by the server's
+-- content hash, in hex.
 CREATE FUNCTION test_chunk_put(data bytea)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

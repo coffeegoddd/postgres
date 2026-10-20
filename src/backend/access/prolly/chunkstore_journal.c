@@ -773,8 +773,26 @@ read_exact(Segment *g, char *buf, Size len, uint64 offset)
 						len, (unsigned long long) offset, g->path)));
 }
 
-static bool header_ok(const char *header);
-static void check_header(const char *header, const char *path);
+static bool header_ok(const char *header, Size len);
+static void check_header(const char *header, Size len, const char *path);
+
+/*
+ * Read the start of a segment's file (as much of its header as it has)
+ * into header; how many bytes.
+ */
+static Size
+read_header(File file, char *header, const char *path)
+{
+	off_t		size = FileSize(file);
+	Size		len = Min(size, JOURNAL_HEADER_SIZE);
+
+	if (size < 0 ||
+		FileRead(file, header, len, 0, WAIT_EVENT_DATA_FILE_READ) != len)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read file \"%s\": %m", path)));
+	return len;
+}
 
 /*
  * Open a segment's file; false if it has none yet.  One with its header is
@@ -784,6 +802,7 @@ static bool
 open_segment(Segment *g)
 {
 	char		header[JOURNAL_HEADER_SIZE];
+	Size		len;
 
 	if (g->file >= 0)
 		return true;
@@ -796,16 +815,13 @@ open_segment(Segment *g)
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", g->path)));
 	}
-	if (FileSize(g->file) >= JOURNAL_HEADER_SIZE)
+	len = read_header(g->file, header, g->path);
+	if (!header_ok(header, len))
 	{
-		read_exact(g, header, sizeof(header), 0);
-		if (!header_ok(header))
-		{
-			/* (closed, so the next open checks again) */
-			FileClose(g->file);
-			g->file = -1;
-			check_header(header, g->path);
-		}
+		/* (closed, so the next open checks again) */
+		FileClose(g->file);
+		g->file = -1;
+		check_header(header, len, g->path);
 	}
 	return true;
 }
@@ -878,7 +894,8 @@ format_read(const char *in, ProllyStoreFormat *f)
 
 /*
  * Refuse a store file (at path) of another version (what) or format than
- * this server writes: its chunks are named, or laid out, otherwise.
+ * this server writes: its chunks are named, or laid out, otherwise.  (Its
+ * format is read only once its version is this server's: NULL before.)
  */
 static void
 check_format(const char *path, const char *what, uint32 version,
@@ -892,7 +909,8 @@ check_format(const char *path, const char *what, uint32 version,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("file \"%s\" is a chunk store %s of version %u, not %u",
 						path, what, version, expected),
-				 errdetail("A server reads only chunk stores made in its own format.")));
+				 errdetail("A server reads only chunk stores made in its own format."),
+				 errhint("There is no conversion: restore a dump into a cluster made by this server.")));
 	format_read(format, &theirs);
 	if (!prolly_store_format_equal(&theirs, mine))
 		ereport(ERROR,
@@ -900,16 +918,25 @@ check_format(const char *path, const char *what, uint32 version,
 				 errmsg("file \"%s\" is a chunk store %s of another format", path, what),
 				 errdetail("Its chunks are %s; this server's are %s.",
 						   prolly_store_format_text(&theirs),
-						   prolly_store_format_text(mine))));
+						   prolly_store_format_text(mine)),
+				 errhint("There is no conversion: restore a dump into a cluster made by this server.")));
 }
 
-/* Is a segment's header a journal's, of this server's version and format? */
+/*
+ * Is the start of a segment's file (len bytes of it) a journal's header, of
+ * this server's version and format?  None at all (a file not given one
+ * yet) is.
+ */
 static bool
-header_ok(const char *header)
+header_ok(const char *header, Size len)
 {
 	char		mine[FORMAT_SIZE];
 	uint32		version;
 
+	if (len == 0)
+		return true;
+	if (len < JOURNAL_HEADER_SIZE)
+		return false;
 	memcpy(&version, header + 8, sizeof(version));
 	format_bytes(prolly_store_format(), mine);
 	return memcmp(header, JOURNAL_MAGIC, 8) == 0 &&
@@ -918,21 +945,31 @@ header_ok(const char *header)
 }
 
 /*
- * Check a segment's header: a journal's, of this server's version and
- * format.
+ * Refuse the start of a segment's file that header_ok() didn't take: one
+ * of another version or format, or no journal's.  (An older version's
+ * header may be shorter than this one's: one with no records yet is only
+ * that.)
  */
 static void
-check_header(const char *header, const char *path)
+check_header(const char *header, Size len, const char *path)
 {
 	uint32		version;
 
-	if (memcmp(header, JOURNAL_MAGIC, 8) != 0)
+	if (len < 8 + sizeof(version) || memcmp(header, JOURNAL_MAGIC, 8) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("file \"%s\" is not a chunk journal", path)));
 	memcpy(&version, header + 8, sizeof(version));
+	if (version == JOURNAL_VERSION && len < JOURNAL_HEADER_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("file \"%s\" has a short chunk journal header", path)));
 	check_format(path, "journal", version, JOURNAL_VERSION,
 				 header + JOURNAL_FORMAT_AT);
+	/* (equal formats, written with other bytes past the hash's name) */
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("file \"%s\" has a damaged chunk journal header", path)));
 }
 
 /*
@@ -2383,8 +2420,13 @@ read_manifest_at(const char *path, Manifest *m)
 
 	p = buf;
 	end = buf + st.st_size;
-	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 4 + 4 + 4 + 4 ||
-		memcmp(p, MANIFEST_MAGIC, 8) != 0)
+	/* (its version first: another's may be laid out, or sized, otherwise) */
+	if (st.st_size < 8 + 4 || memcmp(p, MANIFEST_MAGIC, 8) != 0)
+		goto corrupt;
+	version = (uint32) read_le(p + 8, 4);
+	if (version != MANIFEST_VERSION)
+		check_format(path, "manifest", version, MANIFEST_VERSION, NULL);
+	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 4 + 4 + 4 + 4)
 		goto corrupt;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, buf, st.st_size - sizeof(crc));
@@ -2392,9 +2434,7 @@ read_manifest_at(const char *path, Manifest *m)
 	if (crc != (pg_crc32c) read_le(end - sizeof(crc), 4))
 		goto corrupt;
 	end -= sizeof(crc);
-	p += 8;
-	version = (uint32) read_le(p, 4);
-	p += 4;
+	p += 8 + 4;
 	check_format(path, "manifest", version, MANIFEST_VERSION, p);
 	p += FORMAT_SIZE;
 	m->gc_generation = (uint32) read_le(p, 4);
@@ -4255,6 +4295,13 @@ gc_add_segment(ProllyChunkGc *gc, GcFile *f)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", f->path)));
+	}
+	{
+		char		header[JOURNAL_HEADER_SIZE];
+		Size		hlen = read_header(f->file, header, f->path);
+
+		if (!header_ok(header, hlen))
+			check_header(header, hlen, f->path);
 	}
 	size = FileSize(f->file);
 	f->size = size;
