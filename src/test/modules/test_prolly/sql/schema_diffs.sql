@@ -21,7 +21,9 @@ SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
 -- nothing changed: nothing
 SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
 
--- rows only, definition only, both; added, dropped, renamed
+-- rows only, definition only, both; added, dropped, renamed (an empty
+-- table added or dropped changes no rows, and a new name is a change of
+-- definition, as in Dolt)
 UPDATE app.t SET v = 'z' WHERE id = 1;
 ALTER TABLE app.keep ADD COLUMN note text;
 ALTER TABLE app.old_name RENAME TO new_name;
@@ -116,5 +118,76 @@ SELECT * FROM dolt_schema_diff(:'old', 'HEAD');
 SELECT count(*) > 0 AS summarized FROM dolt_diff_summary(:'old', 'HEAD');
 SELECT * FROM dolt_schema_diff(NULL, 'HEAD');
 
+-- a table dropped and made again under its name, with other rows, is
+-- modified (Dolt's "table drop and recreate with identical primary key");
+-- its key's index keeps the name it was made with, so its definition
+-- differs too
+CREATE TABLE app.t1 (id int PRIMARY KEY, name varchar(10));
+INSERT INTO app.t1 VALUES (1, 'dolt');
+SELECT length(dolt_commit('-Am', 'create_table')::text) AS committed;
+UPDATE app.t1 SET name = 'doltgres' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'update_value')::text) AS committed;
+CREATE TABLE app.temp__t1 (id int PRIMARY KEY, name varchar(10));
+INSERT INTO app.temp__t1 VALUES (1, 'dolt');
+DROP TABLE app.t1;
+ALTER TABLE app.temp__t1 RENAME TO t1;
+SELECT length(dolt_commit('-Am', 'drop and recreate')::text) AS committed;
+SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'app.t1');
+
 \c contrib_regression
 DROP DATABASE regress_schema_diffs;
+
+-- Doltgres's diff function scripts (testing/go/dolt_functions_test.go at
+-- doltgresql d5e05f46: "smoke test select dolt diff functions and tables",
+-- the same "for multiple schemas", and the summary and schema diff of
+-- "dolt table functions WITH ORDINALITY"), their dolt_diff_summary and
+-- dolt_schema_diff assertions.  Where prolly's answer differs from
+-- Doltgres's: statements are Postgres's DDL, rendered from the commit's
+-- description (a table's NOT NULLs and key as ALTER TABLE statements);
+-- other kinds of objects than tables are listed too (a versioned schema
+-- made); a name not qualified is found on the search path, where Doltgres
+-- finds it in any schema; a database starts with no commits (Doltgres's
+-- with its own), so one is made first.
+CREATE DATABASE regress_doltgres_diffs;
+\c regress_doltgres_diffs
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+SELECT length(dolt_commit('--allow-empty', '-m', 'initial')::text) AS committed;
+
+-- smoke test select dolt diff functions and tables
+CREATE TABLE t1 (pk int primary key);
+INSERT INTO t1 VALUES (1);
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't1');
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING');
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING', 't1');
+
+-- ... for multiple schemas
+SELECT dolt_reset('--hard');
+CREATE TABLE t1 (pk int primary key);
+INSERT INTO t1 VALUES (1);
+CREATE SCHEMA testschema VERSIONED;
+CREATE TABLE testschema.t2 (pk int primary key);
+INSERT INTO testschema.t2 VALUES (1);
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't1');
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't2');
+SET search_path = public, testschema;
+SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't2');
+RESET search_path;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING');
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING', 't1');
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING', 'testschema.t2');
+
+-- WITH ORDINALITY (skipped in Doltgres, where these are table functions
+-- of its engine; Postgres's set-returning functions take it)
+SELECT dolt_reset('--hard');
+CREATE TABLE t1 (pk INT4 PRIMARY KEY, v1 TEXT);
+SELECT length(dolt_commit('-A', '-m', 'initial')::text) AS committed;
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+SELECT to_table_name, diff_type, ordinality
+	FROM dolt_diff_summary('HEAD', 'WORKING') WITH ORDINALITY;
+SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WITH ORDINALITY;
+
+\c contrib_regression
+DROP DATABASE regress_doltgres_diffs;

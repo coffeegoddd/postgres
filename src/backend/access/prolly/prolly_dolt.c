@@ -3385,7 +3385,8 @@ summary_rows(const char *from_ref, const char *to_ref, const char *name,
  * them, by name: added, dropped, modified, or renamed (dropped and added
  * with the same definition and rows, alone of their content), '' for the
  * side it isn't on; whether its rows (a sequence's value) and its
- * definition differ.  Objects a read of a working set left out are "not
+ * definition differ (a new name is a change of definition; an empty table
+ * added or dropped changes no rows, as in Dolt).  Objects a read of a working set left out are "not
  * covered", their flags NULL.  With name, that object's alone.
  */
 Datum

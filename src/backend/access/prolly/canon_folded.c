@@ -3920,11 +3920,33 @@ masked_item(const ProllyValue *v, const char *name)
 	return m;
 }
 
-/* Whether an object holds rows, or a value: a table's, a sequence's. */
+/*
+ * Whether an object holds data: a table or materialized view any rows (its
+ * data tree isn't empty), a sequence its value.  An empty table added or
+ * dropped changes no data, as in Dolt.
+ */
 static bool
-holds_data(char object)
+holds_data(const ProllyKey *key, const ProllyValue *item)
 {
-	return object == 't' || object == 'm' || object == 's';
+	Canon		cn;
+	ProllyNodeRef root;
+	ProllyValue def;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		any;
+
+	if (key->data[0] == 's')
+		return true;
+	if (!tree_item(key, item, &root, &def))
+		return false;
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, &root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	any = PROLLY_CALL(cn.tree, cursor_next, c, &k, &v);
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	return any;
 }
 
 static void
@@ -3988,7 +4010,7 @@ note_change(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before
 	{
 		const ProllyValue *v = before ? before : after;
 
-		c->data_change = holds_data(c->object);
+		c->data_change = holds_data(key, v);
 		c->schema_change = true;
 		c->masked = masked_item(v, name);
 		c->content = hash_bytes_extended(c->masked.data, c->masked.len,
@@ -4080,11 +4102,14 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 			m->dropped->object != m->added->object ||
 			!same_values(&m->dropped->masked, &m->added->masked))
 			continue;
-		/* (one row: the dropped one, its new name, its rows as they were) */
+		/*
+		 * (one row: the dropped one, its new name, its rows as they were; a
+		 * new name is a change of definition, as in Dolt)
+		 */
 		m->dropped->to_name = m->added->to_name;
 		m->dropped->to = m->added->to;
 		m->dropped->data_change = false;
-		m->dropped->schema_change = false;
+		m->dropped->schema_change = true;
 		w.changed = list_delete_ptr(w.changed, m->added);
 	}
 	hash_destroy(matches);
