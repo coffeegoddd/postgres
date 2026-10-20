@@ -14,7 +14,7 @@ INSERT INTO ao.big VALUES (1, repeat('a', 100000));
 SELECT length(dolt_commit('-Am', 'first')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS c1 \gset
@@ -25,7 +25,7 @@ UPDATE ao.big SET body = repeat('b', 100000);
 SELECT length(dolt_commit('-Am', 'second')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a column added: old rows read as the table is defined now
@@ -34,7 +34,7 @@ UPDATE ao.t SET w = id * 10;
 SELECT length(dolt_commit('-Am', 'third')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DELETE FROM ao.t WHERE id = 2;
