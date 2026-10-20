@@ -24664,7 +24664,7 @@
       "index": 0,
       "name": "invalid arguments",
       "source_sha256": "169b3b1723bb8b2ba38d2f284ea5f84235ec4c52d681131f2a16ca9cef644fef",
-      "scenario_sha256": "a697836ee90cebd583dc80e2b990b83071c8b3fc9c0643b71915f5264d454e62",
+      "scenario_sha256": "88e61b257dadee1a4a5271c5eba3bcd5308ea6a998068b5a620879a099ab6cac",
       "setup": [
         {
           "index": 0,
@@ -24796,13 +24796,17 @@
         },
         {
           "index": 11,
-          "steps": [],
-          "note": "Left out: Dolt's stat refuses a table neither ref has (ErrTableNotFound); prolly's gives no rows, as its summary does (and Dolt's summary). A difference to decide, reported."
+          "steps": [
+            "assert-11"
+          ],
+          "note": "A table neither ref has: refused, SQLSTATE 42P01 (undefined table), Dolt's ErrTableNotFound; prolly's summary gives none, as Dolt's does."
         },
         {
           "index": 12,
-          "steps": [],
-          "note": "Left out: Dolt's stat refuses a table neither ref has (ErrTableNotFound); prolly's gives no rows, as its summary does (and Dolt's summary). A difference to decide, reported."
+          "steps": [
+            "assert-12"
+          ],
+          "note": "A table neither ref has: refused, SQLSTATE 42P01 (undefined table), Dolt's ErrTableNotFound; prolly's summary gives none, as Dolt's does."
         },
         {
           "index": 13,

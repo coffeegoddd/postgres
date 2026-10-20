@@ -61,5 +61,12 @@ SELECT table_name, rows_added, rows_deleted
 FROM dolt_diff_stat('HEAD', 'WORKING', 'ds.zero');
 SELECT to_create_statement FROM dolt_schema_diff('HEAD~', 'WORKING', 'ds.zero');
 
+-- a name neither version has a table of: refused, as Dolt's stat refuses
+-- it; a table both have unchanged, none; the summary gives none either way
+SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'doesnotexist');
+SELECT * FROM dolt_diff_stat('HEAD~1..HEAD', 'ds.nope');
+SELECT count(*) FROM dolt_diff_stat('HEAD', 'WORKING', 'ds.t');
+SELECT count(*) FROM dolt_diff_summary('HEAD~1', 'HEAD', 'doesnotexist');
+
 \c contrib_regression
 DROP DATABASE regress_diff_stat;

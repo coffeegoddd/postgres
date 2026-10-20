@@ -3436,16 +3436,16 @@ normalized_name(const char *name, bool *schema)
  * of the search path that has one of that name changed (it need not exist
  * now).
  */
+static char *row_name_wanted(List *rows, const char *name);
+
 static List *
 summary_rows(const char *from_ref, const char *to_ref, const char *name,
 			 bool definitions)
 {
 	List	   *rows = NIL;
 	List	   *kept = NIL;
-	char	   *want = NULL;
+	char	   *want;
 	ListCell   *lc;
-	bool		qualified = false;
-	char	   *normal;
 
 	if (!PROLLY_HAS(diff_merge(), summary))
 		ereport(ERROR,
@@ -3455,11 +3455,32 @@ summary_rows(const char *from_ref, const char *to_ref, const char *name,
 				collect_change, &rows);
 	if (name == NULL)
 		return rows;
+	want = row_name_wanted(rows, name);
+	if (want == NULL)
+		return NIL;
+	foreach(lc, rows)
+		if (row_named(lfirst(lc), want))
+			kept = lappend(kept, lfirst(lc));
+	return kept;
+}
+
+/*
+ * The name of rows' object name names, as summary_rows() reads it: as
+ * qualified, or in the first schema of the search path that has one of
+ * that name among rows.  NULL if none.
+ */
+static char *
+row_name_wanted(List *rows, const char *name)
+{
+	char	   *want = NULL;
+	ListCell   *lc;
+	bool		qualified = false;
+	char	   *normal;
 
 	/* qualified, or found by the search path */
 	normal = normalized_name(name, &qualified);
 	if (normal == NULL)
-		return NIL;
+		return NULL;
 	name = normal;
 	foreach(lc, rows)
 		if (row_named(lfirst(lc), name))
@@ -3487,12 +3508,31 @@ summary_rows(const char *from_ref, const char *to_ref, const char *name,
 			}
 		}
 	}
-	if (want == NULL)
-		return NIL;
-	foreach(lc, rows)
-		if (row_named(lfirst(lc), want))
-			kept = lappend(kept, lfirst(lc));
-	return kept;
+	return want;
+}
+
+/*
+ * Does name name a table ref has?  Its objects are what differs from the
+ * empty root to it.
+ */
+static bool
+version_has_table(const char *ref, const char *name)
+{
+	List	   *rows = NIL;
+	char	   *want;
+	ListCell   *lc;
+
+	PROLLY_CALL(diff_merge(), summary, NULL, ref, false, collect_change, &rows);
+	want = row_name_wanted(rows, name);
+	if (want != NULL)
+		foreach(lc, rows)
+		{
+			SummaryRow *r = lfirst(lc);
+
+			if (row_named(r, want) && r->object == PROLLY_OBJECT_TABLE)
+				return true;
+		}
+	return false;
 }
 
 /*
@@ -4436,7 +4476,8 @@ cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
  * counts them.  A keyless table's rows added and deleted are copies, the
  * rest NULL, as in Dolt.  A table the session's branch hasn't, changed on
  * both sides, can't have its rows diffed here (as dolt_diff can't): only
- * its row and cell counts.
+ * its row and cell counts.  With name, that table's alone: one neither
+ * version has is refused (as Dolt's; dolt_diff_summary gives none).
  */
 Datum
 dolt_diff_stat(PG_FUNCTION_ARGS)
@@ -4445,6 +4486,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 	char	   *from_ref;
 	char	   *to_ref;
 	char	   *name = NULL;
+	List	   *stats;
 	ListCell   *lc;
 
 	if (PG_ARGISNULL(0))
@@ -4456,8 +4498,16 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
 		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	diff_refs("dolt_diff_stat", &from_ref, &to_ref, &name);
+	stats = summary_rows(from_ref, to_ref, name, false);
+
+	/* (as Dolt's: a table neither version has is refused, not none) */
+	if (name != NULL && stats == NIL &&
+		!version_has_table(from_ref, name) && !version_has_table(to_ref, name))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" is in neither version", name)));
 	InitMaterializedSRF(fcinfo, 0);
-	foreach(lc, summary_rows(from_ref, to_ref, name, false))
+	foreach(lc, stats)
 	{
 		SummaryRow *r = lfirst(lc);
 		const char *table = r->to_name ? r->to_name : r->from_name;

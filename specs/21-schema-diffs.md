@@ -233,9 +233,8 @@ per-table functions, the view): the range assertions are ported, so
 functions` are whole (P); the primary-key-change cases are ported with
 D19 (of the 17 summary cases, 15 whole, `WORKING and STAGED` in part,
 drop-and-recreate deferred). Of `DiffStatTableFunctionScriptTests`, 13
-cases are ported, 10 whole and 3 in part (staging, as above; a table
-neither ref has, which Dolt refuses and prolly answers with no rows;
-and `basic case with single table`, whose table is dropped before the
+cases are ported, 11 whole and 2 in part (staging, as above; and
+`basic case with single table`, whose table is dropped before the
 assertions: the stat counts a changed table's rows only where the
 session's branch has it), and the keyless one (for that reason) and
 the computed one are deferred. Of `DiffSystemTableScriptTests`, 17
@@ -289,7 +288,9 @@ Decided by the user 2026-10-19, as recommended:
   - `dolt_at(ref, NULL::t)` and `dolt_history_table(NULL::t)` (#495's
     SRF, #497's history), read from commits' trees.
 - **A name argument** is read as Postgres reads identifiers, case folded
-  and quotes kept (#522).
+  and quotes kept (#522). One naming a table neither version has makes
+  `dolt_diff_stat` refuse (42P01), as Dolt's does; `dolt_diff_summary`
+  gives no rows for it, as Dolt's does too (#529).
 - **Ref ranges** (#521), as Dolt takes them: `dolt_diff_summary`,
   `dolt_schema_diff` and `dolt_diff_stat` take `'a..b'` (a to b) or
   `'a...b'` (from their merge base to b) in place of two refs, the next

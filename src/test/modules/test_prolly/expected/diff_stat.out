@@ -126,5 +126,23 @@ SELECT to_create_statement FROM dolt_schema_diff('HEAD~', 'WORKING', 'ds.zero');
  CREATE TABLE ds.zero (id integer, c1 character varying(20));
 (1 row)
 
+-- a name neither version has a table of: refused, as Dolt's stat refuses
+-- it; a table both have unchanged, none; the summary gives none either way
+SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'doesnotexist');
+ERROR:  table "doesnotexist" is in neither version
+SELECT * FROM dolt_diff_stat('HEAD~1..HEAD', 'ds.nope');
+ERROR:  table "ds.nope" is in neither version
+SELECT count(*) FROM dolt_diff_stat('HEAD', 'WORKING', 'ds.t');
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM dolt_diff_summary('HEAD~1', 'HEAD', 'doesnotexist');
+ count 
+-------
+     0
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_diff_stat;
