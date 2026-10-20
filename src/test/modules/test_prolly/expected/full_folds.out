@@ -370,7 +370,7 @@ INSERT INTO ff.wide SELECT g, 0 FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'wide')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- (full reads but those same_as_full() forces)
@@ -413,7 +413,7 @@ SELECT * FROM merged();
 SELECT length(dolt_commit('-am', '1%')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE ff.wide SET v = 2 WHERE id % 100 < 15;
@@ -450,7 +450,7 @@ SELECT * FROM merged();
 SELECT length(dolt_commit('-am', '15%')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE ff.wide SET v = 3 WHERE id % 100 < 60;
