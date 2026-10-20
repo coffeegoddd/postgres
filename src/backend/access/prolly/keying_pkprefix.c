@@ -472,6 +472,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.info = {
 		.iface = PROLLY_IFACE_TABLE_KEYING,
 		.impl_id = 2,
+		/* (pinned by canon_folded.c: change FOLDED_FORMAT with it) */
 		.format_version = 1,
 		.name = "pk_or_prefix",
 		.description = "keyed by the primary key, or by row content's first "

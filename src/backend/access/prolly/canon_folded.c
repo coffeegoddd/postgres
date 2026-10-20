@@ -251,6 +251,19 @@ typedef struct BaseTable BaseTable;
  */
 #define FOLDED_FORMAT	"13"
 
+/*
+ * The format versions of the encoders FOLDED_FORMAT's trees are written
+ * with: the key encoder's, the value encoder's and the keying's.  A tree's
+ * bytes are theirs, so one changed alone would read trees of the format
+ * as its own, with phantom changes in every status, diff and commit, and
+ * spurious conflicts in merges.  Changing one means changing
+ * FOLDED_FORMAT too, and these with it: a fold refuses to run till they
+ * agree (folded_encoders_checked()).
+ */
+#define FOLDED_KEY_ENCODER		4
+#define FOLDED_VALUE_ENCODER	4
+#define FOLDED_KEYING			1
+
 typedef struct Canon
 {
 	ProllyTreeEnv env;
@@ -358,9 +371,34 @@ base_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 	}
 }
 
+/*
+ * The encoders this build writes trees with are those FOLDED_FORMAT was
+ * pinned to; checked once.
+ */
+static void
+folded_encoders_checked(void)
+{
+	static bool checked = false;
+	const ProllyImplInfo *impls[3];
+	const int	pinned[3] = {FOLDED_KEY_ENCODER, FOLDED_VALUE_ENCODER, FOLDED_KEYING};
+
+	if (checked)
+		return;
+	impls[0] = prolly_get_impl(PROLLY_IFACE_KEY_ENCODER, "ordered");
+	impls[1] = prolly_get_impl(PROLLY_IFACE_VALUE_ENCODER, "canonical");
+	impls[2] = prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_prefix");
+	for (int i = 0; i < lengthof(impls); i++)
+		if (impls[i] && impls[i]->format_version != pinned[i])
+			elog(ERROR, "prolly %s \"%s\" is at format version %u, but folded format %s pins %d: change FOLDED_FORMAT with it",
+				 prolly_interface_name(impls[i]->iface), impls[i]->name,
+				 impls[i]->format_version, FOLDED_FORMAT, pinned[i]);
+	checked = true;
+}
+
 static void
 canon_env(Canon *cn)
 {
+	folded_encoders_checked();
 	cn->tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&cn->env);
 	prolly_folded_canon_env(&cn->root_env);
