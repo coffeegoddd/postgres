@@ -259,17 +259,22 @@ on a reduced workload.
 
 `configs/v_counters.toml` runs V7, commit per transaction: 2,000 one-row
 updates of a 100k-row table, each committed as it is made, with the
-counters read after each (`pg_stat_prolly`'s fold, node and chunk counters,
-WAL bytes, and client backends' buffer accesses from `pg_stat_io`).  Its
+counters read after each (`pg_stat_prolly`'s fold, node, chunk and
+change-log page counters, WAL bytes, and client backends' buffer accesses
+from `pg_stat_io`), the load's change-log entries vacuumed away first.  Its
 variants commit with `dolt.transaction_commit` in shared and owned writer
 modes (`shared`, `owned`), with a `dolt_commit` after each transaction
 (`manual`), as manual with another session holding a snapshot open
 (`pinned`), and as owned with a `dolt_status` every 100 transactions
 (`status`).  `vgrowth` fails a counter whose mean per transaction over the
 last tenth is more than 1.5 times its first tenth's (above a floor): work
-that grows with the number of commits before it.  Known growth, with an
-issue to fix it, is listed in `configs/v_growth_accept.toml`, and stands
-until the fix removes it.  Each cell's series is in its raw directory,
+that grows with the number of commits before it.  The variants that run
+autovacuum (every second, so a log is vacuumed within the run) report
+WAL bytes, nodes read and chunks appended without gating them: those
+count autovacuum's work too.  Known growth, with an issue to fix it, is
+listed in `configs/v_growth_accept.toml`, and stands until the fix removes
+it: an accepted counter that has stopped growing fails, as does an entry
+that names no counter of the run.  Each cell's series is in its raw directory,
 `v7-series.json`.
 
 ```sh

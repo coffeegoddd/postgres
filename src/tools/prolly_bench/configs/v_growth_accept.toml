@@ -63,3 +63,31 @@ workload = "V7/status-bgnone"
 engine = "prolly"
 counter = "buffer_accesses"
 reason = "every transaction folds every entry since the last full fold (#569, #568)"
+
+[[accept]]
+workload = "V7/owned-bgnone"
+engine = "prolly"
+counter = "log_pages_read"
+reason = "every transaction folds every entry since the last full fold (#569)"
+
+[[accept]]
+workload = "V7/status-bgnone"
+engine = "prolly"
+counter = "log_pages_read"
+reason = "every transaction folds every entry since the last full fold (#569, #568)"
+
+# #481: a fold walks every page of a table's change log, read and consume,
+# and the log grows with each commit's entries; autovacuum frees the dead
+# but leaves the pages, and a held horizon keeps the dead too.
+
+[[accept]]
+workload = "V7/manual-bgnone"
+engine = "prolly"
+counter = "log_pages_read"
+reason = "each commit walks the whole change log, which grows with every commit (#481)"
+
+[[accept]]
+workload = "V7/pinned-bgnone"
+engine = "prolly"
+counter = "log_pages_read"
+reason = "each commit walks the whole change log, dead entries a held horizon keeps too (#481)"

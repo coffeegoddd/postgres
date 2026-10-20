@@ -14,8 +14,10 @@ configs/v_growth_accept.toml lists growth that is known and has an issue
 to fix it, one [[accept]] entry each (workload "V7/<variant>", engine,
 counter, reason), in perf_accept.toml's format.  Unlike perf_accept.toml's
 entries, these stand until removed: the fix that ends the growth removes
-its entries, and an accepted counter that no longer grows is reported, so
-that it is.
+its entries.  An accepted counter that no longer grows fails, as does an
+entry that names no counter of the run, so a stale entry can't go on
+accepting a later regression.  Counters that count autovacuum's work too
+are reported, not gated, in the variants that run it.
 """
 
 from __future__ import annotations
@@ -39,10 +41,18 @@ FLOORS = {
     "nodes_read": 4.0,
     "chunks_appended": 2.0,
     "wal_bytes": 4096.0,
-    # (every relation's buffers a client read or hit: the change log's walk
-    # among them, dead entries and all)
+    # (every relation's buffers a client read or hit)
     "buffer_accesses": 64.0,
+    # (the change logs' pages folds walked, dead entries' too: what a held
+    # horizon grows)
+    "log_pages_read": 2.0,
 }
+
+# Counters that count every process's work (autovacuum's collections and
+# moves, its WAL): where a variant runs autovacuum, a worker's pass in one
+# tenth and not the other can pass the bound.  vgrowth reports them there
+# (the cell's ungated_<counter> metric), and gates the rest.
+AUTOVACUUM_COUNTED = {"wal_bytes", "nodes_read", "chunks_appended"}
 
 # Those read from the server's views; the rest are pg_stat_prolly's.
 SERVER_COUNTERS = {"wal_bytes", "buffer_accesses"}
@@ -55,6 +65,26 @@ def ratio(first: float, last: float) -> float:
     if first == 0:
         return 1.0 if last == 0 else math.inf
     return last / first
+
+
+def growth_metrics(series: dict[str, Optional[list[float]]],
+                   ungated: set[str] = frozenset()) -> dict[str, Optional[float]]:
+    """A V7 cell's metrics from its per-transaction series: first_ and
+    last_<counter> (None for a counter the server didn't report), growth_
+    (None where infinite: results hold finite numbers only), and
+    ungated_<counter> = 1 for each counter not gated."""
+    out: dict[str, Optional[float]] = {}
+    for c, s in series.items():
+        if s is None:
+            out[f"first_{c}"] = out[f"last_{c}"] = out[f"growth_{c}"] = None
+            continue
+        first, last = means(s)
+        r = ratio(first, last)
+        out[f"first_{c}"], out[f"last_{c}"] = first, last
+        out[f"growth_{c}"] = r if math.isfinite(r) else None
+    for c in ungated:
+        out[f"ungated_{c}"] = 1.0
+    return out
 
 
 def means(series: list[float], fraction: float = 0.1) -> tuple[float, float]:
@@ -70,7 +100,10 @@ class Finding:
     workload: str              # "V7/<variant>"
     engine: str
     counter: str
-    result: str                # flat, grows, accepted, accepted_flat, missing
+    result: str                # flat, grows, accepted, accepted_flat
+                               # (accepted, no longer growing: its entry
+                               # is to be removed), ungated, missing,
+                               # unmatched (an entry naming no finding)
     first: Optional[float] = None
     last: Optional[float] = None
     ratio: Optional[float] = None
@@ -78,15 +111,17 @@ class Finding:
 
     @property
     def fails(self) -> bool:
-        return self.result in ("grows", "missing")
+        return self.result in ("grows", "missing", "accepted_flat", "unmatched")
 
 
 def judge(workload: str, engine: str, counter: str, first: Optional[float],
           last: Optional[float], bound: float,
-          accept: list[Acceptance]) -> Finding:
+          accept: list[Acceptance], gated: bool = True) -> Finding:
     if first is None or last is None:
         return Finding(workload, engine, counter, "missing", first, last)
     r = ratio(first, last)
+    if not gated:
+        return Finding(workload, engine, counter, "ungated", first, last, r)
     grows = r > bound and last > FLOORS.get(counter, 0.0)
     known = next((a for a in accept if a.matches(workload, engine, counter)), None)
     if known:
@@ -109,7 +144,14 @@ def gate(results: list[dict], bound: float, accept: list[Acceptance],
         m = r.get("metrics", {})
         for counter in FLOORS:
             out.append(judge(name, engine, counter, m.get(f"first_{counter}"),
-                             m.get(f"last_{counter}"), bound, accept))
+                             m.get(f"last_{counter}"), bound, accept,
+                             gated=not m.get(f"ungated_{counter}")))
+    # (an entry that names no finding: a variant or counter renamed)
+    named = {(f.workload, f.engine, f.counter) for f in out}
+    for a in accept:
+        if (a.workload, a.engine, a.counter) not in named and a.engine == engine:
+            out.append(Finding(a.workload, a.engine, a.counter, "unmatched",
+                               reason=a.reason))
     return out
 
 
@@ -118,6 +160,8 @@ def run(args) -> int:
     results = [json.loads(line) for line in
                (run_dir / "results.jsonl").read_text().splitlines() if line.strip()]
     engine = json.loads((run_dir / "run.json").read_text())["table_am"]
+    if args.accept is not None and not args.accept.exists():
+        raise SystemExit(f"{args.accept}: no such file")
     accept = load_accept(args.accept)
     findings = gate(results, args.bound, accept, engine)
     if not findings:
@@ -125,7 +169,7 @@ def run(args) -> int:
         return 1
     failed = [f for f in findings if f.fails]
     for f in findings:
-        if f.result in ("grows", "missing", "accepted_flat"):
+        if f.result in ("grows", "missing", "accepted_flat", "unmatched"):
             print(f"{f.result.upper()} {f.workload} {f.engine} {f.counter}: "
                   f"{f.first} -> {f.last} per transaction"
                   + (f" ({f.ratio:.2f}x)" if f.ratio is not None and math.isfinite(f.ratio) else ""),

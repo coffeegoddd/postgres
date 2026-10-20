@@ -73,15 +73,48 @@ class GateTest(unittest.TestCase):
         f = self.judge([float(i + 1) for i in range(K)], accept=[known])
         self.assertEqual((f.result, f.reason), ("accepted", "#569"))
         self.assertFalse(f.fails)
-        # accepted, and flat now: reported, so the entry is removed
+        # accepted, and flat now: fails, so the entry is removed rather
+        # than left to accept a later regression
         f = self.judge([5.0] * K, accept=[known])
         self.assertEqual(f.result, "accepted_flat")
+        self.assertTrue(f.fails)
+
+    def test_ungated(self):
+        f = vgrowth.judge("V7/manual", "prolly", "wal_bytes", 100.0, 1e6,
+                          vgrowth.DEFAULT_BOUND, [], gated=False)
+        self.assertEqual(f.result, "ungated")
         self.assertFalse(f.fails)
 
     def test_missing(self):
         f = vgrowth.judge("V7/owned", "prolly", "fold_rows_read", None, None,
                           vgrowth.DEFAULT_BOUND, [])
         self.assertTrue(f.fails)
+
+
+class MetricsTest(unittest.TestCase):
+    def test_infinite_growth_is_written(self):
+        # 0 at first, then not: growth with no finite ratio, which a cell's
+        # results must still hold (they are JSON, finite numbers only)
+        s = [0.0] * (K // 2) + [1.0] * (K // 2)
+        m = vgrowth.growth_metrics({"fold_full_tables": s})
+        self.assertIsNone(m["growth_fold_full_tables"])
+        self.assertEqual((m["first_fold_full_tables"], m["last_fold_full_tables"]), (0.0, 1.0))
+        json.dumps(m, allow_nan=False)
+        f = vgrowth.judge("V7/shared", "prolly", "fold_full_tables",
+                          m["first_fold_full_tables"], m["last_fold_full_tables"],
+                          vgrowth.DEFAULT_BOUND, [])
+        self.assertEqual(f.result, "grows")
+
+    def test_missing_counter(self):
+        m = vgrowth.growth_metrics({"log_pages_read": None})
+        self.assertIsNone(m["first_log_pages_read"])
+        f = vgrowth.judge("V7/shared", "prolly", "log_pages_read", None, None,
+                          vgrowth.DEFAULT_BOUND, [])
+        self.assertEqual(f.result, "missing")
+
+    def test_ungated_marked(self):
+        m = vgrowth.growth_metrics({"wal_bytes": [1.0] * K}, {"wal_bytes"})
+        self.assertEqual(m["ungated_wal_bytes"], 1.0)
 
 
 class RunTest(unittest.TestCase):
@@ -113,6 +146,33 @@ class RunTest(unittest.TestCase):
             '[[accept]]\nworkload = "V7/owned-bgnone"\nengine = "prolly"\n'
             'counter = "fold_rows_read"\nreason = "#569"\n'))
         self.assertEqual(code, 0)
+
+    def test_unmatched_entry_fails(self):
+        flat = cell("shared-bgnone", {"fold_rows_read": [1.0] * K})
+        code, out = self.run_gate([flat], accept=(
+            '[[accept]]\nworkload = "V7/renamed-bgnone"\nengine = "prolly"\n'
+            'counter = "fold_rows_read"\nreason = "#569"\n'))
+        self.assertEqual(code, 1)
+        self.assertEqual([f["result"] for f in out["findings"] if f["workload"] == "V7/renamed-bgnone"],
+                         ["unmatched"])
+
+    def test_missing_accept_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "results.jsonl").write_text("")
+            (d / "run.json").write_text(json.dumps({"table_am": "prolly"}))
+            args = argparse.Namespace(dir=d, bound=vgrowth.DEFAULT_BOUND,
+                                      accept=d / "no-such.toml", json=None)
+            with self.assertRaises(SystemExit):
+                vgrowth.run(args)
+
+    def test_ungated_cell(self):
+        noisy = cell("manual-bgnone", {"wal_bytes": [float(i) for i in range(K)]})
+        noisy["metrics"]["ungated_wal_bytes"] = 1.0
+        code, out = self.run_gate([noisy])
+        self.assertEqual(code, 0)
+        self.assertEqual([f["result"] for f in out["findings"] if f["counter"] == "wal_bytes"],
+                         ["ungated"])
 
     def test_no_cells_fails(self):
         code, _ = self.run_gate([{"key": {"workload": "V1", "variant": ""}, "metrics": {}}])

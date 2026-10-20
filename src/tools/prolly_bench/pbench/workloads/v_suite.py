@@ -434,7 +434,7 @@ class V7(VWorkload):
                 "'p', (SELECT json_object_agg(name, value) FROM pg_stat_prolly))")
 
     def own_variants(self, params):
-        return [(v, {"v7": v}) for v in params.get("modes", list(self.VARIANTS))]
+        return [(v, {"v7": v}) for v in params.get("commit_modes", list(self.VARIANTS))]
 
     def commits(self, ctx) -> int:
         return int(ctx.params.get("commits", 2000))
@@ -443,8 +443,17 @@ class V7(VWorkload):
         spec = self.VARIANTS[ctx.params["v7"]]
         super().prepare(ctx)
         ctx.cluster.sql(f"SELECT dolt_writer_mode('{spec['mode']}')", dbname=ctx.dbname)
+        # (the load's change-log entries, consumed by its commit, vacuumed
+        # away: else every commit walks them, and what the run adds is lost
+        # beside them)
+        ctx.cluster.sql("VACUUM vc_data", dbname=ctx.dbname)
         if spec.get("autovacuum"):
-            ctx.cluster.sql("ALTER SYSTEM SET autovacuum = on; SELECT pg_reload_conf()")
+            # (a worker every second, so a log is vacuumed within the run,
+            # as it is soon after a fold consumes its entries: a held
+            # horizon, which keeps them, then shows)
+            ctx.cluster.sql("ALTER SYSTEM SET autovacuum = on; "
+                            "ALTER SYSTEM SET autovacuum_naptime = '1s'; "
+                            "SELECT pg_reload_conf()")
 
     def _pin(self, ctx):
         """A session idle in a transaction with a snapshot: the horizon held."""
@@ -498,13 +507,15 @@ class V7(VWorkload):
                     if line.startswith("v7|")]
         if len(readings) != k + 1:
             raise RuntimeError(f"V7 expected {k + 1} counter readings, got {len(readings)}")
-        flat = [{c: float(r[c] if c in vgrowth.SERVER_COUNTERS else r["p"].get(c, 0))
-                 for c in vgrowth.FLOORS} for r in readings]
-        series = {c: [b[c] - a[c] for a, b in zip(flat, flat[1:])] for c in vgrowth.FLOORS}
+        series: dict = {}
+        for c in vgrowth.FLOORS:
+            # (a counter the server doesn't report is missing, not zero: a
+            # renamed one would otherwise stop being gated unseen)
+            values = [r[c] if c in vgrowth.SERVER_COUNTERS else (r["p"] or {}).get(c)
+                      for r in readings]
+            series[c] = None if any(v is None for v in values) else \
+                [float(b) - float(a) for a, b in zip(values, values[1:])]
         (ctx.raw_dir / "v7-series.json").write_text(json.dumps(series) + "\n")
-        metrics = {}
-        for c, s in series.items():
-            first, last = vgrowth.means(s)
-            metrics[f"first_{c}"], metrics[f"last_{c}"] = first, last
-            metrics[f"growth_{c}"] = vgrowth.ratio(first, last)
-        return Outcome(metrics=metrics, transactions=k, unit="transaction")
+        ungated = vgrowth.AUTOVACUUM_COUNTED if spec.get("autovacuum") else set()
+        return Outcome(metrics=vgrowth.growth_metrics(series, ungated),
+                       transactions=k, unit="transaction")
