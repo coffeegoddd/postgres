@@ -212,3 +212,23 @@ VACUUM clv.vac;
 SELECT pg_relation_size('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid) AS log_bytes;
 \c contrib_regression
 DROP DATABASE regress_log_vacuum;
+
+-- A table without a change log (made before logs were, or restored by
+-- pg_upgrade) folds in full at every commit; prolly_make_change_logs()
+-- makes the logs the branch's tables lack, after which folds read them.
+CREATE SCHEMA cml VERSIONED;
+CREATE TABLE cml.t (id int PRIMARY KEY, v text);
+CREATE TABLE cml.u (id int PRIMARY KEY);
+INSERT INTO cml.t SELECT g, 'v' FROM generate_series(1, 100) g;
+SELECT length(dolt_commit('-Am', 'cml')::text) AS committed;
+SELECT test_drop_change_log('cml.t');
+SELECT to_regclass('pg_toast.pg_prolly_log_' || 'cml.t'::regclass::oid) IS NULL AS no_log;
+SELECT * FROM prolly_make_change_logs();
+SELECT to_regclass('pg_toast.pg_prolly_log_' || 'cml.t'::regclass::oid) IS NOT NULL AS has_log;
+SELECT count(*) FROM prolly_make_change_logs();
+UPDATE cml.t SET v = 'w' WHERE id = 1;
+SELECT n FROM pg_temp.entries('cml.t');
+SELECT length(dolt_commit('-am', 'cml changed')::text) AS committed;
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+DROP SCHEMA cml CASCADE;
+SELECT length(dolt_commit('-Am', 'cml gone')::text) AS committed;

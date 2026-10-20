@@ -304,6 +304,10 @@ CREATE FUNCTION test_last_full_fold(OUT rows_read int8, OUT spilled bool,
 	OUT sort_kb int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Drop a prolly table's change log, as a table from before logs has none.
+CREATE FUNCTION test_drop_change_log(tbl regclass) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_fold_counters(reset bool DEFAULT false, OUT pages int8,
 	OUT candidates int8, OUT full_tables int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

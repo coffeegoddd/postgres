@@ -29,6 +29,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
@@ -6208,6 +6209,55 @@ prolly_store_sizes(PG_FUNCTION_ARGS)
 	values[5] = Int64GetDatum(ss.settled_bytes);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
+}
+
+/*
+ * prolly_make_change_logs() returns setof regclass
+ *
+ * The change logs the session branch's prolly tables lack, made: tables
+ * made before logs were, or restored by pg_upgrade (which makes none),
+ * fold in full on every commit until one is.  Each table is locked as an
+ * ALTER that makes one locks it (ShareLock: its writers wait, so none
+ * writes rows the new log misses), in turn.  The tables given one.  An
+ * upgrade step, run on each branch.
+ */
+Datum
+prolly_make_change_logs(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	classes;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relids = NIL;
+
+	PreventCommandIfReadOnly("prolly_make_change_logs()");
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	classes = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relam == PROLLY_TABLE_AM_OID &&
+			(c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW) &&
+			!OidIsValid(prolly_change_log_relid(c->oid, c->relam)))
+			relids = lappend_oid(relids, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(classes, AccessShareLock);
+
+	foreach_oid(relid, relids)
+	{
+		Datum		value = ObjectIdGetDatum(relid);
+		bool		null = false;
+
+		if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+			continue;			/* (another's: theirs to make) */
+		prolly_make_change_log(relid, ShareLock);
+		if (OidIsValid(prolly_change_log_relid(relid, PROLLY_TABLE_AM_OID)))
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, &value, &null);
+	}
+	return (Datum) 0;
 }
 
 /*

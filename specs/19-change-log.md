@@ -198,7 +198,9 @@ made passed in hand.
 - **Tables made before this stack have no log** until an `ALTER TABLE`
   under a strong enough lock makes one (likewise after `pg_upgrade`):
   under `log` they fold in full on every commit, which is correct but a
-  performance cliff after an upgrade.
+  performance cliff after an upgrade. `prolly_make_change_logs()` makes
+  the logs a branch's tables lack, each under `ShareLock` as such an
+  `ALTER` takes: an upgrade step, run on each branch (#425).
 - **Consumed entries are freed only by vacuuming the log**, which sets
   no options of its own: autovacuum gives it its table's, and where the
   table leaves them unset, a vacuum threshold of 1000 dead entries and no
