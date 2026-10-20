@@ -4839,6 +4839,7 @@ static bool
 move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		   const TableDef *to)
 {
+	List	   *not_null_drops = NIL;
 	TableDef	none;
 	bool		remake = false;
 	List	   *from_names = NIL;
@@ -5112,9 +5113,17 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		/* (foreign keys first: they may need others' keys) */
 		if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
 			sm->fk_drops = lappend(sm->fk_drops, sql);
+		/*
+		 * (a column's NOT NULL after the rest: one a primary key going holds
+		 * can't go before the key, whatever their names' order, as when two
+		 * tables' names were swapped)
+		 */
+		else if (strstr(lfirst(lc), "\tNOT NULL ") != NULL)
+			not_null_drops = lappend(not_null_drops, sql);
 		else
 			sm->before = lappend(sm->before, sql);
 	}
+	sm->before = list_concat(sm->before, not_null_drops);
 	foreach(lc, from->indexes)
 	{
 		char	   *idx = index_name(lfirst(lc));

@@ -466,3 +466,39 @@ SELECT length(dolt_commit('-Am', 'without sm14')::text) AS committed;
 DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
+
+-- Two tables' names swapped: a move back to the head puts each back (the
+-- NOT NULL of a key going after the key, whatever their names' order),
+-- by a hard reset, and by a merge's abort.
+CREATE SCHEMA sw VERSIONED;
+CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
+CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
+INSERT INTO sw.a VALUES (1, 'a'); INSERT INTO sw.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sw two')::text) AS committed;
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_reset('--hard');
+SELECT * FROM sw.a;
+SELECT * FROM sw.b;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_branch('sw_side');
+SELECT dolt_checkout('sw_side');
+UPDATE sw.a SET x = 'side';
+SELECT length(dolt_commit('-am', 'sw side')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE sw.a SET x = 'main';
+SELECT length(dolt_commit('-am', 'sw main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('sw_side') IS NOT NULL AS merging;
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+SELECT * FROM sw.a;
+SELECT * FROM sw.b;
+SELECT count(*) AS changed FROM dolt_status;
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('-D', 'sw_side');
+DROP SCHEMA sw CASCADE;
+SELECT length(dolt_commit('-Am', 'sw gone')::text) AS committed;

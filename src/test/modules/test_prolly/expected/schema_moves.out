@@ -1288,3 +1288,126 @@ DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.p
+-- Two tables' names swapped: a move back to the head puts each back (the
+-- NOT NULL of a key going after the key, whatever their names' order),
+-- by a hard reset, and by a merge's abort.
+CREATE SCHEMA sw VERSIONED;
+CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
+CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
+INSERT INTO sw.a VALUES (1, 'a'); INSERT INTO sw.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sw two')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM sw.a;
+ pk | x 
+----+---
+  1 | a
+(1 row)
+
+SELECT * FROM sw.b;
+ pk | y 
+----+---
+  1 | 1
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_branch('sw_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sw_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'sw_side'"}
+(1 row)
+
+UPDATE sw.a SET x = 'side';
+SELECT length(dolt_commit('-am', 'sw side')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE sw.a SET x = 'main';
+SELECT length(dolt_commit('-am', 'sw main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('sw_side') IS NOT NULL AS merging;
+ merging 
+---------
+ t
+(1 row)
+
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+ aborted 
+---------
+ t
+(1 row)
+
+SELECT * FROM sw.a;
+ pk |  x   
+----+------
+  1 | main
+(1 row)
+
+SELECT * FROM sw.b;
+ pk | y 
+----+---
+  1 | 1
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('-D', 'sw_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sw CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table sw.a
+drop cascades to table sw.b
+SELECT length(dolt_commit('-Am', 'sw gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
