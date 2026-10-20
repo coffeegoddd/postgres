@@ -56,9 +56,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
-#include "access/reloptions.h"
 #include "nodes/bitmapset.h"
-#include "nodes/makefuncs.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
@@ -116,7 +114,6 @@ relation_create(Relation rel)
 	Oid			logid;
 	ObjectAddress table;
 	ObjectAddress log;
-	Datum		options;
 
 	/*
 	 * (not as pg_upgrade restores the table: it preassigns the relation
@@ -140,18 +137,6 @@ relation_create(Relation rel)
 	}
 	TupleDescFinalize(desc);
 
-	/*
-	 * (vacuumed soon after entries die, which a fold's consuming makes: its
-	 * reads walk the dead too; the table's options, if it sets them, govern)
-	 */
-	options = transformRelOptions((Datum) 0,
-								  list_make2(makeDefElem("autovacuum_vacuum_scale_factor",
-														 (Node *) makeString("0"), -1),
-											 makeDefElem("autovacuum_vacuum_threshold",
-														 (Node *) makeString("1000"), -1)),
-								  NULL, NULL, false, false);
-	(void) heap_reloptions(RELKIND_TOASTVALUE, options, true);
-
 	logid = heap_create_with_catalog(name,
 									 PG_TOAST_NAMESPACE,
 									 rel->rd_rel->reltablespace,
@@ -167,7 +152,7 @@ relation_create(Relation rel)
 									 false,
 									 false,
 									 ONCOMMIT_NOOP,
-									 options,
+									 (Datum) 0,
 									 false,
 									 true,
 									 true,
