@@ -109,7 +109,8 @@ int f(void) { @1@ return 0; }
       blake3_cflags += '-DBLAKE3_NO_@0@'.format(variant.to_upper())
     endif
   endforeach
-elif host_cpu == 'aarch64'
+elif host_cpu == 'aarch64' and host_machine.endian() == 'little'
+  # (big-endian AArch64 has no NEON variant: the portable code runs)
   blake3_simd += {'blake3_neon': []}
 endif
 blake3_simd_sources = {}

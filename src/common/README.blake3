@@ -15,7 +15,8 @@ in, but for one change: blake3.c and blake3_impl.h include
 The build compiles blake3.c, blake3_dispatch.c and blake3_portable.c
 everywhere; on x86 also blake3_sse2.c, blake3_sse41.c, blake3_avx2.c and
 blake3_avx512.c, each with the instructions it uses enabled (-msse2,
--msse4.1, -mavx2, -mavx512f -mavx512vl), and on AArch64 blake3_neon.c.
+-msse4.1, -mavx2, -mavx512f -mavx512vl), and on little-endian AArch64
+blake3_neon.c (upstream's NEON code is little-endian only).
 The build first checks the compiler can build each x86 variant's
 intrinsics with its flags; one it can't is left out, and BLAKE3_NO_SSE2,
 BLAKE3_NO_SSE41, BLAKE3_NO_AVX2 or BLAKE3_NO_AVX512 tells the dispatcher.
