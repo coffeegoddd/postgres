@@ -2953,8 +2953,12 @@ table_file_read(void *arg, uint64 offset, char *buf, Size len)
 /*
  * Map len bytes of a table file at offset for its format to read in place:
  * every process that has the file open shares the one copy in the page
- * cache.  A table file is never written again (nor truncated) once
- * written; one a conjoin or collection removes stays mapped until closed.
+ * cache.  A table file is never cut short once a manifest names it (redo
+ * writes a named one's bytes over in place); one a conjoin or collection
+ * removes stays mapped until closed.  A read of the mapping the OS can't
+ * do (an I/O error) is a SIGBUS, not an error: the process dies and the
+ * server restarts, as for any of its shared mappings, where read() would
+ * have raised an error.
  */
 static const char *
 table_file_map(void *arg, uint64 offset, Size len)
@@ -3032,8 +3036,19 @@ open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", t->path)));
 	}
-	t->tf = PROLLY_CALL(table_format(), open, table_file_read, table_file_map, t,
-						t->size, cxt);
+	/* (a format that raises an error has its mapping and file closed) */
+	PG_TRY();
+	{
+		t->tf = PROLLY_CALL(table_format(), open, table_file_read,
+							table_file_map, t, t->size, cxt);
+	}
+	PG_CATCH();
+	{
+		t->tf = NULL;
+		release_table(t);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (t->tf == NULL)
 	{
 		const ProllyTableFileRoutine *format = table_format();
@@ -3833,15 +3848,33 @@ table_files_redo(XLogReaderState *record)
 	{
 		char	   *path = table_file_path(dir, xlrec.id);
 
+		/*
+		 * The first bytes cut short what a failed writer left, but not a
+		 * file the manifest names already (replayed again, after a crash or
+		 * a standby's restart): readers may have it mapped, and a mapping
+		 * cut short is a SIGBUS.  Its bytes are the WAL's, so written over
+		 * in place they are the same.
+		 */
 		if (xlrec.offset == 0)
 		{
-			int			fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+			Manifest	m;
+			bool		named = false;
 
-			if (fd < 0)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not open file \"%s\": %m", path)));
-			CloseTransientFile(fd);
+			if (read_manifest(dir, &m))
+			{
+				for (int i = 0; i < m.nfiles; i++)
+					named |= m.files[i].id == xlrec.id;
+			}
+			if (!named)
+			{
+				int			fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+
+				if (fd < 0)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not open file \"%s\": %m", path)));
+				CloseTransientFile(fd);
+			}
 		}
 		write_at(path, XLogRecGetData(record) + SizeOfChunksFile,
 				 XLogRecGetDataLen(record) - SizeOfChunksFile, xlrec.offset);

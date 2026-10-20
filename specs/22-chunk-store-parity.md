@@ -142,7 +142,12 @@ conformance test.
    Dolt's `chooseConjoinees` does, dropping duplicate chunks while
    merging (Dolt keeps them).
 9. **A miss costs O(1) across files:** the database-wide index of 6 and
-   7, or a prefix filter for each file.
+   7, or a prefix filter for each file. As built: a blocked Bloom filter
+   in each file (10 bits a chunk, its probes in one cache line), so a
+   miss costs one line per file: O(files), which conjoining keeps at no
+   more than `prolly.conjoin_max_files`, not O(1). A table file's index
+   is mapped where the OS can; an I/O error reading a mapping is a
+   SIGBUS (the server restarts) where `read()` would raise an error.
 10. **A checkpoint fsyncs only the files written since the last one,**
     through `RegisterSyncRequest`, as `md.c` does. Today
     `journal_checkpoint` fsyncs every file of every database.

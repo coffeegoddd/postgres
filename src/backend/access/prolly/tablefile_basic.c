@@ -16,8 +16,9 @@
  *				chunk by ordinal, the uint64 offset of its bytes in the
  *				file (each ends where the next begins, the last where the
  *				index does); then for each by ordinal, the rest of its hash
- *				(the suffix); then a Bloom filter of the hashes,
- *				FILTER_BITS bits a chunk (a multiple of 64 in all)
+ *				(the suffix); then a blocked Bloom filter of the hashes,
+ *				FILTER_BITS bits a chunk in blocks of FILTER_BLOCK bits
+ *				(one cache line), each hash's FILTER_PROBES bits in one
  *		footer	uint64 offset of the index, uint32 chunk count, uint8 hash
  *				length, three zero bytes, uint32 CRC-32C of the index,
  *				uint32 version (3), "PRLYTBL1"
@@ -60,6 +61,7 @@
 #define PREFIX_ENTRY	12		/* a prefix and an ordinal */
 #define FILTER_BITS		10		/* a Bloom filter's bits a chunk */
 #define FILTER_PROBES	7		/* and the bits each hash sets */
+#define FILTER_BLOCK	512		/* in one block of bits: a cache line */
 
 #define CODEC_NONE		0
 #define CODEC_LZ4		1
@@ -243,17 +245,19 @@ get_prefix(const char *p)
 	return hash_prefix((const uint8 *) p, PREFIX_LEN);
 }
 
-/* a filter of n chunks' size in bits */
+/* a filter of n chunks' size in bits: whole blocks */
 static uint64
 filter_size(uint32 n)
 {
-	return Max(((uint64) n * FILTER_BITS + 63) / 64 * 64, 64);
+	return Max(((uint64) n * FILTER_BITS + FILTER_BLOCK - 1) /
+			   FILTER_BLOCK * FILTER_BLOCK, FILTER_BLOCK);
 }
 
 /*
- * The filter bits a hash sets: by double hashing on its own bytes, which a
- * content hash makes uniform (its first 8, and the 8 after, or its first 8
- * turned over when it is shorter).
+ * The filter bits a hash sets, from its own bytes, which a content hash
+ * makes uniform: its first 8 choose a block (one division), and the 8
+ * after (its first 8 turned over when it is shorter), 9 bits at a time,
+ * the bits in it, so a lookup reads one cache line.
  */
 static void
 filter_probes(const uint8 *bytes, uint8 hash_len, uint64 nbits,
@@ -263,10 +267,12 @@ filter_probes(const uint8 *bytes, uint8 hash_len, uint64 nbits,
 	uint64		h2 = hash_len >= 2 * PREFIX_LEN ?
 		hash_prefix(bytes + PREFIX_LEN, PREFIX_LEN) :
 		(h1 >> 29) ^ (h1 << 35) ^ UINT64CONST(0x9e3779b97f4a7c15);
+	uint64		block = h1 % (nbits / FILTER_BLOCK) * FILTER_BLOCK;
 
-	h2 |= 1;
+	StaticAssertStmt(FILTER_PROBES * 9 <= 64 && FILTER_BLOCK == 1 << 9,
+					 "a filter's probes are 9 bits each of 64");
 	for (int i = 0; i < FILTER_PROBES; i++)
-		probes[i] = (h1 + (uint64) i * h2) % nbits;
+		probes[i] = block + ((h2 >> (9 * i)) & (FILTER_BLOCK - 1));
 }
 
 static void
@@ -352,10 +358,26 @@ prefix_at(ProllyTableFile *tf, int i)
 	return get_prefix(tf->prefixes + (Size) i * PREFIX_ENTRY);
 }
 
+/* (as the index has it: open() checks it) */
+static uint32
+ordinal_raw(ProllyTableFile *tf, int i)
+{
+	return get_u32(tf->prefixes + (Size) i * PREFIX_ENTRY + PREFIX_LEN);
+}
+
+/*
+ * (open() checked every ordinal and offset; checked again as they are
+ * used, as a mapped index is the file's, read where it lies)
+ */
 static uint32
 ordinal_at(ProllyTableFile *tf, int i)
 {
-	return get_u32(tf->prefixes + (Size) i * PREFIX_ENTRY + PREFIX_LEN);
+	uint32		ord = ordinal_raw(tf, i);
+
+	if (ord >= (uint32) tf->n)
+		elog(ERROR, "table file index entry %d has ordinal %u of %d", i, ord,
+			 tf->n);
+	return ord;
 }
 
 static const char *
@@ -372,6 +394,9 @@ chunk_at(ProllyTableFile *tf, uint32 ord, uint64 *offset, uint32 *len)
 	uint64		end = ord + 1 < (uint32) tf->n ?
 		get_u64(tf->offsets + (Size) (ord + 1) * 8) : tf->index_offset;
 
+	if (end < start || end - start > PG_UINT32_MAX)
+		elog(ERROR, "table file chunk %u runs from %llu to %llu", ord,
+			 (unsigned long long) start, (unsigned long long) end);
 	*offset = start;
 	*len = (uint32) (end - start);
 }
@@ -460,7 +485,7 @@ basic_open(ProllyTableFileRead read, ProllyTableFileMap map, void *arg,
 	seen = palloc_extended(Max(n / 8 + 1, 1), MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
 	for (uint32 i = 0; i < n; i++)
 	{
-		uint32		ord = ordinal_at(tf, i);
+		uint32		ord = ordinal_raw(tf, i);
 
 		if (ord >= n || (seen[ord / 8] & (1 << (ord % 8))))
 			goto bad;
