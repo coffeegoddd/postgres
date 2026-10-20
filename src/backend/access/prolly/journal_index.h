@@ -56,8 +56,23 @@ typedef struct JournalScan
 	int			nsegments;
 } JournalScan;
 
-/* The index of database dboid's journal, attached (made if it has none). */
-extern JournalIndex *jindex_attach(Oid dboid, int capacity);
+/*
+ * The index of database dboid's journal (in tablespace spcoid), attached;
+ * made if it has none (*made).
+ */
+extern JournalIndex *jindex_attach(Oid dboid, Oid spcoid, int capacity,
+								   bool *made);
+
+/*
+ * The index as a file in the database's directory, a cache of it: written
+ * at checkpoints (every index changed since), and read by the first to use
+ * an index after the server starts, for the segments the manifest names
+ * (ids), if it is of this format; the rest is read from the journal.
+ */
+#define JINDEX_FILE			"prolly_index"
+extern void jindex_checkpoint(const char *format, int format_len);
+extern bool jindex_load(JournalIndex *ix, const char *format, int format_len,
+						const uint64 *ids, int n, uint64 start);
 
 /* Forget database dboid's index (dropped: an OID used again starts anew). */
 extern void jindex_forget(Oid dboid);

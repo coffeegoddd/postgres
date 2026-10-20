@@ -28,7 +28,8 @@ sub sql { return $node->safe_psql('postgres', $_[0]); }
 my $files = q{SELECT string_agg(f || ' ' || md5(pg_read_binary_file(d || '/' || f)), E'\n' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'postgres') db,
 		pg_ls_dir(d) f
-	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'};
+	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'
+		AND f <> 'prolly_index'};	# (each server's own cache)
 my $segments = q{SELECT string_agg(name || ':' || chunks, ' ' ORDER BY name)
 	FROM test_chunk_segments()};
 my $reads = q{SELECT count(*) FROM generate_series(1, 30) g

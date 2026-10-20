@@ -3478,6 +3478,7 @@ journal_open(Oid dboid, Oid spcoid)
 	ProllyChunkStore *s;
 	MemoryContext old;
 	HASHCTL		ctl;
+	bool		made;
 
 	if (session_store != NULL)
 	{
@@ -3492,12 +3493,25 @@ journal_open(Oid dboid, Oid spcoid)
 	s->spcoid = spcoid;
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(IndexEntry);
-	s->ix = jindex_attach(dboid, 2 * append_ranges());
+	s->ix = jindex_attach(dboid, spcoid, 2 * append_ranges(), &made);
 	s->pending_index = hash_create("prolly journal pending", 256, &ctl,
 								   HASH_ELEM | HASH_BLOBS);
 	initStringInfo(&s->pending);
 	MemoryContextSwitchTo(old);
 
+	/* the first since the server started: the index as last saved */
+	if (made)
+	{
+		char	   *dir = GetDatabasePath(dboid, spcoid);
+		char		format[FORMAT_SIZE];
+		Manifest	m;
+
+		(void) read_manifest(dir, &m);
+		format_bytes(prolly_store_format(), format);
+		(void) jindex_load(s->ix, format, FORMAT_SIZE, m.segments, m.nsegments,
+						   JOURNAL_HEADER_SIZE);
+		pfree(dir);
+	}
 	(void) ensure_journal(s, false);
 
 	RegisterXactCallback(journal_xact_callback, NULL);
@@ -3640,6 +3654,19 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 			 (unsigned long long) segment);
 	rec = palloc(len);
 	read_exact(g, rec, len, offset);
+	/* (the index named it: its record must hold it) */
+	{
+		ProllyHash	h;
+		Size		after;
+
+		if (!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
+			h.len != key.len || memcmp(h.bytes, key.bytes, key.len) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("chunk journal \"%s\" holds no chunk %s at %llu",
+							g->path, prolly_hash_hex(hash),
+							(unsigned long long) offset)));
+	}
 	chunk_bytes(g->path, rec, len, out);
 	pfree(rec);
 	return true;
@@ -4029,6 +4056,13 @@ journal_checkpoint(void)
 
 	/* the appends reserved before the redo point, written */
 	wait_reserved(NULL);
+	/* (the indexes are a cache, written to be read at the next start) */
+	{
+		char		format[FORMAT_SIZE];
+
+		format_bytes(prolly_store_format(), format);
+		jindex_checkpoint(format, FORMAT_SIZE);
+	}
 	if (pg_atomic_exchange_u32(&shared()->sync_all, 0) == 0)
 		return;
 

@@ -40,7 +40,8 @@ sub sql { return $node->safe_psql('gcdb', $_[0]); }
 my $files = q{SELECT string_agg(f || ' ' || md5(pg_read_binary_file(d || '/' || f)), E'\n' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'gcdb') db,
 		pg_ls_dir(d) f
-	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'};
+	WHERE f LIKE 'prolly\_%' AND f NOT LIKE '%.tmp'
+		AND f <> 'prolly_index'};	# (each server's own cache)
 my $on_disk = q{SELECT string_agg(f, ' ' ORDER BY f)
 	FROM (SELECT 'base/' || oid AS d FROM pg_database WHERE datname = 'gcdb') db,
 		pg_ls_dir(d) f
