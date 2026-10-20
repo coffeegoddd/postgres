@@ -33,6 +33,11 @@
  * keep set, gc_kept()), before the window and in it.  A keep set too large
  * to remember keeps every chunk collected.
  *
+ * The chunks marked and not yet read wait in a queue, breadth first, of
+ * at most maintenance_work_mem in memory; past that it goes on in a
+ * temporary file, read back as the memory empties.  (The marks themselves
+ * are a bit a chunk collected.)
+ *
  * A default collection stops at settled files (the store doesn't collect
  * them, so marking ends there): it costs what changed since the last.  A
  * full one collects every file, marks through all of them, then keeps
@@ -54,6 +59,7 @@
 #include "access/prolly_toast.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "storage/buffile.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 
@@ -66,10 +72,13 @@ typedef struct Mark
 	ProllyChunkGc *gc;
 	uint64		nslots;
 	uint8	   *marks;			/* a bit a slot */
-	uint64	   *queue;			/* marked, not yet read */
+	uint64	   *queue;			/* marked, not yet read: [head, tail) */
 	uint64		head;
 	uint64		tail;
-	uint64		cap;
+	uint64		cap;			/* of queue: maintenance_work_mem's worth */
+	BufFile    *spill;			/* and the rest, past cap, in order */
+	uint64		spill_read;		/* slots read back from it */
+	uint64		spill_written;	/* and written */
 	uint8		hash_len;
 	StringInfoData buf;
 } Mark;
@@ -80,12 +89,57 @@ mark_slot(Mark *mk, uint64 slot)
 	if (mk->marks[slot / 8] & (1 << (slot % 8)))
 		return;
 	mk->marks[slot / 8] |= 1 << (slot % 8);
-	if (mk->tail == mk->cap)
+	if (mk->tail == mk->cap && mk->head > 0 && mk->spill_written == mk->spill_read)
 	{
-		mk->cap *= 2;
-		mk->queue = repalloc_huge(mk->queue, sizeof(uint64) * mk->cap);
+		memmove(mk->queue, mk->queue + mk->head,
+				sizeof(uint64) * (mk->tail - mk->head));
+		mk->tail -= mk->head;
+		mk->head = 0;
+	}
+	/* (once some are in the file, the rest follow them there, in order) */
+	if (mk->tail == mk->cap || mk->spill_written > mk->spill_read)
+	{
+		if (mk->spill == NULL)
+			mk->spill = BufFileCreateTemp(false);
+		if (BufFileSeek(mk->spill, 0, mk->spill_written * sizeof(uint64),
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in the collection's temporary file: %m")));
+		BufFileWrite(mk->spill, &slot, sizeof(slot));
+		mk->spill_written++;
+		return;
 	}
 	mk->queue[mk->tail++] = slot;
+}
+
+/* The next slot marked and not yet read; false if none is left. */
+static bool
+next_marked(Mark *mk, uint64 *slot)
+{
+	if (mk->head == mk->tail)
+	{
+		uint64		n = Min(mk->cap, mk->spill_written - mk->spill_read);
+
+		mk->head = mk->tail = 0;
+		if (n == 0)
+		{
+			mk->spill_read = mk->spill_written = 0;
+			return false;
+		}
+		if (BufFileSeek(mk->spill, 0, mk->spill_read * sizeof(uint64),
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in the collection's temporary file: %m")));
+		BufFileReadExact(mk->spill, mk->queue, n * sizeof(uint64));
+		mk->spill_read += n;
+		mk->tail = n;
+		if (mk->spill_read == mk->spill_written)
+			mk->spill_read = mk->spill_written = 0;
+	}
+	*slot = mk->queue[mk->head++];
+	return true;
 }
 
 static void
@@ -143,10 +197,10 @@ mark_all(Mark *mk)
 static void
 drain(Mark *mk)
 {
-	while (mk->head < mk->tail)
-	{
-		uint64		slot = mk->queue[mk->head++];
+	uint64		slot;
 
+	while (next_marked(mk, &slot))
+	{
 		resetStringInfo(&mk->buf);
 		PROLLY_CALL(mk->cs, gc_read, mk->gc, slot, &mk->buf);
 		mark_named(mk, mk->buf.data, mk->buf.len);
@@ -156,7 +210,6 @@ drain(Mark *mk)
 			VacuumCostBalance += VacuumCostPageMiss;
 		vacuum_delay_point(false);
 	}
-	mk->head = mk->tail = 0;
 }
 
 /* What is new since the seal: a root, or a chunk kept whole. */
@@ -242,8 +295,8 @@ copying_collect(bool full, ProllyGcResult *result)
 						&root, &mk.nslots);
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
-	mk.cap = 1024;
-	mk.queue = palloc(sizeof(uint64) * mk.cap);
+	mk.cap = Max((uint64) maintenance_work_mem * 1024 / sizeof(uint64), 1024);
+	mk.queue = MemoryContextAllocHuge(CurrentMemoryContext, sizeof(uint64) * mk.cap);
 	mk.hash_len = root.len;
 	initStringInfo(&mk.buf);
 	PROLLY_CALL(cs, gc_files, mk.gc, count_file, &nfiles);
@@ -298,6 +351,8 @@ copying_collect(bool full, ProllyGcResult *result)
 	drain(&mk);
 	PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
 	PROLLY_CALL(cs, gc_retire, mk.gc);
+	if (mk.spill != NULL)
+		BufFileClose(mk.spill);
 }
 
 /* (nothing to mark: every chunk is) */

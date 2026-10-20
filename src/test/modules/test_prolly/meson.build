@@ -116,6 +116,7 @@ tests += {
       'journal_compression',
       'gc',
       'gc_full',
+      'gc_spill',
       'page_sweep',
       'large_values',
       'large_keys',
