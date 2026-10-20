@@ -31,7 +31,7 @@ FROM generate_series(1, 4) g;
 SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- updated, deleted, inserted rows with long values; one copy of a
@@ -63,7 +63,7 @@ SELECT same_as_full() AS same;
 SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 :flush
@@ -103,7 +103,7 @@ CREATE TABLE kt.wide (a int, b text STORAGE PLAIN);
 SELECT length(dolt_commit('-Am', 'wide')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO kt.wide VALUES (1, repeat('w', 8120));
@@ -127,7 +127,7 @@ SELECT same_as_full() AS same;
 SELECT length(dolt_commit('-am', 'wide row')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 :flush
