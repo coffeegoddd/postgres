@@ -51,5 +51,26 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'kk');
 
 SELECT dolt_reset('--hard');
+
+-- a primary key given a keyless table, reset away: the key goes before
+-- the NOT NULL it holds its column to
+CREATE TABLE km.given (id int, v text);
+INSERT INTO km.given VALUES (1, 'a'), (2, 'b');
+SELECT length(dolt_commit('-Am', 'given')::text) AS committed;
+ALTER TABLE km.given ADD PRIMARY KEY (id);
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+SELECT conname, contype FROM pg_constraint
+WHERE conrelid = 'km.given'::regclass ORDER BY 1;
+SELECT attnotnull FROM pg_attribute
+WHERE attrelid = 'km.given'::regclass AND attname = 'id';
+SELECT * FROM km.given ORDER BY id;
+-- and taken from a keyed one, reset back
+ALTER TABLE km.k DROP CONSTRAINT k_pkey;
+ALTER TABLE km.k ALTER COLUMN id DROP NOT NULL;
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+SELECT conname, contype FROM pg_constraint
+WHERE conrelid = 'km.k'::regclass ORDER BY 1;
+SELECT count(*) FROM km.k;
+
 SELECT dolt_branch('-D', 'kb');
 DROP SCHEMA km CASCADE;
