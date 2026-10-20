@@ -255,6 +255,7 @@ SELECT count(*) AS changed FROM dolt_diff(:'odd_base', 'HEAD', NULL::eh.odd);
 
 -- A rename mixed with additions is ambiguous, even if the old label is
 -- absent from the rows.  Refuse before applying any of the other side.
+-- (A diff of the table's rows, which didn't change, has none to read.)
 CREATE TYPE eh.amb AS ENUM ('a', 'b');
 CREATE TABLE eh.ambiguous (id int PRIMARY KEY, e eh.amb);
 INSERT INTO eh.ambiguous VALUES (1, 'b');
@@ -274,9 +275,11 @@ SELECT length(dolt_commit('-Am', 'rename and add')::text) AS committed;
 (1 row)
 
 SELECT count(*) FROM dolt_diff(:'amb_base', 'HEAD', NULL::eh.ambiguous);
-ERROR:  schema conflict: cannot map historical labels of enum eh.amb
-DETAIL:  Only renames in place or additions preserving all old labels can be read across enum definitions.
-HINT:  Merge row changes before combining enum renames and additions or reusing labels.
+ count 
+-------
+     0
+(1 row)
+
 SELECT dolt_checkout('amb_writer');
              dolt_checkout             
 ---------------------------------------

@@ -4707,9 +4707,12 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	const Table *fp;
 	const Table *tp;
 
-	/* (nothing changed: nothing to convert) */
-	if (from && to && same_hash(&from->data.hash, &to->data.hash) &&
-		same_description(from, to))
+	/*
+	 * (the same rows: none changed, whatever the definitions say, as rows
+	 * are encoded by column position; a column renamed, or a constraint or
+	 * an index added, changes no row)
+	 */
+	if (from && to && same_hash(&from->data.hash, &to->data.hash))
 		return;
 	if (now == NULL || ((from == NULL || same_description(from, now)) &&
 						(to == NULL || same_description(to, now))))

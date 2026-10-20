@@ -290,3 +290,27 @@ SELECT * FROM dolt_status;
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::app.t);
 \c :db
 DROP DATABASE regress_status_unborn;
+
+-- A column renamed, no row changed: dolt_status says the table changed,
+-- dolt_diff that no row did (rows are encoded by position, and its data
+-- tree is the same), in the working set and between commits; an index or
+-- a constraint added the same.  A row changed with it is the one diffed.
+CREATE DATABASE regress_status_rename;
+\c regress_status_rename
+CREATE SCHEMA r VERSIONED;
+CREATE TABLE r.t (id int PRIMARY KEY, x int);
+INSERT INTO r.t VALUES (1, 7), (2, 8);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ALTER TABLE r.t RENAME COLUMN x TO y;
+SELECT * FROM dolt_status;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::r.t);
+SELECT length(dolt_commit('-am', 'rename')::text) AS committed;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::r.t);
+CREATE INDEX t_y ON r.t (y);
+ALTER TABLE r.t ADD CONSTRAINT y_positive CHECK (y > 0);
+SELECT * FROM dolt_status;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::r.t);
+UPDATE r.t SET y = 9 WHERE id = 2;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::r.t);
+\c :db
+DROP DATABASE regress_status_rename;

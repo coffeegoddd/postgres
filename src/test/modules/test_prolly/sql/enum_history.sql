@@ -82,6 +82,7 @@ SELECT count(*) AS changed FROM dolt_diff(:'odd_base', 'HEAD', NULL::eh.odd);
 
 -- A rename mixed with additions is ambiguous, even if the old label is
 -- absent from the rows.  Refuse before applying any of the other side.
+-- (A diff of the table's rows, which didn't change, has none to read.)
 CREATE TYPE eh.amb AS ENUM ('a', 'b');
 CREATE TABLE eh.ambiguous (id int PRIMARY KEY, e eh.amb);
 INSERT INTO eh.ambiguous VALUES (1, 'b');
