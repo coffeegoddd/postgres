@@ -918,3 +918,88 @@ SELECT dolt_branch('-D', 'other');
  {0}
 (1 row)
 
+-- A table "pages" folded keeps its fold, so each page's first change after
+-- copied it once (pages not changed since, at their first change); the
+-- first fold of it by "log" that begins a baseline forgets that fold: no
+-- page is copied after.
+CREATE SCHEMA pf VERSIONED;
+CREATE TABLE pf.t (id int PRIMARY KEY, v text);
+INSERT INTO pf.t SELECT g, 'v' || g FROM generate_series(1, 30000) g;
+SET debug_prolly_change_finder = 'pages';
+SELECT length(dolt_commit('-Am', 'pages fold')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+UPDATE pf.t SET v = 'x' WHERE id <= 500;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value > 0 AS pages_copied FROM pg_stat_prolly WHERE name = 'page_copies_fold';
+ pages_copied 
+--------------
+ t
+(1 row)
+
+RESET debug_prolly_change_finder;
+SELECT length(dolt_commit('-am', 'log fold')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+UPDATE pf.t SET v = 'y' WHERE id > 25000;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value AS pages_copied_after FROM pg_stat_prolly WHERE name = 'page_copies_fold';
+ pages_copied_after 
+--------------------
+                  0
+(1 row)
+
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+ same_as_full 
+--------------
+ t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'after')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP SCHEMA pf CASCADE;
+NOTICE:  drop cascades to table pf.t
+SELECT length(dolt_commit('-am', 'gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

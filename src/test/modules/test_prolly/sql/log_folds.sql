@@ -339,3 +339,28 @@ SELECT * FROM pg_temp.fold();
 
 DROP SCHEMA inc CASCADE;
 SELECT dolt_branch('-D', 'other');
+
+-- A table "pages" folded keeps its fold, so each page's first change after
+-- copied it once (pages not changed since, at their first change); the
+-- first fold of it by "log" that begins a baseline forgets that fold: no
+-- page is copied after.
+CREATE SCHEMA pf VERSIONED;
+CREATE TABLE pf.t (id int PRIMARY KEY, v text);
+INSERT INTO pf.t SELECT g, 'v' || g FROM generate_series(1, 30000) g;
+SET debug_prolly_change_finder = 'pages';
+SELECT length(dolt_commit('-Am', 'pages fold')::text) AS committed;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+UPDATE pf.t SET v = 'x' WHERE id <= 500;
+SELECT pg_stat_force_next_flush();
+SELECT value > 0 AS pages_copied FROM pg_stat_prolly WHERE name = 'page_copies_fold';
+RESET debug_prolly_change_finder;
+SELECT length(dolt_commit('-am', 'log fold')::text) AS committed;
+SELECT pg_stat_reset_shared('prolly');
+UPDATE pf.t SET v = 'y' WHERE id > 25000;
+SELECT pg_stat_force_next_flush();
+SELECT value AS pages_copied_after FROM pg_stat_prolly WHERE name = 'page_copies_fold';
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+SELECT length(dolt_commit('-am', 'after')::text) AS committed;
+DROP SCHEMA pf CASCADE;
+SELECT length(dolt_commit('-am', 'gone')::text) AS committed;

@@ -74,6 +74,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "portability/instr_time.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -990,6 +991,15 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 
 	/* (on a hot standby, a fold only reads: it advances no baseline) */
 	Assert(!RecoveryInProgress() || next == NULL);
+
+	/*
+	 * (a table "pages" folded before keeps its fold, so each page's first
+	 * change since copies it: no one reads those copies now, so a fold
+	 * that begins a baseline forgets it)
+	 */
+	if (next != NULL && RelationGetSmgr(rel)->smgr_which == SMGR_BMAP &&
+		bmap_folded(RelationGetSmgr(rel)))
+		bmap_fold_forget(RelationGetSmgr(rel));
 
 	/* what a table's fold makes is let go of when it's done */
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "log fold",
