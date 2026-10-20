@@ -11,7 +11,7 @@ INSERT INTO st.t VALUES (1, 'a'), (2, 'b');
 SELECT length(dolt_commit('-Am', 'two rows')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- nothing to stash, nothing to pop
@@ -180,7 +180,7 @@ UPDATE st.t SET v = 'b2' WHERE pk = 2;
 SELECT length(dolt_commit('-am', 'b2')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_stash('pop', 's');
@@ -265,7 +265,7 @@ INSERT INTO st.t VALUES (8, 'j');
 SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_stash('pop', 's');
@@ -338,7 +338,7 @@ SELECT pk, w FROM st.t ORDER BY pk;
 SELECT length(dolt_commit('-Am', 'all in')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO st.t VALUES (9, 'k', 9);
