@@ -573,6 +573,8 @@ the values' generation subtracted: 2 KB 12.0 (heap), 11.9 (OID), 17.8
   table as built): 81–109% of heap's tps.
 - Where the CPU goes (64 KB, perf): the value chunker's rolling hash about
   32%, SHA-256 22%, the journal's hash-table lookups 15%, CRC 4%.
+  (Spec 22 replaced SHA-256 with BLAKE3 and batched those lookups; this
+  profile is taken again in step 8.)
 - Found on the way: a backend's first chunk-store miss scans the whole
   unsealed journal to index it, about 1 s a GB (3.0 s at 3.2 GB). With C
   the journal grows with the working set's writes, not with commits.

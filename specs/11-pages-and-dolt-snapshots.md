@@ -208,7 +208,8 @@ commit is atomic with its SQL transaction:
 Most of the canonical format built in step 4 was ours already and
 carries over; only what assumed chunks live in 8 KB pages changes:
 
-- **Hash:** SHA-256 (`hash_sha256.c`), as built.
+- **Hash:** SHA-256 (`hash_sha256.c`), as built; BLAKE3's first 20
+  bytes (`hash_blake3.c`) since spec 22's group A.
 - **Keys:** the memcmp-comparable key encoding from btree opclasses and
   collations (`keyenc_ordered.c`), as built; collation versions in the
   stored format stay a question (46).
@@ -1905,7 +1906,8 @@ Not as designed, or not yet:
   by node, not overlapped).
 - **Clone walks** rather than copying the remote's files whole and then
   checking them (7.4): the same bound, O(B); the whole-file copy waits for
-  V4 to say what it saves.
+  V4 to say what it saves. (Since spec 22's item 20, it copies them
+  whole, and resumes.)
 - **The store's own chunks are trusted.** A commit or chunk the store
   has is declined without reading what it references: the receive check
   resolves references through the store's closure, which it assumes, as
@@ -1921,7 +1923,8 @@ Not as designed, or not yet:
 - **The seen sets aren't bounded.** What a receive has seen (each chunk
   received, its hash in memory, its bytes in a temporary file) and what a
   send has seen are hash tables in memory, growing with the chunks moved;
-  7.1 bounds them by `maintenance_work_mem`, spilling past it.
+  7.1 bounds them by `maintenance_work_mem`, spilling past it. (Since
+  spec 22's item 20, bounded so.)
 - **Shared dependencies.** Built since (7.4): a clone checks every
   branch head's recorded dependencies before it makes anything, and makes
   the extensions the database lacks; a move to a commit refuses what the
@@ -2016,7 +2019,9 @@ Built: decision (A) of 7.5, behind the remote interface (#198–#203).
   was timed moving. Measured in step 8.
 - **Still not built:** a client deleting a remote's branch (so
   `dolt_fetch --prune`), resuming a transfer, a bounded seen set, the
-  whole-file clone.
+  whole-file clone. (Since spec 22's group E: a bounded seen set, the
+  whole-file clone, and resuming a clone; a fetch or push still starts
+  over.)
 
 ## 8. Step 7 design: reclamation
 
@@ -2369,6 +2374,7 @@ Not as designed, or not yet:
   chunk's hash, that chunk is marked. Every reference the store's chunks
   hold is written that way, so nothing named is lost, whatever the kind of
   chunk; bytes that happen to spell a collected hash keep a stray chunk.
+  (Since spec 22's item 17, marks follow what each chunk declares.)
 - **The append check covers what the tree format declares.** Hashes a
   chunk holds otherwise (a commit's parents and root, the refs' heads, a
   canonical root's data trees) are checked, for a transaction that began
@@ -2396,15 +2402,18 @@ Not as designed, or not yet:
   a transfer waiting for the manifest would otherwise deadlock with the
   retire's wait.
 - **The window holds `ProllyJournal`**, which is the server's, not the
-  database's: every database's appends wait for it.
+  database's: every database's appends wait for it. (Since spec 22's
+  item 14, the database's own append lock.)
 - **Files a crash leaves** (a collection's unnamed new files, segments
   retiring) are removed by the next writer or collection, not at the end
-  of recovery. The collection isn't resumed.
+  of recovery. The collection isn't resumed. (Since spec 22's item 16,
+  removed as crash recovery ends.)
 - **The standby conflict** covers every query running in the database
   when the swap was replayed.
 - **The mark's frontier** is an array in memory, not bounded by
   `maintenance_work_mem`; the sealed segments' slots are a hash table of
-  their chunks (what changed since the last collection).
+  their chunks (what changed since the last collection). (Since spec
+  22's item 15, the frontier spills past it.)
 - **Counts past 255 aren't kept in a table of their own.** A block shared
   by more than 255 maps stays stuck while it is; the sweep rewrites its
   count once its holders fit, and frees it once none is left, so a block
@@ -2424,6 +2433,6 @@ Not as designed, or not yet:
   `dolt_gc('--full')` by hand meanwhile.
 - **The rewrite threshold** (half) is a constant, not a setting, and the
   growth factor's default (0.2) is autovacuum's scale factor's.
-- **Not built:** a reflog (8.1), resuming a collection, a collection that
-  holds chunks a transfer was told the receiver has (8.3 refuses the
-  transfer instead).
+- **Not built:** a reflog (8.1; since built, spec 22's item 4), resuming
+  a collection, a collection that holds chunks a transfer was told the
+  receiver has (8.3 refuses the transfer instead).

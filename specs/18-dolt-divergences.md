@@ -147,7 +147,8 @@ adapts.
 
 - **Dolt:** commit ids are 32-character base32 strings of a 20-byte
   hash.
-- **Prolly:** commit ids are 64 hex digits of SHA-256, canonical: the
+- **Prolly:** commit ids are 40 hex digits of BLAKE3's first 20 bytes
+  (64 hex digits of SHA-256 until spec 22's group A), canonical: the
   same history gives the same ids on every cluster.
 - **Why:** prolly's own format (Built for Postgres, not ported); ids
   are never compared with Dolt's.

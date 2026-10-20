@@ -2,8 +2,10 @@
 
 **Status: proposed and decided by the user 2026-10-19, as recommended
 but for the hash's length (20 bytes, the user's choice; item 1), on
-`cf49764a49`. Nothing here is built. Tracked in #442–#447, one issue for
-each group of part 4.**
+`cf49764a49`. Groups A–E built 2026-10-19 as one stack of pull requests
+(#460–#465, #467–#479, #502–#504, stack #466), not merged;
+part 6 says what each built and where it departs. F (#447) waits for
+step 8. Tracked in #442–#447, one issue for each group of part 4.**
 
 This spec compares the chunk store under spec 11 with Dolt's (NBS, the
 reference) and doltlite's, and lists what changes. The decisions are
@@ -219,3 +221,98 @@ Items 14 to 16 are spec 11 8.11's "not as designed".
 
 Spec 21 (schema diffs) is also before step 8. The two don't depend on
 each other.
+
+## 6. As built (2026-10-19)
+
+One linear stack, a pull request a layer, in part 5's order. Part 1's
+"Ours" column is as decided, not as built.
+
+### A. One clean break of format
+
+- **1. BLAKE3, its first 20 bytes** (#460, #461). The official C
+  implementation (1.8.2) is vendored in `src/common`, its SIMD variants
+  chosen at run time; `hash_blake3.c` is the default content hash, and
+  every direct SHA-256 lookup takes the configured one. Commit ids are
+  40 hex digits. The TOAST pointer's tag is `VARTAG_ONDISK_BLAKE3` (6),
+  its hash 20 bytes. Not yet measured again (spec 14's C8 profile, gate
+  3): step 8.
+- **2. Journal chunks compressed with LZ4** (#462), when that makes them
+  smaller; a codec byte in each record. Journal v3.
+- **3. Table files' index laid out as Dolt's** (#463): prefixes with
+  ordinals, lengths, suffixes; interpolation search; about 32 bytes a
+  chunk. B's #469 adds u64 offsets and a Bloom filter (format v3).
+- **4. ROOT records carry a timestamp; `dolt_reflog`** (#464). Dolt's
+  reflog scripts ported (one GC case partial: it tags a commit, and
+  there are no tags).
+- **5. The store records its format** (#461): hash name and length and
+  the chunk format's version, in each segment's header and the
+  manifest (v4); a store of another format is refused.
+
+### C. Observability
+
+- **13.** (#465) `pg_stat_prolly` counts journal scans and bytes,
+  collections, moves, chunks kept and freed, bytes freed and conjoins;
+  `prolly_store_sizes()` gives the store's sizes, `prolly_gc([full])` a
+  collection's statistics. **Departure:** `dolt_gc()` still returns
+  `{0}`, as Dolt's does and the Dolt ports check; its statistics are
+  `prolly_gc()`'s.
+
+### B. The read path and scaling
+
+- **10. A checkpoint fsyncs only what was written since** (#467),
+  through sync requests (`SYNC_HANDLER_PROLLY_CHUNKS`).
+- **8. Autovacuum conjoins the smallest files past a count** (#468),
+  `prolly.conjoin_max_files` (256), Dolt's chooser; settled files kept
+  apart.
+- **7, 9. Table files' indexes mapped and shared**, each with a Bloom
+  filter for misses (#469).
+- **6. One journal index per database in shared memory** (#470), in
+  DSA, and **saved at checkpoints** as `prolly_index`, read back at
+  start and brought up to date from the journal's tail (#471).
+- **11. `get_many()`, read-ahead and ordered copies** (#472).
+  **Departures:** no read streams or AIO (this tree's AIO reads only
+  into shared buffers, through smgr); `FilePrefetch` gives the overlap.
+  Diffs and merges still read a node at a time: reading a node's
+  children ahead would break their bound of reading only what changed.
+- **12. Puts checked for duplicates all at once, as they are appended**
+  (#473).
+
+### D. Garbage collection
+
+- **14. The window takes the database's append lock** (#474), in its
+  shared journal index, not the server's.
+- **15. The mark queue spills to a temporary file** past
+  `maintenance_work_mem` (#475).
+- **16. A collection's leftovers are removed as crash recovery ends**
+  (#476), from `StartupXLOG()` before connections are let in, each
+  removal WAL-logged. **Departure:** not in the end-of-recovery
+  checkpoint, which may write no WAL but its own; and not after archive
+  recovery, where a promoted standby's readers may still read what is
+  retiring.
+- **17. Marks follow the references each chunk declares** (#477). A
+  tree's leaves record the chunks their values name
+  (`PROLLY_ITEM_CHUNK_REFS`, the environment's `chunk_refs()`), which
+  `references()` reports and walks don't follow: commits, the refs,
+  canonical roots and baselines declare theirs. Assert-enabled builds
+  warn of a chunk a chunk's values spell and don't declare.
+- **18. A collection writes files of a set size**,
+  `prolly.gc_file_size` (64 MB) (#478).
+
+### E. Remotes
+
+- **19. Chunks are sent as stored** (#479): framed (codec, length,
+  bytes), as a table file's chunk is less its CRC, read and written so
+  by the store, table files and both remotes; the receiver decodes them
+  only to check them.
+- **20. Whole-file clone, resume, a bounded seen set** (#502, #503). A
+  clone copies the remote's files whole (`dolt_serve_files()`,
+  `dolt_serve_file_chunks()`), each kept out of what the store reads
+  until all are checked, then adopted at once; a clone that fails keeps
+  what it copied, and one tried again copies only what it lacks. A
+  remote that can't list its files, or whose journal is a fifth of it or
+  more, is walked. **Departure:** only a clone resumes; a fetch or push
+  that fails starts over, as Dolt's do. What a transfer has seen (and
+  `dolt_serve_since()` has sent) is a map held to
+  `maintenance_work_mem`, past it sorted runs in a temporary file with
+  a Bloom filter each.
+
