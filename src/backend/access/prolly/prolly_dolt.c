@@ -3257,6 +3257,20 @@ typedef struct SummaryRow
 	int			to_len;
 } SummaryRow;
 
+/*
+ * A copy of an item's bytes: they begin with its data tree's hash, which
+ * can hold zero bytes, so it isn't copied as a string.
+ */
+static char *
+copy_item(const ProllyValue *v)
+{
+	char	   *c = palloc(v->len + 1);
+
+	memcpy(c, v->data, v->len);
+	c[v->len] = '\0';
+	return c;
+}
+
 static void
 collect_change(const ProllyObjectChange *c, void *arg)
 {
@@ -3271,12 +3285,12 @@ collect_change(const ProllyObjectChange *c, void *arg)
 	r->not_covered = c->not_covered;
 	if (c->from_item)
 	{
-		r->from_item = pnstrdup((const char *) c->from_item->data, c->from_item->len);
+		r->from_item = copy_item(c->from_item);
 		r->from_len = c->from_item->len;
 	}
 	if (c->to_item)
 	{
-		r->to_item = pnstrdup((const char *) c->to_item->data, c->to_item->len);
+		r->to_item = copy_item(c->to_item);
 		r->to_len = c->to_item->len;
 	}
 	*rows = lappend(*rows, r);
