@@ -307,9 +307,11 @@ def run(args) -> int:
     md = to_markdown(counters, timing, suggested, left_out)
     if args.out:
         args.out.write_text(md)
+    data = {"counters": counters, "timing": timing, "suggested": suggested, "left_out": left_out}
     if args.json:
-        args.json.write_text(json.dumps({"counters": counters, "timing": timing,
-                                         "suggested": suggested, "left_out": left_out},
-                                        indent=2) + "\n")
+        args.json.write_text(json.dumps(data, indent=2) + "\n")
     print(md)
+    from pbench import finding_reports
+    finding_reports.write(lambda: finding_reports.calibration(data),
+                          args.out, getattr(args, "report_output", None), [*args.counters, *args.timing])
     return 0 if counters or timing else 1

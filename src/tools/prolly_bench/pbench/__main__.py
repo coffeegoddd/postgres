@@ -8,7 +8,7 @@
   prolly_bench cbaseline check DIR...           C suite: heap against the checked-in baseline
   prolly_bench creport DIR... --shards N ...    C suite: the pull-request comment
   prolly_bench list                             workloads, collectors, sinks
-  prolly_bench report DIR                       rewrite DIR/README.md
+  prolly_bench report DIR                       regenerate HTML and Markdown reports
   prolly_bench compare BASELINE_DIR DIR         S results normalized to B0
   prolly_bench table [DIR ...]                  engines side by side, per metric
   prolly_bench cdiff BASELINE_DIR DIR           C suite: one engine's differences from heap
@@ -154,7 +154,7 @@ def _run(args: argparse.Namespace) -> int:
             runners.append(runner)
             out_dirs.append(runner.out_dir)
     from pbench.core.validation import validate_run
-    all_results = run_many(runners)
+    all_results = run_many(runners, report_format=args.report_format)
     ok = all(bool(results) and not validate_run(runner.out_dir)
              for runner, results in zip(runners, all_results))
     if args.suite == "S":
@@ -180,7 +180,7 @@ def _run(args: argparse.Namespace) -> int:
         ok = ok and base is not None and all(not ccompare.gate(base, s,
             cfg["run"]["workloads"] or WORKLOADS)
             for s in sets if s is not base)
-    return 0 if ok else 1
+    return 0 if ok and not all_results.report_errors else 1
 
 
 def _resolve_tools(cfg: dict) -> None:
@@ -222,15 +222,52 @@ def _list(_args) -> int:
     return 0
 
 
+def _show_report(paths, passed, *, show_markdown=False) -> int:
+    if show_markdown:
+        for path in paths:
+            if path.suffix == ".md":
+                print(path.read_text())
+    for path in paths:
+        print(f"written: {path}")
+    return int(not passed)
+
+
+def _render_report(dirs, output, formats, *, baseline=None, notes=(), show_markdown=False) -> int:
+    from pbench import presentation, report_files, reports
+    sources = [reports.load(d) for d in dirs]
+    if output is None:
+        if len(sources) != 1:
+            raise ValueError("multiple result sets require --output STEM")
+        paths, passed = report_files.result_set(sources[0], formats)
+    else:
+        document = reports.build(sources, output.parent, baseline=baseline)
+        document.notes[0:0] = notes
+        paths = presentation.write(document, output, formats)
+        passed = document.passed
+    return _show_report(paths, passed, show_markdown=show_markdown)
+
+
 def _report(args) -> int:
-    from pbench import report
-    report.write_readme(args.dir)
-    print(args.dir / "README.md")
-    from pbench.core.validation import validate_run
-    return int(bool(validate_run(args.dir)))
+    from pbench import report_files
+    if args.catalog:
+        if args.dirs or args.manifest or args.output:
+            raise ValueError("--catalog cannot be combined with inputs, --manifest or --output")
+        return _show_report(report_files.catalog(args.catalog, args.format), True)
+    if args.manifest:
+        if args.dirs or args.output:
+            raise ValueError("--manifest cannot be combined with inputs or --output")
+        return _show_report(*report_files.invocation(args.manifest, formats=args.format))
+    if not args.dirs:
+        raise ValueError("give result directories, --manifest or --catalog")
+    return _render_report(args.dirs, args.output, args.format)
 
 
 def _compare(args) -> int:
+    if args.format:
+        if not args.output:
+            raise ValueError("--format requires --output STEM")
+        return _render_report([args.baseline, args.dir], args.output, args.format,
+                              baseline=args.baseline)
     from pbench import report
     text = report.compare(args.baseline, args.dir)
     if args.output:
@@ -277,6 +314,11 @@ def _creport(args) -> int:
     for problem in report.problems:
         print(problem, file=sys.stderr)
     print(f"C suite: {'PASS' if report.passed else 'FAIL'}; written: {args.out}")
+    from pbench import finding_reports
+    finding_reports.write(lambda: finding_reports.correctness(report.summary,
+        {"base": args.base, "head": args.head, "base_ref": args.base_ref,
+         "run_url": args.run_url, "wall_clock": args.wall_clock}, report.details),
+        args.out, getattr(args, "report_output", None), args.dirs)
     return int(not report.passed)
 
 
@@ -316,41 +358,15 @@ def _gate(args) -> int:
 
 
 def _table(args) -> int:
-    from pbench import table
-    if args.dirs:
-        sets = [table.load_set(d) for d in args.dirs]
-        suites = {s.suite for s in sets}
-        if len(suites) != 1:
-            raise SystemExit("give result sets of one suite")
-        suite = suites.pop()
-    else:
-        suite = args.suite
-        sets = table.discover(args.results, suite)
-    if not sets:
-        raise SystemExit(f"no {suite} result sets under {args.results}")
+    from pbench import discovery
+    dirs = args.dirs or discovery.latest(args.results, args.suite)
+    if not dirs:
+        raise ValueError(f"no {args.suite} result sets under {args.results}")
+    suite = discovery.header(dirs[0]).get("suite", args.suite)
     out = args.output or args.results / f"summary-{suite}"
-    if suite == "C":
-        from pbench import ccompare
-        md = ccompare.to_markdown(sets)
-        out.with_suffix(".md").write_text(md)
-        print(md)
-        print(f"written: {out.with_suffix('.md')}")
-        base = next((s for s in sets if s.table_am == "heap"), None)
-        workloads = sorted({r["key"]["workload"] for s in sets for r in s.results})
-        return int(base is None or len(sets) < 2 or any(ccompare.gate(base, s, workloads)
-                   for s in sets if s is not base))
-    md = table.to_markdown(sets, suite)
-    if any(s.build for s in sets):
-        from pbench import bcompare
-        md += "\n" + bcompare.to_markdown(bcompare.compare(sets))
-    out.with_suffix(".md").write_text(md)
-    out.with_suffix(".html").write_text(table.to_html(sets, suite))
-    print(md)
-    print(f"written: {out.with_suffix('.md')}\n         {out.with_suffix('.html')}")
-    from pbench.core.validation import compatible
-    base = next((s for s in sets if s.is_baseline), None)
-    return int(any(s.problems for s in sets) or bool(base and any(
-        compatible(base.path, s.path) for s in sets if s is not base)))
+    notes = [] if args.dirs else [
+        "Selection: latest result set per label; these runs may belong to different invocations."]
+    return _render_report(dirs, out, args.format, notes=notes, show_markdown=True)
 
 
 def main(argv=None) -> int:
@@ -388,18 +404,26 @@ def main(argv=None) -> int:
                    help="C suite: run shard I of N of the corpus (see cshard)")
     r.add_argument("--keep-failed", action="store_true",
                    help="keep the cluster of a cell that errors, for debugging")
+    r.add_argument("--report-format", choices=["html", "markdown", "both", "none"], default="both",
+                   help="derived report formats (default both; none keeps only execution evidence)")
     r.set_defaults(fn=_run)
 
     sub.add_parser("list", help="list workloads, collectors and sinks").set_defaults(fn=_list)
 
-    rp = sub.add_parser("report", help="rewrite a result set's README.md")
-    rp.add_argument("dir", type=Path)
+    rp = sub.add_parser("report", help="regenerate HTML and Markdown from saved evidence")
+    rp.add_argument("dirs", type=Path, nargs="*")
+    rp.add_argument("--format", choices=["html", "markdown", "both"], default="both")
+    rp.add_argument("-o", "--output", type=Path, help="output stem; required for multiple inputs")
+    rp.add_argument("--manifest", type=Path, help="an invocation's report.json")
+    rp.add_argument("--catalog", type=Path, help="rebuild a result root's index")
     rp.set_defaults(fn=_report)
 
     c = sub.add_parser("compare", help="S results normalized to a baseline")
     c.add_argument("baseline", type=Path)
     c.add_argument("dir", type=Path)
     c.add_argument("-o", "--output", type=Path)
+    c.add_argument("--format", choices=["html", "markdown", "both"],
+                   help="write selected formats; --output is a stem in this mode")
     c.set_defaults(fn=_compare)
 
     t = sub.add_parser("table", help="engines side by side: a table per metric")
@@ -409,6 +433,7 @@ def main(argv=None) -> int:
     t.add_argument("--results", type=Path, default=REPO / "specs" / "results")
     t.add_argument("-o", "--output", type=Path,
                    help="output path without extension (default RESULTS/summary-SUITE)")
+    t.add_argument("--format", choices=["html", "markdown", "both"], default="both")
     t.set_defaults(fn=_table)
 
     d = sub.add_parser("cdiff", help="C suite: one engine's differences from heap")
@@ -450,6 +475,7 @@ def main(argv=None) -> int:
                     help="the heap baseline at the base commit, for the change against it")
     cr.add_argument("--out", type=Path, required=True, help="the comment, Markdown")
     cr.add_argument("--json", type=Path, help="also a summary, JSON")
+    cr.add_argument("--report-output", type=Path, help="full HTML/Markdown output stem (default OUT-stem-full)")
     cr.add_argument("--corpus", type=Path, help="the corpus's test/ directory "
                     "(default: as the result sets recorded it)")
     cr.add_argument("--engines", type=_csv(str),
@@ -485,6 +511,7 @@ def main(argv=None) -> int:
     cal.add_argument("--thresholds", type=Path, help="the gate's settings (configs/s_gate.toml)")
     cal.add_argument("--out", type=Path, help="Markdown report")
     cal.add_argument("--json", type=Path)
+    cal.add_argument("--report-output", type=Path, help="full HTML/Markdown output stem (default OUT-stem-full)")
     cal.set_defaults(fn=scalibrate.run)
 
     from pbench import sgate
@@ -512,6 +539,8 @@ def main(argv=None) -> int:
     sr.add_argument("--failed-job", action="append", default=[], metavar="NAME: RESULT")
     sr.add_argument("--reproduce", help="a command that reproduces the run")
     sr.add_argument("--out", type=Path, required=True)
+    sr.add_argument("--report-output", type=Path, help="full HTML/Markdown output stem (default OUT-stem-full)")
+    sr.add_argument("--results", type=Path, action="append", default=[], help="retained result roots to link (repeatable)")
     sr.add_argument("--nightly", action="store_true",
                     help="a night against the night before: timing only")
     sr.set_defaults(fn=sreport.run)

@@ -145,7 +145,7 @@ jobs:
         with:
           name: s-calibration-${{ matrix.run }}
           path: aa
-          retention-days: 30
+          retention-days: 90
 
   summary:
     name: calibration summary
@@ -178,11 +178,11 @@ jobs:
           [ ${#timing[@]} -eq 0 ] || args+=(--timing "${timing[@]}")
           if [ ${#args[@]} -eq 0 ]; then
             echo "No A/A run left results." | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 1
           fi
           src/tools/prolly_bench/prolly_bench scalibrate "${args[@]}" \
             --thresholds src/tools/prolly_bench/configs/s_gate.toml \
-            --out calibration/calibration.md --json calibration/calibration.json
+            --out calibration/calibration.md --json calibration/calibration.json \
+            --report-output calibration/report
           { echo '```'; cat calibration/probe.txt; echo '```'; cat calibration/calibration.md; } \
             >> "$GITHUB_STEP_SUMMARY"
 
@@ -190,5 +190,18 @@ jobs:
         if: always()
         with:
           name: s-calibration-summary
-          path: calibration
+          path: |
+            calibration/calibration.md
+            calibration/calibration.json
+            calibration/probe.txt
           retention-days: 90
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: s-calibration-report
+          path: |
+            calibration/report.html
+            calibration/report.md
+          retention-days: 90
+          if-no-files-found: ignore

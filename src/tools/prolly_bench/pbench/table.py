@@ -109,14 +109,8 @@ def load_set(path: Path) -> ResultSet:
 
 def discover(root: Path, suite: str) -> list[ResultSet]:
     """The most recent result per label, including failed/incomplete runs."""
-    latest: dict[str, ResultSet] = {}
-    for run_json in sorted(root.glob("*/run.json")):
-        rs = load_set(run_json.parent)
-        if rs.suite != suite:
-            continue
-        if rs.label not in latest or rs.started > latest[rs.label].started:
-            latest[rs.label] = rs
-    return list(latest.values())
+    from pbench.discovery import latest
+    return [load_set(path) for path in latest(root, suite)]
 
 
 def _order(sets: list[ResultSet]) -> list[ResultSet]:

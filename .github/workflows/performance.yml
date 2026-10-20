@@ -288,7 +288,7 @@ jobs:
         with:
           name: s-counters-${{ strategy.job-index }}
           path: counters
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: ignore
 
   timing-hosted:
@@ -342,7 +342,7 @@ jobs:
         with:
           name: s-timing
           path: timing
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: ignore
 
   gate:
@@ -406,7 +406,8 @@ jobs:
             --head "$HEAD_SHA" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
             --run-url "$RUN_URL" "${failed[@]}" \
             --reproduce "prolly_bench run S --am heap,prolly --config $BENCH/configs/s_counters.toml --pg-bin DIR (base and candidate, twice each); prolly_bench sgate counters BASE BASE2 CANDIDATE CANDIDATE2" \
-            --out comment/comment.md || status=$?
+            --out comment/comment.md --report-output comment/report \
+            --results counters --results timing || status=$?
           [ "$TIMING" = success ] || echo "timing: $TIMING (reported only)" >> comment/comment.md
           cat comment/comment.md >> "$GITHUB_STEP_SUMMARY"
           echo "status=$status" >> "$GITHUB_OUTPUT"
@@ -415,7 +416,17 @@ jobs:
         if: always() && needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
         with:
           name: s-suite-comment
-          path: comment
+          path: comment/comment.md
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v5
+        if: always() && needs.classify.outputs.code == 'true' && github.event_name == 'pull_request'
+        with:
+          name: s-suite-report
+          path: |
+            comment/report.html
+            comment/report.md
+          retention-days: 30
           if-no-files-found: ignore
 
       - name: Verdict
@@ -624,19 +635,23 @@ jobs:
           # clean: results, valid, nothing confirmed; regressed: something
           # confirmed; none: no valid results (the watchdog's case)
           verdict=none
+          mkdir -p nightly
+          timing=()
+          [ ! -f nightly/sgate.json ] || timing=(--timing nightly/sgate.json)
+          status=0
+          "$BENCH/prolly_bench" sreport --nightly "${timing[@]}" \
+            --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
+            --run-url "$RUN_URL" --out nightly/comment.md --report-output nightly/report \
+            --results nightly > /dev/null || status=$?
           if [ -f nightly/sgate.json ]; then
-            status=0
-            "$BENCH/prolly_bench" sreport --nightly --timing nightly/sgate.json \
-              --head "$CANDIDATE" --base "$BASE" --runner "ubuntu-24.04 (GitHub-hosted)" \
-              --run-url "$RUN_URL" --out "$RUNNER_TEMP/nightly.md" > /dev/null || status=$?
             confirmed=$(python3 -c 'import json; print(sum(c["result"] == "confirmed" for c in json.load(open("nightly/sgate.json"))["cells"]))')
             if [ "$confirmed" != 0 ]; then
               verdict=regressed
             elif [ "$status" = 0 ]; then
               verdict=clean
             fi
-            cat "$RUNNER_TEMP/nightly.md" >> "$GITHUB_STEP_SUMMARY"
           fi
+          cat nightly/comment.md >> "$GITHUB_STEP_SUMMARY"
           echo "verdict=$verdict" | tee -a "$GITHUB_OUTPUT"
 
       - name: Summary on perf-history

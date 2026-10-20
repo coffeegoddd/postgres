@@ -351,3 +351,6 @@ class Sink(abc.ABC):
 
     @abc.abstractmethod
     def close(self, run: RunInfo, results: list[CellResult]) -> None: ...
+
+    def abort(self, *, state: str = "interrupted", message: str = "") -> None:
+        """Release resources and record why execution stopped before completion."""

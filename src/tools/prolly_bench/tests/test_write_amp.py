@@ -391,9 +391,9 @@ class WriteAmpTest(unittest.TestCase):
         cfg["postgres"] = {"max_replication_slots": "0"}
         with self.assertRaisesRegex(config.ConfigError, "replication slot"):
             config.validate(cfg, "S")
-        # (minimal: no slot; the counter runs have no timed checkpoints)
+        # Minimal uses retention for S4's explicit checkpoint, not a slot.
         cfg["postgres"] = {"wal_level": "minimal", "max_replication_slots": "0",
-                           "checkpoint_timeout": "1d"}
+                           "checkpoint_timeout": "1d", "wal_keep_size": "16GB"}
         config.validate(cfg, "S")
         # ... so a timed one in the window would recycle what it reads
         cfg["run"]["measure_seconds"] = 600

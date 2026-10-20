@@ -42,7 +42,7 @@ VACUUM, recovery) with each S number's ratio to B0, and writes
 `specs/results/summary-S.md` and `summary-S.html`.  In the HTML page, cells
 are colored only for benchmark-quality paired repetitions whose 95% bootstrap
 interval clears a 5% practical effect threshold. Smoke ratios are descriptive.
-Hovering a cell shows its spread and validity details.  `compare BASELINE_DIR DIR` gives one result set's ratios
+Each cell includes its spread and validity details. `compare BASELINE_DIR DIR` gives one result set's ratios
 to a baseline in a single wide table.
 
 ## BenchBase TPC workloads
@@ -322,8 +322,13 @@ Reports and run constraints:
   after that checkpoint.
 - **WAL retention.** A replication slot keeps the window's WAL where
   `wal_level` allows one. That WAL can be tens of GB on a long window.
-  The counter runs keep `minimal` and run with no slot. The config refuses
-  `minimal` unless `checkpoint_timeout` exceeds the window.
+  The counter runs keep `minimal` and run with no slot, so `wal_keep_size`
+  retains 16 GB across S4's explicit checkpoint inside the measured window.
+  This retains existing WAL without preallocating 16 GB; each cell starts
+  with a fresh cluster. The config refuses S4 with write amplification at
+  `minimal` without WAL retention, and requires `checkpoint_timeout` to
+  exceed the window. Retention must cover the entire interval; recycled
+  WAL still invalidates the result.
 - **The gate.** In a counter run, `scounters` gates the logical, WAL and
   chunk-store totals. It doesn't gate the page totals: those sum every
   backend type, and how they repeat depends on timing. `s_counters.toml`
@@ -444,11 +449,99 @@ Missing tools are `unavailable`, and metrics that don't apply are
 
 ## Results
 
+Every `run` writes HTML and Markdown automatically after measurement and
+evidence finalization. Open `index.html` in a result directory for one
+engine/build, or `reports/<invocation-id>/index.html` under the output root
+for exactly the engines/builds run together. The output root's `index.html`
+and `index.md` list saved runs and invocations, including failed runs.
+All HTML is standalone, works from disk without network access, and links
+to retained evidence with relative paths. Move the result tree together to
+preserve those links. The root catalog uses cached counts and evidence status
+from each result directory's `report-status.json`; it does not revalidate
+historical raw artifacts. Changed source files invalidate the cache. Run
+`report RESULT_DIR` to recheck all evidence and refresh that cached summary.
+
+Reports include a workload overview, coverage and provenance, metric tables
+with medians and spread, compatible comparisons and repetition details.
+Additional numeric metrics appear even when they have no curated heading;
+their units are explicitly unspecified and they receive no performance
+ranking. Invalid or missing evidence remains visible. Engine comparisons
+use heap within the same build; candidate/base comparisons appear in both
+formats. C reports show correctness comparisons when heap is present.
+C reports without exactly one heap reference and at least one engine are
+still written, but cannot establish a pass; `report` and `table` return nonzero.
+
+```sh
+# Regenerate from saved evidence; no database server is needed.
+src/tools/prolly_bench/prolly_bench report RESULT_DIR
+src/tools/prolly_bench/prolly_bench report RESULT_DIR --format html
+src/tools/prolly_bench/prolly_bench report HEAP_DIR PROLLY_DIR --output /tmp/storage
+src/tools/prolly_bench/prolly_bench report --manifest ROOT/reports/ID/report.json
+src/tools/prolly_bench/prolly_bench report --catalog ROOT
+src/tools/prolly_bench/prolly_bench table --suite C --format both
+src/tools/prolly_bench/prolly_bench compare HEAP_DIR PROLLY_DIR --format both --output /tmp/comparison
+```
+
+`report`, `table`, and the new formatted `compare` mode accept
+`--format html|markdown|both`. Single-set reports default to `README.md`
+and `index.html`. Explicit output stems produce `.md` and `.html`; multiple
+sets require a stem. Existing `compare` without `--format` still prints
+Markdown or writes it to the exact `--output` filename.
+`run --report-format html|markdown|both|none` chooses automatic formats
+(default `both`). `none` retains execution evidence without derived reports.
+
+Invocation manifests record the original plan, exact source directories and
+source fingerprints. Regeneration diagnoses replaced evidence. Reports are
+derived files outside the execution manifest's hashes; regenerating them
+does not invalidate a run. Renderer failures preserve finalized evidence,
+still run benchmark validation and comparison gates, and attempt the catalog
+update independently; the CLI then returns nonzero. Invocation manifests record
+execution and rendering failures separately, including their reasons. Orderly
+interruption marks execution `interrupted`; other execution errors mark it
+`failed`. Completed result sets retain `complete` even if another set fails.
+Reports show the original plan and missing cells. A lock-rejected process does
+not write reports or the catalog.
+
+`sreport`, `creport`, and `scalibrate` also save full HTML and Markdown
+artifacts alongside their existing comments/reports (the output stem
+defaults to `<out-stem>-full`; override it with `--report-output STEM`).
+Full reports use the same gate findings and have no comment character limit.
+C failure examples retain the analyzer's sampling limit; complete differences
+remain in linked evidence. Full-report failures print a diagnostic and preserve
+the analyzer's exit status, bounded comment, JSON summary and stdout output.
+
+CI uploads `s-suite-report`, `c-suite-report`, and `s-calibration-report`
+with HTML and Markdown. Source evidence stays in the original artifacts,
+with the same retention period as its report: 30 days for PR runs, 90 days
+for calibration. To use relative evidence links, download artifacts from
+the same workflow run into this layout:
+
+| Report artifact → directory | Source artifact → directory |
+|---|---|
+| `s-suite-report` → `comment/` | Each `s-counters-N` → `counters/s-counters-N/`; `s-timing` → `timing/` |
+| `c-suite-report` → `comment/` | Each `c-shard-N` → `shards/c-shard-N/` |
+| `s-calibration-report` → `calibration/` | Each `s-calibration-N` → `runs/` (merge their contents) |
+
+Open `comment/report.html` for PR runs or `calibration/report.html` for
+calibration. For example, download a C report and its source shards with:
+
+```sh
+gh run download RUN_ID --name c-suite-report --dir comment
+# Repeat for each c-shard-N artifact from this run:
+gh run download RUN_ID --name c-shard-N --dir shards/c-shard-N
+```
+
+The `s-nightly` artifact retains its complete tree, with `report.html` at
+its root. Existing sticky comment markers, size limits and gate policies
+are unchanged.
+
 `specs/results/<date>-<suite>-<label>/`:
 
 | File | Contents |
 |---|---|
 | `README.md` | Command, config, environment, warnings, collector status, summary tables (median and min-max per cell) |
+| `index.html` | Standalone HTML with the same findings and tables as the Markdown report |
+| `report-status.json` | Derived counts, evidence findings and source fingerprints for the root catalog |
 | `config.json` | The resolved configuration |
 | `environment.json` | Machine, kernel, CPU settings, filesystem, device, build, git commits, fio baseline |
 | `run.json` | Versioned plan, completion state, comparison identity and artifact hashes |

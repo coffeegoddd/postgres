@@ -134,6 +134,15 @@ def guc_seconds(value) -> float:
     return float(m.group(1)) * _GUC_SECONDS.get(m.group(2) or "s", 1)
 
 
+def guc_bytes(value) -> float:
+    """A WAL size setting in bytes; bare numbers use PostgreSQL's MB unit."""
+    units = {"B": 1, "kB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30, "TB": 1 << 40}
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(B|kB|MB|GB|TB)?\s*", str(value))
+    if not match:
+        raise ConfigError(f"unreadable WAL size setting {value!r}")
+    return float(match.group(1)) * units[match.group(2) or "MB"]
+
+
 def validate(cfg: dict, suite: str) -> None:
     run = cfg["run"]
     def number(value, name, minimum=1, maximum=None):
@@ -189,9 +198,9 @@ def validate(cfg: dict, suite: str) -> None:
         raise ConfigError("write_amp holds a replication slot over its interval, so the WAL "
                           "it splits isn't recycled: give it max_replication_slots >= 1")
     if "write_amp" in run["collectors"] and pg.get("wal_level") == "minimal":
-        # No slot: a checkpoint in the window would recycle the WAL it
-        # reads (the read then fails).  Its first checkpoint restarts the
-        # timer; checkpoints on WAL volume (max_wal_size) remain possible.
+        # No slot: timed, volume-triggered and workload checkpoints can
+        # recycle the WAL before the collector reads it. S4 checkpoints
+        # explicitly inside its measurement window.
         timeout = guc_seconds(pg.get("checkpoint_timeout", "5min"))
         longest = max([run["measure_seconds"]] + [
             p["measure_seconds"] for p in cfg.get("workloads", {}).values()
@@ -200,6 +209,11 @@ def validate(cfg: dict, suite: str) -> None:
             raise ConfigError(f"write_amp at wal_level = minimal keeps no replication slot: "
                               f"checkpoint_timeout ({timeout:.0f} s) must exceed the measured "
                               f"window ({longest} s)")
+        if (suite == "S" and (not run["workloads"] or "S4" in run["workloads"])
+                and guc_bytes(pg.get("wal_keep_size", "0")) < (16 << 20)):
+            raise ConfigError("S4 checkpoints inside its write_amp interval at wal_level = minimal: "
+                              "set wal_keep_size to retain the interval's WAL (at least one 16MB segment), "
+                              "or use wal_level = replica with a replication slot")
     if "write_amp" in run["collectors"] and "recovery" in run["collectors"]:
         raise ConfigError("write_amp checkpoints after the window, which leaves the recovery "
                           "collector nothing to replay: run them in separate configs")
