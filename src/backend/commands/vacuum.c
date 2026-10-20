@@ -31,6 +31,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -2051,10 +2052,12 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	LockRelId	lockrelid;
 	Oid			priv_relid;
 	Oid			toast_relid;
+	Oid			log_relid;
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
 	VacuumParams toast_vacuum_params;
+	VacuumParams log_vacuum_params;
 	StdRdOptions *relopts;
 	StdRdOptions relopts_copy;
 
@@ -2314,6 +2317,11 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 		toast_relid = rel->rd_rel->reltoastrelid;
 	else
 		toast_relid = InvalidOid;
+	log_relid = (params.options & VACOPT_PROCESS_TOAST) != 0 &&
+		rel->rd_rel->relkind == RELKIND_RELATION ?
+		prolly_change_log_relid(RelationGetRelid(rel), rel->rd_rel->relam) :
+		InvalidOid;
+	log_vacuum_params = params;
 
 	/*
 	 * Hand our storage parameters down for the TOAST table to inherit.  Take
@@ -2403,6 +2411,19 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 
 		vacuum_rel(toast_relid, NULL, toast_vacuum_params, bstrategy,
 				   isTopLevel);
+	}
+
+	/*
+	 * A prolly table's change log too, as its TOAST table is (and plainly,
+	 * VACUUM FULL or not: a rewrite of the table doesn't rebuild its log),
+	 * its folds walking the entries they consumed until it is.
+	 */
+	if (log_relid != InvalidOid)
+	{
+		log_vacuum_params.options |= VACOPT_PROCESS_MAIN;
+		log_vacuum_params.options &= ~VACOPT_FULL;
+		log_vacuum_params.toast_parent = relid;
+		vacuum_rel(log_relid, NULL, log_vacuum_params, bstrategy, isTopLevel);
 	}
 
 	/*

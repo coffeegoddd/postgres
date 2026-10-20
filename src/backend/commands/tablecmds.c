@@ -6096,6 +6096,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 true,	/* reindex */
 							 RecentXmin,
 							 ReadNextMultiXactId(),
+							 true,	/* rows_changed */
 							 persistence);
 
 			/*

@@ -293,6 +293,17 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- What the session's folds have read (pages, candidate rows, tables read
 -- in full) since the counters were last reset.
+-- Lose a table's change-log entries the snapshot sees, its baseline kept:
+-- a fold from it then misses their rows' changes.
+CREATE FUNCTION test_lose_change_log(tbl regclass) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The session's last fold of a table in full: rows read, whether its sort
+-- spilled to disk, and its sort's memory (or disk) in kB.
+CREATE FUNCTION test_last_full_fold(OUT rows_read int8, OUT spilled bool,
+	OUT sort_kb int8)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_fold_counters(reset bool DEFAULT false, OUT pages int8,
 	OUT candidates int8, OUT full_tables int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

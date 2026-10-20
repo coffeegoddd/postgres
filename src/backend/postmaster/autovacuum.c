@@ -2202,8 +2202,7 @@ do_autovacuum(void)
 				memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
 			}
 			/* ... and a prolly table's change log, taking its options too */
-			if (relopts)
-				remember_change_log_options(table_toast_map, classForm, relopts);
+			remember_change_log_options(table_toast_map, classForm, relopts);
 
 			/* Release stuff to avoid per-relation leakage */
 			if (relopts)
@@ -2874,9 +2873,37 @@ deleted2:
 }
 
 /*
+ * Options none of which is set: what a table without reloptions has, for
+ * its log to take.
+ */
+static const StdRdOptions *
+unset_relopts(void)
+{
+	static StdRdOptions *unset = NULL;
+
+	if (unset == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		/* (fillfactor at its default: the parse gives NULL for none) */
+		unset = (StdRdOptions *)
+			heap_reloptions(RELKIND_RELATION,
+							transformRelOptions((Datum) 0,
+												list_make1(makeDefElem("fillfactor",
+																	   (Node *) makeString("100"), -1)),
+												NULL, NULL, false, false),
+							false);
+		MemoryContextSwitchTo(old);
+	}
+	return unset;
+}
+
+/*
  * A prolly table's change log (a TOAST-kind relation, but not its table's
  * reltoastrelid) takes the table's autovacuum options, as its TOAST table
- * does: remember them under the log's OID.
+ * does: remember them under the log's OID, relopts (NULL: none set), with
+ * the log's own defaults where the table leaves them unset.  The log sets
+ * none itself, so what the table sets, and later changes, governs.
  */
 static void
 remember_change_log_options(HTAB *table_toast_map, Form_pg_class classForm,
@@ -2892,7 +2919,14 @@ remember_change_log_options(HTAB *table_toast_map, Form_pg_class classForm,
 		return;
 	hentry = hash_search(table_toast_map, &key, HASH_ENTER, &found);
 	Assert(!found);				/* a log is one table's */
-	memcpy(&hentry->ar_reloptions, relopts, sizeof(StdRdOptions));
+	memcpy(&hentry->ar_reloptions, relopts ? relopts : unset_relopts(),
+		   sizeof(StdRdOptions));
+
+	/* (vacuumed soon after entries die, unless the table says otherwise) */
+	if (hentry->ar_reloptions.autovacuum.vacuum_threshold < 0)
+		hentry->ar_reloptions.autovacuum.vacuum_threshold = 1000;
+	if (hentry->ar_reloptions.autovacuum.vacuum_scale_factor < 0)
+		hentry->ar_reloptions.autovacuum.vacuum_scale_factor = 0;
 }
 
 /*
@@ -3777,9 +3811,9 @@ pg_stat_get_autovacuum_scores(PG_FUNCTION_ARGS)
 			continue;
 
 		relopts = (StdRdOptions *) extractRelOptions(tup, RelationGetDescr(rel), NULL);
+		remember_change_log_options(table_toast_map, form, relopts);
 		if (!relopts)
 			continue;
-		remember_change_log_options(table_toast_map, form, relopts);
 		if (!OidIsValid(form->reltoastrelid))
 		{
 			pfree(relopts);

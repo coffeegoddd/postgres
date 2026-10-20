@@ -108,6 +108,7 @@ extern bool bmap_folded(SMgrRelation reln);
 extern bool bmap_fold_changes(SMgrRelation reln, const BmapFold *since,
 							  BmapChangeVisit visit, void *arg);
 extern void bmap_fold_prune(SMgrRelation reln, const BmapFold *keep);
+extern void bmap_fold_forget(SMgrRelation reln);
 extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
 						  BlockNumber old_block, char *page);
 

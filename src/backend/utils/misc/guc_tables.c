@@ -36,6 +36,7 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_memo.h"
 #include "access/prolly_config.h"
+#include "access/prolly_fold.h"
 #include "access/toast_destination.h"
 #include "access/twophase.h"
 #include "access/xlog_internal.h"

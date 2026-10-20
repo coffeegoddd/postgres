@@ -5675,7 +5675,39 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        took out of a tree), <literal>fold_pages</literal>,
        <literal>fold_candidates</literal> and
        <literal>fold_full_tables</literal> (pages read, rows looked up, and
-       tables folded from every row, finding changed rows),
+       tables folded from every row, finding changed rows), and for those
+       tables why, each <literal>fold_full_</literal> and a reason:
+       <literal>no_baseline</literal> (its first fold),
+       <literal>shape_changed</literal> (its definition changed),
+       <literal>no_log</literal> (nothing records what changed),
+       <literal>log_changed</literal> (its change log isn't the one its
+       baseline was folded with), <literal>stale_snapshot</literal>
+       (the snapshot doesn't see the last fold), <literal>unsettled</literal>
+       (the last fold was such a fold), <literal>storage_unseen</literal>
+       (a rewrite or truncation the snapshot doesn't see),
+       <literal>recovery</literal>, <literal>log_entry</literal> (its log
+       says to: truncated, rewritten, or a row the log couldn't hold),
+       <literal>too_many</literal> (more rows changed than reading it all
+       costs), <literal>keying_changed</literal> (changes written under
+       another key), <literal>unsupported_key</literal> (a key rows can't
+       be looked up by), <literal>memory_budget</literal> (the changes it
+       held passed <varname>maintenance_work_mem</varname>) and
+       <literal>forced</literal>
+       (<varname>debug_prolly_force_full_fold</varname>) and
+       <literal>verify</literal> (the fold verifier's), with
+       <literal>fold_full_spilled</literal> those whose sort of the table's
+       rows (in <varname>maintenance_work_mem</varname>) spilled to disk; a
+       fold that reads
+       at least <varname>prolly.log_full_folds</varname> rows so is logged,
+       with why;
+       <literal>fold_merge_builds</literal> (folds that merged many changes
+       with the table's baseline in one pass),
+       <literal>fold_verified</literal> and
+       <literal>fold_verify_mismatches</literal> (tables the fold verifier
+       folded from their baselines and in full, at
+       <varname>prolly.fold_verify_rate</varname> in autovacuum or by
+       <function>dolt_verify_folds</function>, and those whose trees
+       differed: each warned of, and read in full at its next fold),
        <literal>commits</literal> (commits written),
        <literal>head_moves</literal> (branch heads set),
        <literal>memo_hits</literal> and <literal>memo_misses</literal>

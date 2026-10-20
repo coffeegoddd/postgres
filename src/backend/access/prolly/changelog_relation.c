@@ -20,8 +20,11 @@
  * primary key (checked immediately) gets the version's key columns, their
  * values out of line brought inline (compressed ones stay compressed),
  * once for an update that kept the key; one without gets the version's
- * tuple as stored, unless a value of it is out of line (the value may be
- * gone by the time the entry is read).  Either, too long for a page of the
+ * tuple as stored, its values out of line as their hash pointers (by
+ * content in the chunk store, where nothing deletes them with the row, and
+ * a collection keeps what a pointer on the log's pages names), unless one
+ * is out of line otherwise (the value may be gone by the time the entry is
+ * read).  Either, too long for a page of the
  * log with the entry around it (a key's compressed values needn't be as
  * its index holds them), is an entry to read the table in full instead.  A
  * truncation or a rewrite of the table is that too.
@@ -54,6 +57,7 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/bitmapset.h"
+#include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -285,11 +289,49 @@ write_entries(Entries *e)
 		ExecDropSingleTupleTableSlot(slots[i]);
 }
 
-/* A keyless row's entry: its tuple as stored, unless it can't be kept. */
-static void
-insert_row(Entries *e, HeapTuple version, int32 delta)
+/*
+ * Does a version of rel's hold a value out of line other than by a hash
+ * pointer?  A hash pointer names its value by content in the chunk store,
+ * where nothing deletes it with the row, and a collection keeps every tree
+ * a pointer on a page of the store names, the log's pages too: it can be
+ * read when the entry is.  Any other may be gone by then.
+ */
+static bool
+holds_unkept_value(Relation rel, HeapTuple version)
 {
-	if (HeapTupleHasExternal(version) || version->t_len > MAX_IMAGE_LEN)
+	TupleDesc	desc = RelationGetDescr(rel);
+	Datum	   *values;
+	bool	   *nulls;
+	bool		unkept = false;
+
+	if (!HeapTupleHasExternal(version))
+		return false;
+	values = palloc_array(Datum, desc->natts);
+	nulls = palloc_array(bool, desc->natts);
+	heap_deform_tuple(version, desc, values, nulls);
+	for (int i = 0; i < desc->natts && !unkept; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (nulls[i] || att->attlen != -1)
+			continue;
+		if (VARATT_IS_EXTERNAL(DatumGetPointer(values[i])) &&
+			!VARATT_IS_EXTERNAL_ONDISK_HASH(DatumGetPointer(values[i])))
+			unkept = true;
+	}
+	pfree(values);
+	pfree(nulls);
+	return unkept;
+}
+
+/*
+ * A keyless row's entry: its tuple as stored, its values out of line by
+ * their hash pointers, unless it can't be kept.
+ */
+static void
+insert_row(Relation rel, Entries *e, HeapTuple version, int32 delta)
+{
+	if (holds_unkept_value(rel, version) || version->t_len > MAX_IMAGE_LEN)
 		insert_entry(e, NULL, 0);
 	else
 		insert_entry(e, version, delta);
@@ -346,9 +388,9 @@ note_versions(Relation rel, Entries *e, HeapTuple old, HeapTuple *made,
 	else
 	{
 		if (old)
-			insert_row(e, old, -1);
+			insert_row(rel, e, old, -1);
 		for (int i = 0; i < nmade; i++)
-			insert_row(e, made[i], 1);
+			insert_row(rel, e, made[i], 1);
 	}
 }
 
@@ -425,6 +467,7 @@ walk_log(Relation log, Snapshot snapshot, EntryVisit visit, void *arg)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocks(log);
 
+	pgstat_count_prolly(PGSTAT_PROLLY_LOG_PAGES_READ, nblocks);
 	for (BlockNumber blk = 0; blk < nblocks; blk++)
 	{
 		Buffer		buf = ReadBuffer(log, blk);
@@ -514,6 +557,7 @@ relation_read(Relation rel, Snapshot snapshot, ProllyChangeLogVisit visit,
 		Page		page;
 		OffsetNumber maxoff;
 
+		pgstat_count_prolly(PGSTAT_PROLLY_LOG_PAGES_READ, 1);
 		MemoryContextReset(cxt);
 		old = MemoryContextSwitchTo(cxt);
 		c.entries = NULL;

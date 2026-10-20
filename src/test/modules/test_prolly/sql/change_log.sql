@@ -82,7 +82,8 @@ COMMIT;
 SELECT * FROM pg_temp.entries('cl.keyed');
 SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
 
--- A keyless row with a value out of line can't be held: read in full.
+-- A keyless row with a value out of line by content (its hash pointer):
+-- held, the pointer in the entry.
 INSERT INTO cl.keyless
 SELECT 3, string_agg(md5(g::text), '') FROM generate_series(1, 300) g;
 SELECT * FROM pg_temp.entries('cl.keyless');
@@ -144,8 +145,9 @@ COPY cl.keyless FROM STDIN;
 SELECT * FROM pg_temp.entries('cl.keyless');
 SELECT length(dolt_commit('-am', 'conflict and copy')::text) AS committed;
 
--- CLUSTER and VACUUM FULL change no row, but give the table new storage:
--- read in full.  So does a materialized view's refresh.
+-- CLUSTER and VACUUM FULL change no row: no entry, the log's entries (by
+-- key or image) still hold.  A materialized view's refresh may change
+-- them all: read in full.
 CLUSTER cl.keyed USING keyed_pkey;
 SELECT * FROM pg_temp.entries('cl.keyed');
 VACUUM FULL cl.keyless;
@@ -173,3 +175,40 @@ SELECT count(*) AS gone FROM pg_class WHERE relname = :'keyless_log';
 DROP SCHEMA cl CASCADE;
 SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
 SELECT dolt_branch('-D', 'cl_other');
+
+-- VACUUM of a table vacuums its change log too, as it does its TOAST
+-- table: the entries a fold consumed, dead (each fold walking them till
+-- then), are gone, and the log truncated.  A log sets no autovacuum
+-- options of its own: it takes its table's, and where the table leaves
+-- them unset, is vacuumed soon after entries die (1000 dead, no scale).
+-- (a database of its own: no other session's snapshot keeps the dead)
+CREATE DATABASE regress_log_vacuum;
+\c regress_log_vacuum
+CREATE SCHEMA clv VERSIONED;
+CREATE TABLE clv.vac (id int PRIMARY KEY, v text);
+INSERT INTO clv.vac SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
+SELECT c.reloptions FROM pg_class c
+WHERE c.relname = 'pg_prolly_log_' || 'clv.vac'::regclass::oid;
+CREATE FUNCTION pg_temp.log_vacuum_score() RETURNS float8 AS $$
+	SELECT round(vacuum_score::numeric, 2)::float8
+	FROM pg_stat_get_autovacuum_scores()
+	WHERE oid = ('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid)::regclass
+$$ LANGUAGE sql;
+SELECT pg_relation_size('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid) > 0 AS log_has_pages;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+SELECT length(dolt_commit('--allow-empty', '-m', 'empty')::text) AS committed;
+SELECT pg_stat_force_next_flush();
+SELECT value > 50 AS walked_dead FROM pg_stat_prolly WHERE name = 'log_pages_read';
+-- the dead entries against the log's threshold: its own default (1000),
+-- then the table's, set later (40000), then its own again
+SELECT pg_temp.log_vacuum_score() AS default_score;
+ALTER TABLE clv.vac SET (autovacuum_vacuum_threshold = 40000);
+SELECT pg_temp.log_vacuum_score() AS table_threshold_score;
+ALTER TABLE clv.vac RESET (autovacuum_vacuum_threshold);
+SELECT pg_temp.log_vacuum_score() AS reset_score;
+VACUUM clv.vac;
+SELECT pg_relation_size('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid) AS log_bytes;
+\c contrib_regression
+DROP DATABASE regress_log_vacuum;

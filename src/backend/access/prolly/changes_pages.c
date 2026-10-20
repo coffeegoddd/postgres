@@ -71,6 +71,7 @@
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -157,6 +158,7 @@ typedef struct Finder
 	int			maxcblocks;
 	MemoryContext foldcxt;		/* the fold's: what lasts all of it */
 	ProllyChangeCounters work;	/* what this fold read, counted once it's done */
+	ProllyFullFoldReason reason;	/* why it reads in full, once known */
 } Finder;
 
 /* ----------------------------------------------------------------
@@ -356,7 +358,10 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 				get_opfamily_member(opfamily, optype, optype, f->eqstrat[i]);
 			/* a key we can't look up by: fold in full */
 			if (!AttributeNumberIsValid(f->keyattrs[i]) || !OidIsValid(op))
+			{
 				f->give_up = true;
+				f->reason = PROLLY_FULL_UNSUPPORTED_KEY;
+			}
 			else
 				f->eqproc[i] = get_opcode(op);
 		}
@@ -570,6 +575,7 @@ page_tuple(Finder *f, HeapTuple tup, void *arg)
 		if (pv->candidates)
 		{
 			f->give_up = true;
+			f->reason = PROLLY_FULL_KEYING_CHANGED;
 			return false;
 		}
 		f->unsettled = true;
@@ -1332,10 +1338,23 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	 * may be anywhere; a snapshot older than the fold's may not see all it
 	 * saw.
 	 */
-	if (f->give_up || (st->flags & STATE_UNSETTLED) || !sees_fold(f->snap, st))
+	if (f->give_up)
 		return false;
+	if (st->flags & STATE_UNSETTLED)
+	{
+		f->reason = PROLLY_FULL_UNSETTLED;
+		return false;
+	}
+	if (!sees_fold(f->snap, st))
+	{
+		f->reason = PROLLY_FULL_STALE_SNAPSHOT;
+		return false;
+	}
 	if (!bmap_fold_changes(RelationGetSmgr(f->rel), &st->fold, listed_change, &l))
+	{
+		f->reason = PROLLY_FULL_STORAGE_UNSEEN;
 		return false;
+	}
 	for (int i = 0; i < l.n; i++)
 		if (l.changes[i].kind == BMAP_CHANGE_TRUNCATE)
 			low = Min(low, l.changes[i].blkno);
@@ -1480,26 +1499,6 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	return true;
 }
 
-typedef struct FoldRow
-{
-	StringInfoData key;
-	StringInfoData row;
-} FoldRow;
-
-static int
-fold_row_cmp(const void *a, const void *b, void *arg)
-{
-	const FoldRow *ra = *(FoldRow *const *) a;
-	const FoldRow *rb = *(FoldRow *const *) b;
-	ProllyKey	ka = {(const uint8 *) ra->key.data, ra->key.len};
-	ProllyKey	kb = {(const uint8 *) rb->key.data, rb->key.len};
-	int			r = keying_compare(&ka, &kb, arg);
-
-	/* equal keys of a keyless table: the same row; order by bytes anyway */
-	if (r == 0)
-		r = memcmp(ra->key.data, rb->key.data, Min(ra->key.len, rb->key.len));
-	return r != 0 ? r : (ra->key.len > rb->key.len) - (ra->key.len < rb->key.len);
-}
 
 /*
  * Every row the snapshot sees, folded into a data tree: each row's key and
@@ -1510,65 +1509,13 @@ fold_row_cmp(const void *a, const void *b, void *arg)
 static void
 fold_all(Finder *f, ProllyNodeRef *data, bool carry)
 {
-	TableScanDesc scan;
-	FoldRow   **rows = NULL;
-	int			nrows = 0;
-	int			maxrows = 0;
-	ProllyTreeBuilder *b;
+	ProllyFullFold done;
 
 	f->work.full++;
-	scan = table_beginscan(f->rel, f->snap, 0, NULL, SO_NONE);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, f->rowslot))
-	{
-		FoldRow    *r = palloc(sizeof(FoldRow));
-		ProllyHash	content;
-
-		initStringInfo(&r->key);
-		initStringInfo(&r->row);
-		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &r->key, &r->row, &content);
-		if (nrows == maxrows)
-		{
-			maxrows = Max(64, maxrows * 2);
-			rows = rows ? repalloc_array(rows, FoldRow *, maxrows) :
-				palloc_array(FoldRow *, maxrows);
-		}
-		rows[nrows++] = r;
-		CHECK_FOR_INTERRUPTS();
-	}
-	table_endscan(scan);
-	f->work.rows_read += nrows;
-
-	if (nrows > 1)
-		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, f);
-
-	b = PROLLY_CALL(f->tree, build_begin, &f->env, CurrentMemoryContext);
-	for (int i = 0; i < nrows;)
-	{
-		int			j = i + 1;
-		ProllyKey	k = {(const uint8 *) rows[i]->key.data, rows[i]->key.len};
-		ProllyValue row = {(const uint8 *) rows[i]->row.data, rows[i]->row.len};
-		StringInfoData value;
-		ProllyValue v;
-
-		while (j < nrows && rows[j]->key.len == rows[i]->key.len &&
-			   memcmp(rows[j]->key.data, rows[i]->key.data, k.len) == 0)
-			j++;
-		if (!f->keyless && j > i + 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNIQUE_VIOLATION),
-					 errmsg("table \"%s\" holds rows with the same primary key",
-							RelationGetRelationName(f->rel)),
-					 errdetail("A commit can't hold them until the key is unique again.")));
-		initStringInfo(&value);
-		PROLLY_CALL(f->kr, make_value, f->k, &row, (uint64) (j - i), &value);
-		v.data = (const uint8 *) value.data;
-		v.len = value.len;
-		PROLLY_CALL(f->tree, build_add, b, &k, &v);
-		pfree(value.data);
-		f->work.rows_written++;
-		i = j;
-	}
-	PROLLY_CALL(f->tree, build_finish, b, data);
+	prolly_fold_all(f->rel, f->snap, f->rowslot, f->kr, f->k, f->keyless,
+					f->tree, &f->env, data, &done);
+	f->work.rows_read += done.rows_read;
+	f->work.rows_written += done.rows_written;
 
 	/* the tuples of transactions the snapshot doesn't see as settled */
 	if (carry)
@@ -1837,8 +1784,8 @@ pages_fold_rows(Relation rel, const ProllyTreeEnv *env,
 
 static void
 pages_fold(Relation rel, const ProllyTreeEnv *env,
-		   const ProllyTableFold *baseline, ProllyNodeRef *data,
-		   StringInfo next)
+		   const ProllyTableFold *baseline, ProllyFullFoldReason no_baseline,
+		   ProllyNodeRef *data, StringInfo next)
 {
 	Finder		f;
 	State		st;
@@ -1859,6 +1806,15 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 	mapped = RelationGetSmgr(rel)->smgr_which == SMGR_BMAP &&
 		!RecoveryInProgress();
 	have = mapped && baseline != NULL && parse_state(&baseline->state, &st);
+	if (prolly_full_fold_wanted(&f.reason))
+		;
+	else if (!mapped)
+		f.reason = RecoveryInProgress() ? PROLLY_FULL_RECOVERY : PROLLY_FULL_NO_LOG;
+	else if (baseline == NULL)
+		f.reason = no_baseline;
+	else if (!have)
+		f.reason = PROLLY_FULL_LOG_CHANGED;
+	have = have && f.reason == PROLLY_FULL_NONE;
 
 	/*
 	 * A fold's beginning lets go of what changed before the baseline, which
@@ -1882,12 +1838,23 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 		}
 		if (!have || !fold_changed(&f, baseline, &st, next != NULL, data))
 		{
+			instr_time	start;
+			instr_time	took;
+
 			/* (what the fold from the baseline read is thrown away) */
 			memset(&f.work, 0, sizeof(f.work));
 			f.ncarried = 0;
 			f.ncblocks = 0;
 			f.unsettled = false;
+			INSTR_TIME_SET_CURRENT(start);
 			fold_all(&f, data, next != NULL);
+			INSTR_TIME_SET_CURRENT(took);
+			INSTR_TIME_SUBTRACT(took, start);
+			/* (giving up otherwise: what changed costs more than reading it all) */
+			prolly_full_fold_noted(rel, f.reason == PROLLY_FULL_NONE ?
+								   PROLLY_FULL_TOO_MANY : f.reason,
+								   (int64) f.work.rows_read,
+								   INSTR_TIME_GET_MILLISEC(took));
 		}
 		counters.pages += f.work.pages;
 		counters.candidates += f.work.candidates;

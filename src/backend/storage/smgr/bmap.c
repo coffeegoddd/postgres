@@ -2842,6 +2842,97 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 }
 
 /*
+ * Forget the relation's folds: the changes listed let go of (their blocks
+ * freed), and no page copied before a change any more, as if it had never
+ * been folded.  For a relation whose folds no one reads any more (its
+ * change finder now keeps no pages): each first change since its last
+ * fold would otherwise copy its page.  A crash between the two leaves the
+ * list empty and pages still copied, until the next call.
+ */
+void
+bmap_fold_forget(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	Buffer		chgbuf;
+	BmapHeader *header;
+	BmapChangesHead *head;
+	BmapFold	all;
+	xl_bmap_header_delta hdelta;
+	xl_bmap_changes_head_delta cdelta;
+	XLogRecPtr	lsn;
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot forget a relation's folds during recovery")));
+	if (!bmap_folded(reln) || !chg_exists(reln) ||
+		mdnblocks(reln, BMAP_CHANGES_FORKNUM) == 0)
+		return;
+
+	/* every change listed, made before any fold to come */
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	all.epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch + 1;
+	UnlockReleaseBuffer(headerbuf);
+	chgbuf = chg_read(rel, 0);
+	LockBuffer(chgbuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(chgbuf)))
+	{
+		UnlockReleaseBuffer(chgbuf);
+		return;
+	}
+	all.lineage = PageGetBmapChangesHead(BufferGetPage(chgbuf))->lineage;
+	UnlockReleaseBuffer(chgbuf);
+	all.nblocks = 0;
+	bmap_fold_prune(reln, &all);
+
+	/* then no fold: the header's epoch and the list's, none */
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	header = PageGetBmapHeader(BufferGetPage(headerbuf));
+	chgbuf = chg_read(rel, 0);
+	LockBuffer(chgbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(chgbuf), BMAP_PAGE_CHANGES_HEAD, rel,
+			   BMAP_CHANGES_FORKNUM, 0);
+	head = PageGetBmapChangesHead(BufferGetPage(chgbuf));
+
+	hdelta.kind = BMAP_DELTA_HEADER;
+	hdelta.flags = 0;
+	hdelta.nblocks = header->nblocks;
+	hdelta.epoch = header->epoch;
+	hdelta.fold_epoch = 0;
+
+	cdelta.kind = BMAP_DELTA_CHANGES_HEAD;
+	cdelta.flags = 0;
+	cdelta.nentries = head->nentries;
+	cdelta.lineage = head->lineage;
+	cdelta.pruned_epoch = Max(head->pruned_epoch, all.epoch);
+	cdelta.fold_epoch = 0;
+	cdelta.fold_nblocks = head->fold_nblocks;
+
+	START_CRIT_SECTION();
+	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
+	MarkBufferDirty(headerbuf);
+	apply_changes_head_delta(BufferGetPage(chgbuf), &cdelta);
+	MarkBufferDirty(chgbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&rel, sizeof(xl_bmap_rel));
+	XLogRegisterBuffer(0, headerbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &hdelta, sizeof(hdelta));
+	XLogRegisterBuffer(1, chgbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(1, &cdelta, sizeof(cdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_FOLD);
+	PageSetLSN(BufferGetPage(headerbuf), lsn);
+	PageSetLSN(BufferGetPage(chgbuf), lsn);
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(chgbuf);
+	UnlockReleaseBuffer(headerbuf);
+}
+
+/*
  * Whether a fold of the relation has begun: its changes since are listed
  * from then on.
  */

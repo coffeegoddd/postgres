@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC2
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC7
 
 typedef struct PgStat_ArchiverStats
 {
@@ -608,6 +608,28 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_PAGES,	/* pages the change finder read */
 	PGSTAT_PROLLY_FOLD_CANDIDATES,	/* rows the change finder looked up */
 	PGSTAT_PROLLY_FOLD_FULL,	/* tables folded from every row */
+	/* and why (ProllyFullFoldReason, in its order) */
+	PGSTAT_PROLLY_FOLD_FULL_NO_BASELINE,
+	PGSTAT_PROLLY_FOLD_FULL_SHAPE_CHANGED,
+	PGSTAT_PROLLY_FOLD_FULL_NO_LOG,
+	PGSTAT_PROLLY_FOLD_FULL_LOG_CHANGED,
+	PGSTAT_PROLLY_FOLD_FULL_STALE_SNAPSHOT,
+	PGSTAT_PROLLY_FOLD_FULL_UNSETTLED,
+	PGSTAT_PROLLY_FOLD_FULL_STORAGE_UNSEEN,
+	PGSTAT_PROLLY_FOLD_FULL_RECOVERY,
+	PGSTAT_PROLLY_FOLD_FULL_LOG_ENTRY,
+	PGSTAT_PROLLY_FOLD_FULL_TOO_MANY,
+	PGSTAT_PROLLY_FOLD_FULL_KEYING_CHANGED,
+	PGSTAT_PROLLY_FOLD_FULL_UNSUPPORTED_KEY,
+	PGSTAT_PROLLY_FOLD_FULL_MEMORY_BUDGET,
+	PGSTAT_PROLLY_FOLD_FULL_FORCED,
+	PGSTAT_PROLLY_FOLD_FULL_VERIFY,
+	PGSTAT_PROLLY_FOLD_FULL_SPILLED,	/* full folds whose sort spilled to disk */
+	PGSTAT_PROLLY_FOLD_MERGE_BUILDS,	/* folds that merged many changes with
+										 * the baseline in one pass */
+	PGSTAT_PROLLY_LOG_PAGES_READ,	/* change-log pages walked */
+	PGSTAT_PROLLY_FOLD_VERIFIED,	/* tables the verifier checked */
+	PGSTAT_PROLLY_FOLD_VERIFY_MISMATCHES,	/* and those whose folds differed */
 	PGSTAT_PROLLY_COMMITS,		/* commits written */
 	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads set (to the same commit too) */
 	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */

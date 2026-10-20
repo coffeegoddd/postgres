@@ -46,6 +46,8 @@ OBJS = \
 	prolly_deps.o \
 	prolly_registry.o \
 	prolly_seen.o \
+	prolly_fold.o \
+	fold_verify.o \
 	prolly_shmem.o \
 	prolly_table.o \
 	prolly_dolt.o \

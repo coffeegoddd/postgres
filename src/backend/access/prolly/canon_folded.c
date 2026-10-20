@@ -645,9 +645,11 @@ empty_root(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
- * What a baseline's tree is kept for: the table's description, and what
- * its rows' canonical bytes depend on that changes no page (so no change
- * the finder would see).  The columns rows are read over, by number: a
+ * What a baseline's tree is kept for: what its rows' keys and canonical
+ * bytes depend on, the keying's row shape where it gives one (else the
+ * table's whole description), so DDL that changes no row's bytes (an
+ * index, a constraint, a trigger) keeps the baseline; and what they depend
+ * on that changes no page (so no change the finder would see).  The columns rows are read over, by number: a
  * column dropped and one of the same name and type added describe the
  * table alike, but its rows read as NULL.  And the definitions of the
  * columns' types (prolly_datum_definition()): an enum's label renamed, a
@@ -669,9 +671,24 @@ baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
 	const ProllyImplInfo *encoders[3];
 
 	initStringInfo(&match);
-	appendBinaryStringInfo(&match, description->data, description->len);
-	appendStringInfoChar(&match, '\0');
 	prolly_components_for_relation(rel, &c);
+
+	/*
+	 * (the keying's row shape where it says it: DDL that changes no row's
+	 * bytes, as an index or a constraint, keeps the baseline; else the
+	 * whole description)
+	 */
+	if (PROLLY_HAS(c.keying, row_shape))
+	{
+		ProllyKeying *k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+
+		appendStringInfoChar(&match, 'S');
+		PROLLY_CALL(c.keying, row_shape, k, rel, &match);
+		PROLLY_CALL(c.keying, close, k);
+	}
+	else
+		appendBinaryStringInfo(&match, description->data, description->len);
+	appendStringInfoChar(&match, '\0');
 	encoders[0] = &c.key_encoder->info;
 	encoders[1] = &c.value_encoder->info;
 	encoders[2] = &c.keying->info;
@@ -713,6 +730,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 	ProllyTableFold tf;
 	StringInfoData state;
 	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
+	ProllyFullFoldReason why;
 
 	if (OidIsValid(pkoid))
 	{
@@ -730,6 +748,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 
 	baseline_hash(cn, rel, description, &dh);
 	bt = find_base_table(cn, &it->key);
+	why = bt ? PROLLY_FULL_SHAPE_CHANGED : PROLLY_FULL_NO_BASELINE;
 	if (bt && (bt->description.len != dh.len ||
 			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))
 		bt = NULL;
@@ -750,7 +769,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		return;
 	}
 	initStringInfo(&state);
-	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, root,
+	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, why, root,
 				cn->advance ? &state : NULL);
 	if (cn->advance)
 	{

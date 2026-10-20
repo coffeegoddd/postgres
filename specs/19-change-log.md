@@ -70,12 +70,17 @@ Two interfaces, each selected by the table AM's profile
   tuple (other columns null, values out of line inlined, compressed ones
   still compressed), one entry for an update that kept its key; without
   one, the version as stored, with +1 for a version made and −1 for one
-  replaced. A keyless version with a value out of line, or either image
-  too large for the log's page (a key's compressed values needn't be as
+  replaced, its values out of line as their hash pointers: by content in
+  the chunk store, where nothing deletes them with the row, and a
+  collection keeps every tree a pointer on the log's pages names (#508).
+  A keyless version with a value out of line otherwise (not a versioned
+  table's), or either image too large for the log's page (a key's compressed values needn't be as
   its index holds them), is recorded as "fold in full" instead (no
-  image). So is a truncation (made anew or in place) and a rewrite (any
-  heap swap: `ALTER TABLE`'s, `CLUSTER`, `VACUUM FULL`, a materialized
-  view's refresh), which change rows without a write to note.
+  image). So is a truncation (made anew or in place) and a rewrite that
+  may change rows (`ALTER TABLE`'s heap swap, a materialized view's
+  refresh, `REPACK CONCURRENTLY`), which change rows without a write to
+  note. `CLUSTER` and `VACUUM FULL` change none: entries name rows by
+  key or image, so they still hold (#485).
 - **Reset:** a branch's first use that gives its copy of the table new
   storage (repeatable read, a commit its snapshot doesn't see,
   `empty_copy()`) gives the log new storage too, with one "fold in full"
@@ -129,12 +134,30 @@ Two interfaces, each selected by the table AM's profile
     go below none (the keying changed meanwhile);
   - an entry's key column is null (it was written under another key);
   - the primary key has no equality operator to look up by;
-  - the entries name more rows than the table has;
-  - during recovery.
+  - a keyless table's entries name more rows than the table has;
+  - what it holds of the changes passes `maintenance_work_mem`.
 
-  A keying or definition change is caught by the baseline's description
-  hash (`table_root()`, `canon_folded.c`) before the finder is asked, which
-  is what makes it safe to read old images by the table's descriptor now.
+  A keyed table's many changes (past a tenth of the baseline's rows) are
+  merged with the baseline in one pass, not applied one by one (#509).
+  A full fold sorts the rows in `maintenance_work_mem`, spilling past it
+  (#484). Each is counted in `pg_stat_prolly` by why (#486). A hot
+  standby folds from the baseline too, its log and baseline replayed, the
+  trees it builds kept in the transaction's memory (#506).
+
+  A change of what rows' bytes depend on is caught by the baseline's
+  shape hash (`table_root()`, `canon_folded.c`) before the finder is
+  asked, which is what makes it safe to read old images by the table's
+  descriptor now: the keying's `row_shape()` (keyed or not, the key's
+  columns and order, the live columns' numbers, types and missing
+  values), the encoders and the columns' type definitions. DDL that
+  changes none of those (an index, a constraint, a default, a trigger, a
+  policy, reloptions, statistics, storage) keeps the baseline (#485).
+  Adding a column without a default, and an enum's label added, change
+  no row's bytes but do change the shape: still a full fold.
+- **A verifier** (`fold_verify.c`, #513) folds tables from their
+  baselines and in full by one snapshot, at `prolly.fold_verify_rate` in
+  autovacuum or by `dolt_verify_folds()`: a mismatch is warned of,
+  counted, and its table read in full at its next fold.
 - **No baseline copies:** it never begins a fold in block-mapped storage,
   so only sharing between branches copies pages.
 - **The transaction's own changes** (`fold_rows()`, spec 15): from the
@@ -164,8 +187,9 @@ made passed in hand.
 
 - **Bulk writes to keyless tables** log each row whole until the next
   fold: a load of N rows writes N entries of the row's size.
-- **Keyless rows with values out of line** (by content too) are entries
-  to fold in full; `pages` reads values stored by content again.
+- **Keyless rows with values out of line** other than by content (not a
+  versioned table's) are entries to fold in full; `pages` reads values
+  stored by content again.
 - **The log grows between baselines**, as the changed-page list did: with
   `dolt.transaction_commit` and no other fold (spec 15 doesn't advance
   the baseline), until the next commit, checkpoint or move.
@@ -175,7 +199,13 @@ made passed in hand.
   under a strong enough lock makes one (likewise after `pg_upgrade`):
   under `log` they fold in full on every commit, which is correct but a
   performance cliff after an upgrade.
-- **Consumed entries are freed only by vacuuming the log**, which takes
-  its table's autovacuum settings.
+- **Consumed entries are freed only by vacuuming the log**, which sets
+  no options of its own: autovacuum gives it its table's, and where the
+  table leaves them unset, a vacuum threshold of 1000 dead entries and no
+  scale factor, so it's vacuumed soon after a fold consumes a load's
+  entries; `VACUUM` of the table
+  vacuums its log too, as its TOAST table (#480). Until then each fold
+  walks the dead entries (`pg_stat_prolly`'s `log_pages_read`), and a
+  long-running transaction holding back the horizon keeps them.
 - **An update's or delete's old version** is read again by its TID to
   make its entry (heap has let go of its page by then).

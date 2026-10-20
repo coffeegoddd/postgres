@@ -34,6 +34,8 @@ backend_sources += files(
   'prolly_deps.c',
   'prolly_registry.c',
   'prolly_seen.c',
+  'prolly_fold.c',
+  'fold_verify.c',
   'prolly_shmem.c',
   'prolly_table.c',
   'prolly_dolt.c',
