@@ -361,6 +361,66 @@ test_chunk_get(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/* get_many()'s answers, kept by request */
+typedef struct ManyGot
+{
+	bytea	  **got;
+	int		   *visits;
+} ManyGot;
+
+static void
+many_got(int i, const char *data, Size len, void *arg)
+{
+	ManyGot    *mg = arg;
+
+	mg->visits[i]++;
+	if (data != NULL)
+	{
+		bytea	   *b = palloc(VARHDRSZ + len);
+
+		SET_VARSIZE(b, VARHDRSZ + len);
+		memcpy(VARDATA(b), data, len);
+		mg->got[i] = b;
+	}
+}
+
+/*
+ * Get several chunks at once: each request's (ordinal, bytes, times
+ * visited), bytes NULL if the store has none.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_get_many);
+Datum
+test_chunk_get_many(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	ProllyHash *hashes;
+	ManyGot		mg;
+
+	InitMaterializedSRF(fcinfo, 0);
+	deconstruct_array_builtin(arr, TEXTOID, &elems, &nulls, &n);
+	hashes = palloc(sizeof(ProllyHash) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &hashes[i]);
+	mg.got = palloc0(sizeof(bytea *) * Max(n, 1));
+	mg.visits = palloc0(sizeof(int) * Max(n, 1));
+	PROLLY_CALL(cs(), get_many, store(), hashes, n, many_got, &mg);
+	for (int i = 0; i < n; i++)
+	{
+		Datum		values[3];
+		bool		isnull[3] = {false, mg.got[i] == NULL, false};
+
+		values[0] = Int32GetDatum(i + 1);
+		values[1] = PointerGetDatum(mg.got[i]);
+		values[2] = Int32GetDatum(mg.visits[i]);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+	}
+	return (Datum) 0;
+}
+
 PG_FUNCTION_INFO_V1(test_chunk_has);
 Datum
 test_chunk_has(PG_FUNCTION_ARGS)

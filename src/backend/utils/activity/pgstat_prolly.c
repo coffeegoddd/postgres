@@ -74,6 +74,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_GC_BYTES_FREED] = "gc_bytes_freed",
 	[PGSTAT_PROLLY_CONJOINS] = "conjoins",
 	[PGSTAT_PROLLY_GC_WINDOW_USEC] = "gc_window_usec",
+	[PGSTAT_PROLLY_CHUNK_FILE_READS] = "chunk_file_reads",
 };
 
 /*

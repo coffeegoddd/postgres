@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC1
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC2
 
 typedef struct PgStat_ArchiverStats
 {
@@ -648,9 +648,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_CONJOINS, /* table files conjoined into one */
 	PGSTAT_PROLLY_GC_WINDOW_USEC,	/* microseconds collections held their
 									 * windows */
+	PGSTAT_PROLLY_CHUNK_FILE_READS, /* reads of the store's files for chunks:
+									 * several chunks close together, one */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_GC_WINDOW_USEC + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_CHUNK_FILE_READS + 1)
 
 typedef struct PgStat_ProllyStats
 {

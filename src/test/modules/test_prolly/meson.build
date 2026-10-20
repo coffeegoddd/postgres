@@ -109,6 +109,7 @@ tests += {
       'statistics_casts',
       'stat_prolly',
       'store_sizes',
+      'get_many',
       'append_check',
       'journal_segments',
       'journal_compression',

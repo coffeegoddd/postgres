@@ -213,6 +213,13 @@ CREATE FUNCTION test_chunk_get(hash text)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Get several chunks at once (get_many()): each request's bytes (NULL:
+-- none), and how many times it was answered.
+CREATE FUNCTION test_chunk_get_many(hashes text[], OUT i int, OUT data bytea,
+									OUT visits int)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_chunk_has(hash text)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

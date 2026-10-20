@@ -5719,7 +5719,8 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>gc_window_usec</literal> (what collections kept and freed,
        and the microseconds each held its window, in which commits that
        move a root wait; a move keeps every chunk, and is counted only in
-       <literal>gc_moves</literal>).  Bytes are counted when
+       <literal>gc_moves</literal>); <literal>chunk_file_reads</literal> (reads of the chunk store's
+       files for chunks, several chunks close together counting once).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

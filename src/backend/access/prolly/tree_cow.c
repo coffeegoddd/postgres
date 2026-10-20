@@ -607,6 +607,43 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 }
 
 /*
+ * Tell the store which children of a value tree's internal node a read of
+ * bytes [offset, offset + len) of it reads, so it may read them together.
+ */
+static void
+prefetch_range(const ProllyTreeEnv *env, TNode *node, uint64 offset,
+			   uint64 len)
+{
+	ProllyHash *hashes;
+	int			n = 0;
+
+	if (env->chunk_store == NULL || !PROLLY_HAS(env->chunk_store, prefetch) ||
+		node->nitems < 2)
+		return;
+	hashes = palloc(sizeof(ProllyHash) * node->nitems);
+	for (int i = 0; i < node->nitems && len > 0; i++)
+	{
+		ProllyNodeRef child;
+		uint64		count;
+		uint64		take;
+
+		node_child(env, node, i, &child, &count);
+		if (offset >= count)
+		{
+			offset -= count;
+			continue;
+		}
+		hashes[n++] = child.hash;
+		take = Min(len, count - offset);
+		len -= take;
+		offset = 0;
+	}
+	if (n > 1)
+		(void) PROLLY_CALL(env->chunk_store, prefetch, env->chunks, hashes, n);
+	pfree(hashes);
+}
+
+/*
  * Append bytes [offset, offset + len) of the subtree at ref, len > 0, which
  * its parent (or the reference, for the root) says holds size bytes.
  */
@@ -636,6 +673,7 @@ read_value_range(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
 	{
 		uint64		held = 0;
 
+		prefetch_range(env, &node, offset, len);
 		for (int i = 0; i < node.nitems; i++)
 		{
 			ProllyNodeRef child;

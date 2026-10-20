@@ -25,7 +25,10 @@
  *   base backups carry the history, and a database made from another
  *   (CREATE DATABASE) gets a copy of it.
  * - get() appends a chunk's bytes to out; false if the store has none by
- *   that hash.  has() answers without reading the chunk.
+ *   that hash.  has() answers without reading the chunk.  get_many() gets
+ *   several, visiting each (data NULL if the store has none), in any
+ *   order: its reads of the store's files are made in offset order, those
+ *   close together as one.
  * - root() is the root as last committed (or as moved by the calling
  *   transaction); an empty hash if it never was.
  * - move_root() moves the root with the calling transaction, if it is still
@@ -109,9 +112,10 @@
  *   records, oldest first, with the time of each move: what a reflog is
  *   read from.  A collection may forget them.
  * - prefetch() is told the chunks a walk is about to read (a node's
- *   children), so that a read-through source can fetch them at once
- *   (optional): whether a hint heard them, and with none (n 0), whether
- *   one would, so a walk collects them only when it would.
+ *   children), so that a read-through source can fetch them at once, or
+ *   the store read them together (optional): whether it heard them, and
+ *   with none (n 0), whether it would, so a walk collects them only when
+ *   it would.
  *
  * Provisional (v0).
  *
@@ -147,6 +151,10 @@ typedef bool (*ProllyChunkGet) (void *arg, const ProllyHash *hash, StringInfo ou
  * Visits a root the store was moved to, and when (0 if not known).
  */
 typedef void (*ProllyChunkRootVisit) (const ProllyHash *root, TimestampTz at,
+									  void *arg);
+
+/* Visits chunk i of a get_many(): its bytes (NULL, 0: the store has none). */
+typedef void (*ProllyChunkManyVisit) (int i, const char *data, Size len,
 									  void *arg);
 
 /* Hears the chunks a walk is about to read (prefetch()'s). */
@@ -213,6 +221,8 @@ typedef struct ProllyChunkStoreRoutine
 	bool		(*get) (ProllyChunkStore *store, const ProllyHash *hash,
 						StringInfo out);
 	bool		(*has) (ProllyChunkStore *store, const ProllyHash *hash);
+	void		(*get_many) (ProllyChunkStore *store, const ProllyHash *hashes,
+							 int n, ProllyChunkManyVisit visit, void *arg);
 
 	void		(*root) (ProllyChunkStore *store, ProllyHash *root);
 	bool		(*move_root) (ProllyChunkStore *store, const ProllyHash *expected,
@@ -316,7 +326,7 @@ typedef struct ProllyChunkStoreRoutine
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
-	"open", "put", "get", "has", "root", "move_root", "commit_payload", \
+	"open", "put", "get", "has", "get_many", "root", "move_root", "commit_payload", \
 	"commit_writes", "committed", "commit_redo", "checkpoint", "redo", \
 	"add_table_file", \
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
