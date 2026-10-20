@@ -1892,6 +1892,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no merge to abort")));
+		PreventCommandIfReadOnly("dolt_merge()");
 		abort_in_progress("merge");
 		result[0] = "";
 		result[1] = "0";
@@ -1912,6 +1913,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_NO_FF, "--no-ff");
 	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_SQUASH, "--squash");
 
+	PreventCommandIfReadOnly("dolt_merge()");
 	/* (the branch held first: its head is read as the merge finds it) */
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
@@ -2396,6 +2398,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				 errmsg("dolt_integrate runs on a branch of your own, not \"%s\"", mine),
 				 errhint("Check out a branch with dolt_checkout('-b', ...) first.")));
 
+	PreventCommandIfReadOnly("dolt_integrate()");
 	/* (failing, the session stays on its branch, as everything else does) */
 	returning = branch_return_on_abort();
 
@@ -2864,6 +2867,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no cherry-pick to %s",
 							abort_pick ? "abort" : "continue")));
+		PreventCommandIfReadOnly("dolt_cherry_pick()");
 		if (abort_pick)
 		{
 			abort_in_progress("cherry-pick");
@@ -2906,6 +2910,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
+	PreventCommandIfReadOnly("dolt_cherry_pick()");
 	refuse_violations("cherry-pick");
 	note_integration();
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
@@ -3023,6 +3028,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("there is no revert in progress")));
+			PreventCommandIfReadOnly("dolt_revert()");
 			note_integration();
 			if (abort_revert)
 			{
@@ -3057,6 +3063,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("dolt_revert needs a commit")));
+			PreventCommandIfReadOnly("dolt_revert()");
 			revert_series(refs_given, nrefs, NULL, result);
 		}
 	}
@@ -5500,8 +5507,12 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 	}
 	else
 		kept = found;
+	/* (--output-only writes nothing: a read-only transaction's to run) */
 	if (!output_only)
+	{
+		PreventCommandIfReadOnly("dolt_verify_constraints()");
 		PROLLY_CALL(refs(), set_violations, kept);
+	}
 	result[0] = found != NIL ? "1" : "0";
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -5640,6 +5651,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_conflicts_resolve needs --ours or --theirs")));
+	PreventCommandIfReadOnly("dolt_conflicts_resolve()");
 	branch_note_write(MyBranch);
 	BRANCH_WRITES_HUSHED(
 		foreach(lc, tables)
@@ -6003,6 +6015,7 @@ dolt_fetch(PG_FUNCTION_ARGS)
 		else
 			branches = lappend(branches, args[i]);
 	}
+	PreventCommandIfReadOnly("dolt_fetch()");
 	fetch_remote(remote ? remote : "origin", branches, NULL, NULL, false);
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -6318,6 +6331,7 @@ dolt_push(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
 				 errhint("Push a branch made at the commit with dolt_branch().")));
+	PreventCommandIfReadOnly("dolt_push()");
 	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -6435,6 +6449,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 		need_upstream("dolt_pull", &remote, &branch);
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
+	PreventCommandIfReadOnly("dolt_pull()");
 	fetch_remote(remote, list_make1(branch), NULL, NULL, false);
 
 	/* (after "--": a remote's name may begin with "-") */
@@ -6667,6 +6682,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 
 	/* the remote added as dolt_remote() adds one, and fetched */
 	add_remote(remote, url);
+	PreventCommandIfReadOnly("dolt_clone()");
 	fetch_remote(remote, NIL, branch, &h, true);
 	if (h.branches == NIL)
 		ereport(ERROR,
