@@ -51,5 +51,15 @@ SELECT * FROM dolt_diff_stat('HEAD', 'WORKING');
 
 SELECT * FROM dolt_diff_stat(NULL, 'HEAD');
 
+-- a table's item begins with its rows' tree hash, which can hold a zero
+-- byte (this one's does): the item is read whole, not as a string
+SELECT length(dolt_commit('-Am', 'renamed')::text) AS committed;
+CREATE TABLE ds.zero (id int, c1 varchar(20));
+SELECT length(dolt_commit('-Am', 'zero')::text) AS committed;
+INSERT INTO ds.zero VALUES (1, 'one');
+SELECT table_name, rows_added, rows_deleted
+FROM dolt_diff_stat('HEAD', 'WORKING', 'ds.zero');
+SELECT to_create_statement FROM dolt_schema_diff('HEAD~', 'WORKING', 'ds.zero');
+
 \c contrib_regression
 DROP DATABASE regress_diff_stat;
