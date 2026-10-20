@@ -168,3 +168,34 @@ WHERE c.contypid = 'tm3."nv domain"'::regtype ORDER BY c.conname;
 SELECT * FROM dolt_status();
 SELECT dolt_branch('-D', 'not_valid');
 DROP SCHEMA tm3 CASCADE;
+
+-- A default that depends on a redefined type, on a column whose line
+-- changed otherwise too (its statistics target, its storage): a move
+-- across both puts the default back, as each version has it.
+CREATE SCHEMA tm4 VERSIONED;
+CREATE DOMAIN tm4.d AS text;
+CREATE TYPE tm4.e AS ENUM ('a', 'b');
+CREATE TABLE tm4.t (id int PRIMARY KEY, c tm4.d DEFAULT 'x'::tm4.d, m tm4.e DEFAULT 'a');
+INSERT INTO tm4.t (id) VALUES (1);
+SELECT length(dolt_commit('-Am', 'tm4 one')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm4_one \gset
+ALTER DOMAIN tm4.d ADD CONSTRAINT short CHECK (length(VALUE) < 10);
+ALTER TABLE tm4.t ALTER COLUMN c SET STATISTICS 100;
+ALTER TYPE tm4.e RENAME VALUE 'b' TO 'bee';
+ALTER TABLE tm4.t ALTER COLUMN m SET STORAGE EXTERNAL;
+SELECT length(dolt_commit('-am', 'tm4 two')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS tm4_two \gset
+SELECT dolt_reset('--hard', :'tm4_one');
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE d.adrelid = 'tm4.t'::regclass ORDER BY 1;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard', :'tm4_two');
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE d.adrelid = 'tm4.t'::regclass ORDER BY 1;
+SELECT count(*) AS changed FROM dolt_status;
+INSERT INTO tm4.t (id) VALUES (2);
+SELECT * FROM tm4.t ORDER BY id;
+DROP SCHEMA tm4 CASCADE;
+SELECT length(dolt_commit('-Am', 'tm4 gone')::text) AS committed;

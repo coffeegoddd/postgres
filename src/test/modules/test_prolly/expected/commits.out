@@ -577,7 +577,7 @@ SELECT dolt_branch('-c', '--', 'main', '--');
 ERROR:  invalid branch name "--"
 DETAIL:  A branch's name follows git's rules for one, in ASCII: no spaces, control characters or any of ~ ^ : ? * [ \; no "..", "@{" or "//"; not "HEAD" (in any case) or "@"; not "-" or "--" alone, or beginning with "/", nor ending with "/" or "."; and no "/"-separated part beginning with "." or ending with ".lock".
 SELECT dolt_checkout('--', '--');
-ERROR:  branch "--" does not exist
+ERROR:  table "--" does not exist
 SELECT name FROM dolt_branches WHERE name = '--';
  name 
 ------

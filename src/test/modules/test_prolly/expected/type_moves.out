@@ -507,3 +507,91 @@ DETAIL:  drop cascades to table tm3.t
 drop cascades to type tm3.added
 drop cascades to type tm3."nv domain"
 drop cascades to type tm3.child
+-- A default that depends on a redefined type, on a column whose line
+-- changed otherwise too (its statistics target, its storage): a move
+-- across both puts the default back, as each version has it.
+CREATE SCHEMA tm4 VERSIONED;
+CREATE DOMAIN tm4.d AS text;
+CREATE TYPE tm4.e AS ENUM ('a', 'b');
+CREATE TABLE tm4.t (id int PRIMARY KEY, c tm4.d DEFAULT 'x'::tm4.d, m tm4.e DEFAULT 'a');
+INSERT INTO tm4.t (id) VALUES (1);
+SELECT length(dolt_commit('-Am', 'tm4 one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm4_one \gset
+ALTER DOMAIN tm4.d ADD CONSTRAINT short CHECK (length(VALUE) < 10);
+ALTER TABLE tm4.t ALTER COLUMN c SET STATISTICS 100;
+ALTER TYPE tm4.e RENAME VALUE 'b' TO 'bee';
+ALTER TABLE tm4.t ALTER COLUMN m SET STORAGE EXTERNAL;
+ERROR:  column data type tm4.e can only have storage PLAIN
+SELECT length(dolt_commit('-am', 'tm4 two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS tm4_two \gset
+SELECT dolt_reset('--hard', :'tm4_one');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE d.adrelid = 'tm4.t'::regclass ORDER BY 1;
+ attname |    pg_get_expr     
+---------+--------------------
+ c       | ('x'::text)::tm4.d
+ m       | 'a'::tm4.e
+(2 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard', :'tm4_two');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE d.adrelid = 'tm4.t'::regclass ORDER BY 1;
+ attname |    pg_get_expr     
+---------+--------------------
+ c       | ('x'::text)::tm4.d
+ m       | 'a'::tm4.e
+(2 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+INSERT INTO tm4.t (id) VALUES (2);
+SELECT * FROM tm4.t ORDER BY id;
+ id | c | m 
+----+---+---
+  1 | x | a
+  2 | x | a
+(2 rows)
+
+DROP SCHEMA tm4 CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table tm4.t
+drop cascades to type tm4.d
+drop cascades to type tm4.e
+SELECT length(dolt_commit('-Am', 'tm4 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+

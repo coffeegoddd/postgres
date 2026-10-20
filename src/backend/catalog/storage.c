@@ -209,8 +209,11 @@ RelationCreateStorageWith(RelFileLocator rlocator, char relpersistence,
  *		Create a permanent relation's storage as a copy of another's.
  *
  * The new main fork shares src's pages until either relation changes one
- * (smgrshare()); its other forks start empty.  As RelationCreateStorage(),
- * the storage is deleted if the transaction aborts when register_delete.
+ * (smgrshare()); its visibility map and free space map are copies of src's
+ * (its pages are src's, byte for byte, so what src's maps say of them
+ * holds; changes made after clear the new relation's own bits, as any
+ * change does).  As RelationCreateStorage(), the storage is deleted if the
+ * transaction aborts when register_delete.
  */
 SMgrRelation
 RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
@@ -241,6 +244,21 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
 	smgrshare(src, srel);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	/*
+	 * The maps copied, as full-page images (src's buffers written first: the
+	 * copy reads its storage).  Without them the new relation would claim
+	 * no page all-visible, and know of no free space, until vacuumed.
+	 */
+	FlushRelationsAllBuffers(&src, 1);
+	for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+	{
+		if (!smgrexists(src, fork))
+			continue;
+		smgrcreate(srel, fork, false);
+		log_smgrcreate(&srel->smgr_rlocator.locator, fork);
+		RelationCopyStorage(src, srel, fork, RELPERSISTENCE_PERMANENT);
+	}
 
 	/*
 	 * No pending sync, even when WAL is skipped for new relations: the share

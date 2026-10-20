@@ -19,6 +19,10 @@
 #include "access/prolly_changelog.h"
 #include "access/prolly_config.h"
 #include "access/table.h"
+#include "catalog/dependency.h"
+#include "catalog/objectaddress.h"
+#include "catalog/pg_class.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "access/prolly_datum.h"
@@ -745,6 +749,28 @@ test_last_full_fold(PG_FUNCTION_ARGS)
 }
 
 /* What the session's folds have read: pages, candidates, full tables. */
+/*
+ * Drop a prolly table's change log, as a table made before logs were (or
+ * restored by pg_upgrade) has none.
+ */
+PG_FUNCTION_INFO_V1(test_drop_change_log);
+Datum
+test_drop_change_log(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Oid			logid = prolly_change_log_relid(relid, get_rel_relam(relid));
+	ObjectAddress log;
+
+	if (!OidIsValid(logid))
+		elog(ERROR, "relation %u has no change log", relid);
+	/* (its dependency on the table first: that would refuse its drop) */
+	deleteDependencyRecordsFor(RelationRelationId, logid, false);
+	CommandCounterIncrement();
+	ObjectAddressSet(log, RelationRelationId, logid);
+	performDeletion(&log, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+	PG_RETURN_VOID();
+}
+
 PG_FUNCTION_INFO_V1(test_fold_counters);
 Datum
 test_fold_counters(PG_FUNCTION_ARGS)

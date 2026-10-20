@@ -112,6 +112,7 @@
 #include "access/genam.h"
 #include "nodes/makefuncs.h"
 #include "nodes/miscnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "catalog/pg_attribute.h"
 #include "parser/parse_type.h"
 #include "parser/parse_coerce.h"
@@ -250,6 +251,19 @@ typedef struct BaseTable BaseTable;
  */
 #define FOLDED_FORMAT	"13"
 
+/*
+ * The format versions of the encoders FOLDED_FORMAT's trees are written
+ * with: the key encoder's, the value encoder's and the keying's.  A tree's
+ * bytes are theirs, so one changed alone would read trees of the format
+ * as its own, with phantom changes in every status, diff and commit, and
+ * spurious conflicts in merges.  Changing one means changing
+ * FOLDED_FORMAT too, and these with it: a fold refuses to run till they
+ * agree (folded_encoders_checked()).
+ */
+#define FOLDED_KEY_ENCODER		4
+#define FOLDED_VALUE_ENCODER	4
+#define FOLDED_KEYING			1
+
 typedef struct Canon
 {
 	ProllyTreeEnv env;
@@ -357,9 +371,34 @@ base_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 	}
 }
 
+/*
+ * The encoders this build writes trees with are those FOLDED_FORMAT was
+ * pinned to; checked once.
+ */
+static void
+folded_encoders_checked(void)
+{
+	static bool checked = false;
+	const ProllyImplInfo *impls[3];
+	const int	pinned[3] = {FOLDED_KEY_ENCODER, FOLDED_VALUE_ENCODER, FOLDED_KEYING};
+
+	if (checked)
+		return;
+	impls[0] = prolly_get_impl(PROLLY_IFACE_KEY_ENCODER, "ordered");
+	impls[1] = prolly_get_impl(PROLLY_IFACE_VALUE_ENCODER, "canonical");
+	impls[2] = prolly_get_impl(PROLLY_IFACE_TABLE_KEYING, "pk_or_prefix");
+	for (int i = 0; i < lengthof(impls); i++)
+		if (impls[i] && impls[i]->format_version != pinned[i])
+			elog(ERROR, "prolly %s \"%s\" is at format version %u, but folded format %s pins %d: change FOLDED_FORMAT with it",
+				 prolly_interface_name(impls[i]->iface), impls[i]->name,
+				 impls[i]->format_version, FOLDED_FORMAT, pinned[i]);
+	checked = true;
+}
+
 static void
 canon_env(Canon *cn)
 {
+	folded_encoders_checked();
 	cn->tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&cn->env);
 	prolly_folded_canon_env(&cn->root_env);
@@ -4838,6 +4877,7 @@ static bool
 move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		   const TableDef *to)
 {
+	List	   *not_null_drops = NIL;
 	TableDef	none;
 	bool		remake = false;
 	List	   *from_names = NIL;
@@ -5111,9 +5151,17 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 		/* (foreign keys first: they may need others' keys) */
 		if (strstr(lfirst(lc), "\tFOREIGN KEY ") != NULL)
 			sm->fk_drops = lappend(sm->fk_drops, sql);
+		/*
+		 * (a column's NOT NULL after the rest: one a primary key going holds
+		 * can't go before the key, whatever their names' order, as when two
+		 * tables' names were swapped)
+		 */
+		else if (strstr(lfirst(lc), "\tNOT NULL ") != NULL)
+			not_null_drops = lappend(not_null_drops, sql);
 		else
 			sm->before = lappend(sm->before, sql);
 	}
+	sm->before = list_concat(sm->before, not_null_drops);
 	foreach(lc, from->indexes)
 	{
 		char	   *idx = index_name(lfirst(lc));
@@ -5803,6 +5851,47 @@ drop_routine_sql(const MoveItem *it)
 					strstr(it->def, "CREATE OR REPLACE PROCEDURE") == it->def ?
 					"PROCEDURE" : is_aggregate(it) ? "AGGREGATE" : "FUNCTION",
 					it->name);
+}
+
+/*
+ * Run each statement in a subtransaction of its own: those that fail, left
+ * for later (each as is), in order.
+ */
+static List *
+try_statements(List *stmts)
+{
+	MemoryContext mcxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	List	   *failed = NIL;
+	ListCell   *lc;
+
+	foreach(lc, stmts)
+	{
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(mcxt);
+		PG_TRY();
+		{
+			int			rc = SPI_execute(lfirst(lc), false, 0);
+
+			if (rc < 0)
+				elog(ERROR, "could not run \"%s\": %s", (char *) lfirst(lc),
+					 SPI_result_code_string(rc));
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(mcxt);
+			CurrentResourceOwner = owner;
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(mcxt);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(mcxt);
+			CurrentResourceOwner = owner;
+			failed = lappend(failed, lfirst(lc));
+		}
+		PG_END_TRY();
+	}
+	return failed;
 }
 
 /*
@@ -6520,15 +6609,24 @@ type_moves(List *from, List *to)
 						MoveItem   *ft = find_item(from, 't', tname);
 						MoveItem   *tt = find_item(to, 't', tname);
 
+						const char *fl = ft ? table_def_line(ft, 'c', cname) : NULL;
+						const char *tl = tt ? table_def_line(tt, 'c', cname) : NULL;
+						const char *fdef = fl ? column_attr(fl, "default ") : NULL;
+						const char *tdef = tl ? column_attr(tl, "default ") : NULL;
+
 						tm.before = lappend(tm.before,
 											psprintf("ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
 													 tname, cname));
-						if (same_table_line(ft, tt, 'c', cname) &&
-							column_attr(table_def_line(tt, 'c', cname), "default "))
+
+						/*
+						 * (one the move keeps, put back: move_table() sets only a
+						 * default whose text changed, whatever else of the
+						 * column's line did, its storage or statistics)
+						 */
+						if (fdef && tdef && strcmp(fdef, tdef) == 0)
 							tm.after = lappend(tm.after,
 											   psprintf("ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s",
-														tname, cname,
-														column_attr(table_def_line(tt, 'c', cname), "default ")));
+														tname, cname, tdef));
 						handled = true;
 					}
 				}
@@ -6994,6 +7092,9 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			void (*breaking) (List *added, void *arg), void *arg,
 			bool rewritten)
 {
+	List	   *sql_bodies = NIL;	/* routines with SQL-standard bodies, then
+									 * the casts made with functions, which
+									 * may be those */
 	bool		matviews_made = false;
 	List	   *replaced = NIL; /* ordinary schemas they replace */
 	Canon		cn;
@@ -7338,16 +7439,33 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			/* (CREATE OR REPLACE can't change what a routine returns) */
 			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
 				sm.before = lappend(sm.before, drop_routine_sql(f));
-			sm.before = lappend(sm.before, t->def);
+			/*
+			 * (one with an SQL-standard body is parsed as it's made, so needs
+			 * what it reads, which may be a table or materialized view the
+			 * move makes: tried with the rest, again after the tables, and
+			 * last with the views, each after those it uses)
+			 */
+			if (strstr(t->def, "\nBEGIN ATOMIC") != NULL || strstr(t->def, "\nRETURN ") != NULL)
+				sql_bodies = lappend(sql_bodies, t->def);
+			else
+				sm.before = lappend(sm.before, t->def);
 		}
 	}
-	/* Casts coming, once the types and routines they name are made. */
+	/*
+	 * Casts coming, once the types and routines they name are made: one
+	 * with a function, after the routines with SQL-standard bodies, which
+	 * may be made later, and tried with them (still before the tables).
+	 */
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
 		MoveItem   *f = find_item(from, t->kind, t->name);
 
-		if (t->kind == 'x' && !(f && strcmp(t->def, f->def) == 0))
+		if (t->kind != 'x' || (f && strcmp(t->def, f->def) == 0))
+			continue;
+		if (strncmp(t->def, "function\t", 9) == 0)
+			sql_bodies = lappend(sql_bodies, create_cast_sql(t->name, t->def));
+		else
 			sm.before = lappend(sm.before, create_cast_sql(t->name, t->def));
 	}
 	/* Tables made: a partition after its partitioned table. */
@@ -7509,7 +7627,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(tm.unvalidated);
 	make_views(tm.drops);
 	run_statements(tm.after);
-	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
+	run_statements(sm.before);
+	sql_bodies = try_statements(sql_bodies);
+	run_statements(list_concat(sm.changes, late));
+	sql_bodies = try_statements(sql_bodies);
 	make_views(type_drops);
 	run_statements(collation_drops);
 	run_statements(schema_drops);
@@ -7537,7 +7658,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		run_statements(sm.fk_validations);
 	run_statements(links);
 	restore_locality(relinked, to);
-	make_views(views);
+	make_views(list_concat(sql_bodies, views));
 	run_statements(policy_makes);
 	restore_index_places(places);
 	if (matviews_made)
@@ -8569,6 +8690,225 @@ folded_render(char object, const char *name, const ProllyValue *item,
 	pfree(key.data);
 }
 
+/* Does key name one of tables (qualified, server encoding)? */
+static bool
+names_table(const ProllyKey *k, List *tables)
+{
+	char	   *name;
+	ListCell   *lc;
+
+	if (k->len < 2 || k->data[0] != 't' || k->data[1] != ':')
+		return false;
+	name = from_utf8(k->data + 2, k->len - 2);
+	foreach(lc, tables)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/* Does one of defs (tables' definitions) name the object a key names? */
+static bool
+defs_name(List *defs, const ProllyKey *k)
+{
+	char	   *name = from_utf8(k->data + 2, k->len - 2);
+	ListCell   *lc;
+
+	foreach(lc, defs)
+		if (strstr(lfirst(lc), name) != NULL)
+			return true;
+	return false;
+}
+
+/* sequences_drawn()'s walk: string constants cast to regclass */
+static bool
+regclass_names(Node *node, List **names)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, TypeCast))
+	{
+		TypeCast   *tc = (TypeCast *) node;
+
+		if (tc->arg && IsA(tc->arg, A_Const) &&
+			!((A_Const *) tc->arg)->isnull &&
+			IsA(&((A_Const *) tc->arg)->val, String) &&
+			strcmp(strVal(llast(tc->typeName->names)), "regclass") == 0)
+			*names = lappend(*names, strVal(&((A_Const *) tc->arg)->val));
+	}
+	return raw_expression_tree_walker(node, regclass_names, names);
+}
+
+/*
+ * The sequences table (qualified) draws from as def (its definition)
+ * describes it: the relations its columns' defaults name as regclass
+ * constants (nextval('s'::regclass)), parsed, each qualified as an item's
+ * key names it (a bare name in the table's schema).  Not a name's text
+ * found anywhere: a literal, or a longer name, isn't one.
+ */
+static List *
+sequences_drawn(const char *table, const char *def)
+{
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	List	   *tparts = stringToQualifiedNameList(table, (Node *) &escontext);
+	TableDef	td;
+	List	   *seqs = NIL;
+	ListCell   *lc;
+
+	if (list_length(tparts) != 2)
+		return NIL;
+	parse_table_def(def, &td);
+	foreach(lc, td.columns)
+	{
+		const char *d = strstr(lfirst(lc), "\tdefault ");
+		List	   *raw;
+		List	   *names = NIL;
+		ListCell   *nc;
+
+		if (d == NULL)
+			continue;
+		raw = raw_parser(psprintf("SELECT %s", first_field(d + 9)),
+						 RAW_PARSE_DEFAULT);
+		(void) regclass_names(linitial_node(ResTarget,
+											castNode(SelectStmt,
+													 linitial_node(RawStmt, raw)->stmt)->targetList)->val,
+							  &names);
+		foreach(nc, names)
+		{
+			List	   *parts = stringToQualifiedNameList(lfirst(nc),
+														 (Node *) &escontext);
+
+			if (list_length(parts) == 1)
+				seqs = lappend(seqs, quote_qualified_identifier(strVal(linitial(tparts)),
+																strVal(linitial(parts))));
+			else if (list_length(parts) == 2)
+				seqs = lappend(seqs, quote_qualified_identifier(strVal(linitial(parts)),
+																strVal(lsecond(parts))));
+		}
+	}
+	return seqs;
+}
+
+/* Is the object key names (its kind's tag, a colon, its name) one of names? */
+static bool
+key_named(const ProllyKey *k, List *names)
+{
+	char	   *name = from_utf8(k->data + 2, k->len - 2);
+	ListCell   *lc;
+
+	foreach(lc, names)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * into, but for the tables named, as from has them, into *out: a merge of
+ * the two roots' items in key order, each table named taken from from (or
+ * left out where from hasn't it), with the sequences it names (as from
+ * has them: its values' series goes with it), every other from into.  A
+ * type the two hold differently that a table named (as either has it)
+ * names is refused: other tables may use it as into has it.
+ */
+static void
+folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
+			  List *tables, ProllyNodeRef *out)
+{
+	Canon		cn;
+	ProllyTreeCursor *cur[2];
+	bool		more[2];
+	ProllyKey	k[2];
+	ProllyValue v[2];
+	ProllyTreeBuilder *b;
+	const ProllyNodeRef *roots[2] = {into, from};
+	List	   *defs = NIL;		/* the tables' definitions, both sides' */
+	List	   *seqs = NIL;		/* the sequences they draw from */
+	List	   *refused = NIL;
+	ListCell   *lc;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	check_format(&cn, into, "spliced");
+	check_format(&cn, from, "spliced");
+
+	/* the tables' definitions first: what they name, both sides' */
+	foreach(lc, tables)
+	{
+		StringInfoData key;
+
+		initStringInfo(&key);
+		appendStringInfoString(&key, "t:");
+		append_utf8(&key, lfirst(lc));
+		for (int i = 0; i < 2; i++)
+		{
+			StringInfoData item;
+			ProllyKey	tk = {(const uint8 *) key.data, key.len};
+
+			initStringInfo(&item);
+			if (PROLLY_CALL(cn.tree, get, &cn.env, roots[i], &tk, &item))
+			{
+				ProllyValue iv = {(const uint8 *) item.data, item.len};
+				ProllyValue def;
+
+				definition_of(&tk, &iv, &def);
+				defs = lappend(defs, pnstrdup((const char *) def.data, def.len));
+				seqs = list_concat(seqs,
+								   sequences_drawn(lfirst(lc),
+												   from_utf8(def.data, def.len)));
+			}
+		}
+	}
+
+	cur[0] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, into, CurrentMemoryContext);
+	cur[1] = PROLLY_CALL(cn.tree, cursor_open, &cn.env, from, CurrentMemoryContext);
+	for (int i = 0; i < 2; i++)
+	{
+		PROLLY_CALL(cn.tree, cursor_seek, cur[i], NULL, ForwardScanDirection);
+		more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+	}
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.root_env, CurrentMemoryContext);
+	while (more[0] || more[1])
+	{
+		int			c = !more[0] ? 1 : !more[1] ? -1 :
+			prolly_bytes_compare(&k[0], &k[1], NULL);
+		const ProllyKey *key = c <= 0 ? &k[0] : &k[1];
+		bool		has[2] = {c <= 0, c >= 0};
+		bool		differ = !has[0] || !has[1] || v[0].len != v[1].len ||
+			memcmp(v[0].data, v[1].data, v[0].len) != 0;
+		int			take = has[0] ? 0 : -1;
+
+		if (names_table(key, tables) ||
+			(differ && key->len >= 2 && key->data[0] == 's' &&
+			 key->data[1] == ':' && key_named(key, seqs)))
+			take = has[1] ? 1 : -1;
+		else if (differ && key->len >= 2 && key->data[0] == 'y' &&
+				 key->data[1] == ':' && defs_name(defs, key))
+			refused = lappend(refused, from_utf8(key->data + 2, key->len - 2));
+		if (take >= 0)
+			PROLLY_CALL(cn.tree, build_add, b, &k[take], &v[take]);
+		for (int i = 0; i < 2; i++)
+			if (has[i])
+				more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+		CHECK_FOR_INTERRUPTS();
+	}
+	for (int i = 0; i < 2; i++)
+		PROLLY_CALL(cn.tree, cursor_close, cur[i]);
+	if (refused != NIL)
+	{
+		StringInfoData names;
+
+		initStringInfo(&names);
+		foreach(lc, refused)
+			appendStringInfo(&names, "%s%s", foreach_current_index(lc) ? ", " : "",
+							 (char *) lfirst(lc));
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the tables named use types the two versions define differently"),
+				 errdetail("They use %s.", names.data),
+				 errhint("Commit or reset the changes to those types first.")));
+	}
+	PROLLY_CALL(cn.tree, build_finish, b, out);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -8584,6 +8924,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
+	.splice = folded_splice,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,

@@ -635,6 +635,7 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.info = {
 		.iface = PROLLY_IFACE_VALUE_ENCODER,
 		.impl_id = 2,
+		/* (pinned by canon_folded.c: change FOLDED_FORMAT with it) */
 		.format_version = 4,		/* 3: jsonb as stored; 4: NaNs canonical */
 		.name = "canonical",
 		.description = "portable rows of live columns, trailing NULLs omitted, "

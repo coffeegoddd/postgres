@@ -6934,8 +6934,13 @@ fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
 	ms->base = *base;
 	ms->ntables = list_length(conflicted);
 	ms->tables = palloc(sizeof(Oid) * Max(ms->ntables, 1));
+	ms->table_names = palloc(sizeof(char *) * Max(ms->ntables, 1));
 	foreach(lc, conflicted)
+	{
+		/* (its name too: the versions are found by it) */
+		ms->table_names[i] = table_name(lfirst_oid(lc));
 		ms->tables[i++] = lfirst_oid(lc);
+	}
 	ms->pick = pick_message != NULL;
 	ms->message = unconstify(char *, pick_message);
 }
@@ -7193,11 +7198,11 @@ commit_one_parent(const char *message, const ProllyHash *head, const Local *l,
  */
 static int
 pick_held(const char *const *refs, int nrefs, bool allow_empty,
-		  ProllyHash *commit_id)
+		  ProllyHash *commit_id, const char *apply_fn)
 {
 	ProllyDatabaseComponents dc = components();
-	const char *what = "cherry-pick";
-	const char *fn = "dolt_cherry_pick";
+	const char *what = apply_fn ? "apply" : "cherry-pick";
+	const char *fn = apply_fn ? apply_fn : "dolt_cherry_pick";
 	ProllyHash *picked = palloc(sizeof(ProllyHash) * nrefs);
 	ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo) * nrefs);
 	ProllyHash	ours;
@@ -7243,6 +7248,15 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
 									&nviolations);
 
+		/* (applied without a commit: no pick in progress to resolve) */
+		if (apply_fn && conflicts + nviolations > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("%s conflicts with the current branch", fn),
+					 errdetail("It has %d conflicting rows and %d constraint violations.",
+							   conflicts, nviolations),
+					 errhint("Commit or reset the changes in the way, and try again.")));
+
 		/*
 		 * The pick in progress.  Not over uncommitted changes, which its
 		 * commit would take in, and its abort (a reset) would lose.
@@ -7265,6 +7279,11 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		/* the next merges into the rows as this one left them */
 		root_of("WORKING", &roots[1]);
 		appendStringInfoString(&message, info[i].message);
+	}
+	if (apply_fn)
+	{
+		memset(commit_id, 0, sizeof(*commit_id));
+		return 0;
 	}
 	if (same_hash(&roots[1].hash, &before.hash) && !allow_empty)
 		ereport(ERROR,
@@ -7396,6 +7415,30 @@ conflicted_table(Oid relid, ProllyMergeState *state)
 	return -1;
 }
 
+/* Is a version (if any) keyed otherwise, by its description, than now? */
+static bool
+keyed_otherwise(const Table *x, const Table *now)
+{
+	bool		kx;
+	bool		know;
+
+	if (x == NULL || same_description(x, now))
+		return false;
+	(void) version_columns(x, &kx);
+	(void) version_columns(now, &know);
+	return kx != know;
+}
+
+/* Has relid the name the merge recorded for it (if it recorded one)? */
+static bool
+named_as_recorded(Oid relid, const ProllyMergeState *ms, const char *name)
+{
+	for (int i = 0; ms->table_names && i < ms->ntables; i++)
+		if (ms->tables[i] == relid && ms->table_names[i])
+			return strcmp(ms->table_names[i], name) == 0;
+	return true;
+}
+
 /*
  * Walk relid's changes in the merge in progress, as mode says, against
  * the branch's rows as they are now.  (A table the working set leaves out,
@@ -7441,9 +7484,52 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	 * theirs' rows checked as they're taken.  Nothing refused, as a merge
 	 * would: rows are listed whatever happened to the table since.)
 	 */
+	/*
+	 * (a name other than the one the merge recorded for it, as when two
+	 * tables swapped names: its versions found by name would be another's)
+	 */
+	if (!named_as_recorded(relid, ms, name))
+	{
+		char	   *why = psprintf("table %s was renamed or moved since the merge began",
+								   name);
+
+		if (sink != NULL && sink->unreadable != NULL)
+		{
+			sink->unreadable(sink, why);
+			return;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s", why),
+				 errhint("Give it its name back to list or resolve its conflicts.")));
+	}
 	bt = find_table(tables_at(&ms->base), name);
 	ot = find_table(tables_at(&ours), name);
 	tt = find_table(tables_at(&ms->theirs), name);
+
+	/*
+	 * (a version keyed otherwise than the table is now, as a partition the
+	 * merge saw, keyed by its partitioned table's key, detached since:
+	 * its rows can't be read as the table's now; the summary still lists
+	 * the table, its count unknown)
+	 */
+	if (now != NULL && (keyed_otherwise(bt, now) || keyed_otherwise(ot, now) ||
+						keyed_otherwise(tt, now)))
+	{
+		char	   *why = psprintf("table %s is keyed otherwise than when the merge began",
+								   name);
+
+		if (sink != NULL && sink->unreadable != NULL)
+		{
+			sink->unreadable(sink, why);
+			return;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s", why),
+				 errdetail("Its versions in the merge have a primary key where it has none now, or the other way (a partition's is its partitioned table's)."),
+				 errhint("Put the table back as it was (attach the partition again) to list or resolve its conflicts, or abort the merge.")));
+	}
 	rel = table_open(relid, AccessShareLock);
 	retyped_columns(bt, ot, tt, &retyped, &both_retyped);
 	bp = as_defined_now(rel, bt, now, READ_COMPARED, retyped, both_retyped,
@@ -7513,6 +7599,8 @@ folded_resolve(Oid relid, bool theirs)
 	if (theirs)
 		walk_conflicts(relid, &ms, WALK_TAKE_THEIRS, NULL);
 	ms.tables[i] = ms.tables[--ms.ntables];
+	if (ms.table_names)
+		ms.table_names[i] = ms.table_names[ms.ntables];
 	PROLLY_CALL(components().refs, set_merge_state, &ms);
 }
 
@@ -7522,11 +7610,28 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = pick_held(refs, nrefs, allow_empty, commit_id);
+	int			result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
 
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
+}
+
+/*
+ * ref's changes (from its parent) merged three-way into the session
+ * branch's working set, as a cherry-pick merges them, but no commit made:
+ * changes overlapping uncommitted ones, conflicts and violations are each
+ * an error (fn's), and nothing is left in progress.
+ */
+static void
+folded_apply(const char *ref, const char *fn)
+{
+	bool		pushed = PROLLY_CALL(components().refs, hold);
+	ProllyHash	ignored;
+
+	(void) pick_held(&ref, 1, true, &ignored, fn);
+	if (pushed)
+		PopActiveSnapshot();
 }
 
 static int
@@ -7559,4 +7664,5 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.cherry_pick = folded_cherry_pick,
 	.revert = folded_revert,
 	.verify = verify_constraints,
+	.apply = folded_apply,
 };

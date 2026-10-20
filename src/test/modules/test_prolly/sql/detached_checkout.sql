@@ -36,6 +36,21 @@ SELECT dolt_writer_mode('owned');
 SELECT dolt_remote('add', 'dc_other', 'file:///nonexistent/dc_other');
 SELECT dolt_remote('remove', 'dc_remote');
 SELECT dolt_reset('--hard', 'main');
+SELECT dolt_merge('main');
+SELECT dolt_cherry_pick('main');
+SELECT dolt_revert('main');
+SELECT dolt_conflicts_resolve('--ours', 'dc.t');
+SELECT dolt_verify_constraints();
+SELECT dolt_fetch('dc_remote');
+SELECT dolt_pull('dc_remote', 'main');
+SELECT dolt_push('dc_remote', 'main');
+SELECT dolt_stash('push', 's');
+-- (what writes nothing still runs: a check that only reports, and an
+-- abort or continue with nothing in progress says so)
+SELECT dolt_verify_constraints('--output-only');
+SELECT dolt_merge('--abort');
+SELECT dolt_cherry_pick('--abort');
+SELECT dolt_revert('--continue');
 
 -- A branch made there is writable.
 SELECT (dolt_checkout('-b', 'from_first'))[2];

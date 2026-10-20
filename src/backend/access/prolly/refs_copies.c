@@ -76,9 +76,12 @@
 #include <ctype.h>
 
 #include "access/prolly_builtins.h"
+#include "utils/fmgroids.h"
+#include "catalog/pg_branch.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
@@ -118,6 +121,8 @@
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 #define TAG_CONFIG		'C'	/* a database setting */
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
+#define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
+#define TAG_STASH		'Z'	/* a list of stashes, by name */
 
 static bool ready = false;
 
@@ -136,6 +141,8 @@ static List *violations_left(const char *branch, List *violations,
 							 char **name);
 static Oid	branch_oid(const char *name);
 static void merge_key(StringInfo key, const char *branch);
+static void merge_names_put(const char *branch, const ProllyMergeState *state);
+static void merge_names_get(const char *branch, ProllyMergeState *state);
 static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
@@ -187,8 +194,9 @@ commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 
 /*
  * The refs' entries: a branch's head, a remote branch's, a baseline and the
- * working set its fold made, and a merge's commits (theirs and the base;
- * a revert's series head and the commits it has left).
+ * working set its fold made, a merge's commits (theirs and the base; a
+ * revert's series head and the commits it has left), and each stash's
+ * commit.
  */
 static void
 refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
@@ -228,6 +236,19 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 					n = get_be32(p);
 					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
 				}
+			}
+			break;
+		case TAG_STASH:
+			/* (each entry: its commit, then its branch's name) */
+			while (p < end)
+			{
+				uint64		blen;
+
+				p = declare_hashes(p, end, 1, refs);
+				blen = prolly_get_varint(&p, end);
+				if (blen > (uint64) (end - p))
+					break;
+				p += blen;
 			}
 			break;
 		default:
@@ -727,6 +748,28 @@ branch_oid(const char *name)
 
 	branch_ops()->branches(find_branch, &fb);
 	return fb.branch;
+}
+
+/*
+ * Was branch name's catalog row (made at its first use, with its copies)
+ * written by a transaction the transaction's snapshot doesn't see?
+ */
+static bool
+branch_made_unseen(const char *name)
+{
+	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		seen;
+
+	ScanKeyInit(&key, Anum_pg_branch_brname, BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum(name));
+	scan = systable_beginscan(brel, BranchNameIndexId, true,
+							  GetTransactionSnapshot(), 1, &key);
+	seen = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(brel, AccessShareLock);
+	return !seen;
 }
 
 /*
@@ -1749,7 +1792,10 @@ copies_branch_delete(const char *name, bool force)
 		initStringInfo(&key);
 		merge_key(&key, name);
 		if (merge_state_of(name, &ms))
+		{
 			refs_put(key.data, key.len, NULL);
+			merge_names_put(name, NULL);
+		}
 		if (violations_of(name) != NIL)
 		{
 			resetStringInfo(&key);
@@ -1772,7 +1818,7 @@ static void
 copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
-	TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
+	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
 	ListCell   *lc;
 
 	lock_refs();
@@ -1910,6 +1956,18 @@ copies_checkout(const char *name)
 			PopActiveSnapshot();
 		oid = branch_oid(name);
 	}
+	/*
+	 * (a branch another transaction first used after this one's snapshot,
+	 * which can't move: its copies are rows the snapshot doesn't see, so
+	 * the branch would read as the one they were copied from)
+	 */
+	if (strcmp(current, name) != 0 && OidIsValid(oid) &&
+		IsolationUsesXactSnapshot() && branch_made_unseen(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" was first used since this transaction's snapshot",
+						name),
+				 errhint("The transaction might succeed if retried.")));
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
 		OidIsValid(oid))
@@ -2243,6 +2301,86 @@ merge_key(StringInfo key, const char *branch)
 }
 
 /*
+ * A branch's merge's conflicted tables' names, as the merge recorded them,
+ * under a key of their own (the merge state's value ends with a message):
+ * each table's OID, then its name's length (a varint) and bytes.
+ */
+static void
+merge_names_key(StringInfo key, const char *branch)
+{
+	appendStringInfoChar(key, TAG_MERGE_NAMES);
+	appendStringInfoString(key, branch);
+}
+
+static void
+merge_names_put(const char *branch, const ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		any = false;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	merge_names_key(&key, branch);
+	for (int i = 0; state && state->table_names && i < state->ntables; i++)
+		if (state->table_names[i])
+		{
+			put_be32(&v, state->tables[i]);
+			prolly_put_varint(&v, strlen(state->table_names[i]));
+			appendStringInfoString(&v, state->table_names[i]);
+			any = true;
+		}
+	{
+		StringInfoData had;
+
+		initStringInfo(&had);
+		if (any || refs_get(key.data, key.len, &had))
+			refs_put(key.data, key.len, any ? &v : NULL);
+		pfree(had.data);
+	}
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* state's table_names, from the key above (none recorded: NULL) */
+static void
+merge_names_get(const char *branch, ProllyMergeState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	merge_names_key(&key, branch);
+	state->table_names = NULL;
+	if (refs_get(key.data, key.len, &v))
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+
+		state->table_names = palloc0(sizeof(char *) * Max(state->ntables, 1));
+		while (end - p >= 4)
+		{
+			Oid			oid = get_be32(p);
+			uint64		len;
+
+			p += 4;
+			len = prolly_get_varint(&p, end);
+			if (len > (uint64) (end - p))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly refs hold an invalid merge state")));
+			for (int i = 0; i < state->ntables; i++)
+				if (state->tables[i] == oid)
+					state->table_names[i] = pnstrdup(p, len);
+			p += len;
+		}
+	}
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
  * The merge in progress on branch, if there is one, as the refs hold it:
  * its conflicted tables, as merge_tables_left() has them, may include some
  * since dropped.
@@ -2300,6 +2438,8 @@ merge_state_of(const char *branch, ProllyMergeState *state)
 		else
 			state->message = state->pick ? pnstrdup(p + 1, end - p - 1) : NULL;
 	}
+	if (found)
+		merge_names_get(branch, state);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
@@ -2319,7 +2459,11 @@ merge_tables_left(const char *branch, ProllyMergeState *state, char **name)
 	tables_exist_on(branch, state->ntables, state->tables, exists, name);
 	for (int i = 0; i < state->ntables; i++)
 		if (exists[i])
+		{
+			if (state->table_names)
+				state->table_names[n] = state->table_names[i];
 			state->tables[n++] = state->tables[i];
+		}
 	state->ntables = n;
 	pfree(exists);
 }
@@ -2353,6 +2497,7 @@ copies_set_merge_state(const ProllyMergeState *state)
 	{
 		if (had)
 			refs_put(key.data, key.len, NULL);
+		merge_names_put(branch, NULL);
 	}
 	else
 	{
@@ -2378,6 +2523,7 @@ copies_set_merge_state(const ProllyMergeState *state)
 		}
 		refs_put(key.data, key.len, &v);
 		pfree(v.data);
+		merge_names_put(branch, state);
 		note_merge_changed(branch);
 	}
 	pfree(key.data);
@@ -3055,6 +3201,23 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		const char *end = p + v.len;
 		ProllyHash *h;
 
+		/* (a stash list: each one's commit, kept as a head is) */
+		if (k.len >= 1 && k.data[0] == TAG_STASH)
+		{
+			while (p < end)
+			{
+				uint64		blen;
+
+				h = palloc(sizeof(ProllyHash));
+				p = get_hash(p, end, h);
+				heads = lappend(heads, h);
+				blen = prolly_get_varint(&p, end);
+				if (blen > (uint64) (end - p))
+					break;
+				p += blen;
+			}
+			continue;
+		}
 		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE &&
 						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING))
 			continue;
@@ -3161,6 +3324,7 @@ end_merge(const char *name)
 	{
 		merge_key(&key, name);
 		refs_put(key.data, key.len, NULL);
+		merge_names_put(name, NULL);
 	}
 	if (violations_of(name) != NIL)
 	{
@@ -3267,6 +3431,177 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	return true;
 }
 
+/* ------------------------------------------------------------------------
+ * Stashes: TAG_STASH and a list's name, its entries newest first, each its
+ * commit's hash, then its branch's name (a varint length, then the bytes).
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct StashEntry
+{
+	ProllyHash	stash;
+	char	   *branch;
+} StashEntry;
+
+static List *
+stash_list(const char *p, const char *end)
+{
+	List	   *entries = NIL;
+
+	while (p < end)
+	{
+		StashEntry *e = palloc(sizeof(StashEntry));
+		uint64		blen;
+
+		p = get_hash(p, end, &e->stash);
+		blen = prolly_get_varint(&p, end);
+		if (blen > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("corrupt prolly stash list")));
+		e->branch = pnstrdup(p, blen);
+		p += blen;
+		entries = lappend(entries, e);
+	}
+	return entries;
+}
+
+static void
+stash_key(const char *name, StringInfo key)
+{
+	appendStringInfoChar(key, TAG_STASH);
+	appendStringInfoString(key, name);
+}
+
+/* name's list, newest first (NIL: none) */
+static List *
+stash_get(const char *name)
+{
+	StringInfoData key;
+	StringInfoData v;
+	List	   *entries = NIL;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	stash_key(name, &key);
+	if (refs_get(key.data, key.len, &v))
+		entries = stash_list(v.data, v.data + v.len);
+	pfree(key.data);
+	pfree(v.data);
+	return entries;
+}
+
+/* name's list made entries (NIL: none), with the transaction */
+static void
+stash_set(const char *name, List *entries)
+{
+	StringInfoData key;
+	StringInfoData v;
+	ListCell   *lc;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	stash_key(name, &key);
+	foreach(lc, entries)
+	{
+		StashEntry *e = lfirst(lc);
+
+		put_hash(&v, &e->stash);
+		prolly_put_varint(&v, strlen(e->branch));
+		appendStringInfoString(&v, e->branch);
+	}
+	refs_put(key.data, key.len, entries ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+static void
+copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash)
+{
+	ProllyHash	head;
+	StashEntry *e = palloc(sizeof(StashEntry));
+	char	   *branch = branch_ops()->current();
+	List	   *entries;
+
+	if (!copies_resolve("HEAD", &head))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch has no commit to stash changes against")));
+	lock_refs();
+	entries = stash_get(name);
+	write_commit(&root->hash, &head, 1, prolly_commit_author(),
+				 psprintf("WIP on %s", branch), stash);
+	e->stash = *stash;
+	e->branch = pstrdup(branch);
+	stash_set(name, lcons(e, entries));
+}
+
+static void
+copies_stashes(ProllyStashVisit visit, void *arg)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	char		tag = TAG_STASH;
+	ProllyKey	from = {(const uint8 *) &tag, 1};
+
+	refs_init();
+	if (!refs_root(&root))
+		return;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 1 && k.data[0] == TAG_STASH)
+	{
+		char	   *name = pnstrdup((const char *) k.data + 1, k.len - 1);
+		int			n = 0;
+		ListCell   *lc;
+
+		foreach(lc, stash_list((const char *) v.data, (const char *) v.data + v.len))
+		{
+			StashEntry *e = lfirst(lc);
+
+			visit(name, n++, e->branch, &e->stash, arg);
+		}
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+}
+
+static bool
+copies_stash_select(const char *name, int n, ProllyHash *stash)
+{
+	List	   *entries;
+
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return false;
+	*stash = ((StashEntry *) list_nth(entries, n))->stash;
+	return true;
+}
+
+static bool
+copies_stash_drop(const char *name, int n)
+{
+	List	   *entries;
+
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return false;
+	stash_set(name, list_delete_nth_cell(entries, n));
+	return true;
+}
+
+static void
+copies_stash_clear(const char *name)
+{
+	lock_refs();
+	if (stash_get(name) != NIL)
+		stash_set(name, NIL);
+}
+
 const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -3312,4 +3647,9 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_rows = copies_commit_rows,
 	.branch_rename = copies_branch_rename,
 	.root_refs = copies_root_refs,
+	.stash_push = copies_stash_push,
+	.stashes = copies_stashes,
+	.stash_select = copies_stash_select,
+	.stash_drop = copies_stash_drop,
+	.stash_clear = copies_stash_clear,
 };

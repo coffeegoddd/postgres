@@ -560,11 +560,13 @@ SELECT length(dolt_commit('-Am', 'without it')::text) AS committed;
         42
 (1 row)
 
--- A reset is hard: there is no staging area to reset to.
+-- A reset that isn't hard moves only the head: to HEAD, nothing.
 SELECT dolt_reset('HEAD');
-ERROR:  dolt_reset only does hard resets
-DETAIL:  Prolly branches have no staging area to reset.
-HINT:  Pass --hard.
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 -- A hard reset restores a sequence to the commit's value: a versioned
 -- schema's sequences are per branch and in each commit, so the next key
 -- after rows the reset discarded is theirs again (Dolt's auto-increment

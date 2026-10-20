@@ -27,17 +27,24 @@ adapts.
 - **Prolly:** a commit records the branch's whole working set, so every
   change is staged as it is made (user, 2026-10-17). `dolt_add` does
   nothing but check its arguments; `dolt_commit` accepts `-a` and `-A`
-  and needs neither; `dolt_reset` does hard resets only.
+  and needs neither. `dolt_reset('--hard')` moves the head and the
+  working set; `--soft` and the plain form (Dolt's soft and mixed
+  resets, one without an index) move only the head, so what differs from
+  it shows as changes (#493); a protected branch, which has none, refuses
+  one that would leave it with some.
   `dolt_status.staged` is true for every row except those whose status
   is `conflict` or `not covered` (objects a commit can't hold yet,
-  which are listed and unstaged).
+  which are listed and unstaged). `dolt_stash('push', ...)` sets the
+  whole working set aside, so new tables with the rest (Dolt's leaves
+  untracked ones without `-u`); `-u` and `-a` are accepted (#498).
 - **Why:** the user's decision (2026-10-17). A staging area would be a
   second state of each branch beside the working set in Postgres's
   pages, for every fold, status and diff to track.
 - **Port:** drop `dolt_add` calls whose only effect is staging; map
   Dolt's `staged` column as above; a case whose assertion is about the
-  index (a soft or mixed reset, `--cached`, partially staged tables) is
-  N, not applicable. Where Dolt runs `dolt_add` to mark conflicts
+  index (what a soft or mixed reset leaves staged, `--cached`, partially
+  staged tables) is N, not applicable; one about where a soft or mixed
+  reset leaves the head and the working set ports. Where Dolt runs `dolt_add` to mark conflicts
   resolved before `--continue`, prolly resolves with
   `dolt_conflicts_resolve()` (or the rows fixed by hand and resolved),
   then `dolt_commit` or `--continue`.
@@ -187,8 +194,8 @@ adapts.
 
 ## D10. Not ported
 
-- **Staging-area features** (D1): `dolt_workspace_*`, `dolt_rm`, soft
-  and mixed reset, `--cached`.
+- **Staging-area features** (D1): `dolt_workspace_*`, `dolt_rm`,
+  per-table resets, `--cached`.
 - **MySQL-only syntax and types:** `CALL`, backtick identifiers, MySQL
   DDL options, `SET @@…` variables, MySQL-only types; a case translated
   to Postgres keeps its version-control assertions, and one that tests
@@ -301,6 +308,10 @@ OF` are built in D18's shapes.
   branch named `--` could be named only after another `--`.
 - **Port:** a case that makes a branch named `--` expects the
   `invalid branch name` error (SQLSTATE 42602) instead.
+- **Tables after `--`** (#494): `dolt_checkout('--', ...)` names tables,
+  as Dolt's does, their uncommitted changes discarded; one name there
+  that is a branch and no table checks out the branch, so a branch named
+  like an option (`-dash`) can still be checked out.
 
 ## D15. Schema diffs cover every versioned object
 

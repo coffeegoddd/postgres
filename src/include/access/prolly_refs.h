@@ -68,6 +68,9 @@ typedef struct ProllyMergeState
 	ProllyHash	base;			/* the common ancestor */
 	int			ntables;
 	Oid		   *tables;			/* with unresolved conflicts (palloc'd) */
+	char	  **table_names;	/* each one's name (qualified) when the merge
+								 * recorded it, as tables[] (NULL, or an
+								 * entry NULL: not known) */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -99,6 +102,10 @@ typedef struct ProllyViolation
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
+
+/* Visits a stash: its list's name, its place there (0: newest), its commit. */
+typedef void (*ProllyStashVisit) (const char *name, int n, const char *branch,
+								  const ProllyHash *stash, void *arg);
 
 /* Visits a remote: its name and URL. */
 typedef void (*ProllyRemoteVisit) (const char *name, const char *url,
@@ -339,6 +346,26 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*root_refs) (const ProllyHash *root, ProllyRootRefVisit visit,
 							  void *arg);
+
+	/*
+	 * Optional: stashes, working sets set aside, the database's (not a
+	 * branch's) in named lists, each newest first.  stash_push() records a
+	 * commit of root (the session branch's working set, a canonical root)
+	 * whose parent is its head, as the newest of name's list, and sets
+	 * *stash to it; stashes() visits every list's entries, by name, then
+	 * newest first (n: from 0), with the branch each was pushed from;
+	 * stash_select() sets *stash to name's nth (false: it has none), the
+	 * refs locked first, so that no other session's push or drop moves it
+	 * until the transaction ends; stash_drop() forgets name's nth (false:
+	 * it has none); stash_clear() every one of name's.  The walk keeps each one's commit.  With the
+	 * transaction; never pushed to a remote.
+	 */
+	void		(*stash_push) (const char *name, const ProllyNodeRef *root,
+							   ProllyHash *stash);
+	void		(*stashes) (ProllyStashVisit visit, void *arg);
+	bool		(*stash_select) (const char *name, int n, ProllyHash *stash);
+	bool		(*stash_drop) (const char *name, int n);
+	void		(*stash_clear) (const char *name);
 } ProllyRefsRoutine;
 
 /*
@@ -358,9 +385,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
-	"branch_rename", "root_refs"
+	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
+	"stash_clear", "stash_select"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK root_refs
+#define PROLLY_REFS_LAST_CALLBACK stash_clear
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

@@ -982,9 +982,12 @@ describes it as built.
 - **Only the main fork is block-mapped.** The free space map and the
   visibility map are md.c files of the relation: they are extended during
   recovery without WAL records of their own, so a standby can't follow a
-  primary's allocations for them, and they are hints or rebuildable, so
-  they need no sharing. A branch's copy (step 2) starts with an empty
-  visibility map, which is always correct.
+  primary's allocations for them, so they aren't shared. A branch's copy
+  (step 2) gets copies of its source's (full-page images in the WAL): its
+  pages are the source's byte for byte, so what the maps say of them
+  holds, and changes after clear its own bits as any change does. An
+  empty map would be correct too, but every index-only scan would visit
+  the heap, and VACUUM every page, until the branch was vacuumed (#487).
 - The map fork is hidden from callers that walk every fork (copying a
   relation, measuring it): `smgrexists` says no for it.
 - The page store's pages carry checksums of their *logical* block

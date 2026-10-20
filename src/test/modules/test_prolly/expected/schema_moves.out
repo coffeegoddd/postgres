@@ -1288,3 +1288,246 @@ DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 2 other objects
 DETAIL:  drop cascades to table app.t
 drop cascades to table app.p
+-- Two tables' names swapped: a move back to the head puts each back (the
+-- NOT NULL of a key going after the key, whatever their names' order),
+-- by a hard reset, and by a merge's abort.
+CREATE SCHEMA sw VERSIONED;
+CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
+CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
+INSERT INTO sw.a VALUES (1, 'a'); INSERT INTO sw.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sw two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM sw.a;
+ pk | x 
+----+---
+  1 | a
+(1 row)
+
+SELECT * FROM sw.b;
+ pk | y 
+----+---
+  1 | 1
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_branch('sw_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sw_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'sw_side'"}
+(1 row)
+
+UPDATE sw.a SET x = 'side';
+SELECT length(dolt_commit('-am', 'sw side')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE sw.a SET x = 'main';
+SELECT length(dolt_commit('-am', 'sw main')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('sw_side') IS NOT NULL AS merging;
+ merging 
+---------
+ t
+(1 row)
+
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+ aborted 
+---------
+ t
+(1 row)
+
+SELECT * FROM sw.a;
+ pk |  x   
+----+------
+  1 | main
+(1 row)
+
+SELECT * FROM sw.b;
+ pk | y 
+----+---
+  1 | 1
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('-D', 'sw_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sw CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table sw.a
+drop cascades to table sw.b
+SELECT length(dolt_commit('-Am', 'sw gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- Routines with SQL-standard bodies are parsed as they're made, so a move
+-- makes each after what it reads: a materialized view, a table; and one a
+-- table's default uses, before that table.
+CREATE SCHEMA sb VERSIONED;
+CREATE FUNCTION sb.seven() RETURNS int LANGUAGE SQL RETURN 7;
+CREATE TABLE sb.t (id int PRIMARY KEY, d int DEFAULT sb.seven());
+INSERT INTO sb.t (id) VALUES (1), (2);
+CREATE MATERIALIZED VIEW sb.m AS SELECT count(*) AS n FROM sb.t;
+CREATE FUNCTION sb.from_m() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT n FROM sb.m; END;
+CREATE FUNCTION sb.from_t() RETURNS bigint LANGUAGE SQL RETURN (SELECT sum(d) FROM sb.t);
+SELECT length(dolt_commit('-Am', 'sb')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+DROP FUNCTION sb.from_m();
+DROP FUNCTION sb.from_t();
+DROP MATERIALIZED VIEW sb.m;
+DROP TABLE sb.t;
+DROP FUNCTION sb.seven();
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT sb.from_m(), sb.from_t(), sb.seven();
+ from_m | from_t | seven 
+--------+--------+-------
+      2 |     14 |     7
+(1 row)
+
+INSERT INTO sb.t (id) VALUES (3);
+SELECT * FROM sb.t ORDER BY id;
+ id | d 
+----+---
+  1 | 7
+  2 | 7
+  3 | 7
+(3 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       1
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP SCHEMA sb CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to function sb.seven()
+drop cascades to table sb.t
+drop cascades to function sb.from_t()
+drop cascades to materialized view sb.m
+drop cascades to function sb.from_m()
+SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- a cast made with one: after it
+CREATE SCHEMA sc VERSIONED;
+CREATE TYPE sc.wrap AS (v int);
+CREATE FUNCTION sc.unwrap(sc.wrap) RETURNS int LANGUAGE SQL IMMUTABLE RETURN ($1).v;
+CREATE CAST (sc.wrap AS int) WITH FUNCTION sc.unwrap(sc.wrap);
+SELECT length(dolt_commit('-Am', 'sc')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS sc_head \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT to_regnamespace('sc') IS NULL AS sc_gone;
+ sc_gone 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'sc_head');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT ROW(4)::sc.wrap::int AS unwrapped;
+ unwrapped 
+-----------
+         4
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+DROP SCHEMA sc CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to type sc.wrap
+drop cascades to function sc.unwrap(sc.wrap)
+drop cascades to cast from sc.wrap to integer
+SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+

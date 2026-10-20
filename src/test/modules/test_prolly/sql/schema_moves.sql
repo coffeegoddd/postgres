@@ -466,3 +466,79 @@ SELECT length(dolt_commit('-Am', 'without sm14')::text) AS committed;
 DROP SCHEMA sm_full CASCADE;
 DROP SCHEMA sm_empty;
 DROP SCHEMA app CASCADE;
+
+-- Two tables' names swapped: a move back to the head puts each back (the
+-- NOT NULL of a key going after the key, whatever their names' order),
+-- by a hard reset, and by a merge's abort.
+CREATE SCHEMA sw VERSIONED;
+CREATE TABLE sw.a (pk int PRIMARY KEY, x text);
+CREATE TABLE sw.b (pk int PRIMARY KEY, y int);
+INSERT INTO sw.a VALUES (1, 'a'); INSERT INTO sw.b VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sw two')::text) AS committed;
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_reset('--hard');
+SELECT * FROM sw.a;
+SELECT * FROM sw.b;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_branch('sw_side');
+SELECT dolt_checkout('sw_side');
+UPDATE sw.a SET x = 'side';
+SELECT length(dolt_commit('-am', 'sw side')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE sw.a SET x = 'main';
+SELECT length(dolt_commit('-am', 'sw main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_merge('sw_side') IS NOT NULL AS merging;
+ALTER TABLE sw.a RENAME TO tmp;
+ALTER TABLE sw.b RENAME TO a;
+ALTER TABLE sw.tmp RENAME TO b;
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+SELECT * FROM sw.a;
+SELECT * FROM sw.b;
+SELECT count(*) AS changed FROM dolt_status;
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('-D', 'sw_side');
+DROP SCHEMA sw CASCADE;
+SELECT length(dolt_commit('-Am', 'sw gone')::text) AS committed;
+
+-- Routines with SQL-standard bodies are parsed as they're made, so a move
+-- makes each after what it reads: a materialized view, a table; and one a
+-- table's default uses, before that table.
+CREATE SCHEMA sb VERSIONED;
+CREATE FUNCTION sb.seven() RETURNS int LANGUAGE SQL RETURN 7;
+CREATE TABLE sb.t (id int PRIMARY KEY, d int DEFAULT sb.seven());
+INSERT INTO sb.t (id) VALUES (1), (2);
+CREATE MATERIALIZED VIEW sb.m AS SELECT count(*) AS n FROM sb.t;
+CREATE FUNCTION sb.from_m() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT n FROM sb.m; END;
+CREATE FUNCTION sb.from_t() RETURNS bigint LANGUAGE SQL RETURN (SELECT sum(d) FROM sb.t);
+SELECT length(dolt_commit('-Am', 'sb')::text) AS committed;
+DROP FUNCTION sb.from_m();
+DROP FUNCTION sb.from_t();
+DROP MATERIALIZED VIEW sb.m;
+DROP TABLE sb.t;
+DROP FUNCTION sb.seven();
+SELECT dolt_reset('--hard');
+SELECT sb.from_m(), sb.from_t(), sb.seven();
+INSERT INTO sb.t (id) VALUES (3);
+SELECT * FROM sb.t ORDER BY id;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard');
+DROP SCHEMA sb CASCADE;
+SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;
+
+-- a cast made with one: after it
+CREATE SCHEMA sc VERSIONED;
+CREATE TYPE sc.wrap AS (v int);
+CREATE FUNCTION sc.unwrap(sc.wrap) RETURNS int LANGUAGE SQL IMMUTABLE RETURN ($1).v;
+CREATE CAST (sc.wrap AS int) WITH FUNCTION sc.unwrap(sc.wrap);
+SELECT length(dolt_commit('-Am', 'sc')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS sc_head \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT to_regnamespace('sc') IS NULL AS sc_gone;
+SELECT dolt_reset('--hard', :'sc_head');
+SELECT ROW(4)::sc.wrap::int AS unwrapped;
+SELECT count(*) AS changed FROM dolt_status;
+DROP SCHEMA sc CASCADE;
+SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;

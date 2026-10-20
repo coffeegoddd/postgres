@@ -29,6 +29,7 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
@@ -1199,10 +1200,138 @@ sweep_detached(char *current)
 }
 
 
+/* A root's tables' qualified names, appended to *names (each once). */
+static void
+collect_table_name(const char *name, const ProllyNodeRef *data,
+				   const ProllyValue *description, const char *unreadable,
+				   void *arg)
+{
+	List	  **names = arg;
+
+	*names = list_append_unique(*names, makeString(pstrdup(name)));
+}
+
+/*
+ * A table named as a user names it, qualified as roots name tables: the
+ * relation it names now, or (one gone since) the first of from's tables
+ * of that name in the search path.  NULL if neither.
+ */
+static char *
+checkout_table_name(const char *name, List *from_tables)
+{
+	List	   *parts = stringToQualifiedNameList(name, NULL);
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(parts), NoLock, true);
+	ListCell   *lc;
+
+	if (OidIsValid(relid))
+		return quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+										  get_rel_name(relid));
+	if (list_length(parts) == 2)
+	{
+		char	   *q = quote_qualified_identifier(strVal(linitial(parts)),
+												   strVal(lsecond(parts)));
+
+		return list_member(from_tables, makeString(q)) ? q : NULL;
+	}
+	foreach(lc, fetch_search_path(false))
+	{
+		char	   *nsp = get_namespace_name(lfirst_oid(lc));
+		char	   *q;
+
+		if (nsp == NULL)
+			continue;
+		q = quote_qualified_identifier(nsp, strVal(llast(parts)));
+		if (list_member(from_tables, makeString(q)))
+			return q;
+	}
+	return NULL;
+}
+
+/*
+ * The tables named (".": every one) put back as ref's commit has them,
+ * the rest of the working set as it is: their uncommitted changes
+ * discarded, as Dolt's dolt_checkout -- tables.
+ */
+static void
+checkout_tables(const char *ref, char **names, int nnames)
+{
+	ProllyHash	commit;
+	ProllyNodeRef from;
+	ProllyNodeRef working;
+	ProllyNodeRef target;
+	List	   *from_tables = NIL;
+	List	   *working_tables = NIL;
+	List	   *tables = NIL;
+
+	if (!PROLLY_HAS(canonicalizer(), splice))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't check out tables")));
+	PreventCommandIfReadOnly("dolt_checkout()");
+	if (!PROLLY_CALL(refs(), resolve, ref, &commit) ||
+		!PROLLY_CALL(refs(), commit_working_set, &commit, &from))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	if (!PROLLY_CALL(refs(), working_set, NULL, &working))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch has no working set")));
+	PROLLY_CALL(canonicalizer(), tables, &from, collect_table_name, &from_tables);
+	PROLLY_CALL(canonicalizer(), tables, &working, collect_table_name, &working_tables);
+	for (int i = 0; i < nnames; i++)
+	{
+		char	   *q;
+
+		if (strcmp(names[i], ".") == 0)
+		{
+			tables = list_concat_unique(tables, from_tables);
+			tables = list_concat_unique(tables, working_tables);
+			continue;
+		}
+		q = checkout_table_name(names[i], from_tables);
+		if (q == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("table \"%s\" does not exist", names[i])));
+		tables = list_append_unique(tables, makeString(q));
+	}
+	{
+		List	   *strs = NIL;
+		ListCell   *lc;
+
+		foreach(lc, tables)
+			strs = lappend(strs, strVal(lfirst(lc)));
+		PROLLY_CALL(canonicalizer(), splice, &working, &from, strs, &target);
+	}
+	if (same_hash(&target.hash, &working.hash))
+		return;
+
+	/*
+	 * (a write, as any: it makes no commit, so a protected branch refuses
+	 * it; the branch may be its head's again, its changes all put back)
+	 */
+	branch_note_write(MyBranch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), move_to, &target, &working));
+	{
+		ProllyHash	head;
+		ProllyNodeRef head_root;
+
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+			PROLLY_CALL(refs(), commit_working_set, &head, &head_root) &&
+			same_hash(&target.hash, &head_root.hash))
+			settled();
+	}
+}
+
 /*
  * dolt_checkout(VARIADIC args text[]) returns text[]: {status, message}
  *
- * branch, or -b branch [start point] to create it first.
+ * branch, or -b branch [start point] to create it first.  Tables, as
+ * Dolt's: -- tables (or "."), or a name that is no branch but a table
+ * (with more after it), put back as the head has them; ref tables (ref
+ * no table), as ref has them.  After --, one name that is a branch and no
+ * table is the branch.
  */
 Datum
 dolt_checkout(PG_FUNCTION_ARGS)
@@ -1215,19 +1344,24 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	char	   *named = NULL;	/* the one name given apart from -b's */
 	bool		create = false;
 	const char *result[2];
+	char	  **names = palloc_array(char *, Max(nargs, 1));
+	int			nnames = 0;
+	int			dashes = -1;	/* names before "--" */
 
 	for (int i = 0; i < nargs; i++)
 	{
 		char	   *a = args[i];
 
 		if (options && strcmp(a, "--") == 0)
+		{
 			options = false;	/* names after it, even ones like flags */
+			dashes = nnames;
+		}
 		else if (!options || a[0] != '-')
 		{
 			if (named == NULL)
 				named = a;
-			else
-				unexpected("dolt_checkout", a);
+			names[nnames++] = a;
 		}
 		else if (is_option(a, "b"))
 		{
@@ -1241,6 +1375,42 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_checkout", a);
 	}
+	/* tables: after "--", or names that aren't one branch */
+	if (!create && nnames > 0)
+	{
+		bool		is_branch = PROLLY_CALL(refs(), branch_lookup, names[0],
+											&(ProllyBranchId) {0});
+		bool		is_table = strcmp(names[0], ".") == 0 ||
+			OidIsValid(RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(names[0], NULL)),
+										NoLock, true));
+
+		if (dashes == 0 && !(nnames == 1 && is_branch && !is_table))
+		{
+			checkout_tables("HEAD", names, nnames);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (dashes != 0 && nnames > 1 && !is_table)
+		{
+			checkout_tables(names[0], names + 1, nnames - 1);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (dashes != 0 && !is_branch && !names_commit(names[0]) &&
+			(is_table || nnames > 1))
+		{
+			checkout_tables("HEAD", names, nnames);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (nnames > 1)
+			unexpected("dolt_checkout", names[1]);
+	}
+	else if (create && nnames > 1)
+		unexpected("dolt_checkout", names[1]);
 	/* (-b's start point, before or after it, as in Dolt and git) */
 	if (create)
 		start = named;
@@ -1723,6 +1893,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no merge to abort")));
+		PreventCommandIfReadOnly("dolt_merge()");
 		abort_in_progress("merge");
 		result[0] = "";
 		result[1] = "0";
@@ -1743,6 +1914,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_NO_FF, "--no-ff");
 	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_SQUASH, "--squash");
 
+	PreventCommandIfReadOnly("dolt_merge()");
 	/* (the branch held first: its head is read as the merge finds it) */
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
@@ -2227,6 +2399,7 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				 errmsg("dolt_integrate runs on a branch of your own, not \"%s\"", mine),
 				 errhint("Check out a branch with dolt_checkout('-b', ...) first.")));
 
+	PreventCommandIfReadOnly("dolt_integrate()");
 	/* (failing, the session stays on its branch, as everything else does) */
 	returning = branch_return_on_abort();
 
@@ -2273,6 +2446,9 @@ dolt_integrate(PG_FUNCTION_ARGS)
  *
  * --hard [ref]: the session branch's head commit and working set become
  * ref's (HEAD: drops the changes since the last commit).
+ * --soft [ref], or [ref] alone: ref's commit becomes the head, the working
+ * set as it is (with no staging area, Dolt's soft and mixed resets are
+ * one): what differs from it shows as changes, which a commit takes.
  */
 Datum
 dolt_reset(PG_FUNCTION_ARGS)
@@ -2281,6 +2457,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 	int			nargs = text_args(fcinfo, &args);
 	bool		options = true;	/* until "--" */
 	bool		hard = false;
+	bool		soft = false;
 	char	   *ref = NULL;
 	const char *result[1] = {"0"};
 
@@ -2299,21 +2476,37 @@ dolt_reset(PG_FUNCTION_ARGS)
 		}
 		else if (is_option(a, "hard"))
 			hard = true;
+		else if (is_option(a, "soft"))
+			soft = true;
 		else
 			unsupported("dolt_reset", a);
 	}
-	if (!hard)
+	if (hard && soft)
 		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("dolt_reset only does hard resets"),
-				 errdetail("Prolly branches have no staging area to reset."),
-				 errhint("Pass --hard.")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_reset can't be --hard and --soft at once")));
 	PreventCommandIfReadOnly("dolt_reset()");
+	if (!hard)
+	{
+		ProllyMergeState ms;
+		ProllyHash	target;
+
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a merge is in progress on the current branch"),
+					 errhint("Resolve its conflicts and commit, or reset it with --hard.")));
+		if (!PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", ref ? ref : "HEAD"),
+					 errhint("A soft reset moves the head to a commit; there is no staging area to reset a table in.")));
+	}
 	/*
 	 * What the target needs that the head doesn't, checked (a reset to the
-	 * head moves nothing new in, as an abort's doesn't).
+	 * head moves nothing new in, as an abort's doesn't; a soft one, none).
 	 */
-	if (ref)
+	if (ref && hard)
 	{
 		ProllyHash	head;
 		ProllyHash	target;
@@ -2348,6 +2541,34 @@ dolt_reset(PG_FUNCTION_ARGS)
 					 errmsg("branch \"%s\" is protected", branch_ops()->current()),
 					 errhint("Only the database's owner resets a protected branch to another commit.")));
 	}
+	/* (soft: the head moved, nothing of the working set) */
+	if (!hard)
+	{
+		ProllyHash	target;
+		ProllyNodeRef working;
+		ProllyNodeRef target_root;
+		const char *name = branch_ops()->current();
+
+		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
+
+		/*
+		 * (a protected branch is left as its head has it: one whose working
+		 * set the new head doesn't hold would have changes no commit does)
+		 */
+		if (PROLLY_CALL(writers(), protected, name) &&
+			PROLLY_CALL(refs(), working_set, NULL, &working) &&
+			(!PROLLY_CALL(refs(), commit_working_set, &target, &target_root) ||
+			 !same_hash(&working.hash, &target_root.hash)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a soft reset of protected branch \"%s\" would leave it uncommitted", name),
+					 errdetail("Its working set isn't the commit's it would be reset to."),
+					 errhint("Reset it with --hard, or reset a branch of your own.")));
+		note_integration();
+		PROLLY_CALL(refs(), set_head, &target);
+		settled();
+		PG_RETURN_DATUM(text_array(1, result));
+	}
 	/* (the database's owner discards whoever's changes they are) */
 	if (PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_SHARED &&
 		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
@@ -2356,6 +2577,215 @@ dolt_reset(PG_FUNCTION_ARGS)
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
 	settled();
 	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* ------------------------------------------------------------------------
+ * Stashes
+ * ------------------------------------------------------------------------
+ */
+
+static int
+stash_index(const char *arg)
+{
+	const char *p = arg;
+	char	   *end;
+	long		n;
+
+	if (arg == NULL)
+		return 0;
+	if (strncmp(p, "stash@{", 7) == 0)
+		p += 7;
+	n = strtol(p, &end, 10);
+	if (end == p || n < 0 || n > INT_MAX ||
+		(p != arg && strcmp(end, "}") != 0) || (p == arg && *end != '\0'))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" is not a stash", arg),
+				 errhint("Name one as stash@{n}, or by n.")));
+	return (int) n;
+}
+
+static void
+no_stashes(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("No stash entries found.")));
+}
+
+/*
+ * dolt_stash(VARIADIC args text[]) returns text[]: {status}
+ *
+ * As Dolt's, but for the working set alone (there is no staging area, so
+ * every change is one a stash takes, new tables too: -u and -a are
+ * accepted and change nothing):
+ *	push name: the working set set aside as name's newest stash (a commit
+ *		of it whose parent is the head), and the branch reset to its head;
+ *	pop name [stash@{n}]: name's newest (or nth) stash applied to the
+ *		working set and dropped;
+ *	apply name [stash@{n}]: applied, and kept;
+ *	drop name [stash@{n}]: dropped;
+ *	clear name: every one of name's dropped.
+ * A stash is applied three-way, its changes from the head it was pushed
+ * on, as a cherry-pick without a commit: refused where it conflicts with
+ * the branch or with changes not committed.
+ */
+Datum
+dolt_stash(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	const char *cmd = NULL;
+	const char *name = NULL;
+	const char *which = NULL;
+	const char *result[1] = {"0"};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (a[0] == '-')
+		{
+			if (is_option(a, "include-untracked") || strcmp(a, "-u") == 0 ||
+				is_option(a, "all") || strcmp(a, "-a") == 0)
+				continue;		/* (every change is staged) */
+			unsupported("dolt_stash", a);
+		}
+		else if (cmd == NULL)
+			cmd = a;
+		else if (name == NULL)
+			name = a;
+		else if (which == NULL)
+			which = a;
+		else
+			unexpected("dolt_stash", a);
+	}
+	if (cmd == NULL || name == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_stash needs a subcommand and a stash name"),
+				 errhint("As dolt_stash('push', 'name').")));
+	if (!PROLLY_HAS(refs(), stash_push) || !PROLLY_HAS(diff_merge(), apply))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't stash")));
+	PreventCommandIfReadOnly("dolt_stash()");
+
+	if (strcmp(cmd, "push") == 0)
+	{
+		ProllyNodeRef working;
+		ProllyNodeRef head_root;
+		ProllyHash	head;
+		ProllyHash	stash;
+		ProllyMergeState ms;
+
+		if (which)
+			unexpected("dolt_stash", which);
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a merge is in progress on the current branch"),
+					 errhint("Resolve its conflicts and commit, or abort it.")));
+		if (!PROLLY_CALL(refs(), working_set, NULL, &working) ||
+			!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+			!PROLLY_CALL(refs(), commit_working_set, &head, &head_root) ||
+			same_hash(&working.hash, &head_root.hash))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("No local changes to save")));
+		PROLLY_CALL(refs(), stash_push, name, &working, &stash);
+		/* (as dolt_reset('--hard') does) */
+		if (PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_SHARED &&
+			object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+			PROLLY_CALL(writers(), take, MyBranch);
+		note_integration();
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, "HEAD"));
+		settled();
+	}
+	else if (strcmp(cmd, "pop") == 0 || strcmp(cmd, "apply") == 0)
+	{
+		int			n = stash_index(which);
+		ProllyHash	stash;
+
+		/*
+		 * (chosen with the refs locked: no other session's push or drop
+		 * moves it before it's applied and, popped, dropped)
+		 */
+		if (!PROLLY_CALL(refs(), stash_select, name, n, &stash))
+			no_stashes();
+		refuse_violations("stash");
+
+		/*
+		 * (a write, as any: it makes no commit, so a protected branch
+		 * refuses it, and the branch is left with its changes)
+		 */
+		branch_note_write(MyBranch);
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), apply, hash_hex(&stash),
+										 "dolt_stash"));
+		if (strcmp(cmd, "pop") == 0)
+			(void) PROLLY_CALL(refs(), stash_drop, name, n);
+	}
+	else if (strcmp(cmd, "drop") == 0)
+	{
+		if (!PROLLY_CALL(refs(), stash_drop, name, stash_index(which)))
+			no_stashes();
+	}
+	else if (strcmp(cmd, "clear") == 0)
+	{
+		if (which)
+			unexpected("dolt_stash", which);
+		PROLLY_CALL(refs(), stash_clear, name);
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_stash has no subcommand \"%s\"", cmd),
+				 errhint("It takes push, pop, apply, drop and clear.")));
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* dolt_stashes()'s rows */
+static void
+put_stash(const char *name, int n, const char *branch, const ProllyHash *stash,
+		  void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	ProllyCommitInfo info;
+	ProllyCommitInfo head;
+	Datum		values[5];
+	bool		nulls[5] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = CStringGetTextDatum(psprintf("stash@{%d}", n));
+	values[2] = CStringGetTextDatum(branch);
+	if (PROLLY_CALL(refs(), commit_get, stash, &info) && info.nparents > 0 &&
+		PROLLY_CALL(refs(), commit_get, &info.parents[0], &head))
+	{
+		values[3] = CStringGetTextDatum(hash_hex(&info.parents[0]));
+		values[4] = CStringGetTextDatum(head.message);
+	}
+	else
+		nulls[3] = nulls[4] = true;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * dolt_stashes(OUT name text, OUT stash_id text, OUT branch text, OUT hash
+ *				text, OUT commit_message text) returns setof record
+ *
+ * Every stash, by list name, then newest first, as Dolt's dolt_stashes:
+ * its place (stash@{n}), the branch it was pushed from, and the head it
+ * was pushed on, with that commit's message.
+ */
+Datum
+dolt_stashes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (PROLLY_HAS(refs(), stashes))
+		PROLLY_CALL(refs(), stashes, put_stash, rsinfo);
+	return (Datum) 0;
 }
 
 /*
@@ -2438,6 +2868,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no cherry-pick to %s",
 							abort_pick ? "abort" : "continue")));
+		PreventCommandIfReadOnly("dolt_cherry_pick()");
 		if (abort_pick)
 		{
 			abort_in_progress("cherry-pick");
@@ -2480,6 +2911,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
+	PreventCommandIfReadOnly("dolt_cherry_pick()");
 	refuse_violations("cherry-pick");
 	note_integration();
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
@@ -2597,6 +3029,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("there is no revert in progress")));
+			PreventCommandIfReadOnly("dolt_revert()");
 			note_integration();
 			if (abort_revert)
 			{
@@ -2631,6 +3064,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("dolt_revert needs a commit")));
+			PreventCommandIfReadOnly("dolt_revert()");
 			revert_series(refs_given, nrefs, NULL, result);
 		}
 	}
@@ -5074,8 +5508,12 @@ dolt_verify_constraints(PG_FUNCTION_ARGS)
 	}
 	else
 		kept = found;
+	/* (--output-only writes nothing: a read-only transaction's to run) */
 	if (!output_only)
+	{
+		PreventCommandIfReadOnly("dolt_verify_constraints()");
 		PROLLY_CALL(refs(), set_violations, kept);
+	}
 	result[0] = found != NIL ? "1" : "0";
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -5214,6 +5652,7 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_conflicts_resolve needs --ours or --theirs")));
+	PreventCommandIfReadOnly("dolt_conflicts_resolve()");
 	branch_note_write(MyBranch);
 	BRANCH_WRITES_HUSHED(
 		foreach(lc, tables)
@@ -5577,6 +6016,7 @@ dolt_fetch(PG_FUNCTION_ARGS)
 		else
 			branches = lappend(branches, args[i]);
 	}
+	PreventCommandIfReadOnly("dolt_fetch()");
 	fetch_remote(remote ? remote : "origin", branches, NULL, NULL, false);
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -5772,6 +6212,55 @@ prolly_store_sizes(PG_FUNCTION_ARGS)
 }
 
 /*
+ * prolly_make_change_logs() returns setof regclass
+ *
+ * The change logs the session branch's prolly tables lack, made: tables
+ * made before logs were, or restored by pg_upgrade (which makes none),
+ * fold in full on every commit until one is.  Each table is locked as an
+ * ALTER that makes one locks it (ShareLock: its writers wait, so none
+ * writes rows the new log misses), in turn.  The tables given one.  An
+ * upgrade step, run on each branch.
+ */
+Datum
+prolly_make_change_logs(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	classes;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relids = NIL;
+
+	PreventCommandIfReadOnly("prolly_make_change_logs()");
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	classes = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relam == PROLLY_TABLE_AM_OID &&
+			(c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW) &&
+			!OidIsValid(prolly_change_log_relid(c->oid, c->relam)))
+			relids = lappend_oid(relids, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(classes, AccessShareLock);
+
+	foreach_oid(relid, relids)
+	{
+		Datum		value = ObjectIdGetDatum(relid);
+		bool		null = false;
+
+		if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+			continue;			/* (another's: theirs to make) */
+		prolly_make_change_log(relid, ShareLock);
+		if (OidIsValid(prolly_change_log_relid(relid, PROLLY_TABLE_AM_OID)))
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, &value, &null);
+	}
+	return (Datum) 0;
+}
+
+/*
  * prolly_page_sweep(OUT freed int8, OUT recounted int8, OUT truncated int8)
  *
  * The current database's page stores swept (bmap_sweep()), in every
@@ -5892,6 +6381,7 @@ dolt_push(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("branch names beginning \"%s\" are reserved", PROLLY_DETACHED_PREFIX),
 				 errhint("Push a branch made at the commit with dolt_branch().")));
+	PreventCommandIfReadOnly("dolt_push()");
 	if (!PROLLY_CALL(remote_refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -6009,6 +6499,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 		need_upstream("dolt_pull", &remote, &branch);
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
+	PreventCommandIfReadOnly("dolt_pull()");
 	fetch_remote(remote, list_make1(branch), NULL, NULL, false);
 
 	/* (after "--": a remote's name may begin with "-") */
@@ -6241,6 +6732,7 @@ dolt_clone(PG_FUNCTION_ARGS)
 
 	/* the remote added as dolt_remote() adds one, and fetched */
 	add_remote(remote, url);
+	PreventCommandIfReadOnly("dolt_clone()");
 	fetch_remote(remote, NIL, branch, &h, true);
 	if (h.branches == NIL)
 		ereport(ERROR,

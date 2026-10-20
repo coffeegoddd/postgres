@@ -76,6 +76,38 @@ SELECT dolt_remote('remove', 'dc_remote');
 ERROR:  cannot execute dolt_remote() in a read-only transaction
 SELECT dolt_reset('--hard', 'main');
 ERROR:  cannot execute dolt_reset() in a read-only transaction
+SELECT dolt_merge('main');
+ERROR:  cannot execute dolt_merge() in a read-only transaction
+SELECT dolt_cherry_pick('main');
+ERROR:  cannot execute dolt_cherry_pick() in a read-only transaction
+SELECT dolt_revert('main');
+ERROR:  cannot execute dolt_revert() in a read-only transaction
+SELECT dolt_conflicts_resolve('--ours', 'dc.t');
+ERROR:  cannot execute dolt_conflicts_resolve() in a read-only transaction
+SELECT dolt_verify_constraints();
+ERROR:  cannot execute dolt_verify_constraints() in a read-only transaction
+SELECT dolt_fetch('dc_remote');
+ERROR:  cannot execute dolt_fetch() in a read-only transaction
+SELECT dolt_pull('dc_remote', 'main');
+ERROR:  cannot execute dolt_pull() in a read-only transaction
+SELECT dolt_push('dc_remote', 'main');
+ERROR:  cannot execute dolt_push() in a read-only transaction
+SELECT dolt_stash('push', 's');
+ERROR:  cannot execute dolt_stash() in a read-only transaction
+-- (what writes nothing still runs: a check that only reports, and an
+-- abort or continue with nothing in progress says so)
+SELECT dolt_verify_constraints('--output-only');
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+SELECT dolt_merge('--abort');
+ERROR:  there is no merge to abort
+SELECT dolt_cherry_pick('--abort');
+ERROR:  there is no cherry-pick to abort
+SELECT dolt_revert('--continue');
+ERROR:  there is no revert in progress
 -- A branch made there is writable.
 SELECT (dolt_checkout('-b', 'from_first'))[2];
           dolt_checkout          
