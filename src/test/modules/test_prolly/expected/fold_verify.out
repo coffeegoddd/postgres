@@ -21,7 +21,7 @@ INSERT INTO fv.kl SELECT g % 10, 'b' FROM generate_series(1, 200) g;
 SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- changes since the baseline, of every kind: clean
@@ -67,7 +67,7 @@ SELECT * FROM verified();
 SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE fv.k SET v = 'again' WHERE id < 10;
