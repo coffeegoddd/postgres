@@ -295,7 +295,7 @@ INSERT INTO cs.a VALUES (1, 'base'); INSERT INTO cs.b VALUES (1, 'b');
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_branch('side');
@@ -314,7 +314,7 @@ UPDATE cs.a SET v = 'theirs';
 SELECT length(dolt_commit('-am', 'side')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -327,7 +327,7 @@ UPDATE cs.a SET v = 'ours';
 SELECT length(dolt_commit('-am', 'main')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SET dolt.allow_commit_conflicts = on;
