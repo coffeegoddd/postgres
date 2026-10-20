@@ -301,6 +301,73 @@ stash, …) is F, ported with the feature (#163).
 - **Port:** a case that makes a branch named `--` expects the
   `invalid branch name` error (SQLSTATE 42602) instead.
 
+## D15. Schema diffs cover every versioned object
+
+- **Dolt:** `dolt_diff_summary` and `dolt_schema_diff` list tables, by
+  their unqualified names, `''` for the side a table isn't on. Their
+  arguments must be literals (or bind variables): `concat(...)`,
+  `hashof(...)` or `lower(...)` as an argument is an error. A table
+  whose primary key changed is refused by the three-argument summary
+  and skipped, with a warning, by the two-argument one. An
+  `AUTO_INCREMENT` counter is part of its table's schema, so raising it
+  changes the table's schema.
+- **Prolly:** both functions list every kind a commit holds (tables,
+  views, materialized views, routines as `schema.f(args)`, types,
+  sequences, versioned schemas), named qualified as `dolt_status` names
+  them (`public.t`, as Doltgres does), `''` for a missing side. A
+  serial's or identity column's sequence is an object of its own, so a
+  key handed out changes the sequence's data (its value), not the
+  table (D6). A name argument is qualified or found on the search path
+  (Doltgres finds an unqualified name in any schema). Arguments are any
+  expressions of type text, as for any Postgres function; a wrong count
+  or type is `42883` (no such function), a NULL ref `22004`.
+- **Why:** spec 21's decision (user, 2026-10-19): the other kinds are
+  versioned too, and leaving them out would hide changes `dolt_status`
+  shows. Functions resolve by argument types in Postgres.
+- **Port:** expect qualified names, and the rows of the other objects a
+  case's statements change (a versioned schema made, a sequence moved);
+  an argument Dolt refuses as not a literal is evaluated, and the
+  assertion expects the result. A primary-key-change case is deferred
+  until it is decided whether prolly should refuse it too (its summary
+  reads no rows, so it can list the table as modified).
+
+## D16. Schema diffs give Postgres DDL
+
+- **Dolt:** `dolt_schema_diff`'s statements are MySQL's `SHOW CREATE
+  TABLE` (backquoted names, `ENGINE=InnoDB ...`); Doltgres's are a
+  Postgres-like `CREATE TABLE` with the key inline.
+- **Prolly:** each side is rendered from that version's canonical
+  description, never the catalogs, as the statements a move would run,
+  one per line: a table is `CREATE TABLE schema.t (cols);` with the
+  columns' defaults and collations, then `ALTER TABLE ... ADD CONSTRAINT
+  ...;` for each NOT NULL, key, check and foreign key, then its indexes
+  (`CREATE INDEX ... USING btree (...)`), row security, policies,
+  triggers, rules and statistics; other kinds the statement that makes
+  them.
+- **Why:** Postgres's DDL, from what the commit holds (spec 21, 4.2);
+  constraints are named objects in Postgres, so they are statements of
+  their own.
+- **Port:** expected statements are prolly's rendering of the case's
+  tables; which rows appear, and which side is empty, are Dolt's.
+
+## D17. Renames are matched by content
+
+- **Dolt:** a table renamed is matched by its columns' tags, which
+  survive renames, so a table renamed and changed in one commit (rows
+  added, say) is one `renamed` row.
+- **Prolly:** the canonical form has no tags. A dropped and an added
+  object of one kind whose definitions (but for their own names) and
+  data are equal, and the only such pair, are one `renamed` row
+  (`data_change` false, `schema_change` true, as Dolt's); a rename that
+  also changes rows or definition is a drop and an add. A name argument
+  naming either side gives the one row, as in Dolt.
+- **Why:** spec 09's rule, a rename is a removal and an addition of
+  identical content (spec 21, 4.3); nothing else in a commit says two
+  objects are one.
+- **Port:** a case renaming a table and changing its rows in one commit
+  expects a `dropped` and an `added` row; one asking by either name
+  gets that name's row alone.
+
 ## D23. `dolt_gc()` returns a status, not statistics
 
 - **Dolt:** `CALL dolt_gc()` returns a status row (`{0}`), and logs

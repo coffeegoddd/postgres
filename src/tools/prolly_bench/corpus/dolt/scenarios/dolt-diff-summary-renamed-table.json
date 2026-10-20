@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-renamed-table",
+  "description": "Reviewed Dolt port: renamed table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: renamed table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (a int PRIMARY KEY, b int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new table"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "rename",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 RENAME TO t2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "insert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renamed table"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD', 't2')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.t2",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ],
+          [
+            "",
+            "public.t2",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD', 't1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

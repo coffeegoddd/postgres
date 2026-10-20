@@ -1,0 +1,28 @@
+{
+		Name: "new table",
+		SetUpScript: []string{
+			"create table t1 (a int primary key, b int)",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "select * from dolt_diff_summary('HEAD', 'WORKING')",
+				Expected: []sql.Row{{"", "t1", "added", false, true}},
+			},
+			{
+				Query:    "select * from dolt_diff_summary('WORKING', 'HEAD')",
+				Expected: []sql.Row{{"t1", "", "dropped", false, true}},
+			},
+			{
+				Query:            "insert into t1 values (1,2)",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "select * from dolt_diff_summary('HEAD', 'WORKING', 't1')",
+				Expected: []sql.Row{{"", "t1", "added", true, true}},
+			},
+			{
+				Query:    "select * from dolt_diff_summary('WORKING', 'HEAD', 't1')",
+				Expected: []sql.Row{{"t1", "", "dropped", true, true}},
+			},
+		},
+	}

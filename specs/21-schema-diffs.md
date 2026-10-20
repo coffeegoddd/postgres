@@ -108,7 +108,9 @@ a Postgres `CREATE TABLE`:
   differs, or a sequence's value. `false` for kinds without data.
 - `schema_change`: the description (definition) differs. Added and
   dropped objects have both flags `true` if they hold data, otherwise
-  `schema_change` alone.
+  `schema_change` alone: a table or materialized view holds data when
+  it has rows (an empty table added is `false`, `true`, as in Dolt's
+  `HasDataChanged`), a sequence always (its value).
 - `WORKING` and `STAGED` read as `dolt_diff` reads them. Objects a read
   leaves out are listed as `dolt_status` lists them: `diff_type` `not
   covered`, both flags NULL.
@@ -148,7 +150,12 @@ add. Proposed for diffs:
   description and data tree hash are equal are reported as one
   `renamed` row, both names given. Matched in a hash table, O(u + v)
   for u dropped and v added (spec 10, status row). Only one-to-one
-  matches count; several equal candidates stay dropped and added.
+  matches count; several equal candidates stay dropped and added. Its
+  flags are Dolt's for a rename: `data_change` `false` (the rows are
+  equal), `schema_change` `true` (the name is part of the definition;
+  `dolt_schema_diff` gives the row too). A rename that also changes rows
+  or definition is a drop and an add, where Dolt, matching by column
+  tags, reports `renamed` (spec 18, D17).
 - **Columns.** The canonical form doesn't record dropped columns, so a
   rename and a drop plus an add at the end are the same description; the
   schema diff shows both statements and doesn't call it a rename.
@@ -202,6 +209,21 @@ database's history, which `dolt_log` already shows anyone.
   spec 18.
 - Spec 18 gains entries: other kinds than tables in both functions;
   Postgres DDL in statements; renames matched by content, not tags.
+
+**As ported:** of the 19 Dolt cases, 11 summary cases are ported whole
+(now P, area `diff-tables`), and 5 in part: `WORKING and STAGED` (its
+STAGED-versus-WORKING assertions are about the staging area, D1), two
+summary cases left F on `diff-ranges` (Dolt's `a..b` and `a...b`
+arguments, which prolly lacks), `basic schema changes` F on `tags`
+(and ranges), and `prepared table functions` F on `diff-tables`
+(`dolt_diff_stat`). Three are deferred: the two primary-key-change
+cases (Dolt refuses or skips such a table; prolly lists it as modified,
+to be decided, D15) and the drop-and-recreate case, whose setup is
+computed and is checked in `schema_diffs` instead. Spec 18's D15–D17
+are the entries. Porting found two differences from Dolt, fixed to
+match it: an empty table added or dropped had `data_change` true, and
+a renamed object `schema_change` false. Doltgres's cases are in
+`schema_diffs`.
 
 ## 7. Decisions
 

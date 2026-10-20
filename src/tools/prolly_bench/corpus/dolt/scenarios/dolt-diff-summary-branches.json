@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-branches",
+  "description": "Reviewed Dolt port: diff with branch refs",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: diff with branch refs"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20), c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "insert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one', 'two')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 1 into t in main"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "branch1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "drop-c2",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP COLUMN c2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "dropping column c2 in branch1"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "delete-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t WHERE pk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "deleting row 1 in branch1"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "insert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 'two')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 2 in branch1"
+      ],
+      "save": "commit5"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "insert-main",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 'two', 'three')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit6",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 2 in main"
+      ],
+      "save": "commit6"
+    },
+    {
+      "id": "create-newtable",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE newtable (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert-newtable",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO newtable VALUES (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit7",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "new table newtable"
+      ],
+      "save": "commit7"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main', 'branch1', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main', 'branch1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ],
+          [
+            "public.newtable",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('branch1', 'main', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('main~2', 'branch1', 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "public.t",
+            "modified",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

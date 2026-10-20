@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-new-table",
+  "description": "Reviewed Dolt port: new table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: new table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "commit0"
+    },
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (a int PRIMARY KEY, b int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD', 'WORKING')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.t1",
+            "added",
+            "f",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('WORKING', 'HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "",
+            "dropped",
+            "f",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 't1')",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "public.t1",
+            "added",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('WORKING', 'HEAD', 't1')",
+      "expect": {
+        "rows": [
+          [
+            "public.t1",
+            "",
+            "dropped",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

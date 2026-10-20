@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "id": "dolt-diff-summary-sequence",
+  "description": "Reviewed Dolt port: raising the autoincrement value should be seen as a schema change",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSummaryTableFunctionScriptTests: raising the autoincrement value should be seen as a schema change"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "create",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk serial PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "insert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (DEFAULT)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "first commit"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "insert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (DEFAULT)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "delete-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t WHERE pk = 2",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "second commit"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_summary('HEAD~', 'HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "public.t_pk_seq",
+            "public.t_pk_seq",
+            "modified",
+            "t",
+            "f"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

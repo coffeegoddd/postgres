@@ -22352,6 +22352,2803 @@
         "The tag the setup makes isn't: prolly has no tags (F tags), and nothing reads it.",
         "Dolt's doltCommit placeholders are the commits captured as they are made. (D7)"
       ]
+    },
+    {
+      "id": "dolt-diff-summary-arguments",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 0,
+      "name": "invalid arguments",
+      "source_sha256": "07bf5f458e45785700071edd25135a7b40160fa1ebc102cebad1b3c49862eefc",
+      "scenario_sha256": "6a352eb5654398d8a88eb1b757da0cc2055f8cc7cded7b543f136361a8cb7b96",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "No dolt_diff_summary takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4, D15)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "No dolt_diff_summary takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4, D15)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "No dolt_diff_summary takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4, D15)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "A NULL ref is refused: SQLSTATE 22004 (null value not allowed), Dolt's ErrInvalidArgumentDetails. (D4, D15)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "An integer argument: no dolt_diff_summary takes one, SQLSTATE 42883. (D4, D15)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "An integer argument: no dolt_diff_summary takes one, SQLSTATE 42883. (D4, D15)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "An integer argument: no dolt_diff_summary takes one, SQLSTATE 42883. (D4, D15)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "A branch that doesn't exist: SQLSTATE 42704, Dolt's 'branch not found'. (D4)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Refused, SQLSTATE 42704, as Dolt refuses it ('branch not found'); prolly has no range form yet (feature diff-ranges), so it is refused as a ref that doesn't exist. (D4)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "A branch that doesn't exist: SQLSTATE 42704, Dolt's 'branch not found'. (D4)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "Refused, SQLSTATE 42704, as Dolt refuses it ('branch not found'); prolly has no range form yet (feature diff-ranges), so it is refused as a ref that doesn't exist. (D4)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "Dolt refuses a non-literal argument; a Postgres function's arguments are expressions, so the ref is 'fake-branch', which doesn't exist: still refused, SQLSTATE 42704. (D4, D15)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Dolt refuses a non-literal argument; prolly evaluates it (D15): hashof is dolt_hashof, main's head is commit2, so nothing differs."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Dolt refuses a non-literal argument; prolly evaluates it (D15): the name is 't', whose rows commit2 inserted. PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Argument errors are SQLSTATEs: a wrong count or type of arguments finds no function (42883), a NULL ref is 22004, a missing ref 42704. (D4)",
+        "Arguments are any text expressions, as a Postgres function's: Dolt's refusals of non-literal arguments become the expressions' results. (D15)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)"
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 1,
+      "name": "basic case with single table",
+      "source_sha256": "0287b23195e2a95a0d6017705cc84bd631aad6754a65a567ca6571a84f2c35f3",
+      "scenario_sha256": "bbd2820237ae63c5300a2a8a5a09c43ae4347fd641ccf4d052dfab69133f9efd",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Preserved: an empty commit (--allow-empty). Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "insert-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "insert-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "drop"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved: no rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-keyless",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 2,
+      "name": "basic case with single keyless table",
+      "source_sha256": "d52ea9f9d9a3657eb4d5b0ce68d4fe938461e764733a22de7c37985a9bb3bcfa",
+      "scenario_sha256": "fc25f6697f9f303bea4b416c96b68ed11079bea05158793da2b3a06b189ca710",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Preserved: an empty commit (--allow-empty). Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "insert-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "insert-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "drop"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved: no rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-tables",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 3,
+      "name": "basic case with multiple tables",
+      "source_sha256": "386412238ddaff4339fcf33c47ab9bae34b0c41cc8529326d26ee091079bb062",
+      "scenario_sha256": "385be9de476a8f2dac61593655f0a6d9e4f1b41b2866b5fbeef259486da681a7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create-t"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "insert-t"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "create-t2"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "insert-t2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "insert-t-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "update-t"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "insert-t2-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "delete-t"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "update-t2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "create-keyless"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-working-staged",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 4,
+      "name": "WORKING and STAGED",
+      "source_sha256": "0ed34c029e805144ca58413e230b4d1ab3f8e76efdc6304c3a61da4835055bb8",
+      "scenario_sha256": "7669f089f9d3d3d6c7b5bd27e3c18c2a3d9ae1dc479c9bbd31347227e052141a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "insert-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "delete"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "Left out: Dolt's staging area is still at commit1 here, so STAGED and WORKING differ; prolly has no staging area (STAGED reads as the working set), so the assertion is about the index. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Left out: Dolt's staging area is still at commit1 here, so STAGED and WORKING differ; prolly has no staging area (STAGED reads as the working set), so the assertion is about the index. (D1) Its range form ('STAGED..WORKING') is also one prolly lacks yet (feature diff-ranges)."
+        },
+        {
+          "index": 3,
+          "steps": [],
+          "note": "Left out: Dolt's staging area is still at commit1 here, so STAGED and WORKING differ; prolly has no staging area (STAGED reads as the working set), so the assertion is about the index. (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 5,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by the call's success, its status 0; dolt_add stages nothing (D1). CALL becomes SELECT. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved: no rows. (STAGED reads as the working set, D1.)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them).",
+        "STAGED reads as the working set (no staging area); assertions that tell the two apart are left out. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-branches",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 5,
+      "name": "diff with branch refs",
+      "source_sha256": "f2bca7e80ac013c265b26c3ae3dd5bdf06c46416fc981cdf9179e5a838412e0b",
+      "scenario_sha256": "a13b2d816dafa32b90019a51c95086257e173a6c0d3a38ee9a4929d5074f3939",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "insert-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "branch1",
+            "checkout-branch1"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "drop-c2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "delete-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "insert-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "insert-main"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 19,
+          "steps": [
+            "commit6"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "commit6"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 21,
+          "steps": [
+            "create-newtable"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 22,
+          "steps": [
+            "insert-newtable"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 23,
+          "steps": [
+            "commit7"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 24,
+          "steps": [
+            "commit7"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 3,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 5,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 7,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 8,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 9,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 10,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 11,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 12,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 13,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 14,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_checkout('-b') becomes a branch plus a checkout. (D3)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them).",
+        "Dolt's range arguments ('a..b', 'a...b') are left out: prolly has none yet (feature diff-ranges)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-drop-add-column",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 6,
+      "name": "schema modification: drop and add column",
+      "source_sha256": "b72441942b926e17aea4f0bef660bc7fe642f9a89bed8df969b818e4687d48e0",
+      "scenario_sha256": "8fd13f88b6796b6ecedf2f817f5d6ba1c50ebc8b6139054d4b7f6014594963c3",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "drop-c2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "insert-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "add-c2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "insert-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-rename-column",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 7,
+      "name": "schema modification: rename columns",
+      "source_sha256": "746d0ae92d81064bfc390ccbc7e082b125b342e26ea09d0339ec4bfead8f70d1",
+      "scenario_sha256": "3ea898de123f72330f4ed2b4289ed862a9d1c639824113d22fa876f9bf695816",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "rename-c3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "insert-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "update"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "rename-c2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "insert-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f. A column renamed alone leaves the data tree as it was: no data change."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-new-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 8,
+      "name": "new table",
+      "source_sha256": "7eaebe2dea650b012c343883676e64eb3c3ebbcffdbcbfd9b04f294337634155",
+      "scenario_sha256": "62b054f29801c1812dc0f146e00d05e2382455a7c33659765a16203b1e3ae534",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial",
+            "create"
+          ],
+          "note": "Preserved DDL. Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD'). (Without it HEAD is empty and the versioned schema itself is added.)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by the insert's success and its command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-dropped-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 9,
+      "name": "dropped table",
+      "source_sha256": "df0789afa4350c1001b35c3296623ec76b7bb6876733b9efd12015280e715a91",
+      "scenario_sha256": "1bc8deab4151ae9fc9969db690d42daa4ee9cef3214484a77b37b7114606ee16",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "drop"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-renamed-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 10,
+      "name": "renamed table",
+      "source_sha256": "0f729b6da08fa0c15230030627bf06f1ba4ec4e2b4be2143e4070c61473d8dc7",
+      "scenario_sha256": "46268057667d466314055eca3fb97a5641fa29998a461268d4c7b944b25df8b7",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "rename"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "insert-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the new name: its row. PostgreSQL booleans read t/f. (D15)"
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). PostgreSQL booleans read t/f. (D15)"
+        },
+        {
+          "index": 3,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the old name (a name only the older version has, as in Dolt): its row. PostgreSQL booleans read t/f. (D15)"
+        },
+        {
+          "index": 5,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them).",
+        "A rename is matched by content, not column tags: renamed and changed in one commit is a drop and an add. (D17)",
+        "Dolt's range arguments ('a..b') are left out: prolly has none yet (feature diff-ranges)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-foreign-key",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 11,
+      "name": "foreign key change",
+      "source_sha256": "ba24a3a695e1ab61200a365a3100fb1c2c51f980cd067f15827d87a7626c1197",
+      "scenario_sha256": "7bf6a4dbe81ce7828c756a93a6475b65badce6a885ba092ea1b79ee474654814",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create-test"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert-test"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "create-test2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "add-fk"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "insert-test2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "drop-fk"
+          ],
+          "note": "MySQL's DROP FOREIGN KEY is PostgreSQL's DROP CONSTRAINT. (D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "MySQL DDL in PostgreSQL syntax. (D10)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-short-tuple",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 12,
+      "name": "add multiple columns, then set and unset a value. Should not show a diff",
+      "source_sha256": "8b2a944d3e9ce97a9f0878750776d7a8292f4afb2149d0d1bfa326642c5c810c",
+      "scenario_sha256": "04e55871b5cc1d1573a3630dc7e5c2e94aebd13848ed0abcba068c18c19aabb6",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "add-col1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "add-col2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "add-columns"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "add-columns"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "set"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "unset"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "fix"
+          ],
+          "note": "Preserved --allow-empty: the rows are as they were, so nothing else changed. Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved upstream rows; names qualified, '' for the missing side. (D15) PostgreSQL booleans read t/f."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved: no rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-diff-summary-sequence",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 15,
+      "name": "raising the autoincrement value should be seen as a schema change",
+      "source_sha256": "0ae4417d8acfe39686ff0d7815be463eeed5b5e269884e1c0b4e853f45f0a200",
+      "scenario_sha256": "55bcaaa4b4149a51f1dc43e37bef0be551b1c775ddcccbcf7460a19a5000dab8",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create"
+          ],
+          "note": "MySQL's auto_increment key is a serial. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert-1"
+          ],
+          "note": "The key 1, generated: MySQL's explicit key raises the AUTO_INCREMENT counter, but a Postgres sequence moves only when it hands out a key, so the rows take DEFAULT (the same keys). (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "insert-2"
+          ],
+          "note": "The key 2, generated, as for the first row. (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "delete-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Dolt's counter is part of its table's schema, so t's schema changed; prolly's is the serial's sequence, a versioned object of its own (D6), listed with the other kinds (D15): its value moved (data), its definition didn't, and t's rows and definition are as they were. PostgreSQL booleans read t/f."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "MySQL's AUTO_INCREMENT is a serial, its keys generated. (D10)",
+        "A serial's sequence is a versioned object of its own: its value is its data. (D6, D15)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Booleans read t/f; rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-schema-diff-basic",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "SchemaDiffTableFunctionScriptTests",
+      "index": 0,
+      "name": "basic schema changes",
+      "source_sha256": "449fe6530d0ea8cc5dc13e107d7981ecffd31d4eb7a3fa1675daf53357636685",
+      "scenario_sha256": "9ff91a9e422ffede1866bbc416b3d2f91ad01b886cadf42a7f4b03e2754543cb",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create-employees"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "create-vacations"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit0"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit0"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit0"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "branch1",
+            "checkout-branch1"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "create-inventory"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "drop-employees"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "rename-vacations"
+          ],
+          "note": "MySQL's RENAME TABLE is PostgreSQL's ALTER TABLE ... RENAME TO. (D10)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "branch2",
+            "checkout-branch2"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "alter-inventory"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 18,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 19,
+          "steps": [
+            "branch3",
+            "checkout-branch3"
+          ],
+          "note": "dolt_checkout -b as a branch from HEAD plus a checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 20,
+          "steps": [
+            "insert-inventory"
+          ],
+          "note": "Preserved: the integers are assigned to the varchar columns as text, as in MySQL."
+        },
+        {
+          "index": 21,
+          "steps": [
+            "commit3"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 22,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 23,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 24,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15) (The tag doesn't matter: one argument is refused.)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "An empty ref is refused, as Dolt refuses it: no ref of that name, SQLSTATE 42704. (D4)"
+        },
+        {
+          "index": 6,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "A table's name isn't a ref: SQLSTATE 42704, Dolt's 'branch not found'. (D4)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "No dolt_schema_diff takes these arguments (prolly's takes two refs, with no one-argument range form): SQLSTATE 42883, Dolt's argument error. (D4, D15)"
+        },
+        {
+          "index": 9,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 10,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 14,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 16,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "Preserved: no rows. A change of rows alone gives no row, as in Dolt."
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 20,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 21,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 22,
+          "steps": [
+            "assert-22"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 23,
+          "steps": [
+            "assert-23"
+          ],
+          "note": "Preserved: no rows."
+        },
+        {
+          "index": 24,
+          "steps": [
+            "assert-24"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16). vacations and trips are one row, as in Dolt: renamed alone, its definition (but for its name) and rows equal (D17); its key's constraints keep the names they were made with."
+        },
+        {
+          "index": 25,
+          "steps": [
+            "assert-25"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16). vacations and trips are one row, as in Dolt: renamed alone, its definition (but for its name) and rows equal (D17); its key's constraints keep the names they were made with."
+        },
+        {
+          "index": 26,
+          "steps": [
+            "assert-26"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 27,
+          "steps": [
+            "assert-27"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 28,
+          "steps": [
+            "assert-28"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 29,
+          "steps": [
+            "assert-29"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 30,
+          "steps": [
+            "assert-30"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16). vacations and trips are one row, as in Dolt: renamed alone, its definition (but for its name) and rows equal (D17); its key's constraints keep the names they were made with."
+        },
+        {
+          "index": 31,
+          "steps": [
+            "assert-31"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16). vacations and trips are one row, as in Dolt: renamed alone, its definition (but for its name) and rows equal (D17); its key's constraints keep the names they were made with."
+        },
+        {
+          "index": 32,
+          "steps": [
+            "assert-32"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16). vacations and trips are one row, as in Dolt: renamed alone, its definition (but for its name) and rows equal (D17); its key's constraints keep the names they were made with."
+        },
+        {
+          "index": 33,
+          "steps": [
+            "assert-33"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16). vacations and trips are one row, as in Dolt: renamed alone, its definition (but for its name) and rows equal (D17); its key's constraints keep the names they were made with."
+        },
+        {
+          "index": 34,
+          "steps": [
+            "assert-34"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 35,
+          "steps": [
+            "assert-35"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 36,
+          "steps": [
+            "assert-36"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 37,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 38,
+          "steps": [],
+          "note": "Dolt's two- or three-dot range argument: prolly's functions take the two refs as separate arguments and have no range form yet (feature diff-ranges)."
+        },
+        {
+          "index": 39,
+          "steps": [
+            "assert-39"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 40,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 41,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 42,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 43,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 44,
+          "steps": [
+            "assert-44"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 45,
+          "steps": [
+            "assert-45"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 46,
+          "steps": [
+            "assert-46"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 47,
+          "steps": [
+            "assert-47"
+          ],
+          "note": "Dolt's rows (which objects, which side empty), names qualified (D15); each statement is prolly's Postgres DDL, rendered from that commit's description: the table, then its NOT NULL and key as constraints (D16)."
+        },
+        {
+          "index": 48,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        },
+        {
+          "index": 49,
+          "steps": [],
+          "note": "Left out: prolly has no tags yet (feature tags)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_checkout('-b') becomes a branch plus a checkout. (D3)",
+        "MySQL DDL in PostgreSQL syntax. (D10)",
+        "Objects are named qualified, as dolt_status names them (public.t), '' for the side an object isn't on, as Doltgres has it. (D15)",
+        "Statements are prolly's Postgres DDL, rendered from each commit's description. (D16)",
+        "Tags (dolt_tag, a tag as a ref) and range arguments ('a..b', 'a...b') are left out: prolly has neither yet (features tags, diff-ranges).",
+        "Rows compared as bags (Dolt's harness doesn't order them)."
+      ]
+    },
+    {
+      "id": "dolt-schema-diff-prepared",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "SchemaDiffTableFunctionScriptTests",
+      "index": 1,
+      "name": "prepared table functions",
+      "source_sha256": "d8d0c973a78ed6dad2662c00030c13b4329484959b9a4a4b0784045369b65e81",
+      "scenario_sha256": "c8bcdad0bd1033f0b9c729cdec8c00d9a18e973f21260d846cd88915c20b228a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "create-t1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "insert-t1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit0"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "save-commit0"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, kept in a session setting (vars.commitN) for EXECUTE, which takes no bind parameters. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit0"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "add-b"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "save-commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, kept in a session setting (vars.commitN) for EXECUTE, which takes no bind parameters. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "create-t2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "insert-t2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "insert-t1-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "save-commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, kept in a session setting (vars.commitN) for EXECUTE, which takes no bind parameters. (D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "prepare-sch-diff"
+          ],
+          "note": "MySQL's PREPARE ... FROM '...?...' is PostgreSQL's PREPARE name(text, text, text) AS ...$1...; the same query. (D10)"
+        },
+        {
+          "index": 16,
+          "steps": [],
+          "note": "Left out: dolt_diff_stat, which prolly lacks yet (feature diff-tables)."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "prepare-diff-sum"
+          ],
+          "note": "MySQL's PREPARE ... FROM '...?...' is PostgreSQL's PREPARE name(text, text, text) AS ...$1...; the same query. (D10)"
+        },
+        {
+          "index": 18,
+          "steps": [
+            "prepare-patch"
+          ],
+          "note": "MySQL's PREPARE ... FROM '...?...' is PostgreSQL's PREPARE name(text, text, text) AS ...$1...; the same query. (D10)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's @t1_name is a session setting. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "MySQL's EXECUTE ... USING @a, @b, @c is EXECUTE name(current_setting(...), ...). Preserved count. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Left out: dolt_diff_stat, which prolly lacks yet (feature diff-tables)."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "MySQL's EXECUTE ... USING @a, @b, @c is EXECUTE name(current_setting(...), ...). Preserved count. (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "MySQL's EXECUTE ... USING @a, @b, @c is EXECUTE name(current_setting(...), ...). Preserved count. (D10)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; commit ids are captured by the commit steps and kept in session settings for EXECUTE. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "MySQL's PREPARE/EXECUTE and @variables are PostgreSQL's PREPARE/EXECUTE and session settings. (D10)",
+        "dolt_diff_stat is left out: prolly lacks it yet (feature diff-tables)."
+      ]
     }
   ],
   "deferred": [
@@ -22834,6 +25631,30 @@
       "name": "hard reset dropped table with branch restores auto increment",
       "source_sha256": "90efb05eca8330d15b2d933e51e33366ca458d4348eae6410d8fb3ac22cbbc4e",
       "reason": "Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so the hard reset restores main's sequence as its commit has it and the next generated key is 3, not Dolt's 101: Dolt's auto-increment counter is kept across branches and continues past branch1's explicit 100. (A Postgres identity's sequence doesn't advance past a key given explicitly either.) The case is about that counter: ported, it would be DoltAutoIncrementTests 10 again."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 13,
+      "name": "pk set change should throw an error for 3 argument dolt_diff_summary",
+      "source_sha256": "561e92704e1bfdc0c5c85426eb6e00b941bff24463bcb5dad2282ef061845f81",
+      "reason": "A table whose primary key changed: Dolt's three-argument summary refuses it (its diff can't pair rows across keys). Prolly's summary compares data tree hashes and reads no rows, so it lists the table as modified, rows and definition. Whether prolly should refuse it too is to be decided (spec 18, D15)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 14,
+      "name": "pk set change should report warning for 2 argument dolt_diff_summary",
+      "source_sha256": "45d7a2f2697fd243b8f8f7225d752c08b2e3bdcb6fca387a0a05e14b8f259509",
+      "reason": "A table whose primary key changed: Dolt's two-argument summary leaves it out with a warning. Prolly lists it as modified, rows and definition, and raises no warning; whether to match Dolt is to be decided (spec 18, D15)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSummaryTableFunctionScriptTests",
+      "index": 16,
+      "name": "table drop and recreate with identical primary key reports modified data in diff summary",
+      "source_sha256": "a6c6bd3ff7323643ec401d28ceee0ca4b49377b8da7ad0eb0682a603f0ec36b2",
+      "reason": "Its setup is computed (dropAndRecreateScript(\"int\")), which the catalog leaves unresolved, so a port can't map it. Its assertion (a table dropped and made again, with other rows, is modified, data changed) is checked in test_prolly's schema_diffs instead."
     }
   ]
 }

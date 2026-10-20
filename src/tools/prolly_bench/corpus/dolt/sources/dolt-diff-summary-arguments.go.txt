@@ -1,0 +1,71 @@
+{
+		Name: "invalid arguments",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"call dolt_add('.')",
+			"set @Commit1 = '';",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'creating table t');",
+
+			"insert into t values(1, 'one', 'two'), (2, 'two', 'three');",
+			"set @Commit2 = '';",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'inserting into t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "SELECT * from dolt_diff_summary();",
+				ExpectedErr: sql.ErrInvalidArgumentNumber,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary('t');",
+				ExpectedErr: sql.ErrInvalidArgumentNumber,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary('t', @Commit1, @Commit2, 'extra');",
+				ExpectedErr: sql.ErrInvalidArgumentNumber,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary(null, null, null);",
+				ExpectedErr: sql.ErrInvalidArgumentDetails,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary(123, @Commit1, @Commit2);",
+				ExpectedErr: sql.ErrInvalidArgumentDetails,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary('t', 123, @Commit2);",
+				ExpectedErr: sql.ErrInvalidArgumentDetails,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary('t', @Commit1, 123);",
+				ExpectedErr: sql.ErrInvalidArgumentDetails,
+			},
+			{
+				Query:          "SELECT * from dolt_diff_summary('fake-branch', @Commit2, 't');",
+				ExpectedErrStr: "branch not found: fake-branch",
+			},
+			{
+				Query:          "SELECT * from dolt_diff_summary('fake-branch..main', 't');",
+				ExpectedErrStr: "branch not found: fake-branch",
+			},
+			{
+				Query:          "SELECT * from dolt_diff_summary(@Commit1, 'fake-branch', 't');",
+				ExpectedErrStr: "branch not found: fake-branch",
+			},
+			{
+				Query:          "SELECT * from dolt_diff_summary('main..fake-branch', 't');",
+				ExpectedErrStr: "branch not found: fake-branch",
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary(@Commit1, concat('fake', '-', 'branch'), 't');",
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary(hashof('main'), @Commit2, 't');",
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
+			},
+			{
+				Query:       "SELECT * from dolt_diff_summary(@Commit1, @Commit2, LOWER('T'));",
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
+			},
+		},
+	}
