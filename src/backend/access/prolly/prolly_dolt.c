@@ -3834,6 +3834,276 @@ dolt_diff(PG_FUNCTION_ARGS)
 }
 
 /* ------------------------------------------------------------------------
+ * Diff stats
+ * ------------------------------------------------------------------------
+ */
+
+/* What dolt_diff_stat() counts of one table's rows. */
+typedef struct StatSink
+{
+	ProllyDiffSink sink;		/* must be first */
+	Rows		from;			/* (two, as a modified row decodes both) */
+	Rows		to;
+	bool		keyless;
+	uint64		added;
+	uint64		deleted;
+	uint64		modified;
+	uint64		cells_modified;
+} StatSink;
+
+/* The columns of a modified row that differ, as the table is defined now. */
+static uint64
+cells_differing(StatSink *s, const ProllyValue *before, const ProllyValue *after)
+{
+	TupleDesc	desc = s->from.slot->tts_tupleDescriptor;
+	uint64		count;
+	uint64		n = 0;
+	MemoryContext old = rows_next(&s->from);
+
+	(void) rows_next(&s->to);
+	(void) rows_datum(&s->from, before, &count);
+	(void) rows_datum(&s->to, after, &count);
+	slot_getallattrs(s->from.slot);
+	slot_getallattrs(s->to.slot);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool		fnull = s->from.slot->tts_isnull[i];
+		bool		tnull = s->to.slot->tts_isnull[i];
+
+		if (att->attisdropped)
+			continue;
+		if (fnull != tnull ||
+			(!fnull && !datum_image_eq(s->from.slot->tts_values[i],
+									   s->to.slot->tts_values[i],
+									   att->attbyval, att->attlen)))
+			n++;
+	}
+	MemoryContextSwitchTo(old);
+	return n;
+}
+
+static void
+stat_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+			const ProllyKey *key, const ProllyValue *before,
+			const ProllyValue *after)
+{
+	StatSink   *s = (StatSink *) self;
+
+	if (s->keyless)
+	{
+		ProllyValue row;
+		uint64		was = 0;
+		uint64		is = 0;
+
+		/* (a keyless row's copies: those added or taken away) */
+		if (before)
+			PROLLY_CALL(s->from.c.keying, parse_value, s->from.keying, before, &row, &was);
+		if (after)
+			PROLLY_CALL(s->from.c.keying, parse_value, s->from.keying, after, &row, &is);
+		if (is > was)
+			s->added += is - was;
+		else
+			s->deleted += was - is;
+		return;
+	}
+	if (kind == PROLLY_DIFF_ADDED)
+		s->added++;
+	else if (kind == PROLLY_DIFF_REMOVED)
+		s->deleted++;
+	else
+	{
+		s->modified++;
+		s->cells_modified += cells_differing(s, before, after);
+	}
+}
+
+/* A version of a table: its rows (a count of its tree's items), its columns. */
+static void
+table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed)
+{
+	ProllyValue v = {(const uint8 *) item, len};
+	ProllyValue desc;
+	ProllyNodeRef data;
+	ProllyTreeEnv env;
+
+	memset(&data, 0, sizeof(data));
+	if (len < 1 || (uint8) item[0] > PROLLY_HASH_MAX_LEN || len < 1 + (uint8) item[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a canonical table item without its rows")));
+	data.hash.len = (uint8) item[0];
+	memcpy(data.hash.bytes, item + 1, data.hash.len);
+	desc.data = v.data + 1 + data.hash.len;
+	desc.len = v.len - 1 - data.hash.len;
+	*columns = list_length(PROLLY_CALL(canonicalizer(), table_columns, &desc, keyed));
+	prolly_folded_tree_env(&env);
+	*rows = PROLLY_CALL(prolly_tree_lookup("cow"), count, &env, &data);
+}
+
+/*
+ * Dolt's cells added and deleted, from the rows added and deleted and the
+ * cells before and after (its GetCellsAddedAndDeleted, as it counts them).
+ */
+static void
+cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
+					uint64 old_cells, uint64 new_cells,
+					uint64 *cells_added, uint64 *cells_deleted)
+{
+	double		inserts = (double) added * new_columns;
+	double		deletes = (double) deleted * new_columns;
+	double		diff = (double) new_cells - (double) old_cells;
+
+	if (diff > 0)
+	{
+		*cells_added = (uint64) (diff + deletes);
+		*cells_deleted = (uint64) deletes;
+	}
+	else if (diff < 0)
+	{
+		*cells_added = (uint64) inserts;
+		*cells_deleted = (uint64) (-diff + inserts);
+	}
+	else
+	{
+		*cells_added = (uint64) Max(inserts, deletes);
+		*cells_deleted = (uint64) Max(inserts, deletes);
+	}
+}
+
+/*
+ * dolt_diff_stat(from_ref text, to_ref text [, name text], OUT table_name
+ * text, OUT rows_unmodified int8, OUT rows_added int8, OUT rows_deleted
+ * int8, OUT rows_modified int8, OUT cells_added int8, OUT cells_deleted
+ * int8, OUT cells_modified int8, OUT old_row_count int8, OUT new_row_count
+ * int8, OUT old_cell_count int8, OUT new_cell_count int8) returns setof
+ * record
+ *
+ * For each table whose rows (or whose cells' count) differ between two
+ * refs, as Dolt's: the rows added, deleted and modified, found by the tree
+ * diff of its rows (what both sides share is skipped), the cells of the
+ * modified ones that differ (each decoded as the table is defined now),
+ * and the rows and cells each side has; cells added and deleted as Dolt
+ * counts them.  A keyless table's rows added and deleted are copies, the
+ * rest NULL, as in Dolt.  A table the session's branch hasn't, changed on
+ * both sides, can't have its rows diffed here (as dolt_diff can't): only
+ * its row and cell counts.
+ */
+Datum
+dolt_diff_stat(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name = NULL;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff_stat needs two refs")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
+		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, summary_rows(from_ref, to_ref, name, false))
+	{
+		SummaryRow *r = lfirst(lc);
+		const char *table = r->to_name ? r->to_name : r->from_name;
+		uint64		old_rows = 0;
+		uint64		new_rows = 0;
+		int			old_columns = 0;
+		int			new_columns = 0;
+		bool		keyed = true;
+		bool		counted = false;
+		StatSink	s;
+		Oid			relid;
+		Datum		values[12];
+		bool		nulls[12] = {0};
+
+		if (r->not_covered || r->object != PROLLY_OBJECT_TABLE)
+			continue;
+		if (r->from_item)
+			table_version(r->from_item, r->from_len, &old_rows, &old_columns, &keyed);
+		if (r->to_item)
+			table_version(r->to_item, r->to_len, &new_rows, &new_columns, &keyed);
+		memset(&s, 0, sizeof(s));
+		s.sink.change = stat_change;
+		s.keyless = !keyed;
+
+		/* (rows diffed where the branch has the table; one side's: counted) */
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(table, NULL)),
+								 NoLock, true);
+		if (OidIsValid(relid) && get_rel_relam(relid) == PROLLY_TABLE_AM_OID &&
+			(r->data_change || !keyed))
+		{
+			Relation	rel = table_open(relid, AccessShareLock);
+
+			check_history_rls(relid, "dolt_diff_stat");
+			rows_begin(&s.from, rel);
+			rows_begin(&s.to, rel);
+			table_close(rel, AccessShareLock);
+			PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s.sink);
+			rows_end(&s.from);
+			rows_end(&s.to);
+			counted = true;
+		}
+		else if (keyed && (r->from_item == NULL || r->to_item == NULL))
+		{
+			s.added = new_rows;
+			s.deleted = old_rows;
+			counted = true;
+		}
+		else if (keyed && !r->data_change)
+			counted = true;
+
+		/* (as Dolt: a table whose rows and cells' count are the same, none) */
+		if (counted && s.added + s.deleted + s.modified == 0 &&
+			old_rows * old_columns == new_rows * new_columns)
+			continue;
+
+		values[0] = CStringGetTextDatum(table);
+		for (int i = 1; i < 12; i++)
+			nulls[i] = true;
+		if (counted && keyed)
+		{
+			uint64		cells_added;
+			uint64		cells_deleted;
+
+			cells_added_deleted(s.added, s.deleted, new_columns,
+								old_rows * old_columns, new_rows * new_columns,
+								&cells_added, &cells_deleted);
+			values[1] = Int64GetDatum((int64) (old_rows - s.modified - s.deleted));
+			values[2] = Int64GetDatum((int64) s.added);
+			values[3] = Int64GetDatum((int64) s.deleted);
+			values[4] = Int64GetDatum((int64) s.modified);
+			values[5] = Int64GetDatum((int64) cells_added);
+			values[6] = Int64GetDatum((int64) cells_deleted);
+			values[7] = Int64GetDatum((int64) s.cells_modified);
+			for (int i = 1; i <= 7; i++)
+				nulls[i] = false;
+		}
+		else if (counted)
+		{
+			values[2] = Int64GetDatum((int64) s.added);
+			values[3] = Int64GetDatum((int64) s.deleted);
+			nulls[2] = nulls[3] = false;
+		}
+		if (keyed)
+		{
+			values[8] = Int64GetDatum((int64) old_rows);
+			values[9] = Int64GetDatum((int64) new_rows);
+			values[10] = Int64GetDatum((int64) (old_rows * old_columns));
+			values[11] = Int64GetDatum((int64) (new_rows * new_columns));
+			nulls[8] = nulls[9] = nulls[10] = nulls[11] = false;
+		}
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* ------------------------------------------------------------------------
  * Conflicts
  * ------------------------------------------------------------------------
  */

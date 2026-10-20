@@ -59,6 +59,7 @@ tests += {
       'commit_messages',
       'status_diff',
       'schema_diffs',
+      'diff_stat',
       'collations',
       'applier',
       'move_heads',
