@@ -90,7 +90,6 @@ PG_LWLOCK(55, LogicalDecodingControl)
 PG_LWLOCK(56, DataChecksumsWorker)
 PG_LWLOCK(57, AioWorkerControl)
 PG_LWLOCK(58, DataChecksumTransition)
-PG_LWLOCK(59, ProllyJournal)
 
 /*
  * There also exist several built-in LWLock tranches.  As with the predefined
