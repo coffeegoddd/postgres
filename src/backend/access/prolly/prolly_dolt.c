@@ -4044,6 +4044,135 @@ dolt_diff_table(PG_FUNCTION_ARGS)
 }
 
 /* ------------------------------------------------------------------------
+ * A commit's rows
+ * ------------------------------------------------------------------------
+ */
+
+/* What dolt_at() and dolt_history_table() put of a version's rows. */
+typedef struct AtSink
+{
+	ProllyDiffSink sink;		/* must be first */
+	ReturnSetInfo *rsinfo;
+	Rows		rows;
+	bool		history;		/* each row a column, with the commit's */
+	const ProllyCommitInfo *commit;
+	char	   *hash;
+	char	   *committer;
+} AtSink;
+
+static void
+at_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+		  const ProllyKey *key, const ProllyValue *before,
+		  const ProllyValue *after)
+{
+	AtSink	   *s = (AtSink *) self;
+	uint64		copies = 1;
+	MemoryContext old;
+	Datum		row;
+
+	/* (a diff from nothing: every row added) */
+	if (after == NULL)
+		return;
+	old = rows_next(&s->rows);
+	row = rows_datum(&s->rows, after, &copies);
+	if (!s->rows.keyless)
+		copies = 1;
+	for (uint64 i = 0; i < copies; i++)
+	{
+		if (s->history)
+		{
+			Datum		values[4];
+			bool		nulls[4] = {0};
+
+			values[0] = row;
+			values[1] = CStringGetTextDatum(s->hash);
+			values[2] = CStringGetTextDatum(s->committer);
+			values[3] = TimestampTzGetDatum(s->commit->committed_at);
+			tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc,
+								 values, nulls);
+		}
+		else
+			tuplestore_puttupleslot(s->rsinfo->setResult, s->rows.slot);
+	}
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * dolt_at(ref text, tbl anyelement) returns setof anyelement
+ *
+ * tbl's table's rows (its row type, as in NULL::t) as ref has them (any
+ * commit, branch or WORKING), read from ref's tree, never written to
+ * pages: as Dolt's AS OF.  Decoded as the table is defined now, as
+ * dolt_diff decodes them; a keyless row once a copy.
+ */
+Datum
+dolt_at(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	char	   *ref;
+	Relation	rel;
+	AtSink		s;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_at's ref can't be null")));
+	ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	rel = open_row_type_table(relid, "dolt_at", ACL_SELECT);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	rows_begin(&s.rows, rel);
+	PROLLY_CALL(diff_merge(), diff, NULL, ref, relid, &s.sink);
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_history_table(tbl anyelement, OUT row anyelement, OUT commit_hash
+ *					  text, OUT committer text, OUT commit_date timestamptz)
+ *	  returns setof record
+ *
+ * tbl's table's rows at each commit the head reaches (that has the table),
+ * with the commit, as Dolt's dolt_history_<table>: each read from the
+ * commit's tree, as dolt_at() reads it.
+ */
+Datum
+dolt_history_table(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	Relation	rel;
+	AtSink		s;
+	ListCell   *lc;
+
+	rel = open_row_type_table(relid, "dolt_history_table", ACL_SELECT);
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.history = true;
+	rows_begin(&s.rows, rel);
+	foreach(lc, log_entries("HEAD"))
+	{
+		LogEntry   *e = lfirst(lc);
+		char	   *email;
+
+		CHECK_FOR_INTERRUPTS();
+		s.commit = &e->info;
+		s.hash = hash_hex(&e->info.id);
+		split_author(e->info.author, &s.committer, &email);
+		PROLLY_CALL(diff_merge(), diff, NULL, s.hash, relid, &s.sink);
+	}
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/* ------------------------------------------------------------------------
  * Diff stats
  * ------------------------------------------------------------------------
  */

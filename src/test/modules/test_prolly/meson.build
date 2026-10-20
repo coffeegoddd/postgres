@@ -61,6 +61,7 @@ tests += {
       'schema_diffs',
       'diff_stat',
       'diff_history',
+      'as_of',
       'collations',
       'applier',
       'move_heads',
