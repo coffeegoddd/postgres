@@ -138,5 +138,22 @@ SELECT rows_modified = :ool_rows_modified AND cells_modified = :ool_cells_modifi
 	AS ool_as_on_the_branch
 FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.ool');
 
+-- a table the branch doesn't have, whose enum has had a label renamed
+-- since: its old values don't decode as the type is now, so its rows are
+-- counted and the cells modified are unknown
+CREATE TYPE ds.mood AS ENUM ('old', 'kept');
+CREATE TABLE ds.moody (id int PRIMARY KEY, m ds.mood);
+INSERT INTO ds.moody VALUES (1, 'old'), (2, 'kept');
+SELECT length(dolt_commit('-Am', 'moody')::text) AS committed;
+UPDATE ds.moody SET m = 'kept' WHERE id = 1;
+INSERT INTO ds.moody VALUES (3, 'kept');
+SELECT length(dolt_commit('-am', 'moody changed')::text) AS committed;
+DROP TABLE ds.moody;
+ALTER TYPE ds.mood RENAME VALUE 'old' TO 'renamed';
+SELECT table_name, rows_unmodified, rows_added, rows_deleted, rows_modified,
+	cells_added, cells_deleted, cells_modified, old_row_count, new_row_count
+FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.moody');
+DROP TYPE ds.mood;
+
 \c contrib_regression
 DROP DATABASE regress_diff_stat;

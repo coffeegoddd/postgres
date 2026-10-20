@@ -4432,6 +4432,7 @@ typedef struct StatSink
 	uint64		deleted;
 	uint64		modified;
 	uint64		cells_modified;
+	bool		cells_unknown;	/* a modified row's cells aren't compared */
 	int		   *from_of;		/* described versions: each of to's columns'
 								 * of from's, by name (-1: none) */
 } StatSink;
@@ -4523,7 +4524,8 @@ stat_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	else
 	{
 		s->modified++;
-		s->cells_modified += cells_differing(s, before, after);
+		if (!s->cells_unknown)
+			s->cells_modified += cells_differing(s, before, after);
 	}
 }
 
@@ -4633,6 +4635,54 @@ stat_described(StatSink *s, const SummaryRow *r)
 }
 
 /*
+ * stat_described(), its modified rows' cells compared where its values
+ * decode.  The columns' types are found by name as they're defined now, and
+ * a version's value may not read as one (an enum's label renamed since):
+ * then its rows are counted again, their cells modified unknown.
+ */
+static bool
+stat_described_or_counted(StatSink *s, const SummaryRow *r)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	StatSink	start = *s;
+	volatile bool read = false;
+	volatile bool decoded = false;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		read = stat_described(s, r);
+		decoded = true;
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		/* (a cancel, or anything else, isn't a value that doesn't decode) */
+		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION)
+			ReThrowError(ed);
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	if (decoded)
+		return read;
+	*s = start;
+	s->cells_unknown = true;
+	return stat_described(s, r);
+}
+
+/*
  * Dolt's cells added and deleted, from the rows added and deleted and the
  * cells before and after (its GetCellsAddedAndDeleted, as it counts them).
  */
@@ -4680,9 +4730,10 @@ cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
  * keyed otherwise than the versions are (a primary key made or dropped
  * since), changed on both sides, has its rows diffed from the trees, by
  * their keys' bytes (as no relation orders them), each version's decoded
- * by its own description, cells compared by column name.  With name,
- * that table's alone: one neither
- * version has is refused (as Dolt's; dolt_diff_summary gives none).
+ * by its own description, cells compared by column name (unknown, NULL,
+ * where a version's values don't decode as its columns' types are defined
+ * now).  With name, that table's alone: one neither version has is
+ * refused (as Dolt's; dolt_diff_summary gives none).
  */
 Datum
 dolt_diff_stat(PG_FUNCTION_ARGS)
@@ -4766,7 +4817,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			s.deleted = old_rows;
 			counted = true;
 		}
-		else if ((r->data_change || !keyed) && stat_described(&s, r))
+		else if ((r->data_change || !keyed) && stat_described_or_counted(&s, r))
 			counted = true;
 		else if (keyed && !r->data_change)
 			counted = true;
@@ -4796,6 +4847,7 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			values[7] = Int64GetDatum((int64) s.cells_modified);
 			for (int i = 1; i <= 7; i++)
 				nulls[i] = false;
+			nulls[7] = s.cells_unknown && s.modified > 0;
 		}
 		else if (counted)
 		{
