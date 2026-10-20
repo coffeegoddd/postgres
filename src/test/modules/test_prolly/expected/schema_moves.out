@@ -1424,7 +1424,7 @@ CREATE FUNCTION sb.from_t() RETURNS bigint LANGUAGE SQL RETURN (SELECT sum(d) FR
 SELECT length(dolt_commit('-Am', 'sb')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 DROP FUNCTION sb.from_m();
@@ -1475,7 +1475,7 @@ drop cascades to function sb.from_m()
 SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- a cast made with one: after it
@@ -1486,7 +1486,7 @@ CREATE CAST (sc.wrap AS int) WITH FUNCTION sc.unwrap(sc.wrap);
 SELECT length(dolt_commit('-Am', 'sc')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT dolt_hashof('HEAD') AS sc_head \gset
@@ -1528,6 +1528,6 @@ drop cascades to cast from sc.wrap to integer
 SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
