@@ -5816,6 +5816,47 @@ drop_routine_sql(const MoveItem *it)
 }
 
 /*
+ * Run each statement in a subtransaction of its own: those that fail, left
+ * for later (each as is), in order.
+ */
+static List *
+try_statements(List *stmts)
+{
+	MemoryContext mcxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	List	   *failed = NIL;
+	ListCell   *lc;
+
+	foreach(lc, stmts)
+	{
+		BeginInternalSubTransaction(NULL);
+		MemoryContextSwitchTo(mcxt);
+		PG_TRY();
+		{
+			int			rc = SPI_execute(lfirst(lc), false, 0);
+
+			if (rc < 0)
+				elog(ERROR, "could not run \"%s\": %s", (char *) lfirst(lc),
+					 SPI_result_code_string(rc));
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(mcxt);
+			CurrentResourceOwner = owner;
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(mcxt);
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(mcxt);
+			CurrentResourceOwner = owner;
+			failed = lappend(failed, lfirst(lc));
+		}
+		PG_END_TRY();
+	}
+	return failed;
+}
+
+/*
  * Make views, each after the views it uses, or drop them, each after those
  * using it: those that fail are tried again once others are done, until
  * none can be.
@@ -7013,6 +7054,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			void (*breaking) (List *added, void *arg), void *arg,
 			bool rewritten)
 {
+	List	   *sql_bodies = NIL;	/* routines with SQL-standard bodies */
 	bool		matviews_made = false;
 	List	   *replaced = NIL; /* ordinary schemas they replace */
 	Canon		cn;
@@ -7357,7 +7399,16 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			/* (CREATE OR REPLACE can't change what a routine returns) */
 			if (f && strcmp(routine_signature(f->def), routine_signature(t->def)) != 0)
 				sm.before = lappend(sm.before, drop_routine_sql(f));
-			sm.before = lappend(sm.before, t->def);
+			/*
+			 * (one with an SQL-standard body is parsed as it's made, so needs
+			 * what it reads, which may be a table or materialized view the
+			 * move makes: tried with the rest, again after the tables, and
+			 * last with the views, each after those it uses)
+			 */
+			if (strstr(t->def, "\nBEGIN ATOMIC") != NULL || strstr(t->def, "\nRETURN ") != NULL)
+				sql_bodies = lappend(sql_bodies, t->def);
+			else
+				sm.before = lappend(sm.before, t->def);
 		}
 	}
 	/* Casts coming, once the types and routines they name are made. */
@@ -7528,7 +7579,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(tm.unvalidated);
 	make_views(tm.drops);
 	run_statements(tm.after);
-	run_statements(list_concat(list_concat(sm.before, sm.changes), late));
+	run_statements(sm.before);
+	sql_bodies = try_statements(sql_bodies);
+	run_statements(list_concat(sm.changes, late));
+	sql_bodies = try_statements(sql_bodies);
 	make_views(type_drops);
 	run_statements(collation_drops);
 	run_statements(schema_drops);
@@ -7556,7 +7610,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		run_statements(sm.fk_validations);
 	run_statements(links);
 	restore_locality(relinked, to);
-	make_views(views);
+	make_views(list_concat(sql_bodies, views));
 	run_statements(policy_makes);
 	restore_index_places(places);
 	if (matviews_made)

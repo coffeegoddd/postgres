@@ -502,3 +502,28 @@ RESET dolt.allow_commit_conflicts;
 SELECT dolt_branch('-D', 'sw_side');
 DROP SCHEMA sw CASCADE;
 SELECT length(dolt_commit('-Am', 'sw gone')::text) AS committed;
+
+-- Routines with SQL-standard bodies are parsed as they're made, so a move
+-- makes each after what it reads: a materialized view, a table; and one a
+-- table's default uses, before that table.
+CREATE SCHEMA sb VERSIONED;
+CREATE FUNCTION sb.seven() RETURNS int LANGUAGE SQL RETURN 7;
+CREATE TABLE sb.t (id int PRIMARY KEY, d int DEFAULT sb.seven());
+INSERT INTO sb.t (id) VALUES (1), (2);
+CREATE MATERIALIZED VIEW sb.m AS SELECT count(*) AS n FROM sb.t;
+CREATE FUNCTION sb.from_m() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT n FROM sb.m; END;
+CREATE FUNCTION sb.from_t() RETURNS bigint LANGUAGE SQL RETURN (SELECT sum(d) FROM sb.t);
+SELECT length(dolt_commit('-Am', 'sb')::text) AS committed;
+DROP FUNCTION sb.from_m();
+DROP FUNCTION sb.from_t();
+DROP MATERIALIZED VIEW sb.m;
+DROP TABLE sb.t;
+DROP FUNCTION sb.seven();
+SELECT dolt_reset('--hard');
+SELECT sb.from_m(), sb.from_t(), sb.seven();
+INSERT INTO sb.t (id) VALUES (3);
+SELECT * FROM sb.t ORDER BY id;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_reset('--hard');
+DROP SCHEMA sb CASCADE;
+SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;

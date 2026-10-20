@@ -1411,3 +1411,70 @@ SELECT length(dolt_commit('-Am', 'sw gone')::text) AS committed;
         42
 (1 row)
 
+-- Routines with SQL-standard bodies are parsed as they're made, so a move
+-- makes each after what it reads: a materialized view, a table; and one a
+-- table's default uses, before that table.
+CREATE SCHEMA sb VERSIONED;
+CREATE FUNCTION sb.seven() RETURNS int LANGUAGE SQL RETURN 7;
+CREATE TABLE sb.t (id int PRIMARY KEY, d int DEFAULT sb.seven());
+INSERT INTO sb.t (id) VALUES (1), (2);
+CREATE MATERIALIZED VIEW sb.m AS SELECT count(*) AS n FROM sb.t;
+CREATE FUNCTION sb.from_m() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT n FROM sb.m; END;
+CREATE FUNCTION sb.from_t() RETURNS bigint LANGUAGE SQL RETURN (SELECT sum(d) FROM sb.t);
+SELECT length(dolt_commit('-Am', 'sb')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+DROP FUNCTION sb.from_m();
+DROP FUNCTION sb.from_t();
+DROP MATERIALIZED VIEW sb.m;
+DROP TABLE sb.t;
+DROP FUNCTION sb.seven();
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT sb.from_m(), sb.from_t(), sb.seven();
+ from_m | from_t | seven 
+--------+--------+-------
+      2 |     14 |     7
+(1 row)
+
+INSERT INTO sb.t (id) VALUES (3);
+SELECT * FROM sb.t ORDER BY id;
+ id | d 
+----+---
+  1 | 7
+  2 | 7
+  3 | 7
+(3 rows)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       1
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DROP SCHEMA sb CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to function sb.seven()
+drop cascades to table sb.t
+drop cascades to function sb.from_t()
+drop cascades to materialized view sb.m
+drop cascades to function sb.from_m()
+SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
