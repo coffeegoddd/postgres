@@ -4,7 +4,10 @@
 # behind it, folds by a snapshot taken once it has them: incrementally,
 # from the checkpoint's baseline, not every table in full (which would
 # leave each baseline unsettled, for the next commit to read in full
-# again).
+# again).  A session leaving the branch so, behind the checkpoint, leaves
+# the checkpoint's baseline: its own checkpoint, by its older snapshot,
+# would read every table in full and replace that one with an unsettled
+# one.
 
 setup		{ CREATE SCHEMA vcm VERSIONED; }
 setup
@@ -15,6 +18,17 @@ setup
 	INSERT INTO vcm.t2 SELECT g, 'two' FROM generate_series(1, 200) g;
 }
 setup		{ DO $$ BEGIN PERFORM dolt_commit('-Am', 'vcm base'); END $$; }
+setup
+{
+	DO $$
+	BEGIN
+		PERFORM dolt_branch('vcm_other');
+		PERFORM dolt_checkout('vcm_other');
+		PERFORM dolt_checkout('main');
+	END $$;
+}
+# (the setup's own folds counted before a session resets the counters)
+setup		{ SELECT pg_stat_force_next_flush(); }
 
 teardown
 {
@@ -23,6 +37,7 @@ teardown
 		PERFORM dolt_reset('--hard', 'HEAD');
 		DROP SCHEMA vcm CASCADE;
 		PERFORM dolt_commit('-Am', 'vcm gone');
+		PERFORM dolt_branch('-D', 'vcm_other');
 	END $$;
 }
 
@@ -32,6 +47,8 @@ step a_reset	{ SELECT pg_stat_reset_shared('prolly'); }
 step a_dcommit	{ SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed; }
 step a_write2	{ UPDATE vcm.t2 SET v = 'a2' WHERE id = 2; }
 step a_dcommit2	{ SELECT (dolt_commit('-am', 'a again'))[1] IS NOT NULL AS committed; }
+step a_leave	{ SELECT (dolt_checkout('vcm_other'))[1] AS status; }
+step a_back		{ SELECT (dolt_checkout('main'))[1] AS status; }
 step a_flush	{ SELECT pg_stat_force_next_flush(); }
 step a_full		{ SELECT value AS full_folds FROM pg_stat_prolly WHERE name = 'fold_full_tables'; }
 
@@ -45,3 +62,7 @@ step b_flush	{ SELECT pg_stat_force_next_flush(); }
 # b checkpoints, holding the refs; a's commit waits for them, its snapshot
 # taken before b's commit; then a commits again
 permutation a_write b_begin b_write b_ckpt a_reset a_dcommit b_commit b_flush a_write2 a_dcommit2 a_flush a_full
+
+# b checkpoints, holding the refs; a leaves its dirty main, waiting for
+# them, its snapshot taken before b's commit; then a comes back and commits
+permutation a_write b_begin b_write b_ckpt a_reset a_leave b_commit b_flush a_back a_write2 a_dcommit2 a_flush a_full

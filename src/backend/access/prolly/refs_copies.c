@@ -31,6 +31,20 @@
  *				-> a remote-tracking branch: the commit a fetch last found
  *				   the remote's branch at (hash length, hash)
  *	'U' name	-> the branch's upstream: a remote, NUL, its branch
+ *	'X' name	-> the transaction that last moved the branch's head (its
+ *				   FullTransactionId, native byte order; a TransactionId,
+ *				   as noted before)
+ *	'Y' name	-> the transaction that last moved its baseline (the same)
+ *	'C' name	-> a database setting's value (text)
+ *	'N' name	-> the head's tables, as the commit that made it of the
+ *				   working set named them: the head's hash, then a line
+ *				   per table (its OID, then its qualified name)
+ *	'Q' name	-> the branch's merge's conflicted tables' names, as the
+ *				   merge recorded them: each table's OID, then its name's
+ *				   length (a varint) and bytes
+ *	'Z' name	-> a list of stashes, newest first: each its commit (hash
+ *				   length, hash), then its branch's name (a varint length,
+ *				   then the bytes)
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts it left, unless
@@ -584,7 +598,8 @@ branch_set_head(const char *name, const ProllyHash *head)
 {
 	StringInfoData key;
 	StringInfoData v;
-	TransactionId xid = head ? GetTopTransactionId() : InvalidTransactionId;
+	FullTransactionId xid = head ? GetTopFullTransactionId() :
+		InvalidFullTransactionId;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -623,8 +638,26 @@ moved_unseen(char tag, const char *name)
 	initStringInfo(&v);
 	appendStringInfoChar(&key, tag);
 	appendStringInfoString(&key, name);
-	if (refs_get(key.data, key.len, &v) && v.len == sizeof(xid))
-		memcpy(&xid, v.data, sizeof(xid));
+	if (refs_get(key.data, key.len, &v))
+	{
+		/*
+		 * (a FullTransactionId; one 2^31 or more before the next is long
+		 * past, and seen, though its 32 bits alone would look recent; a
+		 * TransactionId, as heads' were noted before)
+		 */
+		if (v.len == sizeof(FullTransactionId))
+		{
+			FullTransactionId fxid;
+			uint64		next = U64FromFullTransactionId(ReadNextFullTransactionId());
+
+			memcpy(&fxid, v.data, sizeof(fxid));
+			if (FullTransactionIdIsValid(fxid) &&
+				next - U64FromFullTransactionId(fxid) < ((uint64) 1 << 31))
+				xid = XidFromFullTransactionId(fxid);
+		}
+		else if (v.len == sizeof(xid))
+			memcpy(&xid, v.data, sizeof(xid));
+	}
 	pfree(key.data);
 	pfree(v.data);
 	return TransactionIdIsValid(xid) && !TransactionIdIsCurrentTransactionId(xid) &&
@@ -730,7 +763,8 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 {
 	StringInfoData key;
 	StringInfoData v;
-	TransactionId xid = baseline ? GetTopTransactionId() : InvalidTransactionId;
+	FullTransactionId xid = baseline ? GetTopFullTransactionId() :
+		InvalidFullTransactionId;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -1960,9 +1994,11 @@ copies_checkpoint(ProllyNodeRef *root)
  * working set isn't its head's, nor what its baseline's fold made already.
  * Not in a transaction that can't write, nor in a transaction block (the
  * refs, held to the transaction's end, would hold up others' commits), nor
- * if the branch moved unseen by the snapshot (its fold wouldn't be the
- * branch's).  (A session choosing its first branch, as it connects, leaves
- * none.)
+ * if the branch's head moved unseen by the snapshot (its fold wouldn't be
+ * the branch's), nor its baseline (another's checkpoint or fold, which the
+ * snapshot can't fold from: it would read every table in full, and replace
+ * that one's baseline with an unsettled one).  (A session choosing its
+ * first branch, as it connects, leaves none.)
  */
 static void
 copies_checkout(const char *name)
@@ -2013,7 +2049,8 @@ copies_checkout(const char *name)
 			  same_hash(&kept.hash, &working.hash)))
 		{
 			lock_refs();
-			if (!head_moved_unseen(current))
+			if (!head_moved_unseen(current) &&
+				!moved_unseen(TAG_BASELINE_MOVER, current))
 			{
 				fold_from_baseline(&working, &next, false);
 				branch_set_baseline(current, &next, &working);

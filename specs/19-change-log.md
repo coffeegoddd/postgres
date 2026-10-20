@@ -105,9 +105,10 @@ Two interfaces, each selected by the table AM's profile
   from them.
 - **A fold by an older snapshot.** Consuming entries means a fold's
   snapshot must see its baseline's fold: a snapshot that doesn't (a
-  repeatable-read transaction's, or a statement's taken before it waited
-  behind another fold) may miss rows committed meanwhile whose entries
-  that fold consumed. Such a fold reads the table in full by its snapshot,
+  repeatable-read transaction's; under read committed, a commit or a
+  checkpoint behind another's fold takes a newer one, and a session
+  leaving the branch behind one takes no checkpoint, #566) may miss rows
+  committed meanwhile whose entries that fold consumed. Such a fold reads the table in full by its snapshot,
   and its baseline is marked unsettled, so the next fold reads the table
   in full again, by its own.
 - **A fold from a baseline** of its own reads the log entries its

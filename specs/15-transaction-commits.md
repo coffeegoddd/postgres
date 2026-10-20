@@ -72,7 +72,11 @@ one write.
   `see_head()` takes a newer snapshot under read committed, and fails the
   transaction with a serialization failure under repeatable read and
   serializable (`head_moved_unseen()` and `see_head()`,
-  `refs_copies.c:406-445`).
+  `refs_copies.c:406-445`). Under read committed it takes a newer one too
+  when only the baseline moved (another session's checkpoint, recorded
+  as the baseline's mover, `'Y'`), so the fold starts from that baseline
+  instead of reading every table in full (#566); repeatable read and
+  serializable keep their snapshot then (#505).
 - The commit's tree is written with the transaction; the commit record
   carries the new root; a rollback, or a rollback to a savepoint taken
   before the commit, undoes it.
