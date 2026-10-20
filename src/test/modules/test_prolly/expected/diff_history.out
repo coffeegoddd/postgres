@@ -148,5 +148,77 @@ FROM dolt_diff_table(NULL::dh.other) ORDER BY to_commit_date DESC NULLS FIRST;
 
 SELECT * FROM dolt_diff_table(NULL::dh.t, 'no_such_ref');
 ERROR:  prolly ref "no_such_ref" does not exist
+-- a column dropped and added again as another type: an old value that
+-- doesn't convert to it shows as null, with a warning (as Dolt shows it);
+-- one that does, converted; a key column's old values that don't, refused
+CREATE TABLE dh.rt (pk int PRIMARY KEY, c varchar(20));
+INSERT INTO dh.rt VALUES (1, 'abc'), (2, '7'), (3, 'xyz');
+SELECT length(dolt_commit('-Am', 'rt')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE dh.rt DROP COLUMN c;
+SELECT length(dolt_commit('-am', 'rt dropped c')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE dh.rt ADD COLUMN c int;
+INSERT INTO dh.rt VALUES (4, 9);
+SELECT length(dolt_commit('-am', 'rt c again')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT count(*) FROM dolt_diff_table(NULL::dh.rt);
+WARNING:  2 values of column "c" of table "rt" don't convert from character varying(20) to integer: shown as null
+WARNING:  2 values of column "c" of table "rt" don't convert from character varying(20) to integer: shown as null
+ count 
+-------
+     5
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.rt, 'HEAD~3', 'HEAD~2')
+ORDER BY coalesce((to_row).pk, (from_row).pk);
+WARNING:  2 values of column "c" of table "rt" don't convert from character varying(20) to integer: shown as null
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ added     |          | (1,)
+ added     |          | (2,7)
+ added     |          | (3,)
+(3 rows)
+
+SELECT * FROM dolt_at('HEAD~2', NULL::dh.rt) ORDER BY pk;
+WARNING:  2 values of column "c" of table "rt" don't convert from character varying(20) to integer: shown as null
+ pk | c 
+----+---
+  1 |  
+  2 | 7
+  3 |  
+(3 rows)
+
+SELECT count(*) FROM dolt_history_table(NULL::dh.rt);
+WARNING:  2 values of column "c" of table "rt" don't convert from character varying(20) to integer: shown as null
+ count 
+-------
+    10
+(1 row)
+
+CREATE TABLE dh.rk (k text PRIMARY KEY);
+INSERT INTO dh.rk VALUES ('1'), ('one');
+SELECT length(dolt_commit('-Am', 'rk')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+ALTER TABLE dh.rk ALTER COLUMN k TYPE int USING length(k);
+SELECT * FROM dolt_at('HEAD', NULL::dh.rk);
+ERROR:  rows of table "rk" can't be read across key column "k" changing type from text to integer
+DETAIL:  A key value of the version's doesn't convert to the new type.
 \c contrib_regression
 DROP DATABASE regress_diff_history;

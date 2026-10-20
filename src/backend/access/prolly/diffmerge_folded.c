@@ -3988,7 +3988,17 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 		}
 	}
 	else
-		return;					/* (shown: as the cast has it) */
+	{
+		/*
+		 * (shown: as the cast has it; a non-key value it fails on, as
+		 * null, which the read counts and warns of, as Dolt shows it; a
+		 * key's, refused, naming the column)
+		 */
+		cr->guarded =
+			!((is_string_type(xa->atttypid) && is_string_type(att->atttypid)) ||
+			  (is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
+		return;
+	}
 
 	back = coerce_to_target_type(NULL, copyObject(e), att->atttypid,
 								 xa->atttypid, xa->atttypmod,
@@ -4259,6 +4269,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	int		   *from;
 	ColumnRead *reads;
 	bool	   *converted;
+	uint64	   *nulled;			/* values shown null: their cast failed */
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
@@ -4338,6 +4349,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	from = palloc_array(int, md->natts);
 	reads = palloc0_array(ColumnRead, md->natts);
 	converted = palloc0_array(bool, md->natts);
+	nulled = palloc0_array(uint64, md->natts);
 	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 	for (int a = 0; a < md->natts; a++)
 	{
@@ -4466,6 +4478,18 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 									   vr.keyed ? "key holds it" : "rows have no key")));
 				else if (reads[a].loss == LOSS_UNSURE && unsure)
 					unsure_cols = bms_add_member(unsure_cols, a);
+				else if (read == READ_SHOWN && reads[a].loss == LOSS_UNCHECKED &&
+						 bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("rows of table \"%s\" can't be read across key column \"%s\" changing type from %s to %s",
+									RelationGetRelationName(rel), NameStr(att->attname),
+									format_type_with_typemod(TupleDescAttr(xd, from[a])->atttypid,
+															 TupleDescAttr(xd, from[a])->atttypmod),
+									format_type_with_typemod(att->atttypid, att->atttypmod)),
+							 errdetail("A key value of the version's doesn't convert to the new type.")));
+				else if (read == READ_SHOWN && reads[a].loss == LOSS_UNCHECKED)
+					nulled[a]++;
 			}
 			else if (!converted[a])
 				ms->tts_values[a] = xs->tts_values[from[a]];
@@ -4551,6 +4575,19 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		CHECK_FOR_INTERRUPTS();
 	}
 	PROLLY_CALL(tree, cursor_close, cur);
+	for (int a = 0; a < md->natts; a++)
+		if (nulled[a] > 0)
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg_plural("%llu value of column \"%s\" of table \"%s\" doesn't convert from %s to %s: shown as null",
+								   "%llu values of column \"%s\" of table \"%s\" don't convert from %s to %s: shown as null",
+								   nulled[a], (unsigned long long) nulled[a],
+								   NameStr(TupleDescAttr(md, a)->attname),
+								   RelationGetRelationName(rel),
+								   format_type_with_typemod(TupleDescAttr(xd, from[a])->atttypid,
+															TupleDescAttr(xd, from[a])->atttypmod),
+								   format_type_with_typemod(TupleDescAttr(md, a)->atttypid,
+															TupleDescAttr(md, a)->atttypmod))));
 	if (estate)
 		FreeExecutorState(estate);
 	if (n > 1)

@@ -27334,6 +27334,143 @@
       ]
     },
     {
+      "id": "dolt-diff-table-column-retype-fails",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 9,
+      "name": "column drop and recreate with different type that can NOT be coerced (string -> int)",
+      "source_sha256": "9842048c5505d5faa4f4751594d9facbf77d30824ac78e484f6b8103a7208be1",
+      "scenario_sha256": "e21ed7adb2c2371472baca72e6224c5875bec5223613ec01fe9cadf8fc7c4c71",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t) (D18). Three rows, not five: the drop's commit changes only values that don't convert to the column's type now, so no row reads as modified. (D21)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7) An old value that doesn't convert to the column's new type is null, with a warning, as Dolt's is."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t) (D18). TO_COMMIT=@Commit2 becomes to_commit = $1 (D7). No rows: c's old values don't convert to int, so both sides show null and the rows read alike. (D21)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7) An old value that doesn't convert to the column's new type is null, with a warning, as Dolt's is."
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "Left out: Dolt's warnings (1105, four of them) on a select; the scenarios don't read warnings. prolly warns once per column and version, with the count of values shown as null (diff_history checks it)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)",
+        "A column's old value that doesn't convert to its new type is shown as null with a WARNING, once per column and version read, counting them; Dolt warns once per value.",
+        "A row whose only change is to a value that doesn't convert reads as unchanged, compared as the table is defined now. (D21)"
+      ]
+    },
+    {
       "id": "dolt-diff-table-column-drop-rename",
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
       "suite": "DiffSystemTableScriptTests",
@@ -31423,14 +31560,6 @@
       "name": "table drop and recreate with identical primary key reports modified row in diff stat",
       "source_sha256": "de423f6432691817a382aa0ee2898d01a633b979b3e536ec27e033d2cd8968ec",
       "reason": "Its setup is computed (dropAndRecreateScript(\"int\")), which the catalog leaves unresolved, so a port can't map it."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
-      "suite": "DiffSystemTableScriptTests",
-      "index": 9,
-      "name": "column drop and recreate with different type that can NOT be coerced (string -> int)",
-      "source_sha256": "9842048c5505d5faa4f4751594d9facbf77d30824ac78e484f6b8103a7208be1",
-      "reason": "A column dropped and made again as integer: dolt_diff_table reads the old text values ('two') as the current type and fails (invalid input syntax for type integer), where Dolt reads them as NULL with a warning. A difference to decide, reported."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",

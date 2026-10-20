@@ -420,6 +420,23 @@ OF` are built in D18's shapes.
 - **Port:** a case adding a column and modifying rows in one commit
   expects the cells whose values differ.
 
+
+## D21. A value that doesn't convert is shown null, and compared so
+
+- **Dolt:** an old value that doesn't convert to its column's type now
+  is shown null with a warning per value; a row whose stored value
+  changed is modified even where both sides show null.
+- **Prolly:** the value is shown null too, with one warning per column
+  and version counting them (a key column's refuses the read, naming
+  it). Rows are compared as the table is defined now, so a row whose
+  only change is to such a value (a column dropped, its old values not
+  converting to the type it was added back as) isn't modified.
+- **Why:** a diff reads each version as the table is defined now,
+  through its casts (D20); what didn't convert has no value left to
+  compare.
+- **Port:** the drop-and-recreate case whose old values don't convert
+  expects no rows for the drop's commit, and the count without them.
+
 ## D23. `dolt_gc()` returns a status, not statistics
 
 - **Dolt:** `CALL dolt_gc()` returns a status row (`{0}`), and logs
