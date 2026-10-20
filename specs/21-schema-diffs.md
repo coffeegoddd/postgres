@@ -270,6 +270,11 @@ Decided by the user 2026-10-19, as recommended:
     SRF, #497's history), read from commits' trees.
 - **A name argument** is read as Postgres reads identifiers, case folded
   and quotes kept (#522).
-- **Not built:** ref ranges (`a..b`, `a...b`; #521), `dolt_at`'s
-  key-range pushdown and the detached checkout cache (#495).
+- **Ref ranges** (#521), as Dolt takes them: `dolt_diff_summary`,
+  `dolt_schema_diff` and `dolt_diff_stat` take `'a..b'` (a to b) or
+  `'a...b'` (from their merge base to b) in place of two refs, the next
+  argument then the name. `dolt_diff`'s row type argument comes third, so
+  it keeps two refs.
+- **Not built:** `dolt_at`'s key-range pushdown and the detached checkout
+  cache (#495).
 

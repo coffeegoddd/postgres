@@ -116,6 +116,27 @@ CREATE TYPE more.pair AS (a int, b text);
 CREATE VIEW more.big AS SELECT id FROM app.orders WHERE qty > 10;
 SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WHERE to_table_name LIKE 'more%';
 
+-- ranges, as Dolt takes them: a..b is a to b; a...b from their merge base
+-- to b; the argument after a range names the object
+SELECT length(dolt_commit('-Am', 'before the fork')::text) AS committed;
+SELECT dolt_branch('fork');
+CREATE TABLE app.on_main (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
+SELECT dolt_checkout('fork');
+CREATE TABLE app.on_fork (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'on fork')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main..fork');
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main', 'fork');
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main...fork');
+SELECT from_table_name, to_table_name FROM dolt_diff_summary('main...fork', 'app.on_fork');
+SELECT to_table_name FROM dolt_schema_diff('main...fork');
+SELECT table_name, rows_added FROM dolt_diff_stat('fork...main');
+SELECT * FROM dolt_diff_summary('main..');
+SELECT * FROM dolt_diff_summary('main..fork', 'app.on_fork', 'app.on_main');
+SELECT * FROM dolt_diff_summary('main');
+SELECT * FROM dolt_diff_summary('main...nowhere');
+
 -- a commit of an older format: refused, as moves refuse it
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
 	'format 7') AS old \gset

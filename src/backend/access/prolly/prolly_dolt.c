@@ -3264,6 +3264,68 @@ status_table(const char *name, ProllyDiffKind kind, char object, void *arg)
 	*names = lappend(*names, psprintf("%s\t%s", name, status));
 }
 
+/*
+ * A diff function's refs, as Dolt's take them: two refs; or one range,
+ * "a..b" (from a to b) or "a...b" (from a's and b's merge base to b), the
+ * argument after it then the object's name.  *from_ref, *to_ref and
+ * *name are set from the arguments given (to_ref and name NULL if not).
+ */
+static void
+diff_refs(const char *fn, char **from_ref, char **to_ref, char **name)
+{
+	char	   *dots = strstr(*from_ref, "..");
+	bool		three;
+	char	   *a;
+	char	   *b;
+
+	if (dots == NULL)
+	{
+		if (*to_ref == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s needs two refs, or a range of them (a..b, a...b)", fn)));
+		return;
+	}
+	three = dots[2] == '.';
+	a = pnstrdup(*from_ref, dots - *from_ref);
+	b = pstrdup(dots + (three ? 3 : 2));
+	if (*a == '\0' || *b == '\0' || strstr(b, "..") != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" isn't a range of refs", *from_ref),
+				 errhint("A range is a..b, or a...b from their merge base.")));
+	if (*to_ref != NULL)
+	{
+		if (*name != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s takes a range and a name, or two refs and a name", fn)));
+		*name = *to_ref;
+	}
+	if (three)
+	{
+		ProllyHash	ha;
+		ProllyHash	hb;
+		ProllyHash	base;
+
+		if (!PROLLY_CALL(refs(), resolve, a, &ha))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", a)));
+		if (!PROLLY_CALL(refs(), resolve, b, &hb))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", b)));
+		if (!PROLLY_CALL(refs(), merge_base, &ha, &hb, &base))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("refs \"%s\" and \"%s\" have no merge base", a, b)));
+		a = hash_hex(&base);
+	}
+	*from_ref = a;
+	*to_ref = b;
+}
+
 /* What dolt_diff_summary() and dolt_schema_diff() list: each change, copied. */
 typedef struct SummaryRow
 {
@@ -3456,14 +3518,15 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	char	   *name = NULL;
 	ListCell   *lc;
 
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+	if (PG_ARGISNULL(0))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("dolt_diff_summary needs two refs")));
 	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	to_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
 	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
 		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_refs("dolt_diff_summary", &from_ref, &to_ref, &name);
 	InitMaterializedSRF(fcinfo, 0);
 	foreach(lc, summary_rows(from_ref, to_ref, name, false))
 	{
@@ -3598,14 +3661,15 @@ dolt_schema_diff(PG_FUNCTION_ARGS)
 	char	   *name = NULL;
 	ListCell   *lc;
 
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+	if (PG_ARGISNULL(0))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("dolt_schema_diff needs two refs")));
 	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	to_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
 	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
 		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_refs("dolt_schema_diff", &from_ref, &to_ref, &name);
 	if (!PROLLY_HAS(canonicalizer(), render))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -4383,14 +4447,15 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 	char	   *name = NULL;
 	ListCell   *lc;
 
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+	if (PG_ARGISNULL(0))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("dolt_diff_stat needs two refs")));
 	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	to_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
 	if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
 		name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	diff_refs("dolt_diff_stat", &from_ref, &to_ref, &name);
 	InitMaterializedSRF(fcinfo, 0);
 	foreach(lc, summary_rows(from_ref, to_ref, name, false))
 	{

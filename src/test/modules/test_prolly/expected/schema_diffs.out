@@ -315,6 +315,92 @@ SELECT * FROM dolt_schema_diff('HEAD', 'WORKING') WHERE to_table_name LIKE 'more
                  | more.pair     |                       | CREATE TYPE more.pair AS (a integer, b pg_catalog.text);
 (4 rows)
 
+-- ranges, as Dolt takes them: a..b is a to b; a...b from their merge base
+-- to b; the argument after a range names the object
+SELECT length(dolt_commit('-Am', 'before the fork')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_branch('fork');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE TABLE app.on_main (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'on main')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('fork');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'fork'"}
+(1 row)
+
+CREATE TABLE app.on_fork (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'on fork')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main..fork');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+                 | app.on_fork   | added
+ app.on_main     |               | dropped
+(2 rows)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main', 'fork');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+                 | app.on_fork   | added
+ app.on_main     |               | dropped
+(2 rows)
+
+SELECT from_table_name, to_table_name, diff_type FROM dolt_diff_summary('main...fork');
+ from_table_name | to_table_name | diff_type 
+-----------------+---------------+-----------
+                 | app.on_fork   | added
+(1 row)
+
+SELECT from_table_name, to_table_name FROM dolt_diff_summary('main...fork', 'app.on_fork');
+ from_table_name | to_table_name 
+-----------------+---------------
+                 | app.on_fork
+(1 row)
+
+SELECT to_table_name FROM dolt_schema_diff('main...fork');
+ to_table_name 
+---------------
+ app.on_fork
+(1 row)
+
+SELECT table_name, rows_added FROM dolt_diff_stat('fork...main');
+ table_name | rows_added 
+------------+------------
+(0 rows)
+
+SELECT * FROM dolt_diff_summary('main..');
+ERROR:  "main.." isn't a range of refs
+HINT:  A range is a..b, or a...b from their merge base.
+SELECT * FROM dolt_diff_summary('main..fork', 'app.on_fork', 'app.on_main');
+ERROR:  dolt_diff_summary takes a range and a name, or two refs and a name
+SELECT * FROM dolt_diff_summary('main');
+ERROR:  dolt_diff_summary needs two refs, or a range of them (a..b, a...b)
+SELECT * FROM dolt_diff_summary('main...nowhere');
+ERROR:  prolly ref "nowhere" does not exist
 -- a commit of an older format: refused, as moves refuse it
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '7'),
 	'format 7') AS old \gset
