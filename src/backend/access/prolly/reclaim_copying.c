@@ -161,6 +161,17 @@ mark_ref(const ProllyHash *hash, void *arg)
 }
 
 #ifdef USE_ASSERT_CHECKING
+static int
+hash_cmp(const void *a, const void *b)
+{
+	const ProllyHash *x = a;
+	const ProllyHash *y = b;
+
+	if (x->len != y->len)
+		return x->len < y->len ? -1 : 1;
+	return memcmp(x->bytes, y->bytes, x->len);
+}
+
 typedef struct Declared
 {
 	ProllyHash *hashes;
@@ -202,6 +213,9 @@ check_declared(Mark *mk, const char *data, Size len)
 	if (hl == 0 || !PROLLY_CALL(format, open, (const uint8 *) data, len, &node))
 		return;
 	prolly_chunk_references(data, len, note_declared, &d);
+	/* (sorted, so each run of bytes is looked up, not compared with all) */
+	if (d.n > 1)
+		qsort(d.hashes, d.n, sizeof(ProllyHash), hash_cmp);
 	memset(&h, 0, sizeof(h));
 	h.len = hl;
 	for (int item = 0; item < node.nitems; item++)
@@ -215,17 +229,13 @@ check_declared(Mark *mk, const char *data, Size len)
 			continue;
 		for (Size i = 0; i + 1 + hl <= v.len; i++)
 		{
-			bool		declared = false;
-
 			if (v.data[i] != hl)
 				continue;
 			memcpy(h.bytes, v.data + i + 1, hl);
 			if (PROLLY_CALL(mk->cs, gc_find, mk->gc, &h) < 0)
 				continue;
-			for (int j = 0; j < d.n && !declared; j++)
-				declared = d.hashes[j].len == h.len &&
-					memcmp(d.hashes[j].bytes, h.bytes, h.len) == 0;
-			if (!declared)
+			if (d.n == 0 ||
+				bsearch(&h, d.hashes, d.n, sizeof(ProllyHash), hash_cmp) == NULL)
 				elog(WARNING, "a chunk names chunk %s, which it doesn't declare",
 					 prolly_hash_hex(&h));
 		}

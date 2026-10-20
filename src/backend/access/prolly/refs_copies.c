@@ -153,6 +153,8 @@ static const ProllyTreeRoutine *tree;
 static ProllyTreeEnv env;		/* the refs' tree, and commits read */
 static ProllyTreeEnv commit_env;	/* commits written */
 
+static const char *get_hash(const char *p, const char *end, ProllyHash *h);
+
 /* Declare each hash at p (a length byte, then the hash), n of them. */
 static const char *
 declare_hashes(const char *p, const char *end, int n, StringInfo refs)
@@ -161,16 +163,9 @@ declare_hashes(const char *p, const char *end, int n, StringInfo refs)
 	{
 		ProllyHash	h;
 
-		if ((uint8) p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + (uint8) p[0])
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly refs hold an invalid hash")));
-		memset(&h, 0, sizeof(h));
-		h.len = (uint8) p[0];
-		memcpy(h.bytes, p + 1, h.len);
+		p = get_hash(p, end, &h);
 		if (h.len > 0)
 			PROLLY_CALL(tree, value_reference, &h, 0, refs);
-		p += 1 + h.len;
 	}
 	return p;
 }

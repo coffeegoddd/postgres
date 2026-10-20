@@ -247,7 +247,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"12"
+#define FOLDED_FORMAT	"13"
 
 typedef struct Canon
 {
@@ -332,7 +332,7 @@ base_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 				StringInfo refs)
 {
 	ProllyValue state = *value;
-	List	   *finders;
+	static List *finders = NIL;
 
 	declare_leading_hash(value, refs);
 	for (int i = 0; i < 2 && state.len >= 1 && state.data[0] <= PROLLY_HASH_MAX_LEN &&
@@ -341,13 +341,19 @@ base_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 		state.len -= 1 + state.data[0];
 		state.data += 1 + state.data[0];
 	}
-	finders = prolly_list_impls(PROLLY_IFACE_CHANGE_FINDER);
+	/* (the finders registered, as of the first: registered at start) */
+	if (finders == NIL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		finders = prolly_list_impls(PROLLY_IFACE_CHANGE_FINDER);
+		MemoryContextSwitchTo(old);
+	}
 	foreach_ptr(const ProllyChangeFinderRoutine, finder, finders)
 	{
 		if (finder->state_refs != NULL)
 			finder->state_refs(&state, refs);
 	}
-	list_free(finders);
 }
 
 static void
@@ -2489,6 +2495,8 @@ collect(Canon *cn)
 						put_hash(&it->value, &root.hash);
 						table_close(rel, AccessShareLock);
 					}
+					else
+						appendStringInfoChar(&it->value, 0);	/* (no tree) */
 					appendBinaryStringInfo(&it->value, query.data, query.len);
 					pfree(query.data);
 				}

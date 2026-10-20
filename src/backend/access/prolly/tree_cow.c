@@ -327,6 +327,8 @@ level_capacity(const ProllyTreeEnv *env, uint16 level)
  */
 
 #define VALUE_INLINE_MAX	2048	/* longer leaf values go out of line */
+#define CHUNK_REFS_INLINE_MAX 1024	/* more declared references go in a
+										 * tree of their own */
 #define CHUNK_MIN			512
 #define CHUNK_MAX			4096
 #define CHUNK_MASK			0x7FF	/* a boundary every ~2 KB past the minimum */
@@ -611,6 +613,84 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 }
 
 /*
+ * Declared references too many for an item to keep (a commit of very many
+ * parents, a merge state of thousands of commits): kept in a tree of their
+ * own, whose leaves declare them (PROLLY_ITEM_CHUNK_REFS, all of each
+ * leaf's value), so a collection follows them through it; the item
+ * declares the tree's root alone.  Nothing reads them but a collection.
+ */
+#define CHUNK_REFS_LEAF_MAX	(16 * 1024)
+static void
+write_refs_tree(const ProllyTreeEnv *env, const char *refs, Size len,
+				StringInfo out)
+{
+	ProllyTreeEnv venv;
+	ValueBuilder *vb = palloc0(sizeof(ValueBuilder));
+	ProllyNodeRef root;
+	StringInfoData leaf;
+	const char *p = refs;
+	const char *end = refs + len;
+
+	value_env(env, &venv);
+	vb->env = &venv;
+	initStringInfo(&vb->child);
+	initStringInfo(&leaf);
+	while (p < end)
+	{
+		const char *from = p;
+		Item		item = {0};
+		ProllyNodeRef ref;
+		uint64		count;
+
+		/* (whole references, up to a leaf's worth) */
+		while (p < end && p - from < CHUNK_REFS_LEAF_MAX)
+		{
+			ProllyNodeRef r;
+			uint64		n;
+
+			next_value_ref(&p, end, &r, &n);
+		}
+		resetStringInfo(&leaf);
+		prolly_put_varint(&leaf, p - from);
+		appendBinaryStringInfo(&leaf, from, p - from);
+		item.value.data = (const uint8 *) leaf.data;
+		item.value.len = leaf.len;
+		item.count = 1;
+		item.flags = PROLLY_ITEM_CHUNK_REFS;
+		write_node(vb->env, 0, &item, 1, &ref, &count);
+		vb->levels[0].emitted++;
+		vb->levels[0].last = ref;
+		value_add(vb, 1, &ref.hash, p - from);
+	}
+	for (uint16 level = 0;; level++)
+	{
+		if (level >= MAX_LEVELS)
+			elog(ERROR, "prolly references tree build found no root");
+		if (level > 0)
+			value_flush(vb, level);
+		if (vb->levels[level].emitted == 1)
+		{
+			root = vb->levels[level].last;
+			break;
+		}
+	}
+	for (int i = 0; i < MAX_LEVELS; i++)
+	{
+		ValueLevel *vl = &vb->levels[i];
+
+		if (vl->chunker == NULL)
+			continue;
+		PROLLY_CALL(env->chunker, end, vl->chunker);
+		pfree(vl->hashes);
+		pfree(vl->counts);
+	}
+	pfree(leaf.data);
+	pfree(vb->child.data);
+	pfree(vb);
+	encode_value_ref(out, &root.hash, len);
+}
+
+/*
  * Tell the store which children of a value tree's internal node a read of
  * bytes [offset, offset + len) of it reads, so it may read them together.
  */
@@ -805,28 +885,41 @@ leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
 	}
 	if (env->chunk_refs)
 	{
-		StringInfoData refs;
+		int			start = buf->len;
+		int			n;
 
-		/* the chunks named, their length first, before all of it */
-		initStringInfo(&refs);
-		env->chunk_refs(key, value, env->chunk_refs_arg, &refs);
-		if (refs.len > 0)
+		/* the chunks named, appended, then moved before all of it */
+		env->chunk_refs(key, value, env->chunk_refs_arg, buf);
+		n = buf->len - start;
+		if (n > CHUNK_REFS_INLINE_MAX)
 		{
-			StringInfoData lead;
+			/* (too many to keep inline: a tree of them, the item naming it) */
+			char	   *all = palloc(n);
 
-			initStringInfo(&lead);
-			prolly_put_varint(&lead, refs.len);
-			appendBinaryStringInfo(&lead, refs.data, refs.len);
-			enlargeStringInfo(buf, lead.len);
-			memmove(buf->data + first + lead.len, buf->data + first,
-					buf->len - first);
-			memcpy(buf->data + first, lead.data, lead.len);
-			buf->len += lead.len;
+			memcpy(all, buf->data + start, n);
+			buf->len = start;
+			write_refs_tree(env, all, n, buf);
+			pfree(all);
+			n = buf->len - start;
+		}
+		if (n > 0)
+		{
+			char		lenbuf[16];
+			StringInfoData len = {lenbuf, 0, sizeof(lenbuf), 0};
+			char		refsbuf[CHUNK_REFS_INLINE_MAX];
+
+			/* [first, start) the value's own references; then n of these */
+			prolly_put_varint(&len, n);
+			memcpy(refsbuf, buf->data + start, n);
+			enlargeStringInfo(buf, len.len);
+			memmove(buf->data + first + len.len + n, buf->data + first,
+					start - first);
+			memcpy(buf->data + first, len.data, len.len);
+			memcpy(buf->data + first + len.len, refsbuf, n);
+			buf->len += len.len;
 			buf->data[buf->len] = '\0';
 			item->flags |= PROLLY_ITEM_CHUNK_REFS;
-			pfree(lead.data);
 		}
-		pfree(refs.data);
 	}
 	if (value->len > VALUE_INLINE_MAX)
 	{

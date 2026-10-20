@@ -1337,8 +1337,8 @@ test_chunk_put_node(PG_FUNCTION_ARGS)
 		appendStringInfoChar(&v, (char) ref.len);
 		appendBinaryStringInfo(&v, ref.bytes, ref.len);
 		prolly_put_varint(&v, 1);
-		keys[i].data = (const uint8 *) psprintf("k%04d", i);
-		keys[i].len = 5;
+		keys[i].data = (const uint8 *) psprintf("k%06d", i);
+		keys[i].len = strlen((const char *) keys[i].data);
 		values[i].data = (const uint8 *) v.data;
 		values[i].len = v.len;
 		flags[i] = level == 0 ? PROLLY_ITEM_VALUE_REF : 0;
@@ -1348,6 +1348,64 @@ test_chunk_put_node(PG_FUNCTION_ARGS)
 	content_hash(node.data, node.len, &h);
 	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
 	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
+/* test_chunk_declaring_tree()'s declared references */
+typedef struct DeclaredRefs
+{
+	ProllyHash *hashes;
+	int			n;
+} DeclaredRefs;
+
+static void
+declare_all(const ProllyKey *key, const ProllyValue *value, void *arg,
+			StringInfo refs)
+{
+	DeclaredRefs *d = arg;
+
+	for (int i = 0; i < d->n; i++)
+		PROLLY_CALL(prolly_tree_lookup("cow"), value_reference, &d->hashes[i],
+					0, refs);
+}
+
+/*
+ * A tree of one item ('k' -> 'v') whose item declares every chunk of
+ * hashes, as a commit declares its parents; its root's hash.
+ */
+PG_FUNCTION_INFO_V1(test_chunk_declaring_tree);
+Datum
+test_chunk_declaring_tree(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef ref;
+	DeclaredRefs d;
+	Datum	   *elems;
+	ProllyKey	k = {(const uint8 *) "k", 1};
+	ProllyValue v = {(const uint8 *) "v", 1};
+
+	deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT, &elems, NULL, &d.n);
+	d.hashes = palloc(sizeof(ProllyHash) * Max(d.n, 1));
+	for (int i = 0; i < d.n; i++)
+		text_hash(DatumGetTextPP(elems[i]), &d.hashes[i]);
+	prolly_folded_tree_env(&env);
+	env.chunk_refs = declare_all;
+	env.chunk_refs_arg = &d;
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	PROLLY_CALL(tree, build_add, b, &k, &v);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	{
+		StringInfoData got;
+
+		initStringInfo(&got);
+		if (!PROLLY_CALL(tree, get, &env, &ref, &k, &got) ||
+			got.len != 1 || got.data[0] != 'v')
+			elog(ERROR, "the declaring tree's item doesn't read back as written");
+		pfree(got.data);
+	}
+	PG_RETURN_TEXT_P(hash_text(&ref.hash));
 }
 
 PG_FUNCTION_INFO_V1(test_chunk_put_leaf);
@@ -1372,8 +1430,8 @@ test_chunk_put_leaf(PG_FUNCTION_ARGS)
 	{
 		bytea	   *v = DatumGetByteaPP(elems[i]);
 
-		keys[i].data = (const uint8 *) psprintf("k%04d", i);
-		keys[i].len = 5;
+		keys[i].data = (const uint8 *) psprintf("k%06d", i);
+		keys[i].len = strlen((const char *) keys[i].data);
 		values[i].data = (const uint8 *) VARDATA_ANY(v);
 		values[i].len = VARSIZE_ANY_EXHDR(v);
 	}

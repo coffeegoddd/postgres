@@ -399,6 +399,12 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- Collect the chunk store's garbage (full: all of it): the chunks kept and
 -- freed of those collected, the bytes freed, and how long (microseconds)
 -- appends were held off.
+-- A tree of one item ('k' -> 'v') whose item declares the chunks named
+-- by hashes; its root's hash.
+CREATE FUNCTION test_chunk_declaring_tree(hashes text[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_chunk_gc(full boolean, OUT kept int8, OUT freed int8,
 	OUT bytes_freed int8, OUT window_usec int8)
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
