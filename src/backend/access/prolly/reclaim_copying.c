@@ -34,7 +34,8 @@
  * to remember keeps every chunk collected.
  *
  * The chunks marked and not yet read wait in a queue, breadth first, of
- * at most maintenance_work_mem in memory; past that it goes on in a
+ * at most maintenance_work_mem in memory (a ring, so taking one and adding
+ * one costs the same however full it is); past that it goes on in a
  * temporary file, read back as the memory empties.  (The marks themselves
  * are a bit a chunk collected.)
  *
@@ -72,9 +73,10 @@ typedef struct Mark
 	ProllyChunkGc *gc;
 	uint64		nslots;
 	uint8	   *marks;			/* a bit a slot */
-	uint64	   *queue;			/* marked, not yet read: [head, tail) */
+	uint64	   *queue;			/* marked, not yet read: a ring, count of
+								 * them from head */
 	uint64		head;
-	uint64		tail;
+	uint64		count;
 	uint64		cap;			/* of queue: maintenance_work_mem's worth */
 	BufFile    *spill;			/* and the rest, past cap, in order */
 	uint64		spill_read;		/* slots read back from it */
@@ -89,15 +91,8 @@ mark_slot(Mark *mk, uint64 slot)
 	if (mk->marks[slot / 8] & (1 << (slot % 8)))
 		return;
 	mk->marks[slot / 8] |= 1 << (slot % 8);
-	if (mk->tail == mk->cap && mk->head > 0 && mk->spill_written == mk->spill_read)
-	{
-		memmove(mk->queue, mk->queue + mk->head,
-				sizeof(uint64) * (mk->tail - mk->head));
-		mk->tail -= mk->head;
-		mk->head = 0;
-	}
 	/* (once some are in the file, the rest follow them there, in order) */
-	if (mk->tail == mk->cap || mk->spill_written > mk->spill_read)
+	if (mk->count == mk->cap || mk->spill_written > mk->spill_read)
 	{
 		if (mk->spill == NULL)
 			mk->spill = BufFileCreateTemp(false);
@@ -110,18 +105,18 @@ mark_slot(Mark *mk, uint64 slot)
 		mk->spill_written++;
 		return;
 	}
-	mk->queue[mk->tail++] = slot;
+	mk->queue[(mk->head + mk->count++) % mk->cap] = slot;
 }
 
 /* The next slot marked and not yet read; false if none is left. */
 static bool
 next_marked(Mark *mk, uint64 *slot)
 {
-	if (mk->head == mk->tail)
+	if (mk->count == 0)
 	{
 		uint64		n = Min(mk->cap, mk->spill_written - mk->spill_read);
 
-		mk->head = mk->tail = 0;
+		mk->head = 0;
 		if (n == 0)
 		{
 			mk->spill_read = mk->spill_written = 0;
@@ -134,11 +129,13 @@ next_marked(Mark *mk, uint64 *slot)
 					 errmsg("could not seek in the collection's temporary file: %m")));
 		BufFileReadExact(mk->spill, mk->queue, n * sizeof(uint64));
 		mk->spill_read += n;
-		mk->tail = n;
+		mk->count = n;
 		if (mk->spill_read == mk->spill_written)
 			mk->spill_read = mk->spill_written = 0;
 	}
-	*slot = mk->queue[mk->head++];
+	*slot = mk->queue[mk->head];
+	mk->head = (mk->head + 1) % mk->cap;
+	mk->count--;
 	return true;
 }
 

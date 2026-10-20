@@ -29,5 +29,22 @@ WHERE datname = 'spill_db';
 SELECT count(*) AS leaves_kept FROM leaves WHERE test_chunk_has(hash);
 SELECT test_chunk_has(test_content_hash(convert_to('garbage 1', 'UTF8'))) AS garbage_kept;
 
+-- A frontier as wide as the queue whose nodes each name one chunk more:
+-- a root of 8,192 nodes of one leaf each (taking one, adding one, as the
+-- queue stays full).  Every leaf kept.
+CREATE TABLE wide AS
+SELECT n, test_chunk_put(convert_to('wide leaf ' || n, 'UTF8')) AS hash
+FROM generate_series(1, 8192) n;
+CREATE TABLE wide_nodes AS
+SELECT n, test_chunk_put_node(1, ARRAY[hash]) AS hash FROM wide;
+SELECT test_chunk_put_node(2, (SELECT array_agg(hash ORDER BY n) FROM wide_nodes))
+	AS wide_root \gset
+SELECT test_chunk_move_root(:'root', :'wide_root');
+\c spill_db
+SET maintenance_work_mem = '64kB';
+SELECT kept > 16000 AS kept_all FROM test_chunk_gc(false);
+\c spill_db
+SELECT count(*) AS wide_leaves_kept FROM wide WHERE test_chunk_has(hash);
+
 \c postgres
 DROP DATABASE spill_db;
