@@ -219,6 +219,7 @@ tests += {
       't/125_gc_window_per_db.pl',
       't/126_clone_whole_files.pl',
       't/127_full_fold_log.pl',
+      't/128_standby_folds.pl',
       't/140_corrupt_compressed.pl',
       't/141_standby_root_redo.pl',
       't/142_get_many_refresh.pl',

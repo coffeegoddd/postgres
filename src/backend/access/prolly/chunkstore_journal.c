@@ -508,6 +508,8 @@ struct ProllyChunkStore
 	/* this transaction's */
 	StringInfoData pending;		/* records not appended yet */
 	HTAB	   *pending_index;
+	HTAB	   *transient;		/* during recovery: chunks a read made, by
+								 * hash, until its transaction ends */
 	bool		moving;
 	ProllyHash	new_root;
 	List	   *saved;			/* MoveSave *, innermost last */
@@ -2534,6 +2536,7 @@ journal_xact_callback(XactEvent event, void *arg)
 			s->through = NULL;
 			s->through_hint = NULL;
 			ahead_forget(s);
+			s->transient = NULL;	/* (with the transaction's memory) */
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
@@ -2553,6 +2556,7 @@ journal_xact_callback(XactEvent event, void *arg)
 			s->through = NULL;
 			s->through_hint = NULL;
 			ahead_forget(s);
+			s->transient = NULL;
 			break;
 	}
 }
@@ -3741,6 +3745,9 @@ journal_open(Oid dboid, Oid spcoid)
 	return s;
 }
 
+static void transient_put(ProllyChunkStore *s, const ProllyHash *hash,
+						  const void *data, Size len);
+
 static void
 journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 			Size len)
@@ -3761,9 +3768,10 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	if (hash->len == 0 || hash->len > PROLLY_HASH_MAX_LEN)
 		elog(ERROR, "invalid chunk hash length %u", hash->len);
 	if (RecoveryInProgress())
-		ereport(ERROR,
-				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("cannot change a chunk store during recovery")));
+	{
+		transient_put(s, hash, data, len);
+		return;
+	}
 	if (len > MaxAllocSize - 64)
 		elog(ERROR, "chunk of %zu bytes is too large", len);
 	if (s->at_commit)
@@ -3811,6 +3819,57 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 
 	if (s->pending.len >= APPEND_BATCH)
 		flush_pending(s);
+}
+
+/* A chunk a transient put kept: the transaction's until it ends. */
+typedef struct TransientChunk
+{
+	ProllyHash	key;
+	char	   *data;
+	Size		len;
+} TransientChunk;
+
+static TransientChunk *
+transient_find(ProllyChunkStore *s, const ProllyHash *key)
+{
+	if (s->transient == NULL)
+		return NULL;
+	return hash_search(s->transient, key, HASH_FIND, NULL);
+}
+
+/*
+ * During recovery, what a read makes (a fold's tree on a hot standby) can't
+ * be appended: it is kept in the transaction's memory instead, read and
+ * found as the store's until the transaction ends, never written.
+ */
+static void
+transient_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
+			  Size len)
+{
+	ProllyHash	key;
+	TransientChunk *t;
+	bool		found;
+	MemoryContext old;
+
+	hash_key(&key, hash);
+	if (transient_find(s, &key) != NULL || stored_has(s, &key))
+		return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	if (s->transient == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(TransientChunk);
+		ctl.hcxt = TopTransactionContext;
+		s->transient = hash_create("prolly transient chunks", 256, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	t = hash_search(s->transient, &key, HASH_ENTER, &found);
+	t->data = palloc(Max(len, 1));
+	memcpy(t->data, data, len);
+	t->len = len;
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -4098,6 +4157,12 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 			chunk_bytes("(pending)", s->pending.data + e->offset, e->len, &out);
 			visit(i, out.data, out.len, arg);
 		}
+		else if (transient_find(s, &key) != NULL)
+		{
+			TransientChunk *t = transient_find(s, &key);
+
+			visit(i, t->data, t->len, arg);
+		}
 		else if (ahead_take(s, &key, &out))
 			visit(i, out.data, out.len, arg);
 		else
@@ -4250,6 +4315,18 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			chunk_bytes("(pending)", s->pending.data + e->offset, e->len, out);
 		return true;
 	}
+	{
+		TransientChunk *t = transient_find(s, &key);
+
+		if (t != NULL)
+		{
+			if (stored)
+				prolly_chunk_frame(t->data, t->len, out);
+			else
+				appendBinaryStringInfo(out, t->data, t->len);
+			return true;
+		}
+	}
 	if (!stored && ahead_take(s, &key, out))
 		return true;
 	if (stored)
@@ -4329,7 +4406,8 @@ journal_has(ProllyChunkStore *s, const ProllyHash *hash)
 	ProllyHash	key;
 
 	hash_key(&key, hash);
-	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL)
+	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
+		transient_find(s, &key) != NULL)
 		return true;
 	refresh_segments(s);
 	xact_note(s);

@@ -27,9 +27,12 @@
  * an entry says to (a row the log couldn't hold, or the table truncated or
  * rewritten), when a keyless table has a key's entry, a row's count would
  * go below none (the keying changed meanwhile) or a key column of an
- * entry is null (it was written under another key), when the entries name
- * more rows than the table has, and during recovery.  A branch's copy of a
- * table has its
+ * entry is null (it was written under another key), or when what it holds
+ * of the changes passes maintenance_work_mem.  Many changes (past a tenth
+ * of the baseline's rows) are merged with the baseline in one pass, not
+ * applied one by one.  A hot standby folds from the baseline as the
+ * primary does: its log and baseline are replayed, its snapshots real; a
+ * fold there only reads.  A branch's copy of a table has its
  * source's baseline and a copy of its log, so it folds from them.  Its
  * pages are never kept as of a fold: only sharing between branches copies
  * them.
@@ -232,21 +235,29 @@ xid_cmp(const void *a, const void *b)
  * then) must be below the snapshot's xmax and not running for it; and the
  * fold's own transaction, whose writes it saw, must be this one or one the
  * snapshot sees finished.  (Aborted, it took the baseline with it: so
- * finished is committed.)
+ * finished is committed.)  A hot standby's snapshot is as real (the same
+ * transactions as the primary's, replayed), but holds those running in its
+ * subxip, subtransactions too: one of those the fold didn't list running
+ * fails the test, conservatively; and one whose subtransactions overflowed
+ * isn't known exactly, so fails it too.
  */
 static bool
 sees_fold(Snapshot snap, const State *st)
 {
-	if (snap->takenDuringRecovery || !TransactionIdIsNormal(st->xmax) ||
-		TransactionIdPrecedes(snap->xmax, st->xmax))
+	TransactionId *running = snap->takenDuringRecovery ? snap->subxip : snap->xip;
+	uint32		nrunning = snap->takenDuringRecovery ? snap->subxcnt : snap->xcnt;
+
+	if (!TransactionIdIsNormal(st->xmax) ||
+		TransactionIdPrecedes(snap->xmax, st->xmax) ||
+		(snap->takenDuringRecovery && snap->suboverflowed))
 		return false;
 	if (TransactionIdIsNormal(st->own) &&
 		!TransactionIdIsCurrentTransactionId(st->own) &&
 		XidInMVCCSnapshot(st->own, snap))
 		return false;
-	for (uint32 i = 0; i < snap->xcnt; i++)
-		if (TransactionIdPrecedes(snap->xip[i], st->xmax) &&
-			bsearch(&snap->xip[i], st->xip, st->nxip, sizeof(TransactionId),
+	for (uint32 i = 0; i < nrunning; i++)
+		if (TransactionIdPrecedes(running[i], st->xmax) &&
+			bsearch(&running[i], st->xip, st->nxip, sizeof(TransactionId),
 					xid_cmp) == NULL)
 			return false;
 	return true;
@@ -977,6 +988,9 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	MemoryContext cxt;
 	MemoryContext old;
 
+	/* (on a hot standby, a fold only reads: it advances no baseline) */
+	Assert(!RecoveryInProgress() || next == NULL);
+
 	/* what a table's fold makes is let go of when it's done */
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "log fold",
 								ALLOCSET_DEFAULT_SIZES);
@@ -1001,8 +1015,6 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	{
 		if (stale)
 			f.reason = PROLLY_FULL_STALE_SNAPSHOT;
-		else if (RecoveryInProgress())
-			f.reason = PROLLY_FULL_RECOVERY;
 		else if (st.flags & STATE_UNSETTLED)
 			f.reason = PROLLY_FULL_UNSETTLED;
 		else if (storage_unseen(rel, f.snap))
