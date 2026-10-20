@@ -110,15 +110,15 @@ adapts.
   nothing commits the transaction early. A merge's unresolved conflicts
   or constraint violations fail the SQL `COMMIT` unless
   `dolt.allow_commit_conflicts` is set. `WORKING` in `dolt_status` and
-  `dolt_diff` is the branch's working set as committed by SQL
-  transactions, so neither shows the current transaction's own
-  uncommitted writes (`dolt_commit` does fold them).
+  `dolt_diff` is the branch's working set as the current transaction
+  sees it, its own uncommitted writes included, as a Dolt session's
+  working root includes its own (#501).
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is
   deferred with this ID (`ports.json` has one); add an explicit `COMMIT`
   only where the assertion isn't about that. Reads of `WORKING` after
-  writes in the same transaction move after its `COMMIT`.
+  writes in the same transaction stay where they are.
 
 ## D6. Merges
 

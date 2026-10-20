@@ -314,3 +314,23 @@ UPDATE r.t SET y = 9 WHERE id = 2;
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', 'WORKING', NULL::r.t);
 \c :db
 DROP DATABASE regress_status_rename;
+
+-- WORKING is the working set as the transaction sees it: its own writes,
+-- not yet committed, are in dolt_status and dolt_diff (as a Dolt session's
+-- working root has its own), and gone with a rollback.
+CREATE DATABASE sd_own_writes;
+\c sd_own_writes
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'a');
+SELECT length(dolt_commit('-Am', 'one row')::text) AS committed;
+BEGIN;
+INSERT INTO app.t VALUES (2, 'b');
+UPDATE app.t SET v = 'z' WHERE id = 1;
+SELECT table_name, status FROM dolt_status;
+SELECT diff_type, (from_row).v AS was, (to_row).v AS is
+FROM dolt_diff('HEAD', 'WORKING', NULL::app.t) ORDER BY (to_row).id;
+ROLLBACK;
+SELECT count(*) AS changed_after_rollback FROM dolt_status;
+\c contrib_regression
+DROP DATABASE sd_own_writes;

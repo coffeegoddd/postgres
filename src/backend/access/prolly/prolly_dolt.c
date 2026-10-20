@@ -18,9 +18,9 @@
  * nothing to do, dolt_commit accepts -a and -A and needs neither,
  * dolt_status shows every change as staged, and dolt_reset only does hard
  * resets.  WORKING
- * means the session branch's working set as last committed by any
- * transaction, so dolt_status and dolt_diff don't see the current
- * transaction's own uncommitted writes.
+ * means the session branch's working set as the current transaction sees
+ * it: dolt_status and dolt_diff see its own uncommitted writes, as a Dolt
+ * session's working root has its own.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_dolt.c
