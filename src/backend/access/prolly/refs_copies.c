@@ -31,6 +31,20 @@
  *				-> a remote-tracking branch: the commit a fetch last found
  *				   the remote's branch at (hash length, hash)
  *	'U' name	-> the branch's upstream: a remote, NUL, its branch
+ *	'X' name	-> the transaction that last moved the branch's head (its
+ *				   FullTransactionId, native byte order; a TransactionId,
+ *				   as noted before)
+ *	'Y' name	-> the transaction that last moved its baseline (the same)
+ *	'C' name	-> a database setting's value (text)
+ *	'N' name	-> the head's tables, as the commit that made it of the
+ *				   working set named them: the head's hash, then a line
+ *				   per table (its OID, then its qualified name)
+ *	'Q' name	-> the branch's merge's conflicted tables' names, as the
+ *				   merge recorded them: each table's OID, then its name's
+ *				   length (a varint) and bytes
+ *	'Z' name	-> a list of stashes, newest first: each its commit (hash
+ *				   length, hash), then its branch's name (a varint length,
+ *				   then the bytes)
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts it left, unless
@@ -119,6 +133,7 @@
 #define TAG_TRACKING	'R'
 #define TAG_UPSTREAM	'U'
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
+#define TAG_BASELINE_MOVER 'Y'	/* and a baseline (a fold, a checkpoint) */
 #define TAG_CONFIG		'C'	/* a database setting */
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
@@ -583,7 +598,8 @@ branch_set_head(const char *name, const ProllyHash *head)
 {
 	StringInfoData key;
 	StringInfoData v;
-	TransactionId xid = head ? GetTopTransactionId() : InvalidTransactionId;
+	FullTransactionId xid = head ? GetTopFullTransactionId() :
+		InvalidFullTransactionId;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -606,11 +622,13 @@ branch_set_head(const char *name, const ProllyHash *head)
 
 /*
  * Did a transaction the active snapshot doesn't see move branch name's
- * head?  (A committer that waited for the refs finds the head another
- * moved, while its snapshot, taken before, lacks that one's rows.)
+ * head (or, with tag TAG_BASELINE_MOVER, its baseline)?  (A committer that
+ * waited for the refs finds the head another moved, while its snapshot,
+ * taken before, lacks that one's rows; or a baseline another's fold or
+ * checkpoint wrote, which its snapshot can't fold from.)
  */
 static bool
-head_moved_unseen(const char *name)
+moved_unseen(char tag, const char *name)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -618,14 +636,38 @@ head_moved_unseen(const char *name)
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	appendStringInfoChar(&key, TAG_MOVER);
+	appendStringInfoChar(&key, tag);
 	appendStringInfoString(&key, name);
-	if (refs_get(key.data, key.len, &v) && v.len == sizeof(xid))
-		memcpy(&xid, v.data, sizeof(xid));
+	if (refs_get(key.data, key.len, &v))
+	{
+		/*
+		 * (a FullTransactionId; one 2^31 or more before the next is long
+		 * past, and seen, though its 32 bits alone would look recent; a
+		 * TransactionId, as heads' were noted before)
+		 */
+		if (v.len == sizeof(FullTransactionId))
+		{
+			FullTransactionId fxid;
+			uint64		next = U64FromFullTransactionId(ReadNextFullTransactionId());
+
+			memcpy(&fxid, v.data, sizeof(fxid));
+			if (FullTransactionIdIsValid(fxid) &&
+				next - U64FromFullTransactionId(fxid) < ((uint64) 1 << 31))
+				xid = XidFromFullTransactionId(fxid);
+		}
+		else if (v.len == sizeof(xid))
+			memcpy(&xid, v.data, sizeof(xid));
+	}
 	pfree(key.data);
 	pfree(v.data);
 	return TransactionIdIsValid(xid) && !TransactionIdIsCurrentTransactionId(xid) &&
 		XidInMVCCSnapshot(xid, GetActiveSnapshot());
+}
+
+static bool
+head_moved_unseen(const char *name)
+{
+	return moved_unseen(TAG_MOVER, name);
 }
 
 /*
@@ -633,12 +675,21 @@ head_moved_unseen(const char *name)
  * one, or (read committed) a newer one, pushed (true; the caller pops it).
  * A transaction whose snapshot can't move fails instead, to be retried,
  * as a commit on top of a head it can't see would undo that head's rows.
+ * Read committed takes a newer one too when only the baseline moved since
+ * its snapshot (another's checkpoint): the old one would see none of that
+ * fold, and read every table in full, and leave each unsettled.
  */
 static bool
 see_head(const char *name)
 {
 	if (!head_moved_unseen(name))
-		return false;
+	{
+		if (IsolationUsesXactSnapshot() ||
+			!moved_unseen(TAG_BASELINE_MOVER, name))
+			return false;
+		PushActiveSnapshot(GetLatestSnapshot());
+		return true;
+	}
 	if (IsolationUsesXactSnapshot())
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -703,7 +754,8 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 
 /*
  * Make baseline (NULL: none) branch name's baseline; 'root' (NULL: not
- * known) is the working set's root its fold made.
+ * known) is the working set's root its fold made.  The transaction that
+ * moved it is noted (see_head()).
  */
 static void
 branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
@@ -711,6 +763,8 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 {
 	StringInfoData key;
 	StringInfoData v;
+	FullTransactionId xid = baseline ? GetTopFullTransactionId() :
+		InvalidFullTransactionId;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -720,6 +774,13 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 		put_hash(&v, &baseline->hash);
 	if (baseline && root)
 		put_hash(&v, &root->hash);
+	refs_put(key.data, key.len, baseline ? &v : NULL);
+
+	resetStringInfo(&key);
+	resetStringInfo(&v);
+	appendStringInfoChar(&key, TAG_BASELINE_MOVER);
+	appendStringInfoString(&key, name);
+	appendBinaryStringInfo(&v, &xid, sizeof(xid));
 	refs_put(key.data, key.len, baseline ? &v : NULL);
 	pfree(key.data);
 	pfree(v.data);
@@ -1818,7 +1879,8 @@ static void
 copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
-	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_NAMES};
+	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
+	TAG_NAMES};
 	ListCell   *lc;
 
 	lock_refs();
@@ -1932,9 +1994,11 @@ copies_checkpoint(ProllyNodeRef *root)
  * working set isn't its head's, nor what its baseline's fold made already.
  * Not in a transaction that can't write, nor in a transaction block (the
  * refs, held to the transaction's end, would hold up others' commits), nor
- * if the branch moved unseen by the snapshot (its fold wouldn't be the
- * branch's).  (A session choosing its first branch, as it connects, leaves
- * none.)
+ * if the branch's head moved unseen by the snapshot (its fold wouldn't be
+ * the branch's), nor its baseline (another's checkpoint or fold, which the
+ * snapshot can't fold from: it would read every table in full, and replace
+ * that one's baseline with an unsettled one).  (A session choosing its
+ * first branch, as it connects, leaves none.)
  */
 static void
 copies_checkout(const char *name)
@@ -1985,7 +2049,8 @@ copies_checkout(const char *name)
 			  same_hash(&kept.hash, &working.hash)))
 		{
 			lock_refs();
-			if (!head_moved_unseen(current))
+			if (!head_moved_unseen(current) &&
+				!moved_unseen(TAG_BASELINE_MOVER, current))
 			{
 				fold_from_baseline(&working, &next, false);
 				branch_set_baseline(current, &next, &working);

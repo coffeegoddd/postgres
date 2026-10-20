@@ -1317,7 +1317,8 @@ statement or check out the writer branch first.
   snapshot sees; the writer branch is made there, not at P's current
   head. If P moved since the snapshot (`head_moved_unseen()`,
   `refs_copies.c:406-445`): a serialization failure under repeatable
-  read and serializable, a new snapshot under read committed.
+  read and serializable, a new snapshot under read committed; under read
+  committed a new one too if only P's baseline moved (`see_head()`).
 - **Made head-only**, O(1) (`copies_branch_create()`,
   `refs_copies.c:1003-1048`); its copies are made at that first write
   (`materialize()`), so read-only sessions never pay for them.
