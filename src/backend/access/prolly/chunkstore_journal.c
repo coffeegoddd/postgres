@@ -1721,32 +1721,34 @@ static uint64 index_range(ProllyChunkStore *s, Segment *g, JournalSegScan *sg,
 						  uint64 offset, uint64 end, char **rec, Size *reclen);
 
 /*
- * Index a segment's records written since its last scan, for every backend
- * (the index's lock held exclusively): up to the first that isn't whole
- * yet.  A PAD seen may since have become a ROOT; one that stays a PAD once
- * its transaction has ended never will (it aborted), and is forgotten.
+ * Has the transaction of the PAD at offset pad of g ended with the PAD
+ * still a PAD?  Then it never becomes a ROOT (the transaction aborted):
+ * a committed one's ROOT is written before its transaction is seen to
+ * end (on a standby, before its xid leaves the known-assigned ones).
+ */
+static bool
+pad_ended(Segment *g, uint64 pad)
+{
+	TransactionId xid;
+	uint8		kind;
+
+	read_exact(g, (char *) &xid, sizeof(xid), pad + sizeof(uint32) + 1);
+	if (TransactionIdIsInProgress(xid))
+		return false;
+	read_exact(g, (char *) &kind, 1, pad + sizeof(uint32));
+	return kind == KIND_PAD;
+}
+
+/*
+ * Settle the PADs of g seen in flight: one now a ROOT is the root (if it
+ * is later than the one known), and one whose transaction ended a PAD is
+ * forgotten.  The index's lock is held.
  */
 static void
-scan_segment(ProllyChunkStore *s, Segment *g)
+prune_pads(ProllyChunkStore *s, Segment *g, JournalSegScan *sg)
 {
-	JournalSegScan *sg = jindex_segment_of(s->ix, g->id);
 	JournalScan *js = jindex_scan(s->ix);
-	uint64	   *pads;
-	JournalHole *holes;
-	uint64		size;
-	uint64		offset;
-	char	   *rec = NULL;
-	Size		reclen = 0;
-
-	if (sg == NULL)
-		elog(ERROR, "chunk journal segment %llu isn't in the shared index",
-			 (unsigned long long) g->id);
-	if (!open_segment(g))
-		return;
-	size = FileSize(g->file);
-	pads = jindex_pads(s->ix, sg);
-	holes = jindex_holes(s->ix, sg);
-	offset = sg->scanned;
+	uint64	   *pads = jindex_pads(s->ix, sg);
 
 	for (int i = 0; i < sg->npads;)
 	{
@@ -1775,25 +1777,40 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 			}
 		}
 		else if (kind == KIND_PAD)
-		{
-			TransactionId xid;
-
-			/*
-			 * (a committed one's ROOT is written before its transaction
-			 * leaves the proc array, so reading it now finds the ROOT)
-			 */
-			read_exact(g, (char *) &xid, sizeof(xid), pad + sizeof(uint32) + 1);
-			if (!TransactionIdIsInProgress(xid))
-			{
-				read_exact(g, (char *) &kind, 1, pad + sizeof(uint32));
-				done = kind == KIND_PAD;
-			}
-		}
+			done = pad_ended(g, pad);
 		if (done)
 			pads[i] = pads[--sg->npads];
 		else
 			i++;
 	}
+}
+
+/*
+ * Index a segment's records written since its last scan, for every backend
+ * (the index's lock held exclusively): up to the first that isn't whole
+ * yet.  A PAD seen may since have become a ROOT; one that stays a PAD once
+ * its transaction has ended never will (it aborted), and is forgotten.
+ */
+static void
+scan_segment(ProllyChunkStore *s, Segment *g)
+{
+	JournalSegScan *sg = jindex_segment_of(s->ix, g->id);
+	JournalHole *holes;
+	uint64		size;
+	uint64		offset;
+	char	   *rec = NULL;
+	Size		reclen = 0;
+
+	if (sg == NULL)
+		elog(ERROR, "chunk journal segment %llu isn't in the shared index",
+			 (unsigned long long) g->id);
+	if (!open_segment(g))
+		return;
+	size = FileSize(g->file);
+	holes = jindex_holes(s->ix, sg);
+	offset = sg->scanned;
+
+	prune_pads(s, g, sg);
 
 	/* ranges skipped while their appends were in flight, if written since */
 	for (int i = 0; i < sg->nholes;)
@@ -1890,8 +1907,11 @@ index_range(ProllyChunkStore *s, Segment *g, JournalSegScan *sg,
 			if (root_later(js, g->id, offset))
 				set_root(js, &h, g->id, offset);
 		}
-		else if (kind == KIND_PAD)
+		else if (kind == KIND_PAD && !pad_ended(g, offset))
 		{
+			/* (full: those settled since they were seen let go first) */
+			if (sg->npads >= jindex_capacity(s->ix))
+				prune_pads(s, g, sg);
 			if (sg->npads >= jindex_capacity(s->ix))
 				elog(ERROR, "chunk journal segment %llu has too many roots in flight",
 					 (unsigned long long) g->id);

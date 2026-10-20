@@ -15,7 +15,11 @@
  *
  * All databases' indexes are in one DSA, found by a registry keyed by
  * database OID.  A dropped database's index is forgotten with it
- * (jindex_forget()), so an OID used again starts anew.
+ * (jindex_forget()), so an OID used again starts anew.  The DSA isn't
+ * bounded: an index holds an entry for each chunk in its journal's
+ * segments (about 64 bytes, and 48 more for each other copy), which a
+ * move of the journal into a table file, or a collection, empties, so
+ * prolly.journal_move_threshold bounds it as it bounds the journal.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/journal_index.c
@@ -162,19 +166,45 @@ jindex_attach(Oid dboid, int capacity)
 	attach_shared();
 	params = chunk_params();
 	old = MemoryContextSwitchTo(TopMemoryContext);
-	r = dshash_find_or_insert(registry, &dboid, &found);
-	if (!found)
+	r = dshash_find(registry, &dboid, false);
+	if (r == NULL)
 	{
-		IndexShared *db;
-		dshash_table *t;
+		/*
+		 * Made whole before it is registered, so an allocation that fails
+		 * leaves no entry another backend would take for one made (and
+		 * frees what it made); one another backend registered meanwhile is
+		 * taken instead.
+		 */
+		dsa_pointer made = dsa_allocate0(area, sizeof(IndexShared));
+		IndexShared *db = dsa_get_address(area, made);
+		dshash_table *t = NULL;
 
-		r->db = dsa_allocate0(area, sizeof(IndexShared));
-		db = dsa_get_address(area, r->db);
-		LWLockInitialize(&db->lock, tranche);
-		db->capacity = capacity;
-		t = dshash_create(area, &params, NULL);
-		db->chunks = dshash_get_hash_table_handle(t);
-		dshash_detach(t);
+		PG_TRY();
+		{
+			LWLockInitialize(&db->lock, tranche);
+			db->capacity = capacity;
+			t = dshash_create(area, &params, NULL);
+			db->chunks = dshash_get_hash_table_handle(t);
+			r = dshash_find_or_insert(registry, &dboid, &found);
+		}
+		PG_CATCH();
+		{
+			if (t != NULL)
+				dshash_destroy(t);
+			dsa_free(area, made);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (found)
+		{
+			dshash_destroy(t);
+			dsa_free(area, made);
+		}
+		else
+		{
+			r->db = made;
+			dshash_detach(t);
+		}
 	}
 	ix = palloc(sizeof(JournalIndex));
 	ix->dboid = dboid;
@@ -285,7 +315,8 @@ jindex_holes(JournalIndex *ix, JournalSegScan *g)
 							MAXALIGN(sizeof(uint64) * ix->db->capacity));
 }
 
-static void drop_segment(JournalIndex *ix, uint64 segment);
+static void drop_segments(JournalIndex *ix, const uint64 *dropped,
+						  int ndropped);
 
 void
 jindex_set_segments(JournalIndex *ix, const uint64 *ids, int n, uint64 start)
@@ -326,8 +357,8 @@ jindex_set_segments(JournalIndex *ix, const uint64 *ids, int n, uint64 start)
 		dsa_free(area, db->segs);
 	db->segs = segs;
 	db->scan.nsegments = n;
-	for (int i = 0; i < ndropped; i++)
-		drop_segment(ix, dropped[i]);
+	if (ndropped > 0)
+		drop_segments(ix, dropped, ndropped);
 	pfree(dropped);
 }
 
@@ -506,9 +537,21 @@ jindex_visit(JournalIndex *ix,
 	dshash_seq_term(&status);
 }
 
-/* Forget the copies in a segment no longer named. */
+/* is segment one of the n of dropped? */
+static bool
+dropped_segment(const uint64 *dropped, int n, uint64 segment)
+{
+	for (int i = 0; i < n; i++)
+	{
+		if (dropped[i] == segment)
+			return true;
+	}
+	return false;
+}
+
+/* Forget the copies in the segments no longer named, in one pass. */
 static void
-drop_segment(JournalIndex *ix, uint64 segment)
+drop_segments(JournalIndex *ix, const uint64 *dropped, int ndropped)
 {
 	dshash_seq_status status;
 	Chunk	   *c;
@@ -522,7 +565,7 @@ drop_segment(JournalIndex *ix, uint64 segment)
 		{
 			Copy	   *o = dsa_get_address(area, *link);
 
-			if (o->segment == segment)
+			if (dropped_segment(dropped, ndropped, o->segment))
 			{
 				dsa_pointer gone = *link;
 
@@ -532,7 +575,7 @@ drop_segment(JournalIndex *ix, uint64 segment)
 			else
 				link = &o->other;
 		}
-		if (c->segment != segment)
+		if (!dropped_segment(dropped, ndropped, c->segment))
 			continue;
 		if (!DsaPointerIsValid(c->other))
 			dshash_delete_current(&status);
