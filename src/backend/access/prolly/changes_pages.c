@@ -1499,26 +1499,6 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	return true;
 }
 
-typedef struct FoldRow
-{
-	StringInfoData key;
-	StringInfoData row;
-} FoldRow;
-
-static int
-fold_row_cmp(const void *a, const void *b, void *arg)
-{
-	const FoldRow *ra = *(FoldRow *const *) a;
-	const FoldRow *rb = *(FoldRow *const *) b;
-	ProllyKey	ka = {(const uint8 *) ra->key.data, ra->key.len};
-	ProllyKey	kb = {(const uint8 *) rb->key.data, rb->key.len};
-	int			r = keying_compare(&ka, &kb, arg);
-
-	/* equal keys of a keyless table: the same row; order by bytes anyway */
-	if (r == 0)
-		r = memcmp(ra->key.data, rb->key.data, Min(ra->key.len, rb->key.len));
-	return r != 0 ? r : (ra->key.len > rb->key.len) - (ra->key.len < rb->key.len);
-}
 
 /*
  * Every row the snapshot sees, folded into a data tree: each row's key and
@@ -1529,65 +1509,13 @@ fold_row_cmp(const void *a, const void *b, void *arg)
 static void
 fold_all(Finder *f, ProllyNodeRef *data, bool carry)
 {
-	TableScanDesc scan;
-	FoldRow   **rows = NULL;
-	int			nrows = 0;
-	int			maxrows = 0;
-	ProllyTreeBuilder *b;
+	ProllyFullFold done;
 
 	f->work.full++;
-	scan = table_beginscan(f->rel, f->snap, 0, NULL, SO_NONE);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, f->rowslot))
-	{
-		FoldRow    *r = palloc(sizeof(FoldRow));
-		ProllyHash	content;
-
-		initStringInfo(&r->key);
-		initStringInfo(&r->row);
-		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &r->key, &r->row, &content);
-		if (nrows == maxrows)
-		{
-			maxrows = Max(64, maxrows * 2);
-			rows = rows ? repalloc_array(rows, FoldRow *, maxrows) :
-				palloc_array(FoldRow *, maxrows);
-		}
-		rows[nrows++] = r;
-		CHECK_FOR_INTERRUPTS();
-	}
-	table_endscan(scan);
-	f->work.rows_read += nrows;
-
-	if (nrows > 1)
-		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, f);
-
-	b = PROLLY_CALL(f->tree, build_begin, &f->env, CurrentMemoryContext);
-	for (int i = 0; i < nrows;)
-	{
-		int			j = i + 1;
-		ProllyKey	k = {(const uint8 *) rows[i]->key.data, rows[i]->key.len};
-		ProllyValue row = {(const uint8 *) rows[i]->row.data, rows[i]->row.len};
-		StringInfoData value;
-		ProllyValue v;
-
-		while (j < nrows && rows[j]->key.len == rows[i]->key.len &&
-			   memcmp(rows[j]->key.data, rows[i]->key.data, k.len) == 0)
-			j++;
-		if (!f->keyless && j > i + 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNIQUE_VIOLATION),
-					 errmsg("table \"%s\" holds rows with the same primary key",
-							RelationGetRelationName(f->rel)),
-					 errdetail("A commit can't hold them until the key is unique again.")));
-		initStringInfo(&value);
-		PROLLY_CALL(f->kr, make_value, f->k, &row, (uint64) (j - i), &value);
-		v.data = (const uint8 *) value.data;
-		v.len = value.len;
-		PROLLY_CALL(f->tree, build_add, b, &k, &v);
-		pfree(value.data);
-		f->work.rows_written++;
-		i = j;
-	}
-	PROLLY_CALL(f->tree, build_finish, b, data);
+	prolly_fold_all(f->rel, f->snap, f->rowslot, f->kr, f->k, f->keyless,
+					f->tree, &f->env, data, &done);
+	f->work.rows_read += done.rows_read;
+	f->work.rows_written += done.rows_written;
 
 	/* the tuples of transactions the snapshot doesn't see as settled */
 	if (carry)

@@ -94,5 +94,33 @@ TRUNCATE ff.m;
 INSERT INTO ff.m (id, a, b) SELECT g, 1, 'r' FROM generate_series(1, 300) g;
 SELECT same_as_full() AS truncate_reload;
 
+-- a full fold's rows are sorted in maintenance_work_mem, spilling past it:
+-- the same tree either way
+CREATE TABLE ff.big (id int PRIMARY KEY, v text);
+INSERT INTO ff.big SELECT g, md5(g::text) FROM generate_series(1, 30000) g;
+CREATE TABLE ff.dups (v int);
+INSERT INTO ff.dups SELECT g % 100 FROM generate_series(1, 30000) g;
+SET debug_prolly_force_full_fold = on;
+SELECT test_fold_root() AS roomy \gset
+SELECT rows_read, spilled FROM test_last_full_fold();
+SET maintenance_work_mem = '64kB';
+SELECT test_fold_root() = :'roomy' AS same_tree;
+SELECT rows_read, spilled, sort_kb < 4096 AS small FROM test_last_full_fold();
+RESET maintenance_work_mem;
+RESET debug_prolly_force_full_fold;
+:flush
+SELECT value > 0 AS counted_spilled FROM pg_stat_prolly WHERE name = 'fold_full_spilled';
+
+-- the changes an incremental fold holds past maintenance_work_mem: in full,
+-- as that costs no more
+SELECT length(dolt_commit('-Am', 'big')::text) AS committed;
+UPDATE ff.big SET v = 'changed' WHERE id <= 5000;
+:reset
+SET maintenance_work_mem = '64kB';
+SELECT test_fold_root() IS NOT NULL AS folded;
+RESET maintenance_work_mem;
+:flush
+SELECT * FROM full_folds();
+
 \c contrib_regression
 DROP DATABASE regress_full_folds;

@@ -281,5 +281,87 @@ SELECT same_as_full() AS truncate_reload;
  t
 (1 row)
 
+-- a full fold's rows are sorted in maintenance_work_mem, spilling past it:
+-- the same tree either way
+CREATE TABLE ff.big (id int PRIMARY KEY, v text);
+INSERT INTO ff.big SELECT g, md5(g::text) FROM generate_series(1, 30000) g;
+CREATE TABLE ff.dups (v int);
+INSERT INTO ff.dups SELECT g % 100 FROM generate_series(1, 30000) g;
+SET debug_prolly_force_full_fold = on;
+SELECT test_fold_root() AS roomy \gset
+SELECT rows_read, spilled FROM test_last_full_fold();
+ rows_read | spilled 
+-----------+---------
+     30000 | f
+(1 row)
+
+SET maintenance_work_mem = '64kB';
+SELECT test_fold_root() = :'roomy' AS same_tree;
+ same_tree 
+-----------
+ t
+(1 row)
+
+SELECT rows_read, spilled, sort_kb < 4096 AS small FROM test_last_full_fold();
+ rows_read | spilled | small 
+-----------+---------+-------
+     30000 | t       | t
+(1 row)
+
+RESET maintenance_work_mem;
+RESET debug_prolly_force_full_fold;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value > 0 AS counted_spilled FROM pg_stat_prolly WHERE name = 'fold_full_spilled';
+ counted_spilled 
+-----------------
+ t
+(1 row)
+
+-- the changes an incremental fold holds past maintenance_work_mem: in full,
+-- as that costs no more
+SELECT length(dolt_commit('-Am', 'big')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+UPDATE ff.big SET v = 'changed' WHERE id <= 5000;
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SET maintenance_work_mem = '64kB';
+SELECT test_fold_root() IS NOT NULL AS folded;
+ folded 
+--------
+ t
+(1 row)
+
+RESET maintenance_work_mem;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM full_folds();
+    reason     | n 
+---------------+---
+ memory_budget | 1
+ spilled       | 1
+(2 rows)
+
 \c contrib_regression
 DROP DATABASE regress_full_folds;

@@ -136,6 +136,7 @@ typedef struct Finder
 	MemoryContext ccxt;			/* the copies' keys and rows */
 	bool		compact;		/* entries: kept once per row */
 	int64		limit;			/* more rows than this: fold in full */
+	Size		bytes;			/* what the copies take */
 	bool		give_up;
 	ProllyFullFoldReason reason;	/* why, once it gives up */
 	StringInfoData key;			/* reused for each encoding */
@@ -421,6 +422,14 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 			f->c = f->c ? repalloc_huge(f->c, f->max * sizeof(Copy)) :
 				MemoryContextAllocHuge(f->ccxt, f->max * sizeof(Copy));
 		}
+	}
+	/* (more than a full fold's sort would take: that, instead) */
+	f->bytes += sizeof(Copy) + key->len + rowlen;
+	if (f->bytes > (Size) maintenance_work_mem * 1024)
+	{
+		f->give_up = true;
+		f->reason = PROLLY_FULL_MEMORY_BUDGET;
+		return;
 	}
 	c = &f->c[f->n++];
 	c->keylen = key->len;
@@ -760,29 +769,6 @@ apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 	return ok;
 }
 
-/* A row read: its key and encoding, each allocated to its length. */
-typedef struct FoldRow
-{
-	char	   *key;
-	uint32		keylen;
-	char	   *row;
-	uint32		rowlen;
-} FoldRow;
-
-static int
-fold_row_cmp(const void *a, const void *b, void *arg)
-{
-	const FoldRow *ra = *(FoldRow *const *) a;
-	const FoldRow *rb = *(FoldRow *const *) b;
-	ProllyKey	ka = {(const uint8 *) ra->key, ra->keylen};
-	ProllyKey	kb = {(const uint8 *) rb->key, rb->keylen};
-	int			r = keying_compare(&ka, &kb, arg);
-
-	/* equal keys of a keyless table: the same row; order by bytes anyway */
-	if (r == 0)
-		r = memcmp(ra->key, rb->key, Min(ra->keylen, rb->keylen));
-	return r != 0 ? r : (ra->keylen > rb->keylen) - (ra->keylen < rb->keylen);
-}
 
 /*
  * Every row the snapshot sees, folded into a data tree: each row's key and
@@ -792,72 +778,13 @@ fold_row_cmp(const void *a, const void *b, void *arg)
 static void
 fold_all(Finder *f, ProllyNodeRef *data)
 {
-	TableScanDesc scan;
-	FoldRow   **rows = NULL;
-	int64		nrows = 0;
-	int64		maxrows = 0;
-	ProllyTreeBuilder *b;
+	ProllyFullFold done;
 
 	f->work.full++;
-	scan = table_beginscan(f->rel, f->snap, 0, NULL, SO_NONE);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, f->rowslot))
-	{
-		FoldRow    *r = palloc(sizeof(FoldRow));
-		ProllyHash	content;
-
-		resetStringInfo(&f->key);
-		resetStringInfo(&f->row);
-		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, &content);
-		r->keylen = f->key.len;
-		r->key = palloc(Max(r->keylen, 1));
-		memcpy(r->key, f->key.data, r->keylen);
-		r->rowlen = f->row.len;
-		r->row = palloc(Max(r->rowlen, 1));
-		memcpy(r->row, f->row.data, r->rowlen);
-		if (nrows == maxrows)
-		{
-			maxrows = Max(64, maxrows * 2);
-			rows = rows ? repalloc_huge(rows, maxrows * sizeof(FoldRow *)) :
-				MemoryContextAllocHuge(CurrentMemoryContext,
-									   maxrows * sizeof(FoldRow *));
-		}
-		rows[nrows++] = r;
-		CHECK_FOR_INTERRUPTS();
-	}
-	table_endscan(scan);
-	f->work.rows_read += nrows;
-
-	if (nrows > 1)
-		qsort_arg(rows, nrows, sizeof(FoldRow *), fold_row_cmp, f);
-
-	b = PROLLY_CALL(f->tree, build_begin, &f->env, CurrentMemoryContext);
-	for (int64 i = 0; i < nrows;)
-	{
-		int64		j = i + 1;
-		ProllyKey	k = {(const uint8 *) rows[i]->key, rows[i]->keylen};
-		ProllyValue row = {(const uint8 *) rows[i]->row, rows[i]->rowlen};
-		StringInfoData value;
-		ProllyValue v;
-
-		while (j < nrows && rows[j]->keylen == rows[i]->keylen &&
-			   memcmp(rows[j]->key, rows[i]->key, k.len) == 0)
-			j++;
-		if (!f->keyless && j > i + 1)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNIQUE_VIOLATION),
-					 errmsg("table \"%s\" holds rows with the same primary key",
-							RelationGetRelationName(f->rel)),
-					 errdetail("A commit can't hold them until the key is unique again.")));
-		initStringInfo(&value);
-		PROLLY_CALL(f->kr, make_value, f->k, &row, (uint64) (j - i), &value);
-		v.data = (const uint8 *) value.data;
-		v.len = value.len;
-		PROLLY_CALL(f->tree, build_add, b, &k, &v);
-		pfree(value.data);
-		f->work.rows_written++;
-		i = j;
-	}
-	PROLLY_CALL(f->tree, build_finish, b, data);
+	prolly_fold_all(f->rel, f->snap, f->rowslot, f->kr, f->k, f->keyless,
+					f->tree, &f->env, data, &done);
+	f->work.rows_read += done.rows_read;
+	f->work.rows_written += done.rows_written;
 }
 
 /*

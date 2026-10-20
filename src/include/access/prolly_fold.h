@@ -17,7 +17,11 @@
 #ifndef PROLLY_FOLD_H
 #define PROLLY_FOLD_H
 
+#include "access/prolly_keying.h"
+#include "access/prolly_tree.h"
+#include "executor/tuptable.h"
 #include "utils/relcache.h"
+#include "utils/snapshot.h"
 
 typedef enum ProllyFullFoldReason
 {
@@ -39,6 +43,8 @@ typedef enum ProllyFullFoldReason
 	PROLLY_FULL_TOO_MANY,		/* more rows changed than the table holds */
 	PROLLY_FULL_KEYING_CHANGED, /* entries written under another keying */
 	PROLLY_FULL_UNSUPPORTED_KEY,	/* a key it can't look rows up by */
+	PROLLY_FULL_MEMORY_BUDGET,	/* the changes held passed
+								 * maintenance_work_mem */
 	PROLLY_FULL_FORCED,			/* debug_prolly_force_full_fold */
 } ProllyFullFoldReason;
 
@@ -52,6 +58,31 @@ extern PGDLLIMPORT int prolly_log_full_folds;
 
 /* A reason's name, as pg_stat_prolly's counters and the log give it. */
 extern const char *prolly_full_fold_reason_name(ProllyFullFoldReason reason);
+
+/* What a full fold read and wrote, and what its sort took. */
+typedef struct ProllyFullFold
+{
+	int64		rows_read;
+	int64		rows_written;
+	bool		spilled;		/* its sort went to disk */
+	int64		sort_kb;		/* the sort's memory, or its disk if spilled */
+} ProllyFullFold;
+
+/*
+ * Every row snap sees of rel folded into a data tree, in key order (the
+ * keying's), identical rows of a keyless table counted once; a keyed
+ * table's rows with one key are an error.  The rows are sorted in
+ * maintenance_work_mem, spilling past it, so a table of any size takes
+ * about that much.  slot is rel's, to read rows into.
+ */
+extern void prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
+							const ProllyKeyingRoutine *kr, ProllyKeying *k,
+							bool keyless, const ProllyTreeRoutine *tree,
+							const ProllyTreeEnv *env, ProllyNodeRef *data,
+							ProllyFullFold *done);
+
+/* The last full fold's (for tests). */
+extern ProllyFullFold prolly_last_full_fold;
 
 /* A full fold of rel done: counted under reason, logged if it was large. */
 extern void prolly_full_fold_noted(Relation rel, ProllyFullFoldReason reason,

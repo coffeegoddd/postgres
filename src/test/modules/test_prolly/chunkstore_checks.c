@@ -19,6 +19,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_fold.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
 #include "access/prolly_memo.h"
@@ -699,6 +700,24 @@ test_fold_trees(PG_FUNCTION_ARGS)
 	fold_in_full(&root);
 	PROLLY_CALL(prolly_canon_lookup("folded"), tables, &root, tree_row, rsinfo);
 	return (Datum) 0;
+}
+
+/* The session's last full fold: rows read, whether it spilled, its sort's kB. */
+PG_FUNCTION_INFO_V1(test_last_full_fold);
+Datum
+test_last_full_fold(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum(prolly_last_full_fold.rows_read);
+	values[1] = BoolGetDatum(prolly_last_full_fold.spilled);
+	values[2] = Int64GetDatum(prolly_last_full_fold.sort_kb);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													 values, nulls)));
 }
 
 /* What the session's folds have read: pages, candidates, full tables. */

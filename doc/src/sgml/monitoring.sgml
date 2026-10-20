@@ -5690,8 +5690,13 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>too_many</literal> (more rows changed than reading it all
        costs), <literal>keying_changed</literal> (changes written under
        another key), <literal>unsupported_key</literal> (a key rows can't
-       be looked up by) and <literal>forced</literal>
-       (<varname>debug_prolly_force_full_fold</varname>); a fold that reads
+       be looked up by), <literal>memory_budget</literal> (the changes it
+       held passed <varname>maintenance_work_mem</varname>) and
+       <literal>forced</literal>
+       (<varname>debug_prolly_force_full_fold</varname>), with
+       <literal>fold_full_spilled</literal> those whose sort of the table's
+       rows (in <varname>maintenance_work_mem</varname>) spilled to disk; a
+       fold that reads
        at least <varname>prolly.log_full_folds</varname> rows so is logged,
        with why,
        <literal>commits</literal> (commits written),
