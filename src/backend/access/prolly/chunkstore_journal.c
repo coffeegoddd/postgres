@@ -2195,6 +2195,9 @@ pending_appended(ProllyChunkStore *s, Segment *g, uint64 base, bool index)
 	{
 		if (index)
 			jindex_add(s->ix, &e->hash, g->id, base + e->offset, e->len, e->xid);
+		/* (counted once appended: those already stored were dropped) */
+		pgstat_count_prolly(PGSTAT_PROLLY_CHUNKS_APPENDED, 1);
+		pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_BYTES_APPENDED, e->raw_len);
 		hash_search(s->pending_index, &e->hash, HASH_REMOVE, NULL);
 	}
 	resetStringInfo(&s->pending);
@@ -2260,8 +2263,10 @@ pending_offset_cmp(const void *a, const void *b)
 /*
  * Before the pending chunks are appended: those the store has already
  * dropped, asked all at once, in hash order (the shared index, then each
- * table file, its filter first), rather than as each was put; what is left
- * is counted as appended.  Only before a root's PAD is added to pending.
+ * table file, its filter first), rather than as each was put.  Only
+ * before a root's PAD is added to pending.  The rest are moved down over
+ * them, in their order, and each subtransaction's saved length of pending
+ * (since the last append) made the length of what is kept of it.
  */
 static void
 drop_stored(ProllyChunkStore *s)
@@ -2307,20 +2312,13 @@ drop_stored(ProllyChunkStore *s)
 			}
 		}
 	}
-	for (int i = 0; i < n; i++)
-	{
-		if (stored[i])
-			continue;
-		pgstat_count_prolly(PGSTAT_PROLLY_CHUNKS_APPENDED, 1);
-		pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_BYTES_APPENDED, es[i]->raw_len);
-	}
 	if (nstored > 0)
 	{
-		StringInfoData kept;
 		ProllyHash *gone = palloc(sizeof(ProllyHash) * nstored);
 		int			ngone = 0;
+		int			to = 0;
+		ListCell   *sc;
 
-		/* (the rest as they were, in their order) */
 		for (int i = 0; i < n; i++)
 			if (stored[i])
 				gone[ngone++] = es[i]->hash;
@@ -2329,20 +2327,35 @@ drop_stored(ProllyChunkStore *s)
 			if (!stored[i])
 				es[k++] = es[i];
 		qsort(es, k, sizeof(IndexEntry *), pending_offset_cmp);
-		initStringInfo(&kept);
+
+		/*
+		 * A save's length: of the bytes kept, those before it (pending only
+		 * grows between appends, so a chunk was there at the save if its
+		 * offset was before the length saved).
+		 */
+		foreach(sc, s->pending_saved)
+		{
+			PendingSave *save = lfirst(sc);
+			int			len = 0;
+
+			if (save->flushes != s->flushes)
+				continue;
+			for (int i = 0; i < k && es[i]->offset < save->len; i++)
+				len += es[i]->len;
+			save->len = len;
+		}
+		/* (in place: in offset order, each moves down, if at all) */
 		for (int i = 0; i < k; i++)
 		{
-			int			at = kept.len;
-
-			appendBinaryStringInfo(&kept, s->pending.data + es[i]->offset,
-								   es[i]->len);
-			es[i]->offset = at;
+			memmove(s->pending.data + to, s->pending.data + es[i]->offset,
+					es[i]->len);
+			es[i]->offset = to;
+			to += es[i]->len;
 		}
+		s->pending.len = to;
+		s->pending.data[to] = '\0';
 		for (int i = 0; i < ngone; i++)
 			hash_search(s->pending_index, &gone[i], HASH_REMOVE, NULL);
-		resetStringInfo(&s->pending);
-		appendBinaryStringInfo(&s->pending, kept.data, kept.len);
-		pfree(kept.data);
 		pfree(gone);
 	}
 	pfree(es);

@@ -55,5 +55,26 @@ COMMIT;
 :flush
 SELECT counted('chunks_appended') AS appended;
 
+-- A savepoint after chunks the store has, a batch of them all dropped
+-- (nothing appended), then a chunk put and rolled back to the savepoint:
+-- the chunk is gone with it, and the commit appends nothing.
+\c puts_db
+SELECT journal_bytes() AS before \gset
+BEGIN;
+SELECT count(test_chunk_put(test_noise('big ' || g, 100000)))
+FROM generate_series(1, 6) g;
+SAVEPOINT a;
+SELECT count(test_chunk_put(test_noise('big ' || g, 100000)))
+FROM generate_series(7, 12) g;
+SELECT test_chunk_put(test_noise('rolled back', 1000)) IS NOT NULL AS put;
+ROLLBACK TO a;
+COMMIT;
+SELECT journal_bytes() = :before AS nothing_appended;
+\c puts_db
+SELECT test_chunk_has(test_content_hash(test_noise('rolled back', 1000))) AS rolled_back_found;
+SELECT test_chunk_has(test_content_hash(test_noise('big 12', 100000))) AS big_found;
+SELECT test_chunk_get(test_chunk_put(test_noise('after', 1000))) = test_noise('after', 1000)
+	AS journal_reads;
+
 \c postgres
 DROP DATABASE puts_db;
