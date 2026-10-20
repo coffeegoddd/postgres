@@ -38,8 +38,11 @@
  *   returns false), at once and for every transaction: the chunks of
  *   another store, received whole, or of a rewrite.  It isn't undone if the
  *   transaction aborts; its chunks are reachable once a root naming them
- *   is.  conjoin() rewrites the table files as one (settled if they all
- *   were).  table_files() visits the store's table files: a settled one is
+ *   is.  conjoin() rewrites table files as one, dropping chunks more than
+ *   one of them holds: with max_files 0, all of them (settled if they all
+ *   were); otherwise, if there are more than max_files, the fewest of the
+ *   smallest that leave max_files (or as close as one rewrite can), settled
+ *   files and the others apart.  table_files() visits the store's table files: a settled one is
  *   closed under what its chunks name (they are in it, in another settled
  *   file, or in the journal's segments).
  * - The journal (where put() appends) is in segments: seal() closes the one
@@ -238,7 +241,7 @@ typedef struct ProllyChunkStoreRoutine
 	/* Table files. */
 	void		(*add_table_file) (ProllyChunkStore *store, ProllyChunkNext next,
 								   void *arg);
-	void		(*conjoin) (ProllyChunkStore *store);
+	void		(*conjoin) (ProllyChunkStore *store, int max_files);
 	void		(*table_files) (ProllyChunkStore *store,
 								ProllyChunkFileVisit visit, void *arg);
 

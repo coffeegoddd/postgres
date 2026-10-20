@@ -445,7 +445,7 @@ PG_FUNCTION_INFO_V1(test_chunk_conjoin);
 Datum
 test_chunk_conjoin(PG_FUNCTION_ARGS)
 {
-	PROLLY_CALL(cs(), conjoin, store());
+	PROLLY_CALL(cs(), conjoin, store(), PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0));
 	PG_RETURN_VOID();
 }
 

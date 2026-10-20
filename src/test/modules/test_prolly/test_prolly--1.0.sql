@@ -233,7 +233,9 @@ CREATE FUNCTION test_chunk_table_file(chunks bytea[])
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_chunk_conjoin()
+-- Conjoin the table files: all of them, or (max_files) the smallest of
+-- those past max_files.
+CREATE FUNCTION test_chunk_conjoin(max_files int DEFAULT 0)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C;
 

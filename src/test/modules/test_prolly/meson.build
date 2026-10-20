@@ -73,6 +73,7 @@ tests += {
       'schema_merges',
       'merge_truth',
       'table_files',
+      'conjoin_choice',
       'incremental_folds',
       'change_log',
       'log_folds',

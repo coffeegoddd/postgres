@@ -118,6 +118,24 @@ sql('SELECT test_chunk_gc(false) IS NOT NULL');
 is(sql("SELECT test_chunk_has('$dead')"), 'f',
 	'a default collection frees the garbage moved');
 
+# Past prolly.conjoin_max_files table files, autovacuum conjoins the
+# smallest, and the files left are no more than that; every chunk reads.
+reload_settings('prolly.conjoin_max_files = 3');
+my $nfiles = q{SELECT count(*) FROM test_chunk_table_files()};
+sql(qq{SELECT test_chunk_table_file(ARRAY[test_noise('file $_', 100)])}) for 1 .. 5;
+ok($node->poll_query_until('mv', "SELECT ($nfiles) <= 3"),
+	'past the limit, autovacuum conjoins the smallest files');
+is(sql(q{SELECT count(*) FROM generate_series(1, 5) g
+	WHERE test_chunk_has(test_content_hash(test_noise('file ' || g, 100)))}), '5',
+	'every conjoined chunk reads');
+ok($node->poll_query_until('mv', q{SELECT value > 0 FROM pg_stat_prolly
+	WHERE name = 'conjoins'}), 'the conjoin is counted');
+reload_settings('prolly.conjoin_max_files = -1');
+my $kept = sql($nfiles);
+sql(qq{SELECT test_chunk_table_file(ARRAY[test_noise('more $_', 100)])}) for 1 .. 4;
+sleep(3);
+is(sql($nfiles), $kept + 4, 'with the limit -1, files aren\'t conjoined');
+
 $standby->stop;
 $node->stop;
 done_testing();

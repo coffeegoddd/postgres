@@ -4107,12 +4107,84 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 	return false;
 }
 
+/* a manifest's file, for choosing what to conjoin */
+typedef struct ConjoinCandidate
+{
+	int			file;			/* in the manifest */
+	uint32		nchunks;
+} ConjoinCandidate;
+
+static int
+candidate_cmp(const void *a, const void *b)
+{
+	const ConjoinCandidate *x = a;
+	const ConjoinCandidate *y = b;
+
+	if (x->nchunks != y->nchunks)
+		return x->nchunks < y->nchunks ? -1 : 1;
+	return x->file - y->file;
+}
+
 /*
- * Rewrite the table files as one, which the manifest names alone: settled
- * if they all were.
+ * Choose the files of m a conjoin past max_files rewrites, as Dolt's
+ * conjoiner does: of the settled files or the others (whichever are more,
+ * so a settled file's chunks stay settled), the smallest by chunks, taking
+ * the next while the ones taken add up to no more than it, or while
+ * leaving it would leave more than max_files; keep[] says which stay.
+ * False if no two can be.
+ */
+static bool
+choose_conjoinees(const Manifest *m, int max_files, bool *keep)
+{
+	ConjoinCandidate *c = palloc(sizeof(ConjoinCandidate) * m->nfiles);
+	int			nsettled = 0;
+	bool		settled;
+	int			n = 0;
+	int			taken;
+	uint64		sum;
+
+	for (int i = 0; i < m->nfiles; i++)
+		nsettled += (m->files[i].flags & MANIFEST_FILE_SETTLED) != 0;
+	settled = nsettled * 2 >= m->nfiles;
+	if ((settled ? nsettled : m->nfiles - nsettled) < 2)
+		settled = !settled;
+	for (int i = 0; i < m->nfiles; i++)
+	{
+		keep[i] = true;
+		if (((m->files[i].flags & MANIFEST_FILE_SETTLED) != 0) == settled)
+		{
+			c[n].file = i;
+			c[n].nchunks = m->files[i].nchunks;
+			n++;
+		}
+	}
+	if (n < 2)
+	{
+		pfree(c);
+		return false;
+	}
+	qsort(c, n, sizeof(ConjoinCandidate), candidate_cmp);
+	sum = (uint64) c[0].nchunks + c[1].nchunks;
+	for (taken = 2; taken < n; taken++)
+	{
+		/* (the files left then: those not taken, and the new one) */
+		if (sum <= c[taken].nchunks && m->nfiles - taken + 1 <= max_files)
+			break;
+		sum += c[taken].nchunks;
+	}
+	for (int i = 0; i < taken; i++)
+		keep[c[i].file] = false;
+	pfree(c);
+	return true;
+}
+
+/*
+ * Rewrite table files as one, which the manifest names instead of them,
+ * settled if they all were: all of them (max_files 0), or past max_files,
+ * the smallest (choose_conjoinees()).
  */
 static void
-journal_conjoin(ProllyChunkStore *s)
+journal_conjoin(ProllyChunkStore *s, int max_files)
 {
 	Manifest	m;
 	bool	   *keep;
@@ -4123,10 +4195,19 @@ journal_conjoin(ProllyChunkStore *s)
 	uint8		flags = MANIFEST_FILE_SETTLED;
 
 	lock_manifest(s, &m);
-	if (m.nfiles < 2)
+	if (m.nfiles < 2 || (max_files > 0 && m.nfiles <= max_files))
 		return;
+	keep = palloc0(sizeof(bool) * m.nfiles);
+	if (max_files > 0 && !choose_conjoinees(&m, max_files, keep))
+	{
+		pfree(keep);
+		return;
+	}
 	for (int i = 0; i < m.nfiles; i++)
-		flags &= m.files[i].flags;
+	{
+		if (!keep[i])
+			flags &= m.files[i].flags;
+	}
 
 	/* the files as the lock's manifest names them, opened for this */
 	dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -4137,15 +4218,17 @@ journal_conjoin(ProllyChunkStore *s)
 	ctl.hcxt = CurrentMemoryContext;
 	cs.seen = hash_create("prolly conjoin", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-	keep = palloc0(sizeof(bool) * m.nfiles);
 
 	/* (closed whatever happens: a file kept open is never given back) */
 	PG_TRY();
 	{
 		for (int i = 0; i < m.nfiles; i++)
 		{
-			TableFile  *t = open_table(dir, &m.files[i], CurrentMemoryContext);
+			TableFile  *t;
 
+			if (keep[i])
+				continue;
+			t = open_table(dir, &m.files[i], CurrentMemoryContext);
 			if (t == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),

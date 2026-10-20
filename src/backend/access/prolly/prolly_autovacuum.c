@@ -13,8 +13,10 @@
  * segments rewritten as a table file, nothing freed) once its segments
  * have passed prolly.journal_move_threshold, which bounds what a backend
  * reads to index the journal when collections are rare (a large store) or
- * off; after a collection, they haven't.  It sweeps a page store when bmap_sweep_due()
- * says so.  Each runs in a transaction of its own, an error reported and
+ * off; after a collection, they haven't.  Then, with more table files than
+ * prolly.conjoin_max_files, it conjoins the smallest (the chunk store's
+ * conjoin()), so a lookup searches no more files than that, as Dolt does
+ * past 256.  It sweeps a page store when bmap_sweep_due() says so.  Each runs in a transaction of its own, an error reported and
  * passed over, as autovacuum's tables' are; a collection and a move read
  * and copy under autovacuum's cost-based delay.
  *
@@ -28,6 +30,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -43,6 +46,19 @@
 int			prolly_gc_journal_threshold = 128;
 double		prolly_gc_growth_scale_factor = 0.2;
 int			prolly_journal_move_threshold = 256;
+int			prolly_conjoin_max_files = 256;
+
+/* fewer than two files would be conjoined at every pass: -1 turns it off */
+static bool
+check_conjoin_max_files(int *newval, void **extra, GucSource source)
+{
+	if (*newval == 0 || *newval == 1)
+	{
+		GUC_check_errdetail("Use at least 2 files, or -1 to turn conjoining off.");
+		return false;
+	}
+	return true;
+}
 
 /* 0 would move the journal at every pass: -1 turns moving off */
 static bool
@@ -87,6 +103,14 @@ prolly_autovacuum_init(void)
 							PGC_SIGHUP,
 							GUC_UNIT_MB,
 							check_move_threshold, NULL, NULL);
+	DefineCustomIntVariable("prolly.conjoin_max_files",
+							"How many table files a chunk store may have before autovacuum conjoins the smallest.",
+							"-1 turns it off.",
+							&prolly_conjoin_max_files,
+							256, -1, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							check_conjoin_max_files, NULL, NULL);
 	defined = true;
 }
 
@@ -197,6 +221,37 @@ move(void)
 							 (unsigned long long) r.window_usec)));
 }
 
+static void
+count_file(const char *name, int nchunks, uint64 size, bool settled,
+		   void *arg)
+{
+	(*(int *) arg)++;
+}
+
+/*
+ * The table files conjoined, the smallest, if there are more than
+ * prolly.conjoin_max_files.
+ */
+static void
+conjoin(void)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store;
+	int			nfiles = 0;
+
+	if (prolly_conjoin_max_files < 0)
+		return;
+	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
+	PROLLY_CALL(cs, table_files, store, count_file, &nfiles);
+	if (nfiles <= prolly_conjoin_max_files)
+		return;
+	PROLLY_CALL(cs, conjoin, store, prolly_conjoin_max_files);
+	ereport(DEBUG1,
+			(errmsg_internal("automatic conjoin of database \"%s\": %d table files, past %d",
+							 get_database_name(MyDatabaseId), nfiles,
+							 prolly_conjoin_max_files)));
+}
+
 /*
  * Sweep the current database's page stores, in every tablespace that has
  * one (only those bmap_sweep_due() names, with due_only), adding to total.
@@ -253,7 +308,7 @@ sweep(void)
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {collect, move, sweep};
+	void		(*steps[]) (void) = {collect, move, conjoin, sweep};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{
