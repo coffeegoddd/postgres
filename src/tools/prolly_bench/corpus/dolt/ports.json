@@ -24853,7 +24853,7 @@
       "index": 1,
       "name": "basic case with single table",
       "source_sha256": "46edd047deb7d47e0eb9ac442f0ef05f402022768f910fb3d950293d0eba1b7e",
-      "scenario_sha256": "d6230f5eded5736d908f6822b75cbc0377829195567162d1af0af361654d1ea1",
+      "scenario_sha256": "b8debb2f0b18ccc1b61a69396fda836922fa82670db1dd4537285ed1ea119775",
       "setup": [
         {
           "index": 0,
@@ -24988,17 +24988,21 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The table is gone from the session's branch (the setup drops it): its rows are counted from the commits' trees. Preserved counts; the table is named schema-qualified. (D4)"
+          "note": "The table is gone from the session's branch (the setup drops it): its rows are diffed from the commits' trees. Preserved counts; the table is named schema-qualified. (D4)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "Left out: the table is gone from the session's branch (the setup drops it); its rows are counted from the commits' trees, but its cells modified, which need its rows decoded, are NULL where Dolt counts 2."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "The table is gone from the session's branch (the setup drops it): its rows are diffed from the commits' trees, each version decoded by its description. Preserved counts; the table is named schema-qualified. (D4)"
         },
         {
           "index": 3,
-          "steps": [],
-          "note": "Left out: the table is gone from the session's branch (the setup drops it); its rows are counted from the commits' trees, but its cells modified, which need its rows decoded, are NULL where Dolt counts 2."
+          "steps": [
+            "assert-3"
+          ],
+          "note": "The table is gone from the session's branch (the setup drops it): its rows are diffed from the commits' trees, each version decoded by its description. Preserved counts; the table is named schema-qualified. (D4)"
         },
         {
           "index": 4,
@@ -25025,6 +25029,193 @@
           "index": 7,
           "steps": [],
           "note": "Left out: dolt_at(ref, NULL::t), standing for t AS OF (D18), needs t's row type, and the setup drops t."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "Tables named qualified. (D15)"
+      ]
+    },
+    {
+      "id": "dolt-diff-stat-keyless",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffStatTableFunctionScriptTests",
+      "index": 2,
+      "name": "basic case with single keyless table",
+      "source_sha256": "5c0cc54f627d84f0cdf64328c39477944d50b55bff59e5ddf6cf6b9c5a043497",
+      "scenario_sha256": "e09e152e12b4fa7b47dfa5b7d04122928988af1f8a903b6f255ce1f338797849",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Preserved --allow-empty. Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved DDL (varchar(20) as in Dolt)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved: no rows. An empty table added changes no rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "The keyless table is gone from the session's branch (the setup drops it): its copies are counted from the commits' trees, each version read by its description; a keyless table's other counts are NULL, as Dolt's. Preserved counts (an update, a copy deleted and one added, as Dolt counts it); the table is named schema-qualified. (D4)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "The keyless table is gone from the session's branch (the setup drops it): its copies are counted from the commits' trees, each version read by its description; a keyless table's other counts are NULL, as Dolt's. Preserved counts (an update, a copy deleted and one added, as Dolt counts it); the table is named schema-qualified. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "The keyless table is gone from the session's branch (the setup drops it): its copies are counted from the commits' trees, each version read by its description; a keyless table's other counts are NULL, as Dolt's. Preserved counts (an update, a copy deleted and one added, as Dolt counts it); the table is named schema-qualified. (D4)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "The keyless table is gone from the session's branch (the setup drops it): its copies are counted from the commits' trees, each version read by its description; a keyless table's other counts are NULL, as Dolt's. Preserved counts (an update, a copy deleted and one added, as Dolt counts it); the table is named schema-qualified. (D4)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "The keyless table is gone from the session's branch (the setup drops it): its copies are counted from the commits' trees, each version read by its description; a keyless table's other counts are NULL, as Dolt's. Preserved counts (an update, a copy deleted and one added, as Dolt counts it); the table is named schema-qualified. (D4)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "A table neither ref has: refused, SQLSTATE 42P01 (undefined table), Dolt's ErrTableNotFound."
         }
       ],
       "adaptations": [
@@ -31753,14 +31944,6 @@
       "name": "hard reset dropped table with branch restores auto increment",
       "source_sha256": "90efb05eca8330d15b2d933e51e33366ca458d4348eae6410d8fb3ac22cbbc4e",
       "reason": "Intended divergence (D6): a versioned schema's sequences are per branch and in each commit, so the hard reset restores main's sequence as its commit has it and the next generated key is 3, not Dolt's 101: Dolt's auto-increment counter is kept across branches and continues past branch1's explicit 100. (A Postgres identity's sequence doesn't advance past a key given explicitly either.) The case is about that counter: ported, it would be DoltAutoIncrementTests 10 again."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
-      "suite": "DiffStatTableFunctionScriptTests",
-      "index": 2,
-      "name": "basic case with single keyless table",
-      "source_sha256": "5c0cc54f627d84f0cdf64328c39477944d50b55bff59e5ddf6cf6b9c5a043497",
-      "reason": "Its setup drops the keyless table before the assertions, and dolt_diff_stat counts a keyless table's copies only where the session's branch has it (it reads them through the table's row type), so every assertion reads NULLs where Dolt counts the copies. A gap in prolly, reported."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",

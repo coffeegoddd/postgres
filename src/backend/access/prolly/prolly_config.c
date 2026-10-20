@@ -107,6 +107,12 @@ prolly_components_for_relation(Relation rel, ProllyComponents *components)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a prolly table",
 						RelationGetRelationName(rel))));
+	prolly_history_components(components);
+}
+
+void
+prolly_history_components(ProllyComponents *components)
+{
 	components->chunker = (const ProllyChunkerRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_CHUNKER);
 	components->hash = prolly_content_hash();

@@ -176,6 +176,78 @@
       ]
     },
     {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "0",
+            "2",
+            "0",
+            "1",
+            "6",
+            "0",
+            "2",
+            "1",
+            "3",
+            "3",
+            "9"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff_stat($1, $2, 't')",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "0",
+            "0",
+            "2",
+            "1",
+            "0",
+            "6",
+            "2",
+            "3",
+            "1",
+            "9",
+            "3"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
       "id": "assert-4",
       "session": "a",
       "op": "query",

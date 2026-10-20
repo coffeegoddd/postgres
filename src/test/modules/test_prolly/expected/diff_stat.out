@@ -186,18 +186,22 @@ SELECT table_name, rows_added, rows_deleted, rows_modified
 FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.nokey');
  table_name | rows_added | rows_deleted | rows_modified 
 ------------+------------+--------------+---------------
- ds.nokey   |            |              |              
+ ds.nokey   |          1 |            1 |              
 (1 row)
 
 DROP TABLE ds.nokey;
 -- a table changed on both sides but gone from the branch: its rows
--- counted from the commits' trees (its cells modified unknown, as they'd
--- need its rows decoded); with a text key in a collation, too, whose
--- order isn't its bytes'
+-- diffed from the commits' trees, each version decoded by its own
+-- description; with a text key in a collation, too, whose order isn't its
+-- bytes'; a keyless one with copies; and values out of line
 CREATE TABLE ds.gone2 (id int PRIMARY KEY, v text);
 INSERT INTO ds.gone2 SELECT g, 'v' || g FROM generate_series(1, 500) g;
 CREATE TABLE ds.coll (k text COLLATE "en-x-icu" PRIMARY KEY, v int);
 INSERT INTO ds.coll SELECT chr(65 + g % 26) || chr(97 + g % 26) || g, g FROM generate_series(1, 400) g;
+CREATE TABLE ds.kl (a int, b text);
+INSERT INTO ds.kl SELECT g % 7, repeat('x', 3000 * (g % 2)) || g % 7 FROM generate_series(1, 70) g;
+CREATE TABLE ds.ool (id int PRIMARY KEY, v text);
+INSERT INTO ds.ool SELECT g, repeat(md5(g::text), 400) FROM generate_series(1, 20) g;
 SELECT length(dolt_commit('-Am', 'left')::text) AS committed;
  committed 
 -----------
@@ -210,6 +214,9 @@ INSERT INTO ds.gone2 VALUES (1000, 'new'), (1001, 'new');
 UPDATE ds.coll SET v = -v WHERE v % 40 = 0;
 DELETE FROM ds.coll WHERE v BETWEEN 1 AND 5;
 INSERT INTO ds.coll VALUES ('aa', 0), ('ZZ', 0), ('Ab', 0);
+DELETE FROM ds.kl WHERE a = 3;
+INSERT INTO ds.kl SELECT 9, 'new' FROM generate_series(1, 4);
+UPDATE ds.ool SET v = repeat(md5((id + 1)::text), 400) WHERE id <= 3;
 SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
  committed 
 -----------
@@ -218,7 +225,9 @@ SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
 
 SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.gone2') AS here \gset here_
 SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.coll') AS here \gset coll_
-DROP TABLE ds.gone2, ds.coll;
+SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.kl') AS here \gset kl_
+SELECT * FROM dolt_diff_stat('HEAD~1', 'HEAD', 'ds.ool') AS here \gset ool_
+DROP TABLE ds.gone2, ds.coll, ds.kl, ds.ool;
 SELECT length(dolt_commit('-am', 'dropped')::text) AS committed;
  committed 
 -----------
@@ -227,16 +236,20 @@ SELECT length(dolt_commit('-am', 'dropped')::text) AS committed;
 
 SELECT table_name, rows_unmodified, rows_added, rows_deleted, rows_modified,
 	cells_added, cells_deleted, cells_modified, old_row_count, new_row_count
-FROM dolt_diff_stat('HEAD~2', 'HEAD~1') WHERE table_name IN ('ds.gone2', 'ds.coll')
+FROM dolt_diff_stat('HEAD~2', 'HEAD~1')
+WHERE table_name IN ('ds.gone2', 'ds.coll', 'ds.kl', 'ds.ool')
 ORDER BY 1;
  table_name | rows_unmodified | rows_added | rows_deleted | rows_modified | cells_added | cells_deleted | cells_modified | old_row_count | new_row_count 
 ------------+-----------------+------------+--------------+---------------+-------------+---------------+----------------+---------------+---------------
- ds.coll    |             385 |          3 |            5 |            10 |           6 |            10 |                |           400 |           398
- ds.gone2   |             481 |          2 |           10 |             9 |           4 |            20 |                |           500 |           492
-(2 rows)
+ ds.coll    |             385 |          3 |            5 |            10 |           6 |            10 |             10 |           400 |           398
+ ds.gone2   |             481 |          2 |           10 |             9 |           4 |            20 |              9 |           500 |           492
+ ds.kl      |                 |          4 |           10 |               |             |               |                |               |              
+ ds.ool     |              17 |          0 |            0 |             3 |           0 |             0 |              3 |            20 |            20
+(4 rows)
 
 SELECT rows_added = :here_rows_added AND rows_deleted = :here_rows_deleted AND
-	rows_modified = :here_rows_modified AS gone2_as_on_the_branch
+	rows_modified = :here_rows_modified AND cells_modified = :here_cells_modified
+	AS gone2_as_on_the_branch
 FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.gone2');
  gone2_as_on_the_branch 
 ------------------------
@@ -244,10 +257,27 @@ FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.gone2');
 (1 row)
 
 SELECT rows_added = :coll_rows_added AND rows_deleted = :coll_rows_deleted AND
-	rows_modified = :coll_rows_modified AS coll_as_on_the_branch
+	rows_modified = :coll_rows_modified AND cells_modified = :coll_cells_modified
+	AS coll_as_on_the_branch
 FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.coll');
  coll_as_on_the_branch 
 -----------------------
+ t
+(1 row)
+
+SELECT rows_added = :kl_rows_added AND rows_deleted = :kl_rows_deleted
+	AS kl_as_on_the_branch
+FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.kl');
+ kl_as_on_the_branch 
+---------------------
+ t
+(1 row)
+
+SELECT rows_modified = :ool_rows_modified AND cells_modified = :ool_cells_modified
+	AS ool_as_on_the_branch
+FROM dolt_diff_stat('HEAD~2', 'HEAD~1', 'ds.ool');
+ ool_as_on_the_branch 
+----------------------
  t
 (1 row)
 

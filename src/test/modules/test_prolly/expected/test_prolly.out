@@ -185,7 +185,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying  | stub           | keys_and_content               | not implemented (missing open, encode_row, compare, close, encode_key)
  table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
- table_keying  | stub           | complete                       | not implemented (13 of 13 callbacks missing)
+ table_keying  | stub           | complete                       | not implemented (14 of 14 callbacks missing)
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass

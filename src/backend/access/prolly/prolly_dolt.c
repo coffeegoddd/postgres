@@ -54,7 +54,9 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/miscnodes.h"
 #include "parser/analyze.h"
+#include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "tcop/utility.h"
@@ -3885,6 +3887,8 @@ typedef struct Rows
 	ProllyTreeEnv env;			/* where values out of line are read */
 	ProllyKeyingRefs refs;
 	MemoryContext rowcxt;		/* a row's decoding, reset for the next */
+	bool		described;		/* a version's, by its description: its
+								 * values parsed as keyless says */
 } Rows;
 
 static void
@@ -3899,6 +3903,82 @@ rows_begin(Rows *r, Relation rel)
 	r->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
 	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
 									  ALLOCSET_DEFAULT_SIZES);
+}
+
+/* A canonical table item's data tree. */
+static void
+table_item_data(const char *item, int len, ProllyNodeRef *data)
+{
+	memset(data, 0, sizeof(*data));
+	if (len < 1 || (uint8) item[0] > PROLLY_HASH_MAX_LEN || len < 1 + (uint8) item[0])
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a canonical table item without its rows")));
+	data->hash.len = (uint8) item[0];
+	memcpy(data->hash.bytes, item + 1, data->hash.len);
+}
+
+/*
+ * rows_begin() of a version of a table only its commits describe (its
+ * item, item bytes): its columns as described, read without a relation.
+ * False if they can't be: a column's type isn't one this database has, or
+ * the keying can't open rows so.
+ */
+static bool
+rows_begin_described(Rows *r, const char *item, int len)
+{
+	ProllyValue v = {(const uint8 *) item, len};
+	ProllyNodeRef data;
+	ProllyValue d;
+	List	   *cols;
+	TupleDesc	desc;
+	bool		keyed;
+	int			i = 1;
+	ListCell   *lc;
+
+	memset(r, 0, sizeof(*r));
+	prolly_history_components(&r->c);
+	if (!PROLLY_HAS(r->c.keying, open_described) ||
+		!PROLLY_HAS(r->c.keying, parse_value_as))
+		return false;
+	table_item_data(item, len, &data);
+	d.data = v.data + 1 + data.hash.len;
+	d.len = v.len - 1 - data.hash.len;
+	cols = PROLLY_CALL(canonicalizer(), table_columns, &d, &keyed);
+	desc = CreateTemplateTupleDesc(list_length(cols));
+	foreach(lc, cols)
+	{
+		ProllyTableColumn *c = lfirst(lc);
+		ErrorSaveContext escontext = {T_ErrorSaveContext};
+		Oid			type;
+		int32		typmod;
+
+		if (!parseTypeString(c->type, &type, &typmod, (Node *) &escontext) ||
+			!OidIsValid(type))
+			return false;
+		TupleDescInitEntry(desc, i++, c->name, type, typmod, 0);
+	}
+	TupleDescFinalize(desc);
+	r->keying = PROLLY_CALL(r->c.keying, open_described, desc, CurrentMemoryContext);
+	r->keyless = !keyed;
+	r->described = true;
+	prolly_folded_tree_env(&r->env);
+	prolly_keying_use_env(&r->refs, r->c.keying, r->keying, r->c.tree, &r->env);
+	r->slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	r->rowcxt = AllocSetContextCreate(CurrentMemoryContext, "dolt rows",
+									  ALLOCSET_DEFAULT_SIZES);
+	return true;
+}
+
+/* A tree value's row and copies, as the rows' version keyed them. */
+static void
+rows_parse(Rows *r, const ProllyValue *value, ProllyValue *row, uint64 *count)
+{
+	if (r->described)
+		PROLLY_CALL(r->c.keying, parse_value_as, r->keying, r->keyless, value,
+					row, count);
+	else
+		PROLLY_CALL(r->c.keying, parse_value, r->keying, value, row, count);
 }
 
 /*
@@ -3931,7 +4011,7 @@ rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 {
 	ProllyValue row;
 
-	PROLLY_CALL(r->c.keying, parse_value, r->keying, value, &row, count);
+	rows_parse(r, value, &row, count);
 	ExecClearTuple(r->slot);
 	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
 	return ExecFetchSlotHeapTupleDatum(r->slot);
@@ -4352,6 +4432,8 @@ typedef struct StatSink
 	uint64		deleted;
 	uint64		modified;
 	uint64		cells_modified;
+	int		   *from_of;		/* described versions: each of to's columns'
+								 * of from's, by name (-1: none) */
 } StatSink;
 
 /* The columns of a modified row that differ, as the table is defined now. */
@@ -4368,16 +4450,40 @@ cells_differing(StatSink *s, const ProllyValue *before, const ProllyValue *after
 	(void) rows_datum(&s->to, after, &count);
 	slot_getallattrs(s->from.slot);
 	slot_getallattrs(s->to.slot);
+	if (s->from_of)
+		desc = s->to.slot->tts_tupleDescriptor;
 	for (int i = 0; i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
-		bool		fnull = s->from.slot->tts_isnull[i];
+		int			j = s->from_of ? s->from_of[i] : i;
+		bool		fnull = j < 0 || s->from.slot->tts_isnull[j];
 		bool		tnull = s->to.slot->tts_isnull[i];
 
 		if (att->attisdropped)
 			continue;
+		if (j >= 0 && s->from_of &&
+			TupleDescAttr(s->from.slot->tts_tupleDescriptor, j)->atttypid != att->atttypid)
+		{
+			/* (a column retyped between the versions: by its text) */
+			Oid			fout;
+			Oid			tout;
+			bool		varlena;
+
+			if (fnull != tnull)
+				n++;
+			else if (!fnull)
+			{
+				getTypeOutputInfo(TupleDescAttr(s->from.slot->tts_tupleDescriptor, j)->atttypid,
+								  &fout, &varlena);
+				getTypeOutputInfo(att->atttypid, &tout, &varlena);
+				if (strcmp(OidOutputFunctionCall(fout, s->from.slot->tts_values[j]),
+						   OidOutputFunctionCall(tout, s->to.slot->tts_values[i])) != 0)
+					n++;
+			}
+			continue;
+		}
 		if (fnull != tnull ||
-			(!fnull && !datum_image_eq(s->from.slot->tts_values[i],
+			(!fnull && !datum_image_eq(s->from.slot->tts_values[j],
 									   s->to.slot->tts_values[i],
 									   att->attbyval, att->attlen)))
 			n++;
@@ -4401,9 +4507,9 @@ stat_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 
 		/* (a keyless row's copies: those added or taken away) */
 		if (before)
-			PROLLY_CALL(s->from.c.keying, parse_value, s->from.keying, before, &row, &was);
+			rows_parse(&s->from, before, &row, &was);
 		if (after)
-			PROLLY_CALL(s->from.c.keying, parse_value, s->from.keying, after, &row, &is);
+			rows_parse(s->from_of ? &s->to : &s->from, after, &row, &is);
 		if (is > was)
 			s->added += is - was;
 		else
@@ -4442,19 +4548,6 @@ keyed_now(Oid relid)
 	return !keyless;
 }
 
-/* A canonical table item's data tree. */
-static void
-table_item_data(const char *item, int len, ProllyNodeRef *data)
-{
-	memset(data, 0, sizeof(*data));
-	if (len < 1 || (uint8) item[0] > PROLLY_HASH_MAX_LEN || len < 1 + (uint8) item[0])
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("a canonical table item without its rows")));
-	data->hash.len = (uint8) item[0];
-	memcpy(data->hash.bytes, item + 1, data->hash.len);
-}
-
 /* A version of a table: its rows (a count of its tree's items), its columns. */
 static void
 table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed)
@@ -4472,19 +4565,71 @@ table_version(const char *item, int len, uint64 *rows, int *columns, bool *keyed
 	*rows = PROLLY_CALL(prolly_tree_lookup("cow"), count, &env, &data);
 }
 
-/* A keyed table's rows added, deleted or modified, as an unordered diff finds them. */
+/* A change an unordered diff finds, to the sink. */
 static void
 stat_tree_change(ProllyDiffKind kind, const ProllyKey *key,
 				 const ProllyValue *before, const ProllyValue *after, void *arg)
 {
-	StatSink   *s = arg;
+	stat_change(arg, InvalidOid, kind, key, before, after);
+}
 
-	if (kind == PROLLY_DIFF_ADDED)
-		s->added++;
-	else if (kind == PROLLY_DIFF_REMOVED)
-		s->deleted++;
-	else
-		s->modified++;
+/*
+ * A table the session's branch hasn't, or has keyed otherwise than its
+ * versions are: its rows diffed from the trees, by their keys' bytes (as
+ * no relation orders them), each decoded by its version's description (a
+ * side without the table, as the empty tree of the other's).  False if
+ * they can't be read so.
+ */
+static bool
+stat_described(StatSink *s, const SummaryRow *r)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	const char *fitem = r->from_item ? r->from_item : r->to_item;
+	int			flen = r->from_item ? r->from_len : r->to_len;
+	const char *titem = r->to_item ? r->to_item : r->from_item;
+	int			tlen = r->to_item ? r->to_len : r->from_len;
+	ProllyNodeRef fd;
+	ProllyNodeRef td;
+	TupleDesc	fdesc;
+	TupleDesc	tdesc;
+
+	if (!PROLLY_HAS(tree, diff_unordered) ||
+		!rows_begin_described(&s->from, fitem, flen))
+		return false;
+	if (!rows_begin_described(&s->to, titem, tlen))
+	{
+		rows_end(&s->from);
+		return false;
+	}
+	fdesc = s->from.slot->tts_tupleDescriptor;
+	tdesc = s->to.slot->tts_tupleDescriptor;
+	s->from_of = palloc_array(int, Max(tdesc->natts, 1));
+	for (int i = 0; i < tdesc->natts; i++)
+	{
+		s->from_of[i] = -1;
+		for (int j = 0; j < fdesc->natts; j++)
+			if (strcmp(NameStr(TupleDescAttr(tdesc, i)->attname),
+					   NameStr(TupleDescAttr(fdesc, j)->attname)) == 0)
+				s->from_of[i] = j;
+	}
+	table_item_data(fitem, flen, &fd);
+	table_item_data(titem, tlen, &td);
+	if (r->from_item == NULL || r->to_item == NULL)
+	{
+		ProllyNodeRef empty;
+
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &s->from.env, CurrentMemoryContext),
+					&empty);
+		if (r->from_item == NULL)
+			fd = empty;
+		else
+			td = empty;
+	}
+	PROLLY_CALL(tree, diff_unordered, &s->from.env, &fd, &td, stat_tree_change, s);
+	rows_end(&s->from);
+	rows_end(&s->to);
+	return true;
 }
 
 /*
@@ -4533,10 +4678,10 @@ cells_added_deleted(uint64 added, uint64 deleted, int new_columns,
  * counts them.  A keyless table's rows added and deleted are copies, the
  * rest NULL, as in Dolt.  A table the session's branch hasn't, or has
  * keyed otherwise than the versions are (a primary key made or dropped
- * since), changed on both sides, has its rows counted from the trees, by
- * their keys' bytes (as no relation orders them), but not its cells
- * modified, which need the rows decoded; a keyless one, its row and cell
- * counts only.  With name, that table's alone: one neither
+ * since), changed on both sides, has its rows diffed from the trees, by
+ * their keys' bytes (as no relation orders them), each version's decoded
+ * by its own description, cells compared by column name.  With name,
+ * that table's alone: one neither
  * version has is refused (as Dolt's; dolt_diff_summary gives none).
  */
 Datum
@@ -4580,7 +4725,6 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 		int			new_columns = 0;
 		bool		keyed = true;
 		bool		counted = false;
-		bool		cells_unknown = false;
 		StatSink	s;
 		Oid			relid;
 		Datum		values[12];
@@ -4622,27 +4766,8 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			s.deleted = old_rows;
 			counted = true;
 		}
-		else if (keyed && r->data_change &&
-				 PROLLY_HAS(prolly_tree_lookup("cow"), diff_unordered))
-		{
-			/*
-			 * (a table the branch hasn't, or has keyed otherwise: its rows'
-			 * keys and values compared from the trees, by bytes, as no
-			 * relation orders them; its cells aren't decoded, so those
-			 * modified aren't known)
-			 */
-			ProllyNodeRef fd;
-			ProllyNodeRef td;
-			ProllyTreeEnv env;
-
-			table_item_data(r->from_item, r->from_len, &fd);
-			table_item_data(r->to_item, r->to_len, &td);
-			prolly_folded_tree_env(&env);
-			PROLLY_CALL(prolly_tree_lookup("cow"), diff_unordered, &env, &fd, &td,
-						stat_tree_change, &s);
+		else if ((r->data_change || !keyed) && stat_described(&s, r))
 			counted = true;
-			cells_unknown = s.modified > 0;
-		}
 		else if (keyed && !r->data_change)
 			counted = true;
 
@@ -4671,7 +4796,6 @@ dolt_diff_stat(PG_FUNCTION_ARGS)
 			values[7] = Int64GetDatum((int64) s.cells_modified);
 			for (int i = 1; i <= 7; i++)
 				nulls[i] = false;
-			nulls[7] = cells_unknown;
 		}
 		else if (counted)
 		{

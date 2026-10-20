@@ -120,14 +120,23 @@ typedef struct ProllyKeyingRoutine
 	void		(*parse_value_as) (ProllyKeying *k, bool keyless,
 								   const ProllyValue *value, ProllyValue *row,
 								   uint64 *count);
+
+	/*
+	 * Optional: a keying of rows of desc's columns opened without a
+	 * relation, keyed by content (as a table without a primary key's): for
+	 * reading a version of a table only its commits describe.  Its
+	 * decode_row() reads such a version's rows, parse_value_as() its
+	 * values either way they were keyed.
+	 */
+	ProllyKeying *(*open_described) (TupleDesc desc, MemoryContext mcxt);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
 	"decode_row", "compare", "close", "set_values", "row_refs", \
-	"decode_row_kept", "encode_key", "parse_value_as"
+	"decode_row_kept", "encode_key", "parse_value_as", "open_described"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK parse_value_as
+#define PROLLY_KEYING_LAST_CALLBACK open_described
 
 /*
  * Set up a data tree's environment and k's value store for each other:

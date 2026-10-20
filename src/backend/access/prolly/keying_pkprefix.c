@@ -192,6 +192,30 @@ pkprefix_open(Relation rel, MemoryContext mcxt)
 }
 
 
+/*
+ * Rows of desc's columns, keyed by content, opened without a relation, as
+ * pkprefix_open() opens a table without a primary key.
+ */
+static ProllyKeying *
+pkprefix_open_described(TupleDesc desc, MemoryContext mcxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(mcxt);
+	ProllyComponents c;
+	ProllyKeying *k = palloc0(sizeof(ProllyKeying));
+
+	prolly_history_components(&c);
+	k->mcxt = mcxt;
+	k->hash = c.hash;
+	k->valenc_routine = c.value_encoder;
+	k->desc = CreateTupleDescCopy(desc);
+	k->valenc = PROLLY_CALL(c.value_encoder, begin, k->desc, mcxt);
+	k->keyless = true;
+	initStringInfo(&k->layout);
+	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
+	MemoryContextSwitchTo(old);
+	return k;
+}
+
 static bool
 pkprefix_keyless(ProllyKeying *k)
 {
@@ -401,6 +425,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.make_value = pkprefix_make_value,
 	.parse_value = pkprefix_parse_value,
 	.parse_value_as = pkprefix_parse_value_as,
+	.open_described = pkprefix_open_described,
 	.decode_row = pkprefix_decode_row,
 	.compare = pkprefix_compare,
 	.close = pkprefix_close,
