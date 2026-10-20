@@ -3335,12 +3335,22 @@ row_named(const SummaryRow *r, const char *name)
 static char *
 normalized_name(const char *name, bool *schema)
 {
-	const char *paren = strchr(name, '(');
-	char	   *ident = paren ? pnstrdup(name, paren - name) : pstrdup(name);
+	const char *paren = NULL;
+	bool		quoted = false;
+	char	   *ident;
 	List	   *parts;
 	StringInfoData out;
 	ListCell   *lc;
 
+	/* a routine's argument list begins at the first '(' outside quotes */
+	for (const char *p = name; *p && paren == NULL; p++)
+	{
+		if (*p == '"')
+			quoted = !quoted;
+		else if (*p == '(' && !quoted)
+			paren = p;
+	}
+	ident = paren ? pnstrdup(name, paren - name) : pstrdup(name);
 	if (!SplitIdentifierString(ident, '.', &parts) || parts == NIL ||
 		list_length(parts) > 2)
 		return NULL;

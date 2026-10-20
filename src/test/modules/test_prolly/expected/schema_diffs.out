@@ -364,6 +364,41 @@ SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'app.t1');
  app.t1          | app.t1        | modified  | t           | t
 (1 row)
 
+-- a parenthesis inside a quoted identifier isn't a routine's arguments
+CREATE SCHEMA "s(x" VERSIONED;
+CREATE TABLE "s(x"."a(b" (id int PRIMARY KEY);
+INSERT INTO "s(x"."a(b" VALUES (1);
+CREATE FUNCTION "s(x"."f(n"(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"s(x"."a(b"');
+ to_table_name | diff_type 
+---------------+-----------
+ "s(x"."a(b"   | added
+(1 row)
+
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"s(x"."f(n"(integer)');
+    to_table_name     | diff_type 
+----------------------+-----------
+ "s(x"."f(n"(integer) | added
+(1 row)
+
+SET search_path = "s(x", public;
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"a(b"');
+ to_table_name | diff_type 
+---------------+-----------
+ "s(x"."a(b"   | added
+(1 row)
+
+RESET search_path;
+SELECT table_name, rows_added
+FROM dolt_diff_stat('HEAD', 'WORKING', '"s(x"."a(b"');
+ table_name  | rows_added 
+-------------+------------
+ "s(x"."a(b" |          1
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_schema_diffs;
 -- Doltgres's diff function scripts (testing/go/dolt_functions_test.go at

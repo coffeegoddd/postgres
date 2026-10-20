@@ -139,6 +139,22 @@ ALTER TABLE app.temp__t1 RENAME TO t1;
 SELECT length(dolt_commit('-Am', 'drop and recreate')::text) AS committed;
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'app.t1');
 
+-- a parenthesis inside a quoted identifier isn't a routine's arguments
+CREATE SCHEMA "s(x" VERSIONED;
+CREATE TABLE "s(x"."a(b" (id int PRIMARY KEY);
+INSERT INTO "s(x"."a(b" VALUES (1);
+CREATE FUNCTION "s(x"."f(n"(int) RETURNS int LANGUAGE sql AS 'SELECT $1';
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"s(x"."a(b"');
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"s(x"."f(n"(integer)');
+SET search_path = "s(x", public;
+SELECT to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING', '"a(b"');
+RESET search_path;
+SELECT table_name, rows_added
+FROM dolt_diff_stat('HEAD', 'WORKING', '"s(x"."a(b"');
+
 \c contrib_regression
 DROP DATABASE regress_schema_diffs;
 
