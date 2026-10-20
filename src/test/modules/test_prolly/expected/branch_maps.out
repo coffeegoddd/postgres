@@ -10,7 +10,7 @@ INSERT INTO bm.t SELECT g, 'v' || g FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 VACUUM (FREEZE) bm.t;
