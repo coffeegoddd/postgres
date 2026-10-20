@@ -1599,5 +1599,8 @@ CREATE VIEW dolt_remote_branches AS
 CREATE VIEW dolt_status AS
     SELECT * FROM dolt_status();
 
+CREATE VIEW dolt_diff AS
+    SELECT * FROM dolt_diff();
+
 CREATE VIEW dolt_conflicts AS
     SELECT * FROM dolt_conflicts();

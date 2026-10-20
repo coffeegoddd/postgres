@@ -193,7 +193,8 @@ keying_of(Relation rel)
 static bool
 is_working(const char *ref)
 {
-	return strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0;
+	return ref != NULL &&
+		(strcmp(ref, "WORKING") == 0 || strcmp(ref, "STAGED") == 0);
 }
 
 /*
@@ -232,6 +233,18 @@ root_of(const char *ref, ProllyNodeRef *root)
 	ProllyCommitInfo info;
 	bool		found;
 
+	/* (NULL: the empty root, what is before a first commit) */
+	if (ref == NULL)
+	{
+		const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+		ProllyTreeEnv env;
+
+		chunk_env(&env);
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext),
+					root);
+		return;
+	}
 	if (is_working(ref))
 	{
 		(void) PROLLY_CALL(dc.refs, working_set, NULL, root);

@@ -60,6 +60,7 @@ tests += {
       'status_diff',
       'schema_diffs',
       'diff_stat',
+      'diff_history',
       'collations',
       'applier',
       'move_heads',

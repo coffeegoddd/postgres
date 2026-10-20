@@ -120,7 +120,7 @@ typedef struct ProllyMergeRoutine
 {
 	ProllyImplInfo info;
 
-	/* relid InvalidOid: every table. */
+	/* relid InvalidOid: every table; from_ref NULL: from the empty root. */
 	void		(*diff) (const char *from_ref, const char *to_ref, Oid relid,
 						 ProllyDiffSink *sink);
 	int			(*merge) (const char *branch, const char *message, int flags,
@@ -135,6 +135,7 @@ typedef struct ProllyMergeRoutine
 	 * canonicalizer's changes() tells it, with the objects a read of a
 	 * working set left out (not_covered) after them.  With definitions,
 	 * for their definitions' text: a ref of an older format is refused.
+	 * from_ref NULL: from the empty root (what a first commit adds).
 	 */
 	void		(*summary) (const char *from_ref, const char *to_ref,
 							bool definitions, ProllyCanonChangeVisit visit,

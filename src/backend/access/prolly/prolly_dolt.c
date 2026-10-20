@@ -2768,18 +2768,12 @@ log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 }
 
 /*
- * dolt_log(ref text, OUT commit_hash text, OUT committer text,
- *			OUT email text, OUT date timestamptz, OUT message text,
- *			OUT commit_order int8) returns setof record
- *
- * Every commit ref reaches, highest commit order (height) first, then
- * newest.
+ * Every commit ref reaches (LogEntry *), highest commit order (height)
+ * first, then newest; NIL for HEAD before a first commit.
  */
-Datum
-dolt_log(PG_FUNCTION_ARGS)
+static List *
+log_entries(const char *ref)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ProllyHash	start;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
@@ -2789,11 +2783,10 @@ dolt_log(PG_FUNCTION_ARGS)
 	ProllyHash	key;
 	bool		found;
 
-	InitMaterializedSRF(fcinfo, 0);
 	if (!PROLLY_CALL(refs(), resolve, ref, &start))
 	{
 		if (pg_strcasecmp(ref, "HEAD") == 0)
-			return (Datum) 0;	/* nothing committed yet */
+			return NIL;			/* nothing committed yet */
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
@@ -2841,7 +2834,26 @@ dolt_log(PG_FUNCTION_ARGS)
 	}
 	hash_destroy(heights);
 	list_sort(entries, log_cmp);
-	foreach(lc, entries)
+	return entries;
+}
+
+/*
+ * dolt_log(ref text, OUT commit_hash text, OUT committer text,
+ *			OUT email text, OUT date timestamptz, OUT message text,
+ *			OUT commit_order int8) returns setof record
+ *
+ * Every commit ref reaches, highest commit order (height) first, then
+ * newest.
+ */
+Datum
+dolt_log(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	char	   *ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, log_entries(ref))
 	{
 		LogEntry   *e = lfirst(lc);
 		Datum		values[6];
@@ -3432,6 +3444,75 @@ dolt_diff_summary(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* One dolt_diff() row: a commit's (or the working set's) object that changed. */
+static void
+put_commit_changes(ReturnSetInfo *rsinfo, const char *hash,
+				   const ProllyCommitInfo *info, List *rows)
+{
+	ListCell   *lc;
+	char	   *name = NULL;
+	char	   *email = NULL;
+
+	if (info)
+		split_author(info->author, &name, &email);
+	foreach(lc, rows)
+	{
+		SummaryRow *r = lfirst(lc);
+		Datum		values[8];
+		bool		nulls[8] = {0};
+
+		if (r->not_covered)
+			continue;
+		values[0] = CStringGetTextDatum(hash);
+		values[1] = CStringGetTextDatum(r->to_name ? r->to_name : r->from_name);
+		if (info)
+		{
+			values[2] = CStringGetTextDatum(name);
+			values[3] = CStringGetTextDatum(email);
+			values[4] = TimestampTzGetDatum(info->committed_at);
+			values[5] = CStringGetTextDatum(info->message);
+		}
+		else
+			nulls[2] = nulls[3] = nulls[4] = nulls[5] = true;
+		values[6] = BoolGetDatum(r->data_change);
+		values[7] = BoolGetDatum(r->schema_change);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+}
+
+/*
+ * dolt_diff(OUT commit_hash text, OUT table_name text, OUT committer text,
+ *			 OUT email text, OUT date timestamptz, OUT message text, OUT
+ *			 data_change bool, OUT schema_change bool) returns setof record
+ *
+ * What each commit the head reaches changed, against its first parent (a
+ * first commit, against nothing), object by object as dolt_diff_summary
+ * names them, with the commit's metadata; the working set's changes first,
+ * as commit WORKING (its metadata NULL).  As Dolt's dolt_diff system
+ * table, but for every kind of object.
+ */
+Datum
+dolt_diff_commits(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	List	   *entries = log_entries("HEAD");
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	put_commit_changes(rsinfo, "WORKING", NULL,
+					   summary_rows(entries ? "HEAD" : NULL, "WORKING", NULL, false));
+	foreach(lc, entries)
+	{
+		LogEntry   *e = lfirst(lc);
+		char	   *to = hash_hex(&e->info.id);
+		char	   *from = e->info.nparents > 0 ? hash_hex(&e->info.parents[0]) : NULL;
+
+		CHECK_FOR_INTERRUPTS();
+		put_commit_changes(rsinfo, to, &e->info, summary_rows(from, to, NULL, false));
+	}
+	return (Datum) 0;
+}
+
 /* The statements that make an object, from its item ('' for none). */
 static char *
 render_item(char object, const char *name, const char *item, int len)
@@ -3742,18 +3823,49 @@ typedef struct RowDiffSink
 	ProllyDiffSink sink;		/* must be first */
 	ReturnSetInfo *rsinfo;
 	Rows		rows;
+
+	/*
+	 * dolt_diff_table()'s: each row with the commits it is between, and
+	 * their dates (to_commit NULL: dolt_diff()'s row, without them)
+	 */
+	const char *to_commit;
+	const char *from_commit;
+	TimestampTz to_date;
+	TimestampTz from_date;
+	bool		to_dated;
+	bool		from_dated;
 } RowDiffSink;
 
 static void
 put_diff(RowDiffSink *s, const char *kind, Datum from, bool from_null,
 		 Datum to, bool to_null, uint64 times)
 {
-	Datum		values[3];
-	bool		nulls[3] = {false, from_null, to_null};
+	Datum		values[7];
+	bool		nulls[7] = {0};
 
-	values[0] = CStringGetTextDatum(kind);
-	values[1] = from;
-	values[2] = to;
+	if (s->to_commit)
+	{
+		values[0] = to;
+		nulls[0] = to_null;
+		values[1] = from;
+		nulls[1] = from_null;
+		values[2] = CStringGetTextDatum(s->to_commit);
+		values[3] = s->from_commit ? CStringGetTextDatum(s->from_commit) : (Datum) 0;
+		nulls[3] = s->from_commit == NULL;
+		values[4] = TimestampTzGetDatum(s->to_date);
+		nulls[4] = !s->to_dated;
+		values[5] = TimestampTzGetDatum(s->from_date);
+		nulls[5] = !s->from_dated;
+		values[6] = CStringGetTextDatum(kind);
+	}
+	else
+	{
+		values[0] = CStringGetTextDatum(kind);
+		values[1] = from;
+		nulls[1] = from_null;
+		values[2] = to;
+		nulls[2] = to_null;
+	}
 	for (uint64 i = 0; i < times; i++)
 		tuplestore_putvalues(s->rsinfo->setResult, s->rsinfo->setDesc, values,
 							 nulls);
@@ -3828,6 +3940,104 @@ dolt_diff(PG_FUNCTION_ARGS)
 	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	rows_begin(&s.rows, rel);
 	PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s.sink);
+	rows_end(&s.rows);
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_diff_table(tbl anyelement, from_ref text DEFAULT NULL, to_ref text
+ *				   DEFAULT NULL, OUT to_row anyelement, OUT from_row
+ *				   anyelement, OUT to_commit text, OUT from_commit text, OUT
+ *				   to_commit_date timestamptz, OUT from_commit_date
+ *				   timestamptz, OUT diff_type text) returns setof record
+ *
+ * tbl's table's changes over its history, a commit at a time, as Dolt's
+ * dolt_diff_<table> system tables have them: from to_ref (the working set,
+ * if NULL: its changes against the head first, to_commit WORKING) back
+ * along first parents to from_ref (not its changes; the first commit's,
+ * against nothing, if NULL), each row as it was and is, decoded as the
+ * table is defined now, with the commits it is between and their dates.
+ * A commit that didn't change the table's rows costs a lookup of it, no
+ * more.
+ */
+Datum
+dolt_diff_table(PG_FUNCTION_ARGS)
+{
+	Oid			type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
+	char	   *from_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *to_ref = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	ProllyHash	stop;
+	bool		stopping = false;
+	ProllyHash	at;
+	bool		more;
+	Relation	rel;
+	RowDiffSink s;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rel = open_row_type_table(relid, "dolt_diff_table", ACL_SELECT);
+	if (from_ref)
+	{
+		if (!PROLLY_CALL(refs(), resolve, from_ref, &stop))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", from_ref)));
+		stopping = true;
+	}
+	memset(&s, 0, sizeof(s));
+	s.sink.change = row_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	rows_begin(&s.rows, rel);
+
+	/* the working set's changes first, against the head (or nothing) */
+	more = PROLLY_CALL(refs(), resolve, "HEAD", &at);
+	if (to_ref == NULL || pg_strcasecmp(to_ref, "WORKING") == 0)
+	{
+		ProllyCommitInfo head;
+
+		s.to_commit = "WORKING";
+		s.from_commit = more ? hash_hex(&at) : NULL;
+		s.to_dated = false;
+		s.from_dated = more && PROLLY_CALL(refs(), commit_get, &at, &head);
+		if (s.from_dated)
+			s.from_date = head.committed_at;
+		PROLLY_CALL(diff_merge(), diff, s.from_commit, "WORKING", relid, &s.sink);
+	}
+	else
+	{
+		more = PROLLY_CALL(refs(), resolve, to_ref, &at);
+		if (!more)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", to_ref)));
+	}
+
+	/* then each commit's, against its first parent */
+	while (more && !(stopping && (at.len == stop.len && memcmp(at.bytes, stop.bytes, at.len) == 0)))
+	{
+		ProllyCommitInfo info;
+		ProllyCommitInfo parent;
+		char	   *to = hash_hex(&at);
+
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(refs(), commit_get, &at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", to)));
+		s.to_commit = to;
+		s.to_date = info.committed_at;
+		s.to_dated = true;
+		s.from_commit = info.nparents > 0 ? hash_hex(&info.parents[0]) : NULL;
+		s.from_dated = info.nparents > 0 &&
+			PROLLY_CALL(refs(), commit_get, &info.parents[0], &parent);
+		if (s.from_dated)
+			s.from_date = parent.committed_at;
+		PROLLY_CALL(diff_merge(), diff, s.from_commit, to, relid, &s.sink);
+		more = info.nparents > 0;
+		if (more)
+			at = info.parents[0];
+	}
 	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
 	return (Datum) 0;
