@@ -59,6 +59,24 @@ SELECT table_files FROM prolly_store_sizes();
 SELECT pg_stat_force_next_flush();
 SELECT counted('conjoins') AS conjoins;
 
+-- A conjoin past max_files takes no more than maintenance_work_mem holds
+-- in one pass (the first two files aside): with a file of a few chunks
+-- and three of 4,000, at 1MB (about 10,000 chunks) the small one and two
+-- of the others (unbounded, all four), leaving two files; a later pass
+-- takes the rest.
+SELECT test_chunk_conjoin();
+SELECT count(test_chunk_table_file(ARRAY(
+	SELECT convert_to(f || ' ' || g, 'UTF8') FROM generate_series(1, 4000) g)))
+FROM generate_series(1, 3) f;
+SELECT table_files FROM prolly_store_sizes();
+SET maintenance_work_mem = '1MB';
+SELECT test_chunk_conjoin(2);
+SELECT table_files FROM prolly_store_sizes();
+RESET maintenance_work_mem;
+SELECT test_chunk_conjoin(1);
+SELECT table_files FROM prolly_store_sizes();
+SELECT test_chunk_has(test_content_hash(convert_to('3 4000', 'UTF8'))) AS reads;
+
 -- A backend that hadn't read the journal reads what was appended since
 -- its last collection to index it, once.
 SELECT count(test_chunk_put(test_noise('scan ' || g, 1000)))

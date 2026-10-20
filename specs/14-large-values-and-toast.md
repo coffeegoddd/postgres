@@ -688,7 +688,10 @@ to decode.
   garbage; table files are left as they are. Autovacuum runs it when the
   journal's segments together (sealed ones too) have passed
   `prolly.journal_move_threshold` (256 MB; 0 refused, -1 off), paced by
-  its cost-based delay.
+  its cost-based delay. And with more table files than
+  `prolly.conjoin_max_files` (256; at least 2, or -1 off), it conjoins
+  the smallest, as Dolt's conjoiner does, no more in one pass than
+  `maintenance_work_mem` and a gigabyte allow, paced likewise.
 - **The pointer.** `VARTAG_ONDISK_BLAKE3` (6; `VARTAG_ONDISK_SHA256` (5)
   before chunks were named by BLAKE3); `va_extinfo`'s high bits
   are the form the tree holds the value in: its bytes, a text-like

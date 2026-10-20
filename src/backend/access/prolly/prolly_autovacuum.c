@@ -16,9 +16,10 @@
  * off; after a collection, they haven't.  Then, with more table files than
  * prolly.conjoin_max_files, it conjoins the smallest (the chunk store's
  * conjoin()), so a lookup searches no more files than that, as Dolt does
- * past 256.  It sweeps a page store when bmap_sweep_due() says so.  Each runs in a transaction of its own, an error reported and
- * passed over, as autovacuum's tables' are; a collection and a move read
- * and copy under autovacuum's cost-based delay.
+ * past 256.  It sweeps a page store when bmap_sweep_due() says so.  Each
+ * runs in a transaction of its own, an error reported and passed over, as
+ * autovacuum's tables' are; a collection, a move and a conjoin read and
+ * copy under autovacuum's cost-based delay.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_autovacuum.c
@@ -221,35 +222,23 @@ move(void)
 							 (unsigned long long) r.window_usec)));
 }
 
-static void
-count_file(const char *name, int nchunks, uint64 size, bool settled,
-		   void *arg)
-{
-	(*(int *) arg)++;
-}
-
 /*
  * The table files conjoined, the smallest, if there are more than
- * prolly.conjoin_max_files.
+ * prolly.conjoin_max_files (which conjoin() checks from the manifest, not
+ * opening the files).
  */
 static void
 conjoin(void)
 {
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
-	ProllyChunkStore *store;
-	int			nfiles = 0;
 
 	if (prolly_conjoin_max_files < 0)
 		return;
-	store = PROLLY_CALL(cs, open, MyDatabaseId, MyDatabaseTableSpace);
-	PROLLY_CALL(cs, table_files, store, count_file, &nfiles);
-	if (nfiles <= prolly_conjoin_max_files)
-		return;
-	PROLLY_CALL(cs, conjoin, store, prolly_conjoin_max_files);
-	ereport(DEBUG1,
-			(errmsg_internal("automatic conjoin of database \"%s\": %d table files, past %d",
-							 get_database_name(MyDatabaseId), nfiles,
-							 prolly_conjoin_max_files)));
+	VacuumUpdateCosts();
+	VacuumCostBalance = 0;
+	PROLLY_CALL(cs, conjoin, PROLLY_CALL(cs, open, MyDatabaseId,
+										 MyDatabaseTableSpace),
+				prolly_conjoin_max_files);
 }
 
 /*

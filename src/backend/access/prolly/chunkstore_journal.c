@@ -4066,6 +4066,7 @@ typedef struct ConjoinSource
 	ListCell   *cur;
 	int			i;				/* the next entry of cur's */
 	HTAB	   *seen;
+	const ProllyHashRoutine *hash;	/* each chunk checked by */
 } ConjoinSource;
 
 static bool
@@ -4099,6 +4100,28 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 								len, (unsigned long long) offset, t->path)));
 			PROLLY_CALL(fmt, decode, t->tf, bytes, len, data);
 			pfree(bytes);
+
+			/* (read and written: a page missed and one dirtied) */
+			if (VacuumCostActive)
+				VacuumCostBalance += VacuumCostPageMiss + VacuumCostPageDirty;
+			vacuum_delay_point(false);
+
+			/* checked as it is copied, as a collection's: its hash's bytes */
+			{
+				ProllyHashCtx *ctx = PROLLY_CALL(cs->hash, begin,
+												 CurrentMemoryContext);
+				ProllyHash	got;
+
+				PROLLY_CALL(cs->hash, update, ctx, (const uint8 *) data->data,
+							data->len);
+				PROLLY_CALL(cs->hash, finish, ctx, &got);
+				if (got.len != hash->len ||
+					memcmp(got.bytes, hash->bytes, got.len) != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("chunk in file \"%s\" doesn't match its hash",
+									t->path)));
+			}
 			return true;
 		}
 		cs->cur = lnext(cs->tables, cs->cur);
@@ -4126,16 +4149,28 @@ candidate_cmp(const void *a, const void *b)
 }
 
 /*
+ * A conjoin pass's bounds: the chunks its table of those seen may hold in
+ * maintenance_work_mem, and the bytes it copies holding the manifest's
+ * lock (which seals, collections and files received wait for).
+ */
+#define CONJOIN_SEEN_ENTRY	(sizeof(ProllyHash) + 32)
+#define CONJOIN_MAX_BYTES	((uint64) 1024 * 1024 * 1024)
+
+/*
  * Choose the files of m a conjoin past max_files rewrites, as Dolt's
  * conjoiner does: of the settled files or the others (whichever are more,
  * so a settled file's chunks stay settled), the smallest by chunks, taking
- * the next while the ones taken add up to no more than it, or while
- * leaving it would leave more than max_files; keep[] says which stay.
- * False if no two can be.
+ * the next while the ones taken add up to more than it, or while leaving
+ * it would leave more than max_files; but, the first two aside, none that
+ * would take the pass past its bounds, so a later pass takes the rest.
+ * keep[] says which stay.  False if no two can be.
  */
 static bool
 choose_conjoinees(const Manifest *m, int max_files, bool *keep)
 {
+	uint64		max_chunks = (uint64) maintenance_work_mem * 1024 /
+		CONJOIN_SEEN_ENTRY;
+	uint64		bytes;
 	ConjoinCandidate *c = palloc(sizeof(ConjoinCandidate) * m->nfiles);
 	int			nsettled = 0;
 	bool		settled;
@@ -4165,12 +4200,17 @@ choose_conjoinees(const Manifest *m, int max_files, bool *keep)
 	}
 	qsort(c, n, sizeof(ConjoinCandidate), candidate_cmp);
 	sum = (uint64) c[0].nchunks + c[1].nchunks;
+	bytes = m->files[c[0].file].size + m->files[c[1].file].size;
 	for (taken = 2; taken < n; taken++)
 	{
 		/* (the files left then: those not taken, and the new one) */
 		if (sum <= c[taken].nchunks && m->nfiles - taken + 1 <= max_files)
 			break;
+		if (sum + c[taken].nchunks > max_chunks ||
+			bytes + m->files[c[taken].file].size > CONJOIN_MAX_BYTES)
+			break;
 		sum += c[taken].nchunks;
+		bytes += m->files[c[taken].file].size;
 	}
 	for (int i = 0; i < taken; i++)
 		keep[c[i].file] = false;
@@ -4213,6 +4253,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	memset(&cs, 0, sizeof(cs));
 	cs.s = s;
+	cs.hash = prolly_content_hash();
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
@@ -4251,6 +4292,9 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	}
 	PG_END_TRY();
 	pgstat_count_prolly(PGSTAT_PROLLY_CONJOINS, 1);
+	ereport(DEBUG1,
+			(errmsg_internal("chunk store of database %u: %d of %d table files conjoined",
+							 s->dboid, list_length(cs.tables), m.nfiles)));
 	hash_destroy(cs.seen);
 	pfree(keep);
 	pfree(dir);

@@ -40,11 +40,14 @@
  *   transaction aborts; its chunks are reachable once a root naming them
  *   is.  conjoin() rewrites table files as one, dropping chunks more than
  *   one of them holds: with max_files 0, all of them (settled if they all
- *   were); otherwise, if there are more than max_files, the fewest of the
- *   smallest that leave max_files (or as close as one rewrite can), settled
- *   files and the others apart.  table_files() visits the store's table files: a settled one is
- *   closed under what its chunks name (they are in it, in another settled
- *   file, or in the journal's segments).
+ *   were); otherwise, if there are more than max_files, the smallest, as
+ *   Dolt's conjoiner takes them (while those taken hold more chunks than
+ *   the next, or leaving it would leave more than max_files), but no more
+ *   in one pass than maintenance_work_mem and a gigabyte allow, settled
+ *   files and the others apart.  Its copying is paced by the cost-based
+ *   delay, where that is on.  table_files() visits the store's table
+ *   files: a settled one is closed under what its chunks name (they are in
+ *   it, in another settled file, or in the journal's segments).
  * - The journal (where put() appends) is in segments: seal() closes the one
  *   appends go to, and they go on to a new one; segments() visits them,
  *   oldest first (with count, each with its chunks counted; without, only

@@ -43,6 +43,25 @@ sub reload_settings
 	  or die 'autovacuum workers did not restart';
 }
 
+# An autovacuum worker's whole visit of the database, from here on: it
+# vacuums a table given a row (its tables come before the stores), then
+# leaves.
+sql(q{CREATE TABLE visits (n int) USING heap WITH
+	(autovacuum_vacuum_insert_threshold = 0,
+	 autovacuum_vacuum_insert_scale_factor = 0)});
+sub autovacuum_visited
+{
+	my $count = q{SELECT coalesce(autovacuum_count, 0) FROM pg_stat_user_tables
+		WHERE relname = 'visits'};
+	my $before = sql($count);
+	sql('INSERT INTO visits VALUES (1)');
+	$node->poll_query_until('mv', "SELECT ($count) > $before")
+	  or die 'autovacuum did not visit';
+	$node->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_stat_activity
+		WHERE backend_type = 'autovacuum worker' AND datname = 'mv'})
+	  or die 'the autovacuum worker did not leave';
+}
+
 my $files = q{SELECT count(*) FROM test_chunk_table_files()};
 is(sql('SHOW prolly.journal_move_threshold'), '1MB', 'the threshold is a setting');
 my ($ret, $out, $err) = $node->psql('mv',
@@ -110,7 +129,7 @@ reload_settings('prolly.journal_move_threshold = -1');
 my $before = sql($files);
 sql(q{SELECT count(test_chunk_put(test_noise(g::text || 'b', 100000)))
 	FROM generate_series(1, 20) g});
-sleep(3);
+autovacuum_visited();
 is(sql($files), $before, 'with the threshold -1, the journal stays');
 
 # A default collection collects the moved files' garbage.
@@ -120,6 +139,8 @@ is(sql("SELECT test_chunk_has('$dead')"), 'f',
 
 # Past prolly.conjoin_max_files table files, autovacuum conjoins the
 # smallest, and the files left are no more than that; every chunk reads.
+my $conjoins = q{SELECT value FROM pg_stat_prolly WHERE name = 'conjoins'};
+my $conjoins_before = sql($conjoins);
 reload_settings('prolly.conjoin_max_files = 3');
 my $nfiles = q{SELECT count(*) FROM test_chunk_table_files()};
 sql(qq{SELECT test_chunk_table_file(ARRAY[test_noise('file $_', 100)])}) for 1 .. 5;
@@ -128,12 +149,12 @@ ok($node->poll_query_until('mv', "SELECT ($nfiles) <= 3"),
 is(sql(q{SELECT count(*) FROM generate_series(1, 5) g
 	WHERE test_chunk_has(test_content_hash(test_noise('file ' || g, 100)))}), '5',
 	'every conjoined chunk reads');
-ok($node->poll_query_until('mv', q{SELECT value > 0 FROM pg_stat_prolly
-	WHERE name = 'conjoins'}), 'the conjoin is counted');
+ok($node->poll_query_until('mv', "SELECT ($conjoins) > $conjoins_before"),
+	'the conjoin is counted');
 reload_settings('prolly.conjoin_max_files = -1');
 my $kept = sql($nfiles);
 sql(qq{SELECT test_chunk_table_file(ARRAY[test_noise('more $_', 100)])}) for 1 .. 4;
-sleep(3);
+autovacuum_visited();
 is(sql($nfiles), $kept + 4, 'with the limit -1, files aren\'t conjoined');
 
 $standby->stop;
