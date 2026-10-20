@@ -1478,3 +1478,56 @@ SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;
         66
 (1 row)
 
+-- a cast made with one: after it
+CREATE SCHEMA sc VERSIONED;
+CREATE TYPE sc.wrap AS (v int);
+CREATE FUNCTION sc.unwrap(sc.wrap) RETURNS int LANGUAGE SQL IMMUTABLE RETURN ($1).v;
+CREATE CAST (sc.wrap AS int) WITH FUNCTION sc.unwrap(sc.wrap);
+SELECT length(dolt_commit('-Am', 'sc')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS sc_head \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT to_regnamespace('sc') IS NULL AS sc_gone;
+ sc_gone 
+---------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'sc_head');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT ROW(4)::sc.wrap::int AS unwrapped;
+ unwrapped 
+-----------
+         4
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+DROP SCHEMA sc CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to type sc.wrap
+drop cascades to function sc.unwrap(sc.wrap)
+drop cascades to cast from sc.wrap to integer
+SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+

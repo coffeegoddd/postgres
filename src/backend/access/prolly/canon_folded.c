@@ -7054,7 +7054,9 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			void (*breaking) (List *added, void *arg), void *arg,
 			bool rewritten)
 {
-	List	   *sql_bodies = NIL;	/* routines with SQL-standard bodies */
+	List	   *sql_bodies = NIL;	/* routines with SQL-standard bodies, then
+									 * the casts made with functions, which
+									 * may be those */
 	bool		matviews_made = false;
 	List	   *replaced = NIL; /* ordinary schemas they replace */
 	Canon		cn;
@@ -7411,13 +7413,21 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				sm.before = lappend(sm.before, t->def);
 		}
 	}
-	/* Casts coming, once the types and routines they name are made. */
+	/*
+	 * Casts coming, once the types and routines they name are made: one
+	 * with a function, after the routines with SQL-standard bodies, which
+	 * may be made later, and tried with them (still before the tables).
+	 */
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
 		MoveItem   *f = find_item(from, t->kind, t->name);
 
-		if (t->kind == 'x' && !(f && strcmp(t->def, f->def) == 0))
+		if (t->kind != 'x' || (f && strcmp(t->def, f->def) == 0))
+			continue;
+		if (strncmp(t->def, "function\t", 9) == 0)
+			sql_bodies = lappend(sql_bodies, create_cast_sql(t->name, t->def));
+		else
 			sm.before = lappend(sm.before, create_cast_sql(t->name, t->def));
 	}
 	/* Tables made: a partition after its partitioned table. */

@@ -527,3 +527,18 @@ SELECT count(*) AS changed FROM dolt_status;
 SELECT dolt_reset('--hard');
 DROP SCHEMA sb CASCADE;
 SELECT length(dolt_commit('-Am', 'sb gone')::text) AS committed;
+
+-- a cast made with one: after it
+CREATE SCHEMA sc VERSIONED;
+CREATE TYPE sc.wrap AS (v int);
+CREATE FUNCTION sc.unwrap(sc.wrap) RETURNS int LANGUAGE SQL IMMUTABLE RETURN ($1).v;
+CREATE CAST (sc.wrap AS int) WITH FUNCTION sc.unwrap(sc.wrap);
+SELECT length(dolt_commit('-Am', 'sc')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS sc_head \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT to_regnamespace('sc') IS NULL AS sc_gone;
+SELECT dolt_reset('--hard', :'sc_head');
+SELECT ROW(4)::sc.wrap::int AS unwrapped;
+SELECT count(*) AS changed FROM dolt_status;
+DROP SCHEMA sc CASCADE;
+SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
