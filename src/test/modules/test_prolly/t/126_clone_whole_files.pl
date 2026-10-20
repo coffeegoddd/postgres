@@ -20,6 +20,14 @@ my $origin = PostgreSQL::Test::Cluster->new('whole_origin');
 $origin->init;
 $origin->append_conf('postgresql.conf', 'autovacuum = off');
 $origin->start;
+sub origin_set
+{
+	$origin->append_conf('postgresql.conf', $_[0]);
+	$origin->reload;
+	$origin->poll_query_until('postgres',
+		"SELECT current_setting('prolly.gc_file_size') = '1MB'")
+	  or die 'the setting did not take';
+}
 my $local = PostgreSQL::Test::Cluster->new('whole_local');
 $local->init;
 $local->append_conf('postgresql.conf', 'autovacuum = off');
@@ -36,7 +44,7 @@ my $received = q{SELECT count(*) FROM test_chunk_table_files()
 o(q{CREATE EXTENSION test_prolly;
 	CREATE SCHEMA w VERSIONED;
 	CREATE TABLE w.t (id int PRIMARY KEY, v text);
-	INSERT INTO w.t SELECT g, md5(g::text) || md5((g + 1)::text) FROM generate_series(1, 3000) g;
+	INSERT INTO w.t SELECT g, md5(g::text) || md5((g + 1)::text) FROM generate_series(1, 60000) g;
 	SELECT dolt_commit('-Am', 'one')});
 my $head = o(q{SELECT dolt_hashof('main')});
 
@@ -47,8 +55,9 @@ l('walked', qq{SELECT dolt_clone('$url')});
 is(l('walked', $received), '0', 'a remote whose journal is all of it is walked');
 is(l('walked', q{SELECT dolt_hashof('main')}), $head, 'and cloned');
 
-# Collected into files of 64 kB: copied whole.
-o(q{SET prolly.gc_file_size = '64kB'; SELECT test_chunk_gc(true)});
+# Collected into files of 1 MB: copied whole.
+origin_set("prolly.gc_file_size = '1MB'");
+o(q{SELECT test_chunk_gc(true)});
 my $files = o(q{SELECT count(*) FROM test_chunk_table_files()});
 cmp_ok($files, '>', 2, 'the remote has a few files');
 l('postgres', 'CREATE DATABASE whole');
@@ -56,7 +65,7 @@ l('whole', 'CREATE EXTENSION test_prolly');
 l('whole', qq{SELECT dolt_clone('$url')});
 is(l('whole', $received), $files, 'a clone copies the remote\'s files whole');
 is(l('whole', q{SELECT dolt_hashof('main')}), $head, 'at the remote\'s head');
-is(l('whole', q{SELECT count(*), sum(length(v)) FROM w.t}), '3000|192000',
+is(l('whole', q{SELECT count(*), sum(length(v)) FROM w.t}), '60000|3840000',
 	'with its rows');
 
 # Failed after its first file, then tried again: that file isn't copied
@@ -87,7 +96,7 @@ my $written = l('resumed', q{SELECT value FROM pg_stat_prolly
 is($written, $total - $kept_size,
 	'tried again, it copies only the files it lacked');
 is(l('resumed', $received), $files, 'and takes them all');
-is(l('resumed', q{SELECT count(*), sum(length(v)) FROM w.t}), '3000|192000',
+is(l('resumed', q{SELECT count(*), sum(length(v)) FROM w.t}), '60000|3840000',
 	'with its rows');
 
 $origin->stop;

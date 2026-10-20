@@ -5136,9 +5136,12 @@ journal_receive_file(ProllyChunkStore *s, const char *key, ProllyChunkNext next,
 {
 	uint32		nchunks;
 	uint64		size;
+	bool		full;
 
+	/* (a remote's file copied whole: one file, whatever its size) */
 	received_changed(s);
-	(void) write_file(s, received_id(key), next, arg, true, &nchunks, &size);
+	(void) write_file(s, received_id(key), next, arg, true, 0, &full, &nchunks,
+					  &size);
 }
 
 static bool
