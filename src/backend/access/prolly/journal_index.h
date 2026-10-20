@@ -72,7 +72,8 @@ extern JournalIndex *jindex_attach(Oid dboid, Oid spcoid, int capacity,
 #define JINDEX_FILE			"prolly_index"
 extern void jindex_checkpoint(const char *format, int format_len);
 extern bool jindex_load(JournalIndex *ix, const char *format, int format_len,
-						const uint64 *ids, int n, uint64 start);
+						const uint64 *ids, const uint64 *sizes, int n,
+						uint64 start);
 
 /* Forget database dboid's index (dropped: an OID used again starts anew). */
 extern void jindex_forget(Oid dboid);

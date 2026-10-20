@@ -201,7 +201,8 @@ jindex_attach(Oid dboid, Oid spcoid, int capacity, bool *made)
 	attach_shared();
 	params = chunk_params();
 	old = MemoryContextSwitchTo(TopMemoryContext);
-	r = dshash_find(registry, &dboid, false);
+	/* (exclusive: the database's tablespace is set again, below) */
+	r = dshash_find(registry, &dboid, true);
 	found = r != NULL;
 	if (r == NULL)
 	{
@@ -248,6 +249,8 @@ jindex_attach(Oid dboid, Oid spcoid, int capacity, bool *made)
 	ix = palloc(sizeof(JournalIndex));
 	ix->dboid = dboid;
 	ix->db = dsa_get_address(area, r->db);
+	/* (moved since, by ALTER DATABASE SET TABLESPACE: its file goes there) */
+	ix->db->spcoid = spcoid;
 	dshash_release_lock(registry, r);
 	ix->chunks = dshash_attach(area, &params, ix->db->chunks, NULL);
 	MemoryContextSwitchTo(old);
@@ -397,7 +400,9 @@ jindex_set_segments(JournalIndex *ix, const uint64 *ids, int n, uint64 start)
 		dsa_free(area, db->segs);
 	db->segs = segs;
 	db->scan.nsegments = n;
-	pg_atomic_fetch_add_u64(&db->changes, 1);
+	/* (a file saved names the segments: changed if they did) */
+	if (n != old || ndropped > 0)
+		pg_atomic_fetch_add_u64(&db->changes, 1);
 	if (ndropped > 0)
 		drop_segments(ix, dropped, ndropped);
 	pfree(dropped);
@@ -445,9 +450,9 @@ jindex_add(JournalIndex *ix, const ProllyHash *hash, uint64 segment,
 
 	hash_key(hash, key);
 	c = dshash_find_or_insert(ix->chunks, key, &found);
-	pg_atomic_fetch_add_u64(&ix->db->changes, 1);
 	if (!found)
 	{
+		pg_atomic_fetch_add_u64(&ix->db->changes, 1);
 		c->hash_len = hash->len;
 		c->segment = segment;
 		c->offset = offset;
@@ -487,6 +492,7 @@ jindex_add(JournalIndex *ix, const ProllyHash *hash, uint64 segment,
 		n->other = InvalidDsaPointer;
 		*link = p;
 	}
+	pg_atomic_fetch_add_u64(&ix->db->changes, 1);
 	dshash_release_lock(ix->chunks, c);
 }
 
@@ -645,10 +651,46 @@ drop_segments(JournalIndex *ix, const uint64 *dropped, int ndropped)
 #define FILE_MAGIC		"PRLYJIX1"
 #define FILE_VERSION	1
 
-static void
-put_bytes(StringInfo out, const void *p, Size n)
+/*
+ * The file written as it is made, through a buffer, its CRC kept as it
+ * goes (so its size isn't bounded by what one allocation holds); ok goes
+ * false at the first write that fails.
+ */
+#define WRITER_BUFFER	(64 * 1024)
+typedef struct IndexWriter
 {
-	appendBinaryStringInfo(out, p, n);
+	int			fd;
+	bool		ok;
+	pg_crc32c	crc;
+	Size		len;
+	char		buf[WRITER_BUFFER];
+} IndexWriter;
+
+static void
+writer_flush(IndexWriter *w)
+{
+	if (w->len == 0)
+		return;
+	COMP_CRC32C(w->crc, w->buf, w->len);
+	if (w->ok && write(w->fd, w->buf, w->len) != w->len)
+		w->ok = false;
+	w->len = 0;
+}
+
+static void
+put_bytes(IndexWriter *w, const void *p, Size n)
+{
+	while (n > 0)
+	{
+		Size		take = Min(n, WRITER_BUFFER - w->len);
+
+		memcpy(w->buf + w->len, p, take);
+		w->len += take;
+		p = (const char *) p + take;
+		n -= take;
+		if (w->len == WRITER_BUFFER)
+			writer_flush(w);
+	}
 }
 
 /*
@@ -669,7 +711,14 @@ saved_position(JournalIndex *ix, JournalSegScan *g)
 	return pos;
 }
 
-/* Write ix's file, aside and then renamed over the last. */
+/*
+ * Write ix's file, aside and then renamed over the last: written (to the
+ * OS) under the index's lock, shared, as it is read; made durable and
+ * renamed after.  Laid out: magic, version, the store's format, the hash's
+ * length, the root (its length, bytes, segment and offset), the segments
+ * (each's id and position), each copy of each chunk (its hash, segment,
+ * offset, length and xid), then how many copies, and the CRC of all of it.
+ */
 static void
 save_index(JournalIndex *ix, const char *format, int format_len)
 {
@@ -677,47 +726,67 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 	char	   *dir = GetDatabasePath(db->dboid, db->spcoid);
 	char	   *path = psprintf("%s/%s", dir, JINDEX_FILE);
 	char	   *temp = psprintf("%s.tmp", path);
-	StringInfoData out;
+	IndexWriter *w;
 	uint32		version = FILE_VERSION;
 	uint8		flen = (uint8) format_len;
 	uint8		hlen = 0;
 	uint64		changes;
 	uint64		count = 0;
-	int			count_at;
 	dshash_seq_status status;
 	Chunk	   *c;
-	pg_crc32c	crc;
-	int			fd;
+	bool		ok;
 
-	initStringInfo(&out);
-	put_bytes(&out, FILE_MAGIC, 8);
-	put_bytes(&out, &version, sizeof(version));
-	put_bytes(&out, &flen, 1);
-	put_bytes(&out, format, format_len);
+	w = palloc(sizeof(IndexWriter));
+	w->fd = OpenTransientFile(temp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+	if (w->fd < 0)
+	{
+		/* (a database dropped meanwhile) */
+		if (errno != ENOENT)
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m", temp)));
+		pfree(w);
+		pfree(temp);
+		pfree(path);
+		pfree(dir);
+		return;
+	}
+	w->ok = true;
+	w->len = 0;
+	INIT_CRC32C(w->crc);
+	put_bytes(w, FILE_MAGIC, 8);
+	put_bytes(w, &version, sizeof(version));
+	put_bytes(w, &flen, 1);
+	put_bytes(w, format, format_len);
 	jindex_lock(ix, false);
 	changes = pg_atomic_read_u64(&db->changes);
-	if (db->scan.root.len > 0)
-		hlen = db->scan.root.len;
+	/* (the hash's length: the root's, or any chunk's) */
+	hlen = db->scan.root.len;
+	if (hlen == 0)
+	{
+		dshash_seq_init(&status, ix->chunks, false);
+		if ((c = dshash_seq_next(&status)) != NULL)
+			hlen = c->hash_len;
+		dshash_seq_term(&status);
+	}
 	{
 		uint32		nsegs = db->scan.nsegments;
 
-		put_bytes(&out, &hlen, 1);	/* (set again below, from a chunk) */
-		put_bytes(&out, &db->scan.root.len, 1);
-		put_bytes(&out, db->scan.root.bytes, db->scan.root.len);
-		put_bytes(&out, &db->scan.root_segment, 8);
-		put_bytes(&out, &db->scan.root_offset, 8);
-		put_bytes(&out, &nsegs, 4);
+		put_bytes(w, &hlen, 1);
+		put_bytes(w, &db->scan.root.len, 1);
+		put_bytes(w, db->scan.root.bytes, db->scan.root.len);
+		put_bytes(w, &db->scan.root_segment, 8);
+		put_bytes(w, &db->scan.root_offset, 8);
+		put_bytes(w, &nsegs, 4);
 		for (int i = 0; i < db->scan.nsegments; i++)
 		{
 			JournalSegScan *g = jindex_segment(ix, i);
 			uint64		pos = saved_position(ix, g);
 
-			put_bytes(&out, &g->id, 8);
-			put_bytes(&out, &pos, 8);
+			put_bytes(w, &g->id, 8);
+			put_bytes(w, &pos, 8);
 		}
 	}
-	count_at = out.len;
-	put_bytes(&out, &count, 8);
 	dshash_seq_init(&status, ix->chunks, false);
 	while ((c = dshash_seq_next(&status)) != NULL)
 	{
@@ -739,13 +808,15 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 			}
 			if (TransactionIdIsValid(xid) && !TransactionIdIsInProgress(xid))
 				xid = InvalidTransactionId;
-			hlen = c->hash_len;
-			put_bytes(&out, c->key, c->hash_len);
-			put_bytes(&out, &segment, 8);
-			put_bytes(&out, &offset, 8);
-			put_bytes(&out, &len, 4);
-			put_bytes(&out, &xid, 4);
-			count++;
+			if (c->hash_len == hlen)
+			{
+				put_bytes(w, c->key, c->hash_len);
+				put_bytes(w, &segment, 8);
+				put_bytes(w, &offset, 8);
+				put_bytes(w, &len, 4);
+				put_bytes(w, &xid, 4);
+				count++;
+			}
 			p = DsaPointerIsValid(p) ? ((Copy *) dsa_get_address(area, p))->other :
 				c->other;
 			if (!DsaPointerIsValid(p))
@@ -754,35 +825,20 @@ save_index(JournalIndex *ix, const char *format, int format_len)
 	}
 	dshash_seq_term(&status);
 	jindex_unlock(ix);
-	memcpy(out.data + 8 + 4 + 1 + format_len, &hlen, 1);
-	memcpy(out.data + count_at, &count, 8);
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, out.data, out.len);
-	FIN_CRC32C(crc);
-	put_bytes(&out, &crc, sizeof(crc));
+	put_bytes(w, &count, 8);
+	writer_flush(w);
+	FIN_CRC32C(w->crc);
+	if (w->ok && write(w->fd, &w->crc, sizeof(w->crc)) != sizeof(w->crc))
+		w->ok = false;
 
-	fd = OpenTransientFile(temp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
-	if (fd < 0)
-	{
-		/* (a database dropped meanwhile) */
-		if (errno != ENOENT)
-			ereport(LOG,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", temp)));
-	}
+	ok = w->ok && pg_fsync(w->fd) == 0;
+	if (CloseTransientFile(w->fd) != 0)
+		ok = false;
+	if (ok && durable_rename(temp, path, LOG) == 0)
+		db->saved = changes;
 	else
-	{
-		bool		ok = write(fd, out.data, out.len) == out.len &&
-			pg_fsync(fd) == 0;
-
-		if (CloseTransientFile(fd) != 0)
-			ok = false;
-		if (ok && durable_rename(temp, path, LOG) == 0)
-			db->saved = changes;
-		else
-			(void) unlink(temp);
-	}
-	pfree(out.data);
+		(void) unlink(temp);
+	pfree(w);
 	pfree(temp);
 	pfree(path);
 	pfree(dir);
@@ -846,7 +902,7 @@ take(FileReader *fr, void *out, Size n)
 
 bool
 jindex_load(JournalIndex *ix, const char *format, int format_len,
-			const uint64 *ids, int n, uint64 start)
+			const uint64 *ids, const uint64 *sizes, int n, uint64 start)
 {
 	IndexShared *db = ix->db;
 	char	   *dir = GetDatabasePath(db->dboid, db->spcoid);
@@ -891,6 +947,11 @@ jindex_load(JournalIndex *ix, const char *format, int format_len,
 		goto done;
 	fr.p = buf;
 	fr.end = buf + st.st_size - sizeof(crc);
+	/* (how many copies: last, before the CRC) */
+	if ((Size) (fr.end - fr.p) < sizeof(count))
+		goto done;
+	fr.end -= sizeof(count);
+	memcpy(&count, fr.end, sizeof(count));
 	if (!take(&fr, magic, 8) || memcmp(magic, FILE_MAGIC, 8) != 0 ||
 		!take(&fr, &version, 4) || version != FILE_VERSION ||
 		!take(&fr, &flen, 1) || flen != format_len ||
@@ -910,8 +971,7 @@ jindex_load(JournalIndex *ix, const char *format, int format_len,
 		if (!take(&fr, &seg_ids[i], 8) || !take(&fr, &seg_pos[i], 8))
 			goto done;
 	}
-	if (!take(&fr, &count, 8) ||
-		(hlen > 0 && count > (uint64) (fr.end - fr.p) / (hlen + 24)) ||
+	if ((hlen > 0 && count > (uint64) (fr.end - fr.p) / (hlen + 24)) ||
 		(Size) (fr.end - fr.p) != count * (hlen + 24))
 		goto done;
 
@@ -928,9 +988,15 @@ jindex_load(JournalIndex *ix, const char *format, int format_len,
 		{
 			JournalSegScan *g = jindex_segment(ix, i);
 
+			/*
+			 * (not past the segment's end now: a file saved before the
+			 * segment's bytes were synced, which a crash then lost, says
+			 * nothing of it, read again whole, its copies left out)
+			 */
 			for (uint32 j = 0; j < nsegs; j++)
 			{
-				if (seg_ids[j] == ids[i] && seg_pos[j] >= start)
+				if (seg_ids[j] == ids[i] && seg_pos[j] >= start &&
+					seg_pos[j] <= sizes[i])
 					g->scanned = seg_pos[j];
 			}
 			root_named |= ids[i] == root_segment;

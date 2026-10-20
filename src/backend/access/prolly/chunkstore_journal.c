@@ -3506,10 +3506,23 @@ journal_open(Oid dboid, Oid spcoid)
 		char		format[FORMAT_SIZE];
 		Manifest	m;
 
+		uint64	   *sizes;
+
 		(void) read_manifest(dir, &m);
 		format_bytes(prolly_store_format(), format);
-		(void) jindex_load(s->ix, format, FORMAT_SIZE, m.segments, m.nsegments,
-						   JOURNAL_HEADER_SIZE);
+		/* (each segment's size now: what the index says past it, not yet) */
+		sizes = palloc(sizeof(uint64) * Max(m.nsegments, 1));
+		for (int i = 0; i < m.nsegments; i++)
+		{
+			char	   *path = segment_path(dboid, spcoid, m.segments[i]);
+			struct stat st;
+
+			sizes[i] = stat(path, &st) == 0 ? (uint64) st.st_size : 0;
+			pfree(path);
+		}
+		(void) jindex_load(s->ix, format, FORMAT_SIZE, m.segments, sizes,
+						   m.nsegments, JOURNAL_HEADER_SIZE);
+		pfree(sizes);
 		pfree(dir);
 	}
 	(void) ensure_journal(s, false);
@@ -3594,25 +3607,47 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 		flush_pending(s);
 }
 
-/* The chunk's bytes from its record (rec, len bytes, in path) to out. */
+/*
+ * The chunk's bytes from its record (rec, len bytes, in path) to out: a
+ * chunk's record (checked once), and, if expected isn't NULL, that one's.
+ */
 static void
-chunk_bytes(const char *path, const char *rec, uint32 len, StringInfo out)
+chunk_bytes_of(const char *path, const char *rec, uint32 len,
+			   const ProllyHash *expected, StringInfo out)
 {
 	ProllyHash	h;
 	Size		after;
 	const char *chunk = NULL;
 	Size		chunk_len;
+	uint8		kind = len > sizeof(uint32) ? (uint8) rec[sizeof(uint32)] : 0;
 
+	if ((kind != KIND_CHUNK && kind != KIND_XCHUNK) ||
+		!record_valid(rec, len) || !record_hash(rec, len, &h, &after))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupt chunk record in file \"%s\"", path)));
+	if (expected != NULL &&
+		(h.len != expected->len || memcmp(h.bytes, expected->bytes, h.len) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk journal \"%s\" holds no chunk %s where its index says",
+						path, prolly_hash_hex(expected))));
 	/* (decompressed straight into out, if it holds nothing yet) */
-	if (record_valid(rec, len) && record_hash(rec, len, &h, &after))
-		chunk = record_chunk(rec, len, after,
-							 out->len == 0 ? out : chunk_scratch(), &chunk_len);
+	chunk = record_chunk(rec, len, after,
+						 out->len == 0 ? out : chunk_scratch(), &chunk_len);
 	if (chunk == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupt chunk record in file \"%s\"", path)));
 	if (chunk != out->data)
 		appendBinaryStringInfo(out, chunk, chunk_len);
+}
+
+/* The chunk's bytes from its record (rec, len bytes, in path) to out. */
+static void
+chunk_bytes(const char *path, const char *rec, uint32 len, StringInfo out)
+{
+	chunk_bytes_of(path, rec, len, NULL, out);
 }
 
 static bool
@@ -3655,19 +3690,7 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 	rec = palloc(len);
 	read_exact(g, rec, len, offset);
 	/* (the index named it: its record must hold it) */
-	{
-		ProllyHash	h;
-		Size		after;
-
-		if (!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
-			h.len != key.len || memcmp(h.bytes, key.bytes, key.len) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("chunk journal \"%s\" holds no chunk %s at %llu",
-							g->path, prolly_hash_hex(hash),
-							(unsigned long long) offset)));
-	}
-	chunk_bytes(g->path, rec, len, out);
+	chunk_bytes_of(g->path, rec, len, &key, out);
 	pfree(rec);
 	return true;
 }
