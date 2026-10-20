@@ -297,6 +297,12 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*gc_retained) (ProllyChunkGc *gc, ProllyChunkGcVisit visit,
 								void *arg);
 
+	/*
+	 * Forget what the store keeps of a dropped database outside its
+	 * directory (optional).
+	 */
+	void		(*drop_database) (Oid dboid);
+
 	/* Checkpoints: a file a sync request names, fsynced (optional). */
 	int			(*sync_file) (const struct FileTag *ftag, char *path);
 
@@ -316,7 +322,7 @@ typedef struct ProllyChunkStoreRoutine
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
-	"keep", "gc_kept", "gc_retained", "sync_file", "roots"
+	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
 #define PROLLY_CHUNKSTORE_LAST_CALLBACK roots
 

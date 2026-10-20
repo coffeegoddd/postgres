@@ -153,6 +153,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "journal_index.h"
 #include "commands/vacuum.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
@@ -421,16 +422,17 @@ typedef struct IndexEntry
 	struct IndexEntry *other;	/* another copy, while this one isn't */
 } IndexEntry;
 
-/* a journal segment a backend reads, and (the last) appends to */
+/*
+ * A journal segment a backend reads, and (the last) appends to: its file.
+ * How far it has been read, and what was skipped, the shared index keeps
+ * (JournalSegScan); scanned is a collection's own reading position.
+ */
 typedef struct Segment
 {
 	uint64		id;
 	char	   *path;
 	File		file;
-	uint64		scanned;		/* indexed up to here */
-	List	   *pads;			/* offsets of PADs seen, which may become ROOTs */
-	List	   *holes;			/* Hole *: ranges before scanned not indexed,
-								 * their appends in flight when scanned */
+	uint64		scanned;
 } Segment;
 
 /* a range of a segment reserved for an append and not written when seen */
@@ -460,8 +462,9 @@ struct ProllyChunkStore
 	Oid			spcoid;
 
 	List	   *segments;		/* Segment *, as the manifest last read names */
-	HTAB	   *index;			/* chunks in the segments, by hash */
-	ProllyHash	root;
+	List	   *other_segments; /* Segment *, others a newer manifest names */
+	JournalIndex *ix;			/* the chunks in the segments, shared */
+	ProllyHash	root;			/* the root as last read (the index's) */
 	uint64		root_segment;	/* where the last ROOT record seen is; 0, 0: */
 	uint64		root_offset;	/* the manifest's root, or none */
 
@@ -541,6 +544,7 @@ static void check_dropped(ProllyChunkStore *s, const ProllyHash *root);
 static void gc_abort(ProllyChunkGc *gc);
 static void gc_abort_sub(ProllyChunkGc *gc, int level);
 static XLogRecPtr logical_horizon(Oid dboid);
+static int	append_ranges(void);
 static uint32 gc_record(Segment *g, uint64 offset, uint64 size, char **rec,
 						Size *reclen);
 
@@ -816,97 +820,6 @@ decoded_chunk(const char *rec, uint32 len, Size after, const char *where,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("corrupt chunk record in %s", where)));
 	return chunk;
-}
-
-/*
- * Index a copy of a chunk: the first, or another while those before it
- * aren't known to be everyone's.
- */
-static void
-index_add(HTAB *index, const ProllyHash *key, uint64 segment, uint64 offset,
-		  uint32 len, TransactionId xid)
-{
-	bool		found;
-	IndexEntry *e = hash_search(index, key, HASH_ENTER, &found);
-	IndexEntry *last;
-
-	if (!found)
-	{
-		e->segment = segment;
-		e->offset = offset;
-		e->len = len;
-		e->xid = xid;
-		e->other = NULL;
-		return;
-	}
-	for (last = e; last != NULL; last = last->other)
-	{
-		if (!TransactionIdIsValid(last->xid))
-			return;				/* one is everyone's already */
-		if (last->other == NULL)
-			break;
-	}
-	last->other = MemoryContextAlloc(TopMemoryContext, sizeof(IndexEntry));
-	*last->other = *e;
-	last->other->segment = segment;
-	last->other->offset = offset;
-	last->other->len = len;
-	last->other->xid = xid;
-	last->other->other = NULL;
-}
-
-/*
- * May this backend read a copy?  Not one of a transaction in progress,
- * unless it is its own; with wait, one whose transaction is in progress is
- * waited for (a reader following a root may meet one being committed).
- */
-static bool
-copy_visible(IndexEntry *e, bool wait)
-{
-	if (!TransactionIdIsValid(e->xid))
-		return true;
-	if (TransactionIdIsCurrentTransactionId(e->xid))
-		return true;
-	for (;;)
-	{
-		if (!TransactionIdIsInProgress(e->xid) || TransactionIdDidCommit(e->xid))
-		{
-			e->xid = InvalidTransactionId;	/* everyone's from now on */
-			return true;
-		}
-		if (!wait)
-			return false;
-		CHECK_FOR_INTERRUPTS();
-		pg_usleep(1000L);
-	}
-}
-
-/* A copy of a chunk this backend may read, waiting only if it must. */
-static IndexEntry *
-index_find(HTAB *index, const ProllyHash *key)
-{
-	IndexEntry *first = hash_search(index, key, HASH_FIND, NULL);
-	IndexEntry *e;
-
-	for (e = first; e != NULL; e = e->other)
-		if (copy_visible(e, false))
-			return e;
-	for (e = first; e != NULL; e = e->other)
-		if (copy_visible(e, true))
-			return e;
-	return NULL;
-}
-
-/* Is there a copy this backend may read now?  Never waits. */
-static bool
-index_has(HTAB *index, const ProllyHash *key)
-{
-	IndexEntry *e;
-
-	for (e = hash_search(index, key, HASH_FIND, NULL); e != NULL; e = e->other)
-		if (copy_visible(e, false))
-			return true;
-	return false;
 }
 
 /* ----------------------------------------------------------------
@@ -1245,8 +1158,6 @@ static void refresh_segments(ProllyChunkStore *s);
 static uint64 manifests_count(void);
 
 static void scan_segment(ProllyChunkStore *s, Segment *g);
-static uint64 index_range(ProllyChunkStore *s, Segment *g, uint64 offset,
-						  uint64 end, char **rec, Size *reclen);
 
 /*
  * The range reserved and not yet written that holds offset of a segment,
@@ -1593,8 +1504,10 @@ segment_end(ProllyChunkStore *s, Segment *g)
 		elog(ERROR, "chunk journal \"%s\" has no header", g->path);
 	if (end_checked(s, g))
 		return size;
+	jindex_lock(s->ix, true);
 	scan_segment(s, g);
-	end = Max(g->scanned, in_flight_end(s, g->id));
+	end = Max(jindex_segment_of(s->ix, g->id)->scanned, in_flight_end(s, g->id));
+	jindex_unlock(s->ix);
 	if (end < (uint64) size)
 	{
 		ereport(LOG,
@@ -1645,7 +1558,11 @@ append_reserve(ProllyChunkStore *s, const char *data, Size len,
 	/* a segment's first check reads it whole: most of it before the lock */
 	g = current_segment(s);
 	if (!end_checked(s, g))
+	{
+		jindex_lock(s->ix, true);
 		scan_segment(s, g);
+		jindex_unlock(s->ix);
+	}
 	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
 	refresh_segments(s);
 	if (checked != NULL && s->gc_generation != *checked)
@@ -1753,41 +1670,89 @@ write_at(const char *path, const char *data, Size len, uint64 offset)
 				 errmsg("could not close file \"%s\": %m", path)));
 }
 
-/* Is a ROOT record at (segment, offset) later than the root's? */
+/*
+ * Is a ROOT record at (segment, offset) later than the root's, as the
+ * index's readers have it?
+ */
 static bool
-root_later(ProllyChunkStore *s, uint64 segment, uint64 offset)
+root_later(JournalScan *js, uint64 segment, uint64 offset)
 {
-	return segment > s->root_segment ||
-		(segment == s->root_segment && offset >= s->root_offset);
+	return segment > js->root_segment ||
+		(segment == js->root_segment && offset >= js->root_offset);
+}
+
+static void
+set_root(JournalScan *js, const ProllyHash *h, uint64 segment, uint64 offset)
+{
+	js->root = *h;
+	js->root_segment = segment;
+	js->root_offset = offset;
 }
 
 /*
- * Index a segment's records written since its last scan: up to the first
- * that isn't whole yet.  A PAD seen may since have become a ROOT.
+ * The local segment of id: one the manifest this backend last read names,
+ * or else one another backend's newer manifest does, opened as it is met.
+ */
+static Segment *
+local_segment(ProllyChunkStore *s, uint64 id)
+{
+	Segment    *g = segment_of(s, id);
+	ListCell   *lc;
+	MemoryContext old;
+
+	if (g != NULL)
+		return g;
+	foreach(lc, s->other_segments)
+	{
+		if (((Segment *) lfirst(lc))->id == id)
+			return lfirst(lc);
+	}
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	g = palloc0(sizeof(Segment));
+	g->id = id;
+	g->path = segment_path(s->dboid, s->spcoid, id);
+	g->file = -1;
+	s->other_segments = lappend(s->other_segments, g);
+	MemoryContextSwitchTo(old);
+	return g;
+}
+
+static uint64 index_range(ProllyChunkStore *s, Segment *g, JournalSegScan *sg,
+						  uint64 offset, uint64 end, char **rec, Size *reclen);
+
+/*
+ * Index a segment's records written since its last scan, for every backend
+ * (the index's lock held exclusively): up to the first that isn't whole
+ * yet.  A PAD seen may since have become a ROOT; one that stays a PAD once
+ * its transaction has ended never will (it aborted), and is forgotten.
  */
 static void
 scan_segment(ProllyChunkStore *s, Segment *g)
 {
+	JournalSegScan *sg = jindex_segment_of(s->ix, g->id);
+	JournalScan *js = jindex_scan(s->ix);
+	uint64	   *pads;
+	JournalHole *holes;
 	uint64		size;
-	uint64		offset = g->scanned;
-	ListCell   *lc;
+	uint64		offset;
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
+	if (sg == NULL)
+		elog(ERROR, "chunk journal segment %llu isn't in the shared index",
+			 (unsigned long long) g->id);
 	if (!open_segment(g))
 		return;
 	size = FileSize(g->file);
+	pads = jindex_pads(s->ix, sg);
+	holes = jindex_holes(s->ix, sg);
+	offset = sg->scanned;
 
-	/*
-	 * Each PAD seen: forgotten once it reads as a whole ROOT (taken if later
-	 * than the root); kept, to look at again, while it doesn't (still a PAD,
-	 * or a ROOT not all written yet).  (Deleted from the list in place: the
-	 * list stays the segment's, in its memory.)
-	 */
-	foreach(lc, g->pads)
+	for (int i = 0; i < sg->npads;)
 	{
-		uint64		pad = *(uint64 *) lfirst(lc);
+		uint64		pad = pads[i];
 		uint8		kind;
+		bool		done = false;
 
 		read_exact(g, (char *) &kind, 1, pad + sizeof(uint32));
 		if (kind == KIND_ROOT)
@@ -1803,36 +1768,48 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 				read_exact(g, buf, len, pad);
 				if (record_valid(buf, len) && record_hash(buf, len, &h, &after))
 				{
-					if (root_later(s, g->id, pad))
-					{
-						s->root = h;
-						s->root_segment = g->id;
-						s->root_offset = pad;
-					}
-					pfree(lfirst(lc));
-					g->pads = foreach_delete_current(g->pads, lc);
+					if (root_later(js, g->id, pad))
+						set_root(js, &h, g->id, pad);
+					done = true;
 				}
 			}
 		}
+		else if (kind == KIND_PAD)
+		{
+			TransactionId xid;
+
+			/*
+			 * (a committed one's ROOT is written before its transaction
+			 * leaves the proc array, so reading it now finds the ROOT)
+			 */
+			read_exact(g, (char *) &xid, sizeof(xid), pad + sizeof(uint32) + 1);
+			if (!TransactionIdIsInProgress(xid))
+			{
+				read_exact(g, (char *) &kind, 1, pad + sizeof(uint32));
+				done = kind == KIND_PAD;
+			}
+		}
+		if (done)
+			pads[i] = pads[--sg->npads];
+		else
+			i++;
 	}
 
 	/* ranges skipped while their appends were in flight, if written since */
-	foreach(lc, g->holes)
+	for (int i = 0; i < sg->nholes;)
 	{
-		Hole	   *hole = lfirst(lc);
+		JournalHole *hole = &holes[i];
 		uint64		end = hole->offset + hole->len;
-		uint64		upto = index_range(s, g, hole->offset, end, &rec, &reclen);
+		uint64		upto = index_range(s, g, sg, hole->offset, end, &rec, &reclen);
 
 		if (upto == end)
-		{
-			pfree(hole);
-			g->holes = foreach_delete_current(g->holes, lc);
-		}
+			holes[i] = holes[--sg->nholes];
 		else
 		{
 			/* (a write seen in part) */
-			hole->offset = upto;
 			hole->len = end - upto;
+			hole->offset = upto;
+			i++;
 		}
 	}
 
@@ -1845,19 +1822,18 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 	{
 		uint64		hole;
 
-		offset = index_range(s, g, offset, size, &rec, &reclen);
+		offset = index_range(s, g, sg, offset, size, &rec, &reclen);
 		if (offset + RECORD_OVERHEAD > size)
 			break;
 		hole = append_in_flight(s, g->id, offset);
 		if (hole > 0 && offset + hole <= size)
 		{
-			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-			Hole	   *h = palloc(sizeof(Hole));
-
-			h->offset = offset;
-			h->len = hole;
-			g->holes = lappend(g->holes, h);
-			MemoryContextSwitchTo(old);
+			if (sg->nholes >= jindex_capacity(s->ix))
+				elog(ERROR, "chunk journal segment %llu has too many appends in flight",
+					 (unsigned long long) g->id);
+			holes[sg->nholes].offset = offset;
+			holes[sg->nholes].len = hole;
+			sg->nholes++;
 			offset += hole;
 			again = false;
 			continue;
@@ -1868,7 +1844,7 @@ scan_segment(ProllyChunkStore *s, Segment *g)
 	}
 	if (rec)
 		pfree(rec);
-	g->scanned = offset;
+	sg->scanned = offset;
 }
 
 /*
@@ -1878,9 +1854,10 @@ scan_segment(ProllyChunkStore *s, Segment *g)
  * TopMemoryContext, grown as needed.
  */
 static uint64
-index_range(ProllyChunkStore *s, Segment *g, uint64 offset, uint64 end,
-			char **rec, Size *reclen)
+index_range(ProllyChunkStore *s, Segment *g, JournalSegScan *sg,
+			uint64 offset, uint64 end, char **rec, Size *reclen)
 {
+	JournalScan *js = jindex_scan(s->ix);
 	uint64		start = offset;
 
 	while (offset + RECORD_OVERHEAD <= end)
@@ -1907,29 +1884,18 @@ index_range(ProllyChunkStore *s, Segment *g, uint64 offset, uint64 end,
 		kind = (uint8) (*rec)[sizeof(uint32)];
 		if ((kind == KIND_CHUNK || kind == KIND_XCHUNK) &&
 			record_hash_xid(*rec, len, &h, &after, &xid))
-		{
-			ProllyHash	key;
-
-			hash_key(&key, &h);
-			index_add(s->index, &key, g->id, offset, len, xid);
-		}
+			jindex_add(s->ix, &h, g->id, offset, len, xid);
 		else if (kind == KIND_ROOT && record_hash(*rec, len, &h, &after))
 		{
-			if (root_later(s, g->id, offset))
-			{
-				s->root = h;
-				s->root_segment = g->id;
-				s->root_offset = offset;
-			}
+			if (root_later(js, g->id, offset))
+				set_root(js, &h, g->id, offset);
 		}
 		else if (kind == KIND_PAD)
 		{
-			uint64	   *pad = MemoryContextAlloc(TopMemoryContext, sizeof(uint64));
-			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-
-			*pad = offset;
-			g->pads = lappend(g->pads, pad);
-			MemoryContextSwitchTo(old);
+			if (sg->npads >= jindex_capacity(s->ix))
+				elog(ERROR, "chunk journal segment %llu has too many roots in flight",
+					 (unsigned long long) g->id);
+			jindex_pads(s->ix, sg)[sg->npads++] = offset;
 		}
 		offset += len;
 	}
@@ -1941,71 +1907,49 @@ index_range(ProllyChunkStore *s, Segment *g, uint64 offset, uint64 end,
 	return offset;
 }
 
-/* Index what was written to the segments since they were last scanned. */
+/* The root as the index's readers have it, copied to the store. */
 static void
-scan_journal(ProllyChunkStore *s)
+copy_root(ProllyChunkStore *s)
 {
-	ListCell   *lc;
+	JournalScan *js = jindex_scan(s->ix);
 
-	refresh_segments(s);
-	foreach(lc, s->segments)
-		scan_segment(s, lfirst(lc));
-}
-
-/* Forget the index's copies in a segment no longer named. */
-static void
-index_drop_segment(HTAB *index, uint64 segment)
-{
-	HASH_SEQ_STATUS status;
-	IndexEntry *e;
-
-	hash_seq_init(&status, index);
-	while ((e = hash_seq_search(&status)) != NULL)
-	{
-		IndexEntry **link = &e->other;
-
-		while (*link != NULL)
-		{
-			if ((*link)->segment == segment)
-			{
-				IndexEntry *gone = *link;
-
-				*link = gone->other;
-				pfree(gone);
-			}
-			else
-				link = &(*link)->other;
-		}
-		if (e->segment != segment)
-			continue;
-		if (e->other == NULL)
-			hash_search(index, &e->hash, HASH_REMOVE, NULL);
-		else
-		{
-			IndexEntry *next = e->other;
-
-			e->segment = next->segment;
-			e->offset = next->offset;
-			e->len = next->len;
-			e->xid = next->xid;
-			e->other = next->other;
-			pfree(next);
-		}
-	}
+	s->root = js->root;
+	s->root_segment = js->root_segment;
+	s->root_offset = js->root_offset;
 }
 
 /*
- * Take the segments a manifest names, in its order: those read before as
- * they are, new ones to be read from their start.  The index forgets the
- * records of those no longer named (a collection retired them), and a root
- * read from one gives way to the manifest's.
+ * Index what was written to the segments since they were last scanned, by
+ * any backend.
  */
 static void
-load_segments(ProllyChunkStore *s, const Manifest *m)
+scan_journal(ProllyChunkStore *s)
+{
+	JournalScan *js;
+
+	refresh_segments(s);
+	jindex_lock(s->ix, true);
+	js = jindex_scan(s->ix);
+	for (int i = 0; i < js->nsegments; i++)
+		scan_segment(s, local_segment(s, jindex_segment(s->ix, i)->id));
+	copy_root(s);
+	jindex_unlock(s->ix);
+}
+
+/*
+ * Take the segments a manifest names (one read when the manifests count
+ * was count), in its order: those read before as they are, new ones to be
+ * read from their start.  The shared index, if its own are older, takes
+ * them too: it forgets the records of those no longer named (a collection
+ * retired them), and a root read from one gives way to the manifest's.
+ */
+static void
+load_segments(ProllyChunkStore *s, const Manifest *m, uint64 count)
 {
 	List	   *segs = NIL;
 	List	   *dropped = NIL;
 	ListCell   *lc;
+	JournalScan *js;
 	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
 
 	for (int i = 0; i < m->nsegments; i++)
@@ -2014,11 +1958,22 @@ load_segments(ProllyChunkStore *s, const Manifest *m)
 
 		if (g == NULL)
 		{
+			foreach(lc, s->other_segments)
+			{
+				if (((Segment *) lfirst(lc))->id == m->segments[i])
+				{
+					g = lfirst(lc);
+					s->other_segments = foreach_delete_current(s->other_segments, lc);
+					break;
+				}
+			}
+		}
+		if (g == NULL)
+		{
 			g = palloc0(sizeof(Segment));
 			g->id = m->segments[i];
 			g->path = segment_path(s->dboid, s->spcoid, g->id);
 			g->file = -1;
-			g->scanned = JOURNAL_HEADER_SIZE;
 		}
 		segs = lappend(segs, g);
 	}
@@ -2027,26 +1982,37 @@ load_segments(ProllyChunkStore *s, const Manifest *m)
 		if (!list_member_ptr(segs, lfirst(lc)))
 			dropped = lappend(dropped, lfirst(lc));
 	}
+	dropped = list_concat(dropped, s->other_segments);
+	s->other_segments = NIL;
 	MemoryContextSwitchTo(old);
 	list_free(s->segments);
 	s->segments = segs;
-
 	s->gc_generation = m->gc_generation;
-	if (s->root_offset == 0 || segment_of(s, s->root_segment) == NULL)
+
+	jindex_lock(s->ix, true);
+	js = jindex_scan(s->ix);
+	if (js->manifests_seen < count)
 	{
-		s->root = m->root;
-		s->root_segment = 0;
-		s->root_offset = 0;
+		bool		root_named = false;
+
+		jindex_set_segments(s->ix, m->segments, m->nsegments,
+							JOURNAL_HEADER_SIZE);
+		for (int i = 0; i < m->nsegments; i++)
+			root_named |= m->segments[i] == js->root_segment;
+		if (js->root_offset == 0 || !root_named)
+			set_root(js, &m->root, 0, 0);
+		js->gc_generation = m->gc_generation;
+		js->manifests_seen = count;
 	}
+	copy_root(s);
+	jindex_unlock(s->ix);
+
 	foreach(lc, dropped)
 	{
 		Segment    *g = lfirst(lc);
 
-		index_drop_segment(s->index, g->id);
 		if (g->file >= 0)
 			FileClose(g->file);
-		list_free_deep(g->pads);
-		list_free_deep(g->holes);
 		pfree(g->path);
 		pfree(g);
 	}
@@ -2069,10 +2035,10 @@ static void load_tables(ProllyChunkStore *s, bool force);
 static bool
 stored_has(ProllyChunkStore *s, const ProllyHash *key)
 {
-	if (index_has(s->index, key) || tables_get(s, key, NULL))
+	if (jindex_has(s->ix, key) || tables_get(s, key, NULL))
 		return true;
 	scan_journal(s);
-	if (index_has(s->index, key))
+	if (jindex_has(s->ix, key))
 		return true;
 	load_tables(s, false);
 	return tables_get(s, key, NULL);
@@ -2184,9 +2150,13 @@ check_root(ProllyChunkStore *s)
 		check_dropped(s, &s->new_root);
 }
 
-/* The pending chunks are in segment g from base on: index them there. */
+/*
+ * The pending chunks are in segment g from base on: index them there (with
+ * index; a commit's are found by the next scan, as nothing may fail as the
+ * transaction ends).
+ */
 static void
-pending_appended(ProllyChunkStore *s, Segment *g, uint64 base)
+pending_appended(ProllyChunkStore *s, Segment *g, uint64 base, bool index)
 {
 	HASH_SEQ_STATUS status;
 	IndexEntry *e;
@@ -2194,7 +2164,8 @@ pending_appended(ProllyChunkStore *s, Segment *g, uint64 base)
 	hash_seq_init(&status, s->pending_index);
 	while ((e = hash_seq_search(&status)) != NULL)
 	{
-		index_add(s->index, &e->hash, g->id, base + e->offset, e->len, e->xid);
+		if (index)
+			jindex_add(s->ix, &e->hash, g->id, base + e->offset, e->len, e->xid);
 		hash_search(s->pending_index, &e->hash, HASH_REMOVE, NULL);
 	}
 	resetStringInfo(&s->pending);
@@ -2246,7 +2217,7 @@ flush_pending(ProllyChunkStore *s)
 		return;
 	reserve_pending(s, &a, NULL);
 	append_write(&a, s->pending.data);
-	pending_appended(s, a.g, a.offset);
+	pending_appended(s, a.g, a.offset, true);
 }
 
 /*
@@ -2346,7 +2317,7 @@ journal_xact_callback(XactEvent event, void *arg)
 
 				reserve_pending(s, &a, s->moving ? &pad_at : NULL);
 				append_write(&a, s->pending.data);
-				pending_appended(s, a.g, a.offset);
+				pending_appended(s, a.g, a.offset, true);
 				if (s->moving)
 					root_padded(s, a.g, a.offset + pad_at, a.at);
 			}
@@ -2366,7 +2337,8 @@ journal_xact_callback(XactEvent event, void *arg)
 			Assert(!s->at_commit);
 			if (s->commit_append.g != NULL)
 			{
-				pending_appended(s, s->commit_append.g, s->commit_append.offset);
+				pending_appended(s, s->commit_append.g, s->commit_append.offset,
+								 false);
 				s->commit_append.g = NULL;
 			}
 			s->moving = false;
@@ -2833,7 +2805,7 @@ refresh_segments(ProllyChunkStore *s)
 		return;
 	dir = GetDatabasePath(s->dboid, s->spcoid);
 	(void) read_manifest(dir, &m);
-	load_segments(s, &m);
+	load_segments(s, &m, count);
 	s->segments_seen = count;
 	pfree(dir);
 }
@@ -3169,7 +3141,7 @@ load_tables(ProllyChunkStore *s, bool force)
 		s->manifests_seen = count;
 		if (s->segments_seen < count)
 		{
-			load_segments(s, &m);
+			load_segments(s, &m, count);
 			s->segments_seen = count;
 		}
 		break;
@@ -3500,8 +3472,7 @@ journal_open(Oid dboid, Oid spcoid)
 	s->spcoid = spcoid;
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(IndexEntry);
-	s->index = hash_create("prolly journal index", 1024, &ctl,
-						   HASH_ELEM | HASH_BLOBS);
+	s->ix = jindex_attach(dboid, 2 * append_ranges());
 	s->pending_index = hash_create("prolly journal pending", 256, &ctl,
 								   HASH_ELEM | HASH_BLOBS);
 	initStringInfo(&s->pending);
@@ -3546,7 +3517,7 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 
 	hash_key(&key, hash);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		index_has(s->index, &key) ||
+		jindex_has(s->ix, &key) ||
 		tables_get(s, &key, NULL))
 		return;
 
@@ -3617,6 +3588,9 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 	IndexEntry *e;
 	Segment    *g;
 	char	   *rec;
+	uint64		segment;
+	uint64		offset;
+	uint32		len;
 
 	hash_key(&key, hash);
 	e = hash_search(s->pending_index, &key, HASH_FIND, NULL);
@@ -3627,14 +3601,12 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 	}
 	refresh_segments(s);
 	xact_note(s);
-	e = index_find(s->index, &key);
-	if (e == NULL)
+	if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 	{
 		if (tables_get(s, &key, out))
 			return true;
 		scan_journal(s);
-		e = index_find(s->index, &key);
-		if (e == NULL)
+		if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 		{
 			load_tables(s, false);
 			if (tables_get(s, &key, out))
@@ -3642,13 +3614,13 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 			return s->through != NULL && s->through(s->through_arg, hash, out);
 		}
 	}
-	g = segment_of(s, e->segment);
-	if (g == NULL || !open_segment(g))
+	g = local_segment(s, segment);
+	if (!open_segment(g))
 		elog(ERROR, "chunk journal segment %llu is missing",
-			 (unsigned long long) e->segment);
-	rec = palloc(e->len);
-	read_exact(g, rec, e->len, e->offset);
-	chunk_bytes(g->path, rec, e->len, out);
+			 (unsigned long long) segment);
+	rec = palloc(len);
+	read_exact(g, rec, len, offset);
+	chunk_bytes(g->path, rec, len, out);
 	pfree(rec);
 	return true;
 }
@@ -4067,6 +4039,31 @@ journal_checkpoint(void)
 	PG_END_TRY();
 }
 
+/*
+ * A database dropped: its shared index, its segments' checked ends and its
+ * sync requests forgotten, so a database given its OID later starts anew.
+ */
+static void
+journal_drop_database(Oid dboid)
+{
+	JournalShared *js = shared();
+	FileTag		tag;
+
+	jindex_forget(dboid);
+	LWLockAcquire(ProllyJournalLock, LW_EXCLUSIVE);
+	for (int i = 0; i < CHECKED_ENDS; i++)
+	{
+		if (js->checked[i].dboid == dboid)
+			memset(&js->checked[i], 0, sizeof(CheckedEnd));
+	}
+	LWLockRelease(ProllyJournalLock);
+	memset(&tag, 0, sizeof(tag));
+	tag.handler = SYNC_HANDLER_PROLLY_CHUNKS;
+	tag.forknum = (int16) prolly_chunkstore_journal.info.impl_id;
+	tag.rlocator.dbOid = dboid;
+	RegisterSyncRequest(&tag, SYNC_FILTER_REQUEST, true);
+}
+
 /* fsync the segment or table file a sync request names. */
 static int
 journal_sync_file(const FileTag *ftag, char *path)
@@ -4448,6 +4445,35 @@ journal_seal(ProllyChunkStore *s)
 	(void) seal_segment(s, &m);
 }
 
+/* journal_segments()'s count: each chunk once per segment it is in */
+typedef struct SegmentCounts
+{
+	ProllyChunkStore *s;
+	int			nsegs;
+	int		   *counts;
+	int		   *last;			/* the ordinal of the chunk last counted */
+} SegmentCounts;
+
+static void
+count_copy(const ProllyHash *hash, uint64 segment, int ordinal, void *arg)
+{
+	SegmentCounts *sc = arg;
+	ListCell   *lc;
+	int			i = 0;
+
+	foreach(lc, sc->s->segments)
+	{
+		if (((Segment *) lfirst(lc))->id == segment)
+			break;
+		i++;
+	}
+	if (i < sc->nsegs && sc->last[i] != ordinal)
+	{
+		sc->counts[i]++;
+		sc->last[i] = ordinal;
+	}
+}
+
 static void
 journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
 				 void *arg)
@@ -4469,30 +4495,9 @@ journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
 	memset(last, -1, sizeof(int) * Max(nsegs, 1));
 	if (count)
 	{
-		HASH_SEQ_STATUS status;
-		IndexEntry *e;
-		int			ordinal = 0;
+		SegmentCounts sc = {s, nsegs, counts, last};
 
-		hash_seq_init(&status, s->index);
-		while ((e = hash_seq_search(&status)) != NULL)
-		{
-			for (IndexEntry *c = e; c != NULL; c = c->other)
-			{
-				i = 0;
-				foreach(lc, s->segments)
-				{
-					if (((Segment *) lfirst(lc))->id == c->segment)
-						break;
-					i++;
-				}
-				if (i < nsegs && last[i] != ordinal)
-				{
-					counts[i]++;
-					last[i] = ordinal;
-				}
-			}
-			ordinal++;
-		}
+		jindex_visit(s->ix, count_copy, &sc);
 	}
 	i = 0;
 	foreach(lc, s->segments)
@@ -4532,36 +4537,35 @@ journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
 static void
 journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
 {
-	ListCell   *lc;
 	char	   *buf = palloc(ROOTS_BUFFER);
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
 	scan_journal(s);
-	foreach(lc, s->segments)
+	jindex_lock(s->ix, false);
+	for (int si = 0; si < jindex_scan(s->ix)->nsegments; si++)
 	{
-		Segment    *g = lfirst(lc);
+		JournalSegScan *sg = jindex_segment(s->ix, si);
+		JournalHole *holes = jindex_holes(s->ix, sg);
+		Segment    *g = local_segment(s, sg->id);
 		uint64		offset = JOURNAL_HEADER_SIZE;
 		uint64		buf_at = 0;
 		Size		buf_len = 0;
 
 		if (!open_segment(g))
 			continue;
-		while (offset + RECORD_OVERHEAD <= g->scanned)
+		while (offset + RECORD_OVERHEAD <= sg->scanned)
 		{
-			ListCell   *hc;
 			bool		skipped = false;
 			uint32		len;
 			uint8		kind;
 
 			CHECK_FOR_INTERRUPTS();
-			foreach(hc, g->holes)
+			for (int h = 0; h < sg->nholes; h++)
 			{
-				Hole	   *hole = lfirst(hc);
-
-				if (hole->offset == offset)
+				if (holes[h].offset == offset)
 				{
-					offset += hole->len;
+					offset += holes[h].len;
 					skipped = true;
 					break;
 				}
@@ -4571,12 +4575,12 @@ journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
 			if (offset < buf_at || offset + sizeof(uint32) + 1 > buf_at + buf_len)
 			{
 				buf_at = offset;
-				buf_len = Min(ROOTS_BUFFER, g->scanned - offset);
+				buf_len = Min(ROOTS_BUFFER, sg->scanned - offset);
 				read_exact(g, buf, buf_len, buf_at);
 			}
 			memcpy(&len, buf + (offset - buf_at), sizeof(len));
 			kind = (uint8) buf[offset - buf_at + sizeof(uint32)];
-			if (len < RECORD_OVERHEAD || offset + len > g->scanned)
+			if (len < RECORD_OVERHEAD || offset + len > sg->scanned)
 				break;
 			if (kind == KIND_ROOT)
 			{
@@ -4595,6 +4599,7 @@ journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
 			offset += len;
 		}
 	}
+	jindex_unlock(s->ix);
 	pfree(buf);
 	if (rec)
 		pfree(rec);
@@ -6160,6 +6165,7 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.keep = journal_keep,
 	.gc_kept = journal_gc_kept,
 	.gc_retained = journal_gc_retained,
+	.drop_database = journal_drop_database,
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,
 };

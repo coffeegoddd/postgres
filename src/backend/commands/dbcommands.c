@@ -1730,6 +1730,7 @@ createdb_failure_callback(int code, Datum arg)
 
 	/* Throw away any successfully copied subdirectories */
 	remove_dbtablespaces(fparms->dest_dboid);
+	ProllyDropDatabase(fparms->dest_dboid);
 }
 
 
@@ -1948,6 +1949,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * Remove all tablespace subdirs belonging to the database.
 	 */
 	remove_dbtablespaces(db_id);
+	ProllyDropDatabase(db_id);
 
 	/*
 	 * Close pg_database, but keep lock till commit.
@@ -3490,6 +3492,9 @@ dbase_redo(XLogReaderState *record)
 
 		/* Clean out the xlog relcache too */
 		XLogDropDatabase(xlrec->db_id);
+
+		/* and what prolly's chunk stores keep of it */
+		ProllyDropDatabase(xlrec->db_id);
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));

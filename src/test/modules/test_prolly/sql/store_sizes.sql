@@ -78,7 +78,7 @@ SELECT table_files FROM prolly_store_sizes();
 SELECT test_chunk_has(test_content_hash(convert_to('3 4000', 'UTF8'))) AS reads;
 
 -- A backend that hadn't read the journal reads what was appended since
--- its last collection to index it, once.
+-- its last collection to index it, once, for every backend.
 SELECT count(test_chunk_put(test_noise('scan ' || g, 1000)))
 FROM generate_series(1, 10) g;
 SELECT pg_stat_force_next_flush();
@@ -89,6 +89,14 @@ SELECT test_chunk_has(test_content_hash(test_noise('scan 2', 1000))) AS found;
 SELECT pg_stat_force_next_flush();
 SELECT counted('journal_scans') AS scans,
 	counted('journal_bytes_scanned') > 10000 AS read_them;
+
+-- One that comes after finds them in the index that read made, shared by
+-- every backend: it reads nothing of the journal.
+SELECT pg_stat_reset_shared('prolly');
+\c sizes_db
+SELECT test_chunk_has(test_content_hash(test_noise('scan 3', 1000))) AS found;
+SELECT pg_stat_force_next_flush();
+SELECT counted('journal_scans') AS scans;
 
 -- Sizes are the manifest's: a backend asking doesn't read (or keep) the
 -- table files' indexes, here 100,000 chunks' (some 3 MB).

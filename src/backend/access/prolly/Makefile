@@ -28,6 +28,7 @@ OBJS = \
 	chunkstore_journal.o \
 	diffmerge_folded.o \
 	hash_blake3.o \
+	journal_index.o \
 	hash_sha256.o \
 	hash_stub.o \
 	keyenc_ordered.o \
