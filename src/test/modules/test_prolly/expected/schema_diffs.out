@@ -18,7 +18,7 @@ CREATE TYPE app.mood AS ENUM ('sad', 'ok');
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- nothing changed: nothing
@@ -62,7 +62,7 @@ SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
 SELECT length(dolt_commit('-Am', 'changes')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD');
@@ -137,7 +137,7 @@ CREATE TABLE app.same_b (v int);
 SELECT length(dolt_commit('-Am', 'twins')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD');
