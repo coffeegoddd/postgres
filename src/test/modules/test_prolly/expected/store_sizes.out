@@ -96,10 +96,11 @@ SELECT pg_stat_force_next_flush();
 
 SELECT counted('gc_collections') AS collections,
 	counted('gc_chunks_kept') AS kept, counted('gc_chunks_freed') AS freed,
-	counted('gc_bytes_freed') > 30000 AS bytes_freed, counted('gc_moves') AS moves;
- collections | kept | freed | bytes_freed | moves 
--------------+------+-------+-------------+-------
-           1 |    1 |    22 | t           |     0
+	counted('gc_bytes_freed') > 30000 AS bytes_freed, counted('gc_moves') AS moves,
+	counted('gc_window_usec') > 0 AS window_timed;
+ collections | kept | freed | bytes_freed | moves | window_timed 
+-------------+------+-------+-------------+-------+--------------
+           1 |    1 |    22 | t           |     0 | t
 (1 row)
 
 SELECT journal_segments, table_files, settled_files,

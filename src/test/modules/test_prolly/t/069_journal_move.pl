@@ -69,6 +69,12 @@ ok($node->poll_query_until('mv', q{SELECT value > 0 FROM pg_stat_prolly
 	'the move is counted, as a move and not a collection');
 is(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'gc_collections'}), '0',
 	'no collection was made');
+is( sql(
+		q{SELECT string_agg(value::text, ',' ORDER BY name) FROM pg_stat_prolly
+	WHERE name IN ('gc_chunks_kept', 'gc_chunks_freed', 'gc_bytes_freed',
+				   'gc_window_usec')}),
+	'0,0,0,0',
+	'... nor in what collections kept and freed');
 is(sql(q{SELECT string_agg(chunks::text, ',') FROM test_chunk_segments()}), '0',
 	'leaving one segment, empty');
 is(sql(q{SELECT string_agg(settled::text, ',') FROM test_chunk_table_files()}), 'false',

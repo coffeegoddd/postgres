@@ -5432,12 +5432,20 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 		r.bytes_freed = freed_bytes > written_bytes ?
 			freed_bytes - written_bytes : 0;
 		r.window_usec = window_usec;
-		/* (a move is a collection of the journal that keeps everything) */
-		pgstat_count_prolly(gc->settle ? PGSTAT_PROLLY_GC_COLLECTIONS :
-							PGSTAT_PROLLY_GC_MOVES, 1);
-		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_KEPT, r.chunks_kept);
-		pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_FREED, r.chunks_freed);
-		pgstat_count_prolly(PGSTAT_PROLLY_GC_BYTES_FREED, r.bytes_freed);
+		/*
+		 * (a move is a collection of the journal that keeps everything:
+		 * counted as one alone, so a collection's totals are collections')
+		 */
+		if (gc->settle)
+		{
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_COLLECTIONS, 1);
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_KEPT, r.chunks_kept);
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_CHUNKS_FREED, r.chunks_freed);
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_BYTES_FREED, r.bytes_freed);
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_WINDOW_USEC, r.window_usec);
+		}
+		else
+			pgstat_count_prolly(PGSTAT_PROLLY_GC_MOVES, 1);
 		if (result)
 			*result = r;
 	}

@@ -41,7 +41,7 @@ Line numbers were read on the dates above.
 | Batched reads | Sorted by prefix, reads 4 KiB apart coalesced, 16 at a time (`table_reader.go`, `store.go`) | Up to 16 adjacent leaves in one read (`chunk_store.c`) | A pread a chunk; batches only in transfers |
 | Transfer | Chunks sent compressed as stored; whole files on clone; files up to 1 GiB (`datas/pull`) | Batches of 256 chunks (`doltlite_remote.c`) | Chunks decoded and written again by the receiver (`remote_file.c`, `remote_serve.c`); clone walks |
 | Reflog | The last 5,000 roots, with their times (`journal.go`) | None | Each root's time in its ROOT record; `dolt_reflog` (item 4) |
-| Statistics | Latency and size histograms, `StoreSizes` (`stats.go`, `doltdb.go`) | None | `pg_stat_prolly`: appends, bytes hashed, and (since #420) bytes the journal, table files and manifest write and GC and conjoin copy; no sizes; GC results only at DEBUG1 |
+| Statistics | Latency and size histograms, `StoreSizes` (`stats.go`, `doltdb.go`) | None | `pg_stat_prolly`: appends, bytes hashed, bytes the journal, table files and manifest write and GC and conjoin copy, journal reads to index it, collections, moves and conjoins with what collections kept and freed and their windows' time; `prolly_store_sizes()` (item 13) |
 
 ## 2. Where ours is ahead, kept
 

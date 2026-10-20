@@ -8,9 +8,10 @@
  * rows folded, commits, head moves, value memo lookups, pages copied, the
  * bytes the chunk store and the block map write to their files
  * themselves, the journal read to index it, and the chunk store's
- * collections, moves and conjoins with what they kept and freed.  It is kept separate from pgstat.c to enforce the line
- * between the statistics access / storage implementation and the details
- * about individual types of statistics.
+ * collections, moves and conjoins with what collections kept and freed.
+ * It is kept separate from pgstat.c to enforce the line between the
+ * statistics access / storage implementation and the details about
+ * individual types of statistics.
  *
  * This statistics kind uses a database's OID as the key of its one entry,
  * with InvalidOid as the object ID.  Backends count in PendingProllyStats,
@@ -72,6 +73,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_GC_CHUNKS_FREED] = "gc_chunks_freed",
 	[PGSTAT_PROLLY_GC_BYTES_FREED] = "gc_bytes_freed",
 	[PGSTAT_PROLLY_CONJOINS] = "conjoins",
+	[PGSTAT_PROLLY_GC_WINDOW_USEC] = "gc_window_usec",
 };
 
 /*

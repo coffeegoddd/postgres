@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC0
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC1
 
 typedef struct PgStat_ArchiverStats
 {
@@ -637,18 +637,20 @@ typedef enum PgStat_ProllyCounter
 											 * copies (smgrextend,
 											 * smgrpreextend), which nothing
 											 * else counts, for md either */
-	PGSTAT_PROLLY_JOURNAL_SCANS,	/* reads of journal records a backend
-									 * hadn't indexed */
+	PGSTAT_PROLLY_JOURNAL_SCANS,	/* ranges of journal records a backend
+									 * read to index them */
 	PGSTAT_PROLLY_JOURNAL_BYTES_SCANNED,	/* and the bytes they read */
 	PGSTAT_PROLLY_GC_COLLECTIONS,	/* chunk store collections */
 	PGSTAT_PROLLY_GC_MOVES, /* moves of the journal into a table file */
-	PGSTAT_PROLLY_GC_CHUNKS_KEPT,	/* chunks a collection or move kept */
+	PGSTAT_PROLLY_GC_CHUNKS_KEPT,	/* chunks a collection kept */
 	PGSTAT_PROLLY_GC_CHUNKS_FREED,	/* and those it freed */
 	PGSTAT_PROLLY_GC_BYTES_FREED,	/* and the bytes of their files */
 	PGSTAT_PROLLY_CONJOINS, /* table files conjoined into one */
+	PGSTAT_PROLLY_GC_WINDOW_USEC,	/* microseconds collections held their
+									 * windows */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_CONJOINS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_GC_WINDOW_USEC + 1)
 
 typedef struct PgStat_ProllyStats
 {

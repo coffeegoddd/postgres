@@ -4404,6 +4404,7 @@ size_segment(const char *name, int nchunks, uint64 size, bool settled,
 {
 	StoreSizes *ss = arg;
 
+	Assert(!settled);			/* (only table files are) */
 	ss->segments++;
 	ss->segment_bytes += size;
 }
@@ -4431,7 +4432,10 @@ size_file(const char *name, int nchunks, uint64 size, bool settled, void *arg)
  * The current database's chunk store as it stands, as Dolt's StoreSizes:
  * its journal (Dolt's journal), its table files, and of those the settled
  * ones (closed under what they name: Dolt's oldgen; the rest its newgen).
- * Only sizes are read.
+ * Only sizes are read.  Approximate while the store changes: the segments
+ * and the table files are listed one after the other, so a move or a
+ * collection between may count bytes in both, or neither; a segment whose
+ * file a collection has just removed counts with no bytes.
  */
 Datum
 prolly_store_sizes(PG_FUNCTION_ARGS)

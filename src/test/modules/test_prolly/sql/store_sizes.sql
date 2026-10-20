@@ -40,7 +40,8 @@ FROM prolly_gc();
 SELECT pg_stat_force_next_flush();
 SELECT counted('gc_collections') AS collections,
 	counted('gc_chunks_kept') AS kept, counted('gc_chunks_freed') AS freed,
-	counted('gc_bytes_freed') > 30000 AS bytes_freed, counted('gc_moves') AS moves;
+	counted('gc_bytes_freed') > 30000 AS bytes_freed, counted('gc_moves') AS moves,
+	counted('gc_window_usec') > 0 AS window_timed;
 SELECT journal_segments, table_files, settled_files,
 	settled_bytes = table_file_bytes AS all_settled FROM prolly_store_sizes();
 
