@@ -79,6 +79,7 @@
 #include "access/prolly_canon.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
@@ -118,6 +119,7 @@
 #define TAG_MOVER		'X'	/* the transaction that last moved a head */
 #define TAG_CONFIG		'C'	/* a database setting */
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
+#define TAG_STASH		'Z'	/* a list of stashes, by name */
 
 static bool ready = false;
 
@@ -3055,6 +3057,23 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		const char *end = p + v.len;
 		ProllyHash *h;
 
+		/* (a stash list: each one's commit, kept as a head is) */
+		if (k.len >= 1 && k.data[0] == TAG_STASH)
+		{
+			while (p < end)
+			{
+				uint64		blen;
+
+				h = palloc(sizeof(ProllyHash));
+				p = get_hash(p, end, h);
+				heads = lappend(heads, h);
+				blen = prolly_get_varint(&p, end);
+				if (blen > (uint64) (end - p))
+					break;
+				p += blen;
+			}
+			continue;
+		}
 		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE &&
 						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING))
 			continue;
@@ -3267,6 +3286,164 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	return true;
 }
 
+/* ------------------------------------------------------------------------
+ * Stashes: TAG_STASH and a list's name, its entries newest first, each its
+ * commit's hash, then its branch's name (a varint length, then the bytes).
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct StashEntry
+{
+	ProllyHash	stash;
+	char	   *branch;
+} StashEntry;
+
+static List *
+stash_list(const char *p, const char *end)
+{
+	List	   *entries = NIL;
+
+	while (p < end)
+	{
+		StashEntry *e = palloc(sizeof(StashEntry));
+		uint64		blen;
+
+		p = get_hash(p, end, &e->stash);
+		blen = prolly_get_varint(&p, end);
+		if (blen > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("corrupt prolly stash list")));
+		e->branch = pnstrdup(p, blen);
+		p += blen;
+		entries = lappend(entries, e);
+	}
+	return entries;
+}
+
+static void
+stash_key(const char *name, StringInfo key)
+{
+	appendStringInfoChar(key, TAG_STASH);
+	appendStringInfoString(key, name);
+}
+
+/* name's list, newest first (NIL: none) */
+static List *
+stash_get(const char *name)
+{
+	StringInfoData key;
+	StringInfoData v;
+	List	   *entries = NIL;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	stash_key(name, &key);
+	if (refs_get(key.data, key.len, &v))
+		entries = stash_list(v.data, v.data + v.len);
+	pfree(key.data);
+	pfree(v.data);
+	return entries;
+}
+
+/* name's list made entries (NIL: none), with the transaction */
+static void
+stash_set(const char *name, List *entries)
+{
+	StringInfoData key;
+	StringInfoData v;
+	ListCell   *lc;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	stash_key(name, &key);
+	foreach(lc, entries)
+	{
+		StashEntry *e = lfirst(lc);
+
+		put_hash(&v, &e->stash);
+		prolly_put_varint(&v, strlen(e->branch));
+		appendStringInfoString(&v, e->branch);
+	}
+	refs_put(key.data, key.len, entries ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+static void
+copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash)
+{
+	ProllyHash	head;
+	StashEntry *e = palloc(sizeof(StashEntry));
+	char	   *branch = branch_ops()->current();
+	List	   *entries;
+
+	if (!copies_resolve("HEAD", &head))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the current branch has no commit to stash changes against")));
+	lock_refs();
+	entries = stash_get(name);
+	write_commit(&root->hash, &head, 1, prolly_commit_author(),
+				 psprintf("WIP on %s", branch), stash);
+	e->stash = *stash;
+	e->branch = pstrdup(branch);
+	stash_set(name, lcons(e, entries));
+}
+
+static void
+copies_stashes(ProllyStashVisit visit, void *arg)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	char		tag = TAG_STASH;
+	ProllyKey	from = {(const uint8 *) &tag, 1};
+
+	refs_init();
+	if (!refs_root(&root))
+		return;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 1 && k.data[0] == TAG_STASH)
+	{
+		char	   *name = pnstrdup((const char *) k.data + 1, k.len - 1);
+		int			n = 0;
+		ListCell   *lc;
+
+		foreach(lc, stash_list((const char *) v.data, (const char *) v.data + v.len))
+		{
+			StashEntry *e = lfirst(lc);
+
+			visit(name, n++, e->branch, &e->stash, arg);
+		}
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+}
+
+static bool
+copies_stash_drop(const char *name, int n)
+{
+	List	   *entries;
+
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return false;
+	stash_set(name, list_delete_nth_cell(entries, n));
+	return true;
+}
+
+static void
+copies_stash_clear(const char *name)
+{
+	lock_refs();
+	if (stash_get(name) != NIL)
+		stash_set(name, NIL);
+}
+
 const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
@@ -3312,4 +3489,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_rows = copies_commit_rows,
 	.branch_rename = copies_branch_rename,
 	.root_refs = copies_root_refs,
+	.stash_push = copies_stash_push,
+	.stashes = copies_stashes,
+	.stash_drop = copies_stash_drop,
+	.stash_clear = copies_stash_clear,
 };

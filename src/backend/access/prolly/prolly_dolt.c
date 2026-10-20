@@ -2358,6 +2358,234 @@ dolt_reset(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(text_array(1, result));
 }
 
+/* ------------------------------------------------------------------------
+ * Stashes
+ * ------------------------------------------------------------------------
+ */
+
+/* name's nth stash (from "stash@{n}", or n; NULL: the newest), or none */
+typedef struct StashFind
+{
+	const char *name;
+	int			n;
+	bool		found;
+	ProllyHash	stash;
+	int			count;			/* name's stashes */
+} StashFind;
+
+static void
+find_stash(const char *name, int n, const char *branch, const ProllyHash *stash,
+		   void *arg)
+{
+	StashFind  *f = arg;
+
+	if (strcmp(name, f->name) != 0)
+		return;
+	f->count++;
+	if (n == f->n)
+	{
+		f->found = true;
+		f->stash = *stash;
+	}
+}
+
+static int
+stash_index(const char *arg)
+{
+	const char *p = arg;
+	char	   *end;
+	long		n;
+
+	if (arg == NULL)
+		return 0;
+	if (strncmp(p, "stash@{", 7) == 0)
+		p += 7;
+	n = strtol(p, &end, 10);
+	if (end == p || n < 0 || n > INT_MAX ||
+		(p != arg && strcmp(end, "}") != 0) || (p == arg && *end != '\0'))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" is not a stash", arg),
+				 errhint("Name one as stash@{n}, or by n.")));
+	return (int) n;
+}
+
+static void
+no_stashes(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("No stash entries found.")));
+}
+
+/*
+ * dolt_stash(VARIADIC args text[]) returns text[]: {status}
+ *
+ * As Dolt's, but for the working set alone (there is no staging area, so
+ * every change is one a stash takes, new tables too: -u and -a are
+ * accepted and change nothing):
+ *	push name: the working set set aside as name's newest stash (a commit
+ *		of it whose parent is the head), and the branch reset to its head;
+ *	pop name [stash@{n}]: name's newest (or nth) stash applied to the
+ *		working set and dropped;
+ *	apply name [stash@{n}]: applied, and kept;
+ *	drop name [stash@{n}]: dropped;
+ *	clear name: every one of name's dropped.
+ * A stash is applied three-way, its changes from the head it was pushed
+ * on, as a cherry-pick without a commit: refused where it conflicts with
+ * the branch or with changes not committed.
+ */
+Datum
+dolt_stash(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	const char *cmd = NULL;
+	const char *name = NULL;
+	const char *which = NULL;
+	const char *result[1] = {"0"};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (a[0] == '-')
+		{
+			if (is_option(a, "include-untracked") || strcmp(a, "-u") == 0 ||
+				is_option(a, "all") || strcmp(a, "-a") == 0)
+				continue;		/* (every change is staged) */
+			unsupported("dolt_stash", a);
+		}
+		else if (cmd == NULL)
+			cmd = a;
+		else if (name == NULL)
+			name = a;
+		else if (which == NULL)
+			which = a;
+		else
+			unexpected("dolt_stash", a);
+	}
+	if (cmd == NULL || name == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_stash needs a subcommand and a stash name"),
+				 errhint("As dolt_stash('push', 'name').")));
+	if (!PROLLY_HAS(refs(), stash_push) || !PROLLY_HAS(diff_merge(), apply))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't stash")));
+	PreventCommandIfReadOnly("dolt_stash()");
+
+	if (strcmp(cmd, "push") == 0)
+	{
+		ProllyNodeRef working;
+		ProllyNodeRef head_root;
+		ProllyHash	head;
+		ProllyHash	stash;
+		ProllyMergeState ms;
+
+		if (which)
+			unexpected("dolt_stash", which);
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a merge is in progress on the current branch"),
+					 errhint("Resolve its conflicts and commit, or abort it.")));
+		if (!PROLLY_CALL(refs(), working_set, NULL, &working) ||
+			!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+			!PROLLY_CALL(refs(), commit_working_set, &head, &head_root) ||
+			same_hash(&working.hash, &head_root.hash))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("No local changes to save")));
+		PROLLY_CALL(refs(), stash_push, name, &working, &stash);
+		/* (as dolt_reset('--hard') does) */
+		if (PROLLY_CALL(writers(), mode) != PROLLY_WRITERS_SHARED &&
+			object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+			PROLLY_CALL(writers(), take, MyBranch);
+		note_integration();
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, "HEAD"));
+		settled();
+	}
+	else if (strcmp(cmd, "pop") == 0 || strcmp(cmd, "apply") == 0)
+	{
+		StashFind	f = {name, stash_index(which)};
+		const char *ref;
+
+		PROLLY_CALL(refs(), stashes, find_stash, &f);
+		if (!f.found)
+			no_stashes();
+		refuse_violations("stash");
+		ref = hash_hex(&f.stash);
+		note_integration();
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(diff_merge(), apply, ref, "dolt_stash"));
+		settled();
+		if (strcmp(cmd, "pop") == 0)
+			(void) PROLLY_CALL(refs(), stash_drop, name, f.n);
+	}
+	else if (strcmp(cmd, "drop") == 0)
+	{
+		if (!PROLLY_CALL(refs(), stash_drop, name, stash_index(which)))
+			no_stashes();
+	}
+	else if (strcmp(cmd, "clear") == 0)
+	{
+		if (which)
+			unexpected("dolt_stash", which);
+		PROLLY_CALL(refs(), stash_clear, name);
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_stash has no subcommand \"%s\"", cmd),
+				 errhint("It takes push, pop, apply, drop and clear.")));
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* dolt_stashes()'s rows */
+static void
+put_stash(const char *name, int n, const char *branch, const ProllyHash *stash,
+		  void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	ProllyCommitInfo info;
+	ProllyCommitInfo head;
+	Datum		values[5];
+	bool		nulls[5] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = CStringGetTextDatum(psprintf("stash@{%d}", n));
+	values[2] = CStringGetTextDatum(branch);
+	if (PROLLY_CALL(refs(), commit_get, stash, &info) && info.nparents > 0 &&
+		PROLLY_CALL(refs(), commit_get, &info.parents[0], &head))
+	{
+		values[3] = CStringGetTextDatum(hash_hex(&info.parents[0]));
+		values[4] = CStringGetTextDatum(head.message);
+	}
+	else
+		nulls[3] = nulls[4] = true;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * dolt_stashes(OUT name text, OUT stash_id text, OUT branch text, OUT hash
+ *				text, OUT commit_message text) returns setof record
+ *
+ * Every stash, by list name, then newest first, as Dolt's dolt_stashes:
+ * its place (stash@{n}), the branch it was pushed from, and the head it
+ * was pushed on, with that commit's message.
+ */
+Datum
+dolt_stashes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (PROLLY_HAS(refs(), stashes))
+		PROLLY_CALL(refs(), stashes, put_stash, rsinfo);
+	return (Datum) 0;
+}
+
 /*
  * The tables with conflicts and the tables with constraint violations a
  * pick or revert in progress left, as Dolt counts them (tables, not rows):

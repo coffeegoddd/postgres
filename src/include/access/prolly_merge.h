@@ -152,12 +152,20 @@ typedef struct ProllyMergeRoutine
 	int			(*revert) (const char *const *refs, int nrefs,
 						   const ProllyHash *series_head,
 						   ProllyHash *commit_id);
+
+	/*
+	 * Optional: cherry_pick() of one ref without a commit: its changes
+	 * merged into the working set, three-way with the branch, but changes
+	 * overlapping uncommitted ones, conflicts and violations each an error
+	 * (fn's, the caller's name in it), nothing left in progress.
+	 */
+	void		(*apply) (const char *ref, const char *fn);
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
-	"diff", "merge", "conflicts", "resolve", "tables", "summary", "move_to", \
-	"cherry_pick", "verify", "revert"
+	"diff", "merge", "conflicts", "resolve", "tables", "summary", \
+	"move_to", "cherry_pick", "verify", "revert", "apply"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
-#define PROLLY_MERGE_LAST_CALLBACK revert
+#define PROLLY_MERGE_LAST_CALLBACK apply
 
 #endif							/* PROLLY_MERGE_H */

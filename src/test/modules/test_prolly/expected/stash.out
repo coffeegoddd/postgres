@@ -1,0 +1,366 @@
+-- dolt_stash sets the working set aside (a commit of it whose parent is
+-- the head) and brings it back, three-way, as a cherry-pick without a
+-- commit; dolt_stashes lists them.  Every change is staged (there is no
+-- staging area), so new tables are stashed too.
+CREATE DATABASE regress_stash;
+\c regress_stash
+CREATE SCHEMA st VERSIONED;
+CREATE TABLE st.t (pk int PRIMARY KEY, v text);
+CREATE TABLE st.o (id int PRIMARY KEY);
+INSERT INTO st.t VALUES (1, 'a'), (2, 'b');
+SELECT length(dolt_commit('-Am', 'two rows')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+-- nothing to stash, nothing to pop
+SELECT dolt_stash('push', 's');
+ERROR:  No local changes to save
+SELECT dolt_stash('pop', 's');
+ERROR:  No stash entries found.
+SELECT dolt_stash('drop', 's');
+ERROR:  No stash entries found.
+SELECT dolt_stash('clear', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('push');
+ERROR:  dolt_stash needs a subcommand and a stash name
+HINT:  As dolt_stash('push', 'name').
+SELECT dolt_stash('shove', 's');
+ERROR:  dolt_stash has no subcommand "shove"
+HINT:  It takes push, pop, apply, drop and clear.
+-- push and pop: the working set exactly as it was
+INSERT INTO st.t VALUES (3, 'c');
+UPDATE st.t SET v = 'z' WHERE pk = 1;
+SELECT table_name || ' ' || status AS before FROM dolt_status \gset
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v 
+----+---
+  1 | a
+  2 | b
+(2 rows)
+
+SELECT name, stash_id, branch, hash = dolt_hashof('HEAD') AS on_head, commit_message
+FROM dolt_stashes;
+ name | stash_id  | branch | on_head | commit_message 
+------+-----------+--------+---------+----------------
+ s    | stash@{0} | main   | t       | two rows
+(1 row)
+
+SELECT dolt_stash('pop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT table_name || ' ' || status = :'before' AS same_status FROM dolt_status;
+ same_status 
+-------------
+ t
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v 
+----+---
+  1 | z
+  2 | b
+  3 | c
+(3 rows)
+
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       0
+(1 row)
+
+-- several, in named lists, newest first; a specific one popped; apply
+-- keeps it; drop and clear
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (4, 'd');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (5, 'e');
+SELECT dolt_stash('push', 'other');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT name, stash_id FROM dolt_stashes;
+ name  | stash_id  
+-------+-----------
+ other | stash@{0}
+ s     | stash@{0}
+ s     | stash@{1}
+(3 rows)
+
+SELECT dolt_stash('apply', 's', 'stash@{1}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v 
+----+---
+  1 | z
+  2 | b
+  3 | c
+(3 rows)
+
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       3
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('drop', 's', 'stash@{1}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('drop', 's', 'stash@{5}');
+ERROR:  No stash entries found.
+SELECT dolt_stash('drop', 's', 'stash@x');
+ERROR:  "stash@x" is not a stash
+HINT:  Name one as stash@{n}, or by n.
+SELECT name, stash_id FROM dolt_stashes;
+ name  | stash_id  
+-------+-----------
+ other | stash@{0}
+ s     | stash@{0}
+(2 rows)
+
+SELECT dolt_stash('clear', 'other');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT name, stash_id FROM dolt_stashes;
+ name | stash_id  
+------+-----------
+ s    | stash@{0}
+(1 row)
+
+-- popped onto a head that moved: its changes, three-way
+UPDATE st.t SET v = 'b2' WHERE pk = 2;
+SELECT length(dolt_commit('-am', 'b2')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_stash('pop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v  
+----+----
+  1 | a
+  2 | b2
+  4 | d
+(3 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- popped over uncommitted changes: refused where they change a table it
+-- changes (as Dolt's, by table), applied where they change another
+INSERT INTO st.t VALUES (6, 'f');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (7, 'g');
+SELECT dolt_stash('pop', 's');
+ERROR:  local changes would be stomped by apply
+DETAIL:  Table "st.t" has uncommitted changes, and the apply changes it too.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT * FROM st.t ORDER BY pk;
+ pk | v  
+----+----
+  1 | a
+  2 | b2
+  7 | g
+(3 rows)
+
+DELETE FROM st.t WHERE pk = 7;
+INSERT INTO st.o VALUES (1);
+SELECT dolt_stash('pop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v  
+----+----
+  1 | a
+  2 | b2
+  6 | f
+(3 rows)
+
+SELECT * FROM st.o;
+ id 
+----
+  1
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- popped onto a head whose change conflicts: refused, kept
+INSERT INTO st.t VALUES (8, 'i');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (8, 'j');
+SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_stash('pop', 's');
+ERROR:  dolt_stash conflicts with the current branch
+DETAIL:  It has 1 conflicting rows and 0 constraint violations.
+HINT:  Commit or reset the changes in the way, and try again.
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       1
+(1 row)
+
+SELECT dolt_stash('clear', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+-- a new table and a column added: stashed (with -u, as without), and back
+CREATE TABLE st.n (id int PRIMARY KEY);
+INSERT INTO st.n VALUES (1);
+ALTER TABLE st.t ADD COLUMN w int;
+UPDATE st.t SET w = pk;
+SELECT dolt_stash('push', 's', '-u');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT to_regclass('st.n') IS NULL AS new_table_gone;
+ new_table_gone 
+----------------
+ t
+(1 row)
+
+SELECT count(*) AS columns FROM information_schema.columns
+WHERE table_schema = 'st' AND table_name = 't';
+ columns 
+---------
+       2
+(1 row)
+
+SELECT dolt_gc();
+ dolt_gc 
+---------
+ {0}
+(1 row)
+
+SELECT dolt_stash('pop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.n;
+ id 
+----
+  1
+(1 row)
+
+SELECT pk, w FROM st.t ORDER BY pk;
+ pk | w 
+----+---
+  1 | 1
+  2 | 2
+  8 | 8
+(3 rows)
+
+-- in a transaction block, as anything else: a rollback undoes it
+SELECT length(dolt_commit('-Am', 'all in')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+INSERT INTO st.t VALUES (9, 'k', 9);
+BEGIN;
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+ROLLBACK;
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       0
+(1 row)
+
+SELECT pk FROM st.t WHERE pk = 9;
+ pk 
+----
+  9
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_stash;

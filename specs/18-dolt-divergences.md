@@ -30,7 +30,9 @@ adapts.
   and needs neither; `dolt_reset` does hard resets only.
   `dolt_status.staged` is true for every row except those whose status
   is `conflict` or `not covered` (objects a commit can't hold yet,
-  which are listed and unstaged).
+  which are listed and unstaged). `dolt_stash('push', ...)` sets the
+  whole working set aside, so new tables with the rest (Dolt's leaves
+  untracked ones without `-u`); `-u` and `-a` are accepted (#498).
 - **Why:** the user's decision (2026-10-17). A staging area would be a
   second state of each branch beside the working set in Postgres's
   pages, for every fold, status and diff to track.

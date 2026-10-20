@@ -7193,11 +7193,11 @@ commit_one_parent(const char *message, const ProllyHash *head, const Local *l,
  */
 static int
 pick_held(const char *const *refs, int nrefs, bool allow_empty,
-		  ProllyHash *commit_id)
+		  ProllyHash *commit_id, const char *apply_fn)
 {
 	ProllyDatabaseComponents dc = components();
-	const char *what = "cherry-pick";
-	const char *fn = "dolt_cherry_pick";
+	const char *what = apply_fn ? "apply" : "cherry-pick";
+	const char *fn = apply_fn ? apply_fn : "dolt_cherry_pick";
 	ProllyHash *picked = palloc(sizeof(ProllyHash) * nrefs);
 	ProllyCommitInfo *info = palloc(sizeof(ProllyCommitInfo) * nrefs);
 	ProllyHash	ours;
@@ -7243,6 +7243,15 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
 									&nviolations);
 
+		/* (applied without a commit: no pick in progress to resolve) */
+		if (apply_fn && conflicts + nviolations > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("%s conflicts with the current branch", fn),
+					 errdetail("It has %d conflicting rows and %d constraint violations.",
+							   conflicts, nviolations),
+					 errhint("Commit or reset the changes in the way, and try again.")));
+
 		/*
 		 * The pick in progress.  Not over uncommitted changes, which its
 		 * commit would take in, and its abort (a reset) would lose.
@@ -7265,6 +7274,11 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		/* the next merges into the rows as this one left them */
 		root_of("WORKING", &roots[1]);
 		appendStringInfoString(&message, info[i].message);
+	}
+	if (apply_fn)
+	{
+		memset(commit_id, 0, sizeof(*commit_id));
+		return 0;
 	}
 	if (same_hash(&roots[1].hash, &before.hash) && !allow_empty)
 		ereport(ERROR,
@@ -7522,11 +7536,28 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = pick_held(refs, nrefs, allow_empty, commit_id);
+	int			result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
 
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
+}
+
+/*
+ * ref's changes (from its parent) merged three-way into the session
+ * branch's working set, as a cherry-pick merges them, but no commit made:
+ * changes overlapping uncommitted ones, conflicts and violations are each
+ * an error (fn's), and nothing is left in progress.
+ */
+static void
+folded_apply(const char *ref, const char *fn)
+{
+	bool		pushed = PROLLY_CALL(components().refs, hold);
+	ProllyHash	ignored;
+
+	(void) pick_held(&ref, 1, true, &ignored, fn);
+	if (pushed)
+		PopActiveSnapshot();
 }
 
 static int
@@ -7559,4 +7590,5 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.cherry_pick = folded_cherry_pick,
 	.revert = folded_revert,
 	.verify = verify_constraints,
+	.apply = folded_apply,
 };

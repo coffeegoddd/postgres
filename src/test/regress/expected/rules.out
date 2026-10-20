@@ -1324,6 +1324,12 @@ dolt_remote_branches| SELECT name,
 dolt_remotes| SELECT name,
     url
    FROM dolt_remotes() dolt_remotes(name, url);
+dolt_stashes| SELECT name,
+    stash_id,
+    branch,
+    hash,
+    commit_message
+   FROM dolt_stashes() dolt_stashes(name, stash_id, branch, hash, commit_message);
 dolt_status| SELECT table_name,
     staged,
     status
