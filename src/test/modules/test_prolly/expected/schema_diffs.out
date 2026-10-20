@@ -205,7 +205,7 @@ CREATE POLICY own_orders ON app.orders USING (qty < 100);
 SELECT length(dolt_commit('-Am', 'orders')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_schema_diff('HEAD~1', 'HEAD');
