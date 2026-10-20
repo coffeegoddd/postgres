@@ -48,5 +48,20 @@ SELECT dolt_reset('--soft', 'HEAD~1');
 SELECT dolt_reset('--hard');
 SELECT count(*) AS changed FROM dolt_status;
 
+-- on a protected branch, a soft reset that would leave it with changes
+-- no commit holds is refused; one to a commit of the same tree isn't,
+-- nor a hard one
+SELECT dolt_branch('--protect', 'main');
+SELECT dolt_hashof('HEAD') AS protected_head \gset
+SELECT dolt_reset('--soft', 'HEAD~1');
+SELECT dolt_hashof('HEAD') = :'protected_head' AS head_kept;
+SELECT count(*) AS changed FROM dolt_status;
+SELECT length(dolt_commit('--allow-empty', '-m', 'same tree')::text) AS committed;
+SELECT dolt_reset('--soft', 'HEAD~1');
+SELECT dolt_hashof('HEAD') = :'protected_head' AS back_to_it;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT count(*) AS changed FROM dolt_status;
+SELECT dolt_branch('--unprotect', 'main');
+
 \c contrib_regression
 DROP DATABASE regress_reset_modes;

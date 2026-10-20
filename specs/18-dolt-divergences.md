@@ -30,7 +30,8 @@ adapts.
   and needs neither. `dolt_reset('--hard')` moves the head and the
   working set; `--soft` and the plain form (Dolt's soft and mixed
   resets, one without an index) move only the head, so what differs from
-  it shows as changes (#493).
+  it shows as changes (#493); a protected branch, which has none, refuses
+  one that would leave it with some.
   `dolt_status.staged` is true for every row except those whose status
   is `conflict` or `not covered` (objects a commit can't hold yet,
   which are listed and unstaged). `dolt_stash('push', ...)` sets the

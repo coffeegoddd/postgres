@@ -2372,8 +2372,25 @@ dolt_reset(PG_FUNCTION_ARGS)
 	if (!hard)
 	{
 		ProllyHash	target;
+		ProllyNodeRef working;
+		ProllyNodeRef target_root;
+		const char *name = branch_ops()->current();
 
 		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
+
+		/*
+		 * (a protected branch is left as its head has it: one whose working
+		 * set the new head doesn't hold would have changes no commit does)
+		 */
+		if (PROLLY_CALL(writers(), protected, name) &&
+			PROLLY_CALL(refs(), working_set, NULL, &working) &&
+			(!PROLLY_CALL(refs(), commit_working_set, &target, &target_root) ||
+			 !same_hash(&working.hash, &target_root.hash)))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a soft reset of protected branch \"%s\" would leave it uncommitted", name),
+					 errdetail("Its working set isn't the commit's it would be reset to."),
+					 errhint("Reset it with --hard, or reset a branch of your own.")));
 		note_integration();
 		PROLLY_CALL(refs(), set_head, &target);
 		settled();

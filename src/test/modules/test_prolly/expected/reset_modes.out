@@ -157,5 +157,67 @@ SELECT count(*) AS changed FROM dolt_status;
        0
 (1 row)
 
+-- on a protected branch, a soft reset that would leave it with changes
+-- no commit holds is refused; one to a commit of the same tree isn't,
+-- nor a hard one
+SELECT dolt_branch('--protect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS protected_head \gset
+SELECT dolt_reset('--soft', 'HEAD~1');
+ERROR:  a soft reset of protected branch "main" would leave it uncommitted
+DETAIL:  Its working set isn't the commit's it would be reset to.
+HINT:  Reset it with --hard, or reset a branch of your own.
+SELECT dolt_hashof('HEAD') = :'protected_head' AS head_kept;
+ head_kept 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'same tree')::text) AS committed;
+ committed 
+-----------
+        66
+(1 row)
+
+SELECT dolt_reset('--soft', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('HEAD') = :'protected_head' AS back_to_it;
+ back_to_it 
+------------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT dolt_branch('--unprotect', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_reset_modes;
