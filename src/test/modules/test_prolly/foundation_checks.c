@@ -1448,7 +1448,7 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 	tablefile_build(tf, 1, &a);
 	mf.data = a.data;
 	mf.len = a.len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, a.len, CurrentMemoryContext);
 	if (f == NULL || PROLLY_CALL(tf, count, f) != 1)
 		elog(ERROR, "a table file of one chunk doesn't read back");
 	{
@@ -1664,11 +1664,25 @@ le32_put(char *p, uint32 v)
 		p[i] = (char) (v >> (8 * i));
 }
 
+static uint64
+le64_at(const char *p)
+{
+	return le32_at(p) | (uint64) le32_at(p + 4) << 32;
+}
+
+static void
+le64_put(char *p, uint64 v)
+{
+	le32_put(p, (uint32) v);
+	le32_put(p + 4, (uint32) (v >> 32));
+}
+
 /*
  * Whether a "basic" table file, its index changed by change and its CRC
  * made again (so only the index's own checks can refuse it), opens.  The
- * index: n entries of an 8-byte prefix and a uint32 ordinal, then n uint32
- * lengths, then the suffixes; the footer: the index's offset (uint64),
+ * index: n entries of an 8-byte prefix and a uint32 ordinal, then n uint64
+ * offsets, then the suffixes, then the filter; the footer: the index's
+ * offset (uint64),
  * n (uint32), the hash's length, three zero bytes, the index's CRC-32C,
  * the version (uint32), the magic.
  */
@@ -1686,7 +1700,7 @@ basic_opens_changed(const StringInfoData *file, void (*change) (char *index, uin
 	ProllyTableFile *f;
 
 	memcpy(copy, file->data, file->len);
-	index_offset = le32_at(footer) | (uint64) le32_at(footer + 4) << 32;
+	index_offset = le64_at(footer);
 	n = le32_at(footer + 8);
 	change(copy + index_offset, n, footer);
 	INIT_CRC32C(crc);
@@ -1695,7 +1709,8 @@ basic_opens_changed(const StringInfoData *file, void (*change) (char *index, uin
 	le32_put(footer + 16, crc);
 	mf.data = copy;
 	mf.len = file->len;
-	f = PROLLY_CALL(tf, open, memfile_read, &mf, file->len, CurrentMemoryContext);
+	f = PROLLY_CALL(tf, open, memfile_read, NULL, &mf, file->len,
+					CurrentMemoryContext);
 	if (f != NULL)
 		PROLLY_CALL(tf, close, f);
 	pfree(copy);
@@ -1722,15 +1737,15 @@ change_ordinal_past(char *index, uint32 n, char *footer)
 static void
 change_short_length(char *index, uint32 n, char *footer)
 {
-	le32_put(index + n * 12, 1);
+	char	   *offsets = index + n * 12;
+
+	le64_put(offsets + 8, le64_at(offsets) + 1);
 }
 
 static void
 change_lengths_sum(char *index, uint32 n, char *footer)
 {
-	char	   *len0 = index + n * 12;
-
-	le32_put(len0, le32_at(len0) + 1);
+	le64_put(index + n * 12, 1);
 }
 
 static void
