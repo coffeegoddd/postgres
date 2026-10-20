@@ -72,6 +72,18 @@ SELECT pg_stat_force_next_flush();
 SELECT counted('journal_scans') AS scans,
 	counted('journal_bytes_scanned') > 10000 AS read_them;
 
+-- Sizes are the manifest's: a backend asking doesn't read (or keep) the
+-- table files' indexes, here 100,000 chunks' (some 3 MB).
+SELECT test_chunk_table_file(ARRAY(SELECT convert_to('many ' || g, 'UTF8')
+								   FROM generate_series(1, 100000) g));
+\c sizes_db
+CREATE FUNCTION pg_temp.backend_bytes() RETURNS bigint LANGUAGE sql VOLATILE AS $$
+	SELECT sum(total_bytes)::bigint FROM pg_backend_memory_contexts
+$$;
+SELECT pg_temp.backend_bytes() AS before \gset
+SELECT table_files > 0 AS has_files FROM prolly_store_sizes();
+SELECT pg_temp.backend_bytes() - :before < 1000000 AS indexes_not_read;
+
 -- Collecting takes owning the database, as dolt_gc() does.
 CREATE ROLE sizes_stranger;
 SET ROLE sizes_stranger;

@@ -4063,21 +4063,27 @@ journal_conjoin(ProllyChunkStore *s)
 	pfree(dir);
 }
 
+/*
+ * The table files as the manifest names them, with their counts, sizes and
+ * flags: the files themselves aren't opened (nor their indexes read), so
+ * a size-only question costs a manifest's read.
+ */
 static void
 journal_table_files(ProllyChunkStore *s, ProllyChunkFileVisit visit, void *arg)
 {
-	ListCell   *lc;
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	Manifest	m;
 
-	load_tables(s, false);
-	foreach(lc, s->tables)
+	(void) read_manifest(dir, &m);
+	for (int i = 0; i < m.nfiles; i++)
 	{
-		TableFile  *t = lfirst(lc);
-		char	   *name = table_file_name(t->id);
+		char	   *name = table_file_name(m.files[i].id);
 
-		visit(name, PROLLY_CALL(table_format(), count, t->tf), t->size,
-			  t->settled, arg);
+		visit(name, (int) m.files[i].nchunks, m.files[i].size,
+			  (m.files[i].flags & MANIFEST_FILE_SETTLED) != 0, arg);
 		pfree(name);
 	}
+	pfree(dir);
 }
 
 /*

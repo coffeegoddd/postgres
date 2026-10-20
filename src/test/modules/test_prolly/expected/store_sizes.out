@@ -219,6 +219,32 @@ SELECT counted('journal_scans') AS scans,
      1 | t
 (1 row)
 
+-- Sizes are the manifest's: a backend asking doesn't read (or keep) the
+-- table files' indexes, here 100,000 chunks' (some 3 MB).
+SELECT test_chunk_table_file(ARRAY(SELECT convert_to('many ' || g, 'UTF8')
+								   FROM generate_series(1, 100000) g));
+ test_chunk_table_file 
+-----------------------
+ 
+(1 row)
+
+\c sizes_db
+CREATE FUNCTION pg_temp.backend_bytes() RETURNS bigint LANGUAGE sql VOLATILE AS $$
+	SELECT sum(total_bytes)::bigint FROM pg_backend_memory_contexts
+$$;
+SELECT pg_temp.backend_bytes() AS before \gset
+SELECT table_files > 0 AS has_files FROM prolly_store_sizes();
+ has_files 
+-----------
+ t
+(1 row)
+
+SELECT pg_temp.backend_bytes() - :before < 1000000 AS indexes_not_read;
+ indexes_not_read 
+------------------
+ t
+(1 row)
+
 -- Collecting takes owning the database, as dolt_gc() does.
 CREATE ROLE sizes_stranger;
 SET ROLE sizes_stranger;
