@@ -2879,7 +2879,14 @@ open_table(const char *dir, const ManifestFile *f, MemoryContext cxt)
 	t->tf = PROLLY_CALL(table_format(), open, table_file_read, t, t->size, cxt);
 	if (t->tf == NULL)
 	{
+		const ProllyTableFileRoutine *format = table_format();
+		uint32		version = format->version == NULL ? 0 :
+			format->version(table_file_read, t, t->size);
+
 		FileClose(t->file);
+		if (version != 0 && version != format->info.format_version)
+			check_format(t->path, "table file", version,
+						 format->info.format_version, NULL);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("file \"%s\" is not a table file", t->path)));

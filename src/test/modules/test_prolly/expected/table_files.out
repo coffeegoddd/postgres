@@ -201,3 +201,9 @@ SELECT test_tablefile_bytes_per_chunk(100000) BETWEEN 28 AND 40 AS compact_index
  t
 (1 row)
 
+SELECT test_tablefile_basic_index() AS index_checked;
+ index_checked 
+---------------
+ t
+(1 row)
+

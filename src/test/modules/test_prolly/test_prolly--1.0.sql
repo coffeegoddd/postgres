@@ -405,6 +405,12 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_write_held_rows(sql text) RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The "basic" table file format's checks of an index, each damage with its
+-- CRC made again; and a file of another version told from a damaged one.
+CREATE FUNCTION test_tablefile_basic_index()
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- The bytes the "basic" table file format keeps in memory for each chunk
 -- of an open file of n chunks named by 20-byte hashes.
 CREATE FUNCTION test_tablefile_bytes_per_chunk(n int)

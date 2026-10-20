@@ -23,6 +23,9 @@
  *   appended to out, failing on corruption.
  * - count() and entry() list the file's chunks, in hash order; locate()
  *   gives a chunk's place in that order (-1: not in the file).
+ * - version(), optional, says which version of the format a file open()
+ *   refused is written in, if it is one of the format's at all (0: it
+ *   isn't), so a file of another version is told from a damaged one.
  *
  * Provisional (v0).
  *
@@ -64,13 +67,16 @@ typedef struct ProllyTableFileRoutine
 						  uint64 *offset, uint32 *len);
 	void		(*close) (ProllyTableFile *tf);
 	int			(*locate) (ProllyTableFile *tf, const ProllyHash *hash);
+
+	/* Optional. */
+	uint32		(*version) (ProllyTableFileRead read, void *arg, uint64 size);
 } ProllyTableFileRoutine;
 
 #define PROLLY_TABLEFILE_CALLBACK_NAMES \
 	"write_begin", "write_add", "write_finish", "open", "find", "decode", \
-	"count", "entry", "close", "locate"
+	"count", "entry", "close", "locate", "version"
 #define PROLLY_TABLEFILE_FIRST_CALLBACK write_begin
-#define PROLLY_TABLEFILE_LAST_CALLBACK locate
+#define PROLLY_TABLEFILE_LAST_CALLBACK version
 
 static inline const ProllyTableFileRoutine *
 prolly_tablefile_lookup(const char *name)

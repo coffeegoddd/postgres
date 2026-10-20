@@ -69,3 +69,4 @@ ROLLBACK;
 -- A file's index takes about 32 bytes a chunk in memory (20-byte hashes):
 -- each hash's 8-byte prefix and ordinal, its 12-byte suffix, its offset.
 SELECT test_tablefile_bytes_per_chunk(100000) BETWEEN 28 AND 40 AS compact_index;
+SELECT test_tablefile_basic_index() AS index_checked;

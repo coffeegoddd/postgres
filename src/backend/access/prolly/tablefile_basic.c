@@ -7,7 +7,9 @@
  *
  *		chunk	uint8 codec (0: as is, 1: LZ4), uint32 length of the chunk,
  *				the bytes stored, uint32 CRC-32C of everything before it
- *		index	laid out as Dolt's table files' are: for each chunk in hash
+ *		index	laid out as Dolt's table files' are (in structure: Dolt's
+ *				tools can't read these files, whose integers, codecs and
+ *				footer are this format's own): for each chunk in hash
  *				order, its hash's first 8 bytes (a big-endian uint64, the
  *				prefix) and its ordinal (uint32: its place among the
  *				chunks); then for each chunk by ordinal, the uint32 length
@@ -23,8 +25,9 @@
  *
  * A reader keeps the index as the file has it, the lengths made offsets:
  * about 32 bytes a chunk for 20-byte hashes.  A lookup interpolates on the
- * prefixes, which are uniform, then compares the suffixes of the chunks
- * with its prefix.
+ * prefixes, which are uniform (every other step bisects, so prefixes that
+ * aren't still take O(log n) steps), then compares the suffixes of the
+ * chunks with its prefix.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/tablefile_basic.c
@@ -319,6 +322,18 @@ cmp_at(ProllyTableFile *tf, int i, uint64 prefix, const uint8 *suffix)
 	return memcmp(suffix_of(tf, i), suffix, tf->suffix_len);
 }
 
+/* The version a file's footer says, if it is this format's (else 0). */
+static uint32
+basic_version(ProllyTableFileRead read, void *arg, uint64 size)
+{
+	char		footer[FOOTER_SIZE];
+
+	if (size < FOOTER_SIZE || !read(arg, size - FOOTER_SIZE, footer, FOOTER_SIZE) ||
+		memcmp(footer + 24, MAGIC, 8) != 0)
+		return 0;
+	return get_u32(footer + 20);
+}
+
 static ProllyTableFile *
 basic_open(ProllyTableFileRead read, void *arg, uint64 size, MemoryContext cxt)
 {
@@ -421,14 +436,16 @@ bad:
 
 /*
  * The first chunk (in hash order) whose prefix is prefix, or -1: by
- * interpolation, as the prefixes of content hashes are uniform, narrowed
- * by bisection when a guess lands badly.
+ * interpolation, as the prefixes of content hashes are uniform, every
+ * other step a bisection, so prefixes that aren't (a guess landing at an
+ * end each time) cost O(log n) steps, not O(n).
  */
 static int
 find_prefix(ProllyTableFile *tf, uint64 prefix)
 {
 	int			lo = 0;
 	int			hi = tf->n - 1;
+	bool		bisect = false;
 
 	while (lo <= hi)
 	{
@@ -440,6 +457,8 @@ find_prefix(ProllyTableFile *tf, uint64 prefix)
 			return -1;
 		if (phi == plo)
 			mid = lo;
+		else if (bisect)
+			mid = lo + (hi - lo) / 2;
 		else
 		{
 			long double f = (long double) (prefix - plo) / (long double) (phi - plo);
@@ -447,6 +466,7 @@ find_prefix(ProllyTableFile *tf, uint64 prefix)
 			mid = lo + (int) (f * (hi - lo));
 			mid = Max(lo, Min(hi, mid));
 		}
+		bisect = !bisect;
 		if (tf->prefixes[mid] < prefix)
 			lo = mid + 1;
 		else if (tf->prefixes[mid] > prefix)
@@ -596,4 +616,5 @@ const ProllyTableFileRoutine prolly_tablefile_basic = {
 	.entry = basic_entry,
 	.locate = basic_locate,
 	.close = basic_close,
+	.version = basic_version,
 };

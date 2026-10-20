@@ -39,6 +39,7 @@
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "nodes/value.h"
+#include "port/pg_crc32c.h"
 #include "test_prolly.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -1409,7 +1410,7 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 	}
 	PROLLY_CALL(tf, close, f);
 
-	/* and a file of no chunks */
+	/* and a file of no chunks, where nothing is found */
 	resetStringInfo(&a);
 	tablefile_build(tf, 0, &a);
 	mf.data = a.data;
@@ -1417,6 +1418,43 @@ tablefile_round_trip(const ProllyImplInfo *impl)
 	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
 	if (f == NULL || PROLLY_CALL(tf, count, f) != 0)
 		elog(ERROR, "an empty table file doesn't read back");
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		tablefile_chunk(0, &chunk, &hash);
+		if (PROLLY_CALL(tf, find, f, &hash, &offset, &len) ||
+			PROLLY_CALL(tf, locate, f, &hash) != -1)
+			elog(ERROR, "a chunk is found in an empty table file");
+	}
+	PROLLY_CALL(tf, close, f);
+
+	/* and of one chunk; a hash of another length isn't found in it */
+	resetStringInfo(&a);
+	tablefile_build(tf, 1, &a);
+	mf.data = a.data;
+	mf.len = a.len;
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, a.len, CurrentMemoryContext);
+	if (f == NULL || PROLLY_CALL(tf, count, f) != 1)
+		elog(ERROR, "a table file of one chunk doesn't read back");
+	{
+		ProllyHash	hash;
+		uint64		offset;
+		uint32		len;
+
+		tablefile_chunk(0, &chunk, &hash);
+		if (!PROLLY_CALL(tf, find, f, &hash, &offset, &len) ||
+			PROLLY_CALL(tf, locate, f, &hash) != 0)
+			elog(ERROR, "the chunk of a one-chunk table file isn't found");
+		resetStringInfo(&out);
+		PROLLY_CALL(tf, decode, f, a.data + offset, len, &out);
+		if (out.len != chunk.len || memcmp(out.data, chunk.data, out.len) != 0)
+			elog(ERROR, "the chunk of a one-chunk table file doesn't decode");
+		hash.len--;
+		if (PROLLY_CALL(tf, find, f, &hash, &offset, &len))
+			elog(ERROR, "a hash of another length is found");
+	}
 	PROLLY_CALL(tf, close, f);
 }
 
@@ -1593,4 +1631,150 @@ test_tablefile_bytes_per_chunk(PG_FUNCTION_ARGS)
 	PROLLY_CALL(tf, close, f);
 	MemoryContextDelete(cxt);
 	PG_RETURN_FLOAT8((double) used / n);
+}
+
+/* a little-endian uint32 of a table file test's, read or written */
+static uint32
+le32_at(const char *p)
+{
+	return (uint32) (uint8) p[0] | (uint32) (uint8) p[1] << 8 |
+		(uint32) (uint8) p[2] << 16 | (uint32) (uint8) p[3] << 24;
+}
+
+static void
+le32_put(char *p, uint32 v)
+{
+	for (int i = 0; i < 4; i++)
+		p[i] = (char) (v >> (8 * i));
+}
+
+/*
+ * Whether a "basic" table file, its index changed by change and its CRC
+ * made again (so only the index's own checks can refuse it), opens.  The
+ * index: n entries of an 8-byte prefix and a uint32 ordinal, then n uint32
+ * lengths, then the suffixes; the footer: the index's offset (uint64),
+ * n (uint32), the hash's length, three zero bytes, the index's CRC-32C,
+ * the version (uint32), the magic.
+ */
+static bool
+basic_opens_changed(const StringInfoData *file, void (*change) (char *index, uint32 n,
+																 char *footer))
+{
+	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
+	char	   *copy = palloc(file->len);
+	char	   *footer = copy + file->len - 32;
+	uint64		index_offset;
+	uint32		n;
+	pg_crc32c	crc;
+	MemFile		mf;
+	ProllyTableFile *f;
+
+	memcpy(copy, file->data, file->len);
+	index_offset = le32_at(footer) | (uint64) le32_at(footer + 4) << 32;
+	n = le32_at(footer + 8);
+	change(copy + index_offset, n, footer);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, copy + index_offset, (footer - copy) - index_offset);
+	FIN_CRC32C(crc);
+	le32_put(footer + 16, crc);
+	mf.data = copy;
+	mf.len = file->len;
+	f = PROLLY_CALL(tf, open, memfile_read, &mf, file->len, CurrentMemoryContext);
+	if (f != NULL)
+		PROLLY_CALL(tf, close, f);
+	pfree(copy);
+	return f != NULL;
+}
+
+static void
+change_nothing(char *index, uint32 n, char *footer)
+{
+}
+
+static void
+change_repeat_ordinal(char *index, uint32 n, char *footer)
+{
+	memcpy(index + 8, index + 12 + 8, 4);
+}
+
+static void
+change_ordinal_past(char *index, uint32 n, char *footer)
+{
+	le32_put(index + 8, n);
+}
+
+static void
+change_short_length(char *index, uint32 n, char *footer)
+{
+	le32_put(index + n * 12, 1);
+}
+
+static void
+change_lengths_sum(char *index, uint32 n, char *footer)
+{
+	char	   *len0 = index + n * 12;
+
+	le32_put(len0, le32_at(len0) + 1);
+}
+
+static void
+change_hash_order(char *index, uint32 n, char *footer)
+{
+	char		entry[12];
+
+	memcpy(entry, index, 12);
+	memcpy(index, index + 12, 12);
+	memcpy(index + 12, entry, 12);
+}
+
+static void
+change_version(char *index, uint32 n, char *footer)
+{
+	le32_put(footer + 20, 1);
+}
+
+/*
+ * The "basic" table file format's own checks of an index: each damage
+ * below, its CRC made again, is refused at open; and a file of another
+ * version is told from a damaged one.
+ */
+PG_FUNCTION_INFO_V1(test_tablefile_basic_index);
+Datum
+test_tablefile_basic_index(PG_FUNCTION_ARGS)
+{
+	const ProllyTableFileRoutine *tf = prolly_tablefile_lookup("basic");
+	static const struct
+	{
+		const char *what;
+		void		(*change) (char *index, uint32 n, char *footer);
+	}			damages[] = {
+		{"an ordinal repeated", change_repeat_ordinal},
+		{"an ordinal past the chunks", change_ordinal_past},
+		{"a length shorter than a chunk's framing", change_short_length},
+		{"lengths not adding up to the index's offset", change_lengths_sum},
+		{"hashes out of order", change_hash_order},
+		{"another version", change_version},
+	};
+	StringInfoData file;
+	MemFile		mf;
+
+	initStringInfo(&file);
+	tablefile_build(tf, 20, &file);
+	if (!basic_opens_changed(&file, change_nothing))
+		elog(ERROR, "a table file with its CRC made again doesn't open");
+	for (int i = 0; i < lengthof(damages); i++)
+		if (basic_opens_changed(&file, damages[i].change))
+			elog(ERROR, "a table file with %s opens", damages[i].what);
+
+	mf.data = file.data;
+	mf.len = file.len;
+	if (tf->version(memfile_read, &mf, file.len) != tf->info.format_version)
+		elog(ERROR, "a table file's version isn't its format's");
+	file.data[file.len - 12] = 1;	/* (the version's low byte) */
+	if (tf->version(memfile_read, &mf, file.len) != 1)
+		elog(ERROR, "a table file of version 1 isn't told as that");
+	file.data[file.len - 1] ^= 1;	/* (the magic) */
+	if (tf->version(memfile_read, &mf, file.len) != 0)
+		elog(ERROR, "bytes that aren't a table file have a version");
+	PG_RETURN_BOOL(true);
 }
