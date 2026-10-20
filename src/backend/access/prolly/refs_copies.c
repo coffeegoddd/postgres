@@ -189,8 +189,9 @@ commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 
 /*
  * The refs' entries: a branch's head, a remote branch's, a baseline and the
- * working set its fold made, and a merge's commits (theirs and the base;
- * a revert's series head and the commits it has left).
+ * working set its fold made, a merge's commits (theirs and the base; a
+ * revert's series head and the commits it has left), and each stash's
+ * commit.
  */
 static void
 refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
@@ -230,6 +231,19 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 					n = get_be32(p);
 					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
 				}
+			}
+			break;
+		case TAG_STASH:
+			/* (each entry: its commit, then its branch's name) */
+			while (p < end)
+			{
+				uint64		blen;
+
+				p = declare_hashes(p, end, 1, refs);
+				blen = prolly_get_varint(&p, end);
+				if (blen > (uint64) (end - p))
+					break;
+				p += blen;
 			}
 			break;
 		default:
