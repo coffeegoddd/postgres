@@ -314,14 +314,14 @@ INSERT INTO app.t1 VALUES (1, 'dolt');
 SELECT length(dolt_commit('-Am', 'create_table')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 UPDATE app.t1 SET name = 'doltgres' WHERE id = 1;
 SELECT length(dolt_commit('-Am', 'update_value')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 CREATE TABLE app.temp__t1 (id int PRIMARY KEY, name varchar(10));
@@ -331,7 +331,7 @@ ALTER TABLE app.temp__t1 RENAME TO t1;
 SELECT length(dolt_commit('-Am', 'drop and recreate')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD', 'app.t1');
@@ -360,7 +360,7 @@ CREATE SCHEMA public VERSIONED;
 SELECT length(dolt_commit('--allow-empty', '-m', 'initial')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 -- smoke test select dolt diff functions and tables
@@ -473,7 +473,7 @@ CREATE TABLE t1 (pk INT4 PRIMARY KEY, v1 TEXT);
 SELECT length(dolt_commit('-A', '-m', 'initial')::text) AS committed;
  committed 
 -----------
-        66
+        42
 (1 row)
 
 INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
