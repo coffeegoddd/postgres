@@ -207,7 +207,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_file    | stub           | round_trip                     | not implemented (missing write_begin, write_add, write_finish, open, find, decode, count, entry, close)
  table_file    | stub           | rejects_other_bytes            | not implemented (missing write_begin, write_add, write_finish, open, entry, decode, close)
  table_file    | stub           | shared_prefixes                | not implemented (missing write_begin, write_add, write_finish, open, find, decode, close)
- table_file    | stub           | complete                       | not implemented (11 of 11 callbacks missing)
+ table_file    | stub           | complete                       | not implemented (13 of 13 callbacks missing)
  change_finder | pages          | identity                       | pass
  change_finder | pages          | complete                       | pass
  change_finder | log            | identity                       | pass

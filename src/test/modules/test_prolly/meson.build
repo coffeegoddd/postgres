@@ -96,6 +96,7 @@ tests += {
       'keyless_keys',
       'walks',
       'remotes',
+      'stored_chunks',
       'remote_clone',
       'remote_serve',
       'dependencies',

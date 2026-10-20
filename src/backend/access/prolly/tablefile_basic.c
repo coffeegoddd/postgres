@@ -153,24 +153,60 @@ basic_write_begin(MemoryContext cxt)
 	return w;
 }
 
+/*
+ * Add a chunk: its header (codec and length), the bytes the codec left,
+ * and the CRC of both.  (A chunk's header and bytes are its frame,
+ * prolly_chunk_frame()'s.)
+ */
 static void
-basic_write_add(ProllyTableFileWriter *w, const ProllyHash *hash,
-				const void *data, Size len, StringInfo out)
+write_chunk(ProllyTableFileWriter *w, const ProllyHash *hash, const char *head,
+			const char *stored, Size stored_len, StringInfo out)
 {
 	int			start = out->len;
-	char		head[CHUNK_HEADER];
 	char		tail[4];
-	const char *stored = data;
-	Size		stored_len = len;
-	char	   *compressed = NULL;
-	uint8		codec = CODEC_NONE;
 	pg_crc32c	crc;
 
 	if (hash->len == 0 || (w->hash_len != 0 && hash->len != w->hash_len))
 		elog(ERROR, "table file chunk hash of %u bytes", hash->len);
+	if (stored_len > PG_UINT32_MAX - CHUNK_OVERHEAD)
+		elog(ERROR, "chunk of %zu bytes is too large for a table file", stored_len);
+	w->hash_len = hash->len;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, head, CHUNK_HEADER);
+	COMP_CRC32C(crc, stored, stored_len);
+	FIN_CRC32C(crc);
+	put_u32(tail, crc);
+	appendBinaryStringInfo(out, head, CHUNK_HEADER);
+	appendBinaryStringInfo(out, stored, stored_len);
+	appendBinaryStringInfo(out, tail, 4);
+
+	if (w->n == w->max)
+	{
+		w->max = Max(64, w->max * 2);
+		w->entries = w->entries ?
+			repalloc_huge(w->entries, sizeof(Entry) * w->max) :
+			MemoryContextAllocHuge(w->cxt, sizeof(Entry) * w->max);
+	}
+	w->entries[w->n].hash = *hash;
+	w->entries[w->n].ordinal = (uint32) w->n;
+	w->entries[w->n].offset = w->offset;
+	w->n++;
+	w->offset += out->len - start;
+}
+
+static void
+basic_write_add(ProllyTableFileWriter *w, const ProllyHash *hash,
+				const void *data, Size len, StringInfo out)
+{
+	char		head[CHUNK_HEADER];
+	const char *stored = data;
+	Size		stored_len = len;
+	char	   *compressed = NULL;
+	uint8		codec = CODEC_NONE;
+
 	if (len > PG_UINT32_MAX - CHUNK_OVERHEAD)
 		elog(ERROR, "chunk of %zu bytes is too large for a table file", len);
-	w->hash_len = hash->len;
 
 #ifdef USE_LZ4
 	/* (one whose bound is past what palloc gives is stored as is) */
@@ -193,29 +229,28 @@ basic_write_add(ProllyTableFileWriter *w, const ProllyHash *hash,
 
 	head[0] = (char) codec;
 	put_u32(head + 1, (uint32) len);
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, head, CHUNK_HEADER);
-	COMP_CRC32C(crc, stored, stored_len);
-	FIN_CRC32C(crc);
-	put_u32(tail, crc);
-	appendBinaryStringInfo(out, head, CHUNK_HEADER);
-	appendBinaryStringInfo(out, stored, stored_len);
-	appendBinaryStringInfo(out, tail, 4);
+	write_chunk(w, hash, head, stored, stored_len, out);
 	if (compressed)
 		pfree(compressed);
+}
 
-	if (w->n == w->max)
-	{
-		w->max = Max(64, w->max * 2);
-		w->entries = w->entries ?
-			repalloc_huge(w->entries, sizeof(Entry) * w->max) :
-			MemoryContextAllocHuge(w->cxt, sizeof(Entry) * w->max);
-	}
-	w->entries[w->n].hash = *hash;
-	w->entries[w->n].ordinal = (uint32) w->n;
-	w->entries[w->n].offset = w->offset;
-	w->n++;
-	w->offset += out->len - start;
+/* A chunk framed as stored: a table file's chunk is its frame, and a CRC. */
+static void
+basic_write_add_stored(ProllyTableFileWriter *w, const ProllyHash *hash,
+					   const char *frame, Size len, StringInfo out)
+{
+	uint32		chunk_len;
+
+	StaticAssertStmt(CHUNK_HEADER == PROLLY_FRAME_HEADER &&
+					 CODEC_NONE == PROLLY_CODEC_NONE &&
+					 CODEC_LZ4 == PROLLY_CODEC_LZ4,
+					 "a table file's chunk header is a stored chunk's frame");
+	if (!prolly_chunk_frame_len(frame, len, &chunk_len))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	write_chunk(w, hash, frame, frame + CHUNK_HEADER, len - CHUNK_HEADER, out);
 }
 
 /* A hash's prefix: its first bytes, as a big-endian number. */
@@ -670,6 +705,30 @@ corrupt:
 			 errmsg("corrupt chunk in a table file")));
 }
 
+static void
+basic_read_stored(ProllyTableFile *tf, const char *bytes, uint32 len,
+				  StringInfo out)
+{
+	pg_crc32c	crc;
+	uint32		chunk_len;
+
+	if (len < CHUNK_OVERHEAD)
+		goto corrupt;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, len - 4);
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, get_u32(bytes + len - 4)) ||
+		!prolly_chunk_frame_len(bytes, len - 4, &chunk_len))
+		goto corrupt;
+	appendBinaryStringInfo(out, bytes, len - 4);
+	return;
+
+corrupt:
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("corrupt chunk in a table file")));
+}
+
 static int
 basic_count(ProllyTableFile *tf)
 {
@@ -710,6 +769,8 @@ const ProllyTableFileRoutine prolly_tablefile_basic = {
 	.count = basic_count,
 	.entry = basic_entry,
 	.locate = basic_locate,
+	.read_stored = basic_read_stored,
+	.write_add_stored = basic_write_add_stored,
 	.close = basic_close,
 	.version = basic_version,
 };

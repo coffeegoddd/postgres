@@ -325,6 +325,29 @@ RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Make a new branch of a remote's at commit, recording format if it has none.
+-- The same, the chunk given as stored (framed), as it is.
+CREATE FUNCTION test_remote_put_stored(url text, hash text, frame bytea)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A remote's chunk as it gives it: as stored, framed (NULL: none).
+CREATE FUNCTION test_remote_get_stored(url text, hash text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A chunk of the store as stored, framed (NULL: none); data framed so.
+CREATE FUNCTION test_chunk_stored(hash text)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION test_chunk_frame(data bytea, compress boolean)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Every chunk a commit's walk reaches, once.
+CREATE FUNCTION test_commit_chunks(commit_id text)
+RETURNS SETOF text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_remote_set_head(url text, branch text, commit_id text,
 	format text)
 RETURNS bool

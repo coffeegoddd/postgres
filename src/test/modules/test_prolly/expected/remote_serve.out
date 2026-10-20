@@ -194,7 +194,7 @@ NOTICE:  refused: this database holds commits of canonical format N, not 0
 SELECT dolt_hashof('rs_b') AS rs_b \gset
 BEGIN;
 SELECT dolt_serve_receive(ARRAY['\x0102030405060708091011121314151617181920'::bytea],
-						  ARRAY['\xdeadbeef'::bytea]);
+						  ARRAY[test_chunk_frame('\xdeadbeef'::bytea, false)]);
  dolt_serve_receive 
 --------------------
  

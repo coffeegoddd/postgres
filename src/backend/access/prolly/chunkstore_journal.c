@@ -2065,6 +2065,8 @@ load_segments(ProllyChunkStore *s, const Manifest *m, uint64 count)
  * ----------------------------------------------------------------
  */
 
+static bool tables_read(ProllyChunkStore *s, const ProllyHash *hash,
+						StringInfo out, bool stored);
 static bool tables_get(ProllyChunkStore *s, const ProllyHash *hash,
 					   StringInfo out);
 static void load_tables(ProllyChunkStore *s, bool force);
@@ -3331,6 +3333,14 @@ load_tables(ProllyChunkStore *s, bool force)
 static bool
 tables_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 {
+	return tables_read(s, hash, out, false);
+}
+
+/* A chunk of a table file: decoded, or (stored) framed as stored. */
+static bool
+tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
+			bool stored)
+{
 	for (int attempt = 0; attempt < 2; attempt++)
 	{
 		ListCell   *lc;
@@ -3364,7 +3374,19 @@ tables_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 						 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 								len, (unsigned long long) offset, t->path)));
 			}
-			PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
+			if (stored && PROLLY_HAS(table_format(), read_stored))
+				PROLLY_CALL(table_format(), read_stored, t->tf, bytes, len, out);
+			else if (stored)
+			{
+				StringInfoData data;
+
+				initStringInfo(&data);
+				PROLLY_CALL(table_format(), decode, t->tf, bytes, len, &data);
+				prolly_chunk_frame(data.data, data.len, out);
+				pfree(data.data);
+			}
+			else
+				PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
 			pfree(bytes);
 			return true;
 		}
@@ -3383,7 +3405,8 @@ tables_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
  */
 static bool
 write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
-		   uint64 limit, bool *full, uint32 *nchunks_out, uint64 *size_out)
+		   bool stored, uint64 limit, bool *full, uint32 *nchunks_out,
+		   uint64 *size_out)
 {
 	const ProllyTableFileRoutine *fmt = table_format();
 	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -3433,7 +3456,23 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 			resetStringInfo(&data);
 			continue;
 		}
-		PROLLY_CALL(fmt, write_add, w, &hash, data.data, data.len, &buf);
+		if (stored && PROLLY_HAS(fmt, write_add_stored))
+			PROLLY_CALL(fmt, write_add_stored, w, &hash, data.data, data.len, &buf);
+		else if (stored)
+		{
+			StringInfoData chunk;
+
+			initStringInfo(&chunk);
+			if (!prolly_chunk_unframe(data.data, data.len, &chunk))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("chunk %s isn't framed as stored chunks are",
+								prolly_hash_hex(&hash))));
+			PROLLY_CALL(fmt, write_add, w, &hash, chunk.data, chunk.len, &buf);
+			pfree(chunk.data);
+		}
+		else
+			PROLLY_CALL(fmt, write_add, w, &hash, data.data, data.len, &buf);
 		nchunks++;
 		if (buf.len >= APPEND_BATCH)
 		{
@@ -3476,7 +3515,8 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
  */
 static void
 write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
-				 ProllyChunkNext next, void *arg, bool copies, uint64 limit)
+				 ProllyChunkNext next, void *arg, bool stored, bool copies,
+				 uint64 limit)
 {
 	char	   *dir;
 	uint64		id = m->last_id + 1;
@@ -3497,7 +3537,7 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 	/* (with a limit, as many files as it takes, each begun as the last fills) */
 	do
 	{
-		if (!write_file(s, id, next, arg, limit, &full, &nchunks, &size))
+		if (!write_file(s, id, next, arg, stored, limit, &full, &nchunks, &size))
 			break;
 		if (copies)
 			pgstat_count_prolly(PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, size);
@@ -3823,8 +3863,56 @@ chunk_bytes(const char *path, const char *rec, uint32 len, StringInfo out)
 	chunk_bytes_of(path, rec, len, NULL, out);
 }
 
+/*
+ * The chunk a CHUNK or XCHUNK record (whole and valid) holds, framed as
+ * stored chunks are, without decoding it, appended to out (a journal
+ * record holds its codec and, compressed, its length, as a frame does).
+ */
+static void
+record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
+{
+	ProllyHash	h;
+	Size		after;
+	const char *p;
+	const char *end = rec + len - sizeof(uint32);
+	char		head[PROLLY_FRAME_HEADER];
+	uint32		chunk_len;
+
+	if (!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
+		(p = rec + after) >= end)
+		goto corrupt;
+	if ((uint8) *p == CODEC_NONE)
+	{
+		chunk_len = (uint32) (end - (p + 1));
+		p += 1;
+	}
+	else if ((uint8) *p == CODEC_LZ4 && end - p >= (ptrdiff_t) CODEC_HEAD_MAX)
+	{
+		memcpy(&chunk_len, p + 1, sizeof(chunk_len));
+		p += CODEC_HEAD_MAX;
+	}
+	else
+		goto corrupt;
+	head[0] = (char) (*(rec + after) == CODEC_NONE ? PROLLY_CODEC_NONE :
+					  PROLLY_CODEC_LZ4);
+	head[1] = chunk_len & 0xff;
+	head[2] = (chunk_len >> 8) & 0xff;
+	head[3] = (chunk_len >> 16) & 0xff;
+	head[4] = (chunk_len >> 24) & 0xff;
+	appendBinaryStringInfo(out, head, PROLLY_FRAME_HEADER);
+	appendBinaryStringInfo(out, p, end - p);
+	return;
+
+corrupt:
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("corrupt chunk record in file \"%s\"", path)));
+}
+
 static bool journal_get(ProllyChunkStore *s, const ProllyHash *hash,
 						StringInfo out);
+static bool journal_read(ProllyChunkStore *s, const ProllyHash *hash,
+						 StringInfo out, bool stored);
 
 /* a chunk read ahead */
 typedef struct AheadEntry
@@ -4130,6 +4218,24 @@ journal_get_many(ProllyChunkStore *s, const ProllyHash *hashes, int n,
 static bool
 journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 {
+	return journal_read(s, hash, out, false);
+}
+
+/*
+ * A chunk as stored, framed, without decoding it: a record's or a table
+ * file's bytes (one only read ahead is read again; one read through a
+ * source is framed).
+ */
+static bool
+journal_get_stored(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
+{
+	return journal_read(s, hash, out, true);
+}
+
+static bool
+journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
+			 bool stored)
+{
 	ProllyHash	key;
 	IndexEntry *e;
 	Segment    *g;
@@ -4142,24 +4248,41 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 	e = hash_search(s->pending_index, &key, HASH_FIND, NULL);
 	if (e != NULL)
 	{
-		chunk_bytes("(pending)", s->pending.data + e->offset, e->len, out);
+		if (stored)
+			record_framed("(pending)", s->pending.data + e->offset, e->len, out);
+		else
+			chunk_bytes("(pending)", s->pending.data + e->offset, e->len, out);
 		return true;
 	}
-	if (ahead_take(s, &key, out))
+	if (!stored && ahead_take(s, &key, out))
 		return true;
 	refresh_segments(s);
 	xact_note(s);
 	if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 	{
-		if (tables_get(s, &key, out))
+		if (tables_read(s, &key, out, stored))
 			return true;
 		scan_journal(s);
 		if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 		{
 			load_tables(s, false);
-			if (tables_get(s, &key, out))
+			if (tables_read(s, &key, out, stored))
 				return true;
-			return s->through != NULL && s->through(s->through_arg, hash, out);
+			if (s->through == NULL)
+				return false;
+			if (!stored)
+				return s->through(s->through_arg, hash, out);
+			{
+				StringInfoData data;
+				bool		found;
+
+				initStringInfo(&data);
+				found = s->through(s->through_arg, hash, &data);
+				if (found)
+					prolly_chunk_frame(data.data, data.len, out);
+				pfree(data.data);
+				return found;
+			}
 		}
 	}
 	g = local_segment(s, segment);
@@ -4170,7 +4293,22 @@ journal_get(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out)
 	read_exact(g, rec, len, offset);
 	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_FILE_READS, 1);
 	/* (the index named it: its record must hold it) */
-	chunk_bytes_of(g->path, rec, len, &key, out);
+	if (stored)
+	{
+		ProllyHash	h;
+		Size		after;
+
+		if (!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
+			h.len != key.len || memcmp(h.bytes, key.bytes, key.len) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("chunk journal \"%s\" holds no chunk %s at %llu",
+							g->path, prolly_hash_hex(hash),
+							(unsigned long long) offset)));
+		record_framed(g->path, rec, len, out);
+	}
+	else
+		chunk_bytes_of(g->path, rec, len, &key, out);
 	pfree(rec);
 	return true;
 }
@@ -4833,7 +4971,8 @@ journal_prefetch(ProllyChunkStore *s, const ProllyHash *hashes, int n)
  * the transaction is retried.
  */
 static void
-journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
+add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg,
+			   bool stored)
 {
 	Manifest	m;
 	bool	   *keep;
@@ -4848,8 +4987,22 @@ journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
 	for (int i = 0; i < m.nfiles; i++)
 		keep[i] = true;
-	write_table_file(s, &m, keep, 0, next, arg, false, 0);
+	write_table_file(s, &m, keep, 0, next, arg, stored, false, 0);
 	pfree(keep);
+}
+
+static void
+journal_add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg)
+{
+	add_table_file(s, next, arg, false);
+}
+
+/* The same, of chunks next() gives framed as stored: written as they are. */
+static void
+journal_add_stored_table_file(ProllyChunkStore *s, ProllyChunkNext next,
+							  void *arg)
+{
+	add_table_file(s, next, arg, true);
 }
 
 /* conjoin()'s source: every chunk of the table files, once */
@@ -5072,7 +5225,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true,
+		write_table_file(s, &m, keep, flags, conjoin_next, &cs, false, true,
 						 (uint64) prolly_gc_file_size * 1024);
 	}
 	PG_FINALLY();
@@ -6408,7 +6561,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 		 * (not in the window, where appends wait: what came since is few
 		 * chunks, written as one file, fsynced once)
 		 */
-		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc,
+		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, false,
 						   paced ? (uint64) prolly_gc_file_size * 1024 : 0,
 						   &full, &nchunks, &size);
 		if (wrote)
@@ -7006,6 +7159,8 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.recovered = journal_recovered,
 	.redo = journal_redo,
 	.add_table_file = journal_add_table_file,
+	.get_stored = journal_get_stored,
+	.add_stored_table_file = journal_add_stored_table_file,
 	.conjoin = journal_conjoin,
 	.table_files = journal_table_files,
 	.shmem_size = journal_shmem_size,

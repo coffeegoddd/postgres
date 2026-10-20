@@ -21,6 +21,11 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_xlog.h"
 #include "storage/sync.h"
+#include "utils/memutils.h"
+
+#ifdef USE_LZ4
+#include <lz4.h>
+#endif
 
 /* the implementation the server's stores use */
 #define CHUNK_STORE_IMPL	"journal"
@@ -151,6 +156,146 @@ prolly_chunks_redo(XLogReaderState *record)
 	memcpy(&hdr, XLogRecGetData(record), SizeOfProllyHeader);
 	store = store_by_id(hdr.impl_id);
 	PROLLY_CALL(store, redo, record);
+}
+
+void
+prolly_chunk_frame(const void *data, Size len, StringInfo out)
+{
+	char		head[PROLLY_FRAME_HEADER];
+
+	if (len > PG_UINT32_MAX)
+		elog(ERROR, "chunk of %zu bytes is too large to frame", len);
+	head[1] = len & 0xff;
+	head[2] = (len >> 8) & 0xff;
+	head[3] = (len >> 16) & 0xff;
+	head[4] = (len >> 24) & 0xff;
+#ifdef USE_LZ4
+	if (len > 0 && len <= LZ4_MAX_INPUT_SIZE)
+	{
+		int			bound = LZ4_compressBound((int) len);
+		int			n;
+
+		enlargeStringInfo(out, PROLLY_FRAME_HEADER + bound);
+		n = LZ4_compress_default(data, out->data + out->len + PROLLY_FRAME_HEADER,
+								 (int) len, bound);
+		if (n > 0 && (Size) n < len)
+		{
+			head[0] = PROLLY_CODEC_LZ4;
+			memcpy(out->data + out->len, head, PROLLY_FRAME_HEADER);
+			out->len += PROLLY_FRAME_HEADER + n;
+			out->data[out->len] = '\0';
+			return;
+		}
+	}
+#endif
+	head[0] = PROLLY_CODEC_NONE;
+	appendBinaryStringInfo(out, head, PROLLY_FRAME_HEADER);
+	appendBinaryStringInfo(out, data, len);
+}
+
+bool
+prolly_chunk_frame_len(const char *frame, Size len, uint32 *chunk_len)
+{
+	const uint8 *p = (const uint8 *) frame;
+
+	if (len < PROLLY_FRAME_HEADER)
+		return false;
+	*chunk_len = p[1] | (p[2] << 8) | (p[3] << 16) | ((uint32) p[4] << 24);
+	if (p[0] == PROLLY_CODEC_NONE)
+		return len - PROLLY_FRAME_HEADER == *chunk_len;
+	return p[0] == PROLLY_CODEC_LZ4;
+}
+
+bool
+prolly_chunk_unframe(const char *frame, Size len, StringInfo out)
+{
+	uint32		chunk_len;
+
+	if (!prolly_chunk_frame_len(frame, len, &chunk_len))
+		return false;
+	if ((uint8) frame[0] == PROLLY_CODEC_NONE)
+	{
+		appendBinaryStringInfo(out, frame + PROLLY_FRAME_HEADER, chunk_len);
+		return true;
+	}
+#ifdef USE_LZ4
+	{
+		int			n;
+
+		if (chunk_len > MaxAllocSize - 1 - (Size) out->len)
+			return false;
+		enlargeStringInfo(out, (int) chunk_len);
+		n = LZ4_decompress_safe(frame + PROLLY_FRAME_HEADER, out->data + out->len,
+								(int) (len - PROLLY_FRAME_HEADER), (int) chunk_len);
+		if (n < 0 || (uint32) n != chunk_len)
+			return false;
+		out->len += n;
+		out->data[out->len] = '\0';
+		return true;
+	}
+#else
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("a chunk is compressed with LZ4, which this server was built without")));
+	return false;
+#endif
+}
+
+bool
+prolly_chunk_get_stored(const ProllyChunkStoreRoutine *cs, ProllyChunkStore *store,
+						const ProllyHash *hash, StringInfo out)
+{
+	StringInfoData data;
+	bool		found;
+
+	if (PROLLY_HAS(cs, get_stored))
+		return PROLLY_CALL(cs, get_stored, store, hash, out);
+	initStringInfo(&data);
+	found = PROLLY_CALL(cs, get, store, hash, &data);
+	if (found)
+		prolly_chunk_frame(data.data, data.len, out);
+	pfree(data.data);
+	return found;
+}
+
+/* add_table_file()'s source for a store without add_stored_table_file() */
+typedef struct Unframing
+{
+	ProllyChunkNext next;
+	void	   *arg;
+	StringInfoData frame;
+} Unframing;
+
+static bool
+unframed_next(void *arg, ProllyHash *hash, StringInfo data)
+{
+	Unframing  *u = arg;
+
+	resetStringInfo(&u->frame);
+	if (!u->next(u->arg, hash, &u->frame))
+		return false;
+	if (!prolly_chunk_unframe(u->frame.data, u->frame.len, data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	return true;
+}
+
+void
+prolly_chunk_add_stored(const ProllyChunkStoreRoutine *cs, ProllyChunkStore *store,
+						ProllyChunkNext next, void *arg)
+{
+	Unframing	u = {next, arg};
+
+	if (PROLLY_HAS(cs, add_stored_table_file))
+	{
+		PROLLY_CALL(cs, add_stored_table_file, store, next, arg);
+		return;
+	}
+	initStringInfo(&u.frame);
+	PROLLY_CALL(cs, add_table_file, store, unframed_next, &u);
+	pfree(u.frame.data);
 }
 
 void

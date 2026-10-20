@@ -9,10 +9,14 @@
  * store that has a chunk has all it references, so nothing below one is
  * looked at.  Chunks are found once each.
  *
+ * Chunks move as stored (prolly_chunk_frame()): sent as the store holds
+ * them, compressed where they were made, and added as received; only the
+ * receiver's checks decode them.
+ *
  * Receiving.  The walk reads through this database's store: a chunk the
  * store hasn't is asked of the remote (the store's read_through(), which
  * answers has() from the remote too), and kept, as received, in a
- * temporary file.  Each is re-hashed and compared
+ * temporary file.  Each is decoded, re-hashed and compared
  * with the address it was asked by before anything reads it, so what the
  * walk follows is what the addresses say; a chunk the remote lacks is an
  * error, so every reference resolves, in the store or in what was
@@ -58,7 +62,7 @@ typedef struct Receiving
 	List	   *order;			/* Received *, as received */
 	BufFile    *spool;
 	uint64		spooled;		/* the spool's length */
-	ListCell   *next;			/* add_table_file()'s */
+	ListCell   *next;			/* the table file's */
 	bool		hinting;		/* receive_hint() asking the store */
 } Receiving;
 
@@ -85,20 +89,23 @@ spool_read(Receiving *rv, const Received *r, StringInfo out)
 }
 
 /*
- * Keep a chunk the remote gave, checked against the address it was asked
- * by first: what the walk follows is what the addresses say.
+ * A chunk the remote gave, as stored (frame), decoded into chunk and
+ * checked against the address it was asked by.
  */
-static Received *
-keep_chunk(Receiving *rv, const ProllyHash *hash, const char *data, int len)
+static void
+check_chunk(Receiving *rv, const ProllyHash *hash, const char *frame, int len,
+			StringInfo chunk)
 {
-	ProllyHash	key;
 	ProllyHashCtx *ctx;
 	ProllyHash	actual;
-	Received   *r;
-	bool		found;
 
+	if (!prolly_chunk_unframe(frame, len, chunk))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
 	ctx = PROLLY_CALL(rv->hash, begin, CurrentMemoryContext);
-	PROLLY_CALL(rv->hash, update, ctx, (const uint8 *) data, len);
+	PROLLY_CALL(rv->hash, update, ctx, (const uint8 *) chunk->data, chunk->len);
 	PROLLY_CALL(rv->hash, finish, ctx, &actual);
 	if (actual.len != hash->len ||
 		memcmp(actual.bytes, hash->bytes, hash->len) != 0)
@@ -107,6 +114,27 @@ keep_chunk(Receiving *rv, const ProllyHash *hash, const char *data, int len)
 				 errmsg("the remote's chunk %s doesn't match its hash",
 						prolly_hash_hex(hash)),
 				 errdetail("Its bytes hash to %s.", prolly_hash_hex(&actual))));
+}
+
+/*
+ * Keep a chunk the remote gave, as stored, checked against the address it
+ * was asked by first: what the walk follows is what the addresses say.
+ * If chunk is given, the chunk decoded is appended to it.
+ */
+static Received *
+keep_chunk(Receiving *rv, const ProllyHash *hash, const char *data, int len,
+		   StringInfo chunk)
+{
+	ProllyHash	key;
+	Received   *r;
+	bool		found;
+	StringInfoData decoded;
+
+	initStringInfo(&decoded);
+	check_chunk(rv, hash, data, len, &decoded);
+	if (chunk)
+		appendBinaryStringInfo(chunk, decoded.data, decoded.len);
+	pfree(decoded.data);
 
 	hash_key(&key, hash);
 	r = hash_search(rv->received, &key, HASH_ENTER, &found);
@@ -146,7 +174,16 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 	if (r)
 	{
 		if (out)
-			spool_read(rv, r, out);
+		{
+			StringInfoData frame;
+
+			initStringInfo(&frame);
+			spool_read(rv, r, &frame);
+			if (!prolly_chunk_unframe(frame.data, frame.len, out))
+				elog(ERROR, "a received chunk %s was spooled unframed",
+					 prolly_hash_hex(hash));
+			pfree(frame.data);
+		}
 		return true;
 	}
 	if (out == NULL)
@@ -157,8 +194,7 @@ receive_chunk(void *arg, const ProllyHash *hash, StringInfo out)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the remote lacks chunk %s, which it references",
 						prolly_hash_hex(hash))));
-	(void) keep_chunk(rv, hash, data.data, data.len);
-	appendBinaryStringInfo(out, data.data, data.len);
+	(void) keep_chunk(rv, hash, data.data, data.len, out);
 	pfree(data.data);
 	return true;
 }
@@ -179,7 +215,7 @@ receive_many_visit(const ProllyHash *hash, const char *data, int len, void *arg)
 
 	hash_key(&key, hash);
 	if (hash_search(asked->hashes, &key, HASH_FIND, NULL) != NULL)
-		(void) keep_chunk(asked->rv, hash, data, len);
+		(void) keep_chunk(asked->rv, hash, data, len, NULL);
 }
 
 /*
@@ -257,7 +293,7 @@ receive_visit(const ProllyNodeRef *node, uint16 level, void *arg)
 	return true;
 }
 
-/* add_table_file()'s source: what was received, in order. */
+/* The table file's source: what was received, in order, as stored. */
 static bool
 received_next(void *arg, ProllyHash *hash, StringInfo data)
 {
@@ -287,7 +323,7 @@ receive_since_visit(const ProllyHash *hash, const char *data, int len, void *arg
 	Receiving  *rv = arg;
 
 	if (!PROLLY_CALL(rv->cs, has, rv->store, hash))
-		(void) keep_chunk(rv, hash, data, len);
+		(void) keep_chunk(rv, hash, data, len, NULL);
 }
 
 /* The heads this database has, which a remote can send what changed since. */
@@ -459,7 +495,7 @@ chunks_receive(const ProllyRemoteRoutine *rr, ProllyRemote *remote,
 	foreach_ptr(Received, r, rv.order)
 		count += r->visited ? 1 : 0;
 	rv.next = list_head(rv.order);
-	PROLLY_CALL(rv.cs, add_table_file, rv.store, received_next, &rv);
+	prolly_chunk_add_stored(rv.cs, rv.store, received_next, &rv);
 	BufFileClose(rv.spool);
 	hash_destroy(rv.received);
 	return count;
@@ -553,7 +589,7 @@ sent_next(void *arg, ProllyHash *hash, StringInfo data)
 	h = lfirst(sd->next);
 	sd->next = lnext(sd->order, sd->next);
 	*hash = *h;
-	if (!PROLLY_CALL(sd->cs, get, sd->store, h, data))
+	if (!prolly_chunk_get_stored(sd->cs, sd->store, h, data))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("chunk %s is missing from the chunk store", prolly_hash_hex(h))));

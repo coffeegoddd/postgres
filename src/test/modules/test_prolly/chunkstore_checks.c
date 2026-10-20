@@ -854,11 +854,23 @@ test_refs_value(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(out);
 }
 
+/* len bytes at data, as a bytea */
+static bytea *
+bytes_bytea(const char *data, Size len)
+{
+	bytea	   *b = palloc(VARHDRSZ + len);
+
+	SET_VARSIZE(b, VARHDRSZ + len);
+	memcpy(VARDATA(b), data, len);
+	return b;
+}
+
 typedef struct OneChunk
 {
 	ProllyHash	hash;
 	bytea	   *data;
 	bool		given;
+	bool		stored;			/* data is framed already */
 } OneChunk;
 
 static bool
@@ -870,7 +882,10 @@ one_chunk(void *arg, ProllyHash *hash, StringInfo data)
 		return false;
 	c->given = true;
 	*hash = c->hash;
-	appendBinaryStringInfo(data, VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data));
+	if (c->stored)
+		appendBinaryStringInfo(data, VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data));
+	else
+		prolly_chunk_frame(VARDATA_ANY(c->data), VARSIZE_ANY_EXHDR(c->data), data);
 	return true;
 }
 
@@ -893,6 +908,139 @@ test_remote_put(PG_FUNCTION_ARGS)
 	PROLLY_CALL(rr, add_chunks, r, one_chunk, &c);
 	PROLLY_CALL(rr, close, r);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_remote_put_stored(url, hash, frame): the same, the chunk given as
+ * stored (framed), as it is.
+ */
+PG_FUNCTION_INFO_V1(test_remote_put_stored);
+Datum
+test_remote_put_stored(PG_FUNCTION_ARGS)
+{
+	char	   *url = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r = PROLLY_CALL(rr, open, url, true);
+	OneChunk	c;
+
+	memset(&c, 0, sizeof(c));
+	text_hash(PG_GETARG_TEXT_PP(1), &c.hash);
+	c.data = PG_GETARG_BYTEA_PP(2);
+	c.stored = true;
+	PROLLY_CALL(rr, add_chunks, r, one_chunk, &c);
+	PROLLY_CALL(rr, close, r);
+	PG_RETURN_VOID();
+}
+
+/* test_remote_get_stored(url, hash): a remote's chunk as it gives it. */
+PG_FUNCTION_INFO_V1(test_remote_get_stored);
+Datum
+test_remote_get_stored(PG_FUNCTION_ARGS)
+{
+	char	   *url = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r = PROLLY_CALL(rr, open, url, false);
+	ProllyHash	h;
+	StringInfoData out;
+	bool		found;
+
+	text_hash(PG_GETARG_TEXT_PP(1), &h);
+	initStringInfo(&out);
+	found = PROLLY_CALL(rr, get, r, &h, &out);
+	PROLLY_CALL(rr, close, r);
+	if (!found)
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+/* test_chunk_stored(hash): a chunk of the store as stored (framed). */
+PG_FUNCTION_INFO_V1(test_chunk_stored);
+Datum
+test_chunk_stored(PG_FUNCTION_ARGS)
+{
+	ProllyHash	h;
+	StringInfoData out;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &h);
+	initStringInfo(&out);
+	if (!prolly_chunk_get_stored(cs(), store(), &h, &out))
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+/*
+ * test_chunk_frame(data, compress): a chunk framed as stored, compressed
+ * if that saves (or not at all).
+ */
+PG_FUNCTION_INFO_V1(test_chunk_frame);
+Datum
+test_chunk_frame(PG_FUNCTION_ARGS)
+{
+	bytea	   *data = PG_GETARG_BYTEA_PP(0);
+	uint32		len = VARSIZE_ANY_EXHDR(data);
+	StringInfoData out;
+
+	initStringInfo(&out);
+	if (PG_GETARG_BOOL(1))
+		prolly_chunk_frame(VARDATA_ANY(data), len, &out);
+	else
+	{
+		char		head[PROLLY_FRAME_HEADER] = {PROLLY_CODEC_NONE,
+			len & 0xff, (len >> 8) & 0xff, (len >> 16) & 0xff, (len >> 24) & 0xff};
+
+		appendBinaryStringInfo(&out, head, PROLLY_FRAME_HEADER);
+		appendBinaryStringInfo(&out, VARDATA_ANY(data), len);
+	}
+	PG_RETURN_BYTEA_P(bytes_bytea(out.data, out.len));
+}
+
+typedef struct Collected
+{
+	HTAB	   *seen;
+	Tuplestorestate *out;
+	TupleDesc	desc;
+} Collected;
+
+static bool
+collect_node(const ProllyNodeRef *node, uint16 level, void *arg)
+{
+	Collected  *c = arg;
+	ProllyHash	key = prolly_hash_key(&node->hash);
+	bool		found;
+	Datum		value;
+	bool		null = false;
+
+	(void) hash_search(c->seen, &key, HASH_ENTER, &found);
+	if (found)
+		return false;
+	value = PointerGetDatum(hash_text(&node->hash));
+	tuplestore_putvalues(c->out, c->desc, &value, &null);
+	return true;
+}
+
+/* test_commit_chunks(commit): every chunk the commit's walk reaches, once. */
+PG_FUNCTION_INFO_V1(test_commit_chunks);
+Datum
+test_commit_chunks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	Collected	c;
+	HASHCTL		ctl;
+
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	c.seen = hash_create("test commit chunks", 64, &ctl,
+						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	c.out = rsinfo->setResult;
+	c.desc = rsinfo->setDesc;
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, walk_commit, &id, collect_node, &c);
+	return (Datum) 0;
 }
 
 /*

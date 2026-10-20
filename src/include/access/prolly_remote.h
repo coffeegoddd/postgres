@@ -17,11 +17,13 @@
  * - format() is the canonical format its commits were made in (as a
  *   folded root's "!:format" item says it): empty if it has none yet.
  * - heads() visits each branch and its commit, in name order.
- * - get() appends a chunk's bytes to out (false if it has none by that
- *   hash), as stored: the caller checks them against the hash.  has()
- *   answers without reading.
- * - add_chunks() adds the chunks next() gives (until it returns false),
- *   all at once: none is found before every one is durable.  A remote
+ * - Chunks move as stored: framed (prolly_chunk_frame()'s), compressed
+ *   where they were made, decoded only to be checked.
+ * - get() appends a chunk to out as stored (false if it has none by that
+ *   hash): the caller checks it against the hash.  has() answers without
+ *   reading.
+ * - add_chunks() adds the chunks next() gives as stored (until it returns
+ *   false), all at once: none is found before every one is durable.  A remote
  *   that has a chunk has every chunk it references, so the caller sends
  *   what the remote lacks of a closed set.
  * - get_many() visits each chunk of those it has, and has_many() answers
@@ -54,7 +56,7 @@
 
 typedef struct ProllyRemote ProllyRemote;
 
-/* Visits a chunk a remote gave: its hash and its bytes, as stored. */
+/* Visits a chunk a remote gave: its hash and the chunk as stored (framed). */
 typedef void (*ProllyRemoteChunkVisit) (const ProllyHash *hash,
 										const char *data, int len, void *arg);
 

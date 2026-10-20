@@ -37,6 +37,12 @@
  *   it, until its transaction ends; the move is made durable by the
  *   transaction's commit record, and is gone if the transaction aborts.
  * - A transaction can't be prepared (two-phase) after moving a root.
+ * - get_stored() appends a chunk as the store holds it, framed
+ *   (prolly_chunk_frame()'s), without decoding it; add_stored_table_file()
+ *   is add_table_file() of chunks next() gives framed so, written as they
+ *   are (both optional: prolly_chunk_get_stored() and
+ *   prolly_chunk_add_stored() decode and encode them otherwise).  So a
+ *   transfer moves chunks as stored, compressed once, where they were made.
  * - add_table_file() adds a table file of the chunks next() gives (until it
  *   returns false), at once and for every transaction: the chunks of
  *   another store, received whole, or of a rewrite.  It isn't undone if the
@@ -330,6 +336,12 @@ typedef struct ProllyChunkStoreRoutine
 	 */
 	void		(*roots) (ProllyChunkStore *store, ProllyChunkRootVisit visit,
 						  void *arg);
+
+	/* Chunks as stored, framed (optional). */
+	bool		(*get_stored) (ProllyChunkStore *store, const ProllyHash *hash,
+							   StringInfo out);
+	void		(*add_stored_table_file) (ProllyChunkStore *store,
+										  ProllyChunkNext next, void *arg);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -340,9 +352,10 @@ typedef struct ProllyChunkStoreRoutine
 	"conjoin", "table_files", "shmem_size", "shmem_init", "copy_database", \
 	"read_through", "prefetch", "seal", "segments", "gc_begin", "gc_files", \
 	"gc_find", "gc_read", "gc_new", "gc_copy", "gc_swap", "gc_retire", \
-	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots"
+	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots", \
+	"get_stored", "add_stored_table_file"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK roots
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK add_stored_table_file
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -367,6 +380,35 @@ extern void prolly_chunkstore_recovered(void);
 extern int	prolly_chunks_syncfiletag(const struct FileTag *ftag, char *path);
 extern bool prolly_chunks_filetagmatches(const struct FileTag *ftag,
 										 const struct FileTag *candidate);
+
+/*
+ * A chunk as stored, which stores, table files and remotes move without
+ * decoding it: its codec (PROLLY_CODEC_*), its length (4 bytes,
+ * little-endian), then its bytes as the codec left them.
+ * prolly_chunk_frame() appends one of a chunk to out, compressed where that
+ * saves; prolly_chunk_unframe() appends the chunk a frame holds, false if
+ * the bytes aren't one (a codec this server was built without is an
+ * error).  prolly_chunk_frame_len() is the chunk's length a frame gives
+ * (false if it isn't one).
+ */
+#define PROLLY_CODEC_NONE	0
+#define PROLLY_CODEC_LZ4	1
+#define PROLLY_FRAME_HEADER	5
+extern void prolly_chunk_frame(const void *data, Size len, StringInfo out);
+extern bool prolly_chunk_unframe(const char *frame, Size len, StringInfo out);
+extern bool prolly_chunk_frame_len(const char *frame, Size len, uint32 *chunk_len);
+
+/*
+ * A chunk of store as stored (its get_stored(), or its get() framed); a
+ * table file added of chunks next() gives framed (its
+ * add_stored_table_file(), or add_table_file() of them decoded).
+ */
+extern bool prolly_chunk_get_stored(const ProllyChunkStoreRoutine *cs,
+									ProllyChunkStore *store,
+									const ProllyHash *hash, StringInfo out);
+extern void prolly_chunk_add_stored(const ProllyChunkStoreRoutine *cs,
+									ProllyChunkStore *store,
+									ProllyChunkNext next, void *arg);
 
 /* The chunks a chunk names, as the server's trees lay their nodes out. */
 extern void prolly_chunk_references(const void *data, Size len,

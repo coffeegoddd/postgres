@@ -29,6 +29,11 @@
  * - version(), optional, says which version of the format a file open()
  *   refused is written in, if it is one of the format's at all (0: it
  *   isn't), so a file of another version is told from a damaged one.
+ * - read_stored() turns a chunk's bytes, as find() locates them, into the
+ *   chunk as stored, framed (prolly_chunk_frame()'s), appended to out,
+ *   without decoding it; write_add_stored() adds a chunk given so, as it
+ *   is (both optional).  Both check the bytes they move, failing on
+ *   corruption.
  *
  * Provisional (v0).
  *
@@ -76,13 +81,21 @@ typedef struct ProllyTableFileRoutine
 
 	/* Optional. */
 	uint32		(*version) (ProllyTableFileRead read, void *arg, uint64 size);
+
+	/* Chunks as stored, framed (optional). */
+	void		(*read_stored) (ProllyTableFile *tf, const char *bytes, uint32 len,
+								StringInfo out);
+	void		(*write_add_stored) (ProllyTableFileWriter *w,
+									 const ProllyHash *hash, const char *frame,
+									 Size len, StringInfo out);
 } ProllyTableFileRoutine;
 
 #define PROLLY_TABLEFILE_CALLBACK_NAMES \
 	"write_begin", "write_add", "write_finish", "open", "find", "decode", \
-	"count", "entry", "close", "locate", "version"
+	"count", "entry", "close", "locate", "version", "read_stored", \
+	"write_add_stored"
 #define PROLLY_TABLEFILE_FIRST_CALLBACK write_begin
-#define PROLLY_TABLEFILE_LAST_CALLBACK version
+#define PROLLY_TABLEFILE_LAST_CALLBACK write_add_stored
 
 static inline const ProllyTableFileRoutine *
 prolly_tablefile_lookup(const char *name)

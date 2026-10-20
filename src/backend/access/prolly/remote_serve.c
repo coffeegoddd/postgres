@@ -340,7 +340,8 @@ dolt_serve_has(PG_FUNCTION_ARGS)
 
 /*
  * dolt_serve_get(hashes bytea[], OUT hash bytea, OUT chunk bytea) returns
- * setof record: the chunks the store has of those, each with its hash.
+ * setof record: the chunks the store has of those, as stored (framed),
+ * each with its hash.
  */
 Datum
 dolt_serve_get(PG_FUNCTION_ARGS)
@@ -361,7 +362,7 @@ dolt_serve_get(PG_FUNCTION_ARGS)
 		bool		nulls[2] = {0};
 
 		resetStringInfo(&data);
-		if (!PROLLY_CALL(prolly_chunk_store(), get, cs, &hashes[i], &data))
+		if (!prolly_chunk_get_stored(prolly_chunk_store(), cs, &hashes[i], &data))
 			continue;
 		values[0] = PointerGetDatum(hash_bytea(&hashes[i]));
 		values[1] = PointerGetDatum(bytes_bytea(data.data, data.len));
@@ -393,7 +394,8 @@ send_since(const ProllyNodeRef *node, uint16 level, void *arg)
 	if (found)
 		return false;
 	resetStringInfo(&sn->data);
-	if (!PROLLY_CALL(prolly_chunk_store(), get, sn->store, &node->hash, &sn->data))
+	if (!prolly_chunk_get_stored(prolly_chunk_store(), sn->store, &node->hash,
+								 &sn->data))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("chunk %s is missing from the chunk store",
@@ -643,7 +645,8 @@ dolt_serve_since(PG_FUNCTION_ARGS)
 
 /*
  * dolt_serve_receive(hashes bytea[], chunks bytea[]) returns void: chunks
- * a push sends, kept for dolt_serve_move_head() in the same transaction.
+ * a push sends, as stored (framed), kept for dolt_serve_move_head() in the
+ * same transaction.
  */
 Datum
 dolt_serve_receive(PG_FUNCTION_ARGS)
@@ -692,20 +695,28 @@ dolt_serve_receive(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* A chunk the push sent, checked against its address. */
+/* A chunk the push sent, as stored, decoded and checked against its address. */
 static void
 check_sent(const ProllyHash *hash)
 {
 	const ProllyHashRoutine *hr = prolly_content_hash();
+	StringInfoData frame;
 	StringInfoData data;
 	ProllyHashCtx *ctx;
 	ProllyHash	actual;
 
+	initStringInfo(&frame);
 	initStringInfo(&data);
-	if (!spool_get(NULL, hash, &data))
+	if (!spool_get(NULL, hash, &frame))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("the push didn't send commit %s", prolly_hash_hex(hash))));
+	if (!prolly_chunk_unframe(frame.data, frame.len, &data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's chunk %s isn't framed as stored chunks are",
+						prolly_hash_hex(hash))));
+	pfree(frame.data);
 	ctx = PROLLY_CALL(hr, begin, CurrentMemoryContext);
 	PROLLY_CALL(hr, update, ctx, (const uint8 *) data.data, data.len);
 	PROLLY_CALL(hr, finish, ctx, &actual);

@@ -556,7 +556,17 @@ file_get(ProllyRemote *r, const ProllyHash *hash, StringInfo out)
 				(errcode_for_file_access(),
 				 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 						len, (unsigned long long) offset, t->path)));
-	PROLLY_CALL(table_format(), decode, t->tf, bytes, len, out);
+	if (PROLLY_HAS(table_format(), read_stored))
+		PROLLY_CALL(table_format(), read_stored, t->tf, bytes, len, out);
+	else
+	{
+		StringInfoData chunk;
+
+		initStringInfo(&chunk);
+		PROLLY_CALL(table_format(), decode, t->tf, bytes, len, &chunk);
+		prolly_chunk_frame(chunk.data, chunk.len, out);
+		pfree(chunk.data);
+	}
 	pfree(bytes);
 	return true;
 }
@@ -572,8 +582,8 @@ file_has(ProllyRemote *r, const ProllyHash *hash)
 }
 
 /*
- * Write the chunks next() gives, the first given already, as table file
- * path, synced; its size.
+ * Write the chunks next() gives as stored (framed), the first given
+ * already, as table file path, synced; its size.
  */
 static uint64
 write_table_file(const char *path, ProllyHash *hash, StringInfo data,
@@ -594,7 +604,21 @@ write_table_file(const char *path, ProllyHash *hash, StringInfo data,
 	initStringInfo(&buf);
 	do
 	{
-		PROLLY_CALL(fmt, write_add, w, hash, data->data, data->len, &buf);
+		if (PROLLY_HAS(fmt, write_add_stored))
+			PROLLY_CALL(fmt, write_add_stored, w, hash, data->data, data->len, &buf);
+		else
+		{
+			StringInfoData chunk;
+
+			initStringInfo(&chunk);
+			if (!prolly_chunk_unframe(data->data, data->len, &chunk))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("chunk %s isn't framed as stored chunks are",
+								prolly_hash_hex(hash))));
+			PROLLY_CALL(fmt, write_add, w, hash, chunk.data, chunk.len, &buf);
+			pfree(chunk.data);
+		}
 		resetStringInfo(data);
 		if (buf.len >= 1024 * 1024)
 		{
