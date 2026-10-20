@@ -240,8 +240,9 @@ session's branch has it), and the keyless one (for that reason) and
 the computed one are deferred. Of `DiffSystemTableScriptTests`, 17
 (the `dolt_diff_<t>` cases and one of the view; one without its SHOW
 INDEX), and the case whose column's old values don't convert to its
-new type in part (D21: they show null, with a warning, #531); two are
-deferred (primary-key changes, which `dolt_diff_table` refuses). Of `HistorySystemTableScriptTests`, cases
+new type in part (D21: they show null, with a warning, #531), and the
+two primary-key changes, read as the table is keyed now (D22, #530):
+one whole, one in part (its warning left out). Of `HistorySystemTableScriptTests`, cases
 0–8 (two without their EXPLAIN assertions); of
 `UnscopedDiffSystemTableScriptTests`, cases 1–5. Differences follow
 D15–D20; D18 says how rows of other versions are read.

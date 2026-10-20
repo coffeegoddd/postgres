@@ -84,5 +84,34 @@ SELECT length(dolt_commit('-Am', 'rk')::text) AS committed;
 ALTER TABLE dh.rk ALTER COLUMN k TYPE int USING length(k);
 SELECT * FROM dolt_at('HEAD', NULL::dh.rk);
 
+-- a primary key dropped, then made on another column: each version read
+-- as the table is keyed now, so its rows diff (where Dolt warns and shows
+-- what it can)
+CREATE TABLE dh.pkc (pk int PRIMARY KEY, c1 int);
+INSERT INTO dh.pkc VALUES (1, 2), (3, 4);
+SELECT length(dolt_commit('-Am', 'pkc')::text) AS committed;
+ALTER TABLE dh.pkc DROP CONSTRAINT pkc_pkey;
+INSERT INTO dh.pkc VALUES (5, 6);
+SELECT length(dolt_commit('-am', 'pkc dropped the key')::text) AS committed;
+ALTER TABLE dh.pkc ADD PRIMARY KEY (c1);
+SELECT length(dolt_commit('-am', 'pkc keyed by c1')::text) AS committed;
+INSERT INTO dh.pkc VALUES (7, 8);
+SELECT length(dolt_commit('-am', 'pkc more')::text) AS committed;
+SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.pkc)
+ORDER BY to_commit IS NULL, (to_row).c1, (from_row).c1;
+SELECT count(*) FROM dolt_history_table(NULL::dh.pkc);
+SELECT * FROM dolt_at('HEAD~2', NULL::dh.pkc) ORDER BY c1;
+SELECT diff_type, data_change, schema_change FROM dolt_diff_summary('HEAD~3', 'HEAD~1', 'dh.pkc');
+-- a keyless table given a key; and one whose copies share it: shown once
+CREATE TABLE dh.kl (i int, j int);
+INSERT INTO dh.kl VALUES (42, 23), (1, 1), (1, 1);
+SELECT length(dolt_commit('-Am', 'kl')::text) AS committed;
+DELETE FROM dh.kl WHERE i = 1;
+INSERT INTO dh.kl VALUES (1, 1);
+ALTER TABLE dh.kl ADD PRIMARY KEY (i);
+SELECT length(dolt_commit('-am', 'kl keyed')::text) AS committed;
+SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.kl, 'HEAD~1', 'HEAD');
+SELECT * FROM dolt_at('HEAD~1', NULL::dh.kl) ORDER BY i;
+
 \c contrib_regression
 DROP DATABASE regress_diff_history;

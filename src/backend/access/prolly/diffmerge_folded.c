@@ -4270,6 +4270,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	ColumnRead *reads;
 	bool	   *converted;
 	uint64	   *nulled;			/* values shown null: their cast failed */
+	uint64		shared = 0;		/* rows shown once: their key is another's */
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
@@ -4333,9 +4334,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	/*
 	 * (a version with a primary key where the table has none now, or the
 	 * other way: its rows are keyed otherwise; one whose key the encoder
-	 * can't order is keyed by content as the table is)
+	 * can't order is keyed by content as the table is.  Shown, they're
+	 * read as the table is keyed now; merged, refused)
 	 */
-	if (vr.keyed != keyed_now)
+	if (vr.keyed != keyed_now &&
+		(refuse || read != READ_SHOWN || !PROLLY_HAS(rd.kr, parse_value_as)))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("rows of table \"%s\" can't be merged across a change of its primary key",
@@ -4411,7 +4414,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	 * order: the rows go straight into the tree.  Otherwise they're sorted
 	 * first.
 	 */
-	keys_kept = vr.keyed;
+	keys_kept = vr.keyed && keyed_now;
 	for (int a = 0; a < md->natts && keys_kept; a++)
 		if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk))
 			keys_kept = from[a] >= 0 && !converted[a] &&
@@ -4433,7 +4436,10 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		Bitmapset  *unsure_cols = NULL;
 
 		outer = MemoryContextSwitchTo(rowcxt);
-		PROLLY_CALL(rd.kr, parse_value, rd.k, &v, &row, &count);
+		if (vr.keyed != keyed_now)
+			PROLLY_CALL(rd.kr, parse_value_as, rd.k, !vr.keyed, &v, &row, &count);
+		else
+			PROLLY_CALL(rd.kr, parse_value, rd.k, &v, &row, &count);
 		ExecClearTuple(xs);
 		PROLLY_CALL(ve, decode, vr.enc, &row, xs);
 		slot_getallattrs(xs);
@@ -4600,15 +4606,34 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		StringInfoData value;
 		ProllyValue val;
 
-		/* (rows that become the same: copies of one, or a key twice) */
+		/*
+		 * (rows that become the same: copies of one, or a key twice: shown,
+		 * the first of those, the rest counted and warned of)
+		 */
 		while (j < n && conv_row_cmp(&rows[i], &rows[j], &rd) == 0)
 		{
-			if (vr.keyed)
+			if (keyed_now && read == READ_SHOWN && !refuse)
+				shared += rows[j]->count;
+			else if (keyed_now)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
 						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
 								RelationGetRelationName(rel))));
-			count += rows[j++]->count;
+			else
+				count += rows[j]->count;
+			j++;
+		}
+		/* (a keyless version's copies of a row, one row keyed) */
+		if (keyed_now && count > 1)
+		{
+			if (read == READ_SHOWN && !refuse)
+				shared += count - 1;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
+								RelationGetRelationName(rel))));
+			count = 1;
 		}
 		initStringInfo(&value);
 		PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->row, count, &value);
@@ -4619,6 +4644,13 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		i = j;
 	}
 	PROLLY_CALL(tree, build_finish, b, &out->data);
+	if (shared > 0)
+		ereport(WARNING,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg_plural("%llu row of a version of table \"%s\" shares a primary key with another as the key is defined now: shown once",
+							   "%llu rows of a version of table \"%s\" share a primary key with others as the key is defined now: each key shown once",
+							   shared, (unsigned long long) shared,
+							   RelationGetRelationName(rel))));
 	if (nunsure > 1)
 		qsort_arg(unsure->rows, nunsure, sizeof(UnsureRow *), unsure_row_cmp, &rd);
 	if (unsure)

@@ -437,6 +437,22 @@ OF` are built in D18's shapes.
 - **Port:** the drop-and-recreate case whose old values don't convert
   expects no rows for the drop's commit, and the count without them.
 
+## D22. Across a primary key change, rows are read as keyed now
+
+- **Dolt:** a row diff across a change of a table's primary key columns
+  warns that it can't render the full diff and shows what it can
+  (rows added and removed under the old and new column tags).
+- **Prolly:** each version's rows are read as the table is keyed now,
+  a keyless version's as keyed rows and a keyed one's as keyless, so
+  they diff as any rows do: the key's change itself changes no row.
+  Rows of a version that share a key as it is defined now are shown
+  once, with a warning counting the rest. A merge across such a change
+  is still refused.
+- **Why:** a diff reads versions as the table is defined now (D20, D21),
+  and the canonical form keys rows by their values, not column tags.
+- **Port:** the key-change cases expect the rows as keyed now: fewer
+  than Dolt's, and none for the key's own commit.
+
 ## D23. `dolt_gc()` returns a status, not statistics
 
 - **Dolt:** `CALL dolt_gc()` returns a status row (`{0}`), and logs

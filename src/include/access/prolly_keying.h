@@ -110,14 +110,24 @@ typedef struct ProllyKeyingRoutine
 	 */
 	bool		(*encode_key) (ProllyKeying *k, TupleTableSlot *slot,
 							   StringInfo key);
+
+	/*
+	 * Optional: parse_value() of a value a table keyed otherwise wrote
+	 * (keyless: by content, its value carrying a count; or by a primary
+	 * key), in this keying's format, as a version of the table from before
+	 * its primary key was added or dropped holds them.
+	 */
+	void		(*parse_value_as) (ProllyKeying *k, bool keyless,
+								   const ProllyValue *value, ProllyValue *row,
+								   uint64 *count);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
 	"decode_row", "compare", "close", "set_values", "row_refs", \
-	"decode_row_kept", "encode_key"
+	"decode_row_kept", "encode_key", "parse_value_as"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK encode_key
+#define PROLLY_KEYING_LAST_CALLBACK parse_value_as
 
 /*
  * Set up a data tree's environment and k's value store for each other:

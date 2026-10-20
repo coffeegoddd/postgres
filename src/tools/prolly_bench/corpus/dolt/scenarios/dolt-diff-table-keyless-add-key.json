@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "id": "dolt-diff-table-keyless-add-key",
+  "description": "Reviewed Dolt port: altered keyless table add pk",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffSystemTableScriptTests: altered keyless table add pk"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE tbl (i int, j int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO tbl VALUES (42, 23)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit1"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE tbl ADD PRIMARY KEY (i)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit2"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).i, (to_row).j, (from_row).i, (from_row).j, diff_type FROM dolt_diff_table(NULL::tbl)",
+      "expect": {
+        "rows": [
+          [
+            "42",
+            "23",
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

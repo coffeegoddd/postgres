@@ -42,11 +42,11 @@ func manifestAt(t *testing.T, root string) Manifest {
 
 // The reviewed corpus: a port added or deferred updates these.
 const (
-	reviewedPorts      = 213 // ported whole
-	reviewedPartial    = 56  // ported in part
-	reviewedAssertions = 1038
-	reviewedOmitted    = 99  // assertions left out, each with its note
-	reviewedDeferred   = 65
+	reviewedPorts      = 214 // ported whole
+	reviewedPartial    = 57  // ported in part
+	reviewedAssertions = 1041
+	reviewedOmitted    = 100 // assertions left out, each with its note
+	reviewedDeferred   = 63
 )
 
 func TestReviewedCorpus(t *testing.T) {

@@ -31062,6 +31062,211 @@
         "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
         "MySQL's PREPARE/EXECUTE and @variables are PostgreSQL's PREPARE/EXECUTE and session settings. (D10)"
       ]
+    },
+    {
+      "id": "dolt-diff-table-key-change",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 12,
+      "name": "primary key change",
+      "source_sha256": "ecb1f5f005b5799e1415227aa6213314822e6f720428ce546a0fa3bddfffec91",
+      "scenario_sha256": "d12b4cf184c82bef3decadc0a28bf54c6ba866db17c6631c982b86c577a526f3",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "MySQL's DROP PRIMARY KEY becomes DROP CONSTRAINT t_pkey, the key's constraint. (D3)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "Left out: Dolt's warning (1105, 'cannot render full diff between commits'); the scenarios don't read warnings, and prolly renders the diff."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t) (D18). Four rows, not Dolt's seven: commit1's two rows, (5,6) added by commit2 and (7,8) by commit4; the key's changes change no row as the table is keyed now. Each version is read as the table is keyed now. (D22)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. to_commit=@Commit4 becomes to_commit = $1, the captured id. (D7)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)",
+        "MySQL's ALTER TABLE ... DROP PRIMARY KEY becomes DROP CONSTRAINT on the key's constraint. (D3)",
+        "Across a primary key change each version is read as the table is keyed now, so rows diff as such, where Dolt warns and shows what it can. (D22)"
+      ]
+    },
+    {
+      "id": "dolt-diff-table-keyless-add-key",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 13,
+      "name": "altered keyless table add pk",
+      "source_sha256": "7c0a5e5769a6e646b42eb6a68937f5305e7545ad4a46255fdbb135e4d3ba5b64",
+      "scenario_sha256": "025cfd7704b13b055d85a51d537161ae7e97e35985bc3a744e411256a5f5c486",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). One row, commit1's (42, 23) added: the key added changes no row as the table is keyed now, where Dolt shows an added and a removed row, with a warning. Each version is read as the table is keyed now. (D22)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; the commit step commits. (D3, D7)",
+        "-Am adds nothing: there is no staging area. (D1)",
+        "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)",
+        "Across a primary key change each version is read as the table is keyed now, so rows diff as such, where Dolt warns and shows what it can. (D22)"
+      ]
     }
   ],
   "deferred": [
@@ -31560,22 +31765,6 @@
       "name": "table drop and recreate with identical primary key reports modified row in diff stat",
       "source_sha256": "de423f6432691817a382aa0ee2898d01a633b979b3e536ec27e033d2cd8968ec",
       "reason": "Its setup is computed (dropAndRecreateScript(\"int\")), which the catalog leaves unresolved, so a port can't map it."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
-      "suite": "DiffSystemTableScriptTests",
-      "index": 12,
-      "name": "primary key change",
-      "source_sha256": "ecb1f5f005b5799e1415227aa6213314822e6f720428ce546a0fa3bddfffec91",
-      "reason": "A primary key dropped and made on another column: dolt_diff_table fails (\"rows of table t can't be merged across a change of its primary key\"), where Dolt shows what it can with a warning. D19 makes such a table modified in the summaries; the row diff is still to do, reported."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
-      "suite": "DiffSystemTableScriptTests",
-      "index": 13,
-      "name": "altered keyless table add pk",
-      "source_sha256": "7c0a5e5769a6e646b42eb6a68937f5305e7545ad4a46255fdbb135e4d3ba5b64",
-      "reason": "A keyless table given a primary key: dolt_diff_table fails as for any key change, where Dolt shows the rows added and removed with a warning; reported, as case 12."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",

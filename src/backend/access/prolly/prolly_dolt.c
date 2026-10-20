@@ -4119,9 +4119,11 @@ dolt_diff(PG_FUNCTION_ARGS)
  * if NULL: its changes against the head first, to_commit WORKING) back
  * along first parents to from_ref (not its changes; the first commit's,
  * against nothing, if NULL), each row as it was and is, decoded as the
- * table is defined now, with the commits it is between and their dates.
- * A commit that didn't change the table's rows costs a lookup of it, no
- * more.
+ * table is defined now, with the commits it is between and their dates:
+ * keyed as it is now (across a change of its primary key too), an old
+ * value that doesn't convert to its column's type now shown null, with a
+ * warning.  A commit that didn't change the table's rows costs a lookup
+ * of it, no more.
  */
 Datum
 dolt_diff_table(PG_FUNCTION_ARGS)

@@ -267,13 +267,13 @@ pkprefix_make_value(ProllyKeying *k, const ProllyValue *row, uint64 count,
 }
 
 static void
-pkprefix_parse_value(ProllyKeying *k, const ProllyValue *value,
-					  ProllyValue *row, uint64 *count)
+pkprefix_parse_value_as(ProllyKeying *k, bool keyless, const ProllyValue *value,
+						ProllyValue *row, uint64 *count)
 {
 	const char *p = (const char *) value->data;
 	const char *end = p + value->len;
 
-	if (k->keyless)
+	if (keyless)
 	{
 		*count = prolly_get_varint(&p, end);
 		if (*count == 0)
@@ -285,6 +285,13 @@ pkprefix_parse_value(ProllyKeying *k, const ProllyValue *value,
 		*count = 1;
 	row->data = (const uint8 *) p;
 	row->len = end - p;
+}
+
+static void
+pkprefix_parse_value(ProllyKeying *k, const ProllyValue *value,
+					  ProllyValue *row, uint64 *count)
+{
+	pkprefix_parse_value_as(k, k->keyless, value, row, count);
 }
 
 /* The encoder that decodes into slot's descriptor. */
@@ -393,6 +400,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.encode_row = pkprefix_encode_row,
 	.make_value = pkprefix_make_value,
 	.parse_value = pkprefix_parse_value,
+	.parse_value_as = pkprefix_parse_value_as,
 	.decode_row = pkprefix_decode_row,
 	.compare = pkprefix_compare,
 	.close = pkprefix_close,
