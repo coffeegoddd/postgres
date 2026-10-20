@@ -1966,6 +1966,18 @@ pages_walk(const ProllyTreeEnv *env, const ProllyValue *state,
 	PROLLY_CALL(prolly_tree_lookup("cow"), walk, &memenv, &st.carried, visit, arg);
 }
 
+/* A state's tree of carried keys. */
+static void
+pages_state_refs(const ProllyValue *state, StringInfo refs)
+{
+	State		st;
+
+	if (!parse_state(state, &st) || st.carried.hash.len == 0)
+		return;
+	PROLLY_CALL(prolly_tree_lookup("cow"), value_reference, &st.carried.hash,
+				0, refs);
+}
+
 static void
 pages_counters(ProllyChangeCounters *out, bool reset)
 {
@@ -1987,4 +1999,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.walk = pages_walk,
 	.counters = pages_counters,
 	.fold_rows = pages_fold_rows,
+	.state_refs = pages_state_refs,
 };

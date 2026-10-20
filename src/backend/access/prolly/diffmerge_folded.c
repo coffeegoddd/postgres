@@ -6675,8 +6675,7 @@ without_local(const Local *l, ProllyNodeRef *root)
 	edits = palloc_array(ProllyEdit, list_length(l->edits));
 	foreach(lc, l->edits)
 		edits[n++] = *(ProllyEdit *) lfirst(lc);
-	chunk_env(&env);
-	env.compare = prolly_bytes_compare;
+	prolly_folded_canon_env(&env);
 	PROLLY_CALL(prolly_tree_lookup("cow"), apply, &env, &now, edits, n, root);
 }
 

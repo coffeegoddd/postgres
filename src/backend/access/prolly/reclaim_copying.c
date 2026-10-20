@@ -16,13 +16,15 @@
  * where one is active (autovacuum's), a chunk read costing a page missed;
  * never in the window, where interrupts are held.
  *
- * What a chunk names is found without knowing what kind of chunk it is:
- * the store's chunks write every reference as the hash's length, then the
- * hash (a tree's children and values stored out of line, a commit's root,
- * parents and dependencies, the refs' heads and baselines, a canonical
- * root's data trees), so wherever a chunk's bytes hold the length followed
- * by a collected chunk's hash, that chunk is marked.  Bytes that happen to
- * spell one can keep a chunk nothing names; nothing named is ever lost.
+ * What a chunk names is what its format declares (prolly_chunk_references(),
+ * the tree's references()): a node's children, a leaf's values stored out
+ * of line, and the references its items declare (a row's value trees, a
+ * commit's root, parents and dependencies, the refs' heads, baselines and
+ * merges, a canonical root's data trees, a baseline's).  Nothing else in
+ * a chunk's bytes is read as a reference, so bytes that happen to spell a
+ * hash keep nothing.  (Assert-enabled builds check it: a collected chunk
+ * whose hash a chunk's bytes hold, as a reference would, and that the
+ * chunk doesn't declare, is warned of.)
  *
  * Tables are roots too: a versioned table's values out of line are value
  * trees its rows name by hash pointers (prolly_toast.h), which no ref
@@ -148,24 +150,99 @@ mark_hash(Mark *mk, const ProllyHash *hash)
 		mark_slot(mk, (uint64) slot);
 }
 
-/* Mark every collected chunk data names. */
+static void
+mark_ref(const ProllyHash *hash, void *arg)
+{
+	Mark	   *mk = arg;
+
+	if (mk->hash_len == 0)
+		mk->hash_len = hash->len;
+	mark_hash(mk, hash);
+}
+
+#ifdef USE_ASSERT_CHECKING
+typedef struct Declared
+{
+	ProllyHash *hashes;
+	int			n;
+	int			max;
+} Declared;
+
+static void
+note_declared(const ProllyHash *hash, void *arg)
+{
+	Declared   *d = arg;
+
+	if (d->n == d->max)
+	{
+		d->max = Max(16, d->max * 2);
+		d->hashes = d->hashes ? repalloc_array(d->hashes, ProllyHash, d->max) :
+			palloc_array(ProllyHash, d->max);
+	}
+	d->hashes[d->n++] = *hash;
+}
+
+/*
+ * Every collected chunk the values of data's items name as a reference
+ * would (the hash's length, then the hash) is one data declares.  (Keys
+ * are passed over: a keyless row's key holds its content's hash, which
+ * may be a chunk's, naming nothing; and so are a value tree's leaves, with
+ * no keys: what a value stored out of line names, the item that stores it
+ * declares.)
+ */
+static void
+check_declared(Mark *mk, const char *data, Size len)
+{
+	const ProllyChunkFormatRoutine *format = prolly_chunkformat_lookup("basic");
+	ProllyChunkNode node;
+	uint8		hl = mk->hash_len;
+	Declared	d = {0};
+	ProllyHash	h;
+
+	if (hl == 0 || !PROLLY_CALL(format, open, (const uint8 *) data, len, &node))
+		return;
+	prolly_chunk_references(data, len, note_declared, &d);
+	memset(&h, 0, sizeof(h));
+	h.len = hl;
+	for (int item = 0; item < node.nitems; item++)
+	{
+		ProllyKey	k;
+		ProllyValue v;
+		uint8		flags;
+
+		PROLLY_CALL(format, item_get, &node, item, &k, &v, &flags);
+		if (node.level == 0 && k.len == 0)
+			continue;
+		for (Size i = 0; i + 1 + hl <= v.len; i++)
+		{
+			bool		declared = false;
+
+			if (v.data[i] != hl)
+				continue;
+			memcpy(h.bytes, v.data + i + 1, hl);
+			if (PROLLY_CALL(mk->cs, gc_find, mk->gc, &h) < 0)
+				continue;
+			for (int j = 0; j < d.n && !declared; j++)
+				declared = d.hashes[j].len == h.len &&
+					memcmp(d.hashes[j].bytes, h.bytes, h.len) == 0;
+			if (!declared)
+				elog(WARNING, "a chunk names chunk %s, which it doesn't declare",
+					 prolly_hash_hex(&h));
+		}
+	}
+	if (d.hashes)
+		pfree(d.hashes);
+}
+#endif
+
+/* Mark every collected chunk data declares. */
 static void
 mark_named(Mark *mk, const char *data, Size len)
 {
-	uint8		hl = mk->hash_len;
-	ProllyHash	h;
-
-	if (hl == 0)
-		return;
-	memset(&h, 0, sizeof(h));
-	h.len = hl;
-	for (Size i = 0; i + 1 + hl <= len; i++)
-	{
-		if ((uint8) data[i] != hl)
-			continue;
-		memcpy(h.bytes, data + i + 1, hl);
-		mark_hash(mk, &h);
-	}
+	prolly_chunk_references(data, len, mark_ref, mk);
+#ifdef USE_ASSERT_CHECKING
+	check_declared(mk, data, len);
+#endif
 }
 
 /*

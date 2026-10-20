@@ -52,7 +52,7 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
 -- The same commit again, in a database just like it: the same counts.
 -- (but the journal's bytes: compressed, a commit's, which holds its time,
 -- may take a byte more or less)
-SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly
+SELECT json_object_agg(name, value) AS first FROM pg_stat_prolly
 WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned') \gset
 \c :home
 CREATE DATABASE stat_prolly_again;
@@ -68,8 +68,11 @@ SELECT pg_stat_reset_shared('prolly');
 UPDATE sp.t SET v = 'x' WHERE id = 500;
 SELECT length(dolt_commit('-m', 'one row')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
-SELECT array_agg(value ORDER BY name) = :'first' AS same_counts FROM pg_stat_prolly
-WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
+-- (any that differ, with both counts)
+SELECT name, value, (:'first'::json ->> name)::bigint AS first
+FROM pg_stat_prolly
+WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint
+	AND name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
 
 -- Per database: the other's work isn't counted here.
 \c stat_prolly

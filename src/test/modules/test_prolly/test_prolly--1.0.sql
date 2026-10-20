@@ -390,6 +390,12 @@ CREATE FUNCTION test_chunk_put_node(level int, refs text[])
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Put a leaf whose values are these bytes, inline, declaring no
+-- references; its hash.
+CREATE FUNCTION test_chunk_put_leaf(vals bytea[])
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Collect the chunk store's garbage (full: all of it): the chunks kept and
 -- freed of those collected, the bytes freed, and how long (microseconds)
 -- appends were held off.

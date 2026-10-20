@@ -38,8 +38,9 @@
  *   by counting.
  * - references() visits the chunks a node's chunk names: an internal
  *   node's children, a leaf's values stored out of line (their trees'
- *   roots).  It reads nothing but the chunk; one that isn't a node of the
- *   format names none.
+ *   roots), and the references its items declare (value_refs()'s and
+ *   chunk_refs()'s).  It reads nothing but the chunk; one that isn't a
+ *   node of the format names none.
  *
  * Provisional (v0).
  *
@@ -99,6 +100,21 @@ typedef struct ProllyTreeEnv
 	void		(*value_refs) (const ProllyValue *value, void *arg,
 							   StringInfo refs);
 	void	   *value_refs_arg;
+
+	/*
+	 * Optional, for a tree whose leaf values name other chunks, not trees of
+	 * their own (a commit's parents, a branch's head, a table's data tree in
+	 * a canonical root): appends the references the item for key and value
+	 * holds to refs, as value_refs() does (value_reference()'s).  A leaf
+	 * records them, so references() reports them, and a collection follows
+	 * them without knowing how values are laid out; walks don't, those
+	 * chunks being no part of the tree (their callers walk them as they
+	 * mean to).  Every tree written with values that name chunks must have
+	 * it set.
+	 */
+	void		(*chunk_refs) (const ProllyKey *key, const ProllyValue *value,
+							   void *arg, StringInfo refs);
+	void	   *chunk_refs_arg;
 } ProllyTreeEnv;
 
 /*

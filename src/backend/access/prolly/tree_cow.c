@@ -52,8 +52,10 @@
  *	varint length of the references, each reference, then the value (or
  *	its value tree's reference)
  *
- * so a walk finds them from the node alone.  Reads return the value
- * without them.
+ * so a walk finds them from the node alone.  The references to other
+ * chunks a value names (the environment's chunk_refs()) lead before those,
+ * the same way, flagged PROLLY_ITEM_CHUNK_REFS: references() reports them,
+ * walks don't follow them.  Reads return the value without either.
  *
  * A value tree is addressed by byte counts, as Dolt's blob trees are: the
  * value's bytes are cut into chunks where a rolling hash (buzhash) of the
@@ -382,6 +384,8 @@ value_env(const ProllyTreeEnv *env, ProllyTreeEnv *venv)
 	venv->compare_arg = NULL;
 	venv->value_refs = NULL;
 	venv->value_refs_arg = NULL;
+	venv->chunk_refs = NULL;
+	venv->chunk_refs_arg = NULL;
 }
 
 static void
@@ -769,6 +773,8 @@ static void
 leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
 		  const ProllyValue *value, Item *item, StringInfo buf)
 {
+	int			first = buf->len;
+
 	item->key = *key;
 	item->count = 1;
 	item->flags = 0;
@@ -797,6 +803,31 @@ leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
 			item->flags |= PROLLY_ITEM_VALUE_REFS;
 		}
 	}
+	if (env->chunk_refs)
+	{
+		StringInfoData refs;
+
+		/* the chunks named, their length first, before all of it */
+		initStringInfo(&refs);
+		env->chunk_refs(key, value, env->chunk_refs_arg, &refs);
+		if (refs.len > 0)
+		{
+			StringInfoData lead;
+
+			initStringInfo(&lead);
+			prolly_put_varint(&lead, refs.len);
+			appendBinaryStringInfo(&lead, refs.data, refs.len);
+			enlargeStringInfo(buf, lead.len);
+			memmove(buf->data + first + lead.len, buf->data + first,
+					buf->len - first);
+			memcpy(buf->data + first, lead.data, lead.len);
+			buf->len += lead.len;
+			buf->data[buf->len] = '\0';
+			item->flags |= PROLLY_ITEM_CHUNK_REFS;
+			pfree(lead.data);
+		}
+		pfree(refs.data);
+	}
 	if (value->len > VALUE_INLINE_MAX)
 	{
 		item->flags |= PROLLY_ITEM_VALUE_REF;
@@ -814,8 +845,32 @@ leaf_item(const ProllyTreeEnv *env, const ProllyKey *key,
  * none).
  */
 static void
-item_payload(ProllyValue *value, uint8 flags, ProllyValue *refs)
+item_payload(ProllyValue *value, uint8 flags, ProllyValue *refs,
+			 ProllyValue *chunk_refs)
 {
+	if (chunk_refs)
+	{
+		chunk_refs->data = value->data;
+		chunk_refs->len = 0;
+	}
+	if (flags & PROLLY_ITEM_CHUNK_REFS)
+	{
+		const char *p = (const char *) value->data;
+		const char *end = p + value->len;
+		uint64		n = prolly_get_varint(&p, end);
+
+		if (n > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid prolly chunk references")));
+		if (chunk_refs)
+		{
+			chunk_refs->data = (const uint8 *) p;
+			chunk_refs->len = (uint32) n;
+		}
+		value->len -= (p + n) - (const char *) value->data;
+		value->data = (const uint8 *) (p + n);
+	}
 	refs->data = value->data;
 	refs->len = 0;
 	if (flags & PROLLY_ITEM_VALUE_REFS)
@@ -846,7 +901,7 @@ leaf_value_into(const ProllyTreeEnv *env, ProllyValue *value, uint8 flags,
 {
 	ProllyValue refs;
 
-	item_payload(value, flags, &refs);
+	item_payload(value, flags, &refs, NULL);
 	if (!(flags & PROLLY_ITEM_VALUE_REF))
 		return false;
 	resolve_value(env, value, out);
@@ -1402,7 +1457,7 @@ prefetch_below(const ProllyTreeEnv *env, TNode *node)
 		node_item(env, node, i, &k, &v, &flags);
 		if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
 			continue;
-		item_payload(&v, flags, &refs);
+		item_payload(&v, flags, &refs, NULL);
 		if (flags & PROLLY_ITEM_VALUE_REF)
 		{
 			decode_value_ref(&v, &ref, &len);
@@ -1437,7 +1492,7 @@ walk_value(const ProllyTreeEnv *env, const ProllyValue *value, uint8 flags,
 
 	if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
 		return;
-	item_payload(&v, flags, &refs);
+	item_payload(&v, flags, &refs, NULL);
 	value_env(env, &venv);
 	if (flags & PROLLY_ITEM_VALUE_REF)
 	{
@@ -2368,6 +2423,7 @@ cow_references(const ProllyChunkFormatRoutine *format, const void *data,
 		ProllyHash	ref;
 		ProllyNodeRef root;
 		ProllyValue refs;
+		ProllyValue chunk_refs;
 		uint64		n;
 
 		PROLLY_CALL(format, item_get, &node, i, &k, &v, &flags);
@@ -2377,9 +2433,16 @@ cow_references(const ProllyChunkFormatRoutine *format, const void *data,
 			visit(&ref, arg);
 			continue;
 		}
-		if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS)))
+		if (!(flags & (PROLLY_ITEM_VALUE_REF | PROLLY_ITEM_VALUE_REFS |
+					   PROLLY_ITEM_CHUNK_REFS)))
 			continue;
-		item_payload(&v, flags, &refs);
+		item_payload(&v, flags, &refs, &chunk_refs);
+		for (const char *p = (const char *) chunk_refs.data,
+			 *end = p + chunk_refs.len; p < end;)
+		{
+			next_value_ref(&p, end, &root, &n);
+			visit(&root.hash, arg);
+		}
 		if (flags & PROLLY_ITEM_VALUE_REF)
 		{
 			decode_value_ref(&v, &root, &n);

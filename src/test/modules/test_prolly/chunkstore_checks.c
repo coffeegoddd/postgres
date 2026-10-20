@@ -1350,6 +1350,40 @@ test_chunk_put_node(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&h));
 }
 
+PG_FUNCTION_INFO_V1(test_chunk_put_leaf);
+Datum
+test_chunk_put_leaf(PG_FUNCTION_ARGS)
+{
+	ArrayType  *vals = PG_GETARG_ARRAYTYPE_P(0);
+	const ProllyChunkFormatRoutine *fmt = prolly_chunkformat_lookup("basic");
+	Datum	   *elems;
+	int			n;
+	ProllyKey  *keys;
+	ProllyValue *values;
+	uint8	   *flags;
+	StringInfoData node;
+	ProllyHash	h;
+
+	deconstruct_array(vals, BYTEAOID, -1, false, TYPALIGN_INT, &elems, NULL, &n);
+	keys = palloc(sizeof(ProllyKey) * Max(n, 1));
+	values = palloc(sizeof(ProllyValue) * Max(n, 1));
+	flags = palloc0(sizeof(uint8) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		bytea	   *v = DatumGetByteaPP(elems[i]);
+
+		keys[i].data = (const uint8 *) psprintf("k%04d", i);
+		keys[i].len = 5;
+		values[i].data = (const uint8 *) VARDATA_ANY(v);
+		values[i].len = VARSIZE_ANY_EXHDR(v);
+	}
+	initStringInfo(&node);
+	PROLLY_CALL(fmt, encode, 0, n, keys, values, flags, &node);
+	content_hash(node.data, node.len, &h);
+	PROLLY_CALL(cs(), put, store(), &h, node.data, node.len);
+	PG_RETURN_TEXT_P(hash_text(&h));
+}
+
 /* Collect the store's garbage: what was kept and freed. */
 PG_FUNCTION_INFO_V1(test_chunk_gc);
 Datum

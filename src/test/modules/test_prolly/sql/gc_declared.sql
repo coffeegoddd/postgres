@@ -1,0 +1,54 @@
+-- A collection marks what each chunk's format declares it names (a node's
+-- children, values stored out of line, the references its items declare),
+-- not every run of bytes shaped like a reference: a leaf whose value
+-- spells a chunk's hash, as a reference would (its length, then the
+-- hash), keeps nothing.  (Assert-enabled builds warn of it, which the
+-- message level hides here.)
+\c postgres
+CREATE DATABASE declared_db;
+\c declared_db
+CREATE EXTENSION test_prolly;
+SELECT test_chunk_put('spelled out') AS spelled,
+	test_chunk_put('pointed to') AS pointed \gset
+SELECT test_chunk_put_leaf(ARRAY['\x14'::bytea || decode(:'spelled', 'hex')]) AS leaf \gset
+SELECT test_chunk_put_node(1, ARRAY[:'leaf']) AS inner_node \gset
+SELECT test_chunk_put_node(0, ARRAY[:'pointed']) AS value_leaf \gset
+SELECT test_chunk_put_node(2, ARRAY[:'inner_node', :'value_leaf']) AS root \gset
+SELECT test_chunk_move_root(NULL, :'root');
+SET client_min_messages = error;
+SELECT kept, freed FROM test_chunk_gc(false);
+RESET client_min_messages;
+SELECT test_chunk_has(:'leaf') AS leaf_kept,
+	test_chunk_has(:'pointed') AS value_kept,
+	test_chunk_has(:'spelled') AS spelled_kept;
+
+-- Versioned data, its history and branches, read whole after a collection
+-- (in a database of its own: the refs are the store's root).
+\c postgres
+CREATE DATABASE declared_vc;
+\c declared_vc
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA app VERSIONED;
+CREATE TABLE app.t (id int PRIMARY KEY, v text, b bytea STORAGE EXTERNAL);
+INSERT INTO app.t SELECT g, 'row ' || g, test_noise('long ' || g, 5000)
+FROM generate_series(1, 50) g;
+SELECT dolt_commit('-m', 'first') IS NOT NULL AS committed;
+SELECT dolt_branch('other');
+UPDATE app.t SET v = 'changed ' || id WHERE id <= 10;
+SELECT dolt_commit('-m', 'second') IS NOT NULL AS committed;
+SELECT dolt_checkout('other');
+UPDATE app.t SET b = test_noise('other ' || id, 5000) WHERE id > 40;
+SELECT dolt_commit('-m', 'on other') IS NOT NULL AS committed;
+SELECT dolt_checkout('main');
+SELECT kept > 0 AS kept FROM test_chunk_gc(true);
+SELECT count(*) AS commits FROM dolt_log('main');
+SELECT count(*), sum(length(b)) FROM app.t;
+SELECT dolt_checkout('other');
+SELECT count(*) FILTER (WHERE b = test_noise('other ' || id, 5000)) AS other_values
+FROM app.t;
+SELECT dolt_checkout('main');
+SELECT count(*) AS diffs FROM dolt_diff('main', 'other', NULL::app.t);
+
+\c postgres
+DROP DATABASE declared_db;
+DROP DATABASE declared_vc;

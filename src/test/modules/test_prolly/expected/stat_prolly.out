@@ -60,8 +60,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written             |    14
  value_nodes_written       |     0
  chunks_appended           |    14
- chunk_bytes_appended      | 25451
- bytes_hashed              | 44593
+ chunk_bytes_appended      | 25838
+ bytes_hashed              | 44980
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -151,7 +151,7 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
 -- The same commit again, in a database just like it: the same counts.
 -- (but the journal's bytes: compressed, a commit's, which holds its time,
 -- may take a byte more or less)
-SELECT array_agg(value ORDER BY name) AS first FROM pg_stat_prolly
+SELECT json_object_agg(name, value) AS first FROM pg_stat_prolly
 WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned') \gset
 \c :home
 CREATE DATABASE stat_prolly_again;
@@ -197,12 +197,14 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
-SELECT array_agg(value ORDER BY name) = :'first' AS same_counts FROM pg_stat_prolly
-WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
- same_counts 
--------------
- t
-(1 row)
+-- (any that differ, with both counts)
+SELECT name, value, (:'first'::json ->> name)::bigint AS first
+FROM pg_stat_prolly
+WHERE value IS DISTINCT FROM (:'first'::json ->> name)::bigint
+	AND name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
+ name | value | first 
+------+-------+-------
+(0 rows)
 
 -- Per database: the other's work isn't counted here.
 \c stat_prolly

@@ -49,6 +49,13 @@
  *				   form of the branch's versioned schemas, folded
  *	"time"		-> microseconds since the Postgres epoch, 8 bytes big-endian
  *
+ * The chunks a commit's items and the refs' entries name (its dependencies,
+ * parents and root; a branch's head, baseline and working set, a merge's
+ * commits, a remote branch's head) are declared to the tree as the
+ * references to chunks its leaves hold (commit_chunk_refs(),
+ * refs_chunk_refs()), so
+ * a collection follows them without reading values.
+ *
  * A branch made at a commit starts as a copy of the session's branch,
  * moved to the commit (the rows that differ written, as a reset writes
  * them).
@@ -140,9 +147,98 @@ static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
 									  ProllyNodeRef *root);
 static bool copies_working_set(const char *branch, ProllyNodeRef *root);
+static uint32 get_be32(const char *p);
 static void fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next, bool commit);
 static const ProllyTreeRoutine *tree;
-static ProllyTreeEnv env;
+static ProllyTreeEnv env;		/* the refs' tree, and commits read */
+static ProllyTreeEnv commit_env;	/* commits written */
+
+/* Declare each hash at p (a length byte, then the hash), n of them. */
+static const char *
+declare_hashes(const char *p, const char *end, int n, StringInfo refs)
+{
+	for (int i = 0; i < n && p < end; i++)
+	{
+		ProllyHash	h;
+
+		if ((uint8) p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + (uint8) p[0])
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly refs hold an invalid hash")));
+		memset(&h, 0, sizeof(h));
+		h.len = (uint8) p[0];
+		memcpy(h.bytes, p + 1, h.len);
+		if (h.len > 0)
+			PROLLY_CALL(tree, value_reference, &h, 0, refs);
+		p += 1 + h.len;
+	}
+	return p;
+}
+
+/* A commit's items: its dependencies, parents and root name chunks. */
+static void
+commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
+				  StringInfo refs)
+{
+	const char *p = (const char *) value->data;
+	const char *end = p + value->len;
+
+#define KEY_IS(name) \
+	(key->len == strlen(name) && memcmp(key->data, name, key->len) == 0)
+	if (KEY_IS("dependencies") || KEY_IS("parents") || KEY_IS("root"))
+		(void) declare_hashes(p, end, INT_MAX, refs);
+#undef KEY_IS
+}
+
+/*
+ * The refs' entries: a branch's head, a remote branch's, a baseline and the
+ * working set its fold made, and a merge's commits (theirs and the base;
+ * a revert's series head and the commits it has left).
+ */
+static void
+refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
+				StringInfo refs)
+{
+	const char *p = (const char *) value->data;
+	const char *end = p + value->len;
+
+	if (key->len < 1)
+		return;
+	switch (key->data[0])
+	{
+		case TAG_BRANCH:
+		case TAG_TRACKING:
+			(void) declare_hashes(p, end, 1, refs);
+			break;
+		case TAG_BASELINE:
+			(void) declare_hashes(p, end, 2, refs);
+			break;
+		case TAG_MERGE:
+			{
+				uint32		n;
+
+				p = declare_hashes(p, end, 2, refs);
+				if (end - p < 4)
+					break;
+				n = get_be32(p);
+				p += 4;
+				if ((uint64) (end - p) < (uint64) n * 4)
+					break;
+				p += (Size) n * 4;
+				if (p < end && *p == 'r')
+				{
+					p = declare_hashes(p + 1, end, 1, refs);
+					if (end - p < 4)
+						break;
+					n = get_be32(p);
+					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
+				}
+			}
+			break;
+		default:
+			break;
+	}
+}
 
 static void
 refs_init(void)
@@ -159,6 +255,9 @@ refs_init(void)
 							 MyDatabaseTableSpace);
 	env.compare = prolly_bytes_compare;
 	env.counters = pgstat_prolly_tree_counters();
+	commit_env = env;
+	env.chunk_refs = refs_chunk_refs;
+	commit_env.chunk_refs = commit_chunk_refs;
 	RegisterXactCallback(refs_xact_callback, NULL);
 	ready = true;
 }
@@ -1058,7 +1157,7 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	}
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
-	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/* Keys in order: author, dependencies, message, parents, root, time. */
 	initStringInfo(&v);

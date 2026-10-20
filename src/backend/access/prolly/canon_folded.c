@@ -252,6 +252,7 @@ typedef struct BaseTable BaseTable;
 typedef struct Canon
 {
 	ProllyTreeEnv env;
+	ProllyTreeEnv root_env;		/* a canonical root's: its items' references */
 	List	   *items;
 	const ProllyTreeRoutine *tree;
 	List	   *collations;		/* OIDs of the collations ordering keys */
@@ -288,11 +289,73 @@ prolly_folded_tree_env(ProllyTreeEnv *env)
 	env->counters = pgstat_prolly_tree_counters();
 }
 
+/* Declare the hash at value's start (a length byte, then the hash). */
+static void
+declare_leading_hash(const ProllyValue *value, StringInfo refs)
+{
+	ProllyHash	h;
+
+	if (value->len < 1 || value->data[0] == 0 ||
+		value->data[0] > PROLLY_HASH_MAX_LEN || value->len < 1 + value->data[0])
+		return;
+	memset(&h, 0, sizeof(h));
+	h.len = value->data[0];
+	memcpy(h.bytes, value->data + 1, h.len);
+	PROLLY_CALL(prolly_tree_lookup("cow"), value_reference, &h, 0, refs);
+}
+
+/* A canonical root's items: a table's or materialized view's data tree. */
+static void
+canon_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
+				 StringInfo refs)
+{
+	if (key->len >= 2 && key->data[1] == ':' &&
+		(key->data[0] == 't' || key->data[0] == 'm'))
+		declare_leading_hash(value, refs);
+}
+
+void
+prolly_folded_canon_env(ProllyTreeEnv *env)
+{
+	prolly_folded_tree_env(env);
+	env->chunk_refs = canon_chunk_refs;
+}
+
+/*
+ * A baseline's items: the table's data tree (its definition's hash, next,
+ * names no chunk), then what its finder's state names, as every change
+ * finder declares it (the one that wrote it may not be the one configured
+ * now).
+ */
+static void
+base_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
+				StringInfo refs)
+{
+	ProllyValue state = *value;
+	List	   *finders;
+
+	declare_leading_hash(value, refs);
+	for (int i = 0; i < 2 && state.len >= 1 && state.data[0] <= PROLLY_HASH_MAX_LEN &&
+		 state.len >= 1 + state.data[0]; i++)
+	{
+		state.len -= 1 + state.data[0];
+		state.data += 1 + state.data[0];
+	}
+	finders = prolly_list_impls(PROLLY_IFACE_CHANGE_FINDER);
+	foreach_ptr(const ProllyChangeFinderRoutine, finder, finders)
+	{
+		if (finder->state_refs != NULL)
+			finder->state_refs(&state, refs);
+	}
+	list_free(finders);
+}
+
 static void
 canon_env(Canon *cn)
 {
 	cn->tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&cn->env);
+	prolly_folded_canon_env(&cn->root_env);
 }
 
 /* Append s in UTF-8. */
@@ -2991,7 +3054,7 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	appendStringInfoString(&add_item(cn, "!:", "format")->value, FOLDED_FORMAT);
 
 	list_sort(cn->items, item_cmp);
-	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
+	b = PROLLY_CALL(cn->tree, build_begin, &cn->root_env, CurrentMemoryContext);
 	foreach(lc, cn->items)
 	{
 		CanonItem  *it = lfirst(lc);
@@ -3008,10 +3071,12 @@ static void
 build_baseline(Canon *cn, ProllyNodeRef *next)
 {
 	ProllyTreeBuilder *b;
+	ProllyTreeEnv benv = cn->env;
 	ListCell   *lc;
 
 	list_sort(cn->next, item_cmp);
-	b = PROLLY_CALL(cn->tree, build_begin, &cn->env, CurrentMemoryContext);
+	benv.chunk_refs = base_chunk_refs;
+	b = PROLLY_CALL(cn->tree, build_begin, &benv, CurrentMemoryContext);
 	foreach(lc, cn->next)
 	{
 		CanonItem  *it = lfirst(lc);
@@ -7809,7 +7874,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		PROLLY_CALL(cn.tree, cursor_seek, cur[i], NULL, ForwardScanDirection);
 		more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
 	}
-	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.root_env, CurrentMemoryContext);
 	while (more[0] || more[1] || more[2])
 	{
 		const ProllyKey *least = NULL;
@@ -8075,7 +8140,7 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 	if (nedits > 1)
 		qsort(edits, nedits, sizeof(ProllyEdit), edit_key_cmp);
 	if (nedits > 0)
-		PROLLY_CALL(cn.tree, apply, &cn.env, head, edits, nedits, root);
+		PROLLY_CALL(cn.tree, apply, &cn.root_env, head, edits, nedits, root);
 	else
 		*root = *head;
 	return true;
