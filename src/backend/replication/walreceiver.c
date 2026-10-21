@@ -67,6 +67,7 @@
 #include "pgstat.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
@@ -1296,17 +1297,11 @@ XLogWalRcvSendHSFeedback(bool immed)
 				catalog_xmin_epoch;
 	TransactionId xmin,
 				catalog_xmin;
+	XLogRecPtr	restart_lsn;
 
 	/* initially true so we always send at least one feedback message */
 	static bool primary_has_standby_xmin = true;
-
-	/*
-	 * If the user doesn't want status to be reported to the primary, be sure
-	 * to exit before doing anything at all.
-	 */
-	if ((wal_receiver_status_interval <= 0 || !hot_standby_feedback) &&
-		!primary_has_standby_xmin)
-		return;
+	static bool primary_has_standby_restart_lsn = true;
 
 	/* Get current timestamp. */
 	now = GetCurrentTimestamp();
@@ -1329,6 +1324,20 @@ XLogWalRcvSendHSFeedback(bool immed)
 	 * this replica.
 	 */
 	if (!HotStandbyActive())
+		return;
+
+	/*
+	 * If the user doesn't want status to be reported to the primary, there
+	 * is nothing to send but the oldest position a logical slot here may
+	 * decode from, which is reported whether or not xmins are: the primary
+	 * keeps for it the values stored by content that such a slot may still
+	 * decode.  (Hence this wakes up every wal_receiver_status_interval with
+	 * hot_standby_feedback off too, to see whether there is one.)
+	 */
+	restart_lsn = ReplicationSlotsLogicalDecodingHorizon(InvalidOid);
+	if ((wal_receiver_status_interval <= 0 || !hot_standby_feedback) &&
+		!primary_has_standby_xmin &&
+		!XLogRecPtrIsValid(restart_lsn) && !primary_has_standby_restart_lsn)
 		return;
 
 	/*
@@ -1358,8 +1367,9 @@ XLogWalRcvSendHSFeedback(bool immed)
 	if (nextXid < catalog_xmin)
 		catalog_xmin_epoch--;
 
-	elog(DEBUG2, "sending hot standby feedback xmin %u epoch %u catalog_xmin %u catalog_xmin_epoch %u",
-		 xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch);
+	elog(DEBUG2, "sending hot standby feedback xmin %u epoch %u catalog_xmin %u catalog_xmin_epoch %u logical restart_lsn %X/%08X",
+		 xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch,
+		 LSN_FORMAT_ARGS(restart_lsn));
 
 	/* Construct the message and send it. */
 	resetStringInfo(&reply_message);
@@ -1369,11 +1379,13 @@ XLogWalRcvSendHSFeedback(bool immed)
 	pq_sendint32(&reply_message, xmin_epoch);
 	pq_sendint32(&reply_message, catalog_xmin);
 	pq_sendint32(&reply_message, catalog_xmin_epoch);
+	pq_sendint64(&reply_message, restart_lsn);
 	walrcv_send(wrconn, reply_message.data, reply_message.len);
 	if (TransactionIdIsValid(xmin) || TransactionIdIsValid(catalog_xmin))
 		primary_has_standby_xmin = true;
 	else
 		primary_has_standby_xmin = false;
+	primary_has_standby_restart_lsn = XLogRecPtrIsValid(restart_lsn);
 }
 
 /*
@@ -1452,7 +1464,8 @@ WalRcvComputeNextWakeup(WalRcvWakeupReason reason, TimestampTz now)
 				wakeup[reason] = TimestampTzPlusMilliseconds(now, wal_receiver_timeout / 2);
 			break;
 		case WALRCV_WAKEUP_HSFEEDBACK:
-			if (!hot_standby_feedback || wal_receiver_status_interval <= 0)
+			/* (with hot_standby_feedback off, for logical slots' position) */
+			if (wal_receiver_status_interval <= 0)
 				wakeup[reason] = TIMESTAMP_INFINITY;
 			else
 				wakeup[reason] = TimestampTzPlusSeconds(now, wal_receiver_status_interval);

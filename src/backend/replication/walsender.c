@@ -2699,6 +2699,45 @@ PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbac
 }
 
 /*
+ * Remember the oldest position a logical slot of the standby may decode
+ * from, as its feedback said: in this walsender's shared state, and in its
+ * physical slot if it has one, which keeps it while the standby is away.
+ * The slot is saved at once if the position moves back (or is new), so a
+ * crash doesn't lose it; moving forward, it is saved at the next
+ * checkpoint, the older position on disk until then.
+ */
+static void
+PhysicalStandbyRestartLsn(XLogRecPtr lsn)
+{
+	ReplicationSlot *slot = MyReplicationSlot;
+	bool		changed = false;
+	bool		back = false;
+
+	SpinLockAcquire(&MyWalSnd->mutex);
+	MyWalSnd->standbyRestartLsn = lsn;
+	SpinLockRelease(&MyWalSnd->mutex);
+
+	if (slot == NULL || !SlotIsPhysical(slot))
+		return;
+	SpinLockAcquire(&slot->mutex);
+	if (slot->data.standby_restart_lsn != lsn)
+	{
+		changed = true;
+		back = XLogRecPtrIsValid(lsn) &&
+			(!XLogRecPtrIsValid(slot->data.standby_restart_lsn) ||
+			 lsn < slot->data.standby_restart_lsn);
+		slot->data.standby_restart_lsn = lsn;
+	}
+	SpinLockRelease(&slot->mutex);
+	if (changed)
+	{
+		ReplicationSlotMarkDirty();
+		if (back)
+			ReplicationSlotSave();
+	}
+}
+
+/*
  * Check that the provided xmin/epoch are sane, that is, not in the future
  * and not so far back as to be already wrapped around.
  *
@@ -2746,6 +2785,7 @@ ProcessStandbyHSFeedbackMessage(void)
 	uint32		feedbackEpoch;
 	TransactionId feedbackCatalogXmin;
 	uint32		feedbackCatalogEpoch;
+	XLogRecPtr	feedbackRestartLsn = InvalidXLogRecPtr;
 	TimestampTz replyTime;
 
 	/*
@@ -2758,6 +2798,11 @@ ProcessStandbyHSFeedbackMessage(void)
 	feedbackEpoch = pq_getmsgint(&reply_message, 4);
 	feedbackCatalogXmin = pq_getmsgint(&reply_message, 4);
 	feedbackCatalogEpoch = pq_getmsgint(&reply_message, 4);
+
+	/* (a standby that doesn't send it has no such slot to tell of) */
+	if (reply_message.cursor + sizeof(int64) <= reply_message.len)
+		feedbackRestartLsn = pq_getmsgint64(&reply_message);
+	PhysicalStandbyRestartLsn(feedbackRestartLsn);
 
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -3265,6 +3310,7 @@ InitWalSenderSlot(void)
 			walsnd->applyLag = -1;
 			walsnd->sync_standby_priority = 0;
 			walsnd->replyTime = 0;
+			walsnd->standbyRestartLsn = InvalidXLogRecPtr;
 
 			/*
 			 * The kind assignment is done here and not in StartReplication()
@@ -3309,7 +3355,37 @@ WalSndKill(int code, Datum arg)
 	SpinLockAcquire(&walsnd->mutex);
 	/* Mark WalSnd struct as no longer being in use. */
 	walsnd->pid = 0;
+	walsnd->standbyRestartLsn = InvalidXLogRecPtr;
 	SpinLockRelease(&walsnd->mutex);
+}
+
+/*
+ * The oldest position a logical slot of a connected standby (or downstream
+ * of one) may decode from, as the standbys' hot standby feedback said;
+ * invalid if none.  (A standby with a physical slot has it there too, kept
+ * while it is away.)
+ */
+XLogRecPtr
+WalSndStandbyRestartLSN(void)
+{
+	XLogRecPtr	result = InvalidXLogRecPtr;
+
+	if (WalSndCtl == NULL)
+		return InvalidXLogRecPtr;
+	for (int i = 0; i < max_wal_senders; i++)
+	{
+		WalSnd	   *walsnd = &WalSndCtl->walsnds[i];
+		XLogRecPtr	lsn = InvalidXLogRecPtr;
+
+		SpinLockAcquire(&walsnd->mutex);
+		if (walsnd->pid != 0)
+			lsn = walsnd->standbyRestartLsn;
+		SpinLockRelease(&walsnd->mutex);
+		if (XLogRecPtrIsValid(lsn) &&
+			(!XLogRecPtrIsValid(result) || lsn < result))
+			result = lsn;
+	}
+	return result;
 }
 
 /* XLogReaderRoutine->segment_open callback */

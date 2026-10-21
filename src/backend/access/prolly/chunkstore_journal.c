@@ -6598,33 +6598,13 @@ journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out)
 
 /*
  * The oldest position a logical replication slot of database dboid may
- * decode from (invalid: it has none).
+ * decode from, or one of a standby's, as its feedback said (invalid: there
+ * is none).
  */
 static XLogRecPtr
 logical_horizon(Oid dboid)
 {
-	XLogRecPtr	horizon = InvalidXLogRecPtr;
-
-	if (max_replication_slots <= 0)
-		return InvalidXLogRecPtr;
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
-	for (int i = 0; i < max_replication_slots; i++)
-	{
-		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
-		XLogRecPtr	lsn = InvalidXLogRecPtr;
-
-		if (!slot->in_use)
-			continue;
-		SpinLockAcquire(&slot->mutex);
-		if (SlotIsLogical(slot) && slot->data.database == dboid)
-			lsn = slot->data.restart_lsn;
-		SpinLockRelease(&slot->mutex);
-		if (XLogRecPtrIsValid(lsn) &&
-			(!XLogRecPtrIsValid(horizon) || lsn < horizon))
-			horizon = lsn;
-	}
-	LWLockRelease(ReplicationSlotControlLock);
-	return horizon;
+	return ReplicationSlotsLogicalDecodingHorizon(dboid);
 }
 
 /*

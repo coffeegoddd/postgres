@@ -447,8 +447,10 @@ for a relation with a chunk-store destination:
     could read those tuples. Reclaiming history's own chunks (unreachable
     commits) has its own horizon, part 8 of spec 11.
   - **Logical decoding.** A collection keeps every chunk appended after
-    the oldest replication slot's position, so a value a slot may still
-    decode is there to fetch.
+    the oldest replication slot's position, and every value tree a hash
+    pointer in the WAL from that position names (#300; a standby's slots
+    too, by its feedback), so a value a slot may still decode is there to
+    fetch.
 - **Compression moves below the hash.** Values out of line lose TOAST's
   compression; the chunk store's table files compress chunks with LZ4
   (spec 11, step 3), and C relies on that, keeping hashes over
@@ -633,8 +635,8 @@ measured.
 6. Logical slots on a standby, which the primary's collections can't see,
    are closed with the WAL scan of #300: the standby feeds its slots'
    oldest position back to the primary, as hot standby feedback carries
-   its xmin, and a collection keeps what either may still decode. Until
-   then it is an open gap, as #300's other two cases are.
+   its xmin, and a collection keeps what either may still decode (built
+   with #300: see "as built").
 7. The roots' scan of every page-store block each collection (decision 3)
    stays as built; scanning only the blocks changed since the last
    collection is a follow-up, #340 (built: see "as built").
@@ -753,19 +755,37 @@ to decode.
   bytea and text in UTF-8, keyed tables only; jsonb is decoded (and so
   checked) as it is written back. A short value moved out (its row was long) is read by a fold
   and stored inline, as designed; so is text in another encoding by an
-  apply (its size is only known converted back). A logical slot's
-  protection is by segment: a collection keeps as they are the sealed
-  segments sealed after the oldest slot's `restart_lsn` (the manifest
-  records each segment's seal position, version 3). Two cases aren't
-  protected, both only when the row naming the value is deleted and
-  pruned before the slot decodes it: a value a transaction after the
-  slot's position reused (deduplicated, so nothing was appended), and a
-  value appended to a segment sealed before the slot's position. Closing
-  them, by a collection scanning the WAL after the oldest slot's
-  `restart_lsn` for hash pointers, is #300 (decided 2026-10-18: a
-  follow-up). A kept segment's roots are its chunks, not an aborted
-  transaction's nor its ROOT records. Logical slots on a standby aren't
-  seen by the primary's collections either (a third gap, open).
+  apply (its size is only known converted back).
+- **Logical slots and collections (#300).** A collection scans the WAL
+  from the oldest position a logical slot may decode from up to its end
+  (flushed as the scan begins, past the seal) for hash pointers, the
+  same conservative way it scans the page store: bytes that spell one in
+  a record's data and its blocks' data (the chunk store's own records
+  aside, which hold chunks no slot decodes) and in full-page images, and
+  marks what they name as roots (`prolly_toast_wal_roots()`). The cost
+  is the slots' lag. So a value a row after the slot's position reused
+  (nothing appended for it), or appended to a segment sealed before the
+  slot's position, is kept while a slot may decode a row naming it,
+  whatever happened to the row. The per-segment retention stays as a
+  first pass (the sealed segments sealed after that position kept as
+  they are, their chunks roots; the manifest records each segment's seal
+  position, version 3; a kept segment's roots are its chunks, not an
+  aborted transaction's nor its ROOT records). The position is
+  `ReplicationSlotsLogicalDecodingHorizon()`: this server's logical
+  slots of the database (the position last saved, if older), and every
+  standby's as its feedback said. A standby sends its slots' oldest
+  `restart_lsn` (and its own standbys', so cascades carry it) as a
+  trailing Int64 of the hot standby feedback message, sent with
+  `hot_standby_feedback` off too while it has such slots; the primary
+  keeps it in the walsender's shared state and, for a standby with a
+  physical slot, in the slot (`standby_restart_lsn`, slot file version 6;
+  version 5 files are read with none), saved at once when the position
+  moves back, so a restart or the standby's absence doesn't lose it.
+  Invalidated slots don't count. A standby's position counts for every
+  database (the feedback doesn't say which). If the WAL from the
+  position is no longer there (a standby's slot behind what the primary
+  kept), the collection warns and keeps every chunk it collected; a
+  segment removed while it reads is an error.
 - **The memo's size** is the server setting `prolly_value_memo_entries`
   (core naming, decided 2026-10-18), not `prolly.value_memo_entries`; 0
   turns it off.

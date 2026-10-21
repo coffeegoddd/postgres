@@ -75,6 +75,13 @@ typedef struct WalSnd
 	 */
 	TimestampTz replyTime;
 
+	/*
+	 * The oldest position a logical slot of the standby (or downstream of
+	 * it) may decode from, as its hot standby feedback last said; invalid if
+	 * none.
+	 */
+	XLogRecPtr	standbyRestartLsn;
+
 	ReplicationKind kind;
 } WalSnd;
 

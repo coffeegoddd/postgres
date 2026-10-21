@@ -141,7 +141,17 @@ StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 	sizeof(ReplicationSlotOnDisk) - ReplicationSlotOnDiskConstantSize
 
 #define SLOT_MAGIC		0x1051CA1	/* format identifier */
-#define SLOT_VERSION	5		/* version for new files */
+#define SLOT_VERSION	6		/* version for new files */
+
+/*
+ * Version 5 had no standby_restart_lsn, its last field: its files are read
+ * with the field invalid.
+ */
+#define SLOT_VERSION_NO_STANDBY_LSN	5
+#define ReplicationSlotOnDiskV5Size \
+	(offsetof(ReplicationSlotOnDisk, slotdata) + \
+	 offsetof(ReplicationSlotPersistentData, standby_restart_lsn) - \
+	 ReplicationSlotOnDiskConstantSize)
 
 /* Control array for replication slot management */
 ReplicationSlotCtlData *ReplicationSlotCtl = NULL;
@@ -1448,6 +1458,55 @@ ReplicationSlotsComputeLogicalRestartLSN(void)
 
 	LWLockRelease(ReplicationSlotControlLock);
 
+	return result;
+}
+
+/*
+ * The oldest position a logical slot may still decode from: one of this
+ * server's slots of database dboid (InvalidOid: of any database), or one of
+ * a standby's, as its hot standby feedback said (each standby's for every
+ * database: the feedback doesn't say which), whether held by the standby's
+ * physical slot or only by its walsender while it is connected.  A slot's
+ * position as last saved counts too, if older: a crash takes it back
+ * there.  Invalidated slots don't count.  Invalid if there is none.
+ *
+ * Values stored by content are kept for what a slot may decode from here
+ * on (a slot decodes rows naming them, and fetches them as it does).
+ */
+XLogRecPtr
+ReplicationSlotsLogicalDecodingHorizon(Oid dboid)
+{
+	XLogRecPtr	result = WalSndStandbyRestartLSN();
+
+	if (max_replication_slots + max_repack_replication_slots <= 0)
+		return result;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (int i = 0; i < max_replication_slots + max_repack_replication_slots; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+		XLogRecPtr	lsn = InvalidXLogRecPtr;
+
+		if (!s->in_use)
+			continue;
+		SpinLockAcquire(&s->mutex);
+		if (s->data.invalidated != RS_INVAL_NONE)
+			lsn = InvalidXLogRecPtr;
+		else if (SlotIsPhysical(s))
+			lsn = s->data.standby_restart_lsn;
+		else if (!OidIsValid(dboid) || s->data.database == dboid)
+		{
+			lsn = s->data.restart_lsn;
+			if (XLogRecPtrIsValid(s->last_saved_restart_lsn) &&
+				(!XLogRecPtrIsValid(lsn) || s->last_saved_restart_lsn < lsn))
+				lsn = s->last_saved_restart_lsn;
+		}
+		SpinLockRelease(&s->mutex);
+		if (XLogRecPtrIsValid(lsn) &&
+			(!XLogRecPtrIsValid(result) || lsn < result))
+			result = lsn;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
 	return result;
 }
 
@@ -2771,14 +2830,15 @@ RestoreSlotFromDisk(const char *name)
 						path, cp.magic, SLOT_MAGIC)));
 
 	/* verify version */
-	if (cp.version != SLOT_VERSION)
+	if (cp.version != SLOT_VERSION && cp.version != SLOT_VERSION_NO_STANDBY_LSN)
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has unsupported version %u",
 						path, cp.version)));
 
 	/* boundary check on length */
-	if (cp.length != ReplicationSlotOnDiskV2Size)
+	if (cp.length != (cp.version == SLOT_VERSION ? ReplicationSlotOnDiskV2Size :
+					  ReplicationSlotOnDiskV5Size))
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has corrupted length %u",
@@ -2808,12 +2868,15 @@ RestoreSlotFromDisk(const char *name)
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", path)));
 
-	/* now verify the CRC */
+	/* now verify the CRC, over the bytes the file's version has */
 	INIT_CRC32C(checksum);
 	COMP_CRC32C(checksum,
 				(char *) &cp + ReplicationSlotOnDiskNotChecksummedSize,
-				ReplicationSlotOnDiskChecksummedSize);
+				ReplicationSlotOnDiskConstantSize -
+				ReplicationSlotOnDiskNotChecksummedSize + cp.length);
 	FIN_CRC32C(checksum);
+	if (cp.version == SLOT_VERSION_NO_STANDBY_LSN)
+		cp.slotdata.standby_restart_lsn = InvalidXLogRecPtr;
 
 	if (!EQ_CRC32C(checksum, cp.checksum))
 		ereport(PANIC,

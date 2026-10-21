@@ -27,6 +27,7 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_tree.h"
 #include "access/toast_destination.h"
+#include "access/xlogdefs.h"
 #include "lib/stringinfo.h"
 
 /* What a hash pointer's tree holds */
@@ -84,6 +85,18 @@ extern varlena *prolly_toast_pointer(const ProllyHash *root, uint64 len,
  * names is missed.  A collection's roots outside the refs.
  */
 extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
+
+/*
+ * Visit the root of every value tree a hash pointer in the WAL from 'from'
+ * to its end (flushed first) may name: a logical slot that decodes from
+ * 'from' fetches the values its rows name, whose rows may be gone from the
+ * pages since.  Conservative as the pages' scan is: bytes that spell a hash
+ * pointer in a record's data, its blocks' data and its full-page images.
+ * False if the WAL from 'from' is no longer here, so the caller keeps what
+ * it may name otherwise.
+ */
+extern bool prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit,
+								   void *arg);
 
 /*
  * The value tree nodes this backend read and wrote through this

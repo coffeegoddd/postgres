@@ -33,7 +33,11 @@
  * the transactions that named a tree before the collection began have
  * ended; and every tree a transaction names while it runs (the store's
  * keep set, gc_kept()), before the window and in it.  A keep set too large
- * to remember keeps every chunk collected.
+ * to remember keeps every chunk collected.  So is every tree a hash pointer
+ * in the WAL may name from the oldest position a logical slot may decode
+ * from, this server's or a standby's (prolly_toast_wal_roots()): the slot
+ * fetches the values of the rows it decodes, which may be gone from the
+ * pages by then.  WAL from there no longer here keeps every chunk.
  *
  * The chunks marked and not yet read wait in a queue, breadth first, of
  * at most maintenance_work_mem in memory (a ring, so taking one and adding
@@ -62,6 +66,7 @@
 #include "access/prolly_toast.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "replication/slot.h"
 #include "storage/buffile.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -371,6 +376,7 @@ copying_collect(bool full, ProllyGcResult *result)
 	ProllyHash	root;
 	int			nfiles = 0;
 	bool	   *keep;
+	XLogRecPtr	horizon;
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
@@ -401,6 +407,17 @@ copying_collect(bool full, ProllyGcResult *result)
 
 	/* what tables name, once those who named a tree before have ended */
 	prolly_toast_roots(mark_root, &mk);
+
+	/* what a logical slot, here or a standby's, may still decode */
+	horizon = ReplicationSlotsLogicalDecodingHorizon(MyDatabaseId);
+	if (!prolly_toast_wal_roots(horizon, mark_root, &mk))
+	{
+		ereport(WARNING,
+				(errmsg("the WAL from %X/%08X, which a logical replication slot may still decode, is gone",
+						LSN_FORMAT_ARGS(horizon)),
+				 errdetail("The collection keeps every chunk it would have freed.")));
+		mark_all(&mk);
+	}
 	INJECTION_POINT("prolly-gc-roots-scanned", NULL);
 	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
 		mark_all(&mk);

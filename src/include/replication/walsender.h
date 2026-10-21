@@ -41,6 +41,7 @@ extern bool exec_replication_command(const char *cmd_string);
 extern void WalSndErrorCleanup(void);
 extern void PhysicalWakeupLogicalWalSnd(void);
 extern XLogRecPtr GetStandbyFlushRecPtr(TimeLineID *tli);
+extern XLogRecPtr WalSndStandbyRestartLSN(void);
 extern void WalSndSignals(void);
 extern void WalSndWakeup(bool physical, bool logical);
 extern void WalSndInitStopping(void);

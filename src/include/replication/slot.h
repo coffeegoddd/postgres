@@ -159,6 +159,15 @@ typedef struct ReplicationSlotPersistentData
 	 * for logical slots on the primary server.
 	 */
 	bool		failover;
+
+	/*
+	 * For a physical slot: the oldest position a logical slot of the standby
+	 * using it (or of a standby downstream of that one) may decode from, as
+	 * the standby's hot standby feedback last said; invalid if none.  A
+	 * value stored by content that such a slot may still decode is kept for
+	 * it, as one a logical slot here may.
+	 */
+	XLogRecPtr	standby_restart_lsn;
 } ReplicationSlotPersistentData;
 
 /*
@@ -358,6 +367,7 @@ extern void ReplicationSlotReserveWal(void);
 extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
+extern XLogRecPtr ReplicationSlotsLogicalDecodingHorizon(Oid dboid);
 extern bool ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive);
 extern bool CheckLogicalSlotExists(void);
 extern void ReplicationSlotsDropDBSlots(Oid dboid);

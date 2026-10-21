@@ -2969,6 +2969,23 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
             </para>
            </listitem>
           </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             The oldest <literal>restart_lsn</literal> of the logical
+             replication slots on the standby, and of those of standbys
+             downstream of it as their feedback said; 0 if there are none.
+             The primary keeps, for as long as these slots may decode from
+             that position, the values of versioned tables stored by content
+             that the slots may still decode.  This field is optional: a
+             message without it says there are none.  It is sent even when
+             <varname>hot_standby_feedback</varname> is off, while the
+             standby has such slots.
+            </para>
+           </listitem>
+          </varlistentry>
          </variablelist>
         </listitem>
        </varlistentry>
