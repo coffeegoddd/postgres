@@ -416,6 +416,17 @@ CREATE FUNCTION test_commit_chain(parent text, n int)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The height a commit records; NULL if it records none.
+CREATE FUNCTION test_commit_height(commit_id text)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A commit's height as the history walk finds it, and the commits it read.
+CREATE FUNCTION test_history_height(commit_id text,
+	OUT height int8, OUT reads int)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- A branch's upstream: a remote and its branch.
 CREATE FUNCTION test_refs_set_upstream(branch text, remote text,
 	remote_branch text)

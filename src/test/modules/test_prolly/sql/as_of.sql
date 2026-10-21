@@ -51,5 +51,72 @@ WHERE committer IS NOT NULL AND commit_date IS NOT NULL;
 SELECT * FROM dolt_at('no_such_ref', NULL::ao.t);
 SELECT * FROM dolt_at(NULL, NULL::ao.t);
 
+-- the planner's estimate of a commit's rows: the count its tree records,
+-- not prorows' 1000; the default where it can't tell (WORKING, a ref
+-- that doesn't resolve, a parameter in a generic plan, a commit without
+-- the table).  A keyless table's rows count once each: bag's one row has
+-- two copies of 7.
+CREATE FUNCTION pg_temp.estimate(query text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	plan json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || query INTO plan;
+	RETURN (plan->0->'Plan'->>'Plan Rows')::float8;
+END
+$$;
+CREATE TABLE ao.many (id int PRIMARY KEY, v text);
+SELECT dolt_hashof('HEAD') AS before_many \gset
+INSERT INTO ao.many SELECT g, 'v' || g FROM generate_series(1, 2500) g;
+SELECT length(dolt_commit('-Am', 'many')::text) AS committed;
+DELETE FROM ao.many WHERE id > 40;
+SELECT length(dolt_commit('-Am', 'fewer')::text) AS committed;
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD~1', NULL::ao.many)$q$) AS at_many,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.many)$q$) AS at_fewer,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.bag)$q$) AS keyless,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('WORKING', NULL::ao.many)$q$) AS working,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('no_such_ref', NULL::ao.many)$q$) AS no_ref,
+	   pg_temp.estimate(format($q$SELECT * FROM dolt_at(%L, NULL::ao.many)$q$, :'before_many')) AS no_table;
+-- a parameter: the default in a generic plan, the commit's in a custom one
+PREPARE at_ref(text) AS SELECT * FROM dolt_at($1, NULL::ao.many);
+SET plan_cache_mode = force_generic_plan;
+SELECT pg_temp.estimate('EXECUTE at_ref(''HEAD~1'')') AS generic;
+SET plan_cache_mode = force_custom_plan;
+SELECT pg_temp.estimate('EXECUTE at_ref(''HEAD~1'')') AS custom;
+RESET plan_cache_mode;
+DEALLOCATE at_ref;
+
+-- a count is history too: a role dolt_at refuses (row security applies to
+-- it, or it lacks SELECT) is estimated the default, not the commit's count
+CREATE TABLE ao.secret (id int PRIMARY KEY);
+INSERT INTO ao.secret SELECT generate_series(1, 60);
+SELECT length(dolt_commit('-Am', 'private rows')::text) AS committed;
+CREATE ROLE regress_as_of_rls;
+CREATE ROLE regress_as_of_no_select;
+GRANT USAGE ON SCHEMA ao TO regress_as_of_rls, regress_as_of_no_select;
+GRANT SELECT ON ao.secret TO regress_as_of_rls;
+ALTER TABLE ao.secret ENABLE ROW LEVEL SECURITY;
+CREATE POLICY only_one ON ao.secret TO regress_as_of_rls USING (id = 1);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS owner;
+SET ROLE regress_as_of_rls;
+SELECT count(*) FROM ao.secret;
+SELECT count(*) FROM dolt_at('HEAD', NULL::ao.secret);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS rls;
+SET ROLE regress_as_of_no_select;
+SELECT count(*) FROM dolt_at('HEAD', NULL::ao.secret);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS no_select;
+RESET ROLE;
+-- a plan kept by the owner isn't used for another role: it's planned again
+PREPARE at_secret AS SELECT * FROM dolt_at('HEAD', NULL::ao.secret);
+SET plan_cache_mode = force_generic_plan;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS owner_plan;
+SET ROLE regress_as_of_rls;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS rls_plan;
+RESET ROLE;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS owner_again;
+RESET plan_cache_mode;
+DEALLOCATE at_secret;
+
 \c contrib_regression
 DROP DATABASE regress_as_of;
+DROP ROLE regress_as_of_rls;
+DROP ROLE regress_as_of_no_select;

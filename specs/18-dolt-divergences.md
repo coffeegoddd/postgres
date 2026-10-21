@@ -404,7 +404,8 @@ OF` are built in D18's shapes.
   `dolt_diff_table(NULL::t [, from_ref, to_ref])` (columns `to_row`,
   `from_row` of `t`'s row type, the commits, their dates, `diff_type`),
   `dolt_history_table(NULL::t)` (`row`, `commit_hash`, `committer`,
-  `commit_date`) and `dolt_at(ref, NULL::t)` (`SETOF t`). The `dolt_diff`
+  `commit_date`) and `dolt_at(ref, NULL::t)` (`SETOF t`; its planner
+  support estimates its rows from the commit's tree, spec 21). The `dolt_diff`
   view, over `dolt_diff()`, is the system table, every kind of object
   listed (D15). Rows of other versions are decoded as the table is
   defined now, by column name (spec 21, decision 3), where Dolt follows

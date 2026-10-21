@@ -2042,6 +2042,16 @@ Built: decision (A) of 7.5, behind the remote interface (#198–#203).
   fetches. `t/048` checks a push's has-checks take few requests; a fetch
   from a remote without the transfer below (a file remote, an older
   build) is batched so.
+- **Commit heights (user, 2026-10-20, #362).** A commit records its
+  height, 1 + the most of its parents' (a root's 1), as Dolt's do: a
+  "height" item beside "dependencies", so the commit id covers it. The
+  walk below goes highest first, and a recorded height means a commit's
+  history isn't read to find it: a call reads the new commits and its
+  frontier, not O(history). A commit without one (made before heights
+  were recorded, or by a build without them) has its height found from
+  its parents', depth first, each commit read once; a commit made on such
+  history records the height found, so the walk is made once.
+  `pg_stat_prolly`'s `commits_read` counts commits read.
 - **From known heads (7.1).** The receiver names every head it has
   (branches and remote-tracking heads), and a remote that runs this code
   (`get_since()`, `dolt_serve_since()`) sends, in one result read a row at

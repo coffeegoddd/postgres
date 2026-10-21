@@ -5756,7 +5756,10 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>gc_pages_scanned</literal> (blocks of the page stores
        collections read for the hash pointers their pages hold: only those
        of the ranges written since the last collection, or every block
-       after a restart).  Bytes are counted when
+       after a restart);
+       <literal>commits_read</literal> (commits read from the chunk store, as
+       walks of history and <function>dolt_serve_since</function> read
+       them).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

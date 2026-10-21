@@ -57,6 +57,10 @@
  *				   the versioned schemas (length byte, hash of the
  *				   canonicalizer's tree of them); a commit without it
  *				   (one made before they were recorded) has them unknown
+ *	"height"	-> its height (prolly_history_height()), 8 bytes
+ *				   big-endian: 1 + the most of its parents', a root's 1;
+ *				   a commit without it (one made before heights were
+ *				   recorded) has its height found from its parents'
  *	"message"	-> the message
  *	"parents"	-> the parents' ids, each a length byte and the hash
  *	"root"		-> the commit's root (length byte, hash): the canonical
@@ -876,6 +880,7 @@ move_settled(void *arg)
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
 static bool commit_time(const ProllyHash *id, TimestampTz *at);
+static bool commit_height(const ProllyHash *id, int64 *height);
 
 /* The session's branch folded, as a commit's fold would be: its baseline. */
 static void
@@ -1203,6 +1208,54 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
 	PROLLY_CALL(tree, build_add, b, &k, &v);
 }
 
+static bool copies_lookup_commit(const ProllyHash *id, ProllyCommitInfo *info,
+								 void *arg);
+
+/* 8 bytes big-endian, as a commit's "height" and "time" items are. */
+static void
+put_uint64(StringInfo v, uint64 n)
+{
+	for (int i = 7; i >= 0; i--)
+		appendStringInfoChar(v, (char) (n >> (i * 8)));
+}
+
+/*
+ * The height of a commit with these parents: 1 + the most of theirs, each
+ * read alone; one that records none has its found from its history, once.
+ */
+static int64
+parents_height(const ProllyHash *parents, int nparents)
+{
+	MemoryContext cxt = NULL;
+	MemoryContext old = CurrentMemoryContext;
+	HTAB	   *heights = NULL;
+	int64		height = 1;
+
+	for (int i = 0; i < nparents; i++)
+	{
+		int64		parent;
+
+		if (!commit_height(&parents[i], &parent))
+		{
+			if (cxt == NULL)
+			{
+				cxt = AllocSetContextCreate(CurrentMemoryContext,
+											"prolly commit height",
+											ALLOCSET_DEFAULT_SIZES);
+				MemoryContextSwitchTo(cxt);
+				heights = prolly_history_heights();
+			}
+			parent = prolly_history_height(&parents[i], heights,
+										   copies_lookup_commit, NULL);
+		}
+		height = Max(height, parent + 1);
+	}
+	MemoryContextSwitchTo(old);
+	if (cxt)
+		MemoryContextDelete(cxt);
+	return height;
+}
+
 /*
  * Write a commit's tree; its id is the root's hash.  What its versioned
  * objects need from outside is folded now, from the catalogs as the
@@ -1242,13 +1295,19 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
-	/* Keys in order: author, dependencies, message, parents, root, time. */
+	/*
+	 * Keys in order: author, dependencies, height, message, parents, root,
+	 * time.
+	 */
 	initStringInfo(&v);
 	appendStringInfoString(&v, author);
 	add_item(b, "author", &v);
 	resetStringInfo(&v);
 	put_hash(&v, &deps.hash);
 	add_item(b, "dependencies", &v);
+	resetStringInfo(&v);
+	put_uint64(&v, (uint64) parents_height(parents, nparents));
+	add_item(b, "height", &v);
 	resetStringInfo(&v);
 	appendStringInfoString(&v, message);
 	add_item(b, "message", &v);
@@ -1260,8 +1319,7 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	put_hash(&v, root);
 	add_item(b, "root", &v);
 	resetStringInfo(&v);
-	for (int i = 7; i >= 0; i--)
-		appendStringInfoChar(&v, (char) ((uint64) at >> (i * 8)));
+	put_uint64(&v, (uint64) at);
 	add_item(b, "time", &v);
 	PROLLY_CALL(tree, build_finish, b, &ref);
 	*id = ref.hash;
@@ -1277,9 +1335,9 @@ read_item(const ProllyNodeRef *commit, const char *key, StringInfo out)
 	return PROLLY_CALL(tree, get, &env, commit, &k, out);
 }
 
-/* A commit's "time" item, as write_commit puts it; false if it isn't one. */
+/* A commit's 8-byte item, as put_uint64() puts it; false if it isn't one. */
 static bool
-get_time(const StringInfoData *v, TimestampTz *at)
+get_uint64(const StringInfoData *v, uint64 *n)
 {
 	uint64		t = 0;
 
@@ -1287,6 +1345,18 @@ get_time(const StringInfoData *v, TimestampTz *at)
 		return false;
 	for (int i = 0; i < 8; i++)
 		t = (t << 8) | (uint8) v->data[i];
+	*n = t;
+	return true;
+}
+
+/* A commit's "time" item, as write_commit puts it; false if it isn't one. */
+static bool
+get_time(const StringInfoData *v, TimestampTz *at)
+{
+	uint64		t;
+
+	if (!get_uint64(v, &t))
+		return false;
 	*at = (TimestampTz) t;
 	return true;
 }
@@ -1333,9 +1403,21 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 		info->has_dependencies = true;
 	}
 	resetStringInfo(&v);
+	if (read_item(&ref, "height", &v))
+	{
+		uint64		height;
+
+		if (get_uint64(&v, &height) && height > 0 && height <= PG_INT64_MAX)
+		{
+			info->height = (int64) height;
+			info->has_height = true;
+		}
+	}
+	resetStringInfo(&v);
 	if (read_item(&ref, "time", &v))
 		(void) get_time(&v, &info->committed_at);
 	pfree(v.data);
+	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS_READ, 1);
 	return true;
 }
 
@@ -1354,6 +1436,28 @@ commit_time(const ProllyHash *id, TimestampTz *at)
 	initStringInfo(&v);
 	found = read_item(&ref, "time", &v) && get_time(&v, at);
 	pfree(v.data);
+	return found;
+}
+
+/* Just the height commit id records, which is read only for it. */
+static bool
+commit_height(const ProllyHash *id, int64 *height)
+{
+	ProllyNodeRef ref;
+	StringInfoData v;
+	uint64		h;
+	bool		found;
+
+	refs_init();
+	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
+		return false;
+	ref_of(id, &ref);
+	initStringInfo(&v);
+	found = read_item(&ref, "height", &v) && get_uint64(&v, &h) &&
+		h > 0 && h <= PG_INT64_MAX;
+	pfree(v.data);
+	if (found)
+		*height = (int64) h;
 	return found;
 }
 

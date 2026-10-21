@@ -1,0 +1,219 @@
+-- Commits record their heights (1 + the most of their parents', a root's
+-- 1), as Dolt's do, so what orders history by height reads only the
+-- commits it needs: a commit that records one isn't walked beneath.  A
+-- commit made before heights were recorded has its height found from its
+-- history, each commit read once.
+CREATE DATABASE regress_commit_heights;
+\c regress_commit_heights
+CREATE EXTENSION test_prolly;
+CREATE FUNCTION counted(name text) RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE pg_stat_prolly.name = counted.name
+$$;
+\set reset 'SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly'');'
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE FUNCTION pg_temp.h(ref text) RETURNS bytea LANGUAGE sql
+  AS $$ SELECT decode(dolt_hashof(ref), 'hex') $$;
+CREATE SCHEMA ch VERSIONED;
+CREATE TABLE ch.t (id int PRIMARY KEY, v text);
+INSERT INTO ch.t VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE ch.t SET v = 'two' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'two')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+INSERT INTO ch.t VALUES (2, 'side');
+SELECT length(dolt_commit('-Am', 'side 1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+INSERT INTO ch.t VALUES (3, 'side');
+SELECT length(dolt_commit('-Am', 'side 2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('side', '--no-ff', '-m', 'merged'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+-- each commit's recorded height is its order in the log; a root's is 1,
+-- and the merge's is 1 + its higher parent's (side's)
+SELECT message, commit_order, test_commit_height(commit_hash) AS recorded
+FROM dolt_log('main') ORDER BY commit_order, message;
+ message | commit_order | recorded 
+---------+--------------+----------
+ one     |            1 |        1
+ side 1  |            2 |        2
+ two     |            2 |        2
+ side 2  |            3 |        3
+ merged  |            4 |        4
+(5 rows)
+
+SELECT test_commit_height(dolt_hashof('main')) =
+	   test_commit_height(dolt_hashof('side')) + 1 AS merge_above_higher_parent;
+ merge_above_higher_parent 
+---------------------------
+ t
+(1 row)
+
+-- the walk takes a recorded height at its word: one commit read
+SELECT * FROM test_history_height(dolt_hashof('main'));
+ height | reads 
+--------+-------
+      4 |     1
+(1 row)
+
+-- commits that record no height, as made before heights were: each one's
+-- found from its parents', each commit read once (the 50 and the one
+-- beneath them, which records its own)
+SELECT test_commit_chain(dolt_hashof('main'), 50) AS old_head \gset
+SELECT test_commit_height(:'old_head') AS recorded_on_old;
+ recorded_on_old 
+-----------------
+                
+(1 row)
+
+SELECT height = test_commit_height(dolt_hashof('main')) + 50 AS found_from_history,
+	   reads
+FROM test_history_height(:'old_head');
+ found_from_history | reads 
+--------------------+-------
+ t                  |    51
+(1 row)
+
+-- a commit made on such history records the height found: the walk beneath
+-- it isn't made again
+SELECT dolt_reset('--hard', :'old_head') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+INSERT INTO ch.t VALUES (4, 'on old');
+SELECT length(dolt_commit('-Am', 'on old')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT test_commit_height(dolt_hashof('main')) =
+	   test_commit_height(dolt_hashof('main~51')) + 51 AS recorded_on_new;
+ recorded_on_new 
+-----------------
+ t
+(1 row)
+
+SELECT * FROM test_history_height(dolt_hashof('main'));
+ height | reads 
+--------+-------
+     55 |     1
+(1 row)
+
+-- dolt_serve_since reads the new commits and the frontier, not the
+-- history beneath them: 200 commits, then what's new since the last but
+-- one (main, read to resolve main~1, and main~1)
+DO $$
+BEGIN
+	FOR i IN 1..200 LOOP
+		PERFORM dolt_commit('--allow-empty', '-m', 'empty ' || i);
+	END LOOP;
+END
+$$;
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT count(*) > 0 AS sent
+FROM dolt_serve_since(ARRAY[pg_temp.h('main')], ARRAY[pg_temp.h('main~1')]);
+ sent 
+------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted('commits_read') AS commits_read;
+ commits_read 
+--------------
+            3
+(1 row)
+
+-- and beneath history that records no heights, it reads that history, each
+-- commit once for its height: the known commit and the 50 beneath it, and
+-- the one beneath those, which records its own (52); and the wanted and
+-- known commits read for the walk, and the wanted to make the known (3)
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT count(*) AS sent
+FROM dolt_serve_since(ARRAY[decode(:'old_head', 'hex')],
+					  ARRAY[decode(test_commit_chain(:'old_head', 1), 'hex')]);
+ sent 
+------
+    0
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted('commits_read') AS commits_read;
+ commits_read 
+--------------
+           55
+(1 row)
+
+\c postgres
+DROP DATABASE regress_commit_heights;

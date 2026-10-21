@@ -156,14 +156,24 @@ first_common(const ProllyHash *b, HTAB *ofa, ProllyCommitLookup lookup,
 /*
  * A commit's height, the most commits on a path from it to a root of its
  * history (a root's is 1), as Dolt keeps one in each commit: heights,
- * keyed by id, holds those known.  Found depth first, each commit once,
- * without recursion.
+ * keyed by id, holds those known.  Found depth first, without recursion,
+ * each commit read once: a commit's frame stays on the stack, under its
+ * parents', until theirs are found, and each frame records the one that
+ * pushed it, whose height it raises as its own is found.
  */
 typedef struct Height
 {
 	ProllyHash	id;				/* (the key) */
-	int64		height;			/* 0: being found */
+	int64		height;
 } Height;
+
+typedef struct HeightFrame
+{
+	ProllyHash	id;
+	int			pusher;			/* the frame that pushed it; -1: none */
+	bool		read;			/* looked up, its parents pushed */
+	int64		height;			/* the most found so far */
+} HeightFrame;
 
 HTAB *
 prolly_history_heights(void)
@@ -181,68 +191,80 @@ int64
 prolly_history_height(const ProllyHash *id, HTAB *heights,
 					  ProllyCommitLookup lookup, void *lookup_arg)
 {
-	ProllyHash	key;
-	ProllyHash *stack;
+	HeightFrame *stack;
 	int			depth = 0;
 	int			cap = 64;
+	int64		result = 0;
 	Height	   *h;
-	bool		known;
 
-	key = prolly_hash_key(id);
-	h = hash_search(heights, &key, HASH_FIND, NULL);
-	if (h != NULL && h->height > 0)
-		return h->height;
-	stack = palloc_array(ProllyHash, cap);
-	stack[depth++] = key;
+	stack = palloc_array(HeightFrame, cap);
+	stack[depth++] = (HeightFrame) {prolly_hash_key(id), -1, false, 1};
 	while (depth > 0)
 	{
-		ProllyHash	top = stack[depth - 1];
-		ProllyCommitInfo info;
-		int64		height = 1;
-		bool		ready = true;
+		int			top = depth - 1;
+		bool		known = false;
 
 		CHECK_FOR_INTERRUPTS();
-		h = hash_search(heights, &top, HASH_ENTER, &known);
-		if (known && h->height > 0)
+		if (!stack[top].read)
 		{
-			depth--;
-			continue;
-		}
-		h->height = 0;
-		if (lookup(&top, &info, lookup_arg))
-		{
-			for (int i = 0; i < info.nparents; i++)
-			{
-				ProllyHash	pk;
-				Height	   *ph;
+			ProllyCommitInfo info;
 
-				pk = prolly_hash_key(&info.parents[i]);
-				ph = hash_search(heights, &pk, HASH_FIND, NULL);
-				if (ph != NULL && ph->height > 0)
-					height = Max(height, ph->height + 1);
-				else
+			stack[top].read = true;
+			h = hash_search(heights, &stack[top].id, HASH_FIND, NULL);
+			if (h != NULL)
+			{
+				stack[top].height = h->height;
+				known = true;
+			}
+			else if (!lookup(&stack[top].id, &info, lookup_arg))
+			{
+				/* (one not found is taken for a root) */
+			}
+			else if (info.has_height && info.height > 0)
+				stack[top].height = info.height;
+			else
+			{
+				for (int i = 0; i < info.nparents; i++)
 				{
+					ProllyHash	pk = prolly_hash_key(&info.parents[i]);
+					Height	   *ph = hash_search(heights, &pk, HASH_FIND, NULL);
+
+					if (ph != NULL)
+					{
+						stack[top].height = Max(stack[top].height, ph->height + 1);
+						continue;
+					}
 					/* (a parent not found yet: found first) */
 					if (depth == cap)
 					{
 						cap *= 2;
-						stack = repalloc_array(stack, ProllyHash, cap);
+						stack = repalloc_array(stack, HeightFrame, cap);
 					}
-					stack[depth++] = pk;
-					ready = false;
+					stack[depth++] = (HeightFrame) {pk, top, false, 1};
 				}
+				if (depth - 1 != top)
+					continue;
 			}
 		}
-		if (ready)
+
+		/* Found: each of its parents' has raised it, as it was found. */
+		if (!known)
 		{
-			h = hash_search(heights, &top, HASH_FIND, NULL);
-			h->height = height;
-			depth--;
+			h = hash_search(heights, &stack[top].id, HASH_ENTER, NULL);
+			h->height = stack[top].height;
 		}
+		if (stack[top].pusher >= 0)
+		{
+			HeightFrame *pusher = &stack[stack[top].pusher];
+
+			pusher->height = Max(pusher->height, stack[top].height + 1);
+		}
+		else
+			result = stack[top].height;
+		depth--;
 	}
 	pfree(stack);
-	h = hash_search(heights, &key, HASH_FIND, NULL);
-	return h->height;
+	return result;
 }
 
 /*

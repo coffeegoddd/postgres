@@ -106,6 +106,7 @@ tests += {
       'clone_whole',
       'transfer_spill',
       'remote_serve',
+      'commit_heights',
       'dependencies',
       'dependency_moves',
       'canonical_escapes',
