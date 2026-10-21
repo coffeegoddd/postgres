@@ -86,6 +86,8 @@ SELECT * FROM dolt_at('HEAD', NULL::dh.rk);
 -- columns narrowed (a shorter varchar; a domain whose check an old value
 -- fails): an old value the column couldn't hold now shows as null, with a
 -- warning, as one that doesn't convert does (#590); one that fits, kept
+-- (1.25, which the ALTER rounded to 1.3 as stored, is a change, though
+-- both show 1.3)
 CREATE DOMAIN dh.tinyint AS smallint CHECK (VALUE BETWEEN -128 AND 127);
 CREATE TABLE dh.nt (pk int PRIMARY KEY, a varchar(20), b int, c int, d numeric(6,2));
 INSERT INTO dh.nt VALUES (1, '123456789012345', 70000, 420, 1234.5), (2, 'short', 7, 7, 1.25);
@@ -105,6 +107,28 @@ ORDER BY c.commit_order DESC, (row).pk;
 -- the same values, written now, fail
 INSERT INTO dh.nt VALUES (3, '123456789012345');
 INSERT INTO dh.nt VALUES (3, NULL, NULL, 420);
+-- a change between two old values that both don't fit now (both null, or
+-- rounded alike) is still a change: compared as stored, shown fitted; a
+-- row that didn't change isn't, though it doesn't fit either (pk 2)
+CREATE DOMAIN dh.pos AS int CHECK (VALUE > 0);
+CREATE TABLE dh.nf (pk int PRIMARY KEY, v varchar(20), p int, d numeric(6,2));
+CREATE TABLE dh.nfk (v varchar(20));
+INSERT INTO dh.nf VALUES (1, 'abcdefghijklmno', -1, 1.25),
+	(2, 'unchanged and long', -5, 2.25);
+INSERT INTO dh.nfk VALUES ('abcdefghijklmno');
+SELECT length(dolt_commit('-Am', 'nf')::text) AS committed;
+UPDATE dh.nf SET v = 'zyxwvutsrqponml', p = -2, d = 1.26 WHERE pk = 1;
+UPDATE dh.nfk SET v = 'zyxwvutsrqponml';
+SELECT length(dolt_commit('-am', 'nf changed')::text) AS committed;
+UPDATE dh.nf SET v = 'x', p = 1, d = 1;
+UPDATE dh.nfk SET v = 'x';
+ALTER TABLE dh.nf ALTER COLUMN v TYPE varchar(10);
+ALTER TABLE dh.nf ALTER COLUMN p TYPE dh.pos;
+ALTER TABLE dh.nf ALTER COLUMN d TYPE numeric(4,1);
+ALTER TABLE dh.nfk ALTER COLUMN v TYPE varchar(10);
+SELECT length(dolt_commit('-am', 'nf narrowed')::text) AS committed;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD~1', NULL::dh.nf);
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD~1', NULL::dh.nfk);
 
 -- a primary key dropped, then made on another column: each version read
 -- as the table is keyed now, so its rows diff (where Dolt warns and shows

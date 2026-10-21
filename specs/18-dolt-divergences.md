@@ -475,9 +475,14 @@ OF` are built in D18's shapes.
   shows as stored), since no key shows null; and a merge's conflicts
   are listed without them too, so what's listed is what resolving
   writes (resolving refuses a value the column can't hold, as an INSERT
-  does). Rows are compared as the table is defined now, so a row whose
-  only change is to such a value (a column dropped, its old values not
-  converting to the type it was added back as) isn't modified.
+  does). The fitting is only what's shown: rows are compared as the
+  cast reads them (a lossy cast between types stored alike keeps the
+  stored value), so a row changed between two old values that both
+  fail to fit (both shown null, or rounded alike) is modified, as in
+  Dolt, and one an ALTER rounded is too. Rows are compared as the table
+  is defined now, so a row whose only change is to a value the cast
+  itself fails on (a column dropped, its old values not converting to
+  the type it was added back as) isn't modified.
 - **Why:** a diff reads each version as the table is defined now,
   through its casts (D20); what didn't convert has no value left to
   compare.

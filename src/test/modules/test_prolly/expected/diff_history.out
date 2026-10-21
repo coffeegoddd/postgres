@@ -223,6 +223,8 @@ DETAIL:  A key value of the version's doesn't convert to the new type.
 -- columns narrowed (a shorter varchar; a domain whose check an old value
 -- fails): an old value the column couldn't hold now shows as null, with a
 -- warning, as one that doesn't convert does (#590); one that fits, kept
+-- (1.25, which the ALTER rounded to 1.3 as stored, is a change, though
+-- both show 1.3)
 CREATE DOMAIN dh.tinyint AS smallint CHECK (VALUE BETWEEN -128 AND 127);
 CREATE TABLE dh.nt (pk int PRIMARY KEY, a varchar(20), b int, c int, d numeric(6,2));
 INSERT INTO dh.nt VALUES (1, '123456789012345', 70000, 420, 1234.5), (2, 'short', 7, 7, 1.25);
@@ -249,10 +251,11 @@ WARNING:  1 value of column "a" of table "nt" doesn't convert from character var
 WARNING:  1 value of column "b" of table "nt" doesn't convert from integer to smallint: shown as null
 WARNING:  1 value of column "c" of table "nt" doesn't convert from integer to dh.tinyint: shown as null
 WARNING:  1 value of column "d" of table "nt" doesn't convert from numeric(6,2) to numeric(4,1): shown as null
- diff_type | from_row |          to_row           
------------+----------+---------------------------
- modified  | (1,,,,)  | (1,1234567890,13,13,12.5)
-(1 row)
+ diff_type |     from_row      |          to_row           
+-----------+-------------------+---------------------------
+ modified  | (1,,,,)           | (1,1234567890,13,13,12.5)
+ modified  | (2,short,7,7,1.3) | (2,short,7,7,1.3)
+(2 rows)
 
 SELECT pk, a, length(a), b, c, d FROM dolt_at('HEAD~1', NULL::dh.nt) ORDER BY pk;
 WARNING:  1 value of column "a" of table "nt" doesn't convert from character varying(20) to character varying(10): shown as null
@@ -285,6 +288,60 @@ INSERT INTO dh.nt VALUES (3, '123456789012345');
 ERROR:  value too long for type character varying(10)
 INSERT INTO dh.nt VALUES (3, NULL, NULL, 420);
 ERROR:  value for domain dh.tinyint violates check constraint "tinyint_check"
+-- a change between two old values that both don't fit now (both null, or
+-- rounded alike) is still a change: compared as stored, shown fitted; a
+-- row that didn't change isn't, though it doesn't fit either (pk 2)
+CREATE DOMAIN dh.pos AS int CHECK (VALUE > 0);
+CREATE TABLE dh.nf (pk int PRIMARY KEY, v varchar(20), p int, d numeric(6,2));
+CREATE TABLE dh.nfk (v varchar(20));
+INSERT INTO dh.nf VALUES (1, 'abcdefghijklmno', -1, 1.25),
+	(2, 'unchanged and long', -5, 2.25);
+INSERT INTO dh.nfk VALUES ('abcdefghijklmno');
+SELECT length(dolt_commit('-Am', 'nf')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE dh.nf SET v = 'zyxwvutsrqponml', p = -2, d = 1.26 WHERE pk = 1;
+UPDATE dh.nfk SET v = 'zyxwvutsrqponml';
+SELECT length(dolt_commit('-am', 'nf changed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE dh.nf SET v = 'x', p = 1, d = 1;
+UPDATE dh.nfk SET v = 'x';
+ALTER TABLE dh.nf ALTER COLUMN v TYPE varchar(10);
+ALTER TABLE dh.nf ALTER COLUMN p TYPE dh.pos;
+ALTER TABLE dh.nf ALTER COLUMN d TYPE numeric(4,1);
+ALTER TABLE dh.nfk ALTER COLUMN v TYPE varchar(10);
+SELECT length(dolt_commit('-am', 'nf narrowed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD~1', NULL::dh.nf);
+WARNING:  2 values of column "v" of table "nf" don't convert from character varying(20) to character varying(10): shown as null
+WARNING:  2 values of column "p" of table "nf" don't convert from integer to dh.pos: shown as null
+WARNING:  2 values of column "v" of table "nf" don't convert from character varying(20) to character varying(10): shown as null
+WARNING:  2 values of column "p" of table "nf" don't convert from integer to dh.pos: shown as null
+ diff_type | from_row  |  to_row   
+-----------+-----------+-----------
+ modified  | (1,,,1.3) | (1,,,1.3)
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD~1', NULL::dh.nfk);
+WARNING:  1 value of column "v" of table "nfk" doesn't convert from character varying(20) to character varying(10): shown as null
+WARNING:  1 value of column "v" of table "nfk" doesn't convert from character varying(20) to character varying(10): shown as null
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ removed   | ()       | 
+ added     |          | ()
+(2 rows)
+
 -- a primary key dropped, then made on another column: each version read
 -- as the table is keyed now, so its rows diff (where Dolt warns and shows
 -- what it can)
