@@ -25,7 +25,9 @@
  * rows at once (heap_multi_insert()), then each row's index entries.  A
  * table filled from nothing that is new in the transaction gets no index
  * entries as its rows are written: its indexes are built over them once
- * they are in, as CREATE INDEX builds them (#490).
+ * they are in, as CREATE INDEX builds them (#490).  Every row removed at
+ * once is removed as TRUNCATE removes them, the table given new storage
+ * (#492).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/applier_replication.c
@@ -39,6 +41,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_config.h"
 #include "access/prolly_keying.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -56,6 +59,7 @@
 #include "parser/parse_relation.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
+#include "storage/predicate.h"
 #include "utils/acl.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -858,6 +862,55 @@ replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
 }
 
 /*
+ * Every row removed at once, as TRUNCATE removes them (#492): the table,
+ * its TOAST table and its indexes given new storage, the old dropped as
+ * the transaction commits, and the change log told every row may have
+ * changed.  No other transaction reads or writes the table meanwhile: it
+ * is locked ACCESS EXCLUSIVE.  Not a table the session reads otherwise (an
+ * open cursor's scan reads its storage) or has trigger events pending
+ * for, which TRUNCATE refuses; nor a materialized view (REFRESH writes
+ * its rows).
+ */
+static bool
+replication_remove_all(ProllyApplier *a)
+{
+	Relation	rel = a->rel;
+	Oid			relid = RelationGetRelid(rel);
+	Oid			toastid = rel->rd_rel->reltoastrelid;
+	ReindexParams params = {0};
+
+	load_end(a);
+	if (a->matview)
+		return false;
+	LockRelationOid(relid, AccessExclusiveLock);
+	if (rel->rd_refcnt != 1 || AfterTriggerPendingOnRel(relid))
+		return false;
+	CheckTableForSerializableConflictIn(rel);
+	ExecCloseIndices(a->rri);
+	a->rri->ri_NumIndices = 0;
+	a->rri->ri_IndexRelationDescs = NULL;
+	a->rri->ri_IndexRelationInfo = NULL;
+	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+	if (OidIsValid(toastid))
+	{
+		Relation	toast = relation_open(toastid, AccessExclusiveLock);
+
+		RelationSetNewRelfilenumber(toast, toast->rd_rel->relpersistence);
+		table_close(toast, NoLock);
+	}
+	(void) reindex_relation(NULL, relid, REINDEX_REL_PROCESS_TOAST, &params);
+	ExecOpenIndices(a->rri, false);
+	/* (its change log told it was emptied, as TRUNCATE tells it) */
+	prolly_note_emptied(rel);
+	pgstat_count_truncate(rel);
+	/* (the rows by their hashes are gone with them) */
+	a->rows = NULL;
+	a->lookups = 0;
+	advance(a);
+	return true;
+}
+
+/*
  * Whether the row found is as the fold before the change read it: not
  * written since by a transaction the active snapshot doesn't see.  (The
  * row found by its key is its newest version.)
@@ -1034,4 +1087,5 @@ const ProllyApplierRoutine prolly_applier_replication = {
 	.immediate = replication_immediate,
 	.end = replication_end,
 	.insert_many = replication_insert_many,
+	.remove_all = replication_remove_all,
 };

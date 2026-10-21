@@ -161,6 +161,7 @@ tests += {
       'diff_memory',
       'reflog',
       'bulk_moves',
+      'retype_moves',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],

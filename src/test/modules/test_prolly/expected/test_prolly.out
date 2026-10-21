@@ -203,7 +203,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  row_applier   | replication    | identity                       | pass
  row_applier   | replication    | complete                       | pass
  row_applier   | stub           | identity                       | pass
- row_applier   | stub           | complete                       | not implemented (7 of 7 callbacks missing)
+ row_applier   | stub           | complete                       | not implemented (8 of 8 callbacks missing)
  table_file    | basic          | identity                       | pass
  table_file    | basic          | round_trip                     | pass
  table_file    | basic          | rejects_other_bytes            | pass

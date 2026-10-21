@@ -1020,6 +1020,36 @@ fails without its fix), and Postgres's suites keep passing after each one.
       index upkeep on a live table (not deferred, above), decoding, and
       the change log; a load's extra WAL over COPY-then-index is its
       change log entries.
+  - **Moves across a column's change of type (#492, built 2026-10-20).**
+    Such a table's rows all go before the column converts (they may not
+    cast, or cast to values its keys or NOT NULLs refuse), and all of the
+    commit's are written. They went one `remove()` at a time; the
+    applier gained an optional `remove_all(a)` (NULL: `remove()` each),
+    which removes them as TRUNCATE does: the table, its TOAST table and
+    its indexes given new storage under ACCESS EXCLUSIVE (which the
+    `ALTER COLUMN ... TYPE` right after takes anyway), the change log
+    told every row may have changed, no trigger fired (ON TRUNCATE ones
+    neither), no foreign key checked (those into the table are dropped
+    first and validated after). It refuses, removing nothing, a table the
+    session reads otherwise or has trigger events pending for, as
+    TRUNCATE does; the `ALTER` after would refuse it too. The table, new
+    storage in the transaction, is then loaded (#490): rows many at once,
+    indexes built after.
+    - Not as the issue proposed (convert with `ALTER ... USING`, fold the
+      converted table in full, diff against the commit, apply the
+      difference): the conversion rewrites every row and rebuilds every
+      index already, and the full fold reads them all again, so it costs
+      more than writing the commit's rows into empty storage once, and
+      needs constraints deferred and a fallback when a cast fails. The
+      next commit folds the table in full either way (new storage).
+    - A change of primary key needed nothing: the table isn't emptied,
+      the new key's index is built, and the rows are folded under it, so
+      only the rows that differ are written (tested: none rewritten).
+    - Measured (1M rows, a column `int` to `bigint` and 1% of rows
+      otherwise changed, `wal_level = replica`; times on a loaded
+      machine): 878 MB of WAL / 12.7 s before #490, 666 MB / 10.1 s with
+      the bulk path alone, 254 MB / 3.0 s with `remove_all()`: no row
+      deleted, and the rows written once, indexes built after.
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
 built (#171, #172, #174, #175; 7.11); network remotes, batching, the

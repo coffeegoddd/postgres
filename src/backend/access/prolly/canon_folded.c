@@ -7785,8 +7785,9 @@ restore_index_places(List *places)
  * the applier the move writes rows with: no trigger fires (one enabled
  * ALWAYS neither), no rule applies and no foreign key is checked, and a
  * table row-level security applies to is refused, as its rows written
- * would be.  A row read is removed as it is: the scan's snapshot keeps
- * seeing those removed.
+ * would be.  Every row at once if the applier can (#492): the table given
+ * new storage, as TRUNCATE gives it.  Else a row read is removed as it is:
+ * the scan's snapshot keeps seeing those removed.
  */
 static void
 empty_table(const char *name)
@@ -7822,6 +7823,12 @@ empty_table(const char *name)
 			continue;
 		}
 		a = PROLLY_CALL(ar, begin, rel);
+		if (PROLLY_HAS(ar, remove_all) && PROLLY_CALL(ar, remove_all, a))
+		{
+			PROLLY_CALL(ar, end, a);
+			table_close(rel, NoLock);
+			continue;
+		}
 		slot = table_slot_create(rel, NULL);
 		snap = RegisterSnapshot(GetLatestSnapshot());
 		scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);

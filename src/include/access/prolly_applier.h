@@ -47,6 +47,11 @@
  *   subtransaction begun since the rows were written (rolled back, it
  *   would leave them unindexed).  A load's failure ends the applier, even
  *   if the caller catches it: every later write but end() raises an error.
+ * - remove_all() (optional; NULL: remove() each row) removes every row at
+ *   once, as TRUNCATE does: the table given new, empty storage, under the
+ *   ACCESS EXCLUSIVE lock that takes, firing no trigger and checking no
+ *   foreign key.  It returns false, having removed nothing, if it can't:
+ *   the session uses the table otherwise (rel is to be open once).
  *
  * Provisional (v0).
  *
@@ -75,12 +80,14 @@ typedef struct ProllyApplierRoutine
 	void		(*immediate) (ProllyApplier *a);
 	void		(*end) (ProllyApplier *a);
 	void		(*insert_many) (ProllyApplier *a, TupleTableSlot **rows, int n);
+	bool		(*remove_all) (ProllyApplier *a);
 } ProllyApplierRoutine;
 
 #define PROLLY_APPLIER_CALLBACK_NAMES \
-	"begin", "insert", "update", "remove", "immediate", "end", "insert_many"
+	"begin", "insert", "update", "remove", "immediate", "end", "insert_many", \
+	"remove_all"
 #define PROLLY_APPLIER_FIRST_CALLBACK begin
-#define PROLLY_APPLIER_LAST_CALLBACK insert_many
+#define PROLLY_APPLIER_LAST_CALLBACK remove_all
 
 static inline const ProllyApplierRoutine *
 prolly_applier_lookup(const char *name)

@@ -1,12 +1,12 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # A move's rows inserted many at once, and a table it fills from nothing
-# with its indexes built after the rows (#490), across a crash: one cut
-# off in the middle leaves the branch as it was, and one committed keeps
-# every row and a valid index of each (a table TRUNCATE emptied in the
-# move's transaction too), whether the rows' WAL was written
-# (wal_level replica) or skipped and the new storage synced or logged at
-# commit (minimal).
+# with its indexes built after the rows (#490), or empties at once as it
+# changes a column's type (#492), across a crash: one cut off in the
+# middle leaves the branch as it was, and one committed keeps every row
+# and a valid index of each (a table TRUNCATE emptied in the move's
+# transaction too), whether the rows' WAL was written (wal_level replica)
+# or skipped and the new storage synced or logged at commit (minimal).
 
 use strict;
 use warnings FATAL => 'all';
@@ -114,6 +114,32 @@ checkpoint_timeout = '1h'
 		"$wal_level: a load cut off by a crash leaves no table");
 	is($sql->('SELECT count(*) FROM dolt_status'), '0',
 		"$wal_level: and the branch as it was");
+
+	# Across a column's change of type: the table emptied at once, given
+	# new storage (#492), then loaded.  Cut off, it keeps its rows.
+	$sql->("SELECT dolt_reset('--hard', '$c1')");
+	$sql->(q{
+		ALTER TABLE bk.t ALTER COLUMN u TYPE bigint;
+		SELECT dolt_commit('-am', 'retyped');
+	});
+	my $c3 = $sql->(q{SELECT dolt_hashof('HEAD')});
+	$sql->("SELECT dolt_reset('--hard', '$c1')");
+	$sql->('CHECKPOINT');
+	$cut_off->($c3);
+	is($rows->('bk.t', 'id'), '20000:200010000',
+		"$wal_level: a retyping move cut off by a crash leaves the rows");
+	is($sql->(q{SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+		WHERE attrelid = 'bk.t'::regclass AND attname = 'u'}), 'integer',
+		"$wal_level: and the column's type");
+	is($valid->(), 't', "$wal_level: and valid indexes");
+	$sql->("SELECT dolt_reset('--hard', '$c3')");
+	$crash->();
+	is($rows->('bk.t', 'id') . ',' . $rows->('bk.t', 'u'),
+		'20000:200010000,20000:200010000',
+		"$wal_level: a committed retyping move keeps every row");
+	is($valid->(), 't', "$wal_level: and valid indexes");
+	is($sql->('SELECT count(*) FROM dolt_status'), '0',
+		"$wal_level: the branch at the commit");
 
 	# Committed, then a crash before any checkpoint: with minimal WAL, the
 	# new storage synced at commit (a threshold of 0), or logged whole.
