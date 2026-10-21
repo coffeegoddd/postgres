@@ -461,11 +461,21 @@ OF` are built in D18's shapes.
 ## D21. A value that doesn't convert is shown null, and compared so
 
 - **Dolt:** an old value that doesn't convert to its column's type now
-  is shown null with a warning per value; a row whose stored value
-  changed is modified even where both sides show null.
+  (or doesn't fit it: "Truncated varchar(10) value") is shown null with
+  a warning per value; a row whose stored value changed is modified
+  even where both sides show null.
 - **Prolly:** the value is shown null too, with one warning per column
   and version counting them (a key column's refuses the read, naming
-  it). Rows are compared as the table is defined now, so a row whose
+  it). An old value is made the column's as an assignment would make
+  it: the cast to the base type, then the typmod (a length coercion
+  that fails rather than cuts, as an INSERT's does; a numeric rounds,
+  as it does) and the domain's constraints. A value that fails any of
+  them is one that doesn't convert (#590). A key column's value meets
+  only the cast, not the typmod or domain (a narrowed varchar's key
+  shows as stored), since no key shows null; and a merge's conflicts
+  are listed without them too, so what's listed is what resolving
+  writes (resolving refuses a value the column can't hold, as an INSERT
+  does). Rows are compared as the table is defined now, so a row whose
   only change is to such a value (a column dropped, its old values not
   converting to the type it was added back as) isn't modified.
 - **Why:** a diff reads each version as the table is defined now,

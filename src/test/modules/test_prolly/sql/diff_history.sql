@@ -83,6 +83,28 @@ INSERT INTO dh.rk VALUES ('1'), ('one');
 SELECT length(dolt_commit('-Am', 'rk')::text) AS committed;
 ALTER TABLE dh.rk ALTER COLUMN k TYPE int USING length(k);
 SELECT * FROM dolt_at('HEAD', NULL::dh.rk);
+-- columns narrowed (a shorter varchar; a domain whose check an old value
+-- fails): an old value the column couldn't hold now shows as null, with a
+-- warning, as one that doesn't convert does (#590); one that fits, kept
+CREATE DOMAIN dh.tinyint AS smallint CHECK (VALUE BETWEEN -128 AND 127);
+CREATE TABLE dh.nt (pk int PRIMARY KEY, a varchar(20), b int, c int, d numeric(6,2));
+INSERT INTO dh.nt VALUES (1, '123456789012345', 70000, 420, 1234.5), (2, 'short', 7, 7, 1.25);
+SELECT length(dolt_commit('-Am', 'nt')::text) AS committed;
+UPDATE dh.nt SET a = '1234567890', b = 13, c = 13, d = 12.5 WHERE pk = 1;
+ALTER TABLE dh.nt ALTER COLUMN a TYPE varchar(10);
+ALTER TABLE dh.nt ALTER COLUMN b TYPE smallint;
+ALTER TABLE dh.nt ALTER COLUMN c TYPE dh.tinyint;
+ALTER TABLE dh.nt ALTER COLUMN d TYPE numeric(4,1);
+SELECT length(dolt_commit('-am', 'nt narrowed')::text) AS committed;
+SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.nt, 'HEAD~1', 'HEAD')
+ORDER BY coalesce((to_row).pk, (from_row).pk);
+SELECT pk, a, length(a), b, c, d FROM dolt_at('HEAD~1', NULL::dh.nt) ORDER BY pk;
+SELECT (row).pk, (row).a, (row).c, c.message
+FROM dolt_history_table(NULL::dh.nt) h JOIN dolt_log c ON c.commit_hash = h.commit_hash
+ORDER BY c.commit_order DESC, (row).pk;
+-- the same values, written now, fail
+INSERT INTO dh.nt VALUES (3, '123456789012345');
+INSERT INTO dh.nt VALUES (3, NULL, NULL, 420);
 
 -- a primary key dropped, then made on another column: each version read
 -- as the table is keyed now, so its rows diff (where Dolt warns and shows

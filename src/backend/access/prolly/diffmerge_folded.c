@@ -4588,14 +4588,16 @@ dup_bytes(const char *data, int len)
  * (a merge's sides, whose rows become the table's), or compared only (a
  * merge's base: a side changed a row where its value isn't base's).
  *
- * Only a written value has to be one the column could hold now, and it's
+ * A written value has to be one the column could hold now, and it's
  * converted as ALTER TABLE ... TYPE without USING converted the side's
- * own rows.  Shown or compared values use domains' base types, with their
- * typmods: a historical value needn't meet a domain's constraints now.
- * A value shown or compared is made the column's only where
- * nothing is lost: it's cast, and the cast kept only if casting it back
- * gives the value again.  A lossy cast (rounding, cutting to fit) could
- * make two of base's keys one, or make a side's change look like none
+ * own rows.  A diff's shown one is too, or shown null where it can't
+ * be, as a row of the table as defined now (#590).  Other shown values
+ * (a merge's conflicts) and compared ones use domains' base types, with
+ * their typmods: a historical value needn't meet a domain's constraints
+ * now.  Such a value is made the column's only where nothing is lost:
+ * it's cast, and the cast kept only if casting it back gives the value
+ * again.  A lossy cast (rounding, cutting to fit) could make two of
+ * base's keys one, or make a side's change look like none
  * (cut to 'abc', base's 'abcdefghij' would equal a side's 'abc'); and a
  * column both sides retyped alike may have been converted with a USING
  * other than the cast ((n * 100)::int), which the cast only matches
@@ -4744,13 +4746,20 @@ is_bit_type(Oid type)
  * checked by casting it back unless the cast is a widening, or a relabel
  * of a type stored alike, which loses nothing.  For these reads, strip
  * domains from both ends of the cast (including the cast back): their
- * constraints don't apply to values only shown or compared.
+ * constraints don't apply to values only compared or listed.
+ *
+ * Where fit (shown by a diff, not of the key), the value is made one
+ * the column could hold now, as an assignment would make it (#590): the
+ * explicit cast to its base type, then its typmod, failing rather than
+ * cutting to fit, and its domain's constraints.  One that fails any of
+ * them shows null, as one the cast fails on does.
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
-			ReadFor read, bool key, bool keyless, bool both, EState *estate,
-			ColumnRead *cr)
+			ReadFor read, bool fit, bool key, bool keyless, bool both,
+			EState *estate, ColumnRead *cr)
 {
+	Form_pg_attribute now_att = att;
 	FormData_pg_attribute source = *TupleDescAttr(xd, j);
 	FormData_pg_attribute target = *att;
 	Form_pg_attribute xa = &source;
@@ -4782,6 +4791,46 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 
 	memset(cr, 0, sizeof(ColumnRead));
 	cr->in_typmod = att->atttypmod;
+	if (fit)
+	{
+		Oid			from_type = xa->atttypid;
+		Oid			to_type = att->atttypid;
+
+		if (can_coerce_type(1, &from_type, &to_type, COERCION_EXPLICIT))
+		{
+			e = coerce_type(NULL, var, xa->atttypid, att->atttypid,
+							att->atttypmod, COERCION_EXPLICIT,
+							COERCE_EXPLICIT_CAST, -1);
+			e = coerce_to_target_type(NULL, e, att->atttypid,
+									  now_att->atttypid, now_att->atttypmod,
+									  COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST,
+									  -1);
+		}
+		if (e == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("rows of table \"%s\" can't be read across column \"%s\" changing type from %s to %s",
+							RelationGetRelationName(rel), NameStr(att->attname),
+							format_type_with_typemod(xa->atttypid, xa->atttypmod),
+							format_type_with_typemod(now_att->atttypid, now_att->atttypmod))));
+		assign_expr_collations(NULL, e);
+		cr->conv = ExecPrepareExpr((Expr *) e, estate);
+
+		/*
+		 * (none can fail: no domain, a typmod as wide or none, and a cast
+		 * that only relabels, or cuts, pads or trims strings or bit strings
+		 * to no typmod)
+		 */
+		cr->guarded =
+			get_typtype(now_att->atttypid) == TYPTYPE_DOMAIN ||
+			!(att->atttypmod < 0 ||
+			  (same && typmod_widens(att->atttypid, xa->atttypmod,
+									 att->atttypmod))) ||
+			!(alike ||
+			  (is_string_type(xa->atttypid) && is_string_type(att->atttypid)) ||
+			  (is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
+		return;
+	}
 	if (read == READ_WRITTEN)
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
@@ -5135,6 +5184,12 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
  * second reading for ambiguous keys or keyless rows.  READ_ALTERNATIVE
  * uses that cast reading, leaving non-key columns' uncertainty unchanged.
  *
+ * Where fit (a diff's read), a value not of the key is made one its
+ * column could hold now, or shown null (column_read()).  A merge's
+ * conflicts aren't fitted: listed as they were, so what resolving them
+ * would write is what's shown, and resolving refuses a value the column
+ * can't hold, as an INSERT does.
+ *
  * Where refuse (a merge), refused where rel's rows can't faithfully come
  * from x's: when x lacks a column whose values each row was given as it
  * was added (an identity, a default such as a serial's).  Otherwise
@@ -5145,8 +5200,8 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
  */
 static Table *
 as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
-			   List *retyped, List *both_retyped, bool refuse, Table *out,
-			   UnsureRows *unsure)
+			   bool fit, List *retyped, List *both_retyped, bool refuse,
+			   Table *out, UnsureRows *unsure)
 {
 	RowDiff		rd;
 	VersionReader vr;
@@ -5286,14 +5341,17 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			(TupleDescAttr(xd, from[a])->atttypid != att->atttypid ||
 			 TupleDescAttr(xd, from[a])->atttypmod != att->atttypmod))
 		{
+			bool		key = bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk);
+
 			if (estate == NULL)
 				estate = CreateExecutorState();
+			/* (a key's value can't show as null: it's read as before) */
 			column_read(rel, xd, from[a], att,
 						(read == READ_COMPARED || read == READ_ALTERNATIVE) &&
 						!name_listed(retyped, NameStr(att->attname)) ?
-						READ_SHOWN : read,
-						bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk),
-						!vr.keyed, name_listed(both_retyped, NameStr(att->attname)),
+						READ_SHOWN : read, fit && read == READ_SHOWN && !key,
+						key, !vr.keyed,
+						name_listed(both_retyped, NameStr(att->attname)),
 						estate, &reads[a]);
 			converted[a] = true;
 		}
@@ -5774,8 +5832,10 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 		return;
 	}
 	rel = table_open(relid, AccessShareLock);
-	fp = as_defined_now(rel, from, now, READ_SHOWN, NIL, NIL, false, &f, NULL);
-	tp = as_defined_now(rel, to, now, READ_SHOWN, NIL, NIL, false, &t, NULL);
+	fp = as_defined_now(rel, from, now, READ_SHOWN, true, NIL, NIL, false, &f,
+						NULL);
+	tp = as_defined_now(rel, to, now, READ_SHOWN, true, NIL, NIL, false, &t,
+						NULL);
 	table_close(rel, AccessShareLock);
 	diff_rows(relid, fp, tp, sink);
 }
@@ -6171,10 +6231,12 @@ merge_rows(void *arg)
 			refuse_lost_changes(rel, b, o, w);
 			refuse_lost_changes(rel, b, t, w);
 			retyped_columns(b, o, t, &retyped, &both_retyped);
-			(void) as_defined_now(rel, b, w, READ_COMPARED, retyped, both_retyped,
+			(void) as_defined_now(rel, b, w, READ_COMPARED, false, retyped, both_retyped,
 								  true, &bn, &unsure);
-			(void) as_defined_now(rel, o, w, READ_WRITTEN, NIL, NIL, true, &on, NULL);
-			(void) as_defined_now(rel, t, w, READ_WRITTEN, NIL, NIL, true, &tn, NULL);
+			(void) as_defined_now(rel, o, w, READ_WRITTEN, false, NIL, NIL, true,
+								  &on, NULL);
+			(void) as_defined_now(rel, t, w, READ_WRITTEN, false, NIL, NIL, true,
+								  &tn, NULL);
 			if (unsure.alternative)
 			{
 				Table		alternative;
@@ -6185,7 +6247,7 @@ merge_rows(void *arg)
 				MemoryContext old = MemoryContextSwitchTo(check);
 
 				/* (all of it freed after: only an ERROR comes out of it) */
-				(void) as_defined_now(rel, b, w, READ_ALTERNATIVE, retyped, both_retyped,
+				(void) as_defined_now(rel, b, w, READ_ALTERNATIVE, false, retyped, both_retyped,
 									  true, &alternative, &alternative_unsure);
 				check_merge_readings(relid, &bn, &alternative, &on, &tn,
 									 &unsure, &alternative_unsure);
@@ -8468,10 +8530,13 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	}
 	rel = table_open(relid, AccessShareLock);
 	retyped_columns(bt, ot, tt, &retyped, &both_retyped);
-	bp = as_defined_now(rel, bt, now, READ_COMPARED, retyped, both_retyped,
+	bp = as_defined_now(rel, bt, now, READ_COMPARED, false, retyped,
+						both_retyped,
 						false, &b, &unsure);
-	op = as_defined_now(rel, ot, now, READ_SHOWN, NIL, NIL, false, &o, NULL);
-	tp = as_defined_now(rel, tt, now, READ_SHOWN, NIL, NIL, false, &t, NULL);
+	op = as_defined_now(rel, ot, now, READ_SHOWN, false, NIL, NIL, false, &o,
+						NULL);
+	tp = as_defined_now(rel, tt, now, READ_SHOWN, false, NIL, NIL, false, &t,
+						NULL);
 	table_close(rel, AccessShareLock);
 
 	/*

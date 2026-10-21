@@ -27666,6 +27666,95 @@
       ]
     },
     {
+      "id": "dolt-diff-table-column-narrowed",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 10,
+      "name": "columns modified to narrower types",
+      "source_sha256": "1bb32d4a4c04ade8186a0b6ef68ce1ee516437ee86c03d6539c8e4a320a3bdf4",
+      "scenario_sha256": "87f244ad4b25bb0a30cd3f502f167e0f3df97d033bfa1a4b063bf43c047de796",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-domain",
+            "setup-0"
+          ],
+          "note": "PostgreSQL DDL. MySQL's tinyint becomes a domain over smallint whose check holds it to tinyint's range, made first."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "MODIFY COLUMN becomes PostgreSQL's ALTER COLUMN ... TYPE."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "MODIFY COLUMN becomes PostgreSQL's ALTER COLUMN ... TYPE, tinyint the domain."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. doltCommit (any commit id) becomes to_commit IS NOT NULL and from_commit IS NOT NULL. An old value the column's narrower type can't hold now (too long for varchar(10), outside the domain's check) is null, with a warning, as Dolt's is."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "Left out: Dolt's warnings (1292, four of them); the scenarios don't read warnings. prolly warns once per column and version, with the count of values shown as null (diff_history checks it)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; the commit step captures the returned id. (D3, D7)",
+        "No staging area: -am/-Am add nothing. (D1)",
+        "MySQL's tinyint becomes a domain over smallint checked to its range; MODIFY COLUMN becomes ALTER COLUMN ... TYPE.",
+        "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)",
+        "A column's old value that its type now can't hold (its typmod, its domain's constraints) is shown as null with a WARNING, once per column and version read, counting them; Dolt warns once per value."
+      ]
+    },
+    {
       "id": "dolt-diff-table-column-drop-rename",
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
       "suite": "DiffSystemTableScriptTests",
@@ -39339,14 +39428,6 @@
       "name": "dolt_commit_ancestors table with commit_hash filter ignored for max1row optimization",
       "source_sha256": "446d4b7aadeffa62f5252d5cbdc8ef52b603fbd80503d7d18955e9217ce149ba",
       "reason": "dolt_commit_ancestors isn't built (#588): both assertions read a merge commit's parents from it."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
-      "suite": "DiffSystemTableScriptTests",
-      "index": 10,
-      "name": "columns modified to narrower types",
-      "source_sha256": "1bb32d4a4c04ade8186a0b6ef68ce1ee516437ee86c03d6539c8e4a320a3bdf4",
-      "reason": "A prolly behavior still to be fixed (#590): an old value read as the column is defined now isn't checked against the column's new typmod or domain, so varchar(20)'s '123456789012345' reads as a varchar(10) and int's 420 as a tinyint (ported as a domain over smallint), where Dolt's are null with warnings (D21 says a value that doesn't convert is null)."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",

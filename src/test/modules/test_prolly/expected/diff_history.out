@@ -220,6 +220,71 @@ ALTER TABLE dh.rk ALTER COLUMN k TYPE int USING length(k);
 SELECT * FROM dolt_at('HEAD', NULL::dh.rk);
 ERROR:  rows of table "rk" can't be read across key column "k" changing type from text to integer
 DETAIL:  A key value of the version's doesn't convert to the new type.
+-- columns narrowed (a shorter varchar; a domain whose check an old value
+-- fails): an old value the column couldn't hold now shows as null, with a
+-- warning, as one that doesn't convert does (#590); one that fits, kept
+CREATE DOMAIN dh.tinyint AS smallint CHECK (VALUE BETWEEN -128 AND 127);
+CREATE TABLE dh.nt (pk int PRIMARY KEY, a varchar(20), b int, c int, d numeric(6,2));
+INSERT INTO dh.nt VALUES (1, '123456789012345', 70000, 420, 1234.5), (2, 'short', 7, 7, 1.25);
+SELECT length(dolt_commit('-Am', 'nt')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE dh.nt SET a = '1234567890', b = 13, c = 13, d = 12.5 WHERE pk = 1;
+ALTER TABLE dh.nt ALTER COLUMN a TYPE varchar(10);
+ALTER TABLE dh.nt ALTER COLUMN b TYPE smallint;
+ALTER TABLE dh.nt ALTER COLUMN c TYPE dh.tinyint;
+ALTER TABLE dh.nt ALTER COLUMN d TYPE numeric(4,1);
+SELECT length(dolt_commit('-am', 'nt narrowed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.nt, 'HEAD~1', 'HEAD')
+ORDER BY coalesce((to_row).pk, (from_row).pk);
+WARNING:  1 value of column "a" of table "nt" doesn't convert from character varying(20) to character varying(10): shown as null
+WARNING:  1 value of column "b" of table "nt" doesn't convert from integer to smallint: shown as null
+WARNING:  1 value of column "c" of table "nt" doesn't convert from integer to dh.tinyint: shown as null
+WARNING:  1 value of column "d" of table "nt" doesn't convert from numeric(6,2) to numeric(4,1): shown as null
+ diff_type | from_row |          to_row           
+-----------+----------+---------------------------
+ modified  | (1,,,,)  | (1,1234567890,13,13,12.5)
+(1 row)
+
+SELECT pk, a, length(a), b, c, d FROM dolt_at('HEAD~1', NULL::dh.nt) ORDER BY pk;
+WARNING:  1 value of column "a" of table "nt" doesn't convert from character varying(20) to character varying(10): shown as null
+WARNING:  1 value of column "b" of table "nt" doesn't convert from integer to smallint: shown as null
+WARNING:  1 value of column "c" of table "nt" doesn't convert from integer to dh.tinyint: shown as null
+WARNING:  1 value of column "d" of table "nt" doesn't convert from numeric(6,2) to numeric(4,1): shown as null
+ pk |   a   | length | b | c |  d  
+----+-------+--------+---+---+-----
+  1 |       |        |   |   |    
+  2 | short |      5 | 7 | 7 | 1.3
+(2 rows)
+
+SELECT (row).pk, (row).a, (row).c, c.message
+FROM dolt_history_table(NULL::dh.nt) h JOIN dolt_log c ON c.commit_hash = h.commit_hash
+ORDER BY c.commit_order DESC, (row).pk;
+WARNING:  1 value of column "a" of table "nt" doesn't convert from character varying(20) to character varying(10): shown as null
+WARNING:  1 value of column "b" of table "nt" doesn't convert from integer to smallint: shown as null
+WARNING:  1 value of column "c" of table "nt" doesn't convert from integer to dh.tinyint: shown as null
+WARNING:  1 value of column "d" of table "nt" doesn't convert from numeric(6,2) to numeric(4,1): shown as null
+ pk |     a      | c  |   message   
+----+------------+----+-------------
+  1 | 1234567890 | 13 | nt narrowed
+  2 | short      |  7 | nt narrowed
+  1 |            |    | nt
+  2 | short      |  7 | nt
+(4 rows)
+
+-- the same values, written now, fail
+INSERT INTO dh.nt VALUES (3, '123456789012345');
+ERROR:  value too long for type character varying(10)
+INSERT INTO dh.nt VALUES (3, NULL, NULL, 420);
+ERROR:  value for domain dh.tinyint violates check constraint "tinyint_check"
 -- a primary key dropped, then made on another column: each version read
 -- as the table is keyed now, so its rows diff (where Dolt warns and shows
 -- what it can)
