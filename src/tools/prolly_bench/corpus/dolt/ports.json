@@ -34178,6 +34178,367 @@
         "No staging area: -Am/-am commit the whole working set. (D1)",
         "information_schema is the branch's; table_schema is the versioned schema, public, not the database's name. (D2, D11)"
       ]
+    },
+    {
+      "id": "dolt-txn-read-committed-savepoint",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 16,
+      "name": "TRANSACTION ISOLATION READ-COMMITTED does not break AUTOCOMMIT=OFF",
+      "source_sha256": "71ba715f302fed34157e4ef37b4ec64b3733acbd674a4f2a2ab6a2d54a827b50",
+      "scenario_sha256": "6777636262fe4c3516d18a302a57132b2475f7015eaeadaa422b190070444742",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's SET SESSION TRANSACTION ISOLATION LEVEL as Postgres's SET SESSION CHARACTERISTICS AS TRANSACTION; upstream SkipResultsCheck becomes its tag. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "autocommit = off as BEGIN: the statements after it are one transaction block, checked open (T). (D5, D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "@@transaction_isolation as current_setting('transaction_isolation'), Postgres's spelling of READ-COMMITTED; @@autocommit 0 as the open transaction block (T). (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its tag, in the open block."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4",
+            "assert-4-commit"
+          ],
+          "note": "Preserved SQL, checked by its tag; the block then commits."
+        }
+      ],
+      "adaptations": [
+        "MySQL's session settings in PostgreSQL syntax: SET SESSION CHARACTERISTICS, current_setting. (D10)",
+        "autocommit = off as an explicit transaction block. (D5)"
+      ]
+    },
+    {
+      "id": "dolt-txn-unique-index-inserts",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 17,
+      "name": "non-ff commit merge with multiple indexes on a column",
+      "source_sha256": "4368bda1b26cc5408c5df08f1087dfb40c05c927b084ce5a557dbcbedb96aec9",
+      "scenario_sha256": "a971c8e358d519bb9fbf548c0f3b51b2f5a6c96d8f3c7a9d3dfb50ed1307025c",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "MySQL's ADD UNIQUE KEY as ADD CONSTRAINT ... UNIQUE. (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "autocommit = off as BEGIN; upstream SkipResultsCheck becomes its tag. (D5, D10) A sequential interleaving of two sessions on one branch, neither waiting, so a multi-session scenario (D8)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "autocommit = off as BEGIN, on session b. (D5, D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; one row: another value of the unique column, so it doesn't wait on a's."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Upstream SkipResultsCheck becomes the commit's tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Upstream SkipResultsCheck becomes the commit's tag: there is no commit-time merge to fail (D8)."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: the unique key as a constraint. (D10)",
+        "autocommit = off as explicit transaction blocks. (D5)",
+        "Two sessions on one branch, interleaved sequentially: their inserts don't wait on each other. (D8)"
+      ]
+    },
+    {
+      "id": "dolt-violations-txn-fast-forward",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConstraintViolationTransactionTests",
+      "index": 2,
+      "name": "a transaction commit that is a fast-forward produces no constraint violations",
+      "source_sha256": "411d68199805bdeb21cb892dd1f753cb3f0fc622246ad1bd8c24bd54f3cbb655",
+      "scenario_sha256": "3908eef3fc89b31c113a785e6fbd75c30236f8d10b2b59a75c85a5b3c10a2f4d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "MySQL's INDEX(v1) as UNIQUE: a Postgres foreign key references a unique key (the values are unique). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "mc1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -a adds nothing. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica, which turns off the foreign keys' triggers (the adapter's session is a superuser). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row, its child left without a parent with the triggers off."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-3-state"
+          ],
+          "note": "Preserved: the commit succeeds. No violation is recorded (dolt_constraint_violations() empty): a commit records none, as Dolt's fast-forward makes none."
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: a foreign key references a unique key. (D10)",
+        "FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica. (D10)",
+        "No staging area: dolt_add stages nothing. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-violations-txn-three-way",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConstraintViolationTransactionTests",
+      "index": 3,
+      "name": "a transaction commit that is a three-way merge produces constraint violations",
+      "source_sha256": "59e6399a29d4f6c063b9b46fdcf68aee66f3754d443314ee4a478615f24386b9",
+      "scenario_sha256": "6afcbc9de2d3874f67e5bddaf1f33275cdfb8aa81b54820b891be19dc3060ac8",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "MySQL's INDEX(v1) as UNIQUE: a Postgres foreign key references a unique key (the values are unique). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "mc1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -a adds nothing. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica, which turns off the foreign keys' triggers (the adapter's session is a superuser). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL. A sequential interleaving of two sessions on one branch, neither waiting, so a multi-session scenario (D8)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL, on session b."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; one row, its child left without a parent with a's triggers off."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved SQL; one row, another parent, so it doesn't wait on a's delete."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6",
+            "assert-6-state"
+          ],
+          "note": "Intended divergence (D8): b's commit succeeds, where Dolt's commit-time merge of b's working set with a's finds the foreign key violation and fails it. Both sessions wrote one set of tables, so there is no merge at COMMIT; the dangling child is what a's checks being off left, and no violation is recorded (dolt_constraint_violations() empty)."
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: a foreign key references a unique key. (D10)",
+        "FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica. (D10)",
+        "No staging area: dolt_add stages nothing. (D1)",
+        "Two sessions on one branch, interleaved sequentially: no commit-time merge, so b's commit succeeds (D8)."
+      ]
     }
   ],
   "deferred": [
@@ -34732,6 +35093,30 @@
       "name": "base case: gc",
       "source_sha256": "ba6768795c90355232a82bb142ea3a0b136a891a6d256af699945ad01650f887",
       "reason": "Its setup is a shared script (gcSetup()) the catalog leaves unresolved, so a port can't map it. Its argument errors are checked as dolt-reflog-errors' are; prolly's dolt_gc() after one with nothing new to collect succeeds, where Dolt's says there were no changes."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 13,
+      "name": "multiple client edit session",
+      "source_sha256": "2f378e2c75f9d21c40377eab61967565cc8a9899b0435ebfa300db06cae1dbbd",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, three sessions' edits: c's update by row 2's old y waits on a's, then (READ COMMITTED) finds the row no longer matching and updates nothing, so the rows are 2:3:2 where Dolt's commit merges c's cell in (2:3:4); in REPEATABLE READ c fails with a serialization failure."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 14,
+      "name": "edits from different clients to table with out of order primary key set",
+      "source_sha256": "f96f088e0ed3b576187627e293dbcf25fad3a103b38b71716a530a08738d1637",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, a primary key out of column order: b's update of the key a's autocommitted update moved finds no row, where Dolt's b adds a second row from its snapshot; b's insert of a's new key fails on it, as Dolt's does."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 6,
+      "name": "conflicts from a DOLT_MERGE return an initially unhelpful error in a concurrent write scenario",
+      "source_sha256": "c2b6e75a68a6402417d3e4f269f864f1689e7cc16a4f370fef8c18ab03581b7c",
+      "reason": "A prolly behavior still to be fixed (#587): after a merge's conflicts are committed with dolt.allow_commit_conflicts on, session b's transaction, which writes a row with the setting off, commits, where Dolt's refuses it for the working set's unresolved conflicts. Rederived, with two sessions interleaved sequentially (D8), the scenario would expect b's COMMIT to fail with 40001 twice (prolly names the conflicts at once, where Dolt's first asks for a retry)."
     }
   ]
 }

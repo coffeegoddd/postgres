@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "id": "dolt-txn-read-committed-savepoint",
+  "description": "Reviewed Dolt port: TRANSACTION ISOLATION READ-COMMITTED does not break AUTOCOMMIT=OFF",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+    "case": "DoltTransactionTests: TRANSACTION ISOLATION READ-COMMITTED does not break AUTOCOMMIT=OFF"
+  },
+  "requires": [
+    "sql"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN",
+        "transaction": "T"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT current_setting('transaction_isolation')",
+      "expect": {
+        "rows": [
+          [
+            "read committed"
+          ]
+        ],
+        "order": "ordered",
+        "transaction": "T"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "SAVEPOINT abc",
+      "expect": {
+        "tag": "SAVEPOINT",
+        "transaction": "T"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "RELEASE SAVEPOINT abc",
+      "expect": {
+        "tag": "RELEASE",
+        "transaction": "T"
+      }
+    },
+    {
+      "id": "assert-4-commit",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT",
+        "transaction": "I"
+      }
+    }
+  ]
+}

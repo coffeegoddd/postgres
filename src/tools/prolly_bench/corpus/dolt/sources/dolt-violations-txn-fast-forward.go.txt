@@ -1,0 +1,30 @@
+{
+		Name: "a transaction commit that is a fast-forward produces no constraint violations",
+		SetUpScript: []string{
+			"CREATE TABLE parent (pk BIGINT PRIMARY KEY, v1 BIGINT, INDEX(v1));",
+			"CREATE TABLE child (pk BIGINT PRIMARY KEY, v1 BIGINT);",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO parent VALUES (10, 1), (20, 2);",
+			"INSERT INTO child VALUES (1, 1), (2, 2);",
+			"ALTER TABLE child ADD CONSTRAINT fk_name FOREIGN KEY (v1) REFERENCES parent (v1);",
+			"CALL DOLT_COMMIT('-am', 'MC1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "/* client a */ SET FOREIGN_KEY_CHECKS = 0;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "/* client a */ START TRANSACTION;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "/* client a */ DELETE FROM PARENT where v1 = 2;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "/* client a */ COMMIT;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

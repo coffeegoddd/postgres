@@ -1,4 +1,4 @@
-# Dolt's multi-session row tests (DoltTransactionTests 0-12,
+# Dolt's multi-session row tests (DoltTransactionTests 0-14,
 # DoltConflictHandlingTests 0-2 and 7-8, DoltConstraintViolationTransaction-
 # Tests 0), rederived under Postgres semantics.  Dolt's sessions each write
 # their own working set and merge it into the branch's at COMMIT, cell by
@@ -19,6 +19,8 @@ setup
 	CREATE TABLE vtr.child (pk int PRIMARY KEY, p int REFERENCES vtr.parent);
 	INSERT INTO vtr.parent VALUES (1);
 	CREATE TABLE vtr.keyless (c int);
+	CREATE TABLE vtr.o (x int, y int, z int, PRIMARY KEY (z, y));
+	INSERT INTO vtr.o VALUES (1, 1, 1), (2, 2, 2);
 }
 setup		{ DO $$ BEGIN PERFORM dolt_commit('-Am', 'vtr base'); END $$; }
 
@@ -40,6 +42,9 @@ step a_upd_all_y { UPDATE vtr.t SET y = 2; }
 step a_del1		{ DELETE FROM vtr.t WHERE x = 1; }
 step a_del_parent { DELETE FROM vtr.parent WHERE pk = 1; }
 step a_keyless	{ INSERT INTO vtr.keyless VALUES (1); }
+step a_upd_y3	{ UPDATE vtr.t SET y = 3 WHERE y = 2; }
+step a_o_upd	{ UPDATE vtr.o SET y = 3 WHERE y = 2; }
+step a_read		{ SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t; }
 step a_commit	{ COMMIT; }
 
 session b
@@ -62,7 +67,19 @@ step b_rollback	{ ROLLBACK; }
 step b_read		{ SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t; }
 step b_keyless_read { SELECT count(*) AS copies FROM vtr.keyless; }
 step b_status	{ SELECT count(*) AS changed FROM dolt_status WHERE table_name LIKE 'vtr.%'; }
+step b_del_y1	{ DELETE FROM vtr.t WHERE y = 1; }
+step b_o_upd	{ UPDATE vtr.o SET y = 5 WHERE y = 2; }
+step b_o_ins	{ INSERT INTO vtr.o VALUES (4, 3, 2); }
+step b_o_read	{ SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x, y) AS rows FROM vtr.o; }
 step b_violations { SELECT count(*) AS violations FROM dolt_constraint_violations() WHERE table_name LIKE 'vtr.%'; }
+
+session c
+step c_begin	{ BEGIN; }
+step c_rr		{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
+step c_upd_z4	{ UPDATE vtr.t SET z = 4 WHERE y = 2; }
+step c_read		{ SELECT string_agg(x || ':' || y || ':' || z, ',' ORDER BY x) AS rows FROM vtr.t; }
+step c_commit	{ COMMIT; }
+step c_rollback	{ ROLLBACK; }
 
 # duplicate inserts, autocommit on (DoltTransactionTests 0): the second
 # insert fails at once, the key taken
@@ -111,3 +128,16 @@ permutation a_begin b_begin b_upd_y_other a_upd_y b_commit a_commit b_read
 # 0): Postgres's foreign key locks the parent row, so the child's insert
 # waits on the parent's delete, then fails; no violation is left to record
 permutation a_begin b_begin a_del_parent b_ins_child a_commit b_rollback b_status b_violations
+# three sessions' edits (DoltTransactionTests 13): a sets y on row 2, b
+# deletes row 1, c sets z on row 2 by its old y.  c waits on a's row,
+# then, in READ COMMITTED, finds it no longer matching and updates
+# nothing, where Dolt's c updates its snapshot's row and the commit
+# merges both cells in (2:3:4); in REPEATABLE READ, c fails with a
+# serialization failure
+permutation a_begin b_begin c_begin a_upd_y3 b_del_y1 c_upd_z4 a_commit b_commit a_read c_read c_commit b_read
+permutation a_rr b_rr c_rr a_upd_y3 b_del_y1 c_upd_z4 a_commit b_commit c_rollback b_read
+# a primary key out of column order (14): a's autocommitted update moves
+# row 2's key; b's update of the old key, after it, finds no row (Dolt's
+# b, from its snapshot, adds a second row); b's insert of a's new key
+# fails on it, as Dolt's does
+permutation b_begin a_o_upd b_o_upd b_commit b_o_read b_o_ins b_o_read
