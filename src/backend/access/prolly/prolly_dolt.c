@@ -1397,8 +1397,9 @@ checkout_tables(const char *ref, char **names, int nnames)
  * branch, or -b branch [start point] to create it first.  Tables, as
  * Dolt's: -- tables (or "."), or a name that is no branch but a table
  * (with more after it), put back as the head has them; ref tables (ref
- * no table), or ref -- tables, as ref has them.  After --, one name that
- * is a branch and no table is the branch; branch -- is the branch.
+ * no table), or ref -- tables, as ref has them; a name before -- that is
+ * no ref is a table.  After --, one name that is a branch and no table is
+ * the branch; branch -- is the branch.
  */
 Datum
 dolt_checkout(PG_FUNCTION_ARGS)
@@ -1414,6 +1415,8 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	char	  **names = palloc_array(char *, Max(nargs, 1));
 	int			nnames = 0;
 	int			dashes = -1;	/* names before "--" */
+	bool		is_branch = false;	/* names[0] is a branch */
+	bool		is_table = false;	/* names[0] is a table (or ".") */
 
 	for (int i = 0; i < nargs; i++)
 	{
@@ -1442,17 +1445,38 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_checkout", a);
 	}
+	if (!create && nnames > 0)
+	{
+		is_branch = PROLLY_CALL(refs(), branch_lookup, names[0],
+								&(ProllyBranchId) {0});
+		is_table = strcmp(names[0], ".") == 0 ||
+			OidIsValid(RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(names[0], NULL)),
+										NoLock, true));
+	}
+
 	/*
-	 * Before "--", a ref, as git's: alone, the branch (a table of its name
-	 * not taken); with names after it, the commit the tables come from.
+	 * Before "--", a ref, as Dolt's, where it names one: a branch alone is
+	 * the branch (a table of its name not taken); with names after it, the
+	 * commit the tables come from.  One that names no ref is a table, put
+	 * back with the rest as the head has them.
 	 */
 	if (!create && dashes > 0)
 	{
+		ProllyHash	ref;
+
 		if (dashes > 1)
 			unexpected("dolt_checkout", names[1]);
-		if (nnames > 1)
+		if (nnames > 1 &&
+			(is_branch || PROLLY_CALL(refs(), resolve, names[0], &ref)))
 		{
 			checkout_tables(names[0], names + 1, nnames - 1);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (!is_branch && (nnames > 1 || is_table))
+		{
+			checkout_tables("HEAD", names, nnames);
 			result[0] = "0";
 			result[1] = "";
 			PG_RETURN_DATUM(text_array(2, result));
@@ -1461,12 +1485,6 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	/* tables: after "--", or names that aren't one branch */
 	else if (!create && nnames > 0)
 	{
-		bool		is_branch = PROLLY_CALL(refs(), branch_lookup, names[0],
-											&(ProllyBranchId) {0});
-		bool		is_table = strcmp(names[0], ".") == 0 ||
-			OidIsValid(RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(names[0], NULL)),
-										NoLock, true));
-
 		if (dashes == 0 && !(nnames == 1 && is_branch && !is_table))
 		{
 			checkout_tables("HEAD", names, nnames);

@@ -319,6 +319,33 @@ SELECT dolt_branch('-D', 'b');
 (1 row)
 
 RESET search_path;
+-- a table before "--" that names no ref is a table, with any after it, as
+-- the head has them
+UPDATE ct.a SET v = 'dirty';
+SELECT dolt_checkout('ct.a', '--');
+ dolt_checkout 
+---------------
+ {0,""}
+(1 row)
+
+SELECT table_name, status FROM dolt_status;
+ table_name | status 
+------------+--------
+(0 rows)
+
+UPDATE ct.a SET v = 'dirty';
+UPDATE ct.b SET v = 'dirty';
+SELECT dolt_checkout('ct.a', '--', 'ct.b');
+ dolt_checkout 
+---------------
+ {0,""}
+(1 row)
+
+SELECT table_name, status FROM dolt_status;
+ table_name | status 
+------------+--------
+(0 rows)
+
 -- the sequences a table draws from come with it, found by its defaults:
 -- not one a text literal names, nor one whose name begins another's; one
 -- quoted, and one two tables share, do

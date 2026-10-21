@@ -339,9 +339,12 @@ OF` are built in D18's shapes.
   as Dolt's does, their uncommitted changes discarded; one name there
   that is a branch and no table checks out the branch, so a branch named
   like an option (`-dash`) can still be checked out. Before `--` is a
-  ref, as git's: `dolt_checkout('b', '--')` checks out branch `b` though
-  a table is named `b`, and `dolt_checkout('HEAD~1', '--', 't')` takes
-  `t` as that commit has it. `.` names the tables the head (or the ref)
+  ref where it names one, as Dolt's: `dolt_checkout('b', '--')` checks
+  out branch `b` though a table is named `b`, and
+  `dolt_checkout('HEAD~1', '--', 't')` takes `t` as that commit has it;
+  a name there that is no ref is a table, so `dolt_checkout('t', '--')`
+  and `dolt_checkout('t1', '--', 't2')` check them out from the head.
+  `.` names the tables the head (or the ref)
   has: a table only the working set has stays, as Dolt's untracked table
   does (the head stands for Dolt's index, D1). A name that matches no
   table fails the whole call (D5), where Dolt checks out the others,

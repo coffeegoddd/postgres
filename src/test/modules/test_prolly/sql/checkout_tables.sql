@@ -101,6 +101,15 @@ SELECT * FROM ct.b;
 SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'b');
 RESET search_path;
+-- a table before "--" that names no ref is a table, with any after it, as
+-- the head has them
+UPDATE ct.a SET v = 'dirty';
+SELECT dolt_checkout('ct.a', '--');
+SELECT table_name, status FROM dolt_status;
+UPDATE ct.a SET v = 'dirty';
+UPDATE ct.b SET v = 'dirty';
+SELECT dolt_checkout('ct.a', '--', 'ct.b');
+SELECT table_name, status FROM dolt_status;
 
 -- the sequences a table draws from come with it, found by its defaults:
 -- not one a text literal names, nor one whose name begins another's; one
