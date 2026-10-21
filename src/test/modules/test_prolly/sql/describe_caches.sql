@@ -189,7 +189,25 @@ ALTER EXTENSION test_prolly_b DROP TYPE public.hue;
 ALTER FUNCTION dc.one() DEPENDS ON EXTENSION test_prolly_b;
 SELECT length(dolt_commit('--allow-empty', '-Am', 'depends')::text) > 0 AS committed;
 SELECT unnest(test_commit_dependencies(dolt_hashof('HEAD'))) AS dependency;
-RESET debug_prolly_verify_fold_caches;
+
+-- An object whose rename tells no table and no pg_depend row of it (a
+-- text search configuration's): a description printing its name (a
+-- generated column's), and the dependency on it, are worked out again.
+CREATE TEXT SEARCH CONFIGURATION public.cfg (COPY = pg_catalog.simple);
+CREATE TABLE dc.d (id int PRIMARY KEY, body text,
+  tsv tsvector GENERATED ALWAYS AS (to_tsvector('public.cfg'::regconfig, body)) STORED);
+INSERT INTO dc.d VALUES (1, 'hello');
+SELECT length(dolt_commit('-Am', 'cfg')::text) > 0 AS committed;
+UPDATE dc.d SET body = 'x';
+SELECT length(dolt_commit('-am', 'warm')::text) > 0 AS committed;
+UPDATE dc.d SET body = 'y';
+ALTER TEXT SEARCH CONFIGURATION public.cfg RENAME TO cfg2;
+CALL public.keep('configuration renamed');
+SELECT length(dolt_commit('-am', 'renamed')::text) > 0 AS committed;
+SELECT dependency FROM unnest(test_commit_dependencies(dolt_hashof('HEAD'))) dependency
+WHERE dependency LIKE 'text search%';
+\c
+SELECT public.same('configuration renamed');
 
 \c contrib_regression
 DROP DATABASE regress_describe_caches;

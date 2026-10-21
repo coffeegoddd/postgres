@@ -89,6 +89,9 @@ extern void CacheRegisterSyscacheCallback(SysCacheIdentifier cacheid,
 										  SyscacheCallbackFunction func,
 										  Datum arg);
 
+extern void CacheRegisterAnySyscacheCallback(SyscacheCallbackFunction func,
+											 Datum arg);
+
 extern void CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
 										  Datum arg);
 

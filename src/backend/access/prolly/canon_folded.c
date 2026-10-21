@@ -2019,10 +2019,10 @@ item_cmp(const ListCell *a, const ListCell *b)
  *
  * - A table's description (describe_table()), with its table_shape(), by
  *   table, for the branch it was described on.  A relcache invalidation of
- *   the table drops it, and one of anything a description names drops
- *   them all: a type, function, schema, collation, relation, column, enum
- *   label, role, operator, operator class or extended statistics object
- *   (renaming a trigger's function sends its table nothing).  Callbacks run
+ *   the table drops it, and an invalidation of any syscache drops them
+ *   all: a description, or a dependency's key, names objects of every
+ *   kind (a type, function, schema, role, text search configuration,
+ *   foreign server ...), and renaming one sends its table nothing.  Callbacks run
  *   for the transaction's own changes at each command's end too, and at a
  *   cache reset (a branch switch).  One described while an invalidation
  *   came isn't kept; and they are dropped when the settings that change how
@@ -2096,12 +2096,6 @@ typedef struct Member
 	Oid			objid;
 	Oid			extension;
 } Member;
-
-/* What a description names, but invalidates no table it is of. */
-static const int described_caches[] = {
-	TYPEOID, PROCOID, NAMESPACEOID, COLLOID, RELOID, ATTNUM, ENUMOID,
-	AUTHOID, OPEROID, CLAOID, STATEXTOID
-};
 
 /*
  * The settings that change how a description prints a constant (a
@@ -2210,9 +2204,14 @@ fold_caches_begin(void)
 	if (!fold_caches_registered)
 	{
 		CacheRegisterRelcacheCallback(fold_caches_relcache, (Datum) 0);
-		for (int i = 0; i < lengthof(described_caches); i++)
-			CacheRegisterSyscacheCallback(described_caches[i],
-										  fold_caches_syscache, (Datum) 0);
+
+		/*
+		 * (a description, and a dependency's key, print by name whatever
+		 * they refer to, of any kind: a type, a function, a text search
+		 * configuration, a foreign server.  Renaming one tells no table it
+		 * is of, nor pg_depend, only its own syscache: every one's)
+		 */
+		CacheRegisterAnySyscacheCallback(fold_caches_syscache, (Datum) 0);
 		RegisterXactCallback(fold_caches_xact, NULL);
 		RegisterSubXactCallback(fold_caches_subxact, NULL);
 		described_cxt = AllocSetContextCreate(CacheMemoryContext,
