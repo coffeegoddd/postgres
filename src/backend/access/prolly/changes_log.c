@@ -721,18 +721,12 @@ merge_build(Finder *f, const ProllyTableFold *baseline, const ProllyEdit *edits,
 	f->work.merges++;
 }
 
-/* Each candidate's old and new rows; the pairs that differ are edits. */
+/* The candidates kept once per key, as the keying tells keys apart. */
 static void
-fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
+unique_keys(Finder *f)
 {
-	ProllyEdit *edits;
-	int			nedits = 0;
-	int			u = 0;
-	ProllyTreeCursor *cur;
-	IndexScanDesc scan;
-	StringInfoData value;
+	int64		u = 0;
 
-	/* (each key once, as the keying tells keys apart) */
 	if (f->n > 1)
 		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
 	for (int64 i = 0; i < f->n; i++)
@@ -747,10 +741,31 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	f->n = u;
 	f->work.candidates += f->n;
 	f->work.rows_read += f->n;
+}
 
-	edits = MemoryContextAllocHuge(CurrentMemoryContext,
-								   Max(f->n, 1) * sizeof(ProllyEdit));
-	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
+/*
+ * A candidate that differs: the row data has by its key (kind REMOVED or
+ * MODIFIED: before), and the row the snapshot sees (ADDED or MODIFIED:
+ * after, with its own key's bytes; REMOVED: the candidate's key).  What
+ * they point to is valid during the call only, but a REMOVED one's key,
+ * which is the candidate's.
+ */
+typedef void (*ChangeEmit) (Finder *f, ProllyDiffKind kind,
+							const ProllyKey *key, const ProllyValue *before,
+							const ProllyValue *after, void *arg);
+
+/*
+ * Each candidate (unique_keys()'s, in key order) looked up in data and in
+ * the heap, by the finder's snapshot; those that differ emitted.
+ */
+static void
+each_change(Finder *f, const ProllyNodeRef *data, ChangeEmit emit, void *arg)
+{
+	ProllyTreeCursor *cur;
+	IndexScanDesc scan;
+	StringInfoData value;
+
+	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, data,
 					  CurrentMemoryContext);
 	scan = index_beginscan(f->rel, f->pk, false, f->snap, NULL, f->nkeys, 0,
 						   SO_NONE);
@@ -781,29 +796,67 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 			;					/* the same row */
 		else if (has)
 		{
-			ProllyEdit *e = &edits[nedits++];
-			char	   *kb = palloc(Max(f->key.len, 1));
-			char	   *vb = palloc(Max(value.len, 1));
+			ProllyKey	nk = {(const uint8 *) f->key.data, f->key.len};
+			ProllyValue nv = {(const uint8 *) value.data, value.len};
 
-			memcpy(kb, f->key.data, f->key.len);
-			memcpy(vb, value.data, value.len);
-			e->key.data = (const uint8 *) kb;
-			e->key.len = f->key.len;
-			e->value.data = (const uint8 *) vb;
-			e->value.len = value.len;
-			e->is_delete = false;
+			emit(f, had ? PROLLY_DIFF_MODIFIED : PROLLY_DIFF_ADDED, &nk,
+				 had ? &v : NULL, &nv, arg);
 		}
 		else if (had)
-		{
-			ProllyEdit *e = &edits[nedits++];
-
-			e->key = ck;
-			e->is_delete = true;
-		}
+			emit(f, PROLLY_DIFF_REMOVED, &ck, &v, NULL, arg);
 		CHECK_FOR_INTERRUPTS();
 	}
 	index_endscan(scan);
 	PROLLY_CALL(f->tree, cursor_close, cur);
+}
+
+typedef struct Edits
+{
+	ProllyEdit *edits;
+	int			nedits;
+} Edits;
+
+static void
+edit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
+		  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	Edits	   *ed = arg;
+	ProllyEdit *e = &ed->edits[ed->nedits++];
+
+	if (kind == PROLLY_DIFF_REMOVED)
+	{
+		e->key = *key;
+		e->is_delete = true;
+	}
+	else
+	{
+		char	   *kb = palloc(Max(key->len, 1));
+		char	   *vb = palloc(Max(after->len, 1));
+
+		memcpy(kb, key->data, key->len);
+		memcpy(vb, after->data, after->len);
+		e->key.data = (const uint8 *) kb;
+		e->key.len = key->len;
+		e->value.data = (const uint8 *) vb;
+		e->value.len = after->len;
+		e->is_delete = false;
+	}
+}
+
+/* Each candidate's old and new rows; the pairs that differ are edits. */
+static void
+fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
+{
+	Edits		ed = {NULL, 0};
+	int			nedits;
+	ProllyEdit *edits;
+
+	unique_keys(f);
+	ed.edits = MemoryContextAllocHuge(CurrentMemoryContext,
+									  Max(f->n, 1) * sizeof(ProllyEdit));
+	each_change(f, &baseline->data, edit_emit, &ed);
+	edits = ed.edits;
+	nedits = ed.nedits;
 	f->work.rows_written += nedits;
 	/* (many edits: merged, a pass over the baseline; else each applied) */
 	if (nedits > 0 &&
@@ -1126,6 +1179,22 @@ own_copies(Finder *f, ItemPointerData *tids, int ntids)
 	}
 }
 
+/* What a fold or a read of changes did, counted. */
+static void
+count_work(const Finder *f)
+{
+	counters.pages += f->work.pages;
+	counters.candidates += f->work.candidates;
+	counters.full += f->work.full;
+	counters.rows_read += f->work.rows_read;
+	counters.rows_written += f->work.rows_written;
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f->work.candidates);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f->work.full);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_READ, f->work.rows_read);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_WRITTEN, f->work.rows_written);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MERGE_BUILDS, f->work.merges);
+}
+
 /* ----------------------------------------------------------------
  * Callbacks
  * ----------------------------------------------------------------
@@ -1212,16 +1281,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 							   (int64) f.work.rows_read,
 							   INSTR_TIME_GET_MILLISEC(took));
 	}
-	counters.pages += f.work.pages;
-	counters.candidates += f.work.candidates;
-	counters.full += f.work.full;
-	counters.rows_read += f.work.rows_read;
-	counters.rows_written += f.work.rows_written;
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f.work.candidates);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f.work.full);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_READ, f.work.rows_read);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_WRITTEN, f.work.rows_written);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MERGE_BUILDS, f.work.merges);
+	count_work(&f);
 	if (next)
 	{
 		State		ns = {0};
@@ -1246,6 +1306,76 @@ static bool
 log_fold_on_leave(void)
 {
 	return false;
+}
+
+typedef struct VisitChanges
+{
+	ProllyTreeVisitChange visit;
+	void	   *arg;
+} VisitChanges;
+
+static void
+visit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
+		   const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	VisitChanges *vc = arg;
+
+	vc->visit(kind, key, before, after, vc->arg);
+}
+
+/*
+ * The rows that differ from the baseline's, from the log's entries since,
+ * as a fold from the baseline finds them, without the tree: only where that
+ * fold would read nothing else (not in full, not for a snapshot that
+ * doesn't see the baseline's fold, nor from a baseline unsettled, nor for a
+ * keyless table, whose rows are counts, nor after the table was emptied).
+ */
+static bool
+log_changes(Relation rel, const ProllyTreeEnv *env,
+			const ProllyTableFold *baseline, ProllyTreeVisitChange visit,
+			void *arg)
+{
+	Finder		f;
+	State		st;
+	ProllyComponents c;
+	uint64		identity = 0;
+	bool		ok;
+	MemoryContext cxt;
+	MemoryContext old;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "log changes",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	finder_open(&f, rel, env);
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log)
+		identity = PROLLY_CALL(c.change_log, identity, rel);
+	ok = !f.keyless && !f.give_up && !prolly_full_fold_wanted(&f.reason) &&
+		identity != 0 && parse_state(&baseline->state, &st) &&
+		st.log == identity && sees_fold(f.snap, &st) &&
+		!(st.flags & STATE_UNSETTLED) && !storage_unseen(rel, f.snap);
+	if (ok)
+	{
+		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
+
+		f.compact = true;
+		ok = PROLLY_CALL(c.change_log, read, f.rel, f.snap, &pos, entry_visit,
+						 &f) &&
+			!f.give_up && !f.emptied;
+	}
+	if (ok)
+	{
+		VisitChanges vc = {visit, arg};
+
+		compact_copies(&f);
+		unique_keys(&f);
+		each_change(&f, &baseline->data, visit_emit, &vc);
+		count_work(&f);
+	}
+	finder_close(&f);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return ok;
 }
 
 /* A state holds no nodes: the log's entries are rows, not chunks. */
@@ -1370,4 +1500,5 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.state_refs = log_state_refs,
 	.advance = log_advance,
 	.fold_on_leave = log_fold_on_leave,
+	.changes = log_changes,
 };

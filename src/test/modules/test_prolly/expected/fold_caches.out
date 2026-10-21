@@ -847,6 +847,24 @@ SELECT pg_temp.since('fold_rows_read') AS history_diff_rows;
                  0
 (1 row)
 
+-- A diff into WORKING folds nothing either: its rows are read from the
+-- change log's entries against the baseline, the changed rows alone, no
+-- tree made (no chunk written); one from another commit merges them with
+-- the tree diff from it to the baseline.  (The check, on, diffs a fold
+-- too and compares.)
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending;
+ appending 
+-----------
+ t
+(1 row)
+
 SELECT diff_type, (from_row).id, (to_row).v
 FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
  diff_type | id |   v   
@@ -861,11 +879,45 @@ FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
  
 (1 row)
 
-SELECT pg_temp.since('fold_rows_read') AS working_diff_rows;
- working_diff_rows 
--------------------
-                 2
+SELECT pg_temp.since('fold_rows_read') AS working_diff_rows,
+	pg_temp.since('chunks_appended') AS working_diff_chunks;
+ working_diff_rows | working_diff_chunks 
+-------------------+---------------------
+                 2 |                   0
 (1 row)
+
+RESET debug_prolly_verify_fold_caches;
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).v
+FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY 2;
+ diff_type | id | v  |     v      
+-----------+----+----+------------
+ modified  |  5 | v5 | left
+ modified  |  6 | v6 | left again
+ modified  |  7 | v7 | dirty
+ modified  |  8 | v8 | dirty
+(4 rows)
+
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
+ diff_type | id |   v   
+-----------+----+-------
+ modified  |  7 | dirty
+ modified  |  8 | dirty
+(2 rows)
+
+UPDATE fc.t SET v = 'left' WHERE id = 7;
+DELETE FROM fc.t WHERE id = 6;
+INSERT INTO fc.t VALUES (2000, 'new');
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
+ diff_type | id | v  |  id  |   v   
+-----------+----+----+------+-------
+ modified  |  5 | v5 |    5 | left
+ removed   |  6 | v6 |      | 
+ modified  |  7 | v7 |    7 | left
+ modified  |  8 | v8 |    8 | dirty
+ added     |    |    | 2000 | new
+(5 rows)
 
 SELECT dolt_reset('--hard');
  dolt_reset 

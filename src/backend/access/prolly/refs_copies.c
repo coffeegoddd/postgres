@@ -2982,6 +2982,32 @@ copies_read_definitions(ProllyNodeRef *root, List **left_out)
 									   left_out);
 }
 
+/*
+ * The session branch's changes to table relid since its baseline, read
+ * without a fold; none if its working set is known, which a read takes
+ * as it is.
+ */
+static bool
+copies_working_changes(Oid relid, ProllyNodeRef *data,
+					   ProllyTreeVisitChange visit, void *arg)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	ProllyNodeRef known;
+	char	   *name = branch_ops()->current();
+
+	/* (asked without taking it: the read that follows takes it) */
+	if (!branch_baseline(name, &baseline) ||
+		(fold_caches_usable() &&
+		 branch_fold_known(MyBranch, fold_snapshot(), &baseline.hash, true,
+						   &known.hash)))
+		return false;
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, table_changes))
+		return false;
+	return dc.canonicalizer->table_changes(&baseline, relid, data, visit, arg);
+}
+
 static bool
 copies_working_set(const char *branch, ProllyNodeRef *root)
 {
@@ -4371,6 +4397,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_set = copies_working_set,
 	.read_working_set = copies_read_working_set,
 	.read_definitions = copies_read_definitions,
+	.working_changes = copies_working_changes,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

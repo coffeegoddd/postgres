@@ -135,12 +135,25 @@ typedef struct ProllyChangeFinderRoutine
 	 * frees but its own record of the changes, which can wait.
 	 */
 	bool		(*fold_on_leave) (void);
+
+	/*
+	 * Optional: the rows of rel that differ from baseline's, as fold() from
+	 * it would find them, visited each once in the keying's order as a
+	 * tree's diff() visits a change, without making a tree (what they point
+	 * to valid during the visit only).  False, having visited nothing,
+	 * where fold() would read more than its record of the changes (the
+	 * table in full, or what the baseline's state can't tell it): the
+	 * caller folds instead.  Needs an active snapshot.
+	 */
+	bool		(*changes) (Relation rel, const ProllyTreeEnv *env,
+							const ProllyTableFold *baseline,
+							ProllyTreeVisitChange visit, void *arg);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
-	"state_refs", "advance", "fold_on_leave"
+	"state_refs", "advance", "fold_on_leave", "changes"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK fold_on_leave
+#define PROLLY_CHANGES_LAST_CALLBACK changes
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

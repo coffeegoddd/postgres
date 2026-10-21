@@ -4232,6 +4232,108 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 }
 
 /*
+ * Table relid's rows that differ from the baseline's, read by the change
+ * finder from what it recorded, as table_root() would fold them: only for
+ * a table collect() describes as a table and reads (not a partition, nor
+ * one with columns of types that hold OIDs), whose baseline is of its
+ * definition now.
+ */
+static bool
+folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
+					 ProllyNodeRef *data, ProllyTreeVisitChange visit,
+					 void *arg)
+{
+	Canon		cn;
+	Relation	rel;
+	Form_pg_class form;
+	bool		ok = false;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (!PROLLY_HAS(cn.finder, changes))
+		return false;
+	load_baseline(&cn, baseline);
+
+	/* (the fold's snapshot: the transaction's writes, this statement's too) */
+	if (!IsInParallelMode())
+		CommandCounterIncrement();
+	if (ActiveSnapshotSet())
+		PushCopiedSnapshot(GetActiveSnapshot());
+	else
+		PushActiveSnapshot(GetTransactionSnapshot());
+	if (!IsInParallelMode())
+		UpdateActiveSnapshotCommandId();
+	rel = table_open(relid, AccessShareLock);
+	PG_TRY();
+	{
+		form = rel->rd_rel;
+		if (form->relkind == RELKIND_RELATION &&
+			form->relam == PROLLY_TABLE_AM_OID && !form->relispartition &&
+			canon_namespace(form->relnamespace) &&
+			!in_extension(RelationRelationId, relid) &&
+			!oid_columns(&cn, rel))
+		{
+			StringInfoData key;
+			StringInfoData desc;
+			ProllyHash	dh;
+			BaseTable  *bt;
+			int			save_nestlevel;
+
+			initStringInfo(&key);
+			appendStringInfoString(&key, "t:");
+			append_utf8(&key, qualified(form->relnamespace,
+										NameStr(form->relname)));
+			/* (described as collect() describes it: see build_canonical()) */
+			fold_caches_begin();
+			check_deparse_settings();
+			cn.cached = true;
+			save_nestlevel = NewGUCNestLevel();
+			(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
+									 false);
+			initStringInfo(&desc);
+			table_description(&cn, rel, &desc, &dh);
+
+			/*
+			 * (its rows folded under the shape they have now, as table_root()
+			 * takes a baseline, not one it would map)
+			 */
+			bt = find_base_table(&cn, &key);
+			if (bt && !(bt->shape_hash.len == dh.len &&
+						memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0))
+			{
+				StringInfoData shape = {0};
+
+				if (!shape_holds(rel, base_shape(&cn, bt),
+								 table_shape_bytes(&cn, rel, &desc, &shape)))
+					bt = NULL;
+			}
+			AtEOXact_GUC(false, save_nestlevel);
+			if (bt)
+			{
+				ProllyTableFold tf;
+
+				memset(&tf, 0, sizeof(tf));
+				tf.data = bt->data;
+				tf.state.data = (const uint8 *) bt->state.data;
+				tf.state.len = bt->state.len;
+				*data = bt->data;
+				ok = cn.finder->changes(rel, &cn.env, &tf, visit, arg);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+	return ok;
+}
+
+/*
  * A baseline's tree, its tables' data trees and the finders' states.  Each
  * state is walked by every change finder, not the one configured now: the
  * one that wrote it may be another (a fold under another setting, or before
@@ -10186,6 +10288,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
 	.read_definitions = folded_read_definitions,
+	.table_changes = folded_table_changes,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,

@@ -2003,6 +2003,18 @@ pages_fold_on_leave(void)
 	return true;
 }
 
+/*
+ * Changes aren't read without a fold here: a page's candidates need both
+ * its versions, which only a fold's walk of the pages pairs up.
+ */
+static bool
+pages_changes(Relation rel, const ProllyTreeEnv *env,
+			  const ProllyTableFold *baseline, ProllyTreeVisitChange visit,
+			  void *arg)
+{
+	return false;
+}
+
 const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.info = {
 		.iface = PROLLY_IFACE_CHANGE_FINDER,
@@ -2019,4 +2031,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.state_refs = pages_state_refs,
 	.advance = pages_advance,
 	.fold_on_leave = pages_fold_on_leave,
+	.changes = pages_changes,
 };

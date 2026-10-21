@@ -252,10 +252,30 @@ SELECT diff_type, (from_row).id, (to_row).v
 FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
 :flush
 SELECT pg_temp.since('fold_rows_read') AS history_diff_rows;
+
+-- A diff into WORKING folds nothing either: its rows are read from the
+-- change log's entries against the baseline, the changed rows alone, no
+-- tree made (no chunk written); one from another commit merges them with
+-- the tree diff from it to the baseline.  (The check, on, diffs a fold
+-- too and compares.)
+SET debug_prolly_verify_fold_caches = off;
+:flush
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending;
 SELECT diff_type, (from_row).id, (to_row).v
 FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
 :flush
-SELECT pg_temp.since('fold_rows_read') AS working_diff_rows;
+SELECT pg_temp.since('fold_rows_read') AS working_diff_rows,
+	pg_temp.since('chunks_appended') AS working_diff_chunks;
+RESET debug_prolly_verify_fold_caches;
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).v
+FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY 2;
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
+UPDATE fc.t SET v = 'left' WHERE id = 7;
+DELETE FROM fc.t WHERE id = 6;
+INSERT INTO fc.t VALUES (2000, 'new');
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
 SELECT dolt_reset('--hard');
 
 -- ... and with a definition changed since, not committed: the commits'

@@ -406,6 +406,17 @@ typedef struct ProllyRefsRoutine
 	 * definitions from, never rows.
 	 */
 	void		(*read_definitions) (ProllyNodeRef *root, List **left_out);
+
+	/*
+	 * Optional: the rows of the session branch's table relid that differ
+	 * between its baseline (its data tree for the table put in *data) and
+	 * its working set, visited without folding them (the canonicalizer's
+	 * table_changes()).  False, having visited nothing, where they can't be
+	 * read so, or where the working set is known (read_working_set() takes
+	 * it, folding nothing): the caller reads the working set.
+	 */
+	bool		(*working_changes) (Oid relid, ProllyNodeRef *data,
+									ProllyTreeVisitChange visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -427,9 +438,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
-	"forget_folds", "prepared_ended", "read_definitions"
+	"forget_folds", "prepared_ended", "read_definitions", "working_changes"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK read_definitions
+#define PROLLY_REFS_LAST_CALLBACK working_changes
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

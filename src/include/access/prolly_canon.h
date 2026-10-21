@@ -329,6 +329,18 @@ typedef struct ProllyCanonRoutine
 	 */
 	void		(*read_definitions) (const ProllyNodeRef *baseline,
 									 ProllyNodeRef *root, List **left_out);
+
+	/*
+	 * Optional: the rows of the session branch's table relid that differ
+	 * from baseline's, without folding them: the change finder's changes()
+	 * from the baseline's data tree for the table as defined now, which is
+	 * put in *data.  False, having visited nothing, where the baseline
+	 * hasn't the table as defined now, the canonical form wouldn't read it
+	 * as a table, or the finder can't: the caller folds.
+	 */
+	bool		(*table_changes) (const ProllyNodeRef *baseline, Oid relid,
+								  ProllyNodeRef *data,
+								  ProllyTreeVisitChange visit, void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -337,9 +349,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions"
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK read_definitions
+#define PROLLY_CANON_LAST_CALLBACK table_changes
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,
