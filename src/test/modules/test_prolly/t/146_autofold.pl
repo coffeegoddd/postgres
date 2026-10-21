@@ -15,10 +15,18 @@ $node->init;
 $node->append_conf('postgresql.conf', qq{
 autovacuum_naptime = 1
 prolly.autofold_threshold = 0.05
+log_min_messages = debug1
 });
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
+
+# Autovacuum's folds logged since offset.
+sub folds_since
+{
+	my $log = slurp_file($node->logfile, $_[0]);
+	return scalar(() = $log =~ /automatic fold of database "postgres"/g);
+}
 
 sql(q{
 	CREATE EXTENSION test_prolly;
@@ -56,6 +64,30 @@ is(sql(q{SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::af.t)}),
 sql(q{UPDATE af.t SET v = repeat('y', 40) WHERE id % 5 = 0});
 ok($node->poll_query_until('postgres', "SELECT count(*) = 0 FROM $log"),
 	'folded again');
+
+# A snapshot held from before the writes: a fold can't trim them while it
+# is, so they don't make the table due (else autovacuum would fold at
+# every pass); once it ends, they're folded.
+my $rr = $node->background_psql('postgres');
+$rr->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM af.t});
+sql(q{UPDATE af.t SET v = repeat('h', 40) WHERE id % 5 = 0});
+my $offset = -s $node->logfile;
+sleep(5);
+ok(folds_since($offset) <= 1, 'held back: not folded at every pass');
+$rr->query_safe('COMMIT');
+$rr->quit;
+ok($node->poll_query_until('postgres', "SELECT count(*) = 0 FROM $log"),
+	'folded once the snapshot ended');
+
+# A table with autovacuum_enabled = false doesn't make the working set due.
+sql(q{ALTER TABLE af.t SET (autovacuum_enabled = false)});
+sql(q{UPDATE af.t SET v = repeat('o', 40) WHERE id % 5 = 0});
+sleep(5);
+ok(sql("SELECT count(*) > 0 FROM $log") eq 't',
+	'autovacuum_enabled = false: not folded');
+sql(q{ALTER TABLE af.t RESET (autovacuum_enabled)});
+ok($node->poll_query_until('postgres', "SELECT count(*) = 0 FROM $log"),
+	'folded once enabled again');
 
 # Off for the database (autovacuum's workers take its settings): the log
 # keeps the writes.

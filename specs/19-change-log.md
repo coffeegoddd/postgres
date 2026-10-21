@@ -244,7 +244,10 @@ Two interfaces, each selected by the table AM's profile
   consumed and trimmed rows are dead until vacuumed, so neither the log's
   size nor its rows' count tells; a keyed table's entries are keys, so
   bytes don't either); one saying to read in full is due, fewer than 1000
-  never are. A table with `autovacuum_enabled = false` doesn't trigger
+  never are. Only the rows of transactions below the horizon count, those
+  a fold trims: while a snapshot holds the horizon back, a fold can't take
+  the rest away, and counting them would fold again at every pass (review
+  of #630). A table with `autovacuum_enabled = false` doesn't trigger
   one.
   Other branches' tables aren't looked at. The test suites turn it off
   (its folds would land in the middle of tests that count folds) but

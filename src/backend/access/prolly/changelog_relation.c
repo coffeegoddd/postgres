@@ -1573,10 +1573,13 @@ relation_read_unseen(Relation rel, Snapshot snapshot,
 #define PENDING_SAMPLE_BLOCKS	32
 
 /*
- * The entries of rel's log no fold has consumed or trimmed (its live rows'),
- * estimated from a sample of its pages, evenly spread, as ANALYZE samples:
- * a row holds one entry to a page of them, and consumed and trimmed rows
- * are dead until vacuumed, so counts of rows don't tell.
+ * The entries of rel's log a fold now would trim: of its live rows (none
+ * consumed or trimmed) those of transactions below the horizon, estimated
+ * from a sample of its pages, evenly spread, as ANALYZE samples: a row
+ * holds one entry to a page of them, and consumed and trimmed rows are
+ * dead until vacuumed, so counts of rows don't tell.  The rows above the
+ * horizon (a snapshot held back, or the writer in flight) stay whatever
+ * folds, so they aren't counted: autovacuum would fold at every pass.
  */
 static double
 relation_pending(Relation rel)
@@ -1588,6 +1591,7 @@ relation_pending(Relation rel)
 	BlockNumber step;
 	BlockNumber sampled = 0;
 	TransactionId horizon;
+	FullTransactionId below;
 	BufferAccessStrategy strategy;
 	double		entries = 0;
 	bool		full = false;
@@ -1600,8 +1604,17 @@ relation_pending(Relation rel)
 	desc = RelationGetDescr(log);
 	nblocks = RelationGetNumberOfBlocks(log);
 	horizon = GetOldestNonRemovableTransactionId(log);
+	if (!TransactionIdIsNormal(horizon))
+	{
+		table_close(log, AccessShareLock);
+		return 0;
+	}
+	below = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											 horizon);
 	strategy = GetAccessStrategy(BAS_BULKREAD);
-	step = Max(nblocks / PENDING_SAMPLE_BLOCKS, 1);
+	/* (rounded up, so at most PENDING_SAMPLE_BLOCKS are read) */
+	step = Max((nblocks + PENDING_SAMPLE_BLOCKS - 1) / PENDING_SAMPLE_BLOCKS,
+			   1);
 	for (BlockNumber blk = 0; blk < nblocks && !full; blk += step)
 	{
 		Buffer		buf = ReadBufferExtended(log, MAIN_FORKNUM, blk, RBM_NORMAL,
@@ -1629,7 +1642,8 @@ relation_pending(Relation rel)
 			tup.t_tableOid = logid;
 			ItemPointerSet(&tup.t_self, blk, off);
 			r = HeapTupleSatisfiesVacuum(&tup, horizon, buf);
-			if (r != HEAPTUPLE_LIVE && r != HEAPTUPLE_INSERT_IN_PROGRESS)
+			if (r != HEAPTUPLE_LIVE ||
+				!FullTransactionIdPrecedes(row_xid(log, &tup), below))
 				continue;
 			b = DatumGetByteaPP(heap_getattr(&tup, Anum_log_entries, desc,
 											 &isnull));

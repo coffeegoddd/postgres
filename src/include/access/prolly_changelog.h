@@ -37,9 +37,12 @@
  *   needn't be read again.  It ignores relations that aren't prolly tables
  *   with a log.  Errors are the write's.
  * - pending() (optional) estimates how many entries rel's log holds that
- *   no fold has consumed or trimmed, cheaply (from a sample: autovacuum
- *   asks each table at each pass); -1 if one says to read the table in
- *   full, 0 if rel has no log.
+ *   a fold now would take away: not consumed or trimmed, of transactions
+ *   every snapshot sees finished (those a fold trims), cheaply (from a
+ *   sample: autovacuum asks each table at each pass); -1 if one says to
+ *   read the table in full, 0 if rel has no log.  Rows a snapshot may not
+ *   see finished aren't counted: no fold can take them while it may, so
+ *   counting them would have autovacuum fold again at every pass.
  * - note_emptied() (optional) is told rel was emptied (truncated) by the
  *   (sub)transaction: a fold that sees it starts from no rows, the writes
  *   after it applied.  Without it, note() is told every row may have
