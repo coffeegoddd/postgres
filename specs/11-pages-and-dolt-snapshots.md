@@ -326,11 +326,19 @@ commit or checkpoint all use it.
   definitions of their types (an enum's label renamed, a composite's
   attribute dropped), and the key encoder's, value encoder's and keying's
   implementations and format versions. Any of these changed, the next
-  fold reads the table in full (#322, #323). An enum's label added
-  (`ALTER TYPE ... ADD VALUE`) changes its definition without changing
-  a row, and costs each table using it one full read: telling an
-  addition from a rename would take the old labels, which a baseline
-  doesn't keep.
+  fold reads the table in full (#322, #323), unless the change leaves
+  every row as it was: the baseline keeps the keying's row shape itself,
+  and the keying tells (#485). So these keep the baseline:
+  - an index, a constraint, a default, a trigger, a rule, a policy,
+    reloptions, replica identity, statistics, storage, compression, a
+    comment (none is in the shape);
+  - `CLUSTER`, `VACUUM FULL`, `REPACK` (they rewrite no row's bytes, and
+    clear only missing values the rows already hold);
+  - a column added without a default (every old row has it as NULL,
+    which isn't stored);
+  - an enum's label added (`ALTER TYPE ... ADD VALUE`, `BEFORE` or
+    `AFTER` too): rows send labels, the old ones keep their names, and
+    their order, so keys too. A label renamed changes rows: read in full.
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
   folds the changes into a tree, which becomes the new baseline, and

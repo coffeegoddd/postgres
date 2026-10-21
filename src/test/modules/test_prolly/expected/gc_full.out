@@ -161,7 +161,7 @@ SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
              name              | chunks | settled 
 -------------------------------+--------+---------
  prolly_table_0000000000000004 |      1 | t
- prolly_table_0000000000000006 |      5 | t
+ prolly_table_0000000000000006 |      6 | t
  prolly_table_0000000000000008 |    163 | t
  prolly_table_000000000000000a |      7 | t
 (4 rows)
@@ -182,7 +182,7 @@ WHERE name = :'live_file';
 SELECT name, chunks, settled FROM test_chunk_table_files() ORDER BY name;
              name              | chunks | settled 
 -------------------------------+--------+---------
- prolly_table_0000000000000006 |      5 | t
+ prolly_table_0000000000000006 |      6 | t
  prolly_table_0000000000000008 |    163 | t
  prolly_table_000000000000000a |      7 | t
 (3 rows)

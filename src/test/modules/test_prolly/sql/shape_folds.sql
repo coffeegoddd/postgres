@@ -1,0 +1,127 @@
+-- DDL that changes a table's row shape but no row's bytes (a column added
+-- without a default, an enum's label added) keeps its baseline: the next
+-- commit folds from it, reading no table in full, and makes the tree a
+-- full fold would (debug_prolly_force_full_fold).  DDL that changes rows'
+-- bytes still reads them all.
+CREATE DATABASE regress_shape_folds;
+\c regress_shape_folds
+CREATE EXTENSION test_prolly;
+CREATE FUNCTION full_folds() RETURNS text LANGUAGE sql AS $$
+	SELECT coalesce(string_agg(substr(name, 11), ',' ORDER BY name), 'none')
+	FROM pg_stat_prolly
+	WHERE name LIKE 'fold\_full\_%' AND name <> 'fold_full_tables' AND value > 0
+$$;
+CREATE FUNCTION same_as_full() RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE
+	inc text;
+	full_root text;
+BEGIN
+	inc := test_fold_root();
+	SET LOCAL debug_prolly_force_full_fold = on;
+	full_root := test_fold_root();
+	SET LOCAL debug_prolly_force_full_fold = off;
+	RETURN inc = full_root;
+END $$;
+-- (the incremental root is the full one's; committed, the reasons any
+-- table was read in full)
+\set check 'SELECT same_as_full() AS same; SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly''); SELECT length(dolt_commit(''-Am'', ''ddl'')::text) > 0 AS committed; SELECT pg_stat_force_next_flush(); SELECT full_folds() AS read_in_full; SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;'
+CREATE SCHEMA sf VERSIONED;
+CREATE TYPE sf.mood AS ENUM ('sad', 'ok', 'glad');
+CREATE DOMAIN sf.small AS int;
+CREATE TABLE sf.t (id int PRIMARY KEY, a int, b text);
+INSERT INTO sf.t SELECT g, g % 10, 'b' || g FROM generate_series(1, 2000) g;
+-- (an enum keys this one: its labels' order is its rows')
+CREATE TABLE sf.e (m sf.mood PRIMARY KEY, n int);
+INSERT INTO sf.e VALUES ('sad', 1), ('ok', 2), ('glad', 3);
+CREATE TABLE sf.k (a int, b text);
+INSERT INTO sf.k SELECT g % 50, 'k' || (g % 7) FROM generate_series(1, 1000) g;
+CREATE TABLE sf.long (id int PRIMARY KEY, v text);
+ALTER TABLE sf.long ALTER COLUMN v SET STORAGE EXTERNAL;
+INSERT INTO sf.long SELECT g, repeat(md5(g::text), 400) FROM generate_series(1, 20) g;
+CREATE TABLE sf.nested (id int PRIMARY KEY, ms sf.mood[]);
+INSERT INTO sf.nested VALUES (1, '{sad,ok}'), (2, '{glad}');
+SELECT length(dolt_commit('-Am', 'shapes')::text) > 0 AS committed;
+
+-- a nullable column added: no row's bytes change (trailing NULLs aren't
+-- stored), whatever is written after it
+ALTER TABLE sf.t ADD COLUMN c int;
+UPDATE sf.t SET c = 1 WHERE id = 1;
+:check
+-- (a baseline keeps its shape out of line, in a tree of its own, which a
+-- collection keeps: the next change of shape reads it)
+SELECT dolt_gc();
+ALTER TABLE sf.t ADD COLUMN d sf.small;
+INSERT INTO sf.t (id, a, b, d) VALUES (5001, 1, 'new', 7);
+:check
+-- (a domain's constraint: its columns' types are as they were)
+ALTER DOMAIN sf.small ADD CONSTRAINT small_check CHECK (VALUE < 1000);
+UPDATE sf.t SET d = 8 WHERE id = 5001;
+:check
+-- (a domain with a constraint added as a column: Postgres rewrites the
+-- table to check it, and an ALTER TABLE's rewrite is read in full)
+ALTER TABLE sf.t ADD COLUMN dd sf.small;
+:check
+
+-- the same, the rows written in its transaction
+BEGIN;
+ALTER TABLE sf.t ADD COLUMN f text;
+UPDATE sf.t SET f = 'f' WHERE id <= 3;
+DELETE FROM sf.t WHERE id = 4;
+COMMIT;
+:check
+
+-- rolled back: the shape the baseline was folded under
+BEGIN;
+ALTER TABLE sf.t ADD COLUMN g int;
+UPDATE sf.t SET g = 1 WHERE id = 5;
+ROLLBACK;
+UPDATE sf.t SET b = 'changed' WHERE id = 6;
+:check
+
+-- keyless: its rows' keys are their bytes
+ALTER TABLE sf.k ADD COLUMN c int;
+INSERT INTO sf.k VALUES (1, 'k1', 3);
+:check
+
+-- values stored out of line
+ALTER TABLE sf.long ADD COLUMN w text;
+UPDATE sf.long SET w = repeat('w', 5000) WHERE id = 1;
+:check
+
+-- an enum's label added, before, after or at the end: the old labels keep
+-- their names and their order, so the rows keyed by them theirs
+ALTER TYPE sf.mood ADD VALUE 'meh' BEFORE 'ok';
+:check
+ALTER TYPE sf.mood ADD VALUE 'joy' AFTER 'glad';
+ALTER TYPE sf.mood ADD VALUE 'blue' BEFORE 'sad';
+INSERT INTO sf.e VALUES ('meh', 4), ('joy', 5), ('blue', 6);
+UPDATE sf.nested SET ms = '{blue,meh,joy}' WHERE id = 2;
+:check
+SELECT m, n FROM sf.e ORDER BY m;
+
+-- a label renamed: rows hold its name, so it changes theirs
+ALTER TYPE sf.mood RENAME VALUE 'glad' TO 'happy';
+:check
+
+-- a column added with a default: in every row's bytes
+ALTER TABLE sf.t ADD COLUMN h int DEFAULT 5;
+:check
+
+-- dropped: gone from every row's bytes; and one added in its place, which
+-- every row has as NULL
+ALTER TABLE sf.t DROP COLUMN h;
+:check
+ALTER TABLE sf.t DROP COLUMN c;
+ALTER TABLE sf.t ADD COLUMN c int;
+:check
+
+-- a rewrite that changes no row clears a default's missing value: the
+-- rows already hold it
+ALTER TABLE sf.k ADD COLUMN m int DEFAULT 9;
+:check
+VACUUM FULL sf.k;
+INSERT INTO sf.k VALUES (2, 'k2');
+:check
+
+\c contrib_regression
+DROP DATABASE regress_shape_folds;

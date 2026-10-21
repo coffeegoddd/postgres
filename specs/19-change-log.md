@@ -220,15 +220,29 @@ Two interfaces, each selected by the table AM's profile
   trees it builds kept in the transaction's memory (#506).
 
   A change of what rows' bytes depend on is caught by the baseline's
-  shape hash (`table_root()`, `canon_folded.c`) before the finder is
-  asked, which is what makes it safe to read old images by the table's
+  shape (`table_root()`, `canon_folded.c`) before the finder is asked,
+  which is what makes it safe to read old images by the table's
   descriptor now: the keying's `row_shape()` (keyed or not, the key's
-  columns and order, the live columns' numbers, types and missing
-  values), the encoders and the columns' type definitions. DDL that
-  changes none of those (an index, a constraint, a default, a trigger, a
-  policy, reloptions, statistics, storage) keeps the baseline (#485).
-  Adding a column without a default, and an enum's label added, change
-  no row's bytes but do change the shape: still a full fold.
+  columns and order, the value encoder's layout, the live columns'
+  numbers, types, missing values and type definitions) and the
+  encoders. DDL that changes none of those (an index, a constraint, a
+  default, a trigger, a policy, reloptions, statistics, storage) keeps
+  the baseline (#485). The baseline item keeps the shape itself, not
+  only a hash of it: in a value tree of its own, which the item names
+  beside the shape's hash (every item is written again at each baseline,
+  its finder's state changing, the shape seldom; the tree is written as
+  the shape changes, and declared, so a collection keeps it). It is a
+  versioned field: an item a build before wrote has none, and its table
+  is read in full once. So a change the keying says leaves every row as
+  it was (`shape_extends()`) keeps the baseline too:
+  a column added without a default (every old row has it as NULL, which
+  isn't stored), an enum's label added (rows send labels, and the old
+  ones keep their names and order, wherever the new one goes), a
+  default's missing value cleared by a rewrite that changes no row. A
+  keying without it reads the table in full on any change of shape.
+  Baselines are local: none of this reaches a commit's root. (A column
+  of a domain with a constraint added is a rewrite Postgres makes to
+  check it, still read in full.)
 - **A verifier** (`fold_verify.c`, #513) folds tables from their
   baselines and in full by one snapshot, at `prolly.fold_verify_rate` in
   autovacuum or by `dolt_verify_folds()`: a mismatch is warned of,

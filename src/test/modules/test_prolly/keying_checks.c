@@ -350,6 +350,86 @@ keying_owns_its_memory_body(const ProllyImplInfo *impl)
 	table_close(rel, AccessShareLock);
 }
 
+/*
+ * relid's row shape now (the table opened only meanwhile: DDL between
+ * mustn't find it in use).
+ */
+static StringInfo
+shape_of(const ProllyKeyingRoutine *kr, Oid relid)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
+	StringInfo	s = makeStringInfo();
+
+	PROLLY_CALL(kr, row_shape, k, rel, s);
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+	return s;
+}
+
+static bool
+extends(const ProllyKeyingRoutine *kr, Oid relid, StringInfo old)
+{
+	Relation	rel = table_open(relid, AccessShareLock);
+	ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
+	ProllyValue v = {(const uint8 *) old->data, old->len};
+	bool		r = PROLLY_CALL(kr, shape_extends, k, rel, &v);
+
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+	return r;
+}
+
+/*
+ * A row shape is stable under DDL that changes no row (an index), and
+ * changes under DDL that changes how rows encode; shape_extends() accepts
+ * a change that leaves every row as it was (a nullable column added, an
+ * enum's label added) and refuses the rest (a label renamed, a column
+ * added with a default, one dropped).
+ */
+static void
+keying_row_shapes_body(const ProllyImplInfo *impl)
+{
+	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
+	Relation	rel;
+	Oid			relid;
+	StringInfo	s0;
+	StringInfo	s;
+
+	keying_schema();
+	run_sql("CREATE TYPE " KEYING_SCHEMA ".conf_mood AS ENUM ('low', 'high')");
+	rel = make_table("conf_shape", "id int PRIMARY KEY, t text, n int");
+	relid = RelationGetRelid(rel);
+	table_close(rel, AccessShareLock);
+	s0 = shape_of(kr, relid);
+	run_sql("CREATE INDEX ON " KEYING_SCHEMA ".conf_shape (t)");
+	s = shape_of(kr, relid);
+	if (!same_bytes(s, s0) || !extends(kr, relid, s0))
+		elog(ERROR, "an index changed the row shape");
+	run_sql("ALTER TABLE " KEYING_SCHEMA ".conf_shape ADD COLUMN m "
+			KEYING_SCHEMA ".conf_mood");
+	s = shape_of(kr, relid);
+	if (same_bytes(s, s0) || !extends(kr, relid, s0))
+		elog(ERROR, "a nullable column added doesn't extend the row shape");
+	s0 = s;
+	run_sql("ALTER TYPE " KEYING_SCHEMA ".conf_mood ADD VALUE 'mid' BEFORE 'high'");
+	s = shape_of(kr, relid);
+	if (same_bytes(s, s0) || !extends(kr, relid, s0))
+		elog(ERROR, "an enum's label added doesn't extend the row shape");
+	s0 = s;
+	run_sql("ALTER TYPE " KEYING_SCHEMA ".conf_mood RENAME VALUE 'low' TO 'least'");
+	if (extends(kr, relid, s0))
+		elog(ERROR, "an enum's label renamed extends the row shape");
+	s0 = shape_of(kr, relid);
+	run_sql("ALTER TABLE " KEYING_SCHEMA ".conf_shape ADD COLUMN d int DEFAULT 5");
+	if (extends(kr, relid, s0))
+		elog(ERROR, "a column added with a default extends the row shape");
+	s0 = shape_of(kr, relid);
+	run_sql("ALTER TABLE " KEYING_SCHEMA ".conf_shape DROP COLUMN n");
+	if (extends(kr, relid, s0))
+		elog(ERROR, "a column dropped extends the row shape");
+}
+
 /* ------------------------------------------------------------------------
  * Value encoder: rows from earlier layouts
  * ------------------------------------------------------------------------
@@ -459,6 +539,12 @@ void
 keying_owns_its_memory(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_owns_its_memory_body, impl);
+}
+
+void
+keying_row_shapes(const ProllyImplInfo *impl)
+{
+	rolled_back(keying_row_shapes_body, impl);
 }
 
 void

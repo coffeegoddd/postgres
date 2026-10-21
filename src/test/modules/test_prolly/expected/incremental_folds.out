@@ -484,12 +484,13 @@ SELECT length(dolt_commit('-am', 'by content gone')::text) AS committed;
         42
 (1 row)
 
--- A table redefined, or rewritten, is read in full once.
+-- A column added without a default changes no row: the baseline holds
+-- (#485).  A table rewritten is read in full once.
 ALTER TABLE inc.big ADD COLUMN w int;
 SELECT * FROM pg_temp.fold();
  pages | candidates | full_tables | same_as_full 
 -------+------------+-------------+--------------
-     0 |          0 |           1 | t
+     0 |          0 |           0 | t
 (1 row)
 
 SELECT length(dolt_commit('-am', 'a column')::text) AS committed;
