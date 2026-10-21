@@ -70,7 +70,8 @@
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
  * four cases: a crash between a drop's commit and the records freeing its
- * blocks, a crash part way through a prune, a crash between the records
+ * blocks, a crash part way through a prune, a crash (or an error, not an
+ * interrupt, which the header's lock holds off) between the records
  * letting go of a truncation's blocks and those freeing them, and a count
  * stuck at 255 maps.
  * A sweep counts exactly what every map (and changes list) of a database's
@@ -2604,9 +2605,18 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 	}
 	ReleaseBuffer(mapbuf);
 
-	/* (sorted, as phys[]; a crash before this leaves them to a sweep) */
+	/*
+	 * (sorted, as phys[]; a crash before this leaves them to a sweep)  A
+	 * released block no other map holds is held by nothing until it is
+	 * freed, and free_blocks()'s reads may wait; but the caller's lock of
+	 * the header holds off interrupts, so a cancelled truncation (an
+	 * autovacuum's, waited on by a query) frees them first.
+	 */
 	if (nfree > 0)
+	{
+		INJECTION_POINT("bmap-truncation-let-go", NULL);
 		free_blocks(rel, tofree, nfree);
+	}
 }
 
 /* a main fork's logical blocks can be given other physical blocks */
@@ -6022,6 +6032,34 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 }
 
 /*
+ * The first of blocks [from, to), on one map page, with an entry, and in
+ * *last the one after the last; false if none has one.
+ */
+static bool
+mapped_span(SMgrRelation reln, uint64 from, uint64 to, uint64 *first,
+			uint64 *last)
+{
+	PGIOAlignedBlock copy;
+	const BmapEntry *entries;
+	bool		found = false;
+
+	if (!read_node_ext(reln, MAP_PAGE(from), false, copy.data, BMAP_PAGE_NODE,
+					   true))
+		return false;
+	entries = PageGetBmapEntries(copy.data);
+	for (uint64 blk = from; blk < to; blk++)
+	{
+		if (!BlockNumberIsValid(entries[MAP_SLOT(blk)].block))
+			continue;
+		if (!found)
+			*first = blk;
+		*last = blk + 1;
+		found = true;
+	}
+	return found;
+}
+
+/*
  * Once a truncation is done, outside its critical section: let go of the
  * entries past the relation's length, this truncation's and any an earlier
  * one left (a crash before this), freeing the blocks no other map holds
@@ -6052,14 +6090,29 @@ bmapposttruncate(SMgrRelation reln, ForkNumber forknum)
 	header = PageGetBmapHeader(BufferGetPage(headerbuf));
 
 	end = map_blocks(reln);
-	for (uint64 from = header->nblocks; from < end;)
+	for (uint64 page = header->nblocks; page < end;)
 	{
-		uint64		to = Min(end, from + BMAP_PIECE);
+		uint64		pageend = Min(end, (page / BMAP_FANOUT + 1) * BMAP_FANOUT);
+		uint64		from;
+		uint64		last;
 
-		to = Min(to, (from / BMAP_FANOUT + 1) * BMAP_FANOUT);
-		unshare_stale(reln, header->epoch, header->fold_epoch,
-					  (BlockNumber) from, (BlockNumber) to, true);
-		from = to;
+		/*
+		 * The map never shrinks, so most of its pages past the length have
+		 * nothing left after the first truncation: each is read once, not
+		 * copied for every piece.
+		 */
+		if (mapped_span(reln, page, pageend, &from, &last))
+		{
+			while (from < last)
+			{
+				uint64		to = Min(last, from + BMAP_PIECE);
+
+				unshare_stale(reln, header->epoch, header->fold_epoch,
+							  (BlockNumber) from, (BlockNumber) to, true);
+				from = to;
+			}
+		}
+		page = pageend;
 	}
 	UnlockReleaseBuffer(headerbuf);
 }

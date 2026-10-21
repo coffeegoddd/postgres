@@ -6,7 +6,8 @@
 # nothing frees a block replay still maps, and the next truncation lets go
 # of them.  A crash after it replays the frees, and records from before
 # the truncation for a page past the length write nothing onto a freed
-# block another relation was given.  A standby replays the same.
+# block another relation was given.  A cancel as the blocks are let go of
+# waits until they are freed.  A standby replays the same.
 
 use strict;
 use warnings FATAL => 'all';
@@ -149,6 +150,30 @@ is(sql(q{SELECT count(*), sum(a), md5(string_agg(b, '' ORDER BY a)) FROM g}), $g
 	'after a crash after the sweep, the other table reads back');
 is(free_blocks($node), $free_now, 'and the page store is as the sweep left it');
 standby_agrees('crash after the sweep', 'k', 'g');
+
+# A truncation cancelled as it lets go of the blocks past the length (an
+# autovacuum's, waited on by a query) still frees those it let go of: the
+# cancel waits until they are freed.
+sql(q{CREATE TABLE c (a int, b text);
+	INSERT INTO c SELECT g, repeat('x', 500) FROM generate_series(1, 1500) g});
+sql(q{DELETE FROM c WHERE a > 150});
+$free_before = free_blocks($node);
+sql(q{SELECT injection_points_attach('bmap-truncation-let-go', 'wait')});
+my $cancelled = $node->background_psql('postgres', on_error_stop => 0);
+my $pid = $cancelled->query_safe('SELECT pg_backend_pid()');
+$cancelled->query_until(qr/vacuuming/, q{\echo vacuuming
+VACUUM c;
+});
+$node->wait_for_event('client backend', 'bmap-truncation-let-go');
+sql(qq{SELECT pg_cancel_backend($pid)});
+sql(q{SELECT injection_points_detach('bmap-truncation-let-go')});
+# (fails if the cancel ended the wait)
+$node->psql('postgres', q{SELECT injection_points_wakeup('bmap-truncation-let-go')});
+$cancelled->quit;
+is(nblocks('c'), '10', 'a cancelled truncation cuts the table');
+is(past_end($node, 'c'), '0', 'and lets go of every block past it');
+cmp_ok(free_blocks($node) - $free_before, '>=', 90, 'freeing them');
+standby_agrees('a cancelled truncation', 'c');
 
 $standby->stop;
 $node->stop;
