@@ -36,6 +36,9 @@ INSERT INTO dm.t SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
 SELECT length(dolt_commit('-Am', 'dm rows')::text) AS committed;
 
 SET work_mem = '64kB';
+-- (the backend's cache of decoded chunks off: it holds up to its setting
+-- whatever is read, and what's measured is what reading the rows holds)
+SET prolly_chunk_cache_size = 0;
 
 -- (when every row's decoding was kept, this held 8 to 25 MB; freed, under
 -- half a MB)

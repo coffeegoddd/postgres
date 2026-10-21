@@ -2469,6 +2469,16 @@
   check_hook => 'check_primary_slot_name',
 },
 
+{ name => 'prolly_chunk_cache_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
+  short_desc => 'Sets how much of the prolly chunk store\'s decoded chunks each backend keeps for its later reads.',
+  long_desc => 'Chunks are named by their content, so one kept is never stale. 0 keeps none.',
+  flags => 'GUC_UNIT_KB',
+  variable => 'prolly_chunk_cache_size',
+  boot_val => '16384',
+  min => '0',
+  max => 'MAX_KILOBYTES',
+},
+
 { name => 'prolly_serve_uncompressed', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_OTHER',
   short_desc => 'Has this server send the session chunks uncompressed, as a remote.',
   long_desc => 'A client built without LZ4 sets it on its connection to a remote, which would otherwise send chunks as it stores them.',

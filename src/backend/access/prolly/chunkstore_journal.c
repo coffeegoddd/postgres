@@ -163,6 +163,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "journal_index.h"
+#include "lib/ilist.h"
 #include "commands/vacuum.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/hashfn.h"
@@ -654,6 +655,181 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
 	memset(key, 0, sizeof(ProllyHash));
 	key->len = hash->len;
 	memcpy(key->bytes, hash->bytes, hash->len);
+}
+
+/*
+ * Decoded chunks the session's store read from its files, kept by hash for
+ * the backend's later reads, least recently used dropped past
+ * prolly_chunk_cache_size kB.  A chunk is named by its content, so one kept
+ * is the chunk whatever happens to the store after: none is ever stale.
+ * Only those read from the files (not the transaction's own, pending or
+ * transient, which an abort takes back, nor one read through a source).
+ *
+ * A chunk is kept the second time it is read from the files, not the
+ * first: the hashes of those read once are remembered (as many as the
+ * cache holds chunks), so a read of many chunks once each, as a fold of
+ * many rows reads leaves, neither churns the cache nor pays to fill it,
+ * while the nodes reads keep coming back to (upper levels, rows read
+ * again) are kept from their second read on.
+ */
+int			prolly_chunk_cache_size = 16384;
+
+typedef struct CachedChunk
+{
+	ProllyHash	key;			/* hash_key()'s */
+	char	   *data;
+	uint32		len;
+	dlist_node	lru;			/* most recent first */
+} CachedChunk;
+
+static HTAB *chunk_cache = NULL;
+static dlist_head chunk_cache_lru = DLIST_STATIC_INIT(chunk_cache_lru);
+static Size chunk_cache_bytes = 0;
+static MemoryContext chunk_cache_cxt = NULL;
+
+/* hashes read once, oldest first: a ring, and a set of what it holds */
+typedef struct SeenChunk
+{
+	ProllyHash	key;
+} SeenChunk;
+
+static HTAB *chunk_seen = NULL;
+static ProllyHash *chunk_seen_ring = NULL;
+static int	chunk_seen_size = 0;
+static int	chunk_seen_next = 0;
+
+/* (about as many as the cache holds chunks of a node's target size) */
+#define CHUNK_SEEN_SIZE(limit) ((int) Min(Max((limit) / 4096, 64), 1 << 20))
+
+/*
+ * Has key been read from the files once already, lately?  If not, it is
+ * remembered as read once.
+ */
+static bool
+chunk_seen_before(const ProllyHash *key, Size limit)
+{
+	bool		found;
+	int			want = CHUNK_SEEN_SIZE(limit);
+
+	if (chunk_seen == NULL || chunk_seen_size != want)
+	{
+		HASHCTL		ctl;
+
+		if (chunk_seen != NULL)
+		{
+			hash_destroy(chunk_seen);
+			pfree(chunk_seen_ring);
+		}
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(SeenChunk);
+		ctl.hcxt = chunk_cache_cxt;
+		chunk_seen = hash_create("prolly chunks read once", want, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		chunk_seen_ring = MemoryContextAllocZero(chunk_cache_cxt,
+												 want * sizeof(ProllyHash));
+		chunk_seen_size = want;
+		chunk_seen_next = 0;
+	}
+	(void) hash_search(chunk_seen, key, HASH_FIND, &found);
+	if (found)
+	{
+		(void) hash_search(chunk_seen, key, HASH_REMOVE, NULL);
+		return true;
+	}
+	/* (the oldest let go of, if the ring is full) */
+	if (chunk_seen_ring[chunk_seen_next].len != 0)
+		(void) hash_search(chunk_seen, &chunk_seen_ring[chunk_seen_next],
+						   HASH_REMOVE, NULL);
+	chunk_seen_ring[chunk_seen_next] = *key;
+	(void) hash_search(chunk_seen, key, HASH_ENTER, NULL);
+	chunk_seen_next = (chunk_seen_next + 1) % chunk_seen_size;
+	return false;
+}
+
+static Size
+chunk_cache_limit(void)
+{
+	return (Size) prolly_chunk_cache_size * 1024;
+}
+
+static void chunk_cache_evict(Size limit);
+
+static bool
+chunk_cache_take(const ProllyHash *key, StringInfo out)
+{
+	CachedChunk *c;
+
+	if (chunk_cache == NULL)
+		return false;
+	/* (the setting lowered: what it no longer holds let go of first) */
+	if (chunk_cache_bytes > chunk_cache_limit())
+		chunk_cache_evict(chunk_cache_limit());
+	c = hash_search(chunk_cache, key, HASH_FIND, NULL);
+	if (c == NULL)
+		return false;
+	dlist_move_head(&chunk_cache_lru, &c->lru);
+	appendBinaryStringInfo(out, c->data, c->len);
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_CACHE_HITS, 1);
+	return true;
+}
+
+static void
+chunk_cache_evict(Size limit)
+{
+	while (chunk_cache_bytes > limit && !dlist_is_empty(&chunk_cache_lru))
+	{
+		CachedChunk *c = dlist_container(CachedChunk, lru,
+										 dlist_tail_node(&chunk_cache_lru));
+
+		dlist_delete(&c->lru);
+		chunk_cache_bytes -= c->len + sizeof(CachedChunk);
+		pfree(c->data);
+		(void) hash_search(chunk_cache, &c->key, HASH_REMOVE, NULL);
+	}
+}
+
+static void
+chunk_cache_put(const ProllyHash *key, const char *data, uint32 len)
+{
+	Size		limit = chunk_cache_limit();
+	CachedChunk *c;
+	bool		found;
+
+	/* (none past an eighth of the cache: one chunk mustn't empty it) */
+	if (limit == 0 || (Size) len + sizeof(CachedChunk) > limit / 8)
+	{
+		if (chunk_cache != NULL)
+			chunk_cache_evict(limit);
+		return;
+	}
+	if (chunk_cache_cxt == NULL)
+		chunk_cache_cxt = AllocSetContextCreate(TopMemoryContext,
+												"prolly chunk cache",
+												ALLOCSET_DEFAULT_SIZES);
+	if (!chunk_seen_before(key, limit))
+		return;
+	if (chunk_cache == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(CachedChunk);
+		ctl.hcxt = chunk_cache_cxt;
+		chunk_cache = hash_create("prolly chunk cache", 1024, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	c = hash_search(chunk_cache, key, HASH_ENTER, &found);
+	if (found)
+	{
+		dlist_move_head(&chunk_cache_lru, &c->lru);
+		return;
+	}
+	c->data = MemoryContextAlloc(chunk_cache_cxt, Max(len, 1));
+	memcpy(c->data, data, len);
+	c->len = len;
+	dlist_push_head(&chunk_cache_lru, &c->lru);
+	chunk_cache_bytes += len + sizeof(CachedChunk);
+	chunk_cache_evict(limit);
 }
 
 /* Append a record of kind with payload (head, then tail) to buf. */
@@ -4605,6 +4781,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	uint64		segment;
 	uint64		offset;
 	uint32		len;
+	int			start;
 
 	hash_key(&key, hash);
 	e = hash_search(s->pending_index, &key, HASH_FIND, NULL);
@@ -4630,6 +4807,11 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	}
 	if (!stored && ahead_take(s, &key, out))
 		return true;
+	if (!stored && s == session_store && chunk_cache_take(&key, out))
+	{
+		xact_note(s);
+		return true;
+	}
 	if (stored)
 	{
 		StringInfoData ahead;
@@ -4646,16 +4828,25 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	}
 	refresh_segments(s);
 	xact_note(s);
+	start = out->len;
 	if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 	{
 		if (tables_read(s, &key, out, stored))
+		{
+			if (!stored && s == session_store)
+				chunk_cache_put(&key, out->data + start, out->len - start);
 			return true;
+		}
 		scan_journal(s);
 		if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 		{
 			load_tables(s, false);
 			if (tables_read(s, &key, out, stored))
+			{
+				if (!stored && s == session_store)
+					chunk_cache_put(&key, out->data + start, out->len - start);
 				return true;
+			}
 			if (s->through == NULL)
 				return false;
 			if (!stored)
@@ -4696,7 +4887,11 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		record_framed(g->path, rec, len, out);
 	}
 	else
+	{
 		chunk_bytes_of(g->path, rec, len, &key, out);
+		if (s == session_store)
+			chunk_cache_put(&key, out->data + start, out->len - start);
+	}
 	pfree(rec);
 	return true;
 }

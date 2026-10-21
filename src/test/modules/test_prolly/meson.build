@@ -119,6 +119,7 @@ tests += {
       'undescribed_objects',
       'statistics_casts',
       'stat_prolly',
+      'chunk_cache',
       'store_sizes',
       'storage_breakdown',
       'get_many',

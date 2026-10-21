@@ -457,6 +457,9 @@ extern void prolly_chunk_frame_plain(const char *frame, Size len,
 
 /* (a session's: frames this server sends it, by get_stored, are plain) */
 extern PGDLLIMPORT bool prolly_serve_uncompressed;
+
+/* prolly_chunk_cache_size: kB of decoded chunks a backend keeps */
+extern PGDLLIMPORT int prolly_chunk_cache_size;
 extern bool prolly_chunk_unframe(const char *frame, Size len, StringInfo out);
 extern bool prolly_chunk_frame_len(const char *frame, Size len, uint32 *chunk_len);
 
