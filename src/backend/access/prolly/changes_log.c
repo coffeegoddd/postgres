@@ -1238,6 +1238,16 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	MemoryContextDelete(cxt);
 }
 
+/*
+ * Leaving a branch folds nothing: the log keeps nothing a fold frees but
+ * its entries, which the branch's next fold reads.
+ */
+static bool
+log_fold_on_leave(void)
+{
+	return false;
+}
+
 /* A state holds no nodes: the log's entries are rows, not chunks. */
 static void
 log_walk(const ProllyTreeEnv *env, const ProllyValue *state,
@@ -1359,4 +1369,5 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.fold_rows = log_fold_rows,
 	.state_refs = log_state_refs,
 	.advance = log_advance,
+	.fold_on_leave = log_fold_on_leave,
 };

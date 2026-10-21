@@ -1993,6 +1993,16 @@ pages_advance(Relation rel, const ProllyValue *state, StringInfo next)
 	return false;
 }
 
+/*
+ * Leaving a branch folds its changes: the first change to each page since
+ * the fold kept the page's old version, which the fold frees.
+ */
+static bool
+pages_fold_on_leave(void)
+{
+	return true;
+}
+
 const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.info = {
 		.iface = PROLLY_IFACE_CHANGE_FINDER,
@@ -2008,4 +2018,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.fold_rows = pages_fold_rows,
 	.state_refs = pages_state_refs,
 	.advance = pages_advance,
+	.fold_on_leave = pages_fold_on_leave,
 };

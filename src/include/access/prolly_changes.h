@@ -126,12 +126,21 @@ typedef struct ProllyChangeFinderRoutine
 	 */
 	bool		(*advance) (Relation rel, const ProllyValue *state,
 							StringInfo next);
+
+	/*
+	 * True if a branch's changes should be folded as it is left: for a
+	 * finder that keeps what it reads changes from until the next fold (old
+	 * versions of pages), so what it keeps for them is freed then rather
+	 * than at its next commit.  False for one that keeps nothing a fold
+	 * frees but its own record of the changes, which can wait.
+	 */
+	bool		(*fold_on_leave) (void);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
-	"state_refs", "advance"
+	"state_refs", "advance", "fold_on_leave"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK advance
+#define PROLLY_CHANGES_LAST_CALLBACK fold_on_leave
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

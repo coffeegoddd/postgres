@@ -102,7 +102,7 @@ SELECT pg_temp.since('folds_reused') AS after_truncate;
 SELECT length(dolt_commit('-am', 'truncated')::text) > 0 AS committed;
 
 -- a branch switched to: its own working set (none of its statuses taken;
--- the two checkouts take the working sets of the branches they leave)
+-- main's, back on it, is: leaving a branch reads nothing of it)
 SELECT dolt_checkout('other');
 SELECT * FROM dolt_status;
 INSERT INTO fc.t VALUES (1000, 'on other');
@@ -168,8 +168,9 @@ RESET debug_prolly_force_full_fold;
 :flush
 SELECT pg_temp.since('folds_reused') AS forced_full;
 
--- No fold around moves: a checkout and a hard reset take the working set
--- known.  Leaving a clean branch, and back: nothing folded.
+-- No fold around moves: a hard reset takes the working set known, and a
+-- checkout reads none.  Leaving a clean branch, and back: nothing taken,
+-- nothing folded.
 SELECT length(dolt_commit('-am', 'on other')::text) > 0 AS committed
 FROM (SELECT dolt_checkout('other')) c;
 SELECT dolt_checkout('main');
@@ -213,14 +214,33 @@ SELECT * FROM dolt_status;
 :flush
 SELECT pg_temp.since('folds_reused') AS fast_forward_taken;
 
--- Leaving a branch with changes known: its checkpoint, folded once, keeps
--- them.
+-- Leaving a branch with changes: no checkpoint (the change log keeps
+-- nothing a fold frees), nothing read or folded; they stay the branch's,
+-- for its next fold.
 UPDATE fc.t SET v = 'left' WHERE id = 5;
 SELECT * FROM dolt_status;
+SET debug_prolly_verify_fold_caches = off;
+:flush
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting,
+	pg_temp.since('bytes_hashed') IS NOT NULL AS hashing,
+	pg_temp.since('chunks_appended') IS NOT NULL AS appending;
 SELECT dolt_checkout('other');
 SELECT dolt_checkout('main');
+:flush
+SELECT pg_temp.since('fold_rows_read') AS dirty_leave_rows,
+	pg_temp.since('bytes_hashed') AS dirty_leave_hashed,
+	pg_temp.since('chunks_appended') AS dirty_leave_chunks;
+RESET debug_prolly_verify_fold_caches;
 SELECT * FROM dolt_status;
 SELECT v FROM fc.t WHERE id = 5;
+UPDATE fc.t SET v = 'left again' WHERE id = 6;
+BEGIN;
+SELECT dolt_checkout('other');
+SELECT dolt_checkout('main');
+COMMIT;
+SELECT * FROM dolt_status;
+SELECT v FROM fc.t WHERE id = 6;
+
 SELECT length(dolt_commit('-am', 'left')::text) > 0 AS committed;
 
 \c contrib_regression

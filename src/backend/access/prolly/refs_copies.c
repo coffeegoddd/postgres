@@ -2555,18 +2555,23 @@ copies_checkpoint(ProllyNodeRef *root)
 }
 
 /*
- * Leaving a branch with changes takes a working-set checkpoint of it, so
- * the pages it changed needn't be kept until its next commit: if its
- * working set isn't its head's, nor what its baseline's fold made already.
- * Not in a transaction that can't write, nor in a transaction block (the
- * refs, held to the transaction's end, would hold up others' commits), nor
- * if the branch's head moved unseen by the snapshot (its fold wouldn't be
- * the branch's), nor its baseline (another's checkpoint or fold, which the
- * snapshot can't fold from: it would read every table in full, and replace
- * that one's baseline with an unsettled one).  (A session choosing its
- * first branch, as it connects, leaves none.)  A working set known (#482)
- * is compared without a fold; one not known is folded once, as the
- * checkpoint, kept even if clean (its fold took its log's entries).
+ * Leaving a branch leaves its changes in its copies, unfolded: its next
+ * fold (a commit, a status, another session's read) reads them from its
+ * change finder's record, as it would have had the session stayed.  Only a
+ * change finder that keeps what it reads changes from until a fold (old
+ * versions of pages, fold_on_leave()) takes a working-set checkpoint of a
+ * branch with changes as it is left, so what it keeps is freed then: if
+ * its working set isn't its head's, nor what its baseline's fold made
+ * already.  Not in a transaction that can't write, nor in a transaction
+ * block (the refs, held to the transaction's end, would hold up others'
+ * commits), nor if the branch's head moved unseen by the snapshot (its
+ * fold wouldn't be the branch's), nor its baseline (another's checkpoint
+ * or fold, which the snapshot can't fold from: it would read every table
+ * in full, and replace that one's baseline with an unsettled one).  (A
+ * session choosing its first branch, as it connects, leaves none.)  A
+ * working set known (#482) is compared without a fold; one not known is
+ * folded once, as the checkpoint, kept even if clean (its fold took the
+ * finder's record of its changes).
  */
 static void
 copies_checkout(const char *name)
@@ -2574,6 +2579,7 @@ copies_checkout(const char *name)
 	char	   *current = branch_ops()->current();
 	Oid			oid = strcmp(current, name) != 0 ? branch_oid(name) : InvalidOid;
 	ProllyHash	only_head;
+	const ProllyChangeFinderRoutine *finder = prolly_change_finder();
 
 	/* (one with only a head gets its copies, a connection's too) */
 	if (strcmp(current, name) != 0 && !OidIsValid(oid) &&
@@ -2602,7 +2608,8 @@ copies_checkout(const char *name)
 				 errhint("The transaction might succeed if retried.")));
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
-		OidIsValid(oid))
+		OidIsValid(oid) && PROLLY_HAS(finder, fold_on_leave) &&
+		finder->fold_on_leave())
 	{
 		ProllyNodeRef working;
 		ProllyNodeRef kept;

@@ -230,10 +230,10 @@ SELECT length(dolt_commit('-am', 'long')::text) AS committed;
         42
 (1 row)
 
--- Leaving a branch with changes folds it as its baseline, which consumes
--- its entries; a branch's first use moves its copy of the table (and of
--- the log) to its head, and the move's fold consumes the move's.  Then
--- each branch's log is its own.
+-- Leaving a branch with changes leaves its entries, for its next fold; a
+-- branch's first use moves its copy of the table (and of the log) to its
+-- head, and the move's fold consumes the move's.  Then each branch's log
+-- is its own.
 INSERT INTO cl.keyed VALUES (10, 'j');
 SELECT dolt_branch('cl_other');
  dolt_branch 
@@ -269,14 +269,14 @@ SELECT dolt_checkout('main');
 SELECT * FROM pg_temp.entries('cl.keyed');
  n | deltas | full_read 
 ---+--------+-----------
- 0 | {}     | f
+ 1 | {0}    | f
 (1 row)
 
 INSERT INTO cl.keyed VALUES (12, 'l');
 SELECT * FROM pg_temp.entries('cl.keyed');
  n | deltas | full_read 
 ---+--------+-----------
- 1 | {0}    | f
+ 2 | {0,0}  | f
 (1 row)
 
 -- A move writes rows on the session's behalf: they are entries too, and
