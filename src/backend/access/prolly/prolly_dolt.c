@@ -4685,6 +4685,47 @@ rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 }
 
 /*
+ * rows_datum()'s row as a jsonb object instead: each column's value as
+ * to_jsonb() has it, by the column's name in the rows' version (#612).
+ */
+static Datum
+rows_jsonb(Rows *r, const ProllyValue *value, uint64 *count)
+{
+	TupleDesc	desc = r->slot->tts_tupleDescriptor;
+	Datum	   *args = palloc_array(Datum, Max(2 * desc->natts, 1));
+	bool	   *nulls = palloc_array(bool, Max(2 * desc->natts, 1));
+	Oid		   *types = palloc_array(Oid, Max(2 * desc->natts, 1));
+	int			n = 0;
+	ProllyValue row;
+
+	rows_parse(r, value, &row, count);
+	ExecClearTuple(r->slot);
+	PROLLY_CALL(r->c.keying, decode_row, r->keying, &row, r->slot);
+	slot_getallattrs(r->slot);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		args[n] = CStringGetTextDatum(NameStr(att->attname));
+		nulls[n] = false;
+		types[n++] = TEXTOID;
+		args[n] = r->slot->tts_values[i];
+		nulls[n] = r->slot->tts_isnull[i];
+		types[n++] = att->atttypid;
+	}
+	return jsonb_build_object_worker(n, args, nulls, types, false, false);
+}
+
+/* A row as a function returns it: of the table's row type, or as jsonb. */
+static Datum
+rows_value(Rows *r, bool json, const ProllyValue *value, uint64 *count)
+{
+	return json ? rows_jsonb(r, value, count) : rows_datum(r, value, count);
+}
+
+/*
  * Whether the user may read relid's history, or what refuses them: they
  * need mode on the table, and row security mustn't apply to them, as
  * history holds every row whatever the table's policies say.  noError as
@@ -4775,6 +4816,9 @@ typedef struct RowDiffSink
 	ProllyDiffSink sink;		/* must be first */
 	ReturnSetInfo *rsinfo;
 	Rows		rows;
+	bool		json;			/* (a table by name) rows as jsonb, the to
+								 * side's decoded by to_rows */
+	Rows		to_rows;
 
 	/*
 	 * dolt_diff_table()'s: each row with the commits it is between, and
@@ -4833,15 +4877,18 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	uint64		nafter = 0;
 	Datum		from = (Datum) 0;
 	Datum		to = (Datum) 0;
+	Rows	   *to_rows = s->json ? &s->to_rows : &s->rows;
 	MemoryContext old = rows_next(&s->rows);
 
+	if (s->json)
+		(void) rows_next(to_rows);
 	if (before)
-		from = rows_datum(&s->rows, before, &nbefore);
+		from = rows_value(&s->rows, s->json, before, &nbefore);
 	if (after)
-		to = rows_datum(&s->rows, after, &nafter);
+		to = rows_value(to_rows, s->json, after, &nafter);
 
 	/* A keyless row's copies: each one added or removed is a row. */
-	if (s->rows.keyless)
+	if (s->rows.keyless || to_rows->keyless)
 	{
 		if (nafter > nbefore)
 			put_diff(s, "added", (Datum) 0, true, to, false, nafter - nbefore);
@@ -4898,6 +4945,282 @@ dolt_diff(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The version of the table name names that a summary's changes (rows) have,
+ * name read as summary_rows() reads it: the table it names on the to side
+ * first, then on the from side (a table renamed, and another made with its
+ * old name).  NULL if none (its rows and definition the same on both, or
+ * neither has it).
+ */
+static SummaryRow *
+named_table(List *rows, const char *name)
+{
+	char	   *want = row_name_wanted(rows, name);
+	SummaryRow *found = NULL;
+	ListCell   *lc;
+
+	if (want == NULL)
+		return NULL;
+	foreach(lc, rows)
+	{
+		SummaryRow *r = lfirst(lc);
+
+		if (r->object != PROLLY_OBJECT_TABLE || r->not_covered)
+			continue;
+		if (r->to_name && strcmp(r->to_name, want) == 0)
+			return r;
+		if (r->from_name && strcmp(r->from_name, want) == 0)
+			found = r;
+	}
+	return found;
+}
+
+/*
+ * May the user read a table's rows as its versions have them, by name?
+ * Where the session has a table of either version's name, SELECT on it
+ * (row security not applying to them, as for the table's row type); where
+ * it has none (dropped since, or renamed), there's no grant to check: the
+ * database's owner or a member of pg_read_all_data may.
+ */
+static void
+check_named_rows(const SummaryRow *r, const char *fn)
+{
+	const char *names[2] = {r->to_name, r->from_name};
+	bool		checked = false;
+
+	for (int i = 0; i < 2; i++)
+	{
+		Oid			relid;
+		AclResult	aclresult;
+
+		if (names[i] == NULL)
+			continue;
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(names[i], NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+			continue;
+		aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+		check_history_rls(relid, fn);
+		checked = true;
+	}
+	if (!checked &&
+		!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
+		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
+						fn, r->from_name ? r->from_name : r->to_name),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+}
+
+/* rows_begin_described() of a table's version, or refused. */
+static void
+rows_begin_named(Rows *r, const char *item, int len, const char *name,
+				 const char *fn)
+{
+	if (!rows_begin_described(r, item, len))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s can't read \"%s\" as a version describes it", fn, name),
+				 errdetail("One of its columns' types isn't one this database has now.")));
+}
+
+/* A change an unordered diff finds, to a RowDiffSink. */
+static void
+row_tree_change(ProllyDiffKind kind, const ProllyKey *key,
+				const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	row_change(arg, InvalidOid, kind, key, before, after);
+}
+
+/*
+ * The rows of the table name names (as named_table() finds it) that differ
+ * between two refs (from_ref NULL: the empty root), to s as jsonb, each
+ * decoded as its own version describes the table (#612): read from the
+ * versions' trees, so a table the session hasn't (dropped since, renamed)
+ * is read too; matched by their keys' bytes, as no relation orders them (a
+ * row whose key changed form between the versions, a primary key made or
+ * dropped, is removed and added).  False if neither version has it
+ * changed.
+ */
+static bool
+diff_by_name(RowDiffSink *s, const char *from_ref, const char *to_ref,
+			 const char *name, const char *fn)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	List	   *rows = NIL;
+	SummaryRow *r;
+	const char *fitem;
+	const char *titem;
+	int			flen;
+	int			tlen;
+	ProllyNodeRef fd;
+	ProllyNodeRef td;
+
+	if (!PROLLY_HAS(diff_merge(), summary) || !PROLLY_HAS(tree, diff_unordered))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't read a table's rows by its name")));
+	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, false, collect_change, &rows);
+	r = named_table(rows, name);
+	if (r == NULL)
+		return false;
+	check_named_rows(r, fn);
+
+	/* (a side without the table: the empty tree, read as the other's) */
+	fitem = r->from_item ? r->from_item : r->to_item;
+	flen = r->from_item ? r->from_len : r->to_len;
+	titem = r->to_item ? r->to_item : r->from_item;
+	tlen = r->to_item ? r->to_len : r->from_len;
+	rows_begin_named(&s->rows, fitem, flen, name, fn);
+	rows_begin_named(&s->to_rows, titem, tlen, name, fn);
+	table_item_data(fitem, flen, &fd);
+	table_item_data(titem, tlen, &td);
+	if (r->from_item == NULL || r->to_item == NULL)
+	{
+		ProllyNodeRef empty;
+
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &s->rows.env, CurrentMemoryContext),
+					&empty);
+		if (r->from_item == NULL)
+			fd = empty;
+		else
+			td = empty;
+	}
+	PROLLY_CALL(tree, diff_unordered, &s->rows.env, &fd, &td, row_tree_change, s);
+	rows_end(&s->rows);
+	rows_end(&s->to_rows);
+	return true;
+}
+
+/*
+ * dolt_diff(from_ref text, to_ref text, table_name text,
+ *			 OUT diff_type text, OUT from_row jsonb, OUT to_row jsonb)
+ *	  returns setof record
+ *
+ * dolt_diff() of a table named by its name, as Dolt's takes it, rather
+ * than by its row type: so a table the session hasn't, dropped since or
+ * renamed (by the name a version has), can be read (#612).  Each row is a
+ * jsonb object of its columns, decoded as its own version defines the
+ * table; a name neither version has is refused (as dolt_diff_stat's).
+ */
+Datum
+dolt_diff_by_name(PG_FUNCTION_ARGS)
+{
+	char	   *from_ref;
+	char	   *to_ref;
+	char	   *name;
+	RowDiffSink s;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff's refs and table name can't be null")));
+	from_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	to_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = row_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.json = true;
+	if (!diff_by_name(&s, from_ref, to_ref, name, "dolt_diff") &&
+		!version_has_table(from_ref, name) && !version_has_table(to_ref, name))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table \"%s\" is in neither version", name)));
+	return (Datum) 0;
+}
+
+/*
+ * A step of a table's history: its rows that differ between two refs, by
+ * its relation (relid), or by name.
+ */
+static void
+diff_step(RowDiffSink *s, Oid relid, const char *name, const char *from_ref,
+		  const char *to_ref)
+{
+	if (name)
+		(void) diff_by_name(s, from_ref, to_ref, name, "dolt_diff_table");
+	else
+		PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s->sink);
+}
+
+/*
+ * dolt_diff_table()'s walk: from to_ref (NULL: the working set's changes
+ * first) back along first parents to from_ref, each step to diff_step().
+ */
+static void
+diff_history(RowDiffSink *s, Oid relid, const char *name,
+			 const char *from_ref, const char *to_ref)
+{
+	ProllyHash	stop;
+	bool		stopping = false;
+	ProllyHash	at;
+	bool		more;
+
+	if (from_ref)
+	{
+		if (!PROLLY_CALL(refs(), resolve, from_ref, &stop))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", from_ref)));
+		stopping = true;
+	}
+
+	/* the working set's changes first, against the head (or nothing) */
+	more = PROLLY_CALL(refs(), resolve, "HEAD", &at);
+	if (to_ref == NULL || pg_strcasecmp(to_ref, "WORKING") == 0)
+	{
+		ProllyCommitInfo head;
+
+		s->to_commit = "WORKING";
+		s->from_commit = more ? hash_hex(&at) : NULL;
+		s->to_dated = false;
+		s->from_dated = more && PROLLY_CALL(refs(), commit_get, &at, &head);
+		if (s->from_dated)
+			s->from_date = head.committed_at;
+		diff_step(s, relid, name, s->from_commit, "WORKING");
+	}
+	else
+	{
+		more = PROLLY_CALL(refs(), resolve, to_ref, &at);
+		if (!more)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("prolly ref \"%s\" does not exist", to_ref)));
+	}
+
+	/* then each commit's, against its first parent */
+	while (more && !(stopping && (at.len == stop.len && memcmp(at.bytes, stop.bytes, at.len) == 0)))
+	{
+		ProllyCommitInfo info;
+		ProllyCommitInfo parent;
+		char	   *to = hash_hex(&at);
+
+		CHECK_FOR_INTERRUPTS();
+		if (!PROLLY_CALL(refs(), commit_get, &at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", to)));
+		s->to_commit = to;
+		s->to_date = info.committed_at;
+		s->to_dated = true;
+		s->from_commit = info.nparents > 0 ? hash_hex(&info.parents[0]) : NULL;
+		s->from_dated = info.nparents > 0 &&
+			PROLLY_CALL(refs(), commit_get, &info.parents[0], &parent);
+		if (s->from_dated)
+			s->from_date = parent.committed_at;
+		diff_step(s, relid, name, s->from_commit, to);
+		more = info.nparents > 0;
+		if (more)
+			at = info.parents[0];
+	}
+}
+
+/*
  * dolt_diff_table(tbl anyelement, from_ref text DEFAULT NULL, to_ref text
  *				   DEFAULT NULL, OUT to_row anyelement, OUT from_row
  *				   anyelement, OUT to_commit text, OUT from_commit text, OUT
@@ -4922,78 +5245,50 @@ dolt_diff_table(PG_FUNCTION_ARGS)
 	Oid			relid = OidIsValid(type) ? get_typ_typrelid(type) : InvalidOid;
 	char	   *from_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char	   *to_ref = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
-	ProllyHash	stop;
-	bool		stopping = false;
-	ProllyHash	at;
-	bool		more;
 	Relation	rel;
 	RowDiffSink s;
 
 	InitMaterializedSRF(fcinfo, 0);
 	rel = open_row_type_table(relid, "dolt_diff_table", ACL_SELECT);
-	if (from_ref)
-	{
-		if (!PROLLY_CALL(refs(), resolve, from_ref, &stop))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("prolly ref \"%s\" does not exist", from_ref)));
-		stopping = true;
-	}
 	memset(&s, 0, sizeof(s));
 	s.sink.change = row_change;
 	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	rows_begin(&s.rows, rel);
-
-	/* the working set's changes first, against the head (or nothing) */
-	more = PROLLY_CALL(refs(), resolve, "HEAD", &at);
-	if (to_ref == NULL || pg_strcasecmp(to_ref, "WORKING") == 0)
-	{
-		ProllyCommitInfo head;
-
-		s.to_commit = "WORKING";
-		s.from_commit = more ? hash_hex(&at) : NULL;
-		s.to_dated = false;
-		s.from_dated = more && PROLLY_CALL(refs(), commit_get, &at, &head);
-		if (s.from_dated)
-			s.from_date = head.committed_at;
-		PROLLY_CALL(diff_merge(), diff, s.from_commit, "WORKING", relid, &s.sink);
-	}
-	else
-	{
-		more = PROLLY_CALL(refs(), resolve, to_ref, &at);
-		if (!more)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("prolly ref \"%s\" does not exist", to_ref)));
-	}
-
-	/* then each commit's, against its first parent */
-	while (more && !(stopping && (at.len == stop.len && memcmp(at.bytes, stop.bytes, at.len) == 0)))
-	{
-		ProllyCommitInfo info;
-		ProllyCommitInfo parent;
-		char	   *to = hash_hex(&at);
-
-		CHECK_FOR_INTERRUPTS();
-		if (!PROLLY_CALL(refs(), commit_get, &at, &info))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("prolly commit %s is missing", to)));
-		s.to_commit = to;
-		s.to_date = info.committed_at;
-		s.to_dated = true;
-		s.from_commit = info.nparents > 0 ? hash_hex(&info.parents[0]) : NULL;
-		s.from_dated = info.nparents > 0 &&
-			PROLLY_CALL(refs(), commit_get, &info.parents[0], &parent);
-		if (s.from_dated)
-			s.from_date = parent.committed_at;
-		PROLLY_CALL(diff_merge(), diff, s.from_commit, to, relid, &s.sink);
-		more = info.nparents > 0;
-		if (more)
-			at = info.parents[0];
-	}
+	diff_history(&s, relid, NULL, from_ref, to_ref);
 	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_diff_table(table_name text, from_ref text DEFAULT NULL, to_ref text
+ *				   DEFAULT NULL, OUT to_row jsonb, OUT from_row jsonb, ...)
+ *	  returns setof record
+ *
+ * dolt_diff_table() of a table named by its name (#612): at each step, the
+ * table the name names in the step's commits, its rows as jsonb, each
+ * decoded as its own commit defines it (as dolt_diff() by name reads
+ * them).  A step neither of whose commits has it changed has none.
+ */
+Datum
+dolt_diff_table_by_name(PG_FUNCTION_ARGS)
+{
+	char	   *name;
+	char	   *from_ref = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *to_ref = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	RowDiffSink s;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_diff_table's table name can't be null")));
+	name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = row_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.json = true;
+	diff_history(&s, InvalidOid, name, from_ref, to_ref);
 	return (Datum) 0;
 }
 
@@ -5009,6 +5304,7 @@ typedef struct AtSink
 	ReturnSetInfo *rsinfo;
 	Rows		rows;
 	bool		history;		/* each row a column, with the commit's */
+	bool		json;			/* (history) a table by name: rows as jsonb */
 	const ProllyCommitInfo *commit;
 	char	   *hash;
 	char	   *committer;
@@ -5028,7 +5324,7 @@ at_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	if (after == NULL)
 		return;
 	old = rows_next(&s->rows);
-	row = rows_datum(&s->rows, after, &copies);
+	row = rows_value(&s->rows, s->json, after, &copies);
 	if (!s->rows.keyless)
 		copies = 1;
 	for (uint64 i = 0; i < copies; i++)
@@ -5173,6 +5469,78 @@ dolt_history_table(PG_FUNCTION_ARGS)
 	}
 	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
+	return (Datum) 0;
+}
+
+/* A change an unordered diff finds, to an AtSink. */
+static void
+at_tree_change(ProllyDiffKind kind, const ProllyKey *key,
+			   const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	at_change(arg, InvalidOid, kind, key, before, after);
+}
+
+/*
+ * dolt_history_table(table_name text, OUT row jsonb, OUT commit_hash text,
+ *					  OUT committer text, OUT commit_date timestamptz)
+ *	  returns setof record
+ *
+ * dolt_history_table() of a table named by its name (#612): at each commit
+ * the head reaches, the rows of the table the name names in it (none
+ * where it has none), as jsonb, decoded as the commit defines the table,
+ * read from its tree.
+ */
+Datum
+dolt_history_table_by_name(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	char	   *name;
+	AtSink		s;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("dolt_history_table's table name can't be null")));
+	name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	if (!PROLLY_HAS(diff_merge(), summary) || !PROLLY_HAS(tree, diff_unordered))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's version control can't read a table's rows by its name")));
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&s, 0, sizeof(s));
+	s.sink.change = at_change;
+	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	s.history = true;
+	s.json = true;
+	foreach(lc, log_entries("HEAD"))
+	{
+		LogEntry   *e = lfirst(lc);
+		List	   *rows = NIL;
+		SummaryRow *r;
+		char	   *email;
+		ProllyNodeRef empty;
+		ProllyNodeRef data;
+
+		CHECK_FOR_INTERRUPTS();
+		s.commit = &e->info;
+		s.hash = hash_hex(&e->info.id);
+		split_author(e->info.author, &s.committer, &email);
+
+		/* (the commit's objects: what differs from the empty root to it) */
+		PROLLY_CALL(diff_merge(), summary, NULL, s.hash, false, collect_change, &rows);
+		r = named_table(rows, name);
+		if (r == NULL || r->to_item == NULL)
+			continue;
+		check_named_rows(r, "dolt_history_table");
+		rows_begin_named(&s.rows, r->to_item, r->to_len, name, "dolt_history_table");
+		table_item_data(r->to_item, r->to_len, &data);
+		PROLLY_CALL(tree, build_finish,
+					PROLLY_CALL(tree, build_begin, &s.rows.env, CurrentMemoryContext),
+					&empty);
+		PROLLY_CALL(tree, diff_unordered, &s.rows.env, &empty, &data, at_tree_change, &s);
+		rows_end(&s.rows);
+	}
 	return (Datum) 0;
 }
 
