@@ -1233,20 +1233,25 @@ add_item(ProllyTreeBuilder *b, const char *key, const StringInfoData *value)
  * stepped back, or a parent come from a remote whose clock runs ahead), so
  * along history the dates only rise.  (A parent dated outside timestamp's
  * range, or at its last microsecond, which only a foreign or corrupt commit
- * could be, leaves the date as it is.)
+ * could be, leaves the date as it is.)  A date the commit was given
+ * (dolt_commit --date) is its date, as Dolt's is.
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 			 const char *author, const char *message, ProllyHash *id)
 {
 	TimestampTz at = GetCurrentTimestamp();
+	int			nparents_dated = nparents;
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
 	ProllyNodeRef deps;
 	ProllyDatabaseComponents dc;
 
-	for (int i = 0; i < nparents; i++)
+	/* (a date given, as dolt_commit --date: as given, whatever the parents') */
+	if (prolly_commit_date(&at))
+		nparents_dated = 0;
+	for (int i = 0; i < nparents_dated; i++)
 	{
 		TimestampTz parent_at;
 

@@ -312,6 +312,35 @@ prolly_set_commit_author(const char *author)
 	author_override = author;
 }
 
+/* the date a dolt_commit or dolt_merge was given (--date), while it runs */
+static bool date_given = false;
+static TimestampTz date_override = 0;
+
+bool
+prolly_commit_date(TimestampTz *at)
+{
+	if (!date_given)
+		return false;
+	*at = date_override;
+	return true;
+}
+
+/* --date's value: a timestamptz, as Postgres reads one */
+static TimestampTz
+given_date(const char *fn, const char *value)
+{
+	TimestampTz at = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+															 CStringGetDatum(value),
+															 ObjectIdGetDatum(InvalidOid),
+															 Int32GetDatum(-1)));
+
+	if (TIMESTAMP_NOT_FINITE(at))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s --date must be a finite timestamp", fn)));
+	return at;
+}
+
 /* ------------------------------------------------------------------------
  * Helpers
  * ------------------------------------------------------------------------
@@ -807,7 +836,9 @@ qualified_name(Oid relid)
  *
  * -m/--message message (required, not empty), --author "Name <email>" (or
  * a name alone), -a/-A/--all (every change is always committed),
- * --allow-empty (else a commit whose root equals its parent's is refused),
+ * --date timestamp (the commit's date, as given: else now, and never
+ * before a parent's), --allow-empty (else a commit whose root equals its
+ * parent's is refused),
  * --skip-empty (nothing to commit: no commit, and NULL), -f/--force
  * (constraint violations don't stop the commit, as in Dolt; the
  * transaction still can't commit with them unless dolt.allow_commit_conflicts
@@ -823,6 +854,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	bool		allow_empty = false;
 	bool		skip_empty = false;
 	bool		force = false;
+	bool		dated = false;
 	bool		options = true;	/* until "--" */
 	ProllyHash	id = {0};
 	bool		committed = false;
@@ -841,6 +873,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 			message = option_value(args, nargs, &i, "dolt_commit");
 		else if (is_option(a, "author"))
 			author = option_value(args, nargs, &i, "dolt_commit");
+		else if (is_option(a, "date"))
+		{
+			date_override = given_date("dolt_commit",
+									   option_value(args, nargs, &i, "dolt_commit"));
+			dated = true;
+		}
 		else if (is_option(a, "all") || is_option(a, "ALL"))
 			continue;
 		else if (is_option(a, "allow-empty"))
@@ -884,6 +922,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PreventCommandIfReadOnly("dolt_commit()");
 	author_override = author;
 	commit_forced = force;
+	date_given = dated;
 	PG_TRY();
 	{
 		note_integration();
@@ -894,6 +933,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	{
 		author_override = NULL;
 		commit_forced = false;
+		date_given = false;
 	}
 	PG_END_TRY();
 
@@ -1824,7 +1864,7 @@ refuse_violations(const char *what)
  *	  {commit id, fast_forward, conflicts, message}
  *
  * branch; --no-ff; --ff-only; --squash; --no-commit; -m/--message
- * message; --abort (each option, long or short, with one dash or two,
+ * message; --date timestamp (the merge commit's, as dolt_commit's); --abort (each option, long or short, with one dash or two,
  * as Dolt takes them; so too every dolt_* function's).  Rows changed differently on both sides leave the
  * merge in progress, with conflicts (dolt_conflicts) to resolve before
  * dolt_commit makes the merge commit; --no-commit leaves it so without
@@ -1848,6 +1888,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	bool		had_head;
 	bool		abort_merge = false;
 	bool		commit = false;
+	bool		dated = false;
 	int			conflicts;
 	int			known;
 	const char *result[4];
@@ -1879,6 +1920,12 @@ dolt_merge(PG_FUNCTION_ARGS)
 			abort_merge = true;
 		else if (is_option(a, "m") || is_option(a, "message"))
 			message = option_value(args, nargs, &i, "dolt_merge");
+		else if (is_option(a, "date"))
+		{
+			date_override = given_date("dolt_merge",
+									   option_value(args, nargs, &i, "dolt_merge"));
+			dated = true;
+		}
 		else
 			unsupported("dolt_merge", a);
 	}
@@ -1920,8 +1967,17 @@ dolt_merge(PG_FUNCTION_ARGS)
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
 	known = list_length(PROLLY_CALL(refs(), violations));
-	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
-												 message, flags, &id));
+	date_given = dated;
+	PG_TRY();
+	{
+		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
+													 message, flags, &id));
+	}
+	PG_FINALLY();
+	{
+		date_given = false;
+	}
+	PG_END_TRY();
 	must_commit(conflicts, "a merge");
 	if (conflicts > 0)
 	{

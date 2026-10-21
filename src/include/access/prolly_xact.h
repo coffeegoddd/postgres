@@ -11,6 +11,8 @@
 #ifndef PROLLY_XACT_H
 #define PROLLY_XACT_H
 
+#include "datatype/timestamp.h"
+
 /*
  * Per-session setup once connected to a database: defines the dolt.*
  * settings, and notes branch (from a "dbname/branch" connection) unless
@@ -31,6 +33,8 @@ extern void prolly_check_connect_branch(const char *branch);
 extern const char *prolly_commit_author(void);
 /* Commits name author until reset (NULL), whatever dolt.author says. */
 extern void prolly_set_commit_author(const char *author);
+/* The date the commit being made was given (true), as dolt_commit --date. */
+extern bool prolly_commit_date(TimestampTz *at);
 
 /* Whether a transaction may commit with unresolved merge conflicts. */
 extern bool prolly_allow_commit_conflicts(void);

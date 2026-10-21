@@ -197,6 +197,102 @@ ERROR:  there is no revert in progress
 SET dolt.transaction_commit_message = '';
 ERROR:  invalid value for parameter "dolt.transaction_commit_message": ""
 DETAIL:  A commit needs a message.
+-- --date dates a commit as given (a timestamptz, any of Postgres's
+-- forms), before its parent's even, as Dolt's does; a merge's commit too.
+-- Without it, a commit is dated now, never before its parent.
+SET TimeZone = 'UTC';
+SELECT length(dolt_commit('--allow-empty', '-m', 'dated', '--date', '2022-08-06T12:00:00')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT date, message FROM dolt_log() LIMIT 1;
+             date             | message 
+------------------------------+---------
+ Sat Aug 06 12:00:00 2022 UTC | dated
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'dated before', '--date', '2001-02-03 04:05:06+01')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT date, message FROM dolt_log() LIMIT 2;
+             date             |   message    
+------------------------------+--------------
+ Sat Feb 03 03:05:06 2001 UTC | dated before
+ Sat Aug 06 12:00:00 2022 UTC | dated
+(2 rows)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'undated')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT date > '2022-08-06' AS dated_now FROM dolt_log() LIMIT 1;
+ dated_now 
+-----------
+ t
+(1 row)
+
+SELECT dolt_commit('--allow-empty', '-m', 'bad date', '--date', 'not a date');
+ERROR:  invalid input syntax for type timestamp with time zone: "not a date"
+SELECT dolt_commit('--allow-empty', '-m', 'bad date', '--date', 'infinity');
+ERROR:  dolt_commit --date must be a finite timestamp
+SELECT dolt_branch('cm_d');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cm_d');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'cm_d'"}
+(1 row)
+
+UPDATE cm.c SET v = 'dated side';
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+UPDATE cm.t SET id = 2;
+SELECT length(dolt_commit('-am', 'main side')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('cm_d', '--no-ff', '-m', 'dated merge', '--date', '2023-01-01'))[4] AS merged;
+      merged      
+------------------
+ merge successful
+(1 row)
+
+SELECT date, message FROM dolt_log() LIMIT 1;
+             date             |   message   
+------------------------------+-------------
+ Sun Jan 01 00:00:00 2023 UTC | dated merge
+(1 row)
+
+SELECT dolt_branch('-D', 'cm_d');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET TimeZone;
 SELECT dolt_branch('-D', 'cm_f');
  dolt_branch 
 -------------
