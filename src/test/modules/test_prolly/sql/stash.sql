@@ -113,6 +113,56 @@ SELECT stash_id FROM dolt_stashes;
 SELECT dolt_stash('clear', 's');
 SELECT dolt_reset('--hard');
 
+-- popped over uncommitted changes to more than rows, each merged rather
+-- than refused as a local change it would stomp
+CREATE SEQUENCE st.q;
+CREATE TABLE st.d (id int PRIMARY KEY);
+CREATE TABLE st.a (id int PRIMARY KEY);
+CREATE TABLE st.m (id int PRIMARY KEY);
+CREATE MATERIALIZED VIEW st.mv AS SELECT coalesce(sum(id), 0) AS c FROM st.m;
+SELECT length(dolt_commit('-Am', 'more kinds')::text) AS committed;
+-- a sequence both advanced: the larger value
+SELECT nextval('st.q'), nextval('st.q'), nextval('st.q');
+SELECT dolt_stash('push', 's');
+SELECT nextval('st.q');
+SELECT dolt_stash('pop', 's');
+SELECT last_value FROM st.q;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+-- a materialized view both refreshed: refreshed from the merged rows
+INSERT INTO st.m VALUES (1);
+REFRESH MATERIALIZED VIEW st.mv;
+SELECT dolt_stash('push', 's');
+INSERT INTO st.m VALUES (10);
+REFRESH MATERIALIZED VIEW st.mv;
+SELECT dolt_stash('pop', 's');
+SELECT c FROM st.mv;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+-- a table the working set altered whose rows the stash changes
+INSERT INTO st.a VALUES (1);
+SELECT dolt_stash('push', 's');
+ALTER TABLE st.a ADD COLUMN x int;
+INSERT INTO st.a VALUES (2, 2);
+SELECT dolt_stash('pop', 's');
+SELECT * FROM st.a ORDER BY id;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+-- a table the working set dropped whose rows the stash changes: refused,
+-- the stash kept
+INSERT INTO st.d VALUES (1);
+SELECT dolt_stash('push', 's');
+DROP TABLE st.d;
+SELECT dolt_stash('pop', 's');
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+SELECT dolt_stash('pop', 's');
+SELECT * FROM st.d;
+DROP MATERIALIZED VIEW st.mv;
+DROP TABLE st.m, st.a, st.d;
+DROP SEQUENCE st.q;
+SELECT length(dolt_commit('-Am', 'fewer kinds')::text) AS committed;
+
 -- popped onto a head whose change conflicts: refused, kept
 INSERT INTO st.t VALUES (8, 'i');
 SELECT dolt_stash('push', 's');
