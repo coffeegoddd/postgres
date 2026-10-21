@@ -80,6 +80,136 @@ func TestModelMerges(t *testing.T) {
 	apply(Op{Kind: OpPick, Ref: "x"}, ClassUnchanged)
 }
 
+func bag(counts map[int]int) State {
+	s := emptyState()
+	for id, n := range counts {
+		s[Keyless][id] = Row{n}
+	}
+	return s
+}
+
+// A keyless row changed by the same copies on both sides is changed once;
+// otherwise copies added on either side add up and the most either side
+// removed are removed; nothing conflicts.
+func TestMerge3Keyless(t *testing.T) {
+	for _, c := range []struct {
+		name               string
+		base, ours, theirs int
+		want               int
+	}{
+		{"both add a copy", 1, 2, 2, 2},
+		{"both add the same new row", 0, 1, 1, 1},
+		{"each adds", 0, 1, 0, 1},
+		{"both delete it", 1, 0, 0, 0},
+		{"one deletes a copy, one adds one", 2, 1, 3, 2},
+		{"one deletes both, one deletes one", 2, 0, 1, 0},
+		{"one adds two, one adds one", 1, 3, 2, 4},
+	} {
+		merged, conflicts := Merge3(bag(map[int]int{1: c.base}), bag(map[int]int{1: c.ours}), bag(map[int]int{1: c.theirs}))
+		if got := merged[Keyless][1][0]; got != c.want || conflicts.count() != 0 {
+			t.Errorf("%s: %d copies, conflicts %v; want %d", c.name, got, conflicts, c.want)
+		}
+		if _, ok := merged[Keyless][1]; ok == (c.want == 0) {
+			t.Errorf("%s: a row of no copies kept, or of copies lost", c.name)
+		}
+	}
+}
+
+func withC(s State, table string) State {
+	s[Columns][tableIndex(table)] = Row{1}
+	return s
+}
+
+// Column c is a table's if both sides keep it or a side added it; a side
+// dropping it changes no row, and a merge that would lose a value the
+// other side changed in it is refused.
+func TestMerge3Columns(t *testing.T) {
+	base := rows(map[int]Row{1: {1, 1, 0}, 2: {2, 2, 0}})
+	ours := withC(rows(map[int]Row{1: {1, 1, 3}, 2: {2, 2, 0}}), "t")
+	theirs := rows(map[int]Row{1: {1, 5, 0}, 2: {2, 2, 0}, 3: {3, 3, 0}})
+	merged, conflicts := Merge3(base, ours, theirs)
+	want := withC(rows(map[int]Row{1: {1, 5, 3}, 2: {2, 2, 0}, 3: {3, 3, 0}}), "t")
+	if !merged.equal(want) || conflicts.count() != 0 {
+		t.Fatalf("added: %s, %v; want %s", merged.key(), conflicts, want.key())
+	}
+	// dropped there: a row deleted here, and one added here with c, are
+	// no lost change; a row whose c changed here is
+	base = withC(rows(map[int]Row{1: {1, 1, 1}, 2: {2, 2, 2}}), "t")
+	ours = withC(rows(map[int]Row{2: {2, 2, 2}, 4: {4, 4, 4}}), "t")
+	theirs = rows(map[int]Row{1: {1, 1, 0}, 2: {2, 7, 0}})
+	if LostChange(base, ours, theirs) {
+		t.Fatal("a lost change in a row deleted")
+	}
+	merged, conflicts = Merge3(base, ours, theirs)
+	want = rows(map[int]Row{2: {2, 7, 0}, 4: {4, 4, 0}})
+	if !merged.equal(want) || conflicts.count() != 0 {
+		t.Fatalf("dropped: %s, %v; want %s", merged.key(), conflicts, want.key())
+	}
+	ours["t"][2] = Row{2, 2, 9}
+	if !LostChange(base, ours, theirs) || !LostChange(base, theirs, ours) {
+		t.Fatal("a change of a dropped column's value merged")
+	}
+}
+
+// A write of a row another open transaction wrote waits for it, and is
+// made as that transaction ends; no session waits on one that waits, and
+// keyless writes never wait.
+func TestModelWaits(t *testing.T) {
+	m := NewModel(3, rows(map[int]Row{1: {1, 1}}))
+	m.Apply(Op{Session: 0, Kind: OpBegin})
+	m.Apply(Op{Session: 0, Kind: OpUpdate, Table: "t", ID: 1, Val: 5})
+	wait := Op{Session: 1, Kind: OpUpdate, Table: "t", ID: 1, Col: 1, Val: 6, Wait: 1}
+	if m.Legal(Op{Session: 1, Kind: OpUpdate, Table: "t", ID: 1, Val: 6}) || !m.Legal(wait) {
+		t.Fatal("a write of a locked row runs, or can't wait")
+	}
+	if o := m.Apply(wait); o.Class != ClassWaiting {
+		t.Fatalf("waiting write: %v", o)
+	}
+	for _, op := range []Op{
+		{Session: 1, Kind: OpCommitTxn},
+		{Session: 2, Kind: OpUpdate, Table: "t", ID: 1, Val: 7, Wait: 1},
+		{Session: 2, Kind: OpReset, Ref: "HEAD"},
+		{Session: 2, Kind: OpAddColumn, Table: "t"},
+	} {
+		if m.Legal(op) {
+			t.Errorf("%s legal while session 1 waits", op)
+		}
+	}
+	m.Apply(Op{Session: 2, Kind: OpBegin})
+	m.Apply(Op{Session: 2, Kind: OpInsert, Table: Keyless, ID: 2})
+	if m.Legal(Op{Session: 0, Kind: OpDelete, Table: Keyless, ID: 2, Wait: 3}) {
+		t.Fatal("a keyless write waits")
+	}
+	m.Apply(Op{Session: 0, Kind: OpCommitTxn})
+	if m.Sessions[1].Waiting != nil || m.Visible(1)["t"][1] != (Row{5, 6}) || m.Visible(2)["t"][1] != (Row{5, 6}) {
+		t.Fatalf("after the commit, session 1's write: %v", m.Visible(1)["t"])
+	}
+}
+
+// Generated histories hold the ops the harness gained: keyless writes,
+// schema changes, and waits.
+func TestGenerateCoverage(t *testing.T) {
+	n := map[string]int{}
+	for seed := int64(1); seed <= 30; seed++ {
+		h := Generate(seed, 150, 1+int(seed%3))
+		for _, op := range h.Ops {
+			switch {
+			case op.Wait > 0:
+				n["wait"]++
+			case op.Table == Keyless:
+				n["keyless "+op.Kind]++
+			case op.Kind == OpAddColumn || op.Kind == OpDropColumn || op.C || op.Col == 2:
+				n[op.Kind]++
+			}
+		}
+	}
+	for _, k := range []string{"wait", "keyless insert", "keyless update", "keyless delete", OpAddColumn, OpDropColumn, OpInsert, OpUpdate} {
+		if n[k] < 5 {
+			t.Errorf("few %s: %v", k, n)
+		}
+	}
+}
+
 // A transaction's writes are its session's alone until it commits; other
 // sessions' commits don't take them, and others can't write its rows.
 func TestModelTransactions(t *testing.T) {

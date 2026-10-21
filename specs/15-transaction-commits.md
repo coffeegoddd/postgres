@@ -371,6 +371,20 @@ foreign keys are not rechecked against the head, as Dolt doesn't, and
   in the mode (no extra commit); a branch's owner cleared by the mode's
   commit.
 
+Built (2026-10-20): `transaction_commits.sql` and
+`transaction_commit_cases.sql` in test_prolly (undescribed objects,
+rewrites, a merge in progress, violations kept, the mode settled at the
+first write, a TID recorded twice, phase 2's roots equal to a fold's for
+one writer, a commit's engine counters the same beside 20,000 rows
+written outside the mode); `vc_transaction_commits.spec` and
+`vc_txn_commit_sessions.spec` (Dolt's one-client, two-client,
+autocommit, late foreign-key and null-indexed-column cases rederived;
+four writers at read committed and repeatable read, three at
+serializable, write skew, `PREPARE TRANSACTION`); `t/058` (crash and
+standby). Dolt's ports are isolation specs, not `vcscenario` ports: its
+`mydb/b1` and cross-database writes have no Postgres form, and the
+branch-left case is the session checking the branch out again.
+
 ## 7. Sequencing, and the writer modes
 
 Phase 1 first (#228), then phase 2 (#229). Phase 2 doesn't wait for
@@ -426,4 +440,50 @@ Still open:
    move alone serialized, or group commit (a leader moving the root once
    for a chain of queued transactions' commits).
    Measured first; nothing changes until the numbers ask for it.
+
+   **Measured** (pgbench TPC-B, scale 10, versioned `public`, cassert
+   build, 20 s a run, one local machine; tps). Phase 1 as built in #276,
+   phase 2 in #283, each with the fixes of #266 and #267 (and, for phase
+   2's runs, #280 and #281) applied; `off` is the mode off, measured with
+   each:
+
+   | Clients | Off (#276) | Phase 1 | Off (#283) | Phase 2 |
+   |---|---|---|---|---|
+   | 1 | 1811 | 190 | 2097 | 295 |
+   | 8 | 8225 | 279 | 7817 | 784 |
+   | 32 | 4510 | 229 | 2445 | 654 |
+   | 64 | 2966 | 175 | 1985 | 457 |
+
+   Select-only, the control, is unchanged by the mode: 15.7k and 112k tps
+   off, 17.3k and 95k on, at 1 and 32 clients. At repeatable read
+   (`--max-tries=1`), phase 2's failure rate with the mode on is heap's
+   own: 37% against 32% at 8 clients, 73% against 72% at 32; phase 1
+   failed every transaction whose snapshot predated a newer head. The
+   on-mode ceiling is the database-wide refs lock, held from the commit's
+   start to the transaction's end: phase 2 shortens the critical section
+   (no fold), but commits stay serialized per database, a few hundred a
+   second here against thousands off. The numbers ask for the narrower
+   lock.
+
+   Measured again 2026-10-20 (the same setup, phase 2 as on `master`,
+   repeatable read with `--max-tries=1`; tps, and the share of
+   transactions failed):
+
+   | Clients | Off | Phase 2 | Every commit a fold |
+   |---|---|---|---|
+   | 8 | 7454, 39% | 546, 45% | 4.9, 86% |
+   | 32 | 1949, 69% | 788, 83% | 4.1, 93% |
+
+   "Every commit a fold" is phase 2 with
+   `dolt.transaction_commit_max_changes = 0`, so each commit falls back
+   to the fold under the transaction's snapshot: phase 1's commit and its
+   serialization failures, though not phase 1's build. Autocommit against
+   explicit transactions, the mode on, read committed: TPC-B's five
+   statements as one transaction made 571 tps at 1 client and 798 at 8;
+   run one statement each (four commits a transaction: the `SELECT`
+   makes none), 354 and 282 transactions a second, about 1,400 and 1,100
+   commits a second.
+
+   Decided (user, 2026-10-20): it is revisited once #568 and #569
+   are fixed, starting with a lock per branch.
 2. **Two-phase commit** (part 3).

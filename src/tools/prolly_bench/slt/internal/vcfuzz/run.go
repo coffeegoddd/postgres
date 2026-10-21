@@ -64,6 +64,11 @@ func Run(h History, open Opener) (Report, error) {
 	identities, _ := e.(Identities)
 	check := func(step int, op Op) (*Failure, error) {
 		for s := range m.Sessions {
+			// (a session waiting on a row lock can't be asked: it is, once
+			// the transaction holding the lock ends)
+			if m.Sessions[s].Waiting != nil {
+				continue
+			}
 			fail := func(kind string, expected, got any) *Failure {
 				return &Failure{Kind: fmt.Sprintf("session %d %s", s, kind), Step: step, Op: op, Expected: expected, Got: got}
 			}

@@ -8,19 +8,21 @@ import (
 
 // Op kinds.
 const (
-	OpInsert    = "insert"    // upsert of (ID, Val, Val2)
-	OpUpdate    = "update"    // set column Col of row ID to Val
-	OpDelete    = "delete"    // delete row ID
-	OpBegin     = "begin"     // open a transaction
-	OpCommitTxn = "commit"    // commit the open transaction
-	OpRollback  = "rollback"  // roll it back
-	OpCommit    = "vc_commit" // commit the branch's working set
-	OpBranch    = "branch"    // make branch Ref at HEAD
-	OpCheckout  = "checkout"  // switch to branch Ref
-	OpReset     = "reset"     // hard reset to Ref
-	OpMerge     = "merge"     // merge Ref (NoFF; Mode)
-	OpPick      = "pick"      // cherry-pick Ref
-	OpRevert    = "revert"    // revert Ref
+	OpInsert     = "insert"      // upsert of (ID, Val, Val2[, Val3]); a copy of keyless content ID
+	OpUpdate     = "update"      // set column Col of row ID to Val; a copy of keyless content ID to content Val
+	OpDelete     = "delete"      // delete row ID; a copy of keyless content ID
+	OpBegin      = "begin"       // open a transaction
+	OpCommitTxn  = "commit"      // commit the open transaction
+	OpRollback   = "rollback"    // roll it back
+	OpCommit     = "vc_commit"   // commit the branch's working set
+	OpBranch     = "branch"      // make branch Ref at HEAD
+	OpCheckout   = "checkout"    // switch to branch Ref
+	OpReset      = "reset"       // hard reset to Ref
+	OpMerge      = "merge"       // merge Ref (NoFF; Mode)
+	OpPick       = "pick"        // cherry-pick Ref
+	OpRevert     = "revert"      // revert Ref
+	OpAddColumn  = "add_column"  // add column c to Table
+	OpDropColumn = "drop_column" // drop column c of Table
 )
 
 // Merge modes: how a merge's conflicts are handled.
@@ -31,7 +33,9 @@ const (
 	ModeAbort  = "abort"  // in one, aborted
 )
 
-// Op is one step of a history, run by one session.
+// Op is one step of a history, run by one session.  A write with Wait
+// waits for the row lock session Wait-1's open transaction holds, and is
+// made once that transaction ends.
 type Op struct {
 	Session int    `json:"s"`
 	Kind    string `json:"op"`
@@ -40,21 +44,39 @@ type Op struct {
 	Col     int    `json:"col,omitempty"`
 	Val     int    `json:"val,omitempty"`
 	Val2    int    `json:"val2,omitempty"`
+	Val3    int    `json:"val3,omitempty"`
+	C       bool   `json:"c,omitempty"` // an insert's table has column c
+	Wait    int    `json:"wait,omitempty"`
 	Ref     string `json:"ref,omitempty"`
 	NoFF    bool   `json:"no_ff,omitempty"`
 	Mode    string `json:"mode,omitempty"`
 }
 
 func (op Op) String() string {
+	wait := ""
+	if op.Wait > 0 {
+		wait = fmt.Sprintf(" (waits on s%d)", op.Wait-1)
+	}
+	switch {
+	case op.Table == Keyless && op.Kind == OpUpdate:
+		return fmt.Sprintf("s%d update a copy of %s #%d to #%d%s", op.Session, op.Table, op.ID, op.Val, wait)
+	case op.Table == Keyless && (op.Kind == OpInsert || op.Kind == OpDelete):
+		return fmt.Sprintf("s%d %s a copy of %s #%d%s", op.Session, op.Kind, op.Table, op.ID, wait)
+	}
 	switch op.Kind {
 	case OpInsert:
-		return fmt.Sprintf("s%d insert %s (%d, %d, %d)", op.Session, op.Table, op.ID, op.Val, op.Val2)
+		if op.C {
+			return fmt.Sprintf("s%d insert %s (%d, %d, %d, %d)%s", op.Session, op.Table, op.ID, op.Val, op.Val2, op.Val3, wait)
+		}
+		return fmt.Sprintf("s%d insert %s (%d, %d, %d)%s", op.Session, op.Table, op.ID, op.Val, op.Val2, wait)
 	case OpUpdate:
-		return fmt.Sprintf("s%d update %s %d col %d = %d", op.Session, op.Table, op.ID, op.Col, op.Val)
+		return fmt.Sprintf("s%d update %s %d col %d = %d%s", op.Session, op.Table, op.ID, op.Col, op.Val, wait)
 	case OpDelete:
-		return fmt.Sprintf("s%d delete %s %d", op.Session, op.Table, op.ID)
+		return fmt.Sprintf("s%d delete %s %d%s", op.Session, op.Table, op.ID, wait)
 	case OpMerge:
 		return fmt.Sprintf("s%d merge %s no_ff=%v mode=%q", op.Session, op.Ref, op.NoFF, op.Mode)
+	case OpAddColumn, OpDropColumn:
+		return fmt.Sprintf("s%d %s %s.c", op.Session, op.Kind, op.Table)
 	}
 	if op.Ref != "" {
 		return fmt.Sprintf("s%d %s %s", op.Session, op.Kind, op.Ref)
@@ -86,6 +108,11 @@ func Generate(seed int64, steps, sessions int) History {
 			}
 		}
 	}
+	for id := 1; id <= keys; id++ {
+		if n := r.Intn(4); n > 0 && r.Intn(2) == 0 {
+			setup[Keyless][id] = Row{n}
+		}
+	}
 	h := History{Version: 1, Seed: seed, Sessions: sessions, Setup: setup}
 	m := NewModel(sessions, setup)
 	nbranches := 0
@@ -109,22 +136,47 @@ func Generate(seed int64, steps, sessions int) History {
 			}
 			return b
 		}
+		working := m.Working[m.Sessions[s].Branch]
 		switch k := r.Intn(100); {
 		case k < 34:
-			op.Table, op.ID = Tables[r.Intn(len(Tables))], 1+r.Intn(keys)
+			op.Table, op.ID = []string{"t", "u", Keyless}[r.Intn(3)], 1+r.Intn(keys)
+			keyless := op.Table == Keyless
 			switch r.Intn(3) {
 			case 0:
-				op.Kind, op.Val, op.Val2 = OpInsert, r.Intn(4), r.Intn(4)
+				op.Kind = OpInsert
+				if !keyless {
+					op.Val, op.Val2 = r.Intn(4), r.Intn(4)
+					if working.HasC(op.Table) {
+						op.C, op.Val3 = true, r.Intn(4)
+					}
+				}
 			case 1:
-				op.Kind, op.Col, op.Val = OpUpdate, r.Intn(2), r.Intn(4)
+				op.Kind = OpUpdate
+				switch {
+				case keyless:
+					op.Val = 1 + r.Intn(keys)
+				case working.HasC(op.Table):
+					op.Col, op.Val = r.Intn(3), r.Intn(4)
+				default:
+					op.Col, op.Val = r.Intn(2), r.Intn(4)
+				}
 			default:
 				op.Kind = OpDelete
 			}
+			// a row another open transaction wrote: waited on, mostly, where it may
+			if h := m.holder(op); h >= 0 && r.Intn(4) > 0 && m.canWait(op, h) {
+				op.Wait = h + 1
+			}
 		case k < 40:
 			op.Kind = []string{OpBegin, OpCommitTxn, OpRollback, OpCommitTxn}[r.Intn(4)]
-		case k < 56:
+		case k < 43:
+			op.Table, op.Kind = Tables[r.Intn(len(Tables))], OpAddColumn
+			if working.HasC(op.Table) {
+				op.Kind = OpDropColumn
+			}
+		case k < 58:
 			op.Kind = OpCommit
-		case k < 61:
+		case k < 62:
 			nbranches++
 			op.Kind, op.Ref = OpBranch, fmt.Sprintf("b%d", nbranches)
 		case k < 70:
@@ -142,10 +194,17 @@ func Generate(seed int64, steps, sessions int) History {
 				op.Ref = ref()
 			}
 		}
+		// a session waiting is let go soon: the transaction it waits on ends
+		for _, w := range m.Sessions {
+			if w.Waiting != nil && r.Intn(3) == 0 {
+				op = Op{Session: w.WaitsOn, Kind: []string{OpCommitTxn, OpCommitTxn, OpRollback}[r.Intn(3)]}
+				break
+			}
+		}
 		if !m.Legal(op) || dull(m, op, r) {
 			// a session that can't move its branch for uncommitted
 			// changes commits them, now and then, so moves happen
-			if (op.Kind == OpMerge || op.Kind == OpPick || op.Kind == OpRevert) && !m.Sessions[s].InTxn &&
+			if (op.Kind == OpMerge || op.Kind == OpPick || op.Kind == OpRevert) && m.Legal(Op{Session: s, Kind: OpCommit}) &&
 				!m.anyTxn() && m.Dirty(m.Sessions[s].Branch) {
 				op = Op{Session: s, Kind: OpCommit}
 			} else {
@@ -155,12 +214,17 @@ func Generate(seed int64, steps, sessions int) History {
 		m.Apply(op)
 		h.Ops = append(h.Ops, op)
 	}
-	// close transactions left open
-	for s := range m.Sessions {
-		if m.Sessions[s].InTxn {
-			op := Op{Session: s, Kind: OpCommitTxn}
-			m.Apply(op)
-			h.Ops = append(h.Ops, op)
+	// close transactions left open (those waited on first: their waiters'
+	// writes are made as they end)
+	for open := true; open; {
+		open = false
+		for s := range m.Sessions {
+			if m.Sessions[s].InTxn && m.Sessions[s].Waiting == nil {
+				op := Op{Session: s, Kind: OpCommitTxn}
+				m.Apply(op)
+				h.Ops = append(h.Ops, op)
+				open = true
+			}
 		}
 	}
 	return h
@@ -193,8 +257,8 @@ func dull(m *Model, op Op, r *rand.Rand) bool {
 
 // Validate checks a history read back (a replayed or edited one) holds only
 // what the model and engines take: every table's setup (an empty one
-// filled in), rows of known tables with keys 1..keys and columns 0 or 1,
-// and known ops.
+// filled in), rows of known tables with keys 1..keys and columns 0 to 2,
+// keyless rows of at least one copy, and known ops.
 func (h *History) Validate() error {
 	if h.Version != 1 || h.Sessions < 1 {
 		return fmt.Errorf("unsupported history: version %d, %d sessions", h.Version, h.Sessions)
@@ -203,7 +267,7 @@ func (h *History) Validate() error {
 		h.Setup = State{}
 	}
 	known := map[string]bool{}
-	for _, t := range Tables {
+	for _, t := range stateTables {
 		known[t] = true
 		if h.Setup[t] == nil {
 			h.Setup[t] = map[int]Row{}
@@ -213,17 +277,38 @@ func (h *History) Validate() error {
 		if !known[t] {
 			return fmt.Errorf("setup of unknown table %q", t)
 		}
-		for id := range rows {
-			if id < 1 || id > keys {
+		for id, r := range rows {
+			last := keys
+			if t == Columns {
+				last = len(Tables)
+			}
+			if id < 1 || id > last || (t == Keyless || t == Columns) && r[0] < 1 {
 				return fmt.Errorf("setup row %d of %s out of range", id, t)
+			}
+			// (what the engines can build: a table's column c only as
+			// Columns' {1}, a keyless content's copies alone, and c's
+			// value only in a table that has c)
+			switch {
+			case t == Columns && r != Row{1}:
+				return fmt.Errorf("setup row %d of %s isn't {1}", id, t)
+			case t == Keyless && (r[1] != 0 || r[2] != 0):
+				return fmt.Errorf("setup row %d of %s holds more than a count of copies", id, t)
+			case t != Keyless && t != Columns && r[2] != 0 && !h.Setup.HasC(t):
+				return fmt.Errorf("setup row %d of %s sets c, which %s doesn't have", id, t, t)
 			}
 		}
 	}
 	for i, op := range h.Ops {
 		switch op.Kind {
 		case OpInsert, OpUpdate, OpDelete:
-			if !known[op.Table] || op.ID < 1 || op.ID > keys || op.Col < 0 || op.Col > 1 {
+			keyless := op.Table == Keyless
+			if !(keyless || tableIndex(op.Table) > 0) || op.ID < 1 || op.ID > keys || op.Col < 0 || op.Col > 2 ||
+				keyless && op.Kind == OpUpdate && (op.Val < 1 || op.Val > keys) || op.Wait < 0 || op.Wait > h.Sessions {
 				return fmt.Errorf("op %d (%s) writes outside the tables", i+1, op)
+			}
+		case OpAddColumn, OpDropColumn:
+			if tableIndex(op.Table) == 0 {
+				return fmt.Errorf("op %d (%s) changes an unknown table", i+1, op)
 			}
 		case OpBegin, OpCommitTxn, OpRollback, OpCommit, OpBranch, OpCheckout, OpReset, OpPick, OpRevert:
 		case OpMerge:

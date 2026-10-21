@@ -1045,6 +1045,8 @@ force_branch(const char *name, const char *from)
 	ProllyHash	head;
 	bool		moved = false;
 	bool		was_read_only = XactReadOnly;
+	List	   *written;
+	ListCell   *lc;
 
 	if (strcmp(name, branch_ops()->current()) == 0)
 		ereport(ERROR,
@@ -1062,6 +1064,7 @@ force_branch(const char *name, const char *from)
 	PG_TRY();
 	{
 		branch_ops()->check_create(name);
+		written = branches_written();
 
 		/*
 		 * (no commit to move to, or from: a branch without commits, made
@@ -1076,6 +1079,15 @@ force_branch(const char *name, const char *from)
 		}
 		else
 			moved = PROLLY_CALL(refs(), branch_move, name, &at, &head, true);
+
+		/*
+		 * The branch's rows, moved to the head, are the move's, as a
+		 * reset's are, not the transaction's changes: not noted as its
+		 * writes (once allowed, the writer modes having been told).
+		 */
+		foreach(lc, branches_written())
+			if (lfirst_oid(lc) != MyBranch && !list_member_oid(written, lfirst_oid(lc)))
+				branch_forget_written(lfirst_oid(lc));
 	}
 	PG_FINALLY();
 	{

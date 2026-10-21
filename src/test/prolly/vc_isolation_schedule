@@ -4,6 +4,7 @@ test: vc_branch_make
 test: vc_writer_claims
 test: vc_writer_branches
 test: vc_transaction_commits
+test: vc_txn_commit_sessions
 test: vc_txn_rows
 test: vc_txn_commits
 test: vc_txn_branches

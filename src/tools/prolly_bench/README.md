@@ -646,9 +646,15 @@ The version-control fuzzer runs seeded histories of branches, commits,
 merges (fast-forward, `--no-ff`, conflicts refused, resolved with ours or
 theirs in a transaction block, or aborted), cherry-picks, reverts and hard
 resets, interleaving one to three sessions, some holding transactions open
-across other sessions' steps. Each history runs on a fresh `prolly`
-database and on a reference model of branches and three-way row and cell
-merges. After every step, it checks the step's outcome, each session's
+across other sessions' steps. The rows are two keyed tables' and a keyless
+table's (its copies counted by content); the histories add and drop a
+column of the keyed tables, so merges, picks and reverts carry schema
+changes (a merge losing a value the other side's dropped column held is
+refused). Some writes wait on purpose for the row lock another session's
+open transaction holds: the server is checked to show the wait, on that
+session, and the write lands as the transaction ends. Each history runs on
+a fresh `prolly` database and on a reference model of branches, three-way
+row and cell merges, and keyless merges by copies. After every step, it checks the step's outcome, each session's
 branch and rows, and whether each branch has uncommitted changes; and that
 each branch's head is the commit the model has there, with commits of the
 same rows having the same `prolly_root_hash` and commits of different rows
@@ -665,12 +671,16 @@ src/tools/prolly_bench/prolly_bench vcfuzz \
 A failing history is reduced to a smaller one failing the same way
 (`reduced.json`); replay it, or a directory of them kept as regression
 cases, with `--replay 'path/*.json'`. The model encodes where prolly's
-sessions wait, so histories stay clear of waits: a session's writes to a
-row another session's open transaction wrote, moves of a branch while any
-transaction is open, and a branch's first checkout while another session's
-transaction writes on the branch it is copied from (Dolt's checkout never
-waits; prolly's first use of a branch copies the session's branch's tables
-under a lock).
+sessions wait. Histories wait only for row locks, and only where the
+outcome is the model's: a keyed row the holder's transaction locked, one
+waiter at a time, never a waiter waited on (so nothing deadlocks), and
+never a keyless write (it picks its copy before it waits, and may find it
+gone after). They stay clear of the other waits: moves of a branch and
+schema changes while any transaction is open, and a branch's first
+checkout while another session's transaction writes on the branch it is
+copied from (Dolt's checkout never waits; prolly's first use of a branch
+copies the session's branch's tables under a lock). Doltgres as a third
+engine is not run: the `Engine` interface is ready for it.
 
 The differential runner compares seeded transaction histories with heap:
 
