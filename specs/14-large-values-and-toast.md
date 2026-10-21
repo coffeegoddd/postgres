@@ -734,8 +734,14 @@ to decode.
   (each scan gets a new token as it clears the bits), of a store dropped
   or no longer watched (64 stores at most, the longest unscanned let
   go), or of a store grown past its bits; each such scan reads every
-  block. The file isn't synced. `pg_stat_prolly`'s `gc_pages_scanned`
-  counts the blocks read.
+  block. The file isn't synced, so it is disposable: before the scan
+  the collector checks the whole file holds together (a header it
+  knows, records in order of range, each with all its hashes, to the
+  file's end) and discards one that doesn't, reading every block, the
+  same as for a stale token; a damaged file (one cut short or
+  overwritten while the server was down, say) is never an error that
+  stops collections. `pg_stat_prolly`'s `gc_pages_scanned` counts the
+  blocks read.
 - **Not as designed:** `debug_toast_relation`, a developer option
   (superuser-only), sends values to the TOAST relation all the same, so
   tests can make OID pointers. A value is stored converted (text in

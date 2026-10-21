@@ -44,6 +44,7 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/detoast.h"
@@ -465,7 +466,8 @@ chunkstore_fetch(varlena *attr, int32 offset, int32 length)
  * (ROOTS_MAGIC, ROOTS_VERSION, the scan's token), then a record a range
  * that holds any hash pointer, in order of range: the range, its count of
  * hashes, and the hashes, each once.  The page store's token says whether
- * it still holds.  It is not synced: a crash makes every token stale.
+ * it still holds.  It is not synced: a crash makes every token stale, and
+ * a file that doesn't hold together is discarded, every block read again.
  */
 #define ROOTS_PREFIX		"prolly_page_roots_"	/* and the tablespace */
 #define ROOTS_MAGIC			0x50524F54	/* "PROT" */
@@ -543,6 +545,44 @@ roots_next(RootScan *rs)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("file \"%s\" is corrupt", rs->old_path)));
+}
+
+/*
+ * Does the last scan's file hold together, past its header: records in
+ * order of range, each with all its hashes, to the file's end?  Read
+ * before the scan (which may trust what it holds), and left at its first
+ * record.  The file isn't synced, and a token from before a restart names
+ * no scan, so a file that doesn't is only discarded.
+ */
+static bool
+roots_check(RootScan *rs)
+{
+	struct stat st;
+	off_t		at = sizeof(RootsHeader);
+	uint32		last = PG_UINT32_MAX;
+	RootsRange	rec;
+
+	if (fstat(fileno(rs->old), &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat file \"%s\": %m", rs->old_path)));
+	while (at < st.st_size)
+	{
+		if (st.st_size - at < (off_t) sizeof(rec) ||
+			fseeko(rs->old, at, SEEK_SET) != 0 ||
+			fread(&rec, 1, sizeof(rec), rs->old) != sizeof(rec) ||
+			(last != PG_UINT32_MAX && rec.range <= last) ||
+			rec.range == PG_UINT32_MAX ||
+			(st.st_size - at - (off_t) sizeof(rec)) / ROOTS_HASH_LEN < rec.n)
+			return false;
+		last = rec.range;
+		at += sizeof(rec) + (off_t) rec.n * ROOTS_HASH_LEN;
+	}
+	if (fseeko(rs->old, sizeof(RootsHeader), SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in file \"%s\": %m", rs->old_path)));
+	return true;
 }
 
 /* A hash pointer's hash, found: a root, and one of the range's. */
@@ -728,7 +768,8 @@ scan_store(Oid spc, RootScan *rs)
 	if (rs->old != NULL)
 	{
 		if (fread(&h, 1, sizeof(h), rs->old) == sizeof(h) &&
-			h.magic == ROOTS_MAGIC && h.version == ROOTS_VERSION)
+			h.magic == ROOTS_MAGIC && h.version == ROOTS_VERSION &&
+			roots_check(rs))
 		{
 			since = h.token;
 			roots_next(rs);

@@ -5,7 +5,8 @@
 # rest it keeps in a file, which the page store's token says still holds.
 # A second collection with nothing written reads far fewer blocks than the
 # first, and a value written between collections is kept.  After a
-# collection that failed, or a restart, every block is read again.
+# collection that failed, or a restart, every block is read again; a file
+# damaged while the server was down is discarded.
 
 use strict;
 use warnings FATAL => 'all';
@@ -117,6 +118,37 @@ cmp_ok($restarted, '>', $all / 2,
 is(has($late), 't', 'and keeps what rows name');
 is(has($between), 't', 'every one of them');
 cmp_ok(gc_pages(), '<', $all / 10, 'and the next reads few again');
+
+# The file isn't synced: one damaged while the server was down (its token
+# stale after the restart) is discarded, every block read again, not an
+# error that stops every collection.
+my $cache = $node->data_dir . '/base/'
+  . sql(q{SELECT oid FROM pg_database WHERE datname = 'postgres'})
+  . '/prolly_page_roots_'
+  . sql(q{SELECT oid FROM pg_tablespace WHERE spcname = 'pg_default'});
+ok(-s $cache > 20, 'a collection leaves its file');
+$node->stop;
+truncate($cache, 20) or die "could not truncate $cache: $!";
+$node->start;
+my $truncated = gc_pages();
+cmp_ok($truncated, '>', $all / 2,
+	"after its file is cut short in a range, a collection reads every block ($truncated)");
+is(has($late), 't', 'and keeps what rows name');
+cmp_ok(gc_pages(), '<', $all / 10, 'and the next reads few again');
+
+# A file whose header is garbage, the same.
+$node->stop;
+open(my $fh, '+<', $cache) or die "could not open $cache: $!";
+binmode $fh;
+print $fh "garbage, not a header";
+close($fh);
+$node->start;
+my $garbage = gc_pages();
+cmp_ok($garbage, '>', $all / 2,
+	"after its header is overwritten, a collection reads every block ($garbage)");
+is(has($late), 't', 'and keeps what rows name');
+is(sql('SELECT v = ' . value('late') . ' FROM c.t WHERE id = 2500'), 't',
+	'which reads back');
 
 $node->stop;
 done_testing();
