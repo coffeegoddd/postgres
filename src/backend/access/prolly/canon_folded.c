@@ -339,26 +339,30 @@ prolly_folded_canon_env(ProllyTreeEnv *env)
 	env->chunk_refs = canon_chunk_refs;
 }
 
+static bool split_base_value(const ProllyValue *v, ProllyHash *data,
+							 ProllyHash *shape, ProllyValue *shape_ref,
+							 ProllyValue *state);
+
 /*
- * A baseline's items: the table's data tree (its definition's hash, next,
- * names no chunk), then what its finder's state names, as every change
- * finder declares it (the one that wrote it may not be the one configured
- * now).
+ * A baseline's items: the table's data tree, the value tree of its shape,
+ * then what its finder's state names, as every change finder declares it
+ * (the one that wrote it may not be the one configured now).
  */
 static void
 base_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 				StringInfo refs)
 {
-	ProllyValue state = *value;
+	ProllyHash	data;
+	ProllyHash	shape;
+	ProllyValue shape_ref;
+	ProllyValue state;
 	static List *finders = NIL;
 
 	declare_leading_hash(value, refs);
-	for (int i = 0; i < 2 && state.len >= 1 && state.data[0] <= PROLLY_HASH_MAX_LEN &&
-		 state.len >= 1 + state.data[0]; i++)
-	{
-		state.len -= 1 + state.data[0];
-		state.data += 1 + state.data[0];
-	}
+	if (!split_base_value(value, &data, &shape, &shape_ref, &state))
+		return;
+	if (shape_ref.len > 0)
+		appendBinaryStringInfo(refs, (const char *) shape_ref.data, shape_ref.len);
 	/* (the finders registered, as of the first: registered at start) */
 	if (finders == NIL)
 	{
@@ -581,9 +585,78 @@ struct BaseTable
 {
 	StringInfoData key;			/* its item's key */
 	ProllyNodeRef data;
-	ProllyHash	description;	/* of its definition (baseline_hash()) */
+	ProllyHash	shape_hash;		/* of what its rows were folded under
+								 * (baseline_shape()); empty if not known */
+	StringInfoData shape_ref;	/* the value tree holding that */
+	StringInfoData shape;		/* and its bytes, once read (base_shape()) */
+	bool		shape_read;
 	StringInfoData state;		/* the change finder's */
 };
+
+/*
+ * A baseline's value: the table's data tree (a length byte, then its
+ * hash); what its rows were folded under, BASE_SHAPED, BASE_VERSION and a
+ * length byte, then the content hash of baseline_shape()'s bytes and the
+ * reference of a value tree holding them (each a length byte, then it);
+ * then the finder's state.  The bytes are out of line: every item is written again at each
+ * fold that begins a baseline (the finder's state changes), the shape
+ * seldom, so it is written once, as it changes, and its hash compared.  (A
+ * build before kept only a hash of the table's shape, as a length byte
+ * then the hash: it names no shape, and its table is read in full once.)
+ */
+#define BASE_SHAPED		0xFF	/* (no hash is as long) */
+#define BASE_VERSION	1
+
+static bool
+split_base_value(const ProllyValue *v, ProllyHash *data, ProllyHash *shape,
+				 ProllyValue *shape_ref, ProllyValue *state)
+{
+	const uint8 *p = v->data;
+	const uint8 *end = v->data + v->len;
+
+	memset(data, 0, sizeof(*data));
+	memset(shape, 0, sizeof(*shape));
+	shape_ref->data = NULL;
+	shape_ref->len = 0;
+	if (p >= end || p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0] + 1)
+		return false;
+	data->len = p[0];
+	memcpy(data->bytes, p + 1, p[0]);
+	p += 1 + p[0];
+	if (p[0] == BASE_SHAPED)
+	{
+		const uint8 *f;
+		const uint8 *fend;
+
+		if (end - p < 3 || end - p < 3 + p[2])
+			return false;
+		f = p + 3;
+		fend = f + p[2];
+		/* (another version's: no shape known) */
+		if (p[1] == BASE_VERSION)
+		{
+			if (f >= fend || f[0] > PROLLY_HASH_MAX_LEN || fend - f < 1 + f[0] + 1)
+				return false;
+			shape->len = f[0];
+			memcpy(shape->bytes, f + 1, f[0]);
+			f += 1 + f[0];
+			if (fend - f != 1 + f[0])
+				return false;
+			shape_ref->data = f + 1;
+			shape_ref->len = f[0];
+		}
+		p = fend;
+	}
+	else
+	{
+		if (p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0])
+			return false;
+		p += 1 + p[0];
+	}
+	state->data = p;
+	state->len = end - p;
+	return true;
+}
 
 static void
 content_hash(Canon *cn, const void *data, Size len, ProllyHash *h)
@@ -606,31 +679,89 @@ base_table_cmp(const void *a, const void *b)
 	return prolly_bytes_compare(&kx, &ky, NULL);
 }
 
-/*
- * A baseline's value: the table's data tree and the hash of its
- * definition (each a length byte, then the hash), then the finder's state.
- */
 static bool
 parse_base_table(const ProllyValue *v, BaseTable *bt)
 {
-	const uint8 *p = v->data;
-	const uint8 *end = v->data + v->len;
+	ProllyValue ref;
+	ProllyValue state;
 
 	memset(&bt->data, 0, sizeof(bt->data));
-	memset(&bt->description, 0, sizeof(bt->description));
-	if (p >= end || p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0] + 1)
+	if (!split_base_value(v, &bt->data.hash, &bt->shape_hash, &ref, &state))
 		return false;
-	bt->data.hash.len = p[0];
-	memcpy(bt->data.hash.bytes, p + 1, p[0]);
-	p += 1 + p[0];
-	if (p[0] > PROLLY_HASH_MAX_LEN || end - p < 1 + p[0])
-		return false;
-	bt->description.len = p[0];
-	memcpy(bt->description.bytes, p + 1, p[0]);
-	p += 1 + p[0];
+	initStringInfo(&bt->shape_ref);
+	if (ref.len > 0)
+		appendBinaryStringInfo(&bt->shape_ref, (const char *) ref.data, ref.len);
+	initStringInfo(&bt->shape);
+	bt->shape_read = false;
 	initStringInfo(&bt->state);
-	appendBinaryStringInfo(&bt->state, p, end - p);
+	appendBinaryStringInfo(&bt->state, (const char *) state.data, state.len);
 	return true;
+}
+
+/* bt's shape's bytes (empty if not known, or its tree is gone). */
+static const StringInfoData *
+base_shape(Canon *cn, BaseTable *bt)
+{
+	ProllyValue ref = {(const uint8 *) bt->shape_ref.data, bt->shape_ref.len};
+
+	if (!bt->shape_read && ref.len > 0 &&
+		PROLLY_CALL(cn->tree, value_present, &cn->env, &ref))
+		PROLLY_CALL(cn->tree, value_read, &cn->env, &ref, 0, PG_UINT64_MAX,
+					&bt->shape);
+	bt->shape_read = true;
+	return &bt->shape;
+}
+
+/*
+ * The shape (hash h, bytes shape) of a next baseline's item: found's tree
+ * of it if it has one, else one written.
+ */
+static void
+put_base_shape(Canon *cn, StringInfo out, const ProllyHash *h,
+			   const StringInfoData *shape, const BaseTable *found)
+{
+	StringInfoData ref;
+
+	initStringInfo(&ref);
+	if (found && found->shape_ref.len > 0 &&
+		found->shape_hash.len == h->len &&
+		memcmp(found->shape_hash.bytes, h->bytes, h->len) == 0)
+		appendBinaryStringInfo(&ref, found->shape_ref.data, found->shape_ref.len);
+	else
+		PROLLY_CALL(cn->tree, value_write, &cn->env, (const uint8 *) shape->data,
+					shape->len, &ref);
+	Assert(1 + h->len + 1 + ref.len <= PG_UINT8_MAX);
+	appendStringInfoChar(out, (char) BASE_SHAPED);
+	appendStringInfoChar(out, BASE_VERSION);
+	appendStringInfoChar(out, (char) (1 + h->len + 1 + ref.len));
+	put_hash(out, h);
+	appendStringInfoChar(out, (char) ref.len);
+	appendBinaryStringInfo(out, ref.data, ref.len);
+	pfree(ref.data);
+}
+
+/*
+ * bt's shape as a baseline's value holds it, as parse_base_table() read it:
+ * its hash and tree (put_base_shape()), or, not known, an empty hash (its
+ * table is read in full once).
+ */
+static void
+put_base_kept_shape(StringInfo out, const BaseTable *bt)
+{
+	ProllyHash	none = {0};
+
+	if (bt->shape_hash.len == 0 || bt->shape_ref.len == 0)
+	{
+		put_hash(out, &none);
+		return;
+	}
+	Assert(1 + bt->shape_hash.len + 1 + bt->shape_ref.len <= PG_UINT8_MAX);
+	appendStringInfoChar(out, (char) BASE_SHAPED);
+	appendStringInfoChar(out, BASE_VERSION);
+	appendStringInfoChar(out, (char) (1 + bt->shape_hash.len + 1 + bt->shape_ref.len));
+	put_hash(out, &bt->shape_hash);
+	appendStringInfoChar(out, (char) bt->shape_ref.len);
+	appendBinaryStringInfo(out, bt->shape_ref.data, bt->shape_ref.len);
 }
 
 /* Read a baseline's tables, in key order. */
@@ -687,84 +818,168 @@ empty_root(Canon *cn, ProllyNodeRef *root)
 }
 
 /*
- * What a baseline's tree is kept for: what its rows' keys and canonical
- * bytes depend on, the keying's row shape where it gives one (else the
- * table's whole description), so DDL that changes no row's bytes (an
- * index, a constraint, a trigger) keeps the baseline; and what they depend
- * on that changes no page (so no change the finder would see).  The columns rows are read over, by number: a
- * column dropped and one of the same name and type added describe the
- * table alike, but its rows read as NULL.  And the definitions of the
- * columns' types (prolly_datum_definition()): an enum's label renamed, a
- * composite's attribute dropped, encode the same rows otherwise.  And
- * the key encoder, value encoder and keying, by implementation and format
- * version: one whose format changed encodes the same rows otherwise too.
- *
- * (An enum's label added changes its definition but no existing row's
- * bytes; telling it from a rename would take the old labels, so the next
- * fold reads each table using it in full, once.)
+ * What a baseline's tree is kept for, appended to shape: what its rows'
+ * keys and canonical bytes depend on, so DDL that changes no row's bytes
+ * (an index, a constraint, a trigger) keeps the baseline; and what they
+ * depend on that changes no page (so no change the finder would see).
+ * The keying's row shape where it gives one ('S', its length, then it):
+ * the columns rows are read over, by number (a column dropped and one of
+ * the same name and type added describe the table alike, but its rows read
+ * as NULL), their types' definitions (an enum's label renamed, a
+ * composite's attribute dropped, encode the same rows otherwise), and so
+ * on.  Else ('D') the hash of the table's whole description and of those
+ * columns and definitions.  Then the key encoder, value encoder and
+ * keying, by implementation and format version: one whose format changed
+ * encodes the same rows otherwise too.
  */
 static void
-baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
-			  ProllyHash *h)
+baseline_shape(Canon *cn, Relation rel, const StringInfoData *description,
+			   StringInfo shape)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
-	StringInfoData match;
 	ProllyComponents c;
 	const ProllyImplInfo *encoders[3];
 
-	initStringInfo(&match);
 	prolly_components_for_relation(rel, &c);
-
-	/*
-	 * (the keying's row shape where it says it: DDL that changes no row's
-	 * bytes, as an index or a constraint, keeps the baseline; else the
-	 * whole description)
-	 */
 	if (PROLLY_HAS(c.keying, row_shape))
 	{
 		ProllyKeying *k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+		uint32		len;
+		int			at;
 
-		appendStringInfoChar(&match, 'S');
-		PROLLY_CALL(c.keying, row_shape, k, rel, &match);
+		appendStringInfoChar(shape, 'S');
+		at = shape->len;
+		appendBinaryStringInfo(shape, (const char *) &len, sizeof(len));
+		PROLLY_CALL(c.keying, row_shape, k, rel, shape);
 		PROLLY_CALL(c.keying, close, k);
+		len = shape->len - at - sizeof(len);
+		memcpy(shape->data + at, &len, sizeof(len));
 	}
 	else
+	{
+		StringInfoData match;
+		ProllyHash	h;
+
+		initStringInfo(&match);
 		appendBinaryStringInfo(&match, description->data, description->len);
-	appendStringInfoChar(&match, '\0');
+		appendStringInfoChar(&match, '\0');
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+
+			if (att->attisdropped)
+				continue;
+			appendBinaryStringInfo(&match, (const char *) &att->attnum,
+								   sizeof(att->attnum));
+			prolly_datum_definition(att->atttypid, &match);
+		}
+		content_hash(cn, match.data, match.len, &h);
+		pfree(match.data);
+		appendStringInfoChar(shape, 'D');
+		put_hash(shape, &h);
+	}
 	encoders[0] = &c.key_encoder->info;
 	encoders[1] = &c.value_encoder->info;
 	encoders[2] = &c.keying->info;
 	for (int i = 0; i < lengthof(encoders); i++)
 	{
-		appendBinaryStringInfo(&match, (const char *) &encoders[i]->impl_id,
+		appendBinaryStringInfo(shape, (const char *) &encoders[i]->impl_id,
 							   sizeof(encoders[i]->impl_id));
-		appendBinaryStringInfo(&match,
+		appendBinaryStringInfo(shape,
 							   (const char *) &encoders[i]->format_version,
 							   sizeof(encoders[i]->format_version));
 	}
-	for (int i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
-
-		if (att->attisdropped)
-			continue;
-		appendBinaryStringInfo(&match, (const char *) &att->attnum,
-							   sizeof(att->attnum));
-		prolly_datum_definition(att->atttypid, &match);
-	}
-	content_hash(cn, match.data, match.len, h);
-	pfree(match.data);
 }
 
 /*
- * A prolly table's baseline_hash() (described in 'description'), and the
- * collations ordering its keys, added to the fold's (and to *collations if
- * given).
+ * A baseline_shape()'s keying's row shape, into row_shape, and the rest
+ * (the encoders), into rest: false if it has none.
+ */
+static bool
+split_shape(const StringInfoData *shape, ProllyValue *row_shape,
+			ProllyValue *rest)
+{
+	uint32		len;
+
+	if (shape->len < 1 + (int) sizeof(len) || shape->data[0] != 'S')
+		return false;
+	memcpy(&len, shape->data + 1, sizeof(len));
+	if (len > shape->len - 1 - sizeof(len))
+		return false;
+	row_shape->data = (const uint8 *) shape->data + 1 + sizeof(len);
+	row_shape->len = len;
+	rest->data = row_shape->data + len;
+	rest->len = shape->len - 1 - sizeof(len) - len;
+	return true;
+}
+
+/*
+ * Does a baseline folded under shape was hold for rel, whose shape is now?
+ * The same, or (the same encoders) one the keying says every row is the
+ * same under (shape_extends(): a nullable column added, an enum's label).
+ */
+static bool
+shape_holds(Relation rel, const StringInfoData *was, const StringInfoData *now)
+{
+	ProllyComponents c;
+	ProllyValue was_rows;
+	ProllyValue was_rest;
+	ProllyValue now_rows;
+	ProllyValue now_rest;
+	ProllyKeying *k;
+	bool		holds;
+
+	if (was->len == now->len && memcmp(was->data, now->data, now->len) == 0)
+		return true;
+	prolly_components_for_relation(rel, &c);
+	if (!PROLLY_HAS(c.keying, shape_extends) ||
+		!split_shape(was, &was_rows, &was_rest) ||
+		!split_shape(now, &now_rows, &now_rest) ||
+		was_rest.len != now_rest.len ||
+		memcmp(was_rest.data, now_rest.data, now_rest.len) != 0)
+		return false;
+	k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+	holds = PROLLY_CALL(c.keying, shape_extends, k, rel, &was_rows);
+	PROLLY_CALL(c.keying, close, k);
+	return holds;
+}
+
+/*
+ * Can a baseline folded under another shape than now's be folded from, its
+ * rows mapped to rel's shape now (prolly_fold_map())?  Not if the encoders
+ * changed since, the keying gives no row shape or can't read the old
+ * one's rows, or a column's type changed: then the finder has no baseline,
+ * so reads none of what changed since by it.  *was gets the shape its rows
+ * were folded under.  (The map itself waits for the finder, which asks
+ * for it only once it will fold from the baseline: a fold that reads rel
+ * in full instead, forced, its log saying to after a rewrite, or what
+ * changed since costing more than that, maps nothing.)
+ */
+static bool
+shape_mappable(Canon *cn, Relation rel, BaseTable *bt,
+			   const StringInfoData *now, ProllyValue *was)
+{
+	ProllyValue was_rest;
+	ProllyValue now_rows;
+	ProllyValue now_rest;
+
+	return split_shape(base_shape(cn, bt), was, &was_rest) &&
+		split_shape(now, &now_rows, &now_rest) &&
+		was_rest.len == now_rest.len &&
+		memcmp(was_rest.data, now_rest.data, now_rest.len) == 0 &&
+		prolly_fold_mappable(rel, was);
+}
+
+/*
+ * A prolly table's shape: the content hash of its baseline_shape()
+ * (described in 'description'), and the collations ordering its keys,
+ * added to the fold's (and to *collations if given).
  */
 static void
 table_shape(Canon *cn, Relation rel, const StringInfoData *description,
 			ProllyHash *dh, List **collations)
 {
+	StringInfoData shape;
 	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
 
 	if (OidIsValid(pkoid))
@@ -784,33 +999,69 @@ table_shape(Canon *cn, Relation rel, const StringInfoData *description,
 		}
 		index_close(pk, AccessShareLock);
 	}
-	baseline_hash(cn, rel, description, dh);
+	initStringInfo(&shape);
+	baseline_shape(cn, rel, description, &shape);
+	content_hash(cn, shape.data, shape.len, dh);
+	pfree(shape.data);
+}
+
+/*
+ * rel's baseline_shape() bytes (described in 'description'), made into
+ * *shape the first time they're asked for (shape->data NULL until then).
+ */
+static const StringInfoData *
+table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
+				  StringInfo shape)
+{
+	if (shape->data == NULL)
+	{
+		initStringInfo(shape);
+		baseline_shape(cn, rel, description, shape);
+	}
+	return shape;
 }
 
 /*
  * A table's data tree, folded from its rows as the transaction sees them by
- * the change finder: from its baseline if it has one for this definition
- * (dh, its table_shape()); with a next baseline being made, its entry there
- * too.  The same rows give the same tree whatever pages, order or history
- * they come from.
+ * the change finder: from its baseline if it has one that holds for this
+ * definition (described in 'description', dh its table_shape(): the same,
+ * or one shape_holds() says its rows are as they were under), or one whose
+ * rows map to it (shape_mappable()); with a next baseline being made, its
+ * entry there too.  The same rows give the same
+ * tree whatever pages, order or history they come from.
  */
 static void
-table_root(Canon *cn, CanonItem *it, Relation rel, const ProllyHash *dh,
+table_root(Canon *cn, CanonItem *it, Relation rel,
+		   const StringInfoData *description, const ProllyHash *dh,
 		   ProllyNodeRef *root)
 {
+	StringInfoData shape = {0};
+	BaseTable  *found;
 	BaseTable  *bt;
 	ProllyTableFold tf;
 	StringInfoData state;
 	ProllyFullFoldReason why;
 
-	bt = find_base_table(cn, &it->key);
+	bt = found = find_base_table(cn, &it->key);
 	why = bt ? PROLLY_FULL_SHAPE_CHANGED : PROLLY_FULL_NO_BASELINE;
-	if (bt && (bt->description.len != dh->len ||
-			   memcmp(bt->description.bytes, dh->bytes, dh->len) != 0))
-		bt = NULL;
+	memset(&tf, 0, sizeof(tf));
+	if (bt)
+		tf.data = bt->data;
+	if (bt && !(bt->shape_hash.len == dh->len &&
+				memcmp(bt->shape_hash.bytes, dh->bytes, dh->len) == 0) &&
+		!shape_holds(rel, base_shape(cn, bt),
+					 table_shape_bytes(cn, rel, description, &shape)))
+	{
+		/* (when reading another table: not mapped, as its rows aren't read) */
+		if (!cn->no_rows &&
+			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
+			shape_mappable(cn, rel, bt, &shape, &tf.shape))
+			tf.reshaped = true;
+		else
+			bt = NULL;
+	}
 	if (bt)
 	{
-		tf.data = bt->data;
 		tf.state.data = (const uint8 *) bt->state.data;
 		tf.state.len = bt->state.len;
 	}
@@ -841,11 +1092,14 @@ table_root(Canon *cn, CanonItem *it, Relation rel, const ProllyHash *dh,
 		appendBinaryStringInfo(&next->key, it->key.data, it->key.len);
 		initStringInfo(&next->value);
 		put_hash(&next->value, &root->hash);
-		put_hash(&next->value, dh);
+		put_base_shape(cn, &next->value, dh,
+					   table_shape_bytes(cn, rel, description, &shape), found);
 		appendBinaryStringInfo(&next->value, state.data, state.len);
 		cn->next = lappend(cn->next, next);
 	}
 	pfree(state.data);
+	if (shape.data)
+		pfree(shape.data);
 }
 
 static bool namespace_known(Oid nsp, bool *canon);
@@ -3122,7 +3376,7 @@ collect(Canon *cn)
 					it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					initStringInfo(&desc);
 					table_description(cn, rel, &desc, &dh);
-					table_root(cn, it, rel, &dh, &root);
+					table_root(cn, it, rel, &desc, &dh, &root);
 					put_hash(&it->value, &root.hash);
 					appendBinaryStringInfo(&it->value, desc.data, desc.len);
 					pfree(desc.data);
@@ -3175,7 +3429,7 @@ collect(Canon *cn)
 						ProllyHash	dh;
 
 						table_shape(cn, rel, &query, &dh, NULL);
-						table_root(cn, it, rel, &dh, &root);
+						table_root(cn, it, rel, &query, &dh, &root);
 						put_hash(&it->value, &root.hash);
 						table_close(rel, AccessShareLock);
 					}
@@ -3815,7 +4069,7 @@ build_baseline(Canon *cn, const ProllyNodeRef *baseline, ProllyNodeRef *next)
 				/* (its value as parse_base_table() read it) */
 				initStringInfo(&value);
 				put_hash(&value, &was->data.hash);
-				put_hash(&value, &was->description);
+				put_base_kept_shape(&value, was);
 				appendBinaryStringInfo(&value, was->state.data, was->state.len);
 			}
 			if (c < 0)
@@ -3987,8 +4241,19 @@ folded_walk_baseline(const ProllyNodeRef *baseline, ProllyTreeVisitNode visit,
 	{
 		ProllyValue state = {(const uint8 *) cn.base[i].state.data,
 		cn.base[i].state.len};
+		ProllyValue shape_ref = {(const uint8 *) cn.base[i].shape_ref.data,
+		cn.base[i].shape_ref.len};
 
 		PROLLY_CALL(cn.tree, walk, &cn.env, &cn.base[i].data, visit, arg);
+		if (shape_ref.len > 0)
+		{
+			ProllyNodeRef shape;
+			uint64		len;
+
+			memset(&shape, 0, sizeof(shape));
+			PROLLY_CALL(cn.tree, value_root, &shape_ref, &shape.hash, &len);
+			PROLLY_CALL(cn.tree, walk, &cn.env, &shape, visit, arg);
+		}
 		foreach_ptr(const ProllyChangeFinderRoutine, finder, finders)
 		{
 			if (finder->walk != NULL)
@@ -9339,6 +9604,7 @@ folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head
 			ProllyNodeRef was;
 			ProllyNodeRef now;
 			StringInfoData desc;
+			StringInfoData shape;
 			ProllyHash	dh;
 			ProllyValue state;
 			StringInfoData ns;
@@ -9371,19 +9637,22 @@ folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head
 			(void) tree_item(&k, &iv, &now, &def);
 			initStringInfo(&desc);
 			describe_table(&cn, rel, &desc);
-			baseline_hash(&cn, rel, &desc, &dh);
+			initStringInfo(&shape);
+			baseline_shape(&cn, rel, &desc, &shape);
+			content_hash(&cn, shape.data, shape.len, &dh);
 			state.data = (const uint8 *) bt->state.data;
 			state.len = bt->state.len;
 			initStringInfo(&ns);
-			if (same_hash(&dh, &bt->description) &&
+			if (same_hash(&dh, &bt->shape_hash) &&
 				PROLLY_CALL(cn.finder, advance, rel, &state, &ns))
 			{
 				resetStringInfo(&it->value);
 				put_hash(&it->value, &now.hash);
-				put_hash(&it->value, &dh);
+				put_base_shape(&cn, &it->value, &dh, &shape, bt);
 				appendBinaryStringInfo(&it->value, ns.data, ns.len);
 				put_edit(edits, &nedits, it);
 			}
+			pfree(shape.data);
 			pfree(desc.data);
 			table_close(rel, AccessShareLock);
 		}
@@ -9785,7 +10054,7 @@ folded_splice_baseline(const ProllyNodeRef *into, const ProllyNodeRef *from,
 			/* (its value as parse_base_table() read it) */
 			initStringInfo(&it->value);
 			put_hash(&it->value, &bt->data.hash);
-			put_hash(&it->value, &bt->description);
+			put_base_kept_shape(&it->value, bt);
 			appendBinaryStringInfo(&it->value, bt->state.data, bt->state.len);
 			edits[nedits].value = (ProllyValue) {(const uint8 *) it->value.data,
 			it->value.len};

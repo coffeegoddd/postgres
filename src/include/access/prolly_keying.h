@@ -134,22 +134,49 @@ typedef struct ProllyKeyingRoutine
 	 * Optional: append what rel's rows' keys and canonical bytes depend on,
 	 * beyond the rows themselves, to out: whether it keys rows by content,
 	 * its key's columns and their order, and its live columns' numbers,
-	 * types and missing values.  Two states of rel that append the same
+	 * types, missing values and types' definitions
+	 * (prolly_datum_definition()).  Two states of rel that append the same
 	 * bytes encode every row alike, so a baseline folded under one holds
 	 * for the other (DDL that changes neither, as CREATE INDEX or a
 	 * constraint added, needs no fold of every row).  Without it, the
-	 * table's whole description stands for it.
+	 * table's whole description stands for it.  The bytes are local, but
+	 * kept (with a baseline) past the build that wrote them: one this
+	 * build can't read is no shape of rel's to the callbacks below.
 	 */
 	void		(*row_shape) (ProllyKeying *k, Relation rel, StringInfo out);
+
+	/*
+	 * Optional: whether every row folded under old (a row_shape() of rel's
+	 * from before) has the same key and bytes under rel's shape now, so a
+	 * baseline folded under old holds as it is: columns added since that
+	 * every old row has as NULL (no missing value), enum labels added with
+	 * the old ones kept.  Without it, any change of shape changes rows.
+	 */
+	bool		(*shape_extends) (ProllyKeying *k, Relation rel,
+								  const ProllyValue *old);
+
+	/*
+	 * Optional: a keying for reading the rows rel had under old (a
+	 * row_shape() of rel's from before), as a baseline folded under it
+	 * holds them: its keyless(), parse_value() and decode_row() (and
+	 * set_values() and close()) work, decoding into slots of *desc, which
+	 * it sets: rel's columns as they were then, each with the type it had
+	 * and no missing value (a folded row holds every value), the others
+	 * dropped; valid till it is closed.  NULL if old's rows can't be read
+	 * so: not a shape this build reads, or a type of a column it names
+	 * defined otherwise now (values decode by the catalog's definition).
+	 */
+	ProllyKeying *(*open_shape) (Relation rel, const ProllyValue *old,
+								 MemoryContext mcxt, TupleDesc *desc);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
 	"decode_row", "compare", "close", "set_values", "row_refs", \
 	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
-	"row_shape"
+	"row_shape", "shape_extends", "open_shape"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK row_shape
+#define PROLLY_KEYING_LAST_CALLBACK open_shape
 
 /*
  * Set up a data tree's environment and k's value store for each other:

@@ -75,7 +75,8 @@ SELECT * FROM full_folds();
 --------+---
 (0 rows)
 
--- its definition changed
+-- its definition changed, its rows' bytes with it: mapped from the baseline
+-- (shape_folds), none read in full
 :reset
  pg_stat_force_next_flush 
 --------------------------
@@ -101,10 +102,9 @@ SELECT length(dolt_commit('-am', 'w added')::text) AS committed;
 (1 row)
 
 SELECT * FROM full_folds();
-    reason     | n 
----------------+---
- shape_changed | 1
-(1 row)
+ reason | n 
+--------+---
+(0 rows)
 
 -- truncated and filled again: not in full, from no rows (truncate_folds)
 :reset
@@ -834,9 +834,9 @@ ALTER TABLE ff.s ADD COLUMN n int;
  
 (1 row)
 
- read_in_full  
----------------
- shape_changed
+ read_in_full 
+--------------
+ none
 (1 row)
 
 ALTER TABLE ff.s ADD COLUMN d int DEFAULT 3;
@@ -866,9 +866,9 @@ ALTER TABLE ff.s ADD COLUMN d int DEFAULT 3;
  
 (1 row)
 
- read_in_full  
----------------
- shape_changed
+ read_in_full 
+--------------
+ none
 (1 row)
 
 ALTER TABLE ff.s DROP COLUMN n;
@@ -898,9 +898,9 @@ ALTER TABLE ff.s DROP COLUMN n;
  
 (1 row)
 
- read_in_full  
----------------
- shape_changed
+ read_in_full 
+--------------
+ none
 (1 row)
 
 ALTER TABLE ff.s ALTER COLUMN a TYPE bigint;
@@ -976,9 +976,9 @@ SELECT length(dolt_commit('-am', 'enum')::text) > 0 AS committed;
 (1 row)
 
 SELECT coalesce(string_agg(reason, ','), 'none') AS read_in_full FROM full_folds();
- read_in_full  
----------------
- shape_changed
+ read_in_full 
+--------------
+ none
 (1 row)
 
 -- a full fold's rows are sorted in maintenance_work_mem, spilling past it:

@@ -1131,6 +1131,20 @@ old_page_cmp(const void *a, const void *b)
 }
 
 /*
+ * The baseline's tree, its rows mapped to the table's shape now if it was
+ * folded under another: asked for only once the fold will be from it, as
+ * a map reads every row of the baseline.  False if they can't be mapped.
+ */
+static bool
+baseline_data(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
+{
+	if (prolly_table_fold_data(f->rel, &f->env, baseline, data))
+		return true;
+	f->reason = PROLLY_FULL_SHAPE_CHANGED;
+	return false;
+}
+
+/*
  * Fold a table without a key from the baseline: of each row on a listed
  * page, the copies the fold saw on the page's old version taken from the
  * baseline's count, those the snapshot sees on its version now added.
@@ -1148,6 +1162,7 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 	ProllyEdit *edits;
 	int			nedits = 0;
 	ProllyTreeCursor *cur;
+	ProllyNodeRef base;
 	bool		ok = true;
 	int			p = 0;
 
@@ -1230,12 +1245,14 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 	}
 	if (!ok)
 		return false;
+	if (!baseline_data(f, baseline, &base))
+		return false;
 
 	/* each row's count, the baseline's changed by its copies' */
 	if (cs.n > 1)
 		qsort_arg(cs.c, cs.n, sizeof(Copy), copy_cmp, f);
 	edits = palloc_array(ProllyEdit, Max(cs.n, 1));
-	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
+	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &base,
 					  CurrentMemoryContext);
 	for (int i = 0; i < cs.n && ok;)
 	{
@@ -1303,9 +1320,9 @@ fold_keyless(Finder *f, const ProllyTableFold *baseline, const State *st,
 	PROLLY_CALL(f->tree, cursor_close, cur);
 	f->work.rows_written += nedits;
 	if (ok && nedits > 0)
-		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
+		PROLLY_CALL(f->tree, apply, &f->env, &base, edits, nedits, data);
 	else if (ok)
-		*data = baseline->data;
+		*data = base;
 	MemoryContextDelete(cs.cxt);
 	return ok;
 }
@@ -1328,6 +1345,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	ProllyEdit *edits;
 	int			nedits = 0;
 	ProllyTreeCursor *cur;
+	ProllyNodeRef base;
 	StringInfoData key;
 	StringInfoData row;
 	StringInfoData value;
@@ -1350,6 +1368,13 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 		f->reason = PROLLY_FULL_STALE_SNAPSHOT;
 		return false;
 	}
+
+	/* (keys carried in the rows of another shape: not read as this one's) */
+	if (baseline->reshaped && st->carried.hash.len > 0)
+	{
+		f->reason = PROLLY_FULL_SHAPE_CHANGED;
+		return false;
+	}
 	if (!bmap_fold_changes(RelationGetSmgr(f->rel), &st->fold, listed_change, &l))
 	{
 		f->reason = PROLLY_FULL_STORAGE_UNSEEN;
@@ -1365,10 +1390,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	{
 		f->base = st;
 		if (l.n == 0 && low >= nblocks && st->nblocks_carried == 0)
-		{
-			*data = baseline->data;
-			return true;
-		}
+			return baseline_data(f, baseline, data);
 		return fold_keyless(f, baseline, st, &l, low, nblocks, data);
 	}
 
@@ -1422,8 +1444,10 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	f->ncands = unique_candidates(f, f->cands, f->ncands);
 	f->work.candidates += f->ncands;
 	f->work.rows_read += f->ncands;
+	if (!baseline_data(f, baseline, &base))
+		return false;
 	edits = palloc_array(ProllyEdit, Max(f->ncands, 1));
-	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
+	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &base,
 					  CurrentMemoryContext);
 	/* one scan, every version if keys are carried */
 	scan = index_beginscan(f->rel, f->pk, false, carry ? SnapshotAny : f->snap,
@@ -1493,9 +1517,9 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	PROLLY_CALL(f->tree, cursor_close, cur);
 	f->work.rows_written += nedits;
 	if (nedits > 0)
-		PROLLY_CALL(f->tree, apply, &f->env, &baseline->data, edits, nedits, data);
+		PROLLY_CALL(f->tree, apply, &f->env, &base, edits, nedits, data);
 	else
-		*data = baseline->data;
+		*data = base;
 	return true;
 }
 

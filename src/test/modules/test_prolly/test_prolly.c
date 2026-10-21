@@ -127,6 +127,10 @@ static const ConformanceCase cases[] = {
 	"open encode_row compare close encode_key", keying_keys_and_content},
 	{PROLLY_IFACE_TABLE_KEYING, "owns_its_memory",
 	"open encode_row decode_row close", keying_owns_its_memory},
+	{PROLLY_IFACE_TABLE_KEYING, "row_shapes",
+	"open close row_shape shape_extends", keying_row_shapes},
+	{PROLLY_IFACE_TABLE_KEYING, "old_shapes",
+	"open encode_row decode_row close row_shape open_shape", keying_old_shapes},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",

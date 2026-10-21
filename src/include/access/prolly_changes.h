@@ -47,11 +47,19 @@
 #include "storage/itemptr.h"
 #include "utils/relcache.h"
 
-/* A table's baseline: its data tree at a fold, and the finder's state. */
+/*
+ * A table's baseline: its data tree at a fold, and the finder's state.
+ * reshaped: the tree's rows were folded under another row shape than the
+ * table's now, shape (the keying's row_shape() then), so a fold from it
+ * reads the tree by prolly_table_fold_data(), which maps them, and rows
+ * the state holds are in another's.
+ */
 typedef struct ProllyTableFold
 {
 	ProllyNodeRef data;
 	ProllyValue state;
+	bool		reshaped;
+	ProllyValue shape;
 } ProllyTableFold;
 
 typedef struct ProllyChangeCounters

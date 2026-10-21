@@ -326,11 +326,37 @@ commit or checkpoint all use it.
   definitions of their types (an enum's label renamed, a composite's
   attribute dropped), and the key encoder's, value encoder's and keying's
   implementations and format versions. Any of these changed, the next
-  fold reads the table in full (#322, #323). An enum's label added
-  (`ALTER TYPE ... ADD VALUE`) changes its definition without changing
-  a row, and costs each table using it one full read: telling an
-  addition from a rename would take the old labels, which a baseline
-  doesn't keep.
+  fold reads the table in full (#322, #323), unless the change leaves
+  every row as it was: the baseline keeps the keying's row shape itself,
+  and the keying tells (#485). So these keep the baseline:
+  - an index, a constraint, a default, a trigger, a rule, a policy,
+    reloptions, replica identity, statistics, storage, compression, a
+    comment (none is in the shape);
+  - `CLUSTER`, `VACUUM FULL`, `REPACK` (they rewrite no row's bytes, and
+    clear only missing values the rows already hold);
+  - a column added without a default (every old row has it as NULL,
+    which isn't stored);
+  - an enum's label added (`ALTER TYPE ... ADD VALUE`, `BEFORE` or
+    `AFTER` too): rows send labels, the old ones keep their names, and
+    their order, so keys too. A label renamed changes rows: read in full.
+
+  And these change rows' bytes without writing them, so the baseline's
+  rows are mapped to the shape now, read as they were folded and
+  encoded as they are now, without reading the table (#485,
+  `19-change-log.md` §2.2):
+  - a column added with a default (rows from before read as its missing
+    value, which every row's bytes now hold: no "lazy default");
+  - a column dropped (gone from every row's bytes; a keyless table's
+    rows sorted again, those become alike counted as one);
+  - a column retyped where the type's cast keeps every value (no
+    rewrite: a length or precision widened, `varchar` to `text`, a
+    domain over the type), each value encoded as the new type's (#510);
+  - a primary key added, dropped or moved: the rows sorted again by the
+    key now, in bounded memory (#510).
+
+  A retype whose cast computes (`int` to `bigint`, a `USING` expression)
+  rewrites the table, which is read in full: what the rewrite did isn't
+  recorded where the fold can read it (`19-change-log.md` §2.2).
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
   folds the changes into a tree, which becomes the new baseline, and

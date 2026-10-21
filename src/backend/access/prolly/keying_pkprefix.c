@@ -38,7 +38,9 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 /* How much of a row without a primary key begins its key. */
 #define KEY_PREFIX	32
@@ -219,59 +221,359 @@ pkprefix_open_described(TupleDesc desc, MemoryContext mcxt)
 }
 
 /*
+ * A row shape (pkprefix_row_shape()), versioned: a baseline keeps one past
+ * the build that wrote it.
+ *
+ *	version			SHAPE_VERSION
+ *	'c' or 'k'		keyed by content, or by the key
+ *	key				a count, then each column's number, operator family,
+ *					collation and options
+ *	layout			the value encoder's layout() (a length, then it)
+ *	columns			a count, then each live column's number, type, typmod
+ *					and flags; its missing value (a length, then its
+ *					bytes) and a virtual generated column's expression
+ *					(the same), as the flags say; and its type's definition
+ *					(prolly_datum_definition(), the same)
+ *
+ * in native byte order (shapes are local, as baselines are).
+ */
+#define SHAPE_VERSION		1
+
+#define SHAPE_MISSING		0x01	/* a missing value (atthasmissing) */
+#define SHAPE_MISSING_NULL	0x02	/* ... that is NULL */
+#define SHAPE_VIRTUAL		0x04	/* a virtual generated column */
+
+typedef struct ShapeColumn
+{
+	AttrNumber	attnum;
+	Oid			type;
+	int32		typmod;
+	uint8		flags;
+	ProllyValue missing;
+	ProllyValue expr;
+	ProllyValue definition;
+} ShapeColumn;
+
+typedef struct Shape
+{
+	bool		keyless;
+	ProllyValue key;			/* its count and columns, as bytes */
+	ProllyValue layout;
+	int			ncols;
+	ShapeColumn *cols;
+} Shape;
+
+static void
+put_bytes(StringInfo out, const void *data, uint32 len)
+{
+	appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
+	appendBinaryStringInfo(out, data, len);
+}
+
+/* A virtual generated column's expression (nodeToString()), else NULL. */
+static const char *
+virtual_expr(TupleDesc desc, Form_pg_attribute att)
+{
+	if (att->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL || !desc->constr)
+		return NULL;
+	for (int j = 0; j < desc->constr->num_defval; j++)
+		if (desc->constr->defval[j].adnum == att->attnum)
+			return desc->constr->defval[j].adbin;
+	return "";
+}
+
+/*
  * What rel's rows' keys and bytes depend on (see the interface): keyed by
  * content or not; the key's columns, operator families, collations and
- * options, in order; each live column's number, type and typmod, its
- * missing value (a default added without a rewrite is stored in the rows
- * that predate it), and a virtual generated column's expression.
+ * options, in order; the value encoder's layout; each live column's
+ * number, type and typmod, its missing value (a default added without a
+ * rewrite is stored in the rows that predate it), a virtual generated
+ * column's expression, and its type's definition (an enum's labels).
  */
 static void
 pkprefix_row_shape(ProllyKeying *k, Relation rel, StringInfo out)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
+	uint16		n = k->keyless ? 0 : k->nkeys;
+	StringInfoData def;
 
+	appendStringInfoChar(out, SHAPE_VERSION);
 	appendStringInfoChar(out, k->keyless ? 'c' : 'k');
-	for (int i = 0; !k->keyless && i < k->nkeys; i++)
+	appendBinaryStringInfo(out, (const char *) &n, sizeof(n));
+	for (int i = 0; i < n; i++)
 	{
 		appendBinaryStringInfo(out, (const char *) &k->key_attnos[i], sizeof(AttrNumber));
 		appendBinaryStringInfo(out, (const char *) &k->opfamilies[i], sizeof(Oid));
 		appendBinaryStringInfo(out, (const char *) &k->collations[i], sizeof(Oid));
 		appendBinaryStringInfo(out, (const char *) &k->options[i], sizeof(int16));
 	}
-	appendStringInfoChar(out, '|');
+	put_bytes(out, k->layout.data, k->layout.len);
+	n = 0;
+	for (int i = 0; i < desc->natts; i++)
+		n += !TupleDescAttr(desc, i)->attisdropped;
+	appendBinaryStringInfo(out, (const char *) &n, sizeof(n));
+	initStringInfo(&def);
 	for (int i = 0; i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
+		uint8		flags = 0;
+		bool		isnull = true;
+		Datum		missing = (Datum) 0;
+		const char *expr = "";
 
 		if (att->attisdropped)
 			continue;
+		if (att->atthasmissing)
+		{
+			missing = getmissingattr(desc, att->attnum, &isnull);
+			flags |= SHAPE_MISSING | (isnull ? SHAPE_MISSING_NULL : 0);
+		}
+		if (virtual_expr(desc, att) != NULL)
+		{
+			flags |= SHAPE_VIRTUAL;
+			expr = virtual_expr(desc, att);
+		}
 		appendBinaryStringInfo(out, (const char *) &att->attnum, sizeof(att->attnum));
 		appendBinaryStringInfo(out, (const char *) &att->atttypid, sizeof(Oid));
 		appendBinaryStringInfo(out, (const char *) &att->atttypmod, sizeof(int32));
-		if (att->atthasmissing)
-		{
-			bool		isnull;
-			Datum		d = getmissingattr(desc, att->attnum, &isnull);
-
-			appendStringInfoChar(out, isnull ? 'N' : 'M');
-			if (!isnull && att->attbyval)
-				appendBinaryStringInfo(out, (const char *) &d, sizeof(Datum));
-			else if (!isnull)
-			{
-				Size		len = datumGetSize(d, false, att->attlen);
-
-				appendBinaryStringInfo(out, (const char *) &len, sizeof(len));
-				appendBinaryStringInfo(out, DatumGetPointer(d), len);
-			}
-		}
-		if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL && desc->constr)
-		{
-			for (int j = 0; j < desc->constr->num_defval; j++)
-				if (desc->constr->defval[j].adnum == att->attnum)
-					appendStringInfoString(out, desc->constr->defval[j].adbin);
-		}
-		appendStringInfoChar(out, ';');
+		appendStringInfoChar(out, (char) flags);
+		if (!isnull && att->attbyval)
+			put_bytes(out, &missing, sizeof(Datum));
+		else if (!isnull)
+			put_bytes(out, DatumGetPointer(missing),
+					  datumGetSize(missing, false, att->attlen));
+		if (flags & SHAPE_VIRTUAL)
+			put_bytes(out, expr, strlen(expr));
+		resetStringInfo(&def);
+		prolly_datum_definition(att->atttypid, &def);
+		put_bytes(out, def.data, def.len);
 	}
+	pfree(def.data);
+}
+
+/* Take len bytes at *p (before end) into v; false if they run past it. */
+static bool
+take(const char **p, const char *end, size_t len, void *v)
+{
+	if ((size_t) (end - *p) < len)
+		return false;
+	memcpy(v, *p, len);
+	*p += len;
+	return true;
+}
+
+/* (a length, then the bytes: v points at them) */
+static bool
+take_bytes(const char **p, const char *end, ProllyValue *v)
+{
+	uint32		len;
+
+	if (!take(p, end, sizeof(len), &len) || (size_t) (end - *p) < len)
+		return false;
+	v->data = (const uint8 *) *p;
+	v->len = len;
+	*p += len;
+	return true;
+}
+
+/* A row shape parsed into s, pointing into it: false if it isn't one. */
+static bool
+parse_shape(const ProllyValue *v, Shape *s)
+{
+	const char *p = (const char *) v->data;
+	const char *end = p + v->len;
+	const char *key;
+	uint8		version;
+	char		keyed;
+	uint16		n;
+	size_t		keycol = sizeof(AttrNumber) + 2 * sizeof(Oid) + sizeof(int16);
+
+	memset(s, 0, sizeof(*s));
+	if (!take(&p, end, 1, &version) || version != SHAPE_VERSION ||
+		!take(&p, end, 1, &keyed) || (keyed != 'c' && keyed != 'k'))
+		return false;
+	s->keyless = keyed == 'c';
+	key = p;
+	if (!take(&p, end, sizeof(n), &n) || (size_t) (end - p) < n * keycol)
+		return false;
+	p += n * keycol;
+	s->key.data = (const uint8 *) key;
+	s->key.len = p - key;
+	if (!take_bytes(&p, end, &s->layout) || !take(&p, end, sizeof(n), &n))
+		return false;
+	s->ncols = n;
+	s->cols = palloc0_array(ShapeColumn, Max(n, 1));
+	for (int i = 0; i < n; i++)
+	{
+		ShapeColumn *c = &s->cols[i];
+
+		if (!take(&p, end, sizeof(c->attnum), &c->attnum) ||
+			!take(&p, end, sizeof(c->type), &c->type) ||
+			!take(&p, end, sizeof(c->typmod), &c->typmod) ||
+			!take(&p, end, 1, &c->flags))
+			return false;
+		if ((c->flags & SHAPE_MISSING) && !(c->flags & SHAPE_MISSING_NULL) &&
+			!take_bytes(&p, end, &c->missing))
+			return false;
+		if ((c->flags & SHAPE_VIRTUAL) && !take_bytes(&p, end, &c->expr))
+			return false;
+		if (!take_bytes(&p, end, &c->definition))
+			return false;
+	}
+	return p == end;
+}
+
+static bool
+same_value(const ProllyValue *a, const ProllyValue *b)
+{
+	return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+/* Does rel's row shape now parse into now?  (buf holds it.) */
+static bool
+shape_now(ProllyKeying *k, Relation rel, StringInfo buf, Shape *now)
+{
+	ProllyValue v;
+
+	initStringInfo(buf);
+	pkprefix_row_shape(k, rel, buf);
+	v.data = (const uint8 *) buf->data;
+	v.len = buf->len;
+	return parse_shape(&v, now);
+}
+
+/*
+ * Rows folded under old encode alike under rel's shape now (see the
+ * interface): the same key and layout, columns only added after it; each
+ * old column the same, but for its type's definition, extended at most,
+ * and a missing value cleared (as a rewrite that changes no row clears
+ * it: folded rows hold every value themselves); and each column added
+ * without a missing value, so NULL in every old row, which leaves it off.
+ */
+static bool
+pkprefix_shape_extends(ProllyKeying *k, Relation rel, const ProllyValue *old)
+{
+	StringInfoData buf;
+	Shape		was;
+	Shape		now;
+	bool		extends;
+
+	extends = parse_shape(old, &was) && shape_now(k, rel, &buf, &now) &&
+		was.keyless == now.keyless && same_value(&was.key, &now.key) &&
+		was.ncols <= now.ncols && was.layout.len <= now.layout.len &&
+		memcmp(was.layout.data, now.layout.data, was.layout.len) == 0;
+	for (int i = 0; extends && i < now.ncols; i++)
+	{
+		ShapeColumn *c = &now.cols[i];
+		ShapeColumn *o = i < was.ncols ? &was.cols[i] : NULL;
+
+		if (o == NULL)
+			extends = c->flags == 0;
+		else
+			extends = o->attnum == c->attnum && o->type == c->type &&
+				o->typmod == c->typmod &&
+				((c->flags == o->flags && same_value(&o->missing, &c->missing) &&
+				  same_value(&o->expr, &c->expr)) ||
+				 (c->flags == 0 && (o->flags & SHAPE_VIRTUAL) == 0)) &&
+				prolly_datum_definition_extends((const char *) o->definition.data,
+												o->definition.len,
+												(const char *) c->definition.data,
+												c->definition.len);
+	}
+	return extends;
+}
+
+/*
+ * Rows folded under old, read as rel's columns were then (see the
+ * interface): rel's descriptor, old's columns live with the types they
+ * had, the rest dropped, decoded by old's layout (which skips those
+ * dropped since).  Each old column still live must have its type defined
+ * as it was, labels added at most, and a virtual generated one its
+ * expression.
+ */
+static ProllyKeying *
+pkprefix_open_shape(Relation rel, const ProllyValue *old, MemoryContext mcxt,
+					TupleDesc *desc)
+{
+	TupleDesc	rd = RelationGetDescr(rel);
+	MemoryContext caller = MemoryContextSwitchTo(mcxt);
+	ProllyComponents c;
+	ProllyKeying *k = NULL;
+	Shape		was;
+	TupleDesc	d;
+	StringInfoData def;
+	ProllyValue layout;
+	bool		readable;
+
+	d = CreateTupleDescCopy(rd);
+	for (int i = 0; i < d->natts; i++)
+		TupleDescAttr(d, i)->attisdropped = true;
+	initStringInfo(&def);
+	readable = parse_shape(old, &was);
+	for (int j = 0; readable && j < was.ncols; j++)
+	{
+		ShapeColumn *o = &was.cols[j];
+		Form_pg_attribute now;
+		Form_pg_attribute att;
+		const char *expr;
+
+		if (o->attnum < 1 || o->attnum > d->natts)
+		{
+			readable = false;
+			break;
+		}
+		now = TupleDescAttr(rd, o->attnum - 1);
+		if (now->attisdropped)
+			continue;
+		att = TupleDescAttr(d, o->attnum - 1);
+		att->attisdropped = false;
+		if (o->type != now->atttypid)
+		{
+			if (!SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(o->type)))
+			{
+				readable = false;
+				break;
+			}
+			att->atttypid = o->type;
+			get_typlenbyvalalign(o->type, &att->attlen, &att->attbyval,
+								 &att->attalign);
+		}
+		att->atttypmod = o->typmod;
+		resetStringInfo(&def);
+		prolly_datum_definition(o->type, &def);
+		expr = virtual_expr(rd, now);
+		readable = prolly_datum_definition_extends((const char *) o->definition.data,
+												   o->definition.len,
+												   def.data, def.len) &&
+			((o->flags & SHAPE_VIRTUAL) == 0) == (expr == NULL) &&
+			(expr == NULL || (o->expr.len == strlen(expr) &&
+							  memcmp(o->expr.data, expr, o->expr.len) == 0));
+	}
+	pfree(def.data);
+	if (!readable)
+	{
+		FreeTupleDesc(d);
+		MemoryContextSwitchTo(caller);
+		return NULL;
+	}
+	for (int i = 0; i < d->natts; i++)
+		populate_compact_attribute(d, i);
+	TupleDescFinalize(d);
+
+	prolly_components_for_relation(rel, &c);
+	k = palloc0(sizeof(ProllyKeying));
+	k->mcxt = mcxt;
+	k->hash = c.hash;
+	k->valenc_routine = c.value_encoder;
+	k->desc = d;
+	k->keyless = was.keyless;
+	layout = was.layout;
+	k->valenc = PROLLY_CALL(c.value_encoder, begin_layout, d, &layout, mcxt);
+	initStringInfo(&k->layout);
+	appendBinaryStringInfo(&k->layout, (const char *) layout.data, layout.len);
+	*desc = d;
+	MemoryContextSwitchTo(caller);
+	return k;
 }
 
 static bool
@@ -493,4 +795,6 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.decode_row_kept = pkprefix_decode_row_kept,
 	.encode_key = pkprefix_encode_key,
 	.row_shape = pkprefix_row_shape,
+	.shape_extends = pkprefix_shape_extends,
+	.open_shape = pkprefix_open_shape,
 };

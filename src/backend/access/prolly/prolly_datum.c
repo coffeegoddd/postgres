@@ -760,6 +760,126 @@ prolly_datum_definition(Oid typid, StringInfo out)
 	}
 }
 
+/* An enum's labels in a definition: a count, then each OID and label. */
+typedef struct DefLabel
+{
+	Oid			oid;
+	const char *label;
+	uint64		len;
+} DefLabel;
+
+static DefLabel *
+definition_labels(const char **p, const char *end, uint64 *n)
+{
+	DefLabel   *labels;
+
+	*n = prolly_get_varint(p, end);
+	if (*n > (uint64) (end - *p))
+		return NULL;
+	labels = palloc_array(DefLabel, Max(*n, 1));
+	for (uint64 i = 0; i < *n; i++)
+	{
+		if (end - *p < (ptrdiff_t) sizeof(Oid))
+			return NULL;
+		memcpy(&labels[i].oid, *p, sizeof(Oid));
+		*p += sizeof(Oid);
+		labels[i].len = prolly_get_varint(p, end);
+		if (labels[i].len > (uint64) (end - *p))
+			return NULL;
+		labels[i].label = *p;
+		*p += labels[i].len;
+	}
+	return labels;
+}
+
+/* (old and now walked together: see prolly_datum_definition_extends()) */
+static bool
+definition_extends(const char **o, const char *oend, const char **n,
+				   const char *nend)
+{
+	Oid			base;
+	Oid			nbase;
+	Oid			elemtype;
+
+	check_stack_depth();
+	if (oend - *o < (ptrdiff_t) sizeof(Oid) || nend - *n < (ptrdiff_t) sizeof(Oid))
+		return false;
+	memcpy(&base, *o, sizeof(Oid));
+	memcpy(&nbase, *n, sizeof(Oid));
+	*o += sizeof(Oid);
+	*n += sizeof(Oid);
+	if (base != nbase)
+		return false;
+	elemtype = get_element_type(base);
+	if (OidIsValid(elemtype))
+		return definition_extends(o, oend, n, nend);
+	switch (get_typtype(base))
+	{
+		case TYPTYPE_ENUM:
+			{
+				/* (each old label kept, by its OID and name: rows send names) */
+				uint64		nold;
+				uint64		nnow;
+				DefLabel   *old = definition_labels(o, oend, &nold);
+				DefLabel   *now = old ? definition_labels(n, nend, &nnow) : NULL;
+
+				if (now == NULL)
+					return false;
+				for (uint64 i = 0; i < nold; i++)
+				{
+					bool		kept = false;
+
+					for (uint64 j = 0; j < nnow && !kept; j++)
+						kept = now[j].oid == old[i].oid &&
+							now[j].len == old[i].len &&
+							memcmp(now[j].label, old[i].label, old[i].len) == 0;
+					if (!kept)
+						return false;
+				}
+				pfree(old);
+				pfree(now);
+				return true;
+			}
+		case TYPTYPE_COMPOSITE:
+			{
+				/* (the same attributes, each extending its own) */
+				uint64		natts = prolly_get_varint(o, oend);
+
+				if (prolly_get_varint(n, nend) != natts)
+					return false;
+				for (uint64 i = 0; i < natts; i++)
+				{
+					bool		live;
+
+					if (*o >= oend || *n >= nend || **o != **n)
+						return false;
+					live = *(*o)++ == 'a';
+					(*n)++;
+					if (live && !definition_extends(o, oend, n, nend))
+						return false;
+				}
+				return true;
+			}
+		case TYPTYPE_RANGE:
+		case TYPTYPE_MULTIRANGE:
+			return definition_extends(o, oend, n, nend);
+	}
+	return true;
+}
+
+bool
+prolly_datum_definition_extends(const char *old, int oldlen, const char *now,
+								int nowlen)
+{
+	const char *o = old;
+	const char *n = now;
+
+	if (oldlen == nowlen && memcmp(old, now, oldlen) == 0)
+		return true;
+	return definition_extends(&o, old + oldlen, &n, now + nowlen) &&
+		o == old + oldlen && n == now + nowlen;
+}
+
 /* ------------------------------------------------------------------------
  * Arrays, composites and anyarray
  * ------------------------------------------------------------------------

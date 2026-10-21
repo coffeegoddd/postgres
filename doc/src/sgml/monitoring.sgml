@@ -5700,6 +5700,10 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        fold that reads
        at least <varname>prolly.log_full_folds</varname> rows so is logged,
        with why;
+       <literal>fold_mapped_tables</literal> (tables whose baseline was
+       mapped to a new shape (a column added with a default or dropped, a
+       type relabeled, the primary key changed),
+       from its own rows, not read in full);
        <literal>fold_merge_builds</literal> (folds that merged many changes
        with the table's baseline in one pass),
        <literal>fold_verified</literal> and

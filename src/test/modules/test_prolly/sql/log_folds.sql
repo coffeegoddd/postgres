@@ -203,7 +203,8 @@ DELETE FROM inc.keyless WHERE a = 5001;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'by content gone')::text) AS committed;
 
--- A table redefined, or rewritten, is read in full once.
+-- A column added without a default changes no row: the baseline holds
+-- (#485).  A table rewritten is read in full once.
 ALTER TABLE inc.big ADD COLUMN w int;
 SELECT * FROM pg_temp.fold();
 SELECT length(dolt_commit('-am', 'a column')::text) AS committed;

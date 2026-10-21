@@ -98,6 +98,15 @@ extern Datum prolly_datum_decode(ProllyDatumCodec *codec, const char *data,
  */
 extern void prolly_datum_definition(Oid typid, StringInfo out);
 
+/*
+ * Whether every value encoded under definition old (prolly_datum_definition(),
+ * appended before) encodes to the same bytes under now: the same, or with
+ * an enum's labels added, each old one kept (its OID and name), anywhere
+ * in it.  (A label added keeps the old ones' order, so keys too.)
+ */
+extern bool prolly_datum_definition_extends(const char *old, int oldlen,
+											const char *now, int nowlen);
+
 /* Unsigned LEB128, the minimal encoding. */
 extern void prolly_put_varint(StringInfo out, uint64 v);
 extern uint64 prolly_get_varint(const char **p, const char *end);
