@@ -167,6 +167,16 @@ that changed definitions, or more rows than it keeps, or whose rows can't
 be applied so (a table the head describes otherwise), commits its working
 set instead.
 
+A fold isn't made again while nothing it reads has changed: the refs
+(refs_generations.c) keep in shared memory each branch's generation,
+moved as a transaction that wrote the branch ends (every writer is told of
+through branch.c), an epoch moved by every catalog change sent and every
+collection, and the root the last fold of the branch made, known once its
+transaction commits.  Reading the working set (status, diff, a branch's
+dirtiness) takes that root while the generation and epoch stay and the
+reader's snapshot sees every writer that ended.
+debug_prolly_verify_fold_caches folds again and compares.
+
 
 Remotes
 -------
@@ -188,11 +198,13 @@ Core hooks
 ----------
 
 prolly_shmem.c is a shared-memory subsystem (subsystemlist.h) reserving
-an area per chunk store and value memo implementation that asks for one, and
-CheckPointProlly() runs in CheckPointGuts(), and ProllyRecoveryConsistent()
-beside XLogCheckInvalidPages(), as recovery becomes consistent; the chunk
-store asks XLogBackupInProgress() (xlog.c) before it removes a file a
-backup's redo may copy from.  createdb() calls
+an area per chunk store, value memo and refs implementation that asks for
+one, and CheckPointProlly() runs in CheckPointGuts(), and
+ProllyRecoveryConsistent() beside XLogCheckInvalidPages(), as recovery
+becomes consistent; the chunk store asks XLogBackupInProgress() (xlog.c)
+before it removes a file a backup's redo may copy from.  Every batch of
+shared invalidation messages sent calls prolly_forget_folds() (sinval.c).
+createdb() calls
 ProllyCopyDatabase() (prolly_database.c) to copy the template's chunk
 store.  A temporary or unlogged table is never stored by prolly
 (prolly_table_am_for_persistence()).

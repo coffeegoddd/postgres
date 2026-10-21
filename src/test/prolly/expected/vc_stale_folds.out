@@ -486,6 +486,6 @@ pg_stat_force_next_flush
 step c_full: SELECT sum(value) FILTER (WHERE name = 'fold_full_tables') - sum(value) FILTER (WHERE name = 'fold_full_verify') AS full_folds, sum(value) FILTER (WHERE name IN ('fold_full_stale_snapshot', 'fold_full_unsettled')) AS stale_full FROM pg_stat_prolly;
 full_folds|stale_full
 ----------+----------
-         6|         6
+         2|         2
 (1 row)
 

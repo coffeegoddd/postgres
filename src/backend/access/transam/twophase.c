@@ -2861,6 +2861,27 @@ LookupGXactBySubid(Oid subid)
 }
 
 /*
+ * TwoPhaseAnyPrepared
+ *		Is any transaction prepared, or being prepared, in any database?
+ *
+ * Prolly's folds that skip reading what didn't change (#482) are told of
+ * every writer's end but not of a prepared one's, so none is skipped while
+ * one exists.
+ */
+bool
+TwoPhaseAnyPrepared(void)
+{
+	bool		any;
+
+	if (max_prepared_xacts == 0)
+		return false;
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	any = TwoPhaseState->numPrepXacts > 0;
+	LWLockRelease(TwoPhaseStateLock);
+	return any;
+}
+
+/*
  * TwoPhaseGetOldestXidInCommit
  *		Return the oldest transaction ID from prepared transactions that are
  *		currently in the commit critical section.

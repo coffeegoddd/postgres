@@ -65,6 +65,7 @@
 #include "postgres.h"
 
 #include "access/prolly_builtins.h"
+#include "access/prolly_config.h"
 #include "access/prolly_toast.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
@@ -476,6 +477,9 @@ copying_collect(bool full, ProllyGcResult *result)
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
 	WalSndHorizonReadEnd();
+
+	/* (a fold's tree no ref names was garbage: the folds made are stale) */
+	prolly_forget_folds();
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);

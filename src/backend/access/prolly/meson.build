@@ -47,6 +47,7 @@ backend_sources += files(
   'remote_libpq_load.c',
   'remote_serve.c',
   'refs_copies.c',
+  'refs_generations.c',
   'refs_history.c',
   'refs_stub.c',
   'transfer_chunks.c',
