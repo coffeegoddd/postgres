@@ -70,10 +70,12 @@
  *   tablespace and autovacuum settings as its TOAST table does.  Asked by
  *   autovacuum with only the table's pg_class row, so it opens nothing.
  *   Optional.
- * - is_log() says whether rel is a change log: its rows are no table's, and
- *   logical decoding passes over them.  Asked of any TOAST-kind relation,
- *   in critical sections too (RelationIsLogicallyLogged), so it is quick
- *   and must neither error nor allocate.
+ * - is_log() says whether the relation of pg_class row form is a change
+ *   log: its rows are no table's, and logical decoding passes over them.
+ *   Asked of any TOAST-kind relation, in critical sections too
+ *   (RelationIsLogicallyLogged), and of pg_class rows read across every
+ *   branch, the log's table perhaps on another branch only: so it judges
+ *   by the row alone, is quick, and must neither error nor allocate.
  * - consume() is called once a fold that read the log by this snapshot is
  *   to be the table's baseline: the transaction's own entries are marked
  *   consumed (the next fold reads its transaction's again, but those), and
@@ -114,6 +116,12 @@
  *   running that wrote such entries or are running still, and the current
  *   transaction its own.  Else rest->xmax is invalid, and the new baseline
  *   holds what the snapshot sees.
+ * - sizes() is what rel's log takes on disk: its relations' bytes (every
+ *   fork, its indexes too), and of its entries' bytes those live (no
+ *   committed deletion: unconsumed, or consumed by a fold not yet
+ *   committed) and those dead (consumed, until a vacuum removes them),
+ *   judged by heap visibility.  False if rel has no log.  Optional: without
+ *   it, a log's sizes are unknown.
  *
  * Provisional (v0).
  *
@@ -127,6 +135,7 @@
 #include "access/htup.h"
 #include "access/prolly_registry.h"
 #include "access/transam.h"
+#include "catalog/pg_class.h"
 #include "storage/itemptr.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
@@ -150,6 +159,14 @@ typedef struct ProllyLogPosition
  */
 typedef bool (*ProllyChangeLogVisit) (HeapTuple entry, int32 delta, void *arg);
 
+/* What a log takes, in bytes (sizes()). */
+typedef struct ProllyChangeLogSizes
+{
+	int64		bytes;			/* its relations, every fork */
+	int64		live_bytes;		/* its entries not deleted, or not yet */
+	int64		dead_bytes;		/* its entries consumed */
+} ProllyChangeLogSizes;
+
 typedef struct ProllyChangeLogRoutine
 {
 	ProllyImplInfo info;
@@ -162,7 +179,7 @@ typedef struct ProllyChangeLogRoutine
 						 const ProllyLogPosition *since,
 						 ProllyChangeLogVisit visit, void *arg);
 	void		(*consume) (Relation rel, Snapshot snapshot);
-	bool		(*is_log) (Relation rel);
+	bool		(*is_log) (Form_pg_class form);
 	Oid			(*relid) (Oid relid);
 	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
 							  HeapTuple oldtup, HeapTuple *made, int nmade);
@@ -176,14 +193,15 @@ typedef struct ProllyChangeLogRoutine
 	void		(*flush) (void);
 	void		(*note_emptied) (Relation rel);
 	double		(*pending) (Relation rel);
+	bool		(*sizes) (Relation rel, ProllyChangeLogSizes *sizes);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", \
 	"relid", "note_made", "consume_own", "written_unseen", "read_unseen", \
-	"flush", "note_emptied", "pending"
+	"flush", "note_emptied", "pending", "sizes"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK pending
+#define PROLLY_CHANGELOG_LAST_CALLBACK sizes
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

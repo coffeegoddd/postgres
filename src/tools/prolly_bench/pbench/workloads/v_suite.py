@@ -519,3 +519,114 @@ class V7(VWorkload):
         ungated = vgrowth.AUTOVACUUM_COUNTED if spec.get("autovacuum") else set()
         return Outcome(metrics=vgrowth.growth_metrics(series, ungated),
                        transactions=k, unit="transaction")
+
+
+@registry.workloads.register("V8")
+class V8(VWorkload):
+    """Storage by component (#500): prolly_storage_breakdown(), the
+    database's size, and a heap table's given the same rows and updates,
+    read after each stage: the load, its first commit, K commits each
+    updating P% of the rows, dolt_gc with prolly_page_sweep(), and a VACUUM
+    with another sweep (what vacuuming the change log and the pages gives
+    back).  Sizes only: no timings."""
+
+    id, title = "V8", "Storage by component"
+
+    STAGES = ("load", "commit", "updates", "gc", "vacuum")
+
+    READ = ("CHECKPOINT;\n"
+            "SELECT 'v8|' || json_build_object("
+            "'breakdown', (SELECT row_to_json(b) FROM prolly_storage_breakdown() b), "
+            "'database_bytes', pg_database_size(current_database()), "
+            "'table_bytes', pg_total_relation_size('vc_data'), "
+            "'heap_bytes', pg_total_relation_size('public.v8_heap'));\n")
+
+    def commits(self, ctx) -> int:
+        return int(ctx.params.get("commits", 10))
+
+    def update_percent(self, ctx) -> float:
+        return float(ctx.params.get("update_percent", 1))
+
+    def variants(self, params):
+        # (storage read alone: never with a background workload, whatever
+        # the suite's backgrounds, so a plain `run V` plans no cell of it
+        # that can't run)
+        return [(f"{label}-bgnone" if label else "bgnone", {**extra, "background": "none"})
+                for label, extra in self.own_variants(params)]
+
+    @staticmethod
+    def update_where(i: int, changed: int, n: int) -> str:
+        """Commit i's rows: the changed ids after (i * changed) mod n,
+        wrapping past the table's end to its start, so each commit updates
+        as many."""
+        lo = i * changed % n
+        hi = lo + changed
+        return f"WHERE (id > {lo} AND id <= {hi}) OR id <= {hi - n}"
+
+    def prepare(self, ctx):
+        # (the tables, empty: the load is the first stage read)
+        self._sql(ctx, """
+            CREATE TABLE vc_data (id bigint PRIMARY KEY, payload text NOT NULL);
+            CREATE TABLE public.v8_heap (id bigint PRIMARY KEY, payload text NOT NULL)
+                USING heap;
+        """)
+
+    def _sql(self, ctx, sql: str) -> str:
+        return ctx.cluster.sql(sql, dbname=ctx.dbname, options=ctx.session_options()).stdout
+
+    def _read(self, ctx) -> dict:
+        lines = [x for x in self._sql(ctx, self.READ).splitlines() if x.startswith("v8|")]
+        if len(lines) != 1:
+            raise RuntimeError(f"V8 expected one reading, got {len(lines)}")
+        return json.loads(lines[0][3:])
+
+    def operations(self, ctx):
+        n, k = self.rows(ctx), self.commits(ctx)
+        changed = max(1, int(n * self.update_percent(ctx) / 100))
+        readings: dict = {}
+        self._sql(ctx, f"""
+            INSERT INTO vc_data SELECT g, md5(g::text) FROM generate_series(1, {n}) g;
+            INSERT INTO public.v8_heap SELECT g, md5(g::text) FROM generate_series(1, {n}) g;
+        """)
+        readings["load"] = self._read(ctx)
+        self._sql(ctx, VC_SQL.commit("v8 load"))
+        readings["commit"] = self._read(ctx)
+        for i in range(k):
+            where = self.update_where(i, changed, n)
+            self._sql(ctx, f"UPDATE vc_data SET payload = md5(payload) {where};\n"
+                           f"UPDATE public.v8_heap SET payload = md5(payload) {where};\n"
+                           f"{VC_SQL.commit(f'v8 {i}')};")
+        readings["updates"] = self._read(ctx)
+        self._sql(ctx, "SELECT dolt_gc(); SELECT prolly_page_sweep();")
+        readings["gc"] = self._read(ctx)
+        self._sql(ctx, "VACUUM vc_data; VACUUM public.v8_heap; CHECKPOINT;\n"
+                       "SELECT prolly_page_sweep();")
+        readings["vacuum"] = self._read(ctx)
+        (ctx.raw_dir / "v8-breakdown.json").write_text(json.dumps(readings, indent=1) + "\n")
+        return Outcome(metrics=self.metrics(readings), transactions=len(self.STAGES),
+                       unit="stage")
+
+    # the breakdown's columns that are files, apart: prolly's storage
+    FILES = ("vm_bytes", "fsm_bytes", "page_store_bytes", "block_map_bytes",
+             "journal_bytes", "settled_bytes", "unsettled_bytes", "chunk_store_other_bytes")
+
+    @classmethod
+    def metrics(cls, readings: dict) -> dict:
+        """Each stage's reading, flat: <stage>_<column> in bytes; prolly's
+        files summed (<stage>_prolly_bytes), and over the heap table's
+        (<stage>_prolly_over_heap).  The database's size holds the heap
+        table too, and the catalogs."""
+        out: dict = {}
+        for stage in cls.STAGES:
+            r = readings[stage]
+            b = r["breakdown"] or {}
+            for col, v in b.items():
+                out[f"{stage}_{col}"] = None if v is None else float(v)
+            for col in ("database_bytes", "table_bytes", "heap_bytes"):
+                out[f"{stage}_{col}"] = float(r[col])
+            files = [b.get(c) for c in cls.FILES]
+            total = None if any(v is None for v in files) else float(sum(files))
+            out[f"{stage}_prolly_bytes"] = total
+            out[f"{stage}_prolly_over_heap"] = (
+                total / float(r["heap_bytes"]) if total is not None and r["heap_bytes"] else None)
+        return out

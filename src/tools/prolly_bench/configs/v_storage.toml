@@ -1,0 +1,38 @@
+# The V suite's storage by component (V8, #500): a 1M-row keyed table and
+# a heap table given the same rows, and prolly_storage_breakdown() read
+# after the load, its first commit, 10 commits of 1% updates, dolt_gc with
+# prolly_page_sweep(), and a VACUUM with another sweep.  Sizes, not
+# timings: one client, autovacuum off, so each stage reads the same bytes
+# whatever else the machine runs.
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["storage"]
+workloads = ["V8"]
+fio_baseline = false
+seed = 1
+collectors = []
+
+[postgres]
+shared_buffers = "512MB"
+autovacuum = "off"
+checkpoint_timeout = "1d"
+max_wal_size = "16GB"
+wal_level = "minimal"
+max_wal_senders = 0
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+max_connections = 32
+
+[sizes.storage]
+v_rows = 1000000
+
+[workloads.V8]
+background = ["none"]
+commits = 10
+update_percent = 1

@@ -119,6 +119,7 @@ tests += {
       'statistics_casts',
       'stat_prolly',
       'store_sizes',
+      'storage_breakdown',
       'get_many',
       'put_batches',
       'full_folds',

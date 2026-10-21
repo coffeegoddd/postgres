@@ -2002,12 +2002,98 @@ relation_relid(Oid relid)
 }
 
 static bool
-relation_is_log(Relation rel)
+relation_is_log(Form_pg_class form)
 {
-	return rel->rd_rel->relkind == RELKIND_TOASTVALUE &&
-		rel->rd_rel->relnamespace == PG_TOAST_NAMESPACE &&
-		strncmp(NameStr(rel->rd_rel->relname), LOG_PREFIX,
+	return form->relkind == RELKIND_TOASTVALUE &&
+		form->relnamespace == PG_TOAST_NAMESPACE &&
+		strncmp(NameStr(form->relname), LOG_PREFIX,
 				sizeof(LOG_PREFIX) - 1) == 0;
+}
+
+/* A relation's bytes, every fork (a block-mapped main fork's as mapped). */
+static int64
+relation_bytes(Relation rel)
+{
+	SMgrRelation smgr = RelationGetSmgr(rel);
+	int64		bytes = 0;
+
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= INIT_FORKNUM; fork++)
+		if (smgrexists(smgr, fork))
+			bytes += (int64) smgrnblocks(smgr, fork) * BLCKSZ;
+	return bytes;
+}
+
+/*
+ * The log's relations' bytes, and its entries' by heap visibility: an
+ * entry's deletion committed (consumed) is dead, whether or not a snapshot
+ * still sees it; any other is live.
+ */
+static bool
+relation_sizes(Relation rel, ProllyChangeLogSizes *sizes)
+{
+	Oid			logid = log_relid(rel);
+	Relation	log;
+	List	   *indexes;
+	TransactionId horizon;
+	BufferAccessStrategy strategy;
+	BlockNumber nblocks;
+
+	memset(sizes, 0, sizeof(*sizes));
+	if (!OidIsValid(logid))
+		return false;
+	log = table_open(logid, AccessShareLock);
+	sizes->bytes = relation_bytes(log);
+	indexes = RelationGetIndexList(log);
+	foreach_oid(indexid, indexes)
+	{
+		Relation	index = index_open(indexid, AccessShareLock);
+
+		sizes->bytes += relation_bytes(index);
+		index_close(index, AccessShareLock);
+	}
+	list_free(indexes);
+
+	horizon = GetOldestNonRemovableTransactionId(log);
+	strategy = GetAccessStrategy(BAS_BULKREAD);
+	nblocks = RelationGetNumberOfBlocks(log);
+	for (BlockNumber blk = 0; blk < nblocks; blk++)
+	{
+		Buffer		buf = ReadBufferExtended(log, MAIN_FORKNUM, blk,
+											 RBM_NORMAL, strategy);
+		Page		page;
+		OffsetNumber maxoff;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoff = PageIsNew(page) ? InvalidOffsetNumber : PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			ItemId		lp = PageGetItemId(page, off);
+			HeapTupleData tup;
+
+			if (!ItemIdIsNormal(lp))
+				continue;
+			tup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			tup.t_len = ItemIdGetLength(lp);
+			tup.t_tableOid = logid;
+			ItemPointerSet(&tup.t_self, blk, off);
+			switch (HeapTupleSatisfiesVacuum(&tup, horizon, buf))
+			{
+				case HEAPTUPLE_DEAD:
+				case HEAPTUPLE_RECENTLY_DEAD:
+					sizes->dead_bytes += tup.t_len;
+					break;
+				default:
+					sizes->live_bytes += tup.t_len;
+					break;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	FreeAccessStrategy(strategy);
+	table_close(log, AccessShareLock);
+	return true;
 }
 
 const ProllyChangeLogRoutine prolly_changelog_relation = {
@@ -2033,4 +2119,5 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.note_emptied = relation_note_emptied,
 	.pending = relation_pending,
 	.flush = flush_all,
+	.sizes = relation_sizes,
 };

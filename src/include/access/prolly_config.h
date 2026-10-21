@@ -135,4 +135,16 @@ extern void prolly_note_branch_write(Oid branch);
 extern void prolly_forget_folds(void);
 extern void prolly_note_prepared_ended(FullTransactionId xid);
 
+/*
+ * Whether the relation of pg_class row form is a change log, judged by the
+ * row alone: a row read on any branch.
+ */
+extern bool prolly_is_change_log_class(Form_pg_class form);
+
+/*
+ * What the change log of rel, a prolly table, takes (all zero if it has
+ * none); false if the change log can't say.
+ */
+extern bool prolly_change_log_sizes(Relation rel, ProllyChangeLogSizes *sizes);
+
 #endif							/* PROLLY_CONFIG_H */

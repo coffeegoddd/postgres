@@ -282,6 +282,25 @@ src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V7 --config sr
 src/tools/prolly_bench/prolly_bench vgrowth G/*-V-prolly --accept src/tools/prolly_bench/configs/v_growth_accept.toml
 ```
 
+### Storage by component (V8)
+
+`configs/v_storage.toml` runs V8: a 1M-row keyed table, and beside it a
+heap table given the same rows and updates, with
+`prolly_storage_breakdown()` read after each stage (each after a
+`CHECKPOINT`): the load, its first commit, 10 commits each updating 1% of
+the rows, `dolt_gc()` with `prolly_page_sweep()`, and a `VACUUM` of both
+tables with another sweep.  Each stage's columns are recorded as
+`<stage>_<column>` in bytes, with `pg_database_size()`, the two tables'
+`pg_total_relation_size()`, and prolly's files summed (`<stage>_prolly_bytes`:
+the breakdown's columns that are files) and over the heap table's
+(`<stage>_prolly_over_heap`).  Sizes, not timings: they repeat on a busy
+machine.  The readings are in the cell's raw directory,
+`v8-breakdown.json`.
+
+```sh
+src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V8 --config src/tools/prolly_bench/configs/v_storage.toml
+```
+
 ## Write amplification
 
 `configs/s_write_amp.toml` runs the standard procedure's workloads with the
@@ -591,7 +610,7 @@ file; the driver doesn't change.
 
 | Interface | Implementations | Directory |
 |---|---|---|
-| `Workload` | S1-S10 and S13, V1-V4 and V6, C1-C4 | `pbench/workloads/` |
+| `Workload` | S1-S10 and S13, V1-V4 and V6-V8, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |

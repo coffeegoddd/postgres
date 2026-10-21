@@ -3,7 +3,9 @@
 **Status: decided by the user 2026-10-19, as recommended, on `39de7462e5`.
 Built in the `s-suite/wa-*` stack (#417–#421), which is in review. Part 3
 describes what the stack builds. Where that differs from the first
-proposal, the difference is noted with its reason.**
+proposal, the difference is noted with its reason. S1 was measured again
+under the `log` change finder for #500 (part 2, "Measured under the `log`
+change finder").**
 
 Every benchmark result reports write amplification for both engines:
 how many bytes the server wrote for each byte of row data the workload
@@ -146,12 +148,59 @@ smoke run, not a ranking:
 | `wa_tree` | n/a | 13.0 |
 | `wa_server` | 47.0 | 87.8 |
 
-Prolly's extra amplification has two sources:
+That run used the `pages` change finder. There, prolly's extra
+amplification had two sources:
 
 - **Chunk WAL.** The `ProllyChunks` records hold the 36 MB of chunks the
   window's fold wrote, and the journal then holds the same bytes again.
-- **Copy-on-write remaps.** These are 47 MB: after a fold, a page's first
-  write copies it into a new block of the page store.
+- **Copy-on-write remaps.** These were 47 MB: after a `pages` fold, a
+  page's first write copied it into a new block of the page store. The
+  `log` finder doesn't copy pages (#500 measures it below), so this
+  source is gone under the current default.
+
+### Measured under the `log` change finder (#500)
+
+The default change finder is now `log`. S1 again, on an -O2 build of the
+`stats/storage-breakdown` stack, one repetition each. The machine was
+loaded by other builds and tests, so transaction counts and timings are
+not comparable between runs. The ratios divide by the logical bytes
+each run wrote, so they still compare:
+
+| | heap, as above | prolly, as above | heap, counters | prolly, counters |
+|---|---:|---:|---:|---:|
+| shape | scale 5, 4 clients, 5 s | scale 5, 4 clients, 5 s | scale 2, 1 client, 2,000 transactions (`s_counters.toml`) | the same |
+| logical bytes per transaction | 236 | 236 | 235 | 235 |
+| `wa_wal` | 25.2 | 57.1 | 36.4 | 112.9 |
+| `wa_pages` | 24.6 | 53.9 | 36.8 | 110.1 |
+| `wa_tree` | n/a | 2.1 | n/a | 2.7 |
+| `wa_server` | 49.8 | 113.1 | 73.2 | 225.7 |
+| copy-on-write remaps (`wa.pages.bmap_store_bytes`) | n/a | 0 | n/a | 0 |
+| `page_copies_fold` | n/a | 0 | n/a | 0 |
+
+The remaps and the chunk WAL are gone: the chunks the fold writes are
+2–3 times the logical bytes, not 13. Prolly's WAL and page writes are
+still twice heap's or more, for a different reason: the change log.
+
+- **What S1 writes.** It updates `pgbench_accounts`, whose log holds an
+  entry for every row the load wrote. The fold before the window
+  consumes those entries, and they stay dead because nothing vacuums the
+  log: autovacuum is off in the counter runs, and in a 5 s window it
+  doesn't get to it.
+- **Why that costs WAL.** The fold after the window reads every page of
+  the log. It sets hint bits on the dead entries, and with checksums,
+  the first hint on each page after a checkpoint logs a full-page image.
+  The next checkpoint writes those pages again.
+- **Measured by relation.** `pg_get_wal_block_info()` over S1's shape at
+  scale 5, 2,000 transactions on one client:
+  - prolly: 109.2 MB of WAL. 82.4 MB of it is full-page images of the
+    accounts log's pages, in 12,205 block references. The run's `XLOG`
+    full-page images, the hint-bit kind, are 66.2 MB; heap's are 0.06 MB.
+  - the same with a `VACUUM` before the window: 26.7 MB.
+  - heap: 23.5 MB.
+
+So under `log`, S1's excess over heap is mostly the dead change-log
+entries a fold reads, not the pages or the history. The breakdown of
+what those entries take on disk is in `13-keyless-tables.md`, part 8.
 
 Read-only S2 writes 8 kB of WAL on heap and 75 kB on prolly, and no
 ratios.
