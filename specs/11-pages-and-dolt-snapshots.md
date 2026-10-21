@@ -2262,7 +2262,9 @@ fraction; `prolly_page_sweep()` runs it by hand.
 
 - **Records.** `GC_BEGIN`, the table files' bytes, `GC_SWAP` and
   `GC_RETIRE` are WAL records, so redo makes the same GC on a standby and
-  after a crash. A crash before the swap leaves the new files unnamed: at
+  after a crash. (As built, #564: the chunks a collection copies are
+  logged as where they come from, a `COPY` record redo copies again from
+  its own files; their invariants are in spec 22, part 6, G.) A crash before the swap leaves the new files unnamed: at
   the end of recovery, files the manifest doesn't name, of ids the
   manifest has given, are unlinked (deterministically, from the
   manifest; not Dolt's prune, which deletes every file a process hasn't

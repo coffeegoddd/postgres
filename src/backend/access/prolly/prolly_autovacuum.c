@@ -50,6 +50,7 @@ double		prolly_gc_growth_scale_factor = 0.2;
 int			prolly_journal_move_threshold = 256;
 int			prolly_conjoin_max_files = 256;
 int			prolly_gc_file_size = 65536;
+bool		prolly_log_copied_bytes = false;
 
 /* fewer than two files would be conjoined at every pass: -1 turns it off */
 static bool
@@ -122,6 +123,14 @@ prolly_autovacuum_init(void)
 							PGC_SIGHUP,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
+	DefineCustomBoolVariable("prolly.log_copied_bytes",
+							 "WAL-logs the bytes a chunk store copies from its own files, not where they come from.",
+							 "For debugging, and comparing the two.",
+							 &prolly_log_copied_bytes,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.log_full_folds",
 							"Logs each fold that reads its table in full, with why, once it reads at least this many rows.",
 							"-1 logs none; 0 logs every one.",

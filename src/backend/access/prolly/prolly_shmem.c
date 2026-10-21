@@ -147,11 +147,23 @@ CheckPointProlly(int flags)
 }
 
 /*
+ * Called as archive recovery reaches a consistent state (beside
+ * XLogCheckInvalidPages()), and as crash recovery ends: the chunk stores
+ * check that redo left nothing unresolved.
+ */
+void
+ProllyRecoveryConsistent(void)
+{
+	prolly_chunkstore_consistent();
+}
+
+/*
  * Called by StartupXLOG() once crash recovery is over, before connections
  * are let in: the chunk stores remove what a crash cut short left.
  */
 void
 ProllyCrashRecovered(void)
 {
+	prolly_chunkstore_consistent();
 	prolly_chunkstore_recovered();
 }

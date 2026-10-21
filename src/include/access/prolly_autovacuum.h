@@ -22,6 +22,11 @@ extern PGDLLIMPORT int prolly_journal_move_threshold;
 extern PGDLLIMPORT int prolly_conjoin_max_files;
 /* prolly.gc_file_size (kB): how large a collection's files grow */
 extern PGDLLIMPORT int prolly_gc_file_size;
+/*
+ * prolly.log_copied_bytes: a store's copies of its own chunks WAL-log their
+ * bytes, not where they come from (for debugging, and comparing the two)
+ */
+extern PGDLLIMPORT bool prolly_log_copied_bytes;
 
 /* Define the settings (once per process). */
 extern void prolly_autovacuum_init(void);

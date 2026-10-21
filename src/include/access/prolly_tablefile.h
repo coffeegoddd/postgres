@@ -33,7 +33,10 @@
  *   chunk as stored, framed (prolly_chunk_frame()'s), appended to out,
  *   without decoding it; write_add_stored() adds a chunk given so, as it
  *   is (both optional).  Both check the bytes they move, failing on
- *   corruption.
+ *   corruption.  The bytes write_add_stored() appends depend on the frame
+ *   and the hash's length alone, not on the file's other chunks, so a
+ *   store's redo can make a chunk's bytes again from its frame; and a frame
+ *   read_stored() gave, added so, gives back the bytes it was read from.
  *
  * Provisional (v0).
  *

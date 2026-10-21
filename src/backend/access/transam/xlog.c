@@ -7271,6 +7271,24 @@ GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 }
 
 /*
+ * Is an online backup running?  On a standby, one taken from it.
+ *
+ * Read under a WAL insertion lock, as do_pg_backup_start() holds them all
+ * to change it: a caller told none is knows that a backup starting later
+ * has its start point after every record the caller inserted before asking.
+ */
+bool
+XLogBackupInProgress(void)
+{
+	bool		running;
+
+	WALInsertLockAcquire();
+	running = XLogCtl->Insert.runningBackups > 0;
+	WALInsertLockRelease();
+	return running;
+}
+
+/*
  * GetInsertRecPtr -- Returns the current insert position.
  *
  * NOTE: The value *actually* returned is the position of the last full

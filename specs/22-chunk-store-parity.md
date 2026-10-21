@@ -49,7 +49,8 @@ Line numbers were read on the dates above.
 ## 2. Where ours is ahead, kept
 
 - **Every byte is in WAL.** That gives point-in-time recovery, base
-  backups and standbys identical byte for byte. Dolt's store has none
+  backups and standbys identical byte for byte. (Bytes copied from the
+  store's own files are logged as where they come from: part 6, G.) Dolt's store has none
   of these.
 - **Concurrent appends.** Backends reserve ranges under a lock and
   write them outside it. Dolt's journaling store holds an exclusive
@@ -322,3 +323,123 @@ as decided (conjoin, reflog, statistics); this part says what was built.
   `maintenance_work_mem`, past it sorted runs in a temporary file with
   a Bloom filter each.
 
+
+### G. Copies WAL-logged as where they come from (#564, 2026-10-20)
+
+A write that copies chunks the store already holds logged their bytes,
+then wrote them: each copied byte twice, though the source is durable on
+the primary and, byte for byte, on every standby. Now it logs where they
+come from, as Postgres's `CREATE DATABASE ... STRATEGY FILE_COPY` does,
+and redo copies them again from its own files. Chunks received from a
+remote are new to the store and stay logged as bytes.
+
+- **The record.** `XLOG_CHUNKS_COPY`: the destination (a table file, or
+  a segment) and offset, the sources' database (the same, or `CREATE
+  DATABASE`'s template), the length and CRC-32C of the bytes, then 21
+  bytes a source: kind, file id, offset, length. A source is a table
+  file's bytes as they are, a segment's bytes as they are, or a
+  segment's `CHUNK`/`XCHUNK` record, which redo frames (no decoding) and
+  adds as the table file format adds a stored chunk. Byte sources that
+  run on are merged. The destination's index and footer stay literal
+  bytes in `XLOG_CHUNKS_FILE`. `XLOG_PAGE_MAGIC` 0xD127.
+- **Copies as stored.** A collection (and so a journal move) copies each
+  chunk as stored: a journal record's frame, a table file's chunk bytes
+  (which the format gives back unchanged: a stored frame added again is
+  the bytes it was read from, now in the table file interface's
+  contract). Each is still decoded and checked against its hash. Redo
+  doesn't depend on LZ4 giving the same bytes on primary and standby: it
+  never compresses. A chunk is described only if the bytes written are
+  what redo will make: a table file's must be the source's bytes; a
+  format without `write_add_stored()` gets literal bytes.
+- **Redo.** Reads the sources, checks length and CRC, writes the
+  destination. Measured (`143_copy_records.pl`): a collection of the
+  journal, 33,856 bytes of WAL for 6,568,381 copied (0.5%, most of it the
+  index); a full collection of a table file, 4,648 bytes for 2,627,431
+  (0.2%); with `prolly.log_copied_bytes = on`, 989,000 for 985,360.
+
+**Why redo finds the sources.** The invariants, in the file header of
+`chunkstore_journal.c` ("Copies in redo"):
+
+1. *A source holds its bytes when the copy is replayed, or is gone.* A
+   copy's sources are named in the manifest, so a table file source was
+   written (and synced, and named) before the copy; table file ids are
+   never given twice, and a table file is never written again. A
+   segment range was written by appends before the copy, and segments
+   are only appended to (the cut of an unwritten tail is past every
+   whole record). Redo runs forward, so it finds those bytes, or finds
+   the file removed by a record after the copy.
+2. *A source is removed only after the copy's file is durable.* A
+   collection's sources go at its retire, after the swap; conjoin's
+   after its manifest; both sync their new file before the manifest
+   naming it. `CREATE DATABASE` syncs each copied file before it
+   commits; its template can be dropped only after. In redo, every
+   removal (unlink, retire, a database dropped) first syncs the files
+   copies wrote since the last removal. So crash recovery, or a
+   standby's restart from a restartpoint before the copy, finds a missing
+   source's copy already on disk: redo checks the destination's bytes
+   against the copy's CRC, and leaves them.
+3. *A removal moves the minimum recovery point past itself* (as a
+   truncation's redo does). A copy whose sources fail it and whose file
+   doesn't hold its bytes (both were removed later) waits for that
+   removal; it can only before recovery is consistent. One still waiting
+   at the consistent point (a new optional chunk store callback,
+   `redo_consistent()`, beside `XLogCheckInvalidPages()`; and at the end
+   of crash recovery) is a PANIC; so is a copy that fails once
+   consistent. Either means the server's files aren't those the WAL was
+   written against, which the byte-identical standby invariant (part 2)
+   rules out; the message names the source that failed.
+4. *No store file is removed while an online backup runs* (the
+   full-page-write analogue: what keeps a backup's redo whole). A backup
+   lists files and reads them later; a source removed in between and a
+   destination made after the listing would leave its redo neither. So a
+   removal checks `XLogBackupInProgress()` (a new export from `xlog.c`,
+   read under a WAL insertion lock, as `do_pg_backup_start()` changes
+   the count under all of them) after logging itself: a backup starting
+   later has its start point after the removal and every copy from the
+   file. A file kept is unnamed: the next writer's `remove_unnamed()`
+   takes it on a primary. On a standby (its own backups: the primary
+   can't know of them) redo keeps a list and removes them at the first
+   record after the backups end; a standby restarted meanwhile leaves
+   them until its promotion's leftovers pass or the next writer after
+   it.
+5. *PITR.* A source written before the backup's start checkpoint was
+   synced by it (a checkpoint waits for ranges in flight, and copies
+   hold `DELAY_CHKPT_START` from their record to their write), so it is
+   in the backup whole; one written after is rewritten by records in the
+   range replayed. Recovery stopping between a copy and its source's
+   removal has both; the copy's file is unnamed there, and the next
+   writer removes it.
+
+- **Conjoin** copies its files' chunks as stored too, each a table file
+  byte range (in hash order, so few run on), checked against its hash.
+  Measured (`144_conjoin_copies.pl`): 23,528 bytes of WAL for 3,937,304
+  copied (0.6%); bytes logged, 6,911,408 for 6,890,242. Its sources go
+  after its manifest, which follows its file's sync (invariant 2).
+- **`CREATE DATABASE`** copies the template's table files and segments
+  as copies of their bytes, a megabyte a record, whatever its strategy
+  (decided, user, 2026-10-20): the file-copy strategy's files are
+  written over with the same bytes, so the store's durability is its own
+  WAL's, not the strategy's checkpoints. A segment is described up to
+  its last whole record; past that (a range a crash left reserved, its
+  zeros never in WAL, so on no standby) its bytes are logged. Each file
+  is synced before the command commits, so before its template can be
+  dropped (invariant 2; a dropped database's redo syncs copies first,
+  as a removal's does). **Not safe as copies:** a template dropped while
+  an online backup runs, which may be missing from the backup and can't
+  be kept for it (Postgres removes the directory). So while a backup runs
+  on the primary the copies log their bytes (`copy_write()`'s
+  `in_backup`, asked under `DELAY_CHKPT_START`: a backup starting later
+  has its start checkpoint after the record and waits for the write).
+  A backup taken from a standby can't tell the primary; there a template
+  dropped during the backup, after a `CREATE DATABASE` from it that the
+  backup's redo replays, fails the restore at its consistent point
+  (invariant 3's PANIC), not silently, as Postgres's own file-copy
+  strategy would leave the copy empty. Measured
+  (`145_createdb_copies.pl`, a 4.9 MB store): the file-copy strategy
+  logs 1,672 bytes, against 4,938,504 with the bytes; the WAL-log
+  strategy, 4,879,728 (its catalogs' pages) against 9,814,832.
+- **Checksums.** The record's CRC covers the bytes the sources make; each
+  table file chunk keeps its own CRC and each journal record its own,
+  which redo checks when it frames one.
+- **`prolly.log_copied_bytes`** (off; superuser): log the bytes, as
+  before, for debugging and to compare.

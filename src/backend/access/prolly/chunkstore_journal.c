@@ -88,10 +88,14 @@
  * the last id given, the root as of its writing and the GC generation; it
  * is replaced whole (written aside, then renamed over the old one).  Every
  * byte of a table file is WAL-logged before it is written, as journal
- * appends are; the file is synced before the manifest naming it is logged;
- * a manifest's record carries its contents, and an unlink's names the
- * file.  One writer of table files (and sealer of segments) at a time (a
- * lock on the manifest, until its transaction ends); a file or segment
+ * appends are: bytes new to the store as they are, those copied from its
+ * own files (a collection's) as where they come from (a COPY record, which
+ * redo copies again from its own files: "Copies in redo", below); the
+ * file is synced before the manifest naming it is logged; a manifest's
+ * record carries its contents, and an unlink's names the file, which isn't
+ * removed while an online backup runs.  One writer of table files (and
+ * sealer of segments) at a time (a lock on the manifest, until its
+ * transaction ends); a file or segment
  * whose writer failed before its manifest stays unnamed, and the next
  * writer removes it.  Backends notice a new manifest by a counter in shared
  * memory, when a lookup misses.
@@ -108,7 +112,8 @@
  * index.  Transactions that appended to a sealed segment and were in
  * progress at the seal are waited for before anything new is read: then
  * their PADs are ROOTs or not, for good, and their chunks committed or
- * not.  The marked chunks are copied, each re-hashed, to a new settled
+ * not.  The marked chunks are copied as stored, each checked against its
+ * hash, to a new settled
  * table file before the window; the window takes the database's append lock, so no
  * append is reserved, and waits for those in flight to be written, while
  * the last new chunks are marked and copied and the
@@ -153,7 +158,10 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecovery.h"
+#include "access/xlogutils.h"
 #include "journal_index.h"
 #include "commands/vacuum.h"
 #include "catalog/pg_tablespace_d.h"
@@ -276,6 +284,66 @@ typedef struct xl_chunks_file
 
 /* XLOG_CHUNKS_MANIFEST: the manifest's contents follow */
 #define SizeOfChunksManifest	(offsetof(xl_chunks_file, id))
+
+/*
+ * Bytes copied from the store's own files: where they come from and their
+ * CRC, not the bytes, which redo copies again from its own files (#564)
+ */
+#define XLOG_CHUNKS_COPY		0x80
+
+typedef struct xl_chunks_copy
+{
+	xl_prolly_header hdr;
+	Oid			dboid;
+	Oid			spcoid;
+	uint64		id;				/* the table file (or segment) written */
+	uint64		offset;			/* where in it */
+	Oid			src_dboid;		/* the sources' database: this one, or
+								 * CREATE DATABASE's template */
+	Oid			src_spcoid;
+	bool		segment;		/* id is a segment's */
+	uint32		len;			/* the bytes the sources make */
+	pg_crc32c	crc;			/* their CRC-32C */
+	uint32		nsources;
+	/* the sources follow, COPY_SOURCE_SIZE bytes each */
+} xl_chunks_copy;
+
+#define SizeOfChunksCopy	(offsetof(xl_chunks_copy, nsources) + sizeof(uint32))
+
+/* a copy's source: bytes as they are, or a journal record's chunk */
+#define COPY_TABLE_BYTES	1	/* a table file's */
+#define COPY_SEGMENT_BYTES	2	/* a segment's */
+#define COPY_SEGMENT_CHUNK	3	/* a segment's CHUNK or XCHUNK record (offset,
+								 * len), as a table file holds its chunk */
+#define COPY_SOURCE_SIZE	21	/* kind, id, offset, len */
+
+typedef struct CopySource
+{
+	uint8		kind;			/* 0: none, the bytes are new */
+	uint64		id;
+	uint64		offset;
+	uint32		len;
+} CopySource;
+
+/* the sources of bytes about to be written */
+typedef struct CopyRun
+{
+	Oid			src_dboid;
+	Oid			src_spcoid;
+	int			n;
+	int			max;
+	CopySource *sources;
+} CopyRun;
+
+/*
+ * Where the chunk a writer's next() gave last is in the store's files,
+ * set by next() (kind 0: nowhere, or it doesn't say)
+ */
+typedef struct CopyFrom
+{
+	CopySource	src;
+	const char *bytes;			/* COPY_TABLE_BYTES: the src.len bytes there */
+} CopyFrom;
 
 /* a table file's and a segment's entries in the manifest, in bytes */
 #define MANIFEST_FILE_ENTRY		21	/* id, chunks, size, flags */
@@ -560,6 +628,9 @@ static ProllyChunkStore *session_store = NULL;
 
 static bool ensure_journal(ProllyChunkStore *s, bool create);
 static void journal_root(ProllyChunkStore *s, ProllyHash *root);
+static void defer_unlink(Oid dboid, Oid spcoid, bool segment, uint64 id);
+typedef void (*DatabaseDirFn) (const char *dir, Oid dboid, Oid spcoid);
+static void each_database_dir(DatabaseDirFn fn);
 static void retire_files(Oid dboid, Oid spcoid, const Manifest *before,
 						 const Manifest *after);
 static void standby_readers_note(Oid dboid);
@@ -3085,6 +3156,152 @@ table_file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
 	END_CRIT_SECTION();
 }
 
+/* Add a source to run; bytes that run on from the last's extend it. */
+static void
+copy_add(CopyRun *run, const CopySource *src)
+{
+	CopySource *last = run->n > 0 ? &run->sources[run->n - 1] : NULL;
+
+	if (last != NULL && src->kind != COPY_SEGMENT_CHUNK &&
+		last->kind == src->kind && last->id == src->id &&
+		last->offset + last->len == src->offset &&
+		(uint64) last->len + src->len <= PG_UINT32_MAX)
+	{
+		last->len += src->len;
+		return;
+	}
+	if (run->n == run->max)
+	{
+		run->max = Max(64, run->max * 2);
+		run->sources = run->sources ?
+			repalloc(run->sources, sizeof(CopySource) * run->max) :
+			palloc(sizeof(CopySource) * run->max);
+	}
+	run->sources[run->n++] = *src;
+}
+
+/*
+ * Write bytes copied from files of the store (or of CREATE DATABASE's
+ * template), run's sources, at offset of table file id (segment: of a
+ * segment), WAL-logged first as where they come from and their CRC, not
+ * as the bytes (#564): redo copies them again from its own files, which
+ * hold the same bytes (every byte of a store's files is the WAL's).
+ *
+ * The bytes are logged instead with prolly.log_copied_bytes, or (in_backup)
+ * while an online backup runs: for a copy whose sources a later DROP
+ * DATABASE may remove before the backup reads them.  That is asked under
+ * DELAY_CHKPT_START: a backup that starts later has its start checkpoint
+ * after the record, waiting for the bytes to be written, so they are in it.
+ */
+static void
+copy_write(Oid dboid, Oid spcoid, bool segment, uint64 id, uint64 offset,
+		   const char *data, Size len, const CopyRun *run, bool in_backup,
+		   int fd, const char *path)
+{
+	xl_chunks_copy xlrec;
+	xl_chunks_file frec;
+	xl_chunks_append arec;
+	char	   *sources = palloc(COPY_SOURCE_SIZE * Max(run->n, 1));
+	char	   *p = sources;
+	XLogRecPtr	lsn;
+	bool		refused;
+
+	Assert(run->n > 0 && len <= PG_UINT32_MAX);
+	memset(&xlrec, 0, sizeof(xlrec));
+	xlrec.hdr.impl_id = prolly_chunkstore_journal.info.impl_id;
+	xlrec.dboid = dboid;
+	xlrec.spcoid = spcoid;
+	xlrec.id = id;
+	xlrec.offset = offset;
+	xlrec.src_dboid = run->src_dboid;
+	xlrec.src_spcoid = run->src_spcoid;
+	xlrec.segment = segment;
+	xlrec.len = (uint32) len;
+	INIT_CRC32C(xlrec.crc);
+	COMP_CRC32C(xlrec.crc, data, len);
+	FIN_CRC32C(xlrec.crc);
+	xlrec.nsources = run->n;
+	for (int i = 0; i < run->n; i++)
+	{
+		const CopySource *src = &run->sources[i];
+
+		*p = (char) src->kind;
+		memcpy(p + 1, &src->id, sizeof(uint64));
+		memcpy(p + 9, &src->offset, sizeof(uint64));
+		memcpy(p + 17, &src->len, sizeof(uint32));
+		p += COPY_SOURCE_SIZE;
+	}
+	/* (the records the bytes would be logged in otherwise) */
+	frec.hdr = arec.hdr = xlrec.hdr;
+	frec.dboid = arec.dboid = dboid;
+	frec.spcoid = arec.spcoid = spcoid;
+	frec.id = arec.segment = id;
+	frec.offset = arec.offset = offset;
+
+	refused = sync_refused();
+	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	XLogBeginInsert();
+	if (prolly_log_copied_bytes || (in_backup && XLogBackupInProgress()))
+	{
+		if (segment)
+			XLogRegisterData(&arec, SizeOfChunksAppend);
+		else
+			XLogRegisterData(&frec, SizeOfChunksFile);
+		XLogRegisterData(data, len);
+		lsn = XLogInsert(RM_PROLLY_CHUNKS_ID,
+						 segment ? XLOG_CHUNKS_APPEND : XLOG_CHUNKS_FILE);
+	}
+	else
+	{
+		XLogRegisterData(&xlrec, SizeOfChunksCopy);
+		XLogRegisterData(sources, COPY_SOURCE_SIZE * run->n);
+		lsn = XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_COPY);
+	}
+	XLogFlush(lsn);
+	pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_WRITE);
+	if (pg_pwrite(fd, data, len, offset) != len)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not write %zu bytes at %llu in file \"%s\": %m",
+						len, (unsigned long long) offset, path)));
+	pgstat_report_wait_end();
+	pgstat_count_prolly(segment ? PGSTAT_PROLLY_JOURNAL_BYTES_WRITTEN :
+						PGSTAT_PROLLY_TABLE_FILE_BYTES_WRITTEN, len);
+	request_sync(dboid, spcoid, segment ? SYNC_SEGMENT : SYNC_TABLE_FILE, id,
+				 refused);
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	END_CRIT_SECTION();
+	pfree(sources);
+}
+
+/*
+ * Remove a store file, which a copy may have copied from (#564): not while
+ * an online backup runs, which may not have read it yet, and whose redo
+ * would copy from it.  So asked once the removal is logged: a backup that
+ * starts later has its start point after the record, and after every copy
+ * from the file.  A file left is named no longer: the next writer's
+ * remove_unnamed() takes it, or, on a standby, redo once the backups end
+ * (or, a restart having forgotten it, as redo reaches a consistent state:
+ * remove_dropped()).
+ */
+static void
+remove_store_file(Oid dboid, Oid spcoid, bool segment, uint64 id,
+				  const char *path)
+{
+	if (XLogBackupInProgress())
+	{
+		if (InRecovery)
+			defer_unlink(dboid, spcoid, segment, id);
+		return;
+	}
+	if (unlink(path) != 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove file \"%s\": %m", path)));
+}
+
 /* Remove a table file, or (segment) a journal segment. */
 static void
 table_file_unlink(ProllyChunkStore *s, const char *dir, uint64 id,
@@ -3102,10 +3319,7 @@ table_file_unlink(ProllyChunkStore *s, const char *dir, uint64 id,
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfChunksFile);
 	XLogFlush(XLogInsert(RM_PROLLY_CHUNKS_ID, XLOG_CHUNKS_UNLINK));
-	if (unlink(path) != 0 && errno != ENOENT)
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove file \"%s\": %m", path)));
+	remove_store_file(s->dboid, s->spcoid, segment, id, path);
 	pfree(path);
 }
 
@@ -3408,15 +3622,49 @@ tables_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 }
 
 /*
+ * Bytes of table file id written at offset: those copied from the store's
+ * files (run's sources, if it has any) logged as a copy, the others as
+ * bytes; run emptied.
+ */
+static void
+file_write(ProllyChunkStore *s, int fd, const char *path, uint64 id,
+		   uint64 offset, StringInfo buf, CopyRun *run)
+{
+	if (run->n > 0)
+		copy_write(s->dboid, s->spcoid, false, id, offset, buf->data, buf->len,
+				   run, false, fd, path);
+	else
+		table_file_write(s, fd, path, id, offset, buf->data, buf->len);
+	run->n = 0;
+}
+
+/*
+ * Did a chunk's bytes as written (bytes, len) come from where from says,
+ * so that redo can make them again from there?  A record's chunk added as
+ * stored is (the format's bytes for a frame are the frame's alone); a
+ * table file's bytes are if they are the same bytes.
+ */
+static bool
+copy_describes(const CopyFrom *from, const char *bytes, Size len)
+{
+	if (from->src.kind == COPY_SEGMENT_CHUNK)
+		return true;
+	return from->src.kind == COPY_TABLE_BYTES && from->src.len == len &&
+		memcmp(from->bytes, bytes, len) == 0;
+}
+
+/*
  * Write table file id of the chunks next() gives (a chunk given twice
  * once), and sync it; false, writing nothing, if it gives none.  With a
  * limit, no more is asked of next() once the file's bytes reach it (*full
- * set): the caller begins another.
+ * set): the caller begins another.  If from is given, next() sets it for
+ * each chunk it gives (framed, stored): where it is in the store's files,
+ * if it is; what the file copies from them is WAL-logged as copies (#564).
  */
 static bool
 write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
-		   bool stored, uint64 limit, bool *full, uint32 *nchunks_out,
-		   uint64 *size_out)
+		   bool stored, CopyFrom *from, uint64 limit, bool *full,
+		   uint32 *nchunks_out, uint64 *size_out)
 {
 	const ProllyTableFileRoutine *fmt = table_format();
 	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
@@ -3430,7 +3678,12 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 	int			fd;
 	HASHCTL		ctl;
 	HTAB	   *seen;
+	CopyRun		run = {s->dboid, s->spcoid, 0, 0, NULL};
+	bool		copied = false; /* buf's bytes are copies */
 
+	/* (a format adding a frame some other way may compress it again) */
+	if (!stored || !PROLLY_HAS(fmt, write_add_stored))
+		from = NULL;
 	*full = false;
 	initStringInfo(&data);
 	if (!next(arg, &hash, &data))
@@ -3457,6 +3710,8 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 	{
 		ProllyHash	key;
 		bool		found;
+		int			start = buf.len;
+		bool		copy;
 
 		/* a chunk given twice is written once */
 		hash_key(&key, &hash);
@@ -3471,9 +3726,26 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 		else
 			PROLLY_CALL(fmt, write_add, w, &hash, data.data, data.len, &buf);
 		nchunks++;
+
+		/* (copies and bytes logged apart: the bytes before written first) */
+		copy = from != NULL && from->src.kind != 0 &&
+			copy_describes(from, buf.data + start, buf.len - start);
+		if (copy != copied && start > 0)
+		{
+			int			added = buf.len - start;
+
+			buf.len = start;
+			file_write(s, fd, path, id, offset, &buf, &run);
+			offset += start;
+			memmove(buf.data, buf.data + start, added);
+			buf.len = added;
+		}
+		copied = copy;
+		if (copy)
+			copy_add(&run, &from->src);
 		if (buf.len >= APPEND_BATCH)
 		{
-			table_file_write(s, fd, path, id, offset, buf.data, buf.len);
+			file_write(s, fd, path, id, offset, &buf, &run);
 			offset += buf.len;
 			resetStringInfo(&buf);
 		}
@@ -3482,8 +3754,14 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 		/* (the bytes as written: compressed, framed) */
 		*full = limit > 0 && offset + buf.len >= limit;
 	} while (!*full && next(arg, &hash, &data));
+	if (copied && buf.len > 0)
+	{
+		file_write(s, fd, path, id, offset, &buf, &run);
+		offset += buf.len;
+		resetStringInfo(&buf);
+	}
 	PROLLY_CALL(fmt, write_finish, w, &buf);
-	table_file_write(s, fd, path, id, offset, buf.data, buf.len);
+	file_write(s, fd, path, id, offset, &buf, &run);
 	offset += buf.len;
 	if (pg_fsync(fd) != 0)
 		ereport(data_sync_elevel(ERROR),
@@ -3496,6 +3774,8 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 	hash_destroy(seen);
 	pfree(buf.data);
 	pfree(data.data);
+	if (run.sources)
+		pfree(run.sources);
 	pfree(path);
 	pfree(dir);
 	*nchunks_out = nchunks;
@@ -3508,12 +3788,12 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
  * (with flags) beside the files keep (of m) names and m's segments; the
  * files m names that keep leaves out are removed after; copies says the
  * chunks are the store's own, written again (conjoining), and counts them
- * so.  The manifest's lock is held.
+ * so (from, as write_file()'s).  The manifest's lock is held.
  */
 static void
 write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
-				 ProllyChunkNext next, void *arg, bool stored, bool copies,
-				 uint64 limit)
+				 ProllyChunkNext next, void *arg, bool stored, CopyFrom *from,
+				 bool copies, uint64 limit)
 {
 	char	   *dir;
 	uint64		id = m->last_id + 1;
@@ -3534,7 +3814,8 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 	/* (with a limit, as many files as it takes, each begun as the last fills) */
 	do
 	{
-		if (!write_file(s, id, next, arg, stored, limit, &full, &nchunks, &size))
+		if (!write_file(s, id, next, arg, stored, from, limit, &full, &nchunks,
+						&size))
 			break;
 		if (copies)
 			pgstat_count_prolly(PGSTAT_PROLLY_CONJOIN_BYTES_COPIED, size);
@@ -3574,20 +3855,16 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 }
 
 /*
- * Remove the table files and journal segments of dir its manifest m
- * doesn't name, as kept or retiring: those a writer replaced but didn't
- * get to remove (it failed, or the server stopped, in between), or one it
- * was writing.  With the manifest's lock held, no writer is writing one
- * now.
+ * The table files (ids) and journal segments (segs) of dir its manifest m
+ * doesn't name, as kept or retiring; given (dropped): only those of ids m
+ * gave, so none a writer is writing now (its id is past m's).
  */
 static void
-remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
+unnamed_files(const char *dir, const Manifest *m, bool dropped, List **ids,
+			  List **segs)
 {
 	DIR		   *d = AllocateDir(dir);
 	struct dirent *de;
-	List	   *ids = NIL;
-	List	   *segs = NIL;
-	ListCell   *lc;
 
 	while ((de = ReadDir(d, dir)) != NULL)
 	{
@@ -3629,18 +3906,35 @@ remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
 		}
 		for (int i = 0; i < m->nretiring; i++)
 			named |= m->retiring[i] == id;
-		if (!named)
+		if (!named && (!dropped || id <= m->last_id))
 		{
 			uint64	   *p = palloc(sizeof(uint64));
 
 			*p = id;
 			if (segment)
-				segs = lappend(segs, p);
+				*segs = lappend(*segs, p);
 			else
-				ids = lappend(ids, p);
+				*ids = lappend(*ids, p);
 		}
 	}
 	FreeDir(d);
+}
+
+/*
+ * Remove the table files and journal segments of dir its manifest m
+ * doesn't name, as kept or retiring: those a writer replaced but didn't
+ * get to remove (it failed, or the server stopped, in between), or one it
+ * was writing.  With the manifest's lock held, no writer is writing one
+ * now.
+ */
+static void
+remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
+{
+	List	   *ids = NIL;
+	List	   *segs = NIL;
+	ListCell   *lc;
+
+	unnamed_files(dir, m, false, &ids, &segs);
 	foreach(lc, ids)
 		table_file_unlink(s, dir, *(uint64 *) lfirst(lc), false);
 	foreach(lc, segs)
@@ -3916,14 +4210,14 @@ chunk_bytes(const char *path, const char *rec, uint32 len, StringInfo out)
 }
 
 /*
- * The chunk a CHUNK or XCHUNK record (whole and valid) holds, framed as
- * stored chunks are, without decoding it, appended to out (a journal
- * record holds its codec and, compressed, its length, as a frame does).
+ * The chunk a CHUNK or XCHUNK record holds, framed as stored chunks are,
+ * without decoding it, appended to out (a journal record holds its codec
+ * and, compressed, its length, as a frame does), its hash to *hash; false,
+ * appending nothing, if the record isn't one, whole and valid.
  */
-static void
-record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
+static bool
+record_frame(const char *rec, uint32 len, ProllyHash *hash, StringInfo out)
 {
-	ProllyHash	h;
 	Size		after;
 	const char *p;
 	const char *end = rec + len - sizeof(uint32);
@@ -3933,9 +4227,9 @@ record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
 
 	/* (a chunk's record, as chunk_bytes_of() asks: not a ROOT's, nor a PAD's) */
 	if ((kind != KIND_CHUNK && kind != KIND_XCHUNK) ||
-		!record_valid(rec, len) || !record_hash(rec, len, &h, &after) ||
+		!record_valid(rec, len) || !record_hash(rec, len, hash, &after) ||
 		(p = rec + after) >= end)
-		goto corrupt;
+		return false;
 	if ((uint8) *p == CODEC_NONE)
 	{
 		chunk_len = (uint32) (end - (p + 1));
@@ -3947,7 +4241,7 @@ record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
 		p += CODEC_HEAD_MAX;
 	}
 	else
-		goto corrupt;
+		return false;
 	head[0] = (char) (*(rec + after) == CODEC_NONE ? PROLLY_CODEC_NONE :
 					  PROLLY_CODEC_LZ4);
 	head[1] = chunk_len & 0xff;
@@ -3956,12 +4250,19 @@ record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
 	head[4] = (chunk_len >> 24) & 0xff;
 	appendBinaryStringInfo(out, head, PROLLY_FRAME_HEADER);
 	appendBinaryStringInfo(out, p, end - p);
-	return;
+	return true;
+}
 
-corrupt:
-	ereport(ERROR,
-			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("corrupt chunk record in file \"%s\"", path)));
+/* record_frame() of a record of path, corrupt if it isn't a chunk's. */
+static void
+record_framed(const char *path, const char *rec, uint32 len, StringInfo out)
+{
+	ProllyHash	h;
+
+	if (!record_frame(rec, len, &h, out))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupt chunk record in file \"%s\"", path)));
 }
 
 static bool journal_get(ProllyChunkStore *s, const ProllyHash *hash,
@@ -4575,10 +4876,486 @@ journal_commit_redo(const char *data, Size len)
 	pfree(rec.data);
 }
 
+/* ----------------------------------------------------------------
+ * Copies in redo (#564)
+ *
+ * A copy record names where its bytes come from, in the server's own
+ * files: redo reads them there, checks their CRC and writes them.  So a
+ * copy's sources must hold, when it is replayed, the bytes they held when
+ * it was logged:
+ *
+ * - A table file's bytes are written once, by records before any copy
+ *   from it (a copy's sources are named in the manifest, so were synced
+ *   and named first), and never again: ids aren't given twice.  A
+ *   segment's records are written by appends before the copy, and a
+ *   segment is only appended to.  So redo running forward finds them, or
+ *   finds the file gone.
+ * - A file is gone only once a later record removed it (an unlink, a
+ *   retire, its database dropped): crash recovery or a standby's restart
+ *   replays from before that.  Then the copy's own file was synced before
+ *   the source went: a writer syncs its file before the manifest naming
+ *   it (and conjoin, collections and CREATE DATABASE remove their sources
+ *   only after), and redo syncs the files its copies wrote before it
+ *   replays a removal.  So the file already holds the copy's bytes, which
+ *   redo checks against the copy's CRC, and leaves.
+ * - An online backup reads the files while they change.  None is removed
+ *   while a backup runs (remove_store_file(): on a standby too, its own
+ *   backups), so a source a backup's redo copies from is in it, or was
+ *   removed before the backup began, the copy's file synced before then,
+ *   and in it whole.  CREATE DATABASE's template may be dropped while one
+ *   runs: its copies log the bytes while a backup runs, as full pages are
+ *   while one does.  A backup taken from a standby can't tell its primary
+ *   so; there a template dropped during the backup, after a CREATE
+ *   DATABASE from it that the backup's redo replays, fails the restore at
+ *   the consistent point, below, not silently.
+ * - A copy whose sources fail it and whose file doesn't hold its bytes
+ *   waits for a later record to remove that file (the file was copied
+ *   and removed, both after the point redo began from); it may only before
+ *   recovery is consistent (a removal's redo moves the minimum recovery
+ *   point past it), and one still waiting then is a PANIC, as is a copy
+ *   that fails once consistent: the server's files differ from those the
+ *   WAL was written against.
+ * ----------------------------------------------------------------
+ */
+
+/* a store file, by its database and id */
+typedef struct StoreFile
+{
+	Oid			dboid;
+	Oid			spcoid;
+	bool		segment;
+	uint64		id;
+	XLogRecPtr	lsn;			/* (a pending copy's) */
+	char	   *why;			/* (a pending copy's: its sources failed) */
+} StoreFile;
+
 /*
- * Replay a table file's bytes (the first truncating what a failed writer
- * left), a manifest (after syncing the files it names, which replay wrote
- * without syncing) or an unlink.
+ * Redo's (the startup process's): the files copies wrote, not synced yet;
+ * those to remove once the backups running end; the copies waiting for
+ * their files to be removed.
+ */
+static List *copied_unsynced = NIL;
+static List *deferred_unlinks = NIL;
+static List *copies_pending = NIL;
+static MemoryContext copy_redo_cxt = NULL;
+
+static char *
+store_file_path(const StoreFile *f)
+{
+	char	   *dir;
+	char	   *path;
+
+	if (f->segment)
+		return segment_path(f->dboid, f->spcoid, f->id);
+	dir = GetDatabasePath(f->dboid, f->spcoid);
+	path = table_file_path(dir, f->id);
+	pfree(dir);
+	return path;
+}
+
+static void
+note_file(List **files, Oid dboid, Oid spcoid, bool segment, uint64 id)
+{
+	MemoryContext old;
+	StoreFile  *f;
+
+	foreach_ptr(StoreFile, g, *files)
+	{
+		if (g->dboid == dboid && g->spcoid == spcoid &&
+			g->segment == segment && g->id == id)
+			return;
+	}
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	f = palloc0(sizeof(StoreFile));
+	f->dboid = dboid;
+	f->spcoid = spcoid;
+	f->segment = segment;
+	f->id = id;
+	*files = lappend(*files, f);
+	MemoryContextSwitchTo(old);
+}
+
+/* Forget the files of dboid (of id, unless all) a list has. */
+static void
+forget_files(List **files, Oid dboid, Oid spcoid, bool all, bool segment,
+			 uint64 id)
+{
+	foreach_ptr(StoreFile, f, *files)
+	{
+		if (f->dboid != dboid || (!all && (f->spcoid != spcoid ||
+										   f->segment != segment || f->id != id)))
+			continue;
+		if (f->why)
+			pfree(f->why);
+		*files = foreach_delete_current(*files, f);
+		pfree(f);
+	}
+}
+
+/* Sync the files copies wrote: a source of theirs is about to be removed. */
+static void
+copied_sync(void)
+{
+	foreach_ptr(StoreFile, f, copied_unsynced)
+	{
+		char	   *path = store_file_path(f);
+
+		sync_if_exists(path);
+		pfree(path);
+	}
+	list_free_deep(copied_unsynced);
+	copied_unsynced = NIL;
+}
+
+static void
+defer_unlink(Oid dboid, Oid spcoid, bool segment, uint64 id)
+{
+	note_file(&deferred_unlinks, dboid, spcoid, segment, id);
+}
+
+/* Remove the files whose removal waited for backups, once none runs. */
+static void
+deferred_run(void)
+{
+	if (deferred_unlinks == NIL || XLogBackupInProgress())
+		return;
+	foreach_ptr(StoreFile, f, deferred_unlinks)
+	{
+		char	   *path = store_file_path(f);
+
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+		pfree(path);
+	}
+	list_free_deep(deferred_unlinks);
+	deferred_unlinks = NIL;
+	manifests_changed();
+}
+
+/*
+ * A file a store file's removal waits for, or a copy into it waits on,
+ * removed by redo (all: its database dropped).
+ */
+static void
+redo_removed(Oid dboid, Oid spcoid, bool all, bool segment, uint64 id)
+{
+	forget_files(&copies_pending, dboid, spcoid, all, segment, id);
+	if (all)
+		forget_files(&deferred_unlinks, dboid, spcoid, all, segment, id);
+}
+
+/*
+ * A table file's first bytes in redo: they cut short what a failed writer
+ * left, but not a file the manifest names already (replayed again, after
+ * a crash or a standby's restart): readers may have it mapped, and a
+ * mapping cut short is a SIGBUS.  Its bytes are the WAL's, so written over
+ * in place they are the same.  A removal of its id waiting for backups is
+ * forgotten: the file is written anew.
+ */
+static void
+redo_table_file_begun(Oid dboid, Oid spcoid, const char *dir, uint64 id,
+					  const char *path)
+{
+	Manifest	m;
+	bool		named = false;
+
+	forget_files(&deferred_unlinks, dboid, spcoid, false, false, id);
+	if (read_manifest(dir, &m))
+	{
+		for (int i = 0; i < m.nfiles; i++)
+			named |= m.files[i].id == id;
+	}
+	if (!named)
+	{
+		int			fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m", path)));
+		CloseTransientFile(fd);
+	}
+}
+
+/*
+ * The bytes a copy's sources (n of them, at sources, of the database
+ * src_dboid) make, appended to out; NULL, or why they can't be had.
+ */
+static char *
+copy_sources(Oid src_dboid, Oid src_spcoid, const char *sources, uint32 n,
+			 StringInfo out)
+{
+	const ProllyTableFileRoutine *fmt = table_format();
+	ProllyTableFileWriter *w = NULL;
+	char	   *dir = GetDatabasePath(src_dboid, src_spcoid);
+	StringInfoData rec;
+	StringInfoData frame;
+	char	   *path = NULL;
+	char	   *why = NULL;
+	int			fd = -1;
+
+	initStringInfo(&rec);
+	initStringInfo(&frame);
+	for (uint32 i = 0; i < n && why == NULL; i++)
+	{
+		CopySource src;
+		ProllyHash	h;
+		const char *p = sources + (Size) i * COPY_SOURCE_SIZE;
+		char	   *spath;
+
+		src.kind = (uint8) p[0];
+		memcpy(&src.id, p + 1, sizeof(uint64));
+		memcpy(&src.offset, p + 9, sizeof(uint64));
+		memcpy(&src.len, p + 17, sizeof(uint32));
+		if (src.kind < COPY_TABLE_BYTES || src.kind > COPY_SEGMENT_CHUNK)
+			elog(PANIC, "chunk store copy source of kind %u", src.kind);
+		spath = src.kind == COPY_TABLE_BYTES ? table_file_path(dir, src.id) :
+			segment_path(src_dboid, src_spcoid, src.id);
+		if (path == NULL || strcmp(path, spath) != 0)
+		{
+			if (fd >= 0)
+				CloseTransientFile(fd);
+			if (path)
+				pfree(path);
+			path = spath;
+			fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+			if (fd < 0)
+			{
+				why = psprintf("could not open file \"%s\": %m", path);
+				break;
+			}
+		}
+		else
+			pfree(spath);
+		if (src.kind != COPY_SEGMENT_CHUNK)
+		{
+			enlargeStringInfo(out, src.len);
+			if (pg_pread(fd, out->data + out->len, src.len, src.offset) != src.len)
+				why = psprintf("file \"%s\" has no %u bytes at %llu", path,
+							   src.len, (unsigned long long) src.offset);
+			else
+				out->len += src.len;
+			continue;
+		}
+		resetStringInfo(&rec);
+		resetStringInfo(&frame);
+		enlargeStringInfo(&rec, src.len);
+		if (pg_pread(fd, rec.data, src.len, src.offset) != src.len ||
+			!record_frame(rec.data, src.len, &h, &frame))
+		{
+			why = psprintf("file \"%s\" has no chunk record of %u bytes at %llu",
+						   path, src.len, (unsigned long long) src.offset);
+			continue;
+		}
+		/* (as the writer added it: the format's bytes for the frame) */
+		if (w == NULL)
+			w = PROLLY_CALL(fmt, write_begin, CurrentMemoryContext);
+		prolly_tablefile_add_stored(fmt, w, &h, frame.data, frame.len, out);
+	}
+	if (fd >= 0)
+		CloseTransientFile(fd);
+	return why;
+}
+
+/* Does path hold len bytes at offset whose CRC-32C is crc? */
+static bool
+file_holds(const char *path, uint64 offset, uint32 len, pg_crc32c crc)
+{
+	int			fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	char	   *bytes;
+	pg_crc32c	got;
+	bool		holds;
+
+	if (fd < 0)
+		return false;
+	bytes = palloc(Max(len, 1));
+	holds = pg_pread(fd, bytes, len, offset) == len;
+	CloseTransientFile(fd);
+	if (holds)
+	{
+		INIT_CRC32C(got);
+		COMP_CRC32C(got, bytes, len);
+		FIN_CRC32C(got);
+		holds = EQ_CRC32C(got, crc);
+	}
+	pfree(bytes);
+	return holds;
+}
+
+static void
+copy_redo(XLogReaderState *record)
+{
+	xl_chunks_copy xlrec;
+	const char *sources = XLogRecGetData(record) + SizeOfChunksCopy;
+	MemoryContext old;
+	StringInfoData out;
+	char	   *dir;
+	char	   *path;
+	char	   *why;
+	struct stat st;
+
+	memcpy(&xlrec, XLogRecGetData(record), SizeOfChunksCopy);
+	if (XLogRecGetDataLen(record) !=
+		SizeOfChunksCopy + (Size) xlrec.nsources * COPY_SOURCE_SIZE)
+		elog(PANIC, "chunk store copy record of %u bytes",
+			 XLogRecGetDataLen(record));
+	if (copy_redo_cxt == NULL)
+		copy_redo_cxt = AllocSetContextCreate(TopMemoryContext,
+											  "prolly copy redo",
+											  ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(copy_redo_cxt);
+	dir = GetDatabasePath(xlrec.dboid, xlrec.spcoid);
+	path = xlrec.segment ? segment_path(xlrec.dboid, xlrec.spcoid, xlrec.id) :
+		table_file_path(dir, xlrec.id);
+	initStringInfo(&out);
+	why = copy_sources(xlrec.src_dboid, xlrec.src_spcoid, sources,
+					   xlrec.nsources, &out);
+	if (why == NULL)
+	{
+		pg_crc32c	crc;
+
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, out.data, out.len);
+		FIN_CRC32C(crc);
+		if (out.len != xlrec.len || !EQ_CRC32C(crc, xlrec.crc))
+			why = psprintf("the %d bytes its %u sources in database directory \"%s\" make don't match the %u bytes copied (CRC %08X, not %08X)",
+						   out.len, xlrec.nsources,
+						   GetDatabasePath(xlrec.src_dboid, xlrec.src_spcoid),
+						   xlrec.len, crc, xlrec.crc);
+	}
+	if (why == NULL && stat(dir, &st) != 0)
+		why = psprintf("database directory \"%s\" is gone", dir);
+	if (why == NULL)
+	{
+		if (xlrec.offset == 0 && !xlrec.segment)
+			redo_table_file_begun(xlrec.dboid, xlrec.spcoid, dir, xlrec.id, path);
+		write_at(path, out.data, out.len, xlrec.offset);
+		request_sync(xlrec.dboid, xlrec.spcoid,
+					 xlrec.segment ? SYNC_SEGMENT : SYNC_TABLE_FILE, xlrec.id,
+					 sync_refused());
+		note_file(&copied_unsynced, xlrec.dboid, xlrec.spcoid, xlrec.segment,
+				  xlrec.id);
+	}
+	else if (!file_holds(path, xlrec.offset, xlrec.len, xlrec.crc))
+	{
+		StoreFile  *f;
+
+		if (reachedConsistency)
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not replay a copy into chunk store file \"%s\"",
+							path),
+					 errdetail_internal("%s", why)));
+		note_file(&copies_pending, xlrec.dboid, xlrec.spcoid, xlrec.segment,
+				  xlrec.id);
+		f = llast(copies_pending);
+		if (f->why == NULL)
+		{
+			f->lsn = record->ReadRecPtr;
+			f->why = MemoryContextStrdup(TopMemoryContext, why);
+		}
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(copy_redo_cxt);
+}
+
+/*
+ * The files of database directory dir (of dboid, in spcoid) its manifest
+ * dropped, as archive recovery reaches a consistent state with no backup
+ * running: those whose removal waited for a backup that ran as their
+ * retire was replayed (a standby's own), and that a restart since forgot,
+ * the retire's redo being before the point redo began from.  The primary
+ * removed them long ago and logs no other removal; a standby runs no
+ * writer whose remove_unnamed() would take them.  Only the ids the
+ * manifest gave: a file past them may be one whose writer's records redo
+ * is still replaying.  Not WAL-logged: a standby can't, and its own
+ * standbys do the same.
+ */
+static void
+remove_dropped(const char *dir, Oid dboid, Oid spcoid)
+{
+	Manifest	m;
+	List	   *ids = NIL;
+	List	   *segs = NIL;
+	ListCell   *lc;
+	bool		found;
+
+	PG_TRY();
+	{
+		found = read_manifest(dir, &m);
+	}
+	PG_CATCH();
+	{
+		/* (a store this server refuses is left as it is) */
+		EmitErrorReport();
+		FlushErrorState();
+		return;
+	}
+	PG_END_TRY();
+	if (!found)
+		return;
+	unnamed_files(dir, &m, true, &ids, &segs);
+	foreach(lc, ids)
+	{
+		char	   *path = table_file_path(dir, *(uint64 *) lfirst(lc));
+
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+		pfree(path);
+	}
+	foreach(lc, segs)
+	{
+		char	   *path = segment_path(dboid, spcoid, *(uint64 *) lfirst(lc));
+
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+		pfree(path);
+	}
+	if (ids != NIL || segs != NIL)
+		manifests_changed();
+	list_free_deep(ids);
+	list_free_deep(segs);
+}
+
+/*
+ * Recovery is consistent: a copy still waiting for its file's removal
+ * means the files differ from those the WAL was written against.  In
+ * archive recovery, with no backup running, the files dropped whose
+ * removal a restart forgot are removed (crash recovery's end removes what
+ * the manifests don't name, WAL-logged, instead).
+ */
+static void
+journal_redo_consistent(void)
+{
+	StoreFile  *f;
+	char	   *path;
+
+	if (ArchiveRecoveryRequested && !XLogBackupInProgress())
+		each_database_dir(remove_dropped);
+	if (copies_pending == NIL)
+		return;
+	f = linitial(copies_pending);
+	path = store_file_path(f);
+	ereport(PANIC,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("chunk store file \"%s\" lacks the bytes copied to it at %X/%08X",
+					path, LSN_FORMAT_ARGS(f->lsn)),
+			 errdetail_internal("The copy's sources failed it: %s; and no later record removed the file.",
+								f->why)));
+}
+
+/*
+ * Replay a table file's bytes, a manifest (after syncing the files it
+ * names, which replay wrote without syncing) or an unlink.  A removal moves
+ * the minimum recovery point past it first, as a truncation's redo does:
+ * redo after a restart doesn't count as consistent before it, while copies
+ * from what it removes may still wait on it.
  */
 static void
 table_files_redo(XLogReaderState *record)
@@ -4596,34 +5373,8 @@ table_files_redo(XLogReaderState *record)
 	{
 		char	   *path = table_file_path(dir, xlrec.id);
 
-		/*
-		 * The first bytes cut short what a failed writer left, but not a
-		 * file the manifest names already (replayed again, after a crash or
-		 * a standby's restart): readers may have it mapped, and a mapping
-		 * cut short is a SIGBUS.  Its bytes are the WAL's, so written over
-		 * in place they are the same.
-		 */
 		if (xlrec.offset == 0)
-		{
-			Manifest	m;
-			bool		named = false;
-
-			if (read_manifest(dir, &m))
-			{
-				for (int i = 0; i < m.nfiles; i++)
-					named |= m.files[i].id == xlrec.id;
-			}
-			if (!named)
-			{
-				int			fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
-
-				if (fd < 0)
-					ereport(ERROR,
-							(errcode_for_file_access(),
-							 errmsg("could not open file \"%s\": %m", path)));
-				CloseTransientFile(fd);
-			}
-		}
+			redo_table_file_begun(xlrec.dboid, xlrec.spcoid, dir, xlrec.id, path);
 		write_at(path, XLogRecGetData(record) + SizeOfChunksFile,
 				 XLogRecGetDataLen(record) - SizeOfChunksFile, xlrec.offset);
 		request_sync(xlrec.dboid, xlrec.spcoid, SYNC_TABLE_FILE, xlrec.id,
@@ -4668,18 +5419,30 @@ table_files_redo(XLogReaderState *record)
 		pfree(path);
 		manifests_changed();
 		if (info == XLOG_CHUNKS_RETIRE)
+		{
+			XLogFlush(record->EndRecPtr);
+			copied_sync();
+			for (int i = 0; i < before.nretiring; i++)
+			{
+				redo_removed(xlrec.dboid, xlrec.spcoid, false, false,
+							 before.retiring[i]);
+				redo_removed(xlrec.dboid, xlrec.spcoid, false, true,
+							 before.retiring[i]);
+			}
 			retire_files(xlrec.dboid, xlrec.spcoid, &before, &m);
+		}
 	}
 	else
 	{
-		char	   *path = xlrec.offset == UNLINK_SEGMENT ?
+		bool		segment = xlrec.offset == UNLINK_SEGMENT;
+		char	   *path = segment ?
 			segment_path(xlrec.dboid, xlrec.spcoid, xlrec.id) :
 			table_file_path(dir, xlrec.id);
 
-		if (unlink(path) != 0 && errno != ENOENT)
-			ereport(WARNING,
-					(errcode_for_file_access(),
-					 errmsg("could not remove file \"%s\": %m", path)));
+		XLogFlush(record->EndRecPtr);
+		copied_sync();
+		redo_removed(xlrec.dboid, xlrec.spcoid, false, segment, xlrec.id);
+		remove_store_file(xlrec.dboid, xlrec.spcoid, segment, xlrec.id, path);
 		pfree(path);
 		manifests_changed();
 	}
@@ -4693,6 +5456,7 @@ journal_redo(XLogReaderState *record)
 	xl_chunks_append xlrec;
 	char	   *path;
 
+	deferred_run();
 	switch (info & PROLLY_XLOG_TYPE_MASK)
 	{
 		case XLOG_CHUNKS_APPEND:
@@ -4703,6 +5467,9 @@ journal_redo(XLogReaderState *record)
 			request_sync(xlrec.dboid, xlrec.spcoid, SYNC_SEGMENT, xlrec.segment,
 						 sync_refused());
 			pfree(path);
+			break;
+		case XLOG_CHUNKS_COPY:
+			copy_redo(record);
 			break;
 		case XLOG_CHUNKS_FILE:
 		case XLOG_CHUNKS_MANIFEST:
@@ -4829,13 +5596,21 @@ journal_checkpoint(void)
 
 /*
  * A database dropped: its shared index, its segments' checked ends and its
- * sync requests forgotten, so a database given its OID later starts anew.
+ * sync requests forgotten, so a database given its OID later starts anew;
+ * in redo, what redo keeps of its files, too.
  */
 static void
 journal_drop_database(Oid dboid)
 {
 	JournalShared *js = shared();
 	FileTag		tag;
+
+	/* (in redo: copies from it synced first, and none waits on it) */
+	if (InRecovery)
+	{
+		copied_sync();
+		redo_removed(dboid, InvalidOid, true, false, 0);
+	}
 
 	jindex_forget(dboid);
 	SpinLockAcquire(&js->mutex);
@@ -4967,9 +5742,9 @@ remove_leftovers(const char *dir, Oid dboid, Oid spcoid)
 	FreeDir(d);
 }
 
-/* every database directory under parent (of tablespace spcoid) */
+/* every database directory under parent (of tablespace spcoid), to fn */
 static void
-leftovers_under(const char *parent, Oid spcoid)
+dirs_under(const char *parent, Oid spcoid, DatabaseDirFn fn)
 {
 	DIR		   *dir = AllocateDir(parent);
 	struct dirent *de;
@@ -4983,19 +5758,20 @@ leftovers_under(const char *parent, Oid spcoid)
 		if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
 			continue;
 		sub = psprintf("%s/%s", parent, de->d_name);
-		remove_leftovers(sub, (Oid) strtoul(de->d_name, NULL, 10), spcoid);
+		fn(sub, (Oid) strtoul(de->d_name, NULL, 10), spcoid);
 		pfree(sub);
 	}
 	FreeDir(dir);
 }
 
+/* every database directory, in every tablespace, to fn */
 static void
-journal_recovered(void)
+each_database_dir(DatabaseDirFn fn)
 {
 	DIR		   *tsdir;
 	struct dirent *de;
 
-	leftovers_under("base", DEFAULTTABLESPACE_OID);
+	dirs_under("base", DEFAULTTABLESPACE_OID, fn);
 	tsdir = AllocateDir(PG_TBLSPC_DIR);
 	if (tsdir == NULL)
 		return;
@@ -5007,10 +5783,16 @@ journal_recovered(void)
 			continue;
 		sub = psprintf("%s/%s/%s", PG_TBLSPC_DIR, de->d_name,
 					   TABLESPACE_VERSION_DIRECTORY);
-		leftovers_under(sub, (Oid) strtoul(de->d_name, NULL, 10));
+		dirs_under(sub, (Oid) strtoul(de->d_name, NULL, 10), fn);
 		pfree(sub);
 	}
 	FreeDir(tsdir);
+}
+
+static void
+journal_recovered(void)
+{
+	each_database_dir(remove_leftovers);
 }
 
 static void
@@ -5080,7 +5862,7 @@ add_table_file(ProllyChunkStore *s, ProllyChunkNext next, void *arg,
 	keep = palloc(sizeof(bool) * Max(m.nfiles, 1));
 	for (int i = 0; i < m.nfiles; i++)
 		keep[i] = true;
-	write_table_file(s, &m, keep, 0, next, arg, stored, false, 0);
+	write_table_file(s, &m, keep, 0, next, arg, stored, NULL, false, 0);
 	pfree(keep);
 }
 
@@ -5234,8 +6016,8 @@ journal_receive_file(ProllyChunkStore *s, const char *key, ProllyChunkNext next,
 
 	/* (a remote's file copied whole: one file, whatever its size) */
 	received_changed(s);
-	(void) write_file(s, received_id(key), next, arg, true, 0, &full, &nchunks,
-					  &size);
+	(void) write_file(s, received_id(key), next, arg, true, NULL, 0, &full,
+					  &nchunks, &size);
 }
 
 static bool
@@ -5507,6 +6289,9 @@ typedef struct ConjoinSource
 	int			i;				/* the next entry of cur's */
 	HTAB	   *seen;
 	const ProllyHashRoutine *hash;	/* each chunk checked by */
+	StringInfoData bytes;		/* the chunk given last, as its file has it */
+	StringInfoData chunk;		/* and decoded, to check it */
+	CopyFrom	from;			/* and where it is */
 } ConjoinSource;
 
 static bool
@@ -5532,14 +6317,23 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 			(void) hash_search(cs->seen, &key, HASH_ENTER, &found);
 			if (found)
 				continue;
-			bytes = palloc(len);
+			/* (as stored, logged as a copy; decoded only to check it) */
+			resetStringInfo(&cs->bytes);
+			enlargeStringInfo(&cs->bytes, len);
+			bytes = cs->bytes.data;
 			if (!table_file_read(t, offset, bytes, len))
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 								len, (unsigned long long) offset, t->path)));
-			PROLLY_CALL(fmt, decode, t->tf, bytes, len, data);
-			pfree(bytes);
+			prolly_tablefile_read_stored(fmt, t->tf, bytes, len, data);
+			resetStringInfo(&cs->chunk);
+			PROLLY_CALL(fmt, decode, t->tf, bytes, len, &cs->chunk);
+			cs->from.src.kind = COPY_TABLE_BYTES;
+			cs->from.src.id = t->id;
+			cs->from.src.offset = offset;
+			cs->from.src.len = len;
+			cs->from.bytes = bytes;
 
 			/* (read and written: a page missed and one dirtied) */
 			if (VacuumCostActive)
@@ -5552,8 +6346,8 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 												 CurrentMemoryContext);
 				ProllyHash	got;
 
-				PROLLY_CALL(cs->hash, update, ctx, (const uint8 *) data->data,
-							data->len);
+				PROLLY_CALL(cs->hash, update, ctx, (const uint8 *) cs->chunk.data,
+							cs->chunk.len);
 				PROLLY_CALL(cs->hash, finish, ctx, &got);
 				if (got.len != hash->len ||
 					memcmp(got.bytes, hash->bytes, got.len) != 0)
@@ -5661,7 +6455,8 @@ choose_conjoinees(const Manifest *m, int max_files, bool *keep)
 /*
  * Rewrite table files as one, which the manifest names instead of them,
  * settled if they all were: all of them (max_files 0), or past max_files,
- * the smallest (choose_conjoinees()).
+ * the smallest (choose_conjoinees()).  Their chunks are copied as stored,
+ * WAL-logged as copies of their bytes (#564).
  */
 static void
 journal_conjoin(ProllyChunkStore *s, int max_files)
@@ -5699,6 +6494,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	ctl.hcxt = CurrentMemoryContext;
 	cs.seen = hash_create("prolly conjoin", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	initStringInfo(&cs.bytes);
+	initStringInfo(&cs.chunk);
 
 	/* (closed whatever happens: a file kept open is never given back) */
 	PG_TRY();
@@ -5718,8 +6515,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, flags, conjoin_next, &cs, false, true,
-						 (uint64) prolly_gc_file_size * 1024);
+		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true, &cs.from,
+						 true, (uint64) prolly_gc_file_size * 1024);
 	}
 	PG_FINALLY();
 	{
@@ -5734,6 +6531,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			(errmsg_internal("chunk store of database %u: %d of %d table files conjoined",
 							 s->dboid, list_length(cs.tables), m.nfiles)));
 	hash_destroy(cs.seen);
+	pfree(cs.bytes.data);
+	pfree(cs.chunk.data);
 	pfree(keep);
 	pfree(dir);
 }
@@ -6178,10 +6977,8 @@ retire_files(Oid dboid, Oid spcoid, const Manifest *before,
 		paths[1] = segment_path(dboid, spcoid, before->retiring[i]);
 		for (int k = 0; k < 2; k++)
 		{
-			if (unlink(paths[k]) != 0 && errno != ENOENT)
-				ereport(WARNING,
-						(errcode_for_file_access(),
-						 errmsg("could not remove file \"%s\": %m", paths[k])));
+			remove_store_file(dboid, spcoid, k == 1, before->retiring[i],
+							  paths[k]);
 			pfree(paths[k]);
 		}
 	}
@@ -6842,6 +7639,8 @@ typedef struct GcCopy
 	GcFile	   *window_file;
 	uint64		window_start;
 	StringInfoData window;
+	CopyFrom	from;			/* where the slot given last is */
+	StringInfoData chunk;		/* and its chunk, decoded to check it */
 } GcCopy;
 
 /* a copy reads its files in windows of this much */
@@ -6909,8 +7708,9 @@ gc_read_order(ProllyChunkGc *gc)
 }
 
 /*
- * A slot's bytes, read through the copy's window: a file's next bytes are
- * read GC_WINDOW at a time, as the copy reads them in order.
+ * A slot's chunk, framed as stored, read through the copy's window (a
+ * file's next bytes are read GC_WINDOW at a time, as the copy reads them
+ * in order); gcc->from says where it is, and gcc->chunk gets it decoded.
  */
 static void
 gc_read_windowed(GcCopy *gcc, uint64 slot, StringInfo out)
@@ -6958,10 +7758,22 @@ gc_read_windowed(GcCopy *gcc, uint64 slot, StringInfo out)
 		gcc->window_start = offset;
 	}
 	bytes = gcc->window.data + (offset - gcc->window_start);
+	resetStringInfo(&gcc->chunk);
 	if (f->segment)
-		chunk_bytes(f->path, bytes, len, out);
+	{
+		record_framed(f->path, bytes, len, out);
+		chunk_bytes(f->path, bytes, len, &gcc->chunk);
+	}
 	else
-		PROLLY_CALL(table_format(), decode, f->t->tf, bytes, len, out);
+	{
+		prolly_tablefile_read_stored(table_format(), f->t->tf, bytes, len, out);
+		PROLLY_CALL(table_format(), decode, f->t->tf, bytes, len, &gcc->chunk);
+	}
+	gcc->from.src.kind = f->segment ? COPY_SEGMENT_CHUNK : COPY_TABLE_BYTES;
+	gcc->from.src.id = f->id;
+	gcc->from.src.offset = offset;
+	gcc->from.src.len = len;
+	gcc->from.bytes = bytes;
 }
 
 static bool
@@ -6992,9 +7804,10 @@ gc_copy_next(void *arg, ProllyHash *hash, StringInfo data)
 			vacuum_delay_point(false);
 		}
 
-		/* checked as it is copied: its bytes are its hash's */
+		/* checked as it is copied (as stored): its bytes are its hash's */
 		ctx = PROLLY_CALL(gcc->hash, begin, CurrentMemoryContext);
-		PROLLY_CALL(gcc->hash, update, ctx, (const uint8 *) data->data, data->len);
+		PROLLY_CALL(gcc->hash, update, ctx, (const uint8 *) gcc->chunk.data,
+					gcc->chunk.len);
 		PROLLY_CALL(gcc->hash, finish, ctx, hash);
 		if (journal_gc_find(gc, hash) != (int64) slot)
 			ereport(ERROR,
@@ -7030,13 +7843,16 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 		gc->read_order = gc_read_order(gc);
 	gcc.order = gc->read_order;
 	initStringInfo(&gcc.window);
+	initStringInfo(&gcc.chunk);
 	do
 	{
 		/*
 		 * (not in the window, where appends wait: what came since is few
-		 * chunks, written as one file, fsynced once)
+		 * chunks, written as one file, fsynced once; the chunks as stored,
+		 * logged as copies)
 		 */
-		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, false,
+		wrote = write_file(gc->s, gc->next_id, gc_copy_next, &gcc, true,
+						   &gcc.from,
 						   paced ? (uint64) prolly_gc_file_size * 1024 : 0,
 						   &full, &nchunks, &size);
 		if (wrote)
@@ -7054,6 +7870,7 @@ gc_write(ProllyChunkGc *gc, const uint8 *marks, const bool *keep, bool paced)
 		}
 	} while (wrote && full);
 	pfree(gcc.window.data);
+	pfree(gcc.chunk.data);
 }
 
 static int
@@ -7469,9 +8286,104 @@ journal_shmem_init(void *area)
 }
 
 /*
+ * The end of a segment's last whole record (fd, size bytes): what follows
+ * is a range a crash left reserved, whose zeros the WAL never had, so a
+ * standby may not have it.
+ */
+static uint64
+records_end(int fd, uint64 size)
+{
+	uint64		offset = JOURNAL_HEADER_SIZE;
+	StringInfoData rec;
+
+	if (size < JOURNAL_HEADER_SIZE)
+		return 0;
+	initStringInfo(&rec);
+	while (offset + RECORD_OVERHEAD <= size)
+	{
+		uint32		len;
+
+		if (pg_pread(fd, &len, sizeof(len), offset) != sizeof(len) ||
+			len < RECORD_OVERHEAD || offset + len > size)
+			break;
+		resetStringInfo(&rec);
+		enlargeStringInfo(&rec, len);
+		if (pg_pread(fd, rec.data, len, offset) != len ||
+			!record_valid(rec.data, len))
+			break;
+		offset += len;
+	}
+	pfree(rec.data);
+	return offset;
+}
+
+/*
+ * Copy a file of the template's store (table file or segment id, spath,
+ * size bytes) to dpath, the new database's, a piece at a time, each
+ * WAL-logged as a copy of the template's bytes, not as the bytes (#564);
+ * but a segment's bytes past its last whole record as bytes.  Synced, so
+ * the copy is durable before the template can be dropped.
+ */
+static void
+copy_store_file(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid,
+				bool segment, uint64 id, const char *spath, const char *dpath,
+				uint64 size, char *buf)
+{
+	CopyRun		run = {src_dboid, src_spcoid, 0, 0, NULL};
+	int			fd = OpenTransientFile(spath, O_RDONLY | PG_BINARY);
+	int			dfd;
+	uint64		end;
+
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", spath)));
+	dfd = OpenTransientFile(dpath, O_RDWR | O_CREAT | (segment ? 0 : O_TRUNC) |
+							PG_BINARY);
+	if (dfd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", dpath)));
+	end = segment ? records_end(fd, size) : size;
+	for (uint64 offset = 0; offset < size;)
+	{
+		Size		len = Min((uint64) APPEND_BATCH,
+							  (offset < end ? end : size) - offset);
+
+		if (pg_pread(fd, buf, len, offset) != len)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
+							len, (unsigned long long) offset, spath)));
+		if (offset < end)
+		{
+			CopySource	src = {segment ? COPY_SEGMENT_BYTES : COPY_TABLE_BYTES,
+			id, offset, (uint32) len};
+
+			/* (the bytes logged instead while a backup runs: copy_write()) */
+			run.n = 0;
+			copy_add(&run, &src);
+			copy_write(dst_dboid, dst_spcoid, segment, id, offset, buf, len,
+					   &run, true, dfd, dpath);
+		}
+		else
+			logged_write(dst_dboid, dst_spcoid, id, offset, buf, len, -1, dfd,
+						 dpath);
+		offset += len;
+	}
+	if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", dpath)));
+	fsync_fname(dpath, false);
+	if (run.sources)
+		pfree(run.sources);
+}
+
+/*
  * A new database's table files and manifest: those of the database it was
- * made from, each file copied as a table file is written (WAL-logged a
- * piece at a time), then the manifest naming them.
+ * made from, each file copied (copy_store_file()), then the manifest naming
+ * them.
  */
 static void
 copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
@@ -7491,35 +8403,9 @@ copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
 	{
 		char	   *spath = table_file_path(sdir, m.files[i].id);
 		char	   *dpath = table_file_path(ddir, m.files[i].id);
-		int			fd = OpenTransientFile(spath, O_RDONLY | PG_BINARY);
-		int			dfd;
 
-		if (fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", spath)));
-		dfd = OpenTransientFile(dpath, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
-		if (dfd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", dpath)));
-		for (uint64 offset = 0; offset < m.files[i].size;)
-		{
-			Size		len = Min((uint64) APPEND_BATCH, m.files[i].size - offset);
-
-			if (pg_pread(fd, buf, len, offset) != len)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
-								len, (unsigned long long) offset, spath)));
-			table_file_write(dst, dfd, dpath, m.files[i].id, offset, buf, len);
-			offset += len;
-		}
-		if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not close file \"%s\": %m", dpath)));
-		fsync_fname(dpath, false);
+		copy_store_file(src_dboid, src_spcoid, dst_dboid, dst_spcoid, false,
+						m.files[i].id, spath, dpath, m.files[i].size, buf);
 		pfree(spath);
 		pfree(dpath);
 	}
@@ -7532,31 +8418,23 @@ copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
 }
 
 /*
- * A new database's store: the files of the database it was made from.
- * The journal's segments are copied a piece at a time as appends to the new
- * one are (WAL-logged and flushed, then written), and the table files and
- * manifest as they are written, so redo, standbys and base backups make
- * them too.  One whose files were copied (the file-copy strategy) has them
- * already.  Nobody else uses the source meanwhile (CREATE DATABASE sees to
- * that), so its files hold still.
+ * A new database's store: the files of the database it was made from,
+ * WAL-logged as copies of them (#564), whatever the strategy: one whose
+ * files were copied (the file-copy strategy) has them already, written
+ * over with the same bytes, so its store's durability is its own WAL's.
+ * Redo, standbys and base backups make them from their copies of the
+ * template.  Nobody else uses the template meanwhile (CREATE DATABASE sees
+ * to that), so its files hold still.
  */
 static void
 journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 					  Oid dst_spcoid)
 {
 	char	   *sdir = GetDatabasePath(src_dboid, src_spcoid);
-	char	   *ddir = GetDatabasePath(dst_dboid, dst_spcoid);
-	char	   *dseg = segment_path(dst_dboid, dst_spcoid, 0);
-	char	   *dman = dir_file(ddir, MANIFEST_FILE);
 	struct stat st;
 	char	   *buf;
 	Manifest	m;
-	bool		copied = stat(dseg, &st) == 0 || stat(dman, &st) == 0;
 
-	pfree(dseg);
-	pfree(dman);
-	if (copied)
-		return;
 	copy_table_files(src_dboid, src_spcoid, dst_dboid, dst_spcoid);
 	(void) read_manifest(sdir, &m);
 	buf = palloc(APPEND_BATCH);
@@ -7564,50 +8442,15 @@ journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 	{
 		char	   *src = segment_path(src_dboid, src_spcoid, m.segments[i]);
 		char	   *dst = segment_path(dst_dboid, dst_spcoid, m.segments[i]);
-		uint64		offset = 0;
-		int			fd;
-		int			dfd;
 
-		if (stat(src, &st) != 0)
-		{
-			pfree(src);
-			pfree(dst);
-			continue;
-		}
-		fd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
-		if (fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", src)));
-		dfd = OpenTransientFile(dst, O_RDWR | O_CREAT | PG_BINARY);
-		if (dfd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", dst)));
-		while (offset < (uint64) st.st_size)
-		{
-			Size		len = Min((uint64) APPEND_BATCH, (uint64) st.st_size - offset);
-
-			if (pg_pread(fd, buf, len, offset) != len)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
-								len, (unsigned long long) offset, src)));
-			logged_write(dst_dboid, dst_spcoid, m.segments[i], offset, buf, len,
-						 -1, dfd, dst);
-			offset += len;
-		}
-		if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not close file \"%s\": %m", src)));
-		fsync_fname(dst, false);
+		if (stat(src, &st) == 0)
+			copy_store_file(src_dboid, src_spcoid, dst_dboid, dst_spcoid, true,
+							m.segments[i], src, dst, (uint64) st.st_size, buf);
 		pfree(src);
 		pfree(dst);
 	}
 	pfree(buf);
 	pfree(sdir);
-	pfree(ddir);
 }
 
 const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
@@ -7666,4 +8509,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.drop_database = journal_drop_database,
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,
+	.redo_consistent = journal_redo_consistent,
 };
