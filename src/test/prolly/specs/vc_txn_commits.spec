@@ -64,6 +64,7 @@ step a_violations { SELECT table_name, num_violations FROM dolt_constraint_viola
 step a_status	{ SELECT table_name, status FROM dolt_status WHERE table_name LIKE 'vtc.%'; }
 step a_log		{ SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1; }
 step a_read		{ SELECT string_agg(id || ':' || name, ',' ORDER BY id) AS users FROM vtc.users; }
+step a_ins2		{ INSERT INTO vtc.users VALUES (12, 'a2'); }
 
 session b
 step b_begin	{ BEGIN; }
@@ -71,6 +72,9 @@ step b_rr		{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step b_jim		{ UPDATE vtc.users SET name = 'jim2' WHERE id = 2; }
 step b_dcommit	{ SELECT length((dolt_commit('-Am', 'b commits'))[1]) = 40 AS committed; }
 step b_commit	{ COMMIT; }
+step b_allow	{ SET LOCAL dolt.allow_commit_conflicts = on; }
+step b_ins3		{ INSERT INTO vtc.users VALUES (13, 'b3'); }
+step b_users	{ SELECT count(*) AS users FROM vtc.users; }
 step b_status	{ SELECT table_name, status FROM dolt_status WHERE table_name LIKE 'vtc.%'; }
 step b_head_users { SELECT string_agg((to_row).id || ':' || (to_row).name, ',' ORDER BY (to_row).id) AS committed_change FROM dolt_diff('HEAD~1', 'HEAD', NULL::vtc.users); }
 
@@ -89,6 +93,11 @@ permutation a_begin a_tim b_jim b_dcommit a_dcommit a_commit a_log b_status
 # 3-5): listed; not committed unless dolt.allow_commit_conflicts is on
 permutation a_tim a_dcommit a_begin a_merge a_conflicts a_commit a_conflicts
 permutation a_tim a_dcommit a_begin a_allow a_merge a_commit a_conflicts a_status
+# conflicts committed with it on, then a transaction that writes the
+# branch (DoltConflictHandlingTests 6): not committed with it off, though
+# another made them, a retry no better (#587); with it on, or reading
+# alone, it commits, as does a's write with it on
+permutation a_tim a_dcommit a_begin a_allow a_merge a_commit a_begin b_begin a_ins2 b_ins3 a_allow a_commit b_commit b_begin b_ins3 b_commit b_ins3 b_begin b_users b_commit b_begin b_allow b_ins3 b_commit a_conflicts a_read
 # a savepoint around the merge: rolled back to it, the merge and its
 # conflicts go, and the transaction commits
 permutation a_tim a_dcommit a_begin a_savepoint a_merge a_conflicts a_to_savepoint a_conflicts a_commit a_read

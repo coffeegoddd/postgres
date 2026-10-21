@@ -193,6 +193,62 @@ vtc.users |conflict
 (2 rows)
 
 
+starting permutation: a_tim a_dcommit a_begin a_allow a_merge a_commit a_begin b_begin a_ins2 b_ins3 a_allow a_commit b_commit b_begin b_ins3 b_commit b_ins3 b_begin b_users b_commit b_begin b_allow b_ins3 b_commit a_conflicts a_read
+step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
+step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_begin: BEGIN;
+step a_allow: SET LOCAL dolt.allow_commit_conflicts = on;
+step a_merge: SELECT (dolt_merge('vtc_side'))[2:4];
+dolt_merge             
+-----------------------
+{0,1,"conflicts found"}
+(1 row)
+
+step a_commit: COMMIT;
+step a_begin: BEGIN;
+step b_begin: BEGIN;
+step a_ins2: INSERT INTO vtc.users VALUES (12, 'a2');
+step b_ins3: INSERT INTO vtc.users VALUES (13, 'b3');
+step a_allow: SET LOCAL dolt.allow_commit_conflicts = on;
+step a_commit: COMMIT;
+step b_commit: COMMIT;
+ERROR:  cannot commit a transaction with unresolved merge conflicts
+step b_begin: BEGIN;
+step b_ins3: INSERT INTO vtc.users VALUES (13, 'b3');
+step b_commit: COMMIT;
+ERROR:  cannot commit a transaction with unresolved merge conflicts
+step b_ins3: INSERT INTO vtc.users VALUES (13, 'b3');
+ERROR:  cannot commit a transaction with unresolved merge conflicts
+step b_begin: BEGIN;
+step b_users: SELECT count(*) AS users FROM vtc.users;
+users
+-----
+    3
+(1 row)
+
+step b_commit: COMMIT;
+step b_begin: BEGIN;
+step b_allow: SET LOCAL dolt.allow_commit_conflicts = on;
+step b_ins3: INSERT INTO vtc.users VALUES (13, 'b3');
+step b_commit: COMMIT;
+step a_conflicts: SELECT table_name, num_conflicts FROM dolt_conflicts WHERE table_name LIKE 'vtc.%';
+table_name|num_conflicts
+----------+-------------
+vtc.users |            1
+(1 row)
+
+step a_read: SELECT string_agg(id || ':' || name, ',' ORDER BY id) AS users FROM vtc.users;
+users                   
+------------------------
+1:tim2,2:jim,12:a2,13:b3
+(1 row)
+
+
 starting permutation: a_tim a_dcommit a_begin a_savepoint a_merge a_conflicts a_to_savepoint a_conflicts a_commit a_read
 step a_tim: UPDATE vtc.users SET name = 'tim2' WHERE id = 1;
 step a_dcommit: SELECT length((dolt_commit('-Am', 'a commits'))[1]) = 40 AS committed;

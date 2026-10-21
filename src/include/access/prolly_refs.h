@@ -197,9 +197,10 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * The session branch's merge in progress (false: none), and setting it
-	 * (NULL: none), with the current transaction.  The transaction can't
-	 * commit while its branch's merge has unresolved conflicts, unless
-	 * prolly_allow_commit_conflicts().  A reset ends a merge.
+	 * (NULL: none), with the current transaction.  A transaction that set
+	 * it, or wrote to the branch, can't commit while the branch's merge has
+	 * unresolved conflicts, unless prolly_allow_commit_conflicts().  A
+	 * reset ends a merge.
 	 */
 	bool		(*merge_state) (ProllyMergeState *state);
 	void		(*set_merge_state) (const ProllyMergeState *state);
@@ -241,8 +242,8 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * The session branch's constraint violations (ProllyViolation *), and
-	 * setting them (NIL: none), with the transaction.  A transaction can't
-	 * commit while its branch has some, unless
+	 * setting them (NIL: none), with the transaction.  A transaction that
+	 * set them, or wrote to the branch, can't commit while it has some, unless
 	 * prolly_allow_commit_conflicts(), nor can a commit be made.  A reset
 	 * clears them.
 	 */

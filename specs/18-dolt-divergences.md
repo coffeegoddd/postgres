@@ -138,7 +138,10 @@ adapts.
   and savepoint: a rollback undoes its commit, head move or merge, and
   nothing commits the transaction early. A merge's unresolved conflicts
   or constraint violations fail the SQL `COMMIT` unless
-  `dolt.allow_commit_conflicts` is set. `WORKING` in `dolt_status` and
+  `dolt.allow_commit_conflicts` is set: the `COMMIT` of the transaction
+  that made them, or of any that writes to the branch while they're
+  there, whoever made them, as in Dolt (#587); one that only reads
+  commits. `WORKING` in `dolt_status` and
   `dolt_diff` is the branch's working set as the current transaction
   sees it, its own uncommitted writes included, as a Dolt session's
   working root includes its own (#501).
