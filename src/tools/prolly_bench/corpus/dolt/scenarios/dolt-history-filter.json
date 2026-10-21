@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "id": "dolt-history-filter",
+  "description": "Reviewed Dolt port: dolt_history table filter correctness",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: dolt_history table filter correctness"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table xy (x int primary key, y int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into xy values (0, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add data",
+        "-a"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into xy values (2, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add data",
+        "-a"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into xy values (4, 5)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add data",
+        "-a"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "select count(*) from dolt_history_table(NULL::xy) where commit_hash = (select dolt_log.commit_hash from dolt_log limit 1 offset 1)",
+      "expect": {
+        "rows": [
+          [
+            "2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

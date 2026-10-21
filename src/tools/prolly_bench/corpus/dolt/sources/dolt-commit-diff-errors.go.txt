@@ -1,0 +1,24 @@
+{
+		Name: "error handling",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int, c2 int);",
+			"call dolt_add('.')",
+			"insert into t values (1, 2, 3), (4, 5, 6);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "SELECT * FROM DOLT_COMMIT_DIFF_t;",
+				ExpectedErrStr: "error querying table dolt_commit_diff_t: dolt_commit_diff_* tables must be filtered to a single 'to_commit'",
+			},
+			{
+				Query:          "SELECT * FROM DOLT_COMMIT_DIFF_t where to_commit=@Commit1;",
+				ExpectedErrStr: dtables.ErrInvalidCommitDiffTableArgs.Error(),
+			},
+			{
+				Query:          "SELECT * FROM DOLT_COMMIT_DIFF_t where from_commit=@Commit1;",
+				ExpectedErrStr: "error querying table dolt_commit_diff_t: dolt_commit_diff_* tables must be filtered to a single 'to_commit'",
+			},
+		},
+	}

@@ -1,0 +1,22 @@
+{
+		// Test a LEFT JOIN to exercise the case where the CommitDiffIterator
+		// must reload its partitions multiple times while executing the join.
+		Name: "Left outer join on dolt_commit_diff",
+		SetUpScript: []string{
+			"CREATE TABLE t (pk int primary key, c1 varchar(100));",
+			"CALL DOLT_COMMIT('-Am', 'Create table t on main');",
+			"INSERT INTO t VALUES (1, 'one'), (2, 'two');",
+			"CALL DOLT_COMMIT('-Am', 'Adding two rows to t on main');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * from t LEFT JOIN (SELECT from_pk, from_c1 from dolt_commit_diff_t where from_commit = HASHOF('HEAD~') and to_commit = HASHOF('HEAD')) as dt on 1 = 1;",
+				Expected: []sql.Row{
+					{1, "one", interface{}(nil), interface{}(nil)},
+					{1, "one", interface{}(nil), interface{}(nil)},
+					{2, "two", interface{}(nil), interface{}(nil)},
+					{2, "two", interface{}(nil), interface{}(nil)},
+				},
+			},
+		},
+	}

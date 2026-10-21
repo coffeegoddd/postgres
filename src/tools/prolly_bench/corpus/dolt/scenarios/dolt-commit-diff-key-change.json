@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "id": "dolt-commit-diff-key-change",
+  "description": "Reviewed Dolt port: schema modification: primary key change",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "CommitDiffSystemTableScriptTests: schema modification: primary key change"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 2), (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-a"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t DROP CONSTRAINT t_pkey",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (5, 6)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "dropping primary key",
+        "-a"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "alter table t add primary key (c1)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "adding primary key",
+        "-a"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (7, 8)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "adding more data",
+        "-a"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (from_row).pk, (from_row).c1, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit4"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "5",
+            "6",
+            null,
+            null,
+            "added"
+          ],
+          [
+            "7",
+            "8",
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (from_row).pk, (from_row).c1, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "7",
+            "8",
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

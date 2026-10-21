@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "id": "dolt-commit-diff-left-join",
+  "description": "Reviewed Dolt port: Left outer join on dolt_commit_diff",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "CommitDiffSystemTableScriptTests: Left outer join on dolt_commit_diff"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int primary key, c1 varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "created",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Create table t on main",
+        "-A"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one'), (2, 'two')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "added",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Adding two rows to t on main",
+        "-A"
+      ],
+      "save": "added"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "SELECT * from t LEFT JOIN (SELECT (from_row).pk AS from_pk, (from_row).c1 AS from_c1 FROM dolt_diff(dolt_hashof('HEAD~'), dolt_hashof('HEAD'), NULL::t)) AS dt ON 1 = 1",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            null,
+            null
+          ],
+          [
+            "1",
+            "one",
+            null,
+            null
+          ],
+          [
+            "2",
+            "two",
+            null,
+            null
+          ],
+          [
+            "2",
+            "two",
+            null,
+            null
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

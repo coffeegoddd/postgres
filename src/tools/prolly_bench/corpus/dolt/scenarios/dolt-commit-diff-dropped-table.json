@@ -1,0 +1,215 @@
+{
+  "version": 1,
+  "id": "dolt-commit-diff-dropped-table",
+  "description": "Reviewed Dolt port: added and dropped table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "CommitDiffSystemTableScriptTests: added and dropped table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 2), (3, 4)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-a"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "drop table t",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "dropping table",
+        "-a"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table unrelated (a int primary key)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created unrelated table",
+        "-A"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "recreating table t",
+        "-A"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (from_row).pk, (from_row).c1, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ],
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (from_row).pk, (from_row).c1, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit3"
+        }
+      ],
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (from_row).pk, (from_row).c1, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (from_row).pk, (from_row).c1, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit4"
+        }
+      ],
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            "3",
+            "4",
+            "removed"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

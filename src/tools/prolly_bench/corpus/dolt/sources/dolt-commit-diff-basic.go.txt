@@ -1,0 +1,106 @@
+{
+		Name: "base case: insert, update, delete",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 int, c2 int);",
+			"call dolt_add('.')",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit0, '-am', 'creating table t');",
+			"insert into t values (1, 2, 3), (4, 5, 6);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'populating table t');",
+
+			"update t set c2=0 where pk=1",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'modifying row');",
+
+			"update t set c2=-1 where pk=1",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'modifying row');",
+
+			"update t set c2=-2 where pk=1",
+			"set @Commit4 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit4, '-am', 'modifying row');",
+
+			"delete from t where pk=1",
+			"set @Commit5 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit5, '-am', 'modifying row');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit1 and FROM_COMMIT=@Commit0;",
+				Expected: []sql.Row{
+					{1, 2, 3, nil, nil, nil, "added"},
+					{4, 5, 6, nil, nil, nil, "added"},
+				},
+			},
+			{
+				// Test case-insensitive table name
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_T WHERE TO_COMMIT=@Commit1 and FROM_COMMIT=@Commit0;",
+				Expected: []sql.Row{
+					{1, 2, 3, nil, nil, nil, "added"},
+					{4, 5, 6, nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit2 and FROM_COMMIT=@Commit1 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, 2, 0, 1, 2, 3, "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_T WHERE TO_COMMIT=@Commit4 and FROM_COMMIT=@Commit1 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, 2, -2, 1, 2, 3, "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_commit_DIFF_t WHERE TO_COMMIT=@Commit5 and FROM_COMMIT=@Commit4 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{nil, nil, nil, 1, 2, -2, "removed"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit5 and FROM_COMMIT=@Commit0 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{4, 5, 6, nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit5 and FROM_COMMIT=@Commit0 AND from_pk IS NULL;",
+				Expected: []sql.Row{
+					{4, 5, 6, nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit5 and FROM_COMMIT=@Commit3 AND from_pk IS NOT NULL;",
+				Expected: []sql.Row{
+					{nil, nil, nil, 1, 2, -1, "removed"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_commit_DIFF_t WHERE TO_COMMIT=@Commit5 and FROM_COMMIT=@Commit4 AND to_pk IS NULL;",
+				Expected: []sql.Row{
+					{nil, nil, nil, 1, 2, -2, "removed"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_commit_DIFF_t WHERE TO_COMMIT=@Commit5 and FROM_COMMIT=@Commit0 AND to_pk IS NOT NULL;",
+				Expected: []sql.Row{
+					{4, 5, 6, nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_commit_DIFF_t WHERE TO_COMMIT=@Commit1 and FROM_COMMIT=@Commit0 AND to_pk = 1;",
+				Expected: []sql.Row{
+					{1, 2, 3, nil, nil, nil, "added"},
+				},
+				ExpectedIndexes: []string{"commits_to"},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type FROM DOLT_commit_DIFF_t WHERE TO_COMMIT=@Commit0 and FROM_COMMIT=@Commit1 AND from_pk = 1;",
+				Expected: []sql.Row{
+					{nil, nil, nil, 1, 2, 3, "removed"},
+				},
+				ExpectedIndexes: []string{"commits_from"},
+			},
+		},
+	}
