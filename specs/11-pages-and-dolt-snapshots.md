@@ -970,7 +970,23 @@ fails without its fix), and Postgres's suites keep passing after each one.
       (`reindex_relation`, unique and exclusion constraints checked
       then, the primary key not re-checking key lengths) before any
       other write or at the applier's end. No other transaction sees
-      such a table, so nothing reads the indexes meanwhile.
+      such a table, so nothing reads the indexes meanwhile. A table
+      emptied by TRUNCATE earlier in the move's transaction is loaded
+      too (its indexes, already given new storage by the TRUNCATE, built
+      again); `bulk_moves` and `t/151` (crash, `wal_level` minimal and
+      replica) cover it.
+    - A load's end can fail (the build finds a duplicate key). Its
+      failure ends the applier, even if the caller catches the error:
+      every later write but `end()` raises, since the indexes are closed
+      or, after a subtransaction's rollback, back to their storage from
+      before the build, with no entries for the rows loaded. The build
+      is refused in a subtransaction begun since the rows were loaded
+      (rolled back, it would leave them unindexed), which also ends the
+      applier; the indexes are closed and opened again under the
+      resource owner of the applier's `begin()`. No caller reaches
+      either today: the only one that writes in subtransactions (a merge
+      recording violations) doesn't batch. `applier.sql` checks both
+      from SQL (`test_apply_failed_load()`).
     - User triggers: none fire, as before (the applier keeps only the
       deferrable constraints' rechecks); no foreign key is checked.
     - Not built: deferring index upkeep on a table other sessions can
