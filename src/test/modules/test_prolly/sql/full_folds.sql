@@ -29,7 +29,8 @@ SELECT length(dolt_commit('-am', 'one row')::text) AS committed;
 :flush
 SELECT * FROM full_folds();
 
--- its definition changed
+-- its definition changed, its rows' bytes with it: mapped from the baseline
+-- (shape_folds), none read in full
 :reset
 ALTER TABLE ff.t ADD COLUMN w int DEFAULT 7;
 SELECT length(dolt_commit('-am', 'w added')::text) AS committed;

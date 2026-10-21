@@ -181,13 +181,15 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | pk_or_prefix   | keys_and_content               | pass
  table_keying  | pk_or_prefix   | owns_its_memory                | pass
  table_keying  | pk_or_prefix   | row_shapes                     | pass
+ table_keying  | pk_or_prefix   | old_shapes                     | pass
  table_keying  | pk_or_prefix   | complete                       | pass
  table_keying  | stub           | identity                       | pass
  table_keying  | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
  table_keying  | stub           | keys_and_content               | not implemented (missing open, encode_row, compare, close, encode_key)
  table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
  table_keying  | stub           | row_shapes                     | not implemented (missing open, close, row_shape, shape_extends)
- table_keying  | stub           | complete                       | not implemented (16 of 16 callbacks missing)
+ table_keying  | stub           | old_shapes                     | not implemented (missing open, encode_row, decode_row, close, row_shape, open_shape)
+ table_keying  | stub           | complete                       | not implemented (17 of 17 callbacks missing)
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
@@ -239,7 +241,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (15 of 15 callbacks missing)
-(179 rows)
+(181 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

@@ -339,6 +339,15 @@ commit or checkpoint all use it.
   - an enum's label added (`ALTER TYPE ... ADD VALUE`, `BEFORE` or
     `AFTER` too): rows send labels, the old ones keep their names, and
     their order, so keys too. A label renamed changes rows: read in full.
+
+  And these change rows' bytes without writing them, so the baseline's
+  rows are mapped to the shape now, read as they were folded and
+  encoded as they are now, without reading the table (#485,
+  `19-change-log.md` §2.2):
+  - a column added with a default (rows from before read as its missing
+    value, which every row's bytes now hold: no "lazy default");
+  - a column dropped (gone from every row's bytes; a keyless table's
+    rows sorted again, those become alike counted as one).
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
   folds the changes into a tree, which becomes the new baseline, and

@@ -2,7 +2,8 @@
  *
  * prolly_fold.c
  *	  What the change finders share about folding a table in full: why a
- *	  fold read every row, counted and logged (prolly_fold.h).
+ *	  fold read every row, counted and logged; and a baseline mapped to its
+ *	  table's shape now (prolly_fold.h).
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_fold.c
@@ -11,10 +12,13 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/prolly_fold.h"
 #include "access/tableam.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -77,9 +81,13 @@ prolly_full_fold_noted(Relation rel, ProllyFullFoldReason reason, int64 rows,
  * ----------------------------------------------------------------
  */
 
-/* A row to sort: its key's and its encoded row's lengths, then both. */
+/*
+ * A row to sort: its copies (a keyless row's count), its key's and its
+ * encoded row's lengths, then both.
+ */
 typedef struct FoldTuple
 {
+	uint64		copies;
 	uint32		keylen;
 	uint32		rowlen;
 	char		data[FLEXIBLE_ARRAY_MEMBER];
@@ -159,7 +167,7 @@ fold_sort_begin(FoldSortArg *arg)
 
 static void
 fold_sort_put(Tuplesortstate *state, const StringInfoData *key,
-			  const StringInfoData *row)
+			  const StringInfoData *row, uint64 copies)
 {
 	TuplesortPublic *base = TuplesortstateGetPublic(state);
 	MemoryContext old = MemoryContextSwitchTo(base->tuplecontext);
@@ -167,6 +175,7 @@ fold_sort_put(Tuplesortstate *state, const StringInfoData *key,
 	FoldTuple  *t = palloc(len);
 	SortTuple	stup;
 
+	t->copies = copies;
 	t->keylen = key->len;
 	t->rowlen = row->len;
 	memcpy(t->data, key->data, key->len);
@@ -193,17 +202,17 @@ fold_sort_next(Tuplesortstate *state)
 	return got ? stup.tuple : NULL;
 }
 
-void
-prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
-				const ProllyKeyingRoutine *kr, ProllyKeying *k, bool keyless,
-				const ProllyTreeRoutine *tree, const ProllyTreeEnv *env,
-				ProllyNodeRef *data, ProllyFullFold *done)
+/*
+ * The sorted rows built into *data, in key order: a keyless row's copies,
+ * one after another, counted.  False, *data unset, at a keyed table's
+ * second row of a key.  done gets the rows written and what the sort took.
+ */
+static bool
+fold_sort_build(Tuplesortstate *sort, const ProllyKeyingRoutine *kr,
+				ProllyKeying *k, bool keyless, const ProllyTreeRoutine *tree,
+				const ProllyTreeEnv *env, ProllyNodeRef *data,
+				ProllyFullFold *done)
 {
-	FoldSortArg arg = {kr, k};
-	Tuplesortstate *sort = fold_sort_begin(&arg);
-	TableScanDesc scan;
-	StringInfoData key;
-	StringInfoData row;
 	StringInfoData prev_key;
 	StringInfoData prev_row;
 	StringInfoData value;
@@ -211,26 +220,9 @@ prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 	TuplesortInstrumentation stats;
 	const FoldTuple *t;
 	uint64		copies = 0;
+	bool		unique = true;
 
-	memset(done, 0, sizeof(*done));
-	initStringInfo(&key);
-	initStringInfo(&row);
-	scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
-	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-	{
-		ProllyHash	content;
-
-		resetStringInfo(&key);
-		resetStringInfo(&row);
-		PROLLY_CALL(kr, encode_row, k, slot, &key, &row, &content);
-		fold_sort_put(sort, &key, &row);
-		done->rows_read++;
-		CHECK_FOR_INTERRUPTS();
-	}
-	table_endscan(scan);
 	tuplesort_performsort(sort);
-
-	/* in key order: a keyless row's copies, one after another, counted */
 	initStringInfo(&prev_key);
 	initStringInfo(&prev_row);
 	initStringInfo(&value);
@@ -257,11 +249,10 @@ prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 		if (t == NULL)
 			break;
 		if (copies > 0 && !keyless)
-			ereport(ERROR,
-					(errcode(ERRCODE_UNIQUE_VIOLATION),
-					 errmsg("table \"%s\" holds rows with the same primary key",
-							RelationGetRelationName(rel)),
-					 errdetail("A commit can't hold them until the key is unique again.")));
+		{
+			unique = false;
+			break;
+		}
 		if (copies == 0)
 		{
 			resetStringInfo(&prev_key);
@@ -269,15 +260,304 @@ prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 			resetStringInfo(&prev_row);
 			appendBinaryStringInfo(&prev_row, t->data + t->keylen, t->rowlen);
 		}
-		copies++;
+		copies += t->copies;
 		CHECK_FOR_INTERRUPTS();
 	}
+	/* (a tree begun is finished, used or not) */
 	PROLLY_CALL(tree, build_finish, b, data);
 	tuplesort_get_stats(sort, &stats);
 	done->spilled = stats.spaceType == SORT_SPACE_TYPE_DISK;
 	done->sort_kb = stats.spaceUsed;
+	pfree(prev_key.data);
+	pfree(prev_row.data);
+	pfree(value.data);
+	return unique;
+}
+
+void
+prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
+				const ProllyKeyingRoutine *kr, ProllyKeying *k, bool keyless,
+				const ProllyTreeRoutine *tree, const ProllyTreeEnv *env,
+				ProllyNodeRef *data, ProllyFullFold *done)
+{
+	FoldSortArg arg = {kr, k};
+	Tuplesortstate *sort = fold_sort_begin(&arg);
+	TableScanDesc scan;
+	StringInfoData key;
+	StringInfoData row;
+
+	memset(done, 0, sizeof(*done));
+	initStringInfo(&key);
+	initStringInfo(&row);
+	scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		ProllyHash	content;
+
+		resetStringInfo(&key);
+		resetStringInfo(&row);
+		PROLLY_CALL(kr, encode_row, k, slot, &key, &row, &content);
+		fold_sort_put(sort, &key, &row, 1);
+		done->rows_read++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	table_endscan(scan);
+	if (!fold_sort_build(sort, kr, k, keyless, tree, env, data, done))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg("table \"%s\" holds rows with the same primary key",
+						RelationGetRelationName(rel)),
+				 errdetail("A commit can't hold them until the key is unique again.")));
 	tuplesort_end(sort);
 	if (done->spilled)
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL_SPILLED, 1);
 	prolly_last_full_fold = *done;
+}
+
+/* ----------------------------------------------------------------
+ * A baseline's rows mapped to the table's shape now
+ * ----------------------------------------------------------------
+ */
+
+/* How a column of rel's rows now is had from a row as it was folded. */
+typedef enum MapKind
+{
+	MAP_NONE,					/* dropped: none */
+	MAP_SAME,					/* the column as it was */
+	MAP_MISSING,				/* added since: its missing value, or NULL */
+} MapKind;
+
+typedef struct MapColumn
+{
+	MapKind		kind;
+	Datum		missing;
+	bool		isnull;
+} MapColumn;
+
+typedef struct MapCompare
+{
+	const ProllyKeyingRoutine *kr;
+	ProllyKeying *k;
+} MapCompare;
+
+static int
+map_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	MapCompare *mc = arg;
+
+	return PROLLY_CALL(mc->kr, compare, mc->k, a, b);
+}
+
+/*
+ * How each of rel's columns now is had from a row of desc's columns (a
+ * row as folded, prolly_keying open_shape()): false if one can't be.
+ */
+static bool
+map_columns(Relation rel, TupleDesc desc, MapColumn *cols)
+{
+	TupleDesc	rd = RelationGetDescr(rel);
+
+	for (int i = 0; i < rd->natts; i++)
+	{
+		Form_pg_attribute now = TupleDescAttr(rd, i);
+		Form_pg_attribute was = TupleDescAttr(desc, i);
+
+		memset(&cols[i], 0, sizeof(MapColumn));
+		cols[i].isnull = true;
+		if (now->attisdropped)
+			cols[i].kind = MAP_NONE;
+		else if (was->attisdropped)
+		{
+			/* (rows read it as Postgres reads a row from before it) */
+			cols[i].kind = MAP_MISSING;
+			if (now->atthasmissing)
+			{
+				Datum		d = getmissingattr(rd, i + 1, &cols[i].isnull);
+
+				if (!cols[i].isnull)
+					cols[i].missing = datumCopy(d, now->attbyval, now->attlen);
+			}
+		}
+		else if (was->atttypid == now->atttypid &&
+				 was->atttypmod == now->atttypmod)
+			cols[i].kind = MAP_SAME;
+		else
+			return false;
+	}
+	return true;
+}
+
+bool
+prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
+				const ProllyNodeRef *from, const ProllyValue *old,
+				ProllyNodeRef *data, int64 *rows)
+{
+	ProllyComponents c;
+	const ProllyKeyingRoutine *kr;
+	const ProllyTreeRoutine *tree;
+	MemoryContext cxt;
+	MemoryContext rowcxt;
+	MemoryContext caller;
+	ProllyKeying *ok;
+	ProllyKeying *k;
+	ProllyKeyingRefs orefs;
+	ProllyKeyingRefs nrefs;
+	ProllyTreeEnv oenv;
+	ProllyTreeEnv nenv;
+	MapCompare	mc;
+	TupleDesc	odesc;
+	TupleDesc	rd = RelationGetDescr(rel);
+	MapColumn  *cols;
+	TupleTableSlot *oslot;
+	TupleTableSlot *nslot;
+	ProllyTreeCursor *cur;
+	ProllyTreeBuilder *b = NULL;
+	Tuplesortstate *sort = NULL;
+	FoldSortArg arg;
+	ProllyFullFold done = {0};
+	StringInfoData key;
+	StringInfoData row;
+	StringInfoData value;
+	StringInfoData prev;
+	ProllyKey	k_in;
+	ProllyValue v_in;
+	bool		keyless;
+	bool		mapped = true;
+
+	prolly_components_for_relation(rel, &c);
+	kr = c.keying;
+	tree = c.tree;
+	*rows = 0;
+	if (!PROLLY_HAS(kr, open_shape))
+		return false;
+
+	/* what the map makes is let go of when it's done, but the tree */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "fold map",
+								ALLOCSET_DEFAULT_SIZES);
+	caller = MemoryContextSwitchTo(cxt);
+	ok = PROLLY_CALL(kr, open_shape, rel, old, cxt, &odesc);
+	if (ok == NULL)
+	{
+		MemoryContextSwitchTo(caller);
+		MemoryContextDelete(cxt);
+		return false;
+	}
+	k = PROLLY_CALL(kr, open, rel, cxt);
+	keyless = PROLLY_CALL(kr, keyless, k);
+	cols = palloc_array(MapColumn, Max(rd->natts, 1));
+	if (PROLLY_CALL(kr, keyless, ok) != keyless || !map_columns(rel, odesc, cols))
+	{
+		PROLLY_CALL(kr, close, ok);
+		PROLLY_CALL(kr, close, k);
+		MemoryContextSwitchTo(caller);
+		MemoryContextDelete(cxt);
+		return false;
+	}
+
+	/*
+	 * Rows read as folded, their long values as the trees they are (hash
+	 * pointers, not read), and encoded as the keying encodes them now.
+	 */
+	oenv = *env;
+	prolly_keying_use_env(&orefs, kr, ok, tree, &oenv);
+	orefs.values.pointers = true;
+	nenv = *env;
+	mc.kr = kr;
+	mc.k = k;
+	nenv.compare = map_compare;
+	nenv.compare_arg = &mc;
+	prolly_keying_use_env(&nrefs, kr, k, tree, &nenv);
+	oslot = MakeSingleTupleTableSlot(odesc, &TTSOpsVirtual);
+	nslot = MakeSingleTupleTableSlot(rd, &TTSOpsVirtual);
+	rowcxt = AllocSetContextCreate(cxt, "fold map row", ALLOCSET_DEFAULT_SIZES);
+	initStringInfo(&key);
+	initStringInfo(&row);
+	initStringInfo(&value);
+	initStringInfo(&prev);
+
+	/* (a keyless row's key is its bytes: sorted again, copies merged) */
+	if (keyless)
+	{
+		arg.kr = kr;
+		arg.k = k;
+		sort = fold_sort_begin(&arg);
+	}
+	else
+		b = PROLLY_CALL(tree, build_begin, &nenv, cxt);
+	cur = PROLLY_CALL(tree, cursor_open, &oenv, from, cxt);
+	PROLLY_CALL(tree, cursor_seek, cur, NULL, ForwardScanDirection);
+	while (mapped && PROLLY_CALL(tree, cursor_next, cur, &k_in, &v_in))
+	{
+		ProllyValue r;
+		uint64		count;
+		ProllyHash	content;
+
+		MemoryContextReset(rowcxt);
+		MemoryContextSwitchTo(rowcxt);
+		PROLLY_CALL(kr, parse_value, ok, &v_in, &r, &count);
+		PROLLY_CALL(kr, decode_row, ok, &r, oslot);
+		slot_getallattrs(oslot);
+		ExecClearTuple(nslot);
+		for (int i = 0; i < rd->natts; i++)
+		{
+			nslot->tts_values[i] = (Datum) 0;
+			nslot->tts_isnull[i] = true;
+			if (cols[i].kind == MAP_SAME)
+			{
+				nslot->tts_values[i] = oslot->tts_values[i];
+				nslot->tts_isnull[i] = oslot->tts_isnull[i];
+			}
+			else if (cols[i].kind == MAP_MISSING)
+			{
+				nslot->tts_values[i] = cols[i].missing;
+				nslot->tts_isnull[i] = cols[i].isnull;
+			}
+		}
+		ExecStoreVirtualTuple(nslot);
+		resetStringInfo(&key);
+		resetStringInfo(&row);
+		PROLLY_CALL(kr, encode_row, k, nslot, &key, &row, &content);
+		MemoryContextSwitchTo(cxt);
+		if (keyless)
+			fold_sort_put(sort, &key, &row, count);
+		else
+		{
+			ProllyKey	nk = {(const uint8 *) key.data, key.len};
+			ProllyKey	pk = {(const uint8 *) prev.data, prev.len};
+			ProllyValue nv;
+			ProllyValue nr = {(const uint8 *) row.data, row.len};
+
+			/* (keys in another order now: the key changed, not mapped so) */
+			if (*rows > 0 && PROLLY_CALL(kr, compare, k, &pk, &nk) >= 0)
+			{
+				mapped = false;
+				break;
+			}
+			resetStringInfo(&value);
+			PROLLY_CALL(kr, make_value, k, &nr, 1, &value);
+			nv.data = (const uint8 *) value.data;
+			nv.len = value.len;
+			PROLLY_CALL(tree, build_add, b, &nk, &nv);
+			resetStringInfo(&prev);
+			appendBinaryStringInfo(&prev, key.data, key.len);
+		}
+		(*rows)++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextSwitchTo(cxt);
+	PROLLY_CALL(tree, cursor_close, cur);
+	if (keyless)
+	{
+		mapped = fold_sort_build(sort, kr, k, true, tree, &nenv, data, &done);
+		tuplesort_end(sort);
+	}
+	else
+		PROLLY_CALL(tree, build_finish, b, data);
+	ExecDropSingleTupleTableSlot(oslot);
+	ExecDropSingleTupleTableSlot(nslot);
+	PROLLY_CALL(kr, close, ok);
+	PROLLY_CALL(kr, close, k);
+	MemoryContextSwitchTo(caller);
+	MemoryContextDelete(cxt);
+	return mapped;
 }

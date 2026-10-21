@@ -944,6 +944,50 @@ shape_holds(Relation rel, const StringInfoData *was, const StringInfoData *now)
 	return holds;
 }
 
+static bool
+every_entry(HeapTuple entry, int32 delta, void *arg)
+{
+	return true;
+}
+
+/*
+ * A baseline folded under another shape than now's, its rows mapped to
+ * rel's shape now (prolly_fold_map()) into *data, without reading rel:
+ * false if they can't be (the encoders changed, a keying without a row
+ * shape, or one that can't read the old one's rows), or the fold will read
+ * rel in full anyway (forced, or its log says to: a rewrite since changed
+ * rows without writes).
+ */
+static bool
+shape_mapped(Canon *cn, Relation rel, BaseTable *bt,
+			 const StringInfoData *now, ProllyNodeRef *data)
+{
+	ProllyValue was_rows;
+	ProllyValue was_rest;
+	ProllyValue now_rows;
+	ProllyValue now_rest;
+	ProllyFullFoldReason forced;
+	ProllyComponents c;
+	int64		rows;
+
+	if (prolly_full_fold_wanted(&forced) ||
+		!split_shape(base_shape(cn, bt), &was_rows, &was_rest) ||
+		!split_shape(now, &now_rows, &now_rest) ||
+		was_rest.len != now_rest.len ||
+		memcmp(was_rest.data, now_rest.data, now_rest.len) != 0)
+		return false;
+	prolly_components_for_relation(rel, &c);
+	/* (every entry: one the baseline holds that says so only stops a map) */
+	if (c.change_log &&
+		!PROLLY_CALL(c.change_log, read, rel, GetActiveSnapshot(), NULL,
+					 every_entry, NULL))
+		return false;
+	if (!prolly_fold_map(rel, &cn->env, &bt->data, &was_rows, data, &rows))
+		return false;
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MAPPED, 1);
+	return true;
+}
+
 /*
  * A prolly table's shape: the content hash of its baseline_shape()
  * (described in 'description'), and the collations ordering its keys,
@@ -999,8 +1043,9 @@ table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
  * A table's data tree, folded from its rows as the transaction sees them by
  * the change finder: from its baseline if it has one that holds for this
  * definition (described in 'description', dh its table_shape(): the same,
- * or one shape_holds() says its rows are as they were under); with a next
- * baseline being made, its entry there too.  The same rows give the same
+ * or one shape_holds() says its rows are as they were under), or one whose
+ * rows map to it (shape_mapped()); with a next baseline being made, its
+ * entry there too.  The same rows give the same
  * tree whatever pages, order or history they come from.
  */
 static void
@@ -1017,14 +1062,24 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 
 	bt = found = find_base_table(cn, &it->key);
 	why = bt ? PROLLY_FULL_SHAPE_CHANGED : PROLLY_FULL_NO_BASELINE;
+	memset(&tf, 0, sizeof(tf));
+	if (bt)
+		tf.data = bt->data;
 	if (bt && !(bt->shape_hash.len == dh->len &&
 				memcmp(bt->shape_hash.bytes, dh->bytes, dh->len) == 0) &&
 		!shape_holds(rel, base_shape(cn, bt),
 					 table_shape_bytes(cn, rel, description, &shape)))
-		bt = NULL;
+	{
+		/* (when reading another table: not mapped, as its rows aren't read) */
+		if (!cn->no_rows &&
+			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
+			shape_mapped(cn, rel, bt, &shape, &tf.data))
+			tf.reshaped = true;
+		else
+			bt = NULL;
+	}
 	if (bt)
 	{
-		tf.data = bt->data;
 		tf.state.data = (const uint8 *) bt->state.data;
 		tf.state.len = bt->state.len;
 	}

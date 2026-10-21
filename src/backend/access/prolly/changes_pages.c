@@ -1350,6 +1350,13 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 		f->reason = PROLLY_FULL_STALE_SNAPSHOT;
 		return false;
 	}
+
+	/* (keys carried in the rows of another shape: not read as this one's) */
+	if (baseline->reshaped && st->carried.hash.len > 0)
+	{
+		f->reason = PROLLY_FULL_SHAPE_CHANGED;
+		return false;
+	}
 	if (!bmap_fold_changes(RelationGetSmgr(f->rel), &st->fold, listed_change, &l))
 	{
 		f->reason = PROLLY_FULL_STORAGE_UNSEEN;

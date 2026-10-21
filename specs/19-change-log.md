@@ -243,6 +243,34 @@ Two interfaces, each selected by the table AM's profile
   Baselines are local: none of this reaches a commit's root. (A column
   of a domain with a constraint added is a rewrite Postgres makes to
   check it, still read in full.)
+
+  DDL that changes rows' bytes without writing them (a column added with
+  a default, which rows from before read as its missing value; a column
+  dropped) maps the baseline instead (`prolly_fold_map()`,
+  `prolly_fold.c`): its tree is streamed, each row read as it was folded
+  (the keying's `open_shape()`: the table's columns then, each with its
+  type then, decoded by the layout then, which skips columns dropped
+  since), given the columns now (a column added since gets its missing
+  value, or NULL), encoded and keyed as now and built; a keyless table's
+  rows, whose keys are their bytes, are sorted again (in
+  `maintenance_work_mem`, spilling past it, as a full fold's), rows
+  that became alike merged with their counts summed. Long values pass as
+  the trees they are (hash pointers, unread). The mapped tree is the
+  baseline the finder folds from, as if the last fold had been made
+  under the shape now: the log's images read by the descriptor now as
+  Postgres reads the heap's (a missing value filled in, a dropped
+  column skipped), so the candidates and copies are what they were. No
+  heap page is read and, for a keyed table, nothing sorted; it is
+  counted in `pg_stat_prolly` (`fold_mapped_tables`). The bytes are what
+  the rows encode to now: never a "lazy default" that would make them
+  depend on the DDL's history. It isn't mapped, and the table is read in
+  full, when a type changed, the key changed (keys come out in another
+  order), a type a column had is defined otherwise now (a label renamed),
+  the encoders changed, a full fold is forced, or the log says to read
+  the table in full anyway (a rewrite that changed rows: a volatile
+  default). The finder "pages" folds from a mapped baseline too, unless
+  its state carries keys, which are rows of the old shape
+  (`reshaped`).
 - **A verifier** (`fold_verify.c`, #513) folds tables from their
   baselines and in full by one snapshot, at `prolly.fold_verify_rate` in
   autovacuum or by `dolt_verify_folds()`: a mismatch is warned of,

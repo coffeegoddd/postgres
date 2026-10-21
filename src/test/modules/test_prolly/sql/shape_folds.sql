@@ -1,8 +1,9 @@
 -- DDL that changes a table's row shape but no row's bytes (a column added
--- without a default, an enum's label added) keeps its baseline: the next
--- commit folds from it, reading no table in full, and makes the tree a
--- full fold would (debug_prolly_force_full_fold).  DDL that changes rows'
--- bytes still reads them all.
+-- without a default, an enum's label added) keeps its baseline; DDL that
+-- changes rows' bytes without writing them (a column added with a
+-- default, one dropped) maps the baseline's rows to the shape now.  Either
+-- way the next commit reads no table in full, and makes the tree a full
+-- fold would (debug_prolly_force_full_fold).
 CREATE DATABASE regress_shape_folds;
 \c regress_shape_folds
 CREATE EXTENSION test_prolly;
@@ -23,8 +24,8 @@ BEGIN
 	RETURN inc = full_root;
 END $$;
 -- (the incremental root is the full one's; committed, the reasons any
--- table was read in full)
-\set check 'SELECT same_as_full() AS same; SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly''); SELECT length(dolt_commit(''-Am'', ''ddl'')::text) > 0 AS committed; SELECT pg_stat_force_next_flush(); SELECT full_folds() AS read_in_full; SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;'
+-- table was read in full, and how many baselines were mapped)
+\set check 'SELECT same_as_full() AS same; SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly''); SELECT length(dolt_commit(''-Am'', ''ddl'')::text) > 0 AS committed; SELECT pg_stat_force_next_flush(); SELECT full_folds() AS read_in_full, (SELECT value FROM pg_stat_prolly WHERE name = ''fold_mapped_tables'') AS mapped; SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;'
 CREATE SCHEMA sf VERSIONED;
 CREATE TYPE sf.mood AS ENUM ('sad', 'ok', 'glad');
 CREATE DOMAIN sf.small AS int;
@@ -121,29 +122,89 @@ ALTER TYPE sf.pair DROP ATTRIBUTE n;
 :check
 SELECT id, p FROM sf.comp ORDER BY id;
 
--- a label renamed: rows hold its name, so it changes theirs
+-- a label renamed: rows hold its name, so it changes theirs, and the
+-- baseline's can't be read by the type now
 ALTER TYPE sf.mood RENAME VALUE 'glad' TO 'happy';
 :check
 
--- a column added with a default: in every row's bytes
+-- DDL that changes rows' bytes without writing them is mapped: the
+-- baseline's rows read as they were folded and encoded as the table's are
+-- now, not read from the table.  A column added with a default is in every
+-- row's bytes.
 ALTER TABLE sf.t ADD COLUMN h int DEFAULT 5;
 :check
+-- (with rows written in its transaction, and a default out of line)
+BEGIN;
+ALTER TABLE sf.t ADD COLUMN big text DEFAULT repeat('x', 3000);
+UPDATE sf.t SET h = 6, big = 'short' WHERE id <= 10;
+INSERT INTO sf.t (id, a, b) VALUES (6001, 2, 'later');
+DELETE FROM sf.t WHERE id BETWEEN 11 AND 20;
+COMMIT;
+:check
+-- (an enum's, by a table an enum keys)
+ALTER TABLE sf.e ADD COLUMN mood sf.mood DEFAULT 'ok';
+:check
 
--- dropped: gone from every row's bytes; and one added in its place, which
--- every row has as NULL
+-- dropped: gone from every row's bytes
 ALTER TABLE sf.t DROP COLUMN h;
 :check
+-- (and one added in its place in the same transaction, with a default)
+BEGIN;
 ALTER TABLE sf.t DROP COLUMN c;
-ALTER TABLE sf.t ADD COLUMN c int;
+ALTER TABLE sf.t ADD COLUMN c int DEFAULT 1;
+UPDATE sf.t SET c = 2 WHERE id = 21;
+COMMIT;
+:check
+
+-- rolled back: the shape the baseline was folded under
+BEGIN;
+ALTER TABLE sf.t ADD COLUMN r int DEFAULT 3;
+ALTER TABLE sf.t DROP COLUMN b;
+ROLLBACK;
+UPDATE sf.t SET b = 'again' WHERE id = 30;
+:check
+
+-- keyless: a row's key is its bytes, so mapped rows are sorted again, and
+-- rows that differed only in a column dropped become one row, counted
+SELECT count(DISTINCT (a, b, c)) AS rows_before, count(DISTINCT a) AS rows_after FROM sf.k;
+ALTER TABLE sf.k DROP COLUMN b;
+:check
+ALTER TABLE sf.k ADD COLUMN m int DEFAULT 9;
+DELETE FROM sf.k WHERE a = 1;
+:check
+
+-- values stored out of line: their trees are the rows', unread
+ALTER TABLE sf.long ADD COLUMN x int DEFAULT 1;
+:check
+ALTER TABLE sf.long DROP COLUMN w;
+:check
+ALTER TABLE sf.long DROP COLUMN v;
 :check
 
 -- a rewrite that changes no row clears a default's missing value: the
 -- rows already hold it
-ALTER TABLE sf.k ADD COLUMN m int DEFAULT 9;
-:check
 VACUUM FULL sf.k;
-INSERT INTO sf.k VALUES (2, 'k2');
+INSERT INTO sf.k VALUES (2, 3);
 :check
+
+-- a volatile default rewrites the table, which its log says to read in
+-- full: not mapped
+ALTER TABLE sf.t ADD COLUMN rnd float8 DEFAULT random();
+:check
+
+-- the change finder "pages" folds from a mapped baseline too
+SET debug_prolly_change_finder = pages;
+CREATE TABLE sf.p (id int PRIMARY KEY, a int, b text);
+INSERT INTO sf.p SELECT g, g, 'p' || g FROM generate_series(1, 500) g;
+SELECT length(dolt_commit('-Am', 'pages')::text) > 0 AS committed;
+UPDATE sf.p SET a = 0 WHERE id = 1;
+SELECT length(dolt_commit('-am', 'pages again')::text) > 0 AS committed;
+ALTER TABLE sf.p ADD COLUMN d int DEFAULT 4;
+ALTER TABLE sf.p DROP COLUMN a;
+UPDATE sf.p SET d = 5 WHERE id = 2;
+:check
+RESET debug_prolly_change_finder;
+
 
 \c contrib_regression
 DROP DATABASE regress_shape_folds;

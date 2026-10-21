@@ -430,6 +430,61 @@ keying_row_shapes_body(const ProllyImplInfo *impl)
 		elog(ERROR, "a column dropped extends the row shape");
 }
 
+/*
+ * open_shape() reads rows folded under an earlier row shape, in the
+ * columns the table had then: a row from before a column was dropped and
+ * another added decodes as it was, the dropped column skipped and the
+ * added one dropped in its descriptor.  Bytes that are no shape aren't
+ * read.
+ */
+static void
+keying_old_shapes_body(const ProllyImplInfo *impl)
+{
+	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
+	Relation	rel = make_table("conf_old_shape", "id int PRIMARY KEY, t text, n int");
+	Oid			relid = RelationGetRelid(rel);
+	ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
+	EncodedRow	er;
+	StringInfo	s0;
+	ProllyValue shape;
+	ProllyValue row;
+	ProllyValue junk = {(const uint8 *) "junk", 4};
+	TupleDesc	desc;
+	TupleTableSlot *slot;
+
+	encode(kr, k, rel, 42, "gone", 7, &er);
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+	s0 = shape_of(kr, relid);
+	run_sql("ALTER TABLE " KEYING_SCHEMA ".conf_old_shape DROP COLUMN t");
+	run_sql("ALTER TABLE " KEYING_SCHEMA ".conf_old_shape ADD COLUMN d int DEFAULT 5");
+
+	rel = table_open(relid, AccessShareLock);
+	if (PROLLY_CALL(kr, open_shape, rel, &junk, CurrentMemoryContext, &desc) != NULL)
+		elog(ERROR, "open_shape() reads bytes that are no row shape");
+	shape.data = (const uint8 *) s0->data;
+	shape.len = s0->len;
+	k = PROLLY_CALL(kr, open_shape, rel, &shape, CurrentMemoryContext, &desc);
+	if (k == NULL)
+		elog(ERROR, "open_shape() doesn't read rows from before a column was dropped");
+	if (desc->natts != 4 || TupleDescAttr(desc, 0)->attisdropped ||
+		!TupleDescAttr(desc, 1)->attisdropped ||
+		TupleDescAttr(desc, 2)->attisdropped ||
+		!TupleDescAttr(desc, 3)->attisdropped)
+		elog(ERROR, "open_shape()'s descriptor isn't the table's columns then");
+	row.data = (const uint8 *) er.row.data;
+	row.len = er.row.len;
+	slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	PROLLY_CALL(kr, decode_row, k, &row, slot);
+	slot_getallattrs(slot);
+	if (slot->tts_isnull[0] || DatumGetInt32(slot->tts_values[0]) != 42 ||
+		slot->tts_isnull[2] || DatumGetInt32(slot->tts_values[2]) != 7)
+		elog(ERROR, "open_shape() misreads a row from before a column was dropped");
+	ExecDropSingleTupleTableSlot(slot);
+	PROLLY_CALL(kr, close, k);
+	table_close(rel, AccessShareLock);
+}
+
 /* ------------------------------------------------------------------------
  * Value encoder: rows from earlier layouts
  * ------------------------------------------------------------------------
@@ -545,6 +600,12 @@ void
 keying_row_shapes(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_row_shapes_body, impl);
+}
+
+void
+keying_old_shapes(const ProllyImplInfo *impl)
+{
+	rolled_back(keying_old_shapes_body, impl);
 }
 
 void

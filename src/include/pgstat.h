@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCE9
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCEA
 
 typedef struct PgStat_ArchiverStats
 {
@@ -625,6 +625,8 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_FULL_FORCED,
 	PGSTAT_PROLLY_FOLD_FULL_VERIFY,
 	PGSTAT_PROLLY_FOLD_FULL_SPILLED,	/* full folds whose sort spilled to disk */
+	PGSTAT_PROLLY_FOLD_MAPPED,	/* tables whose baseline was mapped to a
+								 * new shape, not read in full */
 	PGSTAT_PROLLY_FOLD_MERGE_BUILDS,	/* folds that merged many changes with
 										 * the baseline in one pass */
 	PGSTAT_PROLLY_LOG_PAGES_READ,	/* change-log rows read (each a
