@@ -388,8 +388,10 @@ SELECT dolt_branch('-D', 'cl_other');
 -- An update's or a delete's entry is made from the old version the write
 -- has in hand, not read again from its page: a one-row update and a
 -- one-row delete touch the table's pages five times (seven, read again).
+-- Autovacuum is off: an autoanalyze reading the table would count too.
 CREATE SCHEMA clt VERSIONED;
-CREATE TABLE clt.touch (id int PRIMARY KEY, v text);
+CREATE TABLE clt.touch (id int PRIMARY KEY, v text)
+	WITH (autovacuum_enabled = off);
 INSERT INTO clt.touch SELECT g, 'v' FROM generate_series(1, 100) g;
 SELECT pg_stat_force_next_flush();
  pg_stat_force_next_flush 
