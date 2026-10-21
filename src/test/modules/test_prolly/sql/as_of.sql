@@ -85,5 +85,38 @@ SELECT pg_temp.estimate('EXECUTE at_ref(''HEAD~1'')') AS custom;
 RESET plan_cache_mode;
 DEALLOCATE at_ref;
 
+-- a count is history too: a role dolt_at refuses (row security applies to
+-- it, or it lacks SELECT) is estimated the default, not the commit's count
+CREATE TABLE ao.secret (id int PRIMARY KEY);
+INSERT INTO ao.secret SELECT generate_series(1, 60);
+SELECT length(dolt_commit('-Am', 'private rows')::text) AS committed;
+CREATE ROLE regress_as_of_rls;
+CREATE ROLE regress_as_of_no_select;
+GRANT USAGE ON SCHEMA ao TO regress_as_of_rls, regress_as_of_no_select;
+GRANT SELECT ON ao.secret TO regress_as_of_rls;
+ALTER TABLE ao.secret ENABLE ROW LEVEL SECURITY;
+CREATE POLICY only_one ON ao.secret TO regress_as_of_rls USING (id = 1);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS owner;
+SET ROLE regress_as_of_rls;
+SELECT count(*) FROM ao.secret;
+SELECT count(*) FROM dolt_at('HEAD', NULL::ao.secret);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS rls;
+SET ROLE regress_as_of_no_select;
+SELECT count(*) FROM dolt_at('HEAD', NULL::ao.secret);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS no_select;
+RESET ROLE;
+-- a plan kept by the owner isn't used for another role: it's planned again
+PREPARE at_secret AS SELECT * FROM dolt_at('HEAD', NULL::ao.secret);
+SET plan_cache_mode = force_generic_plan;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS owner_plan;
+SET ROLE regress_as_of_rls;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS rls_plan;
+RESET ROLE;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS owner_again;
+RESET plan_cache_mode;
+DEALLOCATE at_secret;
+
 \c contrib_regression
 DROP DATABASE regress_as_of;
+DROP ROLE regress_as_of_rls;
+DROP ROLE regress_as_of_no_select;

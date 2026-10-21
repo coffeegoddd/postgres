@@ -202,5 +202,81 @@ SELECT pg_temp.estimate('EXECUTE at_ref(''HEAD~1'')') AS custom;
 
 RESET plan_cache_mode;
 DEALLOCATE at_ref;
+-- a count is history too: a role dolt_at refuses (row security applies to
+-- it, or it lacks SELECT) is estimated the default, not the commit's count
+CREATE TABLE ao.secret (id int PRIMARY KEY);
+INSERT INTO ao.secret SELECT generate_series(1, 60);
+SELECT length(dolt_commit('-Am', 'private rows')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE ROLE regress_as_of_rls;
+CREATE ROLE regress_as_of_no_select;
+GRANT USAGE ON SCHEMA ao TO regress_as_of_rls, regress_as_of_no_select;
+GRANT SELECT ON ao.secret TO regress_as_of_rls;
+ALTER TABLE ao.secret ENABLE ROW LEVEL SECURITY;
+CREATE POLICY only_one ON ao.secret TO regress_as_of_rls USING (id = 1);
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS owner;
+ owner 
+-------
+    60
+(1 row)
+
+SET ROLE regress_as_of_rls;
+SELECT count(*) FROM ao.secret;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM dolt_at('HEAD', NULL::ao.secret);
+ERROR:  dolt_at can't read "secret": row security applies to you
+DETAIL:  Other commits' rows aren't filtered by its policies.
+HINT:  The table's owner, or a role that bypasses row security, can read them.
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS rls;
+ rls  
+------
+ 1000
+(1 row)
+
+SET ROLE regress_as_of_no_select;
+SELECT count(*) FROM dolt_at('HEAD', NULL::ao.secret);
+ERROR:  permission denied for table secret
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.secret)$q$) AS no_select;
+ no_select 
+-----------
+      1000
+(1 row)
+
+RESET ROLE;
+-- a plan kept by the owner isn't used for another role: it's planned again
+PREPARE at_secret AS SELECT * FROM dolt_at('HEAD', NULL::ao.secret);
+SET plan_cache_mode = force_generic_plan;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS owner_plan;
+ owner_plan 
+------------
+         60
+(1 row)
+
+SET ROLE regress_as_of_rls;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS rls_plan;
+ rls_plan 
+----------
+     1000
+(1 row)
+
+RESET ROLE;
+SELECT pg_temp.estimate('EXECUTE at_secret') AS owner_again;
+ owner_again 
+-------------
+          60
+(1 row)
+
+RESET plan_cache_mode;
+DEALLOCATE at_secret;
 \c contrib_regression
 DROP DATABASE regress_as_of;
+DROP ROLE regress_as_of_rls;
+DROP ROLE regress_as_of_no_select;

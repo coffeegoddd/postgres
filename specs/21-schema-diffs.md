@@ -312,7 +312,10 @@ Decided by the user 2026-10-19, as recommended:
   the tree's root node read, no rows), for a ref constant by planning;
   WORKING, a ref not known then, or a commit without the table keep
   `prorows`' 1000. Only the estimate comes from the ref: a kept plan reads
-  what the ref names when it runs.
+  what the ref names when it runs. A count is history too: a role
+  `dolt_at` would refuse (no SELECT on the table, or row security applying
+  to it) gets the 1000, the tree unread, and such a plan depends on the
+  role, so a plan kept for one role is planned again for another.
 - **Not built:** a CustomScan over `dolt_at` seeking the tree by primary
   key quals (O(log N + k) nodes), reporting pathkeys for keys whose order
   doesn't depend on a collation (#495's second stage). The cache of

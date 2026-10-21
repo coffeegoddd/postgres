@@ -57,6 +57,7 @@
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
@@ -4511,20 +4512,67 @@ rows_datum(Rows *r, const ProllyValue *value, uint64 *count)
 }
 
 /*
- * History holds every row whatever a table's policies say: a reader of it
- * whom row security applies to is refused, rather than shown rows the
- * policies hide.
+ * Whether the user may read relid's history, or what refuses them: they
+ * need mode on the table, and row security mustn't apply to them, as
+ * history holds every row whatever the table's policies say.  noError as
+ * check_enable_rls() takes it.  Asked before a commit's rows are read,
+ * and before the planner estimates them from a commit's tree.
  */
+typedef enum HistoryAccess
+{
+	HISTORY_READABLE,
+	HISTORY_NO_PRIVILEGE,
+	HISTORY_ROW_SECURITY,
+} HistoryAccess;
+
+static HistoryAccess
+history_access(Oid relid, AclMode mode, bool noError)
+{
+	if (pg_class_aclcheck(relid, GetUserId(), mode) != ACLCHECK_OK)
+		return HISTORY_NO_PRIVILEGE;
+	if (check_enable_rls(relid, InvalidOid, noError) == RLS_ENABLED)
+		return HISTORY_ROW_SECURITY;
+	return HISTORY_READABLE;
+}
+
+/*
+ * A reader of history whom row security applies to is refused, rather
+ * than shown rows the policies hide.
+ */
+static void
+history_rls_error(Oid relid, const char *fn)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("%s can't read \"%s\": row security applies to you",
+					fn, get_rel_name(relid)),
+			 errdetail("Other commits' rows aren't filtered by its policies."),
+			 errhint("The table's owner, or a role that bypasses row security, can read them.")));
+}
+
+/* row security's refusal of history, as an error */
 static void
 check_history_rls(Oid relid, const char *fn)
 {
 	if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("%s can't read \"%s\": row security applies to you",
-						fn, get_rel_name(relid)),
-				 errdetail("Other commits' rows aren't filtered by its policies."),
-				 errhint("The table's owner, or a role that bypasses row security, can read them.")));
+		history_rls_error(relid, fn);
+}
+
+/* history_access(), its refusals as errors */
+static void
+check_history_access(Oid relid, const char *fn, AclMode mode)
+{
+	switch (history_access(relid, mode, false))
+	{
+		case HISTORY_READABLE:
+			break;
+		case HISTORY_NO_PRIVILEGE:
+			aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(relid));
+			break;
+		case HISTORY_ROW_SECURITY:
+			history_rls_error(relid, fn);
+			break;
+	}
 }
 
 /*
@@ -4535,16 +4583,12 @@ static Relation
 open_row_type_table(Oid relid, const char *fn, AclMode mode)
 {
 	Relation	rel;
-	AclResult	aclresult;
 
 	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("%s needs a table's row type, as in NULL::tablename", fn)));
-	aclresult = pg_class_aclcheck(relid, GetUserId(), mode);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
-	check_history_rls(relid, fn);
+	check_history_access(relid, fn, mode);
 	rel = table_open(relid, AccessShareLock);
 	if (rel->rd_rel->relam != PROLLY_TABLE_AM_OID)
 		ereport(ERROR,
@@ -4875,6 +4919,11 @@ dolt_at(PG_FUNCTION_ARGS)
  * value too, in a custom plan); else the planner's default.  Only an
  * estimate is taken from the ref, never the commit it resolved to: a
  * plan kept for later reads whatever the ref names when it runs.
+ *
+ * A count is history too: a user dolt_at would refuse (no SELECT on the
+ * table, or row security applying to them) gets the default, the tree
+ * unread.  The estimate then depends on the role, so the plan is marked
+ * so, and a plan kept for one role isn't used by another.
  */
 Datum
 dolt_at_support(PG_FUNCTION_ARGS)
@@ -4896,13 +4945,17 @@ dolt_at_support(PG_FUNCTION_ARGS)
 			double		rows;
 
 			if (IsA(ref, Const) && !((Const *) ref)->constisnull &&
-				OidIsValid(relid) &&
-				PROLLY_CALL(diff_merge(), row_count,
-							TextDatumGetCString(((Const *) ref)->constvalue),
-							relid, &rows))
+				OidIsValid(relid))
 			{
-				req->rows = rows;
-				ret = (Node *) req;
+				req->root->glob->dependsOnRole = true;
+				if (history_access(relid, ACL_SELECT, true) == HISTORY_READABLE &&
+					PROLLY_CALL(diff_merge(), row_count,
+								TextDatumGetCString(((Const *) ref)->constvalue),
+								relid, &rows))
+				{
+					req->rows = rows;
+					ret = (Node *) req;
+				}
 			}
 		}
 	}
@@ -5512,9 +5565,7 @@ dolt_constraint_violations(PG_FUNCTION_ARGS)
 	ListCell   *lc;
 
 	InitMaterializedSRF(fcinfo, 0);
-	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
-		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(relid));
-	check_history_rls(relid, "dolt_constraint_violations");
+	check_history_access(relid, "dolt_constraint_violations", ACL_SELECT);
 	foreach(lc, PROLLY_CALL(refs(), violations))
 	{
 		ProllyViolation *pv = lfirst(lc);
