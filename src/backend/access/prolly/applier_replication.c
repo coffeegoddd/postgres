@@ -82,6 +82,10 @@ struct ProllyApplier
 	bool		immediate;		/* each write's rechecks fired as it ends */
 	bool		loading;		/* rows written without index entries,
 								 * the indexes built after (load_end()) */
+	bool		failed;			/* a load's end raised: unusable */
+	int			load_level;		/* the nest level of the transaction
+								 * loading */
+	ResourceOwner owner;		/* begin()'s: the indexes open under it */
 	BulkInsertState bistate;	/* insert_many()'s (no pin held between) */
 	/* without a key or match_index: its rows by the hash of their values */
 	HTAB	   *rows;
@@ -413,6 +417,7 @@ replication_begin(Relation rel)
 		lappend(a->estate->es_opened_result_relations, a->rri);
 	a->estate->es_output_cid = GetCurrentCommandId(true);
 	ExecOpenIndices(a->rri, false);
+	a->owner = CurrentResourceOwner;
 	EvalPlanQualInit(&a->epq, a->estate, NULL, NIL, -1, NIL);
 	a->found = table_slot_create(rel, &a->estate->es_tupleTable);
 
@@ -666,6 +671,24 @@ loads(ProllyApplier *a, int n)
 }
 
 /*
+ * A load whose end raised leaves the applier with the rows loaded and no
+ * index entries for them: its indexes closed if the build raised, and a
+ * subtransaction rolled back gives them back their storage from before
+ * it, which has none.  A write after it would make no index entries, or
+ * find no row by an index.  So none is made: the load's failure ends the
+ * applier, but for end().
+ */
+static void
+check_usable(ProllyApplier *a)
+{
+	if (a->failed)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot apply rows to relation \"%s\" after its load failed",
+						RelationGetRelationName(a->rel))));
+}
+
+/*
  * The load's end: every index built over the rows written, its unique and
  * exclusion constraints checked as it is (a row breaking one is refused
  * here), and the primary key's not checking the rows' keys' length (see
@@ -678,11 +701,29 @@ load_end(ProllyApplier *a)
 {
 	ReindexParams params = {0};
 	bool		held;
+	ResourceOwner owner = CurrentResourceOwner;
 
+	check_usable(a);
 	if (!a->loading)
 		return;
 	a->loading = false;
+	/* (until the indexes are built and open again: see check_usable()) */
+	a->failed = true;
+
+	/*
+	 * Not in a subtransaction begun since the load: rolled back, it would
+	 * give the indexes back their storage from before the build, under
+	 * rows it doesn't take away.
+	 */
+	if (GetCurrentTransactionNestLevel() > a->load_level)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot finish loading relation \"%s\" in another subtransaction",
+						RelationGetRelationName(a->rel))));
+	/* (closed and opened again under begin()'s owner, which holds them) */
+	CurrentResourceOwner = a->owner;
 	ExecCloseIndices(a->rri);
+	CurrentResourceOwner = owner;
 	a->rri->ri_NumIndices = 0;
 	a->rri->ri_IndexRelationDescs = NULL;
 	a->rri->ri_IndexRelationInfo = NULL;
@@ -698,7 +739,10 @@ load_end(ProllyApplier *a)
 		prolly_writing_held_rows(held);
 	}
 	PG_END_TRY();
+	CurrentResourceOwner = a->owner;
 	ExecOpenIndices(a->rri, false);
+	CurrentResourceOwner = owner;
+	a->failed = false;
 	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_LOADS, 1);
 }
 
@@ -752,6 +796,7 @@ replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
 	MemoryContext cxt;
 	bool		held;
 
+	check_usable(a);
 	if (n <= 0)
 		return;
 	if (a->matview || a->immediate)
@@ -762,7 +807,10 @@ replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
 		return;
 	}
 	if (!a->loading && loads(a, n))
+	{
 		a->loading = true;
+		a->load_level = GetCurrentTransactionNestLevel();
+	}
 	if (a->bistate == NULL)
 		a->bistate = GetBulkInsertState();
 	CheckCmdReplicaIdentity(rel, CMD_INSERT);
@@ -957,7 +1005,8 @@ replication_immediate(ProllyApplier *a)
 static void
 replication_end(ProllyApplier *a)
 {
-	load_end(a);
+	if (!a->failed)
+		load_end(a);
 	if (a->bistate)
 		FreeBulkInsertState(a->bistate);
 	AfterTriggerEndQuery(a->estate);

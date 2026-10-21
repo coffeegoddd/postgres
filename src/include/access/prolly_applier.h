@@ -43,7 +43,10 @@
  *   transaction (no other sees it), without index entries until the next
  *   write of another kind or end(), then build its indexes over the rows
  *   (#490): a row breaking a unique or exclusion constraint is then
- *   refused there, not as it is written.
+ *   refused there, not as it is written.  That build is refused in a
+ *   subtransaction begun since the rows were written (rolled back, it
+ *   would leave them unindexed).  A load's failure ends the applier, even
+ *   if the caller catches it: every later write but end() raises an error.
  *
  * Provisional (v0).
  *

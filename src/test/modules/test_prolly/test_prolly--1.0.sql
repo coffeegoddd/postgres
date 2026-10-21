@@ -334,6 +334,13 @@ CREATE FUNCTION test_apply(op text, old anyelement, new anyelement)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- The row applier given rows to insert together (nested: in the first
+-- subtransaction), then the first again twice, each in a subtransaction:
+-- the errors caught, or "written".
+CREATE FUNCTION test_apply_failed_load(rows anyarray, nested bool)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Add a chunk to a remote under the hash given, whatever its bytes hash to.
 CREATE FUNCTION test_remote_put(url text, hash text, data bytea)
 RETURNS void
