@@ -823,19 +823,10 @@ folded_summary(const char *from_ref, const char *to_ref, bool definitions,
  * ------------------------------------------------------------------------
  */
 
-/* One row changed, copied out of the trees. */
-typedef struct Change
-{
-	ProllyDiffKind kind;
-	StringInfoData key;
-	StringInfoData before;		/* empty: none */
-	StringInfoData after;		/* empty: none */
-} Change;
-
+/* A table's keying, for its rows' order and values. */
 typedef struct Changes
 {
-	RowDiff		rd;				/* (for the keying's order) */
-	List	   *list;
+	RowDiff		rd;
 } Changes;
 
 static int
@@ -883,75 +874,6 @@ copy_bytes(StringInfo s, const uint8 *data, int len)
 	s->len = len;
 	s->maxlen = len + 1;
 	s->cursor = 0;
-}
-
-static void
-collect_change(ProllyDiffKind kind, const ProllyKey *key,
-			   const ProllyValue *before, const ProllyValue *after, void *arg)
-{
-	Changes    *c = arg;
-	Change	   *ch = palloc0(sizeof(Change));
-
-	ch->kind = kind;
-	copy_bytes(&ch->key, key->data, key->len);
-	copy_bytes(&ch->before, before ? before->data : NULL, before ? before->len : 0);
-	copy_bytes(&ch->after, after ? after->data : NULL, after ? after->len : 0);
-	c->list = lappend(c->list, ch);
-}
-
-/*
- * changes (a side's, from base) with a change made up for each of base's
- * unsure rows it hasn't one for (the side has the row as base has it,
- * which only the cast says), so that a row both sides have is walked as
- * changed on both, its unsure columns merged as changed on both.
- */
-static List *
-with_unsure_rows(Changes *changes, const UnsureRows *unsure,
-				 const ProllyTreeRoutine *tree, ProllyTreeEnv *env,
-				 const Table *base)
-{
-	List	   *out = NIL;
-	ListCell   *lc = list_head(changes->list);
-	int			i = 0;
-
-	while (lc || i < unsure->n)
-	{
-		Change	   *ch = lc ? lfirst(lc) : NULL;
-		int			r;
-
-		if (ch == NULL)
-			r = -1;
-		else if (i == unsure->n)
-			r = 1;
-		else
-		{
-			ProllyKey	ck = {(const uint8 *) ch->key.data, ch->key.len};
-
-			r = changes_compare(&unsure->rows[i]->key, &ck, changes);
-		}
-		if (r < 0)
-		{
-			Change	   *made = palloc0(sizeof(Change));
-			StringInfoData row;
-
-			initStringInfo(&row);
-			if (!PROLLY_CALL(tree, get, env, &base->data, &unsure->rows[i]->key, &row))
-				elog(ERROR, "an unsure row of a merge's base is missing from it");
-			made->kind = PROLLY_DIFF_MODIFIED;
-			copy_bytes(&made->key, unsure->rows[i]->key.data, unsure->rows[i]->key.len);
-			copy_bytes(&made->before, (const uint8 *) row.data, row.len);
-			copy_bytes(&made->after, (const uint8 *) row.data, row.len);
-			pfree(row.data);
-			out = lappend(out, made);
-			i++;
-			continue;
-		}
-		if (r == 0)
-			i++;
-		out = lappend(out, ch);
-		lc = lnext(changes->list, lc);
-	}
-	return out;
 }
 
 /* A tree value's row into slot; returns how many copies it stands for. */
@@ -2465,15 +2387,19 @@ typedef enum KeyRank
 	KEY_PINNED					/* old left in place, then updated to row */
 } KeyRank;
 
-/* What a merge writes for one key: copies of a row removed, then added. */
+/*
+ * What a merge writes for one key: copies of a row removed, then added.
+ * Walked, it is the walk's while it's visited; ranked up, a copy is held.
+ */
 typedef struct KeyWrite
 {
+	ProllyKey	key;
 	const StringInfoData *old;	/* the row removed, nold times */
 	int64		nold;
 	const StringInfoData *row;	/* the row inserted, nrow times */
 	int64		nrow;
 	bool		in_place;		/* or old updated to row */
-	KeyRank		rank;
+	KeyRank		rank;			/* (a copy held's) */
 	/* (in a pass:) */
 	bool		refused;		/* row refused, old in its place */
 	ProllyViolation *violation; /* as recorded */
@@ -2481,10 +2407,11 @@ typedef struct KeyWrite
 
 /*
  * Each column's length coercion (as INSERT applies its typmod), for
- * checking the rows a resolution writes.
+ * checking the rows a resolution writes, made in cxt.
  */
 typedef struct FitCheck
 {
+	MemoryContext cxt;
 	EState	   *estate;
 	ExprState **coerce;			/* per column, or NULL: none */
 } FitCheck;
@@ -2504,6 +2431,8 @@ check_fits(FitCheck *fc, Relation rel, TupleTableSlot *row, const bool *kept)
 
 	if (fc->estate == NULL)
 	{
+		MemoryContext old = MemoryContextSwitchTo(fc->cxt);
+
 		fc->estate = CreateExecutorState();
 		fc->coerce = palloc0_array(ExprState *, desc->natts);
 		for (int i = 0; i < desc->natts; i++)
@@ -2524,6 +2453,7 @@ check_fits(FitCheck *fc, Relation rel, TupleTableSlot *row, const bool *kept)
 			assign_expr_collations(NULL, e);
 			fc->coerce[i] = ExecPrepareExpr((Expr *) e, fc->estate);
 		}
+		MemoryContextSwitchTo(old);
 	}
 	econtext = GetPerTupleExprContext(fc->estate);
 	slot_getallattrs(row);
@@ -2548,9 +2478,20 @@ check_fits(FitCheck *fc, Relation rel, TupleTableSlot *row, const bool *kept)
 	ResetExprContext(econtext);
 }
 
-/* How write_keys() writes a table's KeyWrites. */
-typedef struct KeyWriter
+typedef struct KeyWriter KeyWriter;
+typedef void (*KeyWriteVisit) (KeyWriter *kw, KeyWrite *w);
+
+/*
+ * How write_keys() writes a table's KeyWrites.  They aren't held: each()
+ * walks them, in key order, to visit, a pass each time.  Only those
+ * ranked up (a put-back refused) are held, copies in ranked, in key
+ * order; and while one is pinned, those refused in a pass, for trying
+ * again.
+ */
+struct KeyWriter
 {
+	void		(*each) (KeyWriter *kw, KeyWriteVisit visit);
+	void	   *each_arg;
 	Changes    *c;				/* (the table's keying) */
 	Relation	rel;
 	const ProllyApplierRoutine *ar;
@@ -2564,7 +2505,17 @@ typedef struct KeyWriter
 	bool		keyless;
 	bool		removed_rows;	/* refuse_keyless_violations()'s */
 	RowsFrom	from;			/* row_missing()'s */
-} KeyWriter;
+	FitCheck   *fits;			/* (taking theirs) */
+	/* (write_keys()'s:) */
+	MemoryContext cxt;			/* ranked's */
+	MemoryContext pass_cxt;		/* refused's, a pass's */
+	List	   *ranked;			/* KeyWrite *, held */
+	ListCell   *next_ranked;	/* (ranked_write()'s, in a pass) */
+	List	   *newly_ranked;	/* KeyWrite *, ranked up in a pass */
+	bool		pinning;		/* a row is pinned in this pass */
+	bool		written;		/* no put-back refused in this pass */
+	List	   *refused;		/* KeyWrite *, while pinning */
+};
 
 /* Three versions of a row decoded, for merging it column by column. */
 typedef struct CellMerge
@@ -2719,8 +2670,194 @@ retry_key(KeyWriter *kw, KeyWrite *w)
 }
 
 /*
- * Write writes (KeyWrite *): the rows going first, then those coming, so a
- * row may take a unique value another gives up (theirs swapping two, say).
+ * A copy of w, its key and rows too, in cxt (ranked up, or refused while
+ * a row is pinned: held past the walk that visited it).
+ */
+static KeyWrite *
+copy_write(const KeyWrite *w, MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	KeyWrite   *copy = palloc(sizeof(KeyWrite));
+	uint8	   *key = palloc(Max(w->key.len, 1));
+
+	*copy = *w;
+	memcpy(key, w->key.data, w->key.len);
+	copy->key.data = key;
+	if (w->old)
+	{
+		StringInfo	s = palloc(sizeof(StringInfoData));
+
+		copy_bytes(s, (const uint8 *) w->old->data, w->old->len);
+		copy->old = s;
+	}
+	if (w->row)
+	{
+		StringInfo	s = palloc(sizeof(StringInfoData));
+
+		copy_bytes(s, (const uint8 *) w->row->data, w->row->len);
+		copy->row = s;
+	}
+	MemoryContextSwitchTo(old);
+	return copy;
+}
+
+static int
+write_key_cmp(const void *a, const void *b, void *arg)
+{
+	const KeyWrite *x = lfirst((const ListCell *) a);
+	const KeyWrite *y = lfirst((const ListCell *) b);
+
+	return changes_compare(&x->key, &y->key, arg);
+}
+
+/* Sort writes (KeyWrite *) into key order. */
+static void
+sort_writes(List *writes, Changes *c)
+{
+	if (list_length(writes) > 1)
+		qsort_arg(writes->elements, list_length(writes), sizeof(ListCell),
+				  write_key_cmp, c);
+}
+
+/*
+ * The copy held of w's key ranked up (kw->ranked), if any.  A pass asks
+ * in key order, from the start of ranked.
+ */
+static KeyWrite *
+ranked_write(KeyWriter *kw, const KeyWrite *w)
+{
+	while (kw->next_ranked)
+	{
+		KeyWrite   *r = lfirst(kw->next_ranked);
+		int			c = changes_compare(&r->key, &w->key, kw->c);
+
+		if (c > 0)
+			return NULL;
+		kw->next_ranked = lnext(kw->ranked, kw->next_ranked);
+		if (c == 0)
+			return r;
+	}
+	return NULL;
+}
+
+/* w refused (and not put back), held for trying again while pinning. */
+static void
+note_refused(KeyWriter *kw, KeyWrite *w, bool held)
+{
+	MemoryContext old;
+
+	if (!kw->pinning)
+		return;
+	if (!held)
+		w = copy_write(w, kw->pass_cxt);
+	old = MemoryContextSwitchTo(kw->pass_cxt);
+	kw->refused = lappend(kw->refused, w);
+	MemoryContextSwitchTo(old);
+}
+
+/* A pass's removals: the rows going, but those pinned. */
+static void
+remove_rows(KeyWriter *kw, KeyWrite *w)
+{
+	KeyWrite   *held;
+
+	if (w->nold == 0 || w->in_place)
+		return;
+	held = ranked_write(kw, w);
+	if (held && held->rank == KEY_PINNED)
+		return;
+	kw->removed_rows = true;
+	(void) decode(kw->c, w->old, kw->s1);
+	removed_note(kw->rel, kw->s1);
+	for (int64 i = 0; i < w->nold; i++)
+		if (!PROLLY_CALL(kw->ar, remove, kw->a, kw->s1))
+			row_missing(kw->rel, kw->from);
+}
+
+/*
+ * Write w's row (none pinned), as write_keys_once() says.  held: w is a
+ * copy held, ranked up (KEY_FIRST).
+ */
+static void
+write_row(KeyWriter *kw, KeyWrite *w, bool held)
+{
+	TupleTableSlot *was;
+
+	w->refused = false;
+	w->violation = NULL;
+	if (w->in_place)
+	{
+		/* (a violation recorded instead leaves the row as it was) */
+		(void) update_key(kw, w, true);
+		return;
+	}
+	/* a keyed row that changed: as the branch has it, for its domains */
+	was = NULL;
+	if (!kw->keyless && w->nold == 1 && checks_domains(kw->rel))
+	{
+		(void) decode(kw->c, w->old, kw->s1);
+		was = kw->s1;
+	}
+	(void) decode(kw->c, w->row, kw->s2);
+	for (int64 i = 0; i < w->nrow; i++)
+	{
+		bool		r;
+
+		(void) merge_write(kw->ar, kw->a, kw->rel, NULL, kw->s2, NULL,
+						   was, NULL, &r);
+		if (r)
+		{
+			w->refused = true;
+			w->violation = llast(recorded);
+		}
+	}
+
+	/*
+	 * A keyed row theirs changed, whose new version is recorded as a
+	 * violation instead of written: the row stays as it was.
+	 */
+	if (kw->put_back && w->nold == 1 && w->refused)
+	{
+		ErrorData  *ed;
+
+		(void) decode(kw->c, w->old, kw->s1);
+		ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL,
+					   kw->s1, NULL, NULL);
+		if (ed)
+		{
+			FreeErrorData(ed);
+			kw->written = false;
+			if (held)
+				w->rank = KEY_PINNED;
+			else
+			{
+				MemoryContext old;
+
+				w = copy_write(w, kw->cxt);
+				w->rank = KEY_FIRST;
+				old = MemoryContextSwitchTo(kw->cxt);
+				kw->newly_ranked = lappend(kw->newly_ranked, w);
+				MemoryContextSwitchTo(old);
+			}
+			return;
+		}
+	}
+	if (w->refused)
+		note_refused(kw, w, held);
+}
+
+/* A pass's rows written in key order: those not ranked up. */
+static void
+write_rows(KeyWriter *kw, KeyWrite *w)
+{
+	if (w->nrow == 0 || ranked_write(kw, w) != NULL)
+		return;
+	write_row(kw, w, false);
+}
+
+/*
+ * Write kw's writes: the rows going first, then those coming, so a row
+ * may take a unique value another gives up (theirs swapping two, say).
  * A keyed row refused, recorded as a violation instead, is put back as
  * the branch has it (kw->put_back).  If that is refused too (another row
  * written has taken its unique value), false is returned: the writes are
@@ -2729,103 +2866,59 @@ retry_key(KeyWriter *kw, KeyWrite *w)
  * its value; the second, it is pinned: left in place throughout, and
  * updated to its new version last (if that is refused, it stays as it
  * was).  A pinned row's old values are held throughout, so once it is
- * updated, the rows refused are tried again (retry_key()) while one is
- * written, and a violation is left recorded for those still refused
- * only.
+ * updated, the rows refused are tried again (retry_key()), in key order,
+ * while one is written, and a violation is left recorded for those still
+ * refused only.  The writes are walked twice (kw->each()), for the rows
+ * going and those coming; those ranked up are held.
  */
 static bool
-write_keys_once(KeyWriter *kw, List *writes)
+write_keys_once(KeyWriter *kw)
 {
-	bool		written = true;
-	bool		pinned = false;
 	bool		progress;
 	ListCell   *lc;
 
-	foreach(lc, writes)
+	MemoryContextReset(kw->pass_cxt);
+	kw->refused = NIL;
+	kw->newly_ranked = NIL;
+	kw->written = true;
+	kw->pinning = false;
+	foreach(lc, kw->ranked)
+		kw->pinning |= ((KeyWrite *) lfirst(lc))->rank == KEY_PINNED;
+
+	kw->next_ranked = list_head(kw->ranked);
+	kw->each(kw, remove_rows);
+	foreach(lc, kw->ranked)
 	{
 		KeyWrite   *w = lfirst(lc);
 
-		w->refused = false;
-		w->violation = NULL;
-		if (w->nold == 0 || w->in_place || w->rank == KEY_PINNED)
-			continue;
-		kw->removed_rows = true;
-		(void) decode(kw->c, w->old, kw->s1);
-		removed_note(kw->rel, kw->s1);
-		for (int64 i = 0; i < w->nold; i++)
-			if (!PROLLY_CALL(kw->ar, remove, kw->a, kw->s1))
-				row_missing(kw->rel, kw->from);
+		if (w->nrow > 0 && w->rank == KEY_FIRST)
+			write_row(kw, w, true);
 	}
-	for (int first = 1; first >= 0; first--)
+	kw->next_ranked = list_head(kw->ranked);
+	kw->each(kw, write_rows);
+	if (kw->newly_ranked != NIL)
 	{
-		foreach(lc, writes)
-		{
-			KeyWrite   *w = lfirst(lc);
-			TupleTableSlot *was;
+		MemoryContext old = MemoryContextSwitchTo(kw->cxt);
 
-			if (w->nrow == 0 || w->rank == KEY_PINNED ||
-				(w->rank == KEY_FIRST) != (first == 1))
-				continue;
-			if (w->in_place)
-			{
-				/* (a violation recorded instead leaves the row as it was) */
-				(void) update_key(kw, w, true);
-				continue;
-			}
-			/* a keyed row that changed: as the branch has it, for its domains */
-			was = NULL;
-			if (!kw->keyless && w->nold == 1 && checks_domains(kw->rel))
-			{
-				(void) decode(kw->c, w->old, kw->s1);
-				was = kw->s1;
-			}
-			(void) decode(kw->c, w->row, kw->s2);
-			for (int64 i = 0; i < w->nrow; i++)
-			{
-				bool		r;
-
-				(void) merge_write(kw->ar, kw->a, kw->rel, NULL, kw->s2, NULL,
-								   was, NULL, &r);
-				if (r)
-				{
-					w->refused = true;
-					w->violation = llast(recorded);
-				}
-			}
-
-			/*
-			 * A keyed row theirs changed, whose new version is recorded as
-			 * a violation instead of written: the row stays as it was.
-			 */
-			if (kw->put_back && w->nold == 1 && w->refused)
-			{
-				ErrorData  *ed;
-
-				(void) decode(kw->c, w->old, kw->s1);
-				ed = try_write(kw->rel, kw->ar, kw->a, NULL, kw->s1, NULL,
-							   kw->s1, NULL, NULL);
-				if (ed)
-				{
-					FreeErrorData(ed);
-					w->rank = w->rank == KEY_FIRST ? KEY_PINNED : KEY_FIRST;
-					written = false;
-				}
-			}
-		}
+		kw->ranked = list_concat(kw->ranked, kw->newly_ranked);
+		sort_writes(kw->ranked, kw->c);
+		MemoryContextSwitchTo(old);
 	}
-	if (!written)
+	if (!kw->written)
 		return false;
-	foreach(lc, writes)
+	foreach(lc, kw->ranked)
 	{
 		KeyWrite   *w = lfirst(lc);
 
 		if (w->rank != KEY_PINNED)
 			continue;
-		pinned = true;
+		w->refused = false;
+		w->violation = NULL;
 		if (!update_key(kw, w, true))
 		{
 			w->refused = true;
 			w->violation = llast(recorded);
+			note_refused(kw, w, true);
 		}
 	}
 
@@ -2835,10 +2928,11 @@ write_keys_once(KeyWriter *kw, List *writes)
 	 * one for the other's value, as two swapping one, aren't tried
 	 * together: both stay refused, though they would fit.)
 	 */
+	sort_writes(kw->refused, kw->c);
 	do
 	{
 		progress = false;
-		foreach(lc, pinned ? writes : NIL)
+		foreach(lc, kw->refused)
 		{
 			KeyWrite   *w = lfirst(lc);
 
@@ -2854,7 +2948,7 @@ write_keys_once(KeyWriter *kw, List *writes)
 }
 
 /*
- * Write writes as write_keys_once() does; where a row is put back
+ * Write kw's writes as write_keys_once() does; where a row is put back
  * (kw->put_back), in a subtransaction, rolled back with the violations it
  * recorded and made again while a put-back is refused.  Each time ranks
  * one row up at least, and a row is ranked up twice at most, so it ends.
@@ -2864,20 +2958,25 @@ write_keys_once(KeyWriter *kw, List *writes)
  * so it ends too.)
  */
 static void
-write_keys(KeyWriter *kw, List *writes)
+write_keys(KeyWriter *kw)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	int			nrecorded = list_length(recorded);
 
+	kw->cxt = cxt;
+	kw->pass_cxt = AllocSetContextCreate(cxt, "merge rows refused",
+										 ALLOCSET_SMALL_SIZES);
+	kw->ranked = NIL;
 	if (!kw->put_back)
 	{
 		bool		written PG_USED_FOR_ASSERTS_ONLY;
 
-		written = write_keys_once(kw, writes);
+		written = write_keys_once(kw);
 		Assert(written);
 		if (recording && kw->keyless)
 			refuse_keyless_violations(kw->rel, nrecorded, kw->removed_rows);
+		MemoryContextDelete(kw->pass_cxt);
 		return;
 	}
 	for (;;)
@@ -2886,7 +2985,7 @@ write_keys(KeyWriter *kw, List *writes)
 
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
-		written = write_keys_once(kw, writes);
+		written = write_keys_once(kw);
 		if (written)
 			ReleaseCurrentSubTransaction();
 		else
@@ -2894,13 +2993,69 @@ write_keys(KeyWriter *kw, List *writes)
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
 		if (written)
-			return;
+			break;
 		recorded = list_truncate(recorded, nrecorded);
 	}
+	MemoryContextDelete(kw->pass_cxt);
+}
+
+/* A diff's changes walked as KeyWrites (apply_rows_held()'s). */
+typedef struct HeldWalk
+{
+	const ProllyTreeRoutine *tree;
+	ProllyTreeEnv *env;
+	const Table *from;
+	const Table *to;
+	MemoryContext rowcxt;		/* a change's, reset for the next */
+	KeyWriter  *kw;
+	KeyWriteVisit visit;
+} HeldWalk;
+
+static void
+held_change(ProllyDiffKind kind, const ProllyKey *key,
+			const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	HeldWalk   *hw = arg;
+	MemoryContext old;
+	StringInfoData k;
+	StringInfoData b;
+	StringInfoData a;
+	KeyWrite	w = {0};
+
+	MemoryContextReset(hw->rowcxt);
+	old = MemoryContextSwitchTo(hw->rowcxt);
+	copy_bytes(&k, key->data, key->len);
+	w.key.data = (const uint8 *) k.data;
+	w.key.len = k.len;
+	if (before)
+	{
+		copy_bytes(&b, before->data, before->len);
+		w.old = &b;
+		w.nold = 1;
+	}
+	if (after)
+	{
+		copy_bytes(&a, after->data, after->len);
+		w.row = &a;
+		w.nrow = 1;
+	}
+	hw->visit(hw->kw, &w);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+each_held(KeyWriter *kw, KeyWriteVisit visit)
+{
+	HeldWalk   *hw = kw->each_arg;
+
+	hw->visit = visit;
+	PROLLY_CALL(hw->tree, diff, hw->env, &hw->from->data, &hw->to->data,
+				held_change, hw);
+	MemoryContextReset(hw->rowcxt);
 }
 
 /*
- * apply_rows()'s writes, held as merge_table()'s are and written as
+ * apply_rows()'s writes, walked as merge_table()'s are and written as
  * write_keys() does: for a keyed table where a row refused was refused
  * its put-back too.
  */
@@ -2912,8 +3067,7 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 	ProllyKeyingRefs krefs;
 	Changes		c;
 	KeyWriter	kw;
-	List	   *writes = NIL;
-	ListCell   *lc;
+	HeldWalk	hw = {0};
 
 	memset(&c, 0, sizeof(c));
 	memset(&kw, 0, sizeof(kw));
@@ -2926,25 +3080,16 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 	env.compare_arg = &c;
 	prolly_keying_use_env(&krefs, c.rd.kr, c.rd.k, tree, &env);
 	krefs.values.pointers = true;
-	PROLLY_CALL(tree, diff, &env, &from->data, &to->data, collect_change, &c);
-	foreach(lc, c.list)
-	{
-		Change	   *ch = lfirst(lc);
-		KeyWrite   *w = palloc0(sizeof(KeyWrite));
+	hw.tree = tree;
+	hw.env = &env;
+	hw.from = from;
+	hw.to = to;
+	hw.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "merge row",
+									  ALLOCSET_DEFAULT_SIZES);
+	hw.kw = &kw;
 
-		if (ch->before.len > 0)
-		{
-			w->old = &ch->before;
-			w->nold = 1;
-		}
-		if (ch->after.len > 0)
-		{
-			w->row = &ch->after;
-			w->nrow = 1;
-		}
-		writes = lappend(writes, w);
-	}
-
+	kw.each = each_held;
+	kw.each_arg = &hw;
 	kw.c = &c;
 	kw.ar = prolly_applier_lookup("replication");
 	kw.s1 = table_slot_create(kw.rel, NULL);
@@ -2956,10 +3101,11 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 	kw.from = ROWS_MOVED;
 	Assert(kw.put_back);
 	kw.a = PROLLY_CALL(kw.ar, begin, kw.rel);
-	write_keys(&kw, writes);
+	write_keys(&kw);
 	PROLLY_CALL(kw.ar, end, kw.a);
 	ExecDropSingleTupleTableSlot(kw.s1);
 	ExecDropSingleTupleTableSlot(kw.s2);
+	MemoryContextDelete(hw.rowcxt);
 	pfree(kw.kept);
 	pfree(kw.unread);
 	bms_free((Bitmapset *) kw.pk);
@@ -2968,11 +3114,316 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 }
 
 /*
+ * How merge_table() walks theirs' changes against ours.  Nothing is held
+ * for a change past its visit: a walk's memory is a key's (rowcxt).
+ */
+typedef struct MergeWalk
+{
+	Changes    *c;				/* (the table's keying) */
+	Relation	rel;
+	const ProllyTreeRoutine *tree;
+	ProllyTreeEnv *env;
+	const Table *base;
+	const Table *ours;
+	const Table *theirs;
+	const Table *current;		/* NULL: none */
+	const UnsureRows *unsure;	/* NULL: none */
+	WalkMode	mode;
+	ProllyConflictSink *sink;
+	List	  **plan;
+	bool		keyless;
+	bool		in_place;
+	CellMerge	cm;
+	MemoryContext cxt;			/* merge_table()'s */
+	MemoryContext rowcxt;		/* a key's, reset for the next */
+	StringInfoData theirs_key;	/* (a key's: theirs' change, copied out) */
+	StringInfoData theirs_before;
+	StringInfoData theirs_after;
+	StringInfoData ours_row;	/* (a key's) */
+	StringInfoData current_row; /* (a key's) */
+	/* (a walk's:) */
+	KeyWriter  *kw;
+	KeyWriteVisit visit;		/* each write, or NULL: none */
+	int			ui;				/* unsure's next row */
+	int			conflicts;
+} MergeWalk;
+
+/*
+ * Theirs' change at key tk (tbefore to tafter, either empty: none), with
+ * ours' row there: what merge_table() says of it.  Ours changed the row
+ * if its row isn't base's (tbefore), or base's is unsure there.
+ */
+static void
+merge_key(MergeWalk *mw, const ProllyKey *tk, const StringInfoData *tbefore,
+		  const StringInfoData *tafter, const Bitmapset *unsure_cols,
+		  bool unsure_key)
+{
+	Changes    *c = mw->c;
+	const StringInfoData *oafter = NULL;	/* ours' row, if ours changed it */
+	const StringInfoData *now;
+	const StringInfoData *row;	/* what s2 holds */
+	int64		have;
+	int64		want;
+	bool		conflict;
+	KeyWrite	w = {0};
+
+	resetStringInfo(&mw->ours_row);
+	if (!PROLLY_CALL(mw->tree, get, mw->env, &mw->ours->data, tk, &mw->ours_row))
+		resetStringInfo(&mw->ours_row);
+	if (unsure_key || !same_bytes(&mw->ours_row, tbefore))
+		oafter = &mw->ours_row;
+
+	/* the row as the branch has it, and as theirs has it: how many */
+	now = oafter ? oafter : tbefore;
+	have = (int64) count_of(c, now);
+	want = (int64) count_of(c, tafter);
+	row = tafter;
+	if (mw->keyless)
+	{
+		int64		had = (int64) count_of(c, tbefore);
+		int64		by_ours = have - had;
+		int64		by_theirs = want - had;
+
+		/*
+		 * The same change on both sides is made once (the same update, or a
+		 * pick the branch has already); otherwise copies added on either
+		 * side are each a row, and copies removed on both are removed once
+		 * (two deleting it deleted it).  Each side removes no more than the
+		 * base had, so the count isn't below none, and a keyless row never
+		 * conflicts.
+		 */
+		if (by_ours == by_theirs)
+			want = have;
+		else
+			want = had + Max(by_ours, 0) + Max(by_theirs, 0) -
+				Max(Max(-by_ours, 0), Max(-by_theirs, 0));
+		Assert(want >= 0);
+		conflict = false;
+		/* (theirs changed the key: a row before or after) */
+		Assert(tafter->len > 0 || tbefore->len > 0);
+		row = tafter->len > 0 ? tafter : tbefore;
+	}
+	else
+	{
+		conflict = oafter != NULL && !same_bytes(oafter, tafter);
+
+		/* both changed the row, neither removed it: column by column */
+		if (conflict && tbefore->len > 0 && oafter->len > 0 &&
+			tafter->len > 0)
+		{
+			const StringInfoData *merged;
+
+			if (merge_cells(c, &mw->cm, tbefore, oafter, tafter, unsure_cols,
+							&merged))
+			{
+				conflict = false;
+				row = merged;
+			}
+		}
+	}
+
+	if (mw->mode == WALK_PLAN)
+	{
+		MemoryContext old = MemoryContextSwitchTo(mw->cxt);
+		MergeOutcome *out = palloc0(sizeof(MergeOutcome));
+
+		out->key.len = tk->len;
+		out->key.data = (const uint8 *) palloc(tk->len);
+		memcpy(unconstify(uint8 *, out->key.data), tk->data, tk->len);
+		out->conflict = conflict;
+		initStringInfo(&out->value);
+		if (!conflict && want > 0)
+		{
+			ProllyValue value = {(const uint8 *) row->data, row->len};
+			ProllyValue decoded;
+			uint64		count;
+
+			PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &value, &decoded, &count);
+			PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &decoded, want, &out->value);
+		}
+		*mw->plan = lappend(*mw->plan, out);
+		MemoryContextSwitchTo(old);
+		return;
+	}
+
+	if (conflict)
+	{
+		ProllyValue bv,
+					ov,
+					tv;
+
+		mw->conflicts++;
+		if (mw->current)
+		{
+			resetStringInfo(&mw->current_row);
+			if (!PROLLY_CALL(mw->tree, get, mw->env, &mw->current->data, tk,
+							 &mw->current_row))
+				resetStringInfo(&mw->current_row);
+			now = &mw->current_row;
+			have = (int64) count_of(c, now);
+		}
+		if (mw->mode == WALK_LIST)
+			mw->sink->conflict(mw->sink, tk, value_or_null(tbefore, &bv),
+							   value_or_null(now, &ov),
+							   value_or_null(tafter, &tv));
+		if (mw->mode != WALK_TAKE_THEIRS)
+			return;
+		/* as theirs has it: one row or none (keyed: keyless never conflict) */
+		Assert(!mw->keyless);
+		want = (tafter->len > 0);
+	}
+	else if (mw->mode != WALK_MERGE ||
+			 (!mw->keyless && oafter != NULL && same_bytes(oafter, row)) ||
+			 (mw->keyless && want == have))
+		return;					/* listing; or the branch has it so already */
+	if (mw->visit == NULL)
+		return;
+
+	/* the branch's row (now, have copies) becomes theirs (row, want) */
+	w.key = *tk;
+	if (!mw->keyless && have == 1 && want == 1)
+	{
+		w.old = now;
+		w.nold = 1;
+		w.row = row;
+		w.nrow = 1;
+		w.in_place = mw->in_place;
+	}
+	else if (want < have)
+	{
+		w.old = mw->keyless ? row : now;
+		w.nold = have - Max(want, 0);
+	}
+	else
+	{
+		w.row = row;
+		w.nrow = want - have;
+	}
+	mw->visit(mw->kw, &w);
+}
+
+/*
+ * A merge base's unsure row (mw->unsure's next) that theirs didn't change:
+ * walked as changed to itself, so that a row both sides have is walked as
+ * changed on both, its unsure columns merged as changed on both.
+ */
+static void
+merge_unsure_row(MergeWalk *mw)
+{
+	const UnsureRow *u = mw->unsure->rows[mw->ui++];
+	MemoryContext old;
+	StringInfoData row;
+
+	MemoryContextReset(mw->rowcxt);
+	old = MemoryContextSwitchTo(mw->rowcxt);
+	initStringInfo(&row);
+	if (!PROLLY_CALL(mw->tree, get, mw->env, &mw->base->data, &u->key, &row))
+		elog(ERROR, "an unsure row of a merge's base is missing from it");
+	merge_key(mw, &u->key, &row, &row, u->cols, true);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Theirs' change at key: after base's unsure rows before it, walked
+ * (merge_key()), copied out of the tree first, as ours' row is read.
+ */
+static void
+merge_change(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	MergeWalk  *mw = arg;
+	const Bitmapset *cols = NULL;
+	bool		unsure_key = false;
+	MemoryContext old;
+	ProllyKey	tk;
+
+	resetStringInfo(&mw->theirs_key);
+	resetStringInfo(&mw->theirs_before);
+	resetStringInfo(&mw->theirs_after);
+	appendBinaryStringInfo(&mw->theirs_key, key->data, key->len);
+	if (before)
+		appendBinaryStringInfo(&mw->theirs_before, before->data, before->len);
+	if (after)
+		appendBinaryStringInfo(&mw->theirs_after, after->data, after->len);
+	tk.data = (const uint8 *) mw->theirs_key.data;
+	tk.len = mw->theirs_key.len;
+
+	while (mw->unsure && mw->ui < mw->unsure->n &&
+		   changes_compare(&mw->unsure->rows[mw->ui]->key, &tk, mw->c) < 0)
+		merge_unsure_row(mw);
+	if (mw->unsure && mw->ui < mw->unsure->n &&
+		changes_compare(&mw->unsure->rows[mw->ui]->key, &tk, mw->c) == 0)
+	{
+		cols = mw->unsure->rows[mw->ui++]->cols;
+		unsure_key = true;
+	}
+	MemoryContextReset(mw->rowcxt);
+	old = MemoryContextSwitchTo(mw->rowcxt);
+	merge_key(mw, &tk, &mw->theirs_before, &mw->theirs_after, cols,
+			  unsure_key);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * Walk theirs' changes (and base's unsure rows), visit given each write
+ * (NULL: none).  Returns how many keys conflict.
+ */
+static int
+walk_theirs(MergeWalk *mw, KeyWriteVisit visit)
+{
+	mw->visit = visit;
+	mw->ui = 0;
+	mw->conflicts = 0;
+	PROLLY_CALL(mw->tree, diff, mw->env, &mw->base->data, &mw->theirs->data,
+				merge_change, mw);
+	while (mw->unsure && mw->ui < mw->unsure->n)
+		merge_unsure_row(mw);
+	MemoryContextReset(mw->rowcxt);
+	return mw->conflicts;
+}
+
+static void
+each_merged(KeyWriter *kw, KeyWriteVisit visit)
+{
+	(void) walk_theirs(kw->each_arg, visit);
+}
+
+/*
+ * A row --theirs takes, checked against its columns' typmods and domains
+ * before any is written.  Compared with the branch's row now: an unchanged
+ * value allowed by a NOT VALID domain constraint needn't be checked again.
+ */
+static void
+check_taken(KeyWriter *kw, KeyWrite *w)
+{
+	TupleTableSlot *was = NULL;
+	ErrorData  *ed;
+
+	if (w->nrow == 0)
+		return;
+	(void) decode(kw->c, w->row, kw->s2);
+	check_fits(kw->fits, kw->rel, kw->s2, NULL);
+	if (w->nold > 0)
+	{
+		(void) decode(kw->c, w->old, kw->s1);
+		was = kw->s1;
+	}
+	ed = row_domain_refusal(kw->rel, kw->s2, NULL, was, NULL);
+	if (ed)
+	{
+		describe_resolution_refusal(ed, kw->rel, kw->s2);
+		ThrowErrorData(ed);
+	}
+}
+
+/*
  * Walk theirs (table relid's changes from base to theirs) against ours
- * (base to ours, the session's head, which the branch still is), both in
- * key order, as mode says.  A key both sides changed to different rows is
- * a conflict, unless the columns each changed merge (merge_cells()); one
- * they changed alike isn't.  A keyless table's row
+ * (base to ours, the session's head, which the branch still is), in key
+ * order, as mode says: each change of theirs with ours' row at its key,
+ * read from ours as it's walked, nothing held for it after, so memory is
+ * the same however many rows changed.  A key both sides changed to
+ * different rows is a conflict, unless the columns each changed merge
+ * (merge_cells()); one they changed alike isn't.  A keyless table's row
  * changed alike on both sides (by the same number of copies) is changed
  * once; otherwise it has the copies its base had, those either side
  * added, less the most either removed; it never conflicts.  current, if
@@ -2981,7 +3432,10 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
  * none if it was deleted since, not ours'.  unsure, if not NULL, is base's
  * rows with an unsure value (as_defined_now()): each side that has such a
  * row changed it, in those columns.  WALK_PLAN collects outcomes in *plan
- * without applying or recording writes.  Returns how many keys conflict.
+ * without applying or recording writes.  Writing (WALK_MERGE,
+ * WALK_TAKE_THEIRS), theirs is walked once for each of write_keys()'
+ * passes (and once before, taking theirs, to check the rows taken).
+ * Returns how many keys conflict.
  */
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
@@ -2994,24 +3448,12 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 								 RowExclusiveLock);
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
-	Changes		oc;
 	Changes		tc;
-	ProllyApplier *a = NULL;
-	TupleTableSlot *s1;
-	TupleTableSlot *s2;
-	ListCell   *lo;
-	ListCell   *lt;
-	int			conflicts = 0;
-	bool		keyless;
-	bool		in_place;
-	bool	   *kept;
-	bool	   *unread;
-	Bitmapset  *pk;
-	List	   *writes = NIL;
-	CellMerge	cm = {0};
-	StringInfoData listed = {0};	/* (the branch's row now, listing) */
-	int			ui = 0;			/* (unsure's next row) */
+	MergeWalk	mw = {0};
+	KeyWriter	kw = {0};
 	FitCheck	fits = {0};
+	int			conflicts;
+	bool		keyless;
 
 	require_readable(base);
 	require_readable(ours);
@@ -3023,292 +3465,105 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	tc.rd.kr = keying_of(rel);
 	tc.rd.k = PROLLY_CALL(tc.rd.kr, open, rel, CurrentMemoryContext);
 	keyless = PROLLY_CALL(tc.rd.kr, keyless, tc.rd.k);
-	in_place = !keyless && updates_in_place(rel);
 	if (recording && mode != WALK_PLAN)
 		note_constraints(rel, keyless);
-	kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
-	unread = palloc0_array(bool, RelationGetDescr(rel)->natts);
-	pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
-	oc = tc;
 	chunk_env(&env);
 	env.compare = changes_compare;
 	env.compare_arg = &tc;
 	prolly_keying_use_env(&krefs, tc.rd.kr, tc.rd.k, tree, &env);
 	krefs.values.pointers = !keyless;
-	PROLLY_CALL(tree, diff, &env, &base->data, &theirs->data, collect_change,
-				&tc);
-	PROLLY_CALL(tree, diff, &env, &base->data, &ours->data, collect_change,
-				&oc);
-	if (unsure && unsure->n > 0 && !keyless)
-	{
-		tc.list = with_unsure_rows(&tc, unsure, tree, &env, base);
-		oc.list = with_unsure_rows(&oc, unsure, tree, &env, base);
-	}
-	else
+	if (!(unsure && unsure->n > 0 && !keyless))
 		unsure = NULL;
 
-	s1 = table_slot_create(rel, NULL);
-	s2 = table_slot_create(rel, NULL);
-	if (mode == WALK_MERGE || mode == WALK_TAKE_THEIRS)
-		a = PROLLY_CALL(ar, begin, rel);
-	lo = list_head(oc.list);
-	foreach(lt, tc.list)
+	mw.c = &tc;
+	mw.rel = rel;
+	mw.tree = tree;
+	mw.env = &env;
+	mw.base = base;
+	mw.ours = ours;
+	mw.theirs = theirs;
+	mw.current = current;
+	mw.unsure = unsure;
+	mw.mode = mode;
+	mw.sink = sink;
+	mw.plan = plan;
+	mw.keyless = keyless;
+	mw.in_place = !keyless && updates_in_place(rel);
+	mw.cxt = CurrentMemoryContext;
+	mw.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "merge row",
+									  ALLOCSET_DEFAULT_SIZES);
+	initStringInfo(&mw.theirs_key);
+	initStringInfo(&mw.theirs_before);
+	initStringInfo(&mw.theirs_after);
+	initStringInfo(&mw.ours_row);
+	initStringInfo(&mw.current_row);
+	if (!keyless)
 	{
-		Change	   *t = lfirst(lt);
-		Change	   *o = NULL;
-		ProllyKey	tk = {(const uint8 *) t->key.data, t->key.len};
-		const StringInfoData *now;
-		const StringInfoData *row;	/* what s2 holds */
-		int64		have;
-		int64		want;
-		bool		conflict;
-		KeyWrite   *w;
-		const Bitmapset *unsure_cols = NULL;
-
-		while (lo)
-		{
-			Change	   *cand = lfirst(lo);
-			ProllyKey	ok = {(const uint8 *) cand->key.data, cand->key.len};
-			int			r = PROLLY_CALL(tc.rd.kr, compare, tc.rd.k, &ok, &tk);
-
-			if (r < 0)
-				lo = lnext(oc.list, lo);
-			else
-			{
-				if (r == 0)
-					o = cand;
-				break;
-			}
-		}
-
-		/* the row as the branch has it, and as theirs has it: how many */
-		now = o ? &o->after : &t->before;
-		have = (int64) count_of(&tc, now);
-		want = (int64) count_of(&tc, &t->after);
-		row = &t->after;
-		if (keyless)
-		{
-			int64		had = (int64) count_of(&tc, &t->before);
-			int64		by_ours = have - had;
-			int64		by_theirs = want - had;
-
-			/*
-			 * The same change on both sides is made once (the same update,
-			 * or a pick the branch has already); otherwise copies added on
-			 * either side are each a row, and copies removed on both are
-			 * removed once (two deleting it deleted it).  Each side removes
-			 * no more than the base had, so the count isn't below none, and
-			 * a keyless row never conflicts.
-			 */
-			if (by_ours == by_theirs)
-				want = have;
-			else
-				want = had + Max(by_ours, 0) + Max(by_theirs, 0) -
-					Max(Max(-by_ours, 0), Max(-by_theirs, 0));
-			Assert(want >= 0);
-			conflict = false;
-			/* (theirs changed the key: a row before or after) */
-			Assert(t->after.len > 0 || t->before.len > 0);
-			row = t->after.len > 0 ? &t->after : &t->before;
-		}
-		else
-		{
-			conflict = o != NULL && !same_bytes(&o->after, &t->after);
-			while (unsure && ui < unsure->n)
-			{
-				int			r = changes_compare(&unsure->rows[ui]->key, &tk, &tc);
-
-				if (r > 0)
-					break;
-				if (r == 0)
-					unsure_cols = unsure->rows[ui]->cols;
-				ui++;
-			}
-
-			/* both changed the row, neither removed it: column by column */
-			if (conflict && t->before.len > 0 && o->after.len > 0 &&
-				t->after.len > 0)
-			{
-				const StringInfoData *merged;
-
-				if (cm.merged == NULL)
-				{
-					cm.base = table_slot_create(rel, NULL);
-					cm.ours = table_slot_create(rel, NULL);
-					cm.theirs = table_slot_create(rel, NULL);
-					cm.merged = MakeSingleTupleTableSlot(RelationGetDescr(rel),
-														 &TTSOpsVirtual);
-					initStringInfo(&cm.key);
-					initStringInfo(&cm.row);
-				}
-				if (merge_cells(&tc, &cm, &t->before, &o->after, &t->after,
-								unsure_cols, &merged))
-				{
-					conflict = false;
-					row = merged;
-				}
-			}
-		}
-
-		if (mode == WALK_PLAN)
-		{
-			MergeOutcome *out = palloc0(sizeof(MergeOutcome));
-
-			out->key.len = tk.len;
-			out->key.data = (const uint8 *) palloc(tk.len);
-			memcpy(unconstify(uint8 *, out->key.data), tk.data, tk.len);
-			out->conflict = conflict;
-			initStringInfo(&out->value);
-			if (!conflict && want > 0)
-			{
-				ProllyValue value = {(const uint8 *) row->data, row->len};
-				ProllyValue decoded;
-				uint64		count;
-
-				PROLLY_CALL(tc.rd.kr, parse_value, tc.rd.k, &value, &decoded, &count);
-				PROLLY_CALL(tc.rd.kr, make_value, tc.rd.k, &decoded, want, &out->value);
-			}
-			*plan = lappend(*plan, out);
-			continue;
-		}
-
-		if (conflict)
-		{
-			ProllyValue bv,
-						ov,
-						tv;
-
-			conflicts++;
-			if (current)
-			{
-				StringInfo	cur;
-
-				/* (a listed row is copied out at once; a write keeps its own) */
-				if (mode == WALK_LIST)
-				{
-					if (listed.data == NULL)
-						initStringInfo(&listed);
-					resetStringInfo(&listed);
-					cur = &listed;
-				}
-				else
-					cur = makeStringInfo();
-				if (!PROLLY_CALL(tree, get, &env, &current->data, &tk, cur))
-					resetStringInfo(cur);
-				now = cur;
-				have = (int64) count_of(&tc, now);
-			}
-			if (mode == WALK_LIST)
-				sink->conflict(sink, &tk, value_or_null(&t->before, &bv),
-							   value_or_null(now, &ov),
-							   value_or_null(&t->after, &tv));
-			if (mode != WALK_TAKE_THEIRS)
-				continue;
-			/* as theirs has it: one row or none (keyed: keyless never conflict) */
-			Assert(!keyless);
-			want = (t->after.len > 0);
-		}
-		else if (mode != WALK_MERGE ||
-				 (!keyless && o != NULL && same_bytes(&o->after, row)) ||
-				 (keyless && want == have))
-			continue;			/* listing; or the branch has it so already */
-
-		/* the branch's row (now, have copies) becomes theirs (row, want) */
-		w = palloc0(sizeof(KeyWrite));
-		if (!keyless && have == 1 && want == 1)
-		{
-			w->old = now;
-			w->nold = 1;
-			w->row = row;
-			w->nrow = 1;
-			w->in_place = in_place;
-		}
-		else if (want < have)
-		{
-			w->old = keyless ? row : now;
-			w->nold = have - Max(want, 0);
-		}
-		else
-		{
-			w->row = row;
-			w->nrow = want - have;
-		}
-		writes = lappend(writes, w);
+		mw.cm.base = table_slot_create(rel, NULL);
+		mw.cm.ours = table_slot_create(rel, NULL);
+		mw.cm.theirs = table_slot_create(rel, NULL);
+		mw.cm.merged = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+												&TTSOpsVirtual);
+		initStringInfo(&mw.cm.key);
+		initStringInfo(&mw.cm.row);
 	}
 
-	if (writes != NIL)
+	if (mode == WALK_LIST || mode == WALK_PLAN)
+		conflicts = walk_theirs(&mw, NULL);
+	else
 	{
-		KeyWriter	kw = {0};
-
+		kw.each = each_merged;
+		kw.each_arg = &mw;
 		kw.c = &tc;
 		kw.rel = rel;
 		kw.ar = ar;
-		kw.a = a;
-		kw.s1 = s1;
-		kw.s2 = s2;
-		kw.pk = pk;
-		kw.kept = kept;
-		kw.unread = unread;
+		kw.a = PROLLY_CALL(ar, begin, rel);
+		kw.s1 = table_slot_create(rel, NULL);
+		kw.s2 = table_slot_create(rel, NULL);
+		kw.pk = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+		kw.kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+		kw.unread = palloc0_array(bool, RelationGetDescr(rel)->natts);
 		kw.keyless = keyless;
 		kw.put_back = puts_back(rel, keyless);
 		/* (a table the working set leaves out: ours' rows, as committed) */
 		kw.from = (mode == WALK_TAKE_THEIRS && current == NULL) ?
 			ROWS_COMMITTED : ROWS_MERGED;
+		fits.cxt = CurrentMemoryContext;
+		kw.fits = &fits;
+		mw.kw = &kw;
 
 		/*
-		 * Rows --theirs takes are checked against the columns' typmods
-		 * and domains before any is written.  Resolution doesn't run
-		 * inside merge_recording(), so start its constraint state here.
-		 * Compare with the branch's row now: an unchanged value allowed
-		 * by a NOT VALID domain constraint needn't be checked again.
+		 * Rows --theirs takes are checked before any is written (a walk of
+		 * their own).  Resolution doesn't run inside merge_recording(), so
+		 * start its constraint state here.
 		 */
 		if (mode == WALK_TAKE_THEIRS)
 		{
 			reset_constraints();
 			note_constraints(rel, keyless);
-			foreach(lt, writes)
-			{
-				KeyWrite   *w = lfirst(lt);
-				TupleTableSlot *was = NULL;
-				ErrorData  *ed;
-
-				if (w->nrow == 0)
-					continue;
-				(void) decode(&tc, w->row, s2);
-				check_fits(&fits, rel, s2, NULL);
-				if (w->nold > 0)
-				{
-					(void) decode(&tc, w->old, s1);
-					was = s1;
-				}
-				ed = row_domain_refusal(rel, s2, NULL, was, NULL);
-				if (ed)
-				{
-					describe_resolution_refusal(ed, rel, s2);
-					ThrowErrorData(ed);
-				}
-			}
+			(void) walk_theirs(&mw, check_taken);
 		}
 		removed_begin(rel, keyless);
-		write_keys(&kw, writes);
+		write_keys(&kw);
 		removed_end();
+		conflicts = mw.conflicts;
+		PROLLY_CALL(ar, end, kw.a);
+		ExecDropSingleTupleTableSlot(kw.s1);
+		ExecDropSingleTupleTableSlot(kw.s2);
+		pfree(kw.kept);
+		pfree(kw.unread);
+		bms_free((Bitmapset *) kw.pk);
 	}
-	if (a)
-		PROLLY_CALL(ar, end, a);
-	ExecDropSingleTupleTableSlot(s1);
-	ExecDropSingleTupleTableSlot(s2);
-	if (cm.merged)
+	if (mw.cm.merged)
 	{
-		ExecDropSingleTupleTableSlot(cm.base);
-		ExecDropSingleTupleTableSlot(cm.ours);
-		ExecDropSingleTupleTableSlot(cm.theirs);
-		ExecDropSingleTupleTableSlot(cm.merged);
+		ExecDropSingleTupleTableSlot(mw.cm.base);
+		ExecDropSingleTupleTableSlot(mw.cm.ours);
+		ExecDropSingleTupleTableSlot(mw.cm.theirs);
+		ExecDropSingleTupleTableSlot(mw.cm.merged);
 	}
 	if (fits.estate)
 		FreeExecutorState(fits.estate);
-	pfree(kept);
-	pfree(unread);
-	bms_free(pk);
+	MemoryContextDelete(mw.rowcxt);
 	PROLLY_CALL(tc.rd.kr, close, tc.rd.k);
 	table_close(rel, NoLock);
 	return conflicts;
