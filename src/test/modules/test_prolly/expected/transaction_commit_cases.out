@@ -223,6 +223,39 @@ SELECT dolt_hashof('tcc_side') = dolt_hashof('HEAD') AS forced;
  t
 (1 row)
 
+-- (but a branch the transaction wrote before the move stays its write:
+-- COMMIT still refuses a branch left, and the rows go with the transaction)
+SELECT dolt_hashof('tcc_side') AS side \gset
+BEGIN;
+SELECT dolt_checkout('tcc_side');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'tcc_side'"}
+(1 row)
+
+INSERT INTO tcc.t VALUES (40, 'left behind');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-f', 'tcc_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+COMMIT;
+ERROR:  dolt.transaction_commit can't commit changes to a branch the session has left
+HINT:  Check the changed branch out again before committing.
+SELECT dolt_hashof('tcc_side') = :'side' AS side_unmoved,
+	(SELECT dirty FROM dolt_branches() WHERE name = 'tcc_side') AS side_dirty;
+ side_unmoved | side_dirty 
+--------------+------------
+ t            | f
+(1 row)
+
 SELECT dolt_checkout('tcc_side');
             dolt_checkout            
 -------------------------------------

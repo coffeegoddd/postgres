@@ -117,6 +117,17 @@ INSERT INTO tcc.parent VALUES (1), (2);
 -- the transaction's: it neither commits nor counts as a branch left)
 SELECT dolt_branch('-f', 'tcc_side');
 SELECT dolt_hashof('tcc_side') = dolt_hashof('HEAD') AS forced;
+-- (but a branch the transaction wrote before the move stays its write:
+-- COMMIT still refuses a branch left, and the rows go with the transaction)
+SELECT dolt_hashof('tcc_side') AS side \gset
+BEGIN;
+SELECT dolt_checkout('tcc_side');
+INSERT INTO tcc.t VALUES (40, 'left behind');
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-f', 'tcc_side');
+COMMIT;
+SELECT dolt_hashof('tcc_side') = :'side' AS side_unmoved,
+	(SELECT dirty FROM dolt_branches() WHERE name = 'tcc_side') AS side_dirty;
 SELECT dolt_checkout('tcc_side');
 DELETE FROM tcc.parent WHERE id = 2;
 SELECT dolt_checkout('main');
