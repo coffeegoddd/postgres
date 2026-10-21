@@ -866,14 +866,19 @@ apply_header_delta(Page page, const xl_bmap_header_delta *delta)
 	PageGetBmapHeader(page)->fold_epoch = delta->fold_epoch;
 }
 
-static void
+/* (whether it changed the page) */
+static bool
 apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 {
 	const xl_bmap_entry_delta *ent = (const xl_bmap_entry_delta *) (delta + 1);
 	BmapEntry  *entries;
+	bool		changed = false;
 
 	if (delta->flags & BMAP_DELTA_INIT)
+	{
 		init_node(page);
+		changed = true;
+	}
 	entries = PageGetBmapEntries(page);
 	for (uint32 i = 0; i < delta->nentries; i++)
 	{
@@ -885,9 +890,13 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 			continue;
 		if (e->block != ent[i].block)
 			e->since = delta->since;
+		else if (e->epoch == ent[i].epoch)
+			continue;
 		e->block = ent[i].block;
 		e->epoch = ent[i].epoch;
+		changed = true;
 	}
+	return changed;
 }
 
 static void
@@ -1182,6 +1191,37 @@ copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
 }
 
 /*
+ * Map page 'blk' without loading it into shared buffers: in *buf the buffer
+ * holding it, pinned, if it is cached; otherwise InvalidBuffer, and the page
+ * read from disk into 'dst'.  A read that fails verification (torn by a
+ * concurrent write) is made 'tries' times in all; false if each one failed.
+ */
+static bool
+read_map_uncached(SMgrRelation reln, BlockNumber blk, char *dst, int tries,
+				  Buffer *buf)
+{
+	PrefetchBufferResult r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blk);
+
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(reln->smgr_rlocator.locator, BMAP_FORKNUM, blk,
+						 r.recent_buffer))
+	{
+		*buf = r.recent_buffer;
+		return true;
+	}
+	*buf = InvalidBuffer;
+	for (int i = 0; i < tries; i++)
+	{
+		void	   *page = dst;
+
+		mdreadv(reln, BMAP_FORKNUM, blk, &page, 1);
+		if (PageIsVerified(dst, blk, 0, NULL))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Copy map page 'blk' of 'reln' into 'dst' (I/O-aligned).
  *
  * Writing a block-mapped page looks the page up, and a write may be the
@@ -1206,27 +1246,13 @@ read_node_ext(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 
 	if (for_write)
 	{
-		PrefetchBufferResult r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blk);
-
-		if (!BufferIsValid(r.recent_buffer) ||
-			!ReadRecentBuffer(rel, BMAP_FORKNUM, blk, r.recent_buffer))
-		{
-			for (int tries = 0;; tries++)
-			{
-				void	   *page = dst;
-
-				mdreadv(reln, BMAP_FORKNUM, blk, &page, 1);
-				if (PageIsVerified(dst, blk, 0, NULL))
-					break;
-				if (tries >= 3)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("invalid page in block %u of \"%s\"",
-									blk, relpathperm(rel, BMAP_FORKNUM).str)));
-			}
+		if (!read_map_uncached(reln, blk, dst, 4, &buf))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of \"%s\"",
+							blk, relpathperm(rel, BMAP_FORKNUM).str)));
+		if (!BufferIsValid(buf))
 			return check_node(dst, type, rel, blk, new_ok);
-		}
-		buf = r.recent_buffer;
 
 		/*
 		 * A change locks a map page only after its reads (map_lock()); one
@@ -6045,32 +6071,30 @@ bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate)
  * it, into 'dst', if it is a map page newer than the record; read from
  * shared buffers or disk, and passed over if it fails verification (an
  * image is restored over a torn page).
+ *
+ * This costs an image what images otherwise save redo: a read of the page
+ * it replaces, synchronous if the page isn't cached, so one random read per
+ * map page the first time recovery restores it after a checkpoint.  Whether
+ * the page on disk is newer than the record can't be known without it.
  */
 static bool
 newer_map_page(XLogReaderState *record, RelFileLocator rlocator,
 			   BlockNumber blkno, char *dst)
 {
 	SMgrRelation reln = smgropen(rlocator, INVALID_PROC_NUMBER);
-	PrefetchBufferResult r;
+	Buffer		buf;
 	BmapPageOpaqueData *opaque;
 
 	if (!mdexists(reln, BMAP_FORKNUM) || blkno >= mdnblocks(reln, BMAP_FORKNUM))
 		return false;
-	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blkno);
-	if (BufferIsValid(r.recent_buffer) &&
-		ReadRecentBuffer(rlocator, BMAP_FORKNUM, blkno, r.recent_buffer))
+	/* (only redo dirties map pages, so a read off disk isn't torn by one) */
+	if (!read_map_uncached(reln, blkno, dst, 1, &buf))
+		return false;
+	if (BufferIsValid(buf))
 	{
-		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
-		memcpy(dst, BufferGetPage(r.recent_buffer), BLCKSZ);
-		UnlockReleaseBuffer(r.recent_buffer);
-	}
-	else
-	{
-		void	   *page = dst;
-
-		mdreadv(reln, BMAP_FORKNUM, blkno, &page, 1);
-		if (!PageIsVerified(dst, blkno, 0, NULL))
-			return false;
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(dst, BufferGetPage(buf), BLCKSZ);
+		UnlockReleaseBuffer(buf);
 	}
 	if (PageIsNew(dst) || PageGetLSN(dst) <= record->ReadRecPtr ||
 		PageGetSpecialSize(dst) != MAXALIGN(sizeof(BmapPageOpaqueData)))
@@ -6156,13 +6180,16 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	/*
 	 * A map page newer than the record still takes its entry changes, which
 	 * leave alone those changed later: one whose newer entries were kept
-	 * over an image may have older ones too (above).
+	 * over an image may have older ones too (above).  It is dirtied only if
+	 * an entry changed: written out, a page whose LSN is past the replay
+	 * point asks for the minimum recovery point past it, which recovery
+	 * from a base backup warns of, and most such deltas change nothing.
 	 */
 	if (action == BLK_DONE && kind == BMAP_DELTA_NODE &&
 		forknum == BMAP_FORKNUM)
 	{
-		apply_node_delta(BufferGetPage(buf), (xl_bmap_node_delta *) copy);
-		MarkBufferDirty(buf);
+		if (apply_node_delta(BufferGetPage(buf), (xl_bmap_node_delta *) copy))
+			MarkBufferDirty(buf);
 	}
 	else if (action == BLK_NEEDS_REDO)
 	{
