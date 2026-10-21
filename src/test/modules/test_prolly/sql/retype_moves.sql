@@ -142,5 +142,33 @@ SELECT NOT EXISTS (SELECT FROM dolt_status) AS at_head;
 SELECT indexes_valid();
 SELECT count(*) AS fired FROM public.fired;
 
+-- A change of type the ALTER makes without rewriting the table (one
+-- binary coercible: varchar(10) to varchar(20)) leaves the table its
+-- storage: the rows are removed one by one, as a snapshot from before the
+-- move still sees them.
+CREATE TABLE rt.vc (id int PRIMARY KEY, s varchar(10));
+CREATE INDEX vc_s ON rt.vc (s);
+INSERT INTO rt.vc SELECT g, 's' || g FROM generate_series(1, 300) g;
+SELECT length(dolt_commit('-Am', 'varchar(10)')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS c4 \gset
+ALTER TABLE rt.vc ALTER COLUMN s TYPE varchar(20);
+UPDATE rt.vc SET s = 'longer than ten ' || id WHERE id <= 3;
+SELECT length(dolt_commit('-am', 'varchar(20)')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS c5 \gset
+SELECT dolt_reset('--hard', :'c4');
+SELECT pg_relation_filenode('rt.vc') AS vc_storage \gset
+SELECT pg_stat_force_next_flush();
+BEGIN;
+SELECT dolt_reset('--hard', :'c5');
+SELECT * FROM written('rt.vc');
+SELECT pg_relation_filenode('rt.vc') = :vc_storage AS same_storage;
+COMMIT;
+SELECT NOT EXISTS (SELECT FROM dolt_status) AS at_head;
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'rt.vc'::regclass AND attname = 's';
+SELECT count(*), sum(id), count(*) FILTER (WHERE s LIKE 'longer%') AS changed
+FROM rt.vc;
+SELECT indexes_valid();
+
 \c :home
 DROP DATABASE retype_moves;

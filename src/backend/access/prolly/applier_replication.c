@@ -878,6 +878,7 @@ replication_remove_all(ProllyApplier *a)
 	Oid			relid = RelationGetRelid(rel);
 	Oid			toastid = rel->rd_rel->reltoastrelid;
 	ReindexParams params = {0};
+	ResourceOwner owner = CurrentResourceOwner;
 
 	load_end(a);
 	if (a->matview)
@@ -886,7 +887,10 @@ replication_remove_all(ProllyApplier *a)
 	if (rel->rd_refcnt != 1 || AfterTriggerPendingOnRel(relid))
 		return false;
 	CheckTableForSerializableConflictIn(rel);
+	/* (closed and opened again under begin()'s owner: see load_end()) */
+	CurrentResourceOwner = a->owner;
 	ExecCloseIndices(a->rri);
+	CurrentResourceOwner = owner;
 	a->rri->ri_NumIndices = 0;
 	a->rri->ri_IndexRelationDescs = NULL;
 	a->rri->ri_IndexRelationInfo = NULL;
@@ -899,7 +903,9 @@ replication_remove_all(ProllyApplier *a)
 		table_close(toast, NoLock);
 	}
 	(void) reindex_relation(NULL, relid, REINDEX_REL_PROCESS_TOAST, &params);
+	CurrentResourceOwner = a->owner;
 	ExecOpenIndices(a->rri, false);
+	CurrentResourceOwner = owner;
 	/* (its change log told it was emptied, as TRUNCATE tells it) */
 	prolly_note_emptied(rel);
 	pgstat_count_truncate(rel);

@@ -664,7 +664,6 @@ static void ATPrepAlterColumnType(List **wqueue,
 								  bool recurse, bool recursing,
 								  AlterTableCmd *cmd, LOCKMODE lockmode,
 								  AlterTableUtilityContext *context);
-static bool ATColumnChangeRequiresRewrite(Node *expr, AttrNumber varattno);
 static ObjectAddress ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 										   AlterTableCmd *cmd, LOCKMODE lockmode);
 static void RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
@@ -15218,8 +15217,11 @@ ATPrepAlterColumnType(List **wqueue,
  * In the case of a constrained domain, we could get by with scanning the
  * table and checking the constraint rather than actually rewriting it, but we
  * don't currently try to do that.
+ *
+ * (Exported: a branch move, about to change a column's type, asks it
+ * whether the ALTER it runs will rewrite the table.)
  */
-static bool
+bool
 ATColumnChangeRequiresRewrite(Node *expr, AttrNumber varattno)
 {
 	Assert(expr != NULL);

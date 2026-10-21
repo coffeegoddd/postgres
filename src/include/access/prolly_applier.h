@@ -51,7 +51,9 @@
  *   once, as TRUNCATE does: the table given new, empty storage, under the
  *   ACCESS EXCLUSIVE lock that takes, firing no trigger and checking no
  *   foreign key.  It returns false, having removed nothing, if it can't:
- *   the session uses the table otherwise (rel is to be open once).
+ *   the session uses the table otherwise (rel is to be open once).  As
+ *   TRUNCATE, it isn't MVCC-safe: a snapshot taken before it, once it
+ *   commits, sees the table empty.
  *
  * Provisional (v0).
  *

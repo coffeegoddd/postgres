@@ -186,6 +186,7 @@
 #include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
+#include "commands/tablecmds.h"
 #include "commands/trigger.h"
 #include "common/int.h"
 #include "common/string.h"
@@ -194,6 +195,7 @@
 #include "executor/tuptable.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteSupport.h"
@@ -5225,6 +5227,9 @@ typedef struct SchemaMove
 	bool		render;			/* statements to show, not to run: each
 								 * constraint whole, nothing read from the
 								 * catalogs */
+	List	   *at_once;		/* of emptied, those the ALTER changing a
+								 * column's type rewrites anyway: emptied
+								 * as TRUNCATE empties them */
 } SchemaMove;
 
 static char *
@@ -5838,6 +5843,64 @@ table_remade(const TableDef *from, const TableDef *to)
 }
 
 /*
+ * Whether ALTER TABLE name ALTER COLUMN col TYPE type USING col::type, as
+ * move_table() runs it, rewrites the table: decided as the ALTER decides
+ * it, from the conversion of the column's value, planned.  One that is
+ * binary coercible (varchar(10) to varchar(20), varchar to text) doesn't:
+ * the rows stay where they are, and a snapshot from before the move still
+ * sees them.  False when that can't be told yet: the table, its column or
+ * the type isn't there (the move makes it later).
+ */
+static bool
+retype_rewrites(const char *name, const char *col, const char *type)
+{
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+										 AccessShareLock, true);
+	List	   *raw;
+	ResTarget  *rt;
+	Node	   *cast;
+	ColumnRef  *ref;
+	AttrNumber	attnum;
+	Type		typ;
+	Relation	rel;
+	ParseState *pstate;
+	ParseNamespaceItem *nsitem;
+	Node	   *expr;
+
+	if (!OidIsValid(relid))
+		return false;
+	raw = raw_parser(psprintf("SELECT %s::%s", col, type), RAW_PARSE_DEFAULT);
+	rt = linitial_node(ResTarget,
+					   ((SelectStmt *) linitial_node(RawStmt, raw)->stmt)->targetList);
+	/* (col::type, or (col::type) COLLATE collation) */
+	cast = rt->val;
+	if (IsA(cast, CollateClause))
+		cast = ((CollateClause *) cast)->arg;
+	ref = castNode(ColumnRef, castNode(TypeCast, cast)->arg);
+	attnum = get_attnum(relid, strVal(llast(ref->fields)));
+	if (attnum == InvalidAttrNumber)
+		return false;
+	typ = LookupTypeName(NULL, castNode(TypeCast, cast)->typeName, NULL, true);
+	if (typ == NULL)
+		return false;
+	ReleaseSysCache(typ);
+	/* (a virtual generated column has no rows to rewrite) */
+	if (get_attgenerated(relid, attnum) == ATTRIBUTE_GENERATED_VIRTUAL)
+		return false;
+	rel = relation_open(relid, NoLock);
+	pstate = make_parsestate(NULL);
+	nsitem = addRangeTableEntryForRelation(pstate, rel, AccessShareLock,
+										   NULL, false, true);
+	addNSItemToQuery(pstate, nsitem, false, true, true);
+	expr = transformExpr(pstate, rt->val, EXPR_KIND_ALTER_COL_TRANSFORM);
+	assign_expr_collations(pstate, expr);
+	expr = (Node *) expression_planner((Expr *) expr);
+	free_parsestate(pstate);
+	relation_close(rel, NoLock);
+	return ATColumnChangeRequiresRewrite(expr, attnum);
+}
+
+/*
  * The statements turning table name's definition from (NULL: none) into to
  * (NULL: dropped): what must go before the rows are written, and what the
  * rows must satisfy, after.  Columns are added and dropped, and changed in
@@ -6019,6 +6082,10 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			{
 				if (sm->rewritten && !list_has_string(sm->emptied, name))
 					sm->emptied = lappend(sm->emptied, pstrdup(name));
+				if (sm->rewritten && !sm->render &&
+					!list_has_string(sm->at_once, name) &&
+					retype_rewrites(name, col, column_type_sql(line)))
+					sm->at_once = lappend(sm->at_once, pstrdup(name));
 				/* the old default goes first: it may not cast */
 				if (column_attr(old, "default "))
 					sm->changes = lappend(sm->changes,
@@ -7785,16 +7852,27 @@ restore_index_places(List *places)
  * the applier the move writes rows with: no trigger fires (one enabled
  * ALWAYS neither), no rule applies and no foreign key is checked, and a
  * table row-level security applies to is refused, as its rows written
- * would be.  Every row at once if the applier can (#492): the table given
- * new storage, as TRUNCATE gives it.  Else a row read is removed as it is:
- * the scan's snapshot keeps seeing those removed.
+ * would be.  at_once (the ALTER that follows rewrites the table anyway):
+ * every row at once if the applier can (#492), the table given new
+ * storage, as TRUNCATE gives it.  Else a row read is removed as it is:
+ * the scan's snapshot keeps seeing those removed, as a snapshot from
+ * before the move does, which new storage would leave none to see.
  */
 static void
-empty_table(const char *name)
+empty_table(const char *name, bool at_once)
 {
 	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
+	bool		remove_all = at_once && PROLLY_HAS(ar, remove_all);
+
+	/*
+	 * (Emptied at once, the table is locked ACCESS EXCLUSIVE before its
+	 * partitions are, as TRUNCATE and the ALTER after lock them: a query
+	 * on it locks it before them, and would deadlock with a move holding a
+	 * partition and waiting for the table.)
+	 */
 	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
-										 RowExclusiveLock, false);
+										 remove_all ? AccessExclusiveLock : RowExclusiveLock,
+										 false);
 	List	   *rels;
 	ListCell   *lc;
 
@@ -7823,7 +7901,7 @@ empty_table(const char *name)
 			continue;
 		}
 		a = PROLLY_CALL(ar, begin, rel);
-		if (PROLLY_HAS(ar, remove_all) && PROLLY_CALL(ar, remove_all, a))
+		if (remove_all && PROLLY_CALL(ar, remove_all, a))
 		{
 			PROLLY_CALL(ar, end, a);
 			table_close(rel, NoLock);
@@ -8219,8 +8297,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 */
 	if (rewritten)
 		foreach(lc, tm.tables)
+		{
 			if (!list_has_string(sm.emptied, lfirst(lc)))
 				sm.emptied = lappend(sm.emptied, lfirst(lc));
+			/* (each converts through an expression: a rewrite) */
+			if (!list_has_string(sm.at_once, lfirst(lc)))
+				sm.at_once = lappend(sm.at_once, lfirst(lc));
+		}
 
 	/*
 	 * Foreign keys both sides have, into a table made again or dropped,
@@ -8589,7 +8672,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 */
 	run_statements(sm.fk_drops);
 	foreach(lc, sm.emptied)
-		empty_table(lfirst(lc));
+		empty_table(lfirst(lc), list_has_string(sm.at_once, lfirst(lc)));
 	make_views(list_concat(matviews_change ? matview_drops : NIL, view_drops));
 	run_statements(unlinks);
 

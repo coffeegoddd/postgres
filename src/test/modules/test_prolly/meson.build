@@ -257,6 +257,7 @@ tests += {
       't/150_describe_caches.pl',
       't/151_bulk_apply_crash.pl',
       't/151_nearest_source.pl',
+      't/152_retype_move_sessions.pl',
       't/160_first_use_lock.pl',
     ],
   },
