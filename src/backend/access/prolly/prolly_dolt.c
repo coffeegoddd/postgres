@@ -68,6 +68,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/regproc.h"
 #include "utils/resowner.h"
@@ -3277,13 +3278,12 @@ log_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
 }
 
 /*
- * Every commit ref reaches (LogEntry *), highest commit order (height)
- * first, then newest; NIL for HEAD before a first commit.
+ * Every commit the starts (ProllyHash *) reach (LogEntry *), each once,
+ * highest commit order (height) first, then newest.
  */
 static List *
-log_entries(const char *ref)
+log_walk(List *starts)
 {
-	ProllyHash	start;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
 	HTAB	   *heights;
@@ -3292,14 +3292,6 @@ log_entries(const char *ref)
 	ProllyHash	key;
 	bool		found;
 
-	if (!PROLLY_CALL(refs(), resolve, ref, &start))
-	{
-		if (pg_strcasecmp(ref, "HEAD") == 0)
-			return NIL;			/* nothing committed yet */
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("prolly ref \"%s\" does not exist", ref)));
-	}
 	ctl.keysize = sizeof(ProllyHash);
 	ctl.entrysize = sizeof(LogEntry);
 	ctl.hcxt = CurrentMemoryContext;
@@ -3307,11 +3299,18 @@ log_entries(const char *ref)
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/*
-	 * Every commit from start, each entered once, as it is found: entries is
-	 * the queue too, walked by an index as it grows.
+	 * Every commit from the starts, each entered once, as it is found:
+	 * entries is the queue too, walked by an index as it grows.
 	 */
-	key = prolly_hash_key(&start);
-	entries = lappend(entries, hash_search(seen, &key, HASH_ENTER, &found));
+	foreach(lc, starts)
+	{
+		LogEntry   *e;
+
+		key = prolly_hash_key(lfirst(lc));
+		e = hash_search(seen, &key, HASH_ENTER, &found);
+		if (!found)
+			entries = lappend(entries, e);
+	}
 	for (int n = 0; n < list_length(entries); n++)
 	{
 		LogEntry   *e = list_nth(entries, n);
@@ -3347,6 +3346,51 @@ log_entries(const char *ref)
 }
 
 /*
+ * Every commit ref reaches (LogEntry *), as log_walk() orders them; NIL for
+ * HEAD before a first commit.
+ */
+static List *
+log_entries(const char *ref)
+{
+	ProllyHash	start;
+
+	if (!PROLLY_CALL(refs(), resolve, ref, &start))
+	{
+		if (pg_strcasecmp(ref, "HEAD") == 0)
+			return NIL;			/* nothing committed yet */
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	}
+	return log_walk(list_make1(&start));
+}
+
+static void
+note_head(const char *name, const ProllyHash *head, void *arg)
+{
+	List	  **starts = arg;
+
+	/* (not a session's hidden branch at a commit: Dolt's detached HEAD) */
+	if (head->len == 0 || detached_branch(name))
+		return;
+	*starts = lappend(*starts, memcpy(palloc(sizeof(ProllyHash)), head,
+									  sizeof(ProllyHash)));
+}
+
+/*
+ * Every commit any branch reaches (LogEntry *), as Dolt's dolt_commits
+ * reads them (#588); NIL before a first commit.
+ */
+static List *
+all_log_entries(void)
+{
+	List	   *starts = NIL;
+
+	PROLLY_CALL(refs(), branches, note_head, &starts);
+	return log_walk(starts);
+}
+
+/*
  * dolt_log(ref text, OUT commit_hash text, OUT committer text,
  *			OUT email text, OUT date timestamptz, OUT message text,
  *			OUT commit_order int8) returns setof record
@@ -3378,6 +3422,77 @@ dolt_log(PG_FUNCTION_ARGS)
 		values[4] = CStringGetTextDatum(e->info.message);
 		values[5] = Int64GetDatum(e->order);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * dolt_commits(OUT commit_hash text, OUT committer text, OUT email text,
+ *				OUT date timestamptz, OUT message text) returns setof record
+ *
+ * Every commit any branch reaches, in dolt_log's order (#588).
+ */
+Datum
+dolt_commits(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, all_log_entries())
+	{
+		LogEntry   *e = lfirst(lc);
+		Datum		values[5];
+		bool		nulls[5] = {0};
+		char	   *name;
+		char	   *email;
+
+		split_author(e->info.author, &name, &email);
+		values[0] = CStringGetTextDatum(hash_hex(&e->info.id));
+		values[1] = CStringGetTextDatum(name);
+		values[2] = CStringGetTextDatum(email);
+		values[3] = TimestampTzGetDatum(e->info.committed_at);
+		values[4] = CStringGetTextDatum(e->info.message);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * dolt_commit_ancestors(OUT commit_hash text, OUT parent_hash text,
+ *						 OUT parent_index int4) returns setof record
+ *
+ * Each commit dolt_commits() has, with its parents in order; a root commit
+ * with a null parent, index 0, as Dolt's (#588).
+ */
+Datum
+dolt_commit_ancestors(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ListCell   *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+	foreach(lc, all_log_entries())
+	{
+		LogEntry   *e = lfirst(lc);
+		Datum		values[3];
+		bool		nulls[3] = {0};
+
+		values[0] = CStringGetTextDatum(hash_hex(&e->info.id));
+		if (e->info.nparents == 0)
+		{
+			nulls[1] = true;
+			values[2] = Int32GetDatum(0);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+		}
+		for (int i = 0; i < e->info.nparents; i++)
+		{
+			values[1] = CStringGetTextDatum(hash_hex(&e->info.parents[i]));
+			values[2] = Int32GetDatum(i);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+		}
 	}
 	return (Datum) 0;
 }
@@ -6698,15 +6813,34 @@ static void
 remote_row(const char *name, const char *url, void *arg)
 {
 	ReturnSetInfo *rsinfo = arg;
-	Datum		values[2];
-	bool		nulls[2] = {0};
+	Datum		values[4];
+	bool		nulls[4] = {0};
+	StringInfoData spec;
+	StringInfoData specs;
 
 	values[0] = CStringGetTextDatum(name);
 	values[1] = CStringGetTextDatum(url);
+
+	/*
+	 * Dolt's columns (#586): the one fetch spec a fetch follows (every
+	 * branch to its remote-tracking branch), and no parameters (a remote is
+	 * its URL).
+	 */
+	initStringInfo(&spec);
+	appendStringInfo(&spec, "refs/heads/*:refs/remotes/%s/*", name);
+	initStringInfo(&specs);
+	appendStringInfoChar(&specs, '[');
+	escape_json(&specs, spec.data);
+	appendStringInfoChar(&specs, ']');
+	values[2] = DirectFunctionCall1(jsonb_in, CStringGetDatum(specs.data));
+	values[3] = DirectFunctionCall1(jsonb_in, CStringGetDatum("{}"));
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
-/* dolt_remotes(OUT name text, OUT url text) returns setof record */
+/*
+ * dolt_remotes(OUT name text, OUT url text, OUT fetch_specs jsonb,
+ *				OUT params jsonb) returns setof record
+ */
 Datum
 dolt_remotes(PG_FUNCTION_ARGS)
 {

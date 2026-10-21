@@ -1597,8 +1597,10 @@ step 7's GC to remove; none are read.
 
 - **Remotes** are named, per database, as Dolt's are:
   `dolt_remote('add', name, url)`, `('remove', name)`, listed in a
-  `dolt_remotes` view; kept in the refs tree (a new tag), not in a catalog,
-  so they move with the refs' transactions.
+  `dolt_remotes` view (`name`, `url`, and Dolt's `fetch_specs` and
+  `params`, `jsonb`: the one fetch spec, `refs/heads/*:refs/remotes/<name>/*`,
+  and `{}`, a remote being its URL (#586)); kept in the refs tree (a new
+  tag), not in a catalog, so they move with the refs' transactions.
 - **Remote-tracking branches** (`origin/main`): heads only, written by a
   fetch, never with copies; `dolt_checkout('origin/main')` is refused with
   a hint to make a branch from it, and `dolt_checkout('-b', 'x',

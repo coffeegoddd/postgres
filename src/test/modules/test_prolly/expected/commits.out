@@ -978,3 +978,268 @@ SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;
         42
 (1 row)
 
+-- dolt_commits: every commit any branch reaches; dolt_commit_ancestors:
+-- each one's parents, in order, a root commit's null (#588).
+CREATE SCHEMA cg VERSIONED;
+CREATE TABLE cg.t (id int PRIMARY KEY, message text);
+INSERT INTO cg.t VALUES (1, 'test1');
+SELECT length(dolt_commit('-Am', 'cg 1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('cg_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cg_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'cg_side'"}
+(1 row)
+
+UPDATE cg.t SET message = 'test2' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'cg 2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+INSERT INTO cg.t VALUES (2, 'test3');
+SELECT length(dolt_commit('-am', 'cg 3')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- (a commit on a branch main doesn't reach)
+SELECT message FROM dolt_commits WHERE message LIKE 'cg _' ORDER BY message;
+ message 
+---------
+ cg 1
+ cg 2
+ cg 3
+(3 rows)
+
+SELECT count(*) FILTER (WHERE message = 'cg 2') AS in_log FROM dolt_log;
+ in_log 
+--------
+      0
+(1 row)
+
+SELECT (SELECT count(*) FROM dolt_commits) =
+	(SELECT count(*) FROM (SELECT commit_hash FROM dolt_log('main')
+						   UNION SELECT commit_hash FROM dolt_log('cg_side')) l)
+	AS every_branch;
+ every_branch 
+--------------
+ t
+(1 row)
+
+SELECT count(DISTINCT commit_hash) = count(*) AS once FROM dolt_commits;
+ once 
+------
+ t
+(1 row)
+
+-- (a merge commit's two parents, ours first)
+SELECT (dolt_merge('--no-ff', '-m', 'cg merged', 'cg_side'))[1] IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT parent_index FROM dolt_commit_ancestors
+	WHERE commit_hash = dolt_hashof('HEAD') ORDER BY parent_index;
+ parent_index 
+--------------
+            0
+            1
+(2 rows)
+
+SELECT a.parent_index,
+	(SELECT message FROM dolt_log WHERE commit_hash = a.parent_hash) AS message
+	FROM dolt_commit_ancestors a
+	WHERE a.commit_hash = dolt_hashof('HEAD') ORDER BY a.parent_index;
+ parent_index | message 
+--------------+---------
+            0 | cg 3
+            1 | cg 2
+(2 rows)
+
+-- (the root commit's parent is null; every other commit's is a commit)
+SELECT count(*) AS roots, min(parent_index) AS parent_index
+	FROM dolt_commit_ancestors WHERE parent_hash IS NULL;
+ roots | parent_index 
+-------+--------------
+     1 |            0
+(1 row)
+
+SELECT count(*) AS dangling FROM dolt_commit_ancestors a
+	WHERE a.parent_hash IS NOT NULL
+	AND NOT EXISTS (SELECT 1 FROM dolt_commits c WHERE c.commit_hash = a.parent_hash);
+ dangling 
+----------
+        0
+(1 row)
+
+SELECT count(*) AS without_row FROM dolt_commits c
+	WHERE NOT EXISTS (SELECT 1 FROM dolt_commit_ancestors a
+					  WHERE a.commit_hash = c.commit_hash);
+ without_row 
+-------------
+           0
+(1 row)
+
+-- (a commit only a deleted branch reached is gone)
+SELECT dolt_branch('cg_gone');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cg_gone');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'cg_gone'"}
+(1 row)
+
+UPDATE cg.t SET message = 'gone' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'cg gone soon')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('cg_gone') AS cg_gone_at \gset
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+ on_cg_gone 
+------------
+          1
+(1 row)
+
+SELECT dolt_branch('-D', 'cg_gone', 'cg_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+ on_cg_gone 
+------------
+          0
+(1 row)
+
+-- (and stays gone with a session checked out at it: the hidden branch
+-- that holds it there is Dolt's detached HEAD, not a branch)
+SELECT dolt_checkout(:'cg_gone_at') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+ on_cg_gone 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS on_cg_gone FROM dolt_commit_ancestors
+	WHERE commit_hash = :'cg_gone_at';
+ on_cg_gone 
+------------
+          0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- (a writer's branch is a branch: its commits are listed, though main's
+-- log doesn't reach them)
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET dolt.writer = 'cgw';
+SET client_min_messages = warning;
+INSERT INTO cg.t VALUES (3, 'writer');
+RESET client_min_messages;
+SELECT active_branch();
+  active_branch  
+-----------------
+ writer/cgw/main
+(1 row)
+
+SELECT length(dolt_commit('-am', 'cg on a writer branch')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS on_writer FROM dolt_commits
+	WHERE message = 'cg on a writer branch';
+ on_writer 
+-----------
+         1
+(1 row)
+
+SELECT count(*) AS on_writer FROM dolt_commit_ancestors
+	WHERE commit_hash = dolt_hashof('writer/cgw/main');
+ on_writer 
+-----------
+         1
+(1 row)
+
+SELECT count(*) AS in_log FROM dolt_log WHERE message = 'cg on a writer branch';
+ in_log 
+--------
+      0
+(1 row)
+
+SELECT dolt_branch('-D', 'writer/cgw/main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET dolt.writer;
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+DROP SCHEMA cg CASCADE;
+NOTICE:  drop cascades to table cg.t
+SELECT length(dolt_commit('-Am', 'cg dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+

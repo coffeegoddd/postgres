@@ -42,6 +42,10 @@ SELECT length(dolt_commit('-am', 'rm 3')::text) AS committed;
 -- remotes are named, by URL
 SELECT dolt_remote('add', 'origin', :'url_a');
 SELECT name, url = :'url_a' AS url_is_a FROM dolt_remotes;
+-- with Dolt's fetch spec and parameters (#586)
+SELECT name, fetch_specs, params FROM dolt_remotes;
+SELECT fetch_specs ->> 0 AS spec, jsonb_typeof(params) AS params
+	FROM dolt_remotes() WHERE name = 'origin';
 SELECT dolt_remote('add', 'origin', :'url_a');
 SELECT dolt_remote('add', 'a/b', :'url_a');
 SELECT dolt_remote('add', 'other', 'ftp://example.com/x');

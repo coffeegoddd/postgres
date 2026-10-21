@@ -100,6 +100,13 @@ adapts.
   History stores definitions, not the individual rename commands; there is
   no change to the canonical storage format (labels carry no sort-order
   identity).
+  The commit tables are views over functions, as `dolt_log` is:
+  `dolt_commits` (every commit a branch reaches) and
+  `dolt_commit_ancestors` (each one's parents by `parent_index`, a root
+  commit's a null parent at index 0, as Dolt's) (#588). `dolt_commits`
+  has `commit_hash`, `committer`, `email`, `date` and `message`, not
+  Dolt's `author`, `author_email` and `author_date`: a prolly commit
+  records one author, which those columns would repeat.
 - **Why:** Postgres functions, not MySQL procedures; row composites keep
   the column types and work for any table without generated column
   names.

@@ -1,0 +1,65 @@
+{
+		Name: "schema modification: drop and rename columns with different types",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"call dolt_add('.')",
+			"set @Commit1 = '';",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'creating table t');",
+
+			"insert into t values(1, 'one', 'asdf'), (2, 'two', '2');",
+			"set @Commit2 = '';",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'inserting into t');",
+
+			"alter table t drop column c2;",
+			"set @Commit3 = '';",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'dropping column c2');",
+
+			"insert into t values (3, 'three');",
+			"update t set c1='fdsa' where pk=1;",
+			"set @Commit4 = '';",
+			"call dolt_commit_hash_out(@Commit4, '-am', 'inserting and updating data');",
+
+			"alter table t add column c2 int;",
+			"insert into t values (4, 'four', -4);",
+			"set @Commit5 = '';",
+			"call dolt_commit_hash_out(@Commit5, '-am', 'adding column c2, and inserting data');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type from dolt_diff(@Commit1, @Commit2, 't');",
+				Expected: []sql.Row{
+					{1, "one", "asdf", nil, nil, nil, "added"},
+					{2, "two", "2", nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, from_pk, from_c1, from_c2, diff_type from dolt_diff(@Commit2, @Commit3, 't');",
+				Expected: []sql.Row{
+					{1, "one", 1, "one", "asdf", "modified"},
+					{2, "two", 2, "two", "2", "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, from_pk, from_c1, diff_type from dolt_diff(@Commit3, @Commit4, 't');",
+				Expected: []sql.Row{
+					{3, "three", nil, nil, "added"},
+					{1, "fdsa", 1, "one", "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, diff_type from dolt_diff(@Commit4, @Commit5, 't');",
+				Expected: []sql.Row{
+					{4, "four", -4, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type from dolt_diff(@Commit1, @Commit5, 't');",
+				Expected: []sql.Row{
+					{1, "fdsa", nil, nil, nil, nil, "added"},
+					{2, "two", nil, nil, nil, nil, "added"},
+					{3, "three", nil, nil, nil, nil, "added"},
+					{4, "four", -4, nil, nil, nil, "added"},
+				},
+			},
+		},
+	}

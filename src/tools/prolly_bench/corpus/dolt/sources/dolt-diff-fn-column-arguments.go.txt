@@ -1,0 +1,31 @@
+{
+		// See https://github.com/dolthub/dolt/issues/11187
+		Name: "dolt_diff: column reference commit arguments are rejected with a clear error",
+		SetUpScript: []string{
+			"CREATE TABLE airspaces (id INT PRIMARY KEY, name VARCHAR(20));",
+			"INSERT INTO airspaces VALUES (1, 'a');",
+			"CALL DOLT_ADD('.');",
+			"CALL DOLT_COMMIT('-m', 'init');",
+			"CALL DOLT_BRANCH('branch-x');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "SELECT branch.name, (SELECT COUNT(*) FROM DOLT_DIFF(branch.name, 'branch-x', 'airspaces')) FROM dolt_branches branch;",
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
+			},
+			{
+				Query:       "SELECT branch.name, (SELECT COUNT(*) FROM DOLT_DIFF(CONCAT(branch.name, '...branch-x'), 'airspaces')) FROM dolt_branches branch;",
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
+			},
+			{
+				Query:       "SELECT branch.name, (SELECT COUNT(*) FROM DOLT_DIFF('main', 'branch-x', branch.name)) FROM dolt_branches branch;",
+				ExpectedErr: dtablefunctions.ErrInvalidNonLiteralArgument,
+			},
+			{
+				Query: "SELECT COUNT(*) FROM DOLT_DIFF('main', 'branch-x', 'airspaces');",
+				Expected: []sql.Row{
+					{0},
+				},
+			},
+		},
+	}

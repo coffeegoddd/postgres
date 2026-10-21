@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-per-branch",
+  "description": "Reviewed Dolt port: dolt_diff: per branch diffs run as one literal statement per branch",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: dolt_diff: per branch diffs run as one literal statement per branch"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE airspaces (id int PRIMARY KEY, name varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO airspaces VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+      "expect": {
+        "tag": "INSERT 0 4"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "init"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "branch-x",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch-x"
+      ]
+    },
+    {
+      "id": "branch-y",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch-y"
+      ]
+    },
+    {
+      "id": "checkout-x",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch-x"
+      ]
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE airspaces SET name = 'x1' WHERE id = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE airspaces SET name = 'x2' WHERE id = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "x edits"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "checkout-y",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch-y"
+      ]
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE airspaces SET name = 'y2' WHERE id = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE airspaces SET name = 'y3' WHERE id = 3",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "y edits"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "widened",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "widened"
+      ]
+    },
+    {
+      "id": "checkout-widened",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "widened"
+      ]
+    },
+    {
+      "id": "setup-16",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE airspaces ADD COLUMN altitude int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-17",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE airspaces SET name = 'w2', altitude = 100 WHERE id = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "widen and edit"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "checkout-main-again",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "setup-20",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE FUNCTION airspace_warnings(base text) RETURNS TABLE (branch text, warning_count int) LANGUAGE plpgsql AS $$\nDECLARE\n  b text;\nBEGIN\n  DROP TABLE IF EXISTS warning_counts;\n  CREATE TEMPORARY TABLE warning_counts (branch text, warning_count int);\n  FOR b IN SELECT d.name FROM dolt_branches d WHERE d.name <> airspace_warnings.base LOOP\n    EXECUTE format('INSERT INTO warning_counts SELECT $1, count(*) FROM ('\n      'SELECT COALESCE((to_row).id, (from_row).id) AS id FROM dolt_diff(dolt_merge_base(%L, %L), %L, NULL::airspaces) '\n      'INTERSECT '\n      'SELECT COALESCE((to_row).id, (from_row).id) FROM dolt_diff(dolt_merge_base(%L, %L), %L, NULL::airspaces)'\n      ') co', b, base, base, base, b, b) USING b;\n  END LOOP;\n  RETURN QUERY SELECT * FROM warning_counts ORDER BY 1;\nEND\n$$",
+      "expect": {
+        "tag": "CREATE FUNCTION"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM airspace_warnings('branch-x')",
+      "expect": {
+        "rows": [
+          [
+            "branch-y",
+            "1"
+          ],
+          [
+            "main",
+            "0"
+          ],
+          [
+            "widened",
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM warning_counts ORDER BY branch",
+      "expect": {
+        "rows": [
+          [
+            "branch-y",
+            "1"
+          ],
+          [
+            "main",
+            "0"
+          ],
+          [
+            "widened",
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

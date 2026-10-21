@@ -1588,6 +1588,12 @@ GRANT SELECT ON pg_aios TO pg_read_all_stats;
 CREATE VIEW dolt_log AS
     SELECT * FROM dolt_log('HEAD');
 
+CREATE VIEW dolt_commits AS
+    SELECT * FROM dolt_commits();
+
+CREATE VIEW dolt_commit_ancestors AS
+    SELECT * FROM dolt_commit_ancestors();
+
 CREATE VIEW dolt_branches AS
     SELECT * FROM dolt_branches();
 

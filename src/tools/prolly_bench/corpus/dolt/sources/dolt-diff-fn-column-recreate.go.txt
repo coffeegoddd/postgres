@@ -1,0 +1,64 @@
+{
+		Name: "schema modification: drop and recreate column with same type",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(20), c2 varchar(20));",
+			"call dolt_add('.')",
+			"set @Commit1 = '';",
+			"call dolt_commit_hash_out(@Commit1, '-am', 'creating table t');",
+
+			"insert into t values(1, 'one', 'two'), (2, 'two', 'three');",
+			"set @Commit2 = '';",
+			"call dolt_commit_hash_out(@Commit2, '-am', 'inserting into t');",
+
+			"alter table t drop column c2;",
+			"set @Commit3 = '';",
+			"call dolt_commit_hash_out(@Commit3, '-am', 'dropping column c2');",
+
+			"alter table t add column c2 varchar(20);",
+			"insert into t values (3, 'three', 'four');",
+			"update t set c2='foo' where pk=1;",
+			"set @Commit4 = '';",
+			"call dolt_commit_hash_out(@Commit4, '-am', 'adding column c2, inserting, and updating data');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type from dolt_diff(@Commit1, @Commit2, 't');",
+				Expected: []sql.Row{
+					{1, "one", "two", nil, nil, nil, "added"},
+					{2, "two", "three", nil, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, from_pk, from_c1, from_c2, diff_type from dolt_diff(@Commit2, @Commit3, 't');",
+				Expected: []sql.Row{
+					{1, "one", 1, "one", "two", "modified"},
+					{2, "two", 2, "two", "three", "modified"},
+				},
+			},
+			{
+				Query:       "SELECT to_c2 from dolt_diff(@Commit2, @Commit3, 't');",
+				ExpectedErr: sql.ErrColumnNotFound,
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, diff_type from dolt_diff(@Commit3, @Commit4, 't');",
+				Expected: []sql.Row{
+					{1, "one", "foo", 1, "one", "modified"},
+					// This row doesn't show up as changed because adding a column doesn't touch the row data.
+					//{2, "two", nil, 2, "two", "modified"},
+					{3, "three", "four", nil, nil, "added"},
+				},
+			},
+			{
+				Query:       "SELECT from_c2 from dolt_diff(@Commit3, @Commit4, 't');",
+				ExpectedErr: sql.ErrColumnNotFound,
+			},
+			{
+				Query: "SELECT to_pk, to_c1, to_c2, from_pk, from_c1, from_c2, diff_type from dolt_diff(@Commit1, @Commit4, 't');",
+				Expected: []sql.Row{
+					{1, "one", "foo", nil, nil, nil, "added"},
+					{2, "two", nil, nil, nil, nil, "added"},
+					{3, "three", "four", nil, nil, nil, "added"},
+				},
+			},
+		},
+	}

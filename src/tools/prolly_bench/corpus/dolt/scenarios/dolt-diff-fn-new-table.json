@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-new-table",
+  "description": "Reviewed Dolt port: new table",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: new table"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "initial"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (a int PRIMARY KEY, b int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).a, (to_row).b, diff_type FROM dolt_diff('HEAD', 'WORKING', NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).a, (from_row).b, diff_type FROM dolt_diff('HEAD', 'WORKING', NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (from_row).a, (from_row).b, (to_row).a, diff_type FROM dolt_diff('WORKING', 'HEAD', NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            null,
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}
