@@ -1,0 +1,439 @@
+Parsed test spec with 5 sessions
+
+starting permutation: a_rc b_begin b_outside a_insert b_insert a_rows b_rows b_commit a_commit c_log c_heads a_table c_log c_heads
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step b_begin: BEGIN;
+step b_outside: SET dolt.transaction_commit = off;
+step a_insert: INSERT INTO vts.x VALUES (2, 2);
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step a_rows: SELECT string_agg(y || ':' || z, ',' ORDER BY y) AS a_sees FROM vts.x;
+a_sees 
+-------
+1:1,2:2
+(1 row)
+
+step b_rows: SELECT string_agg(y || ':' || z, ',' ORDER BY y) AS b_sees FROM vts.x;
+b_sees 
+-------
+1:1,3:3
+(1 row)
+
+step b_commit: COMMIT;
+step a_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log
+---
+a  
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head   |working    |uncommitted
+-------+-----------+-----------
+1:1,2:2|1:1,2:2,3:3|          1
+(1 row)
+
+step a_table: SET dolt.transaction_commit_message = 'Commit Message 42'; CREATE TABLE vts.new_table (pk int PRIMARY KEY);
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log                
+-------------------
+Commit Message 42,a
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head       |working    |uncommitted
+-----------+-----------+-----------
+1:1,2:2,3:3|1:1,2:2,3:3|          0
+(1 row)
+
+
+starting permutation: c_insert a_rc b_begin a_insert b_insert a_rows b_rows b_message b_commit a_commit c_log c_diffs c_heads
+step c_insert: INSERT INTO vts.x VALUES (4, 4);
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step b_begin: BEGIN;
+step a_insert: INSERT INTO vts.x VALUES (2, 2);
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step a_rows: SELECT string_agg(y || ':' || z, ',' ORDER BY y) AS a_sees FROM vts.x;
+a_sees     
+-----------
+1:1,2:2,4:4
+(1 row)
+
+step b_rows: SELECT string_agg(y || ':' || z, ',' ORDER BY y) AS b_sees FROM vts.x;
+b_sees     
+-----------
+1:1,3:3,4:4
+(1 row)
+
+step b_message: SET dolt.transaction_commit_message = 'ClientB Commit';
+step b_commit: COMMIT;
+step a_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log             
+----------------
+a,ClientB Commit
+(1 row)
+
+step c_diffs: 
+	SELECT string_agg(l.message || '[' || coalesce((
+			SELECT string_agg(d.diff_type || ' ' ||
+				coalesce((d.to_row).y, (d.from_row).y) || ':' ||
+				coalesce((d.to_row).z::text, '-'), ', '
+				ORDER BY coalesce((d.to_row).y, (d.from_row).y))
+			  FROM dolt_diff(l.commit_hash || '~1', l.commit_hash, NULL::vts.x) d), '') || ']',
+		' ' ORDER BY l.commit_order) AS diffs
+	  FROM dolt_log('main') l
+	 WHERE l.commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+diffs                                 
+--------------------------------------
+ClientB Commit[added 3:3] a[added 2:2]
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head       |working        |uncommitted
+-----------+---------------+-----------
+1:1,2:2,3:3|1:1,2:2,3:3,4:4|          1
+(1 row)
+
+
+starting permutation: b_message a_insert b_insert c_log c_heads
+step b_message: SET dolt.transaction_commit_message = 'ClientB Commit';
+step a_insert: INSERT INTO vts.x VALUES (2, 2);
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log             
+----------------
+ClientB Commit,a
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head       |working    |uncommitted
+-----------+-----------+-----------
+1:1,2:2,3:3|1:1,2:2,3:3|          0
+(1 row)
+
+
+starting permutation: a_rc b_begin d_begin e_begin a_update b_insert d_update e_insert a_commit d_commit b_update e_delete b_commit e_commit c_log c_diffs c_heads
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step b_begin: BEGIN;
+step d_begin: BEGIN;
+step e_begin: BEGIN;
+step a_update: UPDATE vts.x SET z = z + 10 WHERE y = 1;
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step d_update: UPDATE vts.x SET z = z + 1000 WHERE y = 1; <waiting ...>
+step e_insert: INSERT INTO vts.x VALUES (6, 6);
+step a_commit: COMMIT;
+step d_update: <... completed>
+step d_commit: COMMIT;
+step b_update: UPDATE vts.x SET z = z + 100 WHERE y = 1;
+step e_delete: DELETE FROM vts.x WHERE y = 1; <waiting ...>
+step b_commit: COMMIT;
+step e_delete: <... completed>
+step e_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log    
+-------
+e,b,d,a
+(1 row)
+
+step c_diffs: 
+	SELECT string_agg(l.message || '[' || coalesce((
+			SELECT string_agg(d.diff_type || ' ' ||
+				coalesce((d.to_row).y, (d.from_row).y) || ':' ||
+				coalesce((d.to_row).z::text, '-'), ', '
+				ORDER BY coalesce((d.to_row).y, (d.from_row).y))
+			  FROM dolt_diff(l.commit_hash || '~1', l.commit_hash, NULL::vts.x) d), '') || ']',
+		' ' ORDER BY l.commit_order) AS diffs
+	  FROM dolt_log('main') l
+	 WHERE l.commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+diffs                                                                                      
+-------------------------------------------------------------------------------------------
+a[modified 1:11] d[modified 1:1011] b[modified 1:1111, added 3:3] e[removed 1:-, added 6:6]
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head   |working|uncommitted
+-------+-------+-----------
+3:3,6:6|3:3,6:6|          0
+(1 row)
+
+
+starting permutation: a_rr b_rr d_rr a_update b_insert d_update a_commit d_commit b_commit c_log c_diffs c_heads
+step a_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step b_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step d_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step a_update: UPDATE vts.x SET z = z + 10 WHERE y = 1;
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step d_update: UPDATE vts.x SET z = z + 1000 WHERE y = 1; <waiting ...>
+step a_commit: COMMIT;
+step d_update: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step d_commit: COMMIT;
+step b_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log
+---
+b,a
+(1 row)
+
+step c_diffs: 
+	SELECT string_agg(l.message || '[' || coalesce((
+			SELECT string_agg(d.diff_type || ' ' ||
+				coalesce((d.to_row).y, (d.from_row).y) || ':' ||
+				coalesce((d.to_row).z::text, '-'), ', '
+				ORDER BY coalesce((d.to_row).y, (d.from_row).y))
+			  FROM dolt_diff(l.commit_hash || '~1', l.commit_hash, NULL::vts.x) d), '') || ']',
+		' ' ORDER BY l.commit_order) AS diffs
+	  FROM dolt_log('main') l
+	 WHERE l.commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+diffs                        
+-----------------------------
+a[modified 1:11] b[added 3:3]
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head    |working |uncommitted
+--------+--------+-----------
+1:11,3:3|1:11,3:3|          0
+(1 row)
+
+
+starting permutation: a_ser b_ser d_ser a_insert b_insert d_insert d_commit b_commit a_commit c_log c_diffs c_heads
+step a_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step b_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step d_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step a_insert: INSERT INTO vts.x VALUES (2, 2);
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step d_insert: INSERT INTO vts.x VALUES (5, 5);
+step d_commit: COMMIT;
+step b_commit: COMMIT;
+step a_commit: COMMIT;
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log  
+-----
+a,b,d
+(1 row)
+
+step c_diffs: 
+	SELECT string_agg(l.message || '[' || coalesce((
+			SELECT string_agg(d.diff_type || ' ' ||
+				coalesce((d.to_row).y, (d.from_row).y) || ':' ||
+				coalesce((d.to_row).z::text, '-'), ', '
+				ORDER BY coalesce((d.to_row).y, (d.from_row).y))
+			  FROM dolt_diff(l.commit_hash || '~1', l.commit_hash, NULL::vts.x) d), '') || ']',
+		' ' ORDER BY l.commit_order) AS diffs
+	  FROM dolt_log('main') l
+	 WHERE l.commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+diffs                                 
+--------------------------------------
+d[added 5:5] b[added 3:3] a[added 2:2]
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head           |working        |uncommitted
+---------------+---------------+-----------
+1:1,2:2,3:3,5:5|1:1,2:2,3:3,5:5|          0
+(1 row)
+
+
+starting permutation: a_ser b_ser a_read b_read a_insert b_insert a_commit b_commit c_log c_diffs c_heads
+step a_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step b_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step a_read: SELECT count(*) FROM vts.x;
+count
+-----
+    1
+(1 row)
+
+step b_read: SELECT count(*) FROM vts.x;
+count
+-----
+    1
+(1 row)
+
+step a_insert: INSERT INTO vts.x VALUES (2, 2);
+step b_insert: INSERT INTO vts.x VALUES (3, 3);
+step a_commit: COMMIT;
+step b_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log
+---
+a  
+(1 row)
+
+step c_diffs: 
+	SELECT string_agg(l.message || '[' || coalesce((
+			SELECT string_agg(d.diff_type || ' ' ||
+				coalesce((d.to_row).y, (d.from_row).y) || ':' ||
+				coalesce((d.to_row).z::text, '-'), ', '
+				ORDER BY coalesce((d.to_row).y, (d.from_row).y))
+			  FROM dolt_diff(l.commit_hash || '~1', l.commit_hash, NULL::vts.x) d), '') || ']',
+		' ' ORDER BY l.commit_order) AS diffs
+	  FROM dolt_log('main') l
+	 WHERE l.commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+diffs       
+------------
+a[added 2:2]
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head   |working|uncommitted
+-------+-------+-----------
+1:1,2:2|1:1,2:2|          0
+(1 row)
+
+
+starting permutation: a_rc b_begin a_child b_child a_commit b_commit a_children a_bad_child c_log
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step b_begin: BEGIN;
+step a_child: INSERT INTO vts.child VALUES (1, 1);
+step b_child: INSERT INTO vts.child VALUES (2, 2);
+step a_commit: COMMIT;
+step b_commit: COMMIT;
+step a_children: SELECT pk, v1 FROM vts.child WHERE v1 > 0 ORDER BY pk;
+pk|v1
+--+--
+ 1| 1
+ 2| 2
+(2 rows)
+
+step a_bad_child: INSERT INTO vts.child VALUES (3, 3);
+ERROR:  insert or update on table "child" violates foreign key constraint "child_v1_fkey"
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log
+---
+b,a
+(1 row)
+
+
+starting permutation: a_rc b_begin a_email b_email b_commit a_commit a_emails c_log
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step b_begin: BEGIN;
+step a_email: INSERT INTO vts.emails (id, mailbox_id) VALUES ('tx-a', 'box-a');
+step b_email: INSERT INTO vts.emails (id, mailbox_id) VALUES ('tx-b', 'box-b');
+step b_commit: COMMIT;
+step a_commit: COMMIT;
+step a_emails: 
+	SELECT (SELECT count(*) FROM vts.emails) AS emails,
+		   (SELECT count(*) FROM vts.emails
+			 WHERE to_tsvector('simple', html_body) @@ to_tsquery('simple', 'hello')) AS hello,
+		   (SELECT count(*) FROM dolt_at('HEAD', NULL::vts.emails)) AS at_head;
+
+emails|hello|at_head
+------+-----+-------
+   502|  500|    502
+(1 row)
+
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log
+---
+a,b
+(1 row)
+
+
+starting permutation: a_rc a_insert a_prepare b_begin b_read b_prepare c_prepared b_finish c_log c_heads
+step a_rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step a_insert: INSERT INTO vts.x VALUES (2, 2);
+step a_prepare: PREPARE TRANSACTION 'vts_a';
+ERROR:  cannot prepare a transaction that dolt.transaction_commit would commit
+step b_begin: BEGIN;
+step b_read: SELECT count(*) FROM vts.x;
+count
+-----
+    1
+(1 row)
+
+step b_prepare: PREPARE TRANSACTION 'vts_b';
+step c_prepared: SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'vts%' ORDER BY gid;
+gid  
+-----
+vts_b
+(1 row)
+
+step b_finish: COMMIT PREPARED 'vts_b';
+step c_log: 
+	SELECT string_agg(message, ',' ORDER BY commit_order DESC) AS log
+	  FROM dolt_log('main') WHERE commit_order > (SELECT max(commit_order) FROM dolt_log('main') WHERE message = 'vts base');
+
+log
+---
+   
+(1 row)
+
+step c_heads: 
+	SELECT (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM dolt_at('HEAD', NULL::vts.x)) AS head,
+		   (SELECT string_agg(y || ':' || z, ',' ORDER BY y) FROM vts.x) AS working,
+		   (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vts.x)) AS uncommitted;
+
+head|working|uncommitted
+----+-------+-----------
+1:1 |1:1    |          0
+(1 row)
+
