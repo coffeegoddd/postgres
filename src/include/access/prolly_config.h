@@ -120,10 +120,13 @@ extern Oid	prolly_change_log_relid(Oid relid, Oid relam);
  * Told to the refs, for the folds they skip (#482): a transaction about to
  * write a branch (catalog/branch.c), and something every fold reads
  * changed under them all (a catalog change sent to other sessions, chunks
- * a collection dropped).  prolly_forget_folds() neither errors nor
- * allocates: it is called in critical sections too.
+ * a collection dropped), and a prepared transaction that ended
+ * (twophase.c), which may have written any branch.  prolly_forget_folds()
+ * and prolly_note_prepared_ended() neither error nor allocate: they are
+ * called in critical sections, or with interrupts held, too.
  */
 extern void prolly_note_branch_write(Oid branch);
 extern void prolly_forget_folds(void);
+extern void prolly_note_prepared_ended(FullTransactionId xid);
 
 #endif							/* PROLLY_CONFIG_H */

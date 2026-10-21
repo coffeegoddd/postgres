@@ -3960,4 +3960,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.shmem_init = branch_generations_shmem_init,
 	.note_write = branch_generations_note_write,
 	.forget_folds = branch_generations_forget,
+	.prepared_ended = branch_generations_prepared_ended,
 };
