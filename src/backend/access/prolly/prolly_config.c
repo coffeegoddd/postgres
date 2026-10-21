@@ -311,9 +311,16 @@ prolly_change_log_sizes(Relation rel, ProllyChangeLogSizes *sizes)
 bool
 prolly_is_change_log(Relation rel)
 {
+	return prolly_is_change_log_class(rel->rd_rel);
+}
+
+/* (as prolly_is_change_log()) */
+bool
+prolly_is_change_log_class(Form_pg_class form)
+{
 	const ProllyChangeLogRoutine *log = change_log();
 
-	return log != NULL && log->is_log != NULL && log->is_log(rel);
+	return log != NULL && log->is_log != NULL && log->is_log(form);
 }
 
 /*

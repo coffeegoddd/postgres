@@ -2002,11 +2002,11 @@ relation_relid(Oid relid)
 }
 
 static bool
-relation_is_log(Relation rel)
+relation_is_log(Form_pg_class form)
 {
-	return rel->rd_rel->relkind == RELKIND_TOASTVALUE &&
-		rel->rd_rel->relnamespace == PG_TOAST_NAMESPACE &&
-		strncmp(NameStr(rel->rd_rel->relname), LOG_PREFIX,
+	return form->relkind == RELKIND_TOASTVALUE &&
+		form->relnamespace == PG_TOAST_NAMESPACE &&
+		strncmp(NameStr(form->relname), LOG_PREFIX,
 				sizeof(LOG_PREFIX) - 1) == 0;
 }
 

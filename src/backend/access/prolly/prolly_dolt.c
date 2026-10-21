@@ -6568,8 +6568,9 @@ size_mapped(RelFileNumber relnumber, BlockNumber nblocks, void *arg)
 
 /*
  * Every branch's indexes' and change logs' file numbers, in a set.  A log
- * is known by its table (prolly_change_log_relid(), the session branch's
- * name for it), its OID every branch's.
+ * is known by its pg_class row alone (prolly_is_change_log_class()): its
+ * table may be on another branch only, where the session branch's name
+ * lookup wouldn't find its log.
  */
 static HTAB *
 mapped_files(void)
@@ -6579,9 +6580,6 @@ mapped_files(void)
 	HTAB	   *set = hash_create("mapped files", 256, &ctl,
 								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	Relation	classes = table_open(RelationRelationId, AccessShareLock);
-	List	   *rows = NIL;		/* Form_pg_class copies */
-	List	   *tables = NIL;
-	List	   *logs = NIL;
 
 	CatalogAllBranches = true;
 	PG_TRY();
@@ -6593,16 +6591,17 @@ mapped_files(void)
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+			MappedFile	key;
+			MappedFile *entry;
 
-			if (!RelFileNumberIsValid(c->relfilenode))
+			if (!RelFileNumberIsValid(c->relfilenode) ||
+				(c->relkind != RELKIND_INDEX && !prolly_is_change_log_class(c)))
 				continue;
-			if (c->relkind == RELKIND_INDEX || c->relkind == RELKIND_TOASTVALUE)
-				rows = lappend(rows, memcpy(palloc(sizeof(FormData_pg_class)), c,
-											 sizeof(FormData_pg_class)));
-			else if (c->relam == PROLLY_TABLE_AM_OID &&
-					 (c->relkind == RELKIND_RELATION ||
-					  c->relkind == RELKIND_MATVIEW))
-				tables = list_append_unique_oid(tables, c->oid);
+			key.spcOid = OidIsValid(c->reltablespace) ? c->reltablespace :
+				MyDatabaseTableSpace;
+			key.relnumber = c->relfilenode;
+			entry = hash_search(set, &key, HASH_ENTER, NULL);
+			entry->kind = c->relkind == RELKIND_INDEX ? 'i' : 'l';
 		}
 		systable_endscan(scan);
 	}
@@ -6612,30 +6611,6 @@ mapped_files(void)
 	}
 	PG_END_TRY();
 	table_close(classes, AccessShareLock);
-
-	foreach_oid(relid, tables)
-	{
-		Oid			logid = prolly_change_log_relid(relid, PROLLY_TABLE_AM_OID);
-
-		if (OidIsValid(logid))
-			logs = lappend_oid(logs, logid);
-	}
-	foreach_ptr(FormData_pg_class, c, rows)
-	{
-		MappedFile	key;
-		MappedFile *entry;
-
-		if (c->relkind != RELKIND_INDEX && !list_member_oid(logs, c->oid))
-			continue;
-		key.spcOid = OidIsValid(c->reltablespace) ? c->reltablespace :
-			MyDatabaseTableSpace;
-		key.relnumber = c->relfilenode;
-		entry = hash_search(set, &key, HASH_ENTER, NULL);
-		entry->kind = c->relkind == RELKIND_INDEX ? 'i' : 'l';
-	}
-	list_free_deep(rows);
-	list_free(tables);
-	list_free(logs);
 	return set;
 }
 

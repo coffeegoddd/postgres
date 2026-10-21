@@ -169,5 +169,44 @@ SELECT sums_to_database();
  t
 (1 row)
 
+-- A table on another branch only: its change log's pages are no table's
+-- main fork, read from either branch (from main, where the table isn't,
+-- its log is known by its own catalog row).
+SELECT dolt_checkout('-b', 'only_there') IS NOT NULL AS switched;
+ switched 
+----------
+ t
+(1 row)
+
+CREATE TABLE s.u (id int8 PRIMARY KEY, v text);
+INSERT INTO s.u SELECT g, repeat('z', 100) FROM generate_series(1, 5000) g;
+CHECKPOINT;
+SELECT heap_main_bytes AS heap_there, change_log_live_bytes > 0 AS log_live
+FROM prolly_storage_breakdown() \gset
+SELECT :'log_live' AS log_live;
+ log_live 
+----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS switched;
+ switched 
+----------
+ t
+(1 row)
+
+SELECT heap_main_bytes = :heap_there AS heap_same, to_regclass('s.u') AS u
+FROM prolly_storage_breakdown();
+ heap_same | u 
+-----------+---
+ t         | 
+(1 row)
+
+SELECT sums_to_database();
+ sums_to_database 
+------------------
+ t
+(1 row)
+
 \c postgres
 DROP DATABASE breakdown_db;

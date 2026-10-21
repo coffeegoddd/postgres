@@ -96,5 +96,20 @@ SELECT journal_bytes >= 0 AS journal, settled_bytes > 0 AS settled
 FROM prolly_storage_breakdown();
 SELECT sums_to_database();
 
+-- A table on another branch only: its change log's pages are no table's
+-- main fork, read from either branch (from main, where the table isn't,
+-- its log is known by its own catalog row).
+SELECT dolt_checkout('-b', 'only_there') IS NOT NULL AS switched;
+CREATE TABLE s.u (id int8 PRIMARY KEY, v text);
+INSERT INTO s.u SELECT g, repeat('z', 100) FROM generate_series(1, 5000) g;
+CHECKPOINT;
+SELECT heap_main_bytes AS heap_there, change_log_live_bytes > 0 AS log_live
+FROM prolly_storage_breakdown() \gset
+SELECT :'log_live' AS log_live;
+SELECT dolt_checkout('main') IS NOT NULL AS switched;
+SELECT heap_main_bytes = :heap_there AS heap_same, to_regclass('s.u') AS u
+FROM prolly_storage_breakdown();
+SELECT sums_to_database();
+
 \c postgres
 DROP DATABASE breakdown_db;

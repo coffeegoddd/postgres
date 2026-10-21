@@ -70,10 +70,12 @@
  *   tablespace and autovacuum settings as its TOAST table does.  Asked by
  *   autovacuum with only the table's pg_class row, so it opens nothing.
  *   Optional.
- * - is_log() says whether rel is a change log: its rows are no table's, and
- *   logical decoding passes over them.  Asked of any TOAST-kind relation,
- *   in critical sections too (RelationIsLogicallyLogged), so it is quick
- *   and must neither error nor allocate.
+ * - is_log() says whether the relation of pg_class row form is a change
+ *   log: its rows are no table's, and logical decoding passes over them.
+ *   Asked of any TOAST-kind relation, in critical sections too
+ *   (RelationIsLogicallyLogged), and of pg_class rows read across every
+ *   branch, the log's table perhaps on another branch only: so it judges
+ *   by the row alone, is quick, and must neither error nor allocate.
  * - consume() is called once a fold that read the log by this snapshot is
  *   to be the table's baseline: the transaction's own entries are marked
  *   consumed (the next fold reads its transaction's again, but those), and
@@ -133,6 +135,7 @@
 #include "access/htup.h"
 #include "access/prolly_registry.h"
 #include "access/transam.h"
+#include "catalog/pg_class.h"
 #include "storage/itemptr.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
@@ -176,7 +179,7 @@ typedef struct ProllyChangeLogRoutine
 						 const ProllyLogPosition *since,
 						 ProllyChangeLogVisit visit, void *arg);
 	void		(*consume) (Relation rel, Snapshot snapshot);
-	bool		(*is_log) (Relation rel);
+	bool		(*is_log) (Form_pg_class form);
 	Oid			(*relid) (Oid relid);
 	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
 							  HeapTuple oldtup, HeapTuple *made, int nmade);
