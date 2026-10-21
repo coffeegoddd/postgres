@@ -11,9 +11,10 @@
  * (md.c's sequences), a copy of its files.  No page is read.
  *
  * The copy is of the source as its writers left it: its versioned
- * relations are locked against changes meanwhile (ShareLock, which waits
- * for writers to finish), so no change is in flight in a page the copy
- * shares, and the copy holds every row they committed, whether the making
+ * relations are locked against changes meanwhile (ShareLock, taken once no
+ * writer holds them: tried again until then, not queued for, so writers
+ * coming after aren't held up), so no change is in flight in a page the
+ * copy shares, and the copy holds every row they committed, whether the making
  * transaction's snapshot sees it or not (what moves the copy reads it by
  * one that does, or, where the snapshot can't move, empties the copies
  * that hold what it doesn't see).  The locks are let go once the copy is
@@ -61,7 +62,9 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -69,6 +72,8 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 /* the id of the branch called name; InvalidOid if none and missing_ok */
 static Oid
@@ -175,10 +180,55 @@ copy_storage(Form_pg_class c)
 	return relnumber;
 }
 
+/* the longest wait between tries at the copy's locks, in milliseconds */
+#define COPY_LOCK_MAX_DELAY_MS	100
+
+/*
+ * Take ShareLock on every one of relids, or on none: a lock that would
+ * wait gives back those already taken.  Returns the first relation that
+ * couldn't be locked, or InvalidOid once all are.
+ */
+static Oid
+lock_all_or_none(List *relids)
+{
+	int			ntaken = 0;
+	Oid			busy = InvalidOid;
+	ListCell   *lc;
+
+	foreach(lc, relids)
+	{
+		if (!ConditionalLockRelationOid(lfirst_oid(lc), ShareLock))
+		{
+			busy = lfirst_oid(lc);
+			break;
+		}
+		ntaken++;
+	}
+	if (OidIsValid(busy))
+		foreach(lc, relids)
+		{
+			if (ntaken-- == 0)
+				break;
+			UnlockRelationOid(lfirst_oid(lc), ShareLock);
+		}
+	return busy;
+}
+
 /*
  * Lock the session branch's versioned relations against changes, so the
  * copy is of a state no writer is in the middle of.  Returns them, for
  * unlock_relations().
+ *
+ * The locks are tried, not waited for: a ShareLock in the lock queue would
+ * hold up every writer that comes after it, for as long as the writers
+ * before it take, and then for the copy.  So all are taken at once or none
+ * is, and the try is repeated, a little later each time, until they are
+ * (writers coming and going meanwhile go ahead), or lock_timeout passes
+ * (0, the default, waits for as long as it takes).  Nor does the deadlock
+ * detector see this wait: lock_timeout or statement_timeout bounds it.
+ *
+ * The source's dirty pages are written first, outside the locks, so that
+ * what the copy writes under them is only what changed meanwhile.
  */
 static List *
 lock_versioned_relations(void)
@@ -188,7 +238,12 @@ lock_versioned_relations(void)
 	HeapTuple	tup;
 	List	   *relids = NIL;
 	List	   *toasts = NIL;
-	ListCell   *lc;
+	SMgrRelation *srels = NULL;
+	int			nsrels = 0;
+	int			maxsrels = 0;
+	TimestampTz start = 0;
+	long		delay = 1;
+	Oid			busy;
 
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -201,20 +256,63 @@ lock_versioned_relations(void)
 			toasts = lappend_oid(toasts, c->oid);
 		else
 			relids = lappend_oid(relids, c->oid);
+
+		if (RELKIND_HAS_STORAGE(c->relkind) &&
+			c->relpersistence == RELPERSISTENCE_PERMANENT &&
+			RelFileNumberIsValid(c->relfilenode))
+		{
+			if (nsrels == maxsrels)
+			{
+				maxsrels = maxsrels ? maxsrels * 2 : 16;
+				srels = srels ? repalloc_array(srels, SMgrRelation, maxsrels)
+					: palloc_array(SMgrRelation, maxsrels);
+			}
+			srels[nsrels++] = smgropen(class_locator(c, c->relfilenode),
+									   INVALID_PROC_NUMBER);
+		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
+	/* in one pass over the buffers, not one per relation under the locks */
+	if (nsrels > 0)
+	{
+		FlushRelationsAllBuffers(srels, nsrels);
+		pfree(srels);
+	}
+
 	/*
 	 * TOAST-kind relations (TOAST tables, change logs) after every table,
 	 * in the order a writer takes them: its table first, then those as it
-	 * writes a value out of line or an entry.  In the order of pg_class
-	 * the two could each wait on the other.
+	 * writes a value out of line or an entry.
 	 */
 	relids = list_concat(relids, toasts);
 	list_free(toasts);
-	foreach(lc, relids)
-		LockRelationOid(lfirst_oid(lc), ShareLock);
+
+	while (OidIsValid(busy = lock_all_or_none(relids)))
+	{
+		if (start == 0)
+			start = GetCurrentTimestamp();
+		else if (LockTimeout > 0 &&
+				 TimestampDifferenceExceeds(start, GetCurrentTimestamp(),
+											LockTimeout))
+		{
+			char	   *relname = get_rel_name(busy);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("could not lock relation \"%s\" of branch \"%s\" to copy it",
+							relname ? relname : "?", branch_name(MyBranch)),
+					 errdetail("A transaction writing to it was still in progress when \"lock_timeout\" passed."),
+					 errhint("Try again once the branch's writers are done, or raise \"lock_timeout\".")));
+		}
+
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 delay, WAIT_EVENT_BRANCH_COPY_LOCK);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		delay = Min(delay * 2, COPY_LOCK_MAX_DELAY_MS);
+	}
 
 	/* read the catalogs as the locks left them */
 	InvalidateCatalogSnapshot();

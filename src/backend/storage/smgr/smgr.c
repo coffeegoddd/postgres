@@ -110,6 +110,12 @@ typedef struct f_smgr
 	void		(*smgr_share) (SMgrRelation src, SMgrRelation dst);
 
 	/*
+	 * Make durable what this transaction's shares left to be (at commit), or
+	 * forget it (!isCommit); may be NULL (a share is durable once made).
+	 */
+	void		(*smgr_syncshares) (bool isCommit);
+
+	/*
 	 * Can the fork's blocks be given other storage, which may have held
 	 * another relation's pages?  May be NULL (never).
 	 */
@@ -227,6 +233,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = bmapcreate,
 		.smgr_exists = bmapexists,
 		.smgr_share = bmapshare,
+		.smgr_syncshares = bmapsyncshares,
 		.smgr_replacesblocks = bmapreplacesblocks,
 		.smgr_replacedafter = bmapreplacedafter,
 		.smgr_prerestore = bmapprerestore,
@@ -632,6 +639,23 @@ smgrcreatewith(SMgrRelation reln, int which, ForkNumber forknum, bool isRedo)
 	}
 	smgrsw[which].smgr_create(reln, forknum, isRedo);
 	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrsyncshares() -- Make the transaction's shares durable.
+ *
+ * A share may leave the blocks it shares to be made durable after it, once
+ * the caller no longer keeps src from changing; this does it, for every
+ * share made since the last call.  It is called at commit, and earlier by a
+ * caller that would rather not wait for it there.  At abort (!isCommit)
+ * what is left is forgotten: the copies are dropped.
+ */
+void
+smgrsyncshares(bool isCommit)
+{
+	for (int i = 0; i < NSmgr; i++)
+		if (smgrsw[i].smgr_syncshares)
+			smgrsw[i].smgr_syncshares(isCommit);
 }
 
 /*

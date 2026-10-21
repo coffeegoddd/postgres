@@ -1447,6 +1447,26 @@ or settles the above:
   each copied relation a new relation file number whose map is a copy of
   its source's with every entry marked shared, and raises the source's
   sharing epoch. Cost: O(versioned catalog rows + map pages).
+- **The copy's locks (#489, as built).** The copy (made at a branch's
+  first use) holds `ShareLock` on every versioned relation of the source
+  branch, so no writer is in the middle of a page it shares. It doesn't
+  queue for them: it tries them all (`ConditionalLockRelationOid`), and
+  if one is held by a writer, gives back those it took and tries again,
+  1 ms later, doubling to 100 ms (wait event `BranchCopyLock`). A writer
+  that comes meanwhile goes ahead, never behind the first use. With
+  `lock_timeout` set, the first use gives up once it passes, with a hint
+  to try again or raise it; at the default 0 it waits as long as it takes
+  (the deadlock detector doesn't see this wait; `statement_timeout`
+  bounds it too). Under the locks only the map copy, the reference
+  counts, the epoch raise, the marking of cached pages shared and the
+  write of what was dirtied since are done: the source's dirty buffers
+  are written beforehand in one pass over all its relations, and the
+  page store is synced once per store at commit, after the locks are let
+  go (a page the source changes after them is copied first, its old
+  contents written to the shared block, so the blocks hold what the copy
+  starts from either way; it only has to be durable when the copy is).
+  Sharing the source's last fold instead, with no lock writers wait for,
+  is the issue's second part, not built.
 - `dolt_branch_delete(name)` deletes the branch's rows and drops its
   relations' storage; shared physical blocks survive in their other maps.
 

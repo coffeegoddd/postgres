@@ -882,6 +882,9 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 
 	Assert(GetCurrentTransactionNestLevel() == 1);
 
+	/* shared storage too (RelationCreateStorageShared()) */
+	smgrsyncshares(isCommit);
+
 	if (!pendingSyncHash)
 		return;					/* no relation needs sync */
 

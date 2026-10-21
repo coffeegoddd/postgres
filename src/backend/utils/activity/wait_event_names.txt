@@ -180,6 +180,7 @@ ABI_compatibility:
 Section: ClassName - WaitEventTimeout
 
 BASE_BACKUP_THROTTLE	"Waiting during base backup when throttling activity."
+BRANCH_COPY_LOCK	"Waiting to try again to lock a branch's relations, to copy them for a branch's first use."
 CHECKPOINT_WRITE_DELAY	"Waiting between writes while performing a checkpoint."
 COMMIT_DELAY	"Waiting for commit delay before WAL flush."
 PG_SLEEP	"Waiting due to a call to <function>pg_sleep</function> or a sibling function."
