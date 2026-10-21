@@ -26,7 +26,8 @@ if ($ENV{enable_injection_points} ne 'yes')
 
 my $node = PostgreSQL::Test::Cluster->new('copies');
 $node->init(allows_streaming => 1, has_archiving => 1);
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+# (WAL kept for the standby across the primary's crashes and checkpoints)
+$node->append_conf('postgresql.conf', "autovacuum = off\nwal_keep_size = '256MB'");
 $node->start;
 $node->safe_psql('postgres', 'CREATE DATABASE cp');
 $node->safe_psql('cp', 'CREATE EXTENSION test_prolly; CREATE EXTENSION injection_points');
@@ -151,6 +152,43 @@ my $after = sql($files);
 $node->stop('immediate');
 $node->start;
 is(sql($reads), all_read(), 'crash recovery replays copies whose sources are gone');
+is(sql($files), $after, 'and leaves the files as they were');
+
+# Two collections after the checkpoint, the second retiring what the first
+# wrote: the first's copies replay with their sources and their file both
+# gone, so they wait, and the second's retire of that file resolves them.
+put('twice live', 20, 1);
+put('twice dead', 20, 0);
+drop_live(10);
+sql('CHECKPOINT');
+collect('true', '');
+drop_live(5);
+collect('true', '');
+$after = sql($files);
+$node->stop('immediate');
+$node->start;
+is(sql($reads), all_read(),
+	'crash recovery replays copies whose file a later retire removed');
+is(sql($files), $after, 'and leaves the files as they were');
+
+# A collection that fails after its copies, then one that collects what
+# the first copied from: the first's copies wait the same way, and the
+# second's removal of the unnamed file the first wrote resolves them.
+put('failed live', 20, 1);
+put('failed dead', 20, 0);
+drop_live(10);
+sql('CHECKPOINT');
+my ($failed_ok, $failed_out, $failed_err) = $node->psql('cp', q{
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('prolly-gc-copied', 'error');
+	SELECT test_chunk_gc(true);});
+like($failed_err, qr/prolly-gc-copied/, 'a collection fails after its copies');
+collect('true', '');
+$after = sql($files);
+$node->stop('immediate');
+$node->start;
+is(sql($reads), all_read(),
+	'crash recovery replays copies whose file the next writer removed');
 is(sql($files), $after, 'and leaves the files as they were');
 
 # A crash after a collection's copies, before its swap: the copies replay
@@ -289,6 +327,34 @@ $node->wait_for_catchup($standby);
 is(scalar(@kept), 0, 'and removes them once it ends');
 is($standby->safe_psql('cp', $files), sql($files),
 	"the standby's store files are still the primary's");
+
+# A standby restarted while it keeps them for its backup, from a
+# restartpoint past the retire: redo doesn't replay the retire again, and
+# no writer runs there; it removes them as it reaches a consistent state.
+put('restart live', 20, 1);
+put('restart dead', 20, 0);
+drop_live(10);
+@retiring = split(/ /, sql($segments));
+$b = $standby->background_psql('postgres');
+$b->query_safe(q{SET client_min_messages = warning;
+	SELECT pg_backup_start('standby restart', true)});
+collect('true', '');
+my $retired_at = $node->lsn('insert');
+sql('CHECKPOINT');
+$node->wait_for_catchup($standby);
+$standby->safe_psql('postgres', 'CHECKPOINT');
+@kept = grep { -e $standby->data_dir . "/base/$oid/$_" } @retiring;
+is(scalar(@kept), scalar(@retiring), 'the standby keeps them while its backup runs');
+is( $standby->safe_psql('postgres',
+		qq{SELECT redo_lsn >= '$retired_at' FROM pg_control_checkpoint()}),
+	't', 'its restartpoint is past the retire');
+$b->{run}->kill_kill;
+$standby->stop;
+$standby->start;
+@kept = grep { -e $standby->data_dir . "/base/$oid/$_" } @retiring;
+is(scalar(@kept), 0, 'restarted from past the retire, it removes them');
+is($standby->safe_psql('cp', $files), sql($files),
+	"and its store files are the primary's");
 
 # A standby whose source differs from the primary's stops at the copy,
 # rather than writing bytes the WAL never had: a live chunk's record in

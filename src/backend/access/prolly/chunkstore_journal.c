@@ -158,6 +158,7 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -628,6 +629,8 @@ static ProllyChunkStore *session_store = NULL;
 static bool ensure_journal(ProllyChunkStore *s, bool create);
 static void journal_root(ProllyChunkStore *s, ProllyHash *root);
 static void defer_unlink(Oid dboid, Oid spcoid, bool segment, uint64 id);
+typedef void (*DatabaseDirFn) (const char *dir, Oid dboid, Oid spcoid);
+static void each_database_dir(DatabaseDirFn fn);
 static void retire_files(Oid dboid, Oid spcoid, const Manifest *before,
 						 const Manifest *after);
 static void standby_readers_note(Oid dboid);
@@ -3279,7 +3282,9 @@ copy_write(Oid dboid, Oid spcoid, bool segment, uint64 id, uint64 offset,
  * would copy from it.  So asked once the removal is logged: a backup that
  * starts later has its start point after the record, and after every copy
  * from the file.  A file left is named no longer: the next writer's
- * remove_unnamed() takes it, or, on a standby, redo once the backups end.
+ * remove_unnamed() takes it, or, on a standby, redo once the backups end
+ * (or, a restart having forgotten it, as redo reaches a consistent state:
+ * remove_dropped()).
  */
 static void
 remove_store_file(Oid dboid, Oid spcoid, bool segment, uint64 id,
@@ -3850,20 +3855,16 @@ write_table_file(ProllyChunkStore *s, Manifest *m, bool *keep, uint8 flags,
 }
 
 /*
- * Remove the table files and journal segments of dir its manifest m
- * doesn't name, as kept or retiring: those a writer replaced but didn't
- * get to remove (it failed, or the server stopped, in between), or one it
- * was writing.  With the manifest's lock held, no writer is writing one
- * now.
+ * The table files (ids) and journal segments (segs) of dir its manifest m
+ * doesn't name, as kept or retiring; given (dropped): only those of ids m
+ * gave, so none a writer is writing now (its id is past m's).
  */
 static void
-remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
+unnamed_files(const char *dir, const Manifest *m, bool dropped, List **ids,
+			  List **segs)
 {
 	DIR		   *d = AllocateDir(dir);
 	struct dirent *de;
-	List	   *ids = NIL;
-	List	   *segs = NIL;
-	ListCell   *lc;
 
 	while ((de = ReadDir(d, dir)) != NULL)
 	{
@@ -3905,18 +3906,35 @@ remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
 		}
 		for (int i = 0; i < m->nretiring; i++)
 			named |= m->retiring[i] == id;
-		if (!named)
+		if (!named && (!dropped || id <= m->last_id))
 		{
 			uint64	   *p = palloc(sizeof(uint64));
 
 			*p = id;
 			if (segment)
-				segs = lappend(segs, p);
+				*segs = lappend(*segs, p);
 			else
-				ids = lappend(ids, p);
+				*ids = lappend(*ids, p);
 		}
 	}
 	FreeDir(d);
+}
+
+/*
+ * Remove the table files and journal segments of dir its manifest m
+ * doesn't name, as kept or retiring: those a writer replaced but didn't
+ * get to remove (it failed, or the server stopped, in between), or one it
+ * was writing.  With the manifest's lock held, no writer is writing one
+ * now.
+ */
+static void
+remove_unnamed(ProllyChunkStore *s, const char *dir, const Manifest *m)
+{
+	List	   *ids = NIL;
+	List	   *segs = NIL;
+	ListCell   *lc;
+
+	unnamed_files(dir, m, false, &ids, &segs);
 	foreach(lc, ids)
 		table_file_unlink(s, dir, *(uint64 *) lfirst(lc), false);
 	foreach(lc, segs)
@@ -5244,8 +5262,73 @@ copy_redo(XLogReaderState *record)
 }
 
 /*
+ * The files of database directory dir (of dboid, in spcoid) its manifest
+ * dropped, as archive recovery reaches a consistent state with no backup
+ * running: those whose removal waited for a backup that ran as their
+ * retire was replayed (a standby's own), and that a restart since forgot,
+ * the retire's redo being before the point redo began from.  The primary
+ * removed them long ago and logs no other removal; a standby runs no
+ * writer whose remove_unnamed() would take them.  Only the ids the
+ * manifest gave: a file past them may be one whose writer's records redo
+ * is still replaying.  Not WAL-logged: a standby can't, and its own
+ * standbys do the same.
+ */
+static void
+remove_dropped(const char *dir, Oid dboid, Oid spcoid)
+{
+	Manifest	m;
+	List	   *ids = NIL;
+	List	   *segs = NIL;
+	ListCell   *lc;
+	bool		found;
+
+	PG_TRY();
+	{
+		found = read_manifest(dir, &m);
+	}
+	PG_CATCH();
+	{
+		/* (a store this server refuses is left as it is) */
+		EmitErrorReport();
+		FlushErrorState();
+		return;
+	}
+	PG_END_TRY();
+	if (!found)
+		return;
+	unnamed_files(dir, &m, true, &ids, &segs);
+	foreach(lc, ids)
+	{
+		char	   *path = table_file_path(dir, *(uint64 *) lfirst(lc));
+
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+		pfree(path);
+	}
+	foreach(lc, segs)
+	{
+		char	   *path = segment_path(dboid, spcoid, *(uint64 *) lfirst(lc));
+
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+		pfree(path);
+	}
+	if (ids != NIL || segs != NIL)
+		manifests_changed();
+	list_free_deep(ids);
+	list_free_deep(segs);
+}
+
+/*
  * Recovery is consistent: a copy still waiting for its file's removal
- * means the files differ from those the WAL was written against.
+ * means the files differ from those the WAL was written against.  In
+ * archive recovery, with no backup running, the files dropped whose
+ * removal a restart forgot are removed (crash recovery's end removes what
+ * the manifests don't name, WAL-logged, instead).
  */
 static void
 journal_redo_consistent(void)
@@ -5253,6 +5336,8 @@ journal_redo_consistent(void)
 	StoreFile  *f;
 	char	   *path;
 
+	if (ArchiveRecoveryRequested && !XLogBackupInProgress())
+		each_database_dir(remove_dropped);
 	if (copies_pending == NIL)
 		return;
 	f = linitial(copies_pending);
@@ -5657,9 +5742,9 @@ remove_leftovers(const char *dir, Oid dboid, Oid spcoid)
 	FreeDir(d);
 }
 
-/* every database directory under parent (of tablespace spcoid) */
+/* every database directory under parent (of tablespace spcoid), to fn */
 static void
-leftovers_under(const char *parent, Oid spcoid)
+dirs_under(const char *parent, Oid spcoid, DatabaseDirFn fn)
 {
 	DIR		   *dir = AllocateDir(parent);
 	struct dirent *de;
@@ -5673,19 +5758,20 @@ leftovers_under(const char *parent, Oid spcoid)
 		if (strspn(de->d_name, "0123456789") != strlen(de->d_name))
 			continue;
 		sub = psprintf("%s/%s", parent, de->d_name);
-		remove_leftovers(sub, (Oid) strtoul(de->d_name, NULL, 10), spcoid);
+		fn(sub, (Oid) strtoul(de->d_name, NULL, 10), spcoid);
 		pfree(sub);
 	}
 	FreeDir(dir);
 }
 
+/* every database directory, in every tablespace, to fn */
 static void
-journal_recovered(void)
+each_database_dir(DatabaseDirFn fn)
 {
 	DIR		   *tsdir;
 	struct dirent *de;
 
-	leftovers_under("base", DEFAULTTABLESPACE_OID);
+	dirs_under("base", DEFAULTTABLESPACE_OID, fn);
 	tsdir = AllocateDir(PG_TBLSPC_DIR);
 	if (tsdir == NULL)
 		return;
@@ -5697,10 +5783,16 @@ journal_recovered(void)
 			continue;
 		sub = psprintf("%s/%s/%s", PG_TBLSPC_DIR, de->d_name,
 					   TABLESPACE_VERSION_DIRECTORY);
-		leftovers_under(sub, (Oid) strtoul(de->d_name, NULL, 10));
+		dirs_under(sub, (Oid) strtoul(de->d_name, NULL, 10), fn);
 		pfree(sub);
 	}
 	FreeDir(tsdir);
+}
+
+static void
+journal_recovered(void)
+{
+	each_database_dir(remove_leftovers);
 }
 
 static void
