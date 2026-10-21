@@ -123,6 +123,7 @@ tests += {
       'fold_verify',
       'keyless_toast_folds',
       'vacuum_shared',
+      'eager_freeze',
       'append_check',
       'journal_segments',
       'journal_compression',

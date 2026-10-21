@@ -1479,6 +1479,26 @@ or settles the above:
   they never change a page another branch can see.
 - Opportunistic pruning (on a read) skips shared pages, so reads don't
   copy pages.
+- **Freezing before pages are shared (#488, as built).** A VACUUM of a
+  relation whose storage shares pages (`smgrcanshare()`: block-mapped
+  storage) freezes with a freeze age of 0 when
+  its caller gives none, so a page is frozen and marked all-frozen while
+  it is still the relation's own, in place; a branch's copy then shares
+  it all-frozen (its visibility map goes with it), and an aggressive
+  VACUUM of either branch skips it rather than copying it to freeze it.
+  An access-method default applied in `vacuum_get_cutoffs()`, not a
+  reloption written at `CREATE` (which would enter the table's canonical
+  description and its commits' hashes): `vacuum_freeze_min_age` set
+  explicitly (in the configuration file, for a database or role, or in
+  the session) or the relation's `autovacuum_freeze_min_age` reloption
+  still decides. A normal VACUUM then also scans every all-visible page
+  not yet all-frozen (PG18's eager scan, unbounded: no minimum table
+  size, no cap on successes, no failure limit per region), since reads
+  set pages all-visible (on-access pruning) without freezing them and a
+  normal VACUUM would skip those; an explicit
+  `vacuum_max_eager_freeze_failure_rate` (setting or reloption) leaves
+  the eager scan as PG18 has it. The cost: freeze WAL earlier, and
+  reading all-visible pages until they are frozen.
 
 ## 7. Step 6 design: remotes
 
