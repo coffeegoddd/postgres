@@ -177,6 +177,28 @@ class V6RangeTest(unittest.TestCase):
             self.assertEqual(len(ids), n, f"branch {b}")
 
 
+class V8MetricsTest(unittest.TestCase):
+    def test_each_stage_flat(self):
+        from pbench.workloads.v_suite import V8
+        files = {c: 1000 for c in V8.FILES}
+        reading = {"breakdown": {**files, "heap_main_bytes": 500, "change_log_bytes": None},
+                   "database_bytes": 40000, "table_bytes": 16384, "heap_bytes": 4000}
+        m = V8.metrics({s: reading for s in V8.STAGES})
+        for s in V8.STAGES:
+            self.assertEqual(m[f"{s}_page_store_bytes"], 1000.0)
+            self.assertIsNone(m[f"{s}_change_log_bytes"])   # (the log can't say)
+            # (the files, not the parts of the page store)
+            self.assertEqual(m[f"{s}_prolly_bytes"], 1000.0 * len(V8.FILES))
+            self.assertEqual(m[f"{s}_prolly_over_heap"], 0.25 * len(V8.FILES))
+        # (a file column unknown: no sum; no breakdown: the sizes still)
+        m = V8.metrics({s: {**reading, "breakdown": {**files, "chunk_store_other_bytes": None}}
+                        for s in V8.STAGES})
+        self.assertIsNone(m["gc_prolly_bytes"])
+        m = V8.metrics({s: {**reading, "breakdown": None} for s in V8.STAGES})
+        self.assertEqual(m["gc_database_bytes"], 40000.0)
+        self.assertNotIn("gc_page_store_bytes", m)
+
+
 class RegistryTest(unittest.TestCase):
     def test_everything_registered(self):
         registry.load_all()
@@ -185,7 +207,7 @@ class RegistryTest(unittest.TestCase):
                                 key=lambda n: int(n[1:])),
                          [f"S{i}" for i in range(1, 11)] + ["S13"])
         self.assertEqual([n for n in names if n.startswith("V")],
-                         ["V1", "V2", "V3", "V4", "V6", "V7"])
+                         ["V1", "V2", "V3", "V4", "V6", "V7", "V8"])
         for _, cls in registry.workloads.items():
             self.assertTrue(issubclass(cls, Workload))
         for name, cls in registry.collectors.items():

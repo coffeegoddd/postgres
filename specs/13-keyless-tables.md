@@ -4,7 +4,8 @@
 with their reviews' fixes); prolly again in part 6, on `e25140de87` (#141
 and #142 before their reviews), and in part 7 with keyless rows keyed by
 their first bytes (#149) and merged by the rule #150 makes, on
-`a2c14b4b68`.**
+`a2c14b4b68`. The keyed table's space was broken down by component in
+part 8, for #500, under the `log` change finder.**
 This compares how stock Postgres (heap), page-based prolly and Dolt store
 tables without a primary key ("keyless" tables), what their operations
 cost, and how their merges treat them. Where prolly falls short, the
@@ -336,3 +337,96 @@ far as these runs show: what they paid was mostly the history's order
 too (each move reads and writes the trees), with #141's and #142's
 review fixes in the same change. Writes and reads are as before, heap's
 (part 2). Dolt's keyless history still has the random order (part 3).
+
+## 8. What the space is (#500)
+
+Parts 2, 6 and 7 gave only totals: a keyed table's database at about
+2.5 times heap's (245 M against 94 M), of which 53 M was the journal, and
+"the pages much the same either way (about 140 M)". That figure was
+taken under the `pages` change finder, with no collection, and with no
+way to say what the rest was. `prolly_storage_breakdown()` now says it.
+These are sizes only, on an -O2 build of the `stats/storage-breakdown`
+stack, with the `log` change finder (the default). The machine was
+loaded by other work, so no times were taken. MB here are 10^6 bytes.
+
+**The keyed script again.** Heap keyed and prolly keyed, as in part 2:
+
+| | Heap keyed | Prolly keyed |
+|---|---:|---:|
+| Database on disk (`pg_database_size`) | 111.0 | 308.4 |
+| The table with its indexes, on `main` | 102.6 | 126.1 |
+| Page store, every block of it mapped | — | 257.6 |
+| — of it, the change logs | — | 92.2, of which 86.4 dead entries and none live |
+| — of it, the rest (other branches' copies of pages) | — | about 39 |
+| Journal | — | 30.4 |
+| Block map (maps, changes lists, allocator, counts) | — | 9.1 |
+| VM and FSM | — | 1.9 |
+| The chunk store's other files | — | 0.6 |
+| Catalogs and the rest | 8.4 | 8.8 |
+
+So against heap's 111 M, prolly's 308 M is 2.8 times. The 140 M of
+"pages" in part 6 was never the table's pages costing more: a prolly
+table's pages are heap's. It was the table plus its change log, and the
+pages the run's branches copied.
+
+The run's change logs are 92 M, 30% of the database. Their entries were
+consumed by the run's commits and wait for a vacuum. That is three times
+the history's journal (30 M; part 7 measured 53 M).
+
+**Stage by stage (V8, `configs/v_storage.toml`).** A 1M-row table
+`(id bigint PRIMARY KEY, payload text)`, beside a heap table given the
+same rows and updates, read after each stage:
+
+1. **load:** `INSERT` of the rows;
+2. **commit:** the first `dolt_commit`;
+3. **updates:** 10 commits, each updating 1% of the rows;
+4. **gc:** `dolt_gc()` and `prolly_page_sweep()`;
+5. **vacuum:** `VACUUM` of both tables, and another sweep.
+
+| MB | load | commit | updates | gc | vacuum |
+|---|---:|---:|---:|---:|---:|
+| heap table, `pg_total_relation_size` | 99.1 | 99.1 | 109.0 | 109.0 | 109.0 |
+| prolly table, `pg_total_relation_size` | 99.1 | 99.1 | 109.0 | 109.0 | 109.0 |
+| page store (`page_store_bytes`) | 167.3 | 167.3 | 184.0 | 184.0 | 184.0 |
+| — mapped under a relation's length | 167.3 | 167.3 | 184.0 | 184.0 | 109.0 |
+| — held otherwise (`page_store_listed_bytes`) | 0.0 | 0.0 | 0.0 | 0.0 | 75.1 |
+| — the table's main fork, as mapped | 76.6 | 76.6 | 84.2 | 84.2 | 84.2 |
+| — its index's | 22.5 | 22.5 | 24.7 | 24.7 | 24.7 |
+| — its change log (`change_log_bytes`) | 68.3 | 68.3 | 75.1 | 75.1 | 0.0 |
+| — — live entries | 64.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| — — dead entries | 0.0 | 64.0 | 70.4 | 70.4 | 0.0 |
+| block map | 0.4 | 0.4 | 0.5 | 0.5 | 0.5 |
+| VM and FSM | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 |
+| journal | 0.0 | 46.2 | 51.0 | 0.0 | 0.0 |
+| table files, settled | 0.0 | 0.0 | 0.0 | 51.0 | 51.0 |
+| table files, unsettled | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| chunk store's other files | 0.0 | 0.6 | 0.7 | 0.0 | 0.0 |
+| **prolly's files** | 167.8 | 214.7 | 236.3 | 235.6 | 235.6 |
+| **over the heap table** | 1.69 | 2.17 | 2.17 | 2.16 | 2.16 |
+
+("Prolly's files" are the breakdown's columns that are files. The
+catalogs and the heap table are left out.)
+
+What the stages show:
+
+- **The table is heap's, byte for byte.** It is 99,098,624 bytes after
+  the load, as the heap table is, and the two grow alike.
+- **The change log is the largest overhead.** It is 64 bytes an entry,
+  64 MB for a million rows: 65% of the table and its index. A commit
+  consumes the entries, and they then stay as dead tuples until a vacuum.
+- **A vacuum doesn't return the log's space.** `VACUUM` removes the dead
+  entries and truncates the log to 16 kB. But a truncation only shortens
+  a block-mapped relation's logical length: its 75.1 MB of blocks stay
+  held past that length, for the log to reuse. The page store, and the
+  database, don't shrink, and a sweep frees none of it.
+- **The history is half the table.** The first commit's tree is 46.2 MB.
+  Ten commits of 1% updates add 4.7 MB. A collection keeps all of it,
+  since every commit is reachable: it moves the journal into one settled
+  table file of 51.0 MB.
+- **No copy-on-write.** Under `log`, no page was copied: the page store's
+  blocks are all mapped until the vacuum, and none are held by a changes
+  list.
+
+Without the change log's 75.1 MB, prolly's files after the gc stage
+would be 160.5 MB: 1.47 times the heap table. What to reduce, and the
+target, are #500's last step and aren't decided here.
