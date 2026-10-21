@@ -53,10 +53,11 @@
  *   position since doesn't hold (NULL: every one), in no particular order:
  *   a visit returns false to stop.  An entry NULL says the table was
  *   emptied (truncated) by its transaction: a visit takes its other
- *   entries, of before and after, as rows to look up, not to apply.  False if rel has no log, an entry says
- *   to read the table in full, or a visit stopped.  The transaction's own
- *   entries are among them.  An entry is read whether or not a fold since
- *   consumed it: since may be an older snapshot's fold's, which didn't.
+ *   entries, of before and after, as rows to look up, not to apply.  False
+ *   if rel has no log, an entry says to read the table in full, or a visit
+ *   stopped.  The transaction's own entries are among them.  An entry is
+ *   read whether or not a fold since consumed it: since may be an older
+ *   snapshot's fold's, which didn't.
  * - relid() is the relation holding the log of the prolly table relid, if
  *   the log is one (InvalidOid if not): it takes the table's owner,
  *   tablespace and autovacuum settings as its TOAST table does.  Asked by
