@@ -86,7 +86,8 @@ WHERE attrelid = 'rt.t'::regclass AND attname = 'w';
 SELECT count(*), sum(id), sum(w), count(big), sum(length(big)),
 	   count(*) FILTER (WHERE v LIKE 'x%') AS changed FROM rt.t;
 SELECT count(*), sum(a), count(*) FILTER (WHERE b = 'x') AS changed FROM rt.k;
-SELECT tableoid::regclass, count(*), sum(w) FROM rt.pt GROUP BY 1 ORDER BY 1;
+SELECT tableoid::regclass, count(*), sum(w) FROM rt.pt GROUP BY 1
+ORDER BY tableoid::regclass::text COLLATE "C";
 SELECT indexes_valid();
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
@@ -101,7 +102,8 @@ INSERT INTO rt.t (id, v, w) VALUES (9999, 'y', 5);
 DELETE FROM rt.t WHERE id = 1;
 INSERT INTO rt.t (id, v, w, p) VALUES (9999, 'y', 9999, 99);
 SELECT conname, convalidated FROM pg_constraint
-WHERE conrelid IN ('rt.t'::regclass, 'rt.r'::regclass) AND contype = 'f' ORDER BY 1;
+WHERE conrelid IN ('rt.t'::regclass, 'rt.r'::regclass) AND contype = 'f'
+ORDER BY conname COLLATE "C";
 
 -- And back.
 SELECT pg_stat_force_next_flush();

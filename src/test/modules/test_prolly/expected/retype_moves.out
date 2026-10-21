@@ -146,7 +146,8 @@ SELECT count(*), sum(a), count(*) FILTER (WHERE b = 'x') AS changed FROM rt.k;
   1500 | 374250 |       3
 (1 row)
 
-SELECT tableoid::regclass, count(*), sum(w) FROM rt.pt GROUP BY 1 ORDER BY 1;
+SELECT tableoid::regclass, count(*), sum(w) FROM rt.pt GROUP BY 1
+ORDER BY tableoid::regclass::text COLLATE "C";
  tableoid | count |   sum   
 ----------+-------+---------
  rt.pt1   |   999 |  499500
@@ -198,7 +199,8 @@ INSERT INTO rt.t (id, v, w, p) VALUES (9999, 'y', 9999, 99);
 ERROR:  insert or update on table "t" violates foreign key constraint "t_p_fkey"
 DETAIL:  Key (p)=(99) is not present in table "p".
 SELECT conname, convalidated FROM pg_constraint
-WHERE conrelid IN ('rt.t'::regclass, 'rt.r'::regclass) AND contype = 'f' ORDER BY 1;
+WHERE conrelid IN ('rt.t'::regclass, 'rt.r'::regclass) AND contype = 'f'
+ORDER BY conname COLLATE "C";
  conname  | convalidated 
 ----------+--------------
  r_t_fkey | t
