@@ -1120,6 +1120,7 @@ SELECT length(dolt_commit('-am', 'cg gone soon')::text) AS committed;
         42
 (1 row)
 
+SELECT dolt_hashof('cg_gone') AS cg_gone_at \gset
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
@@ -1142,6 +1143,96 @@ SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
  on_cg_gone 
 ------------
           0
+(1 row)
+
+-- (and stays gone with a session checked out at it: the hidden branch
+-- that holds it there is Dolt's detached HEAD, not a branch)
+SELECT dolt_checkout(:'cg_gone_at') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+ on_cg_gone 
+------------
+          0
+(1 row)
+
+SELECT count(*) AS on_cg_gone FROM dolt_commit_ancestors
+	WHERE commit_hash = :'cg_gone_at';
+ on_cg_gone 
+------------
+          0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- (a writer's branch is a branch: its commits are listed, though main's
+-- log doesn't reach them)
+SELECT dolt_writer_mode('branch-auto');
+ dolt_writer_mode 
+------------------
+ branch-auto
+(1 row)
+
+SET dolt.writer = 'cgw';
+SET client_min_messages = warning;
+INSERT INTO cg.t VALUES (3, 'writer');
+RESET client_min_messages;
+SELECT active_branch();
+  active_branch  
+-----------------
+ writer/cgw/main
+(1 row)
+
+SELECT length(dolt_commit('-am', 'cg on a writer branch')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS on_writer FROM dolt_commits
+	WHERE message = 'cg on a writer branch';
+ on_writer 
+-----------
+         1
+(1 row)
+
+SELECT count(*) AS on_writer FROM dolt_commit_ancestors
+	WHERE commit_hash = dolt_hashof('writer/cgw/main');
+ on_writer 
+-----------
+         1
+(1 row)
+
+SELECT count(*) AS in_log FROM dolt_log WHERE message = 'cg on a writer branch';
+ in_log 
+--------
+      0
+(1 row)
+
+SELECT dolt_branch('-D', 'writer/cgw/main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET dolt.writer;
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
 (1 row)
 
 DROP SCHEMA cg CASCADE;

@@ -322,9 +322,35 @@ SELECT dolt_branch('cg_gone');
 SELECT dolt_checkout('cg_gone');
 UPDATE cg.t SET message = 'gone' WHERE id = 1;
 SELECT length(dolt_commit('-am', 'cg gone soon')::text) AS committed;
+SELECT dolt_hashof('cg_gone') AS cg_gone_at \gset
 SELECT dolt_checkout('main');
 SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
 SELECT dolt_branch('-D', 'cg_gone', 'cg_side');
 SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+-- (and stays gone with a session checked out at it: the hidden branch
+-- that holds it there is Dolt's detached HEAD, not a branch)
+SELECT dolt_checkout(:'cg_gone_at') IS NOT NULL AS detached;
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+SELECT count(*) AS on_cg_gone FROM dolt_commit_ancestors
+	WHERE commit_hash = :'cg_gone_at';
+SELECT dolt_checkout('main');
+-- (a writer's branch is a branch: its commits are listed, though main's
+-- log doesn't reach them)
+SELECT dolt_writer_mode('branch-auto');
+SET dolt.writer = 'cgw';
+SET client_min_messages = warning;
+INSERT INTO cg.t VALUES (3, 'writer');
+RESET client_min_messages;
+SELECT active_branch();
+SELECT length(dolt_commit('-am', 'cg on a writer branch')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT count(*) AS on_writer FROM dolt_commits
+	WHERE message = 'cg on a writer branch';
+SELECT count(*) AS on_writer FROM dolt_commit_ancestors
+	WHERE commit_hash = dolt_hashof('writer/cgw/main');
+SELECT count(*) AS in_log FROM dolt_log WHERE message = 'cg on a writer branch';
+SELECT dolt_branch('-D', 'writer/cgw/main');
+RESET dolt.writer;
+SELECT dolt_writer_mode('shared');
 DROP SCHEMA cg CASCADE;
 SELECT length(dolt_commit('-Am', 'cg dropped')::text) AS committed;
