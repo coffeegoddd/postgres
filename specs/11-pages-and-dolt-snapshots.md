@@ -750,10 +750,21 @@ fails without its fix), and Postgres's suites keep passing after each one.
     A standby refuses a branch's first use until the primary has made it.
   - With uncommitted changes, a merge (a fast-forward too), cherry-pick or
     revert is refused, as Dolt refuses it, when it would change a table,
-    sequence or materialized view that has uncommitted changes. Unlike
-    Dolt, it is also refused whenever definitions change, whether
-    uncommitted or on either side of the merge, even without a conflict
-    ("cannot merge with uncommitted changes where definitions change").
+    sequence or materialized view that has uncommitted changes. When
+    definitions change, uncommitted or on either side of the merge, the
+    uncommitted changes are set aside (#494): the branch is moved to its
+    head, writing only what they changed; the merge is made and
+    committed as over a clean working set; then each canonical item they
+    changed is put back over the result, as the working set had it, and
+    the branch moved there, writing only those. Refused, the
+    transaction's error undoing the merge, where the merge changed an
+    item they changed too (a table, sequence, view, type, ...), where a
+    table they changed uses a type the merge changed, where their
+    definitions don't fit the merged ones, and where a foreign key from
+    or to a table they changed is broken. The put-back is an item-level
+    apply, not the canonicalizer's splice(): a splice brings a table's
+    sequences with it, which would undo the merge's advance of a
+    sequence another table shares.
   - A materialized view's rows merge as a REFRESH made them: those of
     the side that refreshed it since the merge base (ours if neither), or
     of the side whose query the merged one is; if both refreshed it to

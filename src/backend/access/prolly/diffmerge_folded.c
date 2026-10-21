@@ -7664,21 +7664,24 @@ keep_violations(List *found)
 
 /*
  * What the working set changed since the head: the canonical items that
- * differ, each with the head's value (to put back), and by kind the
- * tables, sequences and materialized views (refreshed) among them, by
- * name.  A collation's item isn't among them: it says how the collation
- * orders now, which the working set's commits record whatever else they
- * leave out (the rows of the tables it keys are checked as they're read).
+ * differ, each with the head's value (to put back) and the working set's
+ * (to put back again: set_aside()), and by kind the tables, sequences and
+ * materialized views (refreshed) among them, by name.  A collation's item
+ * isn't among them: it says how the collation orders now, which the
+ * working set's commits record whatever else they leave out (the rows of
+ * the tables it keys are checked as they're read).
  */
 typedef struct Local
 {
 	ProllyNodeRef head;
 	ProllyNodeRef working;
 	List	   *edits;			/* ProllyEdit *: the head's items, in order */
+	List	   *after;			/* ProllyEdit *: the working set's, the same */
 	List	   *tables;			/* char * */
 	List	   *sequences;		/* char * */
 	List	   *matviews;		/* char * */
 	bool		definitions;	/* something other than tables and sequences */
+	bool		aside;			/* moved off the branch (set_aside()) */
 } Local;
 
 /* Does item key, of kind ("t:", say), name an object of that kind? */
@@ -7713,27 +7716,34 @@ local_item(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
 		   const ProllyValue *after, void *arg)
 {
 	Local	   *l = arg;
-	ProllyEdit *e;
+	const ProllyValue *values[2] = {before, after};
 	uint8	   *k;
 
 	if (item_kind(key, "c:"))
 		return;
-	e = palloc0(sizeof(ProllyEdit));
 	k = palloc(Max(key->len, 1));
 	memcpy(k, key->data, key->len);
-	e->key.data = k;
-	e->key.len = key->len;
-	if (before)
+	for (int i = 0; i < 2; i++)
 	{
-		uint8	   *v = palloc(Max(before->len, 1));
+		ProllyEdit *e = palloc0(sizeof(ProllyEdit));
 
-		memcpy(v, before->data, before->len);
-		e->value.data = v;
-		e->value.len = before->len;
+		e->key.data = k;
+		e->key.len = key->len;
+		if (values[i])
+		{
+			uint8	   *v = palloc(Max(values[i]->len, 1));
+
+			memcpy(v, values[i]->data, values[i]->len);
+			e->value.data = v;
+			e->value.len = values[i]->len;
+		}
+		else
+			e->is_delete = true;
+		if (i == 0)
+			l->edits = lappend(l->edits, e);
+		else
+			l->after = lappend(l->after, e);
 	}
-	else
-		e->is_delete = true;
-	l->edits = lappend(l->edits, e);
 
 	if (item_kind(key, "t:"))
 		l->tables = lappend(l->tables, item_name(key));
@@ -7802,23 +7812,32 @@ list_has_name(List *list, const char *name)
 }
 
 /*
- * A merge of what changed from base to theirs into a working set with
- * uncommitted changes, refused, for now, if it changes definitions (from
- * base to ours or to theirs), or the uncommitted changes are of something
- * other than tables and sequences.
+ * Whether a merge of what changed from base to theirs into a working set
+ * with uncommitted changes changes definitions (from base to ours or to
+ * theirs), or the uncommitted changes are of something other than tables
+ * and sequences.
+ */
+static bool
+local_definitions_change(const Local *l, const ProllyNodeRef *base,
+						 const ProllyNodeRef *ours, const ProllyNodeRef *theirs)
+{
+	ProllyDatabaseComponents dc = components();
+
+	return l->definitions ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, base, ours) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, base, theirs);
+}
+
+/*
+ * An apply of what changed from base to theirs onto a working set with
+ * uncommitted changes, refused, for now, where local_definitions_change().
  */
 static void
 check_local_definitions(const Local *l, const ProllyNodeRef *base,
 						const ProllyNodeRef *ours, const ProllyNodeRef *theirs,
 						const char *what)
 {
-	ProllyDatabaseComponents dc = components();
-
-	if (!has_local_changes(l))
-		return;
-	if (l->definitions ||
-		!PROLLY_CALL(dc.canonicalizer, same_schema, base, ours) ||
-		!PROLLY_CALL(dc.canonicalizer, same_schema, base, theirs))
+	if (has_local_changes(l) && local_definitions_change(l, base, ours, theirs))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot %s with uncommitted changes where definitions change", what),
@@ -7828,15 +7847,17 @@ check_local_definitions(const Local *l, const ProllyNodeRef *base,
 /*
  * A merge (or pick, or fast-forward) of what changed from base to theirs
  * into a working set with uncommitted changes, as in Dolt: refused if it
- * would change what they changed (a table's rows, a sequence's value), and
- * where check_local_definitions() refuses it (its move from ours' would put
- * the uncommitted rows back as ours has them).  Tables the working set
- * made or redefined, a merge changing no definitions leaves alone.  views
- * (NULL for one merge) is for a series checked before it merges: ours'
- * materialized views as the merges before this one leave them (NIL:
- * ours'), set to those this one leaves.
+ * would change what they changed (a table's rows, a sequence's value).
+ * Tables the working set made or redefined, a merge changing no
+ * definitions leaves alone.  True where local_definitions_change(): then
+ * the uncommitted changes are set aside for it (set_aside()), and checked
+ * as they are put back, not here (its move from ours' would put the
+ * uncommitted rows back as ours has them).  views (NULL for one merge)
+ * is for a series checked before it merges: ours' materialized views as
+ * the merges before this one leave them (NIL: ours'), set to those this
+ * one leaves.
  */
-static void
+static bool
 check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours,
 			const ProllyNodeRef *theirs, const char *what, List **views)
 {
@@ -7847,8 +7868,9 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 	ListCell   *lc;
 
 	if (!has_local_changes(l))
-		return;
-	check_local_definitions(l, base, ours, theirs, what);
+		return false;
+	if (local_definitions_change(l, base, ours, theirs))
+		return true;
 	read_tables(base, &bt);
 	read_tables(theirs, &tt);
 	/* (base and theirs define the same objects) */
@@ -7940,32 +7962,281 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 		if (views)
 			*views = merged;
 	}
+	return false;
+}
+
+/* root with items (ProllyEdit *, in key order) applied, into *out */
+static void
+with_items(const ProllyNodeRef *root, List *items, ProllyNodeRef *out)
+{
+	ProllyTreeEnv env;
+	ProllyEdit *edits;
+	int			n = 0;
+	ListCell   *lc;
+
+	edits = palloc_array(ProllyEdit, Max(list_length(items), 1));
+	foreach(lc, items)
+		edits[n++] = *(ProllyEdit *) lfirst(lc);
+	prolly_folded_canon_env(&env);
+	PROLLY_CALL(prolly_tree_lookup("cow"), apply, &env, root, edits, n, out);
 }
 
 /*
  * The working set as it is, without the uncommitted changes it had before
  * a merge: the commit the merge makes, which leaves them uncommitted.
+ * (Set aside, they aren't on it.)
  */
 static void
 without_local(const Local *l, ProllyNodeRef *root)
 {
-	ProllyTreeEnv env;
 	ProllyNodeRef now;
-	ProllyEdit *edits;
-	int			n = 0;
-	ListCell   *lc;
 
 	(void) PROLLY_CALL(components().refs, working_set, NULL, &now);
-	if (!has_local_changes(l))
+	if (!has_local_changes(l) || l->aside)
 	{
 		*root = now;
 		return;
 	}
-	edits = palloc_array(ProllyEdit, list_length(l->edits));
-	foreach(lc, l->edits)
-		edits[n++] = *(ProllyEdit *) lfirst(lc);
-	prolly_folded_canon_env(&env);
-	PROLLY_CALL(prolly_tree_lookup("cow"), apply, &env, &now, edits, n, root);
+	with_items(&now, l->edits, root);
+}
+
+/*
+ * Uncommitted changes a merge (or pick, or revert) changing definitions
+ * goes ahead over: the branch moved to its head, writing only what they
+ * changed, so the merge is made as over a clean working set and its
+ * commit is of the merge alone; put_back() puts them back after.
+ */
+static void
+set_aside(Local *l)
+{
+	folded_move_to(&l->head, &l->working);
+	l->aside = true;
+}
+
+/* What an object's item key names, for a message ("Table"). */
+static const char *
+item_label(const ProllyKey *key)
+{
+	switch (key->len > 0 ? key->data[0] : '\0')
+	{
+		case 't':
+			return "Table";
+		case 's':
+			return "Sequence";
+		case 'm':
+			return "Materialized view";
+		case 'v':
+			return "View";
+		case 'f':
+			return "Function";
+		case 'y':
+			return "Type";
+		case 'n':
+			return "Schema";
+		default:
+			return "Object";
+	}
+}
+
+/* An item key's object's name, in the server's encoding. */
+static char *
+item_server_name(const ProllyKey *key)
+{
+	char	   *utf8 = pnstrdup((const char *) key->data + 2, key->len - 2);
+
+	return pg_any_to_server(utf8, strlen(utf8), PG_UTF8);
+}
+
+/*
+ * put_back()'s walk of what the merge changed: refused where the
+ * uncommitted changes (local, in key order, as the walk goes) changed
+ * the same object; the types it changed collected.
+ */
+typedef struct PutBack
+{
+	const char *what;
+	List	   *local;			/* ProllyEdit * */
+	int			next;			/* the first of local not before the key */
+	List	   *types;			/* char *: the types the merge changed */
+} PutBack;
+
+static void
+put_back_item(ProllyDiffKind kind, const ProllyKey *key,
+			  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	PutBack    *pb = arg;
+
+	if (item_kind(key, "c:"))
+		return;
+	if (item_kind(key, "y:"))
+		pb->types = lappend(pb->types, item_server_name(key));
+	while (pb->next < list_length(pb->local) &&
+		   prolly_bytes_compare(&((ProllyEdit *) list_nth(pb->local, pb->next))->key,
+								key, NULL) < 0)
+		pb->next++;
+	if (pb->next < list_length(pb->local) &&
+		prolly_bytes_compare(&((ProllyEdit *) list_nth(pb->local, pb->next))->key,
+							 key, NULL) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("local changes would be stomped by %s", pb->what),
+				 errdetail("%s \"%s\" has uncommitted changes, and the %s changes it too.",
+						   item_label(key), item_server_name(key), pb->what),
+				 errhint("Commit the changes, or reset the branch, first.")));
+}
+
+/* Does type use (is, is over, holds) one of the types named? */
+static bool
+type_uses_named(Oid type, List *names, List *seen)
+{
+	char	   *name;
+	Oid			elem;
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (list_member_oid(seen, type))
+		return false;
+	seen = lappend_oid(list_copy(seen), type);
+	name = format_type_be_qualified(type);
+	foreach(lc, names)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	switch (get_typtype(type))
+	{
+		case TYPTYPE_DOMAIN:
+			{
+				HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+				Oid			base;
+
+				if (!HeapTupleIsValid(tup))
+					elog(ERROR, "cache lookup failed for type %u", type);
+				base = ((Form_pg_type) GETSTRUCT(tup))->typbasetype;
+				ReleaseSysCache(tup);
+				return type_uses_named(base, names, seen);
+			}
+		case TYPTYPE_COMPOSITE:
+			{
+				TupleDesc	desc = lookup_rowtype_tupdesc(type, -1);
+				bool		found = false;
+
+				for (int i = 0; i < desc->natts && !found; i++)
+					if (!TupleDescAttr(desc, i)->attisdropped)
+						found = type_uses_named(TupleDescAttr(desc, i)->atttypid,
+												names, seen);
+				ReleaseTupleDesc(desc);
+				return found;
+			}
+		case TYPTYPE_RANGE:
+			return type_uses_named(get_range_subtype(type), names, seen);
+		case TYPTYPE_MULTIRANGE:
+			return type_uses_named(get_multirange_range(type), names, seen);
+		default:
+			break;
+	}
+	elem = get_element_type(type);
+	return OidIsValid(elem) && type_uses_named(elem, names, seen);
+}
+
+/*
+ * Put the uncommitted changes set aside back over what the merge (what)
+ * left, its commit made: each item they changed as the working set had
+ * it, the move writing only those.  Refused, as before the merge's
+ * changes were made (the transaction's error undoes them), where the
+ * merge changed an object they changed too, where a table they changed
+ * uses a type the merge changed (its rows were read by the type as it
+ * was), where their definitions don't fit the merged ones, and where a
+ * foreign key from or to a table they changed is broken.
+ */
+static void
+put_back(const Local *l, const char *what)
+{
+	ProllyNodeRef merged;
+	ProllyNodeRef target;
+	ProllyTreeEnv env;
+	PutBack		pb = {what, l->edits, 0, NIL};
+	List	   *relids = NIL;
+	List	   *broken;
+	ListCell   *lc;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	if (!l->aside)
+		return;
+	(void) PROLLY_CALL(components().refs, working_set, NULL, &merged);
+	chunk_env(&env);
+	env.compare = prolly_bytes_compare;
+	PROLLY_CALL(prolly_tree_lookup("cow"), diff, &env, &l->head, &merged,
+				put_back_item, &pb);
+	with_items(&merged, l->after, &target);
+
+	PG_TRY();
+	{
+		folded_move_to(&target, &merged);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		switch (ed->sqlerrcode)
+		{
+			case ERRCODE_UNDEFINED_FUNCTION:
+			case ERRCODE_UNDEFINED_TABLE:
+			case ERRCODE_UNDEFINED_OBJECT:
+			case ERRCODE_UNDEFINED_COLUMN:
+			case ERRCODE_UNDEFINED_SCHEMA:
+			case ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST:
+			case ERRCODE_INVALID_FOREIGN_KEY:
+				break;
+			default:
+				PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("local changes don't fit what the %s changed", what),
+				 errdetail("Put back over the %s, the uncommitted definitions don't fit the merged ones: %s",
+						   what, ed->message),
+				 errhint("Commit the changes, or reset the branch, first.")));
+	}
+	PG_END_TRY();
+
+	/* the tables they changed, as they are now */
+	foreach(lc, l->after)
+	{
+		ProllyEdit *e = lfirst(lc);
+		Oid			relid;
+		Relation	rel;
+		TupleDesc	desc;
+		bool		uses = false;
+
+		if (e->is_delete || !item_kind(&e->key, "t:") ||
+			!OidIsValid(relid = table_named(item_server_name(&e->key))))
+			continue;
+		relids = lappend_oid(relids, relid);
+		rel = table_open(relid, AccessShareLock);
+		desc = RelationGetDescr(rel);
+		for (int i = 0; i < desc->natts && pb.types != NIL && !uses; i++)
+			uses = !TupleDescAttr(desc, i)->attisdropped &&
+				type_uses_named(TupleDescAttr(desc, i)->atttypid, pb.types, NIL);
+		table_close(rel, AccessShareLock);
+		if (uses)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("local changes would be stomped by %s", what),
+					 errdetail("Table \"%s\" has uncommitted changes, and the %s changes a type it uses.",
+							   item_server_name(&e->key), what),
+					 errhint("Commit the changes, or reset the branch, first.")));
+	}
+	if (relids != NIL && (broken = foreign_key_violations(relids, NIL)) != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot %s with uncommitted changes when the %s conflicts",
+						what, what),
+				 errdetail_plural("Put back over the %s, the uncommitted changes leave %d constraint violation.",
+								  "Put back over the %s, the uncommitted changes leave %d constraint violations.",
+								  list_length(broken), what, list_length(broken)),
+				 errhint("Commit the changes, or reset the branch, first.")));
 }
 
 /*
@@ -8144,16 +8415,18 @@ merge_held(const char *branch, const char *message, int flags,
 	commit_root(&ours, &roots[1]);
 	commit_root(&theirs, &roots[2]);
 	local_changes(&ours, &local);
-	check_local(&local, &roots[0], &roots[1], &roots[2], "merge", NULL);
+	if (check_local(&local, &roots[0], &roots[1], &roots[2], "merge", NULL))
+		set_aside(&local);
 	if (same_hash(&base, &ours) && !(flags & PROLLY_MERGE_NO_FF))
 	{
-		if (has_local_changes(&local))
+		if (has_local_changes(&local) && !local.aside)
 			fast_forward_local(&local, &theirs,
 							   (flags & PROLLY_MERGE_SQUASH) != 0);
 		else if (flags & PROLLY_MERGE_SQUASH)
 			folded_move_to(&roots[2], NULL);	/* the head left where it is */
 		else
 			reset_to(&theirs);
+		put_back(&local, "merge");
 		*commit_id = theirs;
 		return 0;
 	}
@@ -8228,6 +8501,7 @@ merge_held(const char *branch, const char *message, int flags,
 			without_local(&local, &merged);
 		PROLLY_CALL(dc.refs, commit_with, message, parents, 1,
 					has_local_changes(&local) ? &merged : NULL, commit_id);
+		put_back(&local, "merge");
 		return 0;
 	}
 	/* the merge's commit leaves the uncommitted changes uncommitted */
@@ -8240,6 +8514,7 @@ merge_held(const char *branch, const char *message, int flags,
 	}
 	else
 		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, NULL, commit_id);
+	put_back(&local, "merge");
 	return 0;
 }
 
@@ -8342,6 +8617,7 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 	ProllyNodeRef before;
 	Local		local;
 	List	   *views = NIL;
+	bool		aside = false;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -8368,8 +8644,10 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		if (apply_fn)
 			check_local_definitions(&local, &roots[0], &head, &roots[2], what);
 		else
-			check_local(&local, &roots[0], &head, &roots[2], what, &views);
+			aside |= check_local(&local, &roots[0], &head, &roots[2], what, &views);
 	}
+	if (aside)
+		set_aside(&local);
 	root_of("WORKING", &before);
 
 	roots[1] = apply_fn ? before : head;
@@ -8423,6 +8701,7 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 	}
 	if (apply_fn)
 	{
+		put_back(&local, what);
 		memset(commit_id, 0, sizeof(*commit_id));
 		return 0;
 	}
@@ -8442,6 +8721,7 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		prolly_set_commit_author(NULL);
 	}
 	PG_END_TRY();
+	put_back(&local, what);
 	return 0;
 }
 
@@ -8471,6 +8751,7 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 	ProllyMergeState ms;
 	Local		local;
 	List	   *views = NIL;
+	bool		aside = false;
 
 	if (PROLLY_CALL(dc.refs, merge_state, &ms))
 		ereport(ERROR,
@@ -8489,8 +8770,10 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 	{
 		commit_root(&picked[i], &roots[0]);
 		commit_root(&info[i].parents[0], &roots[2]);
-		check_local(&local, &roots[0], &head, &roots[2], what, &views);
+		aside |= check_local(&local, &roots[0], &head, &roots[2], what, &views);
 	}
+	if (aside)
+		set_aside(&local);
 
 	roots[1] = head;
 	memset(commit_id, 0, sizeof(*commit_id));
@@ -8543,6 +8826,7 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 		commit_one_parent(message, &ours, &local, commit_id);
 		ours = *commit_id;
 	}
+	put_back(&local, what);
 	return 0;
 }
 

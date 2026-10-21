@@ -168,14 +168,19 @@ adapts.
   are errors naming the objects; the merge doesn't happen. A merge,
   cherry-pick or revert into uncommitted changes is refused when it
   would change a table, sequence or materialized view with uncommitted
-  changes, as Dolt's is, and also whenever definitions change on either
-  side, even without a conflict.
+  changes, as Dolt's is. When definitions change, on either side or
+  uncommitted, it goes ahead over uncommitted changes to objects it
+  doesn't change (#494), refused only where both change an object, and,
+  beyond Dolt, where a table with uncommitted changes uses a type the
+  merge changes, where the uncommitted definitions don't fit the merged
+  ones (a key dropped that a merged foreign key needs), or where they
+  break a merged foreign key.
 - **Why:** a sequence is a schema object in Postgres, versioned with its
   schema; Postgres DDL can't be left half-merged in the catalogs.
 - **Port:** expected generated keys follow the commit's sequence value
   (`dolt-reset-identity`, deferred with this ID); schema-conflict cases
   expect the error, not rows; dirty-merge cases with definition changes
-  expect the refusal.
+  expect the refusal only in those cases.
 
 ## D7. Hashes
 

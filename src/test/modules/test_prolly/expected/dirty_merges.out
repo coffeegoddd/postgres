@@ -1,7 +1,7 @@
 -- Merges into a working set with uncommitted changes, as in Dolt: allowed
--- when the merge changes none of the tables and sequences they changed,
--- and no definitions change on both sides; they stay uncommitted, left
--- out of the merge's commit.
+-- when the merge changes none of the objects they changed (tables,
+-- sequences, and with definitions changing, any); they stay uncommitted,
+-- left out of the merge's commit.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -271,8 +271,7 @@ SELECT dolt_reset('--hard', 'HEAD~1');
  {0}
 (1 row)
 
--- not when the merge changes that table's rows, nor when it changes
--- definitions too
+-- not when the merge changes that table's rows
 ALTER TABLE dm.a ADD COLUMN w int;
 SELECT (dolt_merge('feature'))[2:4];
 ERROR:  local changes would be stomped by merge
@@ -284,6 +283,10 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- A merge that changes definitions goes ahead too (#494): the
+-- uncommitted changes are set aside, the merge made as over a clean
+-- working set, and they're put back, uncommitted.  One altering a
+-- table, over a table made:
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -304,10 +307,35 @@ SELECT dolt_checkout('main');
 (1 row)
 
 CREATE TABLE dm.made (id int PRIMARY KEY);
+INSERT INTO dm.made VALUES (1);
 SELECT (dolt_merge('feature'))[2:4];
-ERROR:  cannot merge with uncommitted changes where definitions change
-HINT:  Commit the changes, or reset the branch, first.
-SELECT dolt_reset('--hard');
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'a' ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ v
+ x
+(3 rows)
+
+SELECT * FROM dm.made;
+ id 
+----
+  1
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status   
+------------+-----------
+ dm.made    | new table
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
  dolt_reset 
 ------------
  {0}
@@ -331,8 +359,8 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
--- nor when it changes definitions over uncommitted rows of another table
--- (here, makes one: their table isn't the base's), which stay
+-- three-way, making a table, over uncommitted rows of another, which the
+-- merge's commit leaves out
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -354,12 +382,102 @@ SELECT dolt_checkout('main');
 
 UPDATE dm.b SET v = 'dirty' WHERE id = 5;
 SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
-ERROR:  cannot merge with uncommitted changes where definitions change
-HINT:  Commit the changes, or reset the branch, first.
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
 SELECT table_name, status FROM dolt_status ORDER BY 1;
  table_name |  status  
 ------------+----------
  dm.b       | modified
+(1 row)
+
+SELECT id, v FROM dm.b WHERE id = 5;
+ id |   v   
+----+-------
+  5 | dirty
+(1 row)
+
+SELECT count(*) AS b_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.b);
+ b_left_out 
+------------
+          0
+(1 row)
+
+SELECT to_regclass('dm.theirs_made') IS NOT NULL AS theirs_made;
+ theirs_made 
+-------------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- over uncommitted definitions of other kinds (a view, a type), which stay
+CREATE VIEW dm.v AS SELECT id FROM dm.b;
+CREATE TYPE dm.local_t AS ENUM ('x');
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT to_regclass('dm.theirs_made') IS NOT NULL AS theirs_made,
+  to_regclass('dm.v') IS NOT NULL AS view_kept,
+  to_regtype('dm.local_t') IS NOT NULL AS type_kept;
+ theirs_made | view_kept | type_kept 
+-------------+-----------+-----------
+ t           | t         | t
+(1 row)
+
+SELECT from_table_name, to_table_name, diff_type
+  FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 2;
+ from_table_name | to_table_name  | diff_type 
+-----------------+----------------+-----------
+                 | dm.theirs_made | added
+(1 row)
+
+SELECT to_table_name, diff_type
+  FROM dolt_diff_summary('HEAD', 'WORKING') ORDER BY 1;
+ to_table_name | diff_type 
+---------------+-----------
+ dm.local_t    | added
+ dm.v          | added
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT to_regclass('dm.v') IS NULL AS view_gone;
+ view_gone 
+-----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- refused where both change an object: here, both make the table
+CREATE TABLE dm.theirs_made (id int PRIMARY KEY, mine text);
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+ERROR:  local changes would be stomped by merge
+DETAIL:  Table "dm.theirs_made" has uncommitted changes, and the merge changes it too.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT count(*) AS mine FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'theirs_made' AND column_name = 'mine';
+ mine 
+------
+    1
 (1 row)
 
 SELECT dolt_reset('--hard');
@@ -845,6 +963,274 @@ drop cascades to table dms.u
 drop cascades to sequence dms.s
 drop cascades to materialized view dms.mv
 SELECT length(dolt_commit('-Am', 'dms gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- Merges, picks and reverts changing definitions over uncommitted
+-- changes (#494): a local ALTER TABLE of a table the merge doesn't
+-- touch survives; refused where the local changes use what it changed
+-- (a type, here), break what it added (a foreign key), or don't fit it.
+CREATE SCHEMA dmd VERSIONED;
+CREATE TYPE dmd.mood AS ENUM ('sad', 'ok');
+CREATE TABLE dmd.m (id int PRIMARY KEY, m dmd.mood);
+CREATE TABLE dmd.p (id int PRIMARY KEY);
+CREATE TABLE dmd.c (id int PRIMARY KEY, pid int);
+CREATE TABLE dmd.u (id int PRIMARY KEY, v text);
+INSERT INTO dmd.m VALUES (1, 'ok');
+INSERT INTO dmd.p VALUES (1), (2);
+INSERT INTO dmd.u VALUES (1, 'u');
+SELECT length(dolt_commit('-Am', 'dmd base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('dmd_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dmd_feature');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'dmd_feature'"}
+(1 row)
+
+ALTER TYPE dmd.mood ADD VALUE 'happy';
+ALTER TABLE dmd.c ADD FOREIGN KEY (pid) REFERENCES dmd.p;
+INSERT INTO dmd.c VALUES (1, 1);
+SELECT length(dolt_commit('-am', 'feature redefines')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- a fast-forward
+ALTER TABLE dmd.u ADD COLUMN w int;
+SELECT (dolt_merge('dmd_feature'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT dolt_hashof('HEAD') = dolt_hashof('dmd_feature') AS fast_forwarded;
+ fast_forwarded 
+----------------
+ t
+(1 row)
+
+SELECT count(*) AS c_rows FROM dmd.c;
+ c_rows 
+--------
+      1
+(1 row)
+
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dmd' AND table_name = 'u' ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ v
+ w
+(3 rows)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dmd.u      | modified
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- three-way
+INSERT INTO dmd.u VALUES (2, 'side');
+SELECT length(dolt_commit('-am', 'main adds a row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE dmd.u ADD COLUMN w int;
+UPDATE dmd.u SET w = 7 WHERE id = 1;
+SELECT (dolt_merge('dmd_feature', '-m', 'merged over an alter'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+       message        
+----------------------
+ merged over an alter
+(1 row)
+
+SELECT * FROM dmd.u ORDER BY id;
+ id |  v   | w 
+----+------+---
+  1 | u    | 7
+  2 | side |  
+(2 rows)
+
+SELECT * FROM dmd.c;
+ id | pid 
+----+-----
+  1 |   1
+(1 row)
+
+SELECT unnest(enum_range(NULL::dmd.mood)) AS label;
+ label 
+-------
+ sad
+ ok
+ happy
+(3 rows)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dmd.u      | modified
+(1 row)
+
+SELECT count(*) AS u_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dmd.u);
+ u_left_out 
+------------
+          0
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- a table using the type the merge changes
+UPDATE dmd.m SET m = 'sad';
+SELECT (dolt_merge('dmd_feature'))[3:4];
+ERROR:  local changes would be stomped by merge
+DETAIL:  Table "dmd.m" has uncommitted changes, and the merge changes a type it uses.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- a row the merge's new foreign key references, removed
+DELETE FROM dmd.p WHERE id = 1;
+SELECT (dolt_merge('dmd_feature'))[3:4];
+ERROR:  cannot merge with uncommitted changes when the merge conflicts
+DETAIL:  Put back over the merge, the uncommitted changes leave 1 constraint violation.
+HINT:  Commit the changes, or reset the branch, first.
+SELECT id FROM dmd.p ORDER BY id;
+ id 
+----
+  2
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- the key that foreign key needs, dropped
+ALTER TABLE dmd.p DROP CONSTRAINT p_pkey;
+SELECT (dolt_merge('dmd_feature'))[3:4];
+ERROR:  local changes don't fit what the merge changed
+DETAIL:  Put back over the merge, the uncommitted definitions don't fit the merged ones: there is no unique constraint matching given keys for referenced table "p"
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd_feature') AS not_merged;
+ not_merged 
+------------
+ t
+(1 row)
+
+-- a cherry-pick, then its revert, over the alter too
+ALTER TABLE dmd.u ADD COLUMN w int;
+SELECT length(dolt_cherry_pick('dmd_feature')::text) > 0 AS picked;
+ picked 
+--------
+ t
+(1 row)
+
+SELECT count(*) AS c_rows FROM dmd.c;
+ c_rows 
+--------
+      1
+(1 row)
+
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dmd' AND table_name = 'u' ORDER BY ordinal_position;
+ column_name 
+-------------
+ id
+ v
+ w
+(3 rows)
+
+SELECT length(dolt_revert('HEAD')::text) > 0 AS reverted;
+ reverted 
+----------
+ t
+(1 row)
+
+SELECT count(*) AS c_rows FROM dmd.c;
+ c_rows 
+--------
+      0
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status  
+------------+----------
+ dmd.u      | modified
+(1 row)
+
+SELECT count(*) AS u_left_out FROM dolt_diff('HEAD~2', 'HEAD', NULL::dmd.u);
+ u_left_out 
+------------
+          0
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'dmd_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dmd CASCADE;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to table dmd.m
+drop cascades to table dmd.p
+drop cascades to table dmd.c
+drop cascades to table dmd.u
+drop cascades to type dmd.mood
+SELECT length(dolt_commit('-Am', 'dmd gone')::text) AS committed;
  committed 
 -----------
         42

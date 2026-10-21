@@ -344,15 +344,15 @@ SELECT dolt_checkout('main');
 SELECT * FROM dolt_status WHERE table_name LIKE 'dg_smoke.%';
 SELECT dolt_merge('dg-new-branch2', '--no-ff', '-m', 'merge new-branch into main');
 SELECT * FROM dolt_status WHERE table_name LIKE 'dg_smoke.%';
--- dirty, another table: Doltgres merges, the change left uncommitted;
--- prolly refuses a merge that changes definitions (here, makes a table)
--- over uncommitted changes, which stay
+-- dirty, another table: merged, as Doltgres does, though the merge
+-- changes definitions (makes a table); the change left uncommitted
 SELECT dolt_checkout('-b', 'dg-new-branch3', 'HEAD');
 CREATE TABLE t3 (pk int PRIMARY KEY);
 SELECT pg_temp.committed('-Am', 'new table on new branch');
 SELECT dolt_checkout('main');
-SELECT dolt_merge('dg-new-branch3', '--no-ff', '-m', 'merge new-branch into main');
+SELECT (dolt_merge('dg-new-branch3', '--no-ff', '-m', 'merge new-branch into main'))[2:4];
 SELECT * FROM dolt_status WHERE table_name LIKE 'dg_smoke.%';
+SELECT to_regclass('t3') IS NOT NULL AS t3_merged;
 SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'dg-new-branch', 'dg-new-branch2', 'dg-new-branch3');
 RESET search_path;
