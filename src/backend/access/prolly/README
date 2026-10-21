@@ -177,6 +177,17 @@ dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
 
+What a fold works out for every table, changed or not, is cached in the
+backend (canon_folded.c's own): each table's description and the hash its
+baseline is kept by, dropped by a relcache invalidation of the table or a
+syscache one of anything a description names; the tree of what versioned
+objects depend on, against an epoch every such callback moves (inval.c
+sends a relcache invalidation of pg_depend or pg_extension themselves for
+their changes, which have no syscache); which objects are extensions'
+members; and the last canonical tree's items, so the next is applied as
+the items that differ (the baseline's too, from the baseline folded from).
+debug_prolly_verify_fold_caches works each one taken out again too.
+
 
 Remotes
 -------

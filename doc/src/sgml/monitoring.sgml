@@ -5759,7 +5759,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        after a restart);
        <literal>commits_read</literal> (commits read from the chunk store, as
        walks of history and <function>dolt_serve_since</function> read
-       them).  Bytes are counted when
+       them);
+       <literal>describe_cache_hits</literal> (tables' descriptions a fold
+       took from the backend's cache instead of the catalogs).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

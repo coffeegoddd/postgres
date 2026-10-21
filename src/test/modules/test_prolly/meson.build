@@ -125,6 +125,7 @@ tests += {
       'truncate_folds',
       'fold_verify',
       'fold_caches',
+      'describe_caches',
       'keyless_toast_folds',
       'vacuum_shared',
       'eager_freeze',
@@ -241,6 +242,7 @@ tests += {
       't/143_bmap_map_image_since.pl',
       't/160_first_use_lock.pl',
       't/143_fold_caches.pl',
+      't/150_describe_caches.pl',
     ],
   },
 }

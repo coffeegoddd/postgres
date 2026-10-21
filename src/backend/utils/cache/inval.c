@@ -119,6 +119,8 @@
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_extension.h"
 #include "miscadmin.h"
 #include "storage/procnumber.h"
 #include "storage/sinval.h"
@@ -1552,6 +1554,18 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		}
 		else
 			return;
+	}
+	else if (tupleRelId == DependRelationId ||
+			 tupleRelId == ExtensionRelationId)
+	{
+		/*
+		 * Neither has a syscache to tell of its changes: an event for the
+		 * catalog itself tells what is cached from them (prolly's fold of
+		 * what versioned objects depend on: #483).  ALTER EXTENSION ADD, or
+		 * DEPENDS ON EXTENSION, changes nothing else.
+		 */
+		relationId = tupleRelId;
+		databaseId = MyDatabaseId;
 	}
 	else
 		return;
