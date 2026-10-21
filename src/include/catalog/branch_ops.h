@@ -78,6 +78,22 @@ typedef struct BranchOpsRoutine
 	 * whatever happens.
 	 */
 	void		(*run_on) (const char *name, void (*fn) (void *arg), void *arg);
+
+	/*
+	 * Optional: give each of the session branch's relations relids storage
+	 * shared with branch source's relation of the same id, as a copy has
+	 * it when made (its pages, its maps, how old its oldest row is), the
+	 * storage it had going when the transaction commits.  Each is locked
+	 * first, without waiting, as TRUNCATE locks it, and the source's as a
+	 * copy locks them (against writers); then unchanged(arg), if given, says
+	 * whether the source's are still as the caller found them.  False, with
+	 * nothing shared, if a lock isn't free, unchanged says no, or one isn't
+	 * on both branches alike or can't be shared (the locks taken are kept).
+	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
+	 * the new storage once it commits.
+	 */
+	bool		(*share) (Oid source, List *relids,
+						  bool (*unchanged) (void *arg), void *arg);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

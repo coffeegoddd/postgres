@@ -145,7 +145,13 @@ at one transaction's size.
   drop its copies; it is then only its head commit. Its copies are made
   again when it is next used: from a branch whose head is close to it,
   then the difference applied (part 2), or, when no branch is close, from
-  the commit itself.
+  the commit itself. Built for a head-only branch's first use (#491): its
+  copies are made from the branch nearest its head's root, ranked by an
+  equal hash: one whose working set is known to be the root (#482; the
+  copies are then the branch, nothing written or folded), one whose
+  baseline's fold made it, one whose head did (only what that branch
+  changed since is written back), else the session's branch. Dropping a
+  branch's copies isn't built.
 
 ### Clone, fetch and push
 
@@ -450,6 +456,35 @@ one-row commit with 1000 untouched tables 19 ms, a status after a write
 (`changes_log.c`: about 8 of the 16 ms), and the `pg_class` scan, left as
 it is; caching the finder's handle (its keying, key and equality
 procedures) is the change log's to do. The caches are a backend's: a session's first fold fills them.
+
+**Moves share another branch's pages (#491; decided by the user
+2026-10-20: O(Δ) with small constants, not O(1); no hierarchical block
+map).** A move (a hard reset, a fast-forward, a merge's or pick's move, a
+first use) to a root another branch's working set is known to be (part 2's
+known working set: nobody writing it, every writer that ended seen) gives
+each table whose rows differ that branch's storage instead of writing the
+rows (`share_clean_tables()`, `refs_copies.c`): the table's, its indexes',
+its TOAST table's and its change log's, each a share of the other
+branch's (`RelationCreateStorageShared()`, with the visibility and free
+space maps copied, #487), through the branch operations' optional
+`share()` (`branch_copies.c`). The baseline then takes the other branch's
+entry for the table (the canonicalizer's optional `splice_baseline()`),
+which its shared log goes on from, and the working set is folded again,
+so nothing is read in full. Chosen by cost: a table is shared when its
+blocks (its relations', about 10 µs each to share) cost less than its
+changed rows (about 11 µs each to write), counted by a diff of the two
+data trees. Only for a move of rows (the two roots define the same
+objects), only tables whose relations are the other branch's too (the same
+ids: made from the same), and only where the locks are free without
+waiting: the moved branch's copies as `TRUNCATE` locks them, the other
+branch's as a copy does (against its writers), and the other branch still
+known at the root once they are held. As `TRUNCATE`, it isn't MVCC-safe:
+a snapshot taken before the move commits reads the shared storage after.
+A first use whose source's working set is known to be its head does
+neither: the copies are already the head. The known working set is
+fragile (any catalog change anywhere moves part 2's epoch), so a move
+shares only where a fold of the other branch since the last catalog change
+made it known. A hierarchical block map, for O(1) moves, isn't built.
 
 **Applying a tree diff as row changes** reuses the machinery of logical
 replication's apply worker (`src/backend/replication/logical/worker.c`):

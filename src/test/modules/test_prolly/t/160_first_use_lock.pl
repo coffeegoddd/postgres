@@ -59,6 +59,11 @@ $writer->query_safe('COMMIT');
 $user->query_until(qr/done/, '');
 is($user->{stderr}, '', 'once the writer is done, the first use goes on');
 is($user->query_safe($rows), '1:1,2:2,3:3', 'and the branch is its head');
+# (made to differ from its head before it is left: a first use copies the
+# branch nearest its head, and b2's must be of main's copies, behind main's
+# writer)
+$user->query_safe(q{INSERT INTO app.t VALUES (77, 77);
+	SELECT dolt_commit('-am', 'apart')});
 $user->query_safe(q{SELECT dolt_checkout('main')});
 is(sql($rows), '1:100,2:200,3:3', 'main keeps both writers\' changes');
 

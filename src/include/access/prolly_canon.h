@@ -309,6 +309,17 @@ typedef struct ProllyCanonRoutine
 	 */
 	void		(*splice) (const ProllyNodeRef *into, const ProllyNodeRef *from,
 						   List *tables, ProllyNodeRef *out);
+
+	/*
+	 * Optional: baseline into, but for the tables named (qualified, as
+	 * tables() names them), whose entries are as baseline from has them (or
+	 * gone where from hasn't them), into *out: the baseline of a branch
+	 * whose copies of those tables were made the copies from's branch has
+	 * (their pages and change logs shared), which fold from its entries.
+	 */
+	void		(*splice_baseline) (const ProllyNodeRef *into,
+									const ProllyNodeRef *from, List *tables,
+									ProllyNodeRef *out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -317,9 +328,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice"
+	"advance_baseline", "changes", "render", "splice", "splice_baseline"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK splice
+#define PROLLY_CANON_LAST_CALLBACK splice_baseline
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

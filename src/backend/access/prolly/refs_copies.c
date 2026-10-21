@@ -97,6 +97,7 @@
 #include "utils/fmgroids.h"
 #include "catalog/pg_branch.h"
 #include "access/prolly_canon.h"
+#include "access/prolly_changelog.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
@@ -107,12 +108,14 @@
 #include "access/amapi.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
@@ -125,6 +128,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
@@ -896,6 +900,44 @@ branch_exists(const char *name)
 
 static void working_fold(ProllyNodeRef *root);
 static void fold_as_baseline(void *arg);
+static bool known_working_set(const char *name, Oid branch,
+							  const ProllyNodeRef *baseline, bool complete,
+							  ProllyNodeRef *root);
+static bool fold_caches_usable(void);
+static Snapshot fold_snapshot(void);
+static void verify_known(const char *name, bool complete,
+						 const ProllyNodeRef *root);
+static bool share_clean_tables(const ProllyNodeRef *target,
+							   ProllyNodeRef *working);
+
+/*
+ * A first use's source whose working set was known to be the root its
+ * copies were made at (name, the root, and what it was known at), taken
+ * before the copies were made: their catalog rows keep anything from
+ * being known after.
+ */
+typedef struct KnownSource
+{
+	const char *name;
+	ProllyHash	root;
+	BranchFoldStamp at;
+} KnownSource;
+
+/*
+ * The working set of copies made from ks's branch, as it still is (#482):
+ * false if it may have changed since it was known.
+ */
+static bool
+copied_working_set(const KnownSource *ks, ProllyNodeRef *working)
+{
+	if (ks == NULL || !fold_caches_usable() || !branch_fold_unchanged(&ks->at))
+		return false;
+	ref_of(&ks->root, working);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLDS_REUSED, 1);
+	if (debug_prolly_verify_fold_caches)
+		verify_known(ks->name, false, working);
+	return true;
+}
 
 /*
  * Move the session's branch to a commit's root, every move (a reset, a
@@ -904,22 +946,253 @@ static void fold_as_baseline(void *arg);
  * after reads the pages the move wrote again and again.  Objects no
  * commit could hold (the canonical form doesn't describe them) are
  * uncommitted work the move discards, as it does any other.  The working
- * set is folded only if nothing known says what it is (#482).
+ * set is folded only if nothing known says what it is (#482): the
+ * branch's, or (source, a first use's) the working set of the branch its
+ * copies were made from, as they are still (#491).
  */
 static void
-move_settled(void *arg)
+settle(const ProllyNodeRef *target, const KnownSource *source)
 {
-	const ProllyNodeRef *target = arg;
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef working;
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
-	working_fold(&working);
+	if (!copied_working_set(source, &working))
+		working_fold(&working);
 	if (same_hash(&working.hash, &target->hash))
+		return;
+
+	/* (the tables another branch has as the target given its pages) */
+	if (share_clean_tables(target, &working) &&
+		same_hash(&working.hash, &target->hash))
 		return;
 	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
 	fold_as_baseline(NULL);
+}
+
+/*
+ * Sharing pages instead of writing rows (#491).  A move to a root another
+ * branch's working set is known to be (nobody writing it, every writer
+ * that ended seen) gives each table whose rows differ that branch's
+ * storage instead, the table's with its indexes', TOAST table's and change
+ * log's, when sharing their blocks costs less than writing the rows that
+ * differ (about 10 us a block against 11 a row): its pages, maps and log
+ * then are that branch's, and the baseline takes that branch's entry for
+ * it, which its log goes on from.  Only a move of rows (the two roots
+ * define the same objects), only of tables whose relations are that
+ * branch's too (made from the same, so the same ids), and only where the
+ * locks are free now (share()'s: this branch's copies as TRUNCATE locks
+ * them, that branch's against its writers), that branch still known at
+ * the root as it was known once they are held (the first table shared
+ * changes pg_class, after which nothing new is known in the transaction).
+ * Not at a first use: the copies' catalog rows, made in the transaction,
+ * keep anything from being known after them, and a branch known at the
+ * root was copied already.  As TRUNCATE, it isn't MVCC-safe: a snapshot
+ * taken before the move commits reads the shared storage after.
+ */
+#define MOVE_ROW_USEC		11
+#define SHARE_BLOCK_USEC	10
+
+/* A branch other than the session's whose working set is known to be root. */
+typedef struct CleanAt
+{
+	const ProllyHash *root;
+	Snapshot	snap;
+	char	   *name;
+	Oid			branch;
+	ProllyNodeRef baseline;
+	BranchFoldStamp at;			/* what it was known at */
+} CleanAt;
+
+static void
+find_clean_at(const char *name, Oid branch, void *arg)
+{
+	CleanAt    *ca = arg;
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+
+	if (ca->name != NULL || branch == MyBranch ||
+		!branch_baseline(name, &baseline))
+		return;
+	if (branch_fold_known_at(branch, ca->snap, &baseline.hash, false, &h,
+							 &ca->at) &&
+		same_hash(&h, ca->root))
+	{
+		ca->name = pstrdup(name);
+		ca->branch = branch;
+		ca->baseline = baseline;
+	}
+}
+
+/*
+ * Is ca's branch still at its root, as it was known to be?  Asked of what
+ * was known then: the first table shared changes pg_class, after which
+ * nothing new is known in the transaction, though nothing about the other
+ * branch changed.
+ */
+static bool
+still_clean(void *arg)
+{
+	CleanAt    *ca = arg;
+
+	return branch_fold_unchanged(&ca->at);
+}
+
+/* A root's table, as tables() visits it. */
+typedef struct NamedTree
+{
+	char	   *name;
+	ProllyNodeRef data;
+	bool		readable;
+} NamedTree;
+
+static void
+note_table(const char *name, const ProllyNodeRef *data,
+		   const ProllyValue *description, const char *unreadable, void *arg)
+{
+	NamedTree  *t = palloc(sizeof(NamedTree));
+
+	t->name = pstrdup(name);
+	t->data = *data;
+	t->readable = unreadable == NULL;
+	*(List **) arg = lappend(*(List **) arg, t);
+}
+
+static void
+count_change(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	(*(uint64 *) arg)++;
+}
+
+/*
+ * Prolly table relid and the relations stored with it: its indexes, its
+ * TOAST table and change log, and theirs; their blocks counted.
+ */
+static List *
+stored_with(Oid relid, uint64 *blocks)
+{
+	List	   *relids = list_make1_oid(relid);
+	ProllyComponents c;
+
+	*blocks = 0;
+	for (int i = 0; i < list_length(relids); i++)
+	{
+		Relation	rel = relation_open(list_nth_oid(relids, i), AccessShareLock);
+
+		*blocks += RelationGetNumberOfBlocks(rel);
+		if (rel->rd_rel->relkind != RELKIND_INDEX)
+			relids = list_concat(relids, RelationGetIndexList(rel));
+		if (OidIsValid(rel->rd_rel->reltoastrelid))
+			relids = lappend_oid(relids, rel->rd_rel->reltoastrelid);
+		if (i == 0)
+		{
+			prolly_components_for_relation(rel, &c);
+			if (c.change_log && c.change_log->relid != NULL &&
+				OidIsValid(c.change_log->relid(relid)))
+				relids = lappend_oid(relids, c.change_log->relid(relid));
+		}
+		relation_close(rel, NoLock);
+	}
+	return relids;
+}
+
+/*
+ * The tables of the session's branch whose rows differ from target's made
+ * the copies another branch has where that costs less (true: some were);
+ * *working is then the branch's working set, folded as its baseline.
+ */
+static bool
+share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
+{
+	ProllyDatabaseComponents dc;
+	CleanAt		ca = {0};
+	List	   *ours = NIL;
+	List	   *theirs = NIL;
+	List	   *chosen = NIL;	/* NamedTree *, then each one's relations */
+	List	   *relations = NIL;
+	List	   *shared = NIL;
+	ProllyTreeEnv denv;
+	ProllyNodeRef baseline;
+	ProllyNodeRef spliced;
+	ProllyNodeRef next;
+	ListCell   *a;
+	ListCell   *b;
+	char	   *current = branch_ops()->current();
+
+	prolly_database_components(&dc);
+	if (branch_ops()->share == NULL || dc.canonicalizer->splice_baseline == NULL ||
+		!fold_caches_usable() || !branch_baseline(current, &baseline))
+		return false;
+	ca.root = &target->hash;
+	ca.snap = fold_snapshot();
+	branch_ops()->branches(find_clean_at, &ca);
+	if (ca.name == NULL ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, working, target))
+		return false;
+
+	/* the tables whose rows differ, where sharing costs less */
+	PROLLY_CALL(dc.canonicalizer, tables, working, note_table, &ours);
+	PROLLY_CALL(dc.canonicalizer, tables, target, note_table, &theirs);
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	prolly_folded_tree_env(&denv);
+	forboth(a, ours, b, theirs)
+	{
+		NamedTree  *o = lfirst(a);
+		NamedTree  *t = lfirst(b);
+		uint64		changes = 0;
+		uint64		blocks;
+		Oid			relid;
+		List	   *relids;
+
+		if (strcmp(o->name, t->name) != 0)
+			return false;
+		if (same_hash(&o->data.hash, &t->data.hash) || !o->readable ||
+			!t->readable)
+			continue;
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(o->name, NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+			continue;
+		relids = stored_with(relid, &blocks);
+		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
+					&changes);
+		if ((double) changes * MOVE_ROW_USEC <= (double) blocks * SHARE_BLOCK_USEC)
+			continue;
+		chosen = lappend(chosen, o);
+		relations = lappend(relations, relids);
+	}
+	if (chosen == NIL)
+		return false;
+	if (debug_prolly_verify_fold_caches)
+		verify_known(ca.name, false, target);
+
+	/*
+	 * (each shared if nobody uses it now, and the other branch is still at
+	 * the target with it locked: none of its writers ended since, nor can
+	 * write it now)
+	 */
+	forboth(a, chosen, b, relations)
+	{
+		if (branch_ops()->share(ca.branch, lfirst(b), still_clean, &ca))
+			shared = lappend(shared, ((NamedTree *) lfirst(a))->name);
+	}
+	if (shared == NIL)
+		return false;
+	PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &ca.baseline,
+				shared, &spliced);
+	branch_set_baseline(current, &spliced, NULL);
+	fold_from_baseline(working, &next, false);
+	branch_set_baseline(current, &next, working);
+	return true;
+}
+
+static void
+move_settled(void *arg)
+{
+	settle(arg, NULL);
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
@@ -1031,6 +1304,7 @@ holds_unseen(Relation rel, Snapshot snap)
  * them only if that one wrote it.  A table's change log tells which wrote
  * it without reading the table (its entries are written with each write,
  * and kept while the snapshot is); one without a log has every page read.
+ * Asked only once commits_unseen() says one did.
  */
 static bool
 copies_hold_unseen(void)
@@ -1042,8 +1316,6 @@ copies_hold_unseen(void)
 	List	   *relids = NIL;
 	bool		found = false;
 
-	if (!commits_unseen(snap))
-		return false;
 	classes = table_open(RelationRelationId, AccessShareLock);
 	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -1079,9 +1351,16 @@ copies_hold_unseen(void)
 	return found;
 }
 
+/* A first use's move: to target, from copies of source's (NULL: none). */
+typedef struct MoveCopies
+{
+	const ProllyNodeRef *target;
+	const KnownSource *source;
+} MoveCopies;
+
 /*
  * A branch's first use's move to its head.  The copy waited for the
- * session branch's writers, so its pages hold every row they committed,
+ * source branch's writers, so its pages hold every row they committed,
  * some after the active snapshot was taken: rows it doesn't see, and the
  * old versions of rows it sees that they deleted or updated.  A fold by
  * that snapshot wouldn't see the former, and a move by it wouldn't undo
@@ -1097,28 +1376,96 @@ copies_hold_unseen(void)
 static void
 move_copies(void *arg)
 {
+	MoveCopies *mc = arg;
+
 	if (IsolationUsesXactSnapshot())
 	{
-		if (copies_hold_unseen())
+		/*
+		 * (with a commit the snapshot doesn't see, the source's known
+		 * working set may be newer than the snapshot: folded from scratch)
+		 */
+		if (commits_unseen(GetActiveSnapshot()))
 		{
-			pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_REFUSALS, 1);
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("could not serialize access: the branch's first use copies rows committed after this transaction's snapshot"),
-					 errhint("The transaction might succeed if retried.")));
+			if (copies_hold_unseen())
+			{
+				pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_REFUSALS, 1);
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access: the branch's first use copies rows committed after this transaction's snapshot"),
+						 errhint("The transaction might succeed if retried.")));
+			}
+			settle(mc->target, NULL);
 		}
-		move_settled(arg);
+		else
+			settle(mc->target, mc->source);
 		return;
 	}
 	PushActiveSnapshot(GetLatestSnapshot());
-	move_settled(arg);
+	settle(mc->target, mc->source);
 	PopActiveSnapshot();
 }
 
 /*
+ * The branch with copies nearest a root (#491), ranked: its working set
+ * known to be the root (3: copied, nothing is written or folded, if it
+ * is still known once copied: known, what it was known at), its
+ * baseline's fold or its head made the root (2, 1: only what it changed
+ * since is).  The session's branch on a tie; none (rank 0) if no branch
+ * is at the root.
+ */
+typedef struct NearestSource
+{
+	const ProllyHash *root;
+	Snapshot	snap;
+	char	   *name;
+	Oid			branch;
+	int			rank;
+	KnownSource known;
+} NearestSource;
+
+static void
+rank_source(const char *name, Oid branch, void *arg)
+{
+	NearestSource *ns = arg;
+	ProllyNodeRef baseline;
+	ProllyNodeRef ref;
+	ProllyHash	h;
+	ProllyCommitInfo info;
+	BranchFoldStamp at;
+	int			rank = 0;
+
+	if (ns->rank == 3 && ns->branch == MyBranch)
+		return;
+	if (fold_caches_usable() &&
+		branch_fold_known_at(branch, ns->snap,
+							 branch_baseline(name, &baseline) ? &baseline.hash : NULL,
+							 false, &h, &at) &&
+		same_hash(&h, ns->root))
+		rank = 3;
+	else if (branch_baseline_root(name, &ref) && same_hash(&ref.hash, ns->root))
+		rank = 2;
+	else if (branch_head(name, &h) && copies_commit_get(&h, &info) &&
+			 same_hash(&info.root.hash, ns->root))
+		rank = 1;
+	if (rank > ns->rank || (rank > 0 && rank == ns->rank && branch == MyBranch))
+	{
+		ns->rank = rank;
+		ns->name = pstrdup(name);
+		ns->branch = branch;
+		if (rank == 3)
+		{
+			ns->known.name = ns->name;
+			ns->known.root = h;
+			ns->known.at = at;
+		}
+	}
+}
+
+/*
  * Make the copies of a branch that has only its head: a copy of the
- * session's branch's (which has the same changes since the same
- * baseline), moved to the head's root.
+ * nearest branch's to its head's root (#491), or else the session's (each
+ * has the same changes since the same baseline as the copy), moved to the
+ * root.
  */
 static void
 materialize(const char *name)
@@ -1129,6 +1476,9 @@ materialize(const char *name)
 	ProllyNodeRef baseline;
 	bool		was_read_only = XactReadOnly;
 	int			hush;
+	NearestSource ns = {0};
+	MoveCopies	mc;
+	char	   *source;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -1167,13 +1517,23 @@ materialize(const char *name)
 					 errmsg("the head commit of branch \"%s\" is missing", name)));
 		if (!same_hash(&head, &checked))
 			prolly_check_commit_dependencies(&info, NULL, "branch's first use");
-		branch_ops()->make(name, NULL);
+		ns.root = &info.root.hash;
+		ns.snap = IsolationUsesXactSnapshot() ? GetActiveSnapshot() :
+			GetLatestSnapshot();
+		branch_ops()->branches(rank_source, &ns);
+		source = ns.rank > 0 ? ns.name : branch_ops()->current();
+		branch_ops()->make(name, ns.rank > 0 ? source : NULL);
 		branch_set_baseline(name,
-							branch_baseline(branch_ops()->current(), &baseline) ?
-							&baseline : NULL, NULL);
+							branch_baseline(source, &baseline) ? &baseline : NULL,
+							NULL);
 
-		/* (moved to the head, unless the copies are there already) */
-		branch_ops()->run_on(name, move_copies, &info.root);
+		/*
+		 * (moved to the head, unless the copies are there already: those of
+		 * a branch whose working set is, if it still is)
+		 */
+		mc.target = &info.root;
+		mc.source = ns.rank == 3 ? &ns.known : NULL;
+		branch_ops()->run_on(name, move_copies, &mc);
 done:
 		;
 	}

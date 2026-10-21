@@ -46,4 +46,15 @@ extern bool branch_fold_known(Oid branch, Snapshot snap,
 							  const ProllyHash *baseline, bool complete,
 							  ProllyHash *root);
 
+/*
+ * branch_fold_known(), with what it was known at (at): for
+ * branch_fold_unchanged() to ask later, in the same transaction, whether
+ * it still holds, though the transaction's catalog changes since keep
+ * anything new from being known.
+ */
+extern bool branch_fold_known_at(Oid branch, Snapshot snap,
+								 const ProllyHash *baseline, bool complete,
+								 ProllyHash *root, BranchFoldStamp *at);
+extern bool branch_fold_unchanged(const BranchFoldStamp *at);
+
 #endif							/* REFS_GENERATIONS_H */
