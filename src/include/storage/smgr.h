@@ -114,6 +114,8 @@ extern bool smgrwritesread(ForkNumber forknum);
 extern bool smgrreplacedafter(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, XLogRecPtr lsn);
 extern bool smgrreplacesblocks(SMgrRelation reln, ForkNumber forknum);
+extern void smgrprerestore(SMgrRelation reln, ForkNumber forknum,
+						   BlockNumber blocknum, XLogRecPtr lsn);
 extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer,

@@ -37,7 +37,9 @@
  * (smgrreplacedafter()), since the logical block's contents from before
  * the change aren't needed there, and doesn't write pages it made to that
  * block, which may still hold another relation's page at this point of the
- * replay.
+ * replay.  An older image of a map page, restored over a newer version,
+ * doesn't take that back: recovery remembers what the newer one said
+ * (remember_ahead()).
  *
  * The allocator.  Per tablespace and database, BMAP_ALLOC_RELNUMBER is a
  * metapage (the page store's high-water mark, the count of free blocks, and
@@ -125,6 +127,7 @@
 #include "utils/resowner.h"
 
 bool		debug_block_mapped_heap = false;
+int			block_map_replay_entries = 65536;
 
 /* ----------------------------------------------------------------
  * Page layouts
@@ -281,9 +284,32 @@ typedef struct BmapShared
 	int			unlisted;		/* past the most listed: every store is */
 	int			nswept;
 	BmapSwept	swept[BMAP_SWEPT_MAX];
+
+	/* the remaps ahead of replay (bmap_ahead), and how many there are */
+	LWLock		ahead_lock;
+	pg_atomic_uint32 nahead;
 } BmapShared;
 
 static BmapShared *bmap_shared = NULL;
+
+/*
+ * A logical block whose map page recovery replaced with an older image, and
+ * the WAL position since which the version replaced gave it its physical
+ * block (see remember_ahead()).
+ */
+typedef struct BmapAheadKey
+{
+	RelFileLocator rel;
+	BlockNumber blkno;
+} BmapAheadKey;
+
+typedef struct BmapAhead
+{
+	BmapAheadKey key;
+	XLogRecPtr	since;
+} BmapAhead;
+
+static HTAB *bmap_ahead = NULL;
 
 static void
 BmapShmemRequest(void *arg)
@@ -291,6 +317,13 @@ BmapShmemRequest(void *arg)
 	ShmemRequestStruct(.name = "block map",
 					   .size = sizeof(BmapShared),
 					   .ptr = (void **) &bmap_shared,
+		);
+	ShmemRequestHash(.name = "block map remaps ahead of replay",
+					 .nelems = block_map_replay_entries,
+					 .ptr = &bmap_ahead,
+					 .hash_info.keysize = sizeof(BmapAheadKey),
+					 .hash_info.entrysize = sizeof(BmapAhead),
+					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE,
 		);
 }
 
@@ -302,6 +335,9 @@ BmapShmemInit(void *arg)
 	bmap_shared->nlisted = 0;
 	bmap_shared->unlisted = 0;
 	bmap_shared->nswept = 0;
+	LWLockInitialize(&bmap_shared->ahead_lock,
+					 LWLockNewTrancheId("block map replay"));
+	pg_atomic_init_u32(&bmap_shared->nahead, 0);
 }
 
 /* Is a sweep of rel's page store running? */
@@ -2384,11 +2420,213 @@ bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum)
 	return forknum == MAIN_FORKNUM;
 }
 
+/* ----------------------------------------------------------------
+ * Recovery: remaps ahead of replay
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Redo skips a block's records from before the WAL position since which
+ * its entry has its physical block (bmapreplacedafter()), and doesn't write
+ * pages made by them (page_predates_entry()), when the map page read is
+ * newer than the record: the record that gave the block its physical block
+ * carries the page's image, and every record from before it is of another
+ * block.  That holds only if every record up to then is skipped.  The map
+ * page is read as it stands at each point of the replay, and a full-page
+ * image of it, always restored, can be older than the version it replaces:
+ * it gives the entry the position it had at the image, and the block's
+ * records from between then and the newer position would be applied to a
+ * page missing the ones skipped before them, or written to a physical block
+ * that may still hold another relation's page.
+ *
+ * So before an image of a map page is restored (bmapprerestore()), each
+ * entry of the version it replaces whose position is ahead of the replay is
+ * remembered here, in shared memory, since the checkpointer and the
+ * background writer write pages out during recovery too.  Restoring an
+ * image reads nothing of the page it replaces, so the version replaced is
+ * read first: from its buffer, or from disk, where a version newer than the
+ * replay can be.  Both answers take the later of the map page's position
+ * and the one remembered, so neither goes backwards.  An entry is let go of
+ * once the replay passes its position: by then the record at it has given
+ * the map page that position or a later one.  A dropped relation's entries
+ * are let go of that way too; until then they skip records of a relation
+ * that is to be dropped, or of a later one with the same file number, whose
+ * map page on disk gave the position.
+ *
+ * The table holds block_map_replay_entries entries.  If more are needed at
+ * once, there's no safe answer for a block that didn't fit: taking its
+ * record to be of another block skips a change its page needs, and taking
+ * it to be of the block applies the record to a page missing the ones
+ * skipped before it (or writes the page over another relation's).  So
+ * recovery stops before restoring the image, with nothing wrong written,
+ * and can be run again with a larger table.
+ */
+
+/*
+ * The latest position since which logical block 'blkno' of 'rel' has its
+ * physical block, as a version of its map page that an older image replaced
+ * in recovery said: InvalidXLogRecPtr if none is remembered.
+ */
+static XLogRecPtr
+remap_ahead(RelFileLocator rel, BlockNumber blkno)
+{
+	BmapAheadKey key;
+	BmapAhead  *a;
+	XLogRecPtr	since = InvalidXLogRecPtr;
+
+	/*
+	 * An entry is remembered before the image is restored under the map
+	 * page's buffer lock, and read after a lookup of the map page, which
+	 * takes that lock or reads the version on disk: a lookup that finds the
+	 * image finds the entry.
+	 */
+	if (pg_atomic_read_u32(&bmap_shared->nahead) == 0)
+		return InvalidXLogRecPtr;
+	memset(&key, 0, sizeof(key));
+	key.rel = rel;
+	key.blkno = blkno;
+	LWLockAcquire(&bmap_shared->ahead_lock, LW_SHARED);
+	a = hash_search(bmap_ahead, &key, HASH_FIND, NULL);
+	if (a != NULL)
+		since = a->since;
+	LWLockRelease(&bmap_shared->ahead_lock);
+	return since;
+}
+
+/* let go of the remaps the replay, at 'lsn', has passed; the lock held */
+static void
+forget_passed(XLogRecPtr lsn)
+{
+	HASH_SEQ_STATUS status;
+	BmapAhead  *a;
+
+	hash_seq_init(&status, bmap_ahead);
+	while ((a = hash_seq_search(&status)) != NULL)
+	{
+		if (a->since < lsn)
+		{
+			(void) hash_search(bmap_ahead, &a->key, HASH_REMOVE, NULL);
+			pg_atomic_fetch_sub_u32(&bmap_shared->nahead, 1);
+		}
+	}
+}
+
+/*
+ * Remember the entries of map page 'mappage' of 'rel', in a version that an
+ * image from the record at 'lsn' is about to replace, whose positions are
+ * ahead of the record.
+ */
+static void
+remember_ahead(RelFileLocator rel, BlockNumber mappage,
+			   const BmapEntry *entries, XLogRecPtr lsn)
+{
+	bool		passed = false;
+
+	LWLockAcquire(&bmap_shared->ahead_lock, LW_EXCLUSIVE);
+	for (uint32 slot = 0; slot < BMAP_FANOUT; slot++)
+	{
+		BmapAheadKey key;
+		BmapAhead  *a;
+		bool		found;
+
+		if (!BlockNumberIsValid(entries[slot].block) ||
+			entries[slot].since <= lsn)
+			continue;
+		memset(&key, 0, sizeof(key));
+		key.rel = rel;
+		key.blkno = (mappage - 1) * BMAP_FANOUT + slot;
+		a = hash_search(bmap_ahead, &key, HASH_ENTER_NULL, &found);
+		if (a == NULL && !passed)
+		{
+			forget_passed(lsn);
+			passed = true;
+			a = hash_search(bmap_ahead, &key, HASH_ENTER_NULL, &found);
+		}
+		if (a == NULL)
+		{
+			LWLockRelease(&bmap_shared->ahead_lock);
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+					 errmsg("recovery needs to remember more remapped blocks of block-mapped relations than \"block_map_replay_entries\" (%d) holds",
+							block_map_replay_entries),
+					 errdetail("A full-page image of map page %u of \"%s\" is older than the version it replaces.",
+							   mappage, relpathperm(rel, MAIN_FORKNUM).str),
+					 errhint("Increase \"block_map_replay_entries\" and restart the server.")));
+		}
+		if (!found)
+		{
+			a->since = entries[slot].since;
+			pg_atomic_fetch_add_u32(&bmap_shared->nahead, 1);
+		}
+		else
+			a->since = Max(a->since, entries[slot].since);
+	}
+	LWLockRelease(&bmap_shared->ahead_lock);
+}
+
+/*
+ * In recovery, before a full-page image from the record at 'lsn' of block
+ * 'blocknum' of the map fork is restored: remember the entries of the
+ * version it replaces that are ahead of the record (see above).
+ */
+void
+bmapprerestore(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			   XLogRecPtr lsn)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	PGIOAlignedBlock copy;
+	Page		page = (Page) copy.data;
+	PrefetchBufferResult r;
+
+	/* block 0 is the header; the others are map pages */
+	if (forknum != BMAP_FORKNUM || blocknum == 0 ||
+		!mdexists(reln, BMAP_FORKNUM) ||
+		blocknum >= mdnblocks(reln, BMAP_FORKNUM))
+		return;
+
+	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blocknum);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(rel, BMAP_FORKNUM, blocknum, r.recent_buffer))
+	{
+		if (BufferIsLockedByMe(r.recent_buffer))
+			elog(ERROR, "map page %u of \"%s\" is locked by the process restoring its image",
+				 blocknum, relpathperm(rel, MAIN_FORKNUM).str);
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
+		memcpy(copy.data, BufferGetPage(r.recent_buffer), BLCKSZ);
+		UnlockReleaseBuffer(r.recent_buffer);
+	}
+	else
+	{
+		void	   *dst = copy.data;
+
+		/*
+		 * Not cached: the version on disk, which may be the newer one.  A
+		 * page torn by the crash, which fails verification, says nothing
+		 * reliable; it is why the image is restored.
+		 */
+		mdreadv(reln, BMAP_FORKNUM, blocknum, &dst, 1);
+		if (!PageIsVerified(page, blocknum, 0, NULL))
+			return;
+	}
+
+	if (PageIsNew(page) ||
+		((PageHeader) page)->pd_special != BLCKSZ - MAXALIGN(sizeof(BmapPageOpaqueData)) ||
+		PageGetBmapOpaque(page)->magic != BMAP_MAGIC ||
+		PageGetBmapOpaque(page)->type != BMAP_PAGE_NODE)
+		return;
+
+	/* an entry's position is before the end of the record that set it */
+	if (PageGetLSN(page) <= lsn)
+		return;
+	remember_ahead(rel, blocknum, PageGetBmapEntries(page), lsn);
+}
+
 /*
  * In recovery: was logical block 'blocknum' given its physical block after
  * WAL position 'lsn'?  The map page read may be newer than the record being
  * replayed (written before a crash, or copied by a base backup), or not yet
- * initialized.
+ * initialized, or older than a version an image of it replaced earlier in
+ * the replay, whose position counts too (see remember_ahead()).
  */
 bool
 bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
@@ -2396,6 +2634,8 @@ bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	BmapEntry	entry;
 
+	if (remap_ahead(reln->smgr_rlocator.locator, blocknum) > lsn)
+		return true;
 	if (lookup_entry(reln, blocknum, &entry))
 		return entry.since > lsn;
 
@@ -4986,9 +5226,14 @@ page_predates_entry(SMgrRelation reln, BlockNumber blkno, const void *page)
 {
 	PGIOAlignedBlock copy;
 	BmapEntry  *entry = &PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)];
+	XLogRecPtr	since;
 
 	read_node(reln, MAP_PAGE(blkno), true, copy.data, BMAP_PAGE_NODE);
-	return PageGetLSN((const PageData *) page) < entry->since;
+
+	/* (or a later position, of a version an older image replaced) */
+	since = Max(entry->since,
+				remap_ahead(reln->smgr_rlocator.locator, blkno));
+	return PageGetLSN((const PageData *) page) < since;
 }
 
 void

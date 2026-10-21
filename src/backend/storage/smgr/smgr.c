@@ -124,6 +124,14 @@ typedef struct f_smgr
 									   BlockNumber blocknum, XLogRecPtr lsn);
 
 	/*
+	 * In recovery, before a full-page image of the block from the record at
+	 * WAL position lsn is restored over the version the block has, which may
+	 * be newer.  May be NULL.
+	 */
+	void		(*smgr_prerestore) (SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum, XLogRecPtr lsn);
+
+	/*
 	 * Must a fork's pages be prepared before they change (they may be
 	 * shared)?  Then the buffer manager calls smgr_prepareforchange once a
 	 * page is locked exclusively (or, under a cleanup lock taken without
@@ -221,6 +229,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_share = bmapshare,
 		.smgr_replacesblocks = bmapreplacesblocks,
 		.smgr_replacedafter = bmapreplacedafter,
+		.smgr_prerestore = bmapprerestore,
 		.smgr_preparesforchanges = bmappreparesforchanges,
 		.smgr_prepareforchange = bmapprepareforchange,
 		.smgr_pageisshared = bmappageisshared,
@@ -676,6 +685,21 @@ smgrreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return false;
 	return smgrsw[reln->smgr_which].smgr_replacedafter(reln, forknum,
 													   blocknum, lsn);
+}
+
+/*
+ * smgrprerestore() -- In recovery, before a full-page image of the block from
+ * the record at WAL position lsn is restored over its current version.
+ *
+ * The version replaced may be newer than the image, and say something
+ * recovery needs to know until replay reaches it.
+ */
+void
+smgrprerestore(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			   XLogRecPtr lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_prerestore != NULL)
+		smgrsw[reln->smgr_which].smgr_prerestore(reln, forknum, blocknum, lsn);
 }
 
 /*

@@ -397,6 +397,13 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
+
+		/*
+		 * The version the image replaces may be newer than the image, and its
+		 * storage manager may need to know what it said.
+		 */
+		smgrprerestore(smgropen(rlocator, INVALID_PROC_NUMBER), forknum,
+					   blkno, record->ReadRecPtr);
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
 									  prefetch_buffer);
