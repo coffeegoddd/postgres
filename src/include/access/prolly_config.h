@@ -104,6 +104,12 @@ extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_change_logs_flush(void);
 extern void prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 							   HeapTuple oldtup, const ItemPointerData *newtid);
+/*
+ * How many entries a table's change log holds that no fold has consumed,
+ * estimated (-1: one says to read it in full; 0 without a log or an
+ * estimate).
+ */
+extern double prolly_change_log_pending(Relation rel);
 /* ... or that a table was emptied (truncated) */
 extern void prolly_note_emptied(Relation rel);
 /* ... or of the versions a write made, in hand (prolly_changelog.h) */

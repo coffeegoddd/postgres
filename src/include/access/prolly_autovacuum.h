@@ -20,6 +20,8 @@ extern PGDLLIMPORT double prolly_gc_growth_scale_factor;
 /* prolly.journal_move_threshold (MB; -1: the journal is never moved) */
 extern PGDLLIMPORT int prolly_journal_move_threshold;
 extern PGDLLIMPORT int prolly_conjoin_max_files;
+/* prolly.autofold_threshold (a fraction of a table's size; 0: off) */
+extern PGDLLIMPORT double prolly_autofold_threshold;
 /* prolly.gc_file_size (kB): how large a collection's files grow */
 extern PGDLLIMPORT int prolly_gc_file_size;
 /*

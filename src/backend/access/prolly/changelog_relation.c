@@ -1569,6 +1569,113 @@ relation_read_unseen(Relation rel, Snapshot snapshot,
 	return go;
 }
 
+/* The log's pages read to estimate its pending entries, at most. */
+#define PENDING_SAMPLE_BLOCKS	32
+
+/*
+ * The entries of rel's log a fold now would trim: of its live rows (none
+ * consumed or trimmed) those of transactions below the horizon, estimated
+ * from a sample of its pages, evenly spread, as ANALYZE samples: a row
+ * holds one entry to a page of them, and consumed and trimmed rows are
+ * dead until vacuumed, so counts of rows don't tell.  The rows above the
+ * horizon (a snapshot held back, or the writer in flight) stay whatever
+ * folds, so they aren't counted: autovacuum would fold at every pass.
+ */
+static double
+relation_pending(Relation rel)
+{
+	Oid			logid = log_relid(rel);
+	Relation	log;
+	TupleDesc	desc;
+	BlockNumber nblocks;
+	BlockNumber step;
+	BlockNumber sampled = 0;
+	TransactionId horizon;
+	FullTransactionId below;
+	BufferAccessStrategy strategy;
+	double		entries = 0;
+	bool		full = false;
+
+	if (!OidIsValid(logid))
+		return 0;
+	log = try_table_open(logid, AccessShareLock);
+	if (log == NULL)
+		return 0;
+	desc = RelationGetDescr(log);
+	nblocks = RelationGetNumberOfBlocks(log);
+	horizon = GetOldestNonRemovableTransactionId(log);
+	if (!TransactionIdIsNormal(horizon))
+	{
+		table_close(log, AccessShareLock);
+		return 0;
+	}
+	below = FullTransactionIdFromAllowableAt(ReadNextFullTransactionId(),
+											 horizon);
+	strategy = GetAccessStrategy(BAS_BULKREAD);
+	/* (rounded up, so at most PENDING_SAMPLE_BLOCKS are read) */
+	step = Max((nblocks + PENDING_SAMPLE_BLOCKS - 1) / PENDING_SAMPLE_BLOCKS,
+			   1);
+	for (BlockNumber blk = 0; blk < nblocks && !full; blk += step)
+	{
+		Buffer		buf = ReadBufferExtended(log, MAIN_FORKNUM, blk, RBM_NORMAL,
+											 strategy);
+		Page		page;
+		OffsetNumber maxoff;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoff = PageIsNew(page) ? 0 : PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff && !full; off++)
+		{
+			ItemId		id = PageGetItemId(page, off);
+			HeapTupleData tup;
+			HTSV_Result r;
+			bool		isnull;
+			bytea	   *b;
+			const char *p;
+			const char *end;
+
+			if (!ItemIdIsNormal(id))
+				continue;
+			tup.t_data = (HeapTupleHeader) PageGetItem(page, id);
+			tup.t_len = ItemIdGetLength(id);
+			tup.t_tableOid = logid;
+			ItemPointerSet(&tup.t_self, blk, off);
+			r = HeapTupleSatisfiesVacuum(&tup, horizon, buf);
+			if (r != HEAPTUPLE_LIVE ||
+				!FullTransactionIdPrecedes(row_xid(log, &tup), below))
+				continue;
+			b = DatumGetByteaPP(heap_getattr(&tup, Anum_log_entries, desc,
+											 &isnull));
+			p = VARDATA_ANY(b);
+			end = p + VARSIZE_ANY_EXHDR(b);
+			while (p + 2 * sizeof(uint32) <= end)
+			{
+				uint32		len;
+
+				memcpy(&len, p + sizeof(int32), sizeof(len));
+				p += 2 * sizeof(uint32);
+				if (len == FULL_LEN)
+				{
+					full = true;
+					break;
+				}
+				if (len != EMPTIED_LEN)
+					p += len;
+				entries++;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+		sampled++;
+		CHECK_FOR_INTERRUPTS();
+	}
+	FreeAccessStrategy(strategy);
+	table_close(log, AccessShareLock);
+	if (full)
+		return -1;
+	return sampled == 0 ? 0 : entries / sampled * nblocks;
+}
+
 /* The log's upkeep: rows deleted (hushed: no write of the table's branch). */
 static void
 delete_rows(Relation log, ItemPointerData *tids, int n)
@@ -1924,5 +2031,6 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.written_unseen = relation_written_unseen,
 	.read_unseen = relation_read_unseen,
 	.note_emptied = relation_note_emptied,
+	.pending = relation_pending,
 	.flush = flush_all,
 };

@@ -244,6 +244,16 @@ prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 		PROLLY_CALL(log, note, rel, oldtid, oldtup, newtid);
 }
 
+double
+prolly_change_log_pending(Relation rel)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (log == NULL || log->pending == NULL)
+		return 0;
+	return log->pending(rel);
+}
+
 void
 prolly_note_emptied(Relation rel)
 {
