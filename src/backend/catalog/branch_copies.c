@@ -66,10 +66,13 @@
 #include "storage/bufmgr.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -713,6 +716,132 @@ copies_run_on(const char *name, void (*fn) (void *arg), void *arg)
 	on_branch(branch_oid(name, false), fn, arg);
 }
 
+/* A copy of branch's pg_class row of relation relid (any branch's), or NULL. */
+static HeapTuple
+class_row(Relation pg_class, Oid relid, Oid branch)
+{
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup = NULL;
+
+	ScanKeyInit(&key[0], Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	ScanKeyInit(&key[1], Anum_pg_class_relbranch, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(branch));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(pg_class, ClassOidIndexId, true, NULL, 2, key);
+		tup = systable_getnext(scan);
+		if (HeapTupleIsValid(tup))
+			tup = heap_copytuple(tup);
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	return tup;
+}
+
+/*
+ * Give the session branch's relations relids the source branch's storage
+ * (#491): each a share of the source's (copy_storage()'s), its row taking
+ * the source's say of how old its oldest row is and how big it is (the
+ * pages are the source's).  Checked first, all of them, so a refusal
+ * changes nothing.
+ */
+static bool
+copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
+			 void *arg)
+{
+	Relation	pg_class;
+	List	   *ours = NIL;
+	List	   *theirs = NIL;
+	ListCell   *a;
+	ListCell   *b;
+	bool		alike = true;
+
+	/* (ours as TRUNCATE locks them; the source's as a copy does, its own) */
+	foreach_oid(relid, relids)
+	{
+		LOCKTAG		tag;
+
+		if (!ConditionalLockRelationOid(relid, AccessExclusiveLock))
+			return false;
+		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, source);
+		if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+			return false;
+	}
+	AcceptInvalidationMessages();
+	if (unchanged && !unchanged(arg))
+		return false;
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	foreach_oid(relid, relids)
+	{
+		HeapTuple	o = class_row(pg_class, relid, MyBranch);
+		HeapTuple	t = class_row(pg_class, relid, source);
+		Form_pg_class oc;
+		Form_pg_class tc;
+
+		if (o == NULL || t == NULL)
+		{
+			alike = false;
+			break;
+		}
+		oc = (Form_pg_class) GETSTRUCT(o);
+		tc = (Form_pg_class) GETSTRUCT(t);
+		if (oc->relkind != tc->relkind || !RELKIND_HAS_STORAGE(oc->relkind) ||
+			oc->relpersistence != RELPERSISTENCE_PERMANENT ||
+			tc->relpersistence != RELPERSISTENCE_PERMANENT ||
+			oc->reltablespace != tc->reltablespace ||
+			!RelFileNumberIsValid(oc->relfilenode) ||
+			!RelFileNumberIsValid(tc->relfilenode) ||
+			RelFileLocatorSkippingWAL(class_locator(tc, tc->relfilenode)) ||
+			!smgrcanshare(smgropen(class_locator(tc, tc->relfilenode),
+								   INVALID_PROC_NUMBER)))
+		{
+			alike = false;
+			break;
+		}
+		ours = lappend(ours, o);
+		theirs = lappend(theirs, t);
+	}
+	if (!alike)
+	{
+		table_close(pg_class, RowExclusiveLock);
+		return false;
+	}
+	forboth(a, ours, b, theirs)
+	{
+		HeapTuple	o = lfirst(a);
+		Form_pg_class oc = (Form_pg_class) GETSTRUCT(o);
+		Form_pg_class tc = (Form_pg_class) GETSTRUCT((HeapTuple) lfirst(b));
+		RelFileNumber relnumber;
+
+		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
+										oc->relpersistence);
+		RelationCreateStorageShared(class_locator(oc, relnumber),
+									smgropen(class_locator(tc, tc->relfilenode),
+											 INVALID_PROC_NUMBER),
+									true);
+		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
+		oc->relfilenode = relnumber;
+		oc->relpages = tc->relpages;
+		oc->reltuples = tc->reltuples;
+		oc->relallvisible = tc->relallvisible;
+		oc->relallfrozen = tc->relallfrozen;
+		oc->relfrozenxid = tc->relfrozenxid;
+		oc->relminmxid = tc->relminmxid;
+		CatalogTupleUpdate(pg_class, &o->t_self, o);
+	}
+	CommandCounterIncrement();
+	table_close(pg_class, RowExclusiveLock);
+	return true;
+}
+
 static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
@@ -726,6 +855,7 @@ static const BranchOpsRoutine branch_copies = {
 	.current = copies_current,
 	.branches = copies_branches,
 	.run_on = copies_run_on,
+	.share = copies_share,
 };
 
 const BranchOpsRoutine *

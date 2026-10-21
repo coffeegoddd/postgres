@@ -9739,6 +9739,68 @@ folded_splice(const ProllyNodeRef *into, const ProllyNodeRef *from,
 	PROLLY_CALL(cn.tree, build_finish, b, out);
 }
 
+/*
+ * into, but for the tables named, whose entries are from's (none where from
+ * hasn't one), into *out: into with those entries applied.
+ */
+static void
+folded_splice_baseline(const ProllyNodeRef *into, const ProllyNodeRef *from,
+					   List *tables, ProllyNodeRef *out)
+{
+	Canon		a;
+	Canon		b;
+	ProllyTreeEnv benv;
+	ProllyEdit *edits = palloc_array(ProllyEdit, Max(list_length(tables), 1));
+	int			nedits = 0;
+	List	   *keys = NIL;
+
+	memset(&a, 0, sizeof(a));
+	memset(&b, 0, sizeof(b));
+	canon_env(&a);
+	canon_env(&b);
+	load_baseline(&a, into);
+	load_baseline(&b, from);
+	foreach_ptr(char, name, tables)
+	{
+		CanonItem  *it = palloc0(sizeof(CanonItem));
+
+		initStringInfo(&it->key);
+		appendStringInfoString(&it->key, "t:");
+		append_utf8(&it->key, name);
+		keys = lappend(keys, it);
+	}
+	list_sort(keys, item_cmp);
+	foreach_ptr(CanonItem, it, keys)
+	{
+		BaseTable  *bt = find_base_table(&b, &it->key);
+
+		/* (named twice: once) */
+		if (nedits > 0 && edits[nedits - 1].key.len == it->key.len &&
+			memcmp(edits[nedits - 1].key.data, it->key.data, it->key.len) == 0)
+			continue;
+		edits[nedits].key = (ProllyKey) {(const uint8 *) it->key.data, it->key.len};
+		edits[nedits].is_delete = bt == NULL;
+		if (bt)
+		{
+			/* (its value as parse_base_table() read it) */
+			initStringInfo(&it->value);
+			put_hash(&it->value, &bt->data.hash);
+			put_hash(&it->value, &bt->description);
+			appendBinaryStringInfo(&it->value, bt->state.data, bt->state.len);
+			edits[nedits].value = (ProllyValue) {(const uint8 *) it->value.data,
+			it->value.len};
+		}
+		nedits++;
+	}
+	benv = a.env;
+	benv.chunk_refs = base_chunk_refs;
+	if (nedits == 0)
+		*out = *into;
+	else
+		PROLLY_CALL(a.tree, apply, &benv, into, edits, nedits, out);
+	pfree(edits);
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -9756,6 +9818,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,
 	.splice = folded_splice,
+	.splice_baseline = folded_splice_baseline,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,
 	.same_schema = folded_same_schema,

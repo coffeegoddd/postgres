@@ -55,6 +55,15 @@ my $user = $node->background_psql('postgres', on_error_stop => 0);
 
 my $rows = q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM app.t};
 
+# A branch used, made to differ from its head before it is left: a first
+# use copies the branch nearest its head (#491), and each case here is of
+# copies of main, waiting for its writers.
+sub apart
+{
+	$user->query_safe(q{INSERT INTO app.t VALUES (77, 77);
+		SELECT dolt_commit('-am', 'apart')});
+}
+
 sub rows_of
 {
 	my ($s) = @_;
@@ -80,6 +89,7 @@ sub refused_then_retried
 	is(rows_of($user), $expected, "$what: retried, the branch as its head has it");
 	$user->query_safe('COMMIT');
 	is(rows_of($user), $expected, "$what: and after the commit");
+	apart();
 	$user->query_safe(q{SELECT dolt_checkout('main')});
 	return;
 }
@@ -125,6 +135,7 @@ $writer->query_safe(q{INSERT INTO plain VALUES (1)});
 $user->query_safe(q{SELECT dolt_checkout('-b', 'rrp')});
 is(rows_of($user), '1:5,2:2,3:3 0', 'a commit elsewhere doesn\'t refuse the first use');
 $user->query_safe('COMMIT');
+apart();
 $user->query_safe(q{SELECT dolt_checkout('main')});
 sql(q{SELECT pg_stat_force_next_flush()});
 is(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'first_use_tables_scanned'}),
@@ -179,6 +190,7 @@ $user->query_safe(q{SELECT dolt_checkout('rrw')});
 is(rows_of($user), '1:1,2:2 0', 'retried, the branch as its head has it, clean');
 $user->query_safe('COMMIT');
 is(rows_of($user), '1:1,2:2 0', 'and after the commit');
+apart();
 $user->query_safe(q{SELECT dolt_checkout('main')});
 is(sql($rows), '1:5,2:7,3:3', 'main keeps the writer\'s change');
 sql(q{UPDATE app.t SET v = 2 WHERE id = 2});
@@ -233,6 +245,7 @@ $writer->query_safe('COMMIT');
 $user->query_until(qr/done/, '');
 is($user->{stderr}, '', 'and checks out');
 is(rows_of($user), '1:1,2:2 0', 'the branch as its head has it, clean');
+apart();
 $user->query_safe(q{SELECT dolt_checkout('main')});
 is(sql($rows), '1:5,3:3,101:101', 'main keeps the writer\'s rows');
 
@@ -281,8 +294,9 @@ $writer->quit;
 # by the primary key.
 $node->stop('immediate');
 $node->start;
-my %after = (rr => '1:1,2:2', rrs => '1:1,2:2', rrn => '1:1,2:2,77:77',
-	rrd => '1:1,2:2', rrw => '1:1,2:2', rrb => '1:5,2:2,3:3');
+my %after = (rr => '1:1,2:2,77:77', rrs => '1:1,2:2,77:77',
+	rrn => '1:1,2:2,77:77', rrd => '1:1,2:2,77:77', rrw => '1:1,2:2,77:77',
+	rrb => '1:5,2:2,3:3,77:77');
 foreach my $b (sort keys %after)
 {
 	is($node->safe_psql("postgres/$b", $rows), $after{$b},
