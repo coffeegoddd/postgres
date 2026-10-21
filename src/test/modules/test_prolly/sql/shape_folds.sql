@@ -295,6 +295,22 @@ DELETE FROM sf.k2 WHERE ctid = (SELECT min(ctid) FROM sf.k2 WHERE a = 1 AND b = 
 DELETE FROM sf.k2 WHERE a = 1 AND b <> 'k1';
 ALTER TABLE sf.k2 ADD PRIMARY KEY (a);
 :check
+-- (nor two rows the baseline holds that share the key now, one deleted
+-- since: mapped, the tree would hold the key twice, so read in full)
+CREATE TABLE sf.k3 (a int, b text);
+INSERT INTO sf.k3 VALUES (1, 'a'), (1, 'b'), (2, 'c');
+CREATE TABLE sf.rk2 (a int, b text, PRIMARY KEY (a, b));
+INSERT INTO sf.rk2 VALUES (1, 'x'), (1, 'y'), (2, 'z');
+SELECT length(dolt_commit('-Am', 'shared keys')::text) > 0 AS committed;
+DELETE FROM sf.k3 WHERE b = 'b';
+ALTER TABLE sf.k3 ADD PRIMARY KEY (a);
+:check
+DELETE FROM sf.rk2 WHERE b = 'y';
+ALTER TABLE sf.rk2 DROP CONSTRAINT rk2_pkey;
+ALTER TABLE sf.rk2 ADD PRIMARY KEY (a);
+:check
+SELECT * FROM sf.k3 ORDER BY a;
+SELECT * FROM sf.rk2 ORDER BY a;
 
 
 \c contrib_regression

@@ -208,8 +208,9 @@ fold_sort_next(Tuplesortstate *state)
 
 /*
  * The sorted rows built into *data, in key order: a keyless row's copies,
- * one after another, counted.  False, *data unset, at a keyed table's
- * second row of a key.  done gets the rows written and what the sort took.
+ * one after another, counted.  False at a keyed table's second row of a
+ * key, *data then the part built before it, not to be used.  done gets
+ * the rows written and what the sort took.
  */
 static bool
 fold_sort_build(Tuplesortstate *sort, const ProllyKeyingRoutine *kr,
@@ -631,6 +632,7 @@ prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 	TupleDesc	rd = RelationGetDescr(rel);
 	Map			m = {0};
 	MapEnd		end;
+	ProllyNodeRef built;
 
 	prolly_components_for_relation(rel, &c);
 	*rows = 0;
@@ -669,13 +671,16 @@ prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 	 * A keyless row's key is its bytes, and a table keyed otherwise than
 	 * its rows were folded orders them otherwise: sorted again.  Else in the
 	 * baseline's order, unless a key comes out of order (a key column's
-	 * collation changed, say): then sorted.
+	 * collation changed, say): then sorted.  (A pass that fails has built
+	 * a part of the tree: *data gets only a whole one.)
 	 */
 	end = map_pass(&m, from,
 				   m.keyless || PROLLY_CALL(m.kr, keyless, m.ok) != m.keyless,
-				   data);
+				   &built);
 	if (end == MAP_UNORDERED)
-		end = map_pass(&m, from, true, data);
+		end = map_pass(&m, from, true, &built);
+	if (end == MAP_DONE)
+		*data = built;
 	*rows = m.rows;
 	ExecDropSingleTupleTableSlot(m.oslot);
 	ExecDropSingleTupleTableSlot(m.nslot);
