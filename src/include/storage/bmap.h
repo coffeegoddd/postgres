@@ -142,17 +142,28 @@ extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
 extern bool bmap_sweep_due(Oid spcOid, Oid dbOid);
 
 /*
- * Visit every block of a database's page store in a tablespace that is
+ * Visit the blocks of a database's page store in a tablespace that are
  * allocated as the scan begins, each once whatever maps hold it, as read
  * from the store (pages in shared buffers aren't seen until written).  A
  * block written meanwhile is visited until two reads of it agree, so no
  * version of it is seen only torn.  A sweep (which may free blocks and
- * shorten the store) waits for it, as it does for a sweep.  Returns the
- * blocks read.
+ * shorten the store) waits for it, and so does another scan.
+ *
+ * The store is visited as ranges of blocks, in order, each told to 'range'
+ * first: changed, its allocated blocks then visited; or not, and none is
+ * read, because no block of it was written or freed since the scan whose
+ * token is 'since' began, and what that scan visited of the range holds
+ * still (its caller keeps that).  A 'since' of 0, or of a scan whose
+ * watching was lost (a restart, a crash, the store dropped or watched no
+ * more, or grown past its bits), has every range changed; and the ranges
+ * may differ from that scan's then.  This scan's token is set in *token
+ * (0: the store has none).  Returns the blocks read.
  */
 typedef void (*BmapBlockVisit) (const char *page, void *arg);
-extern uint64 bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit,
-							  void *arg);
+typedef void (*BmapRangeVisit) (uint32 range, bool changed, void *arg);
+extern uint64 bmap_scan_store(Oid spcOid, Oid dbOid, uint64 since,
+							  uint64 *token, BmapRangeVisit range,
+							  BmapBlockVisit visit, void *arg);
 
 /* does a relation file number name a block-mapped relation? */
 extern bool bmap_relation_exists(RelFileLocator rlocator);

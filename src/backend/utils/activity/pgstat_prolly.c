@@ -8,7 +8,8 @@
  * rows folded, commits, head moves, value memo lookups, pages copied, the
  * bytes the chunk store and the block map write to their files
  * themselves, the journal read to index it, and the chunk store's
- * collections, moves and conjoins with what collections kept and freed.
+ * collections, moves and conjoins with what collections kept and freed
+ * and the page-store blocks they read.
  * It is kept separate from pgstat.c to enforce the line between the
  * statistics access / storage implementation and the details about
  * individual types of statistics.
@@ -97,6 +98,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_CONJOINS] = "conjoins",
 	[PGSTAT_PROLLY_GC_WINDOW_USEC] = "gc_window_usec",
 	[PGSTAT_PROLLY_CHUNK_FILE_READS] = "chunk_file_reads",
+	[PGSTAT_PROLLY_GC_PAGES_SCANNED] = "gc_pages_scanned",
 };
 
 /*

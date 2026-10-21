@@ -79,6 +79,16 @@
  * read before.  A dropped
  * relation's map stays until the next checkpoint, and counts until then.
  *
+ * Scans (bmap_scan_store()).  A scan of a page store reads every block
+ * allocated, or only the ranges of blocks written or freed since an
+ * earlier scan, which its caller names by the token it was given: from
+ * the first scan on, every write of the store's blocks sets its range's
+ * bit in shared memory (store_written()), a scan taking and clearing them
+ * as it begins.  Nothing of this is on disk: a token from before the
+ * server (or its shared memory) started again names no scan, and neither
+ * does one whose store was watched no more (too many stores watched, the
+ * store dropped) or outgrew its bits, so each such scan reads every block.
+ *
  * WAL.  Every map and allocator change is logged (bmap_xlog.h), and the
  * page store is changed (zeroed, extended) before the record that maps the
  * blocks, so a data record for a new block always follows the record that
@@ -125,6 +135,7 @@
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
 
 bool		debug_block_mapped_heap = false;
 int			block_map_replay_entries = 65536;
@@ -268,16 +279,39 @@ typedef struct BmapSwept
 	uint64		swept_at;
 } BmapSwept;
 
+/* page stores whose blocks written since their last scan are watched, at most */
+#define BMAP_WATCHED_MAX	64
+
+/* a watched store's bits, each for a range of its blocks */
+#define BMAP_WATCH_BITS		32768
+
+/*
+ * A page store watched since a scan of it (bmap_scan_store()): a bit a range
+ * of 1 << shift blocks, set once a block of the range is written or freed
+ * after the scan began, and the scan's token.  Writers set bits without a
+ * lock; the rest is the mutex's.
+ */
+typedef struct BmapWatch
+{
+	pg_atomic_uint32 shift;
+	uint64		token;			/* of the store's last scan */
+	uint64		used;			/* when it last began, as watch_clock was */
+	pg_atomic_uint32 bits[BMAP_WATCH_BITS / 32];
+} BmapWatch;
+
 /*
  * Shared by every backend: the sweeps running, during which the allocator
  * of a page store being swept reuses no freed block (one freed and taken
- * again meanwhile could be held by a map the sweep read before); and the
- * page stores swept since the server started.
+ * again meanwhile could be held by a map the sweep read before); the page
+ * stores swept since the server started; and the page stores watched for
+ * scans, each named by its watch_key[] (tablespace and database, 0: none),
+ * which every write of a page store reads without a lock.
  */
 
 typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
+	pg_atomic_uint64 watch_key[BMAP_WATCHED_MAX];
 	slock_t		mutex;			/* protects what follows */
 	int			nlisted;
 	Oid			listed[BMAP_SWEEPS_LISTED][2];	/* tablespace, database */
@@ -288,6 +322,10 @@ typedef struct BmapShared
 	/* the remaps ahead of replay (bmap_ahead), and how many there are */
 	LWLock		ahead_lock;
 	pg_atomic_uint32 nahead;
+
+	uint64		next_token;		/* a scan's, unique to this shared memory */
+	uint64		watch_clock;
+	BmapWatch	watch[BMAP_WATCHED_MAX];
 } BmapShared;
 
 static BmapShared *bmap_shared = NULL;
@@ -338,6 +376,79 @@ BmapShmemInit(void *arg)
 	LWLockInitialize(&bmap_shared->ahead_lock,
 					 LWLockNewTrancheId("block map replay"));
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
+
+	/*
+	 * Scans' tokens begin anywhere: one remembered from before the server
+	 * (or its shared memory, after a crash) began again names no scan now.
+	 */
+	if (!pg_strong_random(&bmap_shared->next_token,
+						  sizeof(bmap_shared->next_token)))
+		bmap_shared->next_token = (uint64) GetCurrentTimestamp() << 16;
+	bmap_shared->watch_clock = 0;
+	for (int i = 0; i < BMAP_WATCHED_MAX; i++)
+	{
+		pg_atomic_init_u64(&bmap_shared->watch_key[i], 0);
+		pg_atomic_init_u32(&bmap_shared->watch[i].shift, 0);
+		bmap_shared->watch[i].token = 0;
+		bmap_shared->watch[i].used = 0;
+		for (int w = 0; w < BMAP_WATCH_BITS / 32; w++)
+			pg_atomic_init_u32(&bmap_shared->watch[i].bits[w], 0);
+	}
+}
+
+/* a page store's name among those watched */
+static inline uint64
+watch_key(RelFileLocator rel)
+{
+	return ((uint64) rel.spcOid << 32) | rel.dbOid;
+}
+
+/*
+ * Physical blocks [blk, blk + n) of rel's page store were just written, or
+ * freed: a scan watching the store reads their ranges again.  Noted after
+ * the write, so a scan that begins watching after this looks finds what
+ * was written, and one that began before finds the bits set.
+ */
+static void
+store_written(RelFileLocator rel, BlockNumber blk, BlockNumber n)
+{
+	uint64		key = watch_key(rel);
+
+	if (n == 0)
+		return;
+	pg_memory_barrier();
+	for (int i = 0; i < BMAP_WATCHED_MAX; i++)
+	{
+		BmapWatch  *w;
+		uint32		shift;
+		uint64		last;
+
+		if (pg_atomic_read_u64(&bmap_shared->watch_key[i]) != key)
+			continue;
+		w = &bmap_shared->watch[i];
+		shift = pg_atomic_read_u32(&w->shift);
+		last = Min(((uint64) blk + n - 1) >> shift, BMAP_WATCH_BITS - 1);
+		for (uint64 r = (uint64) blk >> shift; r <= last; r++)
+			pg_atomic_fetch_or_u32(&w->bits[r / 32], UINT32_C(1) << (r % 32));
+		break;
+	}
+}
+
+/* rel's page store is gone: what a scan of it found holds no more */
+static void
+store_unwatch(RelFileLocator rel)
+{
+	uint64		key = watch_key(rel);
+
+	SpinLockAcquire(&bmap_shared->mutex);
+	for (int i = 0; i < BMAP_WATCHED_MAX; i++)
+	{
+		if (pg_atomic_read_u64(&bmap_shared->watch_key[i]) != key)
+			continue;
+		pg_atomic_write_u64(&bmap_shared->watch_key[i], 0);
+		bmap_shared->watch[i].token = 0;
+	}
+	SpinLockRelease(&bmap_shared->mutex);
 }
 
 /* Is a sweep of rel's page store running? */
@@ -1294,6 +1405,7 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		if (skip_existing && reused[i] < store_cur)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, reused[i], &page, 1, false);
+		store_written(rel, reused[i], 1);
 		pgstat_count_prolly(counter, BLCKSZ);
 	}
 	for (blk = old_hw; blk < new_hw && blk < store_cur; blk++)
@@ -1303,11 +1415,13 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 		if (skip_existing)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, blk, &page, 1, false);
+		store_written(rel, blk, 1);
 		pgstat_count_prolly(counter, BLCKSZ);
 	}
 	if (blk < new_hw)
 	{
 		mdzeroextend(ssrel, MAIN_FORKNUM, blk, new_hw - blk, false);
+		store_written(rel, blk, new_hw - blk);
 		pgstat_count_prolly(counter,
 							(uint64) (new_hw - blk) * BLCKSZ);
 	}
@@ -1652,6 +1766,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 
 		mdwritev(store_smgr(rel), MAIN_FORKNUM, phys[n - 1], &page, 1,
 				 skipFsync);
+		store_written(rel, phys[n - 1], 1);
 		pgstat_count_prolly(counter, BLCKSZ);
 	}
 
@@ -1883,6 +1998,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 
 				mdwritev(store_smgr(rel), MAIN_FORKNUM, phys, &page, 1,
 						 skipFsync);
+				store_written(rel, phys, 1);
 				pgstat_count_prolly(counter, BLCKSZ);
 			}
 			break;
@@ -2040,6 +2156,10 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 		}
 		UnlockReleaseBuffer(metabuf);
 	}
+
+	/* (what a scan found in them no longer holds) */
+	for (i = 0; i < n; i++)
+		store_written(rel, blocks[i], 1);
 }
 
 /* ----------------------------------------------------------------
@@ -4547,8 +4667,79 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 	pfree(path);
 }
 
+/*
+ * A scan of rel's page store begins watching it: its token, and the shift
+ * of its ranges, into *token and *shift.  True if what a scan whose token
+ * is 'since' found still holds for every range whose bit is clear in
+ * changed[] (the bits set since then, each cleared); false if nothing it
+ * found does (never watched since, or the store outgrew its bits): every
+ * range is read.
+ */
+static bool
+watch_begin(RelFileLocator rel, uint64 since, BlockNumber hw,
+			uint32 *changed, uint64 *token, uint32 *shift)
+{
+	uint64		key = watch_key(rel);
+	BmapWatch  *w = NULL;
+	int			slot = -1;
+	bool		valid;
+
+	SpinLockAcquire(&bmap_shared->mutex);
+	for (int i = 0; i < BMAP_WATCHED_MAX && slot < 0; i++)
+		if (pg_atomic_read_u64(&bmap_shared->watch_key[i]) == key)
+			slot = i;
+	if (slot >= 0)
+		w = &bmap_shared->watch[slot];
+	valid = w != NULL && since != 0 && w->token == since &&
+		(uint64) hw <= ((uint64) BMAP_WATCH_BITS << pg_atomic_read_u32(&w->shift));
+	if (!valid)
+	{
+		uint32		s = 0;
+
+		/* a store not watched takes the place watched longest unscanned */
+		if (w == NULL)
+		{
+			slot = 0;
+			for (int i = 0; i < BMAP_WATCHED_MAX; i++)
+			{
+				if (pg_atomic_read_u64(&bmap_shared->watch_key[i]) == 0)
+				{
+					slot = i;
+					break;
+				}
+				if (bmap_shared->watch[i].used < bmap_shared->watch[slot].used)
+					slot = i;
+			}
+			w = &bmap_shared->watch[slot];
+			pg_atomic_write_u64(&bmap_shared->watch_key[slot], 0);
+		}
+
+		/* bits enough for twice the store */
+		while (((uint64) BMAP_WATCH_BITS << s) < 2 * (uint64) hw)
+			s++;
+		pg_atomic_write_u32(&w->shift, s);
+	}
+	w->token = ++bmap_shared->next_token;
+	if (w->token == 0)
+		w->token = ++bmap_shared->next_token;
+	w->used = ++bmap_shared->watch_clock;
+	*token = w->token;
+	*shift = pg_atomic_read_u32(&w->shift);
+
+	/* the bits set since, cleared: a write from now on sets them again */
+	for (int i = 0; i < BMAP_WATCH_BITS / 32; i++)
+		changed[i] = pg_atomic_exchange_u32(&w->bits[i], 0);
+	pg_atomic_write_u64(&bmap_shared->watch_key[slot], key);
+	SpinLockRelease(&bmap_shared->mutex);
+
+	/* (the writes a cleared bit stood for, before the blocks are read) */
+	pg_memory_barrier();
+	return valid;
+}
+
 uint64
-bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
+bmap_scan_store(Oid spcOid, Oid dbOid, uint64 since, uint64 *token,
+				BmapRangeVisit range, BmapBlockVisit visit, void *arg)
 {
 	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
 	SMgrRelation store;
@@ -4556,17 +4747,37 @@ bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
 	BmapMeta   *meta;
 	BlockNumber hw;
 	uint64	   *allocated;
+	uint32	   *changed;
+	bool		valid;
+	uint32		shift;
+	uint64		nranges;
 	PGIOAlignedBlock a;
 	PGIOAlignedBlock b;
 	uint64		nread = 0;
 	LOCKTAG		sweeptag;
+	LOCKTAG		scantag;
 
+	*token = 0;
 	if (!alloc_exists(rel))
 		return 0;
 
-	/* not while a sweep frees blocks or shortens the store */
+	/* not while a sweep frees blocks or shortens the store, nor another scan */
 	SET_LOCKTAG_OBJECT(sweeptag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
 	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+	SET_LOCKTAG_OBJECT(scantag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 1);
+	(void) LockAcquire(&scantag, ExclusiveLock, false, false);
+
+	/*
+	 * Watching before the blocks allocated are read: a block allocated
+	 * since is written after its bit (and is read, or has its bit set).
+	 */
+	metabuf = alloc_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	hw = PageGetBmapMeta(BufferGetPage(metabuf))->hw;
+	UnlockReleaseBuffer(metabuf);
+	changed = palloc(sizeof(uint32) * (BMAP_WATCH_BITS / 32));
+	valid = watch_begin(rel, since, hw, changed, token, &shift);
 
 	/* the blocks allocated as it begins */
 	metabuf = alloc_read(rel, 0);
@@ -4593,26 +4804,42 @@ bmap_scan_store(Oid spcOid, Oid dbOid, BmapBlockVisit visit, void *arg)
 	INJECTION_POINT("bmap-scan-store", NULL);
 
 	store = store_smgr(rel);
-	for (BlockNumber blk = 0; blk < hw; blk++)
+	nranges = ((uint64) hw + (UINT64CONST(1) << shift) - 1) >> shift;
+	for (uint64 r = 0; r < nranges; r++)
 	{
-		if ((allocated[blk / 64] & (UINT64CONST(1) << (blk % 64))) == 0)
-			continue;
-		CHECK_FOR_INTERRUPTS();
+		BlockNumber first = (BlockNumber) (r << shift);
+		BlockNumber end = (BlockNumber) Min((uint64) hw, (r + 1) << shift);
+		bool		read;
 
-		/* read until two reads agree, visiting each version read */
-		smgrread(store, MAIN_FORKNUM, blk, a.data);
-		visit(a.data, arg);
-		nread++;
-		for (;;)
+		/* (past the bits: the store grew since the scan began watching) */
+		read = !valid || r >= BMAP_WATCH_BITS ||
+			(changed[r / 32] & (UINT32_C(1) << (r % 32))) != 0;
+		range((uint32) r, read, arg);
+		if (!read)
+			continue;
+		for (BlockNumber blk = first; blk < end; blk++)
 		{
-			smgrread(store, MAIN_FORKNUM, blk, b.data);
-			if (memcmp(a.data, b.data, BLCKSZ) == 0)
-				break;
-			visit(b.data, arg);
-			memcpy(a.data, b.data, BLCKSZ);
+			if ((allocated[blk / 64] & (UINT64CONST(1) << (blk % 64))) == 0)
+				continue;
+			CHECK_FOR_INTERRUPTS();
+
+			/* read until two reads agree, visiting each version read */
+			smgrread(store, MAIN_FORKNUM, blk, a.data);
+			visit(a.data, arg);
+			nread++;
+			for (;;)
+			{
+				smgrread(store, MAIN_FORKNUM, blk, b.data);
+				if (memcmp(a.data, b.data, BLCKSZ) == 0)
+					break;
+				visit(b.data, arg);
+				memcpy(a.data, b.data, BLCKSZ);
+			}
 		}
 	}
 	pfree(allocated);
+	pfree(changed);
+	LockRelease(&scantag, ExclusiveLock, false);
 	LockRelease(&sweeptag, ShareLock, false);
 	return nread;
 }
@@ -4793,6 +5020,7 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 		return;
 	/* at once, as in redo: nothing may use the tablespace any more */
 	smgrdounlinkall(srels, 3, true);
+	store_unwatch(rel);
 }
 
 /* ----------------------------------------------------------------
@@ -5277,7 +5505,10 @@ bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			run = 1;
 		}
 		else if (!recovery || !page_predates_entry(reln, blocknum, buffers[0]))
+		{
 			mdwritev(ssrel, MAIN_FORKNUM, phys, buffers, run, skipFsync);
+			store_written(reln->smgr_rlocator.locator, phys, run);
+		}
 		blocknum += run;
 		buffers += run;
 		nblocks -= run;
@@ -5773,6 +6004,7 @@ bmap_redo(XLogReaderState *record)
 					}
 					smgrwrite(store_smgr(xlrec->locator), MAIN_FORKNUM,
 							  xlrec->old_block, old.data, false);
+					store_written(xlrec->locator, xlrec->old_block, 1);
 				}
 				XLogReplaceBlock(xlrec->locator, MAIN_FORKNUM, xlrec->blkno);
 				break;
