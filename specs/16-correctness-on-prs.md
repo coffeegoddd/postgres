@@ -182,14 +182,19 @@ sharded so the wall clock fits:
   silently ran fewer files would pass. The **C suite gate** job checks
   that the shards' files, together, are exactly the pinned corpus's
   files, none twice.
-- **The corpus pin** is in one file, read by the workflow's checkout
-  and by `cbaseline`; today it is only the checkout ref in `prolly.yml`.
-- Four shards: the full corpus's 38 minutes on one runner become about
-  10 minutes per shard, plus build and setup; about 15 minutes per pull
-  request in all. That is an estimate from the nightly's one-runner time,
-  to be measured (#235). Over 15 minutes, the shards go to 6, then 8;
-  still over, every push runs the smoke config and the full corpus runs
-  on `ready_for_review` and on a label (part 7).
+- **The corpus pin** is in one file,
+  `src/tools/prolly_bench/configs/sqllogictest.commit`, read by
+  `correctness.yml`'s corpus checkout (as `PIN_FILE`) and by
+  `pbench/cbaseline.py`. Bumping it is one edit there (and the baseline
+  file regenerated in the same pull request).
+- **Six shards** (built, 2026-10-18). The full corpus's 38 minutes on
+  one runner were estimated at about 15 minutes per pull request with
+  four shards. Measured on hosted runners, four took 14 min 53 s from
+  push to gate, with shards between 3.6 and 9.4 minutes on the same
+  plan: at the edge of the 15-minute budget, so the count went to six,
+  which leaves room (`SHARDS: 6` in `correctness.yml`). Eight weren't
+  needed, nor the fallback of smoke on every push with the full corpus
+  on `ready_for_review` and a label (part 7).
 
 Engines: `heap` and `prolly` (D1 is removed, #183); a new engine joins
 by its `--am` name.
@@ -201,7 +206,7 @@ in place on every run, truncated with a link past 65,000 characters:
 
 ```
 ## C suite: sqllogictest @ 04b0d19, full corpus: PASS
-Merge of <head> into master <base> · 5,675,180 records · 4 shards · 14 min
+Merge of <head> into master <base> · 5,675,180 records · 6 shards · 14 min
 
 | | Pass (corpus) | vs base | agree | pg semantics | regression | hidden | order only | crashed | timeout | gate |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -227,9 +232,14 @@ comment.md` builds it from the shards' result sets, using the existing
 
 ### 3.4 Workflows
 
-`.github/workflows/correctness.yml`, on `pull_request`, `push` to
-`master` and a nightly `schedule` (no `merge_group`: there is no merge
-queue). On `master`, the concurrency group is per commit
+`.github/workflows/correctness.yml` was built for `pull_request`, `push`
+to `master` and a nightly `schedule` (no `merge_group`: there is no
+merge queue). **Today it runs only nightly and on `workflow_dispatch`**
+(user, 2026-10-20): the full corpus on every push held up every pull
+request, so the `pull_request` and `push` triggers are off, to be
+re-enabled later. Until then nothing below runs on a pull request, the
+comment isn't posted, and `master` has no protection (see **Repository
+settings**). On `master`, the concurrency group is per commit
 (`correctness-${{ github.sha }}`), never cancelling a run in progress:
 a group per branch with `cancel-in-progress` would cancel one push's run
 when the next push lands, and that run's failure would never be seen.
@@ -241,7 +251,7 @@ On pull requests, a new push cancels the older run.
    `build and test` does it, plus `build_slt.sh`; uploads the install
    tree and the runner as an artifact. The corpus checkout is cached by
    its pinned commit.
-3. **shard 1–4** (matrix): download, run heap and `prolly` on the shard,
+3. **shard 1–6** (matrix, from `SHARDS`): download, run heap and `prolly` on the shard,
    `cgate`, `cbaseline check`; upload the result sets.
 4. **C suite gate** (the required check): always runs; passes for
    specs-only, otherwise downloads every shard, builds `comment.md` and
@@ -270,7 +280,8 @@ it gets the same always-running **classify** job, and `build and test`
 runs its steps only when something outside `specs/**` changed, reporting
 success at once otherwise, so a specs-only pull request can merge.
 
-**On `master`.** Every push runs the full suite. A failure (two pull
+**On `master`.** Every push runs the full suite (once the `push`
+trigger is back; meanwhile the nightly run covers `master`). A failure (two pull
 requests that each passed, merged in some order, or a flake) opens or
 updates one tracking issue, labelled `ci-failure` and found by a marker
 in its body, with the run's link and the report, as doltlite's
@@ -286,6 +297,10 @@ drifting.
   request rebase and rerun after each merge).
 - Claude applies the settings with `gh api`, and only after asking the
   user at that time.
+- **Not applied yet** (user, 2026-10-20): `master` stays unprotected
+  until the C suite runs on pull requests again. With the
+  `pull_request` trigger off, **C suite gate** never reports on a pull
+  request, so requiring it would block every one.
 
 ## 4. Why not the others' baselines
 
@@ -300,8 +315,9 @@ drifting.
   some order), and the tracking issue on `master` is what catches it; a
   flake is caught the same way.
 - **Private infrastructure (Dolt, Doltgres's release run).** Hosted
-  runners should finish the full corpus in about 15 minutes sharded (an
-  estimate, part 3.2); Dolt's comment asks for 25.
+  runners finish the full corpus in under 15 minutes sharded (four
+  shards measured 14 min 53 s; six are used, part 3.2). Dolt's comment
+  asks for 25.
 
 ## 5. Plan
 
