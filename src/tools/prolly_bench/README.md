@@ -1,5 +1,9 @@
 # prolly_bench
 
+For large-table version-control comparisons against Dolt and Doltgres, including
+per-operation memory sampling and empirical scaling sweeps, see
+[`vc_bench`](../vc_bench/README.md).
+
 Benchmark harness for prolly storage: the S suite (storage, any table AM,
 compared with the fork's heap), the V suite (version control, prolly engines
 only) and the C suite (SQL correctness: sqllogictest, any table AM, compared
