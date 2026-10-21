@@ -27969,7 +27969,7 @@
       "index": 14,
       "name": "table with commit column should maintain its data in diff",
       "source_sha256": "3db1fc490c11e8ea813e86dc999806e982aee1b3c8208e1e2a2796fc0012fbc7",
-      "scenario_sha256": "ad9776b30a91fedac9bf1be779b5d4c233f60379b4ed7daa944ae8dc0d0c4b23",
+      "scenario_sha256": "25498aed21c2083e23c456575505fc3da26c4bb1f2308a3595505a3813eeaff7",
       "setup": [
         {
           "index": 0,
@@ -28013,7 +28013,7 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Commit ids are 64 hex digits, Dolt's 32 (D7)."
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Commit ids are 40 hex digits, Dolt's 32 (D7)."
         }
       ],
       "adaptations": [
