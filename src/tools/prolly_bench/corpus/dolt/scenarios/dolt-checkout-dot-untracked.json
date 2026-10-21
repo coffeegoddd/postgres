@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "id": "dolt-checkout-dot-untracked",
+  "description": "Reviewed Dolt port: dolt_checkout('.') preserves untracked tables",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCheckoutScripts: dolt_checkout('.') preserves untracked tables"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table tracked (pk int primary key);"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add tracked"
+      ],
+      "save": "commit-1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into tracked values (1);"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table untracked (pk int primary key);"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into untracked values (9);"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"\"}"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from tracked;",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from untracked;",
+      "expect": {
+        "rows": [
+          [
+            "9"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+		Name: "dolt_checkout('.') preserves untracked tables",
+		SetUpScript: []string{
+			"create table tracked (pk int primary key);",
+			"call dolt_commit('-Am', 'add tracked');",
+			"insert into tracked values (1);",
+			"create table untracked (pk int primary key);",
+			"insert into untracked values (9);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "call dolt_checkout('.');",
+				Expected: []sql.Row{{0, ""}},
+			},
+			{
+				Query:    "select * from tracked;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select * from untracked;",
+				Expected: []sql.Row{{9}},
+			},
+		},
+	}

@@ -15847,6 +15847,158 @@
       ]
     },
     {
+      "id": "dolt-checkout-tables-missing",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 11,
+      "name": "dolt_checkout multiple tables with one missing",
+      "source_sha256": "996ee0d376d7a9c14b90453ed61acddd6e1409b688bced74e3b7a708bc2c05c8",
+      "scenario_sha256": "4b083c911dd2bbc93485396ad73c7dc037bf92d658d8e64aeb2688598792d903",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'tablespec ... did not match any table(s) known to dolt': SQLSTATE 42P01, naming the first table missing. (D4)"
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "Left out (D5): Dolt checks out t1 and commits that before returning its error, so t1 is back to (1, 1); prolly's error is the statement's, rolling back the whole call, so t1 keeps its uncommitted row (2, 2)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'tablespec ... did not match any table(s) known to dolt': SQLSTATE 42P01, naming the first table missing. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Expected error checked as its PostgreSQL SQLSTATE, not Dolt's message text. Dolt's 'tablespec ... did not match any table(s) known to dolt': SQLSTATE 42P01, naming the first table missing. (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT returning a text array. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "An error is the statement's, rolling back the whole call: the tables found aren't checked out first. (D5)"
+      ]
+    },
+    {
+      "id": "dolt-checkout-dot-untracked",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCheckoutScripts",
+      "index": 17,
+      "name": "dolt_checkout('.') preserves untracked tables",
+      "source_sha256": "6bf8e497ecd74970950d9c68457c88ef8479b8bae54ad361830fd2c545c5eee5",
+      "scenario_sha256": "46786c9ad2b9b52ce95ab7d3373863996fa2d4eb8c6162dfad7c2a743583d5cb",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. (D1, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT; dolt_checkout returns {status, message}, as Dolt's (0, \"\"). (D3) \".\" is every table the head has: the head stands for Dolt's index, there being no staging area. (D1)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT returning a text array. (D3)",
+        "No staging area: -Am commits the whole working set, and the head stands for Dolt's index. (D1)"
+      ]
+    },
+    {
       "id": "dolt-info-schema-use",
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
       "suite": "DoltInfoSchemaScripts",
@@ -39035,23 +39187,7 @@
       "index": 10,
       "name": "dolt_checkout with tracking branch and table with same name",
       "source_sha256": "08dab4ad502ae5d94e31ac06cab506652f68a6b6fb20cf311151b5dce2226dbb",
-      "reason": "Needs dolt_checkout of tables (feature checkout-tables), here a table named like a remote tracking branch."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltCheckoutScripts",
-      "index": 11,
-      "name": "dolt_checkout multiple tables with one missing",
-      "source_sha256": "996ee0d376d7a9c14b90453ed61acddd6e1409b688bced74e3b7a708bc2c05c8",
-      "reason": "Needs dolt_checkout of tables (feature checkout-tables)."
-    },
-    {
-      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
-      "suite": "DoltCheckoutScripts",
-      "index": 17,
-      "name": "dolt_checkout('.') preserves untracked tables",
-      "source_sha256": "6bf8e497ecd74970950d9c68457c88ef8479b8bae54ad361830fd2c545c5eee5",
-      "reason": "Needs dolt_checkout('.') (feature checkout-tables)."
+      "reason": "Needs a remote-tracking branch checked out as a local branch that tracks it (dolt_checkout('feature', '--') after the local branch is deleted), and dolt_checkout of a name that is both a table and a tracking branch refused as ambiguous; its table checkout alone is ported elsewhere (checkout_tables)."
     },
     {
       "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_revert.go",

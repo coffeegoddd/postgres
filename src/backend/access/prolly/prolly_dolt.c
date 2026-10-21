@@ -1305,9 +1305,11 @@ checkout_table_name(const char *name, List *from_tables)
 }
 
 /*
- * The tables named (".": every one) put back as ref's commit has them,
- * the rest of the working set as it is: their uncommitted changes
- * discarded, as Dolt's dolt_checkout -- tables.
+ * The tables named put back as ref's commit has them, the rest of the
+ * working set as it is: their uncommitted changes discarded, as Dolt's
+ * dolt_checkout -- tables.  ".": every table ref's commit or the head
+ * has, as Dolt's (the head standing for its index): a table only the
+ * working set has stays.
  */
 static void
 checkout_tables(const char *ref, char **names, int nnames)
@@ -1317,7 +1319,7 @@ checkout_tables(const char *ref, char **names, int nnames)
 	ProllyNodeRef working;
 	ProllyNodeRef target;
 	List	   *from_tables = NIL;
-	List	   *working_tables = NIL;
+	List	   *head_tables = NIL;
 	List	   *tables = NIL;
 
 	if (!PROLLY_HAS(canonicalizer(), splice))
@@ -1335,7 +1337,15 @@ checkout_tables(const char *ref, char **names, int nnames)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch has no working set")));
 	PROLLY_CALL(canonicalizer(), tables, &from, collect_table_name, &from_tables);
-	PROLLY_CALL(canonicalizer(), tables, &working, collect_table_name, &working_tables);
+	{
+		ProllyHash	head;
+		ProllyNodeRef head_root;
+
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
+			PROLLY_CALL(refs(), commit_working_set, &head, &head_root))
+			PROLLY_CALL(canonicalizer(), tables, &head_root, collect_table_name,
+						&head_tables);
+	}
 	for (int i = 0; i < nnames; i++)
 	{
 		char	   *q;
@@ -1343,7 +1353,7 @@ checkout_tables(const char *ref, char **names, int nnames)
 		if (strcmp(names[i], ".") == 0)
 		{
 			tables = list_concat_unique(tables, from_tables);
-			tables = list_concat_unique(tables, working_tables);
+			tables = list_concat_unique(tables, head_tables);
 			continue;
 		}
 		q = checkout_table_name(names[i], from_tables);
@@ -1387,8 +1397,9 @@ checkout_tables(const char *ref, char **names, int nnames)
  * branch, or -b branch [start point] to create it first.  Tables, as
  * Dolt's: -- tables (or "."), or a name that is no branch but a table
  * (with more after it), put back as the head has them; ref tables (ref
- * no table), as ref has them.  After --, one name that is a branch and no
- * table is the branch.
+ * no table), or ref -- tables, as ref has them; a name before -- that is
+ * no ref is a table.  After --, one name that is a branch and no table is
+ * the branch; branch -- is the branch.
  */
 Datum
 dolt_checkout(PG_FUNCTION_ARGS)
@@ -1404,6 +1415,8 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	char	  **names = palloc_array(char *, Max(nargs, 1));
 	int			nnames = 0;
 	int			dashes = -1;	/* names before "--" */
+	bool		is_branch = false;	/* names[0] is a branch */
+	bool		is_table = false;	/* names[0] is a table (or ".") */
 
 	for (int i = 0; i < nargs; i++)
 	{
@@ -1432,15 +1445,46 @@ dolt_checkout(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_checkout", a);
 	}
-	/* tables: after "--", or names that aren't one branch */
 	if (!create && nnames > 0)
 	{
-		bool		is_branch = PROLLY_CALL(refs(), branch_lookup, names[0],
-											&(ProllyBranchId) {0});
-		bool		is_table = strcmp(names[0], ".") == 0 ||
+		is_branch = PROLLY_CALL(refs(), branch_lookup, names[0],
+								&(ProllyBranchId) {0});
+		is_table = strcmp(names[0], ".") == 0 ||
 			OidIsValid(RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(names[0], NULL)),
 										NoLock, true));
+	}
 
+	/*
+	 * Before "--", a ref, as Dolt's, where it names one: a branch alone is
+	 * the branch (a table of its name not taken); with names after it, the
+	 * commit the tables come from.  One that names no ref is a table, put
+	 * back with the rest as the head has them.
+	 */
+	if (!create && dashes > 0)
+	{
+		ProllyHash	ref;
+
+		if (dashes > 1)
+			unexpected("dolt_checkout", names[1]);
+		if (nnames > 1 &&
+			(is_branch || PROLLY_CALL(refs(), resolve, names[0], &ref)))
+		{
+			checkout_tables(names[0], names + 1, nnames - 1);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+		if (!is_branch && (nnames > 1 || is_table))
+		{
+			checkout_tables("HEAD", names, nnames);
+			result[0] = "0";
+			result[1] = "";
+			PG_RETURN_DATUM(text_array(2, result));
+		}
+	}
+	/* tables: after "--", or names that aren't one branch */
+	else if (!create && nnames > 0)
+	{
 		if (dashes == 0 && !(nnames == 1 && is_branch && !is_table))
 		{
 			checkout_tables("HEAD", names, nnames);
@@ -1448,14 +1492,14 @@ dolt_checkout(PG_FUNCTION_ARGS)
 			result[1] = "";
 			PG_RETURN_DATUM(text_array(2, result));
 		}
-		if (dashes != 0 && nnames > 1 && !is_table)
+		if (dashes < 0 && nnames > 1 && !is_table)
 		{
 			checkout_tables(names[0], names + 1, nnames - 1);
 			result[0] = "0";
 			result[1] = "";
 			PG_RETURN_DATUM(text_array(2, result));
 		}
-		if (dashes != 0 && !is_branch && !names_commit(names[0]) &&
+		if (dashes < 0 && !is_branch && !names_commit(names[0]) &&
 			(is_table || nnames > 1))
 		{
 			checkout_tables("HEAD", names, nnames);

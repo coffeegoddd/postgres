@@ -149,7 +149,9 @@ adapts.
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is
   deferred with this ID (`ports.json` has one); add an explicit `COMMIT`
-  only where the assertion isn't about that. Reads of `WORKING` after
+  only where the assertion isn't about that. An assertion reading what a
+  call did before its error (Dolt's table checkout naming a missing
+  table) is left out with this ID. Reads of `WORKING` after
   writes in the same transaction stay where they are.
 
 ## D6. Merges
@@ -166,14 +168,19 @@ adapts.
   are errors naming the objects; the merge doesn't happen. A merge,
   cherry-pick or revert into uncommitted changes is refused when it
   would change a table, sequence or materialized view with uncommitted
-  changes, as Dolt's is, and also whenever definitions change on either
-  side, even without a conflict.
+  changes, as Dolt's is. When definitions change, on either side or
+  uncommitted, it goes ahead over uncommitted changes to objects it
+  doesn't change (#494), refused only where both change an object, and,
+  beyond Dolt, where a table with uncommitted changes uses a type the
+  merge changes, where the uncommitted definitions don't fit the merged
+  ones (a key dropped that a merged foreign key needs), or where they
+  break a merged foreign key.
 - **Why:** a sequence is a schema object in Postgres, versioned with its
   schema; Postgres DDL can't be left half-merged in the catalogs.
 - **Port:** expected generated keys follow the commit's sequence value
   (`dolt-reset-identity`, deferred with this ID); schema-conflict cases
   expect the error, not rows; dirty-merge cases with definition changes
-  expect the refusal.
+  expect the refusal only in those cases.
 
 ## D7. Hashes
 
@@ -336,7 +343,17 @@ OF` are built in D18's shapes.
 - **Tables after `--`** (#494): `dolt_checkout('--', ...)` names tables,
   as Dolt's does, their uncommitted changes discarded; one name there
   that is a branch and no table checks out the branch, so a branch named
-  like an option (`-dash`) can still be checked out.
+  like an option (`-dash`) can still be checked out. Before `--` is a
+  ref where it names one, as Dolt's: `dolt_checkout('b', '--')` checks
+  out branch `b` though a table is named `b`, and
+  `dolt_checkout('HEAD~1', '--', 't')` takes `t` as that commit has it;
+  a name there that is no ref is a table, so `dolt_checkout('t', '--')`
+  and `dolt_checkout('t1', '--', 't2')` check them out from the head.
+  `.` names the tables the head (or the ref)
+  has: a table only the working set has stays, as Dolt's untracked table
+  does (the head stands for Dolt's index, D1). A name that matches no
+  table fails the whole call (D5), where Dolt checks out the others,
+  commits that, then errors.
 
 ## D15. Schema diffs cover every versioned object
 

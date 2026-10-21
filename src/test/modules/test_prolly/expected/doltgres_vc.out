@@ -1086,9 +1086,8 @@ SELECT * FROM dolt_status WHERE table_name LIKE 'dg_smoke.%';
  dg_smoke.t1 | t      | modified
 (1 row)
 
--- dirty, another table: Doltgres merges, the change left uncommitted;
--- prolly refuses a merge that changes definitions (here, makes a table)
--- over uncommitted changes, which stay
+-- dirty, another table: merged, as Doltgres does, though the merge
+-- changes definitions (makes a table); the change left uncommitted
 SELECT dolt_checkout('-b', 'dg-new-branch3', 'HEAD');
                dolt_checkout               
 -------------------------------------------
@@ -1108,13 +1107,22 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
-SELECT dolt_merge('dg-new-branch3', '--no-ff', '-m', 'merge new-branch into main');
-ERROR:  cannot merge with uncommitted changes where definitions change
-HINT:  Commit the changes, or reset the branch, first.
+SELECT (dolt_merge('dg-new-branch3', '--no-ff', '-m', 'merge new-branch into main'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
 SELECT * FROM dolt_status WHERE table_name LIKE 'dg_smoke.%';
  table_name  | staged |  status  
 -------------+--------+----------
  dg_smoke.t1 | t      | modified
+(1 row)
+
+SELECT to_regclass('t3') IS NOT NULL AS t3_merged;
+ t3_merged 
+-----------
+ t
 (1 row)
 
 SELECT dolt_reset('--hard');

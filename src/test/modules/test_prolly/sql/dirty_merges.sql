@@ -1,7 +1,7 @@
 -- Merges into a working set with uncommitted changes, as in Dolt: allowed
--- when the merge changes none of the tables and sequences they changed,
--- and no definitions change on both sides; they stay uncommitted, left
--- out of the merge's commit.
+-- when the merge changes none of the objects they changed (tables,
+-- sequences, and with definitions changing, any); they stay uncommitted,
+-- left out of the merge's commit.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -77,23 +77,31 @@ SELECT table_name, status FROM dolt_status ORDER BY 1;
 SELECT column_name FROM information_schema.columns
   WHERE table_schema = 'dm' AND table_name = 'b' ORDER BY ordinal_position;
 SELECT dolt_reset('--hard', 'HEAD~1');
--- not when the merge changes that table's rows, nor when it changes
--- definitions too
+-- not when the merge changes that table's rows
 ALTER TABLE dm.a ADD COLUMN w int;
 SELECT (dolt_merge('feature'))[2:4];
 SELECT dolt_reset('--hard');
+-- A merge that changes definitions goes ahead too (#494): the
+-- uncommitted changes are set aside, the merge made as over a clean
+-- working set, and they're put back, uncommitted.  One altering a
+-- table, over a table made:
 SELECT dolt_checkout('feature');
 ALTER TABLE dm.a ADD COLUMN x int;
 SELECT length(dolt_commit('-am', 'feature alters a')::text) AS committed;
 SELECT dolt_checkout('main');
 CREATE TABLE dm.made (id int PRIMARY KEY);
+INSERT INTO dm.made VALUES (1);
 SELECT (dolt_merge('feature'))[2:4];
-SELECT dolt_reset('--hard');
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'a' ORDER BY ordinal_position;
+SELECT * FROM dm.made;
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT dolt_checkout('feature');
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT dolt_checkout('main');
--- nor when it changes definitions over uncommitted rows of another table
--- (here, makes one: their table isn't the base's), which stay
+-- three-way, making a table, over uncommitted rows of another, which the
+-- merge's commit leaves out
 SELECT dolt_checkout('feature');
 CREATE TABLE dm.theirs_made (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'feature makes a table')::text) AS committed;
@@ -101,6 +109,29 @@ SELECT dolt_checkout('main');
 UPDATE dm.b SET v = 'dirty' WHERE id = 5;
 SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
 SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT id, v FROM dm.b WHERE id = 5;
+SELECT count(*) AS b_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dm.b);
+SELECT to_regclass('dm.theirs_made') IS NOT NULL AS theirs_made;
+SELECT dolt_reset('--hard', 'HEAD~1');
+-- over uncommitted definitions of other kinds (a view, a type), which stay
+CREATE VIEW dm.v AS SELECT id FROM dm.b;
+CREATE TYPE dm.local_t AS ENUM ('x');
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+SELECT to_regclass('dm.theirs_made') IS NOT NULL AS theirs_made,
+  to_regclass('dm.v') IS NOT NULL AS view_kept,
+  to_regtype('dm.local_t') IS NOT NULL AS type_kept;
+SELECT from_table_name, to_table_name, diff_type
+  FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 2;
+SELECT to_table_name, diff_type
+  FROM dolt_diff_summary('HEAD', 'WORKING') ORDER BY 1;
+SELECT dolt_reset('--hard');
+SELECT to_regclass('dm.v') IS NULL AS view_gone;
+SELECT dolt_reset('--hard', 'HEAD~1');
+-- refused where both change an object: here, both make the table
+CREATE TABLE dm.theirs_made (id int PRIMARY KEY, mine text);
+SELECT (dolt_merge('feature', '--no-ff', '-m', 'made'))[3:4];
+SELECT count(*) AS mine FROM information_schema.columns
+  WHERE table_schema = 'dm' AND table_name = 'theirs_made' AND column_name = 'mine';
 SELECT dolt_reset('--hard');
 SELECT dolt_checkout('feature');
 SELECT dolt_reset('--hard', 'HEAD~1');
@@ -238,3 +269,94 @@ SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'dms_feature');
 DROP SCHEMA dms CASCADE;
 SELECT length(dolt_commit('-Am', 'dms gone')::text) AS committed;
+
+-- Merges, picks and reverts changing definitions over uncommitted
+-- changes (#494): a local ALTER TABLE of a table the merge doesn't
+-- touch survives; refused where the local changes use what it changed
+-- (a type, here), break what it added (a foreign key), or don't fit it.
+CREATE SCHEMA dmd VERSIONED;
+CREATE TYPE dmd.mood AS ENUM ('sad', 'ok');
+CREATE TABLE dmd.m (id int PRIMARY KEY, m dmd.mood);
+CREATE TABLE dmd.p (id int PRIMARY KEY);
+CREATE TABLE dmd.c (id int PRIMARY KEY, pid int);
+CREATE TABLE dmd.u (id int PRIMARY KEY, v text);
+INSERT INTO dmd.m VALUES (1, 'ok');
+INSERT INTO dmd.p VALUES (1), (2);
+INSERT INTO dmd.u VALUES (1, 'u');
+SELECT length(dolt_commit('-Am', 'dmd base')::text) AS committed;
+SELECT dolt_branch('dmd_feature');
+SELECT dolt_checkout('dmd_feature');
+ALTER TYPE dmd.mood ADD VALUE 'happy';
+ALTER TABLE dmd.c ADD FOREIGN KEY (pid) REFERENCES dmd.p;
+INSERT INTO dmd.c VALUES (1, 1);
+SELECT length(dolt_commit('-am', 'feature redefines')::text) AS committed;
+SELECT dolt_checkout('main');
+-- a fast-forward
+ALTER TABLE dmd.u ADD COLUMN w int;
+SELECT (dolt_merge('dmd_feature'))[2:4];
+SELECT dolt_hashof('HEAD') = dolt_hashof('dmd_feature') AS fast_forwarded;
+SELECT count(*) AS c_rows FROM dmd.c;
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dmd' AND table_name = 'u' ORDER BY ordinal_position;
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT dolt_reset('--hard', 'HEAD~1');
+-- three-way
+INSERT INTO dmd.u VALUES (2, 'side');
+SELECT length(dolt_commit('-am', 'main adds a row')::text) AS committed;
+
+ALTER TABLE dmd.u ADD COLUMN w int;
+UPDATE dmd.u SET w = 7 WHERE id = 1;
+SELECT (dolt_merge('dmd_feature', '-m', 'merged over an alter'))[3:4];
+SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
+SELECT * FROM dmd.u ORDER BY id;
+SELECT * FROM dmd.c;
+SELECT unnest(enum_range(NULL::dmd.mood)) AS label;
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT count(*) AS u_left_out FROM dolt_diff('HEAD~1', 'HEAD', NULL::dmd.u);
+SELECT dolt_reset('--hard', 'HEAD~1');
+
+-- a table using the type the merge changes
+UPDATE dmd.m SET m = 'sad';
+SELECT (dolt_merge('dmd_feature'))[3:4];
+SELECT dolt_reset('--hard');
+-- a row the merge's new foreign key references, removed
+DELETE FROM dmd.p WHERE id = 1;
+SELECT (dolt_merge('dmd_feature'))[3:4];
+SELECT id FROM dmd.p ORDER BY id;
+SELECT dolt_reset('--hard');
+-- the key that foreign key needs, dropped
+ALTER TABLE dmd.p DROP CONSTRAINT p_pkey;
+SELECT (dolt_merge('dmd_feature'))[3:4];
+SELECT dolt_reset('--hard');
+SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd_feature') AS not_merged;
+-- a schema dropped that the merge adds a table to
+CREATE SCHEMA dmd2 VERSIONED;
+CREATE TABLE dmd2.keep (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'dmd2')::text) AS committed;
+SELECT dolt_branch('dmd2_feature');
+SELECT dolt_checkout('dmd2_feature');
+CREATE TABLE dmd2.x (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'dmd2.x')::text) AS committed;
+SELECT dolt_checkout('main');
+DROP SCHEMA dmd2 CASCADE;
+SELECT (dolt_merge('dmd2_feature'))[2:4];
+SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd2_feature') AS not_merged;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'dmd2_feature');
+DROP SCHEMA dmd2 CASCADE;
+SELECT length(dolt_commit('-Am', 'dmd2 gone')::text) AS committed;
+
+-- a cherry-pick, then its revert, over the alter too
+ALTER TABLE dmd.u ADD COLUMN w int;
+SELECT length(dolt_cherry_pick('dmd_feature')::text) > 0 AS picked;
+SELECT count(*) AS c_rows FROM dmd.c;
+SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'dmd' AND table_name = 'u' ORDER BY ordinal_position;
+SELECT length(dolt_revert('HEAD')::text) > 0 AS reverted;
+SELECT count(*) AS c_rows FROM dmd.c;
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT count(*) AS u_left_out FROM dolt_diff('HEAD~2', 'HEAD', NULL::dmd.u);
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'dmd_feature');
+DROP SCHEMA dmd CASCADE;
+SELECT length(dolt_commit('-Am', 'dmd gone')::text) AS committed;
