@@ -69,6 +69,30 @@ SELECT dolt_revert('--abort', '--author', '');	-- (no revert to abort)
 -- (a transaction's commit message isn't empty either)
 SET dolt.transaction_commit_message = '';
 
+-- --date dates a commit as given (a timestamptz, any of Postgres's
+-- forms), before its parent's even, as Dolt's does; a merge's commit too.
+-- Without it, a commit is dated now, never before its parent.
+SET TimeZone = 'UTC';
+SELECT length(dolt_commit('--allow-empty', '-m', 'dated', '--date', '2022-08-06T12:00:00')::text) AS committed;
+SELECT date, message FROM dolt_log() LIMIT 1;
+SELECT length(dolt_commit('--allow-empty', '-m', 'dated before', '--date', '2001-02-03 04:05:06+01')::text) AS committed;
+SELECT date, message FROM dolt_log() LIMIT 2;
+SELECT length(dolt_commit('--allow-empty', '-m', 'undated')::text) AS committed;
+SELECT date > '2022-08-06' AS dated_now FROM dolt_log() LIMIT 1;
+SELECT dolt_commit('--allow-empty', '-m', 'bad date', '--date', 'not a date');
+SELECT dolt_commit('--allow-empty', '-m', 'bad date', '--date', 'infinity');
+SELECT dolt_branch('cm_d');
+SELECT dolt_checkout('cm_d');
+UPDATE cm.c SET v = 'dated side';
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE cm.t SET id = 2;
+SELECT length(dolt_commit('-am', 'main side')::text) AS committed;
+SELECT (dolt_merge('cm_d', '--no-ff', '-m', 'dated merge', '--date', '2023-01-01'))[4] AS merged;
+SELECT date, message FROM dolt_log() LIMIT 1;
+SELECT dolt_branch('-D', 'cm_d');
+RESET TimeZone;
+
 SELECT dolt_branch('-D', 'cm_f');
 DROP SCHEMA cm CASCADE;
 SELECT length(dolt_commit('-Am', 'cm gone')::text) AS committed;
