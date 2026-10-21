@@ -31,7 +31,11 @@
  * A tree is the chunk store's, not a row's: nothing deletes it with the
  * rows that name it.  A collection of the store keeps every tree a hash
  * pointer on a page names (prolly_toast_roots()), and each tree stored is
- * told to the store's keep(), for a collection running meanwhile.
+ * told to the store's keep(), for a collection running meanwhile.  The
+ * pages are read from the page stores, only the ranges of blocks written
+ * since the last collection: what it found in the rest is in a file of the
+ * chunk store's directory a page store, which the page store's token for
+ * that scan says still holds.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/toast_chunkstore.c
@@ -39,6 +43,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <unistd.h>
 
 #include "access/detoast.h"
 #include "access/heapam.h"
@@ -52,10 +58,13 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
+#include "common/relpath.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/fd.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -449,13 +458,190 @@ chunkstore_fetch(varlena *attr, int32 offset, int32 length)
 	return result;
 }
 
-/* the bytes a hash pointer starts with */
+/*
+ * What a scan of a page store found, by range of its blocks
+ * (bmap_scan_store()), so the next collection reads again only the ranges
+ * written since: a file a store in the chunk store's directory.  A header
+ * (ROOTS_MAGIC, ROOTS_VERSION, the scan's token), then a record a range
+ * that holds any hash pointer, in order of range: the range, its count of
+ * hashes, and the hashes, each once.  The page store's token says whether
+ * it still holds.  It is not synced: a crash makes every token stale.
+ */
+#define ROOTS_PREFIX		"prolly_page_roots_"	/* and the tablespace */
+#define ROOTS_MAGIC			0x50524F54	/* "PROT" */
+#define ROOTS_VERSION		1
+#define ROOTS_HASH_LEN		sizeof(((varatt_external_hash *) NULL)->va_hash)
+
+typedef struct RootsHeader
+{
+	uint32		magic;
+	uint32		version;
+	uint64		token;
+} RootsHeader;
+
+typedef struct RootsRange
+{
+	uint32		range;
+	uint32		n;
+} RootsRange;
+
+/* the bytes a hash pointer starts with, and what a store's scan keeps */
 typedef struct RootScan
 {
 	uint8		head[VARHDRSZ_EXTERNAL];
 	ProllyChunkRefVisit visit;
 	void	   *arg;
+
+	/* the last scan's file, read up to a range's record, old_at */
+	FILE	   *old;
+	const char *old_path;
+	RootsRange	old_at;			/* (range PG_UINT32_MAX: none left) */
+
+	/* this scan's file, and the range being read */
+	FILE	   *out;
+	const char *out_path;
+	uint32		range;
+	bool		reading;
+	uint8	   *found;			/* its hashes, ROOTS_HASH_LEN bytes each */
+	uint32		nfound;
+	uint32		maxfound;
 } RootScan;
+
+static void
+roots_read(RootScan *rs, void *buf, size_t len)
+{
+	if (fread(buf, 1, len, rs->old) != len)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read file \"%s\": %m", rs->old_path)));
+}
+
+static void
+roots_write(RootScan *rs, const void *buf, size_t len)
+{
+	if (fwrite(buf, 1, len, rs->out) != len)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", rs->out_path)));
+}
+
+/* The last scan's next record: its range and count read. */
+static void
+roots_next(RootScan *rs)
+{
+	uint32		last = rs->old_at.range;
+	size_t		got = fread(&rs->old_at, 1, sizeof(rs->old_at), rs->old);
+
+	if (got == 0 && feof(rs->old))
+	{
+		rs->old_at.range = PG_UINT32_MAX;
+		rs->old_at.n = 0;
+		return;
+	}
+	if (got != sizeof(rs->old_at) ||
+		(last != PG_UINT32_MAX && rs->old_at.range <= last))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("file \"%s\" is corrupt", rs->old_path)));
+}
+
+/* A hash pointer's hash, found: a root, and one of the range's. */
+static void
+root_found(RootScan *rs, const uint8 *hash)
+{
+	ProllyHash	h;
+
+	h.len = ROOTS_HASH_LEN;
+	memcpy(h.bytes, hash, ROOTS_HASH_LEN);
+	rs->visit(&h, rs->arg);
+	if (rs->out == NULL || !rs->reading)
+		return;
+	if (rs->nfound == rs->maxfound)
+	{
+		rs->maxfound = Max(64, rs->maxfound * 2);
+		rs->found = rs->found ?
+			repalloc_huge(rs->found, (Size) rs->maxfound * ROOTS_HASH_LEN) :
+			MemoryContextAllocHuge(CurrentMemoryContext,
+								   (Size) rs->maxfound * ROOTS_HASH_LEN);
+	}
+	memcpy(rs->found + (Size) rs->nfound++ * ROOTS_HASH_LEN, hash,
+		   ROOTS_HASH_LEN);
+}
+
+static int
+roots_hash_cmp(const void *a, const void *b)
+{
+	return memcmp(a, b, ROOTS_HASH_LEN);
+}
+
+/* The range read: its hashes in this scan's file, each once. */
+static void
+range_done(RootScan *rs)
+{
+	RootsRange	rec;
+	uint32		n = 0;
+
+	if (rs->out == NULL || !rs->reading || rs->nfound == 0)
+		return;
+	qsort(rs->found, rs->nfound, ROOTS_HASH_LEN, roots_hash_cmp);
+	for (uint32 i = 0; i < rs->nfound; i++)
+	{
+		uint8	   *h = rs->found + (Size) i * ROOTS_HASH_LEN;
+
+		if (n > 0 &&
+			memcmp(rs->found + (Size) (n - 1) * ROOTS_HASH_LEN, h,
+				   ROOTS_HASH_LEN) == 0)
+			continue;
+		memmove(rs->found + (Size) n++ * ROOTS_HASH_LEN, h, ROOTS_HASH_LEN);
+	}
+	rec.range = rs->range;
+	rec.n = n;
+	roots_write(rs, &rec, sizeof(rec));
+	roots_write(rs, rs->found, (Size) n * ROOTS_HASH_LEN);
+	rs->nfound = 0;
+}
+
+/*
+ * A range of the page store, read (changed), or not: then what the last
+ * scan found in it holds still, roots again and this scan's.
+ */
+static void
+scan_range(uint32 range, bool changed, void *arg)
+{
+	RootScan   *rs = arg;
+	uint8		hash[ROOTS_HASH_LEN];
+
+	range_done(rs);
+	rs->range = range;
+	rs->reading = changed;
+	if (changed)
+		return;
+	if (rs->old == NULL)
+		elog(ERROR, "a range of a page store unchanged since a scan whose roots aren't known");
+	while (rs->old_at.range < range)
+	{
+		if (fseeko(rs->old, (off_t) rs->old_at.n * ROOTS_HASH_LEN,
+				   SEEK_CUR) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in file \"%s\": %m",
+							rs->old_path)));
+		roots_next(rs);
+	}
+	if (rs->old_at.range != range)
+		return;
+	if (rs->out != NULL)
+		roots_write(rs, &rs->old_at, sizeof(rs->old_at));
+	for (uint32 i = 0; i < rs->old_at.n; i++)
+	{
+		roots_read(rs, hash, sizeof(hash));
+		if (rs->out != NULL)
+			roots_write(rs, hash, sizeof(hash));
+		root_found(rs, hash);
+	}
+	rs->old_at.n = 0;
+	roots_next(rs);
+}
 
 /* Visit what bytes [start, stop) of a page spell hash pointers. */
 static void
@@ -470,12 +656,9 @@ scan_bytes(RootScan *rs, const char *start, const char *stop)
 		if ((uint8) p[1] == rs->head[1])
 		{
 			varatt_external_hash ptr;
-			ProllyHash	h;
 
 			memcpy(&ptr, p + VARHDRSZ_EXTERNAL, sizeof(ptr));
-			h.len = sizeof(ptr.va_hash);
-			memcpy(h.bytes, ptr.va_hash, sizeof(ptr.va_hash));
-			rs->visit(&h, rs->arg);
+			root_found(rs, ptr.va_hash);
 		}
 		p++;
 	}
@@ -517,6 +700,99 @@ scan_page(const char *page, void *arg)
 	}
 }
 
+/*
+ * The database's page store in tablespace spc: what changed since the last
+ * scan read, the rest's hash pointers taken from its file, and the file
+ * written again.
+ */
+static void
+scan_store(Oid spc, RootScan *rs)
+{
+	char	   *dir = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
+	char	   *path = psprintf("%s/%s%u", dir, ROOTS_PREFIX, spc);
+	char	   *tmp = psprintf("%s.tmp", path);
+	RootsHeader h;
+	uint64		since = 0;
+	uint64		token;
+	uint64		nread;
+
+	rs->old_path = path;
+	rs->out_path = tmp;
+	rs->old_at.range = PG_UINT32_MAX;
+	rs->old_at.n = 0;
+	rs->old = AllocateFile(path, PG_BINARY_R);
+	if (rs->old == NULL && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", path)));
+	if (rs->old != NULL)
+	{
+		if (fread(&h, 1, sizeof(h), rs->old) == sizeof(h) &&
+			h.magic == ROOTS_MAGIC && h.version == ROOTS_VERSION)
+		{
+			since = h.token;
+			roots_next(rs);
+		}
+		else
+		{
+			FreeFile(rs->old);
+			rs->old = NULL;
+		}
+	}
+	rs->out = AllocateFile(tmp, PG_BINARY_W);
+	if (rs->out == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", tmp)));
+	h.magic = ROOTS_MAGIC;
+	h.version = ROOTS_VERSION;
+	h.token = 0;
+	roots_write(rs, &h, sizeof(h));
+	rs->reading = false;
+	rs->nfound = 0;
+
+	nread = bmap_scan_store(spc, MyDatabaseId, since, &token, scan_range,
+							scan_page, rs);
+	range_done(rs);
+	pgstat_count_prolly(PGSTAT_PROLLY_GC_PAGES_SCANNED, nread);
+
+	/* the token last, once the rest is written */
+	h.token = token;
+	if (fseeko(rs->out, 0, SEEK_SET) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek in file \"%s\": %m", tmp)));
+	roots_write(rs, &h, sizeof(h));
+	if (FreeFile(rs->out) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	rs->out = NULL;
+	if (rs->old != NULL)
+		FreeFile(rs->old);
+	rs->old = NULL;
+	if (token == 0)
+	{
+		/* (no store in the tablespace) */
+		if (unlink(tmp) != 0 && errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", tmp)));
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path)));
+	}
+	else if (rename(tmp, path) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not rename file \"%s\" to \"%s\": %m",
+						tmp, path)));
+	pfree(tmp);
+	pfree(path);
+	pfree(dir);
+}
+
 void
 prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 {
@@ -527,6 +803,7 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	List	   *spcs = NIL;
 	ListCell   *lc;
 
+	memset(&rs, 0, sizeof(rs));
 	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_BLAKE3);
 	rs.visit = visit;
 	rs.arg = arg;
@@ -546,8 +823,10 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
 	foreach(lc, spcs)
-		(void) bmap_scan_store(lfirst_oid(lc), MyDatabaseId, scan_page, &rs);
+		scan_store(lfirst_oid(lc), &rs);
 	list_free(spcs);
+	if (rs.found)
+		pfree(rs.found);
 }
 
 /* A versioned table's value moved out of line by the toaster. */

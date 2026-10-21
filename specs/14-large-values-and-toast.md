@@ -637,7 +637,7 @@ measured.
    then it is an open gap, as #300's other two cases are.
 7. The roots' scan of every page-store block each collection (decision 3)
    stays as built; scanning only the blocks changed since the last
-   collection is a follow-up, #340.
+   collection is a follow-up, #340 (built: see "as built").
 
 **The layers**, one stack, each with its tests. Layers 7 to 10 merge
 together: from the save hook on, values are saved by content, and only
@@ -715,6 +715,27 @@ to decode.
   tree first. A sweep of the page store waits for the scan. A pointer a
   row is given as it is is told to `keep()` too (the destination's
   `reference()`).
+- **The roots' scan reads what changed (#340).** A collection reads only
+  the page store's blocks written or freed since the last one; the hash
+  pointers it found in the rest are kept from that scan. The block map
+  watches a store from its first scan on: every write of a block (and
+  every free) sets its range's bit in shared memory, a range being one
+  block until the store passes 16 384 blocks (32 768 bits, sized for
+  twice the store; past that a range is a power of two of blocks). A
+  scan takes and clears the bits as it begins (before it reads which
+  blocks are allocated) and gets a token; it reads every range whose bit
+  was set, and tells the caller of each range it didn't. The collector
+  keeps what it found, by range, in a file of the chunk store's
+  directory a page store (`prolly_page_roots_<tablespace>`, its scan's
+  token in the header) and takes an unchanged range's pointers from it.
+  The watching is in shared memory only, so it is conservative by
+  construction: a token from before a restart or crash names no scan
+  (tokens start at a random value), nor does one of a scan that failed
+  (each scan gets a new token as it clears the bits), of a store dropped
+  or no longer watched (64 stores at most, the longest unscanned let
+  go), or of a store grown past its bits; each such scan reads every
+  block. The file isn't synced. `pg_stat_prolly`'s `gc_pages_scanned`
+  counts the blocks read.
 - **Not as designed:** `debug_toast_relation`, a developer option
   (superuser-only), sends values to the TOAST relation all the same, so
   tests can make OID pointers. A value is stored converted (text in
