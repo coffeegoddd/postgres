@@ -768,8 +768,260 @@ SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::eh.mix);
      0
 (1 row)
 
+-- A merge commit that took the enum from its second parent: its labels are
+-- followed through that side's commits, not across the first parent's
+-- edge (an addition and a rename at once, from there).
+CREATE TYPE eh.side AS ENUM ('a', 'b');
+CREATE TABLE eh.sides (id int PRIMARY KEY, e eh.side, n int);
+INSERT INTO eh.sides VALUES (1, 'a', 0);
+SELECT (dolt_commit('-Am', 'side base'))[1] AS side_base \gset
+SELECT dolt_branch('side_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.side ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'side added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.side RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'side renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('side_writer');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'side_writer'"}
+(1 row)
+
+UPDATE eh.sides SET n = 1;
+SELECT length(dolt_commit('-am', 'side writer')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('main', '-m', 'merged side'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM eh.sides;
+ id | e | n 
+----+---+---
+  1 | z | 1
+(1 row)
+
+-- (the persisted merge, from the base and from either parent)
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'side_base', 'HEAD', NULL::eh.sides);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,z,0)  | (1,z,1)
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', :'side_base', NULL::eh.sides);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,z,1)  | (1,z,0)
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD^', 'HEAD', NULL::eh.sides);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('main', 'HEAD', NULL::eh.sides);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,z,0)  | (1,z,1)
+(1 row)
+
+-- (and merged back into main, a fast-forward or past the merge)
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('side_writer'))[2:4];
+        dolt_merge        
+--------------------------
+ {1,0,"merge successful"}
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'side_base', 'HEAD', NULL::eh.sides);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,z,0)  | (1,z,1)
+(1 row)
+
+SELECT dolt_branch('-D', 'side_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (the enum changed on both sides)
+CREATE TYPE eh.both AS ENUM ('a', 'b');
+CREATE TABLE eh.boths (id int PRIMARY KEY, e eh.both, n int);
+INSERT INTO eh.boths VALUES (1, 'a', 0), (2, 'b', 0);
+SELECT (dolt_commit('-Am', 'both base'))[1] AS both_base \gset
+SELECT dolt_branch('both_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.both RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'both renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('both_writer');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'both_writer'"}
+(1 row)
+
+ALTER TYPE eh.both ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'both added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE eh.boths SET n = 1;
+SELECT length(dolt_commit('-am', 'both writer')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_merge('main', '-m', 'merged both');
+ERROR:  schema conflict: eh."both" was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT * FROM eh.boths ORDER BY id;
+ id | e | n 
+----+---+---
+  1 | a | 1
+  2 | b | 1
+(2 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'both_base', 'HEAD', NULL::eh.boths);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,a,0)  | (1,a,1)
+ modified  | (2,b,0)  | (2,b,1)
+(2 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'both_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (both sides made the same definition, in other orders: each parent's
+-- history reads it, the merge's first one followed)
+CREATE TYPE eh.alike AS ENUM ('a', 'b');
+CREATE TABLE eh.alikes (id int PRIMARY KEY, e eh.alike, n int);
+INSERT INTO eh.alikes VALUES (1, 'a', 0), (2, 'b', 0);
+SELECT (dolt_commit('-Am', 'alike base'))[1] AS alike_base \gset
+SELECT dolt_branch('alike_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.alike ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'alike added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.alike RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'alike renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('alike_writer');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'alike_writer'"}
+(1 row)
+
+ALTER TYPE eh.alike RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'alike writer renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.alike ADD VALUE 'c';
+UPDATE eh.alikes SET n = 1 WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'alike writer added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('main', '-m', 'merged alike'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM eh.alikes ORDER BY id;
+ id | e | n 
+----+---+---
+  1 | z | 1
+  2 | b | 0
+(2 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'alike_base', 'HEAD', NULL::eh.alikes);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,z,0)  | (1,z,1)
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('main', 'HEAD', NULL::eh.alikes);
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,z,0)  | (1,z,1)
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'alike_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA eh CASCADE;
-NOTICE:  drop cascades to 31 other objects
+NOTICE:  drop cascades to 37 other objects
 DETAIL:  drop cascades to type eh.mood
 drop cascades to type eh.dmood
 drop cascades to type eh.pair
@@ -801,3 +1053,9 @@ drop cascades to type eh.again
 drop cascades to table eh.agains
 drop cascades to type eh.mixed
 drop cascades to table eh.mix
+drop cascades to type eh.side
+drop cascades to table eh.sides
+drop cascades to type eh."both"
+drop cascades to table eh.boths
+drop cascades to type eh.alike
+drop cascades to table eh.alikes

@@ -3763,12 +3763,34 @@ typedef struct HistoryStep
 } HistoryStep;
 
 /*
- * The commits from one to an ancestor of it, both of them included: along
- * first parents as far as they lead there, through as few others as may
- * be.  NIL if to isn't its ancestor.
+ * Which of a merge commit's parents its enum name came from: the first
+ * defining it as the merge does (the side whose definition it took), else
+ * the first.
+ */
+static int
+defining_parent(HistoryCommit *hc, const char *name)
+{
+	ProllyTypeDefinition *d = history_enum(&hc->id, name);
+
+	for (int i = 0; d != NULL && i < hc->nparents; i++)
+	{
+		ProllyTypeDefinition *p = history_enum(&hc->parents[i], name);
+
+		if (p != NULL && strcmp(p->definition, d->definition) == 0)
+			return i;
+	}
+	return 0;
+}
+
+/*
+ * The commits from one to an ancestor of it, both of them included, for
+ * enum name's labels to be followed along: through each merge, the parent
+ * it took the enum's definition from (the edge from the other may hold
+ * several changes at once, not to be read across), as far as those lead
+ * there, through as few others as may be.  NIL if to isn't its ancestor.
  */
 static List *
-history_down(const ProllyHash *from, const ProllyHash *to)
+history_down(const ProllyHash *from, const ProllyHash *to, const char *name)
 {
 	HASHCTL		ctl;
 	HTAB	   *steps;
@@ -3791,8 +3813,8 @@ history_down(const ProllyHash *from, const ProllyHash *to)
 	*(ProllyHash *) linitial(starts) = key;
 
 	/*
-	 * (each round's starts are reached through one more second parent than
-	 * the last's: from each, its first parents as far as they go)
+	 * (each round's starts are reached through one more other parent than
+	 * the last's: from each, its defining parents as far as they go)
 	 */
 	while (starts != NIL && !reached)
 	{
@@ -3809,6 +3831,7 @@ history_down(const ProllyHash *from, const ProllyHash *to)
 				HistoryStep *ps;
 				ProllyHash	pk;
 				bool		seen;
+				int			via;
 
 				CHECK_FOR_INTERRUPTS();
 				s = hash_search(steps, &c, HASH_FIND, NULL);
@@ -3821,9 +3844,14 @@ history_down(const ProllyHash *from, const ProllyHash *to)
 					break;
 				}
 				hc = history_commit(&c);
-				if (hc->nparents > 1)
+				if (hc->nparents == 0)
+					break;
+				via = hc->nparents > 1 ? defining_parent(hc, name) : 0;
+				for (int i = 0; i < hc->nparents; i++)
 				{
-					pk = prolly_hash_key(&hc->parents[1]);
+					if (i == via)
+						continue;
+					pk = prolly_hash_key(&hc->parents[i]);
 					ps = hash_search(steps, &pk, HASH_ENTER, &seen);
 					if (!seen)
 					{
@@ -3834,9 +3862,7 @@ history_down(const ProllyHash *from, const ProllyHash *to)
 						*(ProllyHash *) llast(next) = pk;
 					}
 				}
-				if (hc->nparents == 0)
-					break;
-				pk = prolly_hash_key(&hc->parents[0]);
+				pk = prolly_hash_key(&hc->parents[via]);
 				ps = hash_search(steps, &pk, HASH_ENTER, &seen);
 				if (seen && ps->done)
 					break;
@@ -3918,6 +3944,78 @@ enum_anchor(const TypeDefs *td, const ProllyTypeDefinition *e,
 }
 
 /*
+ * Follows *cur, labels of enum name as *at (commit from's labels) has
+ * them, on to commit to's: back from from to their merge base, then on to
+ * to, each commit's change read across in turn; *at gets to's labels.
+ * An edge between a merge and a parent it didn't take the enum from is
+ * read through the one it did (as many changes as were made on the way).
+ * False if a commit on the way lacks the enum or its change can't be read.
+ */
+static bool
+labels_between(const ProllyHash *from, const ProllyHash *to,
+			   const char *name, List **cur, List **at)
+{
+	ProllyHash	base;
+	List	   *down;
+	List	   *up;
+	int			n;
+
+	if (same_hash(from, to))
+		base = *from;
+	else if (!PROLLY_CALL(components().refs, merge_base, from, to, &base))
+		return false;
+	down = history_down(from, &base, name);
+	up = history_down(to, &base, name);
+	if (down == NIL || up == NIL)
+		return false;
+
+	/*
+	 * Each definition on the way, in the order they're read across: back
+	 * from from to the base (down), then on to to (up, the other way round,
+	 * the base once).
+	 */
+	n = list_length(down) + list_length(up) - 1;
+	for (int i = 1; i < n; i++)
+	{
+		bool		back = i < list_length(down);
+		ProllyHash *id = back ? list_nth(down, i) : list_nth(up, n - 1 - i);
+		ProllyHash *prev = i - 1 < list_length(down) ? list_nth(down, i - 1) :
+			list_nth(up, n - i);
+		ProllyHash *child = back ? prev : id;
+		ProllyHash *parent = back ? id : prev;
+		ProllyTypeDefinition *d = history_enum(id, name);
+		HistoryCommit *hc;
+		ProllyHash	via;
+		List	   *map;
+
+		CHECK_FOR_INTERRUPTS();
+		if (d == NULL)
+			return false;
+		if (labels_among(*at, d->labels) && labels_among(d->labels, *at))
+			continue;			/* (the same labels) */
+		if (back ? labels_backward(*at, d->labels, &map) :
+			labels_forward(*at, d->labels, &map))
+		{
+			*cur = labels_mapped(*cur, *at, map);
+			*at = d->labels;
+			continue;
+		}
+		hc = history_commit(child);
+		if (hc->nparents < 2)
+			return false;
+		via = prolly_hash_key(&hc->parents[defining_parent(hc, name)]);
+		if (same_hash(&via, parent))
+			return false;
+		/* (the merge's labels are via's: its definition) */
+		if (back ? !labels_between(&via, parent, name, cur, at) :
+			!labels_between(parent, &via, name, cur, at))
+			return false;
+		*at = d->labels;
+	}
+	return true;
+}
+
+/*
  * What each of a's labels of enum ea reads as in b's eb, followed through
  * the commits between them, into *targets.  False if there's no history
  * to follow them through (commits unknown, none in common, one on the way
@@ -3930,7 +4028,6 @@ labels_through_history(const TypeDefs *a, const ProllyTypeDefinition *ea,
 {
 	ProllyHash	ha;
 	ProllyHash	hb;
-	ProllyHash	base;
 	List	   *la;
 	List	   *lb;
 	bool		step_a;
@@ -3938,27 +4035,10 @@ labels_through_history(const TypeDefs *a, const ProllyTypeDefinition *ea,
 	List	   *cur = list_copy(ea->labels);
 	List	   *at;				/* the labels cur's are of */
 	List	   *map;
-	List	   *down;
-	List	   *up;
-	int			n;
 
 	if (!enum_anchor(a, ea, &ha, &la, &step_a) ||
 		!enum_anchor(b, eb, &hb, &lb, &step_b))
 		return false;
-	if (same_hash(&ha, &hb))
-		base = ha;
-	else if (!PROLLY_CALL(components().refs, merge_base, &ha, &hb, &base))
-		return false;
-	down = history_down(&ha, &base);
-	up = history_down(&hb, &base);
-	if (down == NIL || up == NIL)
-		return false;
-
-	/*
-	 * Each definition on the way, in the order they're read across: back
-	 * from a's commit to the base (down), then on to b's (up, the other way
-	 * round, the base once).
-	 */
 	if (step_a)
 	{
 		if (!labels_backward(ea->labels, la, &map))
@@ -3966,24 +4046,8 @@ labels_through_history(const TypeDefs *a, const ProllyTypeDefinition *ea,
 		cur = labels_mapped(cur, ea->labels, map);
 	}
 	at = la;
-	n = list_length(down) + list_length(up) - 1;
-	for (int i = 1; i < n; i++)
-	{
-		bool		back = i < list_length(down);
-		ProllyHash *id = back ? list_nth(down, i) :
-			list_nth(up, n - 1 - i);
-		ProllyTypeDefinition *d = history_enum(id, ea->name);
-
-		if (d == NULL)
-			return false;
-		if (labels_among(at, d->labels) && labels_among(d->labels, at))
-			continue;			/* (the same labels) */
-		if (back ? !labels_backward(at, d->labels, &map) :
-			!labels_forward(at, d->labels, &map))
-			return false;
-		cur = labels_mapped(cur, at, map);
-		at = d->labels;
-	}
+	if (!labels_between(&ha, &hb, ea->name, &cur, &at))
+		return false;
 	if (step_b)
 	{
 		if (!labels_forward(lb, eb->labels, &map))

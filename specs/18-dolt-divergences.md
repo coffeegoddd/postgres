@@ -83,12 +83,14 @@ adapts.
   additions, deletions and conflicts use the current labels on both sides.
   This includes domains, arrays, unchanged composites, enum keys and keyless
   copy counts. Between two commits the labels are followed through the
-  history (#454): back from one version along first parents to the merge
-  base, then on to the other, each commit's change read as a rename in
-  place or an addition and the per-commit mappings composed. So a label
-  added in one commit and another renamed in a later one, a chain of
-  renames, or a renamed label's old name added again later, all read
-  correctly. The working set is a change past the head (and, mid-merge,
+  history (#454): back from one version to the merge base, then on to the
+  other, through each merge along the parent it took the enum's
+  definition from (first parents otherwise; the edge from a merge's other
+  parent may hold several changes at once), each commit's change read as
+  a rename in place or an addition and the per-commit mappings composed.
+  So a label added in one commit and another renamed in a later one, a
+  chain of renames, or a renamed label's old name added again later, all
+  read correctly, also across a merge commit. The working set is a change past the head (and, mid-merge,
   past the merged side), and a merge's result defines each enum as one side
   does. Where no history is known, only the two definitions are compared.
   A single commit that both renames and adds labels (or reorders/reuses

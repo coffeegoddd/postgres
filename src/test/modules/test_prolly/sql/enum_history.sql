@@ -254,4 +254,73 @@ SELECT length(dolt_commit('-Am', 'mixed renamed')::text) AS committed;
 SELECT count(*) FROM dolt_diff(:'mixed_base', 'HEAD', NULL::eh.mix);
 SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::eh.mix);
 
+-- A merge commit that took the enum from its second parent: its labels are
+-- followed through that side's commits, not across the first parent's
+-- edge (an addition and a rename at once, from there).
+CREATE TYPE eh.side AS ENUM ('a', 'b');
+CREATE TABLE eh.sides (id int PRIMARY KEY, e eh.side, n int);
+INSERT INTO eh.sides VALUES (1, 'a', 0);
+SELECT (dolt_commit('-Am', 'side base'))[1] AS side_base \gset
+SELECT dolt_branch('side_writer');
+ALTER TYPE eh.side ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'side added')::text) AS committed;
+ALTER TYPE eh.side RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'side renamed')::text) AS committed;
+SELECT dolt_checkout('side_writer');
+UPDATE eh.sides SET n = 1;
+SELECT length(dolt_commit('-am', 'side writer')::text) AS committed;
+SELECT (dolt_merge('main', '-m', 'merged side'))[2:4];
+SELECT * FROM eh.sides;
+-- (the persisted merge, from the base and from either parent)
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'side_base', 'HEAD', NULL::eh.sides);
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', :'side_base', NULL::eh.sides);
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD^', 'HEAD', NULL::eh.sides);
+SELECT diff_type, from_row, to_row FROM dolt_diff('main', 'HEAD', NULL::eh.sides);
+-- (and merged back into main, a fast-forward or past the merge)
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('side_writer'))[2:4];
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'side_base', 'HEAD', NULL::eh.sides);
+SELECT dolt_branch('-D', 'side_writer');
+-- (the enum changed on both sides)
+CREATE TYPE eh.both AS ENUM ('a', 'b');
+CREATE TABLE eh.boths (id int PRIMARY KEY, e eh.both, n int);
+INSERT INTO eh.boths VALUES (1, 'a', 0), (2, 'b', 0);
+SELECT (dolt_commit('-Am', 'both base'))[1] AS both_base \gset
+SELECT dolt_branch('both_writer');
+ALTER TYPE eh.both RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'both renamed')::text) AS committed;
+SELECT dolt_checkout('both_writer');
+ALTER TYPE eh.both ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'both added')::text) AS committed;
+UPDATE eh.boths SET n = 1;
+SELECT length(dolt_commit('-am', 'both writer')::text) AS committed;
+SELECT dolt_merge('main', '-m', 'merged both');
+SELECT * FROM eh.boths ORDER BY id;
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'both_base', 'HEAD', NULL::eh.boths);
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'both_writer');
+-- (both sides made the same definition, in other orders: each parent's
+-- history reads it, the merge's first one followed)
+CREATE TYPE eh.alike AS ENUM ('a', 'b');
+CREATE TABLE eh.alikes (id int PRIMARY KEY, e eh.alike, n int);
+INSERT INTO eh.alikes VALUES (1, 'a', 0), (2, 'b', 0);
+SELECT (dolt_commit('-Am', 'alike base'))[1] AS alike_base \gset
+SELECT dolt_branch('alike_writer');
+ALTER TYPE eh.alike ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'alike added')::text) AS committed;
+ALTER TYPE eh.alike RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'alike renamed')::text) AS committed;
+SELECT dolt_checkout('alike_writer');
+ALTER TYPE eh.alike RENAME VALUE 'a' TO 'z';
+SELECT length(dolt_commit('-Am', 'alike writer renamed')::text) AS committed;
+ALTER TYPE eh.alike ADD VALUE 'c';
+UPDATE eh.alikes SET n = 1 WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'alike writer added')::text) AS committed;
+SELECT (dolt_merge('main', '-m', 'merged alike'))[2:4];
+SELECT * FROM eh.alikes ORDER BY id;
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'alike_base', 'HEAD', NULL::eh.alikes);
+SELECT diff_type, from_row, to_row FROM dolt_diff('main', 'HEAD', NULL::eh.alikes);
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'alike_writer');
+
 DROP SCHEMA eh CASCADE;
