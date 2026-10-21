@@ -189,7 +189,10 @@ Core hooks
 
 prolly_shmem.c is a shared-memory subsystem (subsystemlist.h) reserving
 an area per chunk store and value memo implementation that asks for one, and
-CheckPointProlly() runs in CheckPointGuts().  createdb() calls
+CheckPointProlly() runs in CheckPointGuts(), and ProllyRecoveryConsistent()
+beside XLogCheckInvalidPages(), as recovery becomes consistent; the chunk
+store asks XLogBackupInProgress() (xlog.c) before it removes a file a
+backup's redo may copy from.  createdb() calls
 ProllyCopyDatabase() (prolly_database.c) to copy the template's chunk
 store.  A temporary or unlogged table is never stored by prolly
 (prolly_table_am_for_persistence()).

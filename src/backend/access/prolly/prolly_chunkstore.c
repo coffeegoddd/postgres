@@ -138,6 +138,15 @@ prolly_chunks_filetagmatches(const FileTag *ftag, const FileTag *candidate)
 }
 
 void
+prolly_chunkstore_consistent(void)
+{
+	const ProllyChunkStoreRoutine *store = prolly_chunk_store();
+
+	if (PROLLY_HAS(store, redo_consistent))
+		store->redo_consistent();
+}
+
+void
 prolly_chunkstore_recovered(void)
 {
 	const ProllyChunkStoreRoutine *store = prolly_chunk_store();

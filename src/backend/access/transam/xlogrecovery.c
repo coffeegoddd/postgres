@@ -30,6 +30,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/prolly_shmem.h"
 #include "access/timeline.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -2225,6 +2226,9 @@ CheckRecoveryConsistency(void)
 		 * references to uninitialized pages.
 		 */
 		XLogCheckInvalidPages();
+
+		/* and to chunk store files no longer there */
+		ProllyRecoveryConsistent();
 
 		/*
 		 * Check that pg_tblspc doesn't contain any real directories. Replay

@@ -377,6 +377,13 @@ typedef struct ProllyChunkStoreRoutine
 	void		(*adopt_received) (ProllyChunkStore *store);
 	void		(*forget_received) (ProllyChunkStore *store,
 									const char *const *keep, int nkeep);
+
+	/*
+	 * Recovery reached a consistent state (or crash recovery ended): what
+	 * redo left unresolved, waiting for a later record, is an error
+	 * (optional).
+	 */
+	void		(*redo_consistent) (void);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -390,9 +397,9 @@ typedef struct ProllyChunkStoreRoutine
 	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots", \
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
-	"forget_received"
+	"forget_received", "redo_consistent"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK forget_received
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK redo_consistent
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)
@@ -411,6 +418,7 @@ extern bool prolly_chunkstore_commit_writes(void);
 extern void prolly_chunkstore_committed(void);
 extern void prolly_chunkstore_commit_redo(const char *data, Size len);
 extern void prolly_chunkstore_checkpoint(void);
+extern void prolly_chunkstore_consistent(void);
 extern void prolly_chunkstore_recovered(void);
 
 /* The sync handler of the stores' files (storage/sync.h). */
