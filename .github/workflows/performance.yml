@@ -15,8 +15,9 @@
 #
 # Pull requests and pushes run none of this unless the repository variable
 # S_SUITE_PRS is 'true' (it is off while the suite would hold up every pull
-# request): the gate passes without building, as for specs/ alone.  The
-# nightly and a run by hand are unaffected.
+# request): the gate passes without building, as for specs/ alone.  A pull
+# request labelled s-suite runs it anyway (adding the label starts a run).
+# The nightly and a run by hand are unaffected.
 #
 # It leaves the pull-request comment (<!-- s-suite -->) as the
 # s-suite-comment artifact for the workflow_run commenter to post, so code
@@ -32,6 +33,8 @@ name: performance
 
 on:
   pull_request:
+    # (labeled: adding the s-suite label runs the suite on the pull request)
+    types: [opened, synchronize, reopened, labeled]
   # (a branch's pushes build and cache its head: a pull request onto it
   # finds its base cached; a pull request's own run builds its merge)
   push:
@@ -46,9 +49,10 @@ permissions:
   contents: read
 
 # A pull request's newer push cancels its older run; pushes each get their
-# own group (by commit), so none cancels another.
+# own group (by commit), so none cancels another.  Adding any other label
+# gets a group of its own, so it doesn't cancel the pull request's run.
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.sha }}
+  group: performance-${{ github.event.pull_request.number || github.sha }}${{ github.event.action == 'labeled' && github.event.label.name != 's-suite' && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -72,6 +76,9 @@ jobs:
         id: classify
         env:
           EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          ADDED_LABEL: ${{ github.event.label.name }}
+          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 's-suite') }}
           S_SUITE_PRS: ${{ vars.S_SUITE_PRS }}
         run: |
           code=true
@@ -86,10 +93,20 @@ jobs:
               code=false
             fi
           fi
-          # (off for pull requests and pushes unless S_SUITE_PRS: see above)
+          # (off for pull requests and pushes unless S_SUITE_PRS, or for a
+          # pull request labelled s-suite: see above)
           if { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } &&
              [ "$S_SUITE_PRS" != true ]; then
-            echo "S_SUITE_PRS isn't 'true': the S suite doesn't run for a $EVENT."
+            if [ "$EVENT" = pull_request ] && [ "$LABELLED" = true ]; then
+              echo "S_SUITE_PRS isn't 'true', but the pull request is labelled s-suite."
+            else
+              echo "S_SUITE_PRS isn't 'true': the S suite doesn't run for a $EVENT."
+              code=false
+            fi
+          fi
+          # (another label added: nothing the last run tested has changed)
+          if [ "$EVENT" = pull_request ] && [ "$ACTION" = labeled ] && [ "$ADDED_LABEL" != s-suite ]; then
+            echo "label $ADDED_LABEL added: the S suite doesn't run again."
             code=false
           fi
           { echo "code=$code"; echo "base=$base"; echo "candidate=$candidate"; } | tee -a "$GITHUB_OUTPUT"
@@ -354,7 +371,7 @@ jobs:
     steps:
       - name: Nothing to compare
         if: needs.classify.result == 'success' && (needs.classify.outputs.code != 'true' || github.event_name != 'pull_request')
-        run: echo "A push, a pull request that changes only specs/, or the S suite off for pull requests (S_SUITE_PRS); it doesn't compare anything."
+        run: echo "A push, a pull request that changes only specs/, or the S suite off for pull requests (S_SUITE_PRS, no s-suite label); it doesn't compare anything."
 
       - name: Classification failed
         if: needs.classify.result != 'success'
@@ -440,7 +457,7 @@ jobs:
   # (360 cells, some 4 to 5 hours), on a hosted runner, so its timing is
   # reported with a shared machine's noise.  Against the last clean night,
   # not the last night: a regression stays in the comparison until it is
-  # fixed.  Each night's summary goes to the orphan perf-history branch (and
+  # fixed.  With no clean night yet, against master's previous commit.  Each night's summary goes to the orphan perf-history branch (and
   # the whole result set to an artifact); a confirmed regression opens or
   # updates one issue labelled nightly-performance-regression, and a clean
   # night says it cleared.  Without hardware counters, Cachegrind counts
@@ -492,9 +509,16 @@ jobs:
           if git fetch --depth 1 origin perf-history:perf-history 2>/dev/null; then
             base=$(git show perf-history:CLEAN 2>/dev/null || true)
           fi
-          # (the first night, or a base no longer fetchable: the build against itself)
           if [ -n "$base" ] && ! git fetch --depth 1 origin "$base" 2>/dev/null; then
             base=
+          fi
+          # No clean night to compare with (the first night, every night so
+          # far regressed, or a base no longer fetchable): against master's
+          # previous commit, so the night still runs and its summary starts
+          # the history.  (Only a master of one commit compares nothing.)
+          if [ -z "$base" ] && git fetch --depth 2 origin "$candidate" 2>/dev/null; then
+            base=$(git rev-parse --verify -q "$candidate^1" || true)
+            [ -z "$base" ] || echo "no clean night on perf-history: tonight is compared with master's previous commit, $base"
           fi
           [ -n "$base" ] || base=$candidate
           { echo "base=$base"; echo "candidate=$candidate"; echo "image=$ImageOS-$ImageVersion"; \
