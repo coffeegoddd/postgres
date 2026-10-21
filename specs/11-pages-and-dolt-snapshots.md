@@ -347,7 +347,16 @@ commit or checkpoint all use it.
   - a column added with a default (rows from before read as its missing
     value, which every row's bytes now hold: no "lazy default");
   - a column dropped (gone from every row's bytes; a keyless table's
-    rows sorted again, those become alike counted as one).
+    rows sorted again, those become alike counted as one);
+  - a column retyped where the type's cast keeps every value (no
+    rewrite: a length or precision widened, `varchar` to `text`, a
+    domain over the type), each value encoded as the new type's (#510);
+  - a primary key added, dropped or moved: the rows sorted again by the
+    key now, in bounded memory (#510).
+
+  A retype whose cast computes (`int` to `bigint`, a `USING` expression)
+  rewrites the table, which is read in full: what the rewrite did isn't
+  recorded where the fold can read it (`19-change-log.md` §2.2).
 - **Old pages are bounded.** A branch that goes long without a commit
   keeps up to two versions of each changed page; a working-set checkpoint
   folds the changes into a tree, which becomes the new baseline, and

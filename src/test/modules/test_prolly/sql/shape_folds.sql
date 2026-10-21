@@ -1,9 +1,10 @@
 -- DDL that changes a table's row shape but no row's bytes (a column added
 -- without a default, an enum's label added) keeps its baseline; DDL that
 -- changes rows' bytes without writing them (a column added with a
--- default, one dropped) maps the baseline's rows to the shape now.  Either
--- way the next commit reads no table in full, and makes the tree a full
--- fold would (debug_prolly_force_full_fold).
+-- default, one dropped, a type relabeled, the key changed) maps the
+-- baseline's rows to the shape now.  Either way the next commit reads no
+-- table in full, and makes the tree a full fold would
+-- (debug_prolly_force_full_fold).
 CREATE DATABASE regress_shape_folds;
 \c regress_shape_folds
 CREATE EXTENSION test_prolly;
@@ -223,6 +224,77 @@ ALTER TABLE sf.p ADD COLUMN e int DEFAULT 6;
 VACUUM FULL sf.p;
 :check
 RESET debug_prolly_change_finder;
+
+-- A column retyped where the type's cast keeps every value as it is
+-- (Postgres rewrites no row: a length or precision widened, a
+-- binary-coercible type, a domain over it): mapped, each value encoded
+-- as the type now's.  A cast that computes rewrites the table, and its log
+-- says to read it in full: not mapped (the fold can't know what it did).
+CREATE TABLE sf.r (id int PRIMARY KEY, s varchar(10), n numeric(8,2), t text, i int);
+INSERT INTO sf.r SELECT g, 's' || g, g / 7.0, CASE WHEN g % 50 = 0 THEN repeat(md5(g::text), 100) ELSE 't' || g END, g FROM generate_series(1, 1000) g;
+CREATE TABLE sf.rk (code varchar(10) PRIMARY KEY, v int);
+INSERT INTO sf.rk SELECT 'c' || g, 1000 - g FROM generate_series(1, 500) g;
+SELECT length(dolt_commit('-Am', 'retyped')::text) > 0 AS committed;
+ALTER TABLE sf.r ALTER COLUMN s TYPE varchar(20);
+:check
+ALTER TABLE sf.r ALTER COLUMN n TYPE numeric(12,2);
+UPDATE sf.r SET n = 12345.67 WHERE id = 3;
+:check
+-- (values out of line too)
+ALTER TABLE sf.r ALTER COLUMN t TYPE varchar;
+:check
+CREATE DOMAIN sf.anyint AS int;
+ALTER TABLE sf.r ALTER COLUMN i TYPE sf.anyint;
+:check
+-- (a key's column: its keys' order is kept, so they stream in order)
+ALTER TABLE sf.rk ALTER COLUMN code TYPE varchar(20);
+:check
+BEGIN;
+ALTER TABLE sf.rk ALTER COLUMN code TYPE text;
+INSERT INTO sf.rk VALUES ('a much longer code than before', 7);
+UPDATE sf.rk SET v = 0 WHERE code = 'c1';
+COMMIT;
+:check
+-- (a cast that computes, and a USING expression whose cast would keep
+-- the values: rewrites)
+ALTER TABLE sf.r ALTER COLUMN i TYPE bigint;
+:check
+ALTER TABLE sf.r ALTER COLUMN n TYPE numeric(14,2) USING n * 2;
+:check
+
+-- The key changed: the rows mapped are sorted again by the key now, in
+-- maintenance_work_mem, spilling past it, as a full fold's are.
+CREATE TABLE sf.k2 (a int, b text);
+INSERT INTO sf.k2 SELECT 1000 - g, 'k' || g FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'keyless')::text) > 0 AS committed;
+ALTER TABLE sf.k2 ADD PRIMARY KEY (a);
+:check
+ALTER TABLE sf.k2 DROP CONSTRAINT k2_pkey;
+INSERT INTO sf.k2 VALUES (1, 'k1'), (1, 'k1');
+:check
+BEGIN;
+ALTER TABLE sf.rk DROP CONSTRAINT rk_pkey;
+ALTER TABLE sf.rk ADD PRIMARY KEY (v);
+UPDATE sf.rk SET code = 'moved' WHERE v = 999;
+COMMIT;
+:check
+SET maintenance_work_mem = '64kB';
+ALTER TABLE sf.rk DROP CONSTRAINT rk_pkey;
+ALTER TABLE sf.rk ADD PRIMARY KEY (code);
+:check
+RESET maintenance_work_mem;
+-- (rolled back)
+BEGIN;
+ALTER TABLE sf.rk DROP CONSTRAINT rk_pkey;
+ROLLBACK;
+UPDATE sf.rk SET v = 1 WHERE code = 'c2';
+:check
+-- (a row the baseline holds twice can't be a keyed table's, though the
+-- table no longer has both: read in full)
+DELETE FROM sf.k2 WHERE ctid = (SELECT min(ctid) FROM sf.k2 WHERE a = 1 AND b = 'k1');
+DELETE FROM sf.k2 WHERE a = 1 AND b <> 'k1';
+ALTER TABLE sf.k2 ADD PRIMARY KEY (a);
+:check
 
 
 \c contrib_regression

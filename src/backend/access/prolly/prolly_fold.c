@@ -18,6 +18,9 @@
 #include "access/prolly_fold.h"
 #include "access/tableam.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_coerce.h"
 #include "pgstat.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -320,6 +323,7 @@ prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
  * ----------------------------------------------------------------
  */
 
+
 /* How a column of rel's rows now is had from a row as it was folded. */
 typedef enum MapKind
 {
@@ -335,18 +339,74 @@ typedef struct MapColumn
 	bool		isnull;
 } MapColumn;
 
-typedef struct MapCompare
+/* A map in progress: the keyings both ways, and what each pass reuses. */
+typedef struct Map
 {
+	Relation	rel;
 	const ProllyKeyingRoutine *kr;
-	ProllyKeying *k;
-} MapCompare;
+	const ProllyTreeRoutine *tree;
+	ProllyKeying *ok;			/* the rows as folded */
+	ProllyKeying *k;			/* the rows now */
+	bool		keyless;
+	MapColumn  *cols;
+	ProllyTreeEnv oenv;
+	ProllyTreeEnv nenv;
+	ProllyKeyingRefs orefs;
+	ProllyKeyingRefs nrefs;
+	TupleTableSlot *oslot;
+	TupleTableSlot *nslot;
+	MemoryContext rowcxt;
+	int64		rows;
+} Map;
+
+/* How a pass ended. */
+typedef enum MapEnd
+{
+	MAP_DONE,
+	MAP_UNORDERED,				/* keys came out of order: sort them */
+	MAP_FAILED,					/* a row can't be mapped */
+} MapEnd;
 
 static int
 map_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
-	MapCompare *mc = arg;
+	Map		   *m = arg;
 
-	return PROLLY_CALL(mc->kr, compare, mc->k, a, b);
+	return PROLLY_CALL(m->kr, compare, m->k, a, b);
+}
+
+/*
+ * Does a value of type was keep its datum as a value of type now, as
+ * ALTER COLUMN TYPE casts it by default?  When its cast reduces to a
+ * relabeling (a binary-coercible type, a domain over it, a length or
+ * precision only widened, whose support function says so): Postgres
+ * rewrites no row then, so the rows hold the old datums.  (A cast that
+ * computes is a rewrite, whose log entry reads the table in full; and a
+ * USING expression makes one, so the cast here needn't be the one used.
+ * Between timestamp and timestamptz whether a rewrite is made depends on
+ * the session's time zone: not mapped.)
+ */
+static bool
+cast_keeps_datum(Oid was, int32 wastypmod, Oid now, int32 nowtypmod)
+{
+	Node	   *e = (Node *) makeVar(1, 1, was, wastypmod, InvalidOid, 0);
+
+	e = coerce_to_target_type(NULL, e, was, now, nowtypmod,
+							  COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+	if (e == NULL)
+		return false;
+	e = (Node *) expression_planner((Expr *) e);
+	for (;;)
+	{
+		if (IsA(e, Var))
+			return true;
+		else if (IsA(e, RelabelType))
+			e = (Node *) ((RelabelType *) e)->arg;
+		else if (IsA(e, CoerceToDomain))
+			e = (Node *) ((CoerceToDomain *) e)->arg;
+		else
+			return false;
+	}
 }
 
 /*
@@ -379,8 +439,10 @@ map_columns(Relation rel, TupleDesc desc, MapColumn *cols)
 					cols[i].missing = datumCopy(d, now->attbyval, now->attlen);
 			}
 		}
-		else if (was->atttypid == now->atttypid &&
-				 was->atttypmod == now->atttypmod)
+		else if ((was->atttypid == now->atttypid &&
+				  was->atttypmod == now->atttypmod) ||
+				 cast_keeps_datum(was->atttypid, was->atttypmod,
+								  now->atttypid, now->atttypmod))
 			cols[i].kind = MAP_SAME;
 		else
 			return false;
@@ -407,8 +469,7 @@ map_open(Relation rel, const ProllyKeyingRoutine *kr, const ProllyValue *old,
 	*k = PROLLY_CALL(kr, open, rel, cxt);
 	*cols = MemoryContextAlloc(cxt, sizeof(MapColumn) *
 							   Max(RelationGetDescr(rel)->natts, 1));
-	if (PROLLY_CALL(kr, keyless, *ok) != PROLLY_CALL(kr, keyless, *k) ||
-		!map_columns(rel, *odesc, *cols))
+	if (!map_columns(rel, *odesc, *cols))
 	{
 		PROLLY_CALL(kr, close, *ok);
 		PROLLY_CALL(kr, close, *k);
@@ -444,33 +505,21 @@ prolly_fold_mappable(Relation rel, const ProllyValue *old)
 	return mappable;
 }
 
-bool
-prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
-				const ProllyNodeRef *from, const ProllyValue *old,
-				ProllyNodeRef *data, int64 *rows)
+/*
+ * One pass over the baseline's tree from: each row mapped, and built into
+ * *data as it comes (sorted: false), or sorted first (true).  Unsorted, a
+ * key out of order ends it (MAP_UNORDERED); sorted, a keyed table's key
+ * twice fails it, as does a keyless row's copies for a keyed table (the
+ * rows aren't the table's: it can't hold them).
+ */
+static MapEnd
+map_pass(Map *m, const ProllyNodeRef *from, bool sorted, ProllyNodeRef *data)
 {
-	ProllyComponents c;
-	const ProllyKeyingRoutine *kr;
-	const ProllyTreeRoutine *tree;
-	MemoryContext cxt;
-	MemoryContext rowcxt;
-	MemoryContext caller;
-	ProllyKeying *ok;
-	ProllyKeying *k;
-	ProllyKeyingRefs orefs;
-	ProllyKeyingRefs nrefs;
-	ProllyTreeEnv oenv;
-	ProllyTreeEnv nenv;
-	MapCompare	mc;
-	TupleDesc	odesc;
-	TupleDesc	rd = RelationGetDescr(rel);
-	MapColumn  *cols;
-	TupleTableSlot *oslot;
-	TupleTableSlot *nslot;
+	TupleDesc	rd = RelationGetDescr(m->rel);
 	ProllyTreeCursor *cur;
 	ProllyTreeBuilder *b = NULL;
 	Tuplesortstate *sort = NULL;
-	FoldSortArg arg;
+	FoldSortArg arg = {m->kr, m->k};
 	ProllyFullFold done = {0};
 	StringInfoData key;
 	StringInfoData row;
@@ -478,91 +527,56 @@ prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 	StringInfoData prev;
 	ProllyKey	k_in;
 	ProllyValue v_in;
-	bool		keyless;
-	bool		mapped = true;
+	MapEnd		end = MAP_DONE;
 
-	prolly_components_for_relation(rel, &c);
-	kr = c.keying;
-	tree = c.tree;
-	*rows = 0;
-
-	/* what the map makes is let go of when it's done, but the tree */
-	cxt = AllocSetContextCreate(CurrentMemoryContext, "fold map",
-								ALLOCSET_DEFAULT_SIZES);
-	caller = MemoryContextSwitchTo(cxt);
-	if (!map_open(rel, kr, old, cxt, &ok, &k, &odesc, &cols))
-	{
-		MemoryContextSwitchTo(caller);
-		MemoryContextDelete(cxt);
-		return false;
-	}
-	keyless = PROLLY_CALL(kr, keyless, k);
-
-	/*
-	 * Rows read as folded, their long values as the trees they are (hash
-	 * pointers, not read), and encoded as the keying encodes them now.
-	 */
-	oenv = *env;
-	prolly_keying_use_env(&orefs, kr, ok, tree, &oenv);
-	orefs.values.pointers = true;
-	nenv = *env;
-	mc.kr = kr;
-	mc.k = k;
-	nenv.compare = map_compare;
-	nenv.compare_arg = &mc;
-	prolly_keying_use_env(&nrefs, kr, k, tree, &nenv);
-	oslot = MakeSingleTupleTableSlot(odesc, &TTSOpsVirtual);
-	nslot = MakeSingleTupleTableSlot(rd, &TTSOpsVirtual);
-	rowcxt = AllocSetContextCreate(cxt, "fold map row", ALLOCSET_DEFAULT_SIZES);
 	initStringInfo(&key);
 	initStringInfo(&row);
 	initStringInfo(&value);
 	initStringInfo(&prev);
-
-	/* (a keyless row's key is its bytes: sorted again, copies merged) */
-	if (keyless)
-	{
-		arg.kr = kr;
-		arg.k = k;
+	m->rows = 0;
+	if (sorted)
 		sort = fold_sort_begin(&arg);
-	}
 	else
-		b = PROLLY_CALL(tree, build_begin, &nenv, cxt);
-	cur = PROLLY_CALL(tree, cursor_open, &oenv, from, cxt);
-	PROLLY_CALL(tree, cursor_seek, cur, NULL, ForwardScanDirection);
-	while (mapped && PROLLY_CALL(tree, cursor_next, cur, &k_in, &v_in))
+		b = PROLLY_CALL(m->tree, build_begin, &m->nenv, CurrentMemoryContext);
+	cur = PROLLY_CALL(m->tree, cursor_open, &m->oenv, from, CurrentMemoryContext);
+	PROLLY_CALL(m->tree, cursor_seek, cur, NULL, ForwardScanDirection);
+	while (end == MAP_DONE &&
+		   PROLLY_CALL(m->tree, cursor_next, cur, &k_in, &v_in))
 	{
+		MemoryContext old;
 		ProllyValue r;
 		uint64		count;
 		ProllyHash	content;
 
-		MemoryContextReset(rowcxt);
-		MemoryContextSwitchTo(rowcxt);
-		PROLLY_CALL(kr, parse_value, ok, &v_in, &r, &count);
-		PROLLY_CALL(kr, decode_row, ok, &r, oslot);
-		slot_getallattrs(oslot);
-		ExecClearTuple(nslot);
+		MemoryContextReset(m->rowcxt);
+		old = MemoryContextSwitchTo(m->rowcxt);
+		PROLLY_CALL(m->kr, parse_value, m->ok, &v_in, &r, &count);
+		PROLLY_CALL(m->kr, decode_row, m->ok, &r, m->oslot);
+		slot_getallattrs(m->oslot);
+		ExecClearTuple(m->nslot);
 		for (int i = 0; i < rd->natts; i++)
 		{
-			nslot->tts_values[i] = (Datum) 0;
-			nslot->tts_isnull[i] = true;
-			if (cols[i].kind == MAP_SAME)
+			m->nslot->tts_values[i] = (Datum) 0;
+			m->nslot->tts_isnull[i] = true;
+			if (m->cols[i].kind == MAP_SAME)
 			{
-				nslot->tts_values[i] = oslot->tts_values[i];
-				nslot->tts_isnull[i] = oslot->tts_isnull[i];
+				m->nslot->tts_values[i] = m->oslot->tts_values[i];
+				m->nslot->tts_isnull[i] = m->oslot->tts_isnull[i];
 			}
-			else if (cols[i].kind == MAP_MISSING)
+			else if (m->cols[i].kind == MAP_MISSING)
 			{
-				nslot->tts_values[i] = cols[i].missing;
-				nslot->tts_isnull[i] = cols[i].isnull;
+				m->nslot->tts_values[i] = m->cols[i].missing;
+				m->nslot->tts_isnull[i] = m->cols[i].isnull;
 			}
 		}
-		ExecStoreVirtualTuple(nslot);
+		ExecStoreVirtualTuple(m->nslot);
 		resetStringInfo(&key);
 		resetStringInfo(&row);
-		PROLLY_CALL(kr, encode_row, k, nslot, &key, &row, &content);
-		MemoryContextSwitchTo(cxt);
-		if (keyless)
+		PROLLY_CALL(m->kr, encode_row, m->k, m->nslot, &key, &row, &content);
+		MemoryContextSwitchTo(old);
+		if (count > 1 && !m->keyless)
+			end = MAP_FAILED;
+		else if (sorted)
 			fold_sort_put(sort, &key, &row, count);
 		else
 		{
@@ -571,39 +585,105 @@ prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 			ProllyValue nv;
 			ProllyValue nr = {(const uint8 *) row.data, row.len};
 
-			/* (keys in another order now: the key changed, not mapped so) */
-			if (*rows > 0 && PROLLY_CALL(kr, compare, k, &pk, &nk) >= 0)
+			if (m->rows > 0 && PROLLY_CALL(m->kr, compare, m->k, &pk, &nk) >= 0)
+				end = MAP_UNORDERED;
+			else
 			{
-				mapped = false;
-				break;
+				resetStringInfo(&value);
+				PROLLY_CALL(m->kr, make_value, m->k, &nr, 1, &value);
+				nv.data = (const uint8 *) value.data;
+				nv.len = value.len;
+				PROLLY_CALL(m->tree, build_add, b, &nk, &nv);
+				resetStringInfo(&prev);
+				appendBinaryStringInfo(&prev, key.data, key.len);
 			}
-			resetStringInfo(&value);
-			PROLLY_CALL(kr, make_value, k, &nr, 1, &value);
-			nv.data = (const uint8 *) value.data;
-			nv.len = value.len;
-			PROLLY_CALL(tree, build_add, b, &nk, &nv);
-			resetStringInfo(&prev);
-			appendBinaryStringInfo(&prev, key.data, key.len);
 		}
-		(*rows)++;
+		m->rows++;
 		CHECK_FOR_INTERRUPTS();
 	}
-	MemoryContextSwitchTo(cxt);
-	PROLLY_CALL(tree, cursor_close, cur);
-	if (keyless)
+	PROLLY_CALL(m->tree, cursor_close, cur);
+	if (sorted)
 	{
-		mapped = fold_sort_build(sort, kr, k, true, tree, &nenv, data, &done);
+		if (end == MAP_DONE &&
+			!fold_sort_build(sort, m->kr, m->k, m->keyless, m->tree, &m->nenv,
+							 data, &done))
+			end = MAP_FAILED;
 		tuplesort_end(sort);
 	}
 	else
-		PROLLY_CALL(tree, build_finish, b, data);
-	ExecDropSingleTupleTableSlot(oslot);
-	ExecDropSingleTupleTableSlot(nslot);
-	PROLLY_CALL(kr, close, ok);
-	PROLLY_CALL(kr, close, k);
+		PROLLY_CALL(m->tree, build_finish, b, data);
+	pfree(key.data);
+	pfree(row.data);
+	pfree(value.data);
+	pfree(prev.data);
+	return end;
+}
+
+bool
+prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
+				const ProllyNodeRef *from, const ProllyValue *old,
+				ProllyNodeRef *data, int64 *rows)
+{
+	ProllyComponents c;
+	MemoryContext cxt;
+	MemoryContext caller;
+	TupleDesc	odesc;
+	TupleDesc	rd = RelationGetDescr(rel);
+	Map			m = {0};
+	MapEnd		end;
+
+	prolly_components_for_relation(rel, &c);
+	*rows = 0;
+
+	/* what the map makes is let go of when it's done, but the tree */
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "fold map",
+								ALLOCSET_DEFAULT_SIZES);
+	caller = MemoryContextSwitchTo(cxt);
+	m.rel = rel;
+	m.kr = c.keying;
+	m.tree = c.tree;
+	if (!map_open(rel, m.kr, old, cxt, &m.ok, &m.k, &odesc, &m.cols))
+	{
+		MemoryContextSwitchTo(caller);
+		MemoryContextDelete(cxt);
+		return false;
+	}
+	m.keyless = PROLLY_CALL(m.kr, keyless, m.k);
+
+	/*
+	 * Rows read as folded, their long values as the trees they are (hash
+	 * pointers, not read), and encoded as the keying encodes them now.
+	 */
+	m.oenv = *env;
+	prolly_keying_use_env(&m.orefs, m.kr, m.ok, m.tree, &m.oenv);
+	m.orefs.values.pointers = true;
+	m.nenv = *env;
+	m.nenv.compare = map_compare;
+	m.nenv.compare_arg = &m;
+	prolly_keying_use_env(&m.nrefs, m.kr, m.k, m.tree, &m.nenv);
+	m.oslot = MakeSingleTupleTableSlot(odesc, &TTSOpsVirtual);
+	m.nslot = MakeSingleTupleTableSlot(rd, &TTSOpsVirtual);
+	m.rowcxt = AllocSetContextCreate(cxt, "fold map row", ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * A keyless row's key is its bytes, and a table keyed otherwise than
+	 * its rows were folded orders them otherwise: sorted again.  Else in the
+	 * baseline's order, unless a key comes out of order (a key column's
+	 * collation changed, say): then sorted.
+	 */
+	end = map_pass(&m, from,
+				   m.keyless || PROLLY_CALL(m.kr, keyless, m.ok) != m.keyless,
+				   data);
+	if (end == MAP_UNORDERED)
+		end = map_pass(&m, from, true, data);
+	*rows = m.rows;
+	ExecDropSingleTupleTableSlot(m.oslot);
+	ExecDropSingleTupleTableSlot(m.nslot);
+	PROLLY_CALL(m.kr, close, m.ok);
+	PROLLY_CALL(m.kr, close, m.k);
 	MemoryContextSwitchTo(caller);
 	MemoryContextDelete(cxt);
-	return mapped;
+	return end == MAP_DONE;
 }
 
 bool

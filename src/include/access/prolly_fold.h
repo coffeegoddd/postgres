@@ -11,9 +11,10 @@
  * and logs it (prolly.log_full_folds) when it read enough rows to matter.
  *
  * A baseline folded under another row shape (DDL that changed rows' bytes
- * without writing them: a column added with a default, one dropped) is
- * mapped to the shape now from its own rows (prolly_fold_map()), not from
- * the table's, and folded from as any baseline is.
+ * without writing them: a column added with a default, one dropped, a type
+ * relabeled, the key changed) is mapped to the shape now from its own rows
+ * (prolly_fold_map()), not from the table's, and folded from as any
+ * baseline is.
  *
  * src/include/access/prolly_fold.h
  *
@@ -144,12 +145,14 @@ extern void prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
  * (rel's keying's row_shape() then), mapped to rel's rows as they are now
  * into *data, without reading the table: each row read as it was folded
  * (the keying's open_shape()), given rel's columns now (those dropped
- * since left out, those added since their missing value, or NULL), and
- * encoded and keyed as rel's are, in key order (a keyless table's rows
- * sorted again, in maintenance_work_mem, spilling past it, their copies
- * merged).  *rows gets how many rows were read.  False, *data unset, if
- * they can't be mapped so: the keying reads no rows of old, a column's
- * type changed, or keys come out in another order (the key changed).
+ * since left out, those added since their missing value, or NULL, those
+ * retyped since their datums, where the type's cast keeps them), and
+ * encoded and keyed as rel's are, in key order: sorted again, in
+ * maintenance_work_mem, spilling past it, if the key changed (keyless
+ * rows, whose key is their bytes, copies merged).  *rows gets how many
+ * rows were read.  False, *data unset, if they can't be mapped so: the
+ * keying reads no rows of old, a column's type changed by a cast that
+ * computes (a rewrite), or the rows can't be the table's (a key twice).
  */
 extern bool prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 							const ProllyNodeRef *from, const ProllyValue *old,

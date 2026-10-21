@@ -263,19 +263,53 @@ Two interfaces, each selected by the table AM's profile
   heap page is read and, for a keyed table, nothing sorted; it is
   counted in `pg_stat_prolly` (`fold_mapped_tables`). The bytes are what
   the rows encode to now: never a "lazy default" that would make them
-  depend on the DDL's history. It isn't mapped, and the table is read in
-  full, when a type changed, the key changed (keys come out in another
-  order), a type a column had is defined otherwise now (a label renamed),
-  or the encoders changed. What can be told without reading rows (all
-  but the key's order) is checked before the finder runs, which then has
-  no baseline. The map itself is made by the finder
-  (`prolly_table_fold_data()`), only once it will fold from the
-  baseline: a fold that gives up on it (forced, the log saying to read
-  the table in full after a rewrite, a rewrite's new storage, or more
-  changes than `maintenance_work_mem` or the table's rows) reads the table
-  in full and maps nothing, so a commit never pays for both. The finder
-  "pages" folds from a mapped baseline too, unless its state carries keys,
-  which are rows of the old shape (`reshaped`).
+  depend on the DDL's history. The finder "pages" folds from a mapped
+  baseline too, unless its state carries keys, which are rows of the old
+  shape (`reshaped`).
+
+  `ALTER COLUMN TYPE` and a changed primary key map the same way (#510):
+  - **A type whose cast keeps every value** (Postgres rewrites no row:
+    the default assignment cast reduces to a relabeling, as a length or
+    a precision widened, `varchar` to `text`, a type to a domain over
+    it): each value is read with its type then and encoded with the
+    type's now. Whether a cast keeps the values is asked of the cast
+    itself at the fold (`cast_keeps_datum()`), never of how the DDL was
+    written: a `USING` expression, or a cast that computes, makes a
+    rewrite, whose "fold in full" entry the fold reads first, and maps
+    nothing. A chain of such retypes keeps the values too, and a direct
+    cast that computes isn't mapped.
+  - **A key changed** (a primary key added, dropped or moved, a key
+    column retyped or recollated): the rows mapped are sorted again by
+    the key now, with a full fold's bounded sort; a keyed table's rows in
+    the baseline's order are built as they come, and sorted only once a
+    key comes out of order. A row the baseline holds twice (a keyless
+    table's copies) can't be a keyed table's: read in full. The log's
+    entries written under the old key are a key's columns that may not be
+    the new key's (then null: the finder reads in full, as it did) or a
+    keyless row's whole image (its key now a candidate).
+  - **Kept in full**: a cast that computes (`int` to `bigint`, a
+    numeric's scale changed, a `USING` expression), which rewrites the
+    table. Mapping it would need what the rewrite did, which nothing
+    records past the DDL (the expression, and that it was the only one
+    since the baseline: two casts in a row needn't be one, as
+    `numeric(10,2)` to `numeric(10,0)` and back), and baseline rows the
+    table no longer holds could make the cast fail at the commit. It
+    could be done at the DDL, from the rewrite's own expressions, or by
+    recording them; until then such a commit reads the table in full,
+    with the bounded sort.
+
+  It isn't mapped, and the table is read in full, when a type a column
+  had is defined otherwise now (a label renamed), the encoders changed, a
+  full fold is forced, or the log says to read the table in full anyway
+  (a rewrite that changed rows: a volatile default, a computing cast).
+  What can be told without reading rows (all but the keys' order) is
+  checked before the finder runs, which then has no baseline. The map
+  itself is made by the finder (`prolly_table_fold_data()`), only once
+  it will fold from the baseline: a fold that gives up on it (forced, the
+  log saying to read the table in full after a rewrite, a rewrite's new
+  storage, or more changes than `maintenance_work_mem` or the table's
+  rows) reads the table in full and maps nothing, so a commit never pays
+  for both.
 - **A verifier** (`fold_verify.c`, #513) folds tables from their
   baselines and in full by one snapshot, at `prolly.fold_verify_rate` in
   autovacuum or by `dolt_verify_folds()`: a mismatch is warned of,
