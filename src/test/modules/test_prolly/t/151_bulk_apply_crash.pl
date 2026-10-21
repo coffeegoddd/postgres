@@ -91,7 +91,8 @@ checkpoint_timeout = '1h'
 			WHERE wait_event = 'prolly-insert-many'})
 		  or die 'the move did not wait';
 		$crash->();
-		$s->quit;
+		# (its psql may be gone with the server: writing it \q then fails)
+		eval { $s->quit; };
 	};
 
 	# Into tables that were there.
