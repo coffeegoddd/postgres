@@ -590,6 +590,8 @@ with_relnumber(RelFileLocator rel, RelFileNumber relnumber)
 	return loc;
 }
 
+static void sync_store_later(RelFileLocator rel);
+
 static SMgrRelation
 store_smgr(RelFileLocator rel)
 {
@@ -3790,8 +3792,9 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
  * Make 'dst', a new relation file number in the same tablespace and
  * database, a copy of 'src' that shares its blocks: dst's map holds src's
  * entries, and its changes list src's, each block's count grows by one,
- * and both maps' epochs pass the entries' births.  src's dirty buffers are written and the page store
- * synced, so the blocks hold what both copies start from.
+ * and both maps' epochs pass the entries' births.  src's dirty buffers are
+ * written, so the blocks hold what both copies start from; the page store is
+ * synced by bmapsyncshares(), at the latest when the transaction commits.
  *
  * The caller keeps src from changing meanwhile (a lock that waits for its
  * writers): a change made to one of src's buffers before the epochs are
@@ -3900,10 +3903,57 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 * whatever map pages are on disk, which may already send them to the
 	 * blocks src moved to later.  A page src changes from here on is copied
 	 * first, its old contents written to the shared block if they were only
-	 * in its buffer.
+	 * in its buffer.  So only the sync waits for src to be let change again:
+	 * the blocks hold what dst starts from either way, and it only has to
+	 * be durable by the time dst is, at commit (bmapsyncshares()).
 	 */
 	FlushRelationsAllBuffers(&src, 1);
-	mdimmedsync(store_smgr(srel), MAIN_FORKNUM);
+	sync_store_later(srel);
+}
+
+/*
+ * The page stores (tablespace and database) that shares made since the last
+ * bmapsyncshares() wrote blocks of, to sync: each once, however many
+ * relations of it were shared.
+ */
+static RelFileLocator *unsynced_stores = NULL;
+static int	n_unsynced_stores = 0;
+static int	max_unsynced_stores = 0;
+
+static void
+sync_store_later(RelFileLocator rel)
+{
+	for (int i = 0; i < n_unsynced_stores; i++)
+		if (unsynced_stores[i].spcOid == rel.spcOid &&
+			unsynced_stores[i].dbOid == rel.dbOid)
+			return;
+	if (n_unsynced_stores == max_unsynced_stores)
+	{
+		max_unsynced_stores = max_unsynced_stores ? max_unsynced_stores * 2 : 4;
+		unsynced_stores = unsynced_stores
+			? repalloc_array(unsynced_stores, RelFileLocator, max_unsynced_stores)
+			: MemoryContextAlloc(TopMemoryContext,
+								 max_unsynced_stores * sizeof(RelFileLocator));
+	}
+	unsynced_stores[n_unsynced_stores++] = rel;
+}
+
+/*
+ * Sync the page stores this transaction's shares wrote blocks of (or, at
+ * abort, forget them: the copies are dropped, their blocks src's alone).
+ */
+void
+bmapsyncshares(bool isCommit)
+{
+	if (isCommit)
+		while (n_unsynced_stores > 0)
+		{
+			INJECTION_POINT("bmap-sync-shares", NULL);
+			mdimmedsync(store_smgr(unsynced_stores[n_unsynced_stores - 1]),
+						MAIN_FORKNUM);
+			n_unsynced_stores--;
+		}
+	n_unsynced_stores = 0;
 }
 
 /* ----------------------------------------------------------------

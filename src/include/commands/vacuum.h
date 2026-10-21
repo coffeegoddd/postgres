@@ -295,6 +295,13 @@ struct VacuumCutoffs
 	 */
 	TransactionId FreezeLimit;
 	MultiXactId MultiXactCutoff;
+
+	/*
+	 * Should a normal VACUUM scan every all-visible page that isn't
+	 * all-frozen, to freeze it (rather than eagerly scanning some)?  Set for
+	 * storage that shares pages, whose freeze age then defaults to 0.
+	 */
+	bool		freeze_all_visible;
 };
 
 /*

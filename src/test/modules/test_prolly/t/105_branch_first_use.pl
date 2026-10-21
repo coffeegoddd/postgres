@@ -84,12 +84,13 @@ sub refused_then_retried
 	return;
 }
 
+# (a first use tries its locks again until it gets them, not queued)
 sub wait_for_lock
 {
 	my ($query) = @_;
 	return $node->poll_query_until('postgres', qq{
-		SELECT count(*) > 0 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-		WHERE NOT l.granted AND a.query LIKE '%$query%'});
+		SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'BranchCopyLock' AND query LIKE '%$query%'});
 }
 
 # Repeatable read: another session commits after the snapshot.  The
@@ -262,7 +263,7 @@ sql(q{ALTER ROLE CURRENT_USER SET default_transaction_isolation = 'repeatable re
 $writer->query_safe(q{BEGIN; INSERT INTO app.t VALUES (103, 103)});
 my $conn = $node->background_psql('postgres/conn', wait => 0);
 ok($node->poll_query_until('postgres', q{
-	SELECT count(*) > 0 FROM pg_locks WHERE NOT granted}),
+	SELECT count(*) > 0 FROM pg_stat_activity WHERE wait_event = 'BranchCopyLock'}),
 	'a connection\'s first use waits for the writer');
 $writer->query_safe('COMMIT');
 $conn->wait_connect;
