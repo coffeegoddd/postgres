@@ -382,6 +382,18 @@ reads has changed since one made before (`refs_generations.c`, the
   (nothing is told of a prepared one's commit), in recovery (nor of a
   replayed one's), or with `debug_prolly_force_full_fold` or the fold
   verifier's folds. Nothing survives a restart.
+- **No fold around moves.** A move (`move_settled()`: a hard reset, a
+  fast-forward, a merge's or pick's move, a pull) takes the working set
+  known instead of folding it, and returns at once if it is the target. A
+  checkout compares the working set known of the branch it leaves with
+  its head's and its baseline's root, and folds nothing if either; one not
+  known is folded once, as the checkpoint, under the refs (it was folded
+  twice, to compare and then to checkpoint), and the checkpoint kept even
+  when clean, since its fold took its log's entries. Setting the baseline
+  to a move's target instead of folding again after `move_to()` (when the
+  log holds only the move's entries) isn't done: the next baseline holds
+  each table's change finder state, which only the finder makes, so it
+  waits for a generation per change log (#481).
 - **Checked.** `debug_prolly_verify_fold_caches` folds again each working
   set taken and errors if the two differ; test_prolly's regression suite
   runs with it on (`test_prolly.conf`). `pg_stat_prolly` counts each one
