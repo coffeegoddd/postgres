@@ -99,8 +99,9 @@ INSERT INTO cl.keyless
 SELECT 3, string_agg(md5(g::text), '') FROM generate_series(1, 300) g;
 SELECT * FROM pg_temp.entries('cl.keyless');
 
--- A truncation changes rows no entry names, made anew or (storage the
--- transaction made) in place, and so does a rewrite: read in full.
+-- A truncation, made anew or (storage the transaction made) in place, says
+-- the table was emptied (an entry of no row, its others kept: truncate_folds);
+-- a rewrite changes rows no entry names: read in full.
 BEGIN;
 TRUNCATE cl.keyed;
 INSERT INTO cl.keyed VALUES (9, 'i');

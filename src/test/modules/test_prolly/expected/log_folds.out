@@ -552,7 +552,7 @@ COMMIT;
 SELECT * FROM pg_temp.fold();
  pages | candidates | full_tables | same_as_full 
 -------+------------+-------------+--------------
-     0 |          0 |           1 | t
+     0 |          0 |           0 | t
 (1 row)
 
 SELECT table_name, status FROM dolt_status;
@@ -614,7 +614,7 @@ COMMIT;
 SELECT * FROM pg_temp.fold();
  pages | candidates | full_tables | same_as_full 
 -------+------------+-------------+--------------
-     0 |          0 |           1 | t
+     0 |         10 |           0 | t
 (1 row)
 
 SELECT count(*), min(v), max(v) FROM inc.made;

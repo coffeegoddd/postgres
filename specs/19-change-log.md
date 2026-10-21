@@ -90,11 +90,24 @@ Two interfaces, each selected by the table AM's profile
   A keyless version with a value out of line otherwise (not a versioned
   table's), or either image too large for the log's page (a key's compressed values needn't be as
   its index holds them), is recorded as "fold in full" instead (no
-  image). So is a truncation (made anew or in place) and a rewrite that
-  may change rows (`ALTER TABLE`'s heap swap, a materialized view's
-  refresh, `REPACK CONCURRENTLY`), which change rows without a write to
-  note. `CLUSTER` and `VACUUM FULL` change none: entries name rows by
-  key or image, so they still hold (#485).
+  image). So is a rewrite that may change rows (`ALTER TABLE`'s heap
+  swap, a materialized view's refresh, `REPACK CONCURRENTLY`), which
+  changes rows without a write to note. `CLUSTER` and `VACUUM FULL`
+  change none: entries name rows by key or image, so they still hold
+  (#485).
+- **A truncation** (made anew or in place) is noted as "emptied", an
+  entry of no row in its (sub)transaction's buffer, written first in its
+  row; the transaction's other entries stay, of before and after (#507).
+  A fold of a keyed table that reads it starts from the empty tree, not
+  the baseline: each key the entries since the position name, before the
+  truncation or after, is a candidate looked up in the heap, finding
+  what came after or nothing; no ordering among the transaction's
+  entries is needed. A keyless table's counts can't be told apart so,
+  and it is read in full (as many rows as were written since). A
+  subtransaction rolled back drops it with its buffer; one released
+  hands it to its parent. A snapshot that doesn't see the truncation
+  (`read_unseen` meets it) reads the table in full, and a transaction's
+  commit doesn't advance a baseline past one.
 - **Written unseen:** a branch's first use under repeatable read asks
   each table's log whether a transaction its snapshot doesn't see wrote
   an entry: by the index, the rows of transactions from the snapshot's

@@ -106,7 +106,7 @@ SELECT * FROM full_folds();
  shape_changed | 1
 (1 row)
 
--- truncated and filled again: the log's entry says to
+-- truncated and filled again: not in full, from no rows (truncate_folds)
 :reset
  pg_stat_force_next_flush 
 --------------------------
@@ -133,10 +133,9 @@ SELECT length(dolt_commit('-am', 'reloaded')::text) AS committed;
 (1 row)
 
 SELECT * FROM full_folds();
-  reason   | n 
------------+---
- log_entry | 1
-(1 row)
+ reason | n 
+--------+---
+(0 rows)
 
 -- forced (logged, past prolly.log_full_folds rows: t/127_full_fold_log)
 :reset

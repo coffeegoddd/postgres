@@ -94,6 +94,8 @@
 
 /* An entry's length that says to read the table in full. */
 #define FULL_LEN			0xFFFFFFFF
+/* ... that says the table was emptied by the row's transaction (#507). */
+#define EMPTIED_LEN			0xFFFFFFFE
 
 /*
  * The most a row's packed entries hold: a log tuple (its header, the
@@ -413,6 +415,7 @@ typedef struct LogBuffer
 	MemoryContext cxt;			/* the entries and their images */
 	Size		bytes;			/* their packed size */
 	bool		full;			/* one says to read the table in full */
+	bool		emptied;		/* the table was emptied (truncated) */
 } LogBuffer;
 
 /* An ancestor's entries a subtransaction wrote, kept till it ends. */
@@ -475,6 +478,7 @@ buffer_init(LogBuffer *b)
 							 HASH_CONTEXT);
 	b->bytes = 0;
 	b->full = false;
+	b->emptied = false;
 }
 
 /* Add an entry to a buffer. */
@@ -512,6 +516,7 @@ buffer_merge(LogBuffer *dst, const LogBuffer *src)
 	while ((be = hash_seq_search(&seq)) != NULL)
 		buffer_add(dst, be->key.data, be->key.len, be->delta, be->row);
 	dst->full = dst->full || src->full;
+	dst->emptied = dst->emptied || src->emptied;
 }
 
 /* The buffer of a log for a (sub)transaction, made if need be. */
@@ -742,13 +747,14 @@ static void
 pack_entry(Relation log, Relation index, IndexInfo *ii, StringInfo packed,
 		   int32 delta, uint32 len, const char *data)
 {
-	uint32		need = 2 * sizeof(uint32) + (len == FULL_LEN ? 0 : len);
+	uint32		need = 2 * sizeof(uint32) +
+		(len == FULL_LEN || len == EMPTIED_LEN ? 0 : len);
 
 	if (packed->len > 0 && packed->len + need > MAX_ROW_ENTRIES)
 		insert_row_packed(log, index, ii, packed);
 	appendBinaryStringInfo(packed, (const char *) &delta, sizeof(delta));
 	appendBinaryStringInfo(packed, (const char *) &len, sizeof(len));
-	if (len != FULL_LEN)
+	if (len != FULL_LEN && len != EMPTIED_LEN)
 		appendBinaryStringInfo(packed, data, len);
 }
 
@@ -768,7 +774,7 @@ flush_buffer(LogBuffer *b)
 	SubTransactionId current = GetCurrentSubTransactionId();
 	BufTag		tag = b->tag;
 
-	if (hash_get_num_entries(b->entries) == 0 && !b->full)
+	if (hash_get_num_entries(b->entries) == 0 && !b->full && !b->emptied)
 		return;
 	/* (a log gone since, with its table: its entries are of nothing) */
 	log = try_table_open(tag.logid, RowExclusiveLock);
@@ -785,6 +791,8 @@ flush_buffer(LogBuffer *b)
 	{
 		if (b->full)
 			pack_entry(log, index, ii, &packed, 0, FULL_LEN, NULL);
+		if (b->emptied)
+			pack_entry(log, index, ii, &packed, 0, EMPTIED_LEN, NULL);
 		hash_seq_init(&seq, b->entries);
 		while ((be = hash_seq_search(&seq)) != NULL)
 		{
@@ -800,7 +808,8 @@ flush_buffer(LogBuffer *b)
 	pfree(packed.data);
 	index_close(index, NoLock);
 	table_close(log, NoLock);
-	if (b->full)
+	/* (a transaction's commit doesn't advance a baseline past either) */
+	if (b->full || b->emptied)
 		own_full(tag.logid);
 
 	if (tag.subid != current && GetCurrentTransactionNestLevel() > 1)
@@ -838,7 +847,7 @@ flush_logs(Oid logid)
 			some = lappend(some, b);
 	foreach_ptr(LogBuffer, one, some)
 	{
-		if (hash_get_num_entries(one->entries) > 0 || one->full)
+		if (hash_get_num_entries(one->entries) > 0 || one->full || one->emptied)
 			any = true;
 		flush_buffer(one);
 	}
@@ -1042,6 +1051,21 @@ relation_note(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
 	note_write(rel, oldtid, oldtup, newtid, NULL, 0);
 }
 
+/*
+ * The table emptied: its other entries the transaction holds stay (they
+ * are of keys a fold looks up, finding none or what came after).
+ */
+static void
+relation_note_emptied(Relation rel)
+{
+	Oid			logid = log_relid(rel);
+
+	if (!OidIsValid(logid))
+		return;
+	register_callbacks();
+	buffer_of(logid, GetCurrentSubTransactionId())->emptied = true;
+}
+
 /* (the versions made are heap's: they aren't read again from their pages) */
 static void
 relation_note_made(Relation rel, const ItemPointerData *oldtid,
@@ -1089,6 +1113,12 @@ visit_row(Relation rel, HeapTuple tup, TupleDesc desc,
 		p += 2 * sizeof(uint32);
 		if (len == FULL_LEN)
 			return false;		/* read the table in full */
+		if (len == EMPTIED_LEN)
+		{
+			if (!visit(NULL, 0, arg))
+				return false;
+			continue;
+		}
 		if (len > (uint32) (end - p))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -1682,7 +1712,7 @@ relation_consume_own(Relation rel, const ProllyLogPosition *since,
 				mine = lappend(mine, b);
 	}
 	foreach_ptr(LogBuffer, one, mine)
-		if (one->full)
+		if (one->full || one->emptied)
 			return false;
 	log = table_open(logid, RowExclusiveLock);
 	(void) others_since(log, since, rest, &told);
@@ -1742,5 +1772,6 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.consume_own = relation_consume_own,
 	.written_unseen = relation_written_unseen,
 	.read_unseen = relation_read_unseen,
+	.note_emptied = relation_note_emptied,
 	.flush = flush_all,
 };

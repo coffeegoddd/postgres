@@ -36,6 +36,10 @@
  *   version at oldtid in hand (the writer still has its page pinned), so it
  *   needn't be read again.  It ignores relations that aren't prolly tables
  *   with a log.  Errors are the write's.
+ * - note_emptied() (optional) is told rel was emptied (truncated) by the
+ *   (sub)transaction: a fold that sees it starts from no rows, the writes
+ *   after it applied.  Without it, note() is told every row may have
+ *   changed.
  * - note_made() is note() told of the versions a write made in hand
  *   (nmade of them, each as heap stored it, its TID in t_self) and of the
  *   one it replaced, if any (oldtid): an insertion of many rows is noted at
@@ -47,7 +51,9 @@
  *   are known to still be there.
  * - read() visits the entries of rel's log the snapshot sees and the
  *   position since doesn't hold (NULL: every one), in no particular order:
- *   a visit returns false to stop.  False if rel has no log, an entry says
+ *   a visit returns false to stop.  An entry NULL says the table was
+ *   emptied (truncated) by its transaction: a visit takes its other
+ *   entries, of before and after, as rows to look up, not to apply.  False if rel has no log, an entry says
  *   to read the table in full, or a visit stopped.  The transaction's own
  *   entries are among them.  An entry is read whether or not a fold since
  *   consumed it: since may be an older snapshot's fold's, which didn't.
@@ -160,14 +166,15 @@ typedef struct ProllyChangeLogRoutine
 								ProllyChangeLogVisit visit, void *arg,
 								bool *consumed);
 	void		(*flush) (void);
+	void		(*note_emptied) (Relation rel);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", \
 	"relid", "note_made", "consume_own", "written_unseen", "read_unseen", \
-	"flush"
+	"flush", "note_emptied"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK flush
+#define PROLLY_CHANGELOG_LAST_CALLBACK note_emptied
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

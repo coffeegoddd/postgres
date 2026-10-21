@@ -36,7 +36,7 @@ SELECT length(dolt_commit('-am', 'w added')::text) AS committed;
 :flush
 SELECT * FROM full_folds();
 
--- truncated and filled again: the log's entry says to
+-- truncated and filled again: not in full, from no rows (truncate_folds)
 :reset
 TRUNCATE ff.t;
 INSERT INTO ff.t SELECT g, 'again', 1 FROM generate_series(1, 500) g;

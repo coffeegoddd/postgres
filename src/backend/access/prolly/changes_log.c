@@ -166,6 +166,7 @@ typedef struct Finder
 	Size		bytes;			/* what the copies take */
 	bool		give_up;
 	bool		unsettled;		/* undid rows its position can't find again */
+	bool		emptied;		/* an entry's transaction emptied the table */
 	ProllyFullFoldReason reason;	/* why, once it gives up */
 	StringInfoData key;			/* reused for each encoding */
 	StringInfoData row;
@@ -563,6 +564,23 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 {
 	Finder	   *f = arg;
 
+	/*
+	 * (the table emptied: with a key, the fold starts from no rows, each key
+	 * read a candidate, before or after, looked up in the heap; without,
+	 * the counts can't be told apart, and it reads the table in full, as
+	 * many rows as were written since)
+	 */
+	if (entry == NULL)
+	{
+		if (f->keyless)
+		{
+			f->give_up = true;
+			f->reason = PROLLY_FULL_LOG_ENTRY;
+			return false;
+		}
+		f->emptied = true;
+		return true;
+	}
 	if (f->keyless)
 	{
 		/* (a key's entry: the table was keyed when it was written) */
@@ -943,6 +961,15 @@ fold_all(Finder *f, ProllyNodeRef *data)
 static bool
 entry_unseen_visit(HeapTuple entry, int32 delta, void *arg)
 {
+	Finder	   *f = arg;
+
+	/* (an emptying it doesn't see: the rows before aren't in the log) */
+	if (entry == NULL)
+	{
+		f->give_up = true;
+		f->reason = PROLLY_FULL_LOG_ENTRY;
+		return false;
+	}
 	return entry_visit(entry, -delta, arg);
 }
 
@@ -987,6 +1014,16 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	if (f->give_up)
 		return false;
 	compact_copies(f);
+	if (!f->keyless && f->emptied)
+	{
+		ProllyTableFold empty = *baseline;
+		ProllyTreeBuilder *b = PROLLY_CALL(f->tree, build_begin, &f->env,
+										   CurrentMemoryContext);
+
+		PROLLY_CALL(f->tree, build_finish, b, &empty.data);
+		fold_keys(f, &empty, data);
+		return true;
+	}
 	if (!f->keyless)
 	{
 		fold_keys(f, baseline, data);
