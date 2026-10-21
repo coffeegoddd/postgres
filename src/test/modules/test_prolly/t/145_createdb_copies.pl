@@ -148,4 +148,40 @@ is($node->safe_psql('c7', $reads), '150 of 150', 'and the copy reads');
 $node->wait_for_catchup($standby);
 is($standby->safe_psql('c7', $reads), '150 of 150', 'on the standby too');
 
+# A template whose segments end in zeros the WAL never had, as a crash
+# leaves a range reserved for an append: the standby's copy of the
+# template ends before them, so they are logged as bytes, not as copies,
+# whatever the strategy.
+template('tpl3');
+my $tpl3 = $node->safe_psql('postgres',
+	q{SELECT oid FROM pg_database WHERE datname = 'tpl3'});
+$node->wait_for_catchup($standby);
+my $tail = 0;
+for my $dir ($node->data_dir . "/base/$tpl3")
+{
+	opendir(my $d, $dir) or die "could not open $dir: $!";
+	for my $f (grep { /^prolly_journal/ } readdir($d))
+	{
+		open(my $fh, '>>', "$dir/$f") or die "could not open $dir/$f: $!";
+		binmode $fh;
+		print $fh "\0" x 8192;
+		close($fh);
+		$tail++;
+	}
+	closedir($d);
+}
+cmp_ok($tail, '>', 0, 'the template\'s segments end in zeros');
+isnt($standby->safe_psql('postgres', files('tpl3')), $node->safe_psql('postgres', files('tpl3')),
+	'the standby\'s template doesn\'t have them');
+createdb('CREATE DATABASE c8 TEMPLATE tpl3');
+createdb('CREATE DATABASE c9 TEMPLATE tpl3 STRATEGY FILE_COPY');
+$node->wait_for_catchup($standby);
+for my $db ('c8', 'c9')
+{
+	is($node->safe_psql($db, $reads), '150 of 150', "$db reads its template's chunks");
+	is($standby->safe_psql($db, $reads), '150 of 150', 'and so does the standby');
+	is($standby->safe_psql('postgres', files($db)), $node->safe_psql('postgres', files($db)),
+		"the standby's files of $db, the zeros too, are the primary's");
+}
+
 done_testing();
