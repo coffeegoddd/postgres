@@ -35,7 +35,7 @@ $$SELECT i.indexrelid::regclass, bt_index_check(i.indexrelid, true) IS NOT NULL
   JOIN pg_am a ON a.oid = c.relam AND a.amname = 'btree'
   WHERE c.relkind = 'i' AND i.indrelid IN (SELECT oid FROM pg_class
 					   WHERE relnamespace = 'bm'::regnamespace)
-  ORDER BY i.indexrelid::regclass::text$$;
+  ORDER BY i.indexrelid::regclass::text COLLATE "C"$$;
 CREATE TABLE bm.p (id int PRIMARY KEY);
 INSERT INTO bm.p SELECT g FROM generate_series(1, 10) g;
 CREATE TABLE bm.t (id int PRIMARY KEY, v text NOT NULL CHECK (v <> 'bad'),
@@ -341,7 +341,7 @@ SELECT count(*), sum(u) FROM bm.d;
    400 | 80200
 (1 row)
 
-SELECT tableoid::regclass, count(*) FROM bm.pt GROUP BY 1 ORDER BY 1;
+SELECT tableoid::regclass, count(*) FROM bm.pt GROUP BY 1 ORDER BY tableoid::regclass::text COLLATE "C";
  tableoid | count 
 ----------+-------
  bm.pt1   |   999
@@ -354,10 +354,10 @@ SELECT * FROM indexes_valid();
  bm.d_pkey   | t
  bm.d_u_key  | t
  bm.few_pkey | t
- bm.nk_a     | t
  bm.n_pkey   | t
  bm.n_v      | t
  bm.n_v_key  | t
+ bm.nk_a     | t
  bm.p_pkey   | t
  bm.pt1_pkey | t
  bm.pt2_pkey | t

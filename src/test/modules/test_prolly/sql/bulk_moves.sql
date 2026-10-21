@@ -39,7 +39,7 @@ $$SELECT i.indexrelid::regclass, bt_index_check(i.indexrelid, true) IS NOT NULL
   JOIN pg_am a ON a.oid = c.relam AND a.amname = 'btree'
   WHERE c.relkind = 'i' AND i.indrelid IN (SELECT oid FROM pg_class
 					   WHERE relnamespace = 'bm'::regnamespace)
-  ORDER BY i.indexrelid::regclass::text$$;
+  ORDER BY i.indexrelid::regclass::text COLLATE "C"$$;
 CREATE TABLE bm.p (id int PRIMARY KEY);
 INSERT INTO bm.p SELECT g FROM generate_series(1, 10) g;
 CREATE TABLE bm.t (id int PRIMARY KEY, v text NOT NULL CHECK (v <> 'bad'),
@@ -155,7 +155,7 @@ SELECT same_as_head();
 SELECT count(*), sum(id), count(big), sum(length(big)) FROM bm.n;
 SELECT count(*), sum(a) FROM bm.nk;
 SELECT count(*), sum(u) FROM bm.d;
-SELECT tableoid::regclass, count(*) FROM bm.pt GROUP BY 1 ORDER BY 1;
+SELECT tableoid::regclass, count(*) FROM bm.pt GROUP BY 1 ORDER BY tableoid::regclass::text COLLATE "C";
 SELECT * FROM indexes_valid();
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
