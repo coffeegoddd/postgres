@@ -242,6 +242,10 @@ static uint64 horizon_ack_answered = 0;
 static uint64 horizon_ack_gen = 0;
 static uint64 horizon_ack_upstream = 0;
 
+/* when it was last said a request is pending (upstream: when it said so) */
+static TimestampTz horizon_ack_pending_sent = 0;
+static TimestampTz horizon_ack_alive_sent = 0;
+
 /*
  * The collections reading the standbys' positions, as WalSndHorizonReaders
  * [procno]: the generation they began in (WalSndCtl->horizonGen), or 0.
@@ -2722,17 +2726,18 @@ PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbac
 /*
  * Remember the oldest position a logical slot of the standby may decode
  * from, as its feedback said: in this walsender's shared state, and in its
- * physical slot if it has one, which keeps it while the standby is away.
- * The slot is saved at once if the position moves back (or is new), so a
- * crash doesn't lose it; moving forward, it is saved at the next
- * checkpoint, the older position on disk until then.
+ * physical slot if it has one, which keeps it while the standby is away,
+ * and keeps the WAL from there (ReplicationSlotsComputeRequiredLSN()).  The
+ * slot is saved at once as the position changes, before the WAL it no
+ * longer needs may go, so a crash doesn't take it back to a position whose
+ * WAL is gone.  (It changes as the standby's slots move, once a feedback
+ * interval at most.)
  */
 static void
 PhysicalStandbyRestartLsn(XLogRecPtr lsn)
 {
 	ReplicationSlot *slot = MyReplicationSlot;
 	bool		changed = false;
-	bool		back = false;
 
 	SpinLockAcquire(&MyWalSnd->mutex);
 	MyWalSnd->standbyRestartLsn = lsn;
@@ -2744,17 +2749,14 @@ PhysicalStandbyRestartLsn(XLogRecPtr lsn)
 	if (slot->data.standby_restart_lsn != lsn)
 	{
 		changed = true;
-		back = XLogRecPtrIsValid(lsn) &&
-			(!XLogRecPtrIsValid(slot->data.standby_restart_lsn) ||
-			 lsn < slot->data.standby_restart_lsn);
 		slot->data.standby_restart_lsn = lsn;
 	}
 	SpinLockRelease(&slot->mutex);
 	if (changed)
 	{
 		ReplicationSlotMarkDirty();
-		if (back)
-			ReplicationSlotSave();
+		ReplicationSlotSave();
+		ReplicationSlotsComputeRequiredLSN();
 	}
 }
 
@@ -4607,16 +4609,20 @@ WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
  * Answer a standby's request, in its hot standby feedback, that the oldest
  * position its logical slots may decode from be acknowledged, once it can
  * be: a keepalive message with, after, the request's number and the end of
- * the primary's WAL as of now.  On a primary, once no collection that began
- * reading the standbys' positions before this one was kept is running: a
- * collection's swap of the chunk store past that end keeps what the WAL
- * names from the position.  On a cascading standby, once its own upstream
- * server acknowledged it, with that server's end of WAL.
+ * the primary's WAL as of now (until then, the same with an invalid end,
+ * now and then, that it is pending).  On a primary, once no collection
+ * that began reading the standbys' positions before this one was kept is
+ * running: a collection's swap of the chunk store past that end keeps what
+ * the WAL names from the position.  On a cascading standby, once its own
+ * upstream server acknowledged it, with that server's end of WAL.
  */
 static void
 WalSndHorizonAckIfReady(void)
 {
 	XLogRecPtr	lsn;
+	TimestampTz alive;
+	TimestampTz now;
+	bool		ready = true;
 
 	if (horizon_ack_request <= horizon_ack_answered)
 		return;
@@ -4627,23 +4633,41 @@ WalSndHorizonAckIfReady(void)
 		horizon_ack_gen = pg_atomic_add_fetch_u64(&WalSndCtl->horizonGen, 1);
 	}
 	if (horizon_ack_upstream != 0)
-	{
-		if (!WalRcvHorizonAcked(horizon_ack_upstream, &lsn))
-			return;
-	}
+		ready = WalRcvHorizonAcked(horizon_ack_upstream, &lsn, &alive);
 	else
 	{
-		for (int i = 0; i < MaxBackends; i++)
+		for (int i = 0; i < MaxBackends && ready; i++)
 		{
 			uint64		began = pg_atomic_read_u64(&WalSndHorizonReaders[i]);
 
 			if (began != 0 && began < horizon_ack_gen)
-				return;
+				ready = false;
 		}
 		lsn = GetXLogInsertEndRecPtr();
 	}
 
-	elog(DEBUG2, "acknowledging logical slots' position, request %" PRIu64 " at %X/%08X",
+	/*
+	 * Not yet: say so every half second, the end of WAL invalid, so the
+	 * standby waits on for a collection however long it runs.  A cascading
+	 * standby passes on only what its own upstream server said.
+	 */
+	if (!ready)
+	{
+		now = GetCurrentTimestamp();
+		if (horizon_ack_upstream != 0)
+		{
+			if (alive <= horizon_ack_alive_sent)
+				return;
+			horizon_ack_alive_sent = alive;
+		}
+		else if (!TimestampDifferenceExceeds(horizon_ack_pending_sent, now, 500))
+			return;
+		horizon_ack_pending_sent = now;
+		lsn = InvalidXLogRecPtr;
+	}
+
+	elog(DEBUG2, "%s logical slots' position, request %" PRIu64 " at %X/%08X",
+		 ready ? "acknowledging" : "still keeping",
 		 horizon_ack_request, LSN_FORMAT_ARGS(lsn));
 	resetStringInfo(&output_message);
 	pq_sendbyte(&output_message, PqReplMsg_Keepalive);
@@ -4653,6 +4677,8 @@ WalSndHorizonAckIfReady(void)
 	pq_sendint64(&output_message, horizon_ack_request);
 	pq_sendint64(&output_message, lsn);
 	pq_putmessage_noblock(PqMsg_CopyData, output_message.data, output_message.len);
+	if (!ready)
+		return;
 	horizon_ack_answered = horizon_ack_request;
 	horizon_ack_upstream = 0;
 	horizon_ack_gen = 0;

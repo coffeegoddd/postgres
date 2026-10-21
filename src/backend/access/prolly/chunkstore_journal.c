@@ -6603,12 +6603,14 @@ journal_gc_read(ProllyChunkGc *gc, uint64 slot, StringInfo out)
 /*
  * The oldest position a logical replication slot of database dboid may
  * decode from, or one of a standby's, as its feedback said (invalid: there
- * is none).
+ * is none); no older than the WAL left (a collection keeps what that names).
  */
 static XLogRecPtr
 logical_horizon(Oid dboid)
 {
-	return ReplicationSlotsLogicalDecodingHorizon(dboid);
+	XLogRecPtr	wanted;
+
+	return ReplicationSlotsLogicalDecodingHorizonKept(dboid, &wanted);
 }
 
 /*

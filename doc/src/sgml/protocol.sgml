@@ -2785,7 +2785,9 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
              With the field above: the end of the server's WAL as it
              acknowledged the request.  A collection whose effects are
              written to the WAL past it keeps what the slots may decode
-             from their position.
+             from their position.  0 while the request is still pending:
+             the server sends that now and then until it can acknowledge
+             the request.
             </para>
            </listitem>
           </varlistentry>

@@ -910,19 +910,18 @@ scan_record(RootScan *rs, XLogReaderState *xlr, char *page)
 	}
 }
 
-bool
+void
 prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit, void *arg)
 {
 	RootScan	rs;
 	XLogRecPtr	end;
 	XLogRecPtr	first;
-	XLogSegNo	segno;
 	XLogReaderState *xlr;
 	PGIOAlignedBlock page;
 	char	   *errormsg;
 
 	if (!XLogRecPtrIsValid(from))
-		return true;
+		return;
 	memset(&rs, 0, sizeof(rs));
 	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_BLAKE3);
 	rs.visit = visit;
@@ -933,12 +932,7 @@ prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit, void *arg)
 	XLogFlush(end);
 	end = GetFlushRecPtr(NULL);
 	if (from >= end)
-		return true;
-
-	/* (WAL a standby's slot needs may be gone here) */
-	XLByteToSeg(from, segno, wal_segment_size);
-	if (segno <= XLogGetLastRemovedSegno())
-		return false;
+		return;
 
 	xlr = XLogReaderAllocate(wal_segment_size, NULL,
 							 XL_ROUTINE(.page_read = read_local_xlog_page,
@@ -950,6 +944,11 @@ prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit, void *arg)
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of memory"),
 				 errdetail("Failed while allocating a WAL reading processor.")));
+
+	/*
+	 * (On an error, the segment open is closed as the memory context the
+	 * reader is in is reset: wal_segment_open() registers for it.)
+	 */
 	first = XLogFindNextRecord(xlr, from, &errormsg);
 	if (!XLogRecPtrIsValid(first))
 		ereport(ERROR,
@@ -966,11 +965,11 @@ prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit, void *arg)
 					 errmsg("could not read WAL at %X/%08X",
 							LSN_FORMAT_ARGS(xlr->EndRecPtr)),
 					 errormsg ? errdetail_internal("%s", errormsg) : 0));
+		INJECTION_POINT("prolly-wal-roots-read", NULL);
 		CHECK_FOR_INTERRUPTS();
 		scan_record(&rs, xlr, page.data);
 	}
 	XLogReaderFree(xlr);
-	return true;
 }
 
 /* A versioned table's value moved out of line by the toaster. */

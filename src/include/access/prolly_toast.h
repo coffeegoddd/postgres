@@ -92,10 +92,10 @@ extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
  * 'from' fetches the values its rows name, whose rows may be gone from the
  * pages since.  Conservative as the pages' scan is: bytes that spell a hash
  * pointer in a record's data, its blocks' data and its full-page images.
- * False if the WAL from 'from' is no longer here, so the caller keeps what
- * it may name otherwise.
+ * The WAL from 'from' must be here (ReplicationSlotsLogicalDecodingHorizonKept()
+ * gives such a position); a segment removed while it is read is an error.
  */
-extern bool prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit,
+extern void prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit,
 								   void *arg);
 
 /*

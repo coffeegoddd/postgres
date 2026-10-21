@@ -970,7 +970,8 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len, TimeLineID tli)
 
 				/*
 				 * (with, after, an acknowledgement of a request in the hot
-				 * standby feedback: its number and the primary's end of WAL)
+				 * standby feedback: its number and the primary's end of WAL,
+				 * invalid while it is pending)
 				 */
 				hdrlen = sizeof(int64) + sizeof(int64) + sizeof(char);
 				if (len != hdrlen && len != hdrlen + 2 * sizeof(int64))
@@ -992,12 +993,16 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len, TimeLineID tli)
 					uint64		acked = pq_getmsgint64(&incoming_message);
 					XLogRecPtr	ackedLsn = pq_getmsgint64(&incoming_message);
 
+					TimestampTz alive = GetCurrentTimestamp();
+
 					SpinLockAcquire(&WalRcv->mutex);
-					if (acked > WalRcv->horizonAcked)
+					if (XLogRecPtrIsValid(ackedLsn) &&
+						acked > WalRcv->horizonAcked)
 					{
 						WalRcv->horizonAcked = acked;
 						WalRcv->horizonAckedLsn = ackedLsn;
 					}
+					WalRcv->horizonAckAlive = alive;
 					SpinLockRelease(&WalRcv->mutex);
 					ConditionVariableBroadcast(&WalRcv->horizonAckCV);
 				}
@@ -1568,15 +1573,18 @@ WalRcvRequestHorizonAck(void)
  * Has a request of WalRcvRequestHorizonAck() been acknowledged?  If so,
  * *lsn is the end of the primary's WAL as it was: a collection there whose
  * swap of the chunk store is past it keeps what the position needs.
+ * *alive is when the upstream server last said a request was pending or
+ * acknowledged (0: never).
  */
 bool
-WalRcvHorizonAcked(uint64 request, XLogRecPtr *lsn)
+WalRcvHorizonAcked(uint64 request, XLogRecPtr *lsn, TimestampTz *alive)
 {
 	bool		acked;
 
 	SpinLockAcquire(&WalRcv->mutex);
 	acked = WalRcv->horizonAcked >= request;
 	*lsn = WalRcv->horizonAckedLsn;
+	*alive = WalRcv->horizonAckAlive;
 	SpinLockRelease(&WalRcv->mutex);
 	return acked;
 }

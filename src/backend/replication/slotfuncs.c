@@ -264,7 +264,7 @@ pg_drop_replication_slot(PG_FUNCTION_ARGS)
 Datum
 pg_get_replication_slots(PG_FUNCTION_ARGS)
 {
-#define PG_GET_REPLICATION_SLOTS_COLS 21
+#define PG_GET_REPLICATION_SLOTS_COLS 22
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	XLogRecPtr	currlsn;
 	int			slotno;
@@ -476,6 +476,12 @@ pg_get_replication_slots(PG_FUNCTION_ARGS)
 			nulls[i++] = true;
 		else
 			values[i++] = CStringGetTextDatum(SlotSyncSkipReasonNames[slot_contents.slotsync_skip_reason]);
+
+		/* a physical slot's standby's logical slots' position */
+		if (XLogRecPtrIsValid(slot_contents.data.standby_restart_lsn))
+			values[i++] = LSNGetDatum(slot_contents.data.standby_restart_lsn);
+		else
+			nulls[i++] = true;
 
 		Assert(i == PG_GET_REPLICATION_SLOTS_COLS);
 

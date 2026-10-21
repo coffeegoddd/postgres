@@ -376,6 +376,8 @@ extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
 extern XLogRecPtr ReplicationSlotsLogicalDecodingHorizon(Oid dboid);
+extern XLogRecPtr ReplicationSlotsLogicalDecodingHorizonKept(Oid dboid,
+														  XLogRecPtr *wanted);
 extern bool ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive);
 extern bool CheckLogicalSlotExists(void);
 extern void ReplicationSlotsDropDBSlots(Oid dboid);

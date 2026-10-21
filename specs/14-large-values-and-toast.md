@@ -763,7 +763,10 @@ to decode.
   a record's data and its blocks' data (the chunk store's own records
   aside, which hold chunks no slot decodes) and in full-page images, and
   marks what they name as roots (`prolly_toast_wal_roots()`). The cost
-  is the slots' lag. So a value a row after the slot's position reused
+  is the slots' lag times the number of databases times how often
+  collections run: a standby's position counts for every database, so
+  each database's collection (autovacuum's too) scans the WAL from the
+  oldest standby slot's position. So a value a row after the slot's position reused
   (nothing appended for it), or appended to a segment sealed before the
   slot's position, is kept while a slot may decode a row naming it,
   whatever happened to the row. The per-segment retention stays as a
@@ -779,13 +782,36 @@ to decode.
   `hot_standby_feedback` off too while it has such slots; the primary
   keeps it in the walsender's shared state and, for a standby with a
   physical slot, in the slot (`standby_restart_lsn`, slot file version 6;
-  version 5 files are read with none), saved at once when the position
-  moves back, so a restart or the standby's absence doesn't lose it.
-  Invalidated slots don't count. A standby's position counts for every
-  database (the feedback doesn't say which). If the WAL from the
-  position is no longer there (a standby's slot behind what the primary
-  kept), the collection warns and keeps every chunk it collected; a
-  segment removed while it reads is an error.
+  version 5 files are read with none), saved at once whenever the
+  position changes (once a feedback interval at most), so a restart or
+  the standby's absence doesn't lose it nor take it back past WAL that
+  went. `pg_replication_slots` shows it as `standby_restart_lsn` (a core
+  view's new last column, rather than a prolly view: it is a physical
+  slot's property, next to what else holds WAL back, where an operator
+  looks for what holds the primary). Invalidated slots don't count. A
+  standby's position counts for every database (the feedback doesn't
+  say which).
+- **The WAL a standby's position needs is kept, within
+  `max_slot_wal_keep_size` (#300, review).** The physical slot keeps the
+  WAL from `standby_restart_lsn` as a logical slot here keeps its own
+  (`ReplicationSlotsComputeRequiredLSN()`), so collections can scan it.
+  Past `max_slot_wal_keep_size` the WAL goes and the physical slot stays
+  valid (its own `restart_lsn` is the standby's flush position, which
+  the WAL-removed invalidation looks at): a standby that is streaming is
+  not cut off for its logical slots' lag. A collection then scans from
+  the oldest WAL left (`ReplicationSlotsLogicalDecodingHorizonKept()`,
+  the per-segment retention too) and warns, naming the position and
+  `standby_restart_lsn`: what only the WAL that went named is collected,
+  and the standby's slot fails to decode such a value ("prolly tree node
+  missing from its chunk store"), as a slot whose WAL went can no longer
+  decode in Postgres. Before the review a collection kept every chunk
+  then, in every database, until the standby's slot caught up or was
+  dropped: collection was off for as long as one idle standby slot
+  stayed behind. Once the position moves into the WAL left, collections
+  are quiet again. A WAL scan that fails leaves no segment open:
+  `wal_segment_open()` registers the reader's memory context reset
+  callback, which closes it as the error resets the context (a test
+  counts the backend's open WAL files across failed scans).
 - **A standby's new slot is kept before it is used (#300).** Periodic
   feedback alone left a window: a slot created on a standby was unknown
   to the primary until the next feedback (`wal_receiver_status_interval`,
@@ -809,7 +835,7 @@ to decode.
      walreceiver sends the feedback at once, the request number a second
      trailing Int64 after the position (read before the position, so the
      position counts the slot);
-  2. waits, at most `wal_receiver_timeout`, for the acknowledgement: the
+  2. waits for the acknowledgement: the
      walsender keeps the position as before, then answers with a
      keepalive message carrying two trailing Int64s, the request number
      and the end of its WAL (`GetXLogInsertEndRecPtr()`), once no
@@ -819,9 +845,18 @@ to decode.
      bumps a generation as it keeps a requested position and waits for
      readers of an older one, polling every 100 ms while one is pending).
      A cascading standby's walsender asks its own upstream server and
-     passes that server's answer on. No answer in time (the standby not
-     streaming, say) fails the slot's creation: a usability error rather
-     than a slot that may lose values;
+     passes that server's answer on. Until it answers, the walsender says
+     every half second that the request is pending (the same keepalive,
+     the end of WAL invalid; a cascading standby passes on only what its
+     upstream server said), so the wait lasts however long a running
+     collection does. Nothing heard for `wal_receiver_timeout` (60 s if
+     it is 0) fails the slot's creation, saying the upstream server did
+     not answer: the standby isn't streaming, or its upstream server
+     predates this and never answers, so a newer standby can't create
+     logical slots against an older primary (mixed versions during an
+     upgrade: create them once the primary is upgraded). Recovery ending
+     meanwhile (a promotion) fails it at once, saying so. Each is a
+     usability error rather than a slot that may lose values;
   3. waits for replay to pass that end of WAL, and then moves the slot's
      position past the last collection's swap replayed
      (`ReplicationSlotsCollectionReplayed()`, noted by the chunk store's
@@ -830,7 +865,8 @@ to decode.
      the WAL names from it; one whose swap is before may not have, and the
      slot starts after it, so it never decodes a row whose value such a
      collection freed (a slot created after values were collected
-     doesn't start before their collection).
+     doesn't start before their collection). A move of the journal swaps
+     too, freeing nothing: a slot then starts after it for nothing.
 
   The moved position, past a running-xacts record logged meanwhile, only
   makes the slot wait for the next one. Still open: a standby without a

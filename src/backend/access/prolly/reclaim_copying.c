@@ -37,7 +37,9 @@
  * in the WAL may name from the oldest position a logical slot may decode
  * from, this server's or a standby's (prolly_toast_wal_roots()): the slot
  * fetches the values of the rows it decodes, which may be gone from the
- * pages by then.  WAL from there no longer here keeps every chunk.
+ * pages by then.  WAL from there no longer here (a standby's slot behind
+ * what max_slot_wal_keep_size kept) is scanned from what is left, with a
+ * warning: what only the rest named isn't kept.
  *
  * The chunks marked and not yet read wait in a queue, breadth first, of
  * at most maintenance_work_mem in memory (a ring, so taking one and adding
@@ -386,6 +388,7 @@ copying_collect(bool full, ProllyGcResult *result)
 	int			nfiles = 0;
 	bool	   *keep;
 	XLogRecPtr	horizon;
+	XLogRecPtr	wanted;
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
@@ -426,15 +429,16 @@ copying_collect(bool full, ProllyGcResult *result)
 	WalSndHorizonReadBegin();
 	PG_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
 	{
-		horizon = ReplicationSlotsLogicalDecodingHorizon(MyDatabaseId);
-		if (!prolly_toast_wal_roots(horizon, mark_root, &mk))
-		{
+		horizon = ReplicationSlotsLogicalDecodingHorizonKept(MyDatabaseId,
+															 &wanted);
+		if (horizon != wanted)
 			ereport(WARNING,
 					(errmsg("the WAL from %X/%08X, which a logical replication slot may still decode, is gone",
-							LSN_FORMAT_ARGS(horizon)),
-					 errdetail("The collection keeps every chunk it would have freed.")));
-			mark_all(&mk);
-		}
+							LSN_FORMAT_ARGS(wanted)),
+					 errdetail("The collection keeps the values the WAL from %X/%08X names, not those named only before it.",
+							   LSN_FORMAT_ARGS(horizon)),
+					 errhint("A standby's logical slot this far behind may fail to decode a value. A physical slot's \"standby_restart_lsn\" in \"pg_replication_slots\" is its standby's position, which \"max_slot_wal_keep_size\" limits the WAL kept for.")));
+		prolly_toast_wal_roots(horizon, mark_root, &mk);
 		INJECTION_POINT("prolly-gc-roots-scanned", NULL);
 		if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
 			mark_all(&mk);
