@@ -2766,6 +2766,29 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
             </para>
            </listitem>
           </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             Optional, sent only to a standby whose hot standby feedback
+             asked for it: the number of the request acknowledged, that the
+             position of the standby's logical replication slots be kept.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             With the field above: the end of the server's WAL as it
+             acknowledged the request.  A collection whose effects are
+             written to the WAL past it keeps what the slots may decode
+             from their position.
+            </para>
+           </listitem>
+          </varlistentry>
          </variablelist>
         </listitem>
        </varlistentry>
@@ -2983,6 +3006,19 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
              message without it says there are none.  It is sent even when
              <varname>hot_standby_feedback</varname> is off, while the
              standby has such slots.
+            </para>
+           </listitem>
+          </varlistentry>
+
+          <varlistentry>
+           <term>Int64</term>
+           <listitem>
+            <para>
+             A request that the server acknowledge the position above,
+             numbered; 0 if none.  The server answers with a primary
+             keepalive message carrying the number, once a collection of
+             the values that it begins keeps what the slots need.  This
+             field is optional, and is sent only after the one above.
             </para>
            </listitem>
           </varlistentry>

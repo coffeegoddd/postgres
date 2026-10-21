@@ -228,6 +228,26 @@ static bool streamingDoneReceiving;
 /* Are we there yet? */
 static bool WalSndCaughtUp = false;
 
+/*
+ * The latest request of the standby's hot standby feedback that the oldest
+ * position a logical slot of it may decode from be acknowledged, and the
+ * latest answered (each feedback carries the latest request).  On a
+ * primary, a request is answered once the collections that may have read
+ * the standbys' positions before it was kept have ended (those that began
+ * before horizon_ack_gen); on a cascading standby, once its own upstream
+ * server has acknowledged horizon_ack_upstream.
+ */
+static uint64 horizon_ack_request = 0;
+static uint64 horizon_ack_answered = 0;
+static uint64 horizon_ack_gen = 0;
+static uint64 horizon_ack_upstream = 0;
+
+/*
+ * The collections reading the standbys' positions, as WalSndHorizonReaders
+ * [procno]: the generation they began in (WalSndCtl->horizonGen), or 0.
+ */
+static pg_atomic_uint64 *WalSndHorizonReaders = NULL;
+
 /* Flags set by signal handlers for later service in main loop */
 static volatile sig_atomic_t got_SIGUSR2 = false;
 static volatile sig_atomic_t got_STOPPING = false;
@@ -308,6 +328,7 @@ static void ProcessRepliesIfAny(void);
 static void ProcessPendingWrites(void);
 static void WalSndKeepalive(bool requestReply, XLogRecPtr writePtr);
 static void WalSndKeepaliveIfNecessary(void);
+static void WalSndHorizonAckIfReady(void);
 static void WalSndCheckTimeOut(void);
 static void WalSndCheckShutdownTimeout(void);
 static long WalSndComputeSleeptime(TimestampTz now);
@@ -2786,6 +2807,7 @@ ProcessStandbyHSFeedbackMessage(void)
 	TransactionId feedbackCatalogXmin;
 	uint32		feedbackCatalogEpoch;
 	XLogRecPtr	feedbackRestartLsn = InvalidXLogRecPtr;
+	uint64		feedbackAckRequest = 0;
 	TimestampTz replyTime;
 
 	/*
@@ -2802,7 +2824,25 @@ ProcessStandbyHSFeedbackMessage(void)
 	/* (a standby that doesn't send it has no such slot to tell of) */
 	if (reply_message.cursor + sizeof(int64) <= reply_message.len)
 		feedbackRestartLsn = pq_getmsgint64(&reply_message);
+	if (reply_message.cursor + sizeof(int64) <= reply_message.len)
+		feedbackAckRequest = pq_getmsgint64(&reply_message);
 	PhysicalStandbyRestartLsn(feedbackRestartLsn);
+
+	/*
+	 * Asked to acknowledge the position, now kept: once no collection that
+	 * may have read the positions before is still running (one that reads
+	 * them from here on keeps it), or, on a cascading standby, once the
+	 * upstream server has acknowledged it too.
+	 */
+	if (feedbackAckRequest > Max(horizon_ack_request, horizon_ack_answered))
+	{
+		horizon_ack_request = feedbackAckRequest;
+		if (RecoveryInProgress())
+			horizon_ack_upstream = WalRcvRequestHorizonAck();
+		else
+			horizon_ack_gen = pg_atomic_add_fetch_u64(&WalSndCtl->horizonGen, 1);
+		WalSndHorizonAckIfReady();
+	}
 
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -3041,6 +3081,10 @@ WalSndComputeSleeptime(TimestampTz now)
 			sleeptime = shutdown_sleeptime;
 	}
 
+	/* (an acknowledgement waits on others: see whether they're done) */
+	if (horizon_ack_request > horizon_ack_answered)
+		sleeptime = Min(sleeptime, 100);
+
 	return sleeptime;
 }
 
@@ -3217,6 +3261,9 @@ WalSndLoop(WalSndSendDataCallback send_data)
 
 		/* Send keepalive if the time has come */
 		WalSndKeepaliveIfNecessary();
+
+		/* Acknowledge a standby's logical slots' position, if it can be */
+		WalSndHorizonAckIfReady();
 
 		/*
 		 * Block if we have unsent data.  XXX For logical replication, let
@@ -4124,6 +4171,10 @@ WalSndShmemRequest(void *arg)
 					   .size = size,
 					   .ptr = (void **) &WalSndCtl,
 		);
+	ShmemRequestStruct(.name = "Wal Sender Horizon Readers",
+					   .size = mul_size(MaxBackends, sizeof(pg_atomic_uint64)),
+					   .ptr = (void **) &WalSndHorizonReaders,
+		);
 }
 
 /* Initialize walsender-related shared memory */
@@ -4143,6 +4194,10 @@ WalSndShmemInit(void *arg)
 	ConditionVariableInit(&WalSndCtl->wal_flush_cv);
 	ConditionVariableInit(&WalSndCtl->wal_replay_cv);
 	ConditionVariableInit(&WalSndCtl->wal_confirm_rcv_cv);
+
+	pg_atomic_init_u64(&WalSndCtl->horizonGen, 1);
+	for (int i = 0; i < MaxBackends; i++)
+		pg_atomic_init_u64(&WalSndHorizonReaders[i], 0);
 }
 
 /*
@@ -4546,6 +4601,85 @@ WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
 	/* Set local flag */
 	if (requestReply)
 		waiting_for_ping_response = true;
+}
+
+/*
+ * Answer a standby's request, in its hot standby feedback, that the oldest
+ * position its logical slots may decode from be acknowledged, once it can
+ * be: a keepalive message with, after, the request's number and the end of
+ * the primary's WAL as of now.  On a primary, once no collection that began
+ * reading the standbys' positions before this one was kept is running: a
+ * collection's swap of the chunk store past that end keeps what the WAL
+ * names from the position.  On a cascading standby, once its own upstream
+ * server acknowledged it, with that server's end of WAL.
+ */
+static void
+WalSndHorizonAckIfReady(void)
+{
+	XLogRecPtr	lsn;
+
+	if (horizon_ack_request <= horizon_ack_answered)
+		return;
+	if (horizon_ack_upstream != 0 && !RecoveryInProgress())
+	{
+		/* (promoted: the collections are this server's now) */
+		horizon_ack_upstream = 0;
+		horizon_ack_gen = pg_atomic_add_fetch_u64(&WalSndCtl->horizonGen, 1);
+	}
+	if (horizon_ack_upstream != 0)
+	{
+		if (!WalRcvHorizonAcked(horizon_ack_upstream, &lsn))
+			return;
+	}
+	else
+	{
+		for (int i = 0; i < MaxBackends; i++)
+		{
+			uint64		began = pg_atomic_read_u64(&WalSndHorizonReaders[i]);
+
+			if (began != 0 && began < horizon_ack_gen)
+				return;
+		}
+		lsn = GetXLogInsertEndRecPtr();
+	}
+
+	elog(DEBUG2, "acknowledging logical slots' position, request %" PRIu64 " at %X/%08X",
+		 horizon_ack_request, LSN_FORMAT_ARGS(lsn));
+	resetStringInfo(&output_message);
+	pq_sendbyte(&output_message, PqReplMsg_Keepalive);
+	pq_sendint64(&output_message, sentPtr);
+	pq_sendint64(&output_message, GetCurrentTimestamp());
+	pq_sendbyte(&output_message, 0);
+	pq_sendint64(&output_message, horizon_ack_request);
+	pq_sendint64(&output_message, lsn);
+	pq_putmessage_noblock(PqMsg_CopyData, output_message.data, output_message.len);
+	horizon_ack_answered = horizon_ack_request;
+	horizon_ack_upstream = 0;
+	horizon_ack_gen = 0;
+}
+
+/*
+ * A collection begins reading the standbys' logical slots' positions
+ * (ReplicationSlotsLogicalDecodingHorizon()), and keeps what the WAL names
+ * from there, until WalSndHorizonReadEnd(), after its swap of the chunk
+ * store: a standby's request that its position be acknowledged waits for
+ * those that began before the position was kept.
+ */
+void
+WalSndHorizonReadBegin(void)
+{
+	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
+	pg_atomic_write_u64(&WalSndHorizonReaders[MyProcNumber],
+						pg_atomic_read_u64(&WalSndCtl->horizonGen));
+	/* (before the positions are read) */
+	pg_memory_barrier();
+}
+
+void
+WalSndHorizonReadEnd(void)
+{
+	/* (after the swap's WAL record) */
+	(void) pg_atomic_exchange_u64(&WalSndHorizonReaders[MyProcNumber], 0);
 }
 
 /*

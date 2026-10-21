@@ -786,6 +786,57 @@ to decode.
   position is no longer there (a standby's slot behind what the primary
   kept), the collection warns and keeps every chunk it collected; a
   segment removed while it reads is an error.
+- **A standby's new slot is kept before it is used (#300).** Periodic
+  feedback alone left a window: a slot created on a standby was unknown
+  to the primary until the next feedback (`wal_receiver_status_interval`,
+  10 s by default), and a collection in it freed values the slot then
+  failed to decode. Postgres has the same window for a standby slot's
+  `catalog_xmin` and closes it after the fact: a primary's vacuum that
+  removes catalog rows the slot needs conflicts on replay and invalidates
+  the slot. For chunks that would make a slot created just before a
+  collection unusable, so the slot's creation is coordinated with the
+  primary instead (the options weighed: waiting for an
+  acknowledgement, which is this; having the primary keep everything
+  while any standby's report is older than its connection, which keeps
+  too much for every standby that never creates a slot and still misses
+  standbys that reconnect after a collection; refusing to decode until
+  acknowledged, which leaves the slot's position itself unprotected
+  from collections already done). `CreateInitDecodingContext()`, having
+  reserved the slot's WAL on a standby, calls
+  `ReplicationSlotReserveWalUpstream()`, which:
+  1. asks the walreceiver for an acknowledgement
+     (`WalRcvRequestHorizonAck()`, a request number in `WalRcvData`); the
+     walreceiver sends the feedback at once, the request number a second
+     trailing Int64 after the position (read before the position, so the
+     position counts the slot);
+  2. waits, at most `wal_receiver_timeout`, for the acknowledgement: the
+     walsender keeps the position as before, then answers with a
+     keepalive message carrying two trailing Int64s, the request number
+     and the end of its WAL (`GetXLogInsertEndRecPtr()`), once no
+     collection that began reading the positions before is still running
+     (a collection registers as a reader, `WalSndHorizonReadBegin()`,
+     before it reads them and until its swap is WAL-logged; the walsender
+     bumps a generation as it keeps a requested position and waits for
+     readers of an older one, polling every 100 ms while one is pending).
+     A cascading standby's walsender asks its own upstream server and
+     passes that server's answer on. No answer in time (the standby not
+     streaming, say) fails the slot's creation: a usability error rather
+     than a slot that may lose values;
+  3. waits for replay to pass that end of WAL, and then moves the slot's
+     position past the last collection's swap replayed
+     (`ReplicationSlotsCollectionReplayed()`, noted by the chunk store's
+     swap redo), if that is later. Every collection whose swap is past
+     the acknowledged end of WAL read the slot's position and keeps what
+     the WAL names from it; one whose swap is before may not have, and the
+     slot starts after it, so it never decodes a row whose value such a
+     collection freed (a slot created after values were collected
+     doesn't start before their collection).
+
+  The moved position, past a running-xacts record logged meanwhile, only
+  makes the slot wait for the next one. Still open: a standby without a
+  physical slot that loses its connection loses its position on the
+  primary until it reconnects and reports again (as its xmin is, in
+  Postgres); a physical slot keeps it.
 - **The memo's size** is the server setting `prolly_value_memo_entries`
   (core naming, decided 2026-10-18), not `prolly.value_memo_entries`; 0
   turns it off.

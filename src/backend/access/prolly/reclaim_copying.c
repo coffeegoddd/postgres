@@ -67,6 +67,8 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "replication/slot.h"
+#include "replication/walsender.h"
+#include "storage/ipc.h"
 #include "storage/buffile.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -366,6 +368,13 @@ mark_from_kept(int file, uint64 first, uint64 nslots, bool settled,
 	drain(k->mk);
 }
 
+/* (a collection's reading of the standbys' positions, ended by an error) */
+static void
+horizon_read_end(int code, Datum arg)
+{
+	WalSndHorizonReadEnd();
+}
+
 static void
 copying_collect(bool full, ProllyGcResult *result)
 {
@@ -408,49 +417,61 @@ copying_collect(bool full, ProllyGcResult *result)
 	/* what tables name, once those who named a tree before have ended */
 	prolly_toast_roots(mark_root, &mk);
 
-	/* what a logical slot, here or a standby's, may still decode */
-	horizon = ReplicationSlotsLogicalDecodingHorizon(MyDatabaseId);
-	if (!prolly_toast_wal_roots(horizon, mark_root, &mk))
+	/*
+	 * What a logical slot, here or a standby's, may still decode: read as
+	 * one of the readers of the standbys' positions until the swap, so a
+	 * standby's slot created meanwhile is told it is kept only once this
+	 * collection, which may not keep it, is done.
+	 */
+	WalSndHorizonReadBegin();
+	PG_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
 	{
-		ereport(WARNING,
-				(errmsg("the WAL from %X/%08X, which a logical replication slot may still decode, is gone",
-						LSN_FORMAT_ARGS(horizon)),
-				 errdetail("The collection keeps every chunk it would have freed.")));
-		mark_all(&mk);
-	}
-	INJECTION_POINT("prolly-gc-roots-scanned", NULL);
-	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
-		mark_all(&mk);
-	drain(&mk);
-
-	/* the settled files kept whole, and what they name */
-	if (full)
-	{
-		Keep		k = {&mk, keep, true};
-
-		/*
-		 * Until no file is newly kept: marking from a kept file's garbage
-		 * may bring another file to little enough garbage to keep.
-		 */
-		while (k.changed)
+		horizon = ReplicationSlotsLogicalDecodingHorizon(MyDatabaseId);
+		if (!prolly_toast_wal_roots(horizon, mark_root, &mk))
 		{
-			k.changed = false;
-			PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
-			if (k.changed)
-				PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+			ereport(WARNING,
+					(errmsg("the WAL from %X/%08X, which a logical replication slot may still decode, is gone",
+							LSN_FORMAT_ARGS(horizon)),
+					 errdetail("The collection keeps every chunk it would have freed.")));
+			mark_all(&mk);
 		}
+		INJECTION_POINT("prolly-gc-roots-scanned", NULL);
+		if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
+			mark_all(&mk);
+		drain(&mk);
+
+		/* the settled files kept whole, and what they name */
+		if (full)
+		{
+			Keep		k = {&mk, keep, true};
+
+			/*
+			 * Until no file is newly kept: marking from a kept file's
+			 * garbage may bring another file to little enough garbage to
+			 * keep.
+			 */
+			while (k.changed)
+			{
+				k.changed = false;
+				PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
+				if (k.changed)
+					PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+			}
+		}
+
+		/* copied, before the window */
+		PROLLY_CALL(cs, gc_copy, mk.gc, mk.marks, keep);
+
+		/* in the window: what came since */
+		PROLLY_CALL(cs, gc_new, mk.gc, true, mark_new, &mk);
+		if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
+			mark_all(&mk);
+		INJECTION_POINT("prolly-gc-kept", NULL);
+		drain(&mk);
+		PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
 	}
-
-	/* copied, before the window */
-	PROLLY_CALL(cs, gc_copy, mk.gc, mk.marks, keep);
-
-	/* in the window: what came since */
-	PROLLY_CALL(cs, gc_new, mk.gc, true, mark_new, &mk);
-	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
-		mark_all(&mk);
-	INJECTION_POINT("prolly-gc-kept", NULL);
-	drain(&mk);
-	PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
+	PG_END_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
+	WalSndHorizonReadEnd();
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);

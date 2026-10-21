@@ -41,6 +41,7 @@
 
 #include "access/transam.h"
 #include "access/xlog_internal.h"
+#include "access/xlogwait.h"
 #include "access/xlogrecovery.h"
 #include "common/file_utils.h"
 #include "common/string.h"
@@ -50,6 +51,7 @@
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/slot.h"
+#include "replication/walreceiver.h"
 #include "replication/walsender_private.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -230,6 +232,8 @@ ReplicationSlotsShmemRequest(void *arg)
 static void
 ReplicationSlotsShmemInit(void *arg)
 {
+	pg_atomic_init_u64(&ReplicationSlotCtl->collection_replayed,
+					   InvalidXLogRecPtr);
 	for (int i = 0; i < max_replication_slots + max_repack_replication_slots; i++)
 	{
 		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
@@ -1508,6 +1512,93 @@ ReplicationSlotsLogicalDecodingHorizon(Oid dboid)
 	}
 	LWLockRelease(ReplicationSlotControlLock);
 	return result;
+}
+
+/*
+ * On a standby, a logical slot just created, its WAL reserved: before it is
+ * used, the primary is to keep for it the values stored by content that the
+ * WAL names from its position (ReplicationSlotsLogicalDecodingHorizon()),
+ * which the hot standby feedback reports, every wal_receiver_status_interval
+ * otherwise.  A collection there that didn't would free values the slot
+ * decodes, and decoding would fail.  So the feedback is sent at once, asking
+ * the upstream server to acknowledge the position, which it does once no
+ * collection that may have read the positions before is running, with the
+ * end of the primary's WAL as of then.  A collection whose swap of the
+ * chunk store is past that end keeps what the WAL names from the position;
+ * one before may not have, so once replay is past that end, the slot's
+ * position moves past the last swap replayed if it is older: what such a
+ * collection freed, the slot doesn't decode.
+ *
+ * Waits wal_receiver_timeout at most (if set) for the acknowledgement: if
+ * the standby isn't streaming from its upstream server, or the server
+ * doesn't answer, the slot isn't created.  The wait for replay has no
+ * limit, as the wait for a consistent point that follows.
+ */
+void
+ReplicationSlotReserveWalUpstream(void)
+{
+	ReplicationSlot *slot = MyReplicationSlot;
+	uint64		request;
+	XLogRecPtr	lsn;
+	TimestampTz deadline = 0;
+
+	Assert(slot != NULL && SlotIsLogical(slot));
+	Assert(RecoveryInProgress());
+
+	if (wal_receiver_timeout > 0)
+		deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+											   wal_receiver_timeout);
+	request = WalRcvRequestHorizonAck();
+	ConditionVariablePrepareToSleep(&WalRcv->horizonAckCV);
+	while (!WalRcvHorizonAcked(request, &lsn))
+	{
+		if (deadline != 0 && GetCurrentTimestamp() >= deadline)
+		{
+			ConditionVariableCancelSleep();
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not create replication slot \"%s\"",
+							NameStr(slot->data.name)),
+					 errdetail("The upstream server did not acknowledge the slot's position within \"%s\".",
+							   "wal_receiver_timeout"),
+					 errhint("A logical replication slot on a standby can be created only while the standby is streaming from its upstream server.")));
+		}
+		(void) ConditionVariableTimedSleep(&WalRcv->horizonAckCV, 1000,
+										   WAIT_EVENT_REPLICATION_SLOT_UPSTREAM_HORIZON);
+	}
+	ConditionVariableCancelSleep();
+
+	if (WaitForLSN(WAIT_LSN_TYPE_STANDBY_REPLAY, lsn, 0) != WAIT_LSN_RESULT_SUCCESS)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not create replication slot \"%s\"",
+						NameStr(slot->data.name)),
+				 errdetail("Recovery ended while the slot was being created.")));
+
+	lsn = pg_atomic_read_u64(&ReplicationSlotCtl->collection_replayed);
+	SpinLockAcquire(&slot->mutex);
+	if (lsn > slot->data.restart_lsn)
+		slot->data.restart_lsn = lsn;
+	else
+		lsn = InvalidXLogRecPtr;
+	SpinLockRelease(&slot->mutex);
+	if (XLogRecPtrIsValid(lsn))
+		ReplicationSlotsComputeRequiredLSN();
+}
+
+/*
+ * A collection's swap of a chunk store, replayed: the values stored by
+ * content it freed, gone here too.  'end' is the end of its WAL record.  A
+ * logical slot being created waits for the primary to keep what it needs
+ * (ReplicationSlotReserveWalUpstream()) and starts after a collection that
+ * may not have.
+ */
+void
+ReplicationSlotsCollectionReplayed(XLogRecPtr end)
+{
+	if (ReplicationSlotCtl == NULL)
+		return;
+	pg_atomic_write_u64(&ReplicationSlotCtl->collection_replayed, end);
 }
 
 /*

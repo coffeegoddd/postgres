@@ -42,6 +42,8 @@ extern void WalSndErrorCleanup(void);
 extern void PhysicalWakeupLogicalWalSnd(void);
 extern XLogRecPtr GetStandbyFlushRecPtr(TimeLineID *tli);
 extern XLogRecPtr WalSndStandbyRestartLSN(void);
+extern void WalSndHorizonReadBegin(void);
+extern void WalSndHorizonReadEnd(void);
 extern void WalSndSignals(void);
 extern void WalSndWakeup(bool physical, bool logical);
 extern void WalSndInitStopping(void);

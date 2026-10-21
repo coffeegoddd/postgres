@@ -4644,7 +4644,11 @@ table_files_redo(XLogReaderState *record)
 		 * as it is replayed, cancelled when the files are retired.
 		 */
 		if (info == XLOG_CHUNKS_SWAP)
+		{
 			standby_readers_note(xlrec.dboid);
+			/* (and a logical slot being created starts after it) */
+			ReplicationSlotsCollectionReplayed(record->EndRecPtr);
+		}
 		else if (info == XLOG_CHUNKS_RETIRE)
 		{
 			standby_readers_resolve(xlrec.dboid);

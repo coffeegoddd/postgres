@@ -302,6 +302,12 @@ typedef struct ReplicationSlot
 typedef struct ReplicationSlotCtlData
 {
 	/*
+	 * On a standby, the end of the last collection's swap of a chunk store
+	 * replayed (ReplicationSlotsCollectionReplayed()).
+	 */
+	pg_atomic_uint64 collection_replayed;
+
+	/*
 	 * This array should be declared [FLEXIBLE_ARRAY_MEMBER], but for some
 	 * reason you can't do that in an otherwise-empty struct.
 	 */
@@ -364,6 +370,8 @@ extern bool ReplicationSlotValidateNameInternal(const char *name,
 												bool allow_reserved_name,
 												int *err_code, char **err_msg, char **err_hint);
 extern void ReplicationSlotReserveWal(void);
+extern void ReplicationSlotReserveWalUpstream(void);
+extern void ReplicationSlotsCollectionReplayed(XLogRecPtr end);
 extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
