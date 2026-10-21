@@ -320,6 +320,15 @@ typedef struct ProllyCanonRoutine
 	void		(*splice_baseline) (const ProllyNodeRef *into,
 									const ProllyNodeRef *from, List *tables,
 									ProllyNodeRef *out);
+
+	/*
+	 * Optional: read_fold() of no table's rows, for reading definitions
+	 * alone: every object described as it is now, each table's rows the
+	 * baseline's (none if it hasn't the table as defined now).  root is
+	 * read for definitions, never rows, nor taken for the working set.
+	 */
+	void		(*read_definitions) (const ProllyNodeRef *baseline,
+									 ProllyNodeRef *root, List **left_out);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -328,9 +337,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline"
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK splice_baseline
+#define PROLLY_CANON_LAST_CALLBACK read_definitions
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

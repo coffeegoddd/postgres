@@ -241,7 +241,22 @@ COMMIT;
 SELECT * FROM dolt_status;
 SELECT v FROM fc.t WHERE id = 6;
 
+-- A diff of two commits reads the working set's definitions, not its rows:
+-- nothing of its changes folded (none read), as the diff from WORKING
+-- does.
 SELECT length(dolt_commit('-am', 'left')::text) > 0 AS committed;
+UPDATE fc.t SET v = 'dirty' WHERE id IN (7, 8);
+:flush
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+:flush
+SELECT pg_temp.since('fold_rows_read') AS history_diff_rows;
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
+:flush
+SELECT pg_temp.since('fold_rows_read') AS working_diff_rows;
+SELECT dolt_reset('--hard');
 
 \c contrib_regression
 DROP DATABASE regress_fold_caches;

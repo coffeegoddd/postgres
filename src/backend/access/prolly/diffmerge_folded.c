@@ -430,6 +430,32 @@ tables_of(const char *ref, Oid relid)
 	return tables_of_reading(ref, relid, NULL, NULL);
 }
 
+/*
+ * The session branch's tables as defined now, for reading other versions'
+ * rows as they are defined: WORKING's definitions, its rows not folded
+ * where the refs can read definitions alone.
+ */
+static List *
+tables_defined_now(Oid relid)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	ProllyNodeRef root;
+	Tables		ts = {NIL};
+
+	if (!PROLLY_HAS(refs, read_definitions))
+		return tables_of("WORKING", relid);
+	refs->read_definitions(&root, NULL);
+	read_tables(&root, &ts);
+	types_of_ref(ts.types, "WORKING");
+	if (OidIsValid(relid))
+	{
+		Table	   *t = find_table(ts.tables, table_name(relid));
+
+		return t ? list_make1(t) : NIL;
+	}
+	return ts.tables;
+}
+
 static bool
 same_hash(const ProllyHash *a, const ProllyHash *b)
 {
@@ -744,7 +770,8 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 
 	/*
 	 * Rows are read as the tables are defined now: the working set's
-	 * definitions, folded only if a version may define one otherwise.
+	 * definitions, read only if a version may define one otherwise, and
+	 * without its rows when neither version is the working set.
 	 */
 	if (is_working(to_ref))
 		now = to;
@@ -753,7 +780,7 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 	else if (!tables_differ(from, to, relid))
 		return;
 	else
-		now = tables_of("WORKING", relid);
+		now = tables_defined_now(relid);
 
 	if (OidIsValid(relid))
 	{

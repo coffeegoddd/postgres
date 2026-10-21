@@ -2954,6 +2954,34 @@ copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
 	return true;
 }
 
+/*
+ * The session branch's definitions: its working set known if any (the rows
+ * in it are right too), else a fold of no table's rows, which is never
+ * published: it isn't the working set.
+ */
+static void
+copies_read_definitions(ProllyNodeRef *root, List **left_out)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	char	   *name = branch_ops()->current();
+	bool		have = branch_baseline(name, &baseline);
+
+	if (known_working_set(name, MyBranch, have ? &baseline : NULL, true,
+						  root))
+		return;
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, read_definitions))
+	{
+		ReadFold	rf = {InvalidOid, root, left_out, false};
+
+		read_fold_into(&rf);
+		return;
+	}
+	dc.canonicalizer->read_definitions(have ? &baseline : NULL, root,
+									   left_out);
+}
+
 static bool
 copies_working_set(const char *branch, ProllyNodeRef *root)
 {
@@ -4342,6 +4370,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branches = copies_branches,
 	.working_set = copies_working_set,
 	.read_working_set = copies_read_working_set,
+	.read_definitions = copies_read_definitions,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

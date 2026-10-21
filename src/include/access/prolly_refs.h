@@ -398,6 +398,14 @@ typedef struct ProllyRefsRoutine
 	void		(*note_write) (Oid branch);
 	void		(*forget_folds) (void);
 	void		(*prepared_ended) (FullTransactionId xid);
+
+	/*
+	 * Optional: the session branch's working set for its definitions
+	 * alone, as read_working_set() would read them, its rows not read
+	 * (the canonicalizer's read_definitions()): a root to read objects'
+	 * definitions from, never rows.
+	 */
+	void		(*read_definitions) (ProllyNodeRef *root, List **left_out);
 } ProllyRefsRoutine;
 
 /*
@@ -419,9 +427,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
-	"forget_folds", "prepared_ended"
+	"forget_folds", "prepared_ended", "read_definitions"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK prepared_ended
+#define PROLLY_REFS_LAST_CALLBACK read_definitions
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

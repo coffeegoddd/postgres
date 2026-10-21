@@ -4122,15 +4122,16 @@ build_baseline(Canon *cn, const ProllyNodeRef *baseline, ProllyNodeRef *next)
 
 static List *
 fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
-		   ProllyNodeRef *next_baseline, bool reading, Oid only)
+		   ProllyNodeRef *next_baseline, bool reading, Oid only, bool no_rows)
 {
 	Canon		cn;
 
 	/* (a baseline holds every table's state: never made from one alone) */
-	Assert(!OidIsValid(only) || next_baseline == NULL);
+	Assert((!OidIsValid(only) && !no_rows) || next_baseline == NULL);
 	memset(&cn, 0, sizeof(cn));
 	cn.reading = reading;
 	cn.only = only;
+	cn.no_rows = no_rows;
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
 	cn.advance = next_baseline != NULL;
@@ -4168,7 +4169,8 @@ static void
 folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 			ProllyNodeRef *next_baseline, bool commit)
 {
-	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid);
+	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid,
+					  false);
 }
 
 /*
@@ -4213,7 +4215,17 @@ static void
 folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root,
 				 List **left_out)
 {
-	List	   *l = fold_canon(baseline, root, NULL, true, only);
+	List	   *l = fold_canon(baseline, root, NULL, true, only, false);
+
+	if (left_out)
+		*left_out = list_concat(*left_out, l);
+}
+
+static void
+folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
+						List **left_out)
+{
+	List	   *l = fold_canon(baseline, root, NULL, true, InvalidOid, true);
 
 	if (left_out)
 		*left_out = list_concat(*left_out, l);
@@ -10173,6 +10185,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.walk_changes = folded_walk_changes,
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
+	.read_definitions = folded_read_definitions,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,

@@ -805,10 +805,72 @@ SELECT v FROM fc.t WHERE id = 6;
  left again
 (1 row)
 
+-- A diff of two commits reads the working set's definitions, not its rows:
+-- nothing of its changes folded (none read), as the diff from WORKING
+-- does.
 SELECT length(dolt_commit('-am', 'left')::text) > 0 AS committed;
  committed 
 -----------
  t
+(1 row)
+
+UPDATE fc.t SET v = 'dirty' WHERE id IN (7, 8);
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+ diff_type | id |     v      
+-----------+----+------------
+ modified  |  5 | left
+ modified  |  6 | left again
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS history_diff_rows;
+ history_diff_rows 
+-------------------
+                 0
+(1 row)
+
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
+ diff_type | id |   v   
+-----------+----+-------
+ modified  |  7 | dirty
+ modified  |  8 | dirty
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS working_diff_rows;
+ working_diff_rows 
+-------------------
+                 2
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
 (1 row)
 
 \c contrib_regression
