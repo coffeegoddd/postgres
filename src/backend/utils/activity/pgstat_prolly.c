@@ -100,6 +100,8 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_CHUNK_FILE_READS] = "chunk_file_reads",
 	[PGSTAT_PROLLY_GC_PAGES_SCANNED] = "gc_pages_scanned",
 	[PGSTAT_PROLLY_COMMITS_READ] = "commits_read",
+	[PGSTAT_PROLLY_FOLDS_REUSED] = "folds_reused",
+	[PGSTAT_PROLLY_DESCRIBE_CACHE_HITS] = "describe_cache_hits",
 };
 
 /*

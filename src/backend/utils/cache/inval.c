@@ -119,6 +119,8 @@
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_extension.h"
 #include "miscadmin.h"
 #include "storage/procnumber.h"
 #include "storage/sinval.h"
@@ -270,6 +272,7 @@ int			debug_discard_caches = 0;
  */
 
 #define MAX_SYSCACHE_CALLBACKS 64
+#define MAX_ANY_SYSCACHE_CALLBACKS 4
 #define MAX_RELCACHE_CALLBACKS 10
 #define MAX_RELSYNC_CALLBACKS 10
 
@@ -284,6 +287,15 @@ static struct SYSCACHECALLBACK
 static int16 syscache_callback_links[SysCacheSize];
 
 static int	syscache_callback_count = 0;
+
+/* Callbacks for every syscache, called after each one's own. */
+static struct ANYSYSCACHECALLBACK
+{
+	SyscacheCallbackFunction function;
+	Datum		arg;
+}			any_syscache_callback_list[MAX_ANY_SYSCACHE_CALLBACKS];
+
+static int	any_syscache_callback_count = 0;
 
 static struct RELCACHECALLBACK
 {
@@ -795,6 +807,14 @@ InvalidateSystemCachesExtended(bool debug_discard)
 		ccitem->function(ccitem->arg, ccitem->id, 0);
 	}
 
+	for (i = 0; i < any_syscache_callback_count; i++)
+	{
+		struct ANYSYSCACHECALLBACK *ccitem = any_syscache_callback_list + i;
+
+		for (int id = 0; id < SysCacheSize; id++)
+			ccitem->function(ccitem->arg, id, 0);
+	}
+
 	for (i = 0; i < relcache_callback_count; i++)
 	{
 		struct RELCACHECALLBACK *ccitem = relcache_callback_list + i;
@@ -1166,6 +1186,18 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 
 	if (RelcacheInitFileInval)
 		RelationCacheInitFilePostInvalidate();
+}
+
+/*
+ * XactHasInvalidations
+ *		Has the transaction changed a catalog, so that others will be told
+ *		of it when it commits?  (Prolly's folds aren't skipped in one: it
+ *		sees what nobody else does yet.)
+ */
+bool
+XactHasInvalidations(void)
+{
+	return transInvalInfo != NULL;
 }
 
 /*
@@ -1541,6 +1573,18 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 		else
 			return;
 	}
+	else if (tupleRelId == DependRelationId ||
+			 tupleRelId == ExtensionRelationId)
+	{
+		/*
+		 * Neither has a syscache to tell of its changes: an event for the
+		 * catalog itself tells what is cached from them (prolly's fold of
+		 * what versioned objects depend on: #483).  ALTER EXTENSION ADD, or
+		 * DEPENDS ON EXTENSION, changes nothing else.
+		 */
+		relationId = tupleRelId;
+		databaseId = MyDatabaseId;
+	}
 	else
 		return;
 
@@ -1840,6 +1884,28 @@ CacheRegisterSyscacheCallback(SysCacheIdentifier cacheid,
 }
 
 /*
+ * CacheRegisterAnySyscacheCallback
+ *		Register the specified function to be called for all future
+ *		invalidation events in every syscache, as
+ *		CacheRegisterSyscacheCallback() would for each one.
+ *
+ * For a cache of what is worked out from objects of any kind (prolly's
+ * descriptions of tables, which print the names of whatever they refer
+ * to): registering it with each cache would take most of the slots.
+ */
+void
+CacheRegisterAnySyscacheCallback(SyscacheCallbackFunction func, Datum arg)
+{
+	if (any_syscache_callback_count >= MAX_ANY_SYSCACHE_CALLBACKS)
+		elog(FATAL, "out of any_syscache_callback_list slots");
+
+	any_syscache_callback_list[any_syscache_callback_count].function = func;
+	any_syscache_callback_list[any_syscache_callback_count].arg = arg;
+
+	++any_syscache_callback_count;
+}
+
+/*
  * CacheRegisterRelcacheCallback
  *		Register the specified function to be called for all future
  *		relcache invalidation events.  The OID of the relation being
@@ -1904,6 +1970,13 @@ CallSyscacheCallbacks(SysCacheIdentifier cacheid, uint32 hashvalue)
 		Assert(ccitem->id == cacheid);
 		ccitem->function(ccitem->arg, cacheid, hashvalue);
 		i = ccitem->link - 1;
+	}
+
+	for (i = 0; i < any_syscache_callback_count; i++)
+	{
+		struct ANYSYSCACHECALLBACK *ccitem = any_syscache_callback_list + i;
+
+		ccitem->function(ccitem->arg, cacheid, hashvalue);
 	}
 }
 

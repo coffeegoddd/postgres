@@ -1,0 +1,756 @@
+-- Folds skipped when nothing changed (#482): reading the working set
+-- (dolt_status, dolt_diff from WORKING, dolt_branches' dirty) takes the
+-- last fold of the branch while nothing it reads has changed since, and
+-- folds again once anything has.  folds_reused counts each one taken.
+-- (This suite runs with debug_prolly_verify_fold_caches on: each one taken
+-- is folded too, an error if the two differ.)
+CREATE DATABASE regress_fold_caches;
+\c regress_fold_caches
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE SCHEMA fc VERSIONED;
+CREATE TABLE fc.t (id int PRIMARY KEY, v text);
+CREATE SEQUENCE fc.s;
+CREATE TYPE fc.mood AS ENUM ('sad');
+CREATE TABLE fc.m (id int PRIMARY KEY, mood fc.mood);
+INSERT INTO fc.t SELECT g, 'v' || g FROM generate_series(1, 100) g;
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked, the session's counts flushed first (:flush, a statement of its
+-- own).
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+SELECT length(dolt_commit('-Am', 'base')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+-- Nothing changed since the commit: its fold is the working set, taken
+-- each time, nothing folded (nothing hashed; the check is off to show it).
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('bytes_hashed') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS clean_statuses,
+	pg_temp.since('bytes_hashed') AS bytes_hashed;
+ clean_statuses | bytes_hashed 
+----------------+--------------
+              2 |            0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+-- A row written: folded once, then taken.
+UPDATE fc.t SET v = 'changed' WHERE id = 1;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT diff_type, (to_row).v FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t);
+ diff_type |    v    
+-----------+---------
+ modified  | changed
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_one_fold;
+ after_one_fold 
+----------------
+              2
+(1 row)
+
+-- Another branch's dirtiness, without checking it out: each branch's
+-- folded once (the checkouts' folds didn't say what they left out), then
+-- taken.
+SELECT dolt_branch('other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT name, dirty FROM dolt_branches ORDER BY name;
+ name  | dirty 
+-------+-------
+ main  | t
+ other | f
+(2 rows)
+
+SELECT name, dirty FROM dolt_branches ORDER BY name;
+ name  | dirty 
+-------+-------
+ main  | t
+ other | f
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS dirty_taken;
+ dirty_taken 
+-------------
+           2
+(1 row)
+
+-- Each change below is seen, none taken from the fold before it.
+SELECT length(dolt_commit('-am', 'one row')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS committed_clean;
+ committed_clean 
+-----------------
+               1
+(1 row)
+
+-- DDL
+ALTER TABLE fc.t ADD COLUMN n int;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_alter;
+ after_alter 
+-------------
+           0
+(1 row)
+
+SELECT length(dolt_commit('-am', 'altered')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- an enum's label added
+ALTER TYPE fc.mood ADD VALUE 'happy';
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.mood    | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_add_value;
+ after_add_value 
+-----------------
+               0
+(1 row)
+
+SELECT length(dolt_commit('-am', 'label')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- a sequence's value: nextval and setval
+SELECT nextval('fc.s');
+ nextval 
+---------
+       1
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.s       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_nextval;
+ after_nextval 
+---------------
+             0
+(1 row)
+
+SELECT length(dolt_commit('-am', 'nextval')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT setval('fc.s', 10);
+ setval 
+--------
+     10
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.s       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_setval;
+ after_setval 
+--------------
+            0
+(1 row)
+
+SELECT length(dolt_commit('-am', 'setval')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- TRUNCATE
+TRUNCATE fc.m;
+INSERT INTO fc.m VALUES (1, 'happy');
+SELECT length(dolt_commit('-am', 'a mood')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+TRUNCATE fc.m;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.m       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_truncate;
+ after_truncate 
+----------------
+              0
+(1 row)
+
+SELECT length(dolt_commit('-am', 'truncated')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- a branch switched to: its own working set (none of its statuses taken;
+-- the two checkouts take the working sets of the branches they leave)
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+INSERT INTO fc.t VALUES (1000, 'on other');
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_switch;
+ after_switch 
+--------------
+            2
+(1 row)
+
+-- the transaction's own writes and DDL: seen at once, taken from no fold
+-- (one taken: the first status, before the transaction wrote)
+BEGIN;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+INSERT INTO fc.t VALUES (2000, 'in a transaction');
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+ROLLBACK;
+BEGIN;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+CREATE TABLE fc.made (id int PRIMARY KEY);
+SELECT * FROM dolt_status;
+ table_name | staged |  status   
+------------+--------+-----------
+ fc.made    | t      | new table
+(1 row)
+
+ROLLBACK;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS own_writes;
+ own_writes 
+------------
+          1
+(1 row)
+
+-- a subtransaction's write rolled back: gone again
+BEGIN;
+SAVEPOINT s;
+DELETE FROM fc.t WHERE id = 2;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+ROLLBACK TO s;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+COMMIT;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_savepoint;
+ after_savepoint 
+-----------------
+               0
+(1 row)
+
+-- a role a policy names, renamed (a catalog outside the branch)
+CREATE ROLE regress_fold_caches_r;
+ALTER TABLE fc.t ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p ON fc.t TO regress_fold_caches_r USING (true);
+SELECT length(dolt_commit('-am', 'policy')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER ROLE regress_fold_caches_r RENAME TO regress_fold_caches_s;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_role_rename;
+ after_role_rename 
+-------------------
+                 0
+(1 row)
+
+DROP POLICY p ON fc.t;
+ALTER TABLE fc.t DISABLE ROW LEVEL SECURITY;
+DROP ROLE regress_fold_caches_s;
+SELECT length(dolt_commit('-am', 'no policy')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- a collection: the fold's tree is no ref's, so it isn't taken after one
+SELECT dolt_gc();
+ dolt_gc 
+---------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS after_gc;
+ after_gc 
+----------
+        0
+(1 row)
+
+-- forced to read every row: nothing taken
+SET debug_prolly_force_full_fold = on;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+RESET debug_prolly_force_full_fold;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS forced_full;
+ forced_full 
+-------------
+           0
+(1 row)
+
+-- No fold around moves: a checkout and a hard reset take the working set
+-- known.  Leaving a clean branch, and back: nothing folded.
+SELECT length(dolt_commit('-am', 'on other')::text) > 0 AS committed
+FROM (SELECT dolt_checkout('other')) c;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS counting,
+	pg_temp.since('bytes_hashed') IS NOT NULL AS hashing;
+ counting | hashing 
+----------+---------
+ t        | t
+(1 row)
+
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS clean_checkouts,
+	pg_temp.since('bytes_hashed') AS bytes_hashed;
+ clean_checkouts | bytes_hashed 
+-----------------+--------------
+               2 |            0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+-- A hard reset of a clean branch: the working set is the head's already.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS clean_reset;
+ clean_reset 
+-------------
+           1
+(1 row)
+
+-- A hard reset after a write: folded, and the row put back.
+UPDATE fc.t SET v = 'to undo' WHERE id = 3;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT v FROM fc.t WHERE id = 3;
+ v  
+----
+ v3
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS reset_after_write;
+ reset_after_write 
+-------------------
+                 0
+(1 row)
+
+-- A fast-forward: the working set before it taken (by the merge, and by
+-- the move), then the move's fold.
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+UPDATE fc.t SET v = 'forward' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'forward')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT (dolt_merge('other'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 0
+(1 row)
+
+SELECT v FROM fc.t WHERE id = 4;
+    v    
+---------
+ forward
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS fast_forward_taken;
+ fast_forward_taken 
+--------------------
+                  2
+(1 row)
+
+-- Leaving a branch with changes known: its checkpoint, folded once, keeps
+-- them.
+UPDATE fc.t SET v = 'left' WHERE id = 5;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT v FROM fc.t WHERE id = 5;
+  v   
+------
+ left
+(1 row)
+
+SELECT length(dolt_commit('-am', 'left')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_fold_caches;

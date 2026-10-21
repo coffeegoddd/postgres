@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_config.h"
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -47,6 +48,9 @@ void
 SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
 	SIInsertDataEntries(msgs, n);
+
+	/* (a fold made before may describe what changed: prolly's are stale) */
+	prolly_forget_folds();
 }
 
 /*

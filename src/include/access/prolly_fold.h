@@ -57,6 +57,20 @@ extern PGDLLIMPORT bool debug_prolly_force_full_fold;
 /* Set while the verifier folds a table in full (fold_verify.c). */
 extern PGDLLIMPORT bool prolly_fold_verifying;
 
+/*
+ * debug_prolly_verify_fold_caches: a working set taken from an earlier
+ * fold, not folded (#482), is folded too, and checked against it
+ * (prolly_check_fold_cache(): left_out, an object the new fold left out
+ * where the earlier one left none; NULL if none).  So is what a fold takes
+ * from the canonicalizer's caches (#483): worked out again, and an error
+ * if it differs.
+ */
+extern PGDLLIMPORT bool debug_prolly_verify_fold_caches;
+extern void prolly_check_fold_cache(const char *branch,
+									const ProllyNodeRef *taken,
+									const ProllyNodeRef *folded,
+									const char *left_out);
+
 /* prolly.fold_verify_rate: tables autovacuum's verifier checks a pass. */
 extern PGDLLIMPORT double prolly_fold_verify_rate;
 

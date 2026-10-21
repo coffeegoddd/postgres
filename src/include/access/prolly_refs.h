@@ -28,6 +28,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "access/transam.h"
 #include "datatype/timestamp.h"
 
 #define PROLLY_MAX_PARENTS 2
@@ -375,6 +376,28 @@ typedef struct ProllyRefsRoutine
 	bool		(*stash_select) (const char *name, int n, ProllyHash *stash);
 	bool		(*stash_drop) (const char *name, int n);
 	void		(*stash_clear) (const char *name);
+
+	/*
+	 * Optional: what lets a working set's fold be skipped when nothing it
+	 * reads has changed (#482).  shmem_size() and shmem_init() as a chunk
+	 * store's (prolly_shmem.h).  note_write() is told of a transaction
+	 * about to write a branch (its rows, its versioned objects' catalog
+	 * rows, or a versioned sequence's value), by every writer, hushed or
+	 * not, before the write is seen by anyone else; forget_folds() that
+	 * something every fold reads changed under them all (a catalog change
+	 * sent to other sessions, chunks a collection dropped), from critical
+	 * sections too, so it neither errors nor allocates.  prepared_ended()
+	 * is told of a prepared transaction committed or rolled back (once
+	 * others see it), which may have written any branch: one recovered at
+	 * startup was never told of by note_write(), so a fold by a snapshot
+	 * from before its end must not be taken for the working set.  It is
+	 * called with interrupts held, so it neither errors nor allocates.
+	 */
+	Size		(*shmem_size) (void);
+	void		(*shmem_init) (void *area);
+	void		(*note_write) (Oid branch);
+	void		(*forget_folds) (void);
+	void		(*prepared_ended) (FullTransactionId xid);
 } ProllyRefsRoutine;
 
 /*
@@ -395,9 +418,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
-	"stash_clear", "stash_select"
+	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
+	"forget_folds", "prepared_ended"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK stash_clear
+#define PROLLY_REFS_LAST_CALLBACK prepared_ended
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

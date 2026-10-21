@@ -78,6 +78,7 @@
 
 #include "access/commit_ts.h"
 #include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -1631,6 +1632,13 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	ProcArrayRemove(proc, latestXid);
 
 	/*
+	 * Prolly's folds that skip reading what didn't change are told of its
+	 * end once others see it: one recovered at startup may have written any
+	 * branch unbeknownst to them.
+	 */
+	prolly_note_prepared_ended(fxid);
+
+	/*
 	 * In case we fail while running the callbacks, mark the gxact invalid so
 	 * no one else will try to commit/rollback, and so it will be recycled if
 	 * we fail after this point.  It is still locked by our backend so it
@@ -2858,6 +2866,27 @@ LookupGXactBySubid(Oid subid)
 	LWLockRelease(TwoPhaseStateLock);
 
 	return found;
+}
+
+/*
+ * TwoPhaseAnyPrepared
+ *		Is any transaction prepared, or being prepared, in any database?
+ *
+ * Prolly's folds that skip reading what didn't change (#482) are told of
+ * every writer's end but not of a prepared one's, so none is skipped while
+ * one exists.
+ */
+bool
+TwoPhaseAnyPrepared(void)
+{
+	bool		any;
+
+	if (max_prepared_xacts == 0)
+		return false;
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	any = TwoPhaseState->numPrepXacts > 0;
+	LWLockRelease(TwoPhaseStateLock);
+	return any;
 }
 
 /*

@@ -47,6 +47,8 @@ typedef void (*RelSyncCallbackFunction) (Datum arg, Oid relid);
 
 extern void AcceptInvalidationMessages(void);
 
+extern bool XactHasInvalidations(void);
+
 extern void AtEOXact_Inval(bool isCommit);
 
 extern void PreInplace_Inval(void);
@@ -86,6 +88,9 @@ extern void CacheInvalidateRelmap(Oid databaseId);
 extern void CacheRegisterSyscacheCallback(SysCacheIdentifier cacheid,
 										  SyscacheCallbackFunction func,
 										  Datum arg);
+
+extern void CacheRegisterAnySyscacheCallback(SyscacheCallbackFunction func,
+											 Datum arg);
 
 extern void CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
 										  Datum arg);

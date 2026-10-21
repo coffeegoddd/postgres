@@ -101,6 +101,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_fold.h"
 #include "access/prolly_xact.h"
 #include "access/xact.h"
 #include "access/amapi.h"
@@ -117,6 +118,7 @@
 #include "catalog/pg_class.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "refs_generations.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
@@ -892,7 +894,7 @@ branch_exists(const char *name)
 	return OidIsValid(branch_oid(name)) || branch_head(name, &head);
 }
 
-static void fold(ProllyNodeRef *root);
+static void working_fold(ProllyNodeRef *root);
 static void fold_as_baseline(void *arg);
 
 /*
@@ -901,7 +903,8 @@ static void fold_as_baseline(void *arg);
  * working set is the root already; then folded from there, so no fold
  * after reads the pages the move wrote again and again.  Objects no
  * commit could hold (the canonical form doesn't describe them) are
- * uncommitted work the move discards, as it does any other.
+ * uncommitted work the move discards, as it does any other.  The working
+ * set is folded only if nothing known says what it is (#482).
  */
 static void
 move_settled(void *arg)
@@ -912,7 +915,7 @@ move_settled(void *arg)
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
-	fold(&working);
+	working_fold(&working);
 	if (same_hash(&working.hash, &target->hash))
 		return;
 	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
@@ -1599,10 +1602,64 @@ copies_merge_base(const ProllyHash *a, const ProllyHash *b, ProllyHash *base)
 	return prolly_history_merge_base(a, b, copies_lookup_commit, NULL, base);
 }
 
+/* The snapshot a fold reads by: the canonicalizer's. */
+static Snapshot
+fold_snapshot(void)
+{
+	return ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+}
+
+/* May a working set be taken from an earlier fold?  Not one forced to read. */
+static bool
+fold_caches_usable(void)
+{
+	return !debug_prolly_force_full_fold && !prolly_fold_verifying;
+}
+
+/*
+ * Publish the fold of the session's branch stamped, by snap, made from
+ * baseline (NULL: none) (#482): complete if it left nothing out.
+ */
+static void
+publish_fold(const BranchFoldStamp *stamp, Snapshot snap,
+			 const ProllyNodeRef *baseline, const ProllyNodeRef *root,
+			 bool complete)
+{
+	if (fold_caches_usable())
+		branch_fold_publish(stamp, snap, baseline ? &baseline->hash : NULL,
+							&root->hash, complete);
+}
+
+static void verify_known(const char *name, bool complete,
+						 const ProllyNodeRef *root);
+
+/*
+ * The working set of branch name (OID branch), from baseline (NULL: none),
+ * taken from an earlier fold if nothing it read changed since (#482):
+ * false if not known.  complete: only one that left nothing out.
+ */
+static bool
+known_working_set(const char *name, Oid branch, const ProllyNodeRef *baseline,
+				  bool complete, ProllyNodeRef *root)
+{
+	ProllyHash	h;
+
+	if (!fold_caches_usable() ||
+		!branch_fold_known(branch, fold_snapshot(),
+						   baseline ? &baseline->hash : NULL, complete, &h))
+		return false;
+	ref_of(&h, root);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLDS_REUSED, 1);
+	if (debug_prolly_verify_fold_caches)
+		verify_known(name, complete, root);
+	return true;
+}
+
 /*
  * The session branch's versioned schemas, folded from its baseline; with
  * next, a new baseline begun.  Only a commit's fold refuses objects the
- * canonical form doesn't describe; others leave them out.
+ * canonical form doesn't describe; others leave them out.  Published, from
+ * next if made (#482).
  */
 static void
 fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next, bool commit)
@@ -1610,16 +1667,36 @@ fold_from_baseline(ProllyNodeRef *root, ProllyNodeRef *next, bool commit)
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef baseline;
 	bool		have = branch_baseline(branch_ops()->current(), &baseline);
+	Snapshot	snap = fold_snapshot();
+	BranchFoldStamp stamp;
 
+	branch_fold_stamp(MyBranch, &stamp);
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, fold, have ? &baseline : NULL, root, next,
 				commit);
+
+	/* (a commit's fold refuses what it would leave out: it left nothing) */
+	publish_fold(&stamp, snap, next ? next : (have ? &baseline : NULL), root,
+				 commit);
 }
 
 static void
 fold(ProllyNodeRef *root)
 {
 	fold_from_baseline(root, NULL, false);
+}
+
+/* fold()'s working set, taken from an earlier fold if known (#482). */
+static void
+working_fold(ProllyNodeRef *root)
+{
+	ProllyNodeRef baseline;
+	char	   *name = branch_ops()->current();
+	bool		have = branch_baseline(name, &baseline);
+
+	if (!known_working_set(name, MyBranch, have ? &baseline : NULL, false,
+						   root))
+		fold(root);
 }
 
 /*
@@ -2127,7 +2204,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * the branch's), nor its baseline (another's checkpoint or fold, which the
  * snapshot can't fold from: it would read every table in full, and replace
  * that one's baseline with an unsettled one).  (A session choosing its
- * first branch, as it connects, leaves none.)
+ * first branch, as it connects, leaves none.)  A working set known (#482)
+ * is compared without a fold; one not known is folded once, as the
+ * checkpoint, kept even if clean (its fold took its log's entries).
  */
 static void
 copies_checkout(const char *name)
@@ -2168,14 +2247,17 @@ copies_checkout(const char *name)
 		ProllyNodeRef working;
 		ProllyNodeRef kept;
 		ProllyNodeRef next;
+		ProllyNodeRef baseline;
 		ProllyHash	head;
 
-		fold(&working);
-		if (!(branch_head(current, &head) &&
-			  copies_commit_working_set(&head, &kept) &&
-			  same_hash(&kept.hash, &working.hash)) &&
-			!(branch_baseline_root(current, &kept) &&
-			  same_hash(&kept.hash, &working.hash)))
+		if (!(known_working_set(current, MyBranch,
+								branch_baseline(current, &baseline) ? &baseline : NULL,
+								false, &working) &&
+			  ((branch_head(current, &head) &&
+				copies_commit_working_set(&head, &kept) &&
+				same_hash(&kept.hash, &working.hash)) ||
+			   (branch_baseline_root(current, &kept) &&
+				same_hash(&kept.hash, &working.hash)))))
 		{
 			lock_refs();
 			if (!head_moved_unseen(current) &&
@@ -2389,15 +2471,20 @@ copies_branches(ProllyBranchVisit visit, void *arg)
 static void
 fold_into(void *arg)
 {
-	fold((ProllyNodeRef *) arg);
+	working_fold((ProllyNodeRef *) arg);
 }
 
-/* The session branch's working set read: see read_working_set(). */
+/*
+ * The session branch's working set read: see read_working_set().  Taken
+ * from an earlier fold if known, unless fresh (#482); published if of
+ * every table and nothing was left out.
+ */
 typedef struct ReadFold
 {
 	Oid			only;
 	ProllyNodeRef *root;
 	List	  **left_out;
+	bool		fresh;
 } ReadFold;
 
 static void
@@ -2406,11 +2493,57 @@ read_fold_into(void *arg)
 	ReadFold   *rf = arg;
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef baseline;
-	bool		have = branch_baseline(branch_ops()->current(), &baseline);
+	char	   *name = branch_ops()->current();
+	bool		have = branch_baseline(name, &baseline);
+	Snapshot	snap;
+	BranchFoldStamp stamp;
+	List	   *left_out = NIL;
 
+	if (!rf->fresh &&
+		known_working_set(name, MyBranch, have ? &baseline : NULL, true,
+						  rf->root))
+		return;
+	snap = fold_snapshot();
+	branch_fold_stamp(MyBranch, &stamp);
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, read_fold, have ? &baseline : NULL, rf->only,
-				rf->root, rf->left_out);
+				rf->root, &left_out);
+	if (!OidIsValid(rf->only) && left_out == NIL)
+		publish_fold(&stamp, snap, have ? &baseline : NULL, rf->root, true);
+	if (rf->left_out)
+		*rf->left_out = list_concat(*rf->left_out, left_out);
+}
+
+/* (the fresh fold of the session's branch verify_known() compares with) */
+static void
+fresh_fold_into(void *arg)
+{
+	ReadFold   *rf = arg;
+
+	if (rf->left_out)
+		read_fold_into(rf);
+	else
+		fold(rf->root);
+}
+
+/*
+ * debug_prolly_verify_fold_caches: the working set taken for branch name,
+ * folded again and compared (prolly_check_fold_cache()); complete, a read
+ * fold's, which must leave nothing out.
+ */
+static void
+verify_known(const char *name, bool complete, const ProllyNodeRef *root)
+{
+	ProllyNodeRef folded;
+	List	   *left_out = NIL;
+	ReadFold	rf = {InvalidOid, &folded, complete ? &left_out : NULL, true};
+
+	if (strcmp(name, branch_ops()->current()) == 0)
+		fresh_fold_into(&rf);
+	else
+		branch_ops()->run_on(name, fresh_fold_into, &rf);
+	prolly_check_fold_cache(name, root, &folded,
+							left_out != NIL ? (const char *) linitial(left_out) : NULL);
 }
 
 /* A branch's working set as a head-only one has it: false if none. */
@@ -2426,19 +2559,30 @@ head_working_set(const char *branch, ProllyNodeRef *root)
 	return true;
 }
 
+/*
+ * (another branch's working set known is taken without checking it out: a
+ * clean one's dirtiness is known without folding (#482))
+ */
 static bool
 copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
 						List **left_out)
 {
-	ReadFold	rf = {only, root, left_out};
+	ReadFold	rf = {only, root, left_out, false};
+	Oid			oid;
+	ProllyNodeRef baseline;
 
 	if (branch == NULL)
 	{
 		read_fold_into(&rf);
 		return true;
 	}
-	if (!OidIsValid(branch_oid(branch)))
+	oid = branch_oid(branch);
+	if (!OidIsValid(oid))
 		return head_working_set(branch, root);
+	if (known_working_set(branch, oid,
+						  branch_baseline(branch, &baseline) ? &baseline : NULL,
+						  true, root))
+		return true;
 	branch_ops()->run_on(branch, read_fold_into, &rf);
 	return true;
 }
@@ -2448,7 +2592,7 @@ copies_working_set(const char *branch, ProllyNodeRef *root)
 {
 	if (branch == NULL)
 	{
-		fold(root);
+		working_fold(root);
 		return true;
 	}
 	/* (one with only a head: its working set is the head's) */
@@ -3859,4 +4003,9 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.stash_select = copies_stash_select,
 	.stash_drop = copies_stash_drop,
 	.stash_clear = copies_stash_clear,
+	.shmem_size = branch_generations_shmem_size,
+	.shmem_init = branch_generations_shmem_init,
+	.note_write = branch_generations_note_write,
+	.forget_folds = branch_generations_forget,
+	.prepared_ended = branch_generations_prepared_ended,
 };

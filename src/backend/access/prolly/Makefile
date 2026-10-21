@@ -59,6 +59,7 @@ OBJS = \
 	remote_libpq_load.o \
 	remote_serve.o \
 	refs_copies.o \
+	refs_generations.o \
 	refs_history.o \
 	refs_stub.o \
 	transfer_chunks.o \
