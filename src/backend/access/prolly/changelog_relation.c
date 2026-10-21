@@ -437,10 +437,11 @@ static List *written = NIL;		/* WrittenSet *; the transaction's */
 static HTAB *own_logs = NULL;	/* OwnLog; the transaction's */
 
 /*
- * A bulk write stops being noted (#499): past this many entries of a log
- * in a transaction, or a quarter of its table's rows if more, its entries
- * are dropped for one saying to read the table in full, which is what its
- * fold would do with so many; a table made in the transaction (no
+ * A bulk write stops being noted (#499): past this many distinct entries of
+ * a log in a transaction (a key written again is the same entry), or a
+ * quarter of its table's rows if more, its entries are dropped for one
+ * saying to read the table in full, writing and reading back so many
+ * costing about what that read does; a table made in the transaction (no
  * baseline to fold from) isn't noted at all.  Per (sub)transaction, so a
  * rollback of the bulk write takes the switch back.
  */
@@ -510,8 +511,8 @@ buffer_init(LogBuffer *b)
 	b->emptied = false;
 }
 
-/* Add an entry to a buffer. */
-static void
+/* Add an entry to a buffer: true if it holds no entry of the same bytes. */
+static bool
 buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row)
 {
 	BufKey		key = {len, data};
@@ -532,6 +533,7 @@ buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row)
 	}
 	be->delta += delta;
 	be->row = be->row || row;
+	return !found;
 }
 
 /* Add what src holds to dst. */
@@ -543,7 +545,7 @@ buffer_merge(LogBuffer *dst, const LogBuffer *src)
 
 	hash_seq_init(&seq, src->entries);
 	while ((be = hash_seq_search(&seq)) != NULL)
-		buffer_add(dst, be->key.data, be->key.len, be->delta, be->row);
+		(void) buffer_add(dst, be->key.data, be->key.len, be->delta, be->row);
 	dst->full = dst->full || src->full;
 	dst->emptied = dst->emptied || src->emptied;
 }
@@ -717,9 +719,11 @@ notes_stopped(Oid logid)
 }
 
 /*
- * Count a write's n entries of rel's log; past the bulk limit (or for a
- * table made in the transaction), stop noting it, the (sub)transaction's
- * entries dropped for one saying to read the table in full.
+ * Count a write's n entries of rel's log its buffer didn't hold (the
+ * entries a fold would read, not the writes: a key updated many times is
+ * one); past the bulk limit (or for a table made in the transaction),
+ * stop noting it, the (sub)transaction's entries dropped for one saying to
+ * read the table in full.
  */
 static void
 notes_count(Relation rel, Oid logid, int n)
@@ -796,11 +800,15 @@ register_callbacks(void)
 
 static void flush_buffer(LogBuffer *b);
 
-/* Hold a write's entries; written past BUFFER_FLUSH_BYTES. */
-static void
+/*
+ * Hold a write's entries; written past BUFFER_FLUSH_BYTES.  The number the
+ * buffer didn't hold already: a key written again is one entry.
+ */
+static int
 buffer_entries(Entries *e)
 {
 	LogBuffer  *b;
+	int			added = 0;
 
 	register_callbacks();
 	b = buffer_of(RelationGetRelid(e->log), GetCurrentSubTransactionId());
@@ -827,12 +835,14 @@ buffer_entries(Entries *e)
 			h = (HeapTupleHeader) (bytes - IMAGE_SKIP);
 			h->t_infomask2 &= ~HEAP2_XACT_MASK;
 			h->t_infomask &= ~HEAP_XACT_MASK;
-			buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0);
+			if (buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0))
+				added++;
 			pfree(bytes);
 		}
 	}
 	if (b->bytes > BUFFER_FLUSH_BYTES)
 		flush_buffer(b);
+	return added;
 }
 
 /* Note that the transaction wrote a log a row saying to read in full. */
@@ -1178,8 +1188,7 @@ note_write(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
 	}
 	note_versions(rel, &e, old, made, nmade);
 	MemoryContextSwitchTo(caller);
-	buffer_entries(&e);
-	notes_count(rel, logid, e.n);
+	notes_count(rel, logid, buffer_entries(&e));
 	MemoryContextReset(note_cxt);
 }
 

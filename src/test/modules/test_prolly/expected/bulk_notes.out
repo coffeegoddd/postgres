@@ -1,8 +1,9 @@
--- A bulk write stops being noted: past 65536 entries of a table's log in a
--- transaction (or a quarter of its rows, if more), its entries are dropped
--- for one saying to read the table in full, as the fold would, and the
--- writes after aren't noted; a rollback to a savepoint before takes it
--- back.  A table made in the transaction isn't noted at all.
+-- A bulk write stops being noted: past 65536 distinct entries of a table's
+-- log in a transaction (or a quarter of its rows, if more), its entries are
+-- dropped for one saying to read the table in full, and the writes after
+-- aren't noted; a rollback to a savepoint before takes it back.  A key
+-- written many times is one entry.  A table made in the transaction isn't
+-- noted at all.
 CREATE DATABASE regress_bulk_notes;
 \c regress_bulk_notes
 CREATE EXTENSION test_prolly;
@@ -247,5 +248,30 @@ SELECT same_as_full() AS made;
  t
 (1 row)
 
+-- the same keys written past the limit's count of times: an entry each,
+-- noted (66000 writes, 1000 entries)
+CREATE TABLE bn.h (id int PRIMARY KEY, v text);
+INSERT INTO bn.h SELECT g, 'v' FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'hot')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+DO $$ BEGIN FOR i IN 1..66 LOOP UPDATE bn.h SET v = 'hot' || i; END LOOP; END $$;
+SELECT * FROM entries('bn.h');
+  n   | full_read 
+------+-----------
+ 1000 | f
+(1 row)
+
+SELECT same_as_full() AS hot;
+ hot 
+-----
+ t
+(1 row)
+
+COMMIT;
 \c contrib_regression
 DROP DATABASE regress_bulk_notes;
