@@ -1,0 +1,35 @@
+{
+		Name: "Clearing and stashing again",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"INSERT INTO test VALUES (1, 'a')",
+			"CALL DOLT_STASH('push', 'myStash')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STASHES;",
+				Expected: []sql.Row{
+					{"myStash", "stash@{0}", "main", doltCommit, "Created table"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('clear', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "INSERT INTO test VALUES (2, 'b');",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:            "CALL DOLT_STASH('push', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM DOLT_STASHES;",
+				Expected: []sql.Row{
+					{"myStash", "stash@{0}", "main", doltCommit, "Created table"},
+				},
+			},
+		},
+	}

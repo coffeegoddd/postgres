@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "id": "dolt-info-schema-checkout",
+  "description": "Reviewed Dolt port: info_schema changes with dolt_checkout",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltInfoSchemaScripts: info_schema changes with dolt_checkout"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (a int primary key, b int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "created",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-A"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "alter table t add column c int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "added-c",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added column c on branch b2",
+        "-a"
+      ],
+      "save": "added-c"
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "alter table t add column d int",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "added-d",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added column d on branch b3",
+        "-a"
+      ],
+      "save": "added-d"
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "select active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "main"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "select column_name::text from information_schema.columns where table_schema = 'public' and table_name = 't' order by 1",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b2"
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "select active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "b2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "select column_name::text from information_schema.columns where table_schema = 'public' and table_name = 't' order by 1",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "c"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "b3"
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "select active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "b3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "sql": "select column_name::text from information_schema.columns where table_schema = 'public' and table_name = 't' order by 1",
+      "expect": {
+        "rows": [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "d"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

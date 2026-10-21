@@ -1,0 +1,96 @@
+{
+		Name: "CALL DOLT_COMMIT('-ALL') adds all tables (including new ones) to the commit.",
+		SetUpScript: []string{
+			"CREATE table t (pk int primary key);",
+			"INSERT INTO t VALUES (1);",
+			"CALL DOLT_ADD('t');",
+			"CALL DOLT_COMMIT('-m', 'add table t');",
+			"CALL DOLT_RESET('--hard');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{{1}},
+			},
+			// update a table
+			{
+				Query:    "DELETE from t where pk = 1;",
+				Expected: []sql.Row{{types.NewOkResult(1)}},
+			},
+			{
+				Query:    "CALL DOLT_COMMIT('-ALL', '-m', 'update table terminator');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			// check last commit
+			{
+				Query:    "select message from dolt_log limit 1",
+				Expected: []sql.Row{{"update table terminator"}},
+			},
+			// amend last commit
+			{
+				Query:    "CALL DOLT_COMMIT('-amend', '-m', 'update table t');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			// check amended commit
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:    "select message from dolt_log limit 1",
+				Expected: []sql.Row{{"update table t"}},
+			},
+			{
+				Query:    "CALL DOLT_RESET('--hard');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * from t;",
+				Expected: []sql.Row{},
+			},
+			// delete a table
+			{
+				Query:    "DROP TABLE t;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "CALL DOLT_COMMIT('-Am', 'drop table t');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				Query:    "CALL DOLT_RESET('--hard');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:       "SELECT * from t;",
+				ExpectedErr: sql.ErrTableNotFound,
+			},
+			// create a table
+			{
+				Query:    "CREATE table t2 (pk int primary key);",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:    "CALL DOLT_COMMIT('-Am', 'add table 21');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			// amend last commit
+			{
+				Query:    "CALL DOLT_COMMIT('-amend', '-m', 'add table 2');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			// check amended commit
+			{
+				Query:    "select message from dolt_log limit 1",
+				Expected: []sql.Row{{"add table 2"}},
+			},
+			{
+				Query:    "CALL DOLT_RESET('--hard');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * from t2;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

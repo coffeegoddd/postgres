@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "id": "dolt-log-as-of",
+  "description": "Reviewed Dolt port: dolt_history table with AS OF",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: dolt_history table with AS OF"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 int, c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 2, '3'), (4, 5, '6')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values",
+        "-a"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (11, 22, '3'), (44, 55, '6')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values again",
+        "-a"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "select message from dolt_log('head^')",
+      "expect": {
+        "rows": [
+          [
+            "added values"
+          ],
+          [
+            "creating table t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

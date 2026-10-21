@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "id": "dolt-commit-expression",
+  "description": "Reviewed Dolt port: dolt commit works with arguments",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCommitTests: dolt commit works with arguments"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE table t (pk int primary key)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length((dolt_commit('-m', concat('author: ','somebody')))[1])",
+      "expect": {
+        "rows": [
+          [
+            "40"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log WHERE message = 'author: somebody'",
+      "expect": {
+        "rows": [
+          [
+            "author: somebody"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

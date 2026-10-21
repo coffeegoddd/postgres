@@ -1,0 +1,26 @@
+{
+		Name: "stash apply maintains stash entry",
+		SetUpScript: []string{
+			"CALL DOLT_COMMIT('--allow-empty', '-m', 'First commit')", //Normal test initialization adds some weird commit
+			"CREATE TABLE test(id INT)",
+			"CALL DOLT_STASH('push', 'myStash', '-a')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STASHES",
+				Expected: []sql.Row{
+					{"myStash", "stash@{0}", "main", doltCommit, "First commit"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('apply', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM DOLT_STASHES",
+				Expected: []sql.Row{
+					{"myStash", "stash@{0}", "main", doltCommit, "First commit"},
+				},
+			},
+		},
+	}

@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "id": "dolt-remote-remove",
+  "description": "Reviewed Dolt port: dolt-remote: SQL remove remotes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltRemoteTestScripts: dolt-remote: SQL remove remotes"
+  },
+  "requires": [
+    "sql",
+    "vc.remotes"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT dolt_remote('add', 'origin1', 'file:///nonexistent/origin1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT dolt_remote('add', 'origin2', 'file:///nonexistent/origin2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT dolt_remote('remove', 'origin2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1-list",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT name, CASE WHEN char_length(url) < 0 THEN NULL ELSE 'not null' END FROM dolt_remotes",
+      "expect": {
+        "rows": [
+          [
+            "origin1",
+            "not null"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "DELETE FROM dolt_remotes WHERE name = 'origin1'",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    }
+  ]
+}

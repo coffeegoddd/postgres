@@ -1,0 +1,232 @@
+{
+  "version": 1,
+  "id": "dolt-index-desc-ranges",
+  "description": "Reviewed Dolt port: descending index scans over several ranges",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltScripts: descending index scans over several ranges"
+  },
+  "requires": [
+    "sql"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk INT PRIMARY KEY, a INT, b INT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-0-a-desc",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX a_desc ON t (a DESC NULLS LAST)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "setup-0-ab",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX ab ON t (a NULLS FIRST, b DESC NULLS LAST)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 10, 1), (2, 20, 2), (3, 30, 3), (4, 40, 4), (5, NULL, 5), (6, 20, 6), (7, 30, NULL)",
+      "expect": {
+        "tag": "INSERT 0 7"
+      }
+    },
+    {
+      "id": "setup-1-plan",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET enable_seqscan = off",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t WHERE a IN (10, 30, 40) ORDER BY a DESC",
+      "expect": {
+        "rows": [
+          [
+            "40"
+          ],
+          [
+            "30"
+          ],
+          [
+            "30"
+          ],
+          [
+            "10"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t WHERE a IN (10, 30, 40) ORDER BY a",
+      "expect": {
+        "rows": [
+          [
+            "10"
+          ],
+          [
+            "30"
+          ],
+          [
+            "30"
+          ],
+          [
+            "40"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t WHERE a < 20 OR a > 30 ORDER BY a DESC",
+      "expect": {
+        "rows": [
+          [
+            "40"
+          ],
+          [
+            "10"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t WHERE a < 20 OR a > 30 ORDER BY a",
+      "expect": {
+        "rows": [
+          [
+            "10"
+          ],
+          [
+            "40"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t WHERE a > 30 OR b = 2 ORDER BY a DESC",
+      "expect": {
+        "rows": [
+          [
+            "40"
+          ],
+          [
+            "20"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a FROM t WHERE a > 30 OR b = 2 ORDER BY a",
+      "expect": {
+        "rows": [
+          [
+            "20"
+          ],
+          [
+            "40"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a, b FROM t WHERE a IN (20, 30) ORDER BY a DESC, b NULLS FIRST",
+      "expect": {
+        "rows": [
+          [
+            "30",
+            null
+          ],
+          [
+            "30",
+            "3"
+          ],
+          [
+            "20",
+            "2"
+          ],
+          [
+            "20",
+            "6"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT a, b FROM t WHERE a IN (20, 30) ORDER BY a, b DESC NULLS LAST",
+      "expect": {
+        "rows": [
+          [
+            "20",
+            "6"
+          ],
+          [
+            "20",
+            "2"
+          ],
+          [
+            "30",
+            "3"
+          ],
+          [
+            "30",
+            null
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

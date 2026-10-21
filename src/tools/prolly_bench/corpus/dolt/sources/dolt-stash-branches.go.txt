@@ -1,0 +1,21 @@
+{
+		Name: "Stashing on different branches",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"INSERT INTO test VALUES (1, 'a')",
+			"CALL DOLT_STASH('push', 'myStash')",
+			"CALL DOLT_CHECKOUT('-b', 'br1')",
+			"INSERT INTO test VALUES (2, 'b')",
+			"CALL DOLT_STASH('push', 'myStash')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STASHES;",
+				Expected: []sql.Row{
+					{"myStash", "stash@{0}", "br1", doltCommit, "Created table"},
+					{"myStash", "stash@{1}", "main", doltCommit, "Created table"},
+				},
+			},
+		},
+	}

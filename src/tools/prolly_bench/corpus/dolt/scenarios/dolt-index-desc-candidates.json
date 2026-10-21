@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "id": "dolt-index-desc-candidates",
+  "description": "Reviewed Dolt port: descending index chosen among candidates",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltScripts: descending index chosen among candidates"
+  },
+  "requires": [
+    "sql"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk INT PRIMARY KEY, a INT, b INT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-0-ab",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX ab ON t (a DESC NULLS LAST, b NULLS FIRST)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "setup-0-ab-desc",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX ab_desc ON t (a DESC NULLS LAST, b DESC NULLS LAST)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, NULL, 3), (5, 2, NULL)",
+      "expect": {
+        "tag": "INSERT 0 5"
+      }
+    },
+    {
+      "id": "setup-1-plan",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET enable_seqscan = off",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk FROM t ORDER BY a DESC NULLS LAST, b DESC NULLS LAST",
+      "expect": {
+        "rows": [
+          [
+            "3"
+          ],
+          [
+            "5"
+          ],
+          [
+            "2"
+          ],
+          [
+            "1"
+          ],
+          [
+            "4"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk FROM t ORDER BY a NULLS FIRST, b NULLS FIRST",
+      "expect": {
+        "rows": [
+          [
+            "4"
+          ],
+          [
+            "1"
+          ],
+          [
+            "2"
+          ],
+          [
+            "5"
+          ],
+          [
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT pk FROM t ORDER BY a DESC NULLS LAST, b NULLS FIRST",
+      "expect": {
+        "rows": [
+          [
+            "5"
+          ],
+          [
+            "3"
+          ],
+          [
+            "1"
+          ],
+          [
+            "2"
+          ],
+          [
+            "4"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

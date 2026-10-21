@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "id": "dolt-commit-diff-errors",
+  "description": "Reviewed Dolt port: error handling",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "CommitDiffSystemTableScriptTests: error handling"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 int, c2 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 2, 3), (4, 5, 6)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff(NULL::t)",
+      "expect": {
+        "sqlstate": "42883"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff(NULL, $1, NULL::t)",
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ],
+      "expect": {
+        "sqlstate": "22004"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT * FROM dolt_diff($1, NULL, NULL::t)",
+      "params": [
+        {
+          "ref": "commit1"
+        }
+      ],
+      "expect": {
+        "sqlstate": "22004"
+      }
+    }
+  ]
+}

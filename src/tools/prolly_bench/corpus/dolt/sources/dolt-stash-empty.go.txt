@@ -1,0 +1,29 @@
+{
+		Name: "DOLT_STASH() subcommands error on empty space.",
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "CALL DOLT_STASH('push', 'myStash');",
+				ExpectedErrStr: "No local changes to save",
+			},
+			{
+				Query:    "CREATE TABLE test (i int)",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:          "CALL DOLT_STASH('push', 'myStash');",
+				ExpectedErrStr: "No local changes to save",
+			},
+			{
+				Query:          "CALL DOLT_STASH('pop', 'myStash');",
+				ExpectedErrStr: "No stash entries found.",
+			},
+			{
+				Query:          "CALL DOLT_STASH('drop', 'myStash');",
+				ExpectedErrStr: "No stash entries found.",
+			},
+			{
+				Query:    "CALL DOLT_STASH('clear','myStash');",
+				Expected: []sql.Row{{0}},
+			},
+		},
+	}

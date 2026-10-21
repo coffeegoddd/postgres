@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "id": "dolt-violations-txn-three-way",
+  "description": "Reviewed Dolt port: a transaction commit that is a three-way merge produces constraint violations",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+    "case": "DoltConstraintViolationTransactionTests: a transaction commit that is a three-way merge produces constraint violations"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.violations"
+  ],
+  "sessions": [
+    "a",
+    "b"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE parent (pk BIGINT PRIMARY KEY, v1 BIGINT UNIQUE)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE child (pk BIGINT PRIMARY KEY, v1 BIGINT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (10, 1), (20, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO child VALUES (1, 1), (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE child ADD CONSTRAINT fk_name FOREIGN KEY (v1) REFERENCES parent (v1)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "mc1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "MC1",
+        "-a"
+      ],
+      "save": "mc1"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "SET session_replication_role = replica",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "START TRANSACTION",
+      "expect": {
+        "tag": "START TRANSACTION"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "b",
+      "op": "exec",
+      "sql": "START TRANSACTION",
+      "expect": {
+        "tag": "START TRANSACTION"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM PARENT where v1 = 2",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "b",
+      "op": "exec",
+      "sql": "INSERT INTO parent VALUES (30, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "b",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
+    },
+    {
+      "id": "assert-6-state",
+      "session": "b",
+      "op": "query",
+      "requires": [
+        "vc.violations"
+      ],
+      "sql": "SELECT (SELECT string_agg(pk || ':' || v1, ',' ORDER BY pk) FROM parent), (SELECT string_agg(pk || ':' || v1, ',' ORDER BY pk) FROM child), (SELECT count(*) FROM dolt_constraint_violations())",
+      "expect": {
+        "rows": [
+          [
+            "10:1,30:3",
+            "1:1,2:2",
+            "0"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

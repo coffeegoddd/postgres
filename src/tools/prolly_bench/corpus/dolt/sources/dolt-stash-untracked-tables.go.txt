@@ -1,0 +1,40 @@
+{
+		Name: "Stash with tracked and untracked tables",
+		SetUpScript: []string{
+			"CREATE TABLE new(i INT PRIMARY KEY)",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO new VALUES (1),(2)",
+			"CREATE TABLE test(id INT)",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{
+					{"new", byte(1), "new table"},
+					{"test", byte(0), "new table"},
+					{"new", byte(0), "modified"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('push', 'myStash')",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{
+					{"test", byte(0), "new table"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('pop', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{
+					{"new", byte(1), "new table"},
+					{"test", byte(0), "new table"},
+				},
+			},
+		},
+	}

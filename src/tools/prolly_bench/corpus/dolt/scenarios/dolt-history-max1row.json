@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "id": "dolt-history-max1row",
+  "description": "Reviewed Dolt port: dolt_history table non-unique pk columns ignored for max1row optimization",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: dolt_history table non-unique pk columns ignored for max1row optimization"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (id INT PRIMARY KEY, message TEXT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 (id, message) VALUES (1, 'test1')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 (id, message) VALUES (2, 'irrelevant')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "test commit 1",
+        "-A"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t1 SET message='test2' WHERE id=1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "test commit 2",
+        "-a"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).id, (row).message FROM dolt_history_table(NULL::t1) WHERE (row).id = 1 ORDER BY commit_date DESC",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "test2"
+          ],
+          [
+            "1",
+            "test1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (row).id, (row).message FROM dolt_history_table(NULL::t1) WHERE (row).id = 2",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "irrelevant"
+          ],
+          [
+            "2",
+            "irrelevant"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

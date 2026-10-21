@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "id": "dolt-commit-diff-working",
+  "description": "Reviewed Dolt port: working, staged, and head commits",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "CommitDiffSystemTableScriptTests: working, staged, and head commits"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 int, c2 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "created",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created table",
+        "-A"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "Commit0"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (7, 8, 9)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "inserted",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "insert into table",
+        "-A"
+      ],
+      "save": "inserted"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "Commit1"
+      ]
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 2, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (4, 5, 6)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff('HEAD', 'WORKING', NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "4",
+            "5",
+            "6",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff('HEAD~', 'WORKING', NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "4",
+            "5",
+            "6",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "7",
+            "8",
+            "9",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff('HEAD', 'STAGED', NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "2",
+            "3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "4",
+            "5",
+            "6",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff('STAGED', 'WORKING', NULL::t)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff('WORKING', 'STAGED', NULL::t)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff('Commit0', 'Commit1', NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "7",
+            "8",
+            "9",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

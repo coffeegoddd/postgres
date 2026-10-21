@@ -1,0 +1,44 @@
+{
+		// When a column is dropped and another column with the same type is renamed to that name, we expect it to be included in dolt_diff output
+		Name: "schema modification: column drop, rename column with same type to same name",
+		SetUpScript: []string{
+			"set @Commit0 = HASHOF('HEAD');",
+			"create table t (pk int primary key, c1 int, c2 int);",
+			"call dolt_add('.')",
+			"insert into t values (1, 2, 3), (4, 5, 6);",
+			"set @Commit1 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit1, '-am', 'creating table t');",
+
+			"alter table t drop column c1;",
+			"set @Commit2 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit2, '-am', 'dropping column c1');",
+
+			"alter table t rename column c2 to c1;",
+			"insert into t values (100, 101);",
+			"set @Commit3 = '';",
+			"CALL DOLT_COMMIT_HASH_OUT(@Commit3, '-am', 'inserting into t');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT to_pk, to_c1, from_pk, from_c1, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit1 and FROM_COMMIT=@Commit0 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, 2, nil, nil, "added"},
+					{4, 5, nil, nil, "added"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, from_pk, from_c1, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit2 and FROM_COMMIT=@Commit1 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					{1, nil, 1, 2, "modified"},
+					{4, nil, 4, 5, "modified"},
+				},
+			},
+			{
+				Query: "SELECT to_pk, to_c1, from_pk, from_c1, diff_type FROM DOLT_COMMIT_DIFF_t WHERE TO_COMMIT=@Commit3 and FROM_COMMIT=@Commit2 ORDER BY to_pk;",
+				Expected: []sql.Row{
+					// TODO: Missing rows here see TestDiffSystemTable tests
+					{100, 101, nil, nil, "added"},
+				},
+			},
+		},
+	}

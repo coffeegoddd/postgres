@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "id": "dolt-history-enum",
+  "description": "Reviewed Dolt port: dolt_history table with enums",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: dolt_history table with enums"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0-type",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TYPE c1_enum AS ENUM ('foo', 'bar')",
+      "expect": {
+        "tag": "CREATE TYPE"
+      }
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t (pk int primary key, c1 c1_enum)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t values (1, 'foo')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "added values",
+        "-a"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "select (row).c1 from dolt_history_table(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "foo"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

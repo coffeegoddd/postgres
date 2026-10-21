@@ -1560,7 +1560,7 @@
           "steps": [
             "step1"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead. (D1, D7)"
         },
         {
           "index": 4,
@@ -1589,7 +1589,7 @@
           "steps": [
             "normal-commit"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead. (D1, D7)"
         },
         {
           "index": 8,
@@ -1610,7 +1610,7 @@
           "steps": [
             "more-commit"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead. (D1, D7)"
         }
       ],
       "assertions": [
@@ -1647,13 +1647,13 @@
           "steps": [
             "assert-4"
           ],
-          "note": "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead."
+          "note": "dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead."
         }
       ],
       "adaptations": [
         "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
         "No staging area: dolt_add stages nothing, and -a commits the whole working set. (D1)",
-        "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead.",
+        "dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead.",
         "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
       ]
     },
@@ -1692,7 +1692,7 @@
           "steps": [
             "step1"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead. (D1, D7)"
         },
         {
           "index": 4,
@@ -1721,7 +1721,7 @@
           "steps": [
             "normal-commit"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead. (D1, D7)"
         },
         {
           "index": 8,
@@ -1742,7 +1742,7 @@
           "steps": [
             "more-commit"
           ],
-          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead. (D1, D7)"
+          "note": "Commits the whole working set: no staging area, so -A/-a add nothing. Captures the returned commit id. dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead. (D1, D7)"
         }
       ],
       "assertions": [
@@ -1772,7 +1772,7 @@
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead."
+          "note": "dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead."
         },
         {
           "index": 4,
@@ -1786,7 +1786,7 @@
       "adaptations": [
         "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
         "No staging area: dolt_add stages nothing, and -a commits the whole working set. (D1)",
-        "dolt_commit's --date is dropped (prolly commits take the transaction's time); a query of the newest commits by date orders by commit_order instead.",
+        "dolt_commit's --date is dropped: it isn't built yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; a query of the newest commits by date orders by commit_order instead.",
         "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
       ]
     },
@@ -21269,7 +21269,7 @@
           "steps": [
             "step1"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time, so the newest commit is found by commit_order, not by date."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; the newest commit is found by commit_order, not by date."
         },
         {
           "index": 5,
@@ -21297,7 +21297,7 @@
           "steps": [
             "ff-commit"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time, so the newest commit is found by commit_order, not by date."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date yet (#576), and a commit is dated when it's made, never before its parent's, so commits made in quick succession can share a date; the newest commit is found by commit_order, not by date."
         },
         {
           "index": 9,
@@ -21339,7 +21339,7 @@
           "steps": [
             "assert-4"
           ],
-          "note": "Preserved upstream expected rows: the merge commit is the newest. Ordered by commit_order (the merge's is the highest), not by date: the three commits share the transaction's start time, where Dolt's test pins distinct dates with --date."
+          "note": "Preserved upstream expected rows: the merge commit is the newest. Ordered by commit_order (the merge's is the highest), not by date: the three commits, made in quick succession, can share a date (a commit is dated when it's made, never before its parent's), where Dolt's test pins distinct dates with --date (#576)."
         },
         {
           "index": 5,
@@ -21595,7 +21595,7 @@
           "steps": [
             "step1"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time; nothing here orders commits by date."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date yet (#576), and a commit is dated when it's made; nothing here orders commits by date."
         },
         {
           "index": 5,
@@ -21623,7 +21623,7 @@
           "steps": [
             "feature-commit"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time; nothing here orders commits by date."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date yet (#576), and a commit is dated when it's made; nothing here orders commits by date."
         },
         {
           "index": 9,
@@ -21644,7 +21644,7 @@
           "steps": [
             "main-commit"
           ],
-          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date, and every commit made in one transaction has its start time; nothing here orders commits by date."
+          "note": "Commit inside the transaction block, checked to return a commit id: -a adds nothing (no staging area). (D1, D5, D7) Dolt's --date is left out: prolly's dolt_commit takes no date yet (#576), and a commit is dated when it's made; nothing here orders commits by date."
         }
       ],
       "assertions": [
@@ -31462,6 +31462,5002 @@
         "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)",
         "Across a primary key change each version is read as the table is keyed now, so rows diff as such, where Dolt warns and shows what it can. (D22)"
       ]
+    },
+    {
+      "id": "dolt-stash-empty",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 0,
+      "name": "DOLT_STASH() subcommands error on empty space.",
+      "source_sha256": "d7ca629854bdb47aa1ceb214f9bf31abaf14154f5d52c2af4027bd92ddcb46eb",
+      "scenario_sha256": "a00db6cbe4ef4ceb73830c73db4d06d6c16d68827d940ad7f3e9a1f3cf74c94d",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "assert-0"
+          ],
+          "note": "Expected error checked as its SQLSTATE, 55000 (nothing to save), not Dolt's text. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none. (D4)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; checked by its command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Intended divergence (D1): the new table is a change to save, as every change is staged, so the push sets it aside and returns {0}, where Dolt's leaves the untracked table and has nothing to save."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-3-table"
+          ],
+          "note": "Follows from assertion 2 (D1): the stash the push made pops, and the table is back, where Dolt's has no stash to pop."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Expected error checked as its SQLSTATE, 55000 (no stash entries): the pop removed the only one. (D4)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Dolt returns {0} for success; checked as the call's status. (D3)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with none.",
+        "Errors are SQLSTATEs, 55000, not Dolt's text. (D4)",
+        "The new table is stashed: there is no staging area, so no table is untracked (D1); the push succeeds, its stash pops, and the drop after it finds none."
+      ]
+    },
+    {
+      "id": "dolt-stash-push-pop",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 1,
+      "name": "Simple push and pop with DOLT_STASH()",
+      "source_sha256": "85d554e175d35495a5e0c336fed3626a11477745fb02635e738d548f2c1fade5",
+      "scenario_sha256": "5ac61185ef174ac40cb9e465a2265319cd3322fa6bac3ff0beceaed5bea45e01",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1",
+            "assert-1-rows"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3) The popped row is checked back in the table."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-stash-clear",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 2,
+      "name": "Clearing stash removes all entries in stash list",
+      "source_sha256": "befddc560dac40b83c6b3bc9aa180896a38e5594abab5893762570bc019bc60e",
+      "scenario_sha256": "94b2101ef8ac6ccb9156a0590cee5e3b63ba81aa9d15e2631ee5be832600ae0c",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-stash-clear-again",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 3,
+      "name": "Clearing and stashing again",
+      "source_sha256": "1c4764173daa7fb9583f0b8083f64be4c9c33841386b7b4e028f50babc3e3ffd",
+      "scenario_sha256": "18d4e7e74a177f64d30ab39fdbeb9842b7316ebc1d25a68cfcc31aec044c20a6",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row, checked by its command tag."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-stash-branches",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 5,
+      "name": "Stashing on different branches",
+      "source_sha256": "f00b2b6abd35057679f724834b6087aba4accd863f1c7881e81e5c25b73ab8ce",
+      "scenario_sha256": "e4b778391afdbcb385c2fe8df6e7acb10d564d7d4fa436d47ccdf097c59d9686",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4-branch",
+            "setup-4"
+          ],
+          "note": "DOLT_CHECKOUT('-b') becomes a branch plus a checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7) A stash list is the database's, across branches, as Dolt's."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)",
+        "DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-stash-pop-other-branch",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 6,
+      "name": "Popping stash onto different branch",
+      "source_sha256": "7795dabc0e9cbfad86353a7c938f7b38ba0f48eb1c5d2f9b5b8a61abd1d12f82",
+      "scenario_sha256": "1460672805b075ea1d0db717802a554b61bf85590b31bf950084eb4e85da5f2b",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "added"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows: the stash's own change, three-way against the commit it was made on, onto br1."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-stash-drop-specific",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 7,
+      "name": "Can drop specific stash",
+      "source_sha256": "309ad96680c358d27e5156e6adf20f3ca015870791f949bbbb9467603875d868",
+      "scenario_sha256": "9a1a25a39cafb4fe04fe4199b030cb903ebb52e9b219566c2d845f7e4a8b8a45",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "added2"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "added4"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-stash-pop-conflict",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 9,
+      "name": "Can't pop into dirty working set with conflict",
+      "source_sha256": "fcecc112dfa452f2b4d9ade4b982155d8050f222a0d68a9d9b1a7244971cde47",
+      "scenario_sha256": "cddd476adab48a222179c026ebae88e245ede5287090a1dba59a795360fae13a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Expected error checked as its SQLSTATE, 55000, not Dolt's text (D4). Prolly refuses it for the table's uncommitted changes before reading rows (#585), where Dolt finds the conflicting row; both keep the stash and the working set."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7) The refused pop kept it."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows: the working set as it was."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)"
+      ]
+    },
+    {
+      "id": "dolt-stash-staged-working",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 10,
+      "name": "Can stash modified staged and working set of changes",
+      "source_sha256": "df51396f2410e3942cb2f8c52b87bf9b95aa15be4e83d01ca7ad6053d545b87d",
+      "scenario_sha256": "615bfeb5d2acd6ea81bcc8bb2bd555f3c1ebb18cd17f4ddb5679ac626132172d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. No staging area: the table is listed once, staged, where Dolt lists its staged and its working changes. (D1)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-3-rows"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3) Both rows are checked back in the table."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change (D1), where Dolt's pop leaves the change unstaged."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-stash-include-untracked",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 11,
+      "name": "Can use --include-untracked on push",
+      "source_sha256": "5076096c7a8735c1accd6ceb1cbf90b326a8b8c3ab67848b1ee7269d7947df6b",
+      "scenario_sha256": "40e0e2d9614a2b77b686ae7d0537cfa1d17b5af5a9e7f69d07ede810a70c9d08",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none, and a stash needs a head."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change, where Dolt's has the table not added unstaged (D1); compared as a bag."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change (D1); compared as a bag."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with none.",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-stash-untracked-tables",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 12,
+      "name": "Stash with tracked and untracked tables",
+      "source_sha256": "bc27e9e486c665b124e4c229c031bb8aab63deca36a8e161b684ce5c9fba7d44",
+      "scenario_sha256": "afa95aa98deaf4c30b0106c360be8daf4b36c4818a69df4637a7fcd2a64fa98a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none, and a stash needs a head."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. No staging area: each table is listed once, as a new table, staged (D1), where Dolt lists new's staged and working changes and test unstaged; compared as a bag."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Intended divergence (D1): the push sets the whole working set aside, the new keyless table test with it, so nothing is left, where Dolt's leaves the untracked table."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-3-rows"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3) new's rows are checked back."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Preserved expected rows, both tables new, staged (D1); compared as a bag."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with none.",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)",
+        "dolt_stash('push') sets the whole working set aside, new tables with the rest, where Dolt's leaves untracked ones without -u: there is no staging area to tell them apart. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-stash-deleted-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 13,
+      "name": "stashing working set with deleted table and popping it",
+      "source_sha256": "55aecaec79117832ef1848ae9e87facbf8642f754c048eaa6b282a6c37a4db61",
+      "scenario_sha256": "810850bcb25c055db06752c12c4a2c89ddf8da013e4d3876d05179854d850c07",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change. (D1)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "SHOW TABLES becomes a query of pg_tables for the versioned schema. (D2)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "SHOW TABLES becomes a query of pg_tables for the versioned schema. (D2)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)",
+        "SHOW TABLES becomes a query of pg_tables. (D2)"
+      ]
+    },
+    {
+      "id": "dolt-stash-deleted-on-head",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 14,
+      "name": "popping stash with deleted table that is deleted already on current head",
+      "source_sha256": "4c60e53d07bcf69c2cd6cb224a3b099f673d316545b54853a3ea2920b3f7f344",
+      "scenario_sha256": "0dbdbb2eb45125d8c3da2ab3c1502eef7b5c4f78505dfb64d7912da61a06d30a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3-branch",
+            "setup-3"
+          ],
+          "note": "DOLT_CHECKOUT('-b') becomes a branch plus a checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "dropped"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "SHOW TABLES becomes a query of pg_tables for the versioned schema. (D2)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; checked by its command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch, as Dolt's result names it. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows: the table is deleted on both sides, so nothing changes."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
+        "SHOW TABLES becomes a query of pg_tables. (D2)"
+      ]
+    },
+    {
+      "id": "dolt-stash-deleted-exists",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 15,
+      "name": "popping stash with deleted table that the same table exists on current head",
+      "source_sha256": "b451a3c9e1569f8d6dfdf133ab6ff0815f9c70dc98d85b1db119026029ef13f2",
+      "scenario_sha256": "236d04609f9f2a324cb28bd2a67c1e2564c6284ae2027a3b9c1baf69ad0b6d1b",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch, as Dolt's result names it. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change. (D1)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-stash-pop-schema-conflict",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 16,
+      "name": "popping stash with deleted table that different table with same name on current head gives conflict",
+      "source_sha256": "02859cb7eb5ebabaa5f5888856277a8ffaaa165bf53791989ffdfb9e3a8f0b96",
+      "scenario_sha256": "85acaa4ba162d9dea37536ea1e3583d73aef0656b8d96110489f961566d2869d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0",
+            "assert-0-kept"
+          ],
+          "note": "Expected error checked as its SQLSTATE, 55000 (D4). Intended divergence (D6): a pop into uncommitted changes is refused whenever definitions change, here the table dropped and made again, before any schema conflict is looked for; Dolt's names the table modified in one branch and deleted in the other. The stash is checked kept."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "A pop into uncommitted changes where definitions change is refused (D6), so the schema conflict Dolt reports isn't reached."
+      ]
+    },
+    {
+      "id": "dolt-stash-added-exists",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 17,
+      "name": "popping stash with added table with PK on current head with the exact same table is added already",
+      "source_sha256": "1f06133d0a2010a07744b83be21f68c3ce85d1958296456f0cafe3260d402ca0",
+      "scenario_sha256": "41ea86fa353871a6687d8f8b9ffff3dad05002909136ead87d01f627def73238",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3-branch",
+            "setup-3"
+          ],
+          "note": "DOLT_CHECKOUT('-b') becomes a branch plus a checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "added"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch, as Dolt's result names it. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows: the table the stash adds is on the head already, as it is."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
+        "DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)"
+      ]
+    },
+    {
+      "id": "dolt-stash-apply",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 18,
+      "name": "simple stash apply",
+      "source_sha256": "474d94899ef29d03e091e1aaa9d0f3393b232a605077319d013f6c3f5ce26cce",
+      "scenario_sha256": "db95c727a9fb333d0f5324acee9875942895867c72cc9656fdf6b8ea6b2a397a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none, and a stash needs a head."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3) -a is accepted, and adds nothing: every new table is stashed. (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change. (D1)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with none.",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-stash-apply-keeps",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 19,
+      "name": "stash apply maintains stash entry",
+      "source_sha256": "ea4f8af2586119042f86002d6892b92b2cc37961ad78794c65ecb8f2cde75076",
+      "scenario_sha256": "8b2778e229c936e76c471ab93c1fe36331cd187ec830b3aaadc35d6908da5230",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "first"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; --allow-empty passed through. (D3, D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3) -a is accepted, and adds nothing: every new table is stashed. (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; each doltCommit is the head commit the stash was made on, captured as it was made. (D7) apply keeps it."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "Dolt's doltCommit placeholders are the head commits captured as they are made. (D7)"
+      ]
+    },
+    {
+      "id": "dolt-stash-apply-specific",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 20,
+      "name": "can apply specific stashes",
+      "source_sha256": "fa4f6c4444923c7b7ff760b9ae9f6bf19bd358d0617aee5027e908e03b3bcd7e",
+      "scenario_sha256": "6200e3135920f6e315239c577293406a87637ded0d1cbacb7b27773fd866e820",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "init",
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too. Preceded by the commit that stands for Dolt's 'Initialize data repository': a prolly database starts with none, and a stash needs a head."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3) -a is accepted, and adds nothing. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "CALL becomes SELECT; dolt_stash returns {0}, as Dolt's status. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT, checked to return {0}; upstream SkipResultsCheck becomes the call's success. (D3) A stash named by its number, 1, is stash@{1}: test2's."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Intended divergence (D6): an apply into uncommitted changes is refused whenever definitions change, here test2 made by the first apply and test1 by this one, so it fails (55000, D4) where Dolt's applies test1 too."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_status names tables schema-qualified (public.test), and staged is a boolean. Staged is true for every change (D1). Follows from assertion 1 (D6): only the first apply's table, where Dolt's has both."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_stash returns {0} where Dolt returns its status. (D3)",
+        "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with none.",
+        "dolt_status names tables schema-qualified, and staged is true for every change: there is no staging area. (D1)",
+        "An apply into uncommitted changes where definitions change is refused (D6): the second apply fails, and only the first's table is there."
+      ]
+    },
+    {
+      "id": "dolt-remote-add",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltRemoteTestScripts",
+      "index": 0,
+      "name": "dolt-remote: SQL add remotes",
+      "source_sha256": "a0d406a6b556e94b05914462f87ba151d8302a217c3301a113e9230bfdbd8aad",
+      "scenario_sha256": "26bd933f28450c423342198b0ac3818797d0e04ea0c832abaec64d0deaefa273",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0",
+            "assert-0-list"
+          ],
+          "note": "CALL becomes SELECT; dolt_remote returns {0}, as Dolt's status (D3). Dolt's relative file://../test is an absolute path: a file remote's path is the server's, and prolly refuses a relative one. The remote is checked listed, by name and url, as assertion 1 would."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "dolt_remotes has no fetch_specs or params columns (#586): not ported, so the case is partial. The remote's listing by name and url is checked with assertion 0."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Expected error checked as its SQLSTATE: dolt_remote takes at least one argument, so the call names no function (42883). (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Expected error checked as its SQLSTATE: an invalid argument (22023). (D4)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Expected error checked as its SQLSTATE: dolt_remotes is a view that can't be written (55000). (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL's IF as CASE. (D3, D10)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "A file remote's URL is an absolute path on the server.",
+        "dolt_remotes lists name and url, without Dolt's fetch_specs and params (#586): that assertion is omitted."
+      ]
+    },
+    {
+      "id": "dolt-remote-remove",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltRemoteTestScripts",
+      "index": 1,
+      "name": "dolt-remote: SQL remove remotes",
+      "source_sha256": "d501c967de81751f63e20535bb444b8ada58d3965946b8e51f8c6cf8a75d3c9f",
+      "scenario_sha256": "f9a17ebb7b26a198890693925fc5fc76ed4925f812d5762453563a44f9073a6e",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's relative file://. is an absolute path: a file remote's path is the server's, and prolly refuses a relative one."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "CALL becomes SELECT (D3). Dolt's aws:// remote is one of its storage backends (D10), which prolly doesn't have (0A000): a file remote stands for it; the case is about its removal."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "dolt_remotes has no fetch_specs or params columns (#586): not ported, so the case is partial."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1",
+            "assert-1-list"
+          ],
+          "note": "CALL becomes SELECT; dolt_remote returns {0}, as Dolt's status (D3). The remotes left are checked by name and url, as assertion 2 would."
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_remotes has no fetch_specs or params columns (#586): not ported. What is left is checked with assertion 1."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Expected error checked as its SQLSTATE: dolt_remotes is a view that can't be written (55000). (D4)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; MySQL's IF as CASE. (D3, D10)",
+        "Errors are SQLSTATEs, not Dolt's text. (D4)",
+        "A file remote's URL is an absolute path on the server; an aws:// remote (Dolt's storage backend, D10) is a file remote.",
+        "dolt_remotes lists name and url, without Dolt's fetch_specs and params (#586): those assertions are omitted."
+      ]
+    },
+    {
+      "id": "dolt-status-sequence",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 6,
+      "name": "dolt_status reports AUTO_INCREMENT value changes",
+      "source_sha256": "d027d34a8687b804a7ce609a9e4a62c1889ca6b9cf8f69183fe6cdf567d38187",
+      "scenario_sha256": "8f983603fe47c3ad07ef84211b75a23970c53868058ca2924d173f1da07e075e",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "MySQL's AUTO_INCREMENT key as an identity column. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "MySQL's VALUES () as DEFAULT VALUES. (D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "ALTER TABLE ... AUTO_INCREMENT = 100 as restarting the identity's sequence at 100 (D10); checked by its tag."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "The counter is the identity's sequence, a versioned object of its own (D6), so dolt_status lists it, schema-qualified, where Dolt lists the table; staged is a boolean, true for every change. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "As assertion 1: the sequence listed, staged as every change is. (D1, D6)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "The same restart again; checked by its tag."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows: restarting at the value committed changes nothing."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or typed operations; MySQL's AUTO_INCREMENT as an identity column. (D3, D10)",
+        "An identity's counter is its sequence, versioned on its own, and listed by dolt_status as itself. (D6)",
+        "No staging area: dolt_add stages nothing, and staged is true for every change. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-index-nulls",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 14,
+      "name": "test null filtering in secondary indexes (https://github.com/dolthub/dolt/issues/4199)",
+      "source_sha256": "4a02a8188886721239ba7d55c5028c8a236d4c973fa7dd54ea0147f37372f1ed",
+      "scenario_sha256": "c1152c3435942b9da66ae6b01c1b27ce138ec0e7a77d9e6e114ad2ed4077ac78",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0",
+            "setup-0-index"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax: the AUTO_INCREMENT key as an identity column, datetime as timestamp, the inline index as CREATE INDEX. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2",
+            "setup-2-plan"
+          ],
+          "note": "Preserved SQL. Sequential scans are turned off, so the counts read the secondary index, as the case means them to."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "MySQL's null-safe <=> as IS NOT DISTINCT FROM. (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "MySQL's null-safe <=> as IS NOT DISTINCT FROM. (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "MySQL's ifnull as coalesce, with a timestamp. (D10)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "MySQL's ifnull as coalesce, with a timestamp. (D10)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "MySQL's ifnull as coalesce, with a timestamp. (D10)"
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL and functions in PostgreSQL syntax: identity, timestamp, CREATE INDEX, IS NOT DISTINCT FROM for <=>, coalesce for ifnull. (D10)",
+        "Sequential scans off, so the index on the versioned table is what answers."
+      ]
+    },
+    {
+      "id": "dolt-index-desc-candidates",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 35,
+      "name": "descending index chosen among candidates",
+      "source_sha256": "0b043ab4c9e5bee6d55283588d9c0c5285b510ce66889baa28ae71d0af7d1c25",
+      "scenario_sha256": "82b2cc71366641f0cd4a9198608e2432711a14e60686895ff1d19b662c1e960c",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0",
+            "setup-0-ab",
+            "setup-0-ab-desc"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax: the inline indexes as CREATE INDEX, with MySQL's NULL order. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1",
+            "setup-1-plan"
+          ],
+          "note": "Preserved SQL. Sequential scans are turned off, so the orders are read from the indexes where the planner can."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "EXPLAIN PLAN output is MySQL's plan text (D10): not ported, so the case is partial; the query's rows are checked by the assertions after it."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "EXPLAIN PLAN output is MySQL's plan text (D10): not ported, so the case is partial; the query's rows are checked by the assertions after it."
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "EXPLAIN PLAN output is MySQL's plan text (D10): not ported, so the case is partial; the query's rows are checked by the assertions after it."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows. MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows. MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows. MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)"
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: indexes as CREATE INDEX. (D10)",
+        "MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)",
+        "EXPLAIN PLAN is MySQL's plan text: those assertions are omitted. (D10)"
+      ]
+    },
+    {
+      "id": "dolt-index-desc-ranges",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 37,
+      "name": "descending index scans over several ranges",
+      "source_sha256": "2f8aed535c041d2863a39656a878f0bb52abf618c491f24daa765a1cec117ae0",
+      "scenario_sha256": "7a8eccfc93347143bbf42becff15960e77da322977843f9f0dafd981df4b4ee9",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0",
+            "setup-0-a-desc",
+            "setup-0-ab"
+          ],
+          "note": "MySQL DDL in PostgreSQL syntax: the inline indexes as CREATE INDEX, with MySQL's NULL order. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1",
+            "setup-1-plan"
+          ],
+          "note": "Preserved SQL. Sequential scans are turned off, so the ranges are read from the indexes where the planner can."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [],
+          "note": "EXPLAIN PLAN output is MySQL's plan text (D10): not ported, so the case is partial; the query's rows are checked by the assertions after it."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows; the filter keeps no NULL, so the order is as written."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows; the filter keeps no NULL, so the order is as written."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows; the filter keeps no NULL, so the order is as written."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved expected rows; the filter keeps no NULL, so the order is as written."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows; the filter keeps no NULL, so the order is as written."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows; the filter keeps no NULL, so the order is as written."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Preserved expected rows. MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows. MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)"
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: indexes as CREATE INDEX. (D10)",
+        "MySQL sorts NULL below every value; the orders and indexes say NULLS FIRST or NULLS LAST where Postgres's default differs, to keep Dolt's rows. (D10)",
+        "EXPLAIN PLAN is MySQL's plan text: that assertion is omitted. (D10)"
+      ]
+    },
+    {
+      "id": "dolt-commit-all",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCommitTests",
+      "index": 0,
+      "name": "CALL DOLT_COMMIT('-ALL') adds all tables (including new ones) to the commit.",
+      "source_sha256": "88c0330e66537bf478197248492a7c2ca228aa0177c51192d89b90c7febc476b",
+      "scenario_sha256": "5481885fefac5973bae23dfcf575cb78e3767ae96343e68c8b46023e4002be92",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "added"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; it commits the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "CALL becomes SELECT; dolt_reset returns {0}, as Dolt's status. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; one row, checked by its command tag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "terminator"
+          ],
+          "note": "-ALL is accepted, and adds nothing: the commit takes the whole working set (D1). Dolt's doltCommit is the id the commit operation captures. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 4,
+          "steps": [],
+          "note": "dolt_commit --amend is a feature prolly lacks (F amend, 0A000): not ported, so the case is partial."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved expected rows: the delete is committed, amended or not."
+        },
+        {
+          "index": 6,
+          "steps": [],
+          "note": "dolt_commit --amend is a feature prolly lacks (F amend, 0A000): not ported, so the case is partial. The newest message would be the amended one."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "CALL becomes SELECT; dolt_reset returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Preserved SQL; checked by its command tag."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "dropped"
+          ],
+          "note": "CALL becomes the commit operation (-A adds nothing; D1), which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "CALL becomes SELECT; dolt_reset returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Dolt's ErrTableNotFound as its SQLSTATE, 42P01 (undefined table). (D4)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "Preserved SQL; checked by its command tag."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "added21"
+          ],
+          "note": "CALL becomes the commit operation (-A adds nothing; D1), which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 15,
+          "steps": [],
+          "note": "dolt_commit --amend is a feature prolly lacks (F amend, 0A000): not ported, so the case is partial."
+        },
+        {
+          "index": 16,
+          "steps": [],
+          "note": "dolt_commit --amend is a feature prolly lacks (F amend, 0A000): not ported, so the case is partial. The newest message would be the amended one."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "CALL becomes SELECT; dolt_reset returns {0}, as Dolt's status. (D3)"
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing, and -ALL/-A add nothing. (D1)",
+        "Errors are SQLSTATEs. (D4)",
+        "dolt_commit --amend isn't built (F amend): its four assertions are omitted."
+      ]
+    },
+    {
+      "id": "dolt-commit-expression",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltCommitTests",
+      "index": 1,
+      "name": "dolt commit works with arguments",
+      "source_sha256": "7d30437493a84a7c08c9ea614cc1155e5d8759e7d558dcbcb3829fa37e94c2bb",
+      "scenario_sha256": "e567dddbf40732a3dd5c08894d3fe136ec07ece6dcf738a89c27daaada45a3f0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes SELECT, its message the same expression; the commit's id checked by its shape, 40 hex digits. (D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; a commit id is 40 hex digits. (D3, D7)",
+        "No staging area: dolt_add stages nothing. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-merge-generated-stored",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "GeneratedColumnMergeTestScripts",
+      "index": 2,
+      "name": "merge a generated column created on another branch",
+      "source_sha256": "e18cbd535de7af578881d3c4db1a70e59148976c256fbc1c00af5b995b22d756",
+      "scenario_sha256": "859772ea44f057de01f8294d5a02b03a3fb97e39cfc6ea50bcf72d74f1ac8170",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "first"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "MySQL's AS (...) STORED as GENERATED ALWAYS AS (...) STORED. (D10)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "MySQL's ALTER TABLE ... ADD KEY as CREATE INDEX. (D10)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "branch1-commit"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as the merge operation, which captures the merge commit; fast_forward 0 and no conflicts checked by its success. (D3, D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows: the generated column computed for main's row too."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or typed operations; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "No staging area: -A adds nothing. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-merge-generated-virtual",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+      "suite": "GeneratedColumnMergeTestScripts",
+      "index": 4,
+      "name": "merge a virtual column created on another branch",
+      "source_sha256": "65845c04bf402550b99d74a4f32be4a6ce7cdc73c20edf80589f3af33648fdd6",
+      "scenario_sha256": "a6ab19acd48b8ef49d7f45c6e2a9cee49f53b800a168835afe81143b683a2482",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "first"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "main-commit"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "MySQL's AS (...) as GENERATED ALWAYS AS (...) VIRTUAL. (D10)"
+        },
+        {
+          "index": 8,
+          "steps": [],
+          "note": "Postgres can't index a virtual generated column: MySQL's index on it is left out, so the case is partial; the lookups by v3 are checked without it. (D10)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL and ordering."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "branch1-commit"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL DOLT_MERGE as the merge operation, which captures the merge commit; fast_forward 0 and no conflicts checked by its success. (D3, D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved expected rows: the generated column computed for main's row too."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or typed operations; MySQL DDL in PostgreSQL syntax. (D3, D10)",
+        "No staging area: -A adds nothing. (D1)",
+        "Postgres can't index a virtual generated column: the index is left out. (D10)"
+      ]
+    },
+    {
+      "id": "dolt-info-schema-checkout",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltInfoSchemaScripts",
+      "index": 0,
+      "name": "info_schema changes with dolt_checkout",
+      "source_sha256": "1036131c188112f9e0b32360d6dda551822f25113312ade1bfc3bbe721914aec",
+      "scenario_sha256": "d68d979dc9cc0ec6ac757acbee0104e051b0953d645b48806b4fb40ece0a2e95",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "added-c"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL: the DDL is PostgreSQL's too."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "added-d"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A/-a add nothing: commits take the whole working set. (D1, D3, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch. (D3)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "information_schema is the session's branch's (D11); the table's schema is public, the versioned schema, where Dolt's is the database, mydb. (D2)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Native checkout; upstream SkipResultsCheck becomes its success, and the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "information_schema is the session's branch's (D11); the table's schema is public, the versioned schema, where Dolt's is the database, mydb. (D2)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Native checkout; upstream SkipResultsCheck becomes its success, and the adapter verifies the active branch. (D3)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "information_schema is the session's branch's (D11); the table's schema is public, the versioned schema, where Dolt's is the database, mydb. (D2)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes typed native operations. (D3)",
+        "No staging area: -Am/-am commit the whole working set. (D1)",
+        "information_schema is the branch's; table_schema is the versioned schema, public, not the database's name. (D2, D11)"
+      ]
+    },
+    {
+      "id": "dolt-txn-read-committed-savepoint",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 16,
+      "name": "TRANSACTION ISOLATION READ-COMMITTED does not break AUTOCOMMIT=OFF",
+      "source_sha256": "71ba715f302fed34157e4ef37b4ec64b3733acbd674a4f2a2ab6a2d54a827b50",
+      "scenario_sha256": "6777636262fe4c3516d18a302a57132b2475f7015eaeadaa422b190070444742",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's SET SESSION TRANSACTION ISOLATION LEVEL as Postgres's SET SESSION CHARACTERISTICS AS TRANSACTION; upstream SkipResultsCheck becomes its tag. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "autocommit = off as BEGIN: the statements after it are one transaction block, checked open (T). (D5, D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "@@transaction_isolation as current_setting('transaction_isolation'), Postgres's spelling of READ-COMMITTED; @@autocommit 0 as the open transaction block (T). (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; upstream SkipResultsCheck becomes its tag, in the open block."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4",
+            "assert-4-commit"
+          ],
+          "note": "Preserved SQL, checked by its tag; the block then commits."
+        }
+      ],
+      "adaptations": [
+        "MySQL's session settings in PostgreSQL syntax: SET SESSION CHARACTERISTICS, current_setting. (D10)",
+        "autocommit = off as an explicit transaction block. (D5)"
+      ]
+    },
+    {
+      "id": "dolt-txn-unique-index-inserts",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 17,
+      "name": "non-ff commit merge with multiple indexes on a column",
+      "source_sha256": "4368bda1b26cc5408c5df08f1087dfb40c05c927b084ce5a557dbcbedb96aec9",
+      "scenario_sha256": "a971c8e358d519bb9fbf548c0f3b51b2f5a6c96d8f3c7a9d3dfb50ed1307025c",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "MySQL's ADD UNIQUE KEY as ADD CONSTRAINT ... UNIQUE. (D10)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "autocommit = off as BEGIN; upstream SkipResultsCheck becomes its tag. (D5, D10) A sequential interleaving of two sessions on one branch, neither waiting, so a multi-session scenario (D8)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "autocommit = off as BEGIN, on session b. (D5, D10)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; one row: another value of the unique column, so it doesn't wait on a's."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Upstream SkipResultsCheck becomes the commit's tag."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Upstream SkipResultsCheck becomes the commit's tag: there is no commit-time merge to fail (D8)."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Preserved expected rows."
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: the unique key as a constraint. (D10)",
+        "autocommit = off as explicit transaction blocks. (D5)",
+        "Two sessions on one branch, interleaved sequentially: their inserts don't wait on each other. (D8)"
+      ]
+    },
+    {
+      "id": "dolt-violations-txn-fast-forward",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConstraintViolationTransactionTests",
+      "index": 2,
+      "name": "a transaction commit that is a fast-forward produces no constraint violations",
+      "source_sha256": "411d68199805bdeb21cb892dd1f753cb3f0fc622246ad1bd8c24bd54f3cbb655",
+      "scenario_sha256": "3908eef3fc89b31c113a785e6fbd75c30236f8d10b2b59a75c85a5b3c10a2f4d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "MySQL's INDEX(v1) as UNIQUE: a Postgres foreign key references a unique key (the values are unique). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "mc1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -a adds nothing. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica, which turns off the foreign keys' triggers (the adapter's session is a superuser). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL; one row, its child left without a parent with the triggers off."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3",
+            "assert-3-state"
+          ],
+          "note": "Preserved: the commit succeeds. No violation is recorded (dolt_constraint_violations() empty): a commit records none, as Dolt's fast-forward makes none."
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: a foreign key references a unique key. (D10)",
+        "FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica. (D10)",
+        "No staging area: dolt_add stages nothing. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-violations-txn-three-way",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConstraintViolationTransactionTests",
+      "index": 3,
+      "name": "a transaction commit that is a three-way merge produces constraint violations",
+      "source_sha256": "59e6399a29d4f6c063b9b46fdcf68aee66f3754d443314ee4a478615f24386b9",
+      "scenario_sha256": "6afcbc9de2d3874f67e5bddaf1f33275cdfb8aa81b54820b891be19dc3060ac8",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "MySQL's INDEX(v1) as UNIQUE: a Postgres foreign key references a unique key (the values are unique). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "mc1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -a adds nothing. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "MySQL's FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica, which turns off the foreign keys' triggers (the adapter's session is a superuser). (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL. A sequential interleaving of two sessions on one branch, neither waiting, so a multi-session scenario (D8)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved SQL, on session b."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved SQL; one row, its child left without a parent with a's triggers off."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Preserved SQL; one row, another parent, so it doesn't wait on a's delete."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6",
+            "assert-6-state"
+          ],
+          "note": "Intended divergence (D8): b's commit succeeds, where Dolt's commit-time merge of b's working set with a's finds the foreign key violation and fails it. Both sessions wrote one set of tables, so there is no merge at COMMIT; the dangling child is what a's checks being off left, and no violation is recorded (dolt_constraint_violations() empty)."
+        }
+      ],
+      "adaptations": [
+        "MySQL DDL in PostgreSQL syntax: a foreign key references a unique key. (D10)",
+        "FOREIGN_KEY_CHECKS = 0 as session_replication_role = replica. (D10)",
+        "No staging area: dolt_add stages nothing. (D1)",
+        "Two sessions on one branch, interleaved sequentially: no commit-time merge, so b's commit succeeds (D8)."
+      ]
+    },
+    {
+      "id": "dolt-history-as-of",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 9,
+      "name": "dolt_history table with AS OF",
+      "source_sha256": "52b9f255ab1c72a9ab3a607a6a58d34b3889da8d29918cd45a85e838e8730296",
+      "scenario_sha256": "49d1f2d71f25769174de8efca4485946a1f167794b7fd1579df92fba0f2cc372",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved count."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "A table's history AS OF a ref (F as-of): dolt_history_table reads the history from the branch's head, and takes no ref, so this assertion is left out and the case is partial. dolt_at reads a table at a ref (D18), not its history."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Preserved expected rows and their order, less Dolt's two first commits: dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_history_<t> becomes dolt_history_table(NULL::t); its columns become (row).col. (D18)",
+        "A history AS OF a ref isn't built (F as-of): that assertion is omitted.",
+        "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+      ]
+    },
+    {
+      "id": "dolt-log-as-of",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 10,
+      "name": "dolt_history table with AS OF",
+      "source_sha256": "65eb347d79ef335f52eba0d7f003857d2519bc77eaa74a916015c908f7e2e946",
+      "scenario_sha256": "32a6b8666754ee96eba39358626de6c174537773cf06ef08b74ca798fac22808",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_log AS OF 'head^' as dolt_log('head^'): the function takes the ref the log starts from (D3, D18). Preserved expected rows and their order, less Dolt's two first commits: dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_log AS OF a ref is dolt_log(ref). (D3, D18)",
+        "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have."
+      ]
+    },
+    {
+      "id": "dolt-history-enum",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 11,
+      "name": "dolt_history table with enums",
+      "source_sha256": "e7ae0d5172b76a9de0ff92bfd69a7dd31d4d0e74d62d6aa005fc2b17674fe889",
+      "scenario_sha256": "94d23db741e8fa5f7a5630c13b500bf03027a23f5b6a2b74f4248e621d4d3f80",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0-type",
+            "setup-0"
+          ],
+          "note": "MySQL's inline enum as a Postgres enum type in the versioned schema, made first. (D10)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved rows: the enum's label."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_history_<t> becomes dolt_history_table(NULL::t); its columns become (row).col. (D18)",
+        "MySQL's enum column as a Postgres enum type. (D10)"
+      ]
+    },
+    {
+      "id": "dolt-history-index-lookup",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 12,
+      "name": "dolt_history table index lookup",
+      "source_sha256": "81110d66edb95bf423896a051c323f4265bd6dae704b5cb32bfb2decc469dbef",
+      "scenario_sha256": "9358df657e74a3d5ee592181684b3af6df3c5a078b4092f62701ca481874955a",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved count."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_history_<t> becomes dolt_history_table(NULL::t); its columns become (row).col. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-history-filter",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 13,
+      "name": "dolt_history table filter correctness",
+      "source_sha256": "6623489a3241ffd110e09b28439e0ffd76a1053595781e24f47f36e11f07fc65",
+      "scenario_sha256": "cbc53400cd6662a1954bdf1e14464735d3e1c23381263a5c419e099b2bc4fa7c",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id. (D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved count. dolt_log is newest first, so the second commit is the one before the head, with two rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_history_<t> becomes dolt_history_table(NULL::t); its columns become (row).col. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-log-sort-by-commit",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 15,
+      "name": "can sort by dolt_log.commit",
+      "source_sha256": "0c33a9a889a92fcd14f48549b04f45d5b4ab202c273d2bd5e26e341c1cf71fcf",
+      "scenario_sha256": "88a9b527fabd2584fc42669202974f5fadc47721be64f8a0e6ef8107c2f33e52",
+      "setup": [],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Dolt's two rows less two: dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have. Ordering by commit_hash is checked to run."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "The dolt_diff view, over dolt_diff() (D18), has no commit to list, as Dolt's, but lists the working set's one change: the scenario's versioned schema, public, made new and not committed, an object the view lists (D2, D15). Dolt's database has no uncommitted changes, so its view is empty."
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "dolt_commits isn't built (#588): not ported, so the case is partial."
+        },
+        {
+          "index": 3,
+          "steps": [],
+          "note": "dolt_commit_ancestors isn't built (#588): not ported."
+        }
+      ],
+      "adaptations": [
+        "dolt_log counts are Dolt's less two: Dolt's engine tests start each database with an initial and a checkpoint commit, which a prolly database doesn't have.",
+        "The scenario's versioned schema is new and uncommitted, so the dolt_diff view lists it as WORKING's change. (D2, D15)",
+        "dolt_commits and dolt_commit_ancestors aren't built (#588): their assertions are omitted."
+      ]
+    },
+    {
+      "id": "dolt-history-max1row",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 16,
+      "name": "dolt_history table non-unique pk columns ignored for max1row optimization",
+      "source_sha256": "aec931ed3721db7b911958489a9cacaa6c732e0e1d817ebf259bf29af53a037c",
+      "scenario_sha256": "56ae3f9ff2b6b363e429d7bd800874903714f53e927f3a7d2cb4d4afba133f2e",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A adds nothing. (D1, D3, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -a adds nothing. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved rows and their order: each commit is dated when it's made, the second after the first."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved rows, compared as a bag (Dolt's has no order)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation, capturing ids. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_history_<t> becomes dolt_history_table(NULL::t); its columns become (row).col. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-errors",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 0,
+      "name": "error handling",
+      "source_sha256": "d2cb129e98b59ea55d707aa8c726e4496dfdfdbc74686988c00f16cc2905c5f5",
+      "scenario_sha256": "94e3e67b7bb0f4e3dd5dde25e58222906775b21c2ee9d059883168fe0401b160",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Unfiltered, the table is dolt_diff without its refs: no such function (42883), as Dolt's needs a to_commit. (D4, D18)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Filtered to a to_commit alone: the from ref is null, refused (22004), as Dolt's refuses the filter. (D4, D18)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "Filtered to a from_commit alone: the to ref is null, refused (22004). (D4, D18)"
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "Errors are SQLSTATEs: a missing ref is a missing argument or a null one. (D4)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-basic",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 1,
+      "name": "base case: insert, update, delete",
+      "source_sha256": "dcab9ce07f003e0ab41791fdba7ffc2f1074e50c344d72e0a5e4027cb81489f3",
+      "scenario_sha256": "84c2540d1c6fef8e6d67599e7424a2b91e3053530593b1c99f1f059d6551b9ed",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit0"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit0"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id as @Commit0. (D3, D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "setup-15"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows, compared as a bag (Dolt's has no order)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). The table named in upper case, NULL::T, as Dolt's case-insensitive name; Postgres folds it. Preserved rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk IS NULL as (from_row).pk IS NULL. Preserved rows."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows. Dolt's ExpectedIndexes (its commits index) aren't checked: the plan is Dolt's."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). TO_COMMIT=@Commit0 and FROM_COMMIT=@Commit1: the refs the other way, so the row is removed. Preserved rows. Dolt's ExpectedIndexes (its commits index) aren't checked: the plan is Dolt's."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-column-drop",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 2,
+      "name": "schema modification: column drop",
+      "source_sha256": "d1df290686276925137b3c879af14d74c64b9e39c53a0a599f67bb84655acbfd",
+      "scenario_sha256": "8ece4720ca924094fb2cc5f91abc339a3c775d6306c73b06bb3905e1918f6d87",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "commit0"
+          ],
+          "note": "MySQL's @Commit0 = HASHOF('HEAD') is the commit that stands for Dolt's 'Initialize data repository', made first and captured: a prolly database starts with none. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). No rows: a column dropped changes no row, as rows of other versions are read as the table is defined now, by column name (D18); Dolt's shows each row modified."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "A dropped column changes no row: rows are read as the table is defined now. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-column-recreate",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 3,
+      "name": "schema modification: column drop, recreate with same type",
+      "source_sha256": "e83d00df2b1c82b9e948dc2a9fef649b91be6b2a4af69b00e3b0f80bef4205aa",
+      "scenario_sha256": "1ed27c4eb617a6101d7b0fcad275b0b35085dbefb17180bb280584be2358767d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "commit0"
+          ],
+          "note": "MySQL's @Commit0 = HASHOF('HEAD') is the commit that stands for Dolt's 'Initialize data repository', made first and captured: a prolly database starts with none. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: c, made again, reads as null where the version before had it dropped (D18)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-column-rename",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 4,
+      "name": "schema modification: column drop, rename column with same type to same name",
+      "source_sha256": "d1878186c0533c88dd2a5618681a85c430a1b11085b20c8a28a10da29f31a08d",
+      "scenario_sha256": "72edbc2d281bea77b27c828adaa9e342643a22ab6fff6bcd114e71cae76ca2cf",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "commit0"
+          ],
+          "note": "MySQL's @Commit0 = HASHOF('HEAD') is the commit that stands for Dolt's 'Initialize data repository', made first and captured: a prolly database starts with none. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: c1 is the column renamed from c2 now, read by name, so its dropped version's values are the old c1's, gone in commit2."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Rows read by name as the table is defined now (D18): c1, renamed from c2, reads as null in the version before the rename, so rows 1 and 4 show modified besides the added row, which Dolt's has alone (its own TODO calls its rows missing)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "A column renamed reads as null in versions before the rename: rows across it show modified. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-working",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 5,
+      "name": "working, staged, and head commits",
+      "source_sha256": "120f9ff605e0734e194158ead048d0f0c34f74bbdaff956a1dabcf2d1fe4aa92",
+      "scenario_sha256": "15f6ec391b58929c040e95287ff690308e8cf24047a2afe38dd93f7223f14834",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A adds nothing. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "inserted"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A adds nothing. (D1, D3, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "CALL becomes the branch operation. (D3)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "dolt_add has nothing to stage (every change is staged as made); called for fidelity, a no-op. (D1)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "TO_COMMIT='WORKING' and FROM_COMMIT='HEAD' as dolt_diff('HEAD', 'WORKING', NULL::t) (D3, D18). Preserved rows, compared as a bag."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "As dolt_diff('HEAD~', 'WORKING', NULL::t) (D3, D18). Preserved rows, compared as a bag."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "No staging area: STAGED is the working set (D1), so HEAD to STAGED has both uncommitted rows, where Dolt's has the one dolt_add staged."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "No staging area: STAGED is the working set (D1), so STAGED to WORKING has nothing, where Dolt's has the row inserted after dolt_add."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "No staging area: STAGED is the working set (D1), so WORKING to STAGED has nothing, where Dolt's has that row removed."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "AS OF Commit1 with to_commit 'HEAD' and from_commit 'Commit0' is dolt_diff('Commit0', 'Commit1', NULL::t): the HEAD of a read AS OF Commit1 is Commit1 (D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t> becomes dolt_diff(from_commit, to_commit, NULL::t); AS OF a ref names that ref for HEAD. (D3, D18)",
+        "No staging area: STAGED is the working set, so diffs to or from STAGED are those of WORKING. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-column-retype",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 7,
+      "name": "schema modification: column drop, recreate with different type that can be coerced (int -> string)",
+      "source_sha256": "f308768343879d65062de541f363062f996c24a38a77dc23f3455d4218ee3108",
+      "scenario_sha256": "0522e4e6500d298b80763d27099e07e7b657b1fcc7ae7c65881a3fa3b43e9542",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "commit0"
+          ],
+          "note": "MySQL's @Commit0 = HASHOF('HEAD') is the commit that stands for Dolt's 'Initialize data repository', made first and captured: a prolly database starts with none. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: the old int values read as the column's text now (D18)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-column-retype-fails",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 8,
+      "name": "schema modification: column drop, recreate with different type that can't be coerced (string -> int)",
+      "source_sha256": "43db515a7163a0560e54765cb6242a6032778daf2d235056a5139c2f6bc5baa8",
+      "scenario_sha256": "c1b3b66d31e808f0b88e661c47cfa1792595c560d3da368413a78ebc371c34f4",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "commit0"
+          ],
+          "note": "MySQL's @Commit0 = HASHOF('HEAD') is the commit that stands for Dolt's 'Initialize data repository', made first and captured: a prolly database starts with none. (D7)"
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: an old value that doesn't convert to the column's type now is null, with a warning, as Dolt's is (D21)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). No rows: c's old values don't convert to int, so both sides show null and the rows read alike (D21); Dolt's shows them modified."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Upstream SkipResultsCheck (its two warnings) becomes the rows' count: the added row alone, the rows whose only change is a value that doesn't convert reading as unchanged (D21). Prolly warns once per column and version, with the count; the scenarios don't read warnings."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "A value that doesn't convert is null, with a warning per column and version, and a row whose only change is such a value reads as unchanged. (D21)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-key-change",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 9,
+      "name": "schema modification: primary key change",
+      "source_sha256": "1a9673856b67b78ae39beefd55049df4ef931016d781d010a46043aabc1abc45",
+      "scenario_sha256": "8d122de86d5d4ed69950cd001b1404996142b7ffca2ec0783b05cfaef55095b8",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "MySQL's DROP PRIMARY KEY as dropping the key's constraint, t_pkey. (D10)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Upstream SkipResultsCheck (Dolt warns it can't render the diff across the key's change) becomes prolly's rows: each version's rows are read as the table is keyed now, by c1, so the rows added since are the ones shown, the key's change itself changing none (D22)."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "MySQL's DROP PRIMARY KEY as dropping its constraint. (D10)",
+        "Across a primary key change, rows are read as keyed now, and diff as any rows do. (D22)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-dropped-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 10,
+      "name": "added and dropped table",
+      "source_sha256": "e7407d7119c8ab766f9774387109ade29debe664000a2cc900daa81d3ebf89cc",
+      "scenario_sha256": "67d925bf0959b74477bca04cba80f200dc827eb218334369b3ee285a7d3084bc",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: none, the table in neither version. Dolt's warning isn't read; the scenarios don't read warnings."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: none. Dolt's warning isn't read."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: the table's history followed by its name (D18)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation; DOLT_COMMIT_HASH_OUT's @CommitN is the id the commit step captures. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_commit_diff_<t>, filtered to one to_commit and from_commit, becomes dolt_diff(from_commit, to_commit, NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "A table's history follows its name: one dropped and made again diffs across. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-commit-diff-left-join",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 11,
+      "name": "Left outer join on dolt_commit_diff",
+      "source_sha256": "d7d502fbf675f0aa39c46c0d54bc58f06a963621d62e3505f943a00c819b35ea",
+      "scenario_sha256": "461d57bd2286bd5fe3c0c033d89d7c7e8d4dee499c09109bfde3559330ac01ab",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "created"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A adds nothing. (D1, D3, D7)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "added"
+          ],
+          "note": "CALL becomes the commit operation, which captures the returned id; -A adds nothing. (D1, D3, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_commit_diff_<t> WHERE from_commit = HASHOF('HEAD~') AND to_commit = HASHOF('HEAD') as dolt_diff(dolt_hashof('HEAD~'), dolt_hashof('HEAD'), NULL::t), from_<col> as (from_row).col (D3, D18). Preserved rows, compared as a bag (Dolt's has no order)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes the commit operation. (D3, D7)",
+        "No staging area: -A adds nothing. (D1)",
+        "dolt_commit_diff_<t> becomes dolt_diff(from, to, NULL::t); from_<col> becomes (from_row).col. (D3, D18)"
+      ]
     }
   ],
   "deferred": [
@@ -31960,6 +36956,142 @@
       "name": "table drop and recreate with identical primary key reports modified data in diff summary",
       "source_sha256": "a6c6bd3ff7323643ec401d28ceee0ca4b49377b8da7ad0eb0682a603f0ec36b2",
       "reason": "Its setup is computed (dropAndRecreateScript(\"int\")), which the catalog leaves unresolved, so a port can't map it. Its assertion (a table dropped and made again, with other rows, is modified, data changed) is checked in test_prolly's schema_diffs instead."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 4,
+      "name": "Popping specific stashes",
+      "source_sha256": "363af590e1070f8f59a5b570e86b18a590e18fb33116bad621353a28290e65be",
+      "reason": "A prolly behavior still to be fixed (#585): its second pop, stash@{1}, is into a working set the first pop left dirty, in the same table, which Dolt merges (refusing only conflicting rows) and prolly refuses for the table's uncommitted changes (55000)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+      "suite": "DoltStashTests",
+      "index": 8,
+      "name": "Can pop into dirty working set without conflict",
+      "source_sha256": "d6d9cb1ab2b16963f4652dcd94c1f2ae31aa42374e6b90f02f2891b7532f4363",
+      "reason": "A prolly behavior still to be fixed (#585): the pop is into a working set with an uncommitted row in the table the stash changes, which Dolt merges (refusing only conflicting rows) and prolly refuses for the table's uncommitted changes (55000)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltRemoteTestScripts",
+      "index": 2,
+      "name": "dolt-remote: multi-repo test",
+      "source_sha256": "2a9edd947cab07c9ddc4124d3e21634be14bb801b8f5d4f6212949c1e5ca4080",
+      "reason": "Its USE one switches the session to another database, which a scenario's connections can't (they are to the case's database or its branches; D11). That remotes are a database's own is checked in test_prolly's remotes.sql instead (a second database adds its own origin)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 8,
+      "name": "dolt_hashof_table tests",
+      "source_sha256": "2f4f8d2cada583b0160e6ee17ee93dd1291b0c27d86ba7b03a8b4842272a94f3",
+      "reason": "dolt_hashof_table and dolt_hashof_db aren't built (F hashof-table); dolt_hashof is, ported as dolt-hashof."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 11,
+      "name": "dolt_hashof_db tests",
+      "source_sha256": "cb96891638b8c60aa9145f04b1c70b5d912cc6929cb09edada207d6df2923f5e",
+      "reason": "dolt_hashof_table and dolt_hashof_db aren't built (F hashof-table); dolt_hashof is, ported as dolt-hashof."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltScripts",
+      "index": 20,
+      "name": "Query table with 10K rows ",
+      "source_sha256": "0ea25e4bbae5d744fd585c6119e407941b7964997b1937ed415447c418fbadba",
+      "reason": "Its setup is computed (makeLargeInsert(10_000)), which the catalog leaves unresolved, so a port can't map it."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "DoltGC",
+      "index": 0,
+      "name": "base case: gc",
+      "source_sha256": "ba6768795c90355232a82bb142ea3a0b136a891a6d256af699945ad01650f887",
+      "reason": "Its setup is a shared script (gcSetup()) the catalog leaves unresolved, so a port can't map it. Its argument errors are checked as dolt-reflog-errors' are; prolly's dolt_gc() after one with nothing new to collect succeeds, where Dolt's says there were no changes."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 13,
+      "name": "multiple client edit session",
+      "source_sha256": "2f378e2c75f9d21c40377eab61967565cc8a9899b0435ebfa300db06cae1dbbd",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, three sessions' edits: c's update by row 2's old y waits on a's, then (READ COMMITTED) finds the row no longer matching and updates nothing, so the rows are 2:3:2 where Dolt's commit merges c's cell in (2:3:4); in REPEATABLE READ c fails with a serialization failure."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltTransactionTests",
+      "index": 14,
+      "name": "edits from different clients to table with out of order primary key set",
+      "source_sha256": "f96f088e0ed3b576187627e293dbcf25fad3a103b38b71716a530a08738d1637",
+      "reason": "Rederived under Postgres semantics, as the classification says (Dolt's sessions merge working sets at COMMIT; prolly's share the branch's tables under MVCC and row locks), not ported literally: src/test/prolly/specs/vc_txn_rows.spec, a primary key out of column order: b's update of the key a's autocommitted update moved finds no row, where Dolt's b adds a second row from its snapshot; b's insert of a's new key fails on it, as Dolt's does."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+      "suite": "DoltConflictHandlingTests",
+      "index": 6,
+      "name": "conflicts from a DOLT_MERGE return an initially unhelpful error in a concurrent write scenario",
+      "source_sha256": "c2b6e75a68a6402417d3e4f269f864f1689e7cc16a4f370fef8c18ab03581b7c",
+      "reason": "A prolly behavior still to be fixed (#587): after a merge's conflicts are committed with dolt.allow_commit_conflicts on, session b's transaction, which writes a row with the setting off, commits, where Dolt's refuses it for the working set's unresolved conflicts. Rederived, with two sessions interleaved sequentially (D8), the scenario would expect b's COMMIT to fail with 40001 twice (prolly names the conflicts at once, where Dolt's first asks for a retry)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 14,
+      "name": "dolt_history table primary key with join",
+      "source_sha256": "3e7955eaeefd7f57efdfbcf246396615bd8ab7ea7ca6e6f017c542a6fd022a10",
+      "reason": "dolt_commits isn't built (#588): every assertion joins dolt_history_<t> with it."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+      "suite": "HistorySystemTableScriptTests",
+      "index": 17,
+      "name": "dolt_commit_ancestors table with commit_hash filter ignored for max1row optimization",
+      "source_sha256": "446d4b7aadeffa62f5252d5cbdc8ef52b603fbd80503d7d18955e9217ce149ba",
+      "reason": "dolt_commit_ancestors isn't built (#588): both assertions read a merge commit's parents from it."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 10,
+      "name": "columns modified to narrower types",
+      "source_sha256": "1bb32d4a4c04ade8186a0b6ef68ce1ee516437ee86c03d6539c8e4a320a3bdf4",
+      "reason": "A prolly behavior still to be fixed (#590): an old value read as the column is defined now isn't checked against the column's new typmod or domain, so varchar(20)'s '123456789012345' reads as a varchar(10) and int's 420 as a tinyint (ported as a domain over smallint), where Dolt's are null with warnings (D21 says a value that doesn't convert is null)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 21,
+      "name": "table drop and recreate with identical primary key keeps per-commit diff history",
+      "source_sha256": "979affa094a7e8207b50d348206bab4930cb4b95796440dd182db58434fdaeb3",
+      "reason": "Its setup is computed (dropAndRecreateScript(\"int\") or its like), which the catalog leaves unresolved, so a port can't map it. A table dropped and made again, its history followed by name (D18), is checked in test_prolly's diff_history instead."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 22,
+      "name": "table drop and recreate with identical decimal primary key keeps per-commit diff history",
+      "source_sha256": "08f9470c8f49e169625878f4ed3a930387642ff55f626718479ef6927aa3243e",
+      "reason": "Its setup is computed (dropAndRecreateScript(\"decimal(10,2)\") or its like), which the catalog leaves unresolved, so a port can't map it. A table dropped and made again, its history followed by name (D18), is checked in test_prolly's diff_history instead."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffSystemTableScriptTests",
+      "index": 23,
+      "name": "table drop and recreate with identical enum primary key keeps per-commit diff history",
+      "source_sha256": "f1ba40685294e0e5bfbfde2d7d87e0a0fb6b80d6041253a0c01f88c2822a8940",
+      "reason": "Its setup is computed (dropAndRecreateScript(\"enum\") or its like), which the catalog leaves unresolved, so a port can't map it. A table dropped and made again, its history followed by name (D18), is checked in test_prolly's diff_history instead."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "CommitDiffSystemTableScriptTests",
+      "index": 6,
+      "name": "detached head",
+      "source_sha256": "90ebcbbe5bf3aca7dd26058e227a3d087271a726d8f2929e8741bcfb89c53641",
+      "reason": "It reads a tag's commit as a detached head (CALL dolt_tag, USE mydb/v1), and prolly has no tags (F tags); a connection to a commit's hidden branch is refused (D11)."
     }
   ]
 }

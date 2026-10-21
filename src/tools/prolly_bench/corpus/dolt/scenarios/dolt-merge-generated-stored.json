@@ -1,0 +1,201 @@
+{
+  "version": 1,
+  "id": "dolt-merge-generated-stored",
+  "description": "Reviewed Dolt port: merge a generated column created on another branch",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_merge.go",
+    "case": "GeneratedColumnMergeTestScripts: merge a generated column created on another branch"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.merge"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t1 (id bigint primary key, v1 bigint, v2 bigint)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 (id, v1, v2) values (1, 1, 1), (2, 2, 2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "first",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "first commit",
+        "-A"
+      ],
+      "save": "first"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 (id, v1, v2) values (3, 3, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "main-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "main commit",
+        "-A"
+      ],
+      "save": "main-commit"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 ADD COLUMN v3 bigint GENERATED ALWAYS AS (v1 + v2) STORED",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE INDEX idx_v3 ON t1 (v3)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 (id, v1, v2) values (4, 4, 4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "branch1-commit",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "branch1 commit",
+        "-A"
+      ],
+      "save": "branch1-commit"
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "merge",
+      "args": [
+        "branch1"
+      ],
+      "save": "merged"
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "select * from t1 order by id",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1",
+            "1",
+            "2"
+          ],
+          [
+            "2",
+            "2",
+            "2",
+            "4"
+          ],
+          [
+            "3",
+            "3",
+            "3",
+            "6"
+          ],
+          [
+            "4",
+            "4",
+            "4",
+            "8"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "select id from t1 where v3 = 6",
+      "expect": {
+        "rows": [
+          [
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "select id from t1 where v3 = 8",
+      "expect": {
+        "rows": [
+          [
+            "4"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

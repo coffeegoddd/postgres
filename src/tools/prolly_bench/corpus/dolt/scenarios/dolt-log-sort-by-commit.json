@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "id": "dolt-log-sort-by-commit",
+  "description": "Reviewed Dolt port: can sort by dolt_log.commit",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "HistorySystemTableScriptTests: can sort by dolt_log.commit"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "select 'something' from dolt_log order by commit_hash",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "select 'something' from dolt_diff order by commit_hash",
+      "expect": {
+        "rows": [
+          [
+            "something"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

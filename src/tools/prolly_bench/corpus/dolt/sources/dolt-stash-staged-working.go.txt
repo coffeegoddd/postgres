@@ -1,0 +1,37 @@
+{
+		Name: "Can stash modified staged and working set of changes",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"INSERT INTO test VALUES (1, 'a')",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO test VALUES (2, 'b')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{
+					{"test", byte(1), "modified"},
+					{"test", byte(0), "modified"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('push', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "SELECT * FROM test;",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:            "CALL DOLT_STASH('pop', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM dolt_status;",
+				Expected: []sql.Row{
+					{"test", byte(0), "modified"},
+				},
+			},
+		},
+	}

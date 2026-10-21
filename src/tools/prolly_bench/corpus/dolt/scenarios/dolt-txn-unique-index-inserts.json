@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "id": "dolt-txn-unique-index-inserts",
+  "description": "Reviewed Dolt port: non-ff commit merge with multiple indexes on a column",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_transaction_queries.go",
+    "case": "DoltTransactionTests: non-ff commit merge with multiple indexes on a column"
+  },
+  "requires": [
+    "sql"
+  ],
+  "sessions": [
+    "a",
+    "b"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t1 (pk int primary key, val int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "create index i1 on t1 (val)",
+      "expect": {
+        "tag": "CREATE INDEX"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 ADD CONSTRAINT u1 UNIQUE (val)",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 values (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "b",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 values (2, 2)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "b",
+      "op": "exec",
+      "sql": "insert into t1 values (3, 3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "b",
+      "op": "exec",
+      "sql": "COMMIT",
+      "expect": {
+        "tag": "COMMIT"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "b",
+      "op": "query",
+      "sql": "select * from t1 order by pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1"
+          ],
+          [
+            "2",
+            "2"
+          ],
+          [
+            "3",
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

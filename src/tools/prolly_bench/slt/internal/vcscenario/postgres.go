@@ -22,7 +22,7 @@ func EngineProfile(am string) (Profile, error) {
 	p := Profile{Engine: am}
 	switch am {
 	case "prolly":
-		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase", "vc.gc", "vc.reflog"}
+		p.Supported = []string{"sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase", "vc.gc", "vc.reflog", "vc.remotes", "vc.stash"}
 		p.Limitations = "Versioned public schema. No staging area: commits take the whole working set and only hard resets exist. " +
 			"Rows merge column by column, and a table's definition part by part (a column or constraint both sides changed differently is a schema conflict, an error: there is no dolt_schema_conflicts). " +
 			"No claim about concurrent sessions beyond sequential interleavings."

@@ -1,0 +1,55 @@
+{
+		Name: "descending index chosen among candidates",
+		SetUpScript: []string{
+			"CREATE TABLE t (pk INT PRIMARY KEY, a INT, b INT, INDEX ab (a DESC, b), INDEX ab_desc (a DESC, b DESC));",
+			"INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, NULL, 3), (5, 2, NULL);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "EXPLAIN PLAN SELECT pk FROM t ORDER BY a DESC, b DESC",
+				Expected: []sql.Row{
+					{"Project"},
+					{" ├─ columns: [t.pk]"},
+					{" └─ IndexedTableAccess(t)"},
+					{"     ├─ index: [t.a DESC,t.b DESC]"},
+					{"     ├─ filters: [{[NULL, ∞), [NULL, ∞)}]"},
+					{"     └─ columns: [pk a b]"},
+				},
+			},
+			{
+				Query: "EXPLAIN PLAN SELECT pk FROM t ORDER BY a, b",
+				Expected: []sql.Row{
+					{"Project"},
+					{" ├─ columns: [t.pk]"},
+					{" └─ IndexedTableAccess(t)"},
+					{"     ├─ index: [t.a DESC,t.b DESC]"},
+					{"     ├─ filters: [{[NULL, ∞), [NULL, ∞)}]"},
+					{"     ├─ columns: [pk a b]"},
+					{"     └─ reverse: true"},
+				},
+			},
+			{
+				Query: "EXPLAIN PLAN SELECT pk FROM t ORDER BY a DESC, b",
+				Expected: []sql.Row{
+					{"Project"},
+					{" ├─ columns: [t.pk]"},
+					{" └─ IndexedTableAccess(t)"},
+					{"     ├─ index: [t.a DESC,t.b]"},
+					{"     ├─ filters: [{[NULL, ∞), [NULL, ∞)}]"},
+					{"     └─ columns: [pk a b]"},
+				},
+			},
+			{
+				Query:    "SELECT pk FROM t ORDER BY a DESC, b DESC",
+				Expected: []sql.Row{{3}, {5}, {2}, {1}, {4}},
+			},
+			{
+				Query:    "SELECT pk FROM t ORDER BY a, b",
+				Expected: []sql.Row{{4}, {1}, {2}, {5}, {3}},
+			},
+			{
+				Query:    "SELECT pk FROM t ORDER BY a DESC, b",
+				Expected: []sql.Row{{5}, {3}, {1}, {2}, {4}},
+			},
+		},
+	}
