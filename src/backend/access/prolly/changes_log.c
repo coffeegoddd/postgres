@@ -753,13 +753,14 @@ unique_keys(Finder *f)
  * they point to is valid during the call only, but a REMOVED one's key,
  * which is the candidate's.
  */
-typedef void (*ChangeEmit) (Finder *f, ProllyDiffKind kind,
+typedef bool (*ChangeEmit) (Finder *f, ProllyDiffKind kind,
 							const ProllyKey *key, const ProllyValue *before,
 							const ProllyValue *after, void *arg);
 
 /*
  * Each candidate (unique_keys()'s, in key order) looked up in data and in
- * the heap, by the finder's snapshot; those that differ emitted.
+ * the heap, by the finder's snapshot; those that differ emitted, until an
+ * emit returns false.
  */
 static void
 each_change(Finder *f, const ProllyNodeRef *data, ChangeEmit emit, void *arg)
@@ -767,13 +768,14 @@ each_change(Finder *f, const ProllyNodeRef *data, ChangeEmit emit, void *arg)
 	ProllyTreeCursor *cur;
 	IndexScanDesc scan;
 	StringInfoData value;
+	bool		go = true;
 
 	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, data,
 					  CurrentMemoryContext);
 	scan = index_beginscan(f->rel, f->pk, false, f->snap, NULL, f->nkeys, 0,
 						   SO_NONE);
 	initStringInfo(&value);
-	for (int64 i = 0; i < f->n; i++)
+	for (int64 i = 0; go && i < f->n; i++)
 	{
 		Copy	   *c = &f->c[i];
 		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
@@ -802,11 +804,11 @@ each_change(Finder *f, const ProllyNodeRef *data, ChangeEmit emit, void *arg)
 			ProllyKey	nk = {(const uint8 *) f->key.data, f->key.len};
 			ProllyValue nv = {(const uint8 *) value.data, value.len};
 
-			emit(f, had ? PROLLY_DIFF_MODIFIED : PROLLY_DIFF_ADDED, &nk,
-				 had ? &v : NULL, &nv, arg);
+			go = emit(f, had ? PROLLY_DIFF_MODIFIED : PROLLY_DIFF_ADDED, &nk,
+					  had ? &v : NULL, &nv, arg);
 		}
 		else if (had)
-			emit(f, PROLLY_DIFF_REMOVED, &ck, &v, NULL, arg);
+			go = emit(f, PROLLY_DIFF_REMOVED, &ck, &v, NULL, arg);
 		CHECK_FOR_INTERRUPTS();
 	}
 	index_endscan(scan);
@@ -819,7 +821,7 @@ typedef struct Edits
 	int			nedits;
 } Edits;
 
-static void
+static bool
 edit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
 		  const ProllyValue *before, const ProllyValue *after, void *arg)
 {
@@ -844,6 +846,7 @@ edit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
 		e->value.len = after->len;
 		e->is_delete = false;
 	}
+	return true;
 }
 
 /* Each candidate's old and new rows; the pairs that differ are edits. */
@@ -1313,17 +1316,17 @@ log_fold_on_leave(void)
 
 typedef struct VisitChanges
 {
-	ProllyTreeVisitChange visit;
+	ProllyRowChangeVisit visit;
 	void	   *arg;
 } VisitChanges;
 
-static void
+static bool
 visit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
 		   const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	VisitChanges *vc = arg;
 
-	vc->visit(kind, key, before, after, vc->arg);
+	return vc->visit(kind, key, before, after, vc->arg);
 }
 
 /*
@@ -1335,7 +1338,7 @@ visit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
  */
 static bool
 log_changes(Relation rel, const ProllyTreeEnv *env,
-			const ProllyTableFold *baseline, ProllyTreeVisitChange visit,
+			const ProllyTableFold *baseline, ProllyRowChangeVisit visit,
 			void *arg)
 {
 	Finder		f;

@@ -140,14 +140,14 @@ typedef struct ProllyChangeFinderRoutine
 	 * Optional: the rows of rel that differ from baseline's, as fold() from
 	 * it would find them, visited each once in the keying's order as a
 	 * tree's diff() visits a change, without making a tree (what they point
-	 * to valid during the visit only).  False, having visited nothing,
-	 * where fold() would read more than its record of the changes (the
-	 * table in full, or what the baseline's state can't tell it): the
-	 * caller folds instead.  Needs an active snapshot.
+	 * to valid during the visit only), until a visit returns false.  False,
+	 * having visited nothing, where fold() would read more than its record
+	 * of the changes (the table in full, or what the baseline's state can't
+	 * tell it): the caller folds instead.  Needs an active snapshot.
 	 */
 	bool		(*changes) (Relation rel, const ProllyTreeEnv *env,
 							const ProllyTableFold *baseline,
-							ProllyTreeVisitChange visit, void *arg);
+							ProllyRowChangeVisit visit, void *arg);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \

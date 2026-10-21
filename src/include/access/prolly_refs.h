@@ -403,9 +403,12 @@ typedef struct ProllyRefsRoutine
 	 * Optional: the session branch's working set for its definitions
 	 * alone, as read_working_set() would read them, its rows not read
 	 * (the canonicalizer's read_definitions()): a root to read objects'
-	 * definitions from, never rows.
+	 * definitions from, not rows, unless *rows is set (the working set
+	 * was known, rows and all; rows may be NULL).  Where it isn't, *read
+	 * (if not NULL) is what the read began at, for publish_definitions().
 	 */
-	void		(*read_definitions) (ProllyNodeRef *root, List **left_out);
+	void		(*read_definitions) (ProllyNodeRef *root, List **left_out,
+									 bool *rows, void **read);
 
 	/*
 	 * Optional: the rows of the session branch's table relid that differ
@@ -416,7 +419,16 @@ typedef struct ProllyRefsRoutine
 	 * it, folding nothing): the caller reads the working set.
 	 */
 	bool		(*working_changes) (Oid relid, ProllyNodeRef *data,
-									ProllyTreeVisitChange visit, void *arg);
+									ProllyRowChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: read_definitions()'s root, begun at read, found to be the
+	 * working set (no table's rows changed since the baseline, as
+	 * working_changes() read them): published as a fold of it would be,
+	 * for later reads to take; complete if it left nothing out.
+	 */
+	void		(*publish_definitions) (void *read, const ProllyNodeRef *root,
+										bool complete);
 } ProllyRefsRoutine;
 
 /*
@@ -438,9 +450,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
-	"forget_folds", "prepared_ended", "read_definitions", "working_changes"
+	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
+	"publish_definitions"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK working_changes
+#define PROLLY_REFS_LAST_CALLBACK publish_definitions
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

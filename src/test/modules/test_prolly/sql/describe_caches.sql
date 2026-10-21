@@ -47,14 +47,18 @@ CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
 	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
 $$;
 
--- A fold after a row written takes both tables' descriptions; a commit's
--- too.
+-- A status after a row written takes both tables' descriptions as it reads
+-- the definitions, and each table's again as it reads that table's
+-- changes, and the check's fold takes both again; a commit's fold takes
+-- both.
 UPDATE dc.u SET w = 'c' WHERE id = 1;
 SELECT count(*) AS changes FROM dolt_status;
 :flush
 SELECT pg_temp.since('describe_cache_hits') >= 0 AS counting;
 UPDATE dc.u SET w = 'd' WHERE id = 1;
 SELECT count(*) AS changes FROM dolt_status;
+:flush
+SELECT pg_temp.since('describe_cache_hits') AS status_taken;
 SELECT length(dolt_commit('-am', 'd')::text) > 0 AS committed;
 :flush
 SELECT pg_temp.since('describe_cache_hits') AS taken;

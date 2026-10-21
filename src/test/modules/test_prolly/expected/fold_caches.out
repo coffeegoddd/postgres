@@ -919,6 +919,68 @@ FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id,
  added     |    |    | 2000 | new
 (5 rows)
 
+-- So does a status: a table defined as at the head, whose baseline holds
+-- the head's rows, changed if its change log has a change since (the first
+-- found is enough), no tree made.  (The check, on, folds too and compares.)
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending,
+	pg_temp.since('fold_rows_written') IS NOT NULL AS writing;
+ appending | writing 
+-----------+---------
+ t         | t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('chunks_appended') AS status_chunks,
+	pg_temp.since('fold_rows_written') AS status_rows_folded;
+ status_chunks | status_rows_folded 
+---------------+--------------------
+             0 |                  0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE fc.t SET v = v WHERE id = 9;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+ALTER TABLE fc.t ADD COLUMN w int;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------

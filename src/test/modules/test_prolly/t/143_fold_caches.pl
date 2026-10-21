@@ -67,9 +67,11 @@ foreach my $point ('prolly-fold-stamp', 'prolly-fold-stamped')
 	});
 	$node->wait_for_event('client backend', $point);
 	sql(q{INSERT INTO s.t VALUES (1000, 'landed')});
+	# (detached once passed: a status that reads definitions first and then
+	# folds stamps twice, by the same older snapshot)
+	sql(qq{SELECT injection_points_detach('$point')});
 	sql(qq{SELECT injection_points_wakeup('$point')});
 	my $out = $a->query_until(qr/done/, '');
-	$a->query_safe(qq{SELECT injection_points_detach('$point')});
 	like($out, qr/^0$/m,
 		"$point: the fold by the older snapshot misses the row");
 	is(sql($changes), '1', "$point: the next status sees it");

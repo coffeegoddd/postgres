@@ -276,6 +276,25 @@ DELETE FROM fc.t WHERE id = 6;
 INSERT INTO fc.t VALUES (2000, 'new');
 SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
 FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
+
+-- So does a status: a table defined as at the head, whose baseline holds
+-- the head's rows, changed if its change log has a change since (the first
+-- found is enough), no tree made.  (The check, on, folds too and compares.)
+SET debug_prolly_verify_fold_caches = off;
+:flush
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending,
+	pg_temp.since('fold_rows_written') IS NOT NULL AS writing;
+SELECT * FROM dolt_status;
+:flush
+SELECT pg_temp.since('chunks_appended') AS status_chunks,
+	pg_temp.since('fold_rows_written') AS status_rows_folded;
+RESET debug_prolly_verify_fold_caches;
+SELECT * FROM dolt_status;
+SELECT dolt_reset('--hard');
+UPDATE fc.t SET v = v WHERE id = 9;
+SELECT * FROM dolt_status;
+ALTER TABLE fc.t ADD COLUMN w int;
+SELECT * FROM dolt_status;
 SELECT dolt_reset('--hard');
 
 -- Changes that cancel out send no row: a row the working set puts back as

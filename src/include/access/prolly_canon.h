@@ -340,7 +340,7 @@ typedef struct ProllyCanonRoutine
 	 */
 	bool		(*table_changes) (const ProllyNodeRef *baseline, Oid relid,
 								  ProllyNodeRef *data,
-								  ProllyTreeVisitChange visit, void *arg);
+								  ProllyRowChangeVisit visit, void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \

@@ -49,8 +49,10 @@ CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
 	ON CONFLICT (name) DO UPDATE SET n = excluded.n
 	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
 $$;
--- A fold after a row written takes both tables' descriptions; a commit's
--- too.
+-- A status after a row written takes both tables' descriptions as it reads
+-- the definitions, and each table's again as it reads that table's
+-- changes, and the check's fold takes both again; a commit's fold takes
+-- both.
 UPDATE dc.u SET w = 'c' WHERE id = 1;
 SELECT count(*) AS changes FROM dolt_status;
  changes 
@@ -77,6 +79,18 @@ SELECT count(*) AS changes FROM dolt_status;
        1
 (1 row)
 
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('describe_cache_hits') AS status_taken;
+ status_taken 
+--------------
+            6
+(1 row)
+
 SELECT length(dolt_commit('-am', 'd')::text) > 0 AS committed;
  committed 
 -----------
@@ -92,7 +106,7 @@ SELECT length(dolt_commit('-am', 'd')::text) > 0 AS committed;
 SELECT pg_temp.since('describe_cache_hits') AS taken;
  taken 
 -------
-     4
+     2
 (1 row)
 
 -- The same with the check off: the incremental fold's root is the full

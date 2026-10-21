@@ -4240,7 +4240,7 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
  */
 static bool
 folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
-					 ProllyNodeRef *data, ProllyTreeVisitChange visit,
+					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
 					 void *arg)
 {
 	Canon		cn;

@@ -2009,7 +2009,7 @@ pages_fold_on_leave(void)
  */
 static bool
 pages_changes(Relation rel, const ProllyTreeEnv *env,
-			  const ProllyTableFold *baseline, ProllyTreeVisitChange visit,
+			  const ProllyTableFold *baseline, ProllyRowChangeVisit visit,
 			  void *arg)
 {
 	return false;

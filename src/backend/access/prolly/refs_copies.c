@@ -2959,14 +2959,28 @@ copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
  * in it are right too), else a fold of no table's rows, which is never
  * published: it isn't the working set.
  */
+/* What a read of definitions began at, for publishing its root. */
+typedef struct DefinitionsRead
+{
+	BranchFoldStamp stamp;
+	Snapshot	snap;
+	bool		have;
+	ProllyNodeRef baseline;
+} DefinitionsRead;
+
 static void
-copies_read_definitions(ProllyNodeRef *root, List **left_out)
+copies_read_definitions(ProllyNodeRef *root, List **left_out, bool *rows,
+						void **read)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef baseline;
 	char	   *name = branch_ops()->current();
 	bool		have = branch_baseline(name, &baseline);
 
+	if (rows)
+		*rows = true;
+	if (read)
+		*read = NULL;
 	if (known_working_set(name, MyBranch, have ? &baseline : NULL, true,
 						  root))
 		return;
@@ -2977,6 +2991,19 @@ copies_read_definitions(ProllyNodeRef *root, List **left_out)
 
 		read_fold_into(&rf);
 		return;
+	}
+	if (rows)
+		*rows = false;
+	if (read)
+	{
+		DefinitionsRead *dr = palloc0(sizeof(DefinitionsRead));
+
+		branch_fold_stamp(MyBranch, &dr->stamp);
+		dr->snap = fold_snapshot();
+		dr->have = have;
+		if (have)
+			dr->baseline = baseline;
+		*read = dr;
 	}
 	dc.canonicalizer->read_definitions(have ? &baseline : NULL, root,
 									   left_out);
@@ -2989,7 +3016,7 @@ copies_read_definitions(ProllyNodeRef *root, List **left_out)
  */
 static bool
 copies_working_changes(Oid relid, ProllyNodeRef *data,
-					   ProllyTreeVisitChange visit, void *arg)
+					   ProllyRowChangeVisit visit, void *arg)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef baseline;
@@ -3006,6 +3033,17 @@ copies_working_changes(Oid relid, ProllyNodeRef *data,
 	if (!PROLLY_HAS(dc.canonicalizer, table_changes))
 		return false;
 	return dc.canonicalizer->table_changes(&baseline, relid, data, visit, arg);
+}
+
+static void
+copies_publish_definitions(void *read, const ProllyNodeRef *root,
+						   bool complete)
+{
+	DefinitionsRead *dr = read;
+
+	if (dr != NULL)
+		publish_fold(&dr->stamp, dr->snap, dr->have ? &dr->baseline : NULL,
+					 root, complete);
 }
 
 static bool
@@ -4398,6 +4436,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.read_working_set = copies_read_working_set,
 	.read_definitions = copies_read_definitions,
 	.working_changes = copies_working_changes,
+	.publish_definitions = copies_publish_definitions,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,
