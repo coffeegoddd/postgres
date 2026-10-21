@@ -125,6 +125,10 @@ func (p *Postgres) connect(dsn, db string) (*pgconn.PgConn, error) {
 func (p *Postgres) exec(c *pgconn.PgConn, sql string) ([][]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
+	return execIn(ctx, c, sql)
+}
+
+func execIn(ctx context.Context, c *pgconn.PgConn, sql string) ([][]string, error) {
 	results, err := c.Exec(ctx, sql).ReadAll()
 	var rows [][]string
 	for _, r := range results {
@@ -273,15 +277,28 @@ func (p *Postgres) Apply(op Op) (Outcome, error) {
 // transaction (or once it finished without waiting).
 func (p *Postgres) waitFor(op Op, sql string) (Outcome, error) {
 	c := p.sessions[op.Session]
+	// (the write waits until the holder's transaction ends, steps later,
+	// so --timeout, a statement's, doesn't bound it: no statement or lock
+	// timeout and no deadline while it waits.  release bounds the wait
+	// once that transaction has ended.  In a transaction already failed
+	// the SET fails, as the write will.)
+	if _, err := p.exec(c, "SET lock_timeout = 0; SET statement_timeout = 0"); err != nil {
+		if _, err := sqlError(err); err != nil {
+			return Outcome{}, err
+		}
+	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := p.exec(c, sql)
+		_, err := execIn(context.Background(), c, sql)
 		done <- err
 	}()
 	blocked := fmt.Sprintf("SELECT %d = ANY(pg_blocking_pids(%d))", p.sessions[op.Wait-1].PID(), c.PID())
 	for deadline := time.Now().Add(p.timeout); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
 		select {
 		case err := <-done:
+			if err := p.timed(c); err != nil {
+				return Outcome{}, err
+			}
 			pgerr, err := sqlError(err)
 			if err != nil {
 				return Outcome{}, fmt.Errorf("%s: %w", sql, err)
@@ -304,6 +321,17 @@ func (p *Postgres) waitFor(op Op, sql string) (Outcome, error) {
 	return Outcome{}, fmt.Errorf("%s: neither waited on session %d nor finished", sql, op.Wait-1)
 }
 
+// timed gives session connection c back the statement and lock timeouts
+// its waiting write went without.  After a write whose error failed its
+// transaction the SET fails too, and the rollback to come undoes the
+// untimed one.
+func (p *Postgres) timed(c *pgconn.PgConn) error {
+	ms := p.timeout.Milliseconds()
+	_, err := p.exec(c, fmt.Sprintf("SET lock_timeout = %d; SET statement_timeout = %d", ms, ms))
+	_, err = sqlError(err)
+	return err
+}
+
 // release finishes the writes that waited on session h's transaction, now
 // ended: its outcome o, or one naming the first of them that failed.
 func (p *Postgres) release(h int, o Outcome) (Outcome, error) {
@@ -318,6 +346,9 @@ func (p *Postgres) release(h int, o Outcome) (Outcome, error) {
 		select {
 		case err := <-p.waits[s].done:
 			delete(p.waits, s)
+			if err := p.timed(p.sessions[s]); err != nil {
+				return Outcome{}, err
+			}
 			pgerr, err := sqlError(err)
 			if err != nil {
 				return Outcome{}, fmt.Errorf("session %d's waiting write: %w", s, err)
