@@ -56,6 +56,10 @@
 #include "access/prolly_tree.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xlogreader.h"
+#include "access/xlogutils.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
@@ -688,9 +692,11 @@ static void
 scan_bytes(RootScan *rs, const char *start, const char *stop)
 {
 	const char *p = start;
-	const char *end = stop -
-		(VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)) + 1;
+	const char *end;
 
+	if (stop - start < (ptrdiff_t) (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)))
+		return;
+	end = stop - (VARHDRSZ_EXTERNAL + sizeof(varatt_external_hash)) + 1;
 	while (p < end && (p = memchr(p, rs->head[0], end - p)) != NULL)
 	{
 		if ((uint8) p[1] == rs->head[1])
@@ -868,6 +874,102 @@ prolly_toast_roots(ProllyChunkRefVisit visit, void *arg)
 	list_free(spcs);
 	if (rs.found)
 		pfree(rs.found);
+}
+
+/* Visit what a WAL record's bytes spell as hash pointers. */
+static void
+scan_record(RootScan *rs, XLogReaderState *xlr, char *page)
+{
+	/* (the chunk store's own records hold chunks, which no slot decodes) */
+	if (XLogRecGetRmid(xlr) != RM_PROLLY_CHUNKS_ID)
+	{
+		char	   *data = XLogRecGetData(xlr);
+
+		scan_bytes(rs, data, data + XLogRecGetDataLen(xlr));
+	}
+	for (int id = 0; id <= XLogRecMaxBlockId(xlr); id++)
+	{
+		if (!XLogRecHasBlockRef(xlr, id))
+			continue;
+		if (XLogRecGetRmid(xlr) != RM_PROLLY_CHUNKS_ID &&
+			XLogRecHasBlockData(xlr, id))
+		{
+			Size		len;
+			char	   *data = XLogRecGetBlockData(xlr, id, &len);
+
+			scan_bytes(rs, data, data + len);
+		}
+		if (XLogRecHasBlockImage(xlr, id))
+		{
+			if (!RestoreBlockImage(xlr, id, page))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg_internal("%s", xlr->errormsg_buf)));
+			scan_bytes(rs, page, page + BLCKSZ);
+		}
+	}
+}
+
+void
+prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit, void *arg)
+{
+	RootScan	rs;
+	XLogRecPtr	end;
+	XLogRecPtr	first;
+	XLogReaderState *xlr;
+	PGIOAlignedBlock page;
+	char	   *errormsg;
+
+	if (!XLogRecPtrIsValid(from))
+		return;
+	memset(&rs, 0, sizeof(rs));
+	SET_VARTAG_EXTERNAL(rs.head, VARTAG_ONDISK_BLAKE3);
+	rs.visit = visit;
+	rs.arg = arg;
+
+	/* to the end of the WAL as of now, flushed */
+	end = GetXLogInsertRecPtr();
+	XLogFlush(end);
+	end = GetFlushRecPtr(NULL);
+	if (from >= end)
+		return;
+
+	xlr = XLogReaderAllocate(wal_segment_size, NULL,
+							 XL_ROUTINE(.page_read = read_local_xlog_page,
+										.segment_open = wal_segment_open,
+										.segment_close = wal_segment_close),
+							 NULL);
+	if (xlr == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory"),
+				 errdetail("Failed while allocating a WAL reading processor.")));
+
+	/*
+	 * (On an error, the segment open is closed as the memory context the
+	 * reader is in is reset: wal_segment_open() registers for it.)
+	 */
+	first = XLogFindNextRecord(xlr, from, &errormsg);
+	if (!XLogRecPtrIsValid(first))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not find a valid record after %X/%08X",
+						LSN_FORMAT_ARGS(from)),
+				 errormsg ? errdetail_internal("%s", errormsg) : 0));
+	XLogBeginRead(xlr, first);
+	while (xlr->EndRecPtr < end)
+	{
+		if (XLogReadRecord(xlr, &errormsg) == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read WAL at %X/%08X",
+							LSN_FORMAT_ARGS(xlr->EndRecPtr)),
+					 errormsg ? errdetail_internal("%s", errormsg) : 0));
+		INJECTION_POINT("prolly-wal-roots-read", NULL);
+		CHECK_FOR_INTERRUPTS();
+		scan_record(&rs, xlr, page.data);
+	}
+	XLogReaderFree(xlr);
 }
 
 /* A versioned table's value moved out of line by the toaster. */

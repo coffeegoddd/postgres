@@ -33,7 +33,13 @@
  * the transactions that named a tree before the collection began have
  * ended; and every tree a transaction names while it runs (the store's
  * keep set, gc_kept()), before the window and in it.  A keep set too large
- * to remember keeps every chunk collected.
+ * to remember keeps every chunk collected.  So is every tree a hash pointer
+ * in the WAL may name from the oldest position a logical slot may decode
+ * from, this server's or a standby's (prolly_toast_wal_roots()): the slot
+ * fetches the values of the rows it decodes, which may be gone from the
+ * pages by then.  WAL from there no longer here (a standby's slot behind
+ * what max_slot_wal_keep_size kept) is scanned from what is left, with a
+ * warning: what only the rest named isn't kept.
  *
  * The chunks marked and not yet read wait in a queue, breadth first, of
  * at most maintenance_work_mem in memory (a ring, so taking one and adding
@@ -62,6 +68,9 @@
 #include "access/prolly_toast.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "replication/slot.h"
+#include "replication/walsender.h"
+#include "storage/ipc.h"
 #include "storage/buffile.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -361,6 +370,13 @@ mark_from_kept(int file, uint64 first, uint64 nslots, bool settled,
 	drain(k->mk);
 }
 
+/* (a collection's reading of the standbys' positions, ended by an error) */
+static void
+horizon_read_end(int code, Datum arg)
+{
+	WalSndHorizonReadEnd();
+}
+
 static void
 copying_collect(bool full, ProllyGcResult *result)
 {
@@ -371,6 +387,8 @@ copying_collect(bool full, ProllyGcResult *result)
 	ProllyHash	root;
 	int			nfiles = 0;
 	bool	   *keep;
+	XLogRecPtr	horizon;
+	XLogRecPtr	wanted;
 
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
@@ -401,39 +419,63 @@ copying_collect(bool full, ProllyGcResult *result)
 
 	/* what tables name, once those who named a tree before have ended */
 	prolly_toast_roots(mark_root, &mk);
-	INJECTION_POINT("prolly-gc-roots-scanned", NULL);
-	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
-		mark_all(&mk);
-	drain(&mk);
 
-	/* the settled files kept whole, and what they name */
-	if (full)
+	/*
+	 * What a logical slot, here or a standby's, may still decode: read as
+	 * one of the readers of the standbys' positions until the swap, so a
+	 * standby's slot created meanwhile is told it is kept only once this
+	 * collection, which may not keep it, is done.
+	 */
+	WalSndHorizonReadBegin();
+	PG_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
 	{
-		Keep		k = {&mk, keep, true};
+		horizon = ReplicationSlotsLogicalDecodingHorizonKept(MyDatabaseId,
+															 &wanted);
+		if (horizon != wanted)
+			ereport(WARNING,
+					(errmsg("the WAL from %X/%08X, which a logical replication slot may still decode, is gone",
+							LSN_FORMAT_ARGS(wanted)),
+					 errdetail("The collection keeps the values the WAL from %X/%08X names, not those named only before it.",
+							   LSN_FORMAT_ARGS(horizon)),
+					 errhint("A standby's logical slot this far behind may fail to decode a value. A physical slot's \"standby_restart_lsn\" in \"pg_replication_slots\" is its standby's position, which \"max_slot_wal_keep_size\" limits the WAL kept for.")));
+		prolly_toast_wal_roots(horizon, mark_root, &mk);
+		INJECTION_POINT("prolly-gc-roots-scanned", NULL);
+		if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
+			mark_all(&mk);
+		drain(&mk);
 
-		/*
-		 * Until no file is newly kept: marking from a kept file's garbage
-		 * may bring another file to little enough garbage to keep.
-		 */
-		while (k.changed)
+		/* the settled files kept whole, and what they name */
+		if (full)
 		{
-			k.changed = false;
-			PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
-			if (k.changed)
-				PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+			Keep		k = {&mk, keep, true};
+
+			/*
+			 * Until no file is newly kept: marking from a kept file's
+			 * garbage may bring another file to little enough garbage to
+			 * keep.
+			 */
+			while (k.changed)
+			{
+				k.changed = false;
+				PROLLY_CALL(cs, gc_files, mk.gc, choose_file, &k);
+				if (k.changed)
+					PROLLY_CALL(cs, gc_files, mk.gc, mark_from_kept, &k);
+			}
 		}
+
+		/* copied, before the window */
+		PROLLY_CALL(cs, gc_copy, mk.gc, mk.marks, keep);
+
+		/* in the window: what came since */
+		PROLLY_CALL(cs, gc_new, mk.gc, true, mark_new, &mk);
+		if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
+			mark_all(&mk);
+		INJECTION_POINT("prolly-gc-kept", NULL);
+		drain(&mk);
+		PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
 	}
-
-	/* copied, before the window */
-	PROLLY_CALL(cs, gc_copy, mk.gc, mk.marks, keep);
-
-	/* in the window: what came since */
-	PROLLY_CALL(cs, gc_new, mk.gc, true, mark_new, &mk);
-	if (!PROLLY_CALL(cs, gc_kept, mk.gc, mark_root, &mk))
-		mark_all(&mk);
-	INJECTION_POINT("prolly-gc-kept", NULL);
-	drain(&mk);
-	PROLLY_CALL(cs, gc_swap, mk.gc, mk.marks, keep, result);
+	PG_END_ENSURE_ERROR_CLEANUP(horizon_read_end, (Datum) 0);
+	WalSndHorizonReadEnd();
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);

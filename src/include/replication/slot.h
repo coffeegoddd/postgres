@@ -159,6 +159,15 @@ typedef struct ReplicationSlotPersistentData
 	 * for logical slots on the primary server.
 	 */
 	bool		failover;
+
+	/*
+	 * For a physical slot: the oldest position a logical slot of the standby
+	 * using it (or of a standby downstream of that one) may decode from, as
+	 * the standby's hot standby feedback last said; invalid if none.  A
+	 * value stored by content that such a slot may still decode is kept for
+	 * it, as one a logical slot here may.
+	 */
+	XLogRecPtr	standby_restart_lsn;
 } ReplicationSlotPersistentData;
 
 /*
@@ -293,6 +302,12 @@ typedef struct ReplicationSlot
 typedef struct ReplicationSlotCtlData
 {
 	/*
+	 * On a standby, the end of the last collection's swap of a chunk store
+	 * replayed (ReplicationSlotsCollectionReplayed()).
+	 */
+	pg_atomic_uint64 collection_replayed;
+
+	/*
 	 * This array should be declared [FLEXIBLE_ARRAY_MEMBER], but for some
 	 * reason you can't do that in an otherwise-empty struct.
 	 */
@@ -355,9 +370,14 @@ extern bool ReplicationSlotValidateNameInternal(const char *name,
 												bool allow_reserved_name,
 												int *err_code, char **err_msg, char **err_hint);
 extern void ReplicationSlotReserveWal(void);
+extern void ReplicationSlotReserveWalUpstream(void);
+extern void ReplicationSlotsCollectionReplayed(XLogRecPtr end);
 extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(void);
 extern XLogRecPtr ReplicationSlotsComputeLogicalRestartLSN(void);
+extern XLogRecPtr ReplicationSlotsLogicalDecodingHorizon(Oid dboid);
+extern XLogRecPtr ReplicationSlotsLogicalDecodingHorizonKept(Oid dboid,
+														  XLogRecPtr *wanted);
 extern bool ReplicationSlotsCountDBSlots(Oid dboid, int *nslots, int *nactive);
 extern bool CheckLogicalSlotExists(void);
 extern void ReplicationSlotsDropDBSlots(Oid dboid);

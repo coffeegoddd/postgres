@@ -41,6 +41,7 @@
 
 #include "access/transam.h"
 #include "access/xlog_internal.h"
+#include "access/xlogwait.h"
 #include "access/xlogrecovery.h"
 #include "common/file_utils.h"
 #include "common/string.h"
@@ -50,6 +51,7 @@
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/slot.h"
+#include "replication/walreceiver.h"
 #include "replication/walsender_private.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -141,7 +143,17 @@ StaticAssertDecl(lengthof(SlotInvalidationCauses) == (RS_INVAL_MAX_CAUSES + 1),
 	sizeof(ReplicationSlotOnDisk) - ReplicationSlotOnDiskConstantSize
 
 #define SLOT_MAGIC		0x1051CA1	/* format identifier */
-#define SLOT_VERSION	5		/* version for new files */
+#define SLOT_VERSION	6		/* version for new files */
+
+/*
+ * Version 5 had no standby_restart_lsn, its last field: its files are read
+ * with the field invalid.
+ */
+#define SLOT_VERSION_NO_STANDBY_LSN	5
+#define ReplicationSlotOnDiskV5Size \
+	(offsetof(ReplicationSlotOnDisk, slotdata) + \
+	 offsetof(ReplicationSlotPersistentData, standby_restart_lsn) - \
+	 ReplicationSlotOnDiskConstantSize)
 
 /* Control array for replication slot management */
 ReplicationSlotCtlData *ReplicationSlotCtl = NULL;
@@ -220,6 +232,8 @@ ReplicationSlotsShmemRequest(void *arg)
 static void
 ReplicationSlotsShmemInit(void *arg)
 {
+	pg_atomic_init_u64(&ReplicationSlotCtl->collection_replayed,
+					   InvalidXLogRecPtr);
 	for (int i = 0; i < max_replication_slots + max_repack_replication_slots; i++)
 	{
 		ReplicationSlot *slot = &ReplicationSlotCtl->replication_slots[i];
@@ -1324,6 +1338,7 @@ ReplicationSlotsComputeRequiredLSN(void)
 		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
 		XLogRecPtr	restart_lsn;
 		XLogRecPtr	last_saved_restart_lsn;
+		XLogRecPtr	standby_restart_lsn;
 		bool		invalidated;
 		ReplicationSlotPersistency persistency;
 
@@ -1335,6 +1350,8 @@ ReplicationSlotsComputeRequiredLSN(void)
 		restart_lsn = s->data.restart_lsn;
 		invalidated = s->data.invalidated != RS_INVAL_NONE;
 		last_saved_restart_lsn = s->last_saved_restart_lsn;
+		standby_restart_lsn = SlotIsPhysical(s) ?
+			s->data.standby_restart_lsn : InvalidXLogRecPtr;
 		SpinLockRelease(&s->mutex);
 
 		/* invalidated slots need not apply */
@@ -1357,6 +1374,18 @@ ReplicationSlotsComputeRequiredLSN(void)
 				restart_lsn = last_saved_restart_lsn;
 			}
 		}
+
+		/*
+		 * A physical slot keeps the WAL from its standby's logical slots'
+		 * position too, as a logical slot here keeps its own: a collection
+		 * scans it for the values those slots may still decode.  (As the
+		 * slot's own, it is bounded by max_slot_wal_keep_size; a collection
+		 * then keeps what the WAL left names.)
+		 */
+		if (XLogRecPtrIsValid(standby_restart_lsn) &&
+			(!XLogRecPtrIsValid(restart_lsn) ||
+			 standby_restart_lsn < restart_lsn))
+			restart_lsn = standby_restart_lsn;
 
 		if (XLogRecPtrIsValid(restart_lsn) &&
 			(!XLogRecPtrIsValid(min_required) ||
@@ -1449,6 +1478,209 @@ ReplicationSlotsComputeLogicalRestartLSN(void)
 	LWLockRelease(ReplicationSlotControlLock);
 
 	return result;
+}
+
+/*
+ * The oldest position a logical slot may still decode from: one of this
+ * server's slots of database dboid (InvalidOid: of any database), or one of
+ * a standby's, as its hot standby feedback said (each standby's for every
+ * database: the feedback doesn't say which), whether held by the standby's
+ * physical slot or only by its walsender while it is connected.  A slot's
+ * position as last saved counts too, if older: a crash takes it back
+ * there.  Invalidated slots don't count.  Invalid if there is none.
+ *
+ * Values stored by content are kept for what a slot may decode from here
+ * on (a slot decodes rows naming them, and fetches them as it does).
+ */
+XLogRecPtr
+ReplicationSlotsLogicalDecodingHorizon(Oid dboid)
+{
+	XLogRecPtr	result = WalSndStandbyRestartLSN();
+
+	if (max_replication_slots + max_repack_replication_slots <= 0)
+		return result;
+
+	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
+	for (int i = 0; i < max_replication_slots + max_repack_replication_slots; i++)
+	{
+		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
+		XLogRecPtr	lsn = InvalidXLogRecPtr;
+
+		if (!s->in_use)
+			continue;
+		SpinLockAcquire(&s->mutex);
+		if (s->data.invalidated != RS_INVAL_NONE)
+			lsn = InvalidXLogRecPtr;
+		else if (SlotIsPhysical(s))
+			lsn = s->data.standby_restart_lsn;
+		else if (!OidIsValid(dboid) || s->data.database == dboid)
+		{
+			lsn = s->data.restart_lsn;
+			if (XLogRecPtrIsValid(s->last_saved_restart_lsn) &&
+				(!XLogRecPtrIsValid(lsn) || s->last_saved_restart_lsn < lsn))
+				lsn = s->last_saved_restart_lsn;
+		}
+		SpinLockRelease(&s->mutex);
+		if (XLogRecPtrIsValid(lsn) &&
+			(!XLogRecPtrIsValid(result) || lsn < result))
+			result = lsn;
+	}
+	LWLockRelease(ReplicationSlotControlLock);
+	return result;
+}
+
+/*
+ * ReplicationSlotsLogicalDecodingHorizon(), but no older than the oldest WAL
+ * here: a position whose WAL is gone (a standby's slot behind what
+ * max_slot_wal_keep_size kept for it) can't be scanned for the values it
+ * names, so what is kept for it is what the WAL left names.  *wanted is
+ * set to the position itself.
+ */
+XLogRecPtr
+ReplicationSlotsLogicalDecodingHorizonKept(Oid dboid, XLogRecPtr *wanted)
+{
+	XLogRecPtr	horizon = ReplicationSlotsLogicalDecodingHorizon(dboid);
+	XLogSegNo	segno;
+	XLogSegNo	oldest;
+	DIR		   *xldir;
+	struct dirent *xlde;
+
+	*wanted = horizon;
+	if (!XLogRecPtrIsValid(horizon))
+		return horizon;
+
+	/*
+	 * The oldest segment left: past the last removed (which a restart
+	 * forgets), and present, on any timeline.
+	 */
+	oldest = XLogGetLastRemovedSegno() + 1;
+	XLByteToSeg(horizon, segno, wal_segment_size);
+	if (segno >= oldest)
+	{
+		XLogSegNo	present = 0;
+
+		xldir = AllocateDir(XLOGDIR);
+		while ((xlde = ReadDir(xldir, XLOGDIR)) != NULL)
+		{
+			TimeLineID	tli;
+			XLogSegNo	file_segno;
+
+			if (!IsXLogFileName(xlde->d_name))
+				continue;
+			XLogFromFileName(xlde->d_name, &tli, &file_segno,
+							 wal_segment_size);
+			if (present == 0 || file_segno < present)
+				present = file_segno;
+		}
+		FreeDir(xldir);
+		oldest = Max(oldest, present);
+	}
+	if (segno < oldest)
+		XLogSegNoOffsetToRecPtr(oldest, 0, wal_segment_size, horizon);
+	return horizon;
+}
+
+/*
+ * On a standby, a logical slot just created, its WAL reserved: before it is
+ * used, the primary is to keep for it the values stored by content that the
+ * WAL names from its position (ReplicationSlotsLogicalDecodingHorizon()),
+ * which the hot standby feedback reports, every wal_receiver_status_interval
+ * otherwise.  A collection there that didn't would free values the slot
+ * decodes, and decoding would fail.  So the feedback is sent at once, asking
+ * the upstream server to acknowledge the position, which it does once no
+ * collection that may have read the positions before is running, with the
+ * end of the primary's WAL as of then.  A collection whose swap of the
+ * chunk store is past that end keeps what the WAL names from the position;
+ * one before may not have, so once replay is past that end, the slot's
+ * position moves past the last swap replayed if it is older: what such a
+ * collection freed, the slot doesn't decode.
+ *
+ * The upstream server says now and then that a request is pending, while
+ * a collection that began before runs, however long; if it says nothing for
+ * wal_receiver_timeout (60 s if that is 0) the slot isn't created: the
+ * standby isn't streaming, or its upstream server doesn't answer such
+ * requests (one older than this).  The slot isn't created either if
+ * recovery ends meanwhile.  The wait for replay has no limit, as the wait
+ * for a consistent point that follows.
+ */
+void
+ReplicationSlotReserveWalUpstream(void)
+{
+	ReplicationSlot *slot = MyReplicationSlot;
+	uint64		request;
+	XLogRecPtr	lsn;
+	TimestampTz began;
+	TimestampTz alive;
+	int			timeout = wal_receiver_timeout > 0 ? wal_receiver_timeout : 60000;
+
+	Assert(slot != NULL && SlotIsLogical(slot));
+	Assert(RecoveryInProgress());
+
+	began = GetCurrentTimestamp();
+	request = WalRcvRequestHorizonAck();
+	ConditionVariablePrepareToSleep(&WalRcv->horizonAckCV);
+	while (!WalRcvHorizonAcked(request, &lsn, &alive))
+	{
+		if (!RecoveryInProgress())
+		{
+			ConditionVariableCancelSleep();
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not create replication slot \"%s\"",
+							NameStr(slot->data.name)),
+					 errdetail("Recovery ended while the slot was being created."),
+					 errhint("Create the slot again.")));
+		}
+		if (TimestampDifferenceExceeds(Max(began, alive),
+									   GetCurrentTimestamp(), timeout))
+		{
+			ConditionVariableCancelSleep();
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not create replication slot \"%s\"",
+							NameStr(slot->data.name)),
+					 errdetail("The upstream server did not answer, in %d ms, the request that it keep the values the slot may decode.",
+							   timeout),
+					 errhint("A logical replication slot can be created on a standby only while the standby is streaming from an upstream server that answers such requests; an older server does not.")));
+		}
+		(void) ConditionVariableTimedSleep(&WalRcv->horizonAckCV, 1000,
+										   WAIT_EVENT_REPLICATION_SLOT_UPSTREAM_HORIZON);
+	}
+	ConditionVariableCancelSleep();
+
+	if (WaitForLSN(WAIT_LSN_TYPE_STANDBY_REPLAY, lsn, 0) != WAIT_LSN_RESULT_SUCCESS)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not create replication slot \"%s\"",
+						NameStr(slot->data.name)),
+				 errdetail("Recovery ended while the slot was being created."),
+				 errhint("Create the slot again.")));
+
+	lsn = pg_atomic_read_u64(&ReplicationSlotCtl->collection_replayed);
+	SpinLockAcquire(&slot->mutex);
+	if (lsn > slot->data.restart_lsn)
+		slot->data.restart_lsn = lsn;
+	else
+		lsn = InvalidXLogRecPtr;
+	SpinLockRelease(&slot->mutex);
+	if (XLogRecPtrIsValid(lsn))
+		ReplicationSlotsComputeRequiredLSN();
+}
+
+/*
+ * A collection's swap of a chunk store, replayed: the values stored by
+ * content it freed, gone here too.  'end' is the end of its WAL record.  A
+ * logical slot being created waits for the primary to keep what it needs
+ * (ReplicationSlotReserveWalUpstream()) and starts after a collection that
+ * may not have.  (A move of the journal, which frees nothing, swaps too: a
+ * slot then starts after it for nothing, which costs it nothing.)
+ */
+void
+ReplicationSlotsCollectionReplayed(XLogRecPtr end)
+{
+	if (ReplicationSlotCtl == NULL)
+		return;
+	pg_atomic_write_u64(&ReplicationSlotCtl->collection_replayed, end);
 }
 
 /*
@@ -2771,14 +3003,15 @@ RestoreSlotFromDisk(const char *name)
 						path, cp.magic, SLOT_MAGIC)));
 
 	/* verify version */
-	if (cp.version != SLOT_VERSION)
+	if (cp.version != SLOT_VERSION && cp.version != SLOT_VERSION_NO_STANDBY_LSN)
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has unsupported version %u",
 						path, cp.version)));
 
 	/* boundary check on length */
-	if (cp.length != ReplicationSlotOnDiskV2Size)
+	if (cp.length != (cp.version == SLOT_VERSION ? ReplicationSlotOnDiskV2Size :
+					  ReplicationSlotOnDiskV5Size))
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has corrupted length %u",
@@ -2808,12 +3041,15 @@ RestoreSlotFromDisk(const char *name)
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", path)));
 
-	/* now verify the CRC */
+	/* now verify the CRC, over the bytes the file's version has */
 	INIT_CRC32C(checksum);
 	COMP_CRC32C(checksum,
 				(char *) &cp + ReplicationSlotOnDiskNotChecksummedSize,
-				ReplicationSlotOnDiskChecksummedSize);
+				ReplicationSlotOnDiskConstantSize -
+				ReplicationSlotOnDiskNotChecksummedSize + cp.length);
 	FIN_CRC32C(checksum);
+	if (cp.version == SLOT_VERSION_NO_STANDBY_LSN)
+		cp.slotdata.standby_restart_lsn = InvalidXLogRecPtr;
 
 	if (!EQ_CRC32C(checksum, cp.checksum))
 		ereport(PANIC,

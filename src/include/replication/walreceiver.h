@@ -161,6 +161,21 @@ typedef struct
 	 * store semantics, so use sig_atomic_t.
 	 */
 	sig_atomic_t apply_reply_requested; /* used as a bool */
+
+	/*
+	 * Requests that the upstream server acknowledge the oldest position a
+	 * logical slot here (or downstream) may decode from, as the hot standby
+	 * feedback reports it (WalRcvRequestHorizonAck()), numbered: the latest
+	 * requested, and the latest acknowledged, with the end of the primary's
+	 * WAL as it was by then; and when the upstream server last said one was
+	 * pending or acknowledged.  Protected by mutex; horizonAckCV is
+	 * broadcast as the upstream server says either.
+	 */
+	uint64		horizonAckRequested;
+	uint64		horizonAcked;
+	XLogRecPtr	horizonAckedLsn;
+	TimestampTz horizonAckAlive;
+	ConditionVariable horizonAckCV;
 } WalRcvData;
 
 extern PGDLLIMPORT WalRcvData *WalRcv;
@@ -492,6 +507,9 @@ walrcv_clear_result(WalRcvExecResult *walres)
 /* prototypes for functions in walreceiver.c */
 pg_noreturn extern void WalReceiverMain(const void *startup_data, size_t startup_data_len);
 extern void WalRcvRequestApplyReply(void);
+extern uint64 WalRcvRequestHorizonAck(void);
+extern bool WalRcvHorizonAcked(uint64 request, XLogRecPtr *lsn,
+							   TimestampTz *alive);
 
 /* prototypes for functions in walreceiverfuncs.c */
 extern void ShutdownWalRcv(void);

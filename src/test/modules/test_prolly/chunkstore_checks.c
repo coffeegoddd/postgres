@@ -39,6 +39,8 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
+#include "replication/slot.h"
+#include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
 #include "miscadmin.h"
 #include "utils/array.h"
@@ -1740,6 +1742,17 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 	values[3] = Int64GetDatum((int64) r.window_usec);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(test_logical_horizon);
+Datum
+test_logical_horizon(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	horizon = ReplicationSlotsLogicalDecodingHorizon(MyDatabaseId);
+
+	if (!XLogRecPtrIsValid(horizon))
+		PG_RETURN_NULL();
+	PG_RETURN_LSN(horizon);
 }
 
 typedef struct NewNodes

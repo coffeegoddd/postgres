@@ -66,6 +66,7 @@ WalRcvShmemInit(void *arg)
 	MemSet(WalRcv, 0, sizeof(WalRcvData));
 	WalRcv->walRcvState = WALRCV_STOPPED;
 	ConditionVariableInit(&WalRcv->walRcvStoppedCV);
+	ConditionVariableInit(&WalRcv->horizonAckCV);
 	SpinLockInit(&WalRcv->mutex);
 	pg_atomic_init_u64(&WalRcv->writtenUpto, 0);
 	WalRcv->procno = INVALID_PROC_NUMBER;

@@ -3175,6 +3175,25 @@ SELECT * FROM pg_locks pl LEFT JOIN pg_prepared_xacts ppx
        </itemizedlist>
       </para></entry>
      </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>standby_restart_lsn</structfield> <type>pg_lsn</type>
+      </para>
+      <para>
+       For a physical slot, the oldest <structfield>restart_lsn</structfield>
+       of the logical slots on the standby using it (and on standbys
+       downstream of that one), as its hot standby feedback last reported.
+       <literal>NULL</literal> if the standby has no logical slots, and for
+       logical slots.  The slot keeps the WAL from this position too, within
+       <xref linkend="guc-max-slot-wal-keep-size"/>, and collections of the
+       chunk store keep every stored-by-content value of a versioned table
+       that this WAL names, so that the standby's slots can still decode
+       those values.  If that WAL has already been removed, a collection
+       logs a warning and keeps only the values named in the WAL that
+       remains.
+      </para></entry>
+     </row>
     </tbody>
    </tgroup>
   </table>

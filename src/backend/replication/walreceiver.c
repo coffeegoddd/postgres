@@ -67,6 +67,7 @@
 #include "pgstat.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
@@ -133,6 +134,9 @@ typedef enum WalRcvWakeupReason
 static TimestampTz wakeup[NUM_WALRCV_WAKEUPS];
 
 static StringInfoData reply_message;
+
+/* the latest request for the logical slots' horizon to be acknowledged, sent */
+static uint64 horizon_ack_sent = 0;
 
 /* Prototypes for private functions */
 static void WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last);
@@ -518,6 +522,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 				int			rc;
 				TimestampTz nextWakeup;
 				long		nap;
+				uint64		requested;
 
 				/*
 				 * Exit walreceiver if we're not in recovery. This should not
@@ -639,6 +644,13 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 						pg_memory_barrier();
 						XLogWalRcvSendReply(false, false, true);
 					}
+
+					/* a logical slot's position to have acknowledged */
+					SpinLockAcquire(&walrcv->mutex);
+					requested = walrcv->horizonAckRequested;
+					SpinLockRelease(&walrcv->mutex);
+					if (requested > horizon_ack_sent)
+						XLogWalRcvSendHSFeedback(true);
 				}
 				if (rc & WL_TIMEOUT)
 				{
@@ -956,14 +968,19 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len, TimeLineID tli)
 			{
 				StringInfoData incoming_message;
 
+				/*
+				 * (with, after, an acknowledgement of a request in the hot
+				 * standby feedback: its number and the primary's end of WAL,
+				 * invalid while it is pending)
+				 */
 				hdrlen = sizeof(int64) + sizeof(int64) + sizeof(char);
-				if (len != hdrlen)
+				if (len != hdrlen && len != hdrlen + 2 * sizeof(int64))
 					ereport(ERROR,
 							(errcode(ERRCODE_PROTOCOL_VIOLATION),
 							 errmsg_internal("invalid keepalive message received from primary")));
 
 				/* initialize a StringInfo with the given buffer */
-				initReadOnlyStringInfo(&incoming_message, buf, hdrlen);
+				initReadOnlyStringInfo(&incoming_message, buf, len);
 
 				/* read the fields */
 				walEnd = pq_getmsgint64(&incoming_message);
@@ -971,6 +988,24 @@ XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len, TimeLineID tli)
 				replyRequested = pq_getmsgbyte(&incoming_message);
 
 				ProcessWalSndrMessage(walEnd, sendTime);
+				if (len > hdrlen)
+				{
+					uint64		acked = pq_getmsgint64(&incoming_message);
+					XLogRecPtr	ackedLsn = pq_getmsgint64(&incoming_message);
+
+					TimestampTz alive = GetCurrentTimestamp();
+
+					SpinLockAcquire(&WalRcv->mutex);
+					if (XLogRecPtrIsValid(ackedLsn) &&
+						acked > WalRcv->horizonAcked)
+					{
+						WalRcv->horizonAcked = acked;
+						WalRcv->horizonAckedLsn = ackedLsn;
+					}
+					WalRcv->horizonAckAlive = alive;
+					SpinLockRelease(&WalRcv->mutex);
+					ConditionVariableBroadcast(&WalRcv->horizonAckCV);
+				}
 
 				/* If the primary requested a reply, send one immediately */
 				if (replyRequested)
@@ -1296,17 +1331,12 @@ XLogWalRcvSendHSFeedback(bool immed)
 				catalog_xmin_epoch;
 	TransactionId xmin,
 				catalog_xmin;
+	XLogRecPtr	restart_lsn;
+	uint64		ack_request;
 
 	/* initially true so we always send at least one feedback message */
 	static bool primary_has_standby_xmin = true;
-
-	/*
-	 * If the user doesn't want status to be reported to the primary, be sure
-	 * to exit before doing anything at all.
-	 */
-	if ((wal_receiver_status_interval <= 0 || !hot_standby_feedback) &&
-		!primary_has_standby_xmin)
-		return;
+	static bool primary_has_standby_restart_lsn = true;
 
 	/* Get current timestamp. */
 	now = GetCurrentTimestamp();
@@ -1329,6 +1359,26 @@ XLogWalRcvSendHSFeedback(bool immed)
 	 * this replica.
 	 */
 	if (!HotStandbyActive())
+		return;
+
+	/*
+	 * If the user doesn't want status to be reported to the primary, there
+	 * is nothing to send but the oldest position a logical slot here may
+	 * decode from, which is reported whether or not xmins are: the primary
+	 * keeps for it the values stored by content that such a slot may still
+	 * decode.  (Hence this wakes up every wal_receiver_status_interval with
+	 * hot_standby_feedback off too, to see whether there is one.)  A request
+	 * that the upstream server acknowledge it is read first, so the position
+	 * sent with it counts every slot that asked.
+	 */
+	SpinLockAcquire(&WalRcv->mutex);
+	ack_request = WalRcv->horizonAckRequested;
+	SpinLockRelease(&WalRcv->mutex);
+	restart_lsn = ReplicationSlotsLogicalDecodingHorizon(InvalidOid);
+	if ((wal_receiver_status_interval <= 0 || !hot_standby_feedback) &&
+		!primary_has_standby_xmin &&
+		!XLogRecPtrIsValid(restart_lsn) && !primary_has_standby_restart_lsn &&
+		ack_request <= horizon_ack_sent)
 		return;
 
 	/*
@@ -1358,8 +1408,9 @@ XLogWalRcvSendHSFeedback(bool immed)
 	if (nextXid < catalog_xmin)
 		catalog_xmin_epoch--;
 
-	elog(DEBUG2, "sending hot standby feedback xmin %u epoch %u catalog_xmin %u catalog_xmin_epoch %u",
-		 xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch);
+	elog(DEBUG2, "sending hot standby feedback xmin %u epoch %u catalog_xmin %u catalog_xmin_epoch %u logical restart_lsn %X/%08X request %" PRIu64,
+		 xmin, xmin_epoch, catalog_xmin, catalog_xmin_epoch,
+		 LSN_FORMAT_ARGS(restart_lsn), ack_request);
 
 	/* Construct the message and send it. */
 	resetStringInfo(&reply_message);
@@ -1369,11 +1420,15 @@ XLogWalRcvSendHSFeedback(bool immed)
 	pq_sendint32(&reply_message, xmin_epoch);
 	pq_sendint32(&reply_message, catalog_xmin);
 	pq_sendint32(&reply_message, catalog_xmin_epoch);
+	pq_sendint64(&reply_message, restart_lsn);
+	pq_sendint64(&reply_message, ack_request);
 	walrcv_send(wrconn, reply_message.data, reply_message.len);
+	horizon_ack_sent = ack_request;
 	if (TransactionIdIsValid(xmin) || TransactionIdIsValid(catalog_xmin))
 		primary_has_standby_xmin = true;
 	else
 		primary_has_standby_xmin = false;
+	primary_has_standby_restart_lsn = XLogRecPtrIsValid(restart_lsn);
 }
 
 /*
@@ -1452,7 +1507,8 @@ WalRcvComputeNextWakeup(WalRcvWakeupReason reason, TimestampTz now)
 				wakeup[reason] = TimestampTzPlusMilliseconds(now, wal_receiver_timeout / 2);
 			break;
 		case WALRCV_WAKEUP_HSFEEDBACK:
-			if (!hot_standby_feedback || wal_receiver_status_interval <= 0)
+			/* (with hot_standby_feedback off, for logical slots' position) */
+			if (wal_receiver_status_interval <= 0)
 				wakeup[reason] = TIMESTAMP_INFINITY;
 			else
 				wakeup[reason] = TimestampTzPlusSeconds(now, wal_receiver_status_interval);
@@ -1487,6 +1543,50 @@ WalRcvRequestApplyReply(void)
 	SpinLockRelease(&WalRcv->mutex);
 	if (procno != INVALID_PROC_NUMBER)
 		SetLatch(&GetPGProcByNumber(procno)->procLatch);
+}
+
+/*
+ * Ask the upstream server to acknowledge the oldest position a logical slot
+ * here may decode from: the walreceiver sends it in the hot standby
+ * feedback at once, with the request's number, and the upstream server
+ * answers once its collections keep the values stored by content that the
+ * WAL names from there (a cascading standby's, once its own upstream
+ * server has).  Returns the request's number, for WalRcvHorizonAcked().
+ * A request a walreceiver had not sent when it stopped is sent by the next.
+ */
+uint64
+WalRcvRequestHorizonAck(void)
+{
+	ProcNumber	procno;
+	uint64		request;
+
+	SpinLockAcquire(&WalRcv->mutex);
+	request = ++WalRcv->horizonAckRequested;
+	procno = WalRcv->procno;
+	SpinLockRelease(&WalRcv->mutex);
+	if (procno != INVALID_PROC_NUMBER)
+		SetLatch(&GetPGProcByNumber(procno)->procLatch);
+	return request;
+}
+
+/*
+ * Has a request of WalRcvRequestHorizonAck() been acknowledged?  If so,
+ * *lsn is the end of the primary's WAL as it was: a collection there whose
+ * swap of the chunk store is past it keeps what the position needs.
+ * *alive is when the upstream server last said a request was pending or
+ * acknowledged (0: never).
+ */
+bool
+WalRcvHorizonAcked(uint64 request, XLogRecPtr *lsn, TimestampTz *alive)
+{
+	bool		acked;
+
+	SpinLockAcquire(&WalRcv->mutex);
+	acked = WalRcv->horizonAcked >= request;
+	*lsn = WalRcv->horizonAckedLsn;
+	*alive = WalRcv->horizonAckAlive;
+	SpinLockRelease(&WalRcv->mutex);
+	return acked;
 }
 
 /*

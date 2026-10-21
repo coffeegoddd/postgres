@@ -2109,7 +2109,10 @@ When spec 14's C is built, the working set becomes a root too: TOAST
 pointers that name chunk-store content live in versioned heaps, so a
 collection scans those heaps, dead tuples included, for the hashes they
 hold, and keeps chunks appended after the oldest replication slot's
-position, which logical decoding may still read (spec 14, C4).
+position, and the value trees hash pointers in the WAL from there name,
+which logical decoding may still read, a standby's slots' too (spec 14,
+C4 and #300). The heaps' scan reads only the page-store blocks written
+since the last collection (#340).
 
 A commit no ref reaches is collected, so a call naming it by hash fails
 after GC, as in Dolt. A reflog (Dolt's `dolt_reflog`, which its GC

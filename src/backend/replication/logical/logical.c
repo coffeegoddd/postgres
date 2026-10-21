@@ -466,7 +466,13 @@ CreateInitDecodingContext(const char *plugin,
 	SpinLockRelease(&slot->mutex);
 
 	if (!XLogRecPtrIsValid(restart_lsn))
+	{
 		ReplicationSlotReserveWal();
+
+		/* on a standby, kept by the primary's collections before it's used */
+		if (RecoveryInProgress())
+			ReplicationSlotReserveWalUpstream();
+	}
 	else
 	{
 		SpinLockAcquire(&slot->mutex);

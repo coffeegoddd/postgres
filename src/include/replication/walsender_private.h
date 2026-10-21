@@ -16,6 +16,7 @@
 #include "lib/ilist.h"
 #include "nodes/nodes.h"
 #include "nodes/replnodes.h"
+#include "port/atomics.h"
 #include "replication/syncrep.h"
 #include "storage/condition_variable.h"
 #include "storage/shmem.h"
@@ -75,6 +76,13 @@ typedef struct WalSnd
 	 */
 	TimestampTz replyTime;
 
+	/*
+	 * The oldest position a logical slot of the standby (or downstream of
+	 * it) may decode from, as its hot standby feedback last said; invalid if
+	 * none.
+	 */
+	XLogRecPtr	standbyRestartLsn;
+
 	ReplicationKind kind;
 } WalSnd;
 
@@ -112,6 +120,13 @@ typedef struct
 	 * logical failover slots when a walreceiver confirms the receipt of LSN.
 	 */
 	ConditionVariable wal_confirm_rcv_cv;
+
+	/*
+	 * Bumped as a standby asks that its logical slots' position be
+	 * acknowledged, once it is kept: the collections that began reading the
+	 * positions before are waited for.
+	 */
+	pg_atomic_uint64 horizonGen;
 
 	WalSnd		walsnds[FLEXIBLE_ARRAY_MEMBER];
 } WalSndCtlData;
