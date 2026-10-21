@@ -108,6 +108,19 @@ Two interfaces, each selected by the table AM's profile
   hands it to its parent. A snapshot that doesn't see the truncation
   (`read_unseen` meets it) reads the table in full, and a transaction's
   commit doesn't advance a baseline past one.
+- **A bulk write stops being noted** (#499): past 65536 distinct entries
+  of a log in a transaction (what its buffers took anew: a key written
+  again is the same entry, so updating a few hot keys many times never
+  switches; review of #622), or a quarter of its table's `reltuples` if
+  more, the (sub)transaction's buffered entries are dropped for one "fold
+  in full", writing and reading back so many costing about what that
+  read does, and the transaction's
+  writes after aren't noted (no image built, no buffer). Counted per
+  (sub)transaction level, so a rollback to a savepoint before the switch
+  takes it back; a release keeps it. A table made in the transaction
+  isn't noted at all (it has no baseline to fold from). What the buffer
+  wrote before the switch (it writes every 64 kB) stays in the log:
+  the saving starts at the limit, not the first row.
 - **Written unseen:** a branch's first use under repeatable read asks
   each table's log whether a transaction its snapshot doesn't see wrote
   an entry: by the index, the rows of transactions from the snapshot's

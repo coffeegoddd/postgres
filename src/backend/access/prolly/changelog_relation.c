@@ -435,6 +435,36 @@ typedef struct OwnLog
 static HTAB *buffers = NULL;	/* LogBuffer; the transaction's */
 static List *written = NIL;		/* WrittenSet *; the transaction's */
 static HTAB *own_logs = NULL;	/* OwnLog; the transaction's */
+
+/*
+ * A bulk write stops being noted (#499): past this many distinct entries of
+ * a log in a transaction (a key written again is the same entry), or a
+ * quarter of its table's rows if more, its entries are dropped for one
+ * saying to read the table in full, writing and reading back so many
+ * costing about what that read does; a table made in the transaction (no
+ * baseline to fold from) isn't noted at all.  Per (sub)transaction, so a
+ * rollback of the bulk write takes the switch back.
+ */
+#define BULK_NOTES			65536
+
+typedef struct NoteLevel
+{
+	SubTransactionId subid;
+	int64		noted;			/* entries noted by it (and its children) */
+	bool		stopped;
+} NoteLevel;
+
+typedef struct LogNotes
+{
+	Oid			logid;			/* hash key */
+	int			n;				/* levels: the (sub)transactions it's in */
+	int			max;
+	NoteLevel  *levels;
+	int64		noted;			/* the levels' summed */
+	int			nstopped;		/* levels stopped */
+} LogNotes;
+
+static HTAB *notes = NULL;		/* LogNotes; the transaction's */
 static bool callbacks_registered = false;
 
 static void flush_all(void);
@@ -481,8 +511,8 @@ buffer_init(LogBuffer *b)
 	b->emptied = false;
 }
 
-/* Add an entry to a buffer. */
-static void
+/* Add an entry to a buffer: true if it holds no entry of the same bytes. */
+static bool
 buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row)
 {
 	BufKey		key = {len, data};
@@ -503,6 +533,7 @@ buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row)
 	}
 	be->delta += delta;
 	be->row = be->row || row;
+	return !found;
 }
 
 /* Add what src holds to dst. */
@@ -514,7 +545,7 @@ buffer_merge(LogBuffer *dst, const LogBuffer *src)
 
 	hash_seq_init(&seq, src->entries);
 	while ((be = hash_seq_search(&seq)) != NULL)
-		buffer_add(dst, be->key.data, be->key.len, be->delta, be->row);
+		(void) buffer_add(dst, be->key.data, be->key.len, be->delta, be->row);
 	dst->full = dst->full || src->full;
 	dst->emptied = dst->emptied || src->emptied;
 }
@@ -550,6 +581,7 @@ forget_all(void)
 	buffers = NULL;
 	written = NIL;
 	own_logs = NULL;
+	notes = NULL;
 }
 
 static void
@@ -640,7 +672,117 @@ log_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	}
 	list_free(written);
 	written = kept;
+	if (notes)
+	{
+		LogNotes   *ln;
+
+		hash_seq_init(&seq, notes);
+		while ((ln = hash_seq_search(&seq)) != NULL)
+		{
+			NoteLevel  *top = ln->n > 0 ? &ln->levels[ln->n - 1] : NULL;
+
+			if (top == NULL || top->subid != mySubid)
+				continue;
+			if (event == SUBXACT_EVENT_ABORT_SUB)
+			{
+				ln->noted -= top->noted;
+				ln->nstopped -= top->stopped ? 1 : 0;
+				ln->n--;
+			}
+			else if (ln->n > 1 && ln->levels[ln->n - 2].subid == parentSubid)
+			{
+				NoteLevel  *parent = &ln->levels[ln->n - 2];
+
+				parent->noted += top->noted;
+				if (top->stopped && parent->stopped)
+					ln->nstopped--;
+				parent->stopped = parent->stopped || top->stopped;
+				ln->n--;
+			}
+			else
+				top->subid = parentSubid;
+		}
+	}
 	MemoryContextSwitchTo(old);
+}
+
+/* Has the transaction stopped noting writes to the log? */
+static bool
+notes_stopped(Oid logid)
+{
+	LogNotes   *ln;
+
+	if (notes == NULL)
+		return false;
+	ln = hash_search(notes, &logid, HASH_FIND, NULL);
+	return ln != NULL && ln->nstopped > 0;
+}
+
+/*
+ * Count a write's n entries of rel's log its buffer didn't hold (the
+ * entries a fold would read, not the writes: a key updated many times is
+ * one); past the bulk limit (or for a table made in the transaction),
+ * stop noting it, the (sub)transaction's entries dropped for one saying to
+ * read the table in full.
+ */
+static void
+notes_count(Relation rel, Oid logid, int n)
+{
+	SubTransactionId cur = GetCurrentSubTransactionId();
+	LogNotes   *ln;
+	NoteLevel  *top;
+	bool		found;
+	double		limit = BULK_NOTES;
+	LogBuffer  *b;
+
+	if (notes == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(LogNotes);
+		ctl.hcxt = TopTransactionContext;
+		notes = hash_create("prolly change log notes", 16, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	ln = hash_search(notes, &logid, HASH_ENTER, &found);
+	if (!found)
+	{
+		ln->n = 0;
+		ln->max = 4;
+		ln->levels = MemoryContextAlloc(TopTransactionContext,
+										ln->max * sizeof(NoteLevel));
+		ln->noted = 0;
+		ln->nstopped = 0;
+	}
+	if (ln->n == 0 || ln->levels[ln->n - 1].subid != cur)
+	{
+		if (ln->n == ln->max)
+		{
+			ln->max *= 2;
+			ln->levels = repalloc(ln->levels, ln->max * sizeof(NoteLevel));
+		}
+		ln->levels[ln->n++] = (NoteLevel) {cur, 0, false};
+	}
+	top = &ln->levels[ln->n - 1];
+	top->noted += n;
+	ln->noted += n;
+	if (rel->rd_rel->reltuples > 0)
+		limit = Max(limit, 0.25 * rel->rd_rel->reltuples);
+	if (rel->rd_createSubid == InvalidSubTransactionId &&
+		(double) ln->noted <= limit)
+		return;
+	top->stopped = true;
+	ln->nstopped++;
+	b = buffer_of(logid, cur);
+	MemoryContextDelete(b->cxt);
+	{
+		bool		emptied = b->emptied;
+
+		buffer_init(b);
+		b->emptied = emptied;
+	}
+	b->full = true;
 }
 
 static void
@@ -658,11 +800,15 @@ register_callbacks(void)
 
 static void flush_buffer(LogBuffer *b);
 
-/* Hold a write's entries; written past BUFFER_FLUSH_BYTES. */
-static void
+/*
+ * Hold a write's entries; written past BUFFER_FLUSH_BYTES.  The number the
+ * buffer didn't hold already: a key written again is one entry.
+ */
+static int
 buffer_entries(Entries *e)
 {
 	LogBuffer  *b;
+	int			added = 0;
 
 	register_callbacks();
 	b = buffer_of(RelationGetRelid(e->log), GetCurrentSubTransactionId());
@@ -689,12 +835,14 @@ buffer_entries(Entries *e)
 			h = (HeapTupleHeader) (bytes - IMAGE_SKIP);
 			h->t_infomask2 &= ~HEAP2_XACT_MASK;
 			h->t_infomask &= ~HEAP_XACT_MASK;
-			buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0);
+			if (buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0))
+				added++;
 			pfree(bytes);
 		}
 	}
 	if (b->bytes > BUFFER_FLUSH_BYTES)
 		flush_buffer(b);
+	return added;
 }
 
 /* Note that the transaction wrote a log a row saying to read in full. */
@@ -1016,7 +1164,7 @@ note_write(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
 	MemoryContext caller;
 	RelationData logstub;
 
-	if (!OidIsValid(logid))
+	if (!OidIsValid(logid) || notes_stopped(logid))
 		return;
 	if (note_cxt == NULL)
 		note_cxt = AllocSetContextCreate(TopMemoryContext, "change log note",
@@ -1040,7 +1188,7 @@ note_write(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
 	}
 	note_versions(rel, &e, old, made, nmade);
 	MemoryContextSwitchTo(caller);
-	buffer_entries(&e);
+	notes_count(rel, logid, buffer_entries(&e));
 	MemoryContextReset(note_cxt);
 }
 
@@ -1524,6 +1672,9 @@ relation_consume(Relation rel, Snapshot snapshot)
 	delete_own_rows(log);
 	if (own_logs)
 		(void) hash_search(own_logs, &logid, HASH_REMOVE, NULL);
+	/* (a bulk write's switch with them: the writes after are noted again) */
+	if (notes)
+		(void) hash_search(notes, &logid, HASH_REMOVE, NULL);
 
 	/* (trimmed: transactions below the horizon, the snapshot saw finished) */
 	horizon = GetOldestNonRemovableTransactionId(log);
