@@ -82,11 +82,24 @@ adapts.
   no typed row diff; the enum's definition still changes. Actual row edits,
   additions, deletions and conflicts use the current labels on both sides.
   This includes domains, arrays, unchanged composites, enum keys and keyless
-  copy counts. Mixed renames and additions, reordered/reused names, changes
-  to enclosing type definitions, ranges holding renamed enums, and merges
-  that also drop columns are refused with a schema-conflict error rather
-  than guessed. History stores definitions, not the individual rename
-  commands; there is no change to the canonical storage format.
+  copy counts. Between two commits the labels are followed through the
+  history (#454): back from one version to the merge base, then on to the
+  other, through each merge along the parent it took the enum's
+  definition from (first parents otherwise; the edge from a merge's other
+  parent may hold several changes at once), each commit's change read as
+  a rename in place or an addition and the per-commit mappings composed.
+  So a label added in one commit and another renamed in a later one, a
+  chain of renames, or a renamed label's old name added again later, all
+  read correctly, also across a merge commit. The working set is a change past the head (and, mid-merge,
+  past the merged side), and a merge's result defines each enum as one side
+  does. Where no history is known, only the two definitions are compared.
+  A single commit that both renames and adds labels (or reorders/reuses
+  names), a value whose label the target enum lacks, changes to enclosing
+  type definitions, ranges holding renamed enums, and merges that also drop
+  columns are refused with a schema-conflict error rather than guessed.
+  History stores definitions, not the individual rename commands; there is
+  no change to the canonical storage format (labels carry no sort-order
+  identity).
 - **Why:** Postgres functions, not MySQL procedures; row composites keep
   the column types and work for any table without generated column
   names.

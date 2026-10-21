@@ -105,34 +105,22 @@ struct ProllyDatumCodec
 };
 
 /*
- * Snapshots do not record individual ALTER TYPE commands.  Accept pure
- * renames in place, or additions retaining every old label in order.  A
- * shifted surviving label in a rename can mean that a name was reused.
+ * The labels a mapping's saved labels read as, or a refusal where they
+ * couldn't be worked out (a change between two of the enum's definitions
+ * that's neither a rename in place nor an addition keeping the old labels
+ * in order: snapshots don't record the ALTER TYPE commands made).
  */
 static List *
 enum_targets(ProllyEnumMapping *m)
 {
-	bool		same_count = list_length(m->before) == list_length(m->after);
-	int			last = -1;
-
-	for (int i = 0; i < list_length(m->before); i++)
-	{
-		int			at = -1;
-
-		for (int j = 0; j < list_length(m->after); j++)
-			if (strcmp(strVal(list_nth(m->before, i)), strVal(list_nth(m->after, j))) == 0)
-				at = j;
-		if ((same_count && at >= 0 && at != i) ||
-			(!same_count && (at < 0 || at <= last)))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("schema conflict: cannot map historical labels of enum %s",
-							format_type_be(m->type)),
-					 errdetail("Only renames in place or additions preserving all old labels can be read across enum definitions."),
-					 errhint("Merge row changes before combining enum renames and additions or reusing labels.")));
-		last = at;
-	}
-	return same_count ? m->after : m->before;
+	if (m->targets == NIL && m->before != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("schema conflict: cannot map historical labels of enum %s",
+						format_type_be(m->type)),
+				 errdetail("Labels are read across commits that rename labels in place or add labels keeping the others in order, not across one that does both or reuses a label."),
+				 errhint("Commit an enum's renames and its additions separately, and merge row changes before reusing labels.")));
+	return m->targets;
 }
 
 /* Attach mappings only to decoders for the enums they describe. */
@@ -181,7 +169,17 @@ historical_enum_label(ProllyDatumCodec *c, const char *label)
 
 	for (int i = 0; i < list_length(before); i++)
 		if (strcmp(strVal(list_nth(before, i)), label) == 0)
-			return strVal(list_nth(c->enum_targets, i));
+		{
+			String	   *target = list_nth(c->enum_targets, i);
+
+			if (target == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("schema conflict: enum label \"%s\" of %s has no label to read as",
+								label, format_type_be(c->type)),
+						 errdetail("It was added where the enum it's read as doesn't have it.")));
+			return strVal(target);
+		}
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
 			 errmsg("enum label \"%s\" is absent from its saved definition", label)));
