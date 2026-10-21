@@ -76,6 +76,10 @@
  *   appends go to, and they go on to a new one; segments() visits them,
  *   oldest first (with count, each with its chunks counted; without, only
  *   whether it has any, nchunks 0 or -1, so nothing is read but sizes).
+ * - other_bytes() is the bytes of the store's files that are neither
+ *   segments nor table files (its manifest, an index of the journal, files
+ *   received but not yet adopted).  Optional: without it, they are
+ *   unknown.
  * - Garbage collection is the store's side of a collector's work
  *   (prolly_reclaim.h), in this order, in one transaction:
  *   gc_begin() holds off conjoins and new table files until the
@@ -385,6 +389,7 @@ typedef struct ProllyChunkStoreRoutine
 	 * (optional).
 	 */
 	void		(*redo_consistent) (void);
+	int64		(*other_bytes) (ProllyChunkStore *store);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -398,9 +403,9 @@ typedef struct ProllyChunkStoreRoutine
 	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots", \
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
-	"forget_received", "redo_consistent"
+	"forget_received", "redo_consistent", "other_bytes"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK redo_consistent
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK other_bytes
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

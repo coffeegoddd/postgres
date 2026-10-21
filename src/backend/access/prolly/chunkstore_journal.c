@@ -8453,6 +8453,39 @@ journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 	pfree(sdir);
 }
 
+/*
+ * The store's files that hold neither segments nor table files: those named
+ * as the store's (its manifest, the journal's index, files received) but
+ * not as either.
+ */
+static int64
+journal_other_bytes(ProllyChunkStore *s)
+{
+	char	   *dir = GetDatabasePath(s->dboid, s->spcoid);
+	DIR		   *d = AllocateDir(dir);
+	struct dirent *de;
+	int64		bytes = 0;
+
+	while ((de = ReadDir(d, dir)) != NULL)
+	{
+		char	   *path;
+		struct stat st;
+
+		if (strncmp(de->d_name, "prolly_", 7) != 0 ||
+			strcmp(de->d_name, JOURNAL_FILE) == 0 ||
+			strncmp(de->d_name, SEGMENT_PREFIX, strlen(SEGMENT_PREFIX)) == 0 ||
+			strncmp(de->d_name, "prolly_table_", 13) == 0)
+			continue;
+		path = dir_file(dir, de->d_name);
+		if (stat(path, &st) == 0)
+			bytes += st.st_size;	/* (else removed meanwhile) */
+		pfree(path);
+	}
+	FreeDir(d);
+	pfree(dir);
+	return bytes;
+}
+
 const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.info = {
 		.iface = PROLLY_IFACE_CHUNK_STORE,
@@ -8510,4 +8543,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.sync_file = journal_sync_file,
 	.roots = journal_roots,
 	.redo_consistent = journal_redo_consistent,
+	.other_bytes = journal_other_bytes,
 };

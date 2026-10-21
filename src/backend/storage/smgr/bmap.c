@@ -120,6 +120,7 @@
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "storage/bmap.h"
 #include "storage/bmap_xlog.h"
 #include "storage/bufmgr.h"
@@ -4892,6 +4893,206 @@ bmap_scan_store(Oid spcOid, Oid dbOid, uint64 since, uint64 *token,
 	LockRelease(&scantag, ExclusiveLock, false);
 	LockRelease(&sweeptag, ShareLock, false);
 	return nread;
+}
+
+/*
+ * Mark, in mapped[] and listed[] (bits of the store's blocks below hw), the
+ * blocks a relation holds: its map's entries under its length, and the
+ * rest (entries past it, its changes list's old blocks).  Its header is
+ * held shared meanwhile, so no extension, truncation or prune of it runs.
+ * Its length, or 0 if it was dropped since the directory was read.
+ */
+static BlockNumber
+size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
+			  BlockNumber hw)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BlockNumber mapnblocks;
+	BlockNumber nblocks;
+	Buffer		headerbuf;
+	BmapChangesHead head;
+	uint32		nchanges;
+	BmapChange *changes;
+
+	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
+		return 0;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(headerbuf)))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return 0;
+	}
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
+	for (BlockNumber mapblk = 1; mapblk < mapnblocks; mapblk++)
+	{
+		Buffer		buf = map_read(rel, mapblk);
+		BmapEntry  *entries;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(BufferGetPage(buf)))
+		{
+			check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
+					   mapblk);
+			entries = PageGetBmapEntries(BufferGetPage(buf));
+			for (uint32 i = 0; i < BMAP_FANOUT; i++)
+			{
+				BlockNumber b = entries[i].block;
+				uint64		blk = (uint64) (mapblk - 1) * BMAP_FANOUT + i;
+
+				if (!BlockNumberIsValid(b) || b >= hw)
+					continue;
+				if (blk < nblocks)
+					mapped[b / 64] |= UINT64CONST(1) << (b % 64);
+				else
+					listed[b / 64] |= UINT64CONST(1) << (b % 64);
+			}
+		}
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
+	if (changes != NULL)
+	{
+		BlockNumber *held = palloc_array(BlockNumber, Max(nchanges, 1));
+		uint32		nheld = changes_blocks(changes, nchanges, held);
+
+		for (uint32 i = 0; i < nheld; i++)
+			if (held[i] < hw)
+				listed[held[i] / 64] |= UINT64CONST(1) << (held[i] % 64);
+		pfree(held);
+		pfree(changes);
+	}
+	UnlockReleaseBuffer(headerbuf);
+	return nblocks;
+}
+
+static int
+cmp_relnumber(const void *a, const void *b)
+{
+	return pg_cmp_u32(*(const RelFileNumber *) a, *(const RelFileNumber *) b);
+}
+
+void
+bmap_sizes(Oid spcOid, Oid dbOid, BmapRelationVisit visit, void *arg,
+		   BmapSizes *sizes)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	char	   *path;
+	LOCKTAG		sweeptag;
+	Buffer		metabuf;
+	BmapMeta   *meta;
+	BlockNumber hw;
+	uint64	   *mapped;
+	uint64	   *listed;
+	RelFileNumber *maps = NULL;
+	int			nmaps = 0;
+	int			maxmaps = 0;
+	DIR		   *dir;
+	struct dirent *de;
+
+	memset(sizes, 0, sizeof(*sizes));
+	if (!alloc_exists(rel))
+		return;
+	path = GetDatabasePath(dbOid, spcOid);
+
+	/* not while a sweep frees blocks or shortens the store */
+	SET_LOCKTAG_OBJECT(sweeptag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
+	(void) LockAcquire(&sweeptag, ShareLock, false, false);
+
+	metabuf = alloc_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(metabuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	meta = PageGetBmapMeta(BufferGetPage(metabuf));
+	hw = meta->hw;
+	sizes->allocated_blocks = hw - meta->nfree;
+	UnlockReleaseBuffer(metabuf);
+	mapped = MemoryContextAllocHuge(CurrentMemoryContext,
+									(hw / 64 + 1) * sizeof(uint64));
+	listed = MemoryContextAllocHuge(CurrentMemoryContext,
+									(hw / 64 + 1) * sizeof(uint64));
+	memset(mapped, 0, (hw / 64 + 1) * sizeof(uint64));
+	memset(listed, 0, (hw / 64 + 1) * sizeof(uint64));
+
+	/* the maps, and what each holds */
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		RelFileNumber relnumber;
+		ForkNumber	fork;
+		unsigned	segno;
+
+		if (!parse_filename_for_nontemp_relation(de->d_name, &relnumber,
+												 &fork, &segno) ||
+			fork != BMAP_FORKNUM || segno != 0)
+			continue;
+		if (nmaps == maxmaps)
+		{
+			maxmaps = Max(maxmaps * 2, 64);
+			maps = maps ? repalloc_array(maps, RelFileNumber, maxmaps) :
+				palloc_array(RelFileNumber, maxmaps);
+		}
+		maps[nmaps++] = relnumber;
+	}
+	FreeDir(dir);
+	qsort(maps, nmaps, sizeof(RelFileNumber), cmp_relnumber);
+	for (int i = 0; i < nmaps; i++)
+	{
+		SMgrRelation reln = smgropen(with_relnumber(rel, maps[i]),
+									 INVALID_PROC_NUMBER);
+		BlockNumber nblocks = size_relation(reln, mapped, listed, hw);
+
+		sizes->relations++;
+		if (visit)
+			visit(maps[i], nblocks, arg);
+	}
+	for (BlockNumber w = 0; w <= hw / 64; w++)
+	{
+		sizes->mapped_blocks += pg_popcount64(mapped[w]);
+		sizes->listed_blocks += pg_popcount64(listed[w] & ~mapped[w]);
+	}
+	LockRelease(&sweeptag, ShareLock, false);
+
+	/* the files: the store's and the allocator's, and the maps' forks */
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		RelFileNumber relnumber;
+		ForkNumber	fork;
+		unsigned	segno;
+		char		file[MAXPGPATH];
+		struct stat st;
+
+		if (!parse_filename_for_nontemp_relation(de->d_name, &relnumber,
+												 &fork, &segno))
+			continue;
+		snprintf(file, sizeof(file), "%s/%s", path, de->d_name);
+		if (stat(file, &st) < 0)
+			continue;			/* (unlinked meanwhile) */
+		if (relnumber == BMAP_STORE_RELNUMBER)
+			sizes->store_bytes += st.st_size;
+		else if (relnumber == BMAP_ALLOC_RELNUMBER ||
+				 relnumber == BMAP_REFS_RELNUMBER)
+			sizes->alloc_bytes += st.st_size;
+		else if (bsearch(&relnumber, maps, nmaps, sizeof(RelFileNumber),
+						 cmp_relnumber) == NULL)
+			continue;			/* (not block-mapped) */
+		else if (fork == BMAP_FORKNUM || fork == BMAP_CHANGES_FORKNUM)
+			sizes->map_bytes += st.st_size;
+		else if (fork == VISIBILITYMAP_FORKNUM)
+			sizes->vm_bytes += st.st_size;
+		else if (fork == FSM_FORKNUM)
+			sizes->fsm_bytes += st.st_size;
+	}
+	FreeDir(dir);
+
+	pfree(mapped);
+	pfree(listed);
+	if (maps)
+		pfree(maps);
+	pfree(path);
 }
 
 /*

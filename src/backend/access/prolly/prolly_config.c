@@ -293,6 +293,20 @@ prolly_change_log_relid(Oid relid, Oid relam)
 	return log->relid(relid);
 }
 
+bool
+prolly_change_log_sizes(Relation rel, ProllyChangeLogSizes *sizes)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	memset(sizes, 0, sizeof(*sizes));
+	if (log == NULL)
+		return true;			/* (none is kept) */
+	if (log->sizes == NULL)
+		return false;
+	(void) log->sizes(rel, sizes);
+	return true;
+}
+
 /* (in critical sections too: no error, no allocation) */
 bool
 prolly_is_change_log(Relation rel)

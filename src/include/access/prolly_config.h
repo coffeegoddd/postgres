@@ -135,4 +135,10 @@ extern void prolly_note_branch_write(Oid branch);
 extern void prolly_forget_folds(void);
 extern void prolly_note_prepared_ended(FullTransactionId xid);
 
+/*
+ * What the change log of rel, a prolly table, takes (all zero if it has
+ * none); false if the change log can't say.
+ */
+extern bool prolly_change_log_sizes(Relation rel, ProllyChangeLogSizes *sizes);
+
 #endif							/* PROLLY_CONFIG_H */

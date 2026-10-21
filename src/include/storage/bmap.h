@@ -166,6 +166,32 @@ extern uint64 bmap_scan_store(Oid spcOid, Oid dbOid, uint64 since,
 							  uint64 *token, BmapRangeVisit range,
 							  BmapBlockVisit visit, void *arg);
 
+/*
+ * What a database's page store in a tablespace takes, as it stands: its
+ * files, and of the store's blocks those allocated, those a map holds under
+ * its relation's length (each once, however many maps hold it), and those
+ * held otherwise (by a changes list, or an entry past a relation's length).
+ * Approximate while the store changes; a sweep waits for it.  visit, if
+ * given, is told each relation's file number and logical length.
+ */
+typedef struct BmapSizes
+{
+	uint64		relations;		/* maps read */
+	uint64		store_bytes;	/* the page store's files */
+	uint64		allocated_blocks;	/* the allocator's: in use */
+	uint64		mapped_blocks;	/* held by a map under its length */
+	uint64		listed_blocks;	/* held otherwise, not mapped */
+	uint64		map_bytes;		/* the maps' and changes lists' files */
+	uint64		alloc_bytes;	/* the allocator's and the counts' files */
+	uint64		vm_bytes;		/* the relations' other forks (md.c) */
+	uint64		fsm_bytes;
+} BmapSizes;
+
+typedef void (*BmapRelationVisit) (RelFileNumber relnumber,
+								   BlockNumber nblocks, void *arg);
+extern void bmap_sizes(Oid spcOid, Oid dbOid, BmapRelationVisit visit,
+					   void *arg, BmapSizes *sizes);
+
 /* does a relation file number name a block-mapped relation? */
 extern bool bmap_relation_exists(RelFileLocator rlocator);
 

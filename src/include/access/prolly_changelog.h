@@ -114,6 +114,12 @@
  *   running that wrote such entries or are running still, and the current
  *   transaction its own.  Else rest->xmax is invalid, and the new baseline
  *   holds what the snapshot sees.
+ * - sizes() is what rel's log takes on disk: its relations' bytes (every
+ *   fork, its indexes too), and of its entries' bytes those live (no
+ *   committed deletion: unconsumed, or consumed by a fold not yet
+ *   committed) and those dead (consumed, until a vacuum removes them),
+ *   judged by heap visibility.  False if rel has no log.  Optional: without
+ *   it, a log's sizes are unknown.
  *
  * Provisional (v0).
  *
@@ -150,6 +156,14 @@ typedef struct ProllyLogPosition
  */
 typedef bool (*ProllyChangeLogVisit) (HeapTuple entry, int32 delta, void *arg);
 
+/* What a log takes, in bytes (sizes()). */
+typedef struct ProllyChangeLogSizes
+{
+	int64		bytes;			/* its relations, every fork */
+	int64		live_bytes;		/* its entries not deleted, or not yet */
+	int64		dead_bytes;		/* its entries consumed */
+} ProllyChangeLogSizes;
+
 typedef struct ProllyChangeLogRoutine
 {
 	ProllyImplInfo info;
@@ -176,14 +190,15 @@ typedef struct ProllyChangeLogRoutine
 	void		(*flush) (void);
 	void		(*note_emptied) (Relation rel);
 	double		(*pending) (Relation rel);
+	bool		(*sizes) (Relation rel, ProllyChangeLogSizes *sizes);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", \
 	"relid", "note_made", "consume_own", "written_unseen", "read_unseen", \
-	"flush", "note_emptied", "pending"
+	"flush", "note_emptied", "pending", "sizes"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK pending
+#define PROLLY_CHANGELOG_LAST_CALLBACK sizes
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

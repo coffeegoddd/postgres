@@ -46,6 +46,7 @@
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_branch.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/dbcommands.h"
@@ -62,6 +63,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_type.h"
+#include "storage/bmap.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "tcop/utility.h"
@@ -6529,6 +6531,265 @@ prolly_store_sizes(PG_FUNCTION_ARGS)
 	values[3] = Int64GetDatum(ss.file_bytes);
 	values[4] = Int64GetDatum(ss.settled);
 	values[5] = Int64GetDatum(ss.settled_bytes);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/* A block-mapped relation's storage, on any branch, and what it is. */
+typedef struct MappedFile
+{
+	Oid			spcOid;			/* (the key) */
+	RelFileNumber relnumber;
+	char		kind;			/* 'i': an index; 'l': a change log */
+} MappedFile;
+
+/* prolly_storage_breakdown()'s sums over one tablespace's page store */
+typedef struct MappedSizes
+{
+	HTAB	   *files;			/* MappedFile, of indexes and change logs */
+	Oid			spcOid;
+	int64		heap_main;
+	int64		index_main;
+} MappedSizes;
+
+static void
+size_mapped(RelFileNumber relnumber, BlockNumber nblocks, void *arg)
+{
+	MappedSizes *ms = arg;
+	MappedFile	key = {ms->spcOid, relnumber};
+	MappedFile *found = hash_search(ms->files, &key, HASH_FIND, NULL);
+
+	if (found == NULL)
+		ms->heap_main += (int64) nblocks * BLCKSZ;
+	else if (found->kind == 'i')
+		ms->index_main += (int64) nblocks * BLCKSZ;
+	/* (a change log's are change_log_bytes') */
+}
+
+/*
+ * Every branch's indexes' and change logs' file numbers, in a set.  A log
+ * is known by its table (prolly_change_log_relid(), the session branch's
+ * name for it), its OID every branch's.
+ */
+static HTAB *
+mapped_files(void)
+{
+	HASHCTL		ctl = {.keysize = offsetof(MappedFile, kind),
+	.entrysize = sizeof(MappedFile),.hcxt = CurrentMemoryContext};
+	HTAB	   *set = hash_create("mapped files", 256, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	Relation	classes = table_open(RelationRelationId, AccessShareLock);
+	List	   *rows = NIL;		/* Form_pg_class copies */
+	List	   *tables = NIL;
+	List	   *logs = NIL;
+
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		SysScanDesc scan = systable_beginscan(classes, InvalidOid, false,
+											  NULL, 0, NULL);
+		HeapTuple	tup;
+
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+			if (!RelFileNumberIsValid(c->relfilenode))
+				continue;
+			if (c->relkind == RELKIND_INDEX || c->relkind == RELKIND_TOASTVALUE)
+				rows = lappend(rows, memcpy(palloc(sizeof(FormData_pg_class)), c,
+											 sizeof(FormData_pg_class)));
+			else if (c->relam == PROLLY_TABLE_AM_OID &&
+					 (c->relkind == RELKIND_RELATION ||
+					  c->relkind == RELKIND_MATVIEW))
+				tables = list_append_unique_oid(tables, c->oid);
+		}
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(classes, AccessShareLock);
+
+	foreach_oid(relid, tables)
+	{
+		Oid			logid = prolly_change_log_relid(relid, PROLLY_TABLE_AM_OID);
+
+		if (OidIsValid(logid))
+			logs = lappend_oid(logs, logid);
+	}
+	foreach_ptr(FormData_pg_class, c, rows)
+	{
+		MappedFile	key;
+		MappedFile *entry;
+
+		if (c->relkind != RELKIND_INDEX && !list_member_oid(logs, c->oid))
+			continue;
+		key.spcOid = OidIsValid(c->reltablespace) ? c->reltablespace :
+			MyDatabaseTableSpace;
+		key.relnumber = c->relfilenode;
+		entry = hash_search(set, &key, HASH_ENTER, NULL);
+		entry->kind = c->relkind == RELKIND_INDEX ? 'i' : 'l';
+	}
+	list_free_deep(rows);
+	list_free(tables);
+	list_free(logs);
+	return set;
+}
+
+/*
+ * prolly_storage_breakdown(OUT heap_main_bytes int8, OUT index_main_bytes int8,
+ *						    OUT vm_bytes int8, OUT fsm_bytes int8,
+ *						    OUT page_store_bytes int8,
+ *						    OUT page_store_allocated_bytes int8,
+ *						    OUT page_store_mapped_bytes int8,
+ *						    OUT page_store_listed_bytes int8,
+ *						    OUT block_map_bytes int8,
+ *						    OUT change_log_bytes int8,
+ *						    OUT change_log_live_bytes int8,
+ *						    OUT change_log_dead_bytes int8,
+ *						    OUT journal_bytes int8, OUT settled_bytes int8,
+ *						    OUT unsettled_bytes int8,
+ *						    OUT chunk_store_other_bytes int8)
+ *	 returns record
+ *
+ * What the current database's prolly storage takes on disk, each component
+ * reporting its own part (#500):
+ *
+ * - its block-mapped relations (prolly tables, their TOAST tables, indexes
+ *   and change logs, on every branch), in every tablespace: their main
+ *   forks' bytes as mapped, tables' (with their TOAST tables') and
+ *   indexes' apart, logs' in neither (a page two branches share counts for
+ *   each), and their visibility maps' and free space maps' files;
+ * - the page stores: their files, and of their blocks those allocated,
+ *   those a relation maps, and those held only otherwise (pages as of a
+ *   fold a changes list keeps, entries past a relation's length);
+ * - the block maps: the maps', changes lists', allocators' and reference
+ *   counts' files;
+ * - the session branch's tables' change logs: their relations' bytes, and
+ *   their entries' live and dead (consumed, until vacuumed) by heap
+ *   visibility; NULL if the change log can't say.  Their pages are the
+ *   page store's;
+ * - the chunk store: its journal, its table files, settled or not, and its
+ *   other files (NULL if it can't say).
+ *
+ * The files of vm, fsm, page_store, block_map, journal, settled, unsettled
+ * and chunk_store_other are apart, and with the database's other
+ * relations (its catalogs) and the few files no relation owns (the
+ * relation map, the relcache's init file) they are pg_database_size().
+ * The other columns are parts of the page store.  Approximate while the
+ * storage changes, as prolly_store_sizes() is.
+ */
+Datum
+prolly_storage_breakdown(PG_FUNCTION_ARGS)
+{
+	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
+	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
+										  MyDatabaseTableSpace);
+	StoreSizes	ss = {0};
+	BmapSizes	total = {0};
+	MappedSizes ms = {0};
+	ProllyChangeLogSizes logs = {0};
+	bool		logs_known = true;
+	List	   *spcs = NIL;
+	List	   *tables = NIL;
+	Relation	rel;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	TupleDesc	desc;
+	Datum		values[16];
+	bool		nulls[16] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	/* the page stores, in every tablespace */
+	rel = table_open(TableSpaceRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Oid			spc = ((Form_pg_tablespace) GETSTRUCT(tup))->oid;
+
+		if (spc != GLOBALTABLESPACE_OID)
+			spcs = lappend_oid(spcs, spc);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	ms.files = mapped_files();
+	foreach_oid(spc, spcs)
+	{
+		BmapSizes	bs;
+
+		ms.spcOid = spc;
+		bmap_sizes(spc, MyDatabaseId, size_mapped, &ms, &bs);
+		total.store_bytes += bs.store_bytes;
+		total.allocated_blocks += bs.allocated_blocks;
+		total.mapped_blocks += bs.mapped_blocks;
+		total.listed_blocks += bs.listed_blocks;
+		total.map_bytes += bs.map_bytes;
+		total.alloc_bytes += bs.alloc_bytes;
+		total.vm_bytes += bs.vm_bytes;
+		total.fsm_bytes += bs.fsm_bytes;
+	}
+	hash_destroy(ms.files);
+
+	/* the change logs of the session branch's tables */
+	rel = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
+
+		if (c->relam == PROLLY_TABLE_AM_OID &&
+			(c->relkind == RELKIND_RELATION || c->relkind == RELKIND_MATVIEW))
+			tables = lappend_oid(tables, c->oid);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	foreach_oid(relid, tables)
+	{
+		Relation	table = try_table_open(relid, AccessShareLock);
+		ProllyChangeLogSizes one;
+
+		if (table == NULL)
+			continue;			/* (dropped meanwhile) */
+		if (prolly_change_log_sizes(table, &one))
+		{
+			logs.bytes += one.bytes;
+			logs.live_bytes += one.live_bytes;
+			logs.dead_bytes += one.dead_bytes;
+		}
+		else
+			logs_known = false;
+		table_close(table, AccessShareLock);
+	}
+
+	/* the chunk store */
+	PROLLY_CALL(cs, segments, store, false, size_segment, &ss);
+	PROLLY_CALL(cs, table_files, store, size_file, &ss);
+
+	values[0] = Int64GetDatum(ms.heap_main);
+	values[1] = Int64GetDatum(ms.index_main);
+	values[2] = Int64GetDatum((int64) total.vm_bytes);
+	values[3] = Int64GetDatum((int64) total.fsm_bytes);
+	values[4] = Int64GetDatum((int64) total.store_bytes);
+	values[5] = Int64GetDatum((int64) total.allocated_blocks * BLCKSZ);
+	values[6] = Int64GetDatum((int64) total.mapped_blocks * BLCKSZ);
+	values[7] = Int64GetDatum((int64) total.listed_blocks * BLCKSZ);
+	values[8] = Int64GetDatum((int64) (total.map_bytes + total.alloc_bytes));
+	values[9] = Int64GetDatum(logs.bytes);
+	values[10] = Int64GetDatum(logs.live_bytes);
+	values[11] = Int64GetDatum(logs.dead_bytes);
+	nulls[9] = nulls[10] = nulls[11] = !logs_known;
+	values[12] = Int64GetDatum(ss.segment_bytes);
+	values[13] = Int64GetDatum(ss.settled_bytes);
+	values[14] = Int64GetDatum(ss.file_bytes - ss.settled_bytes);
+	if (cs->other_bytes != NULL)
+		values[15] = Int64GetDatum(cs->other_bytes(store));
+	else
+		nulls[15] = true;
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }
