@@ -47,7 +47,13 @@ def report(path):
     good = [r for r in rows if r["status"] == "ok" and not r["warmup"]]
     if manifest["status"] != "complete" or len(good) != manifest["planned_samples"]:
         raise ValueError("Run is incomplete or failed; refusing to report a successful comparison. Inspect samples.jsonl and manifest.json.")
-    fields = ["engine", "operation", "rows", "changed_rows", "history_commits", "distance", "pass"]
+    for row in good:
+        # Preserve compatibility with results recorded before dirty VC scenarios.
+        was_dirty = row['operation'] in ('diff_working', 'diff_working_history')
+        row.setdefault('working_set', 'diff' if was_dirty else 'clean')
+        row.setdefault('dirty_rows', row['changed_rows'] if was_dirty else 0)
+    fields = ["engine", "operation", "rows", "changed_rows", "history_commits",
+              "working_set", "dirty_rows", "distance", "pass"]
     groups = collections.defaultdict(list)
     for row in good:
         groups[tuple(row[k] for k in fields)].append(row)
@@ -85,8 +91,9 @@ def report(path):
         writer.writeheader()
         writer.writerows(comparisons.values())
     fits = []
-    for axis in ("rows", "changed_rows", "distance"):
-        fixed = [f for f in fields if f != axis and f != "pass"]
+    for axis in ("rows", "changed_rows", "distance", "dirty_rows"):
+        fixed = [f for f in fields if f not in (axis, "pass")
+                 and not (axis == 'dirty_rows' and f == 'working_set')]
         for metric in ("elapsed_ns", "pss_bytes_peak_delta", "pss_bytes_peak"):
             buckets = collections.defaultdict(lambda: collections.defaultdict(list))
             undersampled = set()

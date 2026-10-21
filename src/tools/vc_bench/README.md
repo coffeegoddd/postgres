@@ -154,6 +154,7 @@ change counts to an existing root and run `prepare` again.
 |---|---|---|
 | Table size N | `sizes_gb` or explicit `rows` | 0.01, 0.1, 1, 10 GB |
 | Changed rows K | `changes` | 1,000 |
+| Pending dirty rows Q | `dirty_sizes` | small 0.01%, medium 1%, large 10% of N |
 | Distance D from current HEAD | `history_depths` | 1, 4, 16, 32 commits |
 | Repetitions | `repetitions`, `warmups` | 7 measured, 1 discarded per pass |
 | Memory sampling | `sample_interval_ms` | 10 ms |
@@ -179,12 +180,65 @@ the maximum configured distance and is recorded in every sample.
 | `branch`, D=0 or D>0 | Create a new branch at HEAD or an older saved hash |
 | `checkout`, D=0 | Switch to another branch with the same root |
 | `checkout`, D>0 | Switch to a branch with an older root |
-| `reset_soft` | Move a scratch branch's HEAD backward while retaining its working rows |
+| `reset_soft` | Reset a scratch branch's HEAD to the current/older commit, retaining its working rows |
 | `diff_equal` | Full count of row diff between identical commit hashes |
 | `diff_working` | Full count of HEAD versus dirty WORKING |
 | `diff_history` | Full count of old hash versus current hash |
 | `diff_working_history` | Full count of old hash versus dirty WORKING |
 | `resolve_ancestor` | Resolve `HEAD~D` without a diff |
+
+### Dirty working sets: small, medium, large
+
+Branch creation, checkout, and soft reset each run with a clean source branch
+and with three sizes of **pending, uncommitted version-control changes**. SQL
+transactions have committed their UPDATEs, but no `dolt_commit` has been made.
+These cases run at D=0 and every configured historical distance, on every table
+size and historical change count K, in both latency and memory passes.
+
+The default `dirty_sizes` configuration is:
+
+```json
+{
+  "small": {"fraction": 0.0001},
+  "medium": {"fraction": 0.01},
+  "large": {"fraction": 0.1}
+}
+```
+
+Fractions are rounded up to a whole row. For the 9,615,384-row / 10 GB table,
+these are 962, 96,154, and 961,539 dirty rows. To hold the dirty count fixed
+while varying table size, use `{"rows": 10}`, `{"rows": 100}`, etc. instead
+of `fraction`. Counts must fit every configured table; oversized values fail
+configuration validation instead of being clamped. Set `"dirty_sizes": {}`
+to disable the additional dirty VC cases. Older configurations that omit the
+field inherit the three default profiles.
+
+Each dirty setup updates Q evenly spaced primary keys to revision H+1, independently
+of the K keys changed by the committed history. Only the revision column changes;
+the payload is retained. Raw samples record `working_set`, `dirty_rows`, and
+`dirty_row_logical_bytes` (the logical footprint of affected rows, **not** bytes
+actually rewritten or allocated). Reports keep every profile and actual Q separate
+so clean and dirty observations cannot be averaged together.
+
+The operation contracts are:
+
+- **Branch creation:** create the new branch at the requested committed hash;
+  the source keeps its pending edits and the new branch starts clean.
+- **Checkout:** switch from the dirty source to the target branch's own clean
+  working set; switching back must reveal the original pending edits. These are
+  the SQL APIs' branch-local working sets, not CLI-style movement of pending
+  changes between branches. No force/discard flag is used.
+- **Soft reset:** move HEAD while retaining both the existing committed contents
+  and the pending edits. The expected diff to the new HEAD accounts for the exact
+  union/overlap of the historical K keys and dirty Q keys.
+
+Dirty setup, validation, and hard-reset cleanup are outside timing and memory
+sampling. Setup uses point probes, avoiding a pre-timed VC diff that could fold
+or materialize pending storage state. Post-operation validation checks values,
+HEADs, and full diff cardinalities before restoring the clean starting state.
+Large dirty sets can make setup/validation substantially longer than the timed
+operation. Memory baseline includes the already-dirty working set; growth is
+the additional resident memory during the operation.
 
 Diff uses `SELECT count(*) FROM dolt_diff(...)` so the engine must exhaust the
 row diff while network output remains one scalar. This is **row-diff enumeration
@@ -271,9 +325,13 @@ python3 "$B" report ~/dbs/benchmarks/results/TIMESTAMP-ID
 Both human-readable formats are generated automatically by `run`. The `report`
 command also adds them to existing complete runs without rerunning benchmarks.
 
-Each fit varies one of N, K, or D while holding the other recorded dimensions
+Each fit varies one of N, K, D, or Q while holding the other recorded dimensions
 fixed. At least four levels spanning 8x and five repetitions per level are
 required. Memory fits also require positive samples and no short-operation flags.
+The default three dirty sizes provide descriptive comparisons; add a fourth
+distinct size for a Q scaling fit. Fractional dirty sizes change Q with N, so
+use fixed `rows` profiles for an N sweep with Q held constant. Q fits group by
+actual count rather than profile name; other fits keep profile and Q fixed.
 No successful report is produced for an incomplete run or missing planned samples.
 An exponent near zero suggests flat growth over the tested range, near one linear
 growth; it is **not proof of asymptotic Big-O**. Fixed protocol costs, cache

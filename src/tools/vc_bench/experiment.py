@@ -10,13 +10,29 @@ import shutil
 import time
 import uuid
 
-from core import (SQL, disk_size, log, server, sha256,
+from core import (SQL, default_dirty_sizes, dirty_rows, disk_size, log, server, sha256,
                   write_json)
 from memory import Sampler
 
 
 def changed_ids(n, k):
     return [1 + i*n//k for i in range(k)]
+
+
+def union_count(n, a, b):
+    """Cardinality of two distributed update sets, without allocating the larger one."""
+    a, b = sorted((a, b))
+    overlap = 0
+    for i in range(a):
+        zero_based_id = i*n//a
+        j = (zero_based_id*b + n-1)//n
+        overlap += j < b and j*n//b == zero_based_id
+    return a+b-overlap
+
+
+def verify_dirty(sql, n, count, revision, latest):
+    probe(sql, n, count, revision)
+    expect(int(sql.scalar(sql.diff_sql(latest, 'WORKING'))), count, 'preserved dirty row count')
 
 
 def update(sql, n, k, revision):
@@ -143,11 +159,18 @@ def cases(c):
     result = [{"operation": "round_trip", "distance": 0},
               {"operation": "branch", "distance": 0},
               {"operation": "checkout", "distance": 0},
+              {"operation": "reset_soft", "distance": 0},
               {"operation": "diff_equal", "distance": 0},
               {"operation": "diff_working", "distance": 0}]
     for d in sorted(set(c["history_depths"])):
         for op in ("branch", "checkout", "reset_soft", "diff_history", "diff_working_history", "resolve_ancestor"):
             result.append({"operation": op, "distance": d})
+    for case in result:
+        case['working_set'] = 'diff' if case['operation'] in ('diff_working', 'diff_working_history') else 'clean'
+    for label in c.get('dirty_sizes', default_dirty_sizes()):
+        for d in [0, *sorted(set(c['history_depths']))]:
+            for op in ('branch', 'checkout', 'reset_soft'):
+                result.append({'operation': op, 'distance': d, 'working_set': label})
     return result
 
 
@@ -172,9 +195,15 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                 for case in order:
                     op, d = case["operation"], case["distance"]
                     old = fixture["commits"][h-d]
-                    dirty = op in ("diff_working", "diff_working_history")
+                    profile = case['working_set']
+                    dirty = profile != 'clean'
+                    count = (k if profile == 'diff' else
+                             dirty_rows(c.get('dirty_sizes', default_dirty_sizes())[profile], n) if dirty else 0)
                     if dirty:
-                        update(sql, n, k, h+1)
+                        update(sql, n, count, h+1)
+                        # Point reads confirm pending values without invoking a VC
+                        # diff that could materialize/fold the dirty tree before timing.
+                        probe(sql, n, count, h+1)
                     if op == "round_trip":
                         query = "SELECT 1"
                     elif op == "branch":
@@ -196,6 +225,7 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         query = sql.diff_sql(old, "WORKING")
                     record = {"engine": engine, "rows": n, "logical_bytes": n*(c["payload_bytes"]+16),
                               "changed_rows": k, "history_commits": h, **case,
+                              "dirty_rows": count, "dirty_row_logical_bytes": count*(c['payload_bytes']+16),
                               "pass": mode, "repetition": rep, "warmup": rep < 0,
                               "sql": query, "status": "started"}
                     sampler = Sampler(pid, c["sample_interval_ms"]) if mode == "memory" and rep >= 0 else None
@@ -213,17 +243,40 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         # AND memory sampling. Mutations must demonstrate their effect.
                         if op == "branch":
                             expect(sql.hash(tmpbranch), old, "new branch target")
+                            if dirty:
+                                expect(sql.hash(), latest, 'branch creation preserves source HEAD')
+                                verify_dirty(sql, n, count, h+1, latest)
+                                sql.vc('checkout', tmpbranch)
+                                probe(sql, n, k, h-d)
+                                expect(int(sql.scalar(sql.diff_sql('HEAD', 'WORKING'))), 0,
+                                       'new branch starts clean at requested commit')
+                                sql.vc('checkout', scratch)
+                                verify_dirty(sql, n, count, h+1, latest)
                             sql.vc("branch", "-D", tmpbranch)
                         elif op == "checkout":
                             expect(sql.hash(), old, "checked-out HEAD")
                             probe(sql, n, k, h-d)
+                            if dirty:
+                                expect(int(sql.scalar(sql.diff_sql('HEAD', 'WORKING'))), 0,
+                                       'checkout destination has its own clean working set')
                             sql.vc("checkout", scratch)
-                            probe(sql, n, k, h)
+                            if dirty:
+                                expect(sql.hash(), latest, 'checkout preserves source HEAD')
+                                verify_dirty(sql, n, count, h+1, latest)
+                            else:
+                                probe(sql, n, k, h)
                         elif op == "reset_soft":
                             expect(sql.hash(), old, "soft-reset HEAD")
-                            probe(sql, n, k, h)
-                            expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), k, "soft reset preserves working set")
+                            if dirty:
+                                verify_dirty(sql, n, count, h+1, latest)
+                            else:
+                                probe(sql, n, k, h)
+                            expected_diff = (union_count(n, k, count) if dirty else k) if d else count
+                            expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), expected_diff,
+                                   "soft reset preserves both committed and dirty working rows")
                             sql.vc("reset", "--soft", latest)
+                            if dirty:
+                                verify_dirty(sql, n, count, h+1, latest)
                         elif op == "resolve_ancestor":
                             expect(result["rows"][0][0], old, "ancestor resolution")
                         elif op.startswith("diff_"):

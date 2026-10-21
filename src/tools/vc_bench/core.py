@@ -1,6 +1,7 @@
 """Configuration, isolated server lifecycle, and persistent SQL client."""
 import contextlib
 import datetime
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import hashlib
 import json
 import os
@@ -13,6 +14,31 @@ import time
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 ENGINES = ("dolt", "doltgres", "prolly")
+
+
+def default_dirty_sizes():
+    return {"small": {"fraction": 0.0001}, "medium": {"fraction": 0.01},
+            "large": {"fraction": 0.1}}
+
+
+def dirty_rows(spec, n):
+    if not isinstance(spec, dict) or set(spec) not in ({'rows'}, {'fraction'}):
+        raise ValueError("each dirty size must specify exactly one of rows or fraction")
+    if 'rows' in spec:
+        count = spec['rows']
+        if type(count) is not int:
+            raise ValueError('dirty size rows must be an integer')
+    else:
+        try:
+            fraction = Decimal(str(spec['fraction']))
+            if not fraction.is_finite() or not 0 < fraction <= 1:
+                raise ValueError('dirty fraction must be > 0 and <= 1')
+            count = int((fraction*n).to_integral_value(rounding=ROUND_CEILING))
+        except InvalidOperation:
+            raise ValueError('dirty fraction must be numeric') from None
+    if not 1 <= count <= n:
+        raise ValueError(f'dirty size {count} must fit in table of {n} rows; no clamping is performed')
+    return count
 
 
 def log(message):
@@ -52,6 +78,7 @@ def init(root, smoke):
         "rows": [128, 512, 2048, 8192] if smoke else [],
         "sizes_gb": [] if smoke else [0.01, 0.1, 1, 10],
         "changes": [8] if smoke else [1000],
+        "dirty_sizes": default_dirty_sizes(),
         "history_depths": [1, 4] if smoke else [1, 4, 16, 32],
         "repetitions": 2 if smoke else 7, "warmups": 1,
         "passes": ["timing", "memory"], "sample_interval_ms": 10,
@@ -78,6 +105,14 @@ def config(root):
             raise ValueError(f"{key} must contain positive integers")
     if max(c["changes"]) > min(rows):
         raise ValueError("every changed-row count must fit in the smallest table")
+    c.setdefault('dirty_sizes', default_dirty_sizes())
+    if not isinstance(c['dirty_sizes'], dict):
+        raise ValueError('dirty_sizes must map profile names to rows or fraction specifications')
+    for label, spec in c['dirty_sizes'].items():
+        if not label or label in ('clean', 'diff') or not label.replace('_', '').isalnum():
+            raise ValueError('dirty size names must be alphanumeric/underscore, excluding clean and diff')
+        for n in rows:
+            dirty_rows(spec, n)
     for k in ("repetitions", "batch_rows", "timeout_seconds"):
         if type(c[k]) is not int or c[k] <= 0:
             raise ValueError(f"{k} must be a positive integer")

@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -9,7 +11,7 @@ import socket
 import sys
 
 import core
-from experiment import changed_ids, integer
+from experiment import changed_ids, integer, union_count, cases
 from memory import Sampler
 from report import fit, report
 from human_report import render
@@ -17,6 +19,74 @@ import preflight
 
 
 class BenchTests(unittest.TestCase):
+    def test_dirty_sizes_validate_and_do_not_clamp(self):
+        self.assertEqual(core.dirty_rows({'fraction': .0001}, 10000), 1)
+        self.assertEqual(core.dirty_rows({'fraction': .01}, 128), 2)
+        self.assertEqual(core.dirty_rows({'fraction': .1}, 9615384), 961539)
+        self.assertEqual(core.dirty_rows({'rows': 17}, 128), 17)
+        for spec in ({'rows': 129}, {'rows': 0}, {'rows': 1.5}, {'fraction': 0},
+                     {'fraction': 1.1}, {'fraction': 'NaN'}, {'fraction': 'bad'},
+                     {'rows': 2, 'fraction': .1}, {}):
+            with self.assertRaises(ValueError):
+                core.dirty_rows(spec, 128)
+
+    def test_dirty_and_historical_union_handles_partial_overlap(self):
+        for n in (1, 7, 16, 31):
+            for a in range(1, n+1):
+                for b in range(1, n+1):
+                    self.assertEqual(union_count(n, a, b),
+                                     len(set(changed_ids(n, a)) | set(changed_ids(n, b))))
+
+    def test_case_plan_covers_each_dirty_size_operation_and_depth(self):
+        plan = cases({'history_depths': [1, 4]})
+        keys = {(case['operation'], case['distance'], case['working_set']) for case in plan}
+        self.assertEqual(len(keys), len(plan))
+        for size in ('clean', 'small', 'medium', 'large'):
+            for op in ('branch', 'checkout', 'reset_soft'):
+                for depth in (0, 1, 4):
+                    self.assertIn((op, depth, size), keys)
+        clean_only = cases({'history_depths': [1], 'dirty_sizes': {}})
+        self.assertEqual({c['working_set'] for c in clean_only}, {'clean', 'diff'})
+
+    def test_dirty_profiles_do_not_overwrite_clean_report_cells(self):
+        summaries = []
+        for profile, count, value in [('clean', 0, 1), ('small', 1, 2), ('large', 100, 3)]:
+            summaries.append(dict(engine='dolt', operation='checkout', rows=1000, changed_rows=10,
+                                  history_commits=4, distance=1, working_set=profile, dirty_rows=count,
+                                  repetitions=7, median_ms=value, min_ms=value, max_ms=value,
+                                  **{'pass': 'timing'}))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            render(p, {'status': 'complete', 'planned_samples': 21}, summaries, [])
+            for name in ('report.md', 'report.html'):
+                text = (p/name).read_text()
+                self.assertIn('clean working set', text)
+                self.assertIn('small dirty working set: 1 rows', text)
+                self.assertIn('large dirty working set: 100 rows', text)
+                for value in ('1.00 ms', '2.00 ms', '3.00 ms'):
+                    self.assertIn(value, text)
+
+    def test_dirty_scaling_varies_count_without_fixing_profile_label(self):
+        records = []
+        for profile, count in [('tiny', 1), ('small', 10), ('medium', 100), ('large', 1000)]:
+            for rep in range(5):
+                records.append(dict(engine='dolt', operation='branch', rows=10000, changed_rows=10,
+                                    history_commits=4, distance=0, working_set=profile, dirty_rows=count,
+                                    repetition=rep, elapsed_ns=count*1000, status='ok', warmup=False,
+                                    **{'pass': 'timing'}))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            core.write_json(path/'manifest.json', {'status': 'complete', 'planned_samples': len(records)})
+            (path/'samples.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+            with contextlib.redirect_stdout(io.StringIO()):
+                report(path)
+            fits = json.loads((path/'scaling.json').read_text())
+            dirty = [f for f in fits if f['axis'] == 'dirty_rows']
+            self.assertEqual(len(dirty), 1)
+            self.assertEqual(dirty[0]['status'], 'descriptive')
+            self.assertAlmostEqual(dirty[0]['exponent'], 1)
+            self.assertEqual(len([f for f in fits if f['axis'] == 'rows']), 4)
+
     def test_preflight_fails_before_starting_an_earlier_valid_engine(self):
         # First engine and driver are runnable. The second engine is absent.
         # An actual CLI invocation must discover that before starting the first.

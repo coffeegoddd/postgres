@@ -145,10 +145,15 @@ def render(path, manifest, summaries, fits):
     doc.paragraph("Latency is a persistent SQL request through complete result consumption, with warm caches. "
                   "Engine and operation order are seeded. SQL setup, validation, and restoration are outside measurement. "
                   "Memory and resource counters use a separate instrumented pass; its latency is excluded here.")
+    doc.paragraph('Clean and dirty working sets are reported separately. Historical changes K and pending dirty rows Q '
+                  'are independent dimensions. Small, medium, and large name configurable dirty profiles; exact row counts '
+                  'appear in each table heading. Dirty SQL writes are transaction-committed but not version-committed. '
+                  'SQL checkout leaves pending edits on the source branch and switches to the destination’s working set.')
 
     fixtures = defaultdict(lambda: defaultdict(dict))
     for row in summaries:
-        fixture = (row['rows'], row['changed_rows'], row['history_commits'])
+        fixture = (row['rows'], row['changed_rows'], row['history_commits'],
+                   row.get('working_set', 'clean'), row.get('dirty_rows', 0))
         case = (row['operation'], row['distance'])
         fixtures[fixture][(row['pass'], case)][row['engine']] = row
 
@@ -156,16 +161,23 @@ def render(path, manifest, summaries, fits):
         return (list(OPERATIONS).index(case[0]) if case[0] in OPERATIONS else 99, case)
 
     def fixture_title(fixture):
-        n, k, h = fixture
+        n, k, h, working_set, dirty = fixture
         width = manifest.get('config', {}).get('payload_bytes')
         size = f"; {number(n*(width+16)/1e9, 'logical GB')}" if width is not None else ''
-        return f"{n:,} rows{size} · {k:,} changed rows · {h} history commits"
+        pending = 'clean working set' if working_set == 'clean' else f'{working_set} dirty working set: {dirty:,} rows'
+        return f"{n:,} rows{size} · K={k:,} historical changes · {h} commits · {pending}"
+
+    def fixture_order(item):
+        fixture = item[0]
+        labels = ['clean', 'diff', 'small', 'medium', 'large']
+        profile = fixture[3]
+        return (*fixture[:3], labels.index(profile) if profile in labels else 5, profile, fixture[4])
 
     def comparisons(title, note, mode, formatter):
         doc.heading(2, title)
         doc.paragraph(note)
         found = False
-        for fixture, cases in sorted(fixtures.items()):
+        for fixture, cases in sorted(fixtures.items(), key=fixture_order):
             selected = sorted((case for pass_, case in cases if pass_ == mode), key=case_order)
             if not selected:
                 continue
@@ -209,7 +221,7 @@ def render(path, manifest, summaries, fits):
                ('Read bytes', 'read_bytes_delta', 'KiB', 1024),
                ('Write bytes', 'write_bytes_delta', 'KiB', 1024)]
     has_resources = False
-    for fixture, cases in sorted(fixtures.items()):
+    for fixture, cases in sorted(fixtures.items(), key=fixture_order):
         selected = sorted((case for pass_, case in cases if pass_ == 'memory'), key=case_order)
         if not selected:
             continue
@@ -233,23 +245,28 @@ def render(path, manifest, summaries, fits):
                   'Each row holds the other dimensions fixed. An insufficient sweep needs at least four levels spanning '
                   '8× with five repetitions each. Sampling too slow means a short-operation flag prevents a memory fit. '
                   'Zero/nonpositive observations cannot be fitted in log space.')
-    axes = {'rows': 'Table size N', 'changed_rows': 'Changed rows K', 'distance': 'History distance D'}
+    axes = {'rows': 'Table size N', 'changed_rows': 'Historical changed rows K',
+            'distance': 'History distance D', 'dirty_rows': 'Pending dirty rows Q'}
     names = {'elapsed_ns': 'Latency', 'pss_bytes_peak_delta': 'PSS peak growth', 'pss_bytes_peak': 'PSS total peak'}
     for axis, title in axes.items():
-        fixed = [field for field in ('rows', 'changed_rows', 'history_commits', 'distance') if field != axis]
+        fixed = [field for field in ('rows', 'changed_rows', 'history_commits', 'distance', 'working_set', 'dirty_rows')
+                 if field != axis and not (axis == 'dirty_rows' and field == 'working_set')]
         grouped = defaultdict(dict)
         for item in fits:
             if item['axis'] == axis:
-                key = (item['metric'], item['operation'], *(item[f] for f in fixed))
+                key = (item['metric'], item['operation'],
+                       *(item.get(f, 'clean' if f == 'working_set' else 0) for f in fixed))
                 grouped[key][item['engine']] = item
         if not grouped:
             continue
         doc.heading(3, 'Varying ' + title)
         rows = []
-        labels = {'rows': 'N', 'changed_rows': 'K', 'history_commits': 'history commits', 'distance': 'D'}
+        labels = {'rows': 'N', 'changed_rows': 'K', 'history_commits': 'history commits', 'distance': 'D',
+                  'working_set': 'working set', 'dirty_rows': 'Q'}
         for key, engines in sorted(grouped.items()):
             metric, op, *values = key
-            context = ', '.join(f'{labels[f]}={value:,}' for f, value in zip(fixed, values))
+            context = ', '.join(f'{labels[f]}={value:,}' if isinstance(value, int) else f'{labels[f]}={value}'
+                                for f, value in zip(fixed, values))
             rows.append([OPERATIONS.get(op, op), names[metric], context,
                          *[fit_cell(engines[e]) if e in engines else '—' for e in ENGINES]])
         doc.table(['Operation', 'Measured cost', 'Held fixed', *ENGINE_NAMES], rows)
