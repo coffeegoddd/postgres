@@ -60,6 +60,21 @@ SELECT * FROM pg_temp.entries('cl.keyed');
 ROLLBACK;
 SELECT * FROM pg_temp.entries('cl.keyed');
 
+-- A subtransaction that writes an ancestor's entries, and one inside it
+-- that ends, then the first rolled back: the entries are the ancestor's
+-- again, the inner one's gone.
+BEGIN;
+INSERT INTO cl.keyed VALUES (4, 'd');
+SAVEPOINT a;
+SELECT * FROM pg_temp.entries('cl.keyed');
+SAVEPOINT b;
+INSERT INTO cl.keyed VALUES (5, 'e');
+ROLLBACK TO b;
+SELECT count(*) AS churned FROM (SELECT repeat('x', 100000) FROM generate_series(1, 50)) s;
+ROLLBACK TO a;
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK;
+
 -- A commit rolled back leaves the entries it consumed.
 INSERT INTO cl.keyed VALUES (6, 'f');
 BEGIN;

@@ -575,9 +575,19 @@ log_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	HASH_SEQ_STATUS seq;
 	LogBuffer  *b;
 	List	   *kept = NIL;
+	MemoryContext old;
 
 	if (event != SUBXACT_EVENT_COMMIT_SUB && event != SUBXACT_EVENT_ABORT_SUB)
 		return;
+
+	/*
+	 * (the lists made here in the transaction's memory: the current context
+	 * is the ending subtransaction's, which a commit keeps to the
+	 * transaction's end once anything was made in it, a block for every
+	 * subtransaction, or an abort's, which is reset, the written list with
+	 * it)
+	 */
+	old = MemoryContextSwitchTo(TopTransactionContext);
 	if (buffers)
 	{
 		List	   *mine = NIL;
@@ -625,6 +635,7 @@ log_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	}
 	list_free(written);
 	written = kept;
+	MemoryContextSwitchTo(old);
 }
 
 static void
@@ -1390,7 +1401,9 @@ relation_written_unseen(Relation rel, Snapshot snapshot)
  * and delete the rows it wrote (and hasn't aborted): those of its own
  * changes, once a baseline holding them is to be the table's.  False,
  * consuming none, if not all can be told (one says to read the table in
- * full, or there were too many).
+ * full), or the position's own transaction wrote more since its fold.
+ * Others' entries since the position stay, and *rest says where the new
+ * baseline is to read them from.
  */
 typedef struct Others
 {
@@ -1415,37 +1428,72 @@ other_row(Relation log, HeapTuple tup, void *arg)
 
 /*
  * Does the log hold an entry since the position, the active snapshot sees,
- * of a transaction but this one?
+ * of a transaction but this one?  If so, *rest is the position holding all
+ * but those and this one's: the position's xmax; of the transactions below
+ * it the position doesn't hold, those with such an entry or running for
+ * the snapshot (they may write more); and this one, its own.  (One that
+ * finished without an entry left has nothing more to read: so a baseline
+ * advanced commit after commit, while others' entries wait, doesn't list
+ * every one.)  False in *told if the position's own transaction (not this
+ * one) wrote such an entry: what it wrote after its fold isn't held, what
+ * it wrote before is, and a position has but one own.
  */
 static bool
-others_since(Relation log, const ProllyLogPosition *since)
+others_since(Relation log, const ProllyLogPosition *since,
+			 ProllyLogPosition *rest, bool *told)
 {
 	Relation	index = index_open(log_index_relid(log), AccessShareLock);
 	Snapshot	snap = GetActiveSnapshot();
-	Others		o = {GetTopFullTransactionIdIfAny(), false};
+	FullTransactionId own = GetTopFullTransactionIdIfAny();
+	Others		o = {own, false};
+	FullTransactionId *keep = palloc_array(FullTransactionId, Max(since->nxip, 1));
+	uint32		nkeep = 0;
+	bool		any;
 
+	*told = true;
 	(void) scan_rows(log, index, snap, since->xmax, InvalidFullTransactionId,
 					 false, other_row, &o);
-	for (uint32 i = 0; !o.found && i < since->nxip; i++)
-		if (FullTransactionIdPrecedes(since->xip[i], since->xmax))
-			(void) scan_rows(log, index, snap, since->xip[i], since->xip[i],
-							 true, other_row, &o);
-	if (!o.found && FullTransactionIdIsValid(since->own) &&
-		FullTransactionIdPrecedes(since->own, since->xmax))
+	any = o.found;
+	for (uint32 i = 0; i < since->nxip; i++)
+	{
+		FullTransactionId x = since->xip[i];
+
+		if (!FullTransactionIdPrecedes(x, since->xmax) ||
+			FullTransactionIdEquals(x, own))
+			continue;
+		o.found = false;
+		(void) scan_rows(log, index, snap, x, x, true, other_row, &o);
+		any = any || o.found;
+		if (o.found || XidInMVCCSnapshot(XidFromFullTransactionId(x), snap))
+			keep[nkeep++] = x;
+	}
+	if (FullTransactionIdIsValid(since->own) &&
+		FullTransactionIdPrecedes(since->own, since->xmax) &&
+		!FullTransactionIdEquals(since->own, own))
+	{
+		o.found = false;
 		(void) scan_rows(log, index, snap, since->own, since->own, true,
 						 other_row, &o);
+		*told = !o.found;
+	}
 	index_close(index, AccessShareLock);
-	return o.found;
+	rest->xmax = any ? since->xmax : InvalidFullTransactionId;
+	rest->own = own;
+	rest->nxip = nkeep;
+	rest->xip = keep;
+	return any;
 }
 
 static bool
-relation_consume_own(Relation rel, const ProllyLogPosition *since)
+relation_consume_own(Relation rel, const ProllyLogPosition *since,
+					 ProllyLogPosition *rest)
 {
 	Oid			logid = log_relid(rel);
 	OwnLog	   *ol;
 	LogBuffer  *b;
 	List	   *mine = NIL;
 	Relation	log;
+	bool		told;
 
 	if (!OidIsValid(logid))
 		return false;
@@ -1465,7 +1513,8 @@ relation_consume_own(Relation rel, const ProllyLogPosition *since)
 		if (one->full)
 			return false;
 	log = table_open(logid, RowExclusiveLock);
-	if (others_since(log, since))
+	(void) others_since(log, since, rest, &told);
+	if (!told)
 	{
 		table_close(log, NoLock);
 		return false;

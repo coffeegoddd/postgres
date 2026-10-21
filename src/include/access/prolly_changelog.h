@@ -78,10 +78,16 @@
  *   advanced, deletes the entries of rel's log the current
  *   transaction wrote and didn't abort: called once a baseline holding
  *   exactly its own changes, applied to the last, is to be the table's.
- *   False, deleting none, if the log can't tell them all, or holds others'
- *   entries since that position the snapshot sees (changes the new
- *   baseline wouldn't hold, nor its position read): the caller then keeps
- *   the old baseline.
+ *   False, deleting none, if the log can't tell them all, or the
+ *   position's own transaction wrote entries since its fold (a position
+ *   has one own, which the current transaction's would replace): the
+ *   caller then keeps the old baseline.  Where the log holds others'
+ *   entries since that position the active snapshot sees (changes the new
+ *   baseline doesn't hold either), *rest is the position the new baseline
+ *   holds, which still reads them: that one's xmax, with those of its
+ *   running that wrote such entries or are running still, and the current
+ *   transaction its own.  Else rest->xmax is invalid, and the new baseline
+ *   holds what the snapshot sees.
  *
  * Provisional (v0).
  *
@@ -134,7 +140,8 @@ typedef struct ProllyChangeLogRoutine
 	Oid			(*relid) (Oid relid);
 	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
 							  HeapTuple oldtup, HeapTuple *made, int nmade);
-	bool		(*consume_own) (Relation rel, const ProllyLogPosition *since);
+	bool		(*consume_own) (Relation rel, const ProllyLogPosition *since,
+								ProllyLogPosition *rest);
 	bool		(*written_unseen) (Relation rel, Snapshot snapshot);
 	void		(*flush) (void);
 } ProllyChangeLogRoutine;

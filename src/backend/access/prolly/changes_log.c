@@ -265,6 +265,14 @@ xid_cmp(const void *a, const void *b)
 	return pg_cmp_u32(*(const TransactionId *) a, *(const TransactionId *) b);
 }
 
+/* (sorted as xid_cmp sorts their xids: the state's xids are searched so) */
+static int
+full_xid_cmp(const void *a, const void *b)
+{
+	return pg_cmp_u32(XidFromFullTransactionId(*(const FullTransactionId *) a),
+					  XidFromFullTransactionId(*(const FullTransactionId *) b));
+}
+
 /*
  * Does the snapshot see every transaction the baseline's fold saw as
  * committed?  Each the fold saw finished (below its xmax, not running
@@ -1159,8 +1167,9 @@ log_fold_rows(Relation rel, const ProllyTreeEnv *env,
 /*
  * The state of a baseline that holds rel's last baseline's rows with the
  * transaction's own changes applied (a commit of them alone), into next:
- * as of the active snapshot, its fold's transaction this one.  The
- * transaction's entries are consumed; the rest stay, the changes of
+ * as of the active snapshot, its fold's transaction this one; or, where
+ * others' entries since the last's position wait, at that position still.
+ * The transaction's entries are consumed; the rest stay, the changes of
  * others the new baseline doesn't hold.  False, consuming nothing, where
  * the last baseline's state doesn't hold so: not this finder's with the
  * table's log as it is, unsettled, its fold one the snapshot doesn't see,
@@ -1174,6 +1183,7 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 	uint64		identity = 0;
 	State		st;
 	State		ns = {0};
+	ProllyLogPosition rest = {0};
 	Snapshot	snap = GetActiveSnapshot();
 
 	prolly_components_for_relation(rel, &c);
@@ -1187,11 +1197,32 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 	{
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
 
-		if (!PROLLY_CALL(c.change_log, consume_own, rel, &pos))
+		if (!PROLLY_CALL(c.change_log, consume_own, rel, &pos, &rest))
 			return false;
 	}
 	ns.log = identity;
-	state_of_snapshot(&ns, snap);
+	if (!FullTransactionIdIsValid(rest.xmax))
+		state_of_snapshot(&ns, snap);
+	else
+	{
+		/*
+		 * (others' entries the new baseline doesn't hold either: its
+		 * position is the last's, which reads them, the transaction its
+		 * own; not the snapshot's, which would skip them)
+		 */
+		ns.fxmax = rest.xmax;
+		ns.xmax = XidFromFullTransactionId(rest.xmax);
+		ns.fown = rest.own;
+		ns.own = XidFromFullTransactionId(rest.own);
+		ns.nxip = rest.nxip;
+		ns.fxip = palloc_array(FullTransactionId, Max(ns.nxip, 1));
+		ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
+		if (ns.nxip > 0)
+			memcpy(ns.fxip, rest.xip, ns.nxip * sizeof(FullTransactionId));
+		qsort(ns.fxip, ns.nxip, sizeof(FullTransactionId), full_xid_cmp);
+		for (uint32 i = 0; i < ns.nxip; i++)
+			ns.xip[i] = XidFromFullTransactionId(ns.fxip[i]);
+	}
 	put_state(next, &ns);
 	return true;
 }
