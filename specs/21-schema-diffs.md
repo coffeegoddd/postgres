@@ -304,6 +304,20 @@ Decided by the user 2026-10-19, as recommended:
   `'a...b'` (from their merge base to b) in place of two refs, the next
   argument then the name. `dolt_diff`'s row type argument comes third, so
   it keeps two refs.
-- **Not built:** `dolt_at`'s key-range pushdown and the detached checkout
-  cache (#495).
+- **`dolt_at` and the planner (user, 2026-10-20, #495).** Key ranges
+  reach `dolt_at` through the planner, not through more arguments. Its
+  support function (`prosupport`) answers the planner's row estimate
+  with the count the commit's tree records for the table (the
+  diff-merge's optional `row_count()`: the commit, its root's items and
+  the tree's root node read, no rows), for a ref constant by planning;
+  WORKING, a ref not known then, or a commit without the table keep
+  `prorows`' 1000. Only the estimate comes from the ref: a kept plan reads
+  what the ref names when it runs.
+- **Not built:** a CustomScan over `dolt_at` seeking the tree by primary
+  key quals (O(log N + k) nodes), reporting pathkeys for keys whose order
+  doesn't depend on a collation (#495's second stage). The cache of
+  detached checkouts #495 proposed is dropped (user, 2026-10-20):
+  `dolt_at` reads a commit without checking it out, so a detached
+  checkout's hidden branch is still made, and swept when no session is
+  on it, as before.
 

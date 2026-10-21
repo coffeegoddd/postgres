@@ -56,6 +56,9 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/supportnodes.h"
+#include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
@@ -4863,6 +4866,47 @@ dolt_at(PG_FUNCTION_ARGS)
 	rows_end(&s.rows);
 	table_close(rel, AccessShareLock);
 	return (Datum) 0;
+}
+
+/*
+ * dolt_at_support(internal) returns internal: dolt_at()'s planner support.
+ * Its rows, estimated as the diff-merge's row_count() counts them from the
+ * commit's tree, when the ref is a constant by planning (a parameter's
+ * value too, in a custom plan); else the planner's default.  Only an
+ * estimate is taken from the ref, never the commit it resolved to: a
+ * plan kept for later reads whatever the ref names when it runs.
+ */
+Datum
+dolt_at_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	Node	   *ret = NULL;
+
+	if (IsA(rawreq, SupportRequestRows))
+	{
+		SupportRequestRows *req = (SupportRequestRows *) rawreq;
+
+		if (is_funcclause(req->node) &&
+			list_length(((FuncExpr *) req->node)->args) == 2 &&
+			PROLLY_HAS(diff_merge(), row_count))
+		{
+			List	   *args = ((FuncExpr *) req->node)->args;
+			Node	   *ref = estimate_expression_value(req->root, linitial(args));
+			Oid			relid = get_typ_typrelid(exprType(lsecond(args)));
+			double		rows;
+
+			if (IsA(ref, Const) && !((Const *) ref)->constisnull &&
+				OidIsValid(relid) &&
+				PROLLY_CALL(diff_merge(), row_count,
+							TextDatumGetCString(((Const *) ref)->constvalue),
+							relid, &rows))
+			{
+				req->rows = rows;
+				ret = (Node *) req;
+			}
+		}
+	}
+	PG_RETURN_POINTER(ret);
 }
 
 /*

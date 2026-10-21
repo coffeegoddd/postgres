@@ -51,5 +51,39 @@ WHERE committer IS NOT NULL AND commit_date IS NOT NULL;
 SELECT * FROM dolt_at('no_such_ref', NULL::ao.t);
 SELECT * FROM dolt_at(NULL, NULL::ao.t);
 
+-- the planner's estimate of a commit's rows: the count its tree records,
+-- not prorows' 1000; the default where it can't tell (WORKING, a ref
+-- that doesn't resolve, a parameter in a generic plan, a commit without
+-- the table).  A keyless table's rows count once each: bag's one row has
+-- two copies of 7.
+CREATE FUNCTION pg_temp.estimate(query text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	plan json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || query INTO plan;
+	RETURN (plan->0->'Plan'->>'Plan Rows')::float8;
+END
+$$;
+CREATE TABLE ao.many (id int PRIMARY KEY, v text);
+SELECT dolt_hashof('HEAD') AS before_many \gset
+INSERT INTO ao.many SELECT g, 'v' || g FROM generate_series(1, 2500) g;
+SELECT length(dolt_commit('-Am', 'many')::text) AS committed;
+DELETE FROM ao.many WHERE id > 40;
+SELECT length(dolt_commit('-Am', 'fewer')::text) AS committed;
+SELECT pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD~1', NULL::ao.many)$q$) AS at_many,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.many)$q$) AS at_fewer,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('HEAD', NULL::ao.bag)$q$) AS keyless,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('WORKING', NULL::ao.many)$q$) AS working,
+	   pg_temp.estimate($q$SELECT * FROM dolt_at('no_such_ref', NULL::ao.many)$q$) AS no_ref,
+	   pg_temp.estimate(format($q$SELECT * FROM dolt_at(%L, NULL::ao.many)$q$, :'before_many')) AS no_table;
+-- a parameter: the default in a generic plan, the commit's in a custom one
+PREPARE at_ref(text) AS SELECT * FROM dolt_at($1, NULL::ao.many);
+SET plan_cache_mode = force_generic_plan;
+SELECT pg_temp.estimate('EXECUTE at_ref(''HEAD~1'')') AS generic;
+SET plan_cache_mode = force_custom_plan;
+SELECT pg_temp.estimate('EXECUTE at_ref(''HEAD~1'')') AS custom;
+RESET plan_cache_mode;
+DEALLOCATE at_ref;
+
 \c contrib_regression
 DROP DATABASE regress_as_of;

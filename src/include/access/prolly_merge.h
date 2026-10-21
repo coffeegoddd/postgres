@@ -160,12 +160,22 @@ typedef struct ProllyMergeRoutine
 	 * (fn's, the caller's name in it), nothing left in progress.
 	 */
 	void		(*apply) (const char *ref, const char *fn);
+
+	/*
+	 * Optional: about how many rows relid's table has at ref (a commit, by
+	 * any ref but WORKING), read from its tree's counts, not its rows: for
+	 * the planner, so it reads no more than the commit and its root's
+	 * items, and refuses nothing.  False if it can't tell (no such ref, a
+	 * ref without the table, WORKING).  A keyless table's rows count once
+	 * however many copies each has.
+	 */
+	bool		(*row_count) (const char *ref, Oid relid, double *rows);
 } ProllyMergeRoutine;
 
 #define PROLLY_MERGE_CALLBACK_NAMES \
 	"diff", "merge", "conflicts", "resolve", "tables", "summary", \
-	"move_to", "cherry_pick", "verify", "revert", "apply"
+	"move_to", "cherry_pick", "verify", "revert", "apply", "row_count"
 #define PROLLY_MERGE_FIRST_CALLBACK diff
-#define PROLLY_MERGE_LAST_CALLBACK apply
+#define PROLLY_MERGE_LAST_CALLBACK row_count
 
 #endif							/* PROLLY_MERGE_H */

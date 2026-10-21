@@ -137,7 +137,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  diff_merge    | stub           | identity                       | pass
  diff_merge    | stub           | diff_reports_each_change_once  | not implemented (missing diff)
  diff_merge    | stub           | merge                          | not implemented (missing merge)
- diff_merge    | stub           | complete                       | not implemented (11 of 11 callbacks missing)
+ diff_merge    | stub           | complete                       | not implemented (12 of 12 callbacks missing)
  tree          | cow            | identity                       | pass
  tree          | cow            | build_and_get                  | pass
  tree          | cow            | large_keys                     | pass

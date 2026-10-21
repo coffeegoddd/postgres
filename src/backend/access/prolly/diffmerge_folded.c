@@ -8558,6 +8558,40 @@ folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
 	return result;
 }
 
+/*
+ * About how many rows relid's table has at ref: its tree's count, which its
+ * internal nodes record, so only the commit, the root's items and the
+ * tree's root node are read.  Nothing is refused: a ref that doesn't
+ * resolve, WORKING (folded only to read it), or a commit without the table
+ * can't tell.
+ */
+static bool
+folded_row_count(const char *ref, Oid relid, double *rows)
+{
+	ProllyDatabaseComponents dc = components();
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+	Tables		ts = {NIL};
+	Table	   *t;
+	char	   *name;
+
+	if (is_working(ref) || !PROLLY_CALL(dc.refs, resolve, ref, &id) ||
+		!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+		return false;
+	name = get_rel_name(relid) ? table_name(relid) : NULL;
+	if (name == NULL)
+		return false;
+	PROLLY_CALL(dc.canonicalizer, tables, &info.root, add_table, &ts);
+	t = find_table(ts.tables, name);
+	if (t == NULL || t->unreadable)
+		return false;
+	chunk_env(&env);
+	*rows = (double) PROLLY_CALL(tree, count, &env, &t->data);
+	return true;
+}
+
 const ProllyMergeRoutine prolly_merge_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_DIFF_MERGE,
@@ -8577,4 +8611,5 @@ const ProllyMergeRoutine prolly_merge_folded = {
 	.revert = folded_revert,
 	.verify = verify_constraints,
 	.apply = folded_apply,
+	.row_count = folded_row_count,
 };
