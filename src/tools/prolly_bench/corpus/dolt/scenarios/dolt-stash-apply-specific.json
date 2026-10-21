@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "id": "dolt-stash-apply-specific",
+  "description": "Reviewed Dolt port: can apply specific stashes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+    "case": "DoltStashTests: can apply specific stashes"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.stash"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test1 (id INT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('push', 'myStash', '-a')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test2 (id INT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('push', 'myStash', '-a')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test3 (id INT)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('push', 'myStash', '-a')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('apply', 'myStash', '1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('apply', 'myStash', 'stash@{2}')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT * FROM dolt_status",
+      "expect": {
+        "rows": [
+          [
+            "public.test2",
+            "t",
+            "new table"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

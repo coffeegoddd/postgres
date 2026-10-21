@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "id": "dolt-remote-add",
+  "description": "Reviewed Dolt port: dolt-remote: SQL add remotes",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltRemoteTestScripts: dolt-remote: SQL add remotes"
+  },
+  "requires": [
+    "sql",
+    "vc.remotes"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT dolt_remote('add', 'origin', 'file:///nonexistent/test')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0-list",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT name, CASE WHEN char_length(url) < 0 THEN NULL ELSE 'not null' END FROM dolt_remotes",
+      "expect": {
+        "rows": [
+          [
+            "origin",
+            "not null"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT dolt_remote()",
+      "expect": {
+        "sqlstate": "42883"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "SELECT dolt_remote('origin')",
+      "expect": {
+        "sqlstate": "22023"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.remotes"
+      ],
+      "sql": "INSERT INTO dolt_remotes (name, url) VALUES ('origin', 'file:///nonexistent/test')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    }
+  ]
+}

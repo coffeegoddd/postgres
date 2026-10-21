@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "id": "dolt-stash-pop-schema-conflict",
+  "description": "Reviewed Dolt port: popping stash with deleted table that different table with same name on current head gives conflict",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+    "case": "DoltStashTests: popping stash with deleted table that different table with same name on current head gives conflict"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.stash"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "created",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Created table",
+        "-A"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE test",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('push', 'myStash')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch2"
+      ]
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE test",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (id BIGINT PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('pop', 'myStash')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    },
+    {
+      "id": "assert-0-kept",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT name, stash_id FROM dolt_stashes",
+      "expect": {
+        "rows": [
+          [
+            "myStash",
+            "stash@{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

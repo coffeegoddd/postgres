@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "id": "dolt-stash-clear-again",
+  "description": "Reviewed Dolt port: Clearing and stashing again",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_stash.go",
+    "case": "DoltStashTests: Clearing and stashing again"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.stash"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "created",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Created table",
+        "-A"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (1, 'a')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('push', 'myStash')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT * FROM dolt_stashes",
+      "expect": {
+        "rows": [
+          [
+            "myStash",
+            "stash@{0}",
+            "main",
+            {
+              "ref": "created"
+            },
+            "Created table"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('clear', 'myStash')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (2, 'b')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT dolt_stash('push', 'myStash')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.stash"
+      ],
+      "sql": "SELECT * FROM dolt_stashes",
+      "expect": {
+        "rows": [
+          [
+            "myStash",
+            "stash@{0}",
+            "main",
+            {
+              "ref": "created"
+            },
+            "Created table"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

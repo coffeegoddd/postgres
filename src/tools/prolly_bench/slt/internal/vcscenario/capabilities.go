@@ -23,6 +23,8 @@ var Capabilities = map[string]string{
 	"vc.mergebase":  "dolt_merge_base",
 	"vc.gc":         "dolt_gc",
 	"vc.reflog":     "dolt_reflog",
+	"vc.remotes":    "dolt_remote, dolt_remotes",
+	"vc.stash":      "dolt_stash, dolt_stashes",
 }
 
 // What each dolt_* name (function, view or setting) a step's SQL mentions
@@ -58,6 +60,10 @@ var callCapability = map[string]string{
 	"dolt_merge_base":             "vc.mergebase",
 	"dolt_gc":                     "vc.gc",
 	"dolt_reflog":                 "vc.reflog",
+	"dolt_remote":                 "vc.remotes",
+	"dolt_remotes":                "vc.remotes",
+	"dolt_stash":                  "vc.stash",
+	"dolt_stashes":                "vc.stash",
 }
 
 // A typed operation: the capability it needs, the dolt_* function it calls

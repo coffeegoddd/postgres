@@ -1,0 +1,34 @@
+{
+		Name: "stashing working set with deleted table and popping it",
+		SetUpScript: []string{
+			"CREATE TABLE new_tab(id INT PRIMARY KEY)",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"DROP TABLE new_tab",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STATUS;",
+				Expected: []sql.Row{
+					{"new_tab", byte(0), "deleted"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('push', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SHOW TABLES;",
+				Expected: []sql.Row{
+					{"new_tab"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('pop', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "SHOW TABLES;",
+				Expected: []sql.Row{},
+			},
+		},
+	}

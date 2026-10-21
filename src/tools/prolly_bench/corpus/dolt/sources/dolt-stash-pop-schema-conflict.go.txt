@@ -1,0 +1,23 @@
+{
+		Name: "popping stash with deleted table that different table with same name on current head gives conflict",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"CALL DOLT_BRANCH('branch1')",
+			"CALL DOLT_BRANCH('branch2')",
+			"CALL DOLT_CHECKOUT('branch1')",
+			"DROP TABLE test",
+			"CALL DOLT_STASH('push', 'myStash')",
+			"CALL DOLT_CHECKOUT('branch2')",
+			"DROP TABLE test",
+			"CREATE TABLE test (id BIGINT PRIMARY KEY)",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "CALL DOLT_STASH('pop', 'myStash');",
+				ExpectedErrStr: "merge aborted: schema conflict found for table test \n " +
+					"please resolve schema conflicts before merging: \n" +
+					"\ttable was modified in one branch and deleted in the other",
+			},
+		},
+	}

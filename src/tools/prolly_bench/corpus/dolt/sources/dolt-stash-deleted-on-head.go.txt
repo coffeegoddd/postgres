@@ -1,0 +1,40 @@
+{
+		Name: "popping stash with deleted table that is deleted already on current head",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"CALL DOLT_BRANCH('branch1');",
+			"CALL DOLT_CHECKOUT('-b', 'branch2');",
+			"DROP TABLE test;",
+			"CALL DOLT_COMMIT('-A','-m','Dropped test');",
+			"CALL DOLT_CHECKOUT('branch1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SHOW TABLES;",
+				Expected: []sql.Row{
+					{"test"},
+				},
+			},
+			{
+				Query:    "DROP TABLE test;",
+				Expected: []sql.Row{{types.NewOkResult(0)}},
+			},
+			{
+				Query:            "CALL DOLT_STASH('push', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "CALL DOLT_CHECKOUT('branch2');",
+				Expected: []sql.Row{{0, "Switched to branch 'branch2'"}},
+			},
+			{
+				Query:            "CALL DOLT_STASH('pop', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query:    "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{},
+			},
+		},
+	}

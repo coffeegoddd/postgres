@@ -1,0 +1,31 @@
+{
+		Name: "Popping stash onto different branch",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk BIGINT PRIMARY KEY, v varchar(10))",
+			"CALL DOLT_COMMIT('-A', '-m', 'Created table')",
+			"CALL DOLT_BRANCH('br1')",
+			"INSERT INTO test VALUES (1, 'a')",
+			"CALL DOLT_COMMIT('-A', '-m', 'Added a row')",
+			"INSERT INTO test VALUES (2, 'b')",
+			"CALL DOLT_STASH('push', 'myStash')",
+			"CALL DOLT_CHECKOUT('br1')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "SELECT * FROM DOLT_STASHES;",
+				Expected: []sql.Row{
+					{"myStash", "stash@{0}", "main", doltCommit, "Added a row"},
+				},
+			},
+			{
+				Query:            "CALL DOLT_STASH('pop', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM TEST;",
+				Expected: []sql.Row{
+					{2, "b"},
+				},
+			},
+		},
+	}

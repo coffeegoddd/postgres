@@ -1,0 +1,23 @@
+{
+		Name: "simple stash apply",
+		SetUpScript: []string{
+			"CREATE TABLE test(id INT)",
+			"CALL DOLT_STASH('push', 'myStash', '-a')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{},
+			},
+			{
+				Query:            "CALL DOLT_STASH('apply', 'myStash');",
+				SkipResultsCheck: true,
+			},
+			{
+				Query: "SELECT * FROM DOLT_STATUS",
+				Expected: []sql.Row{
+					{"test", byte(0), "new table"},
+				},
+			},
+		},
+	}

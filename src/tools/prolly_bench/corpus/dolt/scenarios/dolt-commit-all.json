@@ -1,0 +1,259 @@
+{
+  "version": 1,
+  "id": "dolt-commit-all",
+  "description": "Reviewed Dolt port: CALL DOLT_COMMIT('-ALL') adds all tables (including new ones) to the commit.",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCommitTests: CALL DOLT_COMMIT('-ALL') adds all tables (including new ones) to the commit."
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE table t (pk int primary key)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "added",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add table t"
+      ],
+      "save": "added"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_reset('--hard')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t WHERE pk = 1",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "terminator",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "update table terminator",
+        "-ALL"
+      ],
+      "save": "terminator"
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "update table terminator"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_reset('--hard')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "DROP TABLE t",
+      "expect": {
+        "tag": "DROP TABLE"
+      }
+    },
+    {
+      "id": "dropped",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "drop table t",
+        "-A"
+      ],
+      "save": "dropped"
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_reset('--hard')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "exec",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "sqlstate": "42P01"
+      }
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE table t2 (pk int primary key)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "added21",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add table 21",
+        "-A"
+      ],
+      "save": "added21"
+    },
+    {
+      "id": "assert-17",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_reset('--hard')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-18",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t2",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    }
+  ]
+}
