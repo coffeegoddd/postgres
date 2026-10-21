@@ -975,65 +975,28 @@ holds_unseen(Relation rel, Snapshot snap)
 }
 
 /*
- * Empty a relation of the branch being made, its indexes and its TOAST
- * table: each gets new storage, as TRUNCATE gives it, and the copy's goes
- * when the transaction commits.  (New storage, not the copy's truncated:
- * that would keep the copy's changes list, by which the next fold would
- * take the pages it doesn't list for unchanged, rows and all; new storage
- * isn't of its lineage, and is folded in full.)  Nobody else sees the
- * branch before the transaction commits, and its storage goes with it if
- * the transaction rolls back.  (The locks are what a writer takes: the
- * OIDs are the source branch's relations' too.)
+ * Do the copies of the branch being made hold what the active snapshot
+ * doesn't see: rows a transaction it doesn't see committed, or the old
+ * versions of rows such a one changed?  Only a transaction that committed
+ * after the snapshot could have written them; if one did, a table holds
+ * them only if that one wrote it.  A table's change log tells which wrote
+ * it without reading the table (its entries are written with each write,
+ * and kept while the snapshot is); one without a log has every page read.
  */
-static void
-empty_copy(Relation rel)
-{
-	Oid			toastrelid = rel->rd_rel->reltoastrelid;
-	ProllyComponents c;
-
-	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
-	CommandCounterIncrement();
-
-	/* (and its change log: its entries are of rows the copy no longer has) */
-	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
-	{
-		prolly_components_for_relation(rel, &c);
-		if (c.change_log)
-			PROLLY_CALL(c.change_log, reset, rel);
-	}
-	foreach_oid(indexid, RelationGetIndexList(rel))
-	{
-		Relation	index = index_open(indexid, RowExclusiveLock);
-
-		/* (built empty as index_build() would, without its catalog stats) */
-		RelationSetNewRelfilenumber(index, index->rd_rel->relpersistence);
-		CommandCounterIncrement();
-		(void) index->rd_indam->ambuild(rel, index, BuildDummyIndexInfo(index));
-		index_close(index, NoLock);
-	}
-	if (OidIsValid(toastrelid))
-	{
-		Relation	toast = table_open(toastrelid, RowExclusiveLock);
-
-		empty_copy(toast);
-		table_close(toast, NoLock);
-	}
-}
-
-/*
- * The copies of the branch being made that hold what the active snapshot
- * doesn't see, emptied: the move to the head writes their rows again.
- */
-static void
-empty_unseen_copies(void)
+static bool
+copies_hold_unseen(void)
 {
 	Snapshot	snap = GetActiveSnapshot();
-	Relation	classes = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(classes, InvalidOid, false, NULL, 0,
-										  NULL);
+	Relation	classes;
+	SysScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
+	bool		found = false;
 
+	if (!commits_unseen(snap))
+		return false;
+	classes = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
@@ -1047,16 +1010,24 @@ empty_unseen_copies(void)
 
 	foreach_oid(relid, relids)
 	{
-		Relation	rel = table_open(relid, RowExclusiveLock);
+		Relation	rel = table_open(relid, AccessShareLock);
+		ProllyComponents c;
 
-		if (holds_unseen(rel, snap))
+		prolly_components_for_relation(rel, &c);
+		if (c.change_log && PROLLY_HAS(c.change_log, written_unseen) &&
+			PROLLY_CALL(c.change_log, identity, rel) != 0)
+			found = PROLLY_CALL(c.change_log, written_unseen, rel, snap);
+		else
 		{
-			empty_copy(rel);
-			CommandCounterIncrement();
+			pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_TABLES_SCANNED, 1);
+			found = holds_unseen(rel, snap);
 		}
-		table_close(rel, NoLock);
+		table_close(rel, AccessShareLock);
+		if (found)
+			break;
 	}
 	list_free(relids);
+	return found;
 }
 
 /*
@@ -1068,17 +1039,25 @@ empty_unseen_copies(void)
  * them; the latter it would see still, while every later snapshot
  * wouldn't.  Read committed, the move goes by a newer snapshot, which sees
  * everything the copies hold.  A transaction whose snapshot can't move
- * (repeatable read, serializable) empties the copies that hold such rows
- * instead, for the move to write their every row: then what it sees of the
- * branch is what everyone sees once it commits.
+ * (repeatable read, serializable) fails, to be retried, if the copies hold
+ * such rows (as when it can't see the head it would commit on): what it
+ * saw of the branch would otherwise not be what everyone sees once it
+ * commits.  Commits elsewhere (another database, tables the branch's copies
+ * don't hold) don't stop it.
  */
 static void
 move_copies(void *arg)
 {
 	if (IsolationUsesXactSnapshot())
 	{
-		if (commits_unseen(GetActiveSnapshot()))
-			empty_unseen_copies();
+		if (copies_hold_unseen())
+		{
+			pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_REFUSALS, 1);
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not serialize access: the branch's first use copies rows committed after this transaction's snapshot"),
+					 errhint("The transaction might succeed if retried.")));
+		}
 		move_settled(arg);
 		return;
 	}

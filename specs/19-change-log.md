@@ -81,10 +81,11 @@ Two interfaces, each selected by the table AM's profile
   refresh, `REPACK CONCURRENTLY`), which change rows without a write to
   note. `CLUSTER` and `VACUUM FULL` change none: entries name rows by
   key or image, so they still hold (#485).
-- **Reset:** a branch's first use that gives its copy of the table new
-  storage (repeatable read, a commit its snapshot doesn't see,
-  `empty_copy()`) gives the log new storage too, with one "fold in full"
-  entry, under a writer's lock (the log's OID is every branch's).
+- **Written unseen:** a branch's first use under repeatable read asks
+  each table's log whether a transaction its snapshot doesn't see wrote or
+  consumed an entry, every entry looked at whatever the snapshot sees of
+  it (neither is vacuumed while the snapshot is held); one did, and the
+  first use fails, to be retried (#567).
 - **Read:** the entries a snapshot sees. **Consume:** delete them. The
   canonicalizer consumes a table's log once a fold that begins a new
   baseline has read it, whichever finder folded: what that fold saw is

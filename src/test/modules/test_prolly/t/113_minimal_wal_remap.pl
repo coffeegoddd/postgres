@@ -154,9 +154,9 @@ is($node->safe_psql('postgres', q{
 }), '5000|12502500|25005000',
 	'rows written after an in-place truncate past a remap survive');
 
-# A repeatable-read first use empties a branch copy whose rows include
-# changes committed after the session's snapshot. Its replacement storage
-# skips WAL, just like a TRUNCATE's.
+# A repeatable-read first use whose copy holds changes committed after the
+# session's snapshot is refused; retried, its copy and the writes made on
+# it survive crash recovery.
 $node->safe_psql('postgres', q{
 	CREATE TABLE app.large (id int PRIMARY KEY, v int);
 	INSERT INTO app.large SELECT g, g FROM generate_series(1, 60000) g;
@@ -164,9 +164,15 @@ $node->safe_psql('postgres', q{
 	SELECT dolt_branch('rr');
 	CHECKPOINT;
 });
-my $reader = $node->background_psql('postgres');
+my $reader = $node->background_psql('postgres', on_error_stop => 0);
 $reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $node->safe_psql('postgres', 'INSERT INTO app.large VALUES (60002, 60002)');
+$reader->query(q{SELECT dolt_checkout('rr')});
+like($reader->{stderr}, qr/could not serialize access/,
+	'the repeatable-read first use is refused');
+$reader->{stderr} = '';
+$reader->query_safe('ROLLBACK');
+$reader->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $reader->query_safe(q{
 	SELECT dolt_checkout('rr');
 	INSERT INTO app.large VALUES (60001, 60001);

@@ -46,10 +46,6 @@
  * - read() visits the entries of rel's log the snapshot sees, in no
  *   particular order: a visit returns false to stop.  False if rel has no
  *   log, an entry says to read the table in full, or a visit stopped.
- * - reset() empties rel's log, and leaves an entry to read the table in
- *   full: for a table whose rows were replaced without writes to note
- *   (its storage made anew) where no other transaction sees its branch, so
- *   the entries before are of rows it no longer has.
  * - relid() is the relation holding the log of the prolly table relid, if
  *   the log is one (InvalidOid if not): it takes the table's owner,
  *   tablespace and autovacuum settings as its TOAST table does.  Asked by
@@ -64,6 +60,11 @@
  *   baseline (if the transaction aborts, they come back with the old
  *   baseline).  Entries consumed meanwhile by another transaction are let
  *   be.
+ * - written_unseen() (optional): whether a transaction the snapshot doesn't
+ *   see, committed, wrote or consumed an entry of rel's log: whether it
+ *   changed the table's rows, as far as the log tells (an entry no longer
+ *   in the log was consumed by a transaction the snapshot sees, or one
+ *   that wrote it is seen too).
  * - consume_own() (optional) deletes the entries of rel's log the current
  *   transaction wrote and didn't abort: called once a baseline holding
  *   exactly its own changes, applied to the last, is to be the table's.
@@ -103,18 +104,18 @@ typedef struct ProllyChangeLogRoutine
 						 ProllyChangeLogVisit visit, void *arg);
 	void		(*consume) (Relation rel, Snapshot snapshot);
 	bool		(*is_log) (Relation rel);
-	void		(*reset) (Relation rel);
 	Oid			(*relid) (Oid relid);
 	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
 							  HeapTuple *made, int nmade);
 	bool		(*consume_own) (Relation rel);
+	bool		(*written_unseen) (Relation rel, Snapshot snapshot);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
-	"create", "note", "identity", "read", "consume", "is_log", "reset", \
-	"relid", "note_made", "consume_own"
+	"create", "note", "identity", "read", "consume", "is_log", \
+	"relid", "note_made", "consume_own", "written_unseen"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK consume_own
+#define PROLLY_CHANGELOG_LAST_CALLBACK written_unseen
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)
