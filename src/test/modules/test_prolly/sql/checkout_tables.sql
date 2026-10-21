@@ -40,19 +40,30 @@ SELECT count(*) AS b_columns FROM information_schema.columns
 WHERE table_schema = 'ct' AND table_name = 'b';
 SELECT count(*) AS changed FROM dolt_status;
 
--- "." : every table
+-- "." : every table the head has; one only the working set has stays,
+-- as Dolt's untracked table does
 UPDATE ct.a SET v = 'x';
 UPDATE ct.b SET v = 'y';
+CREATE TABLE ct.untracked (id int PRIMARY KEY);
+INSERT INTO ct.untracked VALUES (9);
 SELECT dolt_checkout('.');
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+SELECT * FROM ct.untracked;
+DROP TABLE ct.untracked;
 SELECT count(*) AS changed FROM dolt_status;
 
--- as another commit has them: ref, then tables
+-- as another commit has them: ref, then tables; or ref -- tables, the
+-- ref before "--" taken as one even where a table is named like it
 UPDATE ct.a SET v = 'later';
 SELECT length(dolt_commit('-am', 'later')::text) AS committed;
 SELECT dolt_checkout('HEAD~1', 'ct.a');
 SELECT * FROM ct.a;
 SELECT table_name, status FROM dolt_status;
 SELECT dolt_reset('--hard');
+SELECT dolt_checkout('HEAD~1', '--', 'ct.a');
+SELECT * FROM ct.a;
+SELECT dolt_reset('--hard');
+SELECT dolt_checkout('HEAD~1', 'HEAD', '--', 'ct.a');
 
 -- a table whose sequence moved: the sequence with it, as the head has it
 CREATE TABLE ct.s (id serial PRIMARY KEY, v text);
@@ -79,6 +90,17 @@ SELECT dolt_checkout('ct.a');
 SELECT active_branch();
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'ct.a');
+-- a branch before "--", alone, is the branch, though a table has its name
+SET search_path = ct, public;
+SELECT dolt_branch('b');
+UPDATE ct.b SET v = 'dirty';
+SELECT dolt_checkout('b', '--');
+SELECT active_branch();
+SELECT dolt_checkout('main');
+SELECT * FROM ct.b;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'b');
+RESET search_path;
 
 -- the sequences a table draws from come with it, found by its defaults:
 -- not one a text literal names, nor one whose name begins another's; one

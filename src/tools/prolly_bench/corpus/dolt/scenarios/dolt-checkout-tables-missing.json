@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "id": "dolt-checkout-tables-missing",
+  "description": "Reviewed Dolt port: dolt_checkout multiple tables with one missing",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltCheckoutScripts: dolt_checkout multiple tables with one missing"
+  },
+  "requires": [
+    "sql",
+    "vc.core"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "create table t1 (pk int primary key, c int);"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created table"
+      ],
+      "save": "commit-1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 values (1,1);"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "add row"
+      ],
+      "save": "commit-3"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "insert into t1 values (2,2);"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('t1', 'missing')",
+      "expect": {
+        "sqlstate": "42P01"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('t1', 'missing', 'missing2')",
+      "expect": {
+        "sqlstate": "42P01"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_checkout('--', 'missing', 't1', 'missing2')",
+      "expect": {
+        "sqlstate": "42P01"
+      }
+    }
+  ]
+}

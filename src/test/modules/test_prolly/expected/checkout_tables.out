@@ -101,22 +101,39 @@ SELECT count(*) AS changed FROM dolt_status;
        0
 (1 row)
 
--- "." : every table
+-- "." : every table the head has; one only the working set has stays,
+-- as Dolt's untracked table does
 UPDATE ct.a SET v = 'x';
 UPDATE ct.b SET v = 'y';
+CREATE TABLE ct.untracked (id int PRIMARY KEY);
+INSERT INTO ct.untracked VALUES (9);
 SELECT dolt_checkout('.');
  dolt_checkout 
 ---------------
  {0,""}
 (1 row)
 
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+  table_name  |  status   
+--------------+-----------
+ ct.untracked | new table
+(1 row)
+
+SELECT * FROM ct.untracked;
+ id 
+----
+  9
+(1 row)
+
+DROP TABLE ct.untracked;
 SELECT count(*) AS changed FROM dolt_status;
  changed 
 ---------
        0
 (1 row)
 
--- as another commit has them: ref, then tables
+-- as another commit has them: ref, then tables; or ref -- tables, the
+-- ref before "--" taken as one even where a table is named like it
 UPDATE ct.a SET v = 'later';
 SELECT length(dolt_commit('-am', 'later')::text) AS committed;
  committed 
@@ -148,6 +165,26 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+SELECT dolt_checkout('HEAD~1', '--', 'ct.a');
+ dolt_checkout 
+---------------
+ {0,""}
+(1 row)
+
+SELECT * FROM ct.a;
+ id | v 
+----+---
+  1 | a
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('HEAD~1', 'HEAD', '--', 'ct.a');
+ERROR:  dolt_checkout: unexpected argument "HEAD"
 -- a table whose sequence moved: the sequence with it, as the head has it
 CREATE TABLE ct.s (id serial PRIMARY KEY, v text);
 INSERT INTO ct.s (v) VALUES ('one');
@@ -236,6 +273,52 @@ SELECT dolt_branch('-D', 'ct.a');
  {0}
 (1 row)
 
+-- a branch before "--", alone, is the branch, though a table has its name
+SET search_path = ct, public;
+SELECT dolt_branch('b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE ct.b SET v = 'dirty';
+SELECT dolt_checkout('b', '--');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'b'"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ b
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT * FROM ct.b;
+ id |   v   
+----+-------
+  1 | dirty
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET search_path;
 -- the sequences a table draws from come with it, found by its defaults:
 -- not one a text literal names, nor one whose name begins another's; one
 -- quoted, and one two tables share, do

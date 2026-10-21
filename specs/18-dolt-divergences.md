@@ -149,7 +149,9 @@ adapts.
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is
   deferred with this ID (`ports.json` has one); add an explicit `COMMIT`
-  only where the assertion isn't about that. Reads of `WORKING` after
+  only where the assertion isn't about that. An assertion reading what a
+  call did before its error (Dolt's table checkout naming a missing
+  table) is left out with this ID. Reads of `WORKING` after
   writes in the same transaction stay where they are.
 
 ## D6. Merges
@@ -336,7 +338,14 @@ OF` are built in D18's shapes.
 - **Tables after `--`** (#494): `dolt_checkout('--', ...)` names tables,
   as Dolt's does, their uncommitted changes discarded; one name there
   that is a branch and no table checks out the branch, so a branch named
-  like an option (`-dash`) can still be checked out.
+  like an option (`-dash`) can still be checked out. Before `--` is a
+  ref, as git's: `dolt_checkout('b', '--')` checks out branch `b` though
+  a table is named `b`, and `dolt_checkout('HEAD~1', '--', 't')` takes
+  `t` as that commit has it. `.` names the tables the head (or the ref)
+  has: a table only the working set has stays, as Dolt's untracked table
+  does (the head stands for Dolt's index, D1). A name that matches no
+  table fails the whole call (D5), where Dolt checks out the others,
+  commits that, then errors.
 
 ## D15. Schema diffs cover every versioned object
 
