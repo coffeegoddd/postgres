@@ -208,37 +208,6 @@
       ]
     },
     {
-      "id": "assert-3",
-      "session": "a",
-      "op": "query",
-      "requires": [
-        "vc.diff"
-      ],
-      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
-      "expect": {
-        "rows": [
-          [
-            "3",
-            "three",
-            null,
-            null,
-            null,
-            null,
-            "added"
-          ]
-        ],
-        "order": "bag"
-      },
-      "params": [
-        {
-          "ref": "commit3"
-        },
-        {
-          "ref": "commit4"
-        }
-      ]
-    },
-    {
       "id": "assert-4",
       "session": "a",
       "op": "query",
