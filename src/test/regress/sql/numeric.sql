@@ -713,6 +713,8 @@ SELECT x1, x2,
   log(x1, x2)
 FROM v AS v1(x1), v AS v2(x2);
 
+SELECT log('0.5'::numeric, 'inf');
+SELECT log('1'::numeric, 'inf');
 SELECT log('0'::numeric, '10');
 SELECT log('10'::numeric, '0');
 SELECT log('-inf'::numeric, '10');
@@ -1033,6 +1035,7 @@ FROM v;
 
 SELECT to_char('100'::numeric, 'FM999.9');
 SELECT to_char('100'::numeric, 'FM999.');
+SELECT to_char('100'::numeric, 'FM999.SG "items"');
 SELECT to_char('100'::numeric, 'FM999');
 SELECT to_char('12345678901'::float8, 'FM9999999999D9999900000000000000000');
 

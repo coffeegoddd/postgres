@@ -4585,7 +4585,6 @@ SyncVariables(void)
 	char		vbuf[32];
 	const char *server_version;
 	char	   *service_name;
-	char	   *service_file;
 
 	/* get stuff from connection */
 	pset.encoding = PQclientEncoding(pset.db);
@@ -4604,11 +4603,6 @@ SyncVariables(void)
 	SetVariable(pset.vars, "SERVICE", service_name);
 	if (service_name)
 		pg_free(service_name);
-
-	service_file = get_conninfo_value("servicefile");
-	SetVariable(pset.vars, "SERVICEFILE", service_file);
-	if (service_file)
-		pg_free(service_file);
 
 	/* this bit should match connection_warnings(): */
 	/* Try to get full text form of version, might include "devel" etc */
@@ -4639,7 +4633,6 @@ UnsyncVariables(void)
 {
 	SetVariable(pset.vars, "DBNAME", NULL);
 	SetVariable(pset.vars, "SERVICE", NULL);
-	SetVariable(pset.vars, "SERVICEFILE", NULL);
 	SetVariable(pset.vars, "USER", NULL);
 	SetVariable(pset.vars, "HOST", NULL);
 	SetVariable(pset.vars, "PORT", NULL);
@@ -6220,7 +6213,7 @@ lookup_object_oid(EditableObjectType obj_type, const char *desc,
 			 * query to retrieve the function's OID using a cast to regproc or
 			 * regprocedure (as appropriate).
 			 */
-			printfPQExpBuffer(query, "/* %s */\n", _("Get function's OID"));
+			addQueryComment(query, "Get function's OID");
 			appendPQExpBufferStr(query, "SELECT ");
 			appendStringLiteralConn(query, desc, pset.db);
 			appendPQExpBuffer(query, "::pg_catalog.%s::pg_catalog.oid",
@@ -6234,7 +6227,7 @@ lookup_object_oid(EditableObjectType obj_type, const char *desc,
 			 * this code doesn't check if the relation is actually a view.
 			 * We'll detect that in get_create_object_cmd().
 			 */
-			printfPQExpBuffer(query, "/* %s */\n", _("Get view's OID"));
+			addQueryComment(query, "Get view's OID");
 			appendPQExpBufferStr(query, "SELECT ");
 			appendStringLiteralConn(query, desc, pset.db);
 			appendPQExpBufferStr(query, "::pg_catalog.regclass::pg_catalog.oid");
@@ -6276,7 +6269,7 @@ get_create_object_cmd(EditableObjectType obj_type, Oid oid,
 	switch (obj_type)
 	{
 		case EditableFunction:
-			printfPQExpBuffer(query, "/* %s */\n", _("Get function's definition"));
+			addQueryComment(query, "Get function's definition");
 			appendPQExpBuffer(query,
 							  "SELECT pg_catalog.pg_get_functiondef(%u)",
 							  oid);
@@ -6295,7 +6288,7 @@ get_create_object_cmd(EditableObjectType obj_type, Oid oid,
 			 * and so need to be retrieved separately.  Materialized views may
 			 * have arbitrary storage parameter reloptions.
 			 */
-			printfPQExpBuffer(query, "/* %s */\n", _("Get view's definition and details"));
+			addQueryComment(query, "Get view's definition and details");
 			appendPQExpBuffer(query,
 							  "SELECT nspname, relname, relkind, "
 							  "pg_catalog.pg_get_viewdef(c.oid, true), "

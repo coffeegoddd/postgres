@@ -933,6 +933,14 @@ FROM v AS v1(x1), v AS v2(x2);
       NaN |      NaN |                NaN
 (16 rows)
 
+SELECT log('0.5'::numeric, 'inf');
+    log    
+-----------
+ -Infinity
+(1 row)
+
+SELECT log('1'::numeric, 'inf');
+ERROR:  cannot take logarithm using base one
 SELECT log('0'::numeric, '10');
 ERROR:  cannot take logarithm of zero
 SELECT log('10'::numeric, '0');
@@ -2114,6 +2122,12 @@ SELECT to_char('100'::numeric, 'FM999.');
  to_char 
 ---------
  100
+(1 row)
+
+SELECT to_char('100'::numeric, 'FM999.SG "items"');
+  to_char   
+------------
+ 100+ items
 (1 row)
 
 SELECT to_char('100'::numeric, 'FM999');
@@ -3492,7 +3506,7 @@ ERROR:  cannot take logarithm of zero
 select log(12.34, 0.0);
 ERROR:  cannot take logarithm of zero
 select log(1.0, 12.34);
-ERROR:  division by zero
+ERROR:  cannot take logarithm using base one
 -- some random tests
 select log(1.23e-89, 6.4689e45);
                                               log                                               
