@@ -17,10 +17,13 @@
 #include "access/prolly_applier.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/resowner.h"
 
 /* A table's row (a composite of its row type) into a slot of the table. */
 static TupleTableSlot *
@@ -80,4 +83,98 @@ test_apply(PG_FUNCTION_ARGS)
 		ExecDropSingleTupleTableSlot(new);
 	table_close(rel, NoLock);
 	PG_RETURN_BOOL(done);
+}
+
+/*
+ * In a subtransaction, rows inserted together (if n > 0), then one
+ * insert() of row: NULL if they were written, else the error raised
+ * (caught, the subtransaction rolled back).
+ */
+static char *
+insert_caught(const ProllyApplierRoutine *ar, ProllyApplier *a,
+			  TupleTableSlot **rows, int n, TupleTableSlot *row)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	char	   *msg = NULL;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		if (n > 0)
+			PROLLY_CALL(ar, insert_many, a, rows, n);
+		PROLLY_CALL(ar, insert, a, row);
+		ReleaseCurrentSubTransaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *e;
+
+		MemoryContextSwitchTo(cxt);
+		e = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		msg = e->message;
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	return msg;
+}
+
+/*
+ * test_apply_failed_load(rows anyarray, nested bool) returns text
+ *
+ * rows, of a table's row type, inserted together (insert_many()) into the
+ * table: when it is new in the transaction and they are enough, a load,
+ * its indexes built at the next write, the first row again.  That write
+ * is made in a subtransaction (nested: the rows' insert too), and so is
+ * one more after it; each one's error, caught, is reported (or
+ * "written").
+ */
+PG_FUNCTION_INFO_V1(test_apply_failed_load);
+Datum
+test_apply_failed_load(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+	bool		nested = PG_GETARG_BOOL(1);
+	Oid			elemtype = ARR_ELEMTYPE(arr);
+	Oid			relid = get_typ_typrelid(elemtype);
+	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
+	Relation	rel;
+	ProllyApplier *a;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	TupleTableSlot **rows;
+	char	   *first;
+	char	   *second;
+
+	if (!OidIsValid(relid))
+		elog(ERROR, "test_apply_failed_load needs rows of a table's row type");
+	get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+	deconstruct_array(arr, elemtype, typlen, typbyval, typalign,
+					  &elems, &nulls, &n);
+	if (n == 0)
+		elog(ERROR, "test_apply_failed_load needs rows");
+	rel = table_open(relid, RowExclusiveLock);
+	rows = palloc_array(TupleTableSlot *, n);
+	for (int i = 0; i < n; i++)
+		rows[i] = row_slot(rel, elems[i]);
+	a = PROLLY_CALL(ar, begin, rel);
+	if (!nested)
+		PROLLY_CALL(ar, insert_many, a, rows, n);
+	first = insert_caught(ar, a, rows, nested ? n : 0, rows[0]);
+	second = insert_caught(ar, a, rows, 0, rows[0]);
+	PROLLY_CALL(ar, end, a);
+	for (int i = 0; i < n; i++)
+		ExecDropSingleTupleTableSlot(rows[i]);
+	table_close(rel, NoLock);
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("build: %s; then: %s",
+											  first ? first : "written",
+											  second ? second : "written")));
 }

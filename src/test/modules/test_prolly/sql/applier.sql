@@ -134,4 +134,23 @@ SELECT * FROM app.fc;
 DROP OWNED BY applier_reader;
 DROP ROLE applier_reader;
 
+-- A table new in the transaction, filled from nothing by rows inserted
+-- together, is loaded: its indexes built at the next write.  A build
+-- refusing a duplicate key ends the applier, though its error is caught:
+-- a write after it would have no index to keep.  So does a build in a
+-- subtransaction begun since the rows were loaded, which may roll the
+-- indexes back from under them.
+BEGIN;
+CREATE TABLE app.ld (id int PRIMARY KEY, v text);
+SELECT test_apply_failed_load(array_agg(ROW(g % 150, 'v')::app.ld), true)
+FROM generate_series(1, 200) g;
+SELECT count(*) FROM app.ld;
+ROLLBACK;
+BEGIN;
+CREATE TABLE app.ld (id int PRIMARY KEY, v text);
+SELECT test_apply_failed_load(array_agg(ROW(g, 'v')::app.ld), false)
+FROM generate_series(1, 200) g;
+SELECT count(*) FROM app.ld;
+ROLLBACK;
+
 DROP SCHEMA app CASCADE;

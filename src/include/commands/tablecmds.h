@@ -108,4 +108,6 @@ extern void RangeVarCallbackOwnsRelation(const RangeVar *relation,
 extern bool PartConstraintImpliedByRelConstraint(Relation scanrel,
 												 List *partConstraint);
 
+extern bool ATColumnChangeRequiresRewrite(Node *expr, AttrNumber varattno);
+
 #endif							/* TABLECMDS_H */

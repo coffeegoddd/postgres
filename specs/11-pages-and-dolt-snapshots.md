@@ -951,6 +951,126 @@ fails without its fix), and Postgres's suites keep passing after each one.
     a row both changed conflicts, or where definitions change as above
     (#585). A pick or revert can't: its commit leaves the uncommitted
     changes out, so it mustn't merge with them.
+  - **Bulk apply (#490, built 2026-10-20).** The row applier gained an
+    optional `insert_many(a, rows, n)` (NULL: `insert()` each). A move
+    (reset, merge, cherry-pick, revert, pull, checkout, clone) holds the
+    rows it inserts into a table, up to 1000 rows or 1 MB, and writes them
+    as COPY does: `heap_multi_insert` with a bulk-insert state (its pin
+    let go after each batch, so nothing stays pinned between writes),
+    then each row's index entries and queued rechecks. Each row's change
+    log entry is still written (`note_made()` takes a page's at once), as
+    are the branch's notes. A merge that records constraint violations
+    still writes each row alone, in its subtransaction.
+    - A table filled from nothing that is new in the transaction (made
+      by the move, a clone's tables, or given new storage under ACCESS
+      EXCLUSIVE) is a load: at least 100 rows in the first batch, no
+      deferrable unique or exclusion constraint (whose rechecks are
+      queued per row), not a materialized view. Its rows get no index
+      entries as they are written; its indexes are built over them
+      (`reindex_relation`, unique and exclusion constraints checked
+      then, the primary key not re-checking key lengths) before any
+      other write or at the applier's end. No other transaction sees
+      such a table, so nothing reads the indexes meanwhile. A table
+      emptied by TRUNCATE earlier in the move's transaction is loaded
+      too (its indexes, already given new storage by the TRUNCATE, built
+      again); `bulk_moves` and `t/151` (crash, `wal_level` minimal and
+      replica) cover it.
+    - A load's end can fail (the build finds a duplicate key). Its
+      failure ends the applier, even if the caller catches the error:
+      every later write but `end()` raises, since the indexes are closed
+      or, after a subtransaction's rollback, back to their storage from
+      before the build, with no entries for the rows loaded. The build
+      is refused in a subtransaction begun since the rows were loaded
+      (rolled back, it would leave them unindexed), which also ends the
+      applier; the indexes are closed and opened again under the
+      resource owner of the applier's `begin()`. No caller reaches
+      either today: the only one that writes in subtransactions (a merge
+      recording violations) doesn't batch. `applier.sql` checks both
+      from SQL (`test_apply_failed_load()`).
+    - User triggers: none fire, as before (the applier keeps only the
+      deferrable constraints' rechecks); no foreign key is checked.
+    - Not built: deferring index upkeep on a table other sessions can
+      write (its indexes marked not ready and rebuilt) needs a lock the
+      move doesn't hold, and REINDEX's ShareLock taken under the move's
+      ROW EXCLUSIVE could deadlock with another writer. A keyless table's
+      row hash is already built lazily (after 8 lookups, and only by
+      removals or updates), so a move that only inserts never scans the
+      table. Skipping the change log during a clone's load (a new
+      table's storage is folded in full anyway) belongs to the change
+      log's work. Parallel decoding waits for a profile.
+    - Measured (100k and 1M rows of `(int pk, md5 text, int indexed)`,
+      `wal_level = replica`, a checkpoint before each; times on a loaded
+      machine, other builds running):
+
+      | Move | Before WAL / time | After WAL / time |
+      |---|---|---|
+      | reset inserting 1M rows into the table | 569 MB / 7.2 s | 463 MB / 6.1 s |
+      | reset making a table of 1M rows (load) | 334 MB / 4.2 s | 181 MB / 3.0 s |
+      | reset across a column type change, 1M rows | 878 MB / 12.7 s | 666 MB / 10.1 s |
+      | COPY into the indexed table (reference) | 189 MB / 2.2–4.0 s | |
+      | COPY, then the indexes built (reference) | 79 MB / 0.8 s | |
+
+      At 100k rows the reset into the table wrote 46.6 MB; by record:
+      heap multi-inserts 9.7 MB and btree inserts into the two indexes
+      14.4 MB (together 1.24× the COPY's 19.0 MB); the rest is pruning
+      and hint-bit page images of the pages the previous reset emptied
+      (17.5 + 16.6 MB) and 100k heap deletes (5.4 MB), none of them the
+      apply's. Before, the same apply wrote a heap insert per row. The 5× speedup the issue
+      asked for at 1M rows isn't reached: the time left is the per-row
+      index upkeep on a live table (not deferred, above), decoding, and
+      the change log; a load's extra WAL over COPY-then-index is its
+      change log entries.
+  - **Moves across a column's change of type (#492, built 2026-10-20).**
+    Such a table's rows all go before the column converts (they may not
+    cast, or cast to values its keys or NOT NULLs refuse), and all of the
+    commit's are written. They went one `remove()` at a time; the
+    applier gained an optional `remove_all(a)` (NULL: `remove()` each),
+    which removes them as TRUNCATE does: the table, its TOAST table and
+    its indexes given new storage under ACCESS EXCLUSIVE (which the
+    `ALTER COLUMN ... TYPE` right after takes anyway), the change log
+    told every row may have changed, no trigger fired (ON TRUNCATE ones
+    neither), no foreign key checked (those into the table are dropped
+    first and validated after). It refuses, removing nothing, a table the
+    session reads otherwise or has trigger events pending for, as
+    TRUNCATE does; the `ALTER` after would refuse it too. The table, new
+    storage in the transaction, is then loaded (#490): rows many at once,
+    indexes built after.
+    - Only when the `ALTER` rewrites the table anyway (review, 2026-10-21).
+      New storage isn't MVCC-safe, as TRUNCATE isn't: a snapshot from
+      before the move sees the table empty once it commits. A rewriting
+      `ALTER` gives the same, but one that changes the type in place (a
+      binary-coercible change: `varchar(10)` to `varchar(20)`, `varchar`
+      to `text`, an unconstrained domain over the old type) leaves the
+      rows where they are, and so did the move that removed them one by
+      one. The move asks as `ALTER TABLE` decides: the column's
+      `col::type` conversion, transformed and planned against the live
+      table, put to `ATColumnChangeRequiresRewrite()` (exported from
+      `tablecmds.c`). Only a table whose `ALTER` rewrites it is emptied
+      at once; a table whose type, column or table doesn't exist yet
+      (the move makes it later) is not; a table retyped because a type
+      it uses is defined otherwise always converts through an expression,
+      a rewrite. The rest are emptied row by row, as before.
+    - Locks: emptied at once, a table is locked ACCESS EXCLUSIVE before
+      its partitions are, as TRUNCATE locks them. Locking the partitions
+      first, and the partitioned table only at the `ALTER`, deadlocked
+      with a query on it, which locks it before its partitions.
+      `t/152_retype_move_sessions` checks both this and the snapshots
+      above.
+    - Not as the issue proposed (convert with `ALTER ... USING`, fold the
+      converted table in full, diff against the commit, apply the
+      difference): the conversion rewrites every row and rebuilds every
+      index already, and the full fold reads them all again, so it costs
+      more than writing the commit's rows into empty storage once, and
+      needs constraints deferred and a fallback when a cast fails. The
+      next commit folds the table in full either way (new storage).
+    - A change of primary key needed nothing: the table isn't emptied,
+      the new key's index is built, and the rows are folded under it, so
+      only the rows that differ are written (tested: none rewritten).
+    - Measured (1M rows, a column `int` to `bigint` and 1% of rows
+      otherwise changed, `wal_level = replica`; times on a loaded
+      machine): 878 MB of WAL / 12.7 s before #490, 666 MB / 10.1 s with
+      the bulk path alone, 254 MB / 3.0 s with `remove_all()`: no row
+      deleted, and the rows written once, indexes built after.
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
 built (#171, #172, #174, #175; 7.11); network remotes, batching, the
