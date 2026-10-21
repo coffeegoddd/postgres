@@ -7592,27 +7592,17 @@ list_has_name(List *list, const char *name)
 }
 
 /*
- * A merge (or pick, or fast-forward) of what changed from base to theirs
- * into a working set with uncommitted changes, as in Dolt: refused if it
- * would change what they changed (a table's rows, a sequence's value), and,
- * for now, if the merge changes definitions (its move from ours' would put
- * the uncommitted rows back as ours has them), or the uncommitted changes
- * are of something other than tables and sequences.  Tables the working
- * set made or redefined, a merge changing no definitions leaves alone.
- * views (NULL for one merge) is for a series checked before it merges:
- * ours' materialized views as the merges before this one leave them (NIL:
- * ours'), set to those this one leaves.
+ * A merge of what changed from base to theirs into a working set with
+ * uncommitted changes, refused, for now, if it changes definitions (from
+ * base to ours or to theirs), or the uncommitted changes are of something
+ * other than tables and sequences.
  */
 static void
-check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours,
-			const ProllyNodeRef *theirs, const char *what, List **views)
+check_local_definitions(const Local *l, const ProllyNodeRef *base,
+						const ProllyNodeRef *ours, const ProllyNodeRef *theirs,
+						const char *what)
 {
 	ProllyDatabaseComponents dc = components();
-	Tables		bt = {NIL};
-	Tables		tt = {NIL};
-	HTAB	   *bs;
-	List	   *ts;
-	ListCell   *lc;
 
 	if (!has_local_changes(l))
 		return;
@@ -7623,6 +7613,32 @@ check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot %s with uncommitted changes where definitions change", what),
 				 errhint("Commit the changes, or reset the branch, first.")));
+}
+
+/*
+ * A merge (or pick, or fast-forward) of what changed from base to theirs
+ * into a working set with uncommitted changes, as in Dolt: refused if it
+ * would change what they changed (a table's rows, a sequence's value), and
+ * where check_local_definitions() refuses it (its move from ours' would put
+ * the uncommitted rows back as ours has them).  Tables the working set
+ * made or redefined, a merge changing no definitions leaves alone.  views
+ * (NULL for one merge) is for a series checked before it merges: ours'
+ * materialized views as the merges before this one leave them (NIL:
+ * ours'), set to those this one leaves.
+ */
+static void
+check_local(const Local *l, const ProllyNodeRef *base, const ProllyNodeRef *ours,
+			const ProllyNodeRef *theirs, const char *what, List **views)
+{
+	Tables		bt = {NIL};
+	Tables		tt = {NIL};
+	HTAB	   *bs;
+	List	   *ts;
+	ListCell   *lc;
+
+	if (!has_local_changes(l))
+		return;
+	check_local_definitions(l, base, ours, theirs, what);
 	read_tables(base, &bt);
 	read_tables(theirs, &tt);
 	/* (base and theirs define the same objects) */
@@ -8127,18 +8143,26 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch has no commit to apply changes to")));
-	/* every pick checked against the uncommitted changes first */
+	/*
+	 * every pick checked against the uncommitted changes first.  An apply
+	 * (a stash's) merges into the working set as it is, the uncommitted
+	 * changes ours, as Dolt's does: only rows both changed conflict (#585).
+	 * A pick's commit leaves them out, so it can't change what they change.
+	 */
 	commit_root(&ours, &head);
 	local_changes(&ours, &local);
 	for (int i = 0; i < nrefs; i++)
 	{
 		commit_root(&info[i].parents[0], &roots[0]);
 		commit_root(&picked[i], &roots[2]);
-		check_local(&local, &roots[0], &head, &roots[2], what, &views);
+		if (apply_fn)
+			check_local_definitions(&local, &roots[0], &head, &roots[2], what);
+		else
+			check_local(&local, &roots[0], &head, &roots[2], what, &views);
 	}
 	root_of("WORKING", &before);
 
-	roots[1] = head;
+	roots[1] = apply_fn ? before : head;
 	initStringInfo(&message);
 	for (int i = 0; i < nrefs; i++)
 	{
@@ -8531,8 +8555,8 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 
 /*
  * ref's changes (from its parent) merged three-way into the session
- * branch's working set, as a cherry-pick merges them, but no commit made:
- * changes overlapping uncommitted ones, conflicts and violations are each
+ * branch's working set, uncommitted changes and all, but no commit made:
+ * conflicts (with the uncommitted changes, too) and violations are each
  * an error (fn's), and nothing is left in progress.
  */
 static void

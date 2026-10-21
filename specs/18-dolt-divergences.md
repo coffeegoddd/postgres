@@ -36,7 +36,9 @@ adapts.
   is `conflict` or `not covered` (objects a commit can't hold yet,
   which are listed and unstaged). `dolt_stash('push', ...)` sets the
   whole working set aside, so new tables with the rest (Dolt's leaves
-  untracked ones without `-u`); `-u` and `-a` are accepted (#498).
+  untracked ones without `-u`); `-u` and `-a` are accepted (#498). A
+  pop or apply merges into uncommitted changes as Dolt's does, refused
+  only where rows conflict (#585), or where definitions change (D6).
 - **Why:** the user's decision (2026-10-17). A staging area would be a
   second state of each branch beside the working set in Postgres's
   pages, for every fold, status and diff to track.

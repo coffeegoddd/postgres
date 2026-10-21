@@ -203,8 +203,9 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
--- popped over uncommitted changes: refused where they change a table it
--- changes (as Dolt's, by table), applied where they change another
+-- popped over uncommitted changes: merged into them, as Dolt's, the same
+-- table's other rows too (#585); refused, kept, where a row both changed
+-- conflicts
 INSERT INTO st.t VALUES (6, 'f');
 SELECT dolt_stash('push', 's');
  dolt_stash 
@@ -213,19 +214,6 @@ SELECT dolt_stash('push', 's');
 (1 row)
 
 INSERT INTO st.t VALUES (7, 'g');
-SELECT dolt_stash('pop', 's');
-ERROR:  local changes would be stomped by apply
-DETAIL:  Table "st.t" has uncommitted changes, and the apply changes it too.
-HINT:  Commit the changes, or reset the branch, first.
-SELECT * FROM st.t ORDER BY pk;
- pk | v  
-----+----
-  1 | a
-  2 | b2
-  7 | g
-(3 rows)
-
-DELETE FROM st.t WHERE pk = 7;
 INSERT INTO st.o VALUES (1);
 SELECT dolt_stash('pop', 's');
  dolt_stash 
@@ -239,12 +227,186 @@ SELECT * FROM st.t ORDER BY pk;
   1 | a
   2 | b2
   6 | f
-(3 rows)
+  7 | g
+(4 rows)
 
 SELECT * FROM st.o;
  id 
 ----
   1
+(1 row)
+
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       0
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (6, 'f');
+UPDATE st.t SET v = 'a2' WHERE pk = 1;
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (6, 'other');
+SELECT dolt_stash('pop', 's');
+ERROR:  dolt_stash conflicts with the current branch
+DETAIL:  It has 1 conflicting rows and 0 constraint violations.
+HINT:  Commit or reset the changes in the way, and try again.
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       1
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk |   v   
+----+-------
+  1 | a
+  2 | b2
+  6 | other
+(3 rows)
+
+UPDATE st.t SET v = 'f' WHERE pk = 6;
+SELECT dolt_stash('apply', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v  
+----+----
+  1 | a2
+  2 | b2
+  6 | f
+(3 rows)
+
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       1
+(1 row)
+
+SELECT dolt_stash('drop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- popped over a table the working set made: it stays, with its rows
+INSERT INTO st.t VALUES (6, 'f');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+CREATE TABLE st.w (id int PRIMARY KEY);
+INSERT INTO st.w VALUES (1);
+INSERT INTO st.t VALUES (7, 'g');
+SELECT dolt_stash('pop', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.t ORDER BY pk;
+ pk | v  
+----+----
+  1 | a
+  2 | b2
+  6 | f
+  7 | g
+(4 rows)
+
+SELECT * FROM st.w;
+ id 
+----
+  1
+(1 row)
+
+DROP TABLE st.w;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- specific stashes popped one after another, each into what the one
+-- before left (Dolt's "Popping specific stashes")
+INSERT INTO st.t VALUES (11, 'a');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (12, 'b');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (13, 'c');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO st.t VALUES (14, 'd');
+SELECT dolt_stash('push', 's');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('pop', 's', 'stash@{3}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('pop', 's', 'stash@{1}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM st.t WHERE pk > 10 ORDER BY pk;
+ pk | v 
+----+---
+ 11 | a
+ 13 | c
+(2 rows)
+
+SELECT stash_id FROM dolt_stashes;
+ stash_id  
+-----------
+ stash@{0}
+ stash@{1}
+(2 rows)
+
+SELECT dolt_stash('clear', 's');
+ dolt_stash 
+------------
+ {0}
 (1 row)
 
 SELECT dolt_reset('--hard');
