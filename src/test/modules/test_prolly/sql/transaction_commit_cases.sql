@@ -264,5 +264,36 @@ SELECT c.name, c.value = b.value AS same,
 SELECT (SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::tcc.w)) AS committed_rows,
 	(SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::tcc.o)) AS uncommitted_rows;
 
+-- The rows changed outside the mode wait in the working set through those
+-- commits: the baseline each advances still reads them, and a commit with
+-- them finds them all.
+UPDATE tcc.w SET v = 'busy again' WHERE id = 12;
+SELECT (SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::tcc.w)) AS committed_rows,
+	(SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::tcc.w)) AS uncommitted_rows;
+SET dolt.transaction_commit = off;
+SELECT length(dolt_commit('-Am', 'tcc outside')::text) AS committed;
+SET dolt.transaction_commit = on;
+SELECT (SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::tcc.w)) AS committed_w,
+	(SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::tcc.o)) AS committed_o,
+	(SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::tcc.w)) AS uncommitted_rows;
+
+-- A row a commit's transaction wrote after its commit (outside the mode)
+-- is a change the next commit of a transaction's own rows doesn't hold:
+-- it waits in the working set too.  (A subtransaction's aborted xid moves
+-- the commit's snapshot past its transaction's.)
+SET dolt.transaction_commit = off;
+BEGIN;
+UPDATE tcc.w SET v = 'before' WHERE id = 20;
+SAVEPOINT s;
+UPDATE tcc.w SET v = 'gone' WHERE id = 23;
+ROLLBACK TO s;
+SELECT length(dolt_commit('-am', 'tcc before')::text) AS committed;
+UPDATE tcc.w SET v = 'after' WHERE id = 21;
+COMMIT;
+SET dolt.transaction_commit = on;
+UPDATE tcc.w SET v = 'own' WHERE id = 22;
+SELECT (SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::tcc.w)) AS committed_rows,
+	(SELECT array_agg((to_row).id ORDER BY (to_row).id) FROM dolt_diff('HEAD', 'WORKING', NULL::tcc.w)) AS uncommitted;
+
 \c :home
 DROP DATABASE regress_tcc;

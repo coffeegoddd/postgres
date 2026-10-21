@@ -221,29 +221,56 @@ prolly_make_change_log(Oid relid, LOCKMODE lockmode)
 	table_close(rel, NoLock);
 }
 
+/*
+ * Before the session's branch changes: entries the transaction holds for
+ * the change logs are written to its branch's.
+ */
+void
+prolly_change_logs_flush(void)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (log != NULL && log->flush != NULL)
+		log->flush();
+}
+
 void
 prolly_note_change(Relation rel, const ItemPointerData *oldtid,
-				   const ItemPointerData *newtid)
+				   HeapTuple oldtup, const ItemPointerData *newtid)
 {
 	const ProllyChangeLogRoutine *log = change_log();
 
 	if (log != NULL)
-		PROLLY_CALL(log, note, rel, oldtid, newtid);
+		PROLLY_CALL(log, note, rel, oldtid, oldtup, newtid);
 }
 
 void
-prolly_note_made(Relation rel, const ItemPointerData *oldtid, HeapTuple *made,
-				 int nmade)
+prolly_note_emptied(Relation rel)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (log == NULL)
+		return;
+	if (log->note_emptied != NULL)
+		log->note_emptied(rel);
+	else
+		PROLLY_CALL(log, note, rel, NULL, NULL, NULL);
+}
+
+void
+prolly_note_made(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
+				 HeapTuple *made, int nmade)
 {
 	const ProllyChangeLogRoutine *log = change_log();
 
 	if (log == NULL)
 		return;
 	if (log->note_made != NULL)
-		log->note_made(rel, oldtid, made, nmade);
+		log->note_made(rel, oldtid, oldtup, made, nmade);
 	else
 		for (int i = 0; i < nmade; i++)
-			PROLLY_CALL(log, note, rel, i == 0 ? oldtid : NULL, &made[i]->t_self);
+			PROLLY_CALL(log, note, rel, i == 0 ? oldtid : NULL,
+						i == 0 ? oldtup : NULL, &made[i]->t_self);
 }
 
 Oid

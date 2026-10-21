@@ -612,6 +612,9 @@ set_session_branch(Oid branch)
 
 	if (branch == MyBranch)
 		return;
+	/* (what the change logs hold for this branch goes to its logs first) */
+	if (IsTransactionState())
+		prolly_change_logs_flush();
 	MyBranch = branch;
 	InvalidateSystemCaches();
 	RelationCacheRebuildNew(from);
@@ -944,7 +947,7 @@ branch_sequences_written(void)
 
 void
 branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
-				  const ItemPointerData *newtid)
+				  HeapTuple oldtup, const ItemPointerData *newtid)
 {
 	/*
 	 * The change log is told of every write, the session's own or not;
@@ -953,7 +956,7 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 	 * session's: the hook isn't told of them either.
 	 */
 	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
-		prolly_note_change(rel, oldtid, newtid);
+		prolly_note_change(rel, oldtid, oldtup, newtid);
 	else if (prolly_is_change_log(rel))
 		return;
 	if (branch_tuple_hook && hushes == NIL)
@@ -966,10 +969,10 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
  */
 void
 branch_note_made(Relation rel, const ItemPointerData *oldtid,
-				 HeapTuple *made, int nmade)
+				 HeapTuple oldtup, HeapTuple *made, int nmade)
 {
 	if (rel->rd_rel->relkind != RELKIND_TOASTVALUE)
-		prolly_note_made(rel, oldtid, made, nmade);
+		prolly_note_made(rel, oldtid, oldtup, made, nmade);
 	else if (prolly_is_change_log(rel))
 		return;
 	if (branch_tuple_hook && hushes == NIL)

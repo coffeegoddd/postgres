@@ -15,8 +15,8 @@ CREATE TABLE cow.t (a int8, b int8);
 INSERT INTO cow.t SELECT g, g FROM generate_series(1, 1000) g;
 SELECT pg_relation_filenode('cow.t') AS src \gset
 SELECT pg_relation_size('cow.t') / 8192 AS nblocks \gset
--- (and its change log's, which no copy holds)
-SELECT pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) / 8192
+-- (and its change log's, its index's too, which no copy holds)
+SELECT (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)) / 8192
 	AS tlog \gset
 
 -- Nothing to do in a store whose counts are right.
@@ -48,7 +48,7 @@ SELECT test_bmap_free_blocks() - :free_before = :nblocks + :tlog AS freed_by_dro
 CREATE TABLE cow.u (a int8, b int8);
 INSERT INTO cow.u SELECT g, g FROM generate_series(1, 1000) g;
 SELECT pg_relation_filenode('cow.u') AS u \gset
-SELECT pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.u'::regclass::oid)::regclass) / 8192
+SELECT (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.u'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.u'::regclass::oid || '_index')::regclass)) / 8192
 	AS ulog \gset
 CREATE TEMP TABLE ucopies AS
 SELECT test_bmap_share(:u) AS copy FROM generate_series(1, 260);

@@ -9,36 +9,3 @@
 # Entries stand until removed (unlike perf_accept.toml's): the change that
 # ends the growth removes its entries, and vgrowth reports an accepted
 # counter that no longer grows, so that it does.
-
-# owned and status fold the working set (the owner's release check, a
-# status); since transaction commits advance the baseline (#568, #569) the
-# fold reads only what's changed since the last commit, but it still walks
-# every page of the table's change log (#481).
-
-[[accept]]
-workload = "V7/owned-bgnone"
-engine = "prolly"
-counter = "log_pages_read"
-reason = "the owner's release check folds the working set each transaction, and a fold walks every page of the change log (#481)"
-
-[[accept]]
-workload = "V7/status-bgnone"
-engine = "prolly"
-counter = "log_pages_read"
-reason = "a status every 100 transactions folds the working set, and a fold walks every page of the change log (#481)"
-
-# #481: a fold walks every page of a table's change log, read and consume,
-# and the log grows with each commit's entries; autovacuum frees the dead
-# but leaves the pages, and a held horizon keeps the dead too.
-
-[[accept]]
-workload = "V7/manual-bgnone"
-engine = "prolly"
-counter = "log_pages_read"
-reason = "each commit walks the whole change log, which grows with every commit (#481)"
-
-[[accept]]
-workload = "V7/pinned-bgnone"
-engine = "prolly"
-counter = "log_pages_read"
-reason = "each commit walks the whole change log, dead entries a held horizon keeps too (#481)"

@@ -320,10 +320,14 @@ it, table by table (user, 2026-10-20, #568; before, 2026-10-18, it
 didn't, and every fold read every change since the last full fold): a
 table whose baseline held exactly the old head's rows, by a fold the
 commit's snapshot sees, now holds the new head's, and the change log's
-entries of the transaction's own are consumed (by TID: the log keeps
-which it wrote, `consume_own()`). Nothing has to prove that no one
-outside the mode wrote the branch: the others' entries stay in the log,
-changes the new baseline doesn't hold, for the next fold. A table whose
+entries of the transaction's own are consumed (by the log's index on
+the writing transaction, `consume_own()`). Nothing has to prove that no
+one outside the mode wrote the branch: the others' entries stay in the
+log, changes the new baseline doesn't hold, for the next fold. While
+they wait, the new baseline's position in the log is the last's (its
+xmax, and those of its running transactions that wrote entries or still
+run), not the commit's snapshot, which would skip them; so a commit
+costs its own rows however many others wait. A table whose
 baseline lags the head, or whose log can't tell the transaction's
 entries (one says to read the table in full, or there are more than
 65,536), keeps its baseline, till the next fold. Then `dolt_status`, a

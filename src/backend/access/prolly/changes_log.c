@@ -37,11 +37,22 @@
  * pages are never kept as of a fold: only sharing between branches copies
  * them.
  *
- * A fold by a snapshot that doesn't see its baseline's fold reads the
- * table in full, but by an old snapshot: rows written meanwhile whose
- * entries another fold consumed are neither in what it reads nor left in
- * the log.  Its baseline is marked unsettled, so the next fold reads the
- * table in full again, by its own snapshot.
+ * A fold by a snapshot that doesn't see its baseline's fold (a repeatable
+ * read transaction's, older than another's fold) starts from the baseline
+ * too: the entries the baseline's fold held of transactions this snapshot
+ * doesn't see finished are undone (their keys re-read by this snapshot,
+ * the version it sees, or none; a keyless row's count taken back), and
+ * those since applied as any fold's.  The log keeps them for it: rows are
+ * trimmed only once every snapshot sees their transactions finished.  But
+ * the baseline it begins, at its own snapshot's position, doesn't hold the
+ * changes of the transactions it didn't see finished, and the rows the
+ * newer fold consumed (its own transaction's, deleted) are kept only while
+ * a snapshot may need them: VACUUM takes them once this one ends.  So when
+ * the undoing found such a row, or such a fold read the table in full, its
+ * baseline is marked unsettled: the next fold by a snapshot that sees more
+ * finished than it held reads the table in full, by its own snapshot (one
+ * that sees no more, as the old transaction's later statements, folds from
+ * it, and keeps the mark).
  *
  * The entries a fold reads are kept once per row (a key's, or a keyless
  * row's with its count summed), so the memory a fold takes is of the rows
@@ -49,7 +60,8 @@
  *
  * A baseline's state: a tag and version, flags, the log's identity, and the
  * fold's snapshot's xmax, the fold's own transaction (if it had written)
- * and the transactions it saw running (a count, then each).
+ * and the transactions it saw running (a count, then each), as
+ * FullTransactionIds: the fold's position.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/changes_log.c
@@ -84,10 +96,12 @@
 
 /* (a first byte no "pages" state has: neither reads the other's) */
 #define STATE_TAG			'L'
-#define STATE_VERSION		2		/* 2: flags */
+#define STATE_VERSION		3		/* 2: flags; 3: full transaction ids */
 
 #define STATE_UNSETTLED		0x01	/* folded by a snapshot older than its
-									 * baseline's fold: fold in full next */
+									 * baseline's fold, which consumed rows
+									 * this one's position doesn't hold:
+									 * one that sees more folds in full */
 
 /* Entries kept before they are first made one per row. */
 #define COMPACT_AT			65536
@@ -103,6 +117,10 @@ typedef struct State
 	uint32		nxip;			/* the transactions it saw running, sorted */
 	TransactionId *xip;
 	TransactionId own;			/* the fold's transaction, if it wrote */
+	/* the same, whole: the fold's position in the log */
+	FullTransactionId fxmax;
+	FullTransactionId *fxip;
+	FullTransactionId fown;
 } State;
 
 static ProllyChangeCounters counters;
@@ -147,6 +165,8 @@ typedef struct Finder
 	bool		merge;			/* merge the changes with the baseline */
 	Size		bytes;			/* what the copies take */
 	bool		give_up;
+	bool		unsettled;		/* undid rows its position can't find again */
+	bool		emptied;		/* an entry's transaction emptied the table */
 	ProllyFullFoldReason reason;	/* why, once it gives up */
 	StringInfoData key;			/* reused for each encoding */
 	StringInfoData row;
@@ -185,6 +205,8 @@ get_u64(const uint8 *p)
 	return (uint64) get_u32(p) | ((uint64) get_u32(p + 4) << 32);
 }
 
+static int	xid_cmp(const void *a, const void *b);
+
 static void
 put_state(StringInfo out, const State *st)
 {
@@ -192,14 +214,37 @@ put_state(StringInfo out, const State *st)
 	appendStringInfoChar(out, (char) STATE_VERSION);
 	appendStringInfoChar(out, (char) st->flags);
 	put_u64(out, st->log);
-	put_u32(out, st->xmax);
-	put_u32(out, st->own);
+	put_u64(out, U64FromFullTransactionId(st->fxmax));
+	put_u64(out, U64FromFullTransactionId(st->fown));
 	put_u32(out, st->nxip);
 	for (uint32 i = 0; i < st->nxip; i++)
-		put_u32(out, st->xip[i]);
+		put_u64(out, U64FromFullTransactionId(st->fxip[i]));
 }
 
-#define STATE_FIXED_LEN	(3 + 8 + 4 + 4 + 4)
+/*
+ * A state for the snapshot's fold by this transaction: its xmax, those it
+ * saw running (sorted) and the transaction itself, whole, as of now.
+ */
+static void
+state_of_snapshot(State *st, Snapshot snap)
+{
+	FullTransactionId next = ReadNextFullTransactionId();
+
+	st->fxmax = FullTransactionIdFromAllowableAt(next, snap->xmax);
+	st->xmax = snap->xmax;
+	st->nxip = snap->xcnt;
+	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
+	st->fxip = palloc_array(FullTransactionId, Max(st->nxip, 1));
+	if (st->nxip > 0)
+		memcpy(st->xip, snap->xip, st->nxip * sizeof(TransactionId));
+	qsort(st->xip, st->nxip, sizeof(TransactionId), xid_cmp);
+	for (uint32 i = 0; i < st->nxip; i++)
+		st->fxip[i] = FullTransactionIdFromAllowableAt(next, st->xip[i]);
+	st->fown = GetTopFullTransactionIdIfAny();
+	st->own = XidFromFullTransactionId(st->fown);
+}
+
+#define STATE_FIXED_LEN	(3 + 8 + 8 + 8 + 4)
 
 static bool
 parse_state(const ProllyValue *state, State *st)
@@ -212,15 +257,21 @@ parse_state(const ProllyValue *state, State *st)
 		return false;
 	st->flags = p[2];
 	st->log = get_u64(p + 3);
-	st->xmax = get_u32(p + 11);
-	st->own = get_u32(p + 15);
-	st->nxip = get_u32(p + 19);
-	if ((uint64) state->len != STATE_FIXED_LEN + (uint64) st->nxip * 4)
+	st->fxmax = FullTransactionIdFromU64(get_u64(p + 11));
+	st->fown = FullTransactionIdFromU64(get_u64(p + 19));
+	st->nxip = get_u32(p + 27);
+	st->xmax = XidFromFullTransactionId(st->fxmax);
+	st->own = XidFromFullTransactionId(st->fown);
+	if ((uint64) state->len != STATE_FIXED_LEN + (uint64) st->nxip * 8)
 		return false;
 	p += STATE_FIXED_LEN;
 	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
-	for (uint32 i = 0; i < st->nxip; i++, p += 4)
-		st->xip[i] = get_u32(p);
+	st->fxip = palloc_array(FullTransactionId, Max(st->nxip, 1));
+	for (uint32 i = 0; i < st->nxip; i++, p += 8)
+	{
+		st->fxip[i] = FullTransactionIdFromU64(get_u64(p));
+		st->xip[i] = XidFromFullTransactionId(st->fxip[i]);
+	}
 	return true;
 }
 
@@ -228,6 +279,14 @@ static int
 xid_cmp(const void *a, const void *b)
 {
 	return pg_cmp_u32(*(const TransactionId *) a, *(const TransactionId *) b);
+}
+
+/* (sorted as xid_cmp sorts their xids: the state's xids are searched so) */
+static int
+full_xid_cmp(const void *a, const void *b)
+{
+	return pg_cmp_u32(XidFromFullTransactionId(*(const FullTransactionId *) a),
+					  XidFromFullTransactionId(*(const FullTransactionId *) b));
 }
 
 /*
@@ -260,6 +319,24 @@ sees_fold(Snapshot snap, const State *st)
 		if (TransactionIdPrecedes(running[i], st->xmax) &&
 			bsearch(&running[i], st->xip, st->nxip, sizeof(TransactionId),
 					xid_cmp) == NULL)
+			return false;
+	return true;
+}
+
+/*
+ * Does the snapshot see no transaction finished that the fold's position
+ * doesn't hold (one at or past its xmax, or one it saw running)?  So an
+ * unsettled baseline's rows are all this snapshot needs: a later
+ * statement of the transaction whose old snapshot began it, say.
+ */
+static bool
+sees_no_more(Snapshot snap, const State *st)
+{
+	if (!TransactionIdIsNormal(st->xmax) ||
+		TransactionIdPrecedes(st->xmax, snap->xmax))
+		return false;
+	for (uint32 i = 0; i < st->nxip; i++)
+		if (!XidInMVCCSnapshot(st->xip[i], snap))
 			return false;
 	return true;
 }
@@ -487,6 +564,23 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 {
 	Finder	   *f = arg;
 
+	/*
+	 * (the table emptied: with a key, the fold starts from no rows, each key
+	 * read a candidate, before or after, looked up in the heap; without,
+	 * the counts can't be told apart, and it reads the table in full, as
+	 * many rows as were written since)
+	 */
+	if (entry == NULL)
+	{
+		if (f->keyless)
+		{
+			f->give_up = true;
+			f->reason = PROLLY_FULL_LOG_ENTRY;
+			return false;
+		}
+		f->emptied = true;
+		return true;
+	}
 	if (f->keyless)
 	{
 		/* (a key's entry: the table was keyed when it was written) */
@@ -863,14 +957,54 @@ fold_all(Finder *f, ProllyNodeRef *data)
  * Fold from the baseline, its state 'st': false if the table must be read
  * in full instead.
  */
+/* An entry the baseline holds and the snapshot doesn't see: undone. */
+static bool
+entry_unseen_visit(HeapTuple entry, int32 delta, void *arg)
+{
+	Finder	   *f = arg;
+
+	/* (an emptying it doesn't see: the rows before aren't in the log) */
+	if (entry == NULL)
+	{
+		f->give_up = true;
+		f->reason = PROLLY_FULL_LOG_ENTRY;
+		return false;
+	}
+	return entry_visit(entry, -delta, arg);
+}
+
 static bool
 fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
-			 const ProllyChangeLogRoutine *log, ProllyNodeRef *data)
+			 bool stale, const ProllyChangeLogRoutine *log,
+			 ProllyNodeRef *data)
 {
+	ProllyLogPosition pos = {st->fxmax, st->fown, st->nxip, st->fxip};
+	bool		consumed = false;
+
 	f->compact = true;
 	if (f->give_up)
 		return false;
-	if (!PROLLY_CALL(log, read, f->rel, f->snap, entry_visit, f))
+
+	/*
+	 * (a snapshot that doesn't see the baseline's fold: the changes the
+	 * fold held of transactions the snapshot doesn't see finished are
+	 * undone, each a candidate re-read by the snapshot, a keyless row's
+	 * count taken back; if one was consumed, the baseline this fold
+	 * begins is unsettled: see the file's header)
+	 */
+	if (stale &&
+		!PROLLY_CALL(log, read_unseen, f->rel, f->snap, &pos,
+					 entry_unseen_visit, f, &consumed))
+	{
+		if (!f->give_up)
+			f->reason = PROLLY_FULL_LOG_ENTRY;
+		return false;
+	}
+	if (consumed)
+		f->unsettled = true;
+	if (f->give_up)
+		return false;
+	if (!PROLLY_CALL(log, read, f->rel, f->snap, &pos, entry_visit, f))
 	{
 		/* (an entry said to, unless the visit gave up) */
 		if (!f->give_up)
@@ -880,6 +1014,16 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	if (f->give_up)
 		return false;
 	compact_copies(f);
+	if (!f->keyless && f->emptied)
+	{
+		ProllyTableFold empty = *baseline;
+		ProllyTreeBuilder *b = PROLLY_CALL(f->tree, build_begin, &f->env,
+										   CurrentMemoryContext);
+
+		PROLLY_CALL(f->tree, build_finish, b, &empty.data);
+		fold_keys(f, &empty, data);
+		return true;
+	}
 	if (!f->keyless)
 	{
 		fold_keys(f, baseline, data);
@@ -1023,15 +1167,18 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	stale = have && !sees_fold(f.snap, &st);
 	if (have && f.reason == PROLLY_FULL_NONE)
 	{
-		if (stale)
-			f.reason = PROLLY_FULL_STALE_SNAPSHOT;
-		else if (st.flags & STATE_UNSETTLED)
+		if ((st.flags & STATE_UNSETTLED) && !sees_no_more(f.snap, &st))
 			f.reason = PROLLY_FULL_UNSETTLED;
+		else if (stale && !PROLLY_HAS(c.change_log, read_unseen))
+			f.reason = PROLLY_FULL_STALE_SNAPSHOT;
 		else if (storage_unseen(rel, f.snap))
 			f.reason = PROLLY_FULL_STORAGE_UNSEEN;
 	}
 	have = have && f.reason == PROLLY_FULL_NONE;
-	if (!have || !fold_changed(&f, baseline, &st, c.change_log, data))
+	/* (a baseline as unsettled, still not holding what it didn't) */
+	if (have && (st.flags & STATE_UNSETTLED))
+		f.unsettled = true;
+	if (!have || !fold_changed(&f, baseline, &st, stale, c.change_log, data))
 	{
 		instr_time	start;
 		instr_time	took;
@@ -1041,6 +1188,9 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 		MemoryContextReset(f.ccxt);
 		f.c = NULL;
 		f.n = f.max = 0;
+		/* (by a stale snapshot: what a newer fold consumed isn't read) */
+		if (stale)
+			f.unsettled = true;
 		INSTR_TIME_SET_CURRENT(start);
 		fold_all(&f, data);
 		INSTR_TIME_SET_CURRENT(took);
@@ -1064,15 +1214,9 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	{
 		State		ns = {0};
 
-		ns.flags = stale ? STATE_UNSETTLED : 0;
+		ns.flags = f.unsettled ? STATE_UNSETTLED : 0;
 		ns.log = identity;
-		ns.xmax = f.snap->xmax;
-		ns.nxip = f.snap->xcnt;
-		ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
-		if (ns.nxip > 0)
-			memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
-		qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
-		ns.own = GetTopTransactionIdIfAny();
+		state_of_snapshot(&ns, f.snap);
 		MemoryContextSwitchTo(old);
 		put_state(next, &ns);
 		MemoryContextSwitchTo(cxt);
@@ -1128,8 +1272,9 @@ log_fold_rows(Relation rel, const ProllyTreeEnv *env,
 /*
  * The state of a baseline that holds rel's last baseline's rows with the
  * transaction's own changes applied (a commit of them alone), into next:
- * as of the active snapshot, its fold's transaction this one.  The
- * transaction's entries are consumed; the rest stay, the changes of
+ * as of the active snapshot, its fold's transaction this one; or, where
+ * others' entries since the last's position wait, at that position still.
+ * The transaction's entries are consumed; the rest stay, the changes of
  * others the new baseline doesn't hold.  False, consuming nothing, where
  * the last baseline's state doesn't hold so: not this finder's with the
  * table's log as it is, unsettled, its fold one the snapshot doesn't see,
@@ -1143,6 +1288,7 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 	uint64		identity = 0;
 	State		st;
 	State		ns = {0};
+	ProllyLogPosition rest = {0};
 	Snapshot	snap = GetActiveSnapshot();
 
 	prolly_components_for_relation(rel, &c);
@@ -1153,16 +1299,35 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
 		storage_unseen(rel, snap))
 		return false;
-	if (!PROLLY_CALL(c.change_log, consume_own, rel))
-		return false;
+	{
+		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
+
+		if (!PROLLY_CALL(c.change_log, consume_own, rel, &pos, &rest))
+			return false;
+	}
 	ns.log = identity;
-	ns.xmax = snap->xmax;
-	ns.nxip = snap->xcnt;
-	ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
-	if (ns.nxip > 0)
-		memcpy(ns.xip, snap->xip, ns.nxip * sizeof(TransactionId));
-	qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
-	ns.own = GetTopTransactionIdIfAny();
+	if (!FullTransactionIdIsValid(rest.xmax))
+		state_of_snapshot(&ns, snap);
+	else
+	{
+		/*
+		 * (others' entries the new baseline doesn't hold either: its
+		 * position is the last's, which reads them, the transaction its
+		 * own; not the snapshot's, which would skip them)
+		 */
+		ns.fxmax = rest.xmax;
+		ns.xmax = XidFromFullTransactionId(rest.xmax);
+		ns.fown = rest.own;
+		ns.own = XidFromFullTransactionId(rest.own);
+		ns.nxip = rest.nxip;
+		ns.fxip = palloc_array(FullTransactionId, Max(ns.nxip, 1));
+		ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
+		if (ns.nxip > 0)
+			memcpy(ns.fxip, rest.xip, ns.nxip * sizeof(FullTransactionId));
+		qsort(ns.fxip, ns.nxip, sizeof(FullTransactionId), full_xid_cmp);
+		for (uint32 i = 0; i < ns.nxip; i++)
+			ns.xip[i] = XidFromFullTransactionId(ns.fxip[i]);
+	}
 	put_state(next, &ns);
 	return true;
 }

@@ -12,16 +12,12 @@ CREATE SCHEMA cl VERSIONED;
 CREATE TABLE cl.keyed (id int PRIMARY KEY, v text);
 CREATE TABLE cl.keyless (a int, b text);
 
--- entries(t): the deltas of the entries of t's log this transaction sees,
--- and how many say to read the table in full.
+-- entries(t): the entries of t's log this transaction sees, their deltas,
+-- and whether one says to read the table in full.
 CREATE FUNCTION pg_temp.entries(t regclass, OUT n int8, OUT deltas int8[],
-	OUT full_reads int8) AS $$
-BEGIN
-	EXECUTE format('SELECT count(*), coalesce(array_agg(delta ORDER BY delta), ''{}''),
-		count(*) FILTER (WHERE image IS NULL) FROM pg_toast.%I',
-		'pg_prolly_log_' || t::oid)
-	INTO n, deltas, full_reads;
-END $$ LANGUAGE plpgsql;
+	OUT full_read bool) AS $$
+	SELECT * FROM test_log_entries(t)
+$$ LANGUAGE sql;
 
 -- The log is a TOAST-kind relation of the table's access method, part
 -- of its table.
@@ -64,6 +60,21 @@ SELECT * FROM pg_temp.entries('cl.keyed');
 ROLLBACK;
 SELECT * FROM pg_temp.entries('cl.keyed');
 
+-- A subtransaction that writes an ancestor's entries, and one inside it
+-- that ends, then the first rolled back: the entries are the ancestor's
+-- again, the inner one's gone.
+BEGIN;
+INSERT INTO cl.keyed VALUES (4, 'd');
+SAVEPOINT a;
+SELECT * FROM pg_temp.entries('cl.keyed');
+SAVEPOINT b;
+INSERT INTO cl.keyed VALUES (5, 'e');
+ROLLBACK TO b;
+SELECT count(*) AS churned FROM (SELECT repeat('x', 100000) FROM generate_series(1, 50)) s;
+ROLLBACK TO a;
+SELECT * FROM pg_temp.entries('cl.keyed');
+ROLLBACK;
+
 -- A commit rolled back leaves the entries it consumed.
 INSERT INTO cl.keyed VALUES (6, 'f');
 BEGIN;
@@ -88,8 +99,9 @@ INSERT INTO cl.keyless
 SELECT 3, string_agg(md5(g::text), '') FROM generate_series(1, 300) g;
 SELECT * FROM pg_temp.entries('cl.keyless');
 
--- A truncation changes rows no entry names, made anew or (storage the
--- transaction made) in place, and so does a rewrite: read in full.
+-- A truncation, made anew or (storage the transaction made) in place, says
+-- the table was emptied (an entry of no row, its others kept: truncate_folds);
+-- a rewrite changes rows no entry names: read in full.
 BEGIN;
 TRUNCATE cl.keyed;
 INSERT INTO cl.keyed VALUES (9, 'i');
@@ -176,6 +188,49 @@ DROP SCHEMA cl CASCADE;
 SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
 SELECT dolt_branch('-D', 'cl_other');
 
+-- A table whose log is of the first format (an entry a row, no index) is
+-- taken as having none: it is written nothing, folds in full, and
+-- prolly_make_change_logs() makes it a log of this format.
+CREATE SCHEMA clf VERSIONED;
+CREATE TABLE clf.t (id int PRIMARY KEY, v text);
+INSERT INTO clf.t SELECT g, 'v' FROM generate_series(1, 10) g;
+SELECT length(dolt_commit('-Am', 'clf')::text) AS committed;
+SELECT test_drop_change_log('clf.t');
+SELECT test_make_format1_change_log('clf.t');
+UPDATE clf.t SET v = 'w' WHERE id = 1;
+SELECT 'pg_toast.pg_prolly_log_' || 'clf.t'::regclass::oid AS clf_log \gset
+SELECT count(*) AS format1_rows FROM :clf_log;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+SELECT length(dolt_commit('-am', 'clf w')::text) AS committed;
+SELECT pg_stat_force_next_flush();
+SELECT value AS full_without_log FROM pg_stat_prolly WHERE name = 'fold_full_tables';
+SELECT * FROM prolly_make_change_logs();
+SELECT attname FROM pg_attribute WHERE attrelid = :'clf_log'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT count(*) AS indexed FROM pg_index WHERE indrelid = :'clf_log'::regclass;
+UPDATE clf.t SET v = 'x' WHERE id = 2;
+SELECT * FROM pg_temp.entries('clf.t');
+DROP SCHEMA clf CASCADE;
+SELECT length(dolt_commit('-Am', 'clf gone')::text) AS committed;
+
+-- An update's or a delete's entry is made from the old version the write
+-- has in hand, not read again from its page: a one-row update and a
+-- one-row delete touch the table's pages five times (seven, read again).
+-- Autovacuum is off: an autoanalyze reading the table would count too.
+CREATE SCHEMA clt VERSIONED;
+CREATE TABLE clt.touch (id int PRIMARY KEY, v text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO clt.touch SELECT g, 'v' FROM generate_series(1, 100) g;
+SELECT pg_stat_force_next_flush();
+SELECT heap_blks_hit + heap_blks_read AS touch0 FROM pg_statio_user_tables
+WHERE relid = 'clt.touch'::regclass \gset
+UPDATE clt.touch SET v = 'w' WHERE id = 50;
+DELETE FROM clt.touch WHERE id = 51;
+SELECT pg_stat_force_next_flush();
+SELECT heap_blks_hit + heap_blks_read - :touch0 AS heap_pages_touched
+FROM pg_statio_user_tables WHERE relid = 'clt.touch'::regclass;
+DROP SCHEMA clt CASCADE;
+
 -- A table without a change log (made before logs were, or restored by
 -- pg_upgrade) folds in full at every commit; prolly_make_change_logs()
 -- makes the logs the branch's tables lack, after which folds read them.
@@ -196,10 +251,12 @@ SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
 DROP SCHEMA cml CASCADE;
 SELECT length(dolt_commit('-Am', 'cml gone')::text) AS committed;
 -- VACUUM of a table vacuums its change log too, as it does its TOAST
--- table: the entries a fold consumed, dead (each fold walking them till
--- then), are gone, and the log truncated.  A log sets no autovacuum
+-- table: the rows a fold consumed, dead, are gone, and the log truncated.
+-- A fold reads only the rows past its baseline's position, so an empty
+-- commit after a load reads none of the load's.  A log sets no autovacuum
 -- options of its own: it takes its table's, and where the table leaves
--- them unset, is vacuumed soon after entries die (1000 dead, no scale).
+-- them unset, is vacuumed soon after rows die (1000 dead, no scale; a
+-- transaction's entries are a row or a few a page, so a load's are few).
 -- (a database of its own: no other session's snapshot keeps the dead)
 CREATE DATABASE regress_log_vacuum;
 \c regress_log_vacuum
@@ -219,7 +276,7 @@ SELECT pg_stat_force_next_flush();
 SELECT pg_stat_reset_shared('prolly');
 SELECT length(dolt_commit('--allow-empty', '-m', 'empty')::text) AS committed;
 SELECT pg_stat_force_next_flush();
-SELECT value > 50 AS walked_dead FROM pg_stat_prolly WHERE name = 'log_pages_read';
+SELECT value AS log_rows_read FROM pg_stat_prolly WHERE name = 'log_pages_read';
 -- the dead entries against the log's threshold: its own default (1000),
 -- then the table's, set later (40000), then its own again
 SELECT pg_temp.log_vacuum_score() AS default_score;

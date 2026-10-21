@@ -14,6 +14,10 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+# (the tables have no change logs: a log's pages, allocated as its table's
+# rows are written, would take the freed blocks each scenario arranges for
+# the tables)
+
 # $s_page: the logical block of s that gets r's old block (r's is 0).
 sub scenario
 {
@@ -35,12 +39,15 @@ full_page_writes = off
 		CREATE EXTENSION pg_buffercache;
 		CREATE SCHEMA cow VERSIONED;
 		CREATE TABLE cow.q (a int8);
+		SELECT test_drop_change_log('cow.q');
 	});
 	$sql->(q{INSERT INTO cow.q VALUES (1)}) if $s_page > 0;
 	$sql->(q{
 		CREATE TABLE cow.r (a int8, b int8);
+		SELECT test_drop_change_log('cow.r');
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
 		CREATE TABLE cow.s (a int8, b char(1900));
+		SELECT test_drop_change_log('cow.s');
 		CREATE TABLE churn (a int8, b text);
 	});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
@@ -130,8 +137,10 @@ full_page_writes = off
 		CREATE EXTENSION pg_buffercache;
 		CREATE SCHEMA cow VERSIONED;
 		CREATE TABLE cow.r (a int8, b int8);
+		SELECT test_drop_change_log('cow.r');
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
 		CREATE TABLE cow.s (a int8, b int8);
+		SELECT test_drop_change_log('cow.s');
 		INSERT INTO cow.s SELECT g, g FROM generate_series(1, 5) g;
 	});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
@@ -186,8 +195,10 @@ full_page_writes = off
 		CREATE EXTENSION pg_buffercache;
 		CREATE SCHEMA cow VERSIONED;
 		CREATE TABLE cow.r (a int8, b int8);
+		SELECT test_drop_change_log('cow.r');
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
 		CREATE TABLE cow.s (a int8, b char(1900));
+		SELECT test_drop_change_log('cow.s');
 		INSERT INTO cow.s SELECT g, 'x' FROM generate_series(1, 4) g;
 	});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});

@@ -81,8 +81,7 @@ is(sql(q{SELECT sum(b) FROM cow.t}), $sum, 'which keeps the source\'s change');
 # on the primary.
 my $src_own = sql(qq{SELECT count(*) FROM test_bmap_map($src)
 	WHERE phys NOT IN (SELECT phys FROM test_bmap_map($copy))});
-$src_own += sql(q{SELECT pg_relation_size(('pg_toast.pg_prolly_log_' ||
-	'cow.t'::regclass::oid)::regclass) / 8192});
+$src_own += sql(q{SELECT (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)) / 8192});
 my $copy_blocks = sql(qq{SELECT count(*) FROM test_bmap_map($copy)});
 my $free = sql(q{SELECT test_bmap_free_blocks()});
 sql(q{DROP TABLE cow.t});

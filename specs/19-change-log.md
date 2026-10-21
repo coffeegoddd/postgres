@@ -47,25 +47,39 @@ Two interfaces, each selected by the table AM's profile
   It has the table's access method and is a TOAST-kind relation, so it
   is block-mapped, versioned with its table (its branch's copy shares its
   pages copy-on-write, as the table's does), skipped by the canonical
-  form, and dropped with its table. Its columns are a row image
-  (`bytea`, never moved out of line) and a count delta (`int4`).
+  form, and dropped with its table. Format 2 (#481): its columns are
+  the writing transaction's top-level `FullTransactionId` (`int8`) and
+  its entries packed (`bytea`, never moved out of line: a count delta,
+  an image's length and the image, each; a length of all ones says to
+  fold the table in full), with a btree index on the transaction id,
+  made with the log. A log of format 1 (an image and a delta per row, no
+  index) is taken as no log, the table folded in full, until
+  `prolly_make_change_logs()` makes it anew.
   Logical decoding passes over it (the interface's `is_log()`, asked in
   critical sections, so it neither errors nor allocates): its rows are
   bookkeeping, not data, and a TOAST-kind relation would otherwise be
   read as TOAST chunks.  It takes its table's owner, tablespace and
   autovacuum settings, as a TOAST table does (`relid()`), and a branch's
   making locks it after every table, as a writer does.
-- **An entry per tuple version, at the write.** Heap reports each version
-  a write made or replaced (`note_branch_tuple()`, or with the versions
-  made in hand `note_branch_made()`, `heapam.c`), and an aborted
-  speculative insertion the version it takes back. Each is recorded as
-  it is reported, hushed writes too (a row applier's for a move): the
-  entry is inserted by the same (sub)transaction as the version, so it is
-  seen exactly when the version is. A write's entries are inserted
-  together (a `COPY` batch is one multi-insert into the log). Aborts,
-  savepoints, two-phase commit, branch switches inside a transaction,
-  standbys and crash recovery need nothing more. A note's memory is freed
-  as it ends. A transient heap a rewrite fills has no log.
+- **An entry per tuple version, buffered by the transaction.** Heap
+  reports each version a write made or replaced (`note_branch_tuple()`,
+  or with the versions made in hand `note_branch_made()`, `heapam.c`;
+  the replaced one in hand while its page is pinned, #424), and an
+  aborted speculative insertion the version it takes back. Each is
+  recorded as it is reported, hushed writes too (a row applier's for a
+  move), in the backend's memory: per log and subtransaction, a key's
+  image once, a keyless row's image once with its deltas summed. A
+  subtransaction's are written to the log when another begins inside it
+  (so only the innermost holds entries unwritten), and its parent takes
+  them when it commits; one aborting drops them. They are written at
+  `PRE_COMMIT` and `PRE_PREPARE`, before the log is read in the
+  transaction (a fold, a `dolt_commit` inside it), and past 64 kB, as
+  log rows of at most a page each, by the (sub)transaction that holds
+  them: a row is seen exactly when its writes are. So a transaction
+  writes a row or a few per table, whatever its writes, and each costs
+  one index entry. Two-phase commit, branch switches inside a
+  transaction, standbys and crash recovery need nothing more. A
+  transient heap a rewrite fills has no log.
 - **What an entry holds:** with a primary key, the key columns as a heap
   tuple (other columns null, values out of line inlined, compressed ones
   still compressed), one entry for an update that kept its key; without
@@ -76,21 +90,55 @@ Two interfaces, each selected by the table AM's profile
   A keyless version with a value out of line otherwise (not a versioned
   table's), or either image too large for the log's page (a key's compressed values needn't be as
   its index holds them), is recorded as "fold in full" instead (no
-  image). So is a truncation (made anew or in place) and a rewrite that
-  may change rows (`ALTER TABLE`'s heap swap, a materialized view's
-  refresh, `REPACK CONCURRENTLY`), which change rows without a write to
-  note. `CLUSTER` and `VACUUM FULL` change none: entries name rows by
-  key or image, so they still hold (#485).
+  image). So is a rewrite that may change rows (`ALTER TABLE`'s heap
+  swap, a materialized view's refresh, `REPACK CONCURRENTLY`), which
+  changes rows without a write to note. `CLUSTER` and `VACUUM FULL`
+  change none: entries name rows by key or image, so they still hold
+  (#485).
+- **A truncation** (made anew or in place) is noted as "emptied", an
+  entry of no row in its (sub)transaction's buffer, written first in its
+  row; the transaction's other entries stay, of before and after (#507).
+  A fold of a keyed table that reads it starts from the empty tree, not
+  the baseline: each key the entries since the position name, before the
+  truncation or after, is a candidate looked up in the heap, finding
+  what came after or nothing; no ordering among the transaction's
+  entries is needed. A keyless table's counts can't be told apart so,
+  and it is read in full (as many rows as were written since). A
+  subtransaction rolled back drops it with its buffer; one released
+  hands it to its parent. A snapshot that doesn't see the truncation
+  (`read_unseen` meets it) reads the table in full, and a transaction's
+  commit doesn't advance a baseline past one.
 - **Written unseen:** a branch's first use under repeatable read asks
-  each table's log whether a transaction its snapshot doesn't see wrote or
-  consumed an entry, every entry looked at whatever the snapshot sees of
-  it (neither is vacuumed while the snapshot is held); one did, and the
-  first use fails, to be retried (#567).
-- **Read:** the entries a snapshot sees. **Consume:** delete them. The
-  canonicalizer consumes a table's log once a fold that begins a new
-  baseline has read it, whichever finder folded: what that fold saw is
-  in the baseline, and what it didn't see (transactions it didn't see as
-  committed) stays for the next.
+  each table's log whether a transaction its snapshot doesn't see wrote
+  an entry: by the index, the rows of transactions from the snapshot's
+  xmin on (a row is kept while the snapshot is: trimming keeps what any
+  snapshot may need); one did, and the first use fails, to be retried
+  (#567).
+- **Read since a position:** the entries of the rows a fold's position
+  doesn't hold and its snapshot sees: by the index, those of
+  transactions from the position's xmax on, of each transaction it saw
+  running, and of its own transaction (which may have written more since
+  it folded). The position is the fold's (the finder's state): O(|running|
+  log n + the entries read), whatever the log holds besides. Each row is
+  told by what it was written as, not whether it was since deleted (the
+  index scan reads every version): the position holds the rows of the
+  transactions it saw finished, and of its own those its fold consumed
+  (deleted). So a baseline an older snapshot's fold began still finds the
+  rows a newer fold consumed (#505).
+- **Read unseen:** for a snapshot that doesn't see a position's fold, the
+  entries the position holds that the snapshot doesn't see, of
+  transactions committed: by the index, those from the snapshot's xmax
+  to the position's, of each transaction running for the snapshot, and of
+  the position's own (#505).
+- **Consume:** a fold that begins a new baseline deletes the rows of its
+  own transaction it read (by their TIDs: the next reads its transaction's
+  rows again, and a keyless row's would count twice); the others' it
+  read are behind the new position, so they are skipped from then on, not
+  deleted. **Trim:** rows behind the last baseline's position and of
+  transactions every snapshot sees as finished (below `OldestXmin`, #505)
+  are deleted as the next fold begins a baseline, the log given new
+  storage instead if that is all of them and its lock is free at once
+  (writers never wait for it).
 - **Identity:** the log relation's OID, so a baseline knows the log it
   was folded with. A branch's copy of the log keeps the OID, as it keeps
   the entries; a log made later (for a table that had none) doesn't.
@@ -98,20 +146,34 @@ Two interfaces, each selected by the table AM's profile
 ### 2.2 The change finder, `log`
 
 - **Its state** records the snapshot of its fold (xmax, running
-  transactions, its own transaction, as `pages` does), the log's identity
-  and flags, and is tagged so `pages` and `log` never read each other's.
+  transactions, its own transaction, as `pages` does, as
+  `FullTransactionId`s since #481: the log's position), the log's
+  identity and flags, and is tagged so `pages` and `log` never read each
+  other's (version 3; a state of an earlier version is no position, and
+  the table is folded in full once).
   Reclamation walks each state with every change finder (each passes over
   states it didn't write), not the one configured now. A branch's copy
   of a table has its source's baseline and a copy of its log, so it folds
   from them.
-- **A fold by an older snapshot.** Consuming entries means a fold's
-  snapshot must see its baseline's fold: a snapshot that doesn't (a
-  repeatable-read transaction's; under read committed, a commit or a
-  checkpoint behind another's fold takes a newer one, and a session
-  leaving the branch behind one takes no checkpoint, #566) may miss rows
-  committed meanwhile whose entries that fold consumed. Such a fold reads the table in full by its snapshot,
-  and its baseline is marked unsettled, so the next fold reads the table
-  in full again, by its own.
+- **A fold by an older snapshot** (a repeatable-read transaction's, its
+  snapshot not seeing the baseline's fold; under read committed, a
+  commit or a checkpoint behind another's fold takes a newer one, and a
+  session leaving the branch behind one takes no checkpoint, #566) folds
+  from the baseline too (#505): the entries read unseen are undone (with a
+  key, each key a candidate re-read by the snapshot, the version it sees
+  or none; without, each row's count taken back by its delta), and those
+  read since the position applied, as any fold's. O(the keys whose
+  visibility differs + the entries since). Its baseline, if it begins one,
+  is as any: the next fold reads from its position. But the rows the newer
+  fold consumed (its own transaction's, deleted) are kept only while some
+  snapshot may need them; once the old transaction ends VACUUM removes
+  them, and its position doesn't hold them. So if the undoing visited a
+  consumed row (or the fold read in full), the baseline is marked
+  unsettled: the next fold by a snapshot that sees more finished than the
+  position held reads in full; one that sees no more (the old
+  transaction's later statements) folds from it and keeps the mark
+  (review of #611). Earlier, such a fold always read the table in full and
+  marked its baseline unsettled.
 - **A fold from a baseline** of its own reads the log entries its
   snapshot sees:
   - with a primary key, each entry's key is a candidate, looked up in the
@@ -126,8 +188,6 @@ Two interfaces, each selected by the table AM's profile
 - **It folds in full** when:
   - there is no baseline of its own, or one folded with another log (or
     none: the table has no log);
-  - the snapshot doesn't see the baseline's fold as committed, or the
-    baseline is unsettled;
   - the table's catalog row was changed by a transaction the snapshot
     doesn't see (a truncation or rewrite whose entry the snapshot can't
     see, though it reads the new storage);
@@ -192,10 +252,10 @@ made passed in hand.
 - **Keyless rows with values out of line** other than by content (not a
   versioned table's) are entries to fold in full; `pages` reads values
   stored by content again.
-- **The log grows between baselines**, as the changed-page list did,
-  until the next commit, checkpoint or move; with
-  `dolt.transaction_commit`, each transaction's commit consumes its own
-  entries (spec 15), but a fold still walks every page of the log.
+- **The log keeps rows behind its baselines' positions** until every
+  snapshot sees their transactions finished (a held horizon keeps them
+  longer); a fold reads only the rows past its position, by the index, so
+  what it keeps costs space, not reads (#481).
 - **Tables `pages` folded before** keep their fold epoch: each page born
   before it is copied and listed once more, and the list isn't pruned.
 - **Tables made before this stack have no log** until an `ALTER TABLE`
@@ -204,13 +264,11 @@ made passed in hand.
   performance cliff after an upgrade. `prolly_make_change_logs()` makes
   the logs a branch's tables lack, each under `ShareLock` as such an
   `ALTER` takes: an upgrade step, run on each branch (#425).
-- **Consumed entries are freed only by vacuuming the log**, which sets
-  no options of its own: autovacuum gives it its table's, and where the
-  table leaves them unset, a vacuum threshold of 1000 dead entries and no
-  scale factor, so it's vacuumed soon after a fold consumes a load's
-  entries; `VACUUM` of the table
-  vacuums its log too, as its TOAST table (#480). Until then each fold
-  walks the dead entries (`pg_stat_prolly`'s `log_pages_read`), and a
-  long-running transaction holding back the horizon keeps them.
-- **An update's or delete's old version** is read again by its TID to
-  make its entry (heap has let go of its page by then).
+- **Consumed and trimmed rows are freed only by vacuuming the log**,
+  which sets no options of its own: autovacuum gives it its table's, and
+  where the table leaves them unset, a vacuum threshold of 1000 dead rows
+  and no scale factor; `VACUUM` of the table vacuums its log too, as its
+  TOAST table (#480). Dead rows cost no fold reads (#481): a fold reads by
+  the index from its position.
+- **An update's or delete's old version** was read again by its TID to
+  make its entry; since #424 heap passes it in hand.

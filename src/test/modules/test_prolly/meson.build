@@ -122,6 +122,7 @@ tests += {
       'get_many',
       'put_batches',
       'full_folds',
+      'truncate_folds',
       'fold_verify',
       'keyless_toast_folds',
       'vacuum_shared',
