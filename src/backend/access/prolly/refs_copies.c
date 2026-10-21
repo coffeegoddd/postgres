@@ -911,6 +911,35 @@ static bool share_clean_tables(const ProllyNodeRef *target,
 							   ProllyNodeRef *working);
 
 /*
+ * A first use's source whose working set was known to be the root its
+ * copies were made at (name, the root, and what it was known at), taken
+ * before the copies were made: their catalog rows keep anything from
+ * being known after.
+ */
+typedef struct KnownSource
+{
+	const char *name;
+	ProllyHash	root;
+	BranchFoldStamp at;
+} KnownSource;
+
+/*
+ * The working set of copies made from ks's branch, as it still is (#482):
+ * false if it may have changed since it was known.
+ */
+static bool
+copied_working_set(const KnownSource *ks, ProllyNodeRef *working)
+{
+	if (ks == NULL || !fold_caches_usable() || !branch_fold_unchanged(&ks->at))
+		return false;
+	ref_of(&ks->root, working);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLDS_REUSED, 1);
+	if (debug_prolly_verify_fold_caches)
+		verify_known(ks->name, false, working);
+	return true;
+}
+
+/*
  * Move the session's branch to a commit's root, every move (a reset, a
  * fast-forward, a branch's first use): its rows written, unless its
  * working set is the root already; then folded from there, so no fold
@@ -922,18 +951,14 @@ static bool share_clean_tables(const ProllyNodeRef *target,
  * copies were made from, as they are still (#491).
  */
 static void
-settle(const ProllyNodeRef *target, const char *source, Oid source_branch)
+settle(const ProllyNodeRef *target, const KnownSource *source)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef working;
-	ProllyNodeRef baseline;
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
-	if (source == NULL ||
-		!known_working_set(source, source_branch,
-						   branch_baseline(branch_ops()->current(), &baseline) ?
-						   &baseline : NULL, false, &working))
+	if (!copied_working_set(source, &working))
 		working_fold(&working);
 	if (same_hash(&working.hash, &target->hash))
 		return;
@@ -959,8 +984,12 @@ settle(const ProllyNodeRef *target, const char *source, Oid source_branch)
  * branch's too (made from the same, so the same ids), and only where the
  * locks are free now (share()'s: this branch's copies as TRUNCATE locks
  * them, that branch's against its writers), that branch still known at
- * the root once they are held.  As TRUNCATE, it isn't MVCC-safe: a
- * snapshot taken before the move commits reads the shared storage after.
+ * the root as it was known once they are held (the first table shared
+ * changes pg_class, after which nothing new is known in the transaction).
+ * Not at a first use: the copies' catalog rows, made in the transaction,
+ * keep anything from being known after them, and a branch known at the
+ * root was copied already.  As TRUNCATE, it isn't MVCC-safe: a snapshot
+ * taken before the move commits reads the shared storage after.
  */
 #define MOVE_ROW_USEC		11
 #define SHARE_BLOCK_USEC	10
@@ -973,6 +1002,7 @@ typedef struct CleanAt
 	char	   *name;
 	Oid			branch;
 	ProllyNodeRef baseline;
+	BranchFoldStamp at;			/* what it was known at */
 } CleanAt;
 
 static void
@@ -985,7 +1015,8 @@ find_clean_at(const char *name, Oid branch, void *arg)
 	if (ca->name != NULL || branch == MyBranch ||
 		!branch_baseline(name, &baseline))
 		return;
-	if (branch_fold_known(branch, ca->snap, &baseline.hash, false, &h) &&
+	if (branch_fold_known_at(branch, ca->snap, &baseline.hash, false, &h,
+							 &ca->at) &&
 		same_hash(&h, ca->root))
 	{
 		ca->name = pstrdup(name);
@@ -994,16 +1025,18 @@ find_clean_at(const char *name, Oid branch, void *arg)
 	}
 }
 
-/* Is ca's branch still known to be at its root? */
+/*
+ * Is ca's branch still at its root, as it was known to be?  Asked of what
+ * was known then: the first table shared changes pg_class, after which
+ * nothing new is known in the transaction, though nothing about the other
+ * branch changed.
+ */
 static bool
 still_clean(void *arg)
 {
 	CleanAt    *ca = arg;
-	ProllyHash	h;
 
-	return branch_fold_known(ca->branch, fold_snapshot(), &ca->baseline.hash,
-							 false, &h) &&
-		same_hash(&h, ca->root);
+	return branch_fold_unchanged(&ca->at);
 }
 
 /* A root's table, as tables() visits it. */
@@ -1159,7 +1192,7 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 static void
 move_settled(void *arg)
 {
-	settle(arg, NULL, InvalidOid);
+	settle(arg, NULL);
 }
 
 static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
@@ -1322,8 +1355,7 @@ copies_hold_unseen(void)
 typedef struct MoveCopies
 {
 	const ProllyNodeRef *target;
-	const char *source;
-	Oid			source_branch;
+	const KnownSource *source;
 } MoveCopies;
 
 /*
@@ -1362,20 +1394,21 @@ move_copies(void *arg)
 						 errmsg("could not serialize access: the branch's first use copies rows committed after this transaction's snapshot"),
 						 errhint("The transaction might succeed if retried.")));
 			}
-			settle(mc->target, NULL, InvalidOid);
+			settle(mc->target, NULL);
 		}
 		else
-			settle(mc->target, mc->source, mc->source_branch);
+			settle(mc->target, mc->source);
 		return;
 	}
 	PushActiveSnapshot(GetLatestSnapshot());
-	settle(mc->target, mc->source, mc->source_branch);
+	settle(mc->target, mc->source);
 	PopActiveSnapshot();
 }
 
 /*
  * The branch with copies nearest a root (#491), ranked: its working set
- * known to be the root (3: copied, nothing is written or folded), its
+ * known to be the root (3: copied, nothing is written or folded, if it
+ * is still known once copied: known, what it was known at), its
  * baseline's fold or its head made the root (2, 1: only what it changed
  * since is).  The session's branch on a tie; none (rank 0) if no branch
  * is at the root.
@@ -1387,6 +1420,7 @@ typedef struct NearestSource
 	char	   *name;
 	Oid			branch;
 	int			rank;
+	KnownSource known;
 } NearestSource;
 
 static void
@@ -1397,14 +1431,15 @@ rank_source(const char *name, Oid branch, void *arg)
 	ProllyNodeRef ref;
 	ProllyHash	h;
 	ProllyCommitInfo info;
+	BranchFoldStamp at;
 	int			rank = 0;
 
 	if (ns->rank == 3 && ns->branch == MyBranch)
 		return;
 	if (fold_caches_usable() &&
-		branch_fold_known(branch, ns->snap,
-						  branch_baseline(name, &baseline) ? &baseline.hash : NULL,
-						  false, &h) &&
+		branch_fold_known_at(branch, ns->snap,
+							 branch_baseline(name, &baseline) ? &baseline.hash : NULL,
+							 false, &h, &at) &&
 		same_hash(&h, ns->root))
 		rank = 3;
 	else if (branch_baseline_root(name, &ref) && same_hash(&ref.hash, ns->root))
@@ -1417,6 +1452,12 @@ rank_source(const char *name, Oid branch, void *arg)
 		ns->rank = rank;
 		ns->name = pstrdup(name);
 		ns->branch = branch;
+		if (rank == 3)
+		{
+			ns->known.name = ns->name;
+			ns->known.root = h;
+			ns->known.at = at;
+		}
 	}
 }
 
@@ -1491,8 +1532,7 @@ materialize(const char *name)
 		 * a branch whose working set is, if it still is)
 		 */
 		mc.target = &info.root;
-		mc.source = ns.rank == 3 ? source : NULL;
-		mc.source_branch = ns.branch;
+		mc.source = ns.rank == 3 ? &ns.known : NULL;
 		branch_ops()->run_on(name, move_copies, &mc);
 done:
 		;

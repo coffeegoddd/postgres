@@ -575,6 +575,13 @@ bool
 branch_fold_known(Oid branch, Snapshot snap, const ProllyHash *baseline,
 				  bool complete, ProllyHash *root)
 {
+	return branch_fold_known_at(branch, snap, baseline, complete, root, NULL);
+}
+
+bool
+branch_fold_known_at(Oid branch, Snapshot snap, const ProllyHash *baseline,
+					 bool complete, ProllyHash *root, BranchFoldStamp *at)
+{
 	BranchGenerations *g = shared();
 	BranchGeneration *e;
 	ProllyHash	none = {0};
@@ -592,8 +599,43 @@ branch_fold_known(Oid branch, Snapshot snap, const ProllyHash *baseline,
 		sees_writers(g, e, snap))
 	{
 		*root = e->root;
+		if (at != NULL)
+		{
+			at->branch = branch;
+			at->generation = e->generation;
+			at->overflow = g->overflow;
+			at->epoch = e->epoch;
+		}
 		found = true;
 	}
 	LWLockRelease(&g->lock);
 	return found;
+}
+
+/*
+ * Is what was known as at still the branch's working set: nothing ended
+ * and nobody writes it since, the epoch stayed?  Its snapshot saw every
+ * writer that had ended then, and none has since.  Asked without
+ * knowable(): the transaction's own catalog changes since (they are sent
+ * only as it commits) leave it as true as it was, and a write of the
+ * branch by the transaction is a writer of it.
+ */
+bool
+branch_fold_unchanged(const BranchFoldStamp *at)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	bool		unchanged;
+
+	if (g == NULL || RecoveryInProgress())
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, at->branch);
+	unchanged = e != NULL && e->known && e->generation == at->generation &&
+		e->writers == 0 && g->overflow == at->overflow &&
+		g->overflow_writers == 0 && e->overflow == g->overflow &&
+		e->epoch == at->epoch &&
+		pg_atomic_read_u64(&g->epoch) == at->epoch;
+	LWLockRelease(&g->lock);
+	return unchanged;
 }

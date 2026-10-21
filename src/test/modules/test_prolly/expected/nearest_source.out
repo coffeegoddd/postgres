@@ -7,7 +7,9 @@
 -- TOAST table's, change log's and maps with them), where sharing its
 -- blocks costs less than writing the rows; the rest are written.
 -- written(): the rows the transaction wrote in ns, by table (the session's
--- counts flushed before it began: :flush, a statement of its own).
+-- counts flushed before it began: :flush, a statement of its own);
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked (flushed first too).
 CREATE DATABASE regress_nearest_source;
 \c regress_nearest_source
 SET client_min_messages = warning;
@@ -21,6 +23,12 @@ CREATE FUNCTION pg_temp.written() RETURNS TABLE (relname name, n int8)
 	SELECT relname, n_tup_ins + n_tup_upd + n_tup_del FROM pg_stat_xact_user_tables
 	WHERE schemaname = 'ns' ORDER BY relname
   $$;
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
 CREATE SCHEMA ns VERSIONED;
 CREATE TABLE ns.t (id int PRIMARY KEY, v text);
 CREATE TABLE ns.u (id int PRIMARY KEY, w text);
@@ -149,7 +157,8 @@ SELECT dolt_checkout('main');
 (1 row)
 
 -- A first use of a branch at feat's head, from main, feat clean again:
--- feat's copies, nothing written.
+-- feat's copies, nothing written, and their working set feat's, known
+-- (taken, not folded).
 SELECT dolt_branch('at_feat2', 'feat');
  dolt_branch 
 -------------
@@ -160,6 +169,12 @@ SELECT dolt_branch('at_feat2', 'feat');
  pg_stat_force_next_flush 
 --------------------------
  
+(1 row)
+
+SELECT pg_temp.since('folds_reused') >= 0 AS counting;
+ counting 
+----------
+ t
 (1 row)
 
 BEGIN;
@@ -177,6 +192,18 @@ SELECT * FROM pg_temp.written();
 (2 rows)
 
 COMMIT;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS reused;
+ reused 
+--------
+      1
+(1 row)
+
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
  at_head 
 ---------
@@ -397,6 +424,107 @@ SELECT test_fold_root() = prolly_root_hash('feat') AS at_target;
  at_target 
 -----------
  t
+(1 row)
+
+-- Two tables whose rows differ from a clean branch's, a hard reset to it:
+-- each is given that branch's pages, not only the first (whose catalog
+-- change keeps anything new from being known in the transaction).
+CREATE TABLE ns.x (id int PRIMARY KEY, y text);
+INSERT INTO ns.x SELECT g, 'y' || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'two')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('two');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('two');
+         dolt_checkout          
+--------------------------------
+ {0,"Switched to branch 'two'"}
+(1 row)
+
+UPDATE ns.t SET v = 'two' WHERE id <= 5000;
+UPDATE ns.x SET y = 'two' WHERE id <= 5000;
+SELECT length(dolt_commit('-am', 'two')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT name, dirty FROM dolt_branches WHERE name = 'two';
+ name | dirty 
+------+-------
+ two  | f
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+BEGIN;
+SELECT dolt_reset('--hard', 'two');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM pg_temp.written();
+ relname | n 
+---------+---
+ t       | 0
+ u       | 0
+ x       | 0
+(3 rows)
+
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('two') AS at_target;
+ at_target 
+-----------
+ t
+(1 row)
+
+SELECT bt_index_check('ns.t_pkey', true);
+ bt_index_check 
+----------------
+ 
+(1 row)
+
+SELECT bt_index_check('ns.x_pkey', true);
+ bt_index_check 
+----------------
+ 
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 'two') AS t_rows FROM ns.t;
+ t_rows 
+--------
+   5000
+(1 row)
+
+SELECT count(*) FILTER (WHERE y = 'two') AS x_rows FROM ns.x;
+ x_rows 
+--------
+   5000
 (1 row)
 
 \c contrib_regression

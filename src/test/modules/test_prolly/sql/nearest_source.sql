@@ -7,7 +7,9 @@
 -- TOAST table's, change log's and maps with them), where sharing its
 -- blocks costs less than writing the rows; the rest are written.
 -- written(): the rows the transaction wrote in ns, by table (the session's
--- counts flushed before it began: :flush, a statement of its own).
+-- counts flushed before it began: :flush, a statement of its own);
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked (flushed first too).
 CREATE DATABASE regress_nearest_source;
 \c regress_nearest_source
 SET client_min_messages = warning;
@@ -21,6 +23,12 @@ CREATE FUNCTION pg_temp.written() RETURNS TABLE (relname name, n int8)
 	SELECT relname, n_tup_ins + n_tup_upd + n_tup_del FROM pg_stat_xact_user_tables
 	WHERE schemaname = 'ns' ORDER BY relname
   $$;
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
 CREATE SCHEMA ns VERSIONED;
 CREATE TABLE ns.t (id int PRIMARY KEY, v text);
 CREATE TABLE ns.u (id int PRIMARY KEY, w text);
@@ -56,13 +64,17 @@ SELECT count(*) AS changes FROM dolt_status;
 SELECT dolt_checkout('main');
 
 -- A first use of a branch at feat's head, from main, feat clean again:
--- feat's copies, nothing written.
+-- feat's copies, nothing written, and their working set feat's, known
+-- (taken, not folded).
 SELECT dolt_branch('at_feat2', 'feat');
 :flush
+SELECT pg_temp.since('folds_reused') >= 0 AS counting;
 BEGIN;
 SELECT dolt_checkout('at_feat2');
 SELECT * FROM pg_temp.written();
 COMMIT;
+:flush
+SELECT pg_temp.since('folds_reused') AS reused;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
 SELECT count(*) FILTER (WHERE v = 'feat') AS feat_rows, count(*) FROM ns.t;
 SELECT count(*) AS changes FROM dolt_status;
@@ -125,6 +137,31 @@ SELECT dolt_reset('--hard');
 SELECT * FROM pg_temp.written();
 COMMIT;
 SELECT test_fold_root() = prolly_root_hash('feat') AS at_target;
+
+-- Two tables whose rows differ from a clean branch's, a hard reset to it:
+-- each is given that branch's pages, not only the first (whose catalog
+-- change keeps anything new from being known in the transaction).
+CREATE TABLE ns.x (id int PRIMARY KEY, y text);
+INSERT INTO ns.x SELECT g, 'y' || g FROM generate_series(1, 20000) g;
+SELECT length(dolt_commit('-Am', 'two')::text) > 0 AS committed;
+SELECT dolt_branch('two');
+SELECT dolt_checkout('two');
+UPDATE ns.t SET v = 'two' WHERE id <= 5000;
+UPDATE ns.x SET y = 'two' WHERE id <= 5000;
+SELECT length(dolt_commit('-am', 'two')::text) > 0 AS committed;
+SELECT count(*) AS changes FROM dolt_status;
+SELECT dolt_checkout('main');
+SELECT name, dirty FROM dolt_branches WHERE name = 'two';
+:flush
+BEGIN;
+SELECT dolt_reset('--hard', 'two');
+SELECT * FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('two') AS at_target;
+SELECT bt_index_check('ns.t_pkey', true);
+SELECT bt_index_check('ns.x_pkey', true);
+SELECT count(*) FILTER (WHERE v = 'two') AS t_rows FROM ns.t;
+SELECT count(*) FILTER (WHERE y = 'two') AS x_rows FROM ns.x;
 
 \c contrib_regression
 DROP DATABASE regress_nearest_source;
