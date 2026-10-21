@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC7
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC8
 
 typedef struct PgStat_ArchiverStats
 {
@@ -632,6 +632,10 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_VERIFY_MISMATCHES,	/* and those whose folds differed */
 	PGSTAT_PROLLY_COMMITS,		/* commits written */
 	PGSTAT_PROLLY_HEAD_MOVES,	/* branch heads set (to the same commit too) */
+	PGSTAT_PROLLY_FIRST_USE_REFUSALS,	/* branch first uses refused: copies
+										 * hold rows the snapshot can't see */
+	PGSTAT_PROLLY_FIRST_USE_TABLES_SCANNED, /* tables a first use read every
+											 * page of, to tell */
 	PGSTAT_PROLLY_MEMO_HITS,	/* value memo lookups that found one */
 	PGSTAT_PROLLY_MEMO_MISSES,	/* and those that didn't */
 	PGSTAT_PROLLY_PAGE_COPIES_FOLD, /* pages copied only to keep a fold's */

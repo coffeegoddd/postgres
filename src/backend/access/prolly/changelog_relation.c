@@ -801,6 +801,67 @@ relation_consume(Relation rel, Snapshot snapshot)
 		(void) hash_search(own_logs, &logid, HASH_REMOVE, NULL);
 }
 
+/* Did a transaction the snapshot doesn't see, committed, write xid's part? */
+static bool
+xid_unseen(TransactionId xid, Snapshot snap)
+{
+	return TransactionIdIsNormal(xid) &&
+		!TransactionIdIsCurrentTransactionId(xid) &&
+		XidInMVCCSnapshot(xid, snap) && TransactionIdDidCommit(xid);
+}
+
+/*
+ * Did a transaction the snapshot doesn't see write or consume an entry of
+ * rel's log?  Every entry is looked at, whatever the snapshot sees of it:
+ * an entry such a transaction wrote is dead to no one, and one it consumed
+ * dead only to it, so neither is vacuumed away while the snapshot is held.
+ */
+static bool
+relation_written_unseen(Relation rel, Snapshot snapshot)
+{
+	Oid			logid = log_relid(rel);
+	Relation	log;
+	BlockNumber nblocks;
+	bool		found = false;
+
+	if (!OidIsValid(logid))
+		return true;			/* (no log to tell: as if it did) */
+	log = table_open(logid, AccessShareLock);
+	nblocks = RelationGetNumberOfBlocks(log);
+	pgstat_count_prolly(PGSTAT_PROLLY_LOG_PAGES_READ, nblocks);
+	for (BlockNumber blk = 0; blk < nblocks && !found; blk++)
+	{
+		Buffer		buf = ReadBuffer(log, blk);
+		Page		page;
+		OffsetNumber maxoff;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		maxoff = PageIsNew(page) ? InvalidOffsetNumber : PageGetMaxOffsetNumber(page);
+		for (OffsetNumber off = FirstOffsetNumber; off <= maxoff && !found; off++)
+		{
+			ItemId		lp = PageGetItemId(page, off);
+			HeapTupleHeader t;
+			uint16		mask;
+
+			if (!ItemIdIsNormal(lp))
+				continue;
+			t = (HeapTupleHeader) PageGetItem(page, lp);
+			mask = t->t_infomask;
+			if (!HeapTupleHeaderXminFrozen(t) && !(mask & HEAP_XMIN_INVALID) &&
+				xid_unseen(HeapTupleHeaderGetRawXmin(t), snapshot))
+				found = true;
+			else if (!(mask & HEAP_XMAX_INVALID) && !HEAP_XMAX_IS_LOCKED_ONLY(mask) &&
+					 xid_unseen(HeapTupleHeaderGetUpdateXid(t), snapshot))
+				found = true;
+		}
+		UnlockReleaseBuffer(buf);
+		CHECK_FOR_INTERRUPTS();
+	}
+	table_close(log, AccessShareLock);
+	return found;
+}
+
 /*
  * Delete the entries of rel's log the current transaction wrote (and
  * hasn't aborted): those of its own changes, once a baseline holding them
@@ -845,32 +906,6 @@ relation_consume_own(Relation rel)
 	return true;
 }
 
-/*
- * New storage for the log, as TRUNCATE gives it (its entries are of rows
- * the table no longer has: no other transaction sees its branch), and an
- * entry to read the table in full.
- */
-static void
-relation_reset(Relation rel)
-{
-	Oid			logid = log_relid(rel);
-	Entries		e = {0};
-
-	if (!OidIsValid(logid))
-		return;
-	/*
-	 * (a writer's lock, as the table's copy is given new storage under: the
-	 * log's OID is every branch's, and only the branch being made, which no
-	 * other transaction sees, sees this storage)
-	 */
-	e.log = table_open(logid, RowExclusiveLock);
-	RelationSetNewRelfilenumber(e.log, e.log->rd_rel->relpersistence);
-	CommandCounterIncrement();
-	insert_entry(&e, NULL, 0);
-	write_entries(&e);
-	table_close(e.log, NoLock);
-}
-
 static Oid
 relation_relid(Oid relid)
 {
@@ -904,8 +939,8 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.read = relation_read,
 	.consume = relation_consume,
 	.is_log = relation_is_log,
-	.reset = relation_reset,
 	.relid = relation_relid,
 	.note_made = relation_note_made,
 	.consume_own = relation_consume_own,
+	.written_unseen = relation_written_unseen,
 };

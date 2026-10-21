@@ -6,8 +6,11 @@
 # to the branch's head must leave the branch as its head has it, both as
 # the session sees it and as everyone sees it once the session commits:
 # read committed, by a snapshot that sees the copies; repeatable read and
-# serializable, by emptying the copies that hold what the snapshot doesn't
-# see, for the move to write their rows.
+# serializable, whose snapshot can't move, fail with a serialization
+# failure when the copies hold what the snapshot doesn't see, and the
+# retry, by a new snapshot, checks the branch out as its head.  Commits
+# the copies don't hold (to a table outside the versioned schemas) don't
+# stop it.
 
 use strict;
 use warnings FATAL => 'all';
@@ -59,6 +62,28 @@ sub rows_of
 	  $s->query_safe(q{SELECT count(*) FROM dolt_status});
 }
 
+# A repeatable read (or serializable) first use, after the writer's
+# change: refused, then retried.
+sub refused_then_retried
+{
+	my ($iso, $checkout, $change, $expected, $what) = @_;
+
+	$user->query_safe("BEGIN ISOLATION LEVEL $iso; SELECT 1");
+	$writer->query_safe($change);
+	my $ret = $user->query("SELECT $checkout");
+	like($user->{stderr}, qr/could not serialize access: the branch's first use/,
+		"$what: refused");
+	$user->{stderr} = '';	# (query() keeps it till cleared)
+	$user->query_safe('ROLLBACK');
+	$user->query_safe("BEGIN ISOLATION LEVEL $iso; SELECT 1");
+	$user->query_safe("SELECT $checkout");
+	is(rows_of($user), $expected, "$what: retried, the branch as its head has it");
+	$user->query_safe('COMMIT');
+	is(rows_of($user), $expected, "$what: and after the commit");
+	$user->query_safe(q{SELECT dolt_checkout('main')});
+	return;
+}
+
 sub wait_for_lock
 {
 	my ($query) = @_;
@@ -68,48 +93,55 @@ sub wait_for_lock
 }
 
 # Repeatable read: another session commits after the snapshot.  The
-# first use succeeds, and the branch is its head, clean, in the
+# first use is refused; retried, the branch is its head, clean, in the
 # transaction and after it.
-$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
-$writer->query_safe(
-	q{INSERT INTO app.t VALUES (4, 4); DELETE FROM app.t WHERE id = 2});
+refused_then_retried('REPEATABLE READ', q{dolt_checkout('rr')},
+	q{INSERT INTO app.t VALUES (4, 4); DELETE FROM app.t WHERE id = 2},
+	'1:1,2:2 0', 'a repeatable read first use whose copy holds rows its snapshot lacks');
+is(sql(q{SELECT length(pad) FROM app.t WHERE id = 1 AND current_setting('search_path') IS NOT NULL}),
+	'5000', 'main\'s values out of line');
 $user->query_safe(q{SELECT dolt_checkout('rr')});
-is(rows_of($user), '1:1,2:2 0',
-	'a repeatable read first use whose copy holds rows its snapshot lacks');
 is($user->query_safe(q{SELECT length(pad) FROM app.t WHERE id = 1}),
-	'5000', 'with its values out of line');
-$user->query_safe('COMMIT');
-is(rows_of($user), '1:1,2:2 0', 'and after the commit');
+	'5000', 'the branch\'s values out of line');
 $user->query_safe(q{SELECT dolt_checkout('main')});
 is(sql($rows), '1:5,3:3,4:4', 'main keeps the other session\'s changes');
 
 # The same with -b, a branch made in the transaction, at main's head.
-$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
-$writer->query_safe(
-	q{INSERT INTO app.t VALUES (2, 2); DELETE FROM app.t WHERE id = 4});
-$user->query_safe(q{SELECT dolt_checkout('-b', 'rrb')});
-is(rows_of($user), '1:5,2:2,3:3 0', 'checkout -b');
-$user->query_safe('COMMIT');
-is(rows_of($user), '1:5,2:2,3:3 0', 'and after the commit');
-$user->query_safe(q{SELECT dolt_checkout('main')});
+refused_then_retried('REPEATABLE READ', q{dolt_checkout('-b', 'rrb')},
+	q{INSERT INTO app.t VALUES (2, 2); DELETE FROM app.t WHERE id = 4},
+	'1:5,2:2,3:3 0', 'checkout -b');
 
 # Serializable too.
-$user->query_safe('BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1');
-$writer->query_safe(q{UPDATE app.t SET v = 6 WHERE id = 1});
-$user->query_safe(q{SELECT dolt_checkout('rrs')});
-is(rows_of($user), '1:1,2:2 0', 'serializable');
-$user->query_safe('COMMIT');
-is(rows_of($user), '1:1,2:2 0', 'and after the commit');
-$user->query_safe(q{SELECT dolt_checkout('main')});
+refused_then_retried('SERIALIZABLE', q{dolt_checkout('rrs')},
+	q{UPDATE app.t SET v = 6 WHERE id = 1}, '1:1,2:2 0', 'serializable');
 sql(q{UPDATE app.t SET v = 5 WHERE id = 1});
+
+# A commit after the snapshot the copies don't hold (a table outside the
+# versioned schemas): no refusal, and no table read in full to tell.
+sql(q{CREATE TABLE plain (id int) USING heap; SELECT pg_stat_reset_shared('prolly')});
+$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$writer->query_safe(q{INSERT INTO plain VALUES (1)});
+$user->query_safe(q{SELECT dolt_checkout('-b', 'rrp')});
+is(rows_of($user), '1:5,2:2,3:3 0', 'a commit elsewhere doesn\'t refuse the first use');
+$user->query_safe('COMMIT');
+$user->query_safe(q{SELECT dolt_checkout('main')});
+sql(q{SELECT pg_stat_force_next_flush()});
+is(sql(q{SELECT value FROM pg_stat_prolly WHERE name = 'first_use_tables_scanned'}),
+	'0', 'the change logs told, no table read in full');
 
 # Changes after the snapshot that leave the rows as they were: the old
 # versions, which the snapshot sees, are gone for everyone else.  The
 # branch, committed to, gets its own rows, not main's.
 $user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $writer->query_safe(q{UPDATE app.t SET v = v WHERE id = 1});
+$user->query(q{SELECT dolt_checkout('rrn')});
+like($user->{stderr}, qr/could not serialize access/,
+	'a no-op update after the snapshot: refused');
+$user->{stderr} = '';	# (query() keeps it till cleared)
+$user->query_safe('ROLLBACK');
+$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $user->query_safe(q{SELECT dolt_checkout('rrn')});
-is(rows_of($user), '1:1,2:2 0', 'a no-op update after the snapshot');
+is(rows_of($user), '1:1,2:2 0', 'and retried');
 $user->query_safe(q{INSERT INTO app.t VALUES (77, 77);
 	SELECT dolt_commit('-am', 'on rrn')});
 is(rows_of($user), '1:1,2:2,77:77 0', 'committed to, clean');
@@ -119,14 +151,9 @@ $user->query_safe(q{SELECT dolt_reset('--hard')});
 is(rows_of($user), '1:1,2:2,77:77 0', 'its commit has the branch\'s rows');
 $user->query_safe(q{SELECT dolt_checkout('main')});
 
-$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
-$writer->query_safe(
-	q{DELETE FROM app.t WHERE id = 3; INSERT INTO app.t VALUES (3, 3)});
-$user->query_safe(q{SELECT dolt_checkout('rrd')});
-is(rows_of($user), '1:1,2:2 0', 'a delete and re-insert after the snapshot');
-$user->query_safe('COMMIT');
-is(rows_of($user), '1:1,2:2 0', 'and after the commit');
-$user->query_safe(q{SELECT dolt_checkout('main')});
+refused_then_retried('REPEATABLE READ', q{dolt_checkout('rrd')},
+	q{DELETE FROM app.t WHERE id = 3; INSERT INTO app.t VALUES (3, 3)},
+	'1:1,2:2 0', 'a delete and re-insert after the snapshot');
 is(sql($rows), '1:5,2:2,3:3', 'main as it was');
 
 # Repeatable read, a writer in flight when the snapshot is taken, which
@@ -142,8 +169,13 @@ ok(wait_for_lock(q{dolt_checkout(''rrw'')}),
 	'a repeatable read first use waits for the writer');
 $writer->query_safe('COMMIT');
 $user->query_until(qr/done/, '');
-is($user->{stderr}, '', 'and checks out');
-is(rows_of($user), '1:1,2:2 0', 'the branch as its head has it, clean');
+like($user->{stderr}, qr/could not serialize access/,
+	'and is refused: the writer committed after the snapshot');
+$user->{stderr} = '';	# (query() keeps it till cleared)
+$user->query_safe('ROLLBACK');
+$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
+$user->query_safe(q{SELECT dolt_checkout('rrw')});
+is(rows_of($user), '1:1,2:2 0', 'retried, the branch as its head has it, clean');
 $user->query_safe('COMMIT');
 is(rows_of($user), '1:1,2:2 0', 'and after the commit');
 $user->query_safe(q{SELECT dolt_checkout('main')});
@@ -151,7 +183,7 @@ is(sql($rows), '1:5,2:7,3:3', 'main keeps the writer\'s change');
 sql(q{UPDATE app.t SET v = 2 WHERE id = 2});
 
 # Tables of many pages, with values out of line and a second index, that
-# commits after the snapshot changed: emptied, every row is written again.
+# commits after the snapshot changed: refused, and retried, every row.
 my $big = join(" || ' / ' || ", map { qq{(SELECT format('%s %s %s %s %s',
 	count(*), min(id), max(id), sum(v), sum(length(pad))) FROM app.$_)} } qw(b1 b20));
 $big = "SELECT $big";
@@ -164,6 +196,11 @@ my $by_index_head = sql($by_index);
 $user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $writer->query_safe(q{INSERT INTO app.b1 VALUES (-1, 3, 'x');
 	DELETE FROM app.b20 WHERE id = 500});
+$user->query(q{SELECT dolt_checkout('rrbig')});
+like($user->{stderr}, qr/could not serialize access/, 'tables of many pages: refused');
+$user->{stderr} = '';	# (query() keeps it till cleared)
+$user->query_safe('ROLLBACK');
+$user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $user->query_safe(q{SELECT dolt_checkout('rrbig')});
 is($user->query_safe($big), $big_head, 'tables of many pages, every row');
 is($user->query_safe($by_index), $by_index_head, 'and by their indexes');
@@ -239,8 +276,8 @@ is(sql($rows), '1:5,3:3,102:102,103:103', 'main keeps the writer\'s rows');
 $user->quit;
 $writer->quit;
 
-# The emptied copies, and the rows written into them again, as recovery
-# replays them: by a sequential scan and by the primary key.
+# The branches' copies as recovery replays them: by a sequential scan and
+# by the primary key.
 $node->stop('immediate');
 $node->start;
 my %after = (rr => '1:1,2:2', rrs => '1:1,2:2', rrn => '1:1,2:2,77:77',

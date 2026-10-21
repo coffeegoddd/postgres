@@ -45,7 +45,7 @@ sql(q{
 	SELECT dolt_commit('-Am', 'base');
 });
 
-my $a = $node->background_psql('postgres');
+my $a = $node->background_psql('postgres', on_error_stop => 0);
 my $c = $node->background_psql('postgres');
 
 # A snapshot older than the baseline's fold: another session's checkpoint
@@ -111,8 +111,14 @@ is(sql(q{SELECT count(*) FROM s.t WHERE id IN (3000, 3001)}), '2',
 # again.
 $a->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 sql(q{INSERT INTO s.t VALUES (4000, 'unseen')});
+$a->query(q{SELECT dolt_checkout('-b', 'lb')});
+like($a->{stderr}, qr/could not serialize access/,
+	'a first use whose copies hold rows the snapshot lacks is refused');
+$a->{stderr} = '';
+$a->query_safe('ROLLBACK');
+$a->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $a->query_safe(q{SELECT dolt_checkout('-b', 'lb')});
-is($a->query_safe($same), 't', 'a first use that empties its copies');
+is($a->query_safe($same), 't', 'retried, its fold is a full one\'s');
 is($a->query_safe(q{SELECT count(*) FROM dolt_status}), '0', 'clean');
 $a->query_safe('COMMIT');
 $a->query_safe(q{SELECT dolt_checkout('main')});
