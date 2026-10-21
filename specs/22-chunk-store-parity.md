@@ -410,6 +410,11 @@ remote are new to the store and stay logged as bytes.
    removal has both; the copy's file is unnamed there, and the next
    writer removes it.
 
+- **Conjoin** copies its files' chunks as stored too, each a table file
+  byte range (in hash order, so few run on), checked against its hash.
+  Measured (`144_conjoin_copies.pl`): 23,528 bytes of WAL for 3,937,304
+  copied (0.6%); bytes logged, 6,911,408 for 6,890,242. Its sources go
+  after its manifest, which follows its file's sync (invariant 2).
 - **Checksums.** The record's CRC covers the bytes the sources make; each
   table file chunk keeps its own CRC and each journal record its own,
   which redo checks when it frames one.

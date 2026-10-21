@@ -6289,6 +6289,9 @@ typedef struct ConjoinSource
 	int			i;				/* the next entry of cur's */
 	HTAB	   *seen;
 	const ProllyHashRoutine *hash;	/* each chunk checked by */
+	StringInfoData bytes;		/* the chunk given last, as its file has it */
+	StringInfoData chunk;		/* and decoded, to check it */
+	CopyFrom	from;			/* and where it is */
 } ConjoinSource;
 
 static bool
@@ -6314,14 +6317,23 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 			(void) hash_search(cs->seen, &key, HASH_ENTER, &found);
 			if (found)
 				continue;
-			bytes = palloc(len);
+			/* (as stored, logged as a copy; decoded only to check it) */
+			resetStringInfo(&cs->bytes);
+			enlargeStringInfo(&cs->bytes, len);
+			bytes = cs->bytes.data;
 			if (!table_file_read(t, offset, bytes, len))
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not read %u bytes at %llu in file \"%s\": %m",
 								len, (unsigned long long) offset, t->path)));
-			PROLLY_CALL(fmt, decode, t->tf, bytes, len, data);
-			pfree(bytes);
+			prolly_tablefile_read_stored(fmt, t->tf, bytes, len, data);
+			resetStringInfo(&cs->chunk);
+			PROLLY_CALL(fmt, decode, t->tf, bytes, len, &cs->chunk);
+			cs->from.src.kind = COPY_TABLE_BYTES;
+			cs->from.src.id = t->id;
+			cs->from.src.offset = offset;
+			cs->from.src.len = len;
+			cs->from.bytes = bytes;
 
 			/* (read and written: a page missed and one dirtied) */
 			if (VacuumCostActive)
@@ -6334,8 +6346,8 @@ conjoin_next(void *arg, ProllyHash *hash, StringInfo data)
 												 CurrentMemoryContext);
 				ProllyHash	got;
 
-				PROLLY_CALL(cs->hash, update, ctx, (const uint8 *) data->data,
-							data->len);
+				PROLLY_CALL(cs->hash, update, ctx, (const uint8 *) cs->chunk.data,
+							cs->chunk.len);
 				PROLLY_CALL(cs->hash, finish, ctx, &got);
 				if (got.len != hash->len ||
 					memcmp(got.bytes, hash->bytes, got.len) != 0)
@@ -6443,7 +6455,8 @@ choose_conjoinees(const Manifest *m, int max_files, bool *keep)
 /*
  * Rewrite table files as one, which the manifest names instead of them,
  * settled if they all were: all of them (max_files 0), or past max_files,
- * the smallest (choose_conjoinees()).
+ * the smallest (choose_conjoinees()).  Their chunks are copied as stored,
+ * WAL-logged as copies of their bytes (#564).
  */
 static void
 journal_conjoin(ProllyChunkStore *s, int max_files)
@@ -6481,6 +6494,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	ctl.hcxt = CurrentMemoryContext;
 	cs.seen = hash_create("prolly conjoin", 1024, &ctl,
 						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	initStringInfo(&cs.bytes);
+	initStringInfo(&cs.chunk);
 
 	/* (closed whatever happens: a file kept open is never given back) */
 	PG_TRY();
@@ -6500,7 +6515,7 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			cs.tables = lappend(cs.tables, t);
 		}
 		cs.cur = list_head(cs.tables);
-		write_table_file(s, &m, keep, flags, conjoin_next, &cs, false, NULL,
+		write_table_file(s, &m, keep, flags, conjoin_next, &cs, true, &cs.from,
 						 true, (uint64) prolly_gc_file_size * 1024);
 	}
 	PG_FINALLY();
@@ -6516,6 +6531,8 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 			(errmsg_internal("chunk store of database %u: %d of %d table files conjoined",
 							 s->dboid, list_length(cs.tables), m.nfiles)));
 	hash_destroy(cs.seen);
+	pfree(cs.bytes.data);
+	pfree(cs.chunk.data);
 	pfree(keep);
 	pfree(dir);
 }
