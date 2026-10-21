@@ -470,6 +470,15 @@ typedef struct RowDiff
 	ProllyKeying *k;
 	Oid			relid;
 	ProllyDiffSink *sink;
+
+	/*
+	 * (diff_rows()) each side's rows as shown, by the keys of those diffed,
+	 * or NULL: those diffed
+	 */
+	const ProllyTreeRoutine *tree;
+	const ProllyTreeEnv *env;
+	const ProllyNodeRef *from_shown;
+	const ProllyNodeRef *to_shown;
 } RowDiff;
 
 static int
@@ -485,8 +494,34 @@ row_change(ProllyDiffKind kind, const ProllyKey *key,
 		   const ProllyValue *before, const ProllyValue *after, void *arg)
 {
 	RowDiff    *rd = arg;
+	StringInfoData b;
+	StringInfoData a;
+	ProllyValue bv;
+	ProllyValue av;
 
+	if (before && rd->from_shown)
+	{
+		initStringInfo(&b);
+		if (!PROLLY_CALL(rd->tree, get, rd->env, rd->from_shown, key, &b))
+			elog(ERROR, "a row diffed is missing from the rows shown");
+		bv.data = (const uint8 *) b.data;
+		bv.len = b.len;
+		before = &bv;
+	}
+	if (after && rd->to_shown)
+	{
+		initStringInfo(&a);
+		if (!PROLLY_CALL(rd->tree, get, rd->env, rd->to_shown, key, &a))
+			elog(ERROR, "a row diffed is missing from the rows shown");
+		av.data = (const uint8 *) a.data;
+		av.len = a.len;
+		after = &av;
+	}
 	rd->sink->change(rd->sink, rd->relid, kind, key, before, after);
+	if (before && rd->from_shown)
+		pfree(b.data);
+	if (after && rd->to_shown)
+		pfree(a.data);
 }
 
 /* Refuse to read the rows of a version of a table that can't be read here. */
@@ -510,10 +545,14 @@ require_readable(const Table *t)
 
 /*
  * The rows of table relid that differ between two versions of it (NULL:
- * the version has no such table), in key order.
+ * the version has no such table), in key order.  from_shown and to_shown,
+ * if not NULL, are the trees whose values are shown for the rows that
+ * differ, by the same keys (as_defined_now()'s shown).
  */
 static void
-diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
+diff_rows(Oid relid, const Table *from, const Table *to,
+		  const ProllyNodeRef *from_shown, const ProllyNodeRef *to_shown,
+		  ProllyDiffSink *sink)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
@@ -532,6 +571,12 @@ diff_rows(Oid relid, const Table *from, const Table *to, ProllyDiffSink *sink)
 	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
 	rd.relid = relid;
 	rd.sink = sink;
+	rd.tree = tree;
+	rd.env = &env;
+	rd.from_shown = from && from_shown &&
+		!same_hash(&from_shown->hash, &from->data.hash) ? from_shown : NULL;
+	rd.to_shown = to && to_shown &&
+		!same_hash(&to_shown->hash, &to->data.hash) ? to_shown : NULL;
 	chunk_env(&env);
 	env.compare = keying_compare;
 	env.compare_arg = &rd;
@@ -4560,6 +4605,7 @@ typedef struct ConvRow
 {
 	ProllyKey	key;
 	ProllyValue row;
+	ProllyValue shown;			/* (fitting) the row shown */
 	uint64		count;
 } ConvRow;
 
@@ -4588,14 +4634,16 @@ dup_bytes(const char *data, int len)
  * (a merge's sides, whose rows become the table's), or compared only (a
  * merge's base: a side changed a row where its value isn't base's).
  *
- * Only a written value has to be one the column could hold now, and it's
+ * A written value has to be one the column could hold now, and it's
  * converted as ALTER TABLE ... TYPE without USING converted the side's
- * own rows.  Shown or compared values use domains' base types, with their
- * typmods: a historical value needn't meet a domain's constraints now.
- * A value shown or compared is made the column's only where
- * nothing is lost: it's cast, and the cast kept only if casting it back
- * gives the value again.  A lossy cast (rounding, cutting to fit) could
- * make two of base's keys one, or make a side's change look like none
+ * own rows.  A diff's shown one is too, or shown null where it can't
+ * be, as a row of the table as defined now (#590).  Other shown values
+ * (a merge's conflicts) and compared ones use domains' base types, with
+ * their typmods: a historical value needn't meet a domain's constraints
+ * now.  Such a value is made the column's only where nothing is lost:
+ * it's cast, and the cast kept only if casting it back gives the value
+ * again.  A lossy cast (rounding, cutting to fit) could make two of
+ * base's keys one, or make a side's change look like none
  * (cut to 'abc', base's 'abcdefghij' would equal a side's 'abc'); and a
  * column both sides retyped alike may have been converted with a USING
  * other than the cast ((n * 100)::int), which the cast only matches
@@ -4670,6 +4718,9 @@ typedef struct ColumnRead
 	Oid			in_param;
 	int32		in_typmod;		/* including a domain's base typmod */
 	CastLoss	loss;
+	ExprState  *fit;			/* (fit) the value as the column could hold
+								 * it, or NULL: none to fit */
+	bool		fit_guarded;	/* fit may fail on a value */
 } ColumnRead;
 
 /* Numeric typmod tm's precision and scale. */
@@ -4744,13 +4795,23 @@ is_bit_type(Oid type)
  * checked by casting it back unless the cast is a widening, or a relabel
  * of a type stored alike, which loses nothing.  For these reads, strip
  * domains from both ends of the cast (including the cast back): their
- * constraints don't apply to values only shown or compared.
+ * constraints don't apply to values only compared or listed.
+ *
+ * Where fit (shown by a diff, not of the key), the value is read twice.
+ * Compared, as one not fitted is shown (above): a lossy cast keeps the
+ * stored value, so two that differ as stored stay apart, and a row
+ * changed between them is modified.  Shown (cr->fit), it's made one the
+ * column could hold now, as an assignment would make it (#590): the
+ * explicit cast to the base type, then the typmod, failing rather than
+ * cutting to fit, and the domain's constraints.  One that fails any of
+ * them shows null, as one the cast fails on does.
  */
 static void
 column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
-			ReadFor read, bool key, bool keyless, bool both, EState *estate,
-			ColumnRead *cr)
+			ReadFor read, bool fit, bool key, bool keyless, bool both,
+			EState *estate, ColumnRead *cr)
 {
+	Form_pg_attribute now_att = att;
 	FormData_pg_attribute source = *TupleDescAttr(xd, j);
 	FormData_pg_attribute target = *att;
 	Form_pg_attribute xa = &source;
@@ -4782,6 +4843,47 @@ column_read(Relation rel, TupleDesc xd, int j, Form_pg_attribute att,
 
 	memset(cr, 0, sizeof(ColumnRead));
 	cr->in_typmod = att->atttypmod;
+	if (fit)
+	{
+		Oid			from_type = xa->atttypid;
+		Oid			to_type = att->atttypid;
+
+		if (can_coerce_type(1, &from_type, &to_type, COERCION_EXPLICIT))
+		{
+			e = coerce_type(NULL, copyObject(var), xa->atttypid, att->atttypid,
+							att->atttypmod, COERCION_EXPLICIT,
+							COERCE_EXPLICIT_CAST, -1);
+			e = coerce_to_target_type(NULL, e, att->atttypid,
+									  now_att->atttypid, now_att->atttypmod,
+									  COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST,
+									  -1);
+		}
+		if (e == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("rows of table \"%s\" can't be read across column \"%s\" changing type from %s to %s",
+							RelationGetRelationName(rel), NameStr(att->attname),
+							format_type_with_typemod(xa->atttypid, xa->atttypmod),
+							format_type_with_typemod(now_att->atttypid, now_att->atttypmod))));
+		assign_expr_collations(NULL, e);
+		cr->fit = ExecPrepareExpr((Expr *) e, estate);
+
+		/*
+		 * (none can fail: no domain, a typmod as wide or none, and a cast
+		 * that only relabels, or cuts, pads or trims strings or bit strings
+		 * to no typmod)
+		 */
+		cr->fit_guarded =
+			get_typtype(now_att->atttypid) == TYPTYPE_DOMAIN ||
+			!(att->atttypmod < 0 ||
+			  (same && typmod_widens(att->atttypid, xa->atttypmod,
+									 att->atttypmod))) ||
+			!(alike ||
+			  (is_string_type(xa->atttypid) && is_string_type(att->atttypid)) ||
+			  (is_bit_type(xa->atttypid) && is_bit_type(att->atttypid)));
+		/* (and read as compared, as one not fitted is shown, below) */
+		e = NULL;
+	}
 	if (read == READ_WRITTEN)
 		e = coerce_to_target_type(NULL, var, xa->atttypid,
 								  att->atttypid, att->atttypmod,
@@ -5117,6 +5219,41 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
 }
 
 /*
+ * A converted row (ms, from xs) as shown (into fs): each fitted column's
+ * value from xs made one the column could hold now, or null, counted in
+ * nulled.
+ */
+static void
+fit_row(const ColumnRead *reads, const int *from, TupleTableSlot *xs,
+		TupleTableSlot *ms, TupleTableSlot *fs, TupleDesc md, TupleDesc xd,
+		ExprContext *econtext, uint64 *nulled)
+{
+	ExecClearTuple(fs);
+	for (int a = 0; a < md->natts; a++)
+	{
+		ColumnRead	cr;
+		bool		unused;
+
+		fs->tts_values[a] = ms->tts_values[a];
+		fs->tts_isnull[a] = ms->tts_isnull[a];
+		if (reads[a].fit == NULL || xs->tts_isnull[from[a]])
+			continue;
+		memset(&cr, 0, sizeof(cr));
+		cr.conv = reads[a].fit;
+		cr.guarded = reads[a].fit_guarded;
+		if (!read_value(&cr, econtext, xs, from[a], TupleDescAttr(md, a),
+						TupleDescAttr(xd, from[a]), &fs->tts_values[a],
+						&fs->tts_isnull[a], &unused))
+		{
+			fs->tts_values[a] = (Datum) 0;
+			fs->tts_isnull[a] = true;
+			nulled[a]++;
+		}
+	}
+	ExecStoreVirtualTuple(fs);
+}
+
+/*
  * A version x of table rel's rows as rel defines them now (now: the
  * version that defines it so), into *out: each row decoded with x's
  * definition and made a row of rel's by column name, a column x hasn't
@@ -5135,6 +5272,15 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
  * second reading for ambiguous keys or keyless rows.  READ_ALTERNATIVE
  * uses that cast reading, leaving non-key columns' uncertainty unchanged.
  *
+ * Where shown isn't NULL (a diff's read), a value not of the key is made
+ * one its column could hold now, or null (column_read()), in the rows of
+ * *shown, by the keys of *out's: *out's keep each value as compared, so
+ * two that differ as stored aren't made one by fitting both (both null,
+ * cut alike), and a row changed between them still differs.  A merge's
+ * conflicts aren't fitted: listed as they were, so what resolving them
+ * would write is what's shown, and resolving refuses a value the column
+ * can't hold, as an INSERT does.
+ *
  * Where refuse (a merge), refused where rel's rows can't faithfully come
  * from x's: when x lacks a column whose values each row was given as it
  * was added (an identity, a default such as a serial's).  Otherwise
@@ -5145,9 +5291,13 @@ retyped_columns(const Table *base, const Table *ours, const Table *theirs,
  */
 static Table *
 as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
-			   List *retyped, List *both_retyped, bool refuse, Table *out,
-			   UnsureRows *unsure)
+			   ProllyNodeRef *shown, List *retyped, List *both_retyped,
+			   bool refuse, Table *out, UnsureRows *unsure)
 {
+	bool		fit = shown != NULL;
+	bool		fitting = false;	/* a column is fitted */
+	TupleTableSlot *fs = NULL;	/* (fitting) the row shown */
+	ProllyTreeBuilder *sb = NULL;
 	RowDiff		rd;
 	VersionReader vr;
 	List	   *now_cols;
@@ -5191,6 +5341,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	if (x == NULL)
 		return NULL;
 	*out = *x;
+	if (shown)
+		*shown = x->data;
 	if (now == NULL || same_description(x, now))
 		return out;
 	require_readable(x);
@@ -5286,16 +5438,20 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			(TupleDescAttr(xd, from[a])->atttypid != att->atttypid ||
 			 TupleDescAttr(xd, from[a])->atttypmod != att->atttypmod))
 		{
+			bool		key = bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk);
+
 			if (estate == NULL)
 				estate = CreateExecutorState();
+			/* (a key's value can't show as null: it's read as before) */
 			column_read(rel, xd, from[a], att,
 						(read == READ_COMPARED || read == READ_ALTERNATIVE) &&
 						!name_listed(retyped, NameStr(att->attname)) ?
-						READ_SHOWN : read,
-						bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk),
-						!vr.keyed, name_listed(both_retyped, NameStr(att->attname)),
+						READ_SHOWN : read, fit && read == READ_SHOWN && !key,
+						key, !vr.keyed,
+						name_listed(both_retyped, NameStr(att->attname)),
 						estate, &reads[a]);
 			converted[a] = true;
+			fitting |= reads[a].fit != NULL;
 		}
 	}
 
@@ -5312,6 +5468,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 				 !type_uses_enums(TupleDescAttr(xd, from[a])->atttypid, enum_names, NIL));
 
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	if (fitting)
+	{
+		fs = MakeSingleTupleTableSlot(md, &TTSOpsVirtual);
+		sb = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	}
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext, "converted row",
 								   ALLOCSET_DEFAULT_SIZES);
 	cur = PROLLY_CALL(tree, cursor_open, &env, &x->data, CurrentMemoryContext);
@@ -5323,6 +5484,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		ProllyHash	content;
 		StringInfoData key;
 		StringInfoData crow;
+		StringInfoData frow;
 		Bitmapset  *unsure_cols = NULL;
 
 		outer = MemoryContextSwitchTo(rowcxt);
@@ -5384,7 +5546,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 															 TupleDescAttr(xd, from[a])->atttypmod),
 									format_type_with_typemod(att->atttypid, att->atttypmod)),
 							 errdetail("A key value of the version's doesn't convert to the new type.")));
-				else if (read == READ_SHOWN && reads[a].loss == LOSS_UNCHECKED)
+				else if (read == READ_SHOWN && reads[a].loss == LOSS_UNCHECKED &&
+						 reads[a].fit == NULL)
 					nulled[a]++;
 			}
 			else if (!converted[a])
@@ -5415,6 +5578,17 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		initStringInfo(&key);
 		initStringInfo(&crow);
 		PROLLY_CALL(rd.kr, encode_row, rd.k, ms, &key, &crow, &content);
+		if (fitting)
+		{
+			StringInfoData fkey;
+			ProllyHash	fcontent;
+
+			fit_row(reads, from, xs, ms, fs, md, xd,
+					GetPerTupleExprContext(estate), nulled);
+			initStringInfo(&fkey);
+			initStringInfo(&frow);
+			PROLLY_CALL(rd.kr, encode_row, rd.k, fs, &fkey, &frow, &fcontent);
+		}
 		if (unsure_cols != NULL)
 		{
 			UnsureRow  *u;
@@ -5446,6 +5620,16 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			val.data = (const uint8 *) value.data;
 			val.len = value.len;
 			PROLLY_CALL(tree, build_add, b, &ck, &val);
+			if (fitting)
+			{
+				ProllyValue fr = {(const uint8 *) frow.data, frow.len};
+
+				resetStringInfo(&value);
+				PROLLY_CALL(rd.kr, make_value, rd.k, &fr, count, &value);
+				val.data = (const uint8 *) value.data;
+				val.len = value.len;
+				PROLLY_CALL(tree, build_add, sb, &ck, &val);
+			}
 			MemoryContextSwitchTo(outer);
 		}
 		else
@@ -5458,6 +5642,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			r->key.len = key.len;
 			r->row.data = dup_bytes(crow.data, crow.len);
 			r->row.len = crow.len;
+			if (fitting)
+			{
+				r->shown.data = dup_bytes(frow.data, frow.len);
+				r->shown.len = frow.len;
+			}
 			r->count = count;
 			if (n == max)
 			{
@@ -5530,10 +5719,25 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		val.data = (const uint8 *) value.data;
 		val.len = value.len;
 		PROLLY_CALL(tree, build_add, b, &rows[i]->key, &val);
+		if (fitting)
+		{
+			resetStringInfo(&value);
+			PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->shown, count, &value);
+			val.data = (const uint8 *) value.data;
+			val.len = value.len;
+			PROLLY_CALL(tree, build_add, sb, &rows[i]->key, &val);
+		}
 		pfree(value.data);
 		i = j;
 	}
 	PROLLY_CALL(tree, build_finish, b, &out->data);
+	if (shown)
+		*shown = out->data;
+	if (fitting)
+	{
+		PROLLY_CALL(tree, build_finish, sb, shown);
+		ExecDropSingleTupleTableSlot(fs);
+	}
 	if (shared > 0)
 		ereport(WARNING,
 				(errcode(ERRCODE_UNIQUE_VIOLATION),
@@ -5759,6 +5963,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	Table		t;
 	const Table *fp;
 	const Table *tp;
+	ProllyNodeRef fs;
+	ProllyNodeRef ts;
 
 	/*
 	 * (the same rows: none changed, whatever the definitions say, as rows
@@ -5770,14 +5976,16 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	if (now == NULL || ((from == NULL || same_description(from, now)) &&
 						(to == NULL || same_description(to, now))))
 	{
-		diff_rows(relid, from, to, sink);
+		diff_rows(relid, from, to, NULL, NULL, sink);
 		return;
 	}
 	rel = table_open(relid, AccessShareLock);
-	fp = as_defined_now(rel, from, now, READ_SHOWN, NIL, NIL, false, &f, NULL);
-	tp = as_defined_now(rel, to, now, READ_SHOWN, NIL, NIL, false, &t, NULL);
+	fp = as_defined_now(rel, from, now, READ_SHOWN, &fs, NIL, NIL, false, &f,
+						NULL);
+	tp = as_defined_now(rel, to, now, READ_SHOWN, &ts, NIL, NIL, false, &t,
+						NULL);
 	table_close(rel, AccessShareLock);
-	diff_rows(relid, fp, tp, sink);
+	diff_rows(relid, fp, tp, &fs, &ts, sink);
 }
 
 /* What a merge across definitions writes, once they're merged. */
@@ -6171,10 +6379,12 @@ merge_rows(void *arg)
 			refuse_lost_changes(rel, b, o, w);
 			refuse_lost_changes(rel, b, t, w);
 			retyped_columns(b, o, t, &retyped, &both_retyped);
-			(void) as_defined_now(rel, b, w, READ_COMPARED, retyped, both_retyped,
+			(void) as_defined_now(rel, b, w, READ_COMPARED, NULL, retyped, both_retyped,
 								  true, &bn, &unsure);
-			(void) as_defined_now(rel, o, w, READ_WRITTEN, NIL, NIL, true, &on, NULL);
-			(void) as_defined_now(rel, t, w, READ_WRITTEN, NIL, NIL, true, &tn, NULL);
+			(void) as_defined_now(rel, o, w, READ_WRITTEN, NULL, NIL, NIL, true,
+								  &on, NULL);
+			(void) as_defined_now(rel, t, w, READ_WRITTEN, NULL, NIL, NIL, true,
+								  &tn, NULL);
 			if (unsure.alternative)
 			{
 				Table		alternative;
@@ -6185,7 +6395,7 @@ merge_rows(void *arg)
 				MemoryContext old = MemoryContextSwitchTo(check);
 
 				/* (all of it freed after: only an ERROR comes out of it) */
-				(void) as_defined_now(rel, b, w, READ_ALTERNATIVE, retyped, both_retyped,
+				(void) as_defined_now(rel, b, w, READ_ALTERNATIVE, NULL, retyped, both_retyped,
 									  true, &alternative, &alternative_unsure);
 				check_merge_readings(relid, &bn, &alternative, &on, &tn,
 									 &unsure, &alternative_unsure);
@@ -8468,10 +8678,13 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	}
 	rel = table_open(relid, AccessShareLock);
 	retyped_columns(bt, ot, tt, &retyped, &both_retyped);
-	bp = as_defined_now(rel, bt, now, READ_COMPARED, retyped, both_retyped,
+	bp = as_defined_now(rel, bt, now, READ_COMPARED, NULL, retyped,
+						both_retyped,
 						false, &b, &unsure);
-	op = as_defined_now(rel, ot, now, READ_SHOWN, NIL, NIL, false, &o, NULL);
-	tp = as_defined_now(rel, tt, now, READ_SHOWN, NIL, NIL, false, &t, NULL);
+	op = as_defined_now(rel, ot, now, READ_SHOWN, NULL, NIL, NIL, false, &o,
+						NULL);
+	tp = as_defined_now(rel, tt, now, READ_SHOWN, NULL, NIL, NIL, false, &t,
+						NULL);
 	table_close(rel, AccessShareLock);
 
 	/*

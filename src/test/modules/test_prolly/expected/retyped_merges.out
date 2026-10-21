@@ -591,8 +591,9 @@ SELECT dolt_branch('-D', 'feature');
  {0}
 (1 row)
 
--- dolt_diff across a narrowing shows older values as they were stored:
--- 'abcdefghij' updated to 'abc' is a change, not cut to 'abc' and hidden;
+-- dolt_diff across a narrowing shows an older value the column can't hold
+-- now as null, with a warning (#590): 'abcdefghij' updated to 'abc' is a
+-- change, not cut to 'abc' and hidden; a key's are read as they were stored:
 -- keys 'abcd1' and 'abcd2' replaced by 'abcd' are removed as themselves.
 CREATE TABLE rt.d (id int PRIMARY KEY, v varchar(10));
 CREATE TABLE rt.dk (k varchar(10) PRIMARY KEY, n int);
@@ -616,9 +617,10 @@ SELECT length(dolt_commit('-am', 'd narrower')::text) AS committed;
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.d) ORDER BY 1;
- diff_type |    from_row    | to_row  
------------+----------------+---------
- modified  | (1,abcdefghij) | (1,abc)
+WARNING:  1 value of column "v" of table "d" doesn't convert from character varying(10) to character varying(3): shown as null
+ diff_type | from_row | to_row  
+-----------+----------+---------
+ modified  | (1,)     | (1,abc)
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.dk) ORDER BY 1, 2;
@@ -1170,8 +1172,10 @@ SELECT dolt_branch('-D', 'feature');
 (1 row)
 
 -- A domain's constraints don't apply to historical values only compared
--- or shown.  Both sides retype to a checked domain after fixing or deleting
--- the old values.  Keep those values for comparison and conflict listing.
+-- or listed as conflicts; a diff shows one the domain refuses as null,
+-- with a warning (#590).  Both sides retype to a checked domain after
+-- fixing or deleting the old values.  Keep those values for comparison
+-- and conflict listing.
 CREATE DOMAIN rt.positive AS int CHECK (VALUE > 0);
 CREATE TABLE rt.domain_rows (id int PRIMARY KEY, v int);
 CREATE TABLE rt.domain_keys (id int PRIMARY KEY, v int);
@@ -1208,11 +1212,12 @@ SELECT length(dolt_commit('-am', 'main: positive')::text) AS committed;
 
 SELECT diff_type, from_row, to_row
 FROM dolt_diff('HEAD~1', 'HEAD', NULL::rt.domain_rows) ORDER BY from_row;
+WARNING:  3 values of column "v" of table "domain_rows" don't convert from integer to rt.positive: shown as null
  diff_type | from_row | to_row 
 -----------+----------+--------
- modified  | (1,-1)   | (1,1)
- modified  | (2,-2)   | (2,2)
- removed   | (3,-3)   | 
+ modified  | (1,)     | (1,1)
+ modified  | (2,)     | (2,2)
+ removed   | (3,)     | 
 (3 rows)
 
 SELECT dolt_checkout('feature');

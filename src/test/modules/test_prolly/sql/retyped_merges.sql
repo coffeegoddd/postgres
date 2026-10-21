@@ -194,8 +194,9 @@ SELECT (dolt_merge('feature', '-m', 'merged varchar'))[3:4];
 SELECT * FROM rt.t ORDER BY id;
 SELECT dolt_branch('-D', 'feature');
 
--- dolt_diff across a narrowing shows older values as they were stored:
--- 'abcdefghij' updated to 'abc' is a change, not cut to 'abc' and hidden;
+-- dolt_diff across a narrowing shows an older value the column can't hold
+-- now as null, with a warning (#590): 'abcdefghij' updated to 'abc' is a
+-- change, not cut to 'abc' and hidden; a key's are read as they were stored:
 -- keys 'abcd1' and 'abcd2' replaced by 'abcd' are removed as themselves.
 CREATE TABLE rt.d (id int PRIMARY KEY, v varchar(10));
 CREATE TABLE rt.dk (k varchar(10) PRIMARY KEY, n int);
@@ -399,8 +400,10 @@ SELECT dolt_branch('-D', 'feature');
 
 
 -- A domain's constraints don't apply to historical values only compared
--- or shown.  Both sides retype to a checked domain after fixing or deleting
--- the old values.  Keep those values for comparison and conflict listing.
+-- or listed as conflicts; a diff shows one the domain refuses as null,
+-- with a warning (#590).  Both sides retype to a checked domain after
+-- fixing or deleting the old values.  Keep those values for comparison
+-- and conflict listing.
 CREATE DOMAIN rt.positive AS int CHECK (VALUE > 0);
 CREATE TABLE rt.domain_rows (id int PRIMARY KEY, v int);
 CREATE TABLE rt.domain_keys (id int PRIMARY KEY, v int);

@@ -240,7 +240,10 @@ commits' trees, #528, #537), with the keyless one whole; the computed one
 is deferred. Of `DiffSystemTableScriptTests`, 17
 (the `dolt_diff_<t>` cases and one of the view; one without its SHOW
 INDEX), and the case whose column's old values don't convert to its
-new type in part (D21: they show null, with a warning, #531), and the
+new type in part (D21: they show null, with a warning, #531), as is
+the one whose columns are narrowed (a shorter varchar, and tinyint as a
+domain over smallint: an old value the column's typmod or domain can't
+hold now shows null too, #590), and the
 two primary-key changes, read as the table is keyed now (D22, #530):
 one whole, one in part (its warning left out). Of `HistorySystemTableScriptTests`, cases
 0–8 (two without their EXPLAIN assertions); of
