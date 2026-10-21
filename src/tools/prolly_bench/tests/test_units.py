@@ -198,6 +198,32 @@ class V8MetricsTest(unittest.TestCase):
         self.assertEqual(m["gc_database_bytes"], 40000.0)
         self.assertNotIn("gc_page_store_bytes", m)
 
+    def test_no_background(self):
+        from pbench.workloads.v_suite import V8
+        # (whatever the suite's backgrounds: a cell with one can't run)
+        self.assertEqual(V8().variants({}), [("bgnone", {"background": "none"})])
+        self.assertEqual(V8().variants({"background": ["S1"]}),
+                         [("bgnone", {"background": "none"})])
+
+    def test_updates_wrap(self):
+        import re
+        from pbench.workloads.v_suite import V8
+
+        def ids(where, n):
+            m = re.fullmatch(r"WHERE \(id > (-?\d+) AND id <= (-?\d+)\) OR id <= (-?\d+)", where)
+            lo, hi, wrapped = map(int, m.groups())
+            return {i for i in range(1, n + 1) if lo < i <= hi or i <= wrapped}
+
+        # (1,000 rows, 3% a commit, 40 commits: past the end, still 30 a
+        # commit, the ones after the last)
+        n, changed = 1000, 30
+        seen = []
+        for i in range(40):
+            got = ids(V8.update_where(i, changed, n), n)
+            self.assertEqual(len(got), changed, i)
+            seen.append(got)
+        self.assertEqual(seen[33], set(range(991, 1001)) | set(range(1, 21)))
+
 
 class RegistryTest(unittest.TestCase):
     def test_everything_registered(self):

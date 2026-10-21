@@ -547,10 +547,24 @@ class V8(VWorkload):
     def update_percent(self, ctx) -> float:
         return float(ctx.params.get("update_percent", 1))
 
+    def variants(self, params):
+        # (storage read alone: never with a background workload, whatever
+        # the suite's backgrounds, so a plain `run V` plans no cell of it
+        # that can't run)
+        return [(f"{label}-bgnone" if label else "bgnone", {**extra, "background": "none"})
+                for label, extra in self.own_variants(params)]
+
+    @staticmethod
+    def update_where(i: int, changed: int, n: int) -> str:
+        """Commit i's rows: the changed ids after (i * changed) mod n,
+        wrapping past the table's end to its start, so each commit updates
+        as many."""
+        lo = i * changed % n
+        hi = lo + changed
+        return f"WHERE (id > {lo} AND id <= {hi}) OR id <= {hi - n}"
+
     def prepare(self, ctx):
         # (the tables, empty: the load is the first stage read)
-        if ctx.params["background"] != "none":
-            raise ValueError("V8 reads storage alone: its background must be none")
         self._sql(ctx, """
             CREATE TABLE vc_data (id bigint PRIMARY KEY, payload text NOT NULL);
             CREATE TABLE public.v8_heap (id bigint PRIMARY KEY, payload text NOT NULL)
@@ -578,8 +592,7 @@ class V8(VWorkload):
         self._sql(ctx, VC_SQL.commit("v8 load"))
         readings["commit"] = self._read(ctx)
         for i in range(k):
-            lo = i * changed % n
-            where = f"WHERE id > {lo} AND id <= {lo + changed}"
+            where = self.update_where(i, changed, n)
             self._sql(ctx, f"UPDATE vc_data SET payload = md5(payload) {where};\n"
                            f"UPDATE public.v8_heap SET payload = md5(payload) {where};\n"
                            f"{VC_SQL.commit(f'v8 {i}')};")
