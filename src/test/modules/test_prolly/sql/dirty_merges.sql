@@ -329,6 +329,22 @@ ALTER TABLE dmd.p DROP CONSTRAINT p_pkey;
 SELECT (dolt_merge('dmd_feature'))[3:4];
 SELECT dolt_reset('--hard');
 SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd_feature') AS not_merged;
+-- a schema dropped that the merge adds a table to
+CREATE SCHEMA dmd2 VERSIONED;
+CREATE TABLE dmd2.keep (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'dmd2')::text) AS committed;
+SELECT dolt_branch('dmd2_feature');
+SELECT dolt_checkout('dmd2_feature');
+CREATE TABLE dmd2.x (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'dmd2.x')::text) AS committed;
+SELECT dolt_checkout('main');
+DROP SCHEMA dmd2 CASCADE;
+SELECT (dolt_merge('dmd2_feature'))[2:4];
+SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd2_feature') AS not_merged;
+SELECT dolt_reset('--hard');
+SELECT dolt_branch('-D', 'dmd2_feature');
+DROP SCHEMA dmd2 CASCADE;
+SELECT length(dolt_commit('-Am', 'dmd2 gone')::text) AS committed;
 
 -- a cherry-pick, then its revert, over the alter too
 ALTER TABLE dmd.u ADD COLUMN w int;

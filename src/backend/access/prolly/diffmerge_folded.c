@@ -2380,8 +2380,16 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 		Table	   *t = lfirst(lc);
 		Table	   *f = find_table(from.tables, t->name);
 
+		/*
+		 * (a target whose definitions don't hold together, as one with a
+		 * table in a schema it drops, leaves the table out of the move: a
+		 * coded error, so put_back() refuses it as changes that don't fit)
+		 */
 		if (f == NULL)
-			elog(ERROR, "table \"%s\" is missing from the working set", t->name);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("table \"%s\" is missing from the working set",
+							t->name)));
 		if (!same_hash(&f->data.hash, &t->data.hash))
 			apply_rows(table_named(t->name), f, t);
 	}

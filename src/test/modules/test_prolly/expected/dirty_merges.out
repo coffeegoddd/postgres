@@ -1164,6 +1164,72 @@ SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd_feature') AS not_merged;
  t
 (1 row)
 
+-- a schema dropped that the merge adds a table to
+CREATE SCHEMA dmd2 VERSIONED;
+CREATE TABLE dmd2.keep (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'dmd2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('dmd2_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dmd2_feature');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'dmd2_feature'"}
+(1 row)
+
+CREATE TABLE dmd2.x (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'dmd2.x')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP SCHEMA dmd2 CASCADE;
+NOTICE:  drop cascades to table dmd2.keep
+SELECT (dolt_merge('dmd2_feature'))[2:4];
+ERROR:  local changes don't fit what the merge changed
+DETAIL:  Put back over the merge, the uncommitted definitions don't fit the merged ones: table "dmd2.x" is missing from the working set
+HINT:  Commit the changes, or reset the branch, first.
+SELECT dolt_hashof('HEAD') <> dolt_hashof('dmd2_feature') AS not_merged;
+ not_merged 
+------------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'dmd2_feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA dmd2 CASCADE;
+NOTICE:  drop cascades to table dmd2.keep
+SELECT length(dolt_commit('-Am', 'dmd2 gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
 -- a cherry-pick, then its revert, over the alter too
 ALTER TABLE dmd.u ADD COLUMN w int;
 SELECT length(dolt_cherry_pick('dmd_feature')::text) > 0 AS picked;
