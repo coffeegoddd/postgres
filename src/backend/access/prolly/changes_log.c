@@ -545,12 +545,10 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 static void
 row_copy(Finder *f, HeapTuple tup, int64 delta)
 {
-	ProllyHash	content;
-
 	ExecForceStoreHeapTuple(tup, f->rowslot, false);
 	resetStringInfo(&f->key);
 	resetStringInfo(&f->row);
-	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, &content);
+	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
 	ExecClearTuple(f->rowslot);
 	add_copy(f, &f->key, f->row.data, f->row.len, delta);
 }
@@ -594,7 +592,6 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 	}
 	else
 	{
-		ProllyHash	content;
 
 		heap_deform_tuple(entry, f->desc, f->values, f->isnull);
 		ExecClearTuple(f->keyslot);
@@ -616,8 +613,13 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 		}
 		ExecStoreVirtualTuple(f->keyslot);
 		resetStringInfo(&f->key);
-		resetStringInfo(&f->row);
-		PROLLY_CALL(f->kr, encode_row, f->k, f->keyslot, &f->key, &f->row, &content);
+		if (!PROLLY_CALL(f->kr, encode_key, f->k, f->keyslot, &f->key))
+		{
+			/* (a keying that keys rows by content: the table's keyed) */
+			f->give_up = true;
+			f->reason = PROLLY_FULL_KEYING_CHANGED;
+			return false;
+		}
 		add_copy(f, &f->key, (const char *) entry->t_data, entry->t_len, 0);
 	}
 	CHECK_FOR_INTERRUPTS();
@@ -654,7 +656,6 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
 {
 	HeapTupleData entry;
 	ScanKeyData skey[INDEX_MAX_KEYS];
-	ProllyHash	content;
 
 	entry.t_data = (HeapTupleHeader) c->row;
 	entry.t_len = c->rowlen;
@@ -673,7 +674,7 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
 		return false;
 	resetStringInfo(&f->key);
 	resetStringInfo(&f->row);
-	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, &content);
+	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
 	ExecClearTuple(f->rowslot);
 	return true;
 }

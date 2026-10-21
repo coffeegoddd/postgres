@@ -297,11 +297,9 @@ prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 	scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{
-		ProllyHash	content;
-
 		resetStringInfo(&key);
 		resetStringInfo(&row);
-		PROLLY_CALL(kr, encode_row, k, slot, &key, &row, &content);
+		PROLLY_CALL(kr, encode_row, k, slot, &key, &row, NULL);
 		fold_sort_put(sort, &key, &row, 1);
 		done->rows_read++;
 		CHECK_FOR_INTERRUPTS();
@@ -547,8 +545,6 @@ map_pass(Map *m, const ProllyNodeRef *from, bool sorted, ProllyNodeRef *data)
 		MemoryContext old;
 		ProllyValue r;
 		uint64		count;
-		ProllyHash	content;
-
 		MemoryContextReset(m->rowcxt);
 		old = MemoryContextSwitchTo(m->rowcxt);
 		PROLLY_CALL(m->kr, parse_value, m->ok, &v_in, &r, &count);
@@ -573,7 +569,7 @@ map_pass(Map *m, const ProllyNodeRef *from, bool sorted, ProllyNodeRef *data)
 		ExecStoreVirtualTuple(m->nslot);
 		resetStringInfo(&key);
 		resetStringInfo(&row);
-		PROLLY_CALL(m->kr, encode_row, m->k, m->nslot, &key, &row, &content);
+		PROLLY_CALL(m->kr, encode_row, m->k, m->nslot, &key, &row, NULL);
 		MemoryContextSwitchTo(old);
 		if (count > 1 && !m->keyless)
 			end = MAP_FAILED;

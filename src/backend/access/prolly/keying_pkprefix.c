@@ -603,9 +603,16 @@ pkprefix_encode_row(ProllyKeying *k, TupleTableSlot *slot, StringInfo key,
 					 StringInfo row, ProllyHash *content)
 {
 	int			start = row->len;
+	ProllyHash	own;
 
 	PROLLY_CALL(k->valenc_routine, encode, k->valenc, slot, row);
-	hash_row(k, (const uint8 *) row->data + start, row->len - start, content);
+
+	/* (hashed if wanted, or for a key by content) */
+	if (content == NULL && k->keyless)
+		content = &own;
+	if (content)
+		hash_row(k, (const uint8 *) row->data + start, row->len - start,
+				 content);
 
 	if (k->keyless)
 	{
