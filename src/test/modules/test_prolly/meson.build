@@ -155,11 +155,13 @@ tests += {
       'diff_memory',
       'reflog',
     ],
+    'regress_args': ['--temp-config', files('autofold_off.conf')],
   },
   'tap': {
     'env': {
        'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
        'with_ssl': ssl_library,
+       'TEMP_CONFIG': meson.current_source_dir() / 'autofold_off.conf',
     },
     'tests': [
       't/028_bmap_storage.pl',
@@ -241,6 +243,7 @@ tests += {
       't/143_copy_records.pl',
       't/144_conjoin_copies.pl',
       't/145_createdb_copies.pl',
+      't/146_autofold.pl',
       't/160_first_use_lock.pl',
     ],
   },

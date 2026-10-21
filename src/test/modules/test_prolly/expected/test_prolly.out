@@ -236,7 +236,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | identity                       | pass
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
- change_log    | stub           | complete                       | not implemented (13 of 13 callbacks missing)
+ change_log    | stub           | complete                       | not implemented (14 of 14 callbacks missing)
 (177 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes

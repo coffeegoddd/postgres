@@ -36,6 +36,10 @@
  *   version at oldtid in hand (the writer still has its page pinned), so it
  *   needn't be read again.  It ignores relations that aren't prolly tables
  *   with a log.  Errors are the write's.
+ * - pending() (optional) estimates how many entries rel's log holds that
+ *   no fold has consumed or trimmed, cheaply (from a sample: autovacuum
+ *   asks each table at each pass); -1 if one says to read the table in
+ *   full, 0 if rel has no log.
  * - note_emptied() (optional) is told rel was emptied (truncated) by the
  *   (sub)transaction: a fold that sees it starts from no rows, the writes
  *   after it applied.  Without it, note() is told every row may have
@@ -168,14 +172,15 @@ typedef struct ProllyChangeLogRoutine
 								bool *consumed);
 	void		(*flush) (void);
 	void		(*note_emptied) (Relation rel);
+	double		(*pending) (Relation rel);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", \
 	"relid", "note_made", "consume_own", "written_unseen", "read_unseen", \
-	"flush", "note_emptied"
+	"flush", "note_emptied", "pending"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK note_emptied
+#define PROLLY_CHANGELOG_LAST_CALLBACK pending
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

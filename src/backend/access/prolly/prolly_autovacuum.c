@@ -16,7 +16,10 @@
  * off; after a collection, they haven't.  Then, with more table files than
  * prolly.conjoin_max_files, it conjoins the smallest (the chunk store's
  * conjoin()), so a lookup searches no more files than that, as Dolt does
- * past 256.  It sweeps a page store when bmap_sweep_due() says so.  Each
+ * past 256.  It sweeps a page store when bmap_sweep_due() says so.  It
+ * folds the working set (a checkpoint, as prolly_checkpoint() does) once a
+ * table's change log holds more entries than prolly.autofold_threshold of
+ * the table's rows, so a commit folds little (#511).  Each
  * runs in a transaction of its own, an error reported and passed over, as
  * autovacuum's tables' are; a collection, a move and a conjoin read and
  * copy under autovacuum's cost-based delay.
@@ -28,22 +31,30 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_config.h"
 #include "access/prolly_fold.h"
+#include "access/prolly_refs.h"
+#include "access/reloptions.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bmap.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 int			prolly_gc_journal_threshold = 128;
 double		prolly_gc_growth_scale_factor = 0.2;
@@ -51,6 +62,7 @@ int			prolly_journal_move_threshold = 256;
 int			prolly_conjoin_max_files = 256;
 int			prolly_gc_file_size = 65536;
 bool		prolly_log_copied_bytes = false;
+double		prolly_autofold_threshold = 0.05;
 
 /* fewer than two files would be conjoined at every pass: -1 turns it off */
 static bool
@@ -128,6 +140,14 @@ prolly_autovacuum_init(void)
 							 "For debugging, and comparing the two.",
 							 &prolly_log_copied_bytes,
 							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+	DefineCustomRealVariable("prolly.autofold_threshold",
+							 "How large a versioned table's change log grows, as a fraction of the table's size, before autovacuum folds the working set.",
+							 "So a commit folds little.  0 turns it off; a table with autovacuum_enabled = false is passed over.",
+							 &prolly_autofold_threshold,
+							 0.05, 0.0, 100.0,
 							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -337,6 +357,84 @@ sweep(void)
 							 (unsigned long long) r.truncated)));
 }
 
+/* A log of fewer entries than this is never due, whatever its table's size. */
+#define AUTOFOLD_MIN_ENTRIES	1000
+
+/*
+ * Is a versioned table's change log past the threshold?  The entries no
+ * fold has consumed (the change log's estimate, from a sample of its
+ * pages) against the table's rows: what the next fold would read against
+ * what a full one would.  One saying to read the table in full is due.
+ */
+static bool
+autofold_table_due(Relation rel)
+{
+	PgStat_StatTabEntry *stats;
+	double		pending;
+	double		rows;
+
+	if (rel->rd_options &&
+		!((StdRdOptions *) rel->rd_options)->autovacuum.enabled)
+		return false;
+	pending = prolly_change_log_pending(rel);
+	if (pending < 0)
+		return true;
+	if (pending < AUTOFOLD_MIN_ENTRIES)
+		return false;
+	stats = pgstat_fetch_stat_tabentry(RelationGetRelid(rel));
+	rows = stats ? (double) stats->live_tuples : 0;
+	rows = Max(rows, rel->rd_rel->reltuples);
+	return pending > prolly_autofold_threshold * rows;
+}
+
+/*
+ * The working set folded, once a versioned table's log is past
+ * prolly.autofold_threshold: a checkpoint of the worker's branch (the
+ * default), every table folded from its baseline, so the next commit's
+ * fold reads only what came after.
+ */
+static void
+autofold(void)
+{
+	Relation	classrel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	bool		due = false;
+	ProllyDatabaseComponents components;
+	ProllyNodeRef root;
+
+	if (prolly_autofold_threshold <= 0)
+		return;
+	PushActiveSnapshot(GetTransactionSnapshot());
+	classrel = table_open(RelationRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(classrel, 0, NULL);
+	while (!due && (tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+		Relation	rel;
+
+		if (form->relam != PROLLY_TABLE_AM_OID ||
+			form->relkind != RELKIND_RELATION)
+			continue;
+		rel = try_table_open(form->oid, AccessShareLock);
+		if (rel == NULL)
+			continue;
+		due = autofold_table_due(rel);
+		table_close(rel, AccessShareLock);
+	}
+	table_endscan(scan);
+	table_close(classrel, AccessShareLock);
+	if (due)
+	{
+		prolly_database_components(&components);
+		PROLLY_CALL(components.refs, checkpoint, &root);
+		ereport(DEBUG1,
+				(errmsg_internal("automatic fold of database \"%s\"",
+								 get_database_name(MyDatabaseId))));
+	}
+	PopActiveSnapshot();
+}
+
 /* The default branch's folds checked against full ones, a sample of tables. */
 static void
 verify(void)
@@ -354,7 +452,8 @@ verify(void)
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {collect, move, conjoin, sweep, verify};
+	void		(*steps[]) (void) = {autofold, collect, move, conjoin, sweep,
+	verify};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{

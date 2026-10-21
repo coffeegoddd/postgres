@@ -233,6 +233,23 @@ Two interfaces, each selected by the table AM's profile
   baselines and in full by one snapshot, at `prolly.fold_verify_rate` in
   autovacuum or by `dolt_verify_folds()`: a mismatch is warned of,
   counted, and its table read in full at its next fold.
+- **Background folds** (#511): after its tables, autovacuum folds the
+  working set (a checkpoint, as `prolly_checkpoint()` does, of the
+  worker's branch: the default) once a versioned table's log holds more
+  entries than `prolly.autofold_threshold` (5% by default; 0 turns it
+  off; settable per database) of the table's rows, so a commit's fold
+  reads little. The change log's `pending()` estimates the entries no
+  fold has consumed or trimmed from a sample of at most 32 of its pages,
+  as ANALYZE samples (a row holds one entry to a page of them, and
+  consumed and trimmed rows are dead until vacuumed, so neither the log's
+  size nor its rows' count tells; a keyed table's entries are keys, so
+  bytes don't either); one saying to read in full is due, fewer than 1000
+  never are. A table with `autovacuum_enabled = false` doesn't trigger
+  one.
+  Other branches' tables aren't looked at. The test suites turn it off
+  (its folds would land in the middle of tests that count folds) but
+  where a test turns it on. Folding inside rewrites (point 1) and a
+  worker for DDL that doesn't rewrite (point 2) are left to #511.
 - **No baseline copies:** it never begins a fold in block-mapped storage,
   so only sharing between branches copies pages.
 - **The transaction's own changes** (`fold_rows()`, spec 15): from the

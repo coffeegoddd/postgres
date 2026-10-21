@@ -29,17 +29,24 @@ export PROLLY_AM
 # TAP groups share tmp_check and the temporary installation.
 .NOTPARALLEL:
 
-# Server settings for every instance the suite starts.
+# Server settings for every instance the suite starts (no autovacuum folds:
+# they would land in the middle of tests that count folds).
 prolly_am.conf: FORCE
 	@{ echo "default_table_access_method = '$(PROLLY_AM)'"; \
-	   echo "max_prepared_transactions = 10"; } > $@
+	   echo "max_prepared_transactions = 10"; \
+	   echo "prolly.autofold_threshold = 0"; } > $@
 
 # Version control of branches made by copying: only the page-based engine
 # keeps branches as copies, so these tests' tables are prolly's whatever
 # PROLLY_AM is.
 vc.conf: FORCE
 	@{ echo "default_table_access_method = 'prolly'"; \
-	   echo "max_prepared_transactions = 10"; } > $@
+	   echo "max_prepared_transactions = 10"; \
+	   echo "prolly.autofold_threshold = 0"; } > $@
+
+# The TAP tests' instances (TEMP_CONFIG), no autovacuum folds either.
+TEMP_CONFIG ?= $(abs_top_srcdir)/$(subdir)/autofold_off.conf
+export TEMP_CONFIG
 
 # Heap tables in block-mapped storage instead (debug_block_mapped_heap).
 bmap.conf: FORCE
