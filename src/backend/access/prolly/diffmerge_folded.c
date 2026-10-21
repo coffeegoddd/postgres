@@ -106,16 +106,41 @@
 #include "utils/varlena.h"
 
 /*
- * A root's named types, shared by its tables, with the enums renamed
- * between it and the root last compared with (by serial: lists come and go).
+ * A root's named types, shared by its tables, with how its enums' labels
+ * read in the other roots' it's been compared with (by serial: lists come
+ * and go).
+ *
+ * The commits it comes from, if known, are where its enums' labels are
+ * followed through history from: exact, the root is the first one's;
+ * otherwise it's a change past them (a working set past the head, or what
+ * a merge of the sides made, which defines each enum as one side does).
  */
 typedef struct TypeDefs
 {
 	List	   *types;			/* ProllyTypeDefinition *, from the root */
 	uint64		serial;
-	uint64		renamed_from;	/* the other's serial, or 0 */
-	List	   *renamed;		/* names of the enums renamed between them */
+	int			ncommits;
+	ProllyHash	commits[PROLLY_MAX_PARENTS];
+	bool		exact;
+	List	   *compared;		/* EnumsCompared * */
 } TypeDefs;
+
+/* An enum defined otherwise in two roots' types: how the first's labels read. */
+typedef struct EnumMap
+{
+	char	   *name;
+	List	   *before;			/* the first's labels, String nodes */
+	List	   *targets;		/* each one's label in the second (NULL: it has
+								 * none); NIL: they couldn't be worked out */
+	bool		renamed;		/* a label reads as another, or can't be read */
+} EnumMap;
+
+typedef struct EnumsCompared
+{
+	uint64		other;			/* the other's serial */
+	List	   *maps;			/* EnumMap *, of the enums defined otherwise */
+	List	   *renamed;		/* names of those renamed */
+} EnumsCompared;
 
 /* A table as one version has it. */
 typedef struct Table
@@ -136,8 +161,19 @@ typedef struct Tables
 	TypeDefs   *types;			/* the root's named types, for its tables */
 } Tables;
 
-static int	merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
-						const char *what, const char *name, List **conflicted);
+/*
+ * The commits of a merge's roots (base, ours, theirs), ours' perhaps with
+ * a change past it (earlier picks of a series).
+ */
+typedef struct MergeCommits
+{
+	ProllyHash	ids[3];
+	bool		ours_exact;
+} MergeCommits;
+
+static int	merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
+						bool fail_on_conflict, const char *what,
+						const char *name, List **conflicted);
 static void apply_rows_held(Oid relid, const Table *from, const Table *to);
 static bool same_description(const Table *a, const Table *b);
 static bool same_table_enums(const Table *a, const Table *b);
@@ -309,6 +345,50 @@ read_tables(const ProllyNodeRef *root, Tables *ts)
 }
 
 /*
+ * Where a root's types come from, for its enums' labels to be followed
+ * through history: exactly the first commit's root, or a change past the
+ * commits.
+ */
+static void
+types_from(TypeDefs *td, const ProllyHash *commits, int n, bool exact)
+{
+	Assert(n <= PROLLY_MAX_PARENTS);
+	td->ncommits = n;
+	for (int i = 0; i < n; i++)
+		td->commits[i] = commits[i];
+	td->exact = exact;
+}
+
+/*
+ * Where a ref's types come from: its commit, or for the working set, a
+ * change past the head (and, a merge in progress, past its other side,
+ * whose definitions it may have taken).
+ */
+static void
+types_of_ref(TypeDefs *td, const char *ref)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyHash	ids[PROLLY_MAX_PARENTS];
+	ProllyMergeState ms;
+	int			n = 0;
+
+	if (ref == NULL)
+		return;
+	if (!is_working(ref))
+	{
+		if (PROLLY_CALL(dc.refs, resolve, ref, &ids[0]))
+			types_from(td, ids, 1, true);
+		return;
+	}
+	if (!PROLLY_CALL(dc.refs, resolve, "HEAD", &ids[n]))
+		return;
+	n++;
+	if (PROLLY_CALL(dc.refs, merge_state, &ms))
+		ids[n++] = ms.theirs;
+	types_from(td, ids, n, false);
+}
+
+/*
  * A ref's tables, to read: WORKING's read (objects a commit would refuse
  * left out, and their names appended to *left_out if it isn't NULL); with
  * relid valid, relid's table alone (the others' rows aren't read).
@@ -334,6 +414,7 @@ tables_of_reading(const char *ref, Oid relid, List **left_out,
 	if (root_out)
 		*root_out = root;
 	read_tables(&root, &ts);
+	types_of_ref(ts.types, ref);
 	if (OidIsValid(relid))
 	{
 		Table	   *t = find_table(ts.tables, table_name(relid));
@@ -1034,9 +1115,9 @@ note_written(Oid relid)
  * it wrote that break a foreign key.  *nviolations gets how many it left.
  */
 static int
-merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
-				const char *what, const char *name, List **conflicted,
-				int *nviolations)
+merge_recording(const ProllyNodeRef *roots, const MergeCommits *commits,
+				bool fail_on_conflict, const char *what, const char *name,
+				List **conflicted, int *nviolations)
 {
 	int			conflicts;
 	List	   *found = NIL;
@@ -1047,7 +1128,7 @@ merge_recording(const ProllyNodeRef *roots, bool fail_on_conflict,
 	reset_constraints();
 	PG_TRY();
 	{
-		conflicts = merge_roots(roots, fail_on_conflict, what, name,
+		conflicts = merge_roots(roots, commits, fail_on_conflict, what, name,
 								conflicted);
 		recording = false;
 		found = list_concat(recorded, foreign_key_violations(written, NIL));
@@ -3475,40 +3556,512 @@ labels_among(List *labels, List *others)
 	return true;
 }
 
+/* ------------------------------------------------------------------------
+ * Enum labels through history
+ *
+ * A root records an enum's labels, not the ALTER TYPE commands that made
+ * them, so two definitions alone can be read across only where one is a
+ * rename in place of the other, or the other's labels with more added.
+ * Between two commits, the definitions of the commits on the way are read
+ * across in turn instead: back from the one to their merge base, then on
+ * to the other, along first parents as far as they lead.  Only a commit
+ * whose own change both renames and adds (or reuses a name) is refused.
+ * ------------------------------------------------------------------------
+ */
+
 /*
- * Whether an enum's labels were renamed between two definitions: neither
- * has all the other's, in order.  (Labels added alone read the same: an old
- * value's label is still the new type's, in the same order to the others.)
+ * What each of an enum's labels before reads as in after, the labels of a
+ * change made since: a rename in place (as many labels, none moved: one
+ * moved may be a name given to another), or labels added, the others kept
+ * in order.  False if it's neither.
  */
 static bool
-enum_renamed(const ProllyTypeDefinition *a, const ProllyTypeDefinition *b)
+labels_forward(List *before, List *after, List **targets)
 {
-	return strcmp(a->definition, b->definition) != 0 &&
-		!labels_among(a->labels, b->labels) && !labels_among(b->labels, a->labels);
+	bool		same_count = list_length(before) == list_length(after);
+	int			last = -1;
+
+	for (int i = 0; i < list_length(before); i++)
+	{
+		int			at = -1;
+
+		for (int j = 0; j < list_length(after); j++)
+			if (strcmp(strVal(list_nth(before, i)), strVal(list_nth(after, j))) == 0)
+				at = j;
+		if ((same_count && at >= 0 && at != i) ||
+			(!same_count && (at < 0 || at <= last)))
+			return false;
+		last = at;
+	}
+	*targets = list_copy(same_count ? after : before);
+	return true;
 }
 
-/* The enums renamed between two roots' types, by name; worked out once. */
-static List *
-renamed_enums(TypeDefs *a, TypeDefs *b)
+/*
+ * The other way: what each of after's labels reads as in before, the
+ * labels after was made from (NULL: one added since).
+ */
+static bool
+labels_backward(List *after, List *before, List **targets)
 {
+	List	   *forward;
 	ListCell   *lc;
 
-	if (a->renamed_from == b->serial)
-		return a->renamed;
-	a->renamed = NIL;
+	if (!labels_forward(before, after, &forward))
+		return false;
+	*targets = NIL;
+	foreach(lc, after)
+	{
+		String	   *target = NULL;
+
+		for (int i = 0; i < list_length(forward); i++)
+			if (strcmp(strVal(list_nth(forward, i)), strVal(lfirst(lc))) == 0)
+				target = list_nth(before, i);
+		*targets = lappend(*targets, target);
+	}
+	return true;
+}
+
+/* labels (each one of from's, or NULL), each as map maps from's */
+static List *
+labels_mapped(List *labels, List *from, List *map)
+{
+	List	   *out = NIL;
+	ListCell   *lc;
+
+	foreach(lc, labels)
+	{
+		String	   *label = lfirst(lc);
+		String	   *target = NULL;
+
+		for (int i = 0; label != NULL && i < list_length(from); i++)
+			if (strcmp(strVal(list_nth(from, i)), strVal(label)) == 0)
+				target = list_nth(map, i);
+		out = lappend(out, target);
+	}
+	return out;
+}
+
+/*
+ * A commit, as its enums' labels are followed: its parents, and its root's
+ * enums once read.  Kept for the backend's life (a commit's id is its
+ * content's hash), up to a few thousand, dropped together between
+ * comparisons once there are more.
+ */
+typedef struct HistoryCommit
+{
+	ProllyHash	id;				/* (the key) */
+	bool		found;
+	int			nparents;
+	ProllyHash	parents[PROLLY_MAX_PARENTS];
+	ProllyNodeRef root;
+	bool		read;
+	List	   *enums;			/* ProllyTypeDefinition *, its root's enums */
+} HistoryCommit;
+
+#define HISTORY_COMMITS_KEPT 4096
+
+static MemoryContext history_cxt = NULL;
+static HTAB *history_commits = NULL;
+
+/* (between comparisons only: what's read from it is used until one ends) */
+static void
+history_trim(void)
+{
+	if (history_commits != NULL &&
+		hash_get_num_entries(history_commits) >= HISTORY_COMMITS_KEPT)
+	{
+		MemoryContextReset(history_cxt);
+		history_commits = NULL;
+	}
+}
+
+static HistoryCommit *
+history_commit(const ProllyHash *id)
+{
+	ProllyHash	key = prolly_hash_key(id);
+	HistoryCommit *hc;
+	bool		known;
+	ProllyCommitInfo info;
+
+	if (history_commits == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (history_cxt == NULL)
+			history_cxt = AllocSetContextCreate(TopMemoryContext,
+												"prolly enum history",
+												ALLOCSET_DEFAULT_SIZES);
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(HistoryCommit);
+		ctl.hcxt = history_cxt;
+		history_commits = hash_create("prolly enum history commits", 256, &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	hc = hash_search(history_commits, &key, HASH_FIND, NULL);
+	if (hc != NULL)
+		return hc;
+	/* (looked up before it's entered: an error leaves no half-made entry) */
+	memset(&info, 0, sizeof(info));
+	known = PROLLY_CALL(components().refs, commit_get, id, &info);
+	hc = hash_search(history_commits, &key, HASH_ENTER, NULL);
+	hc->found = known;
+	hc->nparents = known ? info.nparents : 0;
+	for (int i = 0; i < hc->nparents; i++)
+		hc->parents[i] = info.parents[i];
+	hc->root = info.root;
+	hc->read = false;
+	hc->enums = NIL;
+	return hc;
+}
+
+/* A commit's definition of enum name, or NULL. */
+static ProllyTypeDefinition *
+history_enum(const ProllyHash *id, const char *name)
+{
+	HistoryCommit *hc = history_commit(id);
+	ListCell   *lc;
+
+	if (!hc->found)
+		return NULL;
+	if (!hc->read)
+	{
+		List	   *types = PROLLY_CALL(components().canonicalizer,
+										type_definitions, &hc->root);
+		MemoryContext old = MemoryContextSwitchTo(history_cxt);
+		List	   *enums = NIL;
+
+		foreach(lc, types)
+		{
+			ProllyTypeDefinition *e = lfirst(lc);
+			ProllyTypeDefinition *copy;
+			ListCell   *ll;
+
+			if (strncmp(e->definition, "enum\n", 5) != 0)
+				continue;
+			copy = palloc0(sizeof(ProllyTypeDefinition));
+			copy->name = pstrdup(e->name);
+			copy->definition = pstrdup(e->definition);
+			foreach(ll, e->labels)
+				copy->labels = lappend(copy->labels,
+									   makeString(pstrdup(strVal(lfirst(ll)))));
+			enums = lappend(enums, copy);
+		}
+		MemoryContextSwitchTo(old);
+		hc->enums = enums;
+		hc->read = true;
+	}
+	return find_type_definition(hc->enums, name);
+}
+
+typedef struct HistoryStep
+{
+	ProllyHash	id;				/* (the key) */
+	ProllyHash	from;			/* the commit it's reached from */
+	bool		has_from;
+	bool		done;
+} HistoryStep;
+
+/*
+ * The commits from one to an ancestor of it, both of them included: along
+ * first parents as far as they lead there, through as few others as may
+ * be.  NIL if to isn't its ancestor.
+ */
+static List *
+history_down(const ProllyHash *from, const ProllyHash *to)
+{
+	HASHCTL		ctl;
+	HTAB	   *steps;
+	List	   *starts;
+	ProllyHash	key = prolly_hash_key(from);
+	ProllyHash	goal = prolly_hash_key(to);
+	HistoryStep *s;
+	List	   *path = NIL;
+	bool		reached = false;
+
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(HistoryStep);
+	ctl.hcxt = CurrentMemoryContext;
+	steps = hash_create("prolly enum history path", 64, &ctl,
+						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	s = hash_search(steps, &key, HASH_ENTER, NULL);
+	s->has_from = false;
+	s->done = false;
+	starts = list_make1(palloc_object(ProllyHash));
+	*(ProllyHash *) linitial(starts) = key;
+
+	/*
+	 * (each round's starts are reached through one more second parent than
+	 * the last's: from each, its first parents as far as they go)
+	 */
+	while (starts != NIL && !reached)
+	{
+		List	   *next = NIL;
+		ListCell   *lc;
+
+		foreach(lc, starts)
+		{
+			ProllyHash	c = *(ProllyHash *) lfirst(lc);
+
+			while (!reached)
+			{
+				HistoryCommit *hc;
+				HistoryStep *ps;
+				ProllyHash	pk;
+				bool		seen;
+
+				CHECK_FOR_INTERRUPTS();
+				s = hash_search(steps, &c, HASH_FIND, NULL);
+				if (s->done)
+					break;
+				s->done = true;
+				if (same_hash(&c, &goal))
+				{
+					reached = true;
+					break;
+				}
+				hc = history_commit(&c);
+				if (hc->nparents > 1)
+				{
+					pk = prolly_hash_key(&hc->parents[1]);
+					ps = hash_search(steps, &pk, HASH_ENTER, &seen);
+					if (!seen)
+					{
+						ps->from = c;
+						ps->has_from = true;
+						ps->done = false;
+						next = lappend(next, palloc_object(ProllyHash));
+						*(ProllyHash *) llast(next) = pk;
+					}
+				}
+				if (hc->nparents == 0)
+					break;
+				pk = prolly_hash_key(&hc->parents[0]);
+				ps = hash_search(steps, &pk, HASH_ENTER, &seen);
+				if (seen && ps->done)
+					break;
+				/* (one reached through a second parent: by a first, rather) */
+				ps->from = c;
+				ps->has_from = true;
+				if (!seen)
+					ps->done = false;
+				c = pk;
+			}
+			if (reached)
+				break;
+		}
+		starts = next;
+	}
+	if (reached)
+	{
+		ProllyHash	c = goal;
+
+		for (;;)
+		{
+			path = lcons(palloc_object(ProllyHash), path);
+			*(ProllyHash *) linitial(path) = c;
+			s = hash_search(steps, &c, HASH_FIND, NULL);
+			if (!s->has_from)
+				break;
+			c = s->from;
+		}
+	}
+	hash_destroy(steps);
+	return path;
+}
+
+/*
+ * The commit td's enum e is followed from, into *at, with its labels
+ * there: the first of td's commits if td is exactly its root's types;
+ * else the first that defines e alike, else the first defining it at all,
+ * e a change past it (*step).  False if none can be.
+ */
+static bool
+enum_anchor(const TypeDefs *td, const ProllyTypeDefinition *e,
+			ProllyHash *at, List **labels, bool *step)
+{
+	ProllyTypeDefinition *first = NULL;
+	int			first_at = -1;
+
+	if (td->ncommits == 0)
+		return false;
+	if (td->exact)
+	{
+		*at = td->commits[0];
+		*labels = e->labels;
+		*step = false;
+		return true;
+	}
+	for (int i = 0; i < td->ncommits; i++)
+	{
+		ProllyTypeDefinition *d = history_enum(&td->commits[i], e->name);
+
+		if (d != NULL && strcmp(d->definition, e->definition) == 0)
+		{
+			*at = td->commits[i];
+			*labels = d->labels;
+			*step = false;
+			return true;
+		}
+		if (d != NULL && first == NULL)
+		{
+			first = d;
+			first_at = i;
+		}
+	}
+	if (first == NULL)
+		return false;
+	*at = td->commits[first_at];
+	*labels = first->labels;
+	*step = true;
+	return true;
+}
+
+/*
+ * What each of a's labels of enum ea reads as in b's eb, followed through
+ * the commits between them, into *targets.  False if there's no history
+ * to follow them through (commits unknown, none in common, one on the way
+ * without the enum) or a change on the way can't be read across.
+ */
+static bool
+labels_through_history(const TypeDefs *a, const ProllyTypeDefinition *ea,
+					   const TypeDefs *b, const ProllyTypeDefinition *eb,
+					   List **targets)
+{
+	ProllyHash	ha;
+	ProllyHash	hb;
+	ProllyHash	base;
+	List	   *la;
+	List	   *lb;
+	bool		step_a;
+	bool		step_b;
+	List	   *cur = list_copy(ea->labels);
+	List	   *at;				/* the labels cur's are of */
+	List	   *map;
+	List	   *down;
+	List	   *up;
+	int			n;
+
+	if (!enum_anchor(a, ea, &ha, &la, &step_a) ||
+		!enum_anchor(b, eb, &hb, &lb, &step_b))
+		return false;
+	if (same_hash(&ha, &hb))
+		base = ha;
+	else if (!PROLLY_CALL(components().refs, merge_base, &ha, &hb, &base))
+		return false;
+	down = history_down(&ha, &base);
+	up = history_down(&hb, &base);
+	if (down == NIL || up == NIL)
+		return false;
+
+	/*
+	 * Each definition on the way, in the order they're read across: back
+	 * from a's commit to the base (down), then on to b's (up, the other way
+	 * round, the base once).
+	 */
+	if (step_a)
+	{
+		if (!labels_backward(ea->labels, la, &map))
+			return false;
+		cur = labels_mapped(cur, ea->labels, map);
+	}
+	at = la;
+	n = list_length(down) + list_length(up) - 1;
+	for (int i = 1; i < n; i++)
+	{
+		bool		back = i < list_length(down);
+		ProllyHash *id = back ? list_nth(down, i) :
+			list_nth(up, n - 1 - i);
+		ProllyTypeDefinition *d = history_enum(id, ea->name);
+
+		if (d == NULL)
+			return false;
+		if (labels_among(at, d->labels) && labels_among(d->labels, at))
+			continue;			/* (the same labels) */
+		if (back ? !labels_backward(at, d->labels, &map) :
+			!labels_forward(at, d->labels, &map))
+			return false;
+		cur = labels_mapped(cur, at, map);
+		at = d->labels;
+	}
+	if (step_b)
+	{
+		if (!labels_forward(lb, eb->labels, &map))
+			return false;
+		cur = labels_mapped(cur, lb, map);
+	}
+	*targets = cur;
+	return true;
+}
+
+/*
+ * How the labels of the enums a's and b's types define otherwise read
+ * from a's into b's, worked out once for each other root's: through the
+ * history between them where it's known, else (or where a change there
+ * can't be read across) as the two definitions alone allow.
+ */
+static EnumsCompared *
+enums_compared(TypeDefs *a, TypeDefs *b)
+{
+	EnumsCompared *ec;
+	ListCell   *lc;
+	MemoryContext old;
+
+	foreach(lc, a->compared)
+	{
+		ec = lfirst(lc);
+		if (ec->other == b->serial)
+			return ec;
+	}
+	history_trim();
+	/* (kept as long as a is) */
+	old = MemoryContextSwitchTo(GetMemoryChunkContext(a));
+	ec = palloc0(sizeof(EnumsCompared));
+	ec->other = b->serial;
 	foreach(lc, a->types)
 	{
 		ProllyTypeDefinition *e = lfirst(lc);
 		ProllyTypeDefinition *other;
+		EnumMap    *m;
+		List	   *targets = NIL;
+		bool		mapped;
 
 		if (strncmp(e->definition, "enum\n", 5) != 0)
 			continue;
 		other = find_type_definition(b->types, e->name);
-		if (other != NULL && enum_renamed(e, other))
-			a->renamed = lappend(a->renamed, e->name);
+		if (other == NULL || strcmp(e->definition, other->definition) == 0)
+			continue;
+		mapped = labels_through_history(a, e, b, other, &targets) ||
+			labels_forward(e->labels, other->labels, &targets) ||
+			labels_backward(e->labels, other->labels, &targets);
+		m = palloc0(sizeof(EnumMap));
+		m->name = e->name;
+		m->before = e->labels;
+		m->renamed = !mapped && e->labels != NIL;
+		/* (copied: the history's labels may go before these do) */
+		for (int i = 0; mapped && i < list_length(targets); i++)
+		{
+			String	   *t = list_nth(targets, i);
+
+			if (t != NULL && strcmp(strVal(t), strVal(list_nth(e->labels, i))) != 0)
+				m->renamed = true;
+			m->targets = lappend(m->targets,
+								 t ? makeString(pstrdup(strVal(t))) : NULL);
+		}
+		ec->maps = lappend(ec->maps, m);
+		if (m->renamed)
+			ec->renamed = lappend(ec->renamed, e->name);
 	}
-	a->renamed_from = b->serial;
-	return a->renamed;
+	a->compared = lappend(a->compared, ec);
+	MemoryContextSwitchTo(old);
+	return ec;
+}
+
+/* The enums renamed between two roots' types, by name. */
+static List *
+renamed_enums(TypeDefs *a, TypeDefs *b)
+{
+	return enums_compared(a, b)->renamed;
 }
 
 /*
@@ -3545,25 +4098,21 @@ enum_mappings(const Table *from, const Table *to)
 	List	   *maps = NIL;
 	ListCell   *lc;
 
-	foreach(lc, from->types->types)
+	foreach(lc, enums_compared(from->types, to->types)->maps)
 	{
-		ProllyTypeDefinition *e = lfirst(lc);
-		ProllyTypeDefinition *other;
+		EnumMap    *em = lfirst(lc);
 		ProllyEnumMapping *m;
 		Oid			type;
 
-		if (strncmp(e->definition, "enum\n", 5) != 0)
+		if (!em->renamed)
 			continue;
-		other = find_type_definition(to->types->types, e->name);
-		if (other == NULL || !enum_renamed(e, other))
-			continue;
-		type = LookupTypeNameOid(NULL, typeStringToTypeName(e->name, NULL), true);
+		type = LookupTypeNameOid(NULL, typeStringToTypeName(em->name, NULL), true);
 		if (!OidIsValid(type) || get_typtype(type) != TYPTYPE_ENUM)
 			continue;
 		m = palloc(sizeof(ProllyEnumMapping));
 		m->type = type;
-		m->before = e->labels;
-		m->after = other->labels;
+		m->before = em->before;
+		m->targets = em->targets;
 		maps = lappend(maps, m);
 	}
 	return maps;
@@ -4905,6 +5454,7 @@ typedef struct MergeRows
 								 * known (NIL: folded when needed) */
 	const ProllyNodeRef *roots; /* base, ours, theirs */
 	const ProllyNodeRef *now_root;	/* the branch, if known (as now) */
+	const MergeCommits *commits;	/* the roots' commits */
 } MergeRows;
 
 
@@ -5185,6 +5735,8 @@ merge_rows(void *arg)
 
 		(void) PROLLY_CALL(components().refs, working_set, NULL, &working);
 		read_tables(&working, &ts);
+		/* (each enum as ours or theirs defines it: the schemas merged) */
+		types_from(ts.types, &mr->commits->ids[1], 2, false);
 		now = ts.tables;
 	}
 	foreach(lc, mr->ours)
@@ -5357,12 +5909,14 @@ commit_root(const ProllyHash *id, ProllyNodeRef *root)
 	*root = info.root;
 }
 
+/* The tables of commit's root (exact), or of a change past it. */
 static List *
-tables_in_root(const ProllyNodeRef *root)
+tables_in_root(const ProllyNodeRef *root, const ProllyHash *commit, bool exact)
 {
 	Tables		ts = {NIL};
 
 	read_tables(root, &ts);
+	types_from(ts.types, commit, 1, exact);
 	return ts.tables;
 }
 
@@ -5372,7 +5926,7 @@ tables_at(const ProllyHash *id)
 	ProllyNodeRef root;
 
 	commit_root(id, &root);
-	return tables_in_root(&root);
+	return tables_in_root(&root, id, true);
 }
 
 /*
@@ -5474,27 +6028,29 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
  * changed from roots[0] to roots[2], three-way: what (a merge of branch
  * name, a cherry-pick) fails if a row conflicts and fail_on_conflict, else
  * conflicted gets the tables with conflicts.  Returns how many keys
- * conflict.
+ * conflict.  commits are the roots'.
  */
 static int
-merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
-			const char *what, const char *name, List **conflicted)
+merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
+			bool fail_on_conflict, const char *what, const char *name,
+			List **conflicted)
 {
 	ProllyDatabaseComponents dc = components();
 	List	   *base_tables;
 	List	   *ours_tables;
 	List	   *theirs_tables;
 
-	base_tables = tables_in_root(&roots[0]);
-	ours_tables = tables_in_root(&roots[1]);
-	theirs_tables = tables_in_root(&roots[2]);
+	base_tables = tables_in_root(&roots[0], &commits->ids[0], true);
+	ours_tables = tables_in_root(&roots[1], &commits->ids[1], commits->ours_exact);
+	theirs_tables = tables_in_root(&roots[2], &commits->ids[2], true);
 
 	/* Definitions changed: merged first, then the rows as they allow. */
 	if (!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[1]) ||
 		!PROLLY_CALL(dc.canonicalizer, same_schema, &roots[0], &roots[2]))
 	{
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
-		fail_on_conflict, what, name, conflicted, 0, NIL, roots, NULL};
+		fail_on_conflict, what, name, conflicted, 0, NIL, roots, NULL,
+		commits};
 		ProllyNodeRef merged;
 
 		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
@@ -5508,7 +6064,7 @@ merge_roots(const ProllyNodeRef *roots, bool fail_on_conflict,
 		/* (the branch has ours' rows, every table defined alike) */
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
 		fail_on_conflict, what, name, conflicted, 0, ours_tables, roots,
-		&roots[1]};
+		&roots[1], commits};
 
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		merge_rows(&mr);
@@ -6977,6 +7533,7 @@ merge_held(const char *branch, const char *message, int flags,
 	int			conflicts = 0;
 	ProllyHash	parents[2];
 	ProllyNodeRef roots[3];
+	MergeCommits commits;
 	Local		local;
 	int			nviolations = 0;
 
@@ -7041,7 +7598,11 @@ merge_held(const char *branch, const char *message, int flags,
 						   branch)));
 
 	/* Three-way. */
-	conflicts = merge_recording(roots,
+	commits.ids[0] = base;
+	commits.ids[1] = ours;
+	commits.ids[2] = theirs;
+	commits.ours_exact = true;
+	conflicts = merge_recording(roots, &commits,
 								(flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
 								"merge", branch, &conflicted, &nviolations);
 
@@ -7242,11 +7803,16 @@ pick_held(const char *const *refs, int nrefs, bool allow_empty,
 	{
 		int			conflicts;
 		int			nviolations = 0;
+		MergeCommits commits;
 
 		commit_root(&info[i].parents[0], &roots[0]);
 		commit_root(&picked[i], &roots[2]);
-		conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
-									&nviolations);
+		commits.ids[0] = info[i].parents[0];
+		commits.ids[1] = ours;
+		commits.ids[2] = picked[i];
+		commits.ours_exact = i == 0;
+		conflicts = merge_recording(roots, &commits, false, fn, NULL,
+									&conflicted, &nviolations);
 
 		/* (applied without a commit: no pick in progress to resolve) */
 		if (apply_fn && conflicts + nviolations > 0)
@@ -7360,12 +7926,17 @@ revert_held(const char *const *refs, int nrefs, const ProllyHash *series_head,
 		int			nviolations = 0;
 		char	   *message = psprintf("Revert \"%s\"", info[i].message);
 		ProllyNodeRef before;
+		MergeCommits commits;
 
 		root_of("WORKING", &before);
 		commit_root(&picked[i], &roots[0]);
 		commit_root(&info[i].parents[0], &roots[2]);
-		conflicts = merge_recording(roots, false, fn, NULL, &conflicted,
-									&nviolations);
+		commits.ids[0] = picked[i];
+		commits.ids[1] = ours;
+		commits.ids[2] = info[i].parents[0];
+		commits.ours_exact = i == 0;
+		conflicts = merge_recording(roots, &commits, false, fn, NULL,
+									&conflicted, &nviolations);
 		if (conflicts + nviolations > 0 && has_local_changes(&local))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

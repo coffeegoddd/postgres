@@ -302,8 +302,8 @@ SELECT dolt_checkout('main');
 SELECT test_fold_root() AS before_refusal \gset
 SELECT dolt_merge('amb_writer');
 ERROR:  schema conflict: cannot map historical labels of enum eh.amb
-DETAIL:  Only renames in place or additions preserving all old labels can be read across enum definitions.
-HINT:  Merge row changes before combining enum renames and additions or reusing labels.
+DETAIL:  Labels are read across commits that rename labels in place or add labels keeping the others in order, not across one that does both or reuses a label.
+HINT:  Commit an enum's renames and its additions separately, and merge row changes before reusing labels.
 SELECT test_fold_root() = :'before_refusal' AS unchanged;
  unchanged 
 -----------
@@ -343,8 +343,8 @@ SELECT length(dolt_commit('-Am', 'swapped names')::text) AS committed;
 
 SELECT count(*) FROM dolt_diff(:'reuse_base', 'HEAD', NULL::eh.reuse);
 ERROR:  schema conflict: cannot map historical labels of enum eh.reused
-DETAIL:  Only renames in place or additions preserving all old labels can be read across enum definitions.
-HINT:  Merge row changes before combining enum renames and additions or reusing labels.
+DETAIL:  Labels are read across commits that rename labels in place or add labels keeping the others in order, not across one that does both or reuses a label.
+HINT:  Commit an enum's renames and its additions separately, and merge row changes before reusing labels.
 -- Renaming an enum does not supply a historical layout for an enclosing
 -- composite that also changed.  Refuse that combination explicitly.
 CREATE TYPE eh.ce AS ENUM ('a', 'b');
@@ -444,8 +444,332 @@ SELECT dolt_branch('-D', 'drop_writer');
  {0}
 (1 row)
 
+-- A label added, and another renamed in a later commit: read across both
+-- through the commits between, each one's change mapped in turn.
+CREATE TYPE eh.steps AS ENUM ('sad', 'ok', 'happy');
+CREATE TABLE eh.stepped (id int PRIMARY KEY, m eh.steps, a eh.steps[]);
+INSERT INTO eh.stepped VALUES (1, 'sad', '{sad,happy}'), (2, 'ok', '{ok}');
+SELECT (dolt_commit('-Am', 'steps base'))[1] AS steps_base \gset
+SELECT dolt_branch('steps_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.steps ADD VALUE 'meh' BEFORE 'ok';
+SELECT length(dolt_commit('-Am', 'steps added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.steps RENAME VALUE 'sad' TO 'blue';
+-- (the rename not committed yet: the working set a step past the head)
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'steps_base', 'WORKING', NULL::eh.stepped);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+SELECT length(dolt_commit('-Am', 'steps renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE eh.stepped SET m = 'meh', a = '{meh,blue}' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'steps edited')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'steps_base', 'HEAD', NULL::eh.stepped);
+ diff_type |  from_row   |        to_row        
+-----------+-------------+----------------------
+ modified  | (2,ok,{ok}) | (2,meh,"{meh,blue}")
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD', :'steps_base', NULL::eh.stepped);
+ diff_type |       from_row       |   to_row    
+-----------+----------------------+-------------
+ modified  | (2,meh,"{meh,blue}") | (2,ok,{ok})
+(1 row)
+
+SELECT dolt_checkout('steps_writer');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'steps_writer'"}
+(1 row)
+
+INSERT INTO eh.stepped VALUES (3, 'sad', '{sad,ok}');
+UPDATE eh.stepped SET m = 'happy' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'steps writer')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'steps_base', 'steps_writer', NULL::eh.stepped);
+ diff_type |        from_row         |          to_row          
+-----------+-------------------------+--------------------------
+ modified  | (1,blue,"{blue,happy}") | (1,happy,"{blue,happy}")
+ added     |                         | (3,blue,"{blue,ok}")
+(2 rows)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff('steps_writer', 'HEAD', NULL::eh.stepped);
+ diff_type |         from_row         |         to_row          
+-----------+--------------------------+-------------------------
+ modified  | (1,happy,"{blue,happy}") | (1,blue,"{blue,happy}")
+ modified  | (2,ok,{ok})              | (2,meh,"{meh,blue}")
+ removed   | (3,blue,"{blue,ok}")     | 
+(3 rows)
+
+BEGIN;
+SELECT (dolt_merge('steps_writer', '-m', 'merged steps'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM eh.stepped ORDER BY id;
+ id |   m   |      a       
+----+-------+--------------
+  1 | happy | {blue,happy}
+  2 | meh   | {meh,blue}
+  3 | blue  | {blue,ok}
+(3 rows)
+
+ROLLBACK;
+-- (merged the other way, the branch's rows read into the definition merged in)
+SELECT dolt_checkout('steps_writer');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'steps_writer'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main', '-m', 'merged steps reverse'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM eh.stepped ORDER BY id;
+ id |   m   |      a       
+----+-------+--------------
+  1 | happy | {blue,happy}
+  2 | meh   | {meh,blue}
+  3 | blue  | {blue,ok}
+(3 rows)
+
+ROLLBACK;
+-- (and a conflict, its sides read through the history too)
+UPDATE eh.stepped SET m = 'happy', a = '{happy}' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'steps writer edit')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('steps_writer', '-m', 'steps conflict'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT base_row, our_row, their_row FROM dolt_conflicts(NULL::eh.stepped);
+  base_row   |       our_row        |     their_row     
+-------------+----------------------+-------------------
+ (2,ok,{ok}) | (2,meh,"{meh,blue}") | (2,happy,{happy})
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'eh.stepped');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM eh.stepped ORDER BY id;
+ id |   m   |      a       
+----+-------+--------------
+  1 | happy | {blue,happy}
+  2 | happy | {happy}
+  3 | blue  | {blue,ok}
+(3 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'steps_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- A chain of renames, a name given again to another label: each label
+-- followed through every rename (by name, 'a' would be the wrong one).
+CREATE TYPE eh.chain AS ENUM ('a', 'b');
+CREATE TABLE eh.chained (id int PRIMARY KEY, e eh.chain);
+INSERT INTO eh.chained VALUES (1, 'a'), (2, 'b');
+SELECT (dolt_commit('-Am', 'chain base'))[1] AS chain_base \gset
+SELECT dolt_branch('chain_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TYPE eh.chain RENAME VALUE 'a' TO 'c';
+SELECT length(dolt_commit('-Am', 'chain a to c')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.chain RENAME VALUE 'b' TO 'a';
+SELECT length(dolt_commit('-Am', 'chain b to a')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.chain RENAME VALUE 'c' TO 'd';
+SELECT length(dolt_commit('-Am', 'chain c to d')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+UPDATE eh.chained SET e = 'd' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'chain edited')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'chain_base', 'HEAD', NULL::eh.chained);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ modified  | (2,a)    | (2,d)
+(1 row)
+
+SELECT dolt_checkout('chain_writer');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'chain_writer'"}
+(1 row)
+
+INSERT INTO eh.chained VALUES (3, 'a'), (4, 'b');
+SELECT length(dolt_commit('-am', 'chain writer')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('chain_writer', '-m', 'merged chain'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM eh.chained ORDER BY id;
+ id | e 
+----+---
+  1 | d
+  2 | d
+  3 | d
+  4 | a
+(4 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'chain_writer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (a renamed label's old name added again later is another label: the
+-- rows read as they were, none changed)
+CREATE TYPE eh.again AS ENUM ('a', 'b');
+CREATE TABLE eh.agains (id int PRIMARY KEY, e eh.again);
+INSERT INTO eh.agains VALUES (1, 'b');
+SELECT (dolt_commit('-Am', 'again base'))[1] AS again_base \gset
+ALTER TYPE eh.again RENAME VALUE 'b' TO 'z';
+SELECT length(dolt_commit('-Am', 'again renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.again ADD VALUE 'b';
+SELECT length(dolt_commit('-Am', 'again added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT diff_type, from_row, to_row FROM dolt_diff(:'again_base', 'HEAD', NULL::eh.agains);
+ diff_type | from_row | to_row 
+-----------+----------+--------
+(0 rows)
+
+-- A commit of an addition and a rename together is still refused, even
+-- with commits of one or the other alone around it.
+CREATE TYPE eh.mixed AS ENUM ('a', 'b');
+CREATE TABLE eh.mix (id int PRIMARY KEY, e eh.mixed);
+INSERT INTO eh.mix VALUES (1, 'b');
+SELECT (dolt_commit('-Am', 'mixed base'))[1] AS mixed_base \gset
+ALTER TYPE eh.mixed ADD VALUE 'c';
+SELECT length(dolt_commit('-Am', 'mixed added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.mixed RENAME VALUE 'a' TO 'x';
+ALTER TYPE eh.mixed ADD VALUE 'y';
+SELECT length(dolt_commit('-Am', 'mixed both')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TYPE eh.mixed RENAME VALUE 'b' TO 'z';
+SELECT length(dolt_commit('-Am', 'mixed renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT count(*) FROM dolt_diff(:'mixed_base', 'HEAD', NULL::eh.mix);
+ERROR:  schema conflict: cannot map historical labels of enum eh.mixed
+DETAIL:  Labels are read across commits that rename labels in place or add labels keeping the others in order, not across one that does both or reuses a label.
+HINT:  Commit an enum's renames and its additions separately, and merge row changes before reusing labels.
+SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::eh.mix);
+ count 
+-------
+     0
+(1 row)
+
 DROP SCHEMA eh CASCADE;
-NOTICE:  drop cascades to 23 other objects
+NOTICE:  drop cascades to 31 other objects
 DETAIL:  drop cascades to type eh.mood
 drop cascades to type eh.dmood
 drop cascades to type eh.pair
@@ -469,3 +793,11 @@ drop cascades to type eh.enum_range
 drop cascades to table eh.ranged
 drop cascades to type eh.drop_enum
 drop cascades to table eh.dropped
+drop cascades to type eh.steps
+drop cascades to table eh.stepped
+drop cascades to type eh.chain
+drop cascades to table eh.chained
+drop cascades to type eh.again
+drop cascades to table eh.agains
+drop cascades to type eh.mixed
+drop cascades to table eh.mix

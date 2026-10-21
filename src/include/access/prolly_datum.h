@@ -58,12 +58,17 @@
 
 typedef struct ProllyDatumCodec ProllyDatumCodec;
 
-/* A named enum read from a historical definition into today's type. */
+/*
+ * A named enum read from a historical definition into today's type: each
+ * saved label and the label it reads as (NULL: none, one added where the
+ * enum read into has no such label).  targets NIL, with labels before: they
+ * couldn't be mapped, refused where they'd be decoded.
+ */
 typedef struct ProllyEnumMapping
 {
 	Oid			type;
 	List	   *before;			/* String nodes, in sort order */
-	List	   *after;
+	List	   *targets;		/* String nodes or NULLs, as before */
 } ProllyEnumMapping;
 
 extern bool prolly_datum_map_enums(ProllyDatumCodec *codec, List *mappings);
