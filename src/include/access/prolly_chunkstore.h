@@ -297,7 +297,8 @@ typedef struct ProllyChunkStoreRoutine
 
 	/*
 	 * Give a new database (CREATE DATABASE's, its files copied or not) the
-	 * store of the one it was made from, WAL-logged as any change.
+	 * store of the one it was made from, WAL-logged as any change (as
+	 * copies of the template's files, which redo copies again).
 	 */
 	void		(*copy_database) (Oid src_dboid, Oid src_spcoid,
 								  Oid dst_dboid, Oid dst_spcoid);

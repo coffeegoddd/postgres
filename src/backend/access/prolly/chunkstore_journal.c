@@ -8286,9 +8286,104 @@ journal_shmem_init(void *area)
 }
 
 /*
+ * The end of a segment's last whole record (fd, size bytes): what follows
+ * is a range a crash left reserved, whose zeros the WAL never had, so a
+ * standby may not have it.
+ */
+static uint64
+records_end(int fd, uint64 size)
+{
+	uint64		offset = JOURNAL_HEADER_SIZE;
+	StringInfoData rec;
+
+	if (size < JOURNAL_HEADER_SIZE)
+		return 0;
+	initStringInfo(&rec);
+	while (offset + RECORD_OVERHEAD <= size)
+	{
+		uint32		len;
+
+		if (pg_pread(fd, &len, sizeof(len), offset) != sizeof(len) ||
+			len < RECORD_OVERHEAD || offset + len > size)
+			break;
+		resetStringInfo(&rec);
+		enlargeStringInfo(&rec, len);
+		if (pg_pread(fd, rec.data, len, offset) != len ||
+			!record_valid(rec.data, len))
+			break;
+		offset += len;
+	}
+	pfree(rec.data);
+	return offset;
+}
+
+/*
+ * Copy a file of the template's store (table file or segment id, spath,
+ * size bytes) to dpath, the new database's, a piece at a time, each
+ * WAL-logged as a copy of the template's bytes, not as the bytes (#564);
+ * but a segment's bytes past its last whole record as bytes.  Synced, so
+ * the copy is durable before the template can be dropped.
+ */
+static void
+copy_store_file(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid,
+				bool segment, uint64 id, const char *spath, const char *dpath,
+				uint64 size, char *buf)
+{
+	CopyRun		run = {src_dboid, src_spcoid, 0, 0, NULL};
+	int			fd = OpenTransientFile(spath, O_RDONLY | PG_BINARY);
+	int			dfd;
+	uint64		end;
+
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", spath)));
+	dfd = OpenTransientFile(dpath, O_RDWR | O_CREAT | (segment ? 0 : O_TRUNC) |
+							PG_BINARY);
+	if (dfd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", dpath)));
+	end = segment ? records_end(fd, size) : size;
+	for (uint64 offset = 0; offset < size;)
+	{
+		Size		len = Min((uint64) APPEND_BATCH,
+							  (offset < end ? end : size) - offset);
+
+		if (pg_pread(fd, buf, len, offset) != len)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
+							len, (unsigned long long) offset, spath)));
+		if (offset < end)
+		{
+			CopySource	src = {segment ? COPY_SEGMENT_BYTES : COPY_TABLE_BYTES,
+			id, offset, (uint32) len};
+
+			/* (the bytes logged instead while a backup runs: copy_write()) */
+			run.n = 0;
+			copy_add(&run, &src);
+			copy_write(dst_dboid, dst_spcoid, segment, id, offset, buf, len,
+					   &run, true, dfd, dpath);
+		}
+		else
+			logged_write(dst_dboid, dst_spcoid, id, offset, buf, len, -1, dfd,
+						 dpath);
+		offset += len;
+	}
+	if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close file \"%s\": %m", dpath)));
+	fsync_fname(dpath, false);
+	if (run.sources)
+		pfree(run.sources);
+}
+
+/*
  * A new database's table files and manifest: those of the database it was
- * made from, each file copied as a table file is written (WAL-logged a
- * piece at a time), then the manifest naming them.
+ * made from, each file copied (copy_store_file()), then the manifest naming
+ * them.
  */
 static void
 copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
@@ -8308,35 +8403,9 @@ copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
 	{
 		char	   *spath = table_file_path(sdir, m.files[i].id);
 		char	   *dpath = table_file_path(ddir, m.files[i].id);
-		int			fd = OpenTransientFile(spath, O_RDONLY | PG_BINARY);
-		int			dfd;
 
-		if (fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", spath)));
-		dfd = OpenTransientFile(dpath, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
-		if (dfd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", dpath)));
-		for (uint64 offset = 0; offset < m.files[i].size;)
-		{
-			Size		len = Min((uint64) APPEND_BATCH, m.files[i].size - offset);
-
-			if (pg_pread(fd, buf, len, offset) != len)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
-								len, (unsigned long long) offset, spath)));
-			table_file_write(dst, dfd, dpath, m.files[i].id, offset, buf, len);
-			offset += len;
-		}
-		if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not close file \"%s\": %m", dpath)));
-		fsync_fname(dpath, false);
+		copy_store_file(src_dboid, src_spcoid, dst_dboid, dst_spcoid, false,
+						m.files[i].id, spath, dpath, m.files[i].size, buf);
 		pfree(spath);
 		pfree(dpath);
 	}
@@ -8349,31 +8418,23 @@ copy_table_files(Oid src_dboid, Oid src_spcoid, Oid dst_dboid, Oid dst_spcoid)
 }
 
 /*
- * A new database's store: the files of the database it was made from.
- * The journal's segments are copied a piece at a time as appends to the new
- * one are (WAL-logged and flushed, then written), and the table files and
- * manifest as they are written, so redo, standbys and base backups make
- * them too.  One whose files were copied (the file-copy strategy) has them
- * already.  Nobody else uses the source meanwhile (CREATE DATABASE sees to
- * that), so its files hold still.
+ * A new database's store: the files of the database it was made from,
+ * WAL-logged as copies of them (#564), whatever the strategy: one whose
+ * files were copied (the file-copy strategy) has them already, written
+ * over with the same bytes, so its store's durability is its own WAL's.
+ * Redo, standbys and base backups make them from their copies of the
+ * template.  Nobody else uses the template meanwhile (CREATE DATABASE sees
+ * to that), so its files hold still.
  */
 static void
 journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 					  Oid dst_spcoid)
 {
 	char	   *sdir = GetDatabasePath(src_dboid, src_spcoid);
-	char	   *ddir = GetDatabasePath(dst_dboid, dst_spcoid);
-	char	   *dseg = segment_path(dst_dboid, dst_spcoid, 0);
-	char	   *dman = dir_file(ddir, MANIFEST_FILE);
 	struct stat st;
 	char	   *buf;
 	Manifest	m;
-	bool		copied = stat(dseg, &st) == 0 || stat(dman, &st) == 0;
 
-	pfree(dseg);
-	pfree(dman);
-	if (copied)
-		return;
 	copy_table_files(src_dboid, src_spcoid, dst_dboid, dst_spcoid);
 	(void) read_manifest(sdir, &m);
 	buf = palloc(APPEND_BATCH);
@@ -8381,50 +8442,15 @@ journal_copy_database(Oid src_dboid, Oid src_spcoid, Oid dst_dboid,
 	{
 		char	   *src = segment_path(src_dboid, src_spcoid, m.segments[i]);
 		char	   *dst = segment_path(dst_dboid, dst_spcoid, m.segments[i]);
-		uint64		offset = 0;
-		int			fd;
-		int			dfd;
 
-		if (stat(src, &st) != 0)
-		{
-			pfree(src);
-			pfree(dst);
-			continue;
-		}
-		fd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
-		if (fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", src)));
-		dfd = OpenTransientFile(dst, O_RDWR | O_CREAT | PG_BINARY);
-		if (dfd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", dst)));
-		while (offset < (uint64) st.st_size)
-		{
-			Size		len = Min((uint64) APPEND_BATCH, (uint64) st.st_size - offset);
-
-			if (pg_pread(fd, buf, len, offset) != len)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read %zu bytes at %llu in file \"%s\": %m",
-								len, (unsigned long long) offset, src)));
-			logged_write(dst_dboid, dst_spcoid, m.segments[i], offset, buf, len,
-						 -1, dfd, dst);
-			offset += len;
-		}
-		if (CloseTransientFile(fd) != 0 || CloseTransientFile(dfd) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not close file \"%s\": %m", src)));
-		fsync_fname(dst, false);
+		if (stat(src, &st) == 0)
+			copy_store_file(src_dboid, src_spcoid, dst_dboid, dst_spcoid, true,
+							m.segments[i], src, dst, (uint64) st.st_size, buf);
 		pfree(src);
 		pfree(dst);
 	}
 	pfree(buf);
 	pfree(sdir);
-	pfree(ddir);
 }
 
 const ProllyChunkStoreRoutine prolly_chunkstore_journal = {

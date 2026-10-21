@@ -415,6 +415,29 @@ remote are new to the store and stay logged as bytes.
   Measured (`144_conjoin_copies.pl`): 23,528 bytes of WAL for 3,937,304
   copied (0.6%); bytes logged, 6,911,408 for 6,890,242. Its sources go
   after its manifest, which follows its file's sync (invariant 2).
+- **`CREATE DATABASE`** copies the template's table files and segments
+  as copies of their bytes, a megabyte a record, whatever its strategy
+  (decided, user, 2026-10-20): the file-copy strategy's files are
+  written over with the same bytes, so the store's durability is its own
+  WAL's, not the strategy's checkpoints. A segment is described up to
+  its last whole record; past that (a range a crash left reserved, its
+  zeros never in WAL, so on no standby) its bytes are logged. Each file
+  is synced before the command commits, so before its template can be
+  dropped (invariant 2; a dropped database's redo syncs copies first,
+  as a removal's does). **Not safe as copies:** a template dropped while
+  an online backup runs, which may be missing from the backup and can't
+  be kept for it (Postgres removes the directory). So while a backup runs
+  on the primary the copies log their bytes (`copy_write()`'s
+  `in_backup`, asked under `DELAY_CHKPT_START`: a backup starting later
+  has its start checkpoint after the record and waits for the write).
+  A backup taken from a standby can't tell the primary; there a template
+  dropped during the backup, after a `CREATE DATABASE` from it that the
+  backup's redo replays, fails the restore at its consistent point
+  (invariant 3's PANIC), not silently, as Postgres's own file-copy
+  strategy would leave the copy empty. Measured
+  (`145_createdb_copies.pl`, a 4.9 MB store): the file-copy strategy
+  logs 1,672 bytes, against 4,938,504 with the bytes; the WAL-log
+  strategy, 4,879,728 (its catalogs' pages) against 9,814,832.
 - **Checksums.** The record's CRC covers the bytes the sources make; each
   table file chunk keeps its own CRC and each journal record its own,
   which redo checks when it frames one.
