@@ -3,7 +3,8 @@
 # A move's rows inserted many at once, and a table it fills from nothing
 # with its indexes built after the rows (#490), across a crash: one cut
 # off in the middle leaves the branch as it was, and one committed keeps
-# every row and a valid index of each, whether the rows' WAL was written
+# every row and a valid index of each (a table TRUNCATE emptied in the
+# move's transaction too), whether the rows' WAL was written
 # (wal_level replica) or skipped and the new storage synced or logged at
 # commit (minimal).
 
@@ -131,6 +132,29 @@ checkpoint_timeout = '1h'
 		is($sql->(q{
 			SET enable_seqscan = off;
 			SELECT id FROM bk.n WHERE v = 'n12345'}), '12345',
+			"$wal_level, threshold $threshold: which find the rows");
+		is($sql->('SELECT count(*) FROM dolt_status'), '0',
+			"$wal_level, threshold $threshold: the branch at the commit");
+
+		# A table that was there, emptied by TRUNCATE in the move's
+		# transaction, is loaded into its new storage (whose WAL minimal
+		# skips) and its indexes built again.
+		$sql->('CHECKPOINT');
+		$sql->(qq{
+			SET wal_skip_threshold = '$threshold';
+			BEGIN;
+			TRUNCATE bk.t;
+			SELECT dolt_reset('--hard', '$c2');
+			COMMIT;
+		});
+		$crash->();
+		is($rows->('bk.t', 'id'), '20000:200010000',
+			"$wal_level, threshold $threshold: a truncated table loaded keeps its rows");
+		is($valid->(), 't',
+			"$wal_level, threshold $threshold: and valid indexes");
+		is($sql->(q{
+			SET enable_seqscan = off;
+			SELECT id FROM bk.t WHERE v = 'v12345'}), '12345',
 			"$wal_level, threshold $threshold: which find the rows");
 		is($sql->('SELECT count(*) FROM dolt_status'), '0',
 			"$wal_level, threshold $threshold: the branch at the commit");

@@ -169,6 +169,29 @@ INSERT INTO bm.n VALUES (9999, 'x', int4range(12, 13));
 INSERT INTO bm.d VALUES (9999, 3);
 SELECT count(*) AS fired FROM public.fired;
 
+-- A table emptied by TRUNCATE in the move's transaction has new storage
+-- no other transaction sees: filled again by the move, it is loaded too,
+-- its indexes (given new storage by the TRUNCATE) built again after.
+BEGIN;
+TRUNCATE bm.t;
+SELECT pg_stat_force_next_flush();
+SELECT batched AS batched0, loads AS loads0 FROM counted() \gset
+SELECT dolt_reset('--hard', :'c2');
+COMMIT;
+SELECT pg_stat_force_next_flush();
+SELECT batched - :batched0 AS batched, loads - :loads0 AS loads FROM counted();
+SELECT same_as_head();
+SELECT count(*), sum(id), sum(g), count(big), sum(length(big)) FROM bm.t;
+SELECT * FROM indexes_valid();
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, g FROM bm.t WHERE v = 'v2000';
+SELECT id FROM bm.t WHERE u = 2999;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+INSERT INTO bm.t (id, v, u) VALUES (7, 'x', 5007);
+SELECT count(*) AS fired FROM public.fired;
+
 -- A clone fills every table from nothing too.
 SELECT dolt_remote('add', 'origin', :'url');
 SELECT dolt_push('origin', 'main') AS pushed;
