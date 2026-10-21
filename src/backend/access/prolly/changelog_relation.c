@@ -1252,6 +1252,7 @@ typedef struct ReadState
 	uint64		rows;
 	Snapshot	snapshot;		/* by scan_since(): the snapshot's view */
 	const ProllyLogPosition *pos;
+	bool		consumed;		/* by read_unseen(): a row visited was */
 } ReadState;
 
 static bool
@@ -1285,6 +1286,8 @@ read_unseen_row(Relation log, HeapTuple tup, void *arg)
 		!TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(t)) ||
 		!row_held(log, tup, rs->pos))
 		return true;
+	if (row_consumed(tup))
+		rs->consumed = true;
 	return read_row(log, tup, arg);
 }
 
@@ -1332,12 +1335,14 @@ relation_read(Relation rel, Snapshot snapshot, const ProllyLogPosition *since,
  * the snapshot's xmax to the fold's, of those running for the snapshot,
  * and of the fold's own, by the index, every row whatever it sees (kept
  * while it is: trimming keeps the rows of transactions any snapshot may
- * not see finished).
+ * not see finished).  The fold's own rows it consumed (deleted) are kept
+ * only that long: once no snapshot needs them VACUUM takes them, so
+ * *consumed says one was visited.
  */
 static bool
 relation_read_unseen(Relation rel, Snapshot snapshot,
 					 const ProllyLogPosition *was,
-					 ProllyChangeLogVisit visit, void *arg)
+					 ProllyChangeLogVisit visit, void *arg, bool *consumed)
 {
 	Oid			logid = log_relid(rel);
 	Relation	log;
@@ -1349,6 +1354,7 @@ relation_read_unseen(Relation rel, Snapshot snapshot,
 	uint32		nrunning;
 	bool		go = true;
 
+	*consumed = false;
 	if (!OidIsValid(logid) || !IsMVCCSnapshot(snapshot))
 		return false;
 	log = table_open(logid, AccessShareLock);
@@ -1381,6 +1387,7 @@ relation_read_unseen(Relation rel, Snapshot snapshot,
 	pgstat_count_prolly(PGSTAT_PROLLY_LOG_PAGES_READ, rs.rows);
 	index_close(index, AccessShareLock);
 	table_close(log, AccessShareLock);
+	*consumed = rs.consumed;
 	return go;
 }
 

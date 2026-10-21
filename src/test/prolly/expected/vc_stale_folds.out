@@ -399,3 +399,93 @@ full_folds|stale_full
          0|         0
 (1 row)
 
+
+starting permutation: a_begin c_write_fold c_reset a_checkpoint a_status a_diff a_verify a_commit c_vacuum a_flush c_full c_status c_diff c_verify c_flush c_full
+step a_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) AS k_rows FROM vsf.k;
+k_rows
+------
+   100
+(1 row)
+
+step c_write_fold: BEGIN; UPDATE vsf.k SET v = 'c' WHERE id = 3; INSERT INTO vsf.n VALUES (2); SELECT prolly_checkpoint() IS NOT NULL AS checkpointed; COMMIT;
+checkpointed
+------------
+t           
+(1 row)
+
+step c_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_checkpoint: SELECT prolly_checkpoint() IS NOT NULL AS checkpointed;
+checkpointed
+------------
+t           
+(1 row)
+
+step a_status: SELECT table_name, staged, status FROM dolt_status ORDER BY 1, 2;
+table_name|staged|status
+----------+------+------
+(0 rows)
+
+step a_diff: SELECT (SELECT string_agg(diff_type || ':' || coalesce((to_row).id, (from_row).id) || ':' || coalesce((to_row).v, '-'), ',' ORDER BY coalesce((to_row).id, (from_row).id)) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.n)) AS n_diff;
+k_diff|n_diff
+------+------
+      |     0
+(1 row)
+
+step a_verify: SELECT table_name, matches FROM dolt_verify_folds() ORDER BY 1;
+table_name|matches
+----------+-------
+vsf.k     |t      
+vsf.n     |t      
+(2 rows)
+
+step a_commit: COMMIT;
+step c_vacuum: VACUUM vsf.k, vsf.n;
+step a_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_full: SELECT sum(value) FILTER (WHERE name = 'fold_full_tables') - sum(value) FILTER (WHERE name = 'fold_full_verify') AS full_folds, sum(value) FILTER (WHERE name IN ('fold_full_stale_snapshot', 'fold_full_unsettled')) AS stale_full FROM pg_stat_prolly;
+full_folds|stale_full
+----------+----------
+         0|         0
+(1 row)
+
+step c_status: SELECT table_name, staged, status FROM dolt_status ORDER BY 1, 2;
+table_name|staged|status  
+----------+------+--------
+vsf.k     |t     |modified
+vsf.n     |t     |modified
+(2 rows)
+
+step c_diff: SELECT (SELECT string_agg(diff_type || ':' || coalesce((to_row).id, (from_row).id) || ':' || coalesce((to_row).v, '-'), ',' ORDER BY coalesce((to_row).id, (from_row).id)) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.n)) AS n_diff;
+k_diff      |n_diff
+------------+------
+modified:3:c|     1
+(1 row)
+
+step c_verify: SELECT table_name, matches FROM dolt_verify_folds() ORDER BY 1;
+table_name|matches
+----------+-------
+vsf.k     |t      
+vsf.n     |t      
+(2 rows)
+
+step c_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_full: SELECT sum(value) FILTER (WHERE name = 'fold_full_tables') - sum(value) FILTER (WHERE name = 'fold_full_verify') AS full_folds, sum(value) FILTER (WHERE name IN ('fold_full_stale_snapshot', 'fold_full_unsettled')) AS stale_full FROM pg_stat_prolly;
+full_folds|stale_full
+----------+----------
+         6|         6
+(1 row)
+

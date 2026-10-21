@@ -43,7 +43,16 @@
  * doesn't see finished are undone (their keys re-read by this snapshot,
  * the version it sees, or none; a keyless row's count taken back), and
  * those since applied as any fold's.  The log keeps them for it: rows are
- * trimmed only once every snapshot sees their transactions finished.
+ * trimmed only once every snapshot sees their transactions finished.  But
+ * the baseline it begins, at its own snapshot's position, doesn't hold the
+ * changes of the transactions it didn't see finished, and the rows the
+ * newer fold consumed (its own transaction's, deleted) are kept only while
+ * a snapshot may need them: VACUUM takes them once this one ends.  So when
+ * the undoing found such a row, or such a fold read the table in full, its
+ * baseline is marked unsettled: the next fold by a snapshot that sees more
+ * finished than it held reads the table in full, by its own snapshot (one
+ * that sees no more, as the old transaction's later statements, folds from
+ * it, and keeps the mark).
  *
  * The entries a fold reads are kept once per row (a key's, or a keyless
  * row's with its count summed), so the memory a fold takes is of the rows
@@ -88,6 +97,11 @@
 /* (a first byte no "pages" state has: neither reads the other's) */
 #define STATE_TAG			'L'
 #define STATE_VERSION		3		/* 2: flags; 3: full transaction ids */
+
+#define STATE_UNSETTLED		0x01	/* folded by a snapshot older than its
+									 * baseline's fold, which consumed rows
+									 * this one's position doesn't hold:
+									 * one that sees more folds in full */
 
 /* Entries kept before they are first made one per row. */
 #define COMPACT_AT			65536
@@ -151,6 +165,7 @@ typedef struct Finder
 	bool		merge;			/* merge the changes with the baseline */
 	Size		bytes;			/* what the copies take */
 	bool		give_up;
+	bool		unsettled;		/* undid rows its position can't find again */
 	ProllyFullFoldReason reason;	/* why, once it gives up */
 	StringInfoData key;			/* reused for each encoding */
 	StringInfoData row;
@@ -303,6 +318,24 @@ sees_fold(Snapshot snap, const State *st)
 		if (TransactionIdPrecedes(running[i], st->xmax) &&
 			bsearch(&running[i], st->xip, st->nxip, sizeof(TransactionId),
 					xid_cmp) == NULL)
+			return false;
+	return true;
+}
+
+/*
+ * Does the snapshot see no transaction finished that the fold's position
+ * doesn't hold (one at or past its xmax, or one it saw running)?  So an
+ * unsettled baseline's rows are all this snapshot needs: a later
+ * statement of the transaction whose old snapshot began it, say.
+ */
+static bool
+sees_no_more(Snapshot snap, const State *st)
+{
+	if (!TransactionIdIsNormal(st->xmax) ||
+		TransactionIdPrecedes(st->xmax, snap->xmax))
+		return false;
+	for (uint32 i = 0; i < st->nxip; i++)
+		if (!XidInMVCCSnapshot(st->xip[i], snap))
 			return false;
 	return true;
 }
@@ -919,6 +952,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 			 ProllyNodeRef *data)
 {
 	ProllyLogPosition pos = {st->fxmax, st->fown, st->nxip, st->fxip};
+	bool		consumed = false;
 
 	f->compact = true;
 	if (f->give_up)
@@ -928,16 +962,19 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	 * (a snapshot that doesn't see the baseline's fold: the changes the
 	 * fold held of transactions the snapshot doesn't see finished are
 	 * undone, each a candidate re-read by the snapshot, a keyless row's
-	 * count taken back)
+	 * count taken back; if one was consumed, the baseline this fold
+	 * begins is unsettled: see the file's header)
 	 */
 	if (stale &&
 		!PROLLY_CALL(log, read_unseen, f->rel, f->snap, &pos,
-					 entry_unseen_visit, f))
+					 entry_unseen_visit, f, &consumed))
 	{
 		if (!f->give_up)
 			f->reason = PROLLY_FULL_LOG_ENTRY;
 		return false;
 	}
+	if (consumed)
+		f->unsettled = true;
 	if (f->give_up)
 		return false;
 	if (!PROLLY_CALL(log, read, f->rel, f->snap, &pos, entry_visit, f))
@@ -1093,12 +1130,17 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	stale = have && !sees_fold(f.snap, &st);
 	if (have && f.reason == PROLLY_FULL_NONE)
 	{
-		if (stale && !PROLLY_HAS(c.change_log, read_unseen))
+		if ((st.flags & STATE_UNSETTLED) && !sees_no_more(f.snap, &st))
+			f.reason = PROLLY_FULL_UNSETTLED;
+		else if (stale && !PROLLY_HAS(c.change_log, read_unseen))
 			f.reason = PROLLY_FULL_STALE_SNAPSHOT;
 		else if (storage_unseen(rel, f.snap))
 			f.reason = PROLLY_FULL_STORAGE_UNSEEN;
 	}
 	have = have && f.reason == PROLLY_FULL_NONE;
+	/* (a baseline as unsettled, still not holding what it didn't) */
+	if (have && (st.flags & STATE_UNSETTLED))
+		f.unsettled = true;
 	if (!have || !fold_changed(&f, baseline, &st, stale, c.change_log, data))
 	{
 		instr_time	start;
@@ -1109,6 +1151,9 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 		MemoryContextReset(f.ccxt);
 		f.c = NULL;
 		f.n = f.max = 0;
+		/* (by a stale snapshot: what a newer fold consumed isn't read) */
+		if (stale)
+			f.unsettled = true;
 		INSTR_TIME_SET_CURRENT(start);
 		fold_all(&f, data);
 		INSTR_TIME_SET_CURRENT(took);
@@ -1132,7 +1177,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	{
 		State		ns = {0};
 
-		ns.flags = 0;
+		ns.flags = f.unsettled ? STATE_UNSETTLED : 0;
 		ns.log = identity;
 		state_of_snapshot(&ns, f.snap);
 		MemoryContextSwitchTo(old);
@@ -1214,7 +1259,8 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 		return false;
 	identity = PROLLY_CALL(c.change_log, identity, rel);
 	if (identity == 0 || !parse_state(state, &st) || st.log != identity ||
-		!sees_fold(snap, &st) || storage_unseen(rel, snap))
+		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
+		storage_unseen(rel, snap))
 		return false;
 	{
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};

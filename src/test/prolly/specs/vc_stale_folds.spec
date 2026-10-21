@@ -6,7 +6,11 @@
 # reading no table in full; the next fold, in a fresh transaction, is from
 # the baseline too.  The other transaction committed before the fold, in
 # flight at the snapshot, or aborted; a key written before the snapshot and
-# again after; the stale transaction's own writes.
+# again after; the stale transaction's own writes; the other transaction
+# writing and folding at once, its fold consuming its own entries, and the
+# log vacuumed once the stale transaction ends (the next fold then reads in
+# full: the baseline the stale fold began doesn't hold those entries, and
+# they are gone).
 
 setup		{ CREATE SCHEMA vsf VERSIONED; }
 setup
@@ -34,6 +38,7 @@ step a_write	{ UPDATE vsf.k SET v = 'a' WHERE id = 50; INSERT INTO vsf.n VALUES 
 step a_status	{ SELECT table_name, staged, status FROM dolt_status ORDER BY 1, 2; }
 step a_diff		{ SELECT (SELECT string_agg(diff_type || ':' || coalesce((to_row).id, (from_row).id) || ':' || coalesce((to_row).v, '-'), ',' ORDER BY coalesce((to_row).id, (from_row).id)) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.n)) AS n_diff; }
 step a_verify	{ SELECT table_name, matches FROM dolt_verify_folds() ORDER BY 1; }
+step a_checkpoint	{ SELECT prolly_checkpoint() IS NOT NULL AS checkpointed; }
 step a_commit	{ COMMIT; }
 step a_flush	{ SELECT pg_stat_force_next_flush(); }
 
@@ -47,6 +52,9 @@ step b_abort	{ ROLLBACK; }
 session c
 step c_reset	{ SELECT pg_stat_reset_shared('prolly'); }
 step c_fold		{ SELECT (dolt_commit('-am', 'c commits'))[1] IS NOT NULL AS committed; }
+step c_write_fold	{ BEGIN; UPDATE vsf.k SET v = 'c' WHERE id = 3; INSERT INTO vsf.n VALUES (2); SELECT prolly_checkpoint() IS NOT NULL AS checkpointed; COMMIT; }
+step c_vacuum	{ VACUUM vsf.k, vsf.n; }
+step c_diff		{ SELECT (SELECT string_agg(diff_type || ':' || coalesce((to_row).id, (from_row).id) || ':' || coalesce((to_row).v, '-'), ',' ORDER BY coalesce((to_row).id, (from_row).id)) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vsf.n)) AS n_diff; }
 step c_full		{ SELECT sum(value) FILTER (WHERE name = 'fold_full_tables') - sum(value) FILTER (WHERE name = 'fold_full_verify') AS full_folds, sum(value) FILTER (WHERE name IN ('fold_full_stale_snapshot', 'fold_full_unsettled')) AS stale_full FROM pg_stat_prolly; }
 step c_status	{ SELECT table_name, staged, status FROM dolt_status ORDER BY 1, 2; }
 step c_verify	{ SELECT table_name, matches FROM dolt_verify_folds() ORDER BY 1; }
@@ -62,3 +70,6 @@ permutation b_begin b_write b_commit a_begin b_begin b_write2 b_commit c_fold c_
 permutation b_begin b_write a_begin b_abort c_fold c_reset a_status a_diff a_verify a_commit a_flush c_full c_status c_verify c_flush c_full
 # the stale transaction's own writes
 permutation a_begin b_begin b_write b_commit c_fold c_reset a_write a_status a_diff a_verify a_commit a_flush c_full c_status c_verify c_flush c_full
+# the other transaction's fold consumes its own entries; the stale fold
+# begins a baseline, and the log is vacuumed before the next fold
+permutation a_begin c_write_fold c_reset a_checkpoint a_status a_diff a_verify a_commit c_vacuum a_flush c_full c_status c_diff c_verify c_flush c_full

@@ -151,9 +151,16 @@ Two interfaces, each selected by the table AM's profile
   or none; without, each row's count taken back by its delta), and those
   read since the position applied, as any fold's. O(the keys whose
   visibility differs + the entries since). Its baseline, if it begins one,
-  is as any: the next fold reads from its position, the rows a newer fold
-  consumed included. Earlier, such a fold read the table in full and
-  marked its baseline unsettled, for the next to read in full again.
+  is as any: the next fold reads from its position. But the rows the newer
+  fold consumed (its own transaction's, deleted) are kept only while some
+  snapshot may need them; once the old transaction ends VACUUM removes
+  them, and its position doesn't hold them. So if the undoing visited a
+  consumed row (or the fold read in full), the baseline is marked
+  unsettled: the next fold by a snapshot that sees more finished than the
+  position held reads in full; one that sees no more (the old
+  transaction's later statements) folds from it and keeps the mark
+  (review of #611). Earlier, such a fold always read the table in full and
+  marked its baseline unsettled.
 - **A fold from a baseline** of its own reads the log entries its
   snapshot sees:
   - with a primary key, each entry's key is a candidate, looked up in the
