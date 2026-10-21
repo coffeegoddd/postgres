@@ -315,12 +315,20 @@ table (or the branch) as phase 1 does:
 or drop rows without recording them; they set the "changed" flag, and
 their tables fall back to the fold.
 
-**The baseline.** Phase 2 commits don't advance the branch's baseline
-(user, 2026-10-18): the next full fold (`dolt_commit()`, `dolt_status`,
-a checkout's clean check) reads every page changed since the last full
-fold, finds the rows already in the head unchanged, and advances it.
-Advancing it from a delta commit would need proof that nothing outside
-the mode wrote the branch since; it isn't done.
+**The baseline.** A phase 2 commit advances the branch's baseline with
+it, table by table (user, 2026-10-20, #568; before, 2026-10-18, it
+didn't, and every fold read every change since the last full fold): a
+table whose baseline held exactly the old head's rows, by a fold the
+commit's snapshot sees, now holds the new head's, and the change log's
+entries of the transaction's own are consumed (by TID: the log keeps
+which it wrote, `consume_own()`). Nothing has to prove that no one
+outside the mode wrote the branch: the others' entries stay in the log,
+changes the new baseline doesn't hold, for the next fold. A table whose
+baseline lags the head, or whose log can't tell the transaction's
+entries (one says to read the table in full, or there are more than
+65,536), keeps its baseline, till the next fold. Then `dolt_status`, a
+checkout's clean check and an owned branch's release check read only
+what changed since the last commit (#569).
 
 **What it gives.** The commit holds exactly the transaction's row
 changes, at every isolation level, whoever else writes the branch. In a
@@ -407,7 +415,7 @@ Decided by the user 2026-10-18, as recommended:
    recorded (rule 7, shared with #146's fix); in phase 2, deduplication
    by TID and role, then versions both made and deleted dropped, rewrites
    falling back to the fold, `dolt.transaction_commit_max_changes` at
-   100,000, and no baseline advance from delta commits.
+   100,000, and (since #568) the baseline advanced with each.
 
 Still open:
 

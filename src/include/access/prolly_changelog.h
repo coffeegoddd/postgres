@@ -64,6 +64,11 @@
  *   baseline (if the transaction aborts, they come back with the old
  *   baseline).  Entries consumed meanwhile by another transaction are let
  *   be.
+ * - consume_own() (optional) deletes the entries of rel's log the current
+ *   transaction wrote and didn't abort: called once a baseline holding
+ *   exactly its own changes, applied to the last, is to be the table's.
+ *   False, deleting none, if the log can't tell them all (the caller then
+ *   keeps the old baseline).
  *
  * Provisional (v0).
  *
@@ -102,13 +107,14 @@ typedef struct ProllyChangeLogRoutine
 	Oid			(*relid) (Oid relid);
 	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
 							  HeapTuple *made, int nmade);
+	bool		(*consume_own) (Relation rel);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", "reset", \
-	"relid", "note_made"
+	"relid", "note_made", "consume_own"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
-#define PROLLY_CHANGELOG_LAST_CALLBACK note_made
+#define PROLLY_CHANGELOG_LAST_CALLBACK consume_own
 
 static inline const ProllyChangeLogRoutine *
 prolly_changelog_lookup(const char *name)

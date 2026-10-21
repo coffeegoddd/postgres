@@ -1958,6 +1958,17 @@ pages_counters(ProllyChangeCounters *out, bool reset)
 		memset(&counters, 0, sizeof(counters));
 }
 
+/*
+ * A baseline isn't advanced past a commit of the transaction's own rows:
+ * its state is the pages as of its fold, which a commit of rows alone
+ * doesn't move.
+ */
+static bool
+pages_advance(Relation rel, const ProllyValue *state, StringInfo next)
+{
+	return false;
+}
+
 const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.info = {
 		.iface = PROLLY_IFACE_CHANGE_FINDER,
@@ -1972,4 +1983,5 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.counters = pages_counters,
 	.fold_rows = pages_fold_rows,
 	.state_refs = pages_state_refs,
+	.advance = pages_advance,
 };

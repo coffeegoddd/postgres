@@ -236,7 +236,138 @@ typedef struct Entries
 	HeapTuple  *tups;
 	int			n;
 	int			max;
+	bool		full;			/* one says to read the table in full */
 } Entries;
+
+/* ----------------------------------------------------------------
+ * The transaction's own entries, by TID, for consume_own(): each log's,
+ * with the subtransaction that wrote it (one aborting takes its entries
+ * out; one committing gives them to its parent).  A log some entry of
+ * which says to read the table in full, or that has more than
+ * OWN_ENTRIES_MAX, isn't kept: its entries can't be consumed so.
+ * ----------------------------------------------------------------
+ */
+#define OWN_ENTRIES_MAX		65536
+
+typedef struct OwnEntry
+{
+	ItemPointerData tid;
+	SubTransactionId subid;
+} OwnEntry;
+
+typedef struct OwnLog
+{
+	Oid			logid;			/* hash key */
+	OwnEntry   *entries;
+	int			n;
+	int			max;
+	bool		lost;			/* not all kept */
+} OwnLog;
+
+static HTAB *own_logs = NULL;	/* the transaction's: TopTransactionContext */
+static bool own_callbacks = false;
+
+static void
+own_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			own_logs = NULL;	/* (with the transaction's memory) */
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+own_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					 SubTransactionId parentSubid, void *arg)
+{
+	HASH_SEQ_STATUS seq;
+	OwnLog	   *ol;
+
+	if (own_logs == NULL ||
+		(event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB))
+		return;
+	hash_seq_init(&seq, own_logs);
+	while ((ol = hash_seq_search(&seq)) != NULL)
+	{
+		int			kept = 0;
+
+		for (int i = 0; i < ol->n; i++)
+		{
+			if (ol->entries[i].subid != mySubid)
+				ol->entries[kept++] = ol->entries[i];
+			else if (event == SUBXACT_EVENT_COMMIT_SUB)
+			{
+				ol->entries[kept] = ol->entries[i];
+				ol->entries[kept++].subid = parentSubid;
+			}
+		}
+		ol->n = kept;
+	}
+}
+
+/* Keep the TIDs of a write's entries, just inserted. */
+static void
+own_note(Entries *e, const ItemPointerData *tids)
+{
+	Oid			logid = RelationGetRelid(e->log);
+	OwnLog	   *ol;
+	bool		found;
+
+	if (!own_callbacks)
+	{
+		RegisterXactCallback(own_xact_callback, NULL);
+		RegisterSubXactCallback(own_subxact_callback, NULL);
+		own_callbacks = true;
+	}
+	if (own_logs == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(OwnLog);
+		ctl.hcxt = TopTransactionContext;
+		own_logs = hash_create("prolly own change log entries", 16, &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	ol = hash_search(own_logs, &logid, HASH_ENTER, &found);
+	if (!found)
+	{
+		ol->entries = NULL;
+		ol->n = ol->max = 0;
+		ol->lost = false;
+	}
+	if (ol->lost)
+		return;
+	if (e->full || ol->n + e->n > OWN_ENTRIES_MAX)
+	{
+		ol->lost = true;
+		if (ol->entries)
+			pfree(ol->entries);
+		ol->entries = NULL;
+		ol->n = ol->max = 0;
+		return;
+	}
+	if (ol->n + e->n > ol->max)
+	{
+		ol->max = Max(64, Max(ol->max * 2, ol->n + e->n));
+		ol->entries = ol->entries ?
+			repalloc_array(ol->entries, OwnEntry, ol->max) :
+			MemoryContextAlloc(TopTransactionContext, sizeof(OwnEntry) * ol->max);
+	}
+	for (int i = 0; i < e->n; i++)
+	{
+		ol->entries[ol->n].tid = tids[i];
+		ol->entries[ol->n++].subid = GetCurrentSubTransactionId();
+	}
+}
 
 /* An entry: image (NULL: read the table in full) and delta. */
 static void
@@ -254,7 +385,10 @@ insert_entry(Entries *e, HeapTuple image, int32 delta)
 		values[Anum_log_image - 1] = PointerGetDatum(b);
 	}
 	else
+	{
 		isnull[Anum_log_image - 1] = true;
+		e->full = true;
+	}
 	values[Anum_log_delta - 1] = Int32GetDatum(delta);
 	if (e->n == e->max)
 	{
@@ -269,15 +403,18 @@ static void
 write_entries(Entries *e)
 {
 	TupleTableSlot **slots;
+	ItemPointerData *tids;
 
 	if (e->n == 0)
 		return;
 	if (e->n == 1)
 	{
 		simple_heap_insert(e->log, e->tups[0]);
+		own_note(e, &e->tups[0]->t_self);
 		return;
 	}
 	slots = palloc_array(TupleTableSlot *, e->n);
+	tids = palloc_array(ItemPointerData, e->n);
 	for (int i = 0; i < e->n; i++)
 	{
 		slots[i] = MakeSingleTupleTableSlot(RelationGetDescr(e->log),
@@ -286,7 +423,11 @@ write_entries(Entries *e)
 	}
 	heap_multi_insert(e->log, slots, e->n, GetCurrentCommandId(true), 0, NULL);
 	for (int i = 0; i < e->n; i++)
+	{
+		tids[i] = slots[i]->tts_tid;
 		ExecDropSingleTupleTableSlot(slots[i]);
+	}
+	own_note(e, tids);
 }
 
 /*
@@ -655,6 +796,53 @@ relation_consume(Relation rel, Snapshot snapshot)
 	);
 	pfree(c.tids);
 	table_close(log, NoLock);
+	/* (the transaction's own, which its snapshot sees, are consumed too) */
+	if (own_logs)
+		(void) hash_search(own_logs, &logid, HASH_REMOVE, NULL);
+}
+
+/*
+ * Delete the entries of rel's log the current transaction wrote (and
+ * hasn't aborted): those of its own changes, once a baseline holding them
+ * is to be the table's.  False, deleting none, if not all were kept (an
+ * entry says to read the table in full, or there were too many).
+ */
+static bool
+relation_consume_own(Relation rel)
+{
+	Oid			logid = log_relid(rel);
+	OwnLog	   *ol;
+	Relation	log;
+	CommandId	cid;
+
+	if (!OidIsValid(logid))
+		return false;
+	ol = own_logs ? hash_search(own_logs, &logid, HASH_FIND, NULL) : NULL;
+	if (ol == NULL)
+		return true;
+	if (ol->lost)
+		return false;
+	/* (the deletes as a command after the inserts) */
+	CommandCounterIncrement();
+	cid = GetCurrentCommandId(true);
+	log = table_open(logid, RowExclusiveLock);
+	BRANCH_WRITES_HUSHED(
+		for (int i = 0; i < ol->n; i++)
+		{
+			TM_FailureData tmfd;
+			TM_Result	result;
+
+			result = heap_delete(log, &ol->entries[i].tid, cid, 0,
+								 InvalidSnapshot, true, &tmfd);
+			if (result != TM_Ok && result != TM_SelfModified)
+				elog(ERROR, "unexpected result %d consuming an entry of \"%s\"",
+					 (int) result, RelationGetRelationName(log));
+			CHECK_FOR_INTERRUPTS();
+		}
+	);
+	table_close(log, NoLock);
+	(void) hash_search(own_logs, &logid, HASH_REMOVE, NULL);
+	return true;
 }
 
 /*
@@ -719,4 +907,5 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.reset = relation_reset,
 	.relid = relation_relid,
 	.note_made = relation_note_made,
+	.consume_own = relation_consume_own,
 };

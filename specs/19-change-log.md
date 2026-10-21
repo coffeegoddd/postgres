@@ -191,9 +191,10 @@ made passed in hand.
 - **Keyless rows with values out of line** other than by content (not a
   versioned table's) are entries to fold in full; `pages` reads values
   stored by content again.
-- **The log grows between baselines**, as the changed-page list did: with
-  `dolt.transaction_commit` and no other fold (spec 15 doesn't advance
-  the baseline), until the next commit, checkpoint or move.
+- **The log grows between baselines**, as the changed-page list did,
+  until the next commit, checkpoint or move; with
+  `dolt.transaction_commit`, each transaction's commit consumes its own
+  entries (spec 15), but a fold still walks every page of the log.
 - **Tables `pages` folded before** keep their fold epoch: each page born
   before it is copied and listed once more, and the list isn't pruned.
 - **Tables made before this stack have no log** until an `ALTER TABLE`

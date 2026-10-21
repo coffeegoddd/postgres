@@ -269,6 +269,20 @@ typedef struct ProllyCanonRoutine
 							  ProllyNodeRef *root);
 
 	/*
+	 * Optional: baseline advanced past a commit of the transaction's own
+	 * row changes (fold_rows() made root of head with them), into *next:
+	 * each of those tables whose baseline holds head's rows for it (and
+	 * whose finder can advance its state) holding root's instead, the
+	 * rest as baseline has them.  False, next undefined, if no table's
+	 * could be.
+	 */
+	bool		(*advance_baseline) (const ProllyNodeRef *baseline,
+									 const ProllyNodeRef *head,
+									 const ProllyNodeRef *root,
+									 const ProllyRowChanges *changes,
+									 int nchanges, ProllyNodeRef *next);
+
+	/*
 	 * Optional: each object from and to hold differently, tables and the
 	 * rest, by name; a dropped and an added object of a kind whose items
 	 * are the same (definition and rows), and the only such pair, as one
@@ -303,7 +317,7 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"changes", "render", "splice"
+	"advance_baseline", "changes", "render", "splice"
 #define PROLLY_CANON_FIRST_CALLBACK walk
 #define PROLLY_CANON_LAST_CALLBACK splice
 

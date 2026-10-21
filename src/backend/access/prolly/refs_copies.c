@@ -2105,8 +2105,11 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 /*
  * The head with the transaction's own row changes: no snapshot is checked
  * (heap's row locks, unique indexes and isolation level have decided which
- * changes commit together), and the baseline isn't advanced (the next full
- * fold reads the pages changed since it).
+ * changes commit together).  The baseline advances with it for each table
+ * whose baseline held the old head's rows: then the branch's next fold, as
+ * a status's, a checkout's or the next working-set commit's, reads only the
+ * changes since this commit, not every one since the last fold.  A table
+ * whose baseline lags the head keeps it, till the next fold advances it.
  */
 static int
 copies_commit_rows(const char *message, const ProllyRowChanges *changes,
@@ -2154,6 +2157,16 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 				 commit_id);
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
+	{
+		ProllyNodeRef baseline;
+		ProllyNodeRef next;
+
+		if (PROLLY_HAS(dc.canonicalizer, advance_baseline) &&
+			branch_baseline(name, &baseline) &&
+			PROLLY_CALL(dc.canonicalizer, advance_baseline, &baseline,
+						&info.root, &root, changes, nchanges, &next))
+			branch_set_baseline(name, &next, NULL);
+	}
 	return 1;
 }
 

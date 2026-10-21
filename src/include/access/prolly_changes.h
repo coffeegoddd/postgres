@@ -105,12 +105,25 @@ typedef struct ProllyChangeFinderRoutine
 	 * a state it didn't write.
 	 */
 	void		(*state_refs) (const ProllyValue *state, StringInfo refs);
+
+	/*
+	 * Optional: the next state (into next) of a baseline that holds rel's
+	 * last baseline's rows (whose state is state) with the current
+	 * transaction's own changes applied, as fold_rows() applies them, and
+	 * nothing else: as of the active snapshot, its fold's transaction this
+	 * one.  The finder marks those changes folded (its own record of them
+	 * consumed); the others since the last baseline stay to be folded.
+	 * False, marking nothing, where the last baseline's state can't be
+	 * advanced so: the caller keeps it.
+	 */
+	bool		(*advance) (Relation rel, const ProllyValue *state,
+							StringInfo next);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
-	"state_refs"
+	"state_refs", "advance"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK state_refs
+#define PROLLY_CHANGES_LAST_CALLBACK advance
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

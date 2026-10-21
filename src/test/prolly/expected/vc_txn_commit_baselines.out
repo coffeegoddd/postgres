@@ -1,0 +1,99 @@
+Parsed test spec with 3 sessions
+
+starting permutation: c_reset a_rc b_rc a_write b_write a_commit b_commit c_status c_flush c_full c_rows c_head
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_rc: BEGIN;
+step b_rc: BEGIN;
+step a_write: UPDATE vtb.k SET v = 'a' WHERE id = 1; INSERT INTO vtb.n VALUES (1);
+step b_write: UPDATE vtb.k SET v = 'b' WHERE id = 2; INSERT INTO vtb.n VALUES (1); DELETE FROM vtb.n WHERE ctid = (SELECT min(ctid) FROM vtb.n WHERE v = 2);
+step a_commit: COMMIT;
+step b_commit: COMMIT;
+step c_status: SELECT count(*) AS changed FROM dolt_status;
+changed
+-------
+      0
+(1 row)
+
+step c_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_full: SELECT value AS full_folds FROM pg_stat_prolly WHERE name = 'fold_full_tables';
+full_folds
+----------
+         0
+(1 row)
+
+step c_rows: SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM vtb.k WHERE id <= 2) AS k, (SELECT count(*) FROM vtb.n) AS n, (SELECT count(*) FROM vtb.n WHERE v = 2) AS twos;
+k  |  n|twos
+---+---+----
+a,b|101|  19
+(1 row)
+
+step c_head: SELECT (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vtb.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vtb.n)) AS n_diff;
+k_diff|n_diff
+------+------
+     0|     0
+(1 row)
+
+
+starting permutation: c_reset a_rr b_rr a_write b_write a_commit b_commit c_status c_flush c_full c_rows c_head
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step b_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step a_write: UPDATE vtb.k SET v = 'a' WHERE id = 1; INSERT INTO vtb.n VALUES (1);
+step b_write: UPDATE vtb.k SET v = 'b' WHERE id = 2; INSERT INTO vtb.n VALUES (1); DELETE FROM vtb.n WHERE ctid = (SELECT min(ctid) FROM vtb.n WHERE v = 2);
+step a_commit: COMMIT;
+step b_commit: COMMIT;
+step c_status: SELECT count(*) AS changed FROM dolt_status;
+changed
+-------
+      0
+(1 row)
+
+step c_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_full: SELECT value AS full_folds FROM pg_stat_prolly WHERE name = 'fold_full_tables';
+full_folds
+----------
+         0
+(1 row)
+
+step c_rows: SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM vtb.k WHERE id <= 2) AS k, (SELECT count(*) FROM vtb.n) AS n, (SELECT count(*) FROM vtb.n WHERE v = 2) AS twos;
+k  |  n|twos
+---+---+----
+a,b|101|  19
+(1 row)
+
+step c_head: SELECT (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vtb.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vtb.n)) AS n_diff;
+k_diff|n_diff
+------+------
+     0|     0
+(1 row)
+
