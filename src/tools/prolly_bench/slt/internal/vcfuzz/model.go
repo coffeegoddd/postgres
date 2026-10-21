@@ -1,7 +1,8 @@
 // Package vcfuzz runs seeded version-control histories (branches, commits,
-// merges, cherry-picks, reverts, resets, several sessions) against engines
-// and checks each against a reference model of branches and three-way row
-// merges, and against invariants of the engine's own.
+// merges, cherry-picks, reverts, resets, schema changes, several sessions,
+// some waiting on others' row locks) against engines and checks each
+// against a reference model of branches and three-way row merges, and
+// against invariants of the engine's own.
 package vcfuzz
 
 import (
@@ -12,19 +13,32 @@ import (
 	"strings"
 )
 
-// Tables are the versioned tables every history writes: (id int PRIMARY
-// KEY, a int, b int).
+// Tables are the keyed versioned tables every history writes: (id int
+// PRIMARY KEY, a int, b int), and c int while the history has added it.
 var Tables = []string{"t", "u"}
 
-// Row holds a row's non-key columns, a and b.
-type Row [2]int
+// Keyless is the versioned table without a key, (a int, b int): its rows
+// are counted by content, each content numbered 1..keys (a is (n-1)/4, b
+// is (n-1)%4).
+const Keyless = "k"
+
+// Columns is the state's record of which keyed tables have column c: row
+// i+1 is there, as {1}, while Tables[i] has it.
+const Columns = "columns"
+
+// stateTables are a State's tables: the rows of each, and the columns.
+var stateTables = []string{"t", "u", Keyless, Columns}
+
+// Row holds a keyed row's non-key columns a, b and c (c 0 for NULL, and
+// while its table has no column c); a keyless row's copies are Row[0].
+type Row [3]int
 
 // State is the rows of every table, by table and key.
 type State map[string]map[int]Row
 
 func emptyState() State {
 	s := State{}
-	for _, t := range Tables {
+	for _, t := range stateTables {
 		s[t] = map[int]Row{}
 	}
 	return s
@@ -39,7 +53,7 @@ func (s State) clone() State {
 }
 
 func (s State) equal(o State) bool {
-	for _, t := range Tables {
+	for _, t := range stateTables {
 		if !maps.Equal(s[t], o[t]) {
 			return false
 		}
@@ -50,7 +64,7 @@ func (s State) equal(o State) bool {
 // key is a canonical encoding of the state, for grouping equal states.
 func (s State) key() string {
 	var b strings.Builder
-	for _, t := range Tables {
+	for _, t := range stateTables {
 		ids := make([]int, 0, len(s[t]))
 		for id := range s[t] {
 			ids = append(ids, id)
@@ -59,11 +73,43 @@ func (s State) key() string {
 		b.WriteString(t + ":")
 		for _, id := range ids {
 			r := s[t][id]
-			fmt.Fprintf(&b, "%d=%d,%d;", id, r[0], r[1])
+			switch t {
+			case Keyless:
+				fmt.Fprintf(&b, "%dx%d;", id, r[0])
+			case Columns:
+				fmt.Fprintf(&b, "%d;", id)
+			default:
+				fmt.Fprintf(&b, "%d=%d,%d,%d;", id, r[0], r[1], r[2])
+			}
 		}
 		b.WriteString("|")
 	}
 	return b.String()
+}
+
+// tableIndex is a keyed table's row in Columns, or 0.
+func tableIndex(table string) int {
+	for i, t := range Tables {
+		if t == table {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// HasC is whether keyed table has column c.
+func (s State) HasC(table string) bool {
+	_, ok := s[Columns][tableIndex(table)]
+	return ok
+}
+
+// dropC drops column c of a keyed table, and its values.
+func (s State) dropC(table string) {
+	delete(s[Columns], tableIndex(table))
+	for id, r := range s[table] {
+		r[2] = 0
+		s[table][id] = r
+	}
 }
 
 // Conflicts are the keys of each table's rows a merge couldn't merge.
@@ -77,68 +123,128 @@ func (c Conflicts) count() int {
 	return n
 }
 
-// Merge3 merges ours and theirs from base, row by row and, for a row both
-// changed, cell by cell.  A row both sides changed differently (a cell
-// both changed to different values, a row one side deleted and the other
-// changed, a row both added differently) is a conflict, and the result
-// keeps ours for it.
-func Merge3(base, ours, theirs State) (State, Conflicts) {
-	out := emptyState()
-	conflicts := Conflicts{}
+// LostChange is whether a merge would lose changes: a side kept column c
+// of a table the other dropped, and changed its value in a row both base
+// and that side have (a row added or deleted loses the column as every
+// row does).  The merge is refused.
+func LostChange(base, ours, theirs State) bool {
 	for _, t := range Tables {
-		ids := map[int]bool{}
-		for _, s := range []State{base, ours, theirs} {
-			for id := range s[t] {
-				ids[id] = true
+		if !base.HasC(t) {
+			continue
+		}
+		for _, sides := range [][2]State{{ours, theirs}, {theirs, ours}} {
+			kept, dropped := sides[0], sides[1]
+			if !kept.HasC(t) || dropped.HasC(t) {
+				continue
 			}
-		}
-		sorted := make([]int, 0, len(ids))
-		for id := range ids {
-			sorted = append(sorted, id)
-		}
-		sort.Ints(sorted)
-		for _, id := range sorted {
-			b, inB := base[t][id]
-			o, inO := ours[t][id]
-			th, inT := theirs[t][id]
-			same := func(x Row, inX bool, y Row, inY bool) bool { return inX == inY && (!inX || x == y) }
-			switch {
-			case same(o, inO, th, inT), same(th, inT, b, inB):
-				if inO {
-					out[t][id] = o
+			for id, b := range base[t] {
+				if k, ok := kept[t][id]; ok && k[2] != b[2] {
+					return true
 				}
-			case same(o, inO, b, inB):
-				if inT {
-					out[t][id] = th
-				}
-			case inO && inT && inB:
-				var r Row
-				ok := true
-				for c := range r {
-					switch {
-					case o[c] == th[c], th[c] == b[c]:
-						r[c] = o[c]
-					case o[c] == b[c]:
-						r[c] = th[c]
-					default:
-						ok = false
-					}
-				}
-				if ok {
-					out[t][id] = r
-				} else {
-					out[t][id] = o
-					conflicts[t] = append(conflicts[t], id)
-				}
-			default:
-				if inO {
-					out[t][id] = o
-				}
-				conflicts[t] = append(conflicts[t], id)
 			}
 		}
 	}
+	return false
+}
+
+// Merge3 merges ours and theirs from base: the columns, then the rows.
+// Column c is a table's if both sides keep it or one side added it; a
+// column dropped is no change to the rows it leaves.  Keyed rows merge row
+// by row and, for a row both changed, cell by cell.  A row both sides
+// changed differently (a cell both changed to different values, a row one
+// side deleted and the other changed, a row both added differently) is a
+// conflict, and the result keeps ours for it.  A keyless row changed by
+// the same number of copies on both sides is changed once; otherwise it
+// has the base's copies, those each side added, less the most either
+// removed; it never conflicts.
+func Merge3(base, ours, theirs State) (State, Conflicts) {
+	out := emptyState()
+	conflicts := Conflicts{}
+	mergeKeyed(Columns, base, ours, theirs, out, conflicts)
+	// (a column dropped: gone from every side's rows)
+	for _, t := range Tables {
+		if !out.HasC(t) && base.HasC(t) {
+			base, ours, theirs = base.clone(), ours.clone(), theirs.clone()
+			for _, s := range []State{base, ours, theirs} {
+				s.dropC(t)
+			}
+		}
+	}
+	for _, t := range Tables {
+		mergeKeyed(t, base, ours, theirs, out, conflicts)
+	}
+	ids := map[int]bool{}
+	for _, s := range []State{base, ours, theirs} {
+		for id := range s[Keyless] {
+			ids[id] = true
+		}
+	}
+	for id := range ids {
+		b := base[Keyless][id][0]
+		do, dt := ours[Keyless][id][0]-b, theirs[Keyless][id][0]-b
+		n := b + do
+		if do != dt {
+			n = b + max(do, 0) + max(dt, 0) - max(-do, -dt, 0)
+		}
+		if n > 0 {
+			out[Keyless][id] = Row{n}
+		}
+	}
 	return out, conflicts
+}
+
+func mergeKeyed(t string, base, ours, theirs, out State, conflicts Conflicts) {
+	ids := map[int]bool{}
+	for _, s := range []State{base, ours, theirs} {
+		for id := range s[t] {
+			ids[id] = true
+		}
+	}
+	sorted := make([]int, 0, len(ids))
+	for id := range ids {
+		sorted = append(sorted, id)
+	}
+	sort.Ints(sorted)
+	for _, id := range sorted {
+		b, inB := base[t][id]
+		o, inO := ours[t][id]
+		th, inT := theirs[t][id]
+		same := func(x Row, inX bool, y Row, inY bool) bool { return inX == inY && (!inX || x == y) }
+		switch {
+		case same(o, inO, th, inT), same(th, inT, b, inB):
+			if inO {
+				out[t][id] = o
+			}
+		case same(o, inO, b, inB):
+			if inT {
+				out[t][id] = th
+			}
+		case inO && inT && inB:
+			var r Row
+			ok := true
+			for c := range r {
+				switch {
+				case o[c] == th[c], th[c] == b[c]:
+					r[c] = o[c]
+				case o[c] == b[c]:
+					r[c] = th[c]
+				default:
+					ok = false
+				}
+			}
+			if ok {
+				out[t][id] = r
+			} else {
+				out[t][id] = o
+				conflicts[t] = append(conflicts[t], id)
+			}
+		default:
+			if inO {
+				out[t][id] = o
+			}
+			conflicts[t] = append(conflicts[t], id)
+		}
+	}
 }
 
 // Commit is a commit of the model: its parents (first parent first) and
@@ -165,6 +271,10 @@ type ModelSession struct {
 	// Pending is the session's open transaction's row writes, or nil.
 	Pending []Op
 	InTxn   bool
+	// Waiting is the write the session waits to make, for the row lock
+	// the open transaction of session WaitsOn holds, or nil.
+	Waiting *Op
+	WaitsOn int
 }
 
 func NewModel(sessions int, setup State) *Model {
@@ -200,9 +310,29 @@ func (m *Model) Dirty(branch string) bool {
 
 func applyWrite(s State, op Op) {
 	rows := s[op.Table]
+	if op.Table == Keyless {
+		switch op.Kind {
+		case OpInsert:
+			rows[op.ID] = Row{rows[op.ID][0] + 1}
+		case OpUpdate, OpDelete:
+			n := rows[op.ID][0]
+			if n == 0 {
+				return
+			}
+			if n == 1 {
+				delete(rows, op.ID)
+			} else {
+				rows[op.ID] = Row{n - 1}
+			}
+			if op.Kind == OpUpdate {
+				rows[op.Val] = Row{rows[op.Val][0] + 1}
+			}
+		}
+		return
+	}
 	switch op.Kind {
 	case OpInsert:
-		rows[op.ID] = Row{op.Val, op.Val2}
+		rows[op.ID] = Row{op.Val, op.Val2, op.Val3}
 	case OpUpdate:
 		if r, ok := rows[op.ID]; ok {
 			r[op.Col] = op.Val
@@ -301,7 +431,7 @@ func (m *Model) commit(branch string, parents []int, s State) {
 
 func (m *Model) anyTxn() bool {
 	for _, s := range m.Sessions {
-		if s.InTxn {
+		if s.InTxn || s.Waiting != nil {
 			return true
 		}
 	}
@@ -309,29 +439,80 @@ func (m *Model) anyTxn() bool {
 }
 
 // writing is whether another session's open transaction has written on
-// the branch.
+// the branch, or another session waits to write there.
 func (m *Model) writing(s int, branch string) bool {
 	for i, o := range m.Sessions {
-		if i != s && o.InTxn && o.Branch == branch && len(o.Pending) > 0 {
+		if i != s && o.Branch == branch && (o.InTxn && len(o.Pending) > 0 || o.Waiting != nil) {
 			return true
 		}
 	}
 	return false
 }
 
-// locked is whether another session's open transaction has written the row.
-func (m *Model) locked(s int, table string, id int) bool {
+// touches is the rows a write may change: its row, and a keyless update's
+// content too.
+func touches(op Op) []int {
+	if op.Table == Keyless && op.Kind == OpUpdate {
+		return []int{op.ID, op.Val}
+	}
+	return []int{op.ID}
+}
+
+// holder is the other session whose open transaction has written a row op
+// may change, or -1.  (Its writes are made again on the working set as it
+// commits: so none of those rows may change meanwhile.)
+func (m *Model) holder(op Op) int {
 	for i, o := range m.Sessions {
-		if i == s || !o.InTxn {
+		if i == op.Session || !o.InTxn {
 			continue
 		}
 		for _, p := range o.Pending {
-			if p.Table == table && p.ID == id {
-				return true
+			if p.Table != op.Table {
+				continue
+			}
+			for _, x := range touches(p) {
+				for _, y := range touches(op) {
+					if x == y {
+						return i
+					}
+				}
 			}
 		}
 	}
-	return false
+	return -1
+}
+
+// canWait is whether op's session may wait on holder h for op's row: a
+// keyed row (a keyless write picks its copy before it waits, and finds it
+// gone after) on the same branch, committed there, so h's first write of
+// it locked it, and h's writes of it since were made on it (no insert
+// after a delete, which would make another row than the one waited on);
+// with no other session waiting for it, nor on op's, and h not waiting
+// itself, so no session waits on a session that waits (and none
+// deadlocks).
+func (m *Model) canWait(op Op, h int) bool {
+	hs := m.Sessions[h]
+	if op.Table == Keyless || hs.Waiting != nil || hs.Branch != m.Sessions[op.Session].Branch {
+		return false
+	}
+	if _, ok := m.Working[hs.Branch][op.Table][op.ID]; !ok {
+		return false
+	}
+	deleted := false
+	for _, p := range hs.Pending {
+		if p.Table == op.Table && p.ID == op.ID {
+			if deleted && p.Kind == OpInsert {
+				return false
+			}
+			deleted = deleted || p.Kind == OpDelete
+		}
+	}
+	for _, o := range m.Sessions {
+		if o.Waiting != nil && (o.WaitsOn == op.Session || o.Waiting.Table == op.Table && o.Waiting.ID == op.ID) {
+			return false
+		}
+	}
+	return true
 }
 
 // Legal is whether an op can run in the model's state.  Generated
@@ -342,10 +523,30 @@ func (m *Model) Legal(op Op) bool {
 		return false
 	}
 	ms := m.Sessions[op.Session]
+	if ms.Waiting != nil {
+		return false
+	}
 	switch op.Kind {
 	case OpInsert, OpUpdate, OpDelete:
-		// (rows another open transaction wrote would wait on it)
-		return !m.locked(op.Session, op.Table, op.ID)
+		if op.Table == Keyless {
+			if op.Kind == OpUpdate && (op.Val < 1 || op.Val > keys) {
+				return false
+			}
+		} else {
+			// (a write names column c where its table has it)
+			working := m.Working[ms.Branch]
+			if op.Kind == OpInsert && op.C != working.HasC(op.Table) ||
+				op.Kind == OpUpdate && op.Col == 2 && !working.HasC(op.Table) {
+				return false
+			}
+		}
+		// (rows another open transaction wrote: waited on, if the op says
+		// so and may)
+		h := m.holder(op)
+		if op.Wait == 0 {
+			return h < 0
+		}
+		return h == op.Wait-1 && m.canWait(op, h)
 	case OpBegin:
 		return !ms.InTxn
 	case OpCommitTxn, OpRollback:
@@ -373,12 +574,16 @@ func (m *Model) Legal(op Op) bool {
 		}
 		return true
 	}
-	// the rest move the branch: none while any transaction is open; a
-	// hard reset drops uncommitted changes, the others need none
+	// the rest move the branch or change its tables: none while any
+	// transaction is open (each would wait on those that read the tables);
+	// a hard reset drops uncommitted changes, the others need none
 	if m.anyTxn() {
 		return false
 	}
-	if op.Kind == OpReset {
+	switch op.Kind {
+	case OpAddColumn, OpDropColumn:
+		return tableIndex(op.Table) > 0 && m.Working[ms.Branch].HasC(op.Table) == (op.Kind == OpDropColumn)
+	case OpReset:
 		_, ok := m.Resolve(op.Session, op.Ref)
 		return ok
 	}
@@ -401,6 +606,16 @@ func (m *Model) Legal(op Op) bool {
 	return false
 }
 
+// write makes a session's row write: its open transaction's, or committed.
+func (m *Model) write(s int, op Op) {
+	ms := &m.Sessions[s]
+	if ms.InTxn {
+		ms.Pending = append(ms.Pending, op)
+	} else {
+		applyWrite(m.Working[ms.Branch], op)
+	}
+}
+
 // Apply runs a legal op and returns its outcome.
 func (m *Model) Apply(op Op) Outcome {
 	ms := &m.Sessions[op.Session]
@@ -408,23 +623,30 @@ func (m *Model) Apply(op Op) Outcome {
 	head := m.Branches[branch]
 	switch op.Kind {
 	case OpInsert, OpUpdate, OpDelete:
-		if ms.InTxn {
-			ms.Pending = append(ms.Pending, op)
-		} else {
-			applyWrite(m.Working[branch], op)
+		if op.Wait > 0 {
+			w := op
+			ms.Waiting, ms.WaitsOn = &w, op.Wait-1
+			return Outcome{Class: ClassWaiting}
 		}
+		m.write(op.Session, op)
 		return Outcome{Class: ClassOK}
 	case OpBegin:
 		ms.InTxn = true
 		return Outcome{Class: ClassOK}
-	case OpCommitTxn:
-		for _, p := range ms.Pending {
-			applyWrite(m.Working[branch], p)
+	case OpCommitTxn, OpRollback:
+		if op.Kind == OpCommitTxn {
+			for _, p := range ms.Pending {
+				applyWrite(m.Working[branch], p)
+			}
 		}
 		ms.Pending, ms.InTxn = nil, false
-		return Outcome{Class: ClassOK}
-	case OpRollback:
-		ms.Pending, ms.InTxn = nil, false
+		// (its row locks released, the writes waiting for them are made)
+		for i := range m.Sessions {
+			if w := m.Sessions[i].Waiting; w != nil && m.Sessions[i].WaitsOn == op.Session {
+				m.Sessions[i].Waiting = nil
+				m.write(i, *w)
+			}
+		}
 		return Outcome{Class: ClassOK}
 	case OpCommit:
 		if !m.Dirty(branch) {
@@ -439,6 +661,12 @@ func (m *Model) Apply(op Op) Outcome {
 	case OpCheckout:
 		ms.Branch = op.Ref
 		m.Used[op.Ref] = true
+		return Outcome{Class: ClassOK}
+	case OpAddColumn:
+		m.Working[branch][Columns][tableIndex(op.Table)] = Row{1}
+		return Outcome{Class: ClassOK}
+	case OpDropColumn:
+		m.Working[branch].dropC(op.Table)
 		return Outcome{Class: ClassOK}
 	case OpReset:
 		c, _ := m.Resolve(op.Session, op.Ref)
@@ -456,19 +684,26 @@ func (m *Model) Apply(op Op) Outcome {
 			m.Working[branch] = m.Commits[theirs].State.clone()
 			return Outcome{Class: ClassFastForward}
 		}
-		merged, conflicts := Merge3(m.Commits[base].State, m.Commits[head].State, m.Commits[theirs].State)
+		b, o, t := m.Commits[base].State, m.Commits[head].State, m.Commits[theirs].State
+		if LostChange(b, o, t) {
+			return Outcome{Class: ClassLostChange}
+		}
+		merged, conflicts := Merge3(b, o, t)
 		if conflicts.count() > 0 {
 			switch op.Mode {
 			case ModeOurs, ModeTheirs:
-				for t, ids := range conflicts {
+				for tb, ids := range conflicts {
 					for _, id := range ids {
 						if op.Mode == ModeOurs {
 							continue
 						}
-						if r, ok := m.Commits[theirs].State[t][id]; ok {
-							merged[t][id] = r
+						if r, ok := t[tb][id]; ok {
+							if tb != Columns && !merged.HasC(tb) {
+								r[2] = 0
+							}
+							merged[tb][id] = r
 						} else {
-							delete(merged[t], id)
+							delete(merged[tb], id)
 						}
 					}
 				}
@@ -488,7 +723,11 @@ func (m *Model) Apply(op Op) Outcome {
 		if op.Kind == OpRevert {
 			base, theirs = c, parent
 		}
-		merged, conflicts := Merge3(m.Commits[base].State, m.Commits[head].State, m.Commits[theirs].State)
+		b, o, t := m.Commits[base].State, m.Commits[head].State, m.Commits[theirs].State
+		if LostChange(b, o, t) {
+			return Outcome{Class: ClassLostChange}
+		}
+		merged, conflicts := Merge3(b, o, t)
 		if conflicts.count() > 0 {
 			return Outcome{Class: ClassConflict}
 		}

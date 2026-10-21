@@ -102,7 +102,10 @@ func TestValidate(t *testing.T) {
 		t.Fatalf("%v, setup %v", err, h.Setup)
 	}
 	for _, bad := range []Op{
-		{Kind: OpUpdate, Table: "t", ID: 1, Col: 2},
+		{Kind: OpUpdate, Table: "t", ID: 1, Col: 3},
+		{Kind: OpUpdate, Table: Keyless, ID: 1, Val: 0},
+		{Kind: OpInsert, Table: "t", ID: 1, Wait: 2},
+		{Kind: OpAddColumn, Table: Keyless},
 		{Kind: OpInsert, Table: "v", ID: 1},
 		{Kind: OpDelete, Table: "t", ID: 0},
 		{Kind: "drop"},

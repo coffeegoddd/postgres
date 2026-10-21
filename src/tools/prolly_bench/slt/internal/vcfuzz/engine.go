@@ -7,6 +7,8 @@ const (
 	ClassUpToDate    = "up_to_date"   // nothing to merge
 	ClassFastForward = "fast_forward" // the branch moved to theirs
 	ClassUnchanged   = "unchanged"    // a commit, pick or revert with no change
+	ClassLostChange  = "lost_change"  // refused: a side changed values of a column the other dropped
+	ClassWaiting     = "waiting"      // the write waits for another transaction's row lock
 )
 
 // Outcome is what an op did.  Conflicts counts the conflicted rows a
@@ -18,7 +20,10 @@ type Outcome struct {
 
 // Engine runs a history's ops in sessions and reports what each session
 // sees.  An error is the harness's, never an outcome: an op an engine
-// refuses unexpectedly is an Outcome of its own class.
+// refuses unexpectedly is an Outcome of its own class.  A write that waits
+// for another session's row lock returns at once, waiting; it is made, and
+// the session asked about again, once the transaction holding the lock
+// ends.
 type Engine interface {
 	Apply(op Op) (Outcome, error)
 	// Visible is the rows session s sees.
