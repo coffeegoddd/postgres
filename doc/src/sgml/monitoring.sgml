@@ -5765,7 +5765,11 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        walks of history and <function>dolt_serve_since</function> read
        them);
        <literal>describe_cache_hits</literal> (tables' descriptions a fold
-       took from the backend's cache instead of the catalogs).  Bytes are counted when
+       took from the backend's cache instead of the catalogs);
+       <literal>apply_rows_batched</literal> and <literal>apply_loads</literal>
+       (rows that moving a branch to a commit, a merge or a clone inserted many
+       at once, and the tables it filled from nothing with their indexes built
+       after the rows).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

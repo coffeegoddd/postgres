@@ -103,6 +103,8 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_COMMITS_READ] = "commits_read",
 	[PGSTAT_PROLLY_FOLDS_REUSED] = "folds_reused",
 	[PGSTAT_PROLLY_DESCRIBE_CACHE_HITS] = "describe_cache_hits",
+	[PGSTAT_PROLLY_APPLY_ROWS_BATCHED] = "apply_rows_batched",
+	[PGSTAT_PROLLY_APPLY_LOADS] = "apply_loads",
 };
 
 /*

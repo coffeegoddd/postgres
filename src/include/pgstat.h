@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCEA
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCEB
 
 typedef struct PgStat_ArchiverStats
 {
@@ -687,9 +687,13 @@ typedef enum PgStat_ProllyCounter
 								 * not folded */
 	PGSTAT_PROLLY_DESCRIBE_CACHE_HITS,	/* tables' descriptions a fold took
 										 * from the backend's cache */
+	PGSTAT_PROLLY_APPLY_ROWS_BATCHED,	/* rows the row applier inserted
+										 * many at once */
+	PGSTAT_PROLLY_APPLY_LOADS,	/* tables it filled from nothing, their
+								 * indexes built after the rows */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_DESCRIBE_CACHE_HITS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_APPLY_LOADS + 1)
 
 typedef struct PgStat_ProllyStats
 {

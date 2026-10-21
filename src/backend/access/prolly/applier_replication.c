@@ -21,6 +21,12 @@
  * own: an error a recheck raises is the write's, and a subtransaction the
  * write was made in takes that level with it as it rolls back.
  *
+ * Many rows inserted together are written as COPY writes them: a page's
+ * rows at once (heap_multi_insert()), then each row's index entries.  A
+ * table filled from nothing that is new in the transaction gets no index
+ * entries as its rows are written: its indexes are built over them once
+ * they are in, as CREATE INDEX builds them (#490).
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/applier_replication.c
  *
@@ -30,21 +36,25 @@
 
 #include "access/amapi.h"
 #include "access/genam.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_keying.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/index.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_trigger.h"
 #include "commands/trigger.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
+#include "executor/nodeModifyTable.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/datum.h"
@@ -70,6 +80,9 @@ struct ProllyApplier
 	TupleTableSlot *found;
 	bool		matview;		/* rows written as REFRESH writes them */
 	bool		immediate;		/* each write's rechecks fired as it ends */
+	bool		loading;		/* rows written without index entries,
+								 * the indexes built after (load_end()) */
+	BulkInsertState bistate;	/* insert_many()'s (no pin held between) */
 	/* without a key or match_index: its rows by the hash of their values */
 	HTAB	   *rows;
 	int			lookups;		/* of a keyless table's rows, so far */
@@ -627,6 +640,69 @@ rechecks_fire(ProllyApplier *a)
 }
 
 /*
+ * Is a table's filling from nothing to be a load, its indexes built once
+ * its rows are in rather than kept a row at a time?  Only when no other
+ * transaction can see it: made in this one, or given new storage in it
+ * under the ACCESS EXCLUSIVE lock that takes; and only for enough rows to
+ * be worth the build.  Not with deferrable rechecks to queue (the build
+ * checks every unique and exclusion constraint at once, deferrable or
+ * not), nor for a materialized view.
+ */
+#define LOAD_MIN_ROWS	100
+
+static bool
+loads(ProllyApplier *a, int n)
+{
+	Relation	rel = a->rel;
+
+	if (n < LOAD_MIN_ROWS || a->matview || a->rri->ri_TrigDesc != NULL ||
+		a->rri->ri_NumIndices == 0)
+		return false;
+	if (rel->rd_createSubid == InvalidSubTransactionId &&
+		(rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId ||
+		 !CheckRelationLockedByMe(rel, AccessExclusiveLock, false)))
+		return false;
+	return RelationGetNumberOfBlocks(rel) == 0;
+}
+
+/*
+ * The load's end: every index built over the rows written, its unique and
+ * exclusion constraints checked as it is (a row breaking one is refused
+ * here), and the primary key's not checking the rows' keys' length (see
+ * replication_insert()).  The indexes are closed meanwhile: an index open
+ * is in use, and isn't rebuilt.  Before any write of another kind, which
+ * may look for a row by an index.
+ */
+static void
+load_end(ProllyApplier *a)
+{
+	ReindexParams params = {0};
+	bool		held;
+
+	if (!a->loading)
+		return;
+	a->loading = false;
+	ExecCloseIndices(a->rri);
+	a->rri->ri_NumIndices = 0;
+	a->rri->ri_IndexRelationDescs = NULL;
+	a->rri->ri_IndexRelationInfo = NULL;
+	CommandCounterIncrement();
+	held = prolly_writing_held_rows(true);
+	PG_TRY();
+	{
+		(void) reindex_relation(NULL, RelationGetRelid(a->rel),
+								REINDEX_REL_CHECK_CONSTRAINTS, &params);
+	}
+	PG_FINALLY();
+	{
+		prolly_writing_held_rows(held);
+	}
+	PG_END_TRY();
+	ExecOpenIndices(a->rri, false);
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_LOADS, 1);
+}
+
+/*
  * The rows written are from a tree a commit held, so their keys fit one:
  * they aren't refused for their keys' length (prolly_table.c), whose bound
  * a tree written before it may exceed a little.  (Restored however the
@@ -635,8 +711,10 @@ rechecks_fire(ProllyApplier *a)
 static void
 replication_insert(ProllyApplier *a, TupleTableSlot *row)
 {
-	bool		held = prolly_writing_held_rows(true);
+	bool		held;
 
+	load_end(a);
+	held = prolly_writing_held_rows(true);
 	PG_TRY();
 	{
 		if (a->matview)
@@ -655,6 +733,79 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 	PG_END_TRY();
 	if (a->rows)
 		rows_add(a, row);
+	advance(a);
+}
+
+/*
+ * Rows inserted together, as COPY inserts them: each one's generated
+ * columns computed and constraints checked, then all written into the
+ * table's pages at once, then each one's index entries made (none while
+ * loading: see loads()) and its rechecks queued.  As insert(), their keys
+ * aren't refused for their length.  The bulk-insert state lets go of its
+ * buffer once they are in: nothing stays pinned between writes.
+ */
+static void
+replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
+{
+	Relation	rel = a->rel;
+	TupleConstr *constr = RelationGetDescr(rel)->constr;
+	MemoryContext cxt;
+	bool		held;
+
+	if (n <= 0)
+		return;
+	if (a->matview || a->immediate)
+	{
+		/* (written as a refresh writes them; or each checked as it ends) */
+		for (int i = 0; i < n; i++)
+			replication_insert(a, rows[i]);
+		return;
+	}
+	if (!a->loading && loads(a, n))
+		a->loading = true;
+	if (a->bistate == NULL)
+		a->bistate = GetBulkInsertState();
+	CheckCmdReplicaIdentity(rel, CMD_INSERT);
+	held = prolly_writing_held_rows(true);
+	PG_TRY();
+	{
+		for (int i = 0; i < n; i++)
+		{
+			if (constr && constr->has_generated_stored)
+				ExecComputeStoredGenerated(a->rri, a->estate, rows[i],
+										   CMD_INSERT);
+			if (constr)
+				ExecConstraints(a->rri, rows[i], a->estate);
+			if (rel->rd_rel->relispartition)
+				ExecPartitionCheck(a->rri, rows[i], a->estate, true);
+		}
+		/* (it may leak: in the per-row memory, reset once they are in) */
+		cxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(a->estate));
+		table_multi_insert(rel, rows, n, a->estate->es_output_cid, 0,
+						   a->bistate);
+		MemoryContextSwitchTo(cxt);
+		for (int i = 0; i < n; i++)
+		{
+			List	   *recheck = NIL;
+
+			if (a->rri->ri_NumIndices > 0 && !a->loading)
+				recheck = ExecInsertIndexTuples(a->rri, a->estate, 0, rows[i],
+												NIL, NULL);
+			ExecARInsertTriggers(a->estate, a->rri, rows[i], recheck, NULL);
+			list_free(recheck);
+			if (a->rows)
+				rows_add(a, rows[i]);
+		}
+	}
+	PG_FINALLY();
+	{
+		prolly_writing_held_rows(held);
+		ReleaseBulkInsertStatePin(a->bistate);
+	}
+	PG_END_TRY();
+	ResetPerTupleExprContext(a->estate);
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS_BATCHED, n);
+	INJECTION_POINT("prolly-insert-many", NULL);
 	advance(a);
 }
 
@@ -709,6 +860,7 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 	bool		keeping = false;
 	bool		held;
 
+	load_end(a);
 	for (int i = 0; keep && i < RelationGetDescr(a->rel)->natts; i++)
 		keeping |= keep[i];
 	if (keeping)
@@ -759,6 +911,7 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 static bool
 replication_remove(ProllyApplier *a, TupleTableSlot *old)
 {
+	load_end(a);
 	if (!find_row(a, old))
 	{
 		ExecClearTuple(a->found);
@@ -792,6 +945,7 @@ replication_immediate(ProllyApplier *a)
 {
 	TriggerDesc *td = a->rri->ri_TrigDesc;
 
+	load_end(a);
 	for (int i = 0; td && i < td->numtriggers; i++)
 	{
 		td->triggers[i].tgdeferrable = false;
@@ -803,6 +957,9 @@ replication_immediate(ProllyApplier *a)
 static void
 replication_end(ProllyApplier *a)
 {
+	load_end(a);
+	if (a->bistate)
+		FreeBulkInsertState(a->bistate);
 	AfterTriggerEndQuery(a->estate);
 	EvalPlanQualEnd(&a->epq);
 	ExecCloseIndices(a->rri);
@@ -827,4 +984,5 @@ const ProllyApplierRoutine prolly_applier_replication = {
 	.remove = replication_remove,
 	.immediate = replication_immediate,
 	.end = replication_end,
+	.insert_many = replication_insert_many,
 };

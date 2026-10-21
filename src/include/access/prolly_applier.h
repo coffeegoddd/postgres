@@ -5,7 +5,8 @@
  *	  elsewhere (another commit, another branch), not as a statement does.
  *
  * Moving a branch's working set to a commit (reset, fast-forward, merge,
- * checkout of a commit) applies the rows that differ, one at a time.
+ * checkout of a commit) applies the rows that differ, one at a time, those
+ * it inserts many at once.
  *
  * Contract:
  * - begin() opens rel, a table with storage (a partition's rows are
@@ -36,6 +37,13 @@
  *   subtransaction, calls it.)  Calling it again changes nothing.
  * - Each write is visible to the next, and holds nothing (no buffer pin)
  *   once it returns, so writes may be made in subtransactions.
+ * - insert_many() (optional; NULL: insert() each) adds n rows, each as
+ *   insert() would, written together (a page's rows at once).  An
+ *   implementation may leave a table it fills from nothing, new in the
+ *   transaction (no other sees it), without index entries until the next
+ *   write of another kind or end(), then build its indexes over the rows
+ *   (#490): a row breaking a unique or exclusion constraint is then
+ *   refused there, not as it is written.
  *
  * Provisional (v0).
  *
@@ -63,12 +71,13 @@ typedef struct ProllyApplierRoutine
 	bool		(*remove) (ProllyApplier *a, TupleTableSlot *old);
 	void		(*immediate) (ProllyApplier *a);
 	void		(*end) (ProllyApplier *a);
+	void		(*insert_many) (ProllyApplier *a, TupleTableSlot **rows, int n);
 } ProllyApplierRoutine;
 
 #define PROLLY_APPLIER_CALLBACK_NAMES \
-	"begin", "insert", "update", "remove", "immediate", "end"
+	"begin", "insert", "update", "remove", "immediate", "end", "insert_many"
 #define PROLLY_APPLIER_FIRST_CALLBACK begin
-#define PROLLY_APPLIER_LAST_CALLBACK end
+#define PROLLY_APPLIER_LAST_CALLBACK insert_many
 
 static inline const ProllyApplierRoutine *
 prolly_applier_lookup(const char *name)

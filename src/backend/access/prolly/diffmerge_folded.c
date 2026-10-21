@@ -1910,7 +1910,59 @@ typedef struct Applying
 	bool		stuck;			/* a put-back refused: the rest not written */
 	bool		removed_rows;	/* refuse_keyless_violations()'s */
 	bool		inserting;
+	bool		batching;		/* rows inserted many at once (batch_add()) */
+	TupleTableSlot **batch;		/* those to insert, BATCH_ROWS slots */
+	int			nbatch;
+	Size		batch_bytes;
 } Applying;
+
+/*
+ * Rows a move inserts are written many at once (the applier's
+ * insert_many()), as COPY writes them (#490): up to so many, or so many
+ * bytes, held at a time.
+ */
+#define BATCH_ROWS		1000
+#define BATCH_BYTES		(1024 * 1024)
+
+/*
+ * Are the rows apply_rows() inserts into rel written many at once?  When
+ * the applier can, and each is written as it comes (merge_write()): not
+ * while a merge records the rows a constraint refuses, each written alone.
+ */
+static bool
+inserts_batched(const ProllyApplierRoutine *ar, Relation rel)
+{
+	return PROLLY_HAS(ar, insert_many) &&
+		!(recording && may_break_constraints(rel));
+}
+
+/* The rows held written. */
+static void
+batch_flush(Applying *ap)
+{
+	if (ap->nbatch == 0)
+		return;
+	PROLLY_CALL(ap->ar, insert_many, ap->a, ap->batch, ap->nbatch);
+	for (int i = 0; i < ap->nbatch; i++)
+		ExecClearTuple(ap->batch[i]);
+	ap->nbatch = 0;
+	ap->batch_bytes = 0;
+}
+
+/* A copy of row held, to be written with the next ones. */
+static void
+batch_add(Applying *ap, TupleTableSlot *row)
+{
+	TupleTableSlot *slot;
+
+	if (ap->batch[ap->nbatch] == NULL)
+		ap->batch[ap->nbatch] = table_slot_create(ap->rel, NULL);
+	slot = ap->batch[ap->nbatch++];
+	ExecCopySlot(slot, row);
+	ap->batch_bytes += ExecFetchSlotHeapTuple(slot, false, NULL)->t_len;
+	if (ap->nbatch == BATCH_ROWS || ap->batch_bytes >= BATCH_BYTES)
+		batch_flush(ap);
+}
 
 /*
  * May a keyed row of rel that changed be updated in place, rather than
@@ -2059,6 +2111,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	{
 		if (!ap->inserting)
 			return;
+		batch_flush(ap);
 		decode_update(&ap->c, ap->rel, ap->pk, &brow, &arow, ap->old,
 					  ap->slot, ap->kept, ap->unread);
 		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept,
@@ -2102,6 +2155,12 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		}
 		ExecClearTuple(ap->slot);
 		PROLLY_CALL(ap->c.rd.kr, decode_row, ap->c.rd.k, &arow, ap->slot);
+		if (ap->batching)
+		{
+			for (uint64 i = 0; i < na; i++)
+				batch_add(ap, ap->slot);
+			return;
+		}
 		for (uint64 i = 0; i < na; i++)
 			(void) merge_write(ap->ar, ap->a, ap->rel, NULL, ap->slot, NULL,
 							   was, NULL, &refused);
@@ -2132,7 +2191,8 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 /*
  * Write the rows of relation relid that differ between from and to: the
  * removals, then the inserts (a row taking a unique value another gives
- * up), each written as the trees' diff finds it, nothing held.  While
+ * up), each written as the trees' diff finds it, nothing held but the
+ * inserts, a batch at a time (inserts_batched()).  While
  * violations are recorded, a keyed row refused is put back (puts_back()),
  * in a subtransaction: if a put-back is refused too, it is rolled back,
  * and the rows written held instead.  A keyless table's rows are refused
@@ -2177,6 +2237,9 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ap.kept = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
 	ap.unread = palloc0_array(bool, RelationGetDescr(ap.rel)->natts);
 	ap.pk = RelationGetIndexAttrBitmap(ap.rel, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+	ap.batching = inserts_batched(ap.ar, ap.rel);
+	if (ap.batching)
+		ap.batch = palloc0_array(TupleTableSlot *, BATCH_ROWS);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	removed_begin(ap.rel, ap.keyless);
 	if (ap.put_back)
@@ -2189,6 +2252,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		ap.inserting = (pass == 1);
 		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
 	}
+	batch_flush(&ap);
 	if (recording && ap.keyless)
 		refuse_keyless_violations(ap.rel, nrecorded, ap.removed_rows);
 	if (ap.put_back)
@@ -2208,6 +2272,8 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
 	ExecDropSingleTupleTableSlot(ap.old);
+	for (int i = 0; ap.batch && i < BATCH_ROWS && ap.batch[i]; i++)
+		ExecDropSingleTupleTableSlot(ap.batch[i]);
 	pfree(ap.kept);
 	pfree(ap.unread);
 	bms_free(ap.pk);
