@@ -194,6 +194,8 @@ typedef struct f_smgr
 	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
+	/* after the critical section a truncation runs in; may be NULL */
+	void		(*smgr_posttruncate) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
@@ -256,6 +258,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_nblocks = bmapnblocks,
 		.smgr_pretruncate = bmappretruncate,
 		.smgr_truncate = bmaptruncate,
+		.smgr_posttruncate = bmapposttruncate,
 		.smgr_immedsync = bmapimmedsync,
 		.smgr_registersync = bmapregistersync,
 		.smgr_fd = bmapfd,
@@ -1242,6 +1245,23 @@ smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks)
 	{
 		if (smgrsw[reln->smgr_which].smgr_pretruncate)
 			smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum[i]);
+	}
+}
+
+/*
+ * smgrposttruncate() -- Finish truncating the given forks.
+ *
+ * After smgrtruncate()'s critical section: what a storage manager may do
+ * once the truncation is done, such as letting go of the storage past the
+ * new length.  A crash before it leaves that to the storage manager.
+ */
+void
+smgrposttruncate(SMgrRelation reln, ForkNumber *forknum, int nforks)
+{
+	for (int i = 0; i < nforks; i++)
+	{
+		if (smgrsw[reln->smgr_which].smgr_posttruncate)
+			smgrsw[reln->smgr_which].smgr_posttruncate(reln, forknum[i]);
 	}
 }
 

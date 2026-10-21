@@ -1,0 +1,274 @@
+-- Blocks past a truncated relation's length (#638): once the truncation is
+-- done, a block no other map holds is freed, a shared one loses a
+-- reference, and a page as of a fold goes on the changes list.  The page
+-- sweep then finds nothing held past a length, and shortens the store.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE DATABASE trunc_db;
+\c trunc_db
+CREATE EXTENSION test_prolly;
+SELECT oid AS db FROM pg_database WHERE datname = current_database() \gset
+SET debug_block_mapped_heap = on;
+-- A table's VACUUM truncation, its tail deleted.
+CREATE TABLE h (a int, b text);
+INSERT INTO h SELECT g, repeat('x', 500) FROM generate_series(1, 1500) g;
+SELECT pg_relation_filenode('h') AS h \gset
+SELECT pg_relation_size('h') / 8192 AS nblocks;
+ nblocks 
+---------
+     100
+(1 row)
+
+DELETE FROM h WHERE a > 150;
+SELECT test_bmap_free_blocks() AS free_before \gset
+VACUUM h;
+SELECT pg_relation_size('h') / 8192 AS nblocks;
+ nblocks 
+---------
+      10
+(1 row)
+
+SELECT count(*) AS past_end FROM test_bmap_past_end(:h);
+ past_end 
+----------
+        0
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before AS freed;
+ freed 
+-------
+    90
+(1 row)
+
+SELECT count(*), sum(a) FROM h;
+ count |  sum  
+-------+-------
+   150 | 11325
+(1 row)
+
+-- Nothing is left for the sweep to free; it shortens the store past them.
+SELECT (pg_stat_file(format('base/%s/9421', :db))).size / 8192 AS store_before \gset
+CHECKPOINT;
+SELECT freed, truncated FROM prolly_page_sweep();
+ freed | truncated 
+-------+-----------
+     0 |        90
+(1 row)
+
+SELECT :store_before - (pg_stat_file(format('base/%s/9421', :db))).size / 8192
+	AS store_shorter_by;
+ store_shorter_by 
+------------------
+               90
+(1 row)
+
+-- Growing again takes blocks anew, and reads back.
+INSERT INTO h SELECT g, repeat('y', 500) FROM generate_series(1, 300) g;
+SELECT count(*), sum(a) FROM h;
+ count |  sum  
+-------+-------
+   450 | 56475
+(1 row)
+
+-- TRUNCATE in place: a table made in the same transaction.
+BEGIN;
+CREATE TABLE t (a int, b text);
+INSERT INTO t SELECT g, repeat('x', 500) FROM generate_series(1, 600) g;
+SELECT pg_relation_filenode('t') AS t \gset
+SELECT test_bmap_free_blocks() AS free_before \gset
+TRUNCATE t;
+SELECT count(*) AS past_end FROM test_bmap_past_end(:t);
+ past_end 
+----------
+        0
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before AS freed;
+ freed 
+-------
+    40
+(1 row)
+
+COMMIT;
+SELECT count(*) FROM t;
+ count 
+-------
+     0
+(1 row)
+
+-- A change log's VACUUM truncation (the measurement's case): the entries
+-- a commit's fold consumed, dead, are gone, and the log truncated.
+CREATE SCHEMA v VERSIONED;
+CREATE TABLE v.k (a int8 PRIMARY KEY, b text);
+INSERT INTO v.k SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g;
+SELECT ('pg_toast.pg_prolly_log_' || 'v.k'::regclass::oid) AS logname \gset
+SELECT pg_relation_filenode(:'logname') AS log \gset
+SELECT pg_relation_size(:'logname') / 8192 AS log_blocks \gset
+SELECT :log_blocks > 10 AS log_grown;
+ log_grown 
+-----------
+ t
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'loaded')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'empty')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT test_bmap_free_blocks() AS free_before \gset
+VACUUM v.k;
+SELECT pg_relation_size(:'logname') AS log_bytes;
+ log_bytes 
+-----------
+         0
+(1 row)
+
+SELECT count(*) AS past_end FROM test_bmap_past_end(:log);
+ past_end 
+----------
+        0
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before >= :log_blocks AS log_blocks_freed;
+ log_blocks_freed 
+------------------
+ t
+(1 row)
+
+-- A shared map: the blocks a copy holds too lose a reference, and stay
+-- the copy's; dropping the copy frees them.  (Cut below the table.)
+CREATE TABLE s (a int, b text);
+INSERT INTO s SELECT g, repeat('x', 500) FROM generate_series(1, 300) g;
+SELECT pg_relation_filenode('s') AS s \gset
+SELECT test_bmap_share(:s) AS copy \gset
+SELECT test_bmap_digest(:copy) AS copy_digest \gset
+SELECT DISTINCT refs FROM test_bmap_map(:s);
+ refs 
+------
+    1
+(1 row)
+
+SELECT test_bmap_free_blocks() AS free_before \gset
+SELECT test_bmap_truncate(:s, 5, true);
+ test_bmap_truncate 
+--------------------
+ 
+(1 row)
+
+SELECT count(*) AS past_end FROM test_bmap_past_end(:s);
+ past_end 
+----------
+        0
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before AS freed;
+ freed 
+-------
+     0
+(1 row)
+
+SELECT blkno < 5 AS kept, refs, count(*) FROM test_bmap_map(:copy)
+GROUP BY 1, 2 ORDER BY 1;
+ kept | refs | count 
+------+------+-------
+ f    |    0 |    15
+ t    |    1 |     5
+(2 rows)
+
+SELECT test_bmap_digest(:copy) = :'copy_digest' AS copy_unchanged;
+ copy_unchanged 
+----------------
+ t
+(1 row)
+
+SELECT test_bmap_unlink(:copy);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before AS freed_with_copy;
+ freed_with_copy 
+-----------------
+              15
+(1 row)
+
+-- A fold: a page past the length as of the fold goes on the changes list,
+-- which keeps it until a later fold's prune lets go of it.  (Cut below
+-- the table.)
+CREATE TABLE f (a int, b text);
+INSERT INTO f SELECT g, repeat('x', 500) FROM generate_series(1, 300) g;
+SELECT pg_relation_filenode('f') AS f \gset
+SELECT lineage, epoch AS e1 FROM test_bmap_fold_begin(:f) \gset
+SELECT phys AS phys19 FROM test_bmap_map(:f) WHERE blkno = 19 \gset
+CHECKPOINT;
+SELECT md5(test_bmap_read_old(:f, 19, :phys19)) AS page19 \gset
+SELECT test_bmap_free_blocks() AS free_before \gset
+SELECT test_bmap_truncate(:f, 5, true);
+ test_bmap_truncate 
+--------------------
+ 
+(1 row)
+
+SELECT count(*) AS past_end FROM test_bmap_past_end(:f);
+ past_end 
+----------
+        0
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before AS freed;
+ freed 
+-------
+     0
+(1 row)
+
+SELECT kind, count(*), min(blkno), max(blkno)
+FROM test_bmap_fold_changes(:f, :lineage, :e1) GROUP BY kind ORDER BY kind;
+   kind   | count | min | max 
+----------+-------+-----+-----
+ copy     |    15 |   5 |  19
+ truncate |     1 |   5 |   5
+(2 rows)
+
+SELECT md5(test_bmap_read_old(:f, 19, :phys19)) = :'page19' AS page_kept;
+ page_kept 
+-----------
+ t
+(1 row)
+
+SELECT epoch AS e2 FROM test_bmap_fold_begin(:f) \gset
+SELECT test_bmap_fold_prune(:f, :lineage, :e2);
+ test_bmap_fold_prune 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_free_blocks() - :free_before AS freed_by_prune;
+ freed_by_prune 
+----------------
+             15
+(1 row)
+
+SELECT count(*), sum(a) FROM f;
+ count | sum  
+-------+------
+    75 | 2850
+(1 row)
+
+CHECKPOINT;
+SELECT freed FROM prolly_page_sweep();
+ freed 
+-------
+     0
+(1 row)
+
+\c postgres
+DROP DATABASE trunc_db;

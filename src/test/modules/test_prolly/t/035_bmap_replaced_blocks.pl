@@ -84,15 +84,22 @@ full_page_writes = off
 	$sql->(q{INSERT INTO cow.r VALUES (1, 1)});
 	isnt($sql->(qq{SELECT phys FROM test_bmap_map($r) WHERE blkno = 0}), $r_block,
 		"$name: r let its block go");
-	$sql->(qq{SELECT test_bmap_unlink($rcopy)});
 
 	# s does the same (q dropped first, if it holds a block): s's page
-	# $s_page gets r's old block.
+	# $s_page gets r's old block.  A truncation frees the blocks past the
+	# length once done (#638), so s's emptied pages (copied to free blocks,
+	# being shared) and its change log's give their blocks back, and s's
+	# growth takes blocks for its log too: s's pages before $s_page, and
+	# its log's, take theirs first, and r's copy is dropped only then.
 	my $scopy = $sql->(qq{SELECT test_bmap_share($s)});
 	$sql->(q{DROP TABLE cow.q});
 	$sql->(q{DELETE FROM cow.s});
 	$sql->(q{VACUUM cow.s});
-	$sql->(qq{INSERT INTO cow.s SELECT g, 'y' FROM generate_series(1, 4 * $s_page + 1) g});
+	my $first = 4 * $s_page;
+	$sql->(qq{INSERT INTO cow.s SELECT g, 'y' FROM generate_series(1, $first) g})
+	  if $first > 0;
+	$sql->(qq{SELECT test_bmap_unlink($rcopy)});
+	$sql->(qq{INSERT INTO cow.s VALUES ($first + 1, 'y')});
 	is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = $s_page}), $r_block,
 		"$name: s's page $s_page has r's old block");
 
