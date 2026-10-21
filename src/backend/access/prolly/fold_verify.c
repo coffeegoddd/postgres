@@ -175,7 +175,7 @@ prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit, void *arg)
 				rel = table_open(relid, RowExclusiveLock);
 				prolly_components_for_relation(rel, &c);
 				if (c.change_log)
-					PROLLY_CALL(c.change_log, note, rel, NULL, NULL);
+					PROLLY_CALL(c.change_log, note, rel, NULL, NULL, NULL);
 				table_close(rel, RowExclusiveLock);
 			}
 		}

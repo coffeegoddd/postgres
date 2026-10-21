@@ -22,6 +22,7 @@
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -770,6 +771,8 @@ test_drop_change_log(PG_FUNCTION_ARGS)
 	CommandCounterIncrement();
 	ObjectAddressSet(log, RelationRelationId, logid);
 	performDeletion(&log, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+	/* (the table's cached log OID goes too, as when a log is made) */
+	CacheInvalidateRelcacheByRelid(relid);
 	PG_RETURN_VOID();
 }
 

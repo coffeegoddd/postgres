@@ -60,6 +60,7 @@
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -88,6 +89,20 @@ log_name(Oid relid, char *name)
 }
 
 /*
+ * The log's OID, cached in the table's relcache entry (rd_amcache), which
+ * an invalidation of the table drops: the log's creation sends one, and a
+ * branch checked out drops every entry.  Tagged, so that another of the
+ * AM's components caching there isn't read as this.
+ */
+#define LOG_CACHE_MAGIC		0x50524c47	/* "PRLG" */
+
+typedef struct LogCache
+{
+	uint32		magic;
+	Oid			logid;			/* InvalidOid: none */
+} LogCache;
+
+/*
  * The log of rel, a prolly table (or materialized view); InvalidOid if none.
  * A transient heap a rewrite fills (relrewrite set) has none: its table is
  * told of the rewrite as a whole.
@@ -96,14 +111,26 @@ static Oid
 log_relid(Relation rel)
 {
 	char		name[NAMEDATALEN];
+	LogCache   *lc = rel->rd_amcache;
+	Oid			logid;
 
 	if (rel->rd_rel->relam != PROLLY_TABLE_AM_OID ||
 		(rel->rd_rel->relkind != RELKIND_RELATION &&
 		 rel->rd_rel->relkind != RELKIND_MATVIEW) ||
 		OidIsValid(rel->rd_rel->relrewrite))
 		return InvalidOid;
+	if (lc != NULL && lc->magic == LOG_CACHE_MAGIC)
+		return lc->logid;
 	log_name(RelationGetRelid(rel), name);
-	return get_relname_relid(name, PG_TOAST_NAMESPACE);
+	logid = get_relname_relid(name, PG_TOAST_NAMESPACE);
+	if (rel->rd_amcache == NULL)
+	{
+		lc = MemoryContextAlloc(CacheMemoryContext, sizeof(LogCache));
+		lc->magic = LOG_CACHE_MAGIC;
+		lc->logid = logid;
+		rel->rd_amcache = lc;
+	}
+	return logid;
 }
 
 static void
@@ -163,6 +190,9 @@ relation_create(Relation rel)
 	ObjectAddressSet(table, RelationRelationId, RelationGetRelid(rel));
 	ObjectAddressSet(log, RelationRelationId, logid);
 	recordDependencyOn(&log, &table, DEPENDENCY_INTERNAL);
+
+	/* (the table's cached log OID, here and in other sessions, is stale) */
+	CacheInvalidateRelcache(rel);
 }
 
 /* (its OID: a branch's copy of it keeps the OID, with the entries) */
@@ -548,7 +578,7 @@ static MemoryContext note_cxt = NULL;
  * hand (made) or at newtid.
  */
 static void
-note_write(Relation rel, const ItemPointerData *oldtid,
+note_write(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
 		   const ItemPointerData *newtid, HeapTuple *made, int nmade)
 {
 	Oid			logid = log_relid(rel);
@@ -566,7 +596,9 @@ note_write(Relation rel, const ItemPointerData *oldtid,
 	MemoryContextReset(note_cxt);
 	e.log = table_open(logid, RowExclusiveLock);
 	caller = MemoryContextSwitchTo(note_cxt);
-	if (oldtid)
+	if (oldtup)
+		old = oldtup;
+	else if (oldtid)
 		old = read_version(rel, oldtid);
 	if (newtid)
 	{
@@ -582,18 +614,18 @@ note_write(Relation rel, const ItemPointerData *oldtid,
 }
 
 static void
-relation_note(Relation rel, const ItemPointerData *oldtid,
+relation_note(Relation rel, const ItemPointerData *oldtid, HeapTuple oldtup,
 			  const ItemPointerData *newtid)
 {
-	note_write(rel, oldtid, newtid, NULL, 0);
+	note_write(rel, oldtid, oldtup, newtid, NULL, 0);
 }
 
 /* (the versions made are heap's: they aren't read again from their pages) */
 static void
 relation_note_made(Relation rel, const ItemPointerData *oldtid,
-				   HeapTuple *made, int nmade)
+				   HeapTuple oldtup, HeapTuple *made, int nmade)
 {
-	note_write(rel, oldtid, NULL, made, nmade);
+	note_write(rel, oldtid, oldtup, NULL, made, nmade);
 }
 
 /*

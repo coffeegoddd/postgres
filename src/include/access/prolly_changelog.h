@@ -32,8 +32,10 @@
  *   the write, by the (sub)transaction that wrote it, whether or not the
  *   write is the session's own (hushed writes of a version-control call
  *   too).  Either TID may be NULL; both NULL, every row may have changed
- *   (the table was truncated, or rewritten).  It ignores relations that
- *   aren't prolly tables with a log.  Errors are the write's.
+ *   (the table was truncated, or rewritten).  oldtup, if not NULL, is the
+ *   version at oldtid in hand (the writer still has its page pinned), so it
+ *   needn't be read again.  It ignores relations that aren't prolly tables
+ *   with a log.  Errors are the write's.
  * - note_made() is note() told of the versions a write made in hand
  *   (nmade of them, each as heap stored it, its TID in t_self) and of the
  *   one it replaced, if any (oldtid): an insertion of many rows is noted at
@@ -98,7 +100,7 @@ typedef struct ProllyChangeLogRoutine
 
 	void		(*create) (Relation rel);
 	void		(*note) (Relation rel, const ItemPointerData *oldtid,
-						 const ItemPointerData *newtid);
+						 HeapTuple oldtup, const ItemPointerData *newtid);
 	uint64		(*identity) (Relation rel);
 	bool		(*read) (Relation rel, Snapshot snapshot,
 						 ProllyChangeLogVisit visit, void *arg);
@@ -106,7 +108,7 @@ typedef struct ProllyChangeLogRoutine
 	bool		(*is_log) (Relation rel);
 	Oid			(*relid) (Oid relid);
 	void		(*note_made) (Relation rel, const ItemPointerData *oldtid,
-							  HeapTuple *made, int nmade);
+							  HeapTuple oldtup, HeapTuple *made, int nmade);
 	bool		(*consume_own) (Relation rel);
 	bool		(*written_unseen) (Relation rel, Snapshot snapshot);
 } ProllyChangeLogRoutine;

@@ -2098,7 +2098,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	{
 		Relation	oldheap = relation_open(OIDOldHeap, NoLock);
 
-		prolly_note_change(oldheap, NULL, NULL);
+		prolly_note_change(oldheap, NULL, NULL, NULL);
 		relation_close(oldheap, NoLock);
 	}
 

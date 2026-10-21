@@ -176,6 +176,22 @@ DROP SCHEMA cl CASCADE;
 SELECT length(dolt_commit('-Am', 'cl gone')::text) AS committed;
 SELECT dolt_branch('-D', 'cl_other');
 
+-- An update's or a delete's entry is made from the old version the write
+-- has in hand, not read again from its page: a one-row update and a
+-- one-row delete touch the table's pages five times (seven, read again).
+CREATE SCHEMA clt VERSIONED;
+CREATE TABLE clt.touch (id int PRIMARY KEY, v text);
+INSERT INTO clt.touch SELECT g, 'v' FROM generate_series(1, 100) g;
+SELECT pg_stat_force_next_flush();
+SELECT heap_blks_hit + heap_blks_read AS touch0 FROM pg_statio_user_tables
+WHERE relid = 'clt.touch'::regclass \gset
+UPDATE clt.touch SET v = 'w' WHERE id = 50;
+DELETE FROM clt.touch WHERE id = 51;
+SELECT pg_stat_force_next_flush();
+SELECT heap_blks_hit + heap_blks_read - :touch0 AS heap_pages_touched
+FROM pg_statio_user_tables WHERE relid = 'clt.touch'::regclass;
+DROP SCHEMA clt CASCADE;
+
 -- A table without a change log (made before logs were, or restored by
 -- pg_upgrade) folds in full at every commit; prolly_make_change_logs()
 -- makes the logs the branch's tables lack, after which folds read them.
