@@ -539,6 +539,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	/* We've done all the critical work, so checkpoints are OK now. */
 	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
 
+	/* anything the storage manager does once the truncation is done */
+	smgrposttruncate(RelationGetSmgr(rel), forks, nforks);
+
 	/*
 	 * Update upper-level FSM pages to account for the truncation. This is
 	 * important because the just-truncated pages were likely marked as

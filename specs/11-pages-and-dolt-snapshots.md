@@ -1317,9 +1317,8 @@ describes it as built.
 - Physical blocks are allocated from the bitmap, preferring freed blocks,
   otherwise extending the page store at its high-water mark. Reused
   blocks are zeroed before they are mapped, so a crash can't expose a
-  page's old contents at a new logical block. Truncation only shortens
-  the logical length; blocks past it are reused by a later extension or
-  freed with the relation.
+  page's old contents at a new logical block. Truncation shortens the
+  logical length, then lets go of the blocks past it (below).
 - Epochs in map entries are unused in step 1 (no sharing); they are in the
   format now so step 2 can decide sharing without rewriting maps.
 
@@ -1344,10 +1343,52 @@ and in redo:
   transaction): its pages were synced at commit, and zeroing them would
   lose them (`018_wal_optimize`).
 - **Truncate**: the length, inside `RelationTruncate`'s critical section,
-  with the header pinned beforehand by the new `smgrpretruncate()`.
+  with the header pinned beforehand by the new `smgrpretruncate()`. Once
+  the critical section is done, the new `smgrposttruncate()` lets go of
+  every entry past the length (#638): a block no other map holds is
+  freed, a shared one loses a reference, and a page as of a fold goes on
+  the changes list, which holds it until pruned. These are the records an
+  extension already made for entries a truncation left (unmap with
+  reference-count deltas, then free), so the WAL is unchanged: they
+  follow the truncation's records, and a crash replaying a record from
+  before the truncation for such a page skips it, or writes the page
+  nowhere. That holds only because redo never moves an entry back (#647,
+  below): before it, every truncation would have made the case where a
+  map page's image brings a cleared entry back common. A cleared entry
+  keeps the position of the record that cleared it, so recovery tells a
+  block let go of after a record by its entry, not by the header's
+  length, which a header's image replayed since may make longer. The
+  relation's pages past the length left shared buffers in the
+  truncation, so none is written onto a freed block another relation is
+  given. Before this, the blocks stayed mapped past the length until the
+  relation grew again or was dropped, and every sweep counted them as
+  held: VACUUM truncating a change log left 75 MB of a 184 MB page store
+  held past its length (a 200,000-row table's log here: 1,667 blocks
+  held before, 1,667 freed after). A crash between the truncation and these
+  records leaves the entries past the length, mapped: the next truncation
+  or extension of the relation lets go of them, or its drop frees them.
+  (The sweep can't: it reads maps of relations being dropped, whose
+  freed blocks may already be another's.)
 - **Free**: after commit or abort, a dropped relation's length is cleared
   and its blocks freed, in records of their own. A crash between the
   commit and these records leaks the blocks until reclamation (step 7).
+
+**Redo never moves an entry backwards (#647).** A map page recovery reads
+may be newer than the record it replays (written before a crash, copied
+by a base backup). An entry the newer page changed since (given another
+block, or let go of) makes redo skip the block's records from before the
+change and send its pages nowhere. A full-page image of the same map
+page, logged before the change (an extension of another block on it),
+used to bring the old entry back partway through replay: the block's
+later records were then replayed onto a page that had missed the
+skipped ones (an assertion failure in heap prune redo,
+`156_bmap_redo_newer_entries`). Now an image restored over a newer map
+page keeps each entry whose `since` is later than the image's, a node
+delta leaves such an entry alone, and the page keeps the newer page's
+LSN. A record from before that LSN still applies its entry changes
+(a torn newer page may hold older entries too), and
+`wal_consistency_checking` compares the page only once replay has
+caught up with it, which skips a page whose LSN is ahead of the record.
 
 ### I/O
 
@@ -2537,13 +2578,15 @@ anything else.
 
 ### 8.6 The page store
 
-The page store already frees blocks; three cases leak them:
+The page store already frees blocks; four cases leak them:
 
 - a crash between a drop's commit and the records that free its blocks
   (part 5);
 - a block whose reference count saturated (255 maps), never freed;
 - a crash part way through `bmap_fold_prune`, whose blocks stay
-  allocated.
+  allocated;
+- a crash between the records that let go of a truncation's blocks
+  (part 5) and those that free them.
 
 A **sweep** per tablespace and database finds them: every block-mapped
 relation's map (every branch's copies, so every catalog row of every

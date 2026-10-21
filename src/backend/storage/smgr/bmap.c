@@ -46,8 +46,11 @@
  * the bitmap pages) and bitmap pages saying which physical blocks are used.
  * Freed blocks are reused before the page store grows.  A reused block is
  * zeroed before it is mapped, so a crash can't expose its old contents at a
- * new logical block.  Truncation only shortens the logical length: blocks
- * past it are reused by a later extension, or freed with the relation.
+ * new logical block.  Truncation shortens the logical length, and once
+ * it is done (outside its critical section) lets go of the blocks past it,
+ * freeing those no other map or changes list holds (#638).  A crash in
+ * between leaves them mapped past the length, where a later truncation or
+ * extension lets go of them, or dropping the relation frees them.
  *
  * Locking.  Lookups read the header and a map page under share locks, one
  * at a time.  Extension holds the header exclusively (serializing the
@@ -66,8 +69,11 @@
  * extension keeps it locked while it allocates.
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
- * three cases: a crash between a drop's commit and the records freeing its
- * blocks, a crash part way through a prune, and a count stuck at 255 maps.
+ * four cases: a crash between a drop's commit and the records freeing its
+ * blocks, a crash part way through a prune, a crash (or an error, not an
+ * interrupt, which the header's lock holds off) between the records
+ * letting go of a truncation's blocks and those freeing them, and a count
+ * stuck at 255 maps.
  * A sweep counts exactly what every map (and changes list) of a database's
  * page store holds, each relation's read under its header's lock, and
  * frees the blocks allocated as it began that nothing holds, rewrites the
@@ -573,8 +579,8 @@ static void list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
 					   BlockNumber old_block,
 					   uint32 epoch);
 static void unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
-						  BlockNumber from,
-						  BlockNumber to);
+						  BlockNumber from, BlockNumber to,
+						  bool release);
 static void share_changes(SMgrRelation src, SMgrRelation dst);
 
 /* ----------------------------------------------------------------
@@ -866,25 +872,37 @@ apply_header_delta(Page page, const xl_bmap_header_delta *delta)
 	PageGetBmapHeader(page)->fold_epoch = delta->fold_epoch;
 }
 
-static void
+/* (whether it changed the page) */
+static bool
 apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 {
 	const xl_bmap_entry_delta *ent = (const xl_bmap_entry_delta *) (delta + 1);
 	BmapEntry  *entries;
+	bool		changed = false;
 
 	if (delta->flags & BMAP_DELTA_INIT)
+	{
 		init_node(page);
+		changed = true;
+	}
 	entries = PageGetBmapEntries(page);
 	for (uint32 i = 0; i < delta->nentries; i++)
 	{
 		BmapEntry  *e = &entries[ent[i].slot];
 
 		Assert(ent[i].slot < BMAP_FANOUT);
+		/* (in redo, an entry kept from a newer page: see redo_block()) */
+		if (e->since > delta->since)
+			continue;
 		if (e->block != ent[i].block)
 			e->since = delta->since;
+		else if (e->epoch == ent[i].epoch)
+			continue;
 		e->block = ent[i].block;
 		e->epoch = ent[i].epoch;
+		changed = true;
 	}
+	return changed;
 }
 
 static void
@@ -1115,6 +1133,15 @@ lookup_entry(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry)
 	return found;
 }
 
+/* the logical blocks the map's pages have entries for, past its length too */
+static uint64
+map_blocks(SMgrRelation reln)
+{
+	BlockNumber mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
+
+	return mapnblocks > 1 ? (uint64) (mapnblocks - 1) * BMAP_FANOUT : 0;
+}
+
 /* the map's epoch, read under a share lock */
 static uint32
 lookup_epoch(SMgrRelation reln)
@@ -1179,6 +1206,37 @@ copy_node(RelFileLocator rel, Buffer buf, BlockNumber blk, char *dst,
 }
 
 /*
+ * Map page 'blk' without loading it into shared buffers: in *buf the buffer
+ * holding it, pinned, if it is cached; otherwise InvalidBuffer, and the page
+ * read from disk into 'dst'.  A read that fails verification (torn by a
+ * concurrent write) is made 'tries' times in all; false if each one failed.
+ */
+static bool
+read_map_uncached(SMgrRelation reln, BlockNumber blk, char *dst, int tries,
+				  Buffer *buf)
+{
+	PrefetchBufferResult r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blk);
+
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(reln->smgr_rlocator.locator, BMAP_FORKNUM, blk,
+						 r.recent_buffer))
+	{
+		*buf = r.recent_buffer;
+		return true;
+	}
+	*buf = InvalidBuffer;
+	for (int i = 0; i < tries; i++)
+	{
+		void	   *page = dst;
+
+		mdreadv(reln, BMAP_FORKNUM, blk, &page, 1);
+		if (PageIsVerified(dst, blk, 0, NULL))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Copy map page 'blk' of 'reln' into 'dst' (I/O-aligned).
  *
  * Writing a block-mapped page looks the page up, and a write may be the
@@ -1203,27 +1261,13 @@ read_node_ext(SMgrRelation reln, BlockNumber blk, bool for_write, char *dst,
 
 	if (for_write)
 	{
-		PrefetchBufferResult r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blk);
-
-		if (!BufferIsValid(r.recent_buffer) ||
-			!ReadRecentBuffer(rel, BMAP_FORKNUM, blk, r.recent_buffer))
-		{
-			for (int tries = 0;; tries++)
-			{
-				void	   *page = dst;
-
-				mdreadv(reln, BMAP_FORKNUM, blk, &page, 1);
-				if (PageIsVerified(dst, blk, 0, NULL))
-					break;
-				if (tries >= 3)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("invalid page in block %u of \"%s\"",
-									blk, relpathperm(rel, BMAP_FORKNUM).str)));
-			}
+		if (!read_map_uncached(reln, blk, dst, 4, &buf))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of \"%s\"",
+							blk, relpathperm(rel, BMAP_FORKNUM).str)));
+		if (!BufferIsValid(buf))
 			return check_node(dst, type, rel, blk, new_ok);
-		}
-		buf = r.recent_buffer;
 
 		/*
 		 * A change locks a map page only after its reads (map_lock()); one
@@ -1262,6 +1306,26 @@ header_nblocks(SMgrRelation reln, bool for_write, XLogRecPtr *lsn)
 	if (lsn)
 		*lsn = PageGetLSN(copy.data);
 	return PageGetBmapHeader(copy.data)->nblocks;
+}
+
+/*
+ * Has logical block 'blkno' no entry, let go of after 'lsn'?  (A cleared
+ * entry keeps the position of the record that cleared it.)  See read_node()
+ * for 'for_write'.
+ */
+static bool
+let_go_after(SMgrRelation reln, BlockNumber blkno, bool for_write,
+			 XLogRecPtr lsn)
+{
+	PGIOAlignedBlock copy;
+	BmapEntry  *e;
+
+	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM) ||
+		!read_node_ext(reln, MAP_PAGE(blkno), for_write, copy.data,
+					   BMAP_PAGE_NODE, true))
+		return false;
+	e = &PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)];
+	return !BlockNumberIsValid(e->block) && e->since > lsn;
 }
 
 /*
@@ -1843,9 +1907,9 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
  * already replayed: the startup process keeps it until the truncation's
  * replay (bmaptruncate()).  Redo never allocates; the blocks keep the
  * entries the truncation left them, or none, one let go of since
- * (unshare_stale()): records before the truncation are skipped for such a
- * block (bmapreplacedafter()), and pages made for it go nowhere
- * (bmapwritev()).
+ * (unshare_stale(), or once a truncation is done): records before the
+ * truncation are skipped for such a block (bmapreplacedafter()), and pages
+ * made for it go nowhere (bmapwritev()).
  *
  * The truncation's replay runs in a critical section, so it only finds,
  * changes and removes entries, which allocates nothing: it removes the
@@ -2014,7 +2078,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 		{
 			unshare_stale(reln, PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
 						  PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch,
-						  nblocks, end);
+						  nblocks, end, false);
 			INJECTION_POINT("bmap-unshared", NULL);
 		}
 		extend_piece(reln, headerbuf, nblocks, end,
@@ -2416,14 +2480,16 @@ cmp_slot_entry(const void *a, const void *b)
  * page, that a truncation left past the relation's end: those born before
  * the map's epoch may be shared.  One no other map holds is claimed (born
  * again in this epoch); one another map holds is let go (its count drops)
- * and cleared, to be allocated anew.  The header is locked exclusively, so
- * those entries can't change meanwhile; the map page is locked only after
- * each record's other pages, since reading them may write out one of this
- * relation's pages, which looks it up on the map page.
+ * and cleared, to be allocated anew.  With 'release', once a truncation is
+ * done (bmapposttruncate()), every entry is let go of, and a block no other
+ * map holds is freed.  The header is locked exclusively, so those entries
+ * can't change meanwhile; the map page is locked only after each record's
+ * other pages, since reading them may write out one of this relation's
+ * pages, which looks it up on the map page.
  */
 static void
 unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
-			  BlockNumber from, BlockNumber to)
+			  BlockNumber from, BlockNumber to, bool release)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BlockNumber mapblk = MAP_PAGE(from);
@@ -2432,7 +2498,9 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 	BmapEntry	stale[BMAP_PIECE];
 	SlotEntry	items[BMAP_PIECE];
 	BlockNumber phys[BMAP_PIECE];
+	BlockNumber tofree[BMAP_PIECE];
 	uint32		nitems = 0;
+	uint32		nfree = 0;
 	BlockNumber nrefpages;
 	uint32		i = 0;
 
@@ -2459,7 +2527,7 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 		 */
 		if (e->epoch < fold_epoch)
 			list_stale(reln, mapbuf, blk, e->block, epoch);
-		else if (e->epoch < epoch)
+		else if (e->epoch < epoch || release)
 		{
 			items[nitems].slot = MAP_SLOT(blk);
 			items[nitems].block = e->block;
@@ -2505,7 +2573,7 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 			uint8		c = end > i ? refs_get(&rp, phys[k]) : 0;
 
 			ent[ndelta->nentries].slot = items[k].slot;
-			if (c == 0)
+			if (c == 0 && !release)
 			{
 				/* no other map holds it: it is ours */
 				ent[ndelta->nentries].block = items[k].block;
@@ -2513,7 +2581,9 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 			}
 			else
 			{
-				if (c != BMAP_REFS_STUCK)
+				if (c == 0)
+					tofree[nfree++] = phys[k];
+				else if (c != BMAP_REFS_STUCK)
 					refs_set(&rp, phys[k], c - 1);
 				else
 					stuck_released(rel);
@@ -2534,6 +2604,19 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 		i += covered;
 	}
 	ReleaseBuffer(mapbuf);
+
+	/*
+	 * (sorted, as phys[]; a crash before this leaves them to a sweep)  A
+	 * released block no other map holds is held by nothing until it is
+	 * freed, and free_blocks()'s reads may wait; but the caller's lock of
+	 * the header holds off interrupts, so a cancelled truncation (an
+	 * autovacuum's, waited on by a query) frees them first.
+	 */
+	if (nfree > 0)
+	{
+		INJECTION_POINT("bmap-truncation-let-go", NULL);
+		free_blocks(rel, tofree, nfree);
+	}
 }
 
 /* a main fork's logical blocks can be given other physical blocks */
@@ -2761,6 +2844,10 @@ bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return true;
 	if (lookup_entry(reln, blocknum, &entry))
 		return entry.since > lsn;
+
+	/* (its entry let go of after the record, whatever the header says) */
+	if (InRecovery && let_go_after(reln, blocknum, false, lsn))
+		return true;
 
 	/*
 	 * A block recovery keeps past its header's length whose entry was let
@@ -5300,6 +5387,13 @@ bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
 	*refs = lookup_ref(reln->smgr_rlocator.locator, entry.block);
 }
 
+/* the logical blocks a block-mapped relation's map pages have entries for */
+uint64
+bmap_inspect_map_blocks(SMgrRelation reln)
+{
+	return map_blocks(reln);
+}
+
 /* a block-mapped relation's epoch */
 uint32
 bmap_inspect_epoch(SMgrRelation reln)
@@ -5745,11 +5839,16 @@ bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 * whose replay drops it: its entry may have been let go of
 			 * since (see extend_in_recovery()), and it goes nowhere.  Any
 			 * process may be writing it out, not only the startup process
-			 * that kept the length.  Anywhere else, the lookup fails as
-			 * without 'missing_ok'.
+			 * that kept the length.  So does one whose entry was let go of
+			 * after the page's last change, whatever length a header's
+			 * image replayed since gives (redo never moves an entry back,
+			 * but a header's length may).  Anywhere else, the lookup fails
+			 * as without 'missing_ok'.
 			 */
-			if (blocknum < header_nblocks(reln, true, &lsn) ||
-				PageGetLSN((const PageData *) buffers[0]) >= lsn)
+			if (!let_go_after(reln, blocknum, true,
+							  PageGetLSN((const PageData *) buffers[0])) &&
+				(blocknum < header_nblocks(reln, true, &lsn) ||
+				 PageGetLSN((const PageData *) buffers[0]) >= lsn))
 				(void) lookup_ext(reln, blocknum, 1, NULL, false, true);
 			elog(DEBUG1, "block %u of %s, past its map's length and without an entry, not written",
 				 blocknum, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
@@ -5907,9 +6006,8 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 	reln->bmap_pretrunc = InvalidBuffer;
 
 	/*
-	 * Blocks past the new length stay mapped; extending the relation again
-	 * reuses them, and dropping it frees them.  A folded relation lists the
-	 * truncation.
+	 * Blocks past the new length stay mapped until the truncation is done
+	 * (bmapposttruncate()).  A folded relation lists the truncation.
 	 */
 	if (nblocks < curnblk)
 	{
@@ -5931,6 +6029,92 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 			ReleaseBuffer(reln->bmap_pretrunc_chg[i]);
 		reln->bmap_pretrunc_chg[i] = InvalidBuffer;
 	}
+}
+
+/*
+ * The first of blocks [from, to), on one map page, with an entry, and in
+ * *last the one after the last; false if none has one.
+ */
+static bool
+mapped_span(SMgrRelation reln, uint64 from, uint64 to, uint64 *first,
+			uint64 *last)
+{
+	PGIOAlignedBlock copy;
+	const BmapEntry *entries;
+	bool		found = false;
+
+	if (!read_node_ext(reln, MAP_PAGE(from), false, copy.data, BMAP_PAGE_NODE,
+					   true))
+		return false;
+	entries = PageGetBmapEntries(copy.data);
+	for (uint64 blk = from; blk < to; blk++)
+	{
+		if (!BlockNumberIsValid(entries[MAP_SLOT(blk)].block))
+			continue;
+		if (!found)
+			*first = blk;
+		*last = blk + 1;
+		found = true;
+	}
+	return found;
+}
+
+/*
+ * Once a truncation is done, outside its critical section: let go of the
+ * entries past the relation's length, this truncation's and any an earlier
+ * one left (a crash before this), freeing the blocks no other map holds
+ * (#638).  Pages as of a fold go on its changes list, which holds them
+ * until pruned.  Kept, they would be held until the relation grew again
+ * or was dropped, and counted by every sweep.  The records follow the
+ * truncation's, so their replay finds the length already cut, and the
+ * relation's pages past it have left shared buffers: none is written onto
+ * a block freed here and given to another relation.  Records from before
+ * the truncation that a crash replays for such a page are skipped, or the
+ * page goes nowhere (bmapreplacedafter(), bmapwritev()), as for an entry
+ * let go of on extension.
+ */
+void
+bmapposttruncate(SMgrRelation reln, ForkNumber forknum)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	BmapHeader *header;
+	uint64		end;
+
+	if (forknum != MAIN_FORKNUM || InRecovery)
+		return;
+	INJECTION_POINT("bmap-truncated", NULL);
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	header = PageGetBmapHeader(BufferGetPage(headerbuf));
+
+	end = map_blocks(reln);
+	for (uint64 page = header->nblocks; page < end;)
+	{
+		uint64		pageend = Min(end, (page / BMAP_FANOUT + 1) * BMAP_FANOUT);
+		uint64		from;
+		uint64		last;
+
+		/*
+		 * The map never shrinks, so most of its pages past the length have
+		 * nothing left after the first truncation: each is read once, not
+		 * copied for every piece.
+		 */
+		if (mapped_span(reln, page, pageend, &from, &last))
+		{
+			while (from < last)
+			{
+				uint64		to = Min(last, from + BMAP_PIECE);
+
+				unshare_stale(reln, header->epoch, header->fold_epoch,
+							  (BlockNumber) from, (BlockNumber) to, true);
+				from = to;
+			}
+		}
+		page = pageend;
+	}
+	UnlockReleaseBuffer(headerbuf);
 }
 
 void
@@ -6019,6 +6203,85 @@ bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate)
  * ----------------------------------------------------------------
  */
 
+/*
+ * Redo's view of a map entry never goes backwards (#647).  A map page read
+ * in recovery may be newer than the record being replayed (written out
+ * before a crash, copied by a base backup), and an entry it changed since
+ * (given another block, or let go of) makes redo skip the logical block's
+ * records from before the change, or send its pages nowhere
+ * (bmapreplacedafter(), bmapwritev()).  A full-page image of the map page
+ * logged before the change (an extension of another block on it) would
+ * bring the old entry back partway through replay, and the block's later
+ * records would be replayed onto a page that missed the ones skipped.  So
+ * an image restored over a newer page keeps each entry the newer page
+ * changed later (its 'since' is later), and a delta leaves such an entry
+ * alone (apply_node_delta()).  The page's LSN is then the newer page's: a
+ * record before it changes the entries it changes anyway (a torn newer
+ * page may have older ones), and wal_consistency_checking compares the
+ * page only once replay has caught up with it.
+ */
+
+/*
+ * Map page 'blkno' of 'rlocator' as it is before redo restores an image of
+ * it, into 'dst', if it is a map page newer than the record; read from
+ * shared buffers or disk, and passed over if it fails verification (an
+ * image is restored over a torn page).
+ *
+ * This costs an image what images otherwise save redo: a read of the page
+ * it replaces, synchronous if the page isn't cached, so one random read per
+ * map page the first time recovery restores it after a checkpoint.  Whether
+ * the page on disk is newer than the record can't be known without it.
+ */
+static bool
+newer_map_page(XLogReaderState *record, RelFileLocator rlocator,
+			   BlockNumber blkno, char *dst)
+{
+	SMgrRelation reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	Buffer		buf;
+	BmapPageOpaqueData *opaque;
+
+	if (!mdexists(reln, BMAP_FORKNUM) || blkno >= mdnblocks(reln, BMAP_FORKNUM))
+		return false;
+	/* (only redo dirties map pages, so a read off disk isn't torn by one) */
+	if (!read_map_uncached(reln, blkno, dst, 1, &buf))
+		return false;
+	if (BufferIsValid(buf))
+	{
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		memcpy(dst, BufferGetPage(buf), BLCKSZ);
+		UnlockReleaseBuffer(buf);
+	}
+	if (PageIsNew(dst) || PageGetLSN(dst) <= record->ReadRecPtr ||
+		PageGetSpecialSize(dst) != MAXALIGN(sizeof(BmapPageOpaqueData)))
+		return false;
+	opaque = PageGetBmapOpaque(dst);
+	return opaque->magic == BMAP_MAGIC && opaque->type == BMAP_PAGE_NODE;
+}
+
+/* keep the entries of 'newer' changed after those of the restored page */
+static void
+keep_newer_entries(Buffer buf, char *newer)
+{
+	Page		page = BufferGetPage(buf);
+	BmapEntry  *entries = PageGetBmapEntries(page);
+	const BmapEntry *kept = PageGetBmapEntries(newer);
+	bool		any = false;
+
+	for (uint32 i = 0; i < BMAP_FANOUT; i++)
+	{
+		if (kept[i].since > entries[i].since)
+		{
+			entries[i] = kept[i];
+			any = true;
+		}
+	}
+	if (any)
+	{
+		PageSetLSN(page, Max(PageGetLSN(page), PageGetLSN(newer)));
+		MarkBufferDirty(buf);
+	}
+}
+
 static void
 redo_block(XLogReaderState *record, uint8 block_id)
 {
@@ -6029,12 +6292,25 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	uint16		flags;
 	Buffer		buf;
 	XLogRedoAction action;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	PGIOAlignedBlock newer;
+	bool		have_newer = false;
+
+	/* a map page's image restored: the page it replaces, if newer */
+	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	if (forknum == BMAP_FORKNUM && blkno > 0 &&
+		XLogRecBlockImageApply(record, block_id))
+		have_newer = newer_map_page(record, rlocator, blkno, newer.data);
 
 	/* a full-page image leaves out the block's data, and needs none */
 	if (data == NULL)
 	{
 		if (XLogReadBufferForRedo(record, block_id, &buf) != BLK_RESTORED)
 			elog(PANIC, "block map record without its delta");
+		if (have_newer)
+			keep_newer_entries(buf, newer.data);
 		UnlockReleaseBuffer(buf);
 		return;
 	}
@@ -6053,8 +6329,24 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	}
 	else
 		action = XLogReadBufferForRedo(record, block_id, &buf);
+	if (action == BLK_RESTORED && have_newer)
+		keep_newer_entries(buf, newer.data);
 
-	if (action == BLK_NEEDS_REDO)
+	/*
+	 * A map page newer than the record still takes its entry changes, which
+	 * leave alone those changed later: one whose newer entries were kept
+	 * over an image may have older ones too (above).  It is dirtied only if
+	 * an entry changed: written out, a page whose LSN is past the replay
+	 * point asks for the minimum recovery point past it, which recovery
+	 * from a base backup warns of, and most such deltas change nothing.
+	 */
+	if (action == BLK_DONE && kind == BMAP_DELTA_NODE &&
+		forknum == BMAP_FORKNUM)
+	{
+		if (apply_node_delta(BufferGetPage(buf), (xl_bmap_node_delta *) copy))
+			MarkBufferDirty(buf);
+	}
+	else if (action == BLK_NEEDS_REDO)
 	{
 		Page		page = BufferGetPage(buf);
 

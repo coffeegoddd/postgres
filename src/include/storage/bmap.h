@@ -82,6 +82,7 @@ extern BlockNumber bmapnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void bmappretruncate(SMgrRelation reln, ForkNumber forknum);
 extern void bmaptruncate(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber curnblk, BlockNumber nblocks);
+extern void bmapposttruncate(SMgrRelation reln, ForkNumber forknum);
 extern void bmapimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void bmapregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	bmapfd(SMgrRelation reln, ForkNumber forknum,
@@ -121,6 +122,7 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
 /* inspection, for tests */
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
+extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);
 extern uint32 bmap_inspect_epoch(SMgrRelation reln);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);

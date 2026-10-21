@@ -171,6 +171,40 @@ test_bmap_map(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/*
+ * test_bmap_past_end(relnumber): the entries a map has past its relation's
+ * length (a truncation's, until let go of), as test_bmap_map() does.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_past_end);
+
+Datum
+test_bmap_past_end(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+	uint64		end = bmap_inspect_map_blocks(srel);
+
+	InitMaterializedSRF(fcinfo, 0);
+	for (uint64 blk = smgrnblocks(srel, MAIN_FORKNUM); blk < end; blk++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+		BlockNumber phys;
+		uint32		epoch;
+		uint32		refs;
+
+		bmap_inspect_block(srel, (BlockNumber) blk, &phys, &epoch, &refs);
+		if (!BlockNumberIsValid(phys))
+			continue;
+		values[0] = Int64GetDatum(blk);
+		values[1] = Int64GetDatum(phys);
+		values[2] = Int64GetDatum(epoch);
+		values[3] = Int32GetDatum(refs);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
 /* test_bmap_epoch(relnumber): the map's epoch */
 PG_FUNCTION_INFO_V1(test_bmap_epoch);
 
@@ -219,7 +253,11 @@ test_bmap_unlink(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* test_bmap_truncate(relnumber, nblocks): shorten the logical length */
+/*
+ * test_bmap_truncate(relnumber, nblocks, done): shorten the logical length;
+ * if done, finish as RelationTruncate() does, letting go of the blocks
+ * past it (otherwise as a crash before that leaves them).
+ */
 PG_FUNCTION_INFO_V1(test_bmap_truncate);
 
 Datum
@@ -232,6 +270,8 @@ test_bmap_truncate(PG_FUNCTION_ARGS)
 
 	smgrpretruncate(srel, &fork, 1);
 	smgrtruncate(srel, &fork, 1, &old, &nblocks);
+	if (PG_GETARG_BOOL(2))
+		smgrposttruncate(srel, &fork, 1);
 	PG_RETURN_VOID();
 }
 

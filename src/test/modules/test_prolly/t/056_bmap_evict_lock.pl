@@ -7,8 +7,8 @@
 # before it locks the map page.  Whether a read here evicts such a page
 # depends on timing; an assert-enabled build fails at any read made while
 # a map page is locked for a change, so each path below (a page's first
-# change after a fold, an extension over entries a truncation left) checks
-# the order on every run.
+# change after a fold, a truncation letting go of pages as of a fold)
+# checks the order on every run.
 
 use strict;
 use warnings FATAL => 'all';
@@ -47,21 +47,24 @@ is( sql(
 		WHERE kind = 'copy'}),
 	$pages, 'each page once');
 
-# Entries a truncation left past the end, born before a fold: the
-# extension that reuses them lists them, reading the changes list's pages
-# while the relation's pages it just filled are dirty.
+# Entries past a truncation's end, born before a fold: the truncation,
+# once done, lists them (#638; the extension that reused them listed them
+# before), reading the changes list's pages before it locks the map page.
+# The pages are emptied and vacuumed before the fold, so the truncating
+# VACUUM after it changes none of them: they are as of the fold.
 sql(q{CREATE TABLE f.u (a int8 PRIMARY KEY, b int8);
 	INSERT INTO f.u SELECT g, g FROM generate_series(1, 30000) g;
 	DELETE FROM f.u WHERE ctid >= '(5,0)'});
-sql('VACUUM f.u');
-is(sql(q{SELECT pg_relation_size('f.u') / 8192}), '5', 'truncated');
+sql('VACUUM (TRUNCATE false) f.u');
 my $kept = sql(q{SELECT count(*), sum(b) FROM f.u});
 my $urel = sql(q{SELECT pg_relation_filenode('f.u')});
 my ($ulineage, $uepoch) = split /\|/,
   sql(qq{SELECT lineage, epoch FROM test_bmap_fold_begin($urel)});
+sql('VACUUM f.u');
+is(sql(q{SELECT pg_relation_size('f.u') / 8192}), '5', 'truncated');
 sql(q{INSERT INTO f.u SELECT g, g FROM generate_series(30001, 60000) g});
 is(sql('SELECT count(*), sum(b) FROM f.u WHERE a <= 30000'), $kept,
-	'the extension reuses them');
+	'the table grows again');
 is(sql('SELECT count(*), sum(b) FROM f.u WHERE a > 30000'), '30000|1350015000',
 	'with the rows added');
 cmp_ok(

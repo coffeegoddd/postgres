@@ -111,6 +111,12 @@ CREATE FUNCTION test_bmap_map(relnumber oid,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The entries a map has past its relation's length.
+CREATE FUNCTION test_bmap_past_end(relnumber oid,
+	OUT blkno int8, OUT phys int8, OUT epoch int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION test_bmap_epoch(relnumber oid)
 RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -127,7 +133,8 @@ CREATE FUNCTION test_bmap_unlink(relnumber oid)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int)
+CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int,
+	done bool DEFAULT false)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
