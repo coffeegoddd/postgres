@@ -1349,6 +1349,23 @@ and in redo:
   and its blocks freed, in records of their own. A crash between the
   commit and these records leaks the blocks until reclamation (step 7).
 
+**Redo never moves an entry backwards (#647).** A map page recovery reads
+may be newer than the record it replays (written before a crash, copied
+by a base backup). An entry the newer page changed since (given another
+block, or let go of) makes redo skip the block's records from before the
+change and send its pages nowhere. A full-page image of the same map
+page, logged before the change (an extension of another block on it),
+used to bring the old entry back partway through replay: the block's
+later records were then replayed onto a page that had missed the
+skipped ones (an assertion failure in heap prune redo,
+`156_bmap_redo_newer_entries`). Now an image restored over a newer map
+page keeps each entry whose `since` is later than the image's, a node
+delta leaves such an entry alone, and the page keeps the newer page's
+LSN. A record from before that LSN still applies its entry changes
+(a torn newer page may hold older entries too), and
+`wal_consistency_checking` compares the page only once replay has
+caught up with it, which skips a page whose LSN is ahead of the record.
+
 ### I/O
 
 - Reads and writes translate logical runs to physical runs and call md.c

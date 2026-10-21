@@ -880,6 +880,9 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 		BmapEntry  *e = &entries[ent[i].slot];
 
 		Assert(ent[i].slot < BMAP_FANOUT);
+		/* (in redo, an entry kept from a newer page: see redo_block()) */
+		if (e->since > delta->since)
+			continue;
 		if (e->block != ent[i].block)
 			e->since = delta->since;
 		e->block = ent[i].block;
@@ -6019,6 +6022,87 @@ bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate)
  * ----------------------------------------------------------------
  */
 
+/*
+ * Redo's view of a map entry never goes backwards (#647).  A map page read
+ * in recovery may be newer than the record being replayed (written out
+ * before a crash, copied by a base backup), and an entry it changed since
+ * (given another block, or let go of) makes redo skip the logical block's
+ * records from before the change, or send its pages nowhere
+ * (bmapreplacedafter(), bmapwritev()).  A full-page image of the map page
+ * logged before the change (an extension of another block on it) would
+ * bring the old entry back partway through replay, and the block's later
+ * records would be replayed onto a page that missed the ones skipped.  So
+ * an image restored over a newer page keeps each entry the newer page
+ * changed later (its 'since' is later), and a delta leaves such an entry
+ * alone (apply_node_delta()).  The page's LSN is then the newer page's: a
+ * record before it changes the entries it changes anyway (a torn newer
+ * page may have older ones), and wal_consistency_checking compares the
+ * page only once replay has caught up with it.
+ */
+
+/*
+ * Map page 'blkno' of 'rlocator' as it is before redo restores an image of
+ * it, into 'dst', if it is a map page newer than the record; read from
+ * shared buffers or disk, and passed over if it fails verification (an
+ * image is restored over a torn page).
+ */
+static bool
+newer_map_page(XLogReaderState *record, RelFileLocator rlocator,
+			   BlockNumber blkno, char *dst)
+{
+	SMgrRelation reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	PrefetchBufferResult r;
+	BmapPageOpaqueData *opaque;
+
+	if (!mdexists(reln, BMAP_FORKNUM) || blkno >= mdnblocks(reln, BMAP_FORKNUM))
+		return false;
+	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blkno);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(rlocator, BMAP_FORKNUM, blkno, r.recent_buffer))
+	{
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
+		memcpy(dst, BufferGetPage(r.recent_buffer), BLCKSZ);
+		UnlockReleaseBuffer(r.recent_buffer);
+	}
+	else
+	{
+		void	   *page = dst;
+
+		mdreadv(reln, BMAP_FORKNUM, blkno, &page, 1);
+		if (!PageIsVerified(dst, blkno, 0, NULL))
+			return false;
+	}
+	if (PageIsNew(dst) || PageGetLSN(dst) <= record->ReadRecPtr ||
+		PageGetSpecialSize(dst) != MAXALIGN(sizeof(BmapPageOpaqueData)))
+		return false;
+	opaque = PageGetBmapOpaque(dst);
+	return opaque->magic == BMAP_MAGIC && opaque->type == BMAP_PAGE_NODE;
+}
+
+/* keep the entries of 'newer' changed after those of the restored page */
+static void
+keep_newer_entries(Buffer buf, char *newer)
+{
+	Page		page = BufferGetPage(buf);
+	BmapEntry  *entries = PageGetBmapEntries(page);
+	const BmapEntry *kept = PageGetBmapEntries(newer);
+	bool		any = false;
+
+	for (uint32 i = 0; i < BMAP_FANOUT; i++)
+	{
+		if (kept[i].since > entries[i].since)
+		{
+			entries[i] = kept[i];
+			any = true;
+		}
+	}
+	if (any)
+	{
+		PageSetLSN(page, Max(PageGetLSN(page), PageGetLSN(newer)));
+		MarkBufferDirty(buf);
+	}
+}
+
 static void
 redo_block(XLogReaderState *record, uint8 block_id)
 {
@@ -6029,12 +6113,25 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	uint16		flags;
 	Buffer		buf;
 	XLogRedoAction action;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	PGIOAlignedBlock newer;
+	bool		have_newer = false;
+
+	/* a map page's image restored: the page it replaces, if newer */
+	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	if (forknum == BMAP_FORKNUM && blkno > 0 &&
+		XLogRecBlockImageApply(record, block_id))
+		have_newer = newer_map_page(record, rlocator, blkno, newer.data);
 
 	/* a full-page image leaves out the block's data, and needs none */
 	if (data == NULL)
 	{
 		if (XLogReadBufferForRedo(record, block_id, &buf) != BLK_RESTORED)
 			elog(PANIC, "block map record without its delta");
+		if (have_newer)
+			keep_newer_entries(buf, newer.data);
 		UnlockReleaseBuffer(buf);
 		return;
 	}
@@ -6053,8 +6150,21 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	}
 	else
 		action = XLogReadBufferForRedo(record, block_id, &buf);
+	if (action == BLK_RESTORED && have_newer)
+		keep_newer_entries(buf, newer.data);
 
-	if (action == BLK_NEEDS_REDO)
+	/*
+	 * A map page newer than the record still takes its entry changes, which
+	 * leave alone those changed later: one whose newer entries were kept
+	 * over an image may have older ones too (above).
+	 */
+	if (action == BLK_DONE && kind == BMAP_DELTA_NODE &&
+		forknum == BMAP_FORKNUM)
+	{
+		apply_node_delta(BufferGetPage(buf), (xl_bmap_node_delta *) copy);
+		MarkBufferDirty(buf);
+	}
+	else if (action == BLK_NEEDS_REDO)
 	{
 		Page		page = BufferGetPage(buf);
 
