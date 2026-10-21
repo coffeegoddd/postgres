@@ -1125,6 +1125,48 @@ log_fold_rows(Relation rel, const ProllyTreeEnv *env,
 	return ok;
 }
 
+/*
+ * The state of a baseline that holds rel's last baseline's rows with the
+ * transaction's own changes applied (a commit of them alone), into next:
+ * as of the active snapshot, its fold's transaction this one.  The
+ * transaction's entries are consumed; the rest stay, the changes of
+ * others the new baseline doesn't hold.  False, consuming nothing, where
+ * the last baseline's state doesn't hold so: not this finder's with the
+ * table's log as it is, unsettled, its fold one the snapshot doesn't see,
+ * the table's storage changed unseen, or the log can't tell the
+ * transaction's entries.
+ */
+static bool
+log_advance(Relation rel, const ProllyValue *state, StringInfo next)
+{
+	ProllyComponents c;
+	uint64		identity = 0;
+	State		st;
+	State		ns = {0};
+	Snapshot	snap = GetActiveSnapshot();
+
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log == NULL || !PROLLY_HAS(c.change_log, consume_own))
+		return false;
+	identity = PROLLY_CALL(c.change_log, identity, rel);
+	if (identity == 0 || !parse_state(state, &st) || st.log != identity ||
+		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
+		storage_unseen(rel, snap))
+		return false;
+	if (!PROLLY_CALL(c.change_log, consume_own, rel))
+		return false;
+	ns.log = identity;
+	ns.xmax = snap->xmax;
+	ns.nxip = snap->xcnt;
+	ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
+	if (ns.nxip > 0)
+		memcpy(ns.xip, snap->xip, ns.nxip * sizeof(TransactionId));
+	qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
+	ns.own = GetTopTransactionIdIfAny();
+	put_state(next, &ns);
+	return true;
+}
+
 const ProllyChangeFinderRoutine prolly_changes_log = {
 	.info = {
 		.iface = PROLLY_IFACE_CHANGE_FINDER,
@@ -1139,4 +1181,5 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.counters = log_counters,
 	.fold_rows = log_fold_rows,
 	.state_refs = log_state_refs,
+	.advance = log_advance,
 };

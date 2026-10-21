@@ -8577,6 +8577,127 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 	return true;
 }
 
+static bool
+same_hash(const ProllyHash *a, const ProllyHash *b)
+{
+	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
+}
+
+/*
+ * The baseline after a commit of the transaction's own row changes (head
+ * to root, by fold_rows()): a table changed whose baseline held exactly
+ * head's rows (and the same row shape) holds root's, its finder's state
+ * advanced past them; every other table's entry as it was.  Its rows are
+ * then the baseline's rows of before with the transaction's changes, which
+ * the finder marks folded, the changes of others since staying for the
+ * next fold.
+ */
+static bool
+folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head,
+						const ProllyNodeRef *root, const ProllyRowChanges *changes,
+						int nchanges, ProllyNodeRef *next)
+{
+	Canon		cn;
+	ProllyEdit *edits = palloc_array(ProllyEdit, Max(nchanges, 1));
+	int			nedits = 0;
+	int			save_nestlevel;
+	StringInfoData v;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (!PROLLY_HAS(cn.finder, advance) || !root_in_format(&cn, head))
+		return false;
+	load_baseline(&cn, baseline);
+	initStringInfo(&v);
+
+	/* (described as a commit describes them: every name qualified) */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		for (int i = 0; i < nchanges; i++)
+		{
+			Relation	rel = try_table_open(changes[i].relid, AccessShareLock);
+			CanonItem  *it;
+			BaseTable  *bt;
+			ProllyKey	k;
+			ProllyValue iv;
+			ProllyValue def;
+			ProllyNodeRef was;
+			ProllyNodeRef now;
+			StringInfoData desc;
+			ProllyHash	dh;
+			ProllyValue state;
+			StringInfoData ns;
+
+			if (rel == NULL)
+				continue;
+			it = add_item(&cn, "t:", qualified(RelationGetNamespace(rel),
+											   RelationGetRelationName(rel)));
+			bt = find_base_table(&cn, &it->key);
+			k.data = (const uint8 *) it->key.data;
+			k.len = it->key.len;
+			resetStringInfo(&v);
+			if (bt == NULL || !head_item(&cn, head, &it->key, &v))
+			{
+				table_close(rel, AccessShareLock);
+				continue;
+			}
+			iv.data = (const uint8 *) v.data;
+			iv.len = v.len;
+			(void) tree_item(&k, &iv, &was, &def);
+			resetStringInfo(&v);
+			if (!same_hash(&was.hash, &bt->data.hash) ||
+				!head_item(&cn, root, &it->key, &v))
+			{
+				table_close(rel, AccessShareLock);
+				continue;
+			}
+			iv.data = (const uint8 *) v.data;
+			iv.len = v.len;
+			(void) tree_item(&k, &iv, &now, &def);
+			initStringInfo(&desc);
+			describe_table(&cn, rel, &desc);
+			baseline_hash(&cn, rel, &desc, &dh);
+			state.data = (const uint8 *) bt->state.data;
+			state.len = bt->state.len;
+			initStringInfo(&ns);
+			if (same_hash(&dh, &bt->description) &&
+				PROLLY_CALL(cn.finder, advance, rel, &state, &ns))
+			{
+				resetStringInfo(&it->value);
+				put_hash(&it->value, &now.hash);
+				put_hash(&it->value, &dh);
+				appendBinaryStringInfo(&it->value, ns.data, ns.len);
+				put_edit(edits, &nedits, it);
+			}
+			pfree(desc.data);
+			table_close(rel, AccessShareLock);
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+		AtEOXact_GUC(false, save_nestlevel);
+	}
+	PG_END_TRY();
+	if (nedits == 0)
+		return false;
+	{
+		ProllyTreeEnv benv = cn.env;
+
+		benv.chunk_refs = base_chunk_refs;
+		if (nedits > 1)
+			qsort(edits, nedits, sizeof(ProllyEdit), edit_key_cmp);
+		PROLLY_CALL(cn.tree, apply, &benv, baseline, edits, nedits, next);
+	}
+	return true;
+}
+
 /* A statement, its trailing space and ";" trimmed, ended by one. */
 static void
 append_statement(StringInfo out, const char *stmt)
@@ -8924,6 +9045,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
+	.advance_baseline = folded_advance_baseline,
 	.splice = folded_splice,
 	.tables = folded_tables,
 	.materialized_views = folded_materialized_views,

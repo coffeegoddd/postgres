@@ -56,6 +56,7 @@ tests += {
       'branch_writes',
       'writer_modes',
       'transaction_commits',
+      'txn_commit_baselines',
       'commit_messages',
       'status_diff',
       'schema_diffs',

@@ -1,0 +1,349 @@
+-- dolt.transaction_commit advances the baseline with each transaction's
+-- commit of its own rows, where the baseline held the old head's: so a
+-- fold after many transactions (a status, the owner's release check in an
+-- owned writer mode) reads the changes since the last commit, not every
+-- one since the last fold.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT current_database() AS home \gset
+CREATE DATABASE txn_commit_baselines;
+\c txn_commit_baselines
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA tb VERSIONED;
+CREATE TABLE tb.k (id int PRIMARY KEY, v text);
+CREATE TABLE tb.n (v int);
+INSERT INTO tb.k SELECT g, 'k' FROM generate_series(1, 1000) g;
+INSERT INTO tb.n SELECT g % 10 FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'base')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CREATE FUNCTION pg_temp.counter(n text) RETURNS bigint LANGUAGE sql
+  AS $$ SELECT value FROM pg_stat_prolly WHERE name = n $$;
+SET dolt.transaction_commit = on;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+-- 40 one-row transactions on each table (each statement its own), then
+-- a status: its fold reads what no commit holds (nothing), not the 80
+-- transactions' rows; and the baseline is the fold's in full.
+SELECT format('UPDATE tb.k SET v = %L WHERE id = %s', 'x' || g, g)
+FROM generate_series(1, 40) g \gexec
+UPDATE tb.k SET v = 'x1' WHERE id = 1
+UPDATE tb.k SET v = 'x2' WHERE id = 2
+UPDATE tb.k SET v = 'x3' WHERE id = 3
+UPDATE tb.k SET v = 'x4' WHERE id = 4
+UPDATE tb.k SET v = 'x5' WHERE id = 5
+UPDATE tb.k SET v = 'x6' WHERE id = 6
+UPDATE tb.k SET v = 'x7' WHERE id = 7
+UPDATE tb.k SET v = 'x8' WHERE id = 8
+UPDATE tb.k SET v = 'x9' WHERE id = 9
+UPDATE tb.k SET v = 'x10' WHERE id = 10
+UPDATE tb.k SET v = 'x11' WHERE id = 11
+UPDATE tb.k SET v = 'x12' WHERE id = 12
+UPDATE tb.k SET v = 'x13' WHERE id = 13
+UPDATE tb.k SET v = 'x14' WHERE id = 14
+UPDATE tb.k SET v = 'x15' WHERE id = 15
+UPDATE tb.k SET v = 'x16' WHERE id = 16
+UPDATE tb.k SET v = 'x17' WHERE id = 17
+UPDATE tb.k SET v = 'x18' WHERE id = 18
+UPDATE tb.k SET v = 'x19' WHERE id = 19
+UPDATE tb.k SET v = 'x20' WHERE id = 20
+UPDATE tb.k SET v = 'x21' WHERE id = 21
+UPDATE tb.k SET v = 'x22' WHERE id = 22
+UPDATE tb.k SET v = 'x23' WHERE id = 23
+UPDATE tb.k SET v = 'x24' WHERE id = 24
+UPDATE tb.k SET v = 'x25' WHERE id = 25
+UPDATE tb.k SET v = 'x26' WHERE id = 26
+UPDATE tb.k SET v = 'x27' WHERE id = 27
+UPDATE tb.k SET v = 'x28' WHERE id = 28
+UPDATE tb.k SET v = 'x29' WHERE id = 29
+UPDATE tb.k SET v = 'x30' WHERE id = 30
+UPDATE tb.k SET v = 'x31' WHERE id = 31
+UPDATE tb.k SET v = 'x32' WHERE id = 32
+UPDATE tb.k SET v = 'x33' WHERE id = 33
+UPDATE tb.k SET v = 'x34' WHERE id = 34
+UPDATE tb.k SET v = 'x35' WHERE id = 35
+UPDATE tb.k SET v = 'x36' WHERE id = 36
+UPDATE tb.k SET v = 'x37' WHERE id = 37
+UPDATE tb.k SET v = 'x38' WHERE id = 38
+UPDATE tb.k SET v = 'x39' WHERE id = 39
+UPDATE tb.k SET v = 'x40' WHERE id = 40
+SELECT format('INSERT INTO tb.n VALUES (%s)', g) FROM generate_series(1, 40) g \gexec
+INSERT INTO tb.n VALUES (1)
+INSERT INTO tb.n VALUES (2)
+INSERT INTO tb.n VALUES (3)
+INSERT INTO tb.n VALUES (4)
+INSERT INTO tb.n VALUES (5)
+INSERT INTO tb.n VALUES (6)
+INSERT INTO tb.n VALUES (7)
+INSERT INTO tb.n VALUES (8)
+INSERT INTO tb.n VALUES (9)
+INSERT INTO tb.n VALUES (10)
+INSERT INTO tb.n VALUES (11)
+INSERT INTO tb.n VALUES (12)
+INSERT INTO tb.n VALUES (13)
+INSERT INTO tb.n VALUES (14)
+INSERT INTO tb.n VALUES (15)
+INSERT INTO tb.n VALUES (16)
+INSERT INTO tb.n VALUES (17)
+INSERT INTO tb.n VALUES (18)
+INSERT INTO tb.n VALUES (19)
+INSERT INTO tb.n VALUES (20)
+INSERT INTO tb.n VALUES (21)
+INSERT INTO tb.n VALUES (22)
+INSERT INTO tb.n VALUES (23)
+INSERT INTO tb.n VALUES (24)
+INSERT INTO tb.n VALUES (25)
+INSERT INTO tb.n VALUES (26)
+INSERT INTO tb.n VALUES (27)
+INSERT INTO tb.n VALUES (28)
+INSERT INTO tb.n VALUES (29)
+INSERT INTO tb.n VALUES (30)
+INSERT INTO tb.n VALUES (31)
+INSERT INTO tb.n VALUES (32)
+INSERT INTO tb.n VALUES (33)
+INSERT INTO tb.n VALUES (34)
+INSERT INTO tb.n VALUES (35)
+INSERT INTO tb.n VALUES (36)
+INSERT INTO tb.n VALUES (37)
+INSERT INTO tb.n VALUES (38)
+INSERT INTO tb.n VALUES (39)
+INSERT INTO tb.n VALUES (40)
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.counter('commits') AS commits;
+ commits 
+---------
+      80
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.counter('fold_rows_read') AS status_rows_read,
+	pg_temp.counter('fold_full_tables') AS status_full_tables;
+ status_rows_read | status_full_tables 
+------------------+--------------------
+                0 |                  0
+(1 row)
+
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+ same_as_full 
+--------------
+ t
+(1 row)
+
+SELECT count(*), count(*) FILTER (WHERE v LIKE 'x%') FROM tb.k;
+ count | count 
+-------+-------
+  1000 |    40
+(1 row)
+
+SELECT count(*), sum(v) FROM tb.n;
+ count | sum  
+-------+------
+  1040 | 5320
+(1 row)
+
+-- In an owned writer mode, each transaction's release of the branch's
+-- owner checks the working set is the head's, folding it: each reads the
+-- changes since the last commit, not since the last fold (else the 40th
+-- reads all 40 transactions' rows, 820 in all).
+SELECT dolt_writer_mode('owned');
+ dolt_writer_mode 
+------------------
+ owned
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT format('UPDATE tb.k SET v = %L WHERE id = %s', 'y' || g, g)
+FROM generate_series(1, 40) g \gexec
+UPDATE tb.k SET v = 'y1' WHERE id = 1
+UPDATE tb.k SET v = 'y2' WHERE id = 2
+UPDATE tb.k SET v = 'y3' WHERE id = 3
+UPDATE tb.k SET v = 'y4' WHERE id = 4
+UPDATE tb.k SET v = 'y5' WHERE id = 5
+UPDATE tb.k SET v = 'y6' WHERE id = 6
+UPDATE tb.k SET v = 'y7' WHERE id = 7
+UPDATE tb.k SET v = 'y8' WHERE id = 8
+UPDATE tb.k SET v = 'y9' WHERE id = 9
+UPDATE tb.k SET v = 'y10' WHERE id = 10
+UPDATE tb.k SET v = 'y11' WHERE id = 11
+UPDATE tb.k SET v = 'y12' WHERE id = 12
+UPDATE tb.k SET v = 'y13' WHERE id = 13
+UPDATE tb.k SET v = 'y14' WHERE id = 14
+UPDATE tb.k SET v = 'y15' WHERE id = 15
+UPDATE tb.k SET v = 'y16' WHERE id = 16
+UPDATE tb.k SET v = 'y17' WHERE id = 17
+UPDATE tb.k SET v = 'y18' WHERE id = 18
+UPDATE tb.k SET v = 'y19' WHERE id = 19
+UPDATE tb.k SET v = 'y20' WHERE id = 20
+UPDATE tb.k SET v = 'y21' WHERE id = 21
+UPDATE tb.k SET v = 'y22' WHERE id = 22
+UPDATE tb.k SET v = 'y23' WHERE id = 23
+UPDATE tb.k SET v = 'y24' WHERE id = 24
+UPDATE tb.k SET v = 'y25' WHERE id = 25
+UPDATE tb.k SET v = 'y26' WHERE id = 26
+UPDATE tb.k SET v = 'y27' WHERE id = 27
+UPDATE tb.k SET v = 'y28' WHERE id = 28
+UPDATE tb.k SET v = 'y29' WHERE id = 29
+UPDATE tb.k SET v = 'y30' WHERE id = 30
+UPDATE tb.k SET v = 'y31' WHERE id = 31
+UPDATE tb.k SET v = 'y32' WHERE id = 32
+UPDATE tb.k SET v = 'y33' WHERE id = 33
+UPDATE tb.k SET v = 'y34' WHERE id = 34
+UPDATE tb.k SET v = 'y35' WHERE id = 35
+UPDATE tb.k SET v = 'y36' WHERE id = 36
+UPDATE tb.k SET v = 'y37' WHERE id = 37
+UPDATE tb.k SET v = 'y38' WHERE id = 38
+UPDATE tb.k SET v = 'y39' WHERE id = 39
+UPDATE tb.k SET v = 'y40' WHERE id = 40
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.counter('fold_rows_read') <= 40 AS owner_checks_read_little,
+	pg_temp.counter('fold_full_tables') AS owner_full_tables;
+ owner_checks_read_little | owner_full_tables 
+--------------------------+-------------------
+ t                        |                 0
+(1 row)
+
+SELECT name, dirty FROM dolt_branches() WHERE name = 'main';
+ name | dirty 
+------+-------
+ main | f
+(1 row)
+
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+ same_as_full 
+--------------
+ t
+(1 row)
+
+SELECT dolt_writer_mode('shared');
+ dolt_writer_mode 
+------------------
+ shared
+(1 row)
+
+-- A transaction that changes the table and rolls a part back: only what
+-- it kept is committed, and folded.
+BEGIN;
+UPDATE tb.k SET v = 'kept' WHERE id = 100;
+SAVEPOINT s;
+UPDATE tb.k SET v = 'undone' WHERE id = 101;
+INSERT INTO tb.n VALUES (77);
+ROLLBACK TO s;
+INSERT INTO tb.n VALUES (88);
+COMMIT;
+SELECT count(*) AS changed FROM dolt_status;
+ changed 
+---------
+       0
+(1 row)
+
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+ same_as_full 
+--------------
+ t
+(1 row)
+
+SELECT v FROM tb.k WHERE id IN (100, 101) ORDER BY id;
+  v   
+------
+ kept
+ k
+(2 rows)
+
+SELECT count(*) FILTER (WHERE v = 77) AS undone, count(*) FILTER (WHERE v = 88) AS kept
+FROM tb.n;
+ undone | kept 
+--------+------
+      0 |    1
+(1 row)
+
+-- A working-set commit after (a DDL transaction's) folds from the
+-- advanced baseline: incrementally.
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+BEGIN;
+UPDATE tb.k SET v = 'ddl' WHERE id = 1;
+CREATE TABLE tb.extra (id int PRIMARY KEY);
+COMMIT;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.counter('fold_full_tables') AS full_tables_new_table_only;
+ full_tables_new_table_only 
+----------------------------
+                          1
+(1 row)
+
+SELECT test_fold_root() = test_fold_root(true) AS same_as_full;
+ same_as_full 
+--------------
+ t
+(1 row)
+
+RESET dolt.transaction_commit;
+\c :home
+DROP DATABASE txn_commit_baselines;
