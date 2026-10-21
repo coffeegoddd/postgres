@@ -462,6 +462,117 @@ SELECT m, n FROM sf.e ORDER BY m;
  joy  | 5
 (6 rows)
 
+-- (and inside a composite, a composite key, a range and a multirange:
+-- each holds the enum's labels as a column of it does)
+CREATE TYPE sf.tone AS ENUM ('low', 'high');
+CREATE TYPE sf.pair AS (m sf.tone, n int);
+CREATE TYPE sf.tones AS RANGE (subtype = sf.tone);
+CREATE TABLE sf.comp (id int PRIMARY KEY, p sf.pair);
+INSERT INTO sf.comp VALUES (1, ('low', 1)), (2, ('high', 2));
+CREATE TABLE sf.compk (p sf.pair PRIMARY KEY, v int);
+INSERT INTO sf.compk VALUES (('low', 1), 1), (('high', 2), 2);
+CREATE TABLE sf.ranges (id int PRIMARY KEY, r sf.tones, mr sf.tones_multirange);
+INSERT INTO sf.ranges VALUES (1, '[low,high]', '{[low,high)}');
+SELECT length(dolt_commit('-Am', 'tones')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TYPE sf.tone ADD VALUE 'mid' BEFORE 'high';
+INSERT INTO sf.comp VALUES (3, ('mid', 3));
+INSERT INTO sf.compk VALUES (('mid', 3), 3);
+INSERT INTO sf.ranges VALUES (2, '[low,mid]', '{[mid,high]}');
+:check
+ same 
+------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+ committed 
+-----------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ read_in_full 
+--------------
+ none
+(1 row)
+
+ verify_mismatches 
+-------------------
+                 0
+(1 row)
+
+SELECT p, v FROM sf.compk ORDER BY p;
+    p     | v 
+----------+---
+ (low,1)  | 1
+ (mid,3)  | 3
+ (high,2) | 2
+(3 rows)
+
+-- (a composite's attribute dropped: its values hold it no longer)
+ALTER TYPE sf.pair DROP ATTRIBUTE n;
+:check
+ same 
+------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+ committed 
+-----------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ read_in_full  
+---------------
+ shape_changed
+(1 row)
+
+ verify_mismatches 
+-------------------
+                 0
+(1 row)
+
+SELECT id, p FROM sf.comp ORDER BY id;
+ id |   p    
+----+--------
+  1 | (low)
+  2 | (high)
+  3 | (mid)
+(3 rows)
+
 -- a label renamed: rows hold its name, so it changes theirs
 ALTER TYPE sf.mood RENAME VALUE 'glad' TO 'happy';
 :check

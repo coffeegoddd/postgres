@@ -98,6 +98,28 @@ INSERT INTO sf.e VALUES ('meh', 4), ('joy', 5), ('blue', 6);
 UPDATE sf.nested SET ms = '{blue,meh,joy}' WHERE id = 2;
 :check
 SELECT m, n FROM sf.e ORDER BY m;
+-- (and inside a composite, a composite key, a range and a multirange:
+-- each holds the enum's labels as a column of it does)
+CREATE TYPE sf.tone AS ENUM ('low', 'high');
+CREATE TYPE sf.pair AS (m sf.tone, n int);
+CREATE TYPE sf.tones AS RANGE (subtype = sf.tone);
+CREATE TABLE sf.comp (id int PRIMARY KEY, p sf.pair);
+INSERT INTO sf.comp VALUES (1, ('low', 1)), (2, ('high', 2));
+CREATE TABLE sf.compk (p sf.pair PRIMARY KEY, v int);
+INSERT INTO sf.compk VALUES (('low', 1), 1), (('high', 2), 2);
+CREATE TABLE sf.ranges (id int PRIMARY KEY, r sf.tones, mr sf.tones_multirange);
+INSERT INTO sf.ranges VALUES (1, '[low,high]', '{[low,high)}');
+SELECT length(dolt_commit('-Am', 'tones')::text) > 0 AS committed;
+ALTER TYPE sf.tone ADD VALUE 'mid' BEFORE 'high';
+INSERT INTO sf.comp VALUES (3, ('mid', 3));
+INSERT INTO sf.compk VALUES (('mid', 3), 3);
+INSERT INTO sf.ranges VALUES (2, '[low,mid]', '{[mid,high]}');
+:check
+SELECT p, v FROM sf.compk ORDER BY p;
+-- (a composite's attribute dropped: its values hold it no longer)
+ALTER TYPE sf.pair DROP ATTRIBUTE n;
+:check
+SELECT id, p FROM sf.comp ORDER BY id;
 
 -- a label renamed: rows hold its name, so it changes theirs
 ALTER TYPE sf.mood RENAME VALUE 'glad' TO 'happy';
