@@ -78,6 +78,7 @@
 
 #include "access/commit_ts.h"
 #include "access/htup_details.h"
+#include "access/prolly_config.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -1629,6 +1630,13 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 									   gid);
 
 	ProcArrayRemove(proc, latestXid);
+
+	/*
+	 * Prolly's folds that skip reading what didn't change are told of its
+	 * end once others see it: one recovered at startup may have written any
+	 * branch unbeknownst to them.
+	 */
+	prolly_note_prepared_ended(fxid);
 
 	/*
 	 * In case we fail while running the callbacks, mark the gxact invalid so

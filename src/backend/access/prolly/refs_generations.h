@@ -12,6 +12,7 @@
 #define REFS_GENERATIONS_H
 
 #include "access/prolly_types.h"
+#include "access/transam.h"
 #include "utils/snapshot.h"
 
 /* What a branch's fold was begun at: taken before it reads anything. */
@@ -27,6 +28,7 @@ extern Size branch_generations_shmem_size(void);
 extern void branch_generations_shmem_init(void *area);
 extern void branch_generations_note_write(Oid branch);
 extern void branch_generations_forget(void);
+extern void branch_generations_prepared_ended(FullTransactionId xid);
 
 /*
  * A fold of branch's working set by snap: stamped before it, published

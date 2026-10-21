@@ -36,8 +36,9 @@
  * branch without an entry has the counter's value as of the last eviction
  * (and its writers are remembered with every evicted entry's), and an
  * entry made for a writer a new one.  A writer finding no entry free
- * counts as a writer of every branch.  Nothing survives a restart: the
- * first fold after one folds.
+ * counts as a writer of every branch, as does a prepared transaction as
+ * it is committed or rolled back (one recovered at startup was never told
+ * of).  Nothing survives a restart: the first fold after one folds.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/refs_generations.c
@@ -367,6 +368,27 @@ branch_generations_note_write(Oid branch)
 		g->overflow_writers++;
 		written_overflow = true;
 	}
+	LWLockRelease(&g->lock);
+}
+
+/*
+ * A prepared transaction committed or rolled back, once others see it: it
+ * may have written any branch, as an overflow writer does.  One prepared
+ * by this server was noted as it was (end_writes()), but one recovered at
+ * startup was never told of, so a snapshot that does not see its commit
+ * must not have its fold taken.  (No error, no allocation: interrupts are
+ * held.)
+ */
+void
+branch_generations_prepared_ended(FullTransactionId xid)
+{
+	BranchGenerations *g = shared();
+
+	if (g == NULL)
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	g->overflow = ++g->counter;
+	g->overflow_ended = later(g->overflow_ended, xid);
 	LWLockRelease(&g->lock);
 }
 

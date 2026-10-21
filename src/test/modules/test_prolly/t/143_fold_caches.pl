@@ -4,7 +4,7 @@
 # commit landing between a fold's snapshot and its reading of the
 # generation, or after that; another session writing, or a prepared
 # transaction, while one folds; a restart, with a prepared transaction
-# across it; and a write the generation missed, which the check of
+# across it, committed after a reader's snapshot too; and a write the generation missed, which the check of
 # debug_prolly_verify_fold_caches catches.  None is taken where a fold now
 # would differ.
 
@@ -174,6 +174,25 @@ $before = reused($c);
 is($c->query_safe($changes), '0', 'committed');
 is(reused($c), $before + 1, 'and taken again');
 $c->quit;
+
+# A prepared transaction across a restart, committed after a reader's
+# snapshot: that reader's fold, which misses its row, isn't the working
+# set (nothing was told of the prepared one before it ended).
+$c = $node->background_psql('postgres');
+$c->query_safe(q{BEGIN; INSERT INTO s.t VALUES (5001, 'across again');
+	PREPARE TRANSACTION 'across2'});
+$c->quit;
+$node->restart;
+$r = $node->background_psql('postgres');
+$r->query_safe(q{BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT count(*) FROM s.t});
+sql(q{COMMIT PREPARED 'across2'});
+is($r->query_safe($changes), '0', 'the older snapshot misses its row');
+$r->query_safe('COMMIT');
+$r->quit;
+is(sql(qq{SET debug_prolly_verify_fold_caches = off; $changes}), '1',
+	'its fold isn\'t taken: the commit is a change');
+is(sql($changes), '1', 'and the check agrees');
 
 $node->stop;
 done_testing();

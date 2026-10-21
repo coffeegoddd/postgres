@@ -341,6 +341,15 @@ prolly_forget_folds(void)
 		refs->forget_folds();
 }
 
+void
+prolly_note_prepared_ended(FullTransactionId xid)
+{
+	const ProllyRefsRoutine *refs = database_refs();
+
+	if (refs != NULL && refs->prepared_ended != NULL)
+		refs->prepared_ended(xid);
+}
+
 /*
  * The content hash chunks are named by: the profile's, the one hash every
  * chunk store, tree, transfer and canonical form of this server shares.
