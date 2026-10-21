@@ -37,11 +37,13 @@
  * pages are never kept as of a fold: only sharing between branches copies
  * them.
  *
- * A fold by a snapshot that doesn't see its baseline's fold reads the
- * table in full, but by an old snapshot: rows written meanwhile whose
- * entries another fold consumed are neither in what it reads nor left in
- * the log.  Its baseline is marked unsettled, so the next fold reads the
- * table in full again, by its own snapshot.
+ * A fold by a snapshot that doesn't see its baseline's fold (a repeatable
+ * read transaction's, older than another's fold) starts from the baseline
+ * too: the entries the baseline's fold held of transactions this snapshot
+ * doesn't see finished are undone (their keys re-read by this snapshot,
+ * the version it sees, or none; a keyless row's count taken back), and
+ * those since applied as any fold's.  The log keeps them for it: rows are
+ * trimmed only once every snapshot sees their transactions finished.
  *
  * The entries a fold reads are kept once per row (a key's, or a keyless
  * row's with its count summed), so the memory a fold takes is of the rows
@@ -49,7 +51,8 @@
  *
  * A baseline's state: a tag and version, flags, the log's identity, and the
  * fold's snapshot's xmax, the fold's own transaction (if it had written)
- * and the transactions it saw running (a count, then each).
+ * and the transactions it saw running (a count, then each), as
+ * FullTransactionIds: the fold's position.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/changes_log.c
@@ -85,9 +88,6 @@
 /* (a first byte no "pages" state has: neither reads the other's) */
 #define STATE_TAG			'L'
 #define STATE_VERSION		3		/* 2: flags; 3: full transaction ids */
-
-#define STATE_UNSETTLED		0x01	/* folded by a snapshot older than its
-									 * baseline's fold: fold in full next */
 
 /* Entries kept before they are first made one per row. */
 #define COMPACT_AT			65536
@@ -906,13 +906,38 @@ fold_all(Finder *f, ProllyNodeRef *data)
  * Fold from the baseline, its state 'st': false if the table must be read
  * in full instead.
  */
+/* An entry the baseline holds and the snapshot doesn't see: undone. */
+static bool
+entry_unseen_visit(HeapTuple entry, int32 delta, void *arg)
+{
+	return entry_visit(entry, -delta, arg);
+}
+
 static bool
 fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
-			 const ProllyChangeLogRoutine *log, ProllyNodeRef *data)
+			 bool stale, const ProllyChangeLogRoutine *log,
+			 ProllyNodeRef *data)
 {
 	ProllyLogPosition pos = {st->fxmax, st->fown, st->nxip, st->fxip};
 
 	f->compact = true;
+	if (f->give_up)
+		return false;
+
+	/*
+	 * (a snapshot that doesn't see the baseline's fold: the changes the
+	 * fold held of transactions the snapshot doesn't see finished are
+	 * undone, each a candidate re-read by the snapshot, a keyless row's
+	 * count taken back)
+	 */
+	if (stale &&
+		!PROLLY_CALL(log, read_unseen, f->rel, f->snap, &pos,
+					 entry_unseen_visit, f))
+	{
+		if (!f->give_up)
+			f->reason = PROLLY_FULL_LOG_ENTRY;
+		return false;
+	}
 	if (f->give_up)
 		return false;
 	if (!PROLLY_CALL(log, read, f->rel, f->snap, &pos, entry_visit, f))
@@ -1068,15 +1093,13 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	stale = have && !sees_fold(f.snap, &st);
 	if (have && f.reason == PROLLY_FULL_NONE)
 	{
-		if (stale)
+		if (stale && !PROLLY_HAS(c.change_log, read_unseen))
 			f.reason = PROLLY_FULL_STALE_SNAPSHOT;
-		else if (st.flags & STATE_UNSETTLED)
-			f.reason = PROLLY_FULL_UNSETTLED;
 		else if (storage_unseen(rel, f.snap))
 			f.reason = PROLLY_FULL_STORAGE_UNSEEN;
 	}
 	have = have && f.reason == PROLLY_FULL_NONE;
-	if (!have || !fold_changed(&f, baseline, &st, c.change_log, data))
+	if (!have || !fold_changed(&f, baseline, &st, stale, c.change_log, data))
 	{
 		instr_time	start;
 		instr_time	took;
@@ -1109,7 +1132,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	{
 		State		ns = {0};
 
-		ns.flags = stale ? STATE_UNSETTLED : 0;
+		ns.flags = 0;
 		ns.log = identity;
 		state_of_snapshot(&ns, f.snap);
 		MemoryContextSwitchTo(old);
@@ -1191,8 +1214,7 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 		return false;
 	identity = PROLLY_CALL(c.change_log, identity, rel);
 	if (identity == 0 || !parse_state(state, &st) || st.log != identity ||
-		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
-		storage_unseen(rel, snap))
+		!sees_fold(snap, &st) || storage_unseen(rel, snap))
 		return false;
 	{
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};

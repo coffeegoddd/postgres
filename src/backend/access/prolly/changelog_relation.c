@@ -1150,12 +1150,108 @@ scan_rows(Relation log, Relation index, Snapshot snapshot,
 	return go;
 }
 
+/* A row's transaction (the top-level one whose entries it holds). */
+static FullTransactionId
+row_xid(Relation log, HeapTuple tup)
+{
+	bool		isnull;
+
+	return FullTransactionIdFromU64((uint64)
+									DatumGetInt64(heap_getattr(tup, Anum_log_xid,
+															   RelationGetDescr(log),
+															   &isnull)));
+}
+
+/* Does the snapshot see the row written (the current transaction's: yes)? */
+static bool
+row_seen(HeapTuple tup, Snapshot snapshot)
+{
+	HeapTupleHeader t = tup->t_data;
+	TransactionId xmin;
+
+	if (HeapTupleHeaderXminFrozen(t))
+		return true;
+	if (HeapTupleHeaderXminInvalid(t))
+		return false;
+	xmin = HeapTupleHeaderGetRawXmin(t);
+	if (TransactionIdIsCurrentTransactionId(xmin))
+		return true;
+	return !XidInMVCCSnapshot(xmin, snapshot) && TransactionIdDidCommit(xmin);
+}
+
+/* Was the row consumed: deleted by its transaction's fold, not aborted? */
+static bool
+row_consumed(HeapTuple tup)
+{
+	HeapTupleHeader t = tup->t_data;
+	TransactionId xmax;
+
+	if ((t->t_infomask & HEAP_XMAX_INVALID) ||
+		HEAP_XMAX_IS_LOCKED_ONLY(t->t_infomask))
+		return false;
+	xmax = HeapTupleHeaderGetUpdateXid(t);
+	return TransactionIdIsValid(xmax) &&
+		(TransactionIdIsCurrentTransactionId(xmax) ||
+		 TransactionIdDidCommit(xmax));
+}
+
+/*
+ * Does a fold at the position hold the row's entries?  Those of the
+ * transactions it saw finished (a row of one it didn't see committed has
+ * none it would read), and of its own those its fold consumed.  So a row
+ * is read by what it was written as, whether or not a fold since consumed
+ * (deleted) it: a baseline can be one an older snapshot's fold began, which
+ * didn't hold what a newer one consumed.
+ */
+static bool
+row_held(Relation log, HeapTuple tup, const ProllyLogPosition *pos)
+{
+	FullTransactionId xid = row_xid(log, tup);
+
+	if (FullTransactionIdIsValid(pos->own) &&
+		FullTransactionIdEquals(xid, pos->own))
+		return row_consumed(tup);
+	if (!FullTransactionIdPrecedes(xid, pos->xmax))
+		return false;
+	for (uint32 i = 0; i < pos->nxip; i++)
+		if (FullTransactionIdEquals(xid, pos->xip[i]))
+			return false;
+	return true;
+}
+
+/*
+ * The rows a fold from the position reads (others_since() looks through the
+ * same, a transaction at a time): of transactions from its xmax on, of each
+ * it saw running and of its own, by the index, every row whatever the
+ * snapshot sees, each told by row_seen() and row_held().
+ */
+static bool
+scan_since(Relation log, Relation index, const ProllyLogPosition *pos,
+		   RowVisit visit, void *arg)
+{
+	bool		go;
+
+	go = scan_rows(log, index, SnapshotAny, pos->xmax,
+				   InvalidFullTransactionId, false, visit, arg);
+	for (uint32 i = 0; go && i < pos->nxip; i++)
+		if (FullTransactionIdPrecedes(pos->xip[i], pos->xmax))
+			go = scan_rows(log, index, SnapshotAny, pos->xip[i], pos->xip[i],
+						   true, visit, arg);
+	if (go && FullTransactionIdIsValid(pos->own) &&
+		FullTransactionIdPrecedes(pos->own, pos->xmax))
+		go = scan_rows(log, index, SnapshotAny, pos->own, pos->own, true,
+					   visit, arg);
+	return go;
+}
+
 typedef struct ReadState
 {
 	Relation	rel;
 	ProllyChangeLogVisit visit;
 	void	   *arg;
 	uint64		rows;
+	Snapshot	snapshot;		/* by scan_since(): the snapshot's view */
+	const ProllyLogPosition *pos;
 } ReadState;
 
 static bool
@@ -1167,11 +1263,35 @@ read_row(Relation log, HeapTuple tup, void *arg)
 	return visit_row(rs->rel, tup, RelationGetDescr(log), rs->visit, rs->arg);
 }
 
+/* A row by scan_since() the snapshot sees and the position doesn't hold. */
+static bool
+read_since_row(Relation log, HeapTuple tup, void *arg)
+{
+	ReadState  *rs = arg;
+
+	if (!row_seen(tup, rs->snapshot) || row_held(log, tup, rs->pos))
+		return true;
+	return read_row(log, tup, arg);
+}
+
+/* A row the position holds and the snapshot doesn't see (committed). */
+static bool
+read_unseen_row(Relation log, HeapTuple tup, void *arg)
+{
+	ReadState  *rs = arg;
+	HeapTupleHeader t = tup->t_data;
+
+	if (row_seen(tup, rs->snapshot) || HeapTupleHeaderXminInvalid(t) ||
+		!TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(t)) ||
+		!row_held(log, tup, rs->pos))
+		return true;
+	return read_row(log, tup, arg);
+}
+
 /*
  * The entries of rel's log the snapshot sees and the position since
- * doesn't hold (NULL: every one): of transactions from its xmax on, of
- * each it saw running, and of its own.  The transaction's own buffered
- * entries are written first, to be read with the rest.
+ * doesn't hold (NULL: every one), by scan_since().  The transaction's own
+ * buffered entries are written first, to be read with the rest.
  */
 static bool
 relation_read(Relation rel, Snapshot snapshot, const ProllyLogPosition *since,
@@ -1180,40 +1300,87 @@ relation_read(Relation rel, Snapshot snapshot, const ProllyLogPosition *since,
 	Oid			logid = log_relid(rel);
 	Relation	log;
 	Relation	index;
-	ReadState	rs = {rel, visit, arg, 0};
+	ReadState	rs = {rel, visit, arg, 0, snapshot, since};
 	bool		go;
 	bool		pushed = false;
 
 	if (!OidIsValid(logid))
 		return false;
-	if (flush_log(logid) && IsMVCCSnapshot(snapshot))
+	if (flush_log(logid) && IsMVCCSnapshot(snapshot) && since == NULL)
 	{
 		snapshot = push_with_own(snapshot);
 		pushed = true;
 	}
 	log = table_open(logid, AccessShareLock);
 	index = index_open(log_index_relid(log), AccessShareLock);
-	if (since == NULL)
+	if (since == NULL || !IsMVCCSnapshot(snapshot))
 		go = scan_rows(log, index, snapshot, FullTransactionIdFromU64(0),
 					   InvalidFullTransactionId, false, read_row, &rs);
 	else
-	{
-		go = scan_rows(log, index, snapshot, since->xmax,
-					   InvalidFullTransactionId, false, read_row, &rs);
-		for (uint32 i = 0; go && i < since->nxip; i++)
-			if (FullTransactionIdPrecedes(since->xip[i], since->xmax))
-				go = scan_rows(log, index, snapshot, since->xip[i],
-							   since->xip[i], true, read_row, &rs);
-		if (go && FullTransactionIdIsValid(since->own) &&
-			FullTransactionIdPrecedes(since->own, since->xmax))
-			go = scan_rows(log, index, snapshot, since->own, since->own, true,
-						   read_row, &rs);
-	}
+		go = scan_since(log, index, since, read_since_row, &rs);
 	pgstat_count_prolly(PGSTAT_PROLLY_LOG_PAGES_READ, rs.rows);
 	index_close(index, AccessShareLock);
 	table_close(log, AccessShareLock);
 	if (pushed)
 		PopActiveSnapshot();
+	return go;
+}
+
+/*
+ * The entries of rel's log a fold at position was held that the snapshot
+ * doesn't see (a snapshot older than that fold's): of transactions from
+ * the snapshot's xmax to the fold's, of those running for the snapshot,
+ * and of the fold's own, by the index, every row whatever it sees (kept
+ * while it is: trimming keeps the rows of transactions any snapshot may
+ * not see finished).
+ */
+static bool
+relation_read_unseen(Relation rel, Snapshot snapshot,
+					 const ProllyLogPosition *was,
+					 ProllyChangeLogVisit visit, void *arg)
+{
+	Oid			logid = log_relid(rel);
+	Relation	log;
+	Relation	index;
+	ReadState	rs = {rel, visit, arg, 0, snapshot, was};
+	FullTransactionId next = ReadNextFullTransactionId();
+	FullTransactionId from;
+	TransactionId *running;
+	uint32		nrunning;
+	bool		go = true;
+
+	if (!OidIsValid(logid) || !IsMVCCSnapshot(snapshot))
+		return false;
+	log = table_open(logid, AccessShareLock);
+	index = index_open(log_index_relid(log), AccessShareLock);
+	from = FullTransactionIdFromAllowableAt(next, snapshot->xmax);
+	if (FullTransactionIdPrecedes(from, was->xmax))
+		go = scan_rows(log, index, SnapshotAny, from,
+					   FullTransactionIdFromU64(U64FromFullTransactionId(was->xmax) - 1),
+					   true, read_unseen_row, &rs);
+	running = snapshot->takenDuringRecovery ? snapshot->subxip : snapshot->xip;
+	nrunning = snapshot->takenDuringRecovery ? snapshot->subxcnt : snapshot->xcnt;
+	for (uint32 i = 0; go && i < nrunning; i++)
+	{
+		FullTransactionId x;
+
+		if (!TransactionIdIsNormal(running[i]))
+			continue;
+		x = FullTransactionIdFromAllowableAt(next, running[i]);
+		if (FullTransactionIdPrecedes(x, was->xmax) &&
+			!(FullTransactionIdIsValid(was->own) &&
+			  FullTransactionIdEquals(x, was->own)))
+			go = scan_rows(log, index, SnapshotAny, x, x, true,
+						   read_unseen_row, &rs);
+	}
+	if (go && FullTransactionIdIsValid(was->own) &&
+		!(FullTransactionIdPrecedes(was->own, was->xmax) &&
+		  !FullTransactionIdPrecedes(was->own, from)))
+		go = scan_rows(log, index, SnapshotAny, was->own, was->own, true,
+					   read_unseen_row, &rs);
+	pgstat_count_prolly(PGSTAT_PROLLY_LOG_PAGES_READ, rs.rows);
+	index_close(index, AccessShareLock);
+	table_close(log, AccessShareLock);
 	return go;
 }
 
@@ -1408,6 +1575,8 @@ relation_written_unseen(Relation rel, Snapshot snapshot)
 typedef struct Others
 {
 	FullTransactionId own;
+	Snapshot	snapshot;
+	const ProllyLogPosition *since;
 	bool		found;
 } Others;
 
@@ -1415,13 +1584,9 @@ static bool
 other_row(Relation log, HeapTuple tup, void *arg)
 {
 	Others	   *o = arg;
-	bool		isnull;
-	FullTransactionId xid = FullTransactionIdFromU64((uint64)
-													 DatumGetInt64(heap_getattr(tup, Anum_log_xid,
-																				RelationGetDescr(log),
-																				&isnull)));
 
-	if (!FullTransactionIdEquals(xid, o->own))
+	if (!FullTransactionIdEquals(row_xid(log, tup), o->own) &&
+		row_seen(tup, o->snapshot) && !row_held(log, tup, o->since))
 		o->found = true;
 	return !o->found;
 }
@@ -1445,14 +1610,14 @@ others_since(Relation log, const ProllyLogPosition *since,
 	Relation	index = index_open(log_index_relid(log), AccessShareLock);
 	Snapshot	snap = GetActiveSnapshot();
 	FullTransactionId own = GetTopFullTransactionIdIfAny();
-	Others		o = {own, false};
+	Others		o = {own, snap, since, false};
 	FullTransactionId *keep = palloc_array(FullTransactionId, Max(since->nxip, 1));
 	uint32		nkeep = 0;
 	bool		any;
 
 	*told = true;
-	(void) scan_rows(log, index, snap, since->xmax, InvalidFullTransactionId,
-					 false, other_row, &o);
+	(void) scan_rows(log, index, SnapshotAny, since->xmax,
+					 InvalidFullTransactionId, false, other_row, &o);
 	any = o.found;
 	for (uint32 i = 0; i < since->nxip; i++)
 	{
@@ -1462,7 +1627,7 @@ others_since(Relation log, const ProllyLogPosition *since,
 			FullTransactionIdEquals(x, own))
 			continue;
 		o.found = false;
-		(void) scan_rows(log, index, snap, x, x, true, other_row, &o);
+		(void) scan_rows(log, index, SnapshotAny, x, x, true, other_row, &o);
 		any = any || o.found;
 		if (o.found || XidInMVCCSnapshot(XidFromFullTransactionId(x), snap))
 			keep[nkeep++] = x;
@@ -1472,7 +1637,7 @@ others_since(Relation log, const ProllyLogPosition *since,
 		!FullTransactionIdEquals(since->own, own))
 	{
 		o.found = false;
-		(void) scan_rows(log, index, snap, since->own, since->own, true,
+		(void) scan_rows(log, index, SnapshotAny, since->own, since->own, true,
 						 other_row, &o);
 		*told = !o.found;
 	}
@@ -1569,5 +1734,6 @@ const ProllyChangeLogRoutine prolly_changelog_relation = {
 	.note_made = relation_note_made,
 	.consume_own = relation_consume_own,
 	.written_unseen = relation_written_unseen,
+	.read_unseen = relation_read_unseen,
 	.flush = flush_all,
 };

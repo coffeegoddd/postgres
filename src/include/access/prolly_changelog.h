@@ -49,7 +49,8 @@
  *   position since doesn't hold (NULL: every one), in no particular order:
  *   a visit returns false to stop.  False if rel has no log, an entry says
  *   to read the table in full, or a visit stopped.  The transaction's own
- *   entries are among them.
+ *   entries are among them.  An entry is read whether or not a fold since
+ *   consumed it: since may be an older snapshot's fold's, which didn't.
  * - relid() is the relation holding the log of the prolly table relid, if
  *   the log is one (InvalidOid if not): it takes the table's owner,
  *   tablespace and autovacuum settings as its TOAST table does.  Asked by
@@ -60,8 +61,9 @@
  *   in critical sections too (RelationIsLogicallyLogged), so it is quick
  *   and must neither error nor allocate.
  * - consume() is called once a fold that read the log by this snapshot is
- *   to be the table's baseline: the transaction's own entries go (the next
- *   fold reads its transaction's again), and those of transactions every
+ *   to be the table's baseline: the transaction's own entries are marked
+ *   consumed (the next fold reads its transaction's again, but those), and
+ *   those of transactions every
  *   snapshot sees finished that this one saw (trimmed); the others it read
  *   are behind the baseline's position.  If the transaction aborts, they
  *   come back with the old baseline.
@@ -70,6 +72,13 @@
  *   changed the table's rows, as far as the log tells (an entry no longer
  *   in the log was consumed by a transaction the snapshot sees, or one
  *   that wrote it is seen too).
+ * - read_unseen() (optional) visits the entries a fold at position was
+ *   held (of transactions it saw finished, of its own those it consumed)
+ *   that the snapshot doesn't see, of transactions committed: for a
+ *   snapshot older than that fold to undo them.  False if one says to read
+ *   the table in full, or a visit stopped.  Entries are kept for it:
+ *   trimmed only below OldestXmin.  Without it, such a snapshot's fold
+ *   reads the table in full.
  * - flush() (optional) writes the entries the transaction holds unwritten
  *   to the logs of the session's branch: called before the session's
  *   branch changes in the transaction (a log's OID is every branch's, its
@@ -107,8 +116,8 @@
 
 /*
  * A fold's position in a log: the transactions whose entries it holds are
- * those below xmax but those it saw running (xip) and its own (own, which
- * may have written more since).
+ * those below xmax but those it saw running (xip), and of its own (own,
+ * which may have written more since) those its fold consumed.
  */
 typedef struct ProllyLogPosition
 {
@@ -143,12 +152,16 @@ typedef struct ProllyChangeLogRoutine
 	bool		(*consume_own) (Relation rel, const ProllyLogPosition *since,
 								ProllyLogPosition *rest);
 	bool		(*written_unseen) (Relation rel, Snapshot snapshot);
+	bool		(*read_unseen) (Relation rel, Snapshot snapshot,
+								const ProllyLogPosition *was,
+								ProllyChangeLogVisit visit, void *arg);
 	void		(*flush) (void);
 } ProllyChangeLogRoutine;
 
 #define PROLLY_CHANGELOG_CALLBACK_NAMES \
 	"create", "note", "identity", "read", "consume", "is_log", \
-	"relid", "note_made", "consume_own", "written_unseen", "flush"
+	"relid", "note_made", "consume_own", "written_unseen", "read_unseen", \
+	"flush"
 #define PROLLY_CHANGELOG_FIRST_CALLBACK create
 #define PROLLY_CHANGELOG_LAST_CALLBACK flush
 

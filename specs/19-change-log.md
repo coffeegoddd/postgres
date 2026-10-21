@@ -106,7 +106,17 @@ Two interfaces, each selected by the table AM's profile
   transactions from the position's xmax on, of each transaction it saw
   running, and of its own transaction (which may have written more since
   it folded). The position is the fold's (the finder's state): O(|running|
-  log n + the entries read), whatever the log holds besides.
+  log n + the entries read), whatever the log holds besides. Each row is
+  told by what it was written as, not whether it was since deleted (the
+  index scan reads every version): the position holds the rows of the
+  transactions it saw finished, and of its own those its fold consumed
+  (deleted). So a baseline an older snapshot's fold began still finds the
+  rows a newer fold consumed (#505).
+- **Read unseen:** for a snapshot that doesn't see a position's fold, the
+  entries the position holds that the snapshot doesn't see, of
+  transactions committed: by the index, those from the snapshot's xmax
+  to the position's, of each transaction running for the snapshot, and of
+  the position's own (#505).
 - **Consume:** a fold that begins a new baseline deletes the rows of its
   own transaction it read (by their TIDs: the next reads its transaction's
   rows again, and a keyless row's would count twice); the others' it
@@ -132,14 +142,18 @@ Two interfaces, each selected by the table AM's profile
   states it didn't write), not the one configured now. A branch's copy
   of a table has its source's baseline and a copy of its log, so it folds
   from them.
-- **A fold by an older snapshot.** Consuming entries means a fold's
-  snapshot must see its baseline's fold: a snapshot that doesn't (a
-  repeatable-read transaction's; under read committed, a commit or a
-  checkpoint behind another's fold takes a newer one, and a session
-  leaving the branch behind one takes no checkpoint, #566) may miss rows
-  committed meanwhile whose entries that fold consumed. Such a fold reads the table in full by its snapshot,
-  and its baseline is marked unsettled, so the next fold reads the table
-  in full again, by its own.
+- **A fold by an older snapshot** (a repeatable-read transaction's, its
+  snapshot not seeing the baseline's fold; under read committed, a
+  commit or a checkpoint behind another's fold takes a newer one, and a
+  session leaving the branch behind one takes no checkpoint, #566) folds
+  from the baseline too (#505): the entries read unseen are undone (with a
+  key, each key a candidate re-read by the snapshot, the version it sees
+  or none; without, each row's count taken back by its delta), and those
+  read since the position applied, as any fold's. O(the keys whose
+  visibility differs + the entries since). Its baseline, if it begins one,
+  is as any: the next fold reads from its position, the rows a newer fold
+  consumed included. Earlier, such a fold read the table in full and
+  marked its baseline unsettled, for the next to read in full again.
 - **A fold from a baseline** of its own reads the log entries its
   snapshot sees:
   - with a primary key, each entry's key is a candidate, looked up in the
@@ -154,8 +168,6 @@ Two interfaces, each selected by the table AM's profile
 - **It folds in full** when:
   - there is no baseline of its own, or one folded with another log (or
     none: the table has no log);
-  - the snapshot doesn't see the baseline's fold as committed, or the
-    baseline is unsettled;
   - the table's catalog row was changed by a transaction the snapshot
     doesn't see (a truncation or rewrite whose entry the snapshot can't
     see, though it reads the new storage);

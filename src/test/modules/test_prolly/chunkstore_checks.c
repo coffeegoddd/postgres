@@ -719,43 +719,26 @@ test_fold_trees(PG_FUNCTION_ARGS)
 }
 
 /*
- * Lose rel's change-log entries the snapshot sees, as if folded, without
- * its baseline moving: a fold from the baseline then misses those rows'
- * changes, as a bug in a finder might.
+ * Lose rel's change-log entries, as if folded, without its baseline
+ * moving: a fold from the baseline then misses those rows' changes, as a
+ * bug in a finder might.  The log and its index are emptied (a deleted row
+ * is still read for what its transaction wrote: only a fold's consuming its
+ * own changes marks a row folded).
  */
 PG_FUNCTION_INFO_V1(test_lose_change_log);
 Datum
 test_lose_change_log(PG_FUNCTION_ARGS)
 {
 	Relation	rel = table_open(PG_GETARG_OID(0), RowExclusiveLock);
-	ProllyComponents c;
-
 	Oid			logid;
 	Relation	log;
-	TableScanDesc scan;
-	HeapTuple	tup;
-	List	   *tids = NIL;
 
-	prolly_components_for_relation(rel, &c);
-	if (c.change_log == NULL)
-		elog(ERROR, "\"%s\" has no change log", RelationGetRelationName(rel));
-	/* (its rows the snapshot sees deleted, the writes before committed) */
 	logid = prolly_change_log_relid(RelationGetRelid(rel), rel->rd_rel->relam);
 	if (!OidIsValid(logid))
 		elog(ERROR, "\"%s\" has no change log", RelationGetRelationName(rel));
-	log = table_open(logid, RowExclusiveLock);
-	scan = table_beginscan(log, GetActiveSnapshot(), 0, NULL, 0);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		ItemPointerData *tid = palloc(sizeof(ItemPointerData));
-
-		*tid = tup->t_self;
-		tids = lappend(tids, tid);
-	}
-	table_endscan(scan);
-	foreach_ptr(ItemPointerData, tid, tids)
-		simple_heap_delete(log, tid);
-	table_close(log, RowExclusiveLock);
+	log = table_open(logid, AccessExclusiveLock);
+	heap_truncate_one_rel(log);
+	table_close(log, NoLock);
 	table_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
 }
