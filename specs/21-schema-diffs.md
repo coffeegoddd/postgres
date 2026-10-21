@@ -338,6 +338,48 @@ Decided by the user 2026-10-19, as recommended:
   `dolt_at` would refuse (no SELECT on the table, or row security applying
   to it) gets the 1000, the tree unread, and such a plan depends on the
   role, so a plan kept for one role is planned again for another.
+- **A table by its name** (#612): `dolt_diff(from, to, 't')`,
+  `dolt_diff_table('t' [, from, to])` and `dolt_history_table('t')`
+  overload the row-type forms, which are unchanged, so a table the
+  session hasn't (dropped since; renamed, by the name a version has) can
+  have its rows read. Decided by the lead 2026-10-20, as recommended (the
+  user may revise it):
+  - **Shape:** the row-type forms' columns, the rows as `jsonb` objects
+    (`from_row`, `to_row`; `row`), rather than `record` with columns
+    the caller gives or a composite type of the table's shape: a
+    dropped table has no type to give, and each version's columns may
+    differ.
+  - **Decoding:** each side's row as that side's ref defines the table,
+    by its description (`open_described`, `parse_value_as`), read from
+    the commits' trees by `diff_unordered`, as `dolt_diff_stat` reads a
+    table the branch hasn't; each value as `to_jsonb()` gives it. So the
+    rows are matched by their keys' bytes: a primary key made or dropped
+    between the versions makes each row removed and added, where the
+    row-type form reads both keyed as the table is now.
+  - **Names:** read as `dolt_diff_stat` reads them (qualified, or in the
+    first schema of the search path that has one of that name changed);
+    the table that name names on the to side first, then the from side.
+    `dolt_diff` refuses a name neither version has (42P01);
+    `dolt_diff_table` and `dolt_history_table` give no rows for a step
+    or commit without it.
+  - **A type this database hasn't now** (a column of an enum dropped
+    since): refused, as no value can be decoded without its type, not
+    shown by its text.
+  - **Privileges:** where the session has a table of either version's
+    name, SELECT on it (row security refusing, as for the row-type
+    forms); where it has none, there's no grant to check, so only the
+    database's owner or a member of `pg_read_all_data` may read it.
+    A table's grant covers only the versions that are it: commits hold
+    tables by name alone, so a version is the session's table when the
+    name has had a table at every commit from it to the working set
+    (walked back from the head through parents, following a rename a
+    commit pairs). A table dropped and another made with its name (or a
+    renamed one's old name) is another table, and its readers don't
+    read the first's rows (the owner's rule applies). A drop and a
+    remake within one commit, or in the working set, can't be told from
+    an ALTER, as in Dolt.
+  Dolt's `DiffTableFunctionScriptTests` 12 and 13's third assertion,
+  deferred on #612, can be ported with them.
 - **Not built:** a CustomScan over `dolt_at` seeking the tree by primary
   key quals (O(log N + k) nodes), reporting pathkeys for keys whose order
   doesn't depend on a collation (#495's second stage). The cache of

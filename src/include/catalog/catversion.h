@@ -57,6 +57,6 @@
  */
 
 /*							yyyymmddN */
-#define CATALOG_VERSION_NO	202610216
+#define CATALOG_VERSION_NO	202610224
 
 #endif

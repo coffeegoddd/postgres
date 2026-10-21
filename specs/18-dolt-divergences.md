@@ -109,11 +109,17 @@ adapts.
   has `commit_hash`, `committer`, `email`, `date` and `message`, not
   Dolt's `author`, `author_email` and `author_date`: a prolly commit
   records one author, which those columns would repeat.
+  A table the session hasn't (dropped since, or renamed) has no row
+  type, so `dolt_diff(from, to, 't')`, given the name as text, returns
+  `(diff_type, from_row jsonb, to_row jsonb)` instead: each side's row
+  as an object of its columns, decoded as that side's ref defines the
+  table (#612, D18).
 - **Why:** Postgres functions, not MySQL procedures; row composites keep
   the column types and work for any table without generated column
   names.
 - **Port:** compare array elements by position; read `(from_row).col`
-  where Dolt reads `from_col`.
+  where Dolt reads `from_col`; for a table that doesn't exist now, name
+  it as text and read `from_row->>'col'`.
 
 ## D4. Errors are SQLSTATEs
 
@@ -444,13 +450,19 @@ OF` are built in D18's shapes.
   cell); a column of another type in an older version is converted to
   today's type (text `'3'` reads as integer 3, where Dolt gives NULL).
   A table's history is followed by its name: one dropped and made again
-  has both tables' rows.
+  has both tables' rows. Each also takes the table's name as text, for a
+  table the session hasn't (#612): `dolt_diff_table('t' [, from_ref,
+  to_ref])` and `dolt_history_table('t')`, the same columns with the
+  rows as `jsonb`, each version's decoded as that version defines the
+  table, read from its tree (spec 21, part 8).
 - **Why:** Postgres's catalogs; the functions keep a table's own row
   type. The canonical form records no column tags.
 - **Port:** `SELECT * FROM dolt_diff_t` becomes `dolt_diff_table(NULL::t)`
   with `(to_row).col` for `to_col`; `AS OF 'r'` becomes `dolt_at('r',
   NULL::t)`; `dolt_history_t` becomes `dolt_history_table(NULL::t)` with
-  `(row).col`. Expected rows follow the reading by name.
+  `(row).col`. Expected rows follow the reading by name. A case reading
+  a table that doesn't exist now names it as text and reads
+  `to_row->>'col'`.
 
 ## D19. A primary key changed is a modified table
 
