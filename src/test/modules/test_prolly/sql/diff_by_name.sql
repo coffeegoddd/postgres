@@ -105,6 +105,49 @@ SET ROLE regress_dn_reader;
 SELECT count(*) FROM dolt_diff('HEAD~3', 'HEAD~2', 'bag');
 RESET ROLE;
 REVOKE pg_read_all_data FROM regress_dn_reader;
+
+-- a table made with a dropped one's name isn't it: SELECT on it doesn't
+-- cover the dropped one's rows, by any of the three, only its own
+CREATE TABLE dn.secret (id int PRIMARY KEY, s text);
+INSERT INTO dn.secret VALUES (1, 'top secret');
+SELECT length(dolt_commit('-Am', 'secret')::text) AS committed;
+DROP TABLE dn.secret;
+SELECT length(dolt_commit('-am', 'secret dropped')::text) AS committed;
+CREATE TABLE dn.secret (id int PRIMARY KEY, note text);
+INSERT INTO dn.secret VALUES (2, 'public');
+GRANT SELECT ON dn.secret TO regress_dn_reader;
+SELECT length(dolt_commit('-Am', 'public secret')::text) AS committed;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_diff('HEAD~2', 'HEAD~', 'dn.secret');
+SELECT * FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');
+SELECT diff_type, from_row FROM dolt_diff_table('dn.secret');
+SELECT row FROM dolt_history_table('dn.secret');
+SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', 'dn.secret');
+SELECT diff_type, to_row FROM dolt_diff_table('dn.secret', 'HEAD~');
+RESET ROLE;
+-- (the database's owner reads both)
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');
+
+-- nor one made with a renamed one's old name: the renamed one's rows by
+-- that name, without SELECT on it
+CREATE TABLE dn.k1 (id int PRIMARY KEY, s text);
+INSERT INTO dn.k1 VALUES (1, 'kept');
+SELECT length(dolt_commit('-Am', 'k1')::text) AS committed;
+ALTER TABLE dn.k1 RENAME TO k2;
+SELECT length(dolt_commit('-am', 'k1 renamed')::text) AS committed;
+CREATE TABLE dn.k1 (id int PRIMARY KEY);
+GRANT SELECT ON dn.k1 TO regress_dn_reader;
+SELECT length(dolt_commit('-Am', 'k1 again')::text) AS committed;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_diff('HEAD~3', 'HEAD~2', 'k1');
+SELECT count(*) FROM dolt_history_table('k1');
+RESET ROLE;
+GRANT SELECT ON dn.k2 TO regress_dn_reader;
+SET ROLE regress_dn_reader;
+-- (k2's grant covers its version by the name it had, across the rename)
+SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD~', 'k2');
+SELECT count(*) FROM dolt_diff_table('k2');
+RESET ROLE;
 DROP OWNED BY regress_dn_reader;
 DROP ROLE regress_dn_reader;
 

@@ -4830,6 +4830,7 @@ typedef struct RowDiffSink
 	TimestampTz from_date;
 	bool		to_dated;
 	bool		from_dated;
+	List	   *lineages;		/* (a table by name) check_named_rows()' */
 } RowDiffSink;
 
 static void
@@ -4975,22 +4976,178 @@ named_table(List *rows, const char *name)
 }
 
 /*
- * May the user read a table's rows as its versions have them, by name?
- * Where the session has a table of either version's name, SELECT on it
- * (row security not applying to them, as for the table's row type); where
- * it has none (dropped since, or renamed), there's no grant to check: the
- * database's owner or a member of pg_read_all_data may.
+ * What a table of the session's has been called back through history: the
+ * versions that are it, as commits name tables.  A commit holds tables by
+ * name alone, so a table here vouches for a version of its name only if
+ * the name was never without a table between them: from the working set
+ * back through the head, each commit's parents, a step at a time, the name
+ * followed across a rename the step pairs.  A table dropped and made again
+ * by its name breaks it, at the commit that hasn't one: the older one's
+ * rows aren't this one's, whatever grants this one has.  Walked as far as
+ * a question needs (lineage_has()), each commit seen once.
+ */
+typedef struct LineageStep
+{
+	char		key[PROLLY_HASH_MAX_LEN * 2 + 1];	/* a commit's hex, or
+													 * "WORKING" */
+	char	   *name;			/* the table's name there */
+} LineageStep;
+
+typedef struct NameLineage
+{
+	char	   *now;			/* the table's name now */
+	HTAB	   *steps;			/* LineageStep, each version reached */
+	List	   *queue;			/* (ProllyHash *, its name) pairs, to walk */
+	bool		started;
+} NameLineage;
+
+/*
+ * The name in from of to's table name: name if the step's changes don't
+ * list it; NULL if to made it (from has none), or a read left it out.
+ */
+static char *
+lineage_name_before(const char *from, const char *to, const char *name)
+{
+	List	   *rows = NIL;
+	ListCell   *lc;
+
+	PROLLY_CALL(diff_merge(), summary, from, to, false, collect_change, &rows);
+	foreach(lc, rows)
+	{
+		SummaryRow *r = lfirst(lc);
+
+		if (r->not_covered && r->from_name && strcmp(r->from_name, name) == 0)
+			return NULL;
+		if (r->object == PROLLY_OBJECT_TABLE && r->to_name &&
+			strcmp(r->to_name, name) == 0)
+			return r->from_name;
+	}
+	return pstrdup(name);
+}
+
+static void
+lineage_enter(NameLineage *l, const char *key, const char *name)
+{
+	LineageStep *st;
+	bool		found;
+
+	st = hash_search(l->steps, key, HASH_ENTER, &found);
+	if (!found)
+		st->name = pstrdup(name);
+}
+
+/*
+ * Is the version ref has (a commit, or the working set) of the table named
+ * name l's table?
+ */
+static bool
+lineage_has(NameLineage *l, const char *ref, const char *name)
+{
+	char		key[PROLLY_HASH_MAX_LEN * 2 + 1];
+	ProllyHash	h;
+	LineageStep *st;
+
+	if (ref == NULL)
+		return false;
+	if (pg_strcasecmp(ref, "WORKING") == 0 || pg_strcasecmp(ref, "STAGED") == 0)
+		strlcpy(key, "WORKING", sizeof(key));
+	else if (PROLLY_CALL(refs(), resolve, ref, &h))
+		strlcpy(key, hash_hex(&h), sizeof(key));
+	else
+		return false;
+
+	if (!l->started)
+	{
+		char	   *before;
+
+		l->started = true;
+		lineage_enter(l, "WORKING", l->now);
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
+			(before = lineage_name_before(hash_hex(&h), "WORKING", l->now)) != NULL)
+			l->queue = lappend(lappend(l->queue, copy_hash(&h)), before);
+	}
+	while ((st = hash_search(l->steps, key, HASH_FIND, NULL)) == NULL &&
+		   l->queue != NIL)
+	{
+		ProllyHash *at = linitial(l->queue);
+		char	   *at_name = lsecond(l->queue);
+		char	   *hex = hash_hex(at);
+		ProllyCommitInfo info;
+
+		CHECK_FOR_INTERRUPTS();
+		l->queue = list_delete_first(list_delete_first(l->queue));
+		if (hash_search(l->steps, hex, HASH_FIND, NULL) != NULL)
+			continue;
+		lineage_enter(l, hex, at_name);
+		if (!PROLLY_CALL(refs(), commit_get, at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", hex)));
+		for (int i = 0; i < info.nparents; i++)
+		{
+			char	   *phex = hash_hex(&info.parents[i]);
+			char	   *before;
+
+			if (hash_search(l->steps, phex, HASH_FIND, NULL) != NULL)
+				continue;
+			before = lineage_name_before(phex, hex, at_name);
+			if (before)
+				l->queue = lappend(lappend(l->queue, copy_hash(&info.parents[i])),
+								   before);
+		}
+	}
+	return st != NULL && strcmp(st->name, name) == 0;
+}
+
+/* The lineage of the table here named now: from lineages, or begun. */
+static NameLineage *
+name_lineage(List **lineages, const char *now)
+{
+	NameLineage *l;
+	HASHCTL		ctl = {0};
+	ListCell   *lc;
+
+	foreach(lc, *lineages)
+	{
+		l = lfirst(lc);
+		if (strcmp(l->now, now) == 0)
+			return l;
+	}
+	l = palloc0(sizeof(NameLineage));
+	l->now = pstrdup(now);
+	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
+	ctl.entrysize = sizeof(LineageStep);
+	ctl.hcxt = CurrentMemoryContext;
+	l->steps = hash_create("prolly table lineage", 64, &ctl,
+						   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	*lineages = lappend(*lineages, l);
+	return l;
+}
+
+/*
+ * May the user read a table's rows as its versions (at from_ref and
+ * to_ref) have them, by name?  Where the session has a table of either
+ * version's name, SELECT on it (row security not applying to them, as for
+ * the table's row type), a grant that covers each version that is that
+ * table (name_lineage()).  A version no table here is (dropped since, or
+ * one of its name made after it) has no grant to check: only the
+ * database's owner or a member of pg_read_all_data may read it.
  */
 static void
-check_named_rows(const SummaryRow *r, const char *fn)
+check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
+				 List **lineages, const char *fn)
 {
 	const char *names[2] = {r->to_name, r->from_name};
-	bool		checked = false;
+	bool		from_ok = r->from_item == NULL;
+	bool		to_ok = r->to_item == NULL;
+	bool		some = false;
+	const char *name;
 
 	for (int i = 0; i < 2; i++)
 	{
 		Oid			relid;
 		AclResult	aclresult;
+		NameLineage *l;
 
 		if (names[i] == NULL)
 			continue;
@@ -5002,16 +5159,30 @@ check_named_rows(const SummaryRow *r, const char *fn)
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 		check_history_rls(relid, fn);
-		checked = true;
+		some = true;
+		l = name_lineage(lineages, names[i]);
+		if (!from_ok)
+			from_ok = lineage_has(l, from_ref, r->from_name);
+		if (!to_ok)
+			to_ok = lineage_has(l, to_ref, r->to_name);
 	}
-	if (!checked &&
-		!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) &&
-		!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+	if ((from_ok && to_ok) ||
+		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+		return;
+	name = !from_ok ? r->from_name : r->to_name;
+	if (some)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
-						fn, r->from_name ? r->from_name : r->to_name),
+				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
+						fn, name),
+				 errdetail("The name was without a table since that version, so the table here is another."),
 				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
+					fn, name),
+			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
 }
 
 /* rows_begin_described() of a table's version, or refused. */
@@ -5066,7 +5237,7 @@ diff_by_name(RowDiffSink *s, const char *from_ref, const char *to_ref,
 	r = named_table(rows, name);
 	if (r == NULL)
 		return false;
-	check_named_rows(r, fn);
+	check_named_rows(r, from_ref, to_ref, &s->lineages, fn);
 
 	/* (a side without the table: the empty tree, read as the other's) */
 	fitem = r->from_item ? r->from_item : r->to_item;
@@ -5496,6 +5667,7 @@ dolt_history_table_by_name(PG_FUNCTION_ARGS)
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	char	   *name;
 	AtSink		s;
+	List	   *lineages = NIL;
 	ListCell   *lc;
 
 	if (PG_ARGISNULL(0))
@@ -5532,7 +5704,7 @@ dolt_history_table_by_name(PG_FUNCTION_ARGS)
 		r = named_table(rows, name);
 		if (r == NULL || r->to_item == NULL)
 			continue;
-		check_named_rows(r, "dolt_history_table");
+		check_named_rows(r, NULL, s.hash, &lineages, "dolt_history_table");
 		rows_begin_named(&s.rows, r->to_item, r->to_len, name, "dolt_history_table");
 		table_item_data(r->to_item, r->to_len, &data);
 		PROLLY_CALL(tree, build_finish,

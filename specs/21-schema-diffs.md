@@ -369,6 +369,15 @@ Decided by the user 2026-10-19, as recommended:
     name, SELECT on it (row security refusing, as for the row-type
     forms); where it has none, there's no grant to check, so only the
     database's owner or a member of `pg_read_all_data` may read it.
+    A table's grant covers only the versions that are it: commits hold
+    tables by name alone, so a version is the session's table when the
+    name has had a table at every commit from it to the working set
+    (walked back from the head through parents, following a rename a
+    commit pairs). A table dropped and another made with its name (or a
+    renamed one's old name) is another table, and its readers don't
+    read the first's rows (the owner's rule applies). A drop and a
+    remake within one commit, or in the working set, can't be told from
+    an ALTER, as in Dolt.
   Dolt's `DiffTableFunctionScriptTests` 12 and 13's third assertion,
   deferred on #612, can be ported with them.
 - **Not built:** a CustomScan over `dolt_at` seeking the tree by primary
