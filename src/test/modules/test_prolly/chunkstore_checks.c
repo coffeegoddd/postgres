@@ -1549,6 +1549,72 @@ test_commit_chain(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&head));
 }
 
+/*
+ * test_commit_height(commit): the height the commit records; NULL if it
+ * records none.
+ */
+PG_FUNCTION_INFO_V1(test_commit_height);
+Datum
+test_commit_height(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	if (!PROLLY_CALL(dc.refs, commit_get, &id, &info))
+		elog(ERROR, "no such commit");
+	if (!info.has_height)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64(info.height);
+}
+
+/* The refs' commits, counted as prolly_history_height() reads them. */
+typedef struct CountedLookup
+{
+	ProllyDatabaseComponents dc;
+	int			reads;
+} CountedLookup;
+
+static bool
+counted_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	CountedLookup *cl = arg;
+
+	cl->reads++;
+	return PROLLY_CALL(cl->dc.refs, commit_get, id, info);
+}
+
+/*
+ * test_history_height(commit, OUT height, OUT reads): the commit's height
+ * as prolly_history_height() finds it, and how many commits it read.
+ */
+PG_FUNCTION_INFO_V1(test_history_height);
+Datum
+test_history_height(PG_FUNCTION_ARGS)
+{
+	CountedLookup cl = {0};
+	ProllyHash	id;
+	HTAB	   *heights;
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	int64		height;
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&cl.dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &id);
+	heights = prolly_history_heights();
+	height = prolly_history_height(&id, heights, counted_lookup, &cl);
+	hash_destroy(heights);
+	values[0] = Int64GetDatum(height);
+	values[1] = Int32GetDatum(cl.reads);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
 /* test_refs_set_upstream(branch, remote, remote_branch) */
 PG_FUNCTION_INFO_V1(test_refs_set_upstream);
 Datum

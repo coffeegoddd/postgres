@@ -56,6 +56,14 @@ typedef struct ProllyCommitInfo
 	 */
 	bool		has_dependencies;
 	ProllyNodeRef dependencies;
+
+	/*
+	 * Its height, as prolly_history_height() finds it (1 + the most of its
+	 * parents'; a root's 1); has_height false for a commit that doesn't
+	 * record it (one made before commits recorded it, or elsewhere).
+	 */
+	bool		has_height;
+	int64		height;
 } ProllyCommitInfo;
 
 /*
@@ -408,11 +416,12 @@ extern bool prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 /*
  * A commit's height: the most commits on a path from it to a root of its
  * history (a root's is 1, and one that isn't found is taken for a root), so
- * each commit's is greater than its parents'.  heights, a table
- * prolly_history_heights() makes, keeps those found, so each commit's
- * height is found once however many are asked for; lookup may be asked
- * twice for a commit (before its parents' heights are found, and after),
- * so one whose reads cost should remember them.
+ * each commit's is greater than its parents'.  A commit that records its
+ * height (has_height) is taken at its word, and its parents aren't looked
+ * up; for one that doesn't, its parents' heights are found first.
+ * heights, a table prolly_history_heights() makes, keeps those found, so
+ * each commit's height is found once however many are asked for, and
+ * lookup is asked once for each commit it finds one of.
  */
 extern struct HTAB *prolly_history_heights(void);
 extern int64 prolly_history_height(const ProllyHash *id, struct HTAB *heights,

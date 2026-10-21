@@ -5,7 +5,7 @@
  *
  * This file contains the implementation of the prolly engine's work
  * counters: tree nodes read and written, chunks appended, bytes hashed,
- * rows folded, commits, head moves, value memo lookups, pages copied, the
+ * rows folded, commits written and read, head moves, value memo lookups, pages copied, the
  * bytes the chunk store and the block map write to their files
  * themselves, the journal read to index it, and the chunk store's
  * collections, moves and conjoins with what collections kept and freed
@@ -99,6 +99,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_GC_WINDOW_USEC] = "gc_window_usec",
 	[PGSTAT_PROLLY_CHUNK_FILE_READS] = "chunk_file_reads",
 	[PGSTAT_PROLLY_GC_PAGES_SCANNED] = "gc_pages_scanned",
+	[PGSTAT_PROLLY_COMMITS_READ] = "commits_read",
 };
 
 /*

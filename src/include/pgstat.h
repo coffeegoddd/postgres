@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCC9
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCCA
 
 typedef struct PgStat_ArchiverStats
 {
@@ -678,9 +678,10 @@ typedef enum PgStat_ProllyCounter
 									 * several chunks close together, one */
 	PGSTAT_PROLLY_GC_PAGES_SCANNED, /* page-store blocks collections read
 									 * for the hash pointers they hold */
+	PGSTAT_PROLLY_COMMITS_READ, /* commits read */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_GC_PAGES_SCANNED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_COMMITS_READ + 1)
 
 typedef struct PgStat_ProllyStats
 {

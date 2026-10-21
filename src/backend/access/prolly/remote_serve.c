@@ -603,7 +603,7 @@ since_commit(SinceWalk *sw, const ProllyHash *id)
 		MemoryContextSwitchTo(old);
 		c->paint = c->walked = 0;
 		c->queued = false;
-		c->height = 0;
+		c->height = c->found && info.has_height ? info.height : 0;
 		c->committed_at = c->found ? info.committed_at : DT_NOBEGIN;
 		c->nparents = c->found ? info.nparents : 0;
 		for (int p = 0; p < c->nparents; p++)
@@ -617,8 +617,9 @@ since_commit(SinceWalk *sw, const ProllyHash *id)
 }
 
 /*
- * A commit's parents for its height: read, not kept (most commits a height
- * reaches are never walked, and keep only their heights' entries).
+ * A commit's parents for its height, one that doesn't record it: read, not
+ * kept (most commits a height reaches are never walked, and keep only
+ * their heights' entries).
  */
 static bool
 since_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
@@ -666,10 +667,12 @@ since_paint(SinceWalk *sw, const ProllyHash *id, uint8 paint)
  * one go: the commits the wanted reach and the known don't (by parents),
  * and of each, its own chunks and what its root changed from its first
  * parent's (each tree diffed, equal subtrees skipped).  The trees walked
- * are the new commits' and what they changed, not the history's; the
- * commits beneath them are read for their heights, each keeping only its
- * height's entry for the call (until commits record their heights).  The
- * receiver checks all it is sent, and reads what it still lacks as it
+ * are the new commits' and what they changed, not the history's.  A
+ * commit records its height, so the commits read are the new ones and
+ * those the walk reaches beneath them; beneath a commit that doesn't (one
+ * made before commits recorded heights), its history is read for its
+ * height, each commit once, keeping only its height's entry for the call.
+ * The receiver checks all it is sent, and reads what it still lacks as it
  * would without this.
  *
  * The commits are told apart as git's negotiation tells them: walked from
