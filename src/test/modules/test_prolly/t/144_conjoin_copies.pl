@@ -21,6 +21,8 @@ $node->safe_psql('cj', 'CREATE EXTENSION test_prolly');
 $node->backup('base');
 my $standby = PostgreSQL::Test::Cluster->new('conjoin_copies_standby');
 $standby->init_from_backup($node, 'base', has_streaming => 1);
+# (no restartpoint but those asked for: one past a conjoin would replay none of it)
+$standby->append_conf('postgresql.conf', 'checkpoint_timeout = 1h');
 $standby->start;
 
 sub sql { return $node->safe_psql('cj', $_[0]); }
@@ -93,8 +95,12 @@ is($standby->safe_psql('cj', $reads), all_read(), 'and it reads the chunks');
 # from are gone, the file it wrote whole.
 table_files('third', 3);
 sql('CHECKPOINT');
+my $before_conjoin = $node->lsn('insert');
 conjoin('');
 my $after = sql($files);
+my $redo_before = q{SELECT redo_lsn <= '%s' FROM pg_control_checkpoint()};
+is(sql(sprintf($redo_before, $before_conjoin)), 't',
+	'the primary\'s checkpoint is from before the conjoin');
 $node->stop('immediate');
 $node->start;
 is(sql($reads), all_read(), 'crash recovery replays a conjoin whose sources are gone');
@@ -102,6 +108,8 @@ is(sql($files), $after, 'and leaves the files as they were');
 
 # A standby restarted from before the conjoin likewise.
 $node->wait_for_catchup($standby);
+is($standby->safe_psql('postgres', sprintf($redo_before, $before_conjoin)), 't',
+	'the standby\'s restartpoint is from before the conjoin');
 $standby->stop('immediate');
 $standby->start;
 is($standby->safe_psql('cj', $reads), all_read(), 'so does a standby restarted');

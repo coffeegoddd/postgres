@@ -239,6 +239,7 @@ tests += {
       't/142_get_many_refresh.pl',
       't/143_bmap_map_image_since.pl',
       't/143_copy_records.pl',
+      't/144_conjoin_copies.pl',
       't/160_first_use_lock.pl',
     ],
   },
