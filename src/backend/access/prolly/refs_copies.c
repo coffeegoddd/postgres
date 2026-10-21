@@ -894,7 +894,7 @@ branch_exists(const char *name)
 	return OidIsValid(branch_oid(name)) || branch_head(name, &head);
 }
 
-static void fold(ProllyNodeRef *root);
+static void working_fold(ProllyNodeRef *root);
 static void fold_as_baseline(void *arg);
 
 /*
@@ -903,7 +903,8 @@ static void fold_as_baseline(void *arg);
  * working set is the root already; then folded from there, so no fold
  * after reads the pages the move wrote again and again.  Objects no
  * commit could hold (the canonical form doesn't describe them) are
- * uncommitted work the move discards, as it does any other.
+ * uncommitted work the move discards, as it does any other.  The working
+ * set is folded only if nothing known says what it is (#482).
  */
 static void
 move_settled(void *arg)
@@ -914,7 +915,7 @@ move_settled(void *arg)
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
-	fold(&working);
+	working_fold(&working);
 	if (same_hash(&working.hash, &target->hash))
 		return;
 	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
@@ -2203,7 +2204,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * the branch's), nor its baseline (another's checkpoint or fold, which the
  * snapshot can't fold from: it would read every table in full, and replace
  * that one's baseline with an unsettled one).  (A session choosing its
- * first branch, as it connects, leaves none.)
+ * first branch, as it connects, leaves none.)  A working set known (#482)
+ * is compared without a fold; one not known is folded once, as the
+ * checkpoint, kept even if clean (its fold took its log's entries).
  */
 static void
 copies_checkout(const char *name)
@@ -2244,14 +2247,17 @@ copies_checkout(const char *name)
 		ProllyNodeRef working;
 		ProllyNodeRef kept;
 		ProllyNodeRef next;
+		ProllyNodeRef baseline;
 		ProllyHash	head;
 
-		fold(&working);
-		if (!(branch_head(current, &head) &&
-			  copies_commit_working_set(&head, &kept) &&
-			  same_hash(&kept.hash, &working.hash)) &&
-			!(branch_baseline_root(current, &kept) &&
-			  same_hash(&kept.hash, &working.hash)))
+		if (!(known_working_set(current, MyBranch,
+								branch_baseline(current, &baseline) ? &baseline : NULL,
+								false, &working) &&
+			  ((branch_head(current, &head) &&
+				copies_commit_working_set(&head, &kept) &&
+				same_hash(&kept.hash, &working.hash)) ||
+			   (branch_baseline_root(current, &kept) &&
+				same_hash(&kept.hash, &working.hash)))))
 		{
 			lock_refs();
 			if (!head_moved_unseen(current) &&

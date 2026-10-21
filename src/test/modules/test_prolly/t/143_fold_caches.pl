@@ -150,6 +150,21 @@ $p->quit;
 $r->quit;
 sql(q{SELECT dolt_commit('-am', 'remembered')});
 
+# Moves and checkouts after another session's write: the working set known
+# before it isn't taken.  A checkout leaving the branch keeps the write in
+# its checkpoint; a hard reset undoes it.
+sql(q{SELECT dolt_branch('elsewhere')});
+$a->query_safe($changes);
+sql(q{UPDATE s.t SET v = 'by another' WHERE id = 2});
+$a->query_safe(q{SELECT dolt_checkout('elsewhere'); SELECT dolt_checkout('main')});
+is($a->query_safe(q{SELECT v FROM s.t WHERE id = 2}), 'by another',
+	'a checkout after another\'s write keeps it');
+is($a->query_safe($changes), '1', 'as a change');
+$a->query_safe(q{SELECT dolt_reset('--hard')});
+is(sql(q{SELECT v FROM s.t WHERE id = 2}), 'x',
+	'a hard reset after another\'s write undoes it');
+is(sql($changes), '0', 'clean');
+
 $a->quit;
 $b->quit;
 

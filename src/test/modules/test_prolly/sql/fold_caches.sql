@@ -101,7 +101,8 @@ SELECT * FROM dolt_status;
 SELECT pg_temp.since('folds_reused') AS after_truncate;
 SELECT length(dolt_commit('-am', 'truncated')::text) > 0 AS committed;
 
--- a branch switched to: its own working set
+-- a branch switched to: its own working set (none of its statuses taken;
+-- the two checkouts take the working sets of the branches they leave)
 SELECT dolt_checkout('other');
 SELECT * FROM dolt_status;
 INSERT INTO fc.t VALUES (1000, 'on other');
@@ -166,6 +167,61 @@ SELECT * FROM dolt_status;
 RESET debug_prolly_force_full_fold;
 :flush
 SELECT pg_temp.since('folds_reused') AS forced_full;
+
+-- No fold around moves: a checkout and a hard reset take the working set
+-- known.  Leaving a clean branch, and back: nothing folded.
+SELECT length(dolt_commit('-am', 'on other')::text) > 0 AS committed
+FROM (SELECT dolt_checkout('other')) c;
+SELECT dolt_checkout('main');
+SELECT * FROM dolt_status;
+SET debug_prolly_verify_fold_caches = off;
+:flush
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS counting,
+	pg_temp.since('bytes_hashed') IS NOT NULL AS hashing;
+SELECT dolt_checkout('other');
+SELECT dolt_checkout('main');
+:flush
+SELECT pg_temp.since('folds_reused') AS clean_checkouts,
+	pg_temp.since('bytes_hashed') AS bytes_hashed;
+
+RESET debug_prolly_verify_fold_caches;
+
+-- A hard reset of a clean branch: the working set is the head's already.
+SELECT dolt_reset('--hard');
+:flush
+SELECT pg_temp.since('folds_reused') AS clean_reset;
+
+-- A hard reset after a write: folded, and the row put back.
+UPDATE fc.t SET v = 'to undo' WHERE id = 3;
+SELECT dolt_reset('--hard');
+SELECT v FROM fc.t WHERE id = 3;
+SELECT * FROM dolt_status;
+:flush
+SELECT pg_temp.since('folds_reused') AS reset_after_write;
+
+-- A fast-forward: the working set before it taken (by the merge, and by
+-- the move), then the move's fold.
+SELECT dolt_checkout('other');
+UPDATE fc.t SET v = 'forward' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'forward')::text) > 0 AS committed;
+SELECT dolt_checkout('main');
+:flush
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS counting;
+SELECT (dolt_merge('other'))[2] AS fast_forward;
+SELECT v FROM fc.t WHERE id = 4;
+SELECT * FROM dolt_status;
+:flush
+SELECT pg_temp.since('folds_reused') AS fast_forward_taken;
+
+-- Leaving a branch with changes known: its checkpoint, folded once, keeps
+-- them.
+UPDATE fc.t SET v = 'left' WHERE id = 5;
+SELECT * FROM dolt_status;
+SELECT dolt_checkout('other');
+SELECT dolt_checkout('main');
+SELECT * FROM dolt_status;
+SELECT v FROM fc.t WHERE id = 5;
+SELECT length(dolt_commit('-am', 'left')::text) > 0 AS committed;
 
 \c contrib_regression
 DROP DATABASE regress_fold_caches;
