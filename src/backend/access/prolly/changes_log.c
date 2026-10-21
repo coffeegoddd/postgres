@@ -980,6 +980,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 {
 	ProllyLogPosition pos = {st->fxmax, st->fown, st->nxip, st->fxip};
 	bool		consumed = false;
+	ProllyTableFold from;
 
 	f->compact = true;
 	if (f->give_up)
@@ -1024,12 +1025,23 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 		fold_keys(f, &empty, data);
 		return true;
 	}
+
+	/*
+	 * (a baseline of another shape: its rows mapped to this one's now, only
+	 * here, once the fold will be from it, as a map reads every row of it)
+	 */
+	from = *baseline;
+	if (!prolly_table_fold_data(f->rel, &f->env, baseline, &from.data))
+	{
+		f->reason = PROLLY_FULL_SHAPE_CHANGED;
+		return false;
+	}
 	if (!f->keyless)
 	{
-		fold_keys(f, baseline, data);
+		fold_keys(f, &from, data);
 		return true;
 	}
-	if (!apply_copies(f, &baseline->data, data))
+	if (!apply_copies(f, &from.data, data))
 	{
 		/* (a row's count below none: written under another keying) */
 		f->reason = PROLLY_FULL_KEYING_CHANGED;

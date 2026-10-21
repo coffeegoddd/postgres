@@ -944,48 +944,30 @@ shape_holds(Relation rel, const StringInfoData *was, const StringInfoData *now)
 	return holds;
 }
 
-static bool
-every_entry(HeapTuple entry, int32 delta, void *arg)
-{
-	return true;
-}
-
 /*
- * A baseline folded under another shape than now's, its rows mapped to
- * rel's shape now (prolly_fold_map()) into *data, without reading rel:
- * false if they can't be (the encoders changed, a keying without a row
- * shape, or one that can't read the old one's rows), or the fold will read
- * rel in full anyway (forced, or its log says to: a rewrite since changed
- * rows without writes).
+ * Can a baseline folded under another shape than now's be folded from, its
+ * rows mapped to rel's shape now (prolly_fold_map())?  Not if the encoders
+ * changed since, the keying gives no row shape or can't read the old
+ * one's rows, or a column's type changed: then the finder has no baseline,
+ * so reads none of what changed since by it.  *was gets the shape its rows
+ * were folded under.  (The map itself waits for the finder, which asks
+ * for it only once it will fold from the baseline: a fold that reads rel
+ * in full instead, forced, its log saying to after a rewrite, or what
+ * changed since costing more than that, maps nothing.)
  */
 static bool
-shape_mapped(Canon *cn, Relation rel, BaseTable *bt,
-			 const StringInfoData *now, ProllyNodeRef *data)
+shape_mappable(Canon *cn, Relation rel, BaseTable *bt,
+			   const StringInfoData *now, ProllyValue *was)
 {
-	ProllyValue was_rows;
 	ProllyValue was_rest;
 	ProllyValue now_rows;
 	ProllyValue now_rest;
-	ProllyFullFoldReason forced;
-	ProllyComponents c;
-	int64		rows;
 
-	if (prolly_full_fold_wanted(&forced) ||
-		!split_shape(base_shape(cn, bt), &was_rows, &was_rest) ||
-		!split_shape(now, &now_rows, &now_rest) ||
-		was_rest.len != now_rest.len ||
-		memcmp(was_rest.data, now_rest.data, now_rest.len) != 0)
-		return false;
-	prolly_components_for_relation(rel, &c);
-	/* (every entry: one the baseline holds that says so only stops a map) */
-	if (c.change_log &&
-		!PROLLY_CALL(c.change_log, read, rel, GetActiveSnapshot(), NULL,
-					 every_entry, NULL))
-		return false;
-	if (!prolly_fold_map(rel, &cn->env, &bt->data, &was_rows, data, &rows))
-		return false;
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MAPPED, 1);
-	return true;
+	return split_shape(base_shape(cn, bt), was, &was_rest) &&
+		split_shape(now, &now_rows, &now_rest) &&
+		was_rest.len == now_rest.len &&
+		memcmp(was_rest.data, now_rest.data, now_rest.len) == 0 &&
+		prolly_fold_mappable(rel, was);
 }
 
 /*
@@ -1044,7 +1026,7 @@ table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
  * the change finder: from its baseline if it has one that holds for this
  * definition (described in 'description', dh its table_shape(): the same,
  * or one shape_holds() says its rows are as they were under), or one whose
- * rows map to it (shape_mapped()); with a next baseline being made, its
+ * rows map to it (shape_mappable()); with a next baseline being made, its
  * entry there too.  The same rows give the same
  * tree whatever pages, order or history they come from.
  */
@@ -1073,7 +1055,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		/* (when reading another table: not mapped, as its rows aren't read) */
 		if (!cn->no_rows &&
 			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
-			shape_mapped(cn, rel, bt, &shape, &tf.data))
+			shape_mappable(cn, rel, bt, &shape, &tf.shape))
 			tf.reshaped = true;
 		else
 			bt = NULL;

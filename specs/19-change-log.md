@@ -266,11 +266,16 @@ Two interfaces, each selected by the table AM's profile
   depend on the DDL's history. It isn't mapped, and the table is read in
   full, when a type changed, the key changed (keys come out in another
   order), a type a column had is defined otherwise now (a label renamed),
-  the encoders changed, a full fold is forced, or the log says to read
-  the table in full anyway (a rewrite that changed rows: a volatile
-  default). The finder "pages" folds from a mapped baseline too, unless
-  its state carries keys, which are rows of the old shape
-  (`reshaped`).
+  or the encoders changed. What can be told without reading rows (all
+  but the key's order) is checked before the finder runs, which then has
+  no baseline. The map itself is made by the finder
+  (`prolly_table_fold_data()`), only once it will fold from the
+  baseline: a fold that gives up on it (forced, the log saying to read
+  the table in full after a rewrite, a rewrite's new storage, or more
+  changes than `maintenance_work_mem` or the table's rows) reads the table
+  in full and maps nothing, so a commit never pays for both. The finder
+  "pages" folds from a mapped baseline too, unless its state carries keys,
+  which are rows of the old shape (`reshaped`).
 - **A verifier** (`fold_verify.c`, #513) folds tables from their
   baselines and in full by one snapshot, at `prolly.fold_verify_rate` in
   autovacuum or by `dolt_verify_folds()`: a mismatch is warned of,

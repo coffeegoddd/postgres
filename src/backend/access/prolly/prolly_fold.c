@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/prolly_changes.h"
 #include "access/prolly_config.h"
 #include "access/prolly_fold.h"
 #include "access/tableam.h"
@@ -387,6 +388,62 @@ map_columns(Relation rel, TupleDesc desc, MapColumn *cols)
 	return true;
 }
 
+/*
+ * The keyings to read rows folded under old by (*ok) and to encode them as
+ * rel's now (*k), and how each column of rel's is had from one of the old
+ * rows (*cols, of *odesc's): false if they can't be, as for
+ * prolly_fold_map().  Opened in cxt.
+ */
+static bool
+map_open(Relation rel, const ProllyKeyingRoutine *kr, const ProllyValue *old,
+		 MemoryContext cxt, ProllyKeying **ok, ProllyKeying **k,
+		 TupleDesc *odesc, MapColumn **cols)
+{
+	if (!PROLLY_HAS(kr, open_shape))
+		return false;
+	*ok = PROLLY_CALL(kr, open_shape, rel, old, cxt, odesc);
+	if (*ok == NULL)
+		return false;
+	*k = PROLLY_CALL(kr, open, rel, cxt);
+	*cols = MemoryContextAlloc(cxt, sizeof(MapColumn) *
+							   Max(RelationGetDescr(rel)->natts, 1));
+	if (PROLLY_CALL(kr, keyless, *ok) != PROLLY_CALL(kr, keyless, *k) ||
+		!map_columns(rel, *odesc, *cols))
+	{
+		PROLLY_CALL(kr, close, *ok);
+		PROLLY_CALL(kr, close, *k);
+		return false;
+	}
+	return true;
+}
+
+bool
+prolly_fold_mappable(Relation rel, const ProllyValue *old)
+{
+	ProllyComponents c;
+	MemoryContext cxt;
+	MemoryContext caller;
+	ProllyKeying *ok;
+	ProllyKeying *k;
+	TupleDesc	odesc;
+	MapColumn  *cols;
+	bool		mappable;
+
+	prolly_components_for_relation(rel, &c);
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "fold mappable",
+								ALLOCSET_DEFAULT_SIZES);
+	caller = MemoryContextSwitchTo(cxt);
+	mappable = map_open(rel, c.keying, old, cxt, &ok, &k, &odesc, &cols);
+	if (mappable)
+	{
+		PROLLY_CALL(c.keying, close, ok);
+		PROLLY_CALL(c.keying, close, k);
+	}
+	MemoryContextSwitchTo(caller);
+	MemoryContextDelete(cxt);
+	return mappable;
+}
+
 bool
 prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 				const ProllyNodeRef *from, const ProllyValue *old,
@@ -428,31 +485,18 @@ prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 	kr = c.keying;
 	tree = c.tree;
 	*rows = 0;
-	if (!PROLLY_HAS(kr, open_shape))
-		return false;
 
 	/* what the map makes is let go of when it's done, but the tree */
 	cxt = AllocSetContextCreate(CurrentMemoryContext, "fold map",
 								ALLOCSET_DEFAULT_SIZES);
 	caller = MemoryContextSwitchTo(cxt);
-	ok = PROLLY_CALL(kr, open_shape, rel, old, cxt, &odesc);
-	if (ok == NULL)
+	if (!map_open(rel, kr, old, cxt, &ok, &k, &odesc, &cols))
 	{
 		MemoryContextSwitchTo(caller);
 		MemoryContextDelete(cxt);
 		return false;
 	}
-	k = PROLLY_CALL(kr, open, rel, cxt);
 	keyless = PROLLY_CALL(kr, keyless, k);
-	cols = palloc_array(MapColumn, Max(rd->natts, 1));
-	if (PROLLY_CALL(kr, keyless, ok) != keyless || !map_columns(rel, odesc, cols))
-	{
-		PROLLY_CALL(kr, close, ok);
-		PROLLY_CALL(kr, close, k);
-		MemoryContextSwitchTo(caller);
-		MemoryContextDelete(cxt);
-		return false;
-	}
 
 	/*
 	 * Rows read as folded, their long values as the trees they are (hash
@@ -560,4 +604,22 @@ prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 	MemoryContextSwitchTo(caller);
 	MemoryContextDelete(cxt);
 	return mapped;
+}
+
+bool
+prolly_table_fold_data(Relation rel, const ProllyTreeEnv *env,
+					   const ProllyTableFold *baseline, ProllyNodeRef *data)
+{
+	int64		rows;
+
+	if (!baseline->reshaped)
+	{
+		*data = baseline->data;
+		return true;
+	}
+	if (!prolly_fold_map(rel, env, &baseline->data, &baseline->shape, data,
+						 &rows))
+		return false;
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MAPPED, 1);
+	return true;
 }

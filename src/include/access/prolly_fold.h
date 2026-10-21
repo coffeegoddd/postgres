@@ -155,6 +155,26 @@ extern bool prolly_fold_map(Relation rel, const ProllyTreeEnv *env,
 							const ProllyNodeRef *from, const ProllyValue *old,
 							ProllyNodeRef *data, int64 *rows);
 
+/*
+ * Could rows folded under the row shape old be mapped to rel's now
+ * (prolly_fold_map()), as far as is known without reading them: the
+ * keying reads rows of old, and each column of rel's is had from theirs?
+ * (Their keys' order is known only by reading them.)
+ */
+extern bool prolly_fold_mappable(Relation rel, const ProllyValue *old);
+
+/*
+ * A baseline's tree as a fold from it reads it, into *data: its own, or,
+ * folded under another row shape (reshaped), its rows mapped to rel's
+ * now (prolly_fold_map(), counted in pg_stat_prolly).  A finder asks for
+ * it only once it will fold from the baseline, not read rel in full, as a
+ * map reads every row of the baseline.  False if they can't be mapped.
+ */
+struct ProllyTableFold;
+extern bool prolly_table_fold_data(Relation rel, const ProllyTreeEnv *env,
+								   const struct ProllyTableFold *baseline,
+								   ProllyNodeRef *data);
+
 /* The last full fold's (for tests). */
 extern ProllyFullFold prolly_last_full_fold;
 
