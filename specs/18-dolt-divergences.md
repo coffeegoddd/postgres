@@ -36,7 +36,9 @@ adapts.
   is `conflict` or `not covered` (objects a commit can't hold yet,
   which are listed and unstaged). `dolt_stash('push', ...)` sets the
   whole working set aside, so new tables with the rest (Dolt's leaves
-  untracked ones without `-u`); `-u` and `-a` are accepted (#498).
+  untracked ones without `-u`); `-u` and `-a` are accepted (#498). A
+  pop or apply merges into uncommitted changes as Dolt's does, refused
+  only where rows conflict (#585), or where definitions change (D6).
 - **Why:** the user's decision (2026-10-17). A staging area would be a
   second state of each branch beside the working set in Postgres's
   pages, for every fold, status and diff to track.
@@ -136,7 +138,10 @@ adapts.
   and savepoint: a rollback undoes its commit, head move or merge, and
   nothing commits the transaction early. A merge's unresolved conflicts
   or constraint violations fail the SQL `COMMIT` unless
-  `dolt.allow_commit_conflicts` is set. `WORKING` in `dolt_status` and
+  `dolt.allow_commit_conflicts` is set: the `COMMIT` of the transaction
+  that made them, or of any that writes to the branch while they're
+  there, whoever made them, as in Dolt (#587); one that only reads
+  commits. `WORKING` in `dolt_status` and
   `dolt_diff` is the branch's working set as the current transaction
   sees it, its own uncommitted writes included, as a Dolt session's
   working root includes its own (#501).

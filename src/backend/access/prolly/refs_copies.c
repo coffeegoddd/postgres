@@ -47,8 +47,8 @@
  *				   then the bytes)
  *
  * A branch without an entry has no commits yet.  A transaction can't
- * commit a merge with unresolved conflicts it left, unless
- * dolt.allow_commit_conflicts is on.  A commit is a tree of its
+ * commit a merge with unresolved conflicts, or write to a branch that has
+ * them, unless dolt.allow_commit_conflicts is on.  A commit is a tree of its
  * own (keys by memcmp), and its id is that tree's root hash, so the same
  * commit content has the same id in every database:
  *
@@ -377,10 +377,51 @@ tables_exist_on(const char *branch, int n, const Oid *relids, bool *exists,
 	}
 }
 
+typedef struct NameBranch
+{
+	Oid			branch;
+	char	   *name;
+} NameBranch;
+
+static void
+name_branch(const char *name, Oid branch, void *arg)
+{
+	NameBranch *nb = arg;
+
+	if (branch == nb->branch)
+		nb->name = pstrdup(name);
+}
+
 /*
- * Unresolved conflicts, or constraint violations, of a merge the
- * transaction made aren't committed: on each branch it made one on, as
- * that branch has its tables (a checkout since doesn't hide them).
+ * The branches whose unresolved conflicts or violations the transaction
+ * can't commit: those whose merge states it set, and those it wrote, as
+ * Dolt refuses a commit of a working set with conflicts whoever made them
+ * (#587).  Names, palloc'd.
+ */
+static List *
+branches_to_check(void)
+{
+	List	   *names = list_copy(merge_changed);
+	ListCell   *lc;
+
+	foreach(lc, branches_written())
+	{
+		NameBranch	nb = {lfirst_oid(lc), NULL};
+
+		if (nb.branch == MyBranch)
+			nb.name = branch_ops()->current();
+		else
+			branch_ops()->branches(name_branch, &nb);
+		if (nb.name != NULL && !name_listed(names, nb.name))
+			names = lappend(names, nb.name);
+	}
+	return names;
+}
+
+/*
+ * Unresolved conflicts, or constraint violations, aren't committed: on
+ * each branch the transaction made a merge on or wrote, as that branch
+ * has its tables (a checkout since doesn't hide them).
  */
 static void
 check_merge_conflicts(const char *what)
@@ -389,7 +430,7 @@ check_merge_conflicts(const char *what)
 
 	if (prolly_allow_commit_conflicts())
 		return;
-	foreach(lc, merge_changed)
+	foreach(lc, branches_to_check())
 	{
 		const char *branch = lfirst(lc);
 		ProllyMergeState ms;

@@ -761,6 +761,13 @@ fails without its fix), and Postgres's suites keep passing after each one.
     it is refreshed from the merged rows (refused over uncommitted rows,
     which it would read). A fast-forward over uncommitted changes brings
     theirs' rows too (#320).
+  - A stash's pop or apply is the exception to the refusal by table: as
+    Dolt's (`MergeRoots(working, stash, parent)`), it merges three-way
+    into the working set as it is, the uncommitted changes ours and the
+    stash's parent the base, so it is refused, the stash kept, only where
+    a row both changed conflicts, or where definitions change as above
+    (#585). A pick or revert can't: its commit leaves the uncommitted
+    changes out, so it mustn't merge with them.
 
 **Step 6. Remotes.** Designed in part 7 (decided 2026-10-17). File remotes
 built (#171, #172, #174, #175; 7.11); network remotes, batching, the

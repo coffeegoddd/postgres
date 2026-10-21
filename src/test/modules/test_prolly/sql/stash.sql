@@ -58,19 +58,110 @@ SELECT dolt_stash('pop', 's');
 SELECT * FROM st.t ORDER BY pk;
 SELECT dolt_reset('--hard');
 
--- popped over uncommitted changes: refused where they change a table it
--- changes (as Dolt's, by table), applied where they change another
+-- popped over uncommitted changes: merged into them, as Dolt's, the same
+-- table's other rows too (#585); refused, kept, where a row both changed
+-- conflicts
 INSERT INTO st.t VALUES (6, 'f');
 SELECT dolt_stash('push', 's');
 INSERT INTO st.t VALUES (7, 'g');
-SELECT dolt_stash('pop', 's');
-SELECT * FROM st.t ORDER BY pk;
-DELETE FROM st.t WHERE pk = 7;
 INSERT INTO st.o VALUES (1);
 SELECT dolt_stash('pop', 's');
 SELECT * FROM st.t ORDER BY pk;
 SELECT * FROM st.o;
+SELECT count(*) AS stashes FROM dolt_stashes;
 SELECT dolt_reset('--hard');
+INSERT INTO st.t VALUES (6, 'f');
+UPDATE st.t SET v = 'a2' WHERE pk = 1;
+SELECT dolt_stash('push', 's');
+INSERT INTO st.t VALUES (6, 'other');
+SELECT dolt_stash('pop', 's');
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT * FROM st.t ORDER BY pk;
+UPDATE st.t SET v = 'f' WHERE pk = 6;
+SELECT dolt_stash('apply', 's');
+SELECT * FROM st.t ORDER BY pk;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_stash('drop', 's');
+SELECT dolt_reset('--hard');
+
+-- popped over a table the working set made: it stays, with its rows
+INSERT INTO st.t VALUES (6, 'f');
+SELECT dolt_stash('push', 's');
+CREATE TABLE st.w (id int PRIMARY KEY);
+INSERT INTO st.w VALUES (1);
+INSERT INTO st.t VALUES (7, 'g');
+SELECT dolt_stash('pop', 's');
+SELECT * FROM st.t ORDER BY pk;
+SELECT * FROM st.w;
+DROP TABLE st.w;
+SELECT dolt_reset('--hard');
+
+-- specific stashes popped one after another, each into what the one
+-- before left (Dolt's "Popping specific stashes")
+INSERT INTO st.t VALUES (11, 'a');
+SELECT dolt_stash('push', 's');
+INSERT INTO st.t VALUES (12, 'b');
+SELECT dolt_stash('push', 's');
+INSERT INTO st.t VALUES (13, 'c');
+SELECT dolt_stash('push', 's');
+INSERT INTO st.t VALUES (14, 'd');
+SELECT dolt_stash('push', 's');
+SELECT dolt_stash('pop', 's', 'stash@{3}');
+SELECT dolt_stash('pop', 's', 'stash@{1}');
+SELECT * FROM st.t WHERE pk > 10 ORDER BY pk;
+SELECT stash_id FROM dolt_stashes;
+SELECT dolt_stash('clear', 's');
+SELECT dolt_reset('--hard');
+
+-- popped over uncommitted changes to more than rows, each merged rather
+-- than refused as a local change it would stomp
+CREATE SEQUENCE st.q;
+CREATE TABLE st.d (id int PRIMARY KEY);
+CREATE TABLE st.a (id int PRIMARY KEY);
+CREATE TABLE st.m (id int PRIMARY KEY);
+CREATE MATERIALIZED VIEW st.mv AS SELECT coalesce(sum(id), 0) AS c FROM st.m;
+SELECT length(dolt_commit('-Am', 'more kinds')::text) AS committed;
+-- a sequence both advanced: the larger value
+SELECT nextval('st.q'), nextval('st.q'), nextval('st.q');
+SELECT dolt_stash('push', 's');
+SELECT nextval('st.q');
+SELECT dolt_stash('pop', 's');
+SELECT last_value FROM st.q;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+-- a materialized view both refreshed: refreshed from the merged rows
+INSERT INTO st.m VALUES (1);
+REFRESH MATERIALIZED VIEW st.mv;
+SELECT dolt_stash('push', 's');
+INSERT INTO st.m VALUES (10);
+REFRESH MATERIALIZED VIEW st.mv;
+SELECT dolt_stash('pop', 's');
+SELECT c FROM st.mv;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+-- a table the working set altered whose rows the stash changes
+INSERT INTO st.a VALUES (1);
+SELECT dolt_stash('push', 's');
+ALTER TABLE st.a ADD COLUMN x int;
+INSERT INTO st.a VALUES (2, 2);
+SELECT dolt_stash('pop', 's');
+SELECT * FROM st.a ORDER BY id;
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+-- a table the working set dropped whose rows the stash changes: refused,
+-- the stash kept
+INSERT INTO st.d VALUES (1);
+SELECT dolt_stash('push', 's');
+DROP TABLE st.d;
+SELECT dolt_stash('pop', 's');
+SELECT count(*) AS stashes FROM dolt_stashes;
+SELECT dolt_reset('--hard');
+SELECT dolt_stash('pop', 's');
+SELECT * FROM st.d;
+DROP MATERIALIZED VIEW st.mv;
+DROP TABLE st.m, st.a, st.d;
+DROP SEQUENCE st.q;
+SELECT length(dolt_commit('-Am', 'fewer kinds')::text) AS committed;
 
 -- popped onto a head whose change conflicts: refused, kept
 INSERT INTO st.t VALUES (8, 'i');

@@ -370,6 +370,28 @@ SELECT dolt_branch('-D', 'dw_theirs');
 DROP SCHEMA dw CASCADE;
 SELECT length(dolt_commit('-Am', 'dw dropped')::text) AS committed;
 
+-- Violations kept by one transaction keep any later one that writes the
+-- branch from committing, as Dolt's, whoever found them; one that only
+-- reads still commits.  Fixing the rows takes checking them again in the
+-- same transaction: a fix alone still leaves them recorded.
+SET session_replication_role = replica;	-- (no foreign key checks)
+INSERT INTO cv.child VALUES (90, 97, 'orphan kept');
+RESET session_replication_role;
+SET dolt.allow_commit_conflicts = on;
+SELECT dolt_verify_constraints('cv.child');
+RESET dolt.allow_commit_conflicts;
+SELECT count(*) AS kept FROM dolt_constraint_violations('cv.child');
+SELECT count(*) AS read_only_commits FROM cv.child WHERE id = 90;
+INSERT INTO cv.parent VALUES (50);
+UPDATE cv.child SET pid = 1 WHERE id = 90;
+BEGIN;
+UPDATE cv.child SET pid = 1 WHERE id = 90;
+SELECT dolt_verify_constraints('cv.child');
+COMMIT;
+SELECT count(*) AS left_over FROM dolt_constraint_violations();
+SELECT pid FROM cv.child WHERE id = 90;
+DELETE FROM cv.child WHERE id = 90;
+
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;
 DROP ROLE regress_cv_owner;

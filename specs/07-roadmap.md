@@ -893,7 +893,8 @@ table (taking theirs writes their rows through the executor, as the merge
 does); `dolt_status` shows conflicted tables, unstaged; `dolt_commit` then
 makes the merge commit, with both heads as parents; `dolt_merge('--abort')`
 (a hard reset) ends it. As in Dolt, a transaction can't commit with
-unresolved conflicts unless `dolt.allow_commit_conflicts` is on, so
+unresolved conflicts unless `dolt.allow_commit_conflicts` is on (the one
+that made them, or, since #587, any that writes to their branch), so
 outside a transaction block a merge with conflicts fails and changes
 nothing. To allow that workflow (`BEGIN; dolt_merge; resolve; dolt_commit;
 COMMIT`), a commit may now be made by a transaction that has written: the
