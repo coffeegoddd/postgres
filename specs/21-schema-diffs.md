@@ -247,6 +247,18 @@ one whole, one in part (its warning left out). Of `HistorySystemTableScriptTests
 `UnscopedDiffSystemTableScriptTests`, cases 1–5. Differences follow
 D15–D20; D18 says how rows of other versions are read.
 
+**`dolt_diff`'s own suite** (#589): of the 20
+`DiffTableFunctionScriptTests`, as `dolt_diff(from, to, NULL::t)` (D3),
+12 are ported whole and 4 in part: argument errors as SQLSTATEs, less
+the two naming the table by an expression (a row type isn't one, D3);
+the column-reference case likewise; `WORKING and STAGED` (D1); and
+`renamed table`, less its read by the old name. A range is the two refs
+it names (`a...b` from `dolt_merge_base(a, b)`), and MySQL's procedure
+a PL/pgSQL function. Columns a version lacks, or calls otherwise, read
+as NULL where Dolt refuses them or follows tags (D18, D21). Deferred:
+the computed `--skinny` case (F), `dropped table` (#612: a dropped
+table has no row type to name it by), events (N) and `dolt_ignore` (F).
+
 ## 7. Decisions
 
 Decided by the user 2026-10-19, as recommended:

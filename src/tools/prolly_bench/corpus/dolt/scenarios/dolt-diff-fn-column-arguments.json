@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-column-arguments",
+  "description": "Reviewed Dolt port: dolt_diff: column reference commit arguments are rejected with a clear error",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: dolt_diff: column reference commit arguments are rejected with a clear error"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff",
+    "vc.mergebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE airspaces (id int PRIMARY KEY, name varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO airspaces VALUES (1, 'a')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "init"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "branch-x",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch-x"
+      ]
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "SELECT branch.name, (SELECT count(*) FROM dolt_diff(branch.name, 'branch-x', NULL::airspaces)) FROM dolt_branches branch",
+      "expect": {
+        "rows": [
+          [
+            "branch-x",
+            "0"
+          ],
+          [
+            "main",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff",
+        "vc.mergebase"
+      ],
+      "sql": "SELECT branch.name, (SELECT count(*) FROM dolt_diff(dolt_merge_base(branch.name, 'branch-x'), 'branch-x', NULL::airspaces)) FROM dolt_branches branch",
+      "expect": {
+        "rows": [
+          [
+            "branch-x",
+            "0"
+          ],
+          [
+            "main",
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_diff('main', 'branch-x', NULL::airspaces)",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

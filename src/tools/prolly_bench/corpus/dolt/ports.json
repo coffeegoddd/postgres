@@ -36458,6 +36458,2294 @@
         "No staging area: -A adds nothing. (D1)",
         "dolt_commit_diff_<t> becomes dolt_diff(from, to, NULL::t); from_<col> becomes (from_row).col. (D3, D18)"
       ]
+    },
+    {
+      "id": "dolt-diff-fn-in-clause",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 0,
+      "name": "IN clause with NOT IN correctly returns table names from DOLT_DIFF",
+      "source_sha256": "40b7ce191c53e00372a36c552457387c6f0fec88d51865b8f803598a7b5108f6",
+      "scenario_sha256": "051d140fd467304755f601617e6405eab0f00fd31c4bde11eec50d01e0389fa0",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch1"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "checkout-branch1"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "The dolt_diff system table is the dolt_diff view (D18), its tables named qualified (D15); data_change = 1 is the boolean data_change, HASHOF dolt_hashof. The names asked for, 'filter_table' and 'test_table', are public.filter_table and public.test_table. Preserved rows: test_table, filter_table being uncommitted."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "The dolt_diff system table is the dolt_diff view (D18), its tables named qualified (D15); data_change = 1 is the boolean data_change, HASHOF dolt_hashof. Preserved: no rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "The dolt_diff system table is the dolt_diff view (D18), its tables named qualified (D15); data_change = 1 is the boolean data_change, HASHOF dolt_hashof. Preserved: no rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "The dolt_diff system table is the dolt_diff view; HASHOF becomes dolt_hashof, data_change = 1 the boolean. (D18)",
+        "Tables named qualified. (D15)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-arguments",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 2,
+      "name": "invalid arguments",
+      "source_sha256": "ea4afe3f099ad9fe74c62dfd310da4565a4bb9952c988cc11e174682215edad1",
+      "scenario_sha256": "43ed588a7f12d35ae0cbad954c46360c72a2b972e329556b93b2c961cc9b1079",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff() with no arguments is the function behind the dolt_diff system table (D18), not an error: each commit's changed objects, the versioned schema public and t at commit1, t at commit2 (D15). Counted, its hashes and dates varying."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "No dolt_diff takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "No dolt_diff takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "No dolt_diff takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4) 't' is NULL::t (D3)."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "Three NULLs leave the table argument's polymorphic type unknown: SQLSTATE 42804 (datatype mismatch), Dolt's ErrInvalidArgumentDetails. (D4)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "123 is no table's row type: SQLSTATE 42809 (wrong object type), Dolt's ErrInvalidArgumentDetails. (D4)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "No dolt_diff takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "No dolt_diff takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "No table doesnotexist, so no such row type: SQLSTATE 42704 (undefined object), Dolt's ErrTableNotFound. (D3, D4)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "A commit that doesn't exist: SQLSTATE 42704, Dolt's 'target commit not found'. (D4)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "A branch that doesn't exist: SQLSTATE 42704, Dolt's 'branch not found'. (D4)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "Dolt refuses a non-literal argument; prolly evaluates it, as any function's argument (D15): 'fake-branch' doesn't exist, SQLSTATE 42704. (D4)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "Dolt refuses a non-literal argument; prolly evaluates it, as any function's argument (D15): HASHOF is dolt_hashof, main's head is commit2, so nothing differs."
+        },
+        {
+          "index": 13,
+          "steps": [],
+          "note": "Left out: the table is named by its row type (D3); no text expression, LOWER('T') or another, names one, so there is nothing to evaluate."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "assert-14"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. Without a table no dolt_diff takes them: SQLSTATE 42883, Dolt's ErrInvalidArgumentNumber. (D4)"
+        },
+        {
+          "index": 15,
+          "steps": [
+            "assert-15"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. No dolt_diff takes these arguments: SQLSTATE 42883 (no such function), Dolt's ErrInvalidArgumentNumber/Details. (D4)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "assert-16"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. 123 is no table's row type: SQLSTATE 42809, Dolt's ErrInvalidArgumentDetails. (D4)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "assert-17"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. No table doesnotexist, so no such row type: SQLSTATE 42704, Dolt's ErrTableNotFound. (D3, D4)"
+        },
+        {
+          "index": 18,
+          "steps": [
+            "assert-18"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. A commit that doesn't exist: SQLSTATE 42704, Dolt's 'target commit not found'. (D4)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "assert-19"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. A commit that doesn't exist: SQLSTATE 42704, Dolt's 'target commit not found'. (D4)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "assert-20"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. A commit that doesn't exist: SQLSTATE 42704, Dolt's 'target commit not found'. (D4)"
+        },
+        {
+          "index": 21,
+          "steps": [
+            "assert-21"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. A commit that doesn't exist: SQLSTATE 42704, Dolt's 'target commit not found'. (D4)"
+        },
+        {
+          "index": 22,
+          "steps": [],
+          "note": "Left out: the table is named by its row type (D3); no text expression, LOWER('T') or another, names one, so there is nothing to evaluate."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "Argument errors are SQLSTATEs: a wrong count or type finds no function (42883), NULLs leave the table's type unknown (42804), a table argument that isn't a row type is 42809, a missing ref or table 42704. (D4)",
+        "Arguments are any expressions: Dolt's refusals of non-literal refs become the expressions' results; a table named by an expression has no translation, and is left out. (D15)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-column-arguments",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 3,
+      "name": "dolt_diff: column reference commit arguments are rejected with a clear error",
+      "source_sha256": "d6cc0ca166aa0d7f7dc699817d627b4684fa6da92dc1136e184997c553e2bf42",
+      "scenario_sha256": "15a7afaca1b7ea30d522d3ddaaca22d92a6073cb57ca716594f665e7d1aead03",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch-x"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Dolt refuses a non-literal argument; prolly evaluates it, as any function's argument (D15): each branch's head against branch-x's, the same commit: 0 rows each."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Dolt refuses a non-literal argument; prolly evaluates it, as any function's argument (D15): Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. Each branch's merge base with branch-x is the one commit: 0 rows each."
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Left out: the table is named by its row type (D3); no text expression, LOWER('T') or another, names one, so there is nothing to evaluate."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved count."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "Arguments are any expressions: Dolt's refusals of column references become the expressions' results; a table named by an expression has no translation, and is left out. (D15)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-per-branch",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 4,
+      "name": "dolt_diff: per branch diffs run as one literal statement per branch",
+      "source_sha256": "9142079a7bb74140924661ab4bbdcf379b77e48f2df7558b86af6d513b32236f",
+      "scenario_sha256": "f4a6405ebdf4e4ae6f31993bdaab4823c288eec3649f8c91ffaed78d2f96e268",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "branch-x"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "branch-y"
+          ],
+          "note": "Native branch operation; errors fail the case."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "checkout-x"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "checkout-y"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "widened",
+            "checkout-widened"
+          ],
+          "note": "Native branch creation plus checkout for -b; adapter verifies active branch after checkout."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "setup-16"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 17,
+          "steps": [
+            "setup-17"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 19,
+          "steps": [
+            "checkout-main-again"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 20,
+          "steps": [
+            "setup-20"
+          ],
+          "note": "MySQL's procedure, its cursor loop, handler and PREPARE/EXECUTE, becomes a PL/pgSQL function doing the same (D10): for each other branch a dynamic statement with the refs as literals, its counts in the temporary table warning_counts, returned as the procedure's last SELECT returns them. b...base and base...b become dolt_merge_base(b, base) to base and dolt_merge_base(base, b) to b, as Dolt reads three-dot ranges; COALESCE(to_id, from_id) is COALESCE((to_row).id, (from_row).id) (D3)."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "CALL becomes SELECT from the function. Preserved rows: widened's added column isn't in the table as defined now (main's), read by name (D18), and its row 2 changed, as branch-x's did."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved rows: the temporary table the function filled."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "The MySQL procedure becomes a PL/pgSQL function returning its rows. (D10)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-basic",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 5,
+      "name": "basic case",
+      "source_sha256": "eb2f1c29a89cb306f885038588030766847b7010b2b0678bee4fade16559e7cd",
+      "scenario_sha256": "dc46d6322d72de27b79871004bcc64be9bc663b3acf3c44db33df3e6b71b6dad",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "setup-5"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "setup-13"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved count."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). 'T2' names t2 as the unquoted NULL::T2 does, folded to lower case. Preserved: no rows."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows. Dolt's ExpectedIndexes checks its plan's index lookup; prolly's function rows are checked alone."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows. Dolt's ExpectedIndexes checks its plan's index lookup; prolly's function rows are checked alone."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). 'T' is the unquoted NULL::T. Preserved rows."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows. Dolt's ExpectedIndexes checks its plan's index lookup; prolly's function rows are checked alone."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "assert-10"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows. Dolt's ExpectedIndexes checks its plan's index lookup; prolly's function rows are checked alone."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "assert-11"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "assert-12"
+          ],
+          "note": "MySQL's INNER JOIN without ON is Postgres's CROSS JOIN (D10). Both calls are named dolt_diff, which Postgres refuses before it reads a column: SQLSTATE 42712 (duplicate alias), where Dolt refuses the ambiguous columns. (D4)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "assert-13"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "A table named by a string, case-insensitively, is the unquoted row type, folded to lower case.",
+        "MySQL's join without ON becomes CROSS JOIN. (D10)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-working-staged",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 6,
+      "name": "WORKING and STAGED",
+      "source_sha256": "16e8d39f729ce539b74679fd990f463b495bfd5f4ffaa07f6957a07410edde55",
+      "scenario_sha256": "2156eb4c8329dd2fc89febbd5e42d30ab448bb29d95a3f4b73e104e74bc18361",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD')."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [],
+          "note": "Left out: Dolt's staging area is still at commit1 here, so STAGED and WORKING differ; prolly has no staging area (STAGED reads as the working set), so the assertion is about the index. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Left out: Dolt's staging area is still at commit1 here, so STAGED and WORKING differ; prolly has no staging area (STAGED reads as the working set), so the assertion is about the index. (D1) (Its range form, 'STAGED..WORKING', is the same pair of refs.)"
+        },
+        {
+          "index": 3,
+          "steps": [],
+          "note": "Left out: Dolt's staging area is still at commit1 here, so STAGED and WORKING differ; prolly has no staging area (STAGED reads as the working set), so the assertion is about the index. (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved: no rows."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. Preserved: no rows."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved: no rows."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by the call's success, its status 0; dolt_add stages nothing (D1). CALL becomes SELECT. (D3)"
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved: no rows. (STAGED reads as the working set, D1.)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: STAGED reads as the working set (D1), which dolt_add left as Dolt's index."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "STAGED reads as the working set (no staging area); assertions that tell the two apart are left out. (D1)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-branch-refs",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 7,
+      "name": "diff with branch refs",
+      "source_sha256": "01755ddc65f024512ca2cba5fb5530367e284d9d2d668a18ccf005bb8b7f8e9c",
+      "scenario_sha256": "caf2078bbf939c49beb1e7a9ff612fe98909bf41e23fda429df9ca25424fcf7d",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "branch1",
+            "checkout-branch1"
+          ],
+          "note": "Native branch creation plus checkout for -b; adapter verifies active branch after checkout."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "checkout-main"
+          ],
+          "note": "Native checkout; the adapter verifies the active branch."
+        },
+        {
+          "index": 18,
+          "steps": [
+            "setup-18"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 19,
+          "steps": [
+            "commit6"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 20,
+          "steps": [
+            "commit6"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "assert-9"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a...b' is dolt_merge_base(a, b) and b, as Dolt reads it. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows; branch1's versions, without c2, read it as NULL (D18), as Dolt's to side has none."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "Rows are read as the table is defined now, by column name: a column renamed or dropped and added again reads as NULL in versions without it. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-column-recreate",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 8,
+      "name": "schema modification: drop and recreate column with same type",
+      "source_sha256": "a902d568f844a8ea991968ac09d98fe5232a24efa7297293779382974fd55c98",
+      "scenario_sha256": "a23fcb18d7c49f018f72ee9752c36d7f1476f4ff84131aa10f14c65dd5c5bfcd",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "setup-12"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: commit3's version, without c2, reads it as NULL (D18)."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Dolt's to side has no c2 at commit3, so it refuses the column (ErrColumnNotFound); prolly's rows are the table's row type now, which has c2, read as NULL in commit3's version (D18): a NULL per row."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: row 2 reads c2 as NULL on both sides, unchanged, as Dolt's is."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Dolt's from side has no c2 at commit3, so it refuses the column (ErrColumnNotFound); prolly's rows are the table's row type now (D18): commit3's c2 reads as NULL, and row 3's from row is NULL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "Rows are read as the table is defined now, by column name: a column renamed or dropped and added again reads as NULL in versions without it. (D18)",
+        "The rows are the table's row type now, so a column a version lacks is NULL there, not refused. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-column-renames",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 9,
+      "name": "schema modification: rename columns",
+      "source_sha256": "e299d5aa91cb8e51c63c8f3d3a659cb9789af3548c6cf88fbbb3384973735a3b",
+      "scenario_sha256": "961b60f375074f9da83e665a94bb67a5bc3d17a0341f430f8ee7bdca59036ab8",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "setup-15"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Dolt's to side calls the column c3 at commit3, so it refuses c2 (ErrColumnNotFound); prolly's rows are the table's row type now, which has c2 (D18), and the rename changed no row: the two versions' rows are the same, so none differ, and no rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). The table's column is c2 now, so to_c3 is read as (to_row).c2 (D18). Preserved: no rows, the rename having changed no row."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). The column is c2 now, so to_c3 and from_c3 are read as c2 (D18), which commit3's and commit4's versions, where it was c3, read as NULL: row 1's change of c3 doesn't show, and row 3's value is NULL. Dolt follows the tag and has row 1 modified and row 3's -3."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Dolt's from side calls the column c3 at commit4, so it refuses c2 (ErrColumnNotFound); prolly's rows are the table's row type now (D18): commit4's c3 reads as c2, NULL, and row 4's from row is NULL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "assert-5"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). No column c3 in the table's row type now: SQLSTATE 42703 (undefined column), as Dolt refuses it at commit5 (ErrColumnNotFound). (D4)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "assert-6"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_c3 is read as (from_row).c2 (D18), NULL in commit4's version, where the column was c3: rows 1 to 3 show modified besides row 4 added, which Dolt's has alone."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "assert-7"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "Rows are read as the table is defined now, by column name: a column renamed or dropped and added again reads as NULL in versions without it. (D18)",
+        "The rows are the table's row type now: a column a version calls otherwise reads as NULL there, not refused, and a name the table no longer has is 42703. (D4, D18)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-column-retype",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 10,
+      "name": "schema modification: drop and rename columns with different types",
+      "source_sha256": "33da2490eb9acc0ae44b29e45c1c3bc2cc9c745d9b2082ff40456bb50334c3a8",
+      "scenario_sha256": "3764d7c7fba4b9231bb639b86c305f001be8a0bcb9527d7a4b40a128f60a59eb",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit1"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "commit3"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 9,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "setup-11"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 12,
+          "steps": [
+            "commit4"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 13,
+          "steps": [
+            "commit4"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        },
+        {
+          "index": 14,
+          "steps": [
+            "setup-14"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 15,
+          "steps": [
+            "setup-15"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 16,
+          "steps": [
+            "commit5"
+          ],
+          "note": "MySQL's @CommitN is the id the commit step returns, captured. (D7)"
+        },
+        {
+          "index": 17,
+          "steps": [
+            "commit5"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing) and captures the returned id. (D1, D7)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). c2 is an integer now, and commit2's varchar values are read as it: '2' converts to 2 (D18) and 'asdf' doesn't, so it reads as NULL, with a warning (D21); Dolt shows the old varchar values."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). c2 read as an integer now: row 2's '2' is 2 (D18); row 1's 'asdf' doesn't convert, so it reads as NULL on both sides and the row isn't modified (D21), where Dolt has both rows modified."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "assert-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT; dolt_commit_hash_out's id is captured by the commit step, standing for MySQL's @CommitN variables. (D3, D7)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "Rows are read as the table is defined now, by column name: a column renamed or dropped and added again reads as NULL in versions without it. (D18)",
+        "An old value is read as the column's type now: one that converts is converted (D18), one that doesn't is NULL, and a row whose only difference was such a value isn't modified. (D21)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-new-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 11,
+      "name": "new table",
+      "source_sha256": "f4a3140284e645d6dba460796ce5164b2e8289381c711720427ae4aac9891ff0",
+      "scenario_sha256": "d18211a8b7feb3b4cf6358bda7cca9fd3af75555e83235a6d8c249645aeeba43",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "initial",
+            "setup-0"
+          ],
+          "note": "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD'). Then preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Preserved rows."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Preserved rows."
+        }
+      ],
+      "adaptations": [
+        "Prolly's database starts with no commits, Dolt's with its initial ones: an empty commit stands for them, and its id for HashOf('HEAD').",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "Dolt's from_commit and to_commit, the refs given, aren't in prolly's rows (D3): left out of the selects."
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-renamed-table",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 13,
+      "name": "renamed table",
+      "source_sha256": "c2f3234e7c759f20e21b2cb6840fbb9151d5c4c0e843f07ccb0e8640ca415d09",
+      "scenario_sha256": "9f73f0b506b7fe0a3dba359e84197ee83718d654503829880081b115040da188",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit2"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17): t2's rows, both added."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17): t2's rows, both added."
+        },
+        {
+          "index": 2,
+          "steps": [],
+          "note": "Left out: the table is named by its row type (D3), and t1 doesn't exist now, so its rows can't be asked for (#612)."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "Dolt's from_commit and to_commit, the refs given, aren't in prolly's rows (D3): left out of the selects.",
+        "A rename is matched by content: renamed and changed in one commit is a drop and an add. (D17)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-key-renames",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 14,
+      "name": "Renaming a primary key column shows PK values in both the to and from columns",
+      "source_sha256": "f6ed3213657f593c01b0bd91869e28cd3490e602f686808185ec07861707d377",
+      "scenario_sha256": "5890bb308b408d5c06fdc442436b4136d4eba742746719a091cc08ff67d6d250",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "setup-1"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "setup-3"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 4,
+          "steps": [
+            "commit1"
+          ],
+          "note": "No staging area: dolt_add stages nothing; the commit that follows takes the whole working set. (D1)"
+        },
+        {
+          "index": 5,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 6,
+          "steps": [
+            "setup-6"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 7,
+          "steps": [
+            "setup-7"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 8,
+          "steps": [
+            "setup-8"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 9,
+          "steps": [
+            "setup-9"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 10,
+          "steps": [
+            "setup-10"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 11,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
+        "Rows are read as the table is defined now, by column name: a key column renamed reads as NULL in versions before the rename, so its row there is another row. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-view",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 16,
+      "name": "diff table function works with views",
+      "source_sha256": "8d030009eb37ed47d7590c0fef8dcff1a18ae5898ca063bb4c8f3222badc19ab",
+      "scenario_sha256": "e5a0ffb0118989e279dd57ee795e525d839b8722807891ddb8db2481d798f139",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 3,
+          "steps": [
+            "commit2"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 4,
+          "steps": [
+            "setup-4"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). The view's to_commit and from_commit, Dolt's echo of the refs, aren't in prolly's rows (D3): the view has to_i, from_i and diff_type."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved rows, without the commit columns (D3): the view reads HEAD and HEAD~1 when it's read."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "Preserved SQL; Dolt's OkResult(3) is the tag INSERT 0 3."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "commit3"
+          ],
+          "note": "Upstream SkipResultsCheck replaced by the commit's success; it commits the whole working set. (D1)"
+        },
+        {
+          "index": 3,
+          "steps": [
+            "assert-3"
+          ],
+          "note": "Preserved rows, without the commit columns (D3): the view's refs are read again, at the new HEAD."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "Dolt's from_commit and to_commit, the refs given, aren't in prolly's rows (D3): left out of the selects."
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-virtual-generated",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 17,
+      "name": "diff table function works with virtual generated columns",
+      "source_sha256": "a7a2d1e8af02eb2cd3bab1b1cae1ab766ceff64382371e562b6c5474c90e825e",
+      "scenario_sha256": "13d3619e774977c78ac4156431b8b2e1ff66a53932bf14a52b591920f4ecc2ae",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL. A generated column is virtual unless STORED, in Postgres as in MySQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows: a virtual column isn't stored, so a diff's row has none, NULL as in Dolt."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: a virtual column isn't stored, so a diff's row has none, NULL as in Dolt."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)"
+      ]
+    },
+    {
+      "id": "dolt-diff-fn-stored-generated",
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 18,
+      "name": "diff table function works with stored generated columns",
+      "source_sha256": "f9ce8dcbb62a91e9745483c87cba9f32dbf9699fd7bb7fafd5d623bdfd2d6bf1",
+      "scenario_sha256": "657601c7c10f72f4414028dd720b27ad591755225dcb448a9defa204e22d135b",
+      "setup": [
+        {
+          "index": 0,
+          "steps": [
+            "setup-0"
+          ],
+          "note": "Preserved SQL."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "commit1"
+          ],
+          "note": "Commits the whole working set (-am/-Am stage nothing). (D1)"
+        },
+        {
+          "index": 2,
+          "steps": [
+            "setup-2"
+          ],
+          "note": "Preserved SQL."
+        }
+      ],
+      "assertions": [
+        {
+          "index": 0,
+          "steps": [
+            "assert-0"
+          ],
+          "note": "Preserved rows."
+        },
+        {
+          "index": 1,
+          "steps": [
+            "assert-1"
+          ],
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows: the stored value."
+        },
+        {
+          "index": 2,
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: the stored value."
+        }
+      ],
+      "adaptations": [
+        "CALL becomes SELECT or the commit operation. (D3)",
+        "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
+        "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
+        "dolt_diff_<t> becomes dolt_diff_table(NULL::t); to_<col> and from_<col> become (to_row).col and (from_row).col. (D18)"
+      ]
     }
   ],
   "deferred": [
@@ -37092,6 +39380,38 @@
       "name": "detached head",
       "source_sha256": "90ebcbbe5bf3aca7dd26058e227a3d087271a726d8f2929e8741bcfb89c53641",
       "reason": "It reads a tag's commit as a detached head (CALL dolt_tag, USE mydb/v1), and prolly has no tags (F tags); a connection to a commit's hidden branch is refused (D11)."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 1,
+      "name": "dolt_diff: SELECT * skinny schema visibility",
+      "source_sha256": "ba09c5708d4e30c7f4ebf082d26a72910541529498642aa9694dc2db9f0db62e",
+      "reason": "Its assertions are computed (built by a function and assertDoltDiffColumnCount), not literals the catalog can pin; and each reads dolt_diff's --skinny and --include-cols options, which prolly's dolt_diff, returning the table's whole row type (D3), has no counterpart for."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 12,
+      "name": "dropped table",
+      "source_sha256": "95d9d4d4c41c2527bac67429a378ceeb2bc5e419395b2313402d9ee7df602332",
+      "reason": "Prolly behavior to fix (#612): the table is named by its row type (D3), and a dropped table has none, so dolt_diff can't be asked for its rows, which Dolt shows removed."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 15,
+      "name": "diff on dolt_schemas on events",
+      "source_sha256": "b655116817cb787215adc63f969b2e20a283817ab079ca4393c4870bbd053ad9",
+      "reason": "Not applicable (D10): MySQL events (CREATE EVENT) and their rows in dolt_schemas; Postgres has no events."
+    },
+    {
+      "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+      "suite": "DiffTableFunctionScriptTests",
+      "index": 19,
+      "name": "dolt_diff commit-to-commit shows tables added to dolt_ignore after the commit",
+      "source_sha256": "040b875f1dac5163b149a6221e6549d75b3055ac66f15e453e40fd5abeaf835a",
+      "reason": "Needs dolt_ignore, which prolly lacks (F dolt-ignore)."
     }
   ]
 }

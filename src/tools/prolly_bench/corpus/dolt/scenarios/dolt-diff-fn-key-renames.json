@@ -1,0 +1,240 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-key-renames",
+  "description": "Reviewed Dolt port: Renaming a primary key column shows PK values in both the to and from columns",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: Renaming a primary key column shows PK values in both the to and from columns"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t1 (pk int PRIMARY KEY, col1 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t1 VALUES (1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t2 (pk1a int, pk1b int, col1 int, PRIMARY KEY (pk1a, pk1b))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (1, 1, 1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t1 RENAME COLUMN pk TO pk2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t1 SET col1 = 100",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t2 RENAME COLUMN pk1a TO pk2a",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t2 RENAME COLUMN pk1b TO pk2b",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t2 SET col1 = 100",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "edit"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk2, (to_row).col1, (from_row).pk2, (from_row).col1, diff_type FROM dolt_diff('HEAD~', 'HEAD', NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "100",
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            "1",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk2, (to_row).col1, (from_row).pk2, (from_row).col1, diff_type FROM dolt_diff('HEAD~', 'HEAD', NULL::t1)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "100",
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            "1",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk2a, (to_row).pk2b, (to_row).col1, (from_row).pk2a, (from_row).pk2b, (from_row).col1, diff_type FROM dolt_diff('HEAD~', 'HEAD', NULL::t2)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1",
+            "100",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            "1",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk2a, (to_row).pk2b, (to_row).col1, (from_row).pk2a, (from_row).pk2b, (from_row).col1, diff_type FROM dolt_diff('HEAD~', 'HEAD', NULL::t2)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "1",
+            "100",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            "1",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

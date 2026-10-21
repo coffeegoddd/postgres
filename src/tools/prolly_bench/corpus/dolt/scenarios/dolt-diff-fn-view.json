@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-view",
+  "description": "Reviewed Dolt port: diff table function works with views",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: diff table function works with views"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (i int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created table"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1), (2), (3)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserted into table"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "CREATE VIEW v AS SELECT (to_row).i AS to_i, (from_row).i AS from_i, diff_type FROM dolt_diff('HEAD', 'HEAD~1', NULL::t)",
+      "expect": {
+        "tag": "CREATE VIEW"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM v",
+      "expect": {
+        "rows": [
+          [
+            null,
+            "1",
+            "removed"
+          ],
+          [
+            null,
+            "2",
+            "removed"
+          ],
+          [
+            null,
+            "3",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (4), (5), (6)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserted into table again"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM v",
+      "expect": {
+        "rows": [
+          [
+            null,
+            "4",
+            "removed"
+          ],
+          [
+            null,
+            "5",
+            "removed"
+          ],
+          [
+            null,
+            "6",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

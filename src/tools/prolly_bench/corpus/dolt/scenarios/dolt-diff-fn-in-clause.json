@@ -1,0 +1,181 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-in-clause",
+  "description": "Reviewed Dolt port: IN clause with NOT IN correctly returns table names from DOLT_DIFF",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: IN clause with NOT IN correctly returns table names from DOLT_DIFF"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test_table (id int PRIMARY KEY, name varchar(50))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test_table VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initial commit"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "branch1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "checkout-branch1",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test_table VALUES (4, 'David'), (5, 'Eve')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Add David and Eve"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "checkout-main",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "main"
+      ]
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test_table VALUES (6, 'Frank')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE test_table SET name = 'Alice Updated' WHERE id = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Update Alice and add Frank"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE filter_table (name varchar(50))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO filter_table VALUES ('Alice Updated'), ('Bob'), ('Charlie'), ('David')",
+      "expect": {
+        "tag": "INSERT 0 4"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name FROM dolt_diff WHERE commit_hash = dolt_hashof('main') AND data_change AND table_name NOT IN (SELECT 'dropped_table') AND table_name IN (SELECT 'public.filter_table' UNION SELECT 'public.test_table')",
+      "expect": {
+        "rows": [
+          [
+            "public.test_table"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name FROM dolt_diff WHERE commit_hash = dolt_hashof('main') AND data_change AND table_name NOT IN (SELECT 'dropped_table') AND table_name IN (SELECT 'other_name' UNION SELECT 'another_name')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.diff"
+      ],
+      "sql": "SELECT table_name FROM dolt_diff WHERE commit_hash = dolt_hashof('main') AND data_change AND table_name IN (SELECT 'other_name' UNION SELECT 'another_name')",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    }
+  ]
+}

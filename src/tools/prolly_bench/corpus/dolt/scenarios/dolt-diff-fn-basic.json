@@ -1,0 +1,642 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-basic",
+  "description": "Reviewed Dolt port: basic case",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: basic case"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "initial",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial",
+        "--allow-empty"
+      ],
+      "save": "initial"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20), c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one', 'two')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into table t"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t2 (pk int PRIMARY KEY, c1 varchar(20), c2 varchar(20))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t2 VALUES (100, 'hundred', 'hundert')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into table t2"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (2, 'two', 'three'), (3, 'three', 'four')",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "setup-14",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET c1 = 'uno', c2 = 'dos' WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into table t"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            "two",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT count(*) FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "uno",
+            "dos",
+            "1",
+            "one",
+            "two",
+            "modified"
+          ],
+          [
+            "2",
+            "two",
+            "three",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "3",
+            "three",
+            "four",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            "two",
+            "1",
+            "uno",
+            "dos",
+            "modified"
+          ],
+          [
+            null,
+            null,
+            null,
+            "2",
+            "two",
+            "three",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "3",
+            "three",
+            "four",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::T2)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "uno",
+            "dos",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "2",
+            "two",
+            "three",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "3",
+            "three",
+            "four",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t) WHERE (to_row).pk = 2",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "two",
+            "three",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t) WHERE (from_row).pk IS NULL",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "uno",
+            "dos",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "2",
+            "two",
+            "three",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "3",
+            "three",
+            "four",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::T)",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            "1",
+            "uno",
+            "dos",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "2",
+            "two",
+            "three",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "3",
+            "three",
+            "four",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-9",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::T) WHERE (from_row).pk = 2",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            "2",
+            "two",
+            "three",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-10",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::T) WHERE (to_row).pk IS NULL",
+      "expect": {
+        "rows": [
+          [
+            null,
+            null,
+            null,
+            "1",
+            "uno",
+            "dos",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "2",
+            "two",
+            "three",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "3",
+            "three",
+            "four",
+            "removed"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit1"
+        }
+      ]
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t) INNER JOIN t ON (to_row).pk = t.pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            "two",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (from_row).c1, (to_row).c1, (from_row).c1, (to_row).c1, diff_type, diff_type FROM dolt_diff($1, $2, NULL::t) CROSS JOIN dolt_diff($1, $3, NULL::t)",
+      "expect": {
+        "sqlstate": "42712"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (a.to_row).pk, (a.from_row).c1, (a.to_row).c1, (b.from_row).c1, (b.to_row).c1, a.diff_type, b.diff_type FROM dolt_diff($1, $2, NULL::t) a INNER JOIN dolt_diff($1, $3, NULL::t) b ON (a.to_row).pk = (b.to_row).pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            null,
+            "one",
+            null,
+            "one",
+            "added",
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    }
+  ]
+}

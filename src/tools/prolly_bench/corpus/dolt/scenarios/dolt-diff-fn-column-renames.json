@@ -1,0 +1,412 @@
+{
+  "version": 1,
+  "id": "dolt-diff-fn-column-renames",
+  "description": "Reviewed Dolt port: schema modification: rename columns",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_diff.go",
+    "case": "DiffTableFunctionScriptTests: schema modification: rename columns"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.diff"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(20), c2 int)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "commit1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t"
+      ],
+      "save": "commit1"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'one', -1), (2, 'two', -2)",
+      "expect": {
+        "tag": "INSERT 0 2"
+      }
+    },
+    {
+      "id": "commit2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting into t"
+      ],
+      "save": "commit2"
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t RENAME COLUMN c2 TO c3",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "commit3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renaming column c2 to c3"
+      ],
+      "save": "commit3"
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (3, 'three', -3)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET c3 = 1 WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "commit4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting and updating data"
+      ],
+      "save": "commit4"
+    },
+    {
+      "id": "setup-14",
+      "session": "a",
+      "op": "exec",
+      "sql": "ALTER TABLE t RENAME COLUMN c3 TO c2",
+      "expect": {
+        "tag": "ALTER TABLE"
+      }
+    },
+    {
+      "id": "setup-15",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (4, 'four', -4)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "commit5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "renaming column c3 to c2, and inserting data"
+      ],
+      "save": "commit5"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            "-1",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "2",
+            "two",
+            "-2",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit2"
+        }
+      ]
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).c2 FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit2"
+        },
+        {
+          "ref": "commit3"
+        }
+      ]
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "3",
+            "three",
+            null,
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit3"
+        },
+        {
+          "ref": "commit4"
+        }
+      ]
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (from_row).c2 FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            null
+          ],
+          [
+            null
+          ],
+          [
+            null
+          ],
+          [
+            null
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit5"
+        }
+      ]
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).c3 FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "sqlstate": "42703"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit5"
+        }
+      ]
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            "1",
+            "1",
+            "one",
+            null,
+            "modified"
+          ],
+          [
+            "2",
+            "two",
+            "-2",
+            "2",
+            "two",
+            null,
+            "modified"
+          ],
+          [
+            "3",
+            "three",
+            "-3",
+            "3",
+            "three",
+            null,
+            "modified"
+          ],
+          [
+            "4",
+            "four",
+            "-4",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit4"
+        },
+        {
+          "ref": "commit5"
+        }
+      ]
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.diff"
+      ],
+      "sql": "SELECT (to_row).pk, (to_row).c1, (to_row).c2, (from_row).pk, (from_row).c1, (from_row).c2, diff_type FROM dolt_diff($1, $2, NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "one",
+            "1",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "2",
+            "two",
+            "-2",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "3",
+            "three",
+            "-3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "4",
+            "four",
+            "-4",
+            null,
+            null,
+            null,
+            "added"
+          ]
+        ],
+        "order": "bag"
+      },
+      "params": [
+        {
+          "ref": "commit1"
+        },
+        {
+          "ref": "commit5"
+        }
+      ]
+    }
+  ]
+}
