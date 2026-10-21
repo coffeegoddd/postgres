@@ -117,6 +117,24 @@ func TestValidate(t *testing.T) {
 			t.Errorf("%s accepted", bad)
 		}
 	}
+	// (setups the engines can't build: each would fail at step 0 as a
+	// divergence, not as a history out of range)
+	withC := History{Version: 1, Sessions: 1, Setup: State{"t": {1: {0, 0, 2}}, Columns: {1: {1}}}}
+	if err := withC.Validate(); err != nil {
+		t.Fatalf("a table with c: %v", err)
+	}
+	for _, bad := range []State{
+		{"t": {1: {0, 0, 2}}},
+		{Columns: {1: {2}}},
+		{Columns: {1: {1, 1}}},
+		{Keyless: {1: {1, 2}}},
+		{Keyless: {1: {1, 0, 3}}},
+	} {
+		h := History{Version: 1, Sessions: 1, Setup: bad}
+		if err := h.Validate(); err == nil {
+			t.Errorf("setup %v accepted", bad)
+		}
+	}
 }
 
 // A merge result of another shape is an outcome no model predicts, not a

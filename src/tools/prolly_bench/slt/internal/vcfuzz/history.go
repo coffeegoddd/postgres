@@ -285,6 +285,17 @@ func (h *History) Validate() error {
 			if id < 1 || id > last || (t == Keyless || t == Columns) && r[0] < 1 {
 				return fmt.Errorf("setup row %d of %s out of range", id, t)
 			}
+			// (what the engines can build: a table's column c only as
+			// Columns' {1}, a keyless content's copies alone, and c's
+			// value only in a table that has c)
+			switch {
+			case t == Columns && r != Row{1}:
+				return fmt.Errorf("setup row %d of %s isn't {1}", id, t)
+			case t == Keyless && (r[1] != 0 || r[2] != 0):
+				return fmt.Errorf("setup row %d of %s holds more than a count of copies", id, t)
+			case t != Keyless && t != Columns && r[2] != 0 && !h.Setup.HasC(t):
+				return fmt.Errorf("setup row %d of %s sets c, which %s doesn't have", id, t, t)
+			}
 		}
 	}
 	for i, op := range h.Ops {
