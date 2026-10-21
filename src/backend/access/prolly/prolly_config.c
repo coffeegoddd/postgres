@@ -221,6 +221,19 @@ prolly_make_change_log(Oid relid, LOCKMODE lockmode)
 	table_close(rel, NoLock);
 }
 
+/*
+ * Before the session's branch changes: entries the transaction holds for
+ * the change logs are written to its branch's.
+ */
+void
+prolly_change_logs_flush(void)
+{
+	const ProllyChangeLogRoutine *log = change_log();
+
+	if (log != NULL && log->flush != NULL)
+		log->flush();
+}
+
 void
 prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 				   HeapTuple oldtup, const ItemPointerData *newtid)

@@ -101,6 +101,7 @@ extern const ProllyChangeFinderRoutine *prolly_change_finder(void);
  * each tuple version a write to one made or replaced.
  */
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
+extern void prolly_change_logs_flush(void);
 extern void prolly_note_change(Relation rel, const ItemPointerData *oldtid,
 							   HeapTuple oldtup, const ItemPointerData *newtid);
 /* ... or of the versions a write made, in hand (prolly_changelog.h) */

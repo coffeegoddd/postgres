@@ -9,16 +9,12 @@ RESET client_min_messages;
 CREATE SCHEMA cl VERSIONED;
 CREATE TABLE cl.keyed (id int PRIMARY KEY, v text);
 CREATE TABLE cl.keyless (a int, b text);
--- entries(t): the deltas of the entries of t's log this transaction sees,
--- and how many say to read the table in full.
+-- entries(t): the entries of t's log this transaction sees, their deltas,
+-- and whether one says to read the table in full.
 CREATE FUNCTION pg_temp.entries(t regclass, OUT n int8, OUT deltas int8[],
-	OUT full_reads int8) AS $$
-BEGIN
-	EXECUTE format('SELECT count(*), coalesce(array_agg(delta ORDER BY delta), ''{}''),
-		count(*) FILTER (WHERE image IS NULL) FROM pg_toast.%I',
-		'pg_prolly_log_' || t::oid)
-	INTO n, deltas, full_reads;
-END $$ LANGUAGE plpgsql;
+	OUT full_read bool) AS $$
+	SELECT * FROM test_log_entries(t)
+$$ LANGUAGE sql;
 -- The log is a TOAST-kind relation of the table's access method, part
 -- of its table.
 SELECT c.relkind, a.amname, d.deptype, d.refobjid = 'cl.keyed'::regclass AS of_table
@@ -33,32 +29,32 @@ WHERE c.relname = 'pg_prolly_log_' || 'cl.keyed'::regclass::oid;
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 -- With a key: each key changed, once for an update that keeps the key.
 INSERT INTO cl.keyed VALUES (1, 'a'), (2, 'b'), (3, 'c');
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas  | full_reads 
----+---------+------------
- 3 | {0,0,0} |          0
+ n | deltas  | full_read 
+---+---------+-----------
+ 3 | {0,0,0} | f
 (1 row)
 
 UPDATE cl.keyed SET v = 'bb' WHERE id = 2;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n |  deltas   | full_reads 
----+-----------+------------
- 4 | {0,0,0,0} |          0
+ n |  deltas   | full_read 
+---+-----------+-----------
+ 4 | {0,0,0,0} | f
 (1 row)
 
 UPDATE cl.keyed SET id = 30 WHERE id = 3;
 DELETE FROM cl.keyed WHERE id = 1;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n |     deltas      | full_reads 
----+-----------------+------------
- 7 | {0,0,0,0,0,0,0} |          0
+ n |     deltas      | full_read 
+---+-----------------+-----------
+ 7 | {0,0,0,0,0,0,0} | f
 (1 row)
 
 -- Without one: each version made and replaced.
@@ -66,9 +62,9 @@ INSERT INTO cl.keyless VALUES (1, 'x'), (1, 'x'), (2, 'y');
 UPDATE cl.keyless SET b = 'z' WHERE a = 2;
 DELETE FROM cl.keyless WHERE a = 1;
 SELECT * FROM pg_temp.entries('cl.keyless');
- n |       deltas       | full_reads 
----+--------------------+------------
- 7 | {-1,-1,-1,1,1,1,1} |          0
+ n |    deltas     | full_read 
+---+---------------+-----------
+ 5 | {-2,-1,1,1,2} | f
 (1 row)
 
 -- A commit's fold consumes them.
@@ -79,15 +75,15 @@ SELECT length(dolt_commit('-Am', 'tables')::text) AS committed;
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyless');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 -- An entry is the write's: rolled back with it, a savepoint's too.
@@ -96,23 +92,23 @@ INSERT INTO cl.keyed VALUES (4, 'd');
 SAVEPOINT s;
 INSERT INTO cl.keyed VALUES (5, 'e');
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 2 | {0,0}  |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 2 | {0,0}  | f
 (1 row)
 
 ROLLBACK TO s;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
 (1 row)
 
 ROLLBACK;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 -- A commit rolled back leaves the entries it consumed.
@@ -125,16 +121,16 @@ SELECT length(dolt_commit('-am', 'gone')::text) AS committed;
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 ROLLBACK;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
 (1 row)
 
 SELECT length(dolt_commit('-am', 'six')::text) AS committed;
@@ -155,9 +151,9 @@ SELECT length(dolt_commit('-am', 'seven')::text) AS committed;
 INSERT INTO cl.keyed VALUES (8, 'h');
 COMMIT;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
 (1 row)
 
 SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
@@ -171,9 +167,9 @@ SELECT length(dolt_commit('-am', 'eight')::text) AS committed;
 INSERT INTO cl.keyless
 SELECT 3, string_agg(md5(g::text), '') FROM generate_series(1, 300) g;
 SELECT * FROM pg_temp.entries('cl.keyless');
- n | deltas | full_reads 
----+--------+------------
- 1 | {1}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {1}    | f
 (1 row)
 
 -- A truncation changes rows no entry names, made anew or (storage the
@@ -183,18 +179,18 @@ TRUNCATE cl.keyed;
 INSERT INTO cl.keyed VALUES (9, 'i');
 TRUNCATE cl.keyed;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas  | full_reads 
----+---------+------------
- 3 | {0,0,0} |          2
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | t
 (1 row)
 
 ROLLBACK;
 BEGIN;
 ALTER TABLE cl.keyed ALTER COLUMN v TYPE varchar(10);
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          1
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | t
 (1 row)
 
 ROLLBACK;
@@ -222,16 +218,16 @@ SELECT dolt_checkout('cl_other');
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 INSERT INTO cl.keyed VALUES (11, 'k');
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
 (1 row)
 
 SELECT dolt_checkout('main');
@@ -241,16 +237,16 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 INSERT INTO cl.keyed VALUES (12, 'l');
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
 (1 row)
 
 -- A move writes rows on the session's behalf: they are entries too, and
@@ -262,9 +258,9 @@ SELECT dolt_reset('--hard');
 (1 row)
 
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 SELECT count(*) AS reset_away FROM cl.keyed WHERE id = 10;
@@ -279,9 +275,9 @@ CREATE TABLE cl.wide (a text, b text, PRIMARY KEY (a, b));
 ALTER TABLE cl.wide ALTER a SET STORAGE EXTERNAL;
 INSERT INTO cl.wide VALUES (repeat('a', 2500), 'b');
 SELECT * FROM pg_temp.entries('cl.wide');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
 (1 row)
 
 -- INSERT ... ON CONFLICT, and COPY's many rows at a time: an entry for
@@ -296,16 +292,16 @@ INSERT INTO cl.keyed VALUES (13, 'm'), (12, 'conflict')
 	ON CONFLICT (id) DO UPDATE SET v = excluded.v;
 INSERT INTO cl.keyed VALUES (13, 'n') ON CONFLICT DO NOTHING;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 2 | {0,0}  |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 2 | {0,0}  | f
 (1 row)
 
 COPY cl.keyless FROM STDIN;
 SELECT * FROM pg_temp.entries('cl.keyless');
- n | deltas  | full_reads 
----+---------+------------
- 3 | {1,1,1} |          0
+ n | deltas  | full_read 
+---+---------+-----------
+ 3 | {1,1,1} | f
 (1 row)
 
 SELECT length(dolt_commit('-am', 'conflict and copy')::text) AS committed;
@@ -319,16 +315,16 @@ SELECT length(dolt_commit('-am', 'conflict and copy')::text) AS committed;
 -- them all: read in full.
 CLUSTER cl.keyed USING keyed_pkey;
 SELECT * FROM pg_temp.entries('cl.keyed');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 VACUUM FULL cl.keyless;
 SELECT * FROM pg_temp.entries('cl.keyless');
- n | deltas | full_reads 
----+--------+------------
- 0 | {}     |          0
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | f
 (1 row)
 
 CREATE MATERIALIZED VIEW cl.mv AS SELECT id FROM cl.keyed;
@@ -340,9 +336,9 @@ SELECT length(dolt_commit('-Am', 'mv')::text) AS committed;
 
 REFRESH MATERIALIZED VIEW cl.mv;
 SELECT * FROM pg_temp.entries('cl.mv');
- n | deltas | full_reads 
----+--------+------------
- 1 | {0}    |          1
+ n | deltas | full_read 
+---+--------+-----------
+ 0 | {}     | t
 (1 row)
 
 -- The log takes its table's owner, as a TOAST table does.
@@ -383,6 +379,102 @@ SELECT dolt_branch('-D', 'cl_other');
  dolt_branch 
 -------------
  {0}
+(1 row)
+
+-- A table whose log is of the first format (an entry a row, no index) is
+-- taken as having none: it is written nothing, folds in full, and
+-- prolly_make_change_logs() makes it a log of this format.
+CREATE SCHEMA clf VERSIONED;
+CREATE TABLE clf.t (id int PRIMARY KEY, v text);
+INSERT INTO clf.t SELECT g, 'v' FROM generate_series(1, 10) g;
+SELECT length(dolt_commit('-Am', 'clf')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT test_drop_change_log('clf.t');
+ test_drop_change_log 
+----------------------
+ 
+(1 row)
+
+SELECT test_make_format1_change_log('clf.t');
+ test_make_format1_change_log 
+------------------------------
+ 
+(1 row)
+
+UPDATE clf.t SET v = 'w' WHERE id = 1;
+SELECT 'pg_toast.pg_prolly_log_' || 'clf.t'::regclass::oid AS clf_log \gset
+SELECT count(*) AS format1_rows FROM :clf_log;
+ format1_rows 
+--------------
+            0
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT length(dolt_commit('-am', 'clf w')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value AS full_without_log FROM pg_stat_prolly WHERE name = 'fold_full_tables';
+ full_without_log 
+------------------
+                1
+(1 row)
+
+SELECT * FROM prolly_make_change_logs();
+ prolly_make_change_logs 
+-------------------------
+ clf.t
+(1 row)
+
+SELECT attname FROM pg_attribute WHERE attrelid = :'clf_log'::regclass AND attnum > 0 ORDER BY attnum;
+ attname 
+---------
+ xid
+ entries
+(2 rows)
+
+SELECT count(*) AS indexed FROM pg_index WHERE indrelid = :'clf_log'::regclass;
+ indexed 
+---------
+       1
+(1 row)
+
+UPDATE clf.t SET v = 'x' WHERE id = 2;
+SELECT * FROM pg_temp.entries('clf.t');
+ n | deltas | full_read 
+---+--------+-----------
+ 1 | {0}    | f
+(1 row)
+
+DROP SCHEMA clf CASCADE;
+NOTICE:  drop cascades to table clf.t
+SELECT length(dolt_commit('-Am', 'clf gone')::text) AS committed;
+ committed 
+-----------
+        42
 (1 row)
 
 -- An update's or a delete's entry is made from the old version the write
@@ -491,10 +583,12 @@ SELECT length(dolt_commit('-Am', 'cml gone')::text) AS committed;
 (1 row)
 
 -- VACUUM of a table vacuums its change log too, as it does its TOAST
--- table: the entries a fold consumed, dead (each fold walking them till
--- then), are gone, and the log truncated.  A log sets no autovacuum
+-- table: the rows a fold consumed, dead, are gone, and the log truncated.
+-- A fold reads only the rows past its baseline's position, so an empty
+-- commit after a load reads none of the load's.  A log sets no autovacuum
 -- options of its own: it takes its table's, and where the table leaves
--- them unset, is vacuumed soon after entries die (1000 dead, no scale).
+-- them unset, is vacuumed soon after rows die (1000 dead, no scale; a
+-- transaction's entries are a row or a few a page, so a load's are few).
 -- (a database of its own: no other session's snapshot keeps the dead)
 CREATE DATABASE regress_log_vacuum;
 \c regress_log_vacuum
@@ -549,10 +643,10 @@ SELECT pg_stat_force_next_flush();
  
 (1 row)
 
-SELECT value > 50 AS walked_dead FROM pg_stat_prolly WHERE name = 'log_pages_read';
- walked_dead 
--------------
- t
+SELECT value AS log_rows_read FROM pg_stat_prolly WHERE name = 'log_pages_read';
+ log_rows_read 
+---------------
+             0
 (1 row)
 
 -- the dead entries against the log's threshold: its own default (1000),
@@ -560,21 +654,21 @@ SELECT value > 50 AS walked_dead FROM pg_stat_prolly WHERE name = 'log_pages_rea
 SELECT pg_temp.log_vacuum_score() AS default_score;
  default_score 
 ---------------
-            20
+          0.05
 (1 row)
 
 ALTER TABLE clv.vac SET (autovacuum_vacuum_threshold = 40000);
 SELECT pg_temp.log_vacuum_score() AS table_threshold_score;
  table_threshold_score 
 -----------------------
-                   0.5
+                     0
 (1 row)
 
 ALTER TABLE clv.vac RESET (autovacuum_vacuum_threshold);
 SELECT pg_temp.log_vacuum_score() AS reset_score;
  reset_score 
 -------------
-          20
+        0.05
 (1 row)
 
 VACUUM clv.vac;

@@ -627,7 +627,9 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_FULL_SPILLED,	/* full folds whose sort spilled to disk */
 	PGSTAT_PROLLY_FOLD_MERGE_BUILDS,	/* folds that merged many changes with
 										 * the baseline in one pass */
-	PGSTAT_PROLLY_LOG_PAGES_READ,	/* change-log pages walked */
+	PGSTAT_PROLLY_LOG_PAGES_READ,	/* change-log rows read (each a
+									 * transaction's entries, a page at
+									 * most) */
 	PGSTAT_PROLLY_FOLD_VERIFIED,	/* tables the verifier checked */
 	PGSTAT_PROLLY_FOLD_VERIFY_MISMATCHES,	/* and those whose folds differed */
 	PGSTAT_PROLLY_COMMITS,		/* commits written */

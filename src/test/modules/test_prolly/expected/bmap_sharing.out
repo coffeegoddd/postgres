@@ -10,8 +10,8 @@ CREATE TABLE cow.t (a int8, b int8, c int8, d int8);
 INSERT INTO cow.t SELECT g, g, g, g FROM generate_series(1, 20000) g;
 SELECT pg_relation_filenode('cow.t') AS src \gset
 SELECT pg_relation_size('cow.t') / 8192 AS nblocks \gset
--- (and its change log's, its own)
-SELECT pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) / 8192
+-- (and its change log's, its index's too, its own)
+SELECT (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)) / 8192
 	AS tlog \gset
 -- A copy reads the same pages, from the same blocks, each now counted once.
 SELECT test_bmap_share(:src) AS copy \gset

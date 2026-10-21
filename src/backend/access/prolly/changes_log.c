@@ -84,7 +84,7 @@
 
 /* (a first byte no "pages" state has: neither reads the other's) */
 #define STATE_TAG			'L'
-#define STATE_VERSION		2		/* 2: flags */
+#define STATE_VERSION		3		/* 2: flags; 3: full transaction ids */
 
 #define STATE_UNSETTLED		0x01	/* folded by a snapshot older than its
 									 * baseline's fold: fold in full next */
@@ -103,6 +103,10 @@ typedef struct State
 	uint32		nxip;			/* the transactions it saw running, sorted */
 	TransactionId *xip;
 	TransactionId own;			/* the fold's transaction, if it wrote */
+	/* the same, whole: the fold's position in the log */
+	FullTransactionId fxmax;
+	FullTransactionId *fxip;
+	FullTransactionId fown;
 } State;
 
 static ProllyChangeCounters counters;
@@ -185,6 +189,8 @@ get_u64(const uint8 *p)
 	return (uint64) get_u32(p) | ((uint64) get_u32(p + 4) << 32);
 }
 
+static int	xid_cmp(const void *a, const void *b);
+
 static void
 put_state(StringInfo out, const State *st)
 {
@@ -192,14 +198,37 @@ put_state(StringInfo out, const State *st)
 	appendStringInfoChar(out, (char) STATE_VERSION);
 	appendStringInfoChar(out, (char) st->flags);
 	put_u64(out, st->log);
-	put_u32(out, st->xmax);
-	put_u32(out, st->own);
+	put_u64(out, U64FromFullTransactionId(st->fxmax));
+	put_u64(out, U64FromFullTransactionId(st->fown));
 	put_u32(out, st->nxip);
 	for (uint32 i = 0; i < st->nxip; i++)
-		put_u32(out, st->xip[i]);
+		put_u64(out, U64FromFullTransactionId(st->fxip[i]));
 }
 
-#define STATE_FIXED_LEN	(3 + 8 + 4 + 4 + 4)
+/*
+ * A state for the snapshot's fold by this transaction: its xmax, those it
+ * saw running (sorted) and the transaction itself, whole, as of now.
+ */
+static void
+state_of_snapshot(State *st, Snapshot snap)
+{
+	FullTransactionId next = ReadNextFullTransactionId();
+
+	st->fxmax = FullTransactionIdFromAllowableAt(next, snap->xmax);
+	st->xmax = snap->xmax;
+	st->nxip = snap->xcnt;
+	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
+	st->fxip = palloc_array(FullTransactionId, Max(st->nxip, 1));
+	if (st->nxip > 0)
+		memcpy(st->xip, snap->xip, st->nxip * sizeof(TransactionId));
+	qsort(st->xip, st->nxip, sizeof(TransactionId), xid_cmp);
+	for (uint32 i = 0; i < st->nxip; i++)
+		st->fxip[i] = FullTransactionIdFromAllowableAt(next, st->xip[i]);
+	st->fown = GetTopFullTransactionIdIfAny();
+	st->own = XidFromFullTransactionId(st->fown);
+}
+
+#define STATE_FIXED_LEN	(3 + 8 + 8 + 8 + 4)
 
 static bool
 parse_state(const ProllyValue *state, State *st)
@@ -212,15 +241,21 @@ parse_state(const ProllyValue *state, State *st)
 		return false;
 	st->flags = p[2];
 	st->log = get_u64(p + 3);
-	st->xmax = get_u32(p + 11);
-	st->own = get_u32(p + 15);
-	st->nxip = get_u32(p + 19);
-	if ((uint64) state->len != STATE_FIXED_LEN + (uint64) st->nxip * 4)
+	st->fxmax = FullTransactionIdFromU64(get_u64(p + 11));
+	st->fown = FullTransactionIdFromU64(get_u64(p + 19));
+	st->nxip = get_u32(p + 27);
+	st->xmax = XidFromFullTransactionId(st->fxmax);
+	st->own = XidFromFullTransactionId(st->fown);
+	if ((uint64) state->len != STATE_FIXED_LEN + (uint64) st->nxip * 8)
 		return false;
 	p += STATE_FIXED_LEN;
 	st->xip = palloc_array(TransactionId, Max(st->nxip, 1));
-	for (uint32 i = 0; i < st->nxip; i++, p += 4)
-		st->xip[i] = get_u32(p);
+	st->fxip = palloc_array(FullTransactionId, Max(st->nxip, 1));
+	for (uint32 i = 0; i < st->nxip; i++, p += 8)
+	{
+		st->fxip[i] = FullTransactionIdFromU64(get_u64(p));
+		st->xip[i] = XidFromFullTransactionId(st->fxip[i]);
+	}
 	return true;
 }
 
@@ -867,10 +902,12 @@ static bool
 fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 			 const ProllyChangeLogRoutine *log, ProllyNodeRef *data)
 {
+	ProllyLogPosition pos = {st->fxmax, st->fown, st->nxip, st->fxip};
+
 	f->compact = true;
 	if (f->give_up)
 		return false;
-	if (!PROLLY_CALL(log, read, f->rel, f->snap, entry_visit, f))
+	if (!PROLLY_CALL(log, read, f->rel, f->snap, &pos, entry_visit, f))
 	{
 		/* (an entry said to, unless the visit gave up) */
 		if (!f->give_up)
@@ -1066,13 +1103,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 
 		ns.flags = stale ? STATE_UNSETTLED : 0;
 		ns.log = identity;
-		ns.xmax = f.snap->xmax;
-		ns.nxip = f.snap->xcnt;
-		ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
-		if (ns.nxip > 0)
-			memcpy(ns.xip, f.snap->xip, ns.nxip * sizeof(TransactionId));
-		qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
-		ns.own = GetTopTransactionIdIfAny();
+		state_of_snapshot(&ns, f.snap);
 		MemoryContextSwitchTo(old);
 		put_state(next, &ns);
 		MemoryContextSwitchTo(cxt);
@@ -1153,16 +1184,14 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
 		storage_unseen(rel, snap))
 		return false;
-	if (!PROLLY_CALL(c.change_log, consume_own, rel))
-		return false;
+	{
+		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
+
+		if (!PROLLY_CALL(c.change_log, consume_own, rel, &pos))
+			return false;
+	}
 	ns.log = identity;
-	ns.xmax = snap->xmax;
-	ns.nxip = snap->xcnt;
-	ns.xip = palloc_array(TransactionId, Max(ns.nxip, 1));
-	if (ns.nxip > 0)
-		memcpy(ns.xip, snap->xip, ns.nxip * sizeof(TransactionId));
-	qsort(ns.xip, ns.nxip, sizeof(TransactionId), xid_cmp);
-	ns.own = GetTopTransactionIdIfAny();
+	state_of_snapshot(&ns, snap);
 	put_state(next, &ns);
 	return true;
 }

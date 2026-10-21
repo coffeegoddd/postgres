@@ -612,6 +612,9 @@ set_session_branch(Oid branch)
 
 	if (branch == MyBranch)
 		return;
+	/* (what the change logs hold for this branch goes to its logs first) */
+	if (IsTransactionState())
+		prolly_change_logs_flush();
 	MyBranch = branch;
 	InvalidateSystemCaches();
 	RelationCacheRebuildNew(from);

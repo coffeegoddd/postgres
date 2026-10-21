@@ -13,13 +13,18 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/tableam.h"
+#include "common/int.h"
 #include "access/xact.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_changelog.h"
 #include "access/prolly_config.h"
 #include "access/table.h"
 #include "catalog/dependency.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/heap.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
 #include "utils/inval.h"
@@ -725,12 +730,138 @@ test_lose_change_log(PG_FUNCTION_ARGS)
 	Relation	rel = table_open(PG_GETARG_OID(0), RowExclusiveLock);
 	ProllyComponents c;
 
+	Oid			logid;
+	Relation	log;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *tids = NIL;
+
 	prolly_components_for_relation(rel, &c);
 	if (c.change_log == NULL)
 		elog(ERROR, "\"%s\" has no change log", RelationGetRelationName(rel));
-	PROLLY_CALL(c.change_log, consume, rel, GetActiveSnapshot());
+	/* (its rows the snapshot sees deleted, the writes before committed) */
+	logid = prolly_change_log_relid(RelationGetRelid(rel), rel->rd_rel->relam);
+	if (!OidIsValid(logid))
+		elog(ERROR, "\"%s\" has no change log", RelationGetRelationName(rel));
+	log = table_open(logid, RowExclusiveLock);
+	scan = table_beginscan(log, GetActiveSnapshot(), 0, NULL, 0);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		ItemPointerData *tid = palloc(sizeof(ItemPointerData));
+
+		*tid = tup->t_self;
+		tids = lappend(tids, tid);
+	}
+	table_endscan(scan);
+	foreach_ptr(ItemPointerData, tid, tids)
+		simple_heap_delete(log, tid);
+	table_close(log, RowExclusiveLock);
 	table_close(rel, RowExclusiveLock);
 	PG_RETURN_VOID();
+}
+
+/*
+ * Give a prolly table, its change log dropped, a log of the first format:
+ * a row an entry (an image, a delta), no index.  As a table logged before
+ * the format changed has.
+ */
+PG_FUNCTION_INFO_V1(test_make_format1_change_log);
+Datum
+test_make_format1_change_log(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), ShareLock);
+	char		name[NAMEDATALEN];
+	TupleDesc	desc;
+	Oid			logid;
+	ObjectAddress table;
+	ObjectAddress log;
+
+	snprintf(name, NAMEDATALEN, "pg_prolly_log_%u", RelationGetRelid(rel));
+	desc = CreateTemplateTupleDesc(2);
+	TupleDescInitEntry(desc, 1, "image", BYTEAOID, -1, 0);
+	TupleDescInitEntry(desc, 2, "delta", INT4OID, -1, 0);
+	for (int i = 0; i < 2; i++)
+	{
+		TupleDescAttr(desc, i)->attstorage = TYPSTORAGE_PLAIN;
+		populate_compact_attribute(desc, i);
+	}
+	TupleDescFinalize(desc);
+	logid = heap_create_with_catalog(name, PG_TOAST_NAMESPACE,
+									 rel->rd_rel->reltablespace,
+									 InvalidOid, InvalidOid, InvalidOid,
+									 rel->rd_rel->relowner, rel->rd_rel->relam,
+									 desc, NIL, RELKIND_TOASTVALUE,
+									 rel->rd_rel->relpersistence, false, false,
+									 ONCOMMIT_NOOP, (Datum) 0, false, true,
+									 true, InvalidOid, NULL);
+	ObjectAddressSet(table, RelationRelationId, RelationGetRelid(rel));
+	ObjectAddressSet(log, RelationRelationId, logid);
+	recordDependencyOn(&log, &table, DEPENDENCY_INTERNAL);
+	CacheInvalidateRelcache(rel);
+	table_close(rel, NoLock);
+	PG_RETURN_VOID();
+}
+
+/* test_log_entries()'s count of the entries read */
+typedef struct LogEntries
+{
+	int64		n;
+	List	   *deltas;
+} LogEntries;
+
+static bool
+log_entry_counted(HeapTuple entry, int32 delta, void *arg)
+{
+	LogEntries *le = arg;
+
+	le->n++;
+	le->deltas = lappend_int(le->deltas, delta);
+	return true;
+}
+
+static int
+int_cmp(const ListCell *a, const ListCell *b)
+{
+	return pg_cmp_s32(lfirst_int(a), lfirst_int(b));
+}
+
+/*
+ * The entries of rel's log the transaction sees (its own buffered ones
+ * written first, as a fold reads them): how many were read, their deltas,
+ * sorted, and whether one said to read the table in full (the read stops
+ * there).
+ */
+PG_FUNCTION_INFO_V1(test_log_entries);
+Datum
+test_log_entries(PG_FUNCTION_ARGS)
+{
+	Relation	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	ProllyComponents c;
+	LogEntries	le = {0, NIL};
+	bool		read;
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+	Datum	   *deltas;
+	int			i = 0;
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log == NULL)
+		elog(ERROR, "\"%s\" has no change log", RelationGetRelationName(rel));
+	read = PROLLY_CALL(c.change_log, read, rel, GetActiveSnapshot(), NULL,
+					   log_entry_counted, &le);
+	table_close(rel, AccessShareLock);
+	list_sort(le.deltas, int_cmp);
+	deltas = palloc_array(Datum, Max(list_length(le.deltas), 1));
+	foreach_int(d, le.deltas)
+		deltas[i++] = Int64GetDatum((int64) d);
+	values[0] = Int64GetDatum(le.n);
+	values[1] = PointerGetDatum(construct_array_builtin(deltas, i, INT8OID));
+	values[2] = BoolGetDatum(!read);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													 values, nulls)));
 }
 
 /* The session's last full fold: rows read, whether it spilled, its sort's kB. */

@@ -60,8 +60,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written             |    15
  value_nodes_written       |     0
  chunks_appended           |    15
- chunk_bytes_appended      | 26227
- bytes_hashed              | 45190
+ chunk_bytes_appended      | 26235
+ bytes_hashed              | 45198
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -84,7 +84,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  fold_full_verify          |     0
  fold_full_spilled         |     0
  fold_merge_builds         |     1
- log_pages_read            |    18
+ log_pages_read            |     3
  fold_verified             |     0
  fold_verify_mismatches    |     0
  commits                   |     1
@@ -100,7 +100,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  gc_bytes_copied           |     0
  conjoin_bytes_copied      |     0
  bmap_store_bytes_written  |     0
- bmap_extend_bytes_written |    19
+ bmap_extend_bytes_written |    14
  bmap_bulk_bytes_written   |     0
  journal_scans             |     1
  gc_collections            |     0
@@ -266,7 +266,7 @@ WHERE name IN ('page_copies_fold', 'page_copies_shared');
         name        | value 
 --------------------+-------
  page_copies_fold   |     0
- page_copies_shared |     4
+ page_copies_shared |     5
 (2 rows)
 
 SELECT dolt_checkout('main');

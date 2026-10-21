@@ -76,8 +76,7 @@ is(sql($sum), $want, 'the table reads as before');
 # freed: the sweep frees them.
 sql(q{CREATE TABLE cow.d (a int8); INSERT INTO cow.d SELECT g FROM generate_series(1, 5000) g});
 # (its change log's blocks are freed with it)
-my $dblocks = sql(q{SELECT (pg_relation_size('cow.d') + pg_relation_size(('pg_toast.pg_prolly_log_' ||
-	'cow.d'::regclass::oid)::regclass)) / 8192});
+my $dblocks = sql(q{SELECT (pg_relation_size('cow.d') + (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.d'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.d'::regclass::oid || '_index')::regclass))) / 8192});
 my $d = $node->background_psql('sw', on_error_stop => 0);
 $d->query_safe(q{SELECT injection_points_set_local();
 	SELECT injection_points_attach('bmap-predrop', 'wait')});

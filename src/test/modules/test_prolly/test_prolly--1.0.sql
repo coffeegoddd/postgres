@@ -499,3 +499,15 @@ AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION test_tablefile_bytes_per_chunk(n int, mapped bool DEFAULT false)
 RETURNS float8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- The entries of a table's change log the transaction sees (its own
+-- unwritten ones written first): how many were read, their deltas, and
+-- whether one says to read the table in full (the read stops there).
+CREATE FUNCTION test_log_entries(tbl regclass, OUT n int8, OUT deltas int8[],
+	OUT full_read bool)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Give a table, its change log dropped, a log of the first format (a row an
+-- entry, no index), as a table logged before the format changed has.
+CREATE FUNCTION test_make_format1_change_log(tbl regclass) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

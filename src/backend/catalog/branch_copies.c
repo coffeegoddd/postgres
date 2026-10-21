@@ -43,6 +43,8 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_config.h"
+
 #include "access/genam.h"
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
@@ -450,7 +452,14 @@ on_branch(Oid branch, void (*fn) (void *arg), void *arg)
 static void
 copy_from_here(void *arg)
 {
-	List	   *locked = lock_versioned_relations();
+	List	   *locked;
+
+	/*
+	 * (the change logs' entries the transaction holds, of rows on the pages
+	 * the copy shares, written first: the copy's log holds them too)
+	 */
+	prolly_change_logs_flush();
+	locked = lock_versioned_relations();
 
 	copy_rows(*(Oid *) arg);
 	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
