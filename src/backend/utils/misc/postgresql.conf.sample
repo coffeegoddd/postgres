@@ -164,6 +164,9 @@
                                         #   mmap
                                         # (change requires restart)
 #min_dynamic_shared_memory = 0MB        # (change requires restart)
+#block_map_replay_entries = 65536       # blocks of block-mapped relations
+                                        # recovery remembers a later remap of
+                                        # (change requires restart)
 #prolly_value_memo_entries = 8192       # values in versioned tables' TOAST
                                         # relations whose references a fold
                                         # remembers (0 turns it off)

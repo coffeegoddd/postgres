@@ -364,6 +364,15 @@
   max => '10.0',
 },
 
+{ name => 'block_map_replay_entries', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
+  short_desc => 'Sets how many logical blocks of block-mapped relations recovery remembers a later remap of, ahead of its replay.',
+  long_desc => 'A full-page image of a block map page can be older than the version on disk; recovery remembers each block the newer version maps from a later WAL position, until replay reaches it. Recovery stops if more are needed at once.',
+  variable => 'block_map_replay_entries',
+  boot_val => '65536',
+  min => '64',
+  max => '67108864',
+},
+
 { name => 'block_size', type => 'int', context => 'PGC_INTERNAL', group => 'PRESET_OPTIONS',
   short_desc => 'Shows the size of a disk block.',
   flags => 'GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE',

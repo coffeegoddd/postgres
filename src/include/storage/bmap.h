@@ -27,6 +27,9 @@
 /* developer setting: heap tables made in block-mapped storage */
 extern PGDLLIMPORT bool debug_block_mapped_heap;
 
+/* logical blocks recovery remembers a later remap of, at most */
+extern PGDLLIMPORT int block_map_replay_entries;
+
 /* storage manager callbacks */
 extern void bmapinit(void);
 extern bool bmapclaims(RelFileLocatorBackend rlocator);
@@ -38,6 +41,8 @@ extern void bmapshare(SMgrRelation src, SMgrRelation dst);
 extern bool bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum);
 extern bool bmapreplacedafter(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, XLogRecPtr lsn);
+extern void bmapprerestore(SMgrRelation reln, ForkNumber forknum,
+						   BlockNumber blocknum, XLogRecPtr lsn);
 extern bool bmappreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer,
