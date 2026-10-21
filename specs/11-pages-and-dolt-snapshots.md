@@ -1035,6 +1035,27 @@ fails without its fix), and Postgres's suites keep passing after each one.
     TRUNCATE does; the `ALTER` after would refuse it too. The table, new
     storage in the transaction, is then loaded (#490): rows many at once,
     indexes built after.
+    - Only when the `ALTER` rewrites the table anyway (review, 2026-10-21).
+      New storage isn't MVCC-safe, as TRUNCATE isn't: a snapshot from
+      before the move sees the table empty once it commits. A rewriting
+      `ALTER` gives the same, but one that changes the type in place (a
+      binary-coercible change: `varchar(10)` to `varchar(20)`, `varchar`
+      to `text`, an unconstrained domain over the old type) leaves the
+      rows where they are, and so did the move that removed them one by
+      one. The move asks as `ALTER TABLE` decides: the column's
+      `col::type` conversion, transformed and planned against the live
+      table, put to `ATColumnChangeRequiresRewrite()` (exported from
+      `tablecmds.c`). Only a table whose `ALTER` rewrites it is emptied
+      at once; a table whose type, column or table doesn't exist yet
+      (the move makes it later) is not; a table retyped because a type
+      it uses is defined otherwise always converts through an expression,
+      a rewrite. The rest are emptied row by row, as before.
+    - Locks: emptied at once, a table is locked ACCESS EXCLUSIVE before
+      its partitions are, as TRUNCATE locks them. Locking the partitions
+      first, and the partitioned table only at the `ALTER`, deadlocked
+      with a query on it, which locks it before its partitions.
+      `t/152_retype_move_sessions` checks both this and the snapshots
+      above.
     - Not as the issue proposed (convert with `ALTER ... USING`, fold the
       converted table in full, diff against the commit, apply the
       difference): the conversion rewrites every row and rebuilds every
