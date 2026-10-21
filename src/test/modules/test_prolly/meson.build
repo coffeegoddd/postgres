@@ -124,6 +124,7 @@ tests += {
       'full_folds',
       'truncate_folds',
       'fold_verify',
+      'fold_caches',
       'keyless_toast_folds',
       'vacuum_shared',
       'eager_freeze',
@@ -154,6 +155,7 @@ tests += {
       'diff_memory',
       'reflog',
     ],
+    'regress_args': ['--temp-config', files('test_prolly.conf')],
   },
   'tap': {
     'env': {
@@ -238,6 +240,7 @@ tests += {
       't/142_get_many_refresh.pl',
       't/143_bmap_map_image_since.pl',
       't/160_first_use_lock.pl',
+      't/143_fold_caches.pl',
     ],
   },
 }

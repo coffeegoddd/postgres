@@ -4,7 +4,7 @@
  *	  Shared memory and checkpoints for prolly implementations.
  *
  * Implementations of the interfaces that have shared state (the chunk
- * store) declare its size with
+ * store, the value memo, the refs) declare its size with
  * shmem_size() and set it up in shmem_init(area).  The prolly
  * shared-memory subsystem reserves one area per implementation at
  * postmaster startup, so implementations added by shared_preload_libraries

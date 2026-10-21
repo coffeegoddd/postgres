@@ -1169,6 +1169,18 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 }
 
 /*
+ * XactHasInvalidations
+ *		Has the transaction changed a catalog, so that others will be told
+ *		of it when it commits?  (Prolly's folds aren't skipped in one: it
+ *		sees what nobody else does yet.)
+ */
+bool
+XactHasInvalidations(void)
+{
+	return transInvalInfo != NULL;
+}
+
+/*
  * AtEOXact_Inval
  *		Process queued-up invalidation messages at end of main transaction.
  *

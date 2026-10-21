@@ -293,6 +293,45 @@ prolly_is_change_log(Relation rel)
 }
 
 /*
+ * The profile's refs, looked up once, as change_log() is: asked in critical
+ * sections too (prolly_forget_folds()).
+ */
+static const ProllyRefsRoutine *
+database_refs(void)
+{
+	static const ProllyRefsRoutine *routine = NULL;
+	static bool looked_up = false;
+
+	if (!looked_up)
+	{
+		if (copies_profile[PROLLY_IFACE_REFS] != NULL)
+			routine = (const ProllyRefsRoutine *)
+				prolly_lookup_impl(PROLLY_IFACE_REFS,
+								   copies_profile[PROLLY_IFACE_REFS]);
+		looked_up = true;
+	}
+	return routine;
+}
+
+void
+prolly_note_branch_write(Oid branch)
+{
+	const ProllyRefsRoutine *refs = database_refs();
+
+	if (refs != NULL && refs->note_write != NULL)
+		refs->note_write(branch);
+}
+
+void
+prolly_forget_folds(void)
+{
+	const ProllyRefsRoutine *refs = database_refs();
+
+	if (refs != NULL && refs->forget_folds != NULL)
+		refs->forget_folds();
+}
+
+/*
  * The content hash chunks are named by: the profile's, the one hash every
  * chunk store, tree, transfer and canonical form of this server shares.
  * Not one to change on its own yet: a TOAST pointer to a tree (va_hash)

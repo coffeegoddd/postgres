@@ -18,6 +18,11 @@
  * fraction of tables checked at a pass; 0, the default, none), on the
  * default branch; dolt_verify_folds() runs it on the session's.
  *
+ * A working set the refs took from an earlier fold instead of folding
+ * (#482) is checked too, with debug_prolly_verify_fold_caches: folded
+ * again, and the two roots compared (prolly_check_fold_cache()).  One that
+ * differs is an error, so the earlier fold's root goes into nothing.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/fold_verify.c
  *
@@ -45,6 +50,7 @@
 bool		prolly_fold_verifying = false;
 double		prolly_fold_verify_rate = 0;
 bool		prolly_fold_verify_fatal = false;
+bool		debug_prolly_verify_fold_caches = false;
 
 /* A folded root's tables: their names and data trees, in name order. */
 typedef struct FoldedTable
@@ -177,6 +183,9 @@ prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit, void *arg)
 				if (c.change_log)
 					PROLLY_CALL(c.change_log, note, rel, NULL, NULL, NULL);
 				table_close(rel, RowExclusiveLock);
+
+				/* (nor is a working set taken from an earlier fold (#482)) */
+				prolly_forget_folds();
 			}
 		}
 		if (visit)
@@ -184,6 +193,24 @@ prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit, void *arg)
 	}
 	PopActiveSnapshot();
 	return mismatches;
+}
+
+void
+prolly_check_fold_cache(const char *branch, const ProllyNodeRef *taken,
+						const ProllyNodeRef *folded, const char *left_out)
+{
+	if (left_out != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly working set of branch \"%s\" taken from an earlier fold left nothing out, a fold now leaves out %s",
+						branch, left_out)));
+	if (!same_tree(taken, folded))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly working set of branch \"%s\" taken from an earlier fold differs from a fold now",
+						branch),
+				 errdetail("Taken: %s; folded: %s.", tree_hex(taken),
+						   tree_hex(folded))));
 }
 
 /* dolt_verify_folds()'s rows. */

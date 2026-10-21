@@ -47,6 +47,8 @@ typedef void (*RelSyncCallbackFunction) (Datum arg, Oid relid);
 
 extern void AcceptInvalidationMessages(void);
 
+extern bool XactHasInvalidations(void);
+
 extern void AtEOXact_Inval(bool isCommit);
 
 extern void PreInplace_Inval(void);

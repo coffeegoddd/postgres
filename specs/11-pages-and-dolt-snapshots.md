@@ -340,6 +340,62 @@ The cost of a working-set diff is O(changed pages + Δ): a changed row
 touches one or two pages, so changed pages are a small multiple of Δ, and
 each costs a page read rather than a few tree nodes.
 
+**Folds skipped when nothing changed (#482; decided by the user
+2026-10-20, in three phases: a generation per branch and a known working
+set, then no fold around moves, then a generation per change log after
+#481).** Status, diff and `dolt_branches` folded the same unchanged
+working set again on every call. A fold is now skipped when nothing it
+reads has changed since one made before (`refs_generations.c`, the
+`copies` refs'):
+
+- **A generation per branch**, in shared memory, keyed by (database,
+  branch), with a count of the transactions writing the branch now. Each
+  writer is told of before anyone else can see its write, hushed or not
+  (the refs' optional `note_write()`, from `catalog/branch.c`): its rows
+  (`branch_note_tuple()`, `branch_note_made()`), its versioned objects'
+  catalog rows (DDL, `ALTER TYPE ... ADD VALUE`, `TRUNCATE`'s new
+  storage, a branch's copies) and its versioned sequences' values
+  (`nextval`, `setval`). When a writer's transaction ends (commits,
+  aborts or is prepared), once others see it and its catalog changes are
+  sent, the generation moves and the writer is remembered: the last eight
+  by transaction id, the latest of those before.
+- **An epoch** moves with every shared invalidation sent (any catalog
+  change: a fold describes objects by what they depend on outside the
+  branch too, such as a policy's role names) and every collection that
+  dropped chunks (a fold's tree is no ref's, so garbage to it): the refs'
+  `forget_folds()`.
+- **Publishing.** A fold of a branch is stamped (generation, epoch) before
+  it reads anything, and after it published if nothing ended, nobody
+  writes the branch, the epoch stayed, and its snapshot sees every writer
+  that ended (a commit landing between the snapshot and the stamp is one
+  it doesn't). It becomes known when its transaction commits, if nothing
+  ended meanwhile: its tree's chunks are others' only then, and gone if it
+  aborts. Read folds, checkpoints', commits' and moves' folds publish; a
+  read fold's says it left nothing out (others' don't say).
+- **Taking.** A read of a branch's working set (status, `dolt_diff` from
+  `WORKING`, `dolt_branches`' dirtiness, another branch's without checking
+  it out) and `working_set()` take the root known if its baseline is the
+  branch's now, nobody writes the branch, the epoch stayed, and the
+  reader's snapshot sees every writer that ended. Nothing is published or
+  taken by a transaction that wrote the branch or changed a catalog (its
+  fold holds what nobody else sees), while any transaction is prepared
+  (nothing is told of a prepared one's commit), in recovery (nor of a
+  replayed one's), or with `debug_prolly_force_full_fold` or the fold
+  verifier's folds. Nothing survives a restart.
+- **Checked.** `debug_prolly_verify_fold_caches` folds again each working
+  set taken and errors if the two differ; test_prolly's regression suite
+  runs with it on (`test_prolly.conf`). `pg_stat_prolly` counts each one
+  taken (`folds_reused`).
+- **Known limits.** Any catalog change anywhere in the cluster (a
+  temporary table, `ANALYZE`, autovacuum's statistics) moves the epoch,
+  and any prepared transaction stops it, so neither is taken until the
+  next fold. A long transaction holding back the xmin of every snapshot,
+  with more than eight writers of a branch ended since it began, keeps
+  folds of that branch from being published until it ends. A fold's
+  tree is named only by the shared entry, so a collection forgets them
+  all. Entries are 1024; a writer finding none free counts as a writer of
+  every branch.
+
 **Applying a tree diff as row changes** reuses the machinery of logical
 replication's apply worker (`src/backend/replication/logical/worker.c`):
 inserts, updates and deletes by key with index maintenance and constraint

@@ -444,10 +444,13 @@ catalog_row_with_branch(Relation rel, HeapTuple tup)
 	if (info == NULL)
 		return tup;
 
-	/* a branch's copy of a row carries its branch already */
+	/* a branch's copy of a row carries its branch already (told the refs) */
 	if (CatalogKeepRowBranch &&
 		!heap_attisnull(tup, info->attnum, RelationGetDescr(rel)))
+	{
+		prolly_note_branch_write(catalog_row_branch(info, tup));
 		return tup;
+	}
 
 	branch = row_branch(rel, tup);
 	note_catalog_write(branch);
@@ -493,7 +496,8 @@ catalog_slot_set_branch(Relation rel, TupleTableSlot *slot)
 /*
  * (a versioned row of another branch is changed only on the session's
  * behalf, hushed: what's left is the session's branch, so once that is
- * noted the row needn't be read)
+ * noted the row needn't be read; hushed, it is, for the refs, told of
+ * every write (#482))
  */
 void
 catalog_note_old_row(Relation rel, const ItemPointerData *tid)
@@ -502,9 +506,14 @@ catalog_note_old_row(Relation rel, const ItemPointerData *tid)
 	HeapTupleData tup;
 	Buffer		buf;
 
-	if (info == NULL || hushes != NIL || last_written == MyBranch ||
-		!database_has_versioned_schemas() || branch_written(MyBranch))
+	if (info == NULL || !database_has_versioned_schemas())
 		return;
+	if (hushes == NIL &&
+		(last_written == MyBranch || branch_written(MyBranch)))
+	{
+		prolly_note_branch_write(MyBranch);
+		return;
+	}
 	tup.t_self = *tid;
 	if (heap_fetch(rel, SnapshotAny, &tup, &buf, false))
 	{
@@ -904,10 +913,16 @@ branch_note_write(Oid branch)
 
 BranchTupleHook branch_tuple_hook = NULL;
 
-/* A versioned object's catalog row written: the branch's, and noted so. */
+/*
+ * A versioned object's catalog row written: the branch's, and noted so.
+ * (The refs are told of it hushed too: whoever wrote it, a fold of the
+ * branch reads it (#482).)
+ */
 static void
 note_catalog_write(Oid branch)
 {
+	if (OidIsValid(branch))
+		prolly_note_branch_write(branch);
 	if (OidIsValid(branch) && hushes == NIL)
 		catalog_written = true;
 	branch_note_write(branch);
@@ -923,6 +938,10 @@ void
 branch_note_sequence(Relation seqrel)
 {
 	Oid			branch = seqrel->rd_rel->relbranch;
+
+	/* (told to the refs before the value changes, hushed too (#482)) */
+	if (OidIsValid(branch))
+		prolly_note_branch_write(branch);
 
 	/* (the last noted first: a statement's values are one sequence's) */
 	if (OidIsValid(branch) && hushes == NIL &&
@@ -959,6 +978,8 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 		prolly_note_change(rel, oldtid, oldtup, newtid);
 	else if (prolly_is_change_log(rel))
 		return;
+	/* (the refs are told of every write to the branch, hushed too (#482)) */
+	prolly_note_branch_write(MyBranch);
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
 }
@@ -975,6 +996,7 @@ branch_note_made(Relation rel, const ItemPointerData *oldtid,
 		prolly_note_made(rel, oldtid, oldtup, made, nmade);
 	else if (prolly_is_change_log(rel))
 		return;
+	prolly_note_branch_write(MyBranch);
 	if (branch_tuple_hook && hushes == NIL)
 		for (int i = 0; i < nmade; i++)
 			branch_tuple_hook(rel, i == 0 ? oldtid : NULL, &made[i]->t_self);
