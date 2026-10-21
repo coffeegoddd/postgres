@@ -408,6 +408,49 @@ reads has changed since one made before (`refs_generations.c`, the
   all. Entries are 1024; a writer finding none free counts as a writer of
   every branch.
 
+**Per-table work cached (#483; approved by the user 2026-10-20).** A fold
+that does run still described, hashed and rebuilt trees for every
+versioned table, changed or not, and a commit scanned all of `pg_depend`
+for what the versioned objects depend on (1000 untouched tables: a
+one-row commit 145–150 ms, a status after a write 61 ms, `--enable-cassert`
+build). The canonicalizer (`canon_folded.c`) now keeps, in the backend and
+private to it:
+
+- **Each table's description** (and the hash its baseline is kept by, and
+  its key's collations), by table, for the branch described on. A relcache
+  invalidation of the table drops it; a syscache one of anything a
+  description names drops them all (types, functions, schemas,
+  collations, relations, columns, enum labels, roles, operators, operator
+  classes, extended statistics: a trigger's function renamed sends its
+  table nothing). Callbacks run for the transaction's own changes at each
+  command's end, and at a cache reset (a branch switch). One described
+  while an invalidation came isn't kept; all are dropped when the settings
+  that change how a constant prints (`DateStyle`, `extra_float_digits`, …)
+  change. `pg_stat_prolly.describe_cache_hits` counts each one taken.
+- **The dependency tree**, against an epoch every callback moves.
+  `pg_depend` and `pg_extension` have no syscache, and `ALTER EXTENSION
+  ADD`, `DEPENDS ON EXTENSION` or an extension's version change alone
+  sends nothing, so `inval.c` now sends a relcache invalidation of the
+  catalog itself for each change to either.
+- **Which objects are extensions' members** (one read of `pg_depend` by
+  reference, not an index probe per relation, type and function) and
+  which namespaces' objects are the canonical form's, against the same
+  epoch.
+- **The last canonical tree's items**: the next tree is it with only the
+  items that differ applied (`apply()`), and the next baseline is the
+  baseline folded from with the entries that differ applied.
+
+A tree is taken only while its chunks are known to be there: made by this
+transaction (not in a subtransaction rolled back) or one that committed,
+and still in the store, which then keeps it from a collection (`keep()`).
+`debug_prolly_verify_fold_caches` works out again whatever is taken and
+errors if it differs (test_prolly's suite runs with it on). After: a
+one-row commit with 1000 untouched tables 19 ms, a status after a write
+16 ms. What is left per table is mostly the change finder's
+(`changes_log.c`: about 8 of the 16 ms), and the `pg_class` scan, left as
+it is; caching the finder's handle (its keying, key and equality
+procedures) is the change log's to do. The caches are a backend's: a session's first fold fills them.
+
 **Applying a tree diff as row changes** reuses the machinery of logical
 replication's apply worker (`src/backend/replication/logical/worker.c`):
 inserts, updates and deletes by key with index maintenance and constraint

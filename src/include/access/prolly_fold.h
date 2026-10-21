@@ -61,7 +61,9 @@ extern PGDLLIMPORT bool prolly_fold_verifying;
  * debug_prolly_verify_fold_caches: a working set taken from an earlier
  * fold, not folded (#482), is folded too, and checked against it
  * (prolly_check_fold_cache(): left_out, an object the new fold left out
- * where the earlier one left none; NULL if none).
+ * where the earlier one left none; NULL if none).  So is what a fold takes
+ * from the canonicalizer's caches (#483): worked out again, and an error
+ * if it differs.
  */
 extern PGDLLIMPORT bool debug_prolly_verify_fold_caches;
 extern void prolly_check_fold_cache(const char *branch,

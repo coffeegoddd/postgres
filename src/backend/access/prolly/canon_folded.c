@@ -125,6 +125,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_fold.h"
 #include "access/prolly_keying.h"
 #include "access/relation.h"
 #include "access/reloptions.h"
@@ -132,6 +133,7 @@
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/dependency.h"
@@ -285,6 +287,7 @@ typedef struct Canon
 	List	   *refused;		/* (committing) Refused *: the same */
 	Oid			only;			/* valid: only this table's rows folded */
 	bool		no_rows;		/* no table's rows folded (objects only) */
+	bool		cached;			/* descriptions from this backend's cache */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
@@ -754,22 +757,15 @@ baseline_hash(Canon *cn, Relation rel, const StringInfoData *description,
 }
 
 /*
- * A table's data tree, folded from its rows as the transaction sees them by
- * the change finder: from its baseline if it has one for this definition
- * (described in 'description', its rows as baseline_hash() has them); with
- * a next baseline being made, its entry there too.  The same rows give the
- * same tree whatever pages, order or history they come from.
+ * A prolly table's baseline_hash() (described in 'description'), and the
+ * collations ordering its keys, added to the fold's (and to *collations if
+ * given).
  */
 static void
-table_root(Canon *cn, CanonItem *it, Relation rel,
-				  const StringInfoData *description, ProllyNodeRef *root)
+table_shape(Canon *cn, Relation rel, const StringInfoData *description,
+			ProllyHash *dh, List **collations)
 {
-	ProllyHash	dh;
-	BaseTable  *bt;
-	ProllyTableFold tf;
-	StringInfoData state;
 	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
-	ProllyFullFoldReason why;
 
 	if (OidIsValid(pkoid))
 	{
@@ -778,18 +774,39 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 
 		for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(pk); i++)
 		{
-			if (OidIsValid(pk->rd_indcollation[i]))
-				cn->collations = list_append_unique_oid(cn->collations,
-														pk->rd_indcollation[i]);
+			if (!OidIsValid(pk->rd_indcollation[i]))
+				continue;
+			cn->collations = list_append_unique_oid(cn->collations,
+													pk->rd_indcollation[i]);
+			if (collations)
+				*collations = list_append_unique_oid(*collations,
+													 pk->rd_indcollation[i]);
 		}
 		index_close(pk, AccessShareLock);
 	}
+	baseline_hash(cn, rel, description, dh);
+}
 
-	baseline_hash(cn, rel, description, &dh);
+/*
+ * A table's data tree, folded from its rows as the transaction sees them by
+ * the change finder: from its baseline if it has one for this definition
+ * (dh, its table_shape()); with a next baseline being made, its entry there
+ * too.  The same rows give the same tree whatever pages, order or history
+ * they come from.
+ */
+static void
+table_root(Canon *cn, CanonItem *it, Relation rel, const ProllyHash *dh,
+		   ProllyNodeRef *root)
+{
+	BaseTable  *bt;
+	ProllyTableFold tf;
+	StringInfoData state;
+	ProllyFullFoldReason why;
+
 	bt = find_base_table(cn, &it->key);
 	why = bt ? PROLLY_FULL_SHAPE_CHANGED : PROLLY_FULL_NO_BASELINE;
-	if (bt && (bt->description.len != dh.len ||
-			   memcmp(bt->description.bytes, dh.bytes, dh.len) != 0))
+	if (bt && (bt->description.len != dh->len ||
+			   memcmp(bt->description.bytes, dh->bytes, dh->len) != 0))
 		bt = NULL;
 	if (bt)
 	{
@@ -824,20 +841,29 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		appendBinaryStringInfo(&next->key, it->key.data, it->key.len);
 		initStringInfo(&next->value);
 		put_hash(&next->value, &root->hash);
-		put_hash(&next->value, &dh);
+		put_hash(&next->value, dh);
 		appendBinaryStringInfo(&next->value, state.data, state.len);
 		cn->next = lappend(cn->next, next);
 	}
 	pfree(state.data);
 }
 
+static bool namespace_known(Oid nsp, bool *canon);
+static void namespace_learned(Oid nsp, bool canon, uint64 epoch);
+static uint64 catalog_epoch;
+
 /* Is an object in this namespace the canonical form's? */
 static bool
 canon_namespace(Oid nsp)
 {
-	if (is_system_namespace(nsp))
-		return false;
-	return namespace_is_versioned(nsp);
+	bool		canon;
+	uint64		epoch = catalog_epoch;
+
+	if (namespace_known(nsp, &canon))
+		return canon;
+	canon = !is_system_namespace(nsp) && namespace_is_versioned(nsp);
+	namespace_learned(nsp, canon, epoch);
+	return canon;
 }
 
 static int
@@ -1956,11 +1982,13 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 	ReleaseSysCache(tup);
 }
 
+static Oid	extension_of(Oid classid, Oid objid);
+
 /* Members of an extension come with it. */
 static bool
 in_extension(Oid classid, Oid objid)
 {
-	return OidIsValid(getExtensionOfObject(classid, objid));
+	return OidIsValid(extension_of(classid, objid));
 }
 
 /* ------------------------------------------------------------------------
@@ -1977,6 +2005,566 @@ item_cmp(const ListCell *a, const ListCell *b)
 	ProllyKey	kb = {(const uint8 *) ib->key.data, ib->key.len};
 
 	return prolly_bytes_compare(&ka, &kb, NULL);
+}
+
+/* ------------------------------------------------------------------------
+ * Caches
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * This backend's caches of what each fold would otherwise work out again
+ * for every table, changed or not (#483); no other implementation sees
+ * them.
+ *
+ * - A table's description (describe_table()), with its table_shape(), by
+ *   table, for the branch it was described on.  A relcache invalidation of
+ *   the table drops it, and one of anything a description names drops
+ *   them all: a type, function, schema, collation, relation, column, enum
+ *   label, role, operator, operator class or extended statistics object
+ *   (renaming a trigger's function sends its table nothing).  Callbacks run
+ *   for the transaction's own changes at each command's end too, and at a
+ *   cache reset (a branch switch).  One described while an invalidation
+ *   came isn't kept; and they are dropped when the settings that change how
+ *   a constant prints (DateStyle, say) differ from those they were
+ *   described under.
+ * - The tree of what the versioned objects depend on (fold_dependencies()),
+ *   against an epoch every one of those callbacks moves, and a relcache
+ *   invalidation of pg_depend or pg_extension, which neither has a
+ *   syscache to send (inval.c sends one for each change to them).
+ * - The last canonical tree built, with its items in order: the next one
+ *   is it with only the items that differ applied.  Its hash is its
+ *   content, so it is never stale.
+ * - Which objects are extensions' members, and which namespaces' objects
+ *   the canonical form's, against the same epoch: each is asked of every
+ *   relation, type and function.
+ *
+ * A tree is taken only while its chunks are known to be there: made by
+ * this transaction (not in a subtransaction rolled back) or one that
+ * committed, and still in the store, which keeps it from a collection
+ * from then on (keep()).  With debug_prolly_verify_fold_caches, whatever
+ * is taken is worked out again too, and they differing is an error.
+ */
+typedef struct DescribedTable
+{
+	Oid			relid;			/* the hash key */
+	Oid			branch;			/* the branch it was described on */
+	char	   *description;
+	int			len;
+	bool		shaped;			/* a prolly table's: shape and collations */
+	ProllyHash	shape;
+	int			ncollations;
+	Oid		   *collations;
+} DescribedTable;
+
+/* A tree made here, and whether its chunks are known to be there. */
+typedef struct MadeTree
+{
+	bool		valid;
+	Oid			branch;			/* the session's branch when it was made */
+	ProllyNodeRef root;
+	bool		pending;		/* made by the transaction in progress */
+	SubTransactionId subid;		/* (pending) in this subtransaction */
+} MadeTree;
+
+static bool fold_caches_registered = false;
+static uint64 catalog_epoch = 0;	/* moved by each callback */
+static MemoryContext described_cxt = NULL;
+static HTAB *described = NULL;
+static char *described_settings = NULL;
+static MadeTree dependencies_made;
+static uint64 dependencies_epoch;
+static MadeTree items_made;
+static MemoryContext items_cxt = NULL;
+static CanonItem *made_items = NULL;	/* items_made's, in key order */
+static int	nmade_items = 0;
+static MemoryContext members_cxt = NULL;
+static HTAB *members = NULL;	/* Member, by object */
+static uint64 members_epoch;
+static uint64 namespaces_epoch;
+static int	nnamespaces = 0;
+static struct
+{
+	Oid			nsp;
+	bool		canon;
+}			namespaces[16];
+
+/* An extension's member: (class, object) -> extension. */
+typedef struct Member
+{
+	Oid			classid;
+	Oid			objid;
+	Oid			extension;
+} Member;
+
+/* What a description names, but invalidates no table it is of. */
+static const int described_caches[] = {
+	TYPEOID, PROCOID, NAMESPACEOID, COLLOID, RELOID, ATTNUM, ENUMOID,
+	AUTHOID, OPEROID, CLAOID, STATEXTOID
+};
+
+/*
+ * The settings that change how a description prints a constant (a
+ * default's, a check's), whatever the search path.
+ */
+static const char *const deparse_settings[] = {
+	"DateStyle", "IntervalStyle", "TimeZone", "extra_float_digits",
+	"bytea_output", "standard_conforming_strings", "quote_all_identifiers",
+	"lc_monetary", "lc_numeric"
+};
+
+static void
+forget_descriptions(void)
+{
+	if (described_cxt != NULL)
+		MemoryContextReset(described_cxt);
+	described = NULL;
+}
+
+static void
+fold_caches_relcache(Datum arg, Oid relid)
+{
+	DescribedTable *d;
+
+	catalog_epoch++;
+	if (!OidIsValid(relid))
+		forget_descriptions();
+	else if (described != NULL &&
+			 (d = hash_search(described, &relid, HASH_FIND, NULL)) != NULL)
+	{
+		pfree(d->description);
+		if (d->collations)
+			pfree(d->collations);
+		(void) hash_search(described, &relid, HASH_REMOVE, NULL);
+	}
+}
+
+static void
+fold_caches_syscache(Datum arg, int cacheid, uint32 hashvalue)
+{
+	catalog_epoch++;
+	forget_descriptions();
+}
+
+/* A transaction's end: its trees kept if it committed, else dropped. */
+static void
+made_tree_end(MadeTree *t, bool commit)
+{
+	if (t->valid && t->pending)
+	{
+		t->pending = false;
+		t->valid = commit;
+	}
+}
+
+/* (prepared: its chunks are others' only if it commits, and not here) */
+static void
+fold_caches_xact(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			made_tree_end(&dependencies_made, true);
+			made_tree_end(&items_made, true);
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			made_tree_end(&dependencies_made, false);
+			made_tree_end(&items_made, false);
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+made_tree_sub(MadeTree *t, SubXactEvent event, SubTransactionId mySubid,
+			  SubTransactionId parentSubid)
+{
+	if (!t->valid || !t->pending || t->subid != mySubid)
+		return;
+	if (event == SUBXACT_EVENT_COMMIT_SUB)
+		t->subid = parentSubid;
+	else if (event == SUBXACT_EVENT_ABORT_SUB)
+		t->valid = false;
+}
+
+static void
+fold_caches_subxact(SubXactEvent event, SubTransactionId mySubid,
+					SubTransactionId parentSubid, void *arg)
+{
+	made_tree_sub(&dependencies_made, event, mySubid, parentSubid);
+	made_tree_sub(&items_made, event, mySubid, parentSubid);
+}
+
+/*
+ * Ready the caches for a fold: callbacks registered once, and every
+ * invalidation sent so far taken in (a catalog read now may see changes
+ * whose invalidations haven't been, which a cache would miss).
+ */
+static void
+fold_caches_begin(void)
+{
+	if (!fold_caches_registered)
+	{
+		CacheRegisterRelcacheCallback(fold_caches_relcache, (Datum) 0);
+		for (int i = 0; i < lengthof(described_caches); i++)
+			CacheRegisterSyscacheCallback(described_caches[i],
+										  fold_caches_syscache, (Datum) 0);
+		RegisterXactCallback(fold_caches_xact, NULL);
+		RegisterSubXactCallback(fold_caches_subxact, NULL);
+		described_cxt = AllocSetContextCreate(CacheMemoryContext,
+											  "prolly folded descriptions",
+											  ALLOCSET_DEFAULT_SIZES);
+		items_cxt = AllocSetContextCreate(CacheMemoryContext,
+										  "prolly folded items",
+										  ALLOCSET_DEFAULT_SIZES);
+		members_cxt = AllocSetContextCreate(CacheMemoryContext,
+											"prolly extension members",
+											ALLOCSET_DEFAULT_SIZES);
+		fold_caches_registered = true;
+	}
+	AcceptInvalidationMessages();
+}
+
+/* Drop the descriptions if the deparsing settings changed since. */
+static void
+check_deparse_settings(void)
+{
+	StringInfoData now;
+
+	initStringInfo(&now);
+	for (int i = 0; i < lengthof(deparse_settings); i++)
+		appendStringInfo(&now, "%s\n",
+						 GetConfigOption(deparse_settings[i], false, false));
+	if (described_settings == NULL || strcmp(now.data, described_settings) != 0)
+	{
+		forget_descriptions();
+		if (described_settings)
+			pfree(described_settings);
+		described_settings = MemoryContextStrdup(CacheMemoryContext, now.data);
+	}
+	pfree(now.data);
+}
+
+/*
+ * The extension an object is a member of (InvalidOid: none), as
+ * getExtensionOfObject() finds it, from every member read at once.  (Before
+ * a fold readies the caches, nothing would say they changed: asked of the
+ * catalog each time.)
+ */
+static Oid
+extension_of(Oid classid, Oid objid)
+{
+	Member		key;
+	Member	   *m;
+	Oid			ext;
+
+	if (!fold_caches_registered)
+		return getExtensionOfObject(classid, objid);
+	if (members == NULL || members_epoch != catalog_epoch)
+	{
+		uint64		epoch = catalog_epoch;
+		Relation	rel;
+		ScanKeyData skey;
+		SysScanDesc scan;
+		HeapTuple	tup;
+		HASHCTL		ctl;
+
+		MemoryContextReset(members_cxt);
+		members = NULL;
+		ctl.keysize = offsetof(Member, extension);
+		ctl.entrysize = sizeof(Member);
+		ctl.hcxt = members_cxt;
+		members = hash_create("prolly extension members", 256, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		rel = table_open(DependRelationId, AccessShareLock);
+		ScanKeyInit(&skey, Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(ExtensionRelationId));
+		scan = systable_beginscan(rel, DependReferenceIndexId, true, NULL, 1,
+								  &skey);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+			bool		found;
+
+			if (d->deptype != DEPENDENCY_EXTENSION)
+				continue;
+			key.classid = d->classid;
+			key.objid = d->objid;
+			m = hash_search(members, &key, HASH_ENTER, &found);
+			if (!found)
+				m->extension = d->refobjid;
+		}
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+		/* (read while an invalidation came: read again next time) */
+		members_epoch = epoch;
+	}
+	key.classid = classid;
+	key.objid = objid;
+	m = hash_search(members, &key, HASH_FIND, NULL);
+	ext = m ? m->extension : InvalidOid;
+	if (debug_prolly_verify_fold_caches &&
+		ext != getExtensionOfObject(classid, objid))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly extension membership of object %u of catalog %u taken from this backend's cache differs from pg_depend's",
+						objid, classid)));
+	return ext;
+}
+
+/* canon_namespace()'s answer for nsp, if known since nothing changed. */
+static bool
+namespace_known(Oid nsp, bool *canon)
+{
+	if (!fold_caches_registered || namespaces_epoch != catalog_epoch)
+		return false;
+	for (int i = 0; i < nnamespaces; i++)
+	{
+		if (namespaces[i].nsp == nsp)
+		{
+			*canon = namespaces[i].canon;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* (learned at epoch: not kept if an invalidation came meanwhile) */
+static void
+namespace_learned(Oid nsp, bool canon, uint64 epoch)
+{
+	if (!fold_caches_registered || epoch != catalog_epoch)
+		return;
+	if (namespaces_epoch != catalog_epoch)
+	{
+		namespaces_epoch = catalog_epoch;
+		nnamespaces = 0;
+	}
+	if (nnamespaces < lengthof(namespaces))
+	{
+		namespaces[nnamespaces].nsp = nsp;
+		namespaces[nnamespaces++].canon = canon;
+	}
+}
+
+static void
+made_tree(MadeTree *t, const ProllyNodeRef *root)
+{
+	t->valid = true;
+	t->branch = MyBranch;
+	t->root = *root;
+	t->pending = true;
+	t->subid = GetCurrentSubTransactionId();
+}
+
+/*
+ * Whether a tree made here can be taken: made on the session's branch, and
+ * its chunks there, kept from here on.
+ */
+static bool
+made_tree_usable(Canon *cn, const MadeTree *t)
+{
+	if (!t->valid || t->branch != MyBranch || RecoveryInProgress() ||
+		!PROLLY_CALL(cn->env.chunk_store, has, cn->env.chunks, &t->root.hash))
+		return false;
+	PROLLY_CALL(cn->env.chunk_store, keep, cn->env.chunks, &t->root.hash);
+	return true;
+}
+
+static void
+put_description(DescribedTable *d, const StringInfoData *desc,
+				const ProllyHash *shape, List *collations)
+{
+	d->branch = MyBranch;
+	d->description = MemoryContextAlloc(described_cxt, desc->len + 1);
+	memcpy(d->description, desc->data, desc->len + 1);
+	d->len = desc->len;
+	d->shaped = shape != NULL;
+	if (shape)
+		d->shape = *shape;
+	d->ncollations = list_length(collations);
+	d->collations = NULL;
+	if (collations != NIL)
+	{
+		d->collations = MemoryContextAlloc(described_cxt,
+										   sizeof(Oid) * d->ncollations);
+		for (int i = 0; i < d->ncollations; i++)
+			d->collations[i] = list_nth_oid(collations, i);
+	}
+}
+
+/*
+ * rel's description (describe_table()) into desc, and for a prolly table
+ * (shape not NULL) its table_shape(), from the cache if there.
+ */
+static void
+table_description(Canon *cn, Relation rel, StringInfo desc, ProllyHash *shape)
+{
+	Oid			relid = RelationGetRelid(rel);
+	DescribedTable *d = NULL;
+	uint64		epoch = catalog_epoch;
+	List	   *collations = NIL;
+
+	if (cn->cached && described != NULL)
+		d = hash_search(described, &relid, HASH_FIND, NULL);
+	if (d != NULL && d->branch == MyBranch && d->shaped == (shape != NULL))
+	{
+		appendBinaryStringInfo(desc, d->description, d->len);
+		if (shape)
+			*shape = d->shape;
+		for (int i = 0; i < d->ncollations; i++)
+			cn->collations = list_append_unique_oid(cn->collations,
+													d->collations[i]);
+		pgstat_count_prolly(PGSTAT_PROLLY_DESCRIBE_CACHE_HITS, 1);
+		if (debug_prolly_verify_fold_caches)
+		{
+			StringInfoData again;
+			ProllyHash	h;
+
+			initStringInfo(&again);
+			describe_table(cn, rel, &again);
+			if (shape)
+				table_shape(cn, rel, &again, &h, NULL);
+			if (again.len != desc->len ||
+				memcmp(again.data, desc->data, desc->len) != 0 ||
+				(shape && (h.len != shape->len ||
+						   memcmp(h.bytes, shape->bytes, h.len) != 0)))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("prolly description of table \"%s\" taken from this backend's cache differs from its catalogs",
+								RelationGetRelationName(rel))));
+			pfree(again.data);
+		}
+		return;
+	}
+	describe_table(cn, rel, desc);
+	if (shape)
+		table_shape(cn, rel, desc, shape, &collations);
+	if (!cn->cached || catalog_epoch != epoch)
+		return;
+	if (described == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(DescribedTable);
+		ctl.hcxt = described_cxt;
+		described = hash_create("prolly folded descriptions", 256, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	d = hash_search(described, &relid, HASH_ENTER, NULL);
+	put_description(d, desc, shape, collations);
+}
+
+/*
+ * With debug_prolly_verify_fold_caches, a tree applied from an earlier one
+ * (#483) against the same items built whole.
+ */
+static void
+check_applied(const char *what, const ProllyNodeRef *applied,
+			  const ProllyNodeRef *built)
+{
+	if (applied->hash.len != built->hash.len ||
+		memcmp(applied->hash.bytes, built->hash.bytes, built->hash.len) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly %s tree applied from an earlier one differs from it built whole",
+						what),
+				 errdetail("Applied: %s; built: %s.",
+						   prolly_hash_hex(&applied->hash),
+						   prolly_hash_hex(&built->hash))));
+}
+
+/*
+ * The canonical tree of cn's items (sorted), as the last one built here with
+ * the items that differ applied (true), if it can be taken.
+ */
+static bool
+apply_items(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyEdit *edits;
+	int			nedits = 0;
+	int			i = 0;
+	ListCell   *lc;
+
+	if (made_items == NULL || !made_tree_usable(cn, &items_made))
+		return false;
+	edits = palloc_array(ProllyEdit, nmade_items + list_length(cn->items));
+	lc = list_head(cn->items);
+	while (i < nmade_items || lc != NULL)
+	{
+		CanonItem  *was = i < nmade_items ? &made_items[i] : NULL;
+		CanonItem  *is = lc ? lfirst(lc) : NULL;
+		ProllyKey	kw = {0};
+		ProllyKey	ki = {0};
+		int			c;
+
+		if (was)
+			kw = (ProllyKey) {(const uint8 *) was->key.data, was->key.len};
+		if (is)
+			ki = (ProllyKey) {(const uint8 *) is->key.data, is->key.len};
+		c = !was ? 1 : !is ? -1 : prolly_bytes_compare(&kw, &ki, NULL);
+		if (c < 0)
+		{
+			edits[nedits].key = kw;
+			edits[nedits++].is_delete = true;
+		}
+		else if (c > 0 || was->value.len != is->value.len ||
+				 memcmp(was->value.data, is->value.data, is->value.len) != 0)
+		{
+			edits[nedits].key = ki;
+			edits[nedits].value = (ProllyValue) {(const uint8 *) is->value.data,
+			is->value.len};
+			edits[nedits++].is_delete = false;
+		}
+		if (c <= 0)
+			i++;
+		if (c >= 0)
+			lc = lnext(cn->items, lc);
+	}
+	if (nedits == 0)
+		*root = items_made.root;
+	else
+		PROLLY_CALL(cn->tree, apply, &cn->root_env, &items_made.root, edits,
+					nedits, root);
+	pfree(edits);
+	return true;
+}
+
+/* Keep cn's items (sorted) as those of the canonical tree root. */
+static void
+remember_items(Canon *cn, const ProllyNodeRef *root)
+{
+	ListCell   *lc;
+
+	if (made_items != NULL && items_made.valid &&
+		items_made.branch == MyBranch &&
+		items_made.root.hash.len == root->hash.len &&
+		memcmp(items_made.root.hash.bytes, root->hash.bytes, root->hash.len) == 0)
+		return;
+	MemoryContextReset(items_cxt);
+	made_items = MemoryContextAlloc(items_cxt,
+									sizeof(CanonItem) * Max(list_length(cn->items), 1));
+	nmade_items = 0;
+	foreach(lc, cn->items)
+	{
+		CanonItem  *it = lfirst(lc);
+		CanonItem  *m = &made_items[nmade_items++];
+
+		m->key.data = MemoryContextAlloc(items_cxt, it->key.len + 1);
+		memcpy(m->key.data, it->key.data, it->key.len + 1);
+		m->key.len = m->key.maxlen = it->key.len;
+		m->key.cursor = 0;
+		m->value.data = MemoryContextAlloc(items_cxt, it->value.len + 1);
+		memcpy(m->value.data, it->value.data, it->value.len + 1);
+		m->value.len = m->value.maxlen = it->value.len;
+		m->value.cursor = 0;
+	}
+	made_tree(&items_made, root);
 }
 
 /* An extension's version, from its catalog row. */
@@ -2130,9 +2718,22 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	List	   *deps = NIL;
 	ListCell   *lc;
 	ProllyTreeBuilder *b;
+	uint64		epoch;
+	bool		taken = false;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
+
+	/* (the tree made last, if nothing it was read from changed since: #483) */
+	fold_caches_begin();
+	epoch = catalog_epoch;
+	if (dependencies_epoch == epoch && made_tree_usable(&cn, &dependencies_made))
+	{
+		*out = dependencies_made.root;
+		if (!debug_prolly_verify_fold_caches)
+			return;
+		taken = true;
+	}
 	ctl.keysize = sizeof(ObjectAddress);
 	ctl.entrysize = sizeof(ObjectAddress);
 	ctl.hcxt = CurrentMemoryContext;
@@ -2159,7 +2760,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 		ObjectAddressSet(referenced, d->refclassid, d->refobjid);
 		if (object_is_versioned(&referenced))
 			continue;
-		ext = getExtensionOfObject(referenced.classId, referenced.objectId);
+		ext = extension_of(referenced.classId, referenced.objectId);
 		if (OidIsValid(ext))
 			ObjectAddressSet(referenced, ExtensionRelationId, ext);
 		(void) hash_search(seen, &referenced, HASH_ENTER, &found);
@@ -2183,7 +2784,29 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			continue;
 		PROLLY_CALL(cn.tree, build_add, b, &k, &v);
 	}
-	PROLLY_CALL(cn.tree, build_finish, b, out);
+	if (taken)
+	{
+		ProllyNodeRef built;
+
+		PROLLY_CALL(cn.tree, build_finish, b, &built);
+		if (built.hash.len != out->hash.len ||
+			memcmp(built.hash.bytes, out->hash.bytes, built.hash.len) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly dependencies taken from this backend's cache differ from the catalogs'"),
+					 errdetail("Taken: %s; folded: %s.",
+							   prolly_hash_hex(&out->hash),
+							   prolly_hash_hex(&built.hash))));
+	}
+	else
+	{
+		PROLLY_CALL(cn.tree, build_finish, b, out);
+		if (catalog_epoch == epoch)
+		{
+			made_tree(&dependencies_made, out);
+			dependencies_epoch = epoch;
+		}
+	}
 	hash_destroy(seen);
 }
 
@@ -2490,6 +3113,7 @@ collect(Canon *cn)
 					CanonItem  *it;
 					ProllyNodeRef root;
 					StringInfoData desc;
+					ProllyHash	dh;
 
 					if (oid_columns(cn, rel) && !cn->reading)
 					{
@@ -2498,8 +3122,8 @@ collect(Canon *cn)
 					}
 					it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					initStringInfo(&desc);
-					describe_table(cn, rel, &desc);
-					table_root(cn, it, rel, &desc, &root);
+					table_description(cn, rel, &desc, &dh);
+					table_root(cn, it, rel, &dh, &root);
 					put_hash(&it->value, &root.hash);
 					appendBinaryStringInfo(&it->value, desc.data, desc.len);
 					pfree(desc.data);
@@ -2549,8 +3173,10 @@ collect(Canon *cn)
 					if (rel != NULL)
 					{
 						ProllyNodeRef root;
+						ProllyHash	dh;
 
-						table_root(cn, it, rel, &query, &root);
+						table_shape(cn, rel, &query, &dh, NULL);
+						table_root(cn, it, rel, &dh, &root);
 						put_hash(&it->value, &root.hash);
 						table_close(rel, AccessShareLock);
 					}
@@ -2583,7 +3209,7 @@ collect(Canon *cn)
 					it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					empty_root(cn, &root);
 					initStringInfo(&desc);
-					describe_table(cn, rel, &desc);
+					table_description(cn, rel, &desc, NULL);
 					put_hash(&it->value, &root.hash);
 					appendBinaryStringInfo(&it->value, desc.data, desc.len);
 					pfree(desc.data);
@@ -3109,8 +3735,15 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	int			save_nestlevel;
 	ProllyTreeBuilder *b;
 	ListCell   *lc;
+	bool		applied;
 
-	/* Deparse with every name qualified, whatever the session's settings. */
+	/*
+	 * Deparse with every name qualified, whatever the session's settings;
+	 * tables described as before taken from the cache (#483).
+	 */
+	fold_caches_begin();
+	check_deparse_settings();
+	cn->cached = true;
 	save_nestlevel = NewGUCNestLevel();
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
@@ -3121,21 +3754,35 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 	appendStringInfoString(&add_item(cn, "!:", "format")->value, FOLDED_FORMAT);
 
 	list_sort(cn->items, item_cmp);
-	b = PROLLY_CALL(cn->tree, build_begin, &cn->root_env, CurrentMemoryContext);
-	foreach(lc, cn->items)
+	applied = apply_items(cn, root);
+	if (!applied || debug_prolly_verify_fold_caches)
 	{
-		CanonItem  *it = lfirst(lc);
-		ProllyKey	k = {(const uint8 *) it->key.data, it->key.len};
-		ProllyValue v = {(const uint8 *) it->value.data, it->value.len};
+		ProllyNodeRef built;
 
-		PROLLY_CALL(cn->tree, build_add, b, &k, &v);
+		b = PROLLY_CALL(cn->tree, build_begin, &cn->root_env, CurrentMemoryContext);
+		foreach(lc, cn->items)
+		{
+			CanonItem  *it = lfirst(lc);
+			ProllyKey	k = {(const uint8 *) it->key.data, it->key.len};
+			ProllyValue v = {(const uint8 *) it->value.data, it->value.len};
+
+			PROLLY_CALL(cn->tree, build_add, b, &k, &v);
+		}
+		PROLLY_CALL(cn->tree, build_finish, b, &built);
+		if (applied)
+			check_applied("canonical", root, &built);
+		*root = built;
 	}
-	PROLLY_CALL(cn->tree, build_finish, b, root);
+	remember_items(cn, root);
 }
 
-/* The next baseline: each table's entry, as a tree by key. */
+/*
+ * The next baseline: each table's entry, as a tree by key; the baseline
+ * folded from (NULL: none) with only the entries that differ applied, if
+ * there was one (#483).
+ */
 static void
-build_baseline(Canon *cn, ProllyNodeRef *next)
+build_baseline(Canon *cn, const ProllyNodeRef *baseline, ProllyNodeRef *next)
 {
 	ProllyTreeBuilder *b;
 	ProllyTreeEnv benv = cn->env;
@@ -3143,6 +3790,61 @@ build_baseline(Canon *cn, ProllyNodeRef *next)
 
 	list_sort(cn->next, item_cmp);
 	benv.chunk_refs = base_chunk_refs;
+	if (baseline)
+	{
+		ProllyEdit *edits = palloc_array(ProllyEdit, cn->nbase + list_length(cn->next));
+		int			nedits = 0;
+		int			i = 0;
+
+		lc = list_head(cn->next);
+		while (i < cn->nbase || lc != NULL)
+		{
+			BaseTable  *was = i < cn->nbase ? &cn->base[i] : NULL;
+			CanonItem  *is = lc ? lfirst(lc) : NULL;
+			ProllyKey	kw = {0};
+			ProllyKey	ki = {0};
+			StringInfoData value;
+			int			c;
+
+			if (was)
+				kw = (ProllyKey) {(const uint8 *) was->key.data, was->key.len};
+			if (is)
+				ki = (ProllyKey) {(const uint8 *) is->key.data, is->key.len};
+			c = !was ? 1 : !is ? -1 : prolly_bytes_compare(&kw, &ki, NULL);
+			if (c == 0)
+			{
+				/* (its value as parse_base_table() read it) */
+				initStringInfo(&value);
+				put_hash(&value, &was->data.hash);
+				put_hash(&value, &was->description);
+				appendBinaryStringInfo(&value, was->state.data, was->state.len);
+			}
+			if (c < 0)
+			{
+				edits[nedits].key = kw;
+				edits[nedits++].is_delete = true;
+			}
+			else if (c > 0 || value.len != is->value.len ||
+					 memcmp(value.data, is->value.data, value.len) != 0)
+			{
+				edits[nedits].key = ki;
+				edits[nedits].value = (ProllyValue) {(const uint8 *) is->value.data,
+				is->value.len};
+				edits[nedits++].is_delete = false;
+			}
+			if (c <= 0)
+				i++;
+			if (c >= 0)
+				lc = lnext(cn->next, lc);
+		}
+		if (nedits == 0)
+			*next = *baseline;
+		else
+			PROLLY_CALL(cn->tree, apply, &benv, baseline, edits, nedits, next);
+		pfree(edits);
+		if (!debug_prolly_verify_fold_caches)
+			return;
+	}
 	b = PROLLY_CALL(cn->tree, build_begin, &benv, CurrentMemoryContext);
 	foreach(lc, cn->next)
 	{
@@ -3152,7 +3854,15 @@ build_baseline(Canon *cn, ProllyNodeRef *next)
 
 		PROLLY_CALL(cn->tree, build_add, b, &k, &v);
 	}
-	PROLLY_CALL(cn->tree, build_finish, b, next);
+	if (baseline)
+	{
+		ProllyNodeRef built;
+
+		PROLLY_CALL(cn->tree, build_finish, b, &built);
+		check_applied("baseline", next, &built);
+	}
+	else
+		PROLLY_CALL(cn->tree, build_finish, b, next);
 }
 
 static List *
@@ -3195,7 +3905,7 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	}
 	PG_END_TRY();
 	if (next_baseline)
-		build_baseline(&cn, next_baseline);
+		build_baseline(&cn, baseline, next_baseline);
 	return cn.left_out;
 }
 
