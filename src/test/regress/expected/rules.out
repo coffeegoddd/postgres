@@ -1299,6 +1299,16 @@ dolt_branches| SELECT name,
     kind,
     base
    FROM dolt_branches() dolt_branches(name, hash, latest_committer, latest_committer_email, latest_commit_date, latest_commit_message, dirty, owner, owner_role, protected, kind, base);
+dolt_commit_ancestors| SELECT commit_hash,
+    parent_hash,
+    parent_index
+   FROM dolt_commit_ancestors() dolt_commit_ancestors(commit_hash, parent_hash, parent_index);
+dolt_commits| SELECT commit_hash,
+    committer,
+    email,
+    date,
+    message
+   FROM dolt_commits() dolt_commits(commit_hash, committer, email, date, message);
 dolt_conflicts| SELECT table_name,
     num_conflicts
    FROM dolt_conflicts() dolt_conflicts(table_name, num_conflicts);

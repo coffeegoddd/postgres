@@ -278,3 +278,53 @@ ROLLBACK;
 SELECT dolt_branch('-D', 'cp_src');
 DROP SCHEMA cp CASCADE;
 SELECT length(dolt_commit('-Am', 'cp gone')::text) AS committed;
+
+-- dolt_commits: every commit any branch reaches; dolt_commit_ancestors:
+-- each one's parents, in order, a root commit's null (#588).
+CREATE SCHEMA cg VERSIONED;
+CREATE TABLE cg.t (id int PRIMARY KEY, message text);
+INSERT INTO cg.t VALUES (1, 'test1');
+SELECT length(dolt_commit('-Am', 'cg 1')::text) AS committed;
+SELECT dolt_branch('cg_side');
+SELECT dolt_checkout('cg_side');
+UPDATE cg.t SET message = 'test2' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'cg 2')::text) AS committed;
+SELECT dolt_checkout('main');
+INSERT INTO cg.t VALUES (2, 'test3');
+SELECT length(dolt_commit('-am', 'cg 3')::text) AS committed;
+-- (a commit on a branch main doesn't reach)
+SELECT message FROM dolt_commits WHERE message LIKE 'cg _' ORDER BY message;
+SELECT count(*) FILTER (WHERE message = 'cg 2') AS in_log FROM dolt_log;
+SELECT (SELECT count(*) FROM dolt_commits) =
+	(SELECT count(*) FROM (SELECT commit_hash FROM dolt_log('main')
+						   UNION SELECT commit_hash FROM dolt_log('cg_side')) l)
+	AS every_branch;
+SELECT count(DISTINCT commit_hash) = count(*) AS once FROM dolt_commits;
+-- (a merge commit's two parents, ours first)
+SELECT (dolt_merge('--no-ff', '-m', 'cg merged', 'cg_side'))[1] IS NOT NULL AS merged;
+SELECT parent_index FROM dolt_commit_ancestors
+	WHERE commit_hash = dolt_hashof('HEAD') ORDER BY parent_index;
+SELECT a.parent_index,
+	(SELECT message FROM dolt_log WHERE commit_hash = a.parent_hash) AS message
+	FROM dolt_commit_ancestors a
+	WHERE a.commit_hash = dolt_hashof('HEAD') ORDER BY a.parent_index;
+-- (the root commit's parent is null; every other commit's is a commit)
+SELECT count(*) AS roots, min(parent_index) AS parent_index
+	FROM dolt_commit_ancestors WHERE parent_hash IS NULL;
+SELECT count(*) AS dangling FROM dolt_commit_ancestors a
+	WHERE a.parent_hash IS NOT NULL
+	AND NOT EXISTS (SELECT 1 FROM dolt_commits c WHERE c.commit_hash = a.parent_hash);
+SELECT count(*) AS without_row FROM dolt_commits c
+	WHERE NOT EXISTS (SELECT 1 FROM dolt_commit_ancestors a
+					  WHERE a.commit_hash = c.commit_hash);
+-- (a commit only a deleted branch reached is gone)
+SELECT dolt_branch('cg_gone');
+SELECT dolt_checkout('cg_gone');
+UPDATE cg.t SET message = 'gone' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'cg gone soon')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+SELECT dolt_branch('-D', 'cg_gone', 'cg_side');
+SELECT count(*) AS on_cg_gone FROM dolt_commits WHERE message = 'cg gone soon';
+DROP SCHEMA cg CASCADE;
+SELECT length(dolt_commit('-Am', 'cg dropped')::text) AS committed;
