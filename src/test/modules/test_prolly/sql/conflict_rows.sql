@@ -154,3 +154,44 @@ SELECT dolt_conflicts_resolve('--theirs', 'pt.q');
 SELECT * FROM pt.q;
 \c contrib_regression
 DROP DATABASE regress_conflict_detached;
+
+-- A table the working set leaves out (a partition whose columns are in
+-- another order than its partitioned table's) has its conflicts walked
+-- against the branch's rows as last committed.  Its conflicted row
+-- deleted since can't be made theirs with --theirs, and trying again
+-- can't succeed: refused, not "try again" (40001), until the row is back.
+CREATE DATABASE regress_conflict_left_out;
+\c regress_conflict_left_out
+CREATE SCHEMA lo VERSIONED;
+CREATE TABLE lo.a (pk int PRIMARY KEY, col1 int);
+INSERT INTO lo.a VALUES (1, 0), (2, 0);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+SELECT dolt_branch('side');
+SELECT dolt_checkout('side');
+UPDATE lo.a SET col1 = 100;
+SELECT length(dolt_commit('-am', 'side')::text) AS committed;
+SELECT dolt_checkout('main');
+UPDATE lo.a SET col1 = -100;
+SELECT length(dolt_commit('-am', 'main')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('side'))[3] AS conflicts;
+CREATE TABLE lo.p (col1 int, pk int) PARTITION BY RANGE (pk);
+ALTER TABLE lo.p ATTACH PARTITION lo.a FOR VALUES FROM (0) TO (100);
+-- (a row changed since is found by its key, and made theirs; one deleted
+-- since isn't there to make theirs)
+UPDATE lo.a SET col1 = -200 WHERE pk = 2;
+DELETE FROM lo.a WHERE pk = 1;
+SELECT dolt_conflicts_resolve('--theirs', 'lo.a');
+DO $$
+BEGIN
+	PERFORM dolt_conflicts_resolve('--theirs', 'lo.a');
+EXCEPTION WHEN OTHERS THEN
+	RAISE NOTICE 'refused again: %', SQLSTATE;
+END$$;
+SELECT * FROM dolt_conflicts;
+INSERT INTO lo.a VALUES (1, -100);
+SELECT dolt_conflicts_resolve('--theirs', 'lo.a');
+SELECT * FROM lo.a ORDER BY pk;
+SELECT * FROM dolt_conflicts;
+\c contrib_regression
+DROP DATABASE regress_conflict_left_out;

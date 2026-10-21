@@ -1909,14 +1909,33 @@ refuse_keyless_violations(Relation rel, int nrecorded, bool removed_rows)
 			 errhint("Change the rows on one branch so they satisfy the table's constraints, then merge again.")));
 }
 
+/* Where the rows a merge writes over were taken from (row_missing()'s). */
+typedef enum RowsFrom
+{
+	ROWS_MERGED,				/* the branch's, as the merge reads them */
+	ROWS_MOVED,					/* the branch's, brought to one side's */
+	ROWS_COMMITTED				/* ours', the table left out of the working set */
+} RowsFrom;
+
 /*
- * A row the merge removes or updates isn't there: another wrote it since
- * (moving: as the branch was brought to one side's rows).
+ * A row the merge removes or updates isn't there: another wrote it since,
+ * and trying again finds it.  But for a table the working set leaves out
+ * (ROWS_COMMITTED), whose conflicts are walked against the branch's rows
+ * as last committed, a row deleted since stays deleted: trying again
+ * can't succeed.  (A keyed row is found by its key: one changed since is
+ * there.)
  */
 static void
-row_missing(Relation rel, bool moving)
+row_missing(Relation rel, RowsFrom from)
 {
-	if (moving)
+	if (from == ROWS_COMMITTED)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a conflicted row of \"%s\" is gone since the branch's last commit",
+						RelationGetRelationName(rel)),
+				 errdetail("The working set leaves the table out as it is defined now, so its conflicts are resolved against its rows as last committed."),
+				 errhint("Put the row back, or the table as it was when the merge began, to resolve its conflicts; or abort the merge.")));
+	if (from == ROWS_MOVED)
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("a row of \"%s\" changed while the branch was moved",
@@ -1996,7 +2015,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 					  ap->slot, ap->kept, ap->unread);
 		if (!merge_write(ap->ar, ap->a, ap->rel, ap->old, ap->slot, ap->kept,
 						 ap->old, ap->unread, NULL))
-			row_missing(ap->rel, true);
+			row_missing(ap->rel, ROWS_MOVED);
 		return;
 	}
 
@@ -2019,7 +2038,7 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 		removed_note(ap->rel, ap->slot);
 		for (uint64 i = 0; i < nb; i++)
 			if (!PROLLY_CALL(ap->ar, remove, ap->a, ap->slot))
-				row_missing(ap->rel, true);
+				row_missing(ap->rel, ROWS_MOVED);
 	}
 	else if (ap->inserting && na > 0)
 	{
@@ -2544,7 +2563,7 @@ typedef struct KeyWriter
 	bool		put_back;		/* puts_back() */
 	bool		keyless;
 	bool		removed_rows;	/* refuse_keyless_violations()'s */
-	bool		moving;			/* row_missing()'s */
+	RowsFrom	from;			/* row_missing()'s */
 } KeyWriter;
 
 /* Three versions of a row decoded, for merging it column by column. */
@@ -2661,7 +2680,7 @@ update_key(KeyWriter *kw, KeyWrite *w, bool record)
 
 		if (!merge_write(kw->ar, kw->a, kw->rel, kw->s1, kw->s2, kw->kept,
 						 kw->s1, kw->unread, &refused))
-			row_missing(kw->rel, kw->moving);
+			row_missing(kw->rel, kw->from);
 		return !refused;
 	}
 	ed = try_write(kw->rel, kw->ar, kw->a, kw->s1, kw->s2, kw->kept, kw->s1,
@@ -2672,7 +2691,7 @@ update_key(KeyWriter *kw, KeyWrite *w, bool record)
 		return false;
 	}
 	if (!found)
-		row_missing(kw->rel, kw->moving);
+		row_missing(kw->rel, kw->from);
 	return true;
 }
 
@@ -2735,7 +2754,7 @@ write_keys_once(KeyWriter *kw, List *writes)
 		removed_note(kw->rel, kw->s1);
 		for (int64 i = 0; i < w->nold; i++)
 			if (!PROLLY_CALL(kw->ar, remove, kw->a, kw->s1))
-				row_missing(kw->rel, kw->moving);
+				row_missing(kw->rel, kw->from);
 	}
 	for (int first = 1; first >= 0; first--)
 	{
@@ -2934,7 +2953,7 @@ apply_rows_held(Oid relid, const Table *from, const Table *to)
 	kw.kept = palloc0_array(bool, RelationGetDescr(kw.rel)->natts);
 	kw.unread = palloc0_array(bool, RelationGetDescr(kw.rel)->natts);
 	kw.put_back = puts_back(kw.rel, false);
-	kw.moving = true;
+	kw.from = ROWS_MOVED;
 	Assert(kw.put_back);
 	kw.a = PROLLY_CALL(kw.ar, begin, kw.rel);
 	write_keys(&kw, writes);
@@ -3232,6 +3251,9 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		kw.unread = unread;
 		kw.keyless = keyless;
 		kw.put_back = puts_back(rel, keyless);
+		/* (a table the working set leaves out: ours' rows, as committed) */
+		kw.from = (mode == WALK_TAKE_THEIRS && current == NULL) ?
+			ROWS_COMMITTED : ROWS_MERGED;
 
 		/*
 		 * Rows --theirs takes are checked against the columns' typmods
