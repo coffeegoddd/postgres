@@ -68,6 +68,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/regproc.h"
 #include "utils/resowner.h"
@@ -6698,15 +6699,34 @@ static void
 remote_row(const char *name, const char *url, void *arg)
 {
 	ReturnSetInfo *rsinfo = arg;
-	Datum		values[2];
-	bool		nulls[2] = {0};
+	Datum		values[4];
+	bool		nulls[4] = {0};
+	StringInfoData spec;
+	StringInfoData specs;
 
 	values[0] = CStringGetTextDatum(name);
 	values[1] = CStringGetTextDatum(url);
+
+	/*
+	 * Dolt's columns (#586): the one fetch spec a fetch follows (every
+	 * branch to its remote-tracking branch), and no parameters (a remote is
+	 * its URL).
+	 */
+	initStringInfo(&spec);
+	appendStringInfo(&spec, "refs/heads/*:refs/remotes/%s/*", name);
+	initStringInfo(&specs);
+	appendStringInfoChar(&specs, '[');
+	escape_json(&specs, spec.data);
+	appendStringInfoChar(&specs, ']');
+	values[2] = DirectFunctionCall1(jsonb_in, CStringGetDatum(specs.data));
+	values[3] = DirectFunctionCall1(jsonb_in, CStringGetDatum("{}"));
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 }
 
-/* dolt_remotes(OUT name text, OUT url text) returns setof record */
+/*
+ * dolt_remotes(OUT name text, OUT url text, OUT fetch_specs jsonb,
+ *				OUT params jsonb) returns setof record
+ */
 Datum
 dolt_remotes(PG_FUNCTION_ARGS)
 {
