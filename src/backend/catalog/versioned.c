@@ -668,6 +668,114 @@ check_versioned_extension_schema(Oid nspid)
 }
 
 /*
+ * Error if a shared row an extension's script is making in a versioned
+ * schema has the identity of another branch's object: the catalog's unique
+ * indexes include the branch, so both rows would stand, and that branch
+ * would resolve the name to the extension's object instead of its own.  The
+ * session's branch needn't be checked: Postgres refuses a duplicate there as
+ * it makes the object.  Each unique index with the schema in its key is
+ * checked on its other key columns.
+ */
+void
+check_extension_member_identity(Relation rel, HeapTuple tup)
+{
+	Oid			relid = RelationGetRelid(rel);
+	const CatalogBranchInfo *info = catalog_branch_info(relid);
+	AttrNumber	nspattno = get_object_attnum_namespace(relid);
+	AttrNumber	oidattno = get_object_attnum_oid(relid);
+	bool		isnull;
+	Oid			self;
+	List	   *indexes;
+	ListCell   *lc;
+
+	if (info == NULL || nspattno == InvalidAttrNumber || !other_branches_have_copies())
+		return;
+	self = DatumGetObjectId(heap_getattr(tup, oidattno, RelationGetDescr(rel), &isnull));
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Relation	irel = index_open(lfirst_oid(lc), AccessShareLock);
+		int			nkeys = IndexRelationGetNumberOfKeyAttributes(irel);
+		ScanKeyData *keys = palloc(sizeof(ScanKeyData) * nkeys);
+		int			n = 0;
+		bool		has_nsp = false;
+		Oid			other = InvalidOid;
+
+		if (!irel->rd_index->indisunique)
+		{
+			index_close(irel, AccessShareLock);
+			continue;
+		}
+		for (int i = 0; i < nkeys; i++)
+		{
+			AttrNumber	att = irel->rd_index->indkey.values[i];
+			Oid			op;
+
+			if (att == info->attnum)
+				continue;
+			if (att == nspattno)
+				has_nsp = true;
+			op = get_opfamily_member(irel->rd_opfamily[i], irel->rd_opcintype[i],
+									 irel->rd_opcintype[i], BTEqualStrategyNumber);
+			ScanKeyInit(&keys[n++], att, BTEqualStrategyNumber, get_opcode(op),
+						heap_getattr(tup, att, RelationGetDescr(rel), &isnull));
+			if (isnull)
+				has_nsp = false;	/* (no identity to collide with) */
+		}
+		if (has_nsp)
+		{
+			SysScanDesc scan;
+			HeapTuple	row;
+
+			CatalogAllBranches = true;
+			PG_TRY();
+			{
+				scan = systable_beginscan(rel, RelationGetRelid(irel), true,
+										  NULL, n, keys);
+				while (HeapTupleIsValid(row = systable_getnext(scan)))
+				{
+					Oid			branch = catalog_row_branch(info, row);
+					Oid			oid = DatumGetObjectId(heap_getattr(row, oidattno,
+																	RelationGetDescr(rel),
+																	&isnull));
+
+					if (OidIsValid(branch) && branch != MyBranch && oid != self)
+					{
+						other = branch;
+						break;
+					}
+				}
+				systable_endscan(scan);
+			}
+			PG_FINALLY();
+			{
+				CatalogAllBranches = false;
+			}
+			PG_END_TRY();
+		}
+		index_close(irel, AccessShareLock);
+		if (OidIsValid(other))
+		{
+			Datum		name = heap_getattr(tup, get_object_attnum_name(relid),
+											RelationGetDescr(rel), &isnull);
+			Oid			nsp = DatumGetObjectId(heap_getattr(tup, nspattno,
+															RelationGetDescr(rel),
+															&isnull));
+
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("extension \"%s\" can't make \"%s.%s\": branch \"%s\" has an object of that name",
+							get_extension_name(CurrentExtensionObject),
+							get_namespace_name(nsp), NameStr(*DatumGetName(name)),
+							branch_name_for_message(other)),
+					 errdetail("An extension's objects in a versioned schema are every branch's."),
+					 errhint("Drop or rename it on that branch, or install the extension in another schema.")));
+		}
+	}
+	list_free(indexes);
+}
+
+/*
  * Error if a versioned schema is being dropped or renamed while an
  * extension is in it: the extension's objects are every branch's, and
  * every branch keeps the schema they are in.

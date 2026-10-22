@@ -229,3 +229,159 @@ DETAIL:  drop cascades to table base
 drop cascades to function mine()
 \c contrib_regression
 DROP DATABASE regress_versioned_extensions;
+-- An index added to an extension's shared table later is shared too, so
+-- every branch's writes keep it; and a script can't make an object whose
+-- identity another branch's object has.
+CREATE DATABASE regress_versioned_extensions2;
+\c regress_versioned_extensions2
+CREATE SCHEMA v VERSIONED;
+CREATE TABLE v.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE EXTENSION test_prolly_ext_table SCHEMA v;
+SELECT dolt_checkout('-b', 'side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE UNIQUE INDEX ext_unique ON v.test_prolly_ext_rows (v);
+SELECT relbranch = 0 AS shared FROM pg_class WHERE relname = 'ext_unique';
+ shared 
+--------
+ t
+(1 row)
+
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+INSERT INTO v.test_prolly_ext_rows VALUES (10);
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET enable_seqscan = off;
+SELECT * FROM v.test_prolly_ext_rows WHERE v = 10;
+ v  
+----
+ 10
+(1 row)
+
+RESET enable_seqscan;
+ALTER TABLE v.test_prolly_ext_rows ADD CONSTRAINT ext_small CHECK (v < 100);
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+INSERT INTO v.test_prolly_ext_rows VALUES (500);	-- the constraint is shared
+ERROR:  new row for relation "test_prolly_ext_rows" violates check constraint "ext_small"
+DETAIL:  Failing row contains (500).
+SELECT conname FROM pg_constraint WHERE conrelid = 'v.test_prolly_ext_rows'::regclass ORDER BY 1;
+             conname             
+---------------------------------
+ ext_small
+ test_prolly_ext_rows_pkey
+ test_prolly_ext_rows_v_not_null
+(3 rows)
+
+-- side's own type and function take names the extensions would make
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP EXTENSION test_prolly_ext_table;
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+CREATE TYPE v.citext AS ENUM ('red');
+CREATE FUNCTION v.test_prolly_ext_count() RETURNS bigint LANGUAGE sql RETURN 0;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE EXTENSION citext SCHEMA v;
+ERROR:  extension "citext" can't make "v.citext": branch "side" has an object of that name
+DETAIL:  An extension's objects in a versioned schema are every branch's.
+HINT:  Drop or rename it on that branch, or install the extension in another schema.
+CONTEXT:  SQL statement "CREATE TYPE citext"
+extension script file "citext--1.4.sql", near line 17
+CREATE EXTENSION test_prolly_ext_table SCHEMA v;
+ERROR:  extension "test_prolly_ext_table" can't make "v.test_prolly_ext_count": branch "side" has an object of that name
+DETAIL:  An extension's objects in a versioned schema are every branch's.
+HINT:  Drop or rename it on that branch, or install the extension in another schema.
+CONTEXT:  SQL statement "CREATE FUNCTION v.test_prolly_ext_count() RETURNS bigint
+  LANGUAGE sql AS 'SELECT count(*) FROM v.test_prolly_ext_rows'"
+extension script file "test_prolly_ext_table--1.0.sql", near line 8
+SELECT count(*) AS installed FROM pg_extension WHERE extname IN ('citext', 'test_prolly_ext_table');
+ installed 
+-----------
+         0
+(1 row)
+
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+SELECT 'red'::v.citext AS sides_enum;
+ sides_enum 
+------------
+ red
+(1 row)
+
+DROP TYPE v.citext;
+DROP FUNCTION v.test_prolly_ext_count();
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE EXTENSION citext SCHEMA v;		-- nothing in the way now
+CREATE EXTENSION test_prolly_ext_table SCHEMA v;
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+SET search_path = public, v;
+SELECT 'Red'::v.citext = 'RED'::v.citext AS shared_citext, v.test_prolly_ext_count() AS rows;
+ shared_citext | rows 
+---------------+------
+ t             |    1
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_versioned_extensions2;
