@@ -22,6 +22,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
+#include "utils/datum.h"
 #include "utils/geo_decls.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
@@ -47,7 +48,11 @@ typedef enum CodecKind
 	CODEC_ANYARRAY,
 	CODEC_JSONB,
 	CODEC_SEND,
+	CODEC_OUTPUT,				/* a type without binary send/receive */
 } CodecKind;
+
+/* The version byte of a CODEC_OUTPUT value's canonical bytes. */
+#define OUTPUT_VERSION 1
 
 /*
  * The floats a CODEC_SEND value holds, whose NaNs are made canonical
@@ -87,6 +92,12 @@ struct ProllyDatumCodec
 	Oid			floats_type;	/* FLOATS_*RANGE: float4 or float8 */
 	TypeCacheEntry *floats_range;	/* FLOATS_*RANGE: the range type's */
 	int16		floats_len;		/* FLOATS_GEOMETRIC: typlen */
+
+	/* CODEC_OUTPUT (ioparam above too) */
+	FmgrInfo	output;
+	FmgrInfo	input;
+	int16		typlen;
+	bool		typbyval;
 
 	/* CODEC_ARRAY */
 	ElemInfo	elem;
@@ -495,6 +506,50 @@ send_floats(ProllyDatumCodec *c, Datum value)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * A CODEC_OUTPUT value: a version byte, then its text form in UTF-8.  The
+ * text must read back as the value, byte for byte (datum_image_eq), or the
+ * value isn't stored: a type whose text form drops precision (PostGIS's
+ * box2d, at 15 significant digits) can't be kept this way, and it is
+ * refused where it would be written rather than changed.
+ */
+static void
+encode_output(ProllyDatumCodec *c, Datum value, StringInfo out)
+{
+	char	   *text = OutputFunctionCall(&c->output, value);
+	Datum		back = InputFunctionCall(&c->input, text, c->ioparam, c->typmod);
+	char	   *utf8;
+
+	if (!datum_image_eq(value, back, c->typbyval, c->typlen))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("value of type %s can't be stored in a versioned table: its text form doesn't read back as the same value",
+						format_type_be(c->type)),
+				 errdetail("The value is \"%s\".", text),
+				 errhint("The type has no binary send and receive functions, so a versioned table keeps its values as text.")));
+	utf8 = pg_server_to_any(text, strlen(text), PG_UTF8);
+	appendStringInfoChar(out, OUTPUT_VERSION);
+	appendBinaryStringInfo(out, utf8, strlen(utf8));
+	if (utf8 != text)
+		pfree(utf8);
+	pfree(text);
+}
+
+static Datum
+decode_output(ProllyDatumCodec *c, const char *data, int len)
+{
+	char	   *text;
+	char	   *server;
+
+	if (len < 1 || (uint8) data[0] != OUTPUT_VERSION)
+		bad_value("text form without its version");
+	text = pnstrdup(data + 1, len - 1);
+	if (strlen(text) != len - 1)
+		bad_value("text form contains a zero byte");
+	server = pg_any_to_server(text, len - 1, PG_UTF8);
+	return InputFunctionCall(&c->input, server, c->ioparam, c->typmod);
+}
+
 static bytea *
 send_utf8(FmgrInfo *send, Datum value)
 {
@@ -632,6 +687,38 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 													 mcxt);
 		}
 		return c;
+	}
+
+	/*
+	 * A type without binary send or receive (an extension's, say) is
+	 * stored as its text form, which encoding checks reads back as the
+	 * value it came from.
+	 */
+	{
+		HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base));
+		Form_pg_type typ;
+		bool		binary;
+
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for type %u", base);
+		typ = (Form_pg_type) GETSTRUCT(tup);
+		binary = OidIsValid(typ->typsend) && OidIsValid(typ->typreceive);
+		c->typlen = typ->typlen;
+		c->typbyval = typ->typbyval;
+		ReleaseSysCache(tup);
+		if (!binary)
+		{
+			Oid			output;
+			Oid			input;
+			bool		varlena;
+
+			c->kind = CODEC_OUTPUT;
+			getTypeOutputInfo(base, &output, &varlena);
+			getTypeInputInfo(base, &input, &c->ioparam);
+			fmgr_info_cxt(output, &c->output, mcxt);
+			fmgr_info_cxt(input, &c->input, mcxt);
+			return c;
+		}
 	}
 
 	{
@@ -1389,6 +1476,25 @@ decode_jsonb(ProllyDatumCodec *c, const char *data, int len)
 	return JsonbPGetDatum(jb);
 }
 
+bool
+prolly_datum_codec_checks(const ProllyDatumCodec *c)
+{
+	switch (c->kind)
+	{
+		case CODEC_OUTPUT:
+			return true;
+		case CODEC_ARRAY:
+			return prolly_datum_codec_checks(c->elem.codec);
+		case CODEC_COMPOSITE:
+			for (int i = 0; i < c->tupdesc->natts; i++)
+				if (c->attcodecs[i] && prolly_datum_codec_checks(c->attcodecs[i]))
+					return true;
+			return false;
+		default:
+			return false;
+	}
+}
+
 /* ------------------------------------------------------------------------
  * Encode and decode
  * ------------------------------------------------------------------------
@@ -1437,6 +1543,9 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 			break;
 		case CODEC_JSONB:
 			encode_jsonb(value, out);
+			break;
+		case CODEC_OUTPUT:
+			encode_output(c, value, out);
 			break;
 		case CODEC_SEND:
 			{
@@ -1527,6 +1636,8 @@ prolly_datum_decode(ProllyDatumCodec *c, const char *data, int len)
 				return recv_utf8(c, utf8, strlen(utf8));
 			}
 			return recv_utf8(c, data, len);
+		case CODEC_OUTPUT:
+			return decode_output(c, data, len);
 		default:
 			elog(ERROR, "unrecognized prolly datum codec kind %d", c->kind);
 			return (Datum) 0;	/* keep compiler quiet */

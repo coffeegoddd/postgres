@@ -32,6 +32,13 @@
  *					(after its varlena header), its strings in UTF-8: in a
  *					UTF-8 database, the bytes the value holds.  Version 1,
  *					jsonb's send format, is still read.
+ *	a type without binary send and receive
+ *					a version byte (1), then its text form (its output
+ *					function's) in UTF-8, read back with its input function
+ *					and the column's typmod.  A value whose text doesn't read
+ *					back as the same value (datum_image_eq) isn't stored:
+ *					encoding refuses it, and so do writes to a versioned
+ *					table (prolly_check_row_key()).
  *	anything else	the type's binary send format, produced with the client
  *					encoding fixed to UTF-8, so text-like values are UTF-8
  *					whatever the session's client_encoding or the server
@@ -76,6 +83,13 @@ extern bool prolly_datum_map_enums(ProllyDatumCodec *codec, List *mappings);
 /* A codec for values of typid/typmod; lives in mcxt. */
 extern ProllyDatumCodec *prolly_datum_codec(Oid typid, int32 typmod,
 											MemoryContext mcxt);
+
+/*
+ * Whether encoding a value with c may refuse it: c holds (in an element or
+ * attribute too) a type kept as its text form, whose value is refused where
+ * its text doesn't read back as it.
+ */
+extern bool prolly_datum_codec_checks(const ProllyDatumCodec *c);
 
 /* Append the canonical bytes of a non-NULL value. */
 extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,

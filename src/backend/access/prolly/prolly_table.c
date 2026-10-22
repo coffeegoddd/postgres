@@ -45,6 +45,7 @@
 #include "access/heapam.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/tableam.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -79,6 +80,9 @@ typedef struct KeyBound
 	TupleTableSlot *slot;		/* a row as written */
 	MemoryContext scratch;		/* a key's encoding */
 	Size		max;			/* the longest key a data tree holds */
+	int			ntext;			/* columns holding a type kept as text */
+	AttrNumber *text_atts;
+	ProllyDatumCodec **text_codecs;
 } KeyBound;
 
 static HTAB *key_bounds = NULL;
@@ -195,6 +199,26 @@ key_bound(Relation rel)
 	/* (in the chunk format and hash of folded trees, prolly_folded_tree_env()) */
 	made.max = PROLLY_CALL(c.tree, key_max, prolly_chunkformat_lookup("basic"),
 						   prolly_content_hash());
+
+	/*
+	 * the columns whose values encoding may refuse: those holding a type
+	 * without binary send and receive, kept as its text form
+	 */
+	made.text_atts = palloc(sizeof(AttrNumber) * desc->natts);
+	made.text_codecs = palloc(sizeof(ProllyDatumCodec *) * desc->natts);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		ProllyDatumCodec *codec;
+
+		if (att->attisdropped)
+			continue;
+		codec = prolly_datum_codec(att->atttypid, att->atttypmod, made.cxt);
+		if (!prolly_datum_codec_checks(codec))
+			continue;
+		made.text_atts[made.ntext] = att->attnum;
+		made.text_codecs[made.ntext++] = codec;
+	}
 	MemoryContextSwitchTo(old);
 
 	MemoryContextSetParent(made.cxt, CacheMemoryContext);
@@ -262,6 +286,30 @@ prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 	if (writing_held_rows)
 		return;
 	kb = key_bound(rel);
+
+	/*
+	 * a value of a type kept as its text form whose text doesn't read back
+	 * as it: refused here, by encoding it, rather than when commits read it
+	 */
+	if (kb->ntext > 0)
+	{
+		MemoryContext old = MemoryContextSwitchTo(kb->scratch);
+		TupleDesc	desc = RelationGetDescr(rel);
+
+		for (int i = 0; i < kb->ntext; i++)
+		{
+			bool		isnull;
+			Datum		value = heap_getattr(tuple, kb->text_atts[i], desc, &isnull);
+			StringInfoData buf;
+
+			if (isnull)
+				continue;
+			initStringInfo(&buf);
+			prolly_datum_encode(kb->text_codecs[i], value, &buf);
+		}
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(kb->scratch);
+	}
 	if (kb->keyless)
 		return;
 	MemoryContextReset(kb->scratch);
