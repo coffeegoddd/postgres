@@ -1,0 +1,207 @@
+-- A shared object (outside the versioned schemas: an extension, an
+-- ordinary schema's type, function or table) is every branch's.  Dropping
+-- one while an object on another branch depends on it is refused, CASCADE
+-- or not: CASCADE reaches only the session's branch, and the dependent
+-- would be left naming an object that is gone.  Dependents on the
+-- session's own branch behave as on stock Postgres.
+CREATE SCHEMA sd_ext;
+CREATE EXTENSION citext SCHEMA sd_ext;
+CREATE DOMAIN public.sd_pos AS int CHECK (VALUE > 0);
+CREATE FUNCTION public.sd_one() RETURNS int LANGUAGE sql RETURN 1;
+CREATE TABLE public.sd_plain (id int PRIMARY KEY, a int, b int);
+CREATE SCHEMA sd VERSIONED;
+CREATE TABLE sd.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('sd_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- on sd_side only: a column of an extension type, a column of a shared
+-- domain with a shared function as its default, a view over a shared
+-- table's column
+SELECT dolt_checkout('sd_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'sd_side'"}
+(1 row)
+
+CREATE TABLE sd.t (id int PRIMARY KEY, name sd_ext.citext,
+				   n public.sd_pos DEFAULT public.sd_one());
+INSERT INTO sd.t (id, name) VALUES (1, 'Hi');
+CREATE VIEW sd.v AS SELECT id, a FROM public.sd_plain;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- each drop is refused from main, with CASCADE too
+DROP EXTENSION citext;
+ERROR:  cannot drop type sd_ext.citext because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+DROP EXTENSION citext CASCADE;
+ERROR:  cannot drop type sd_ext.citext because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+DROP SCHEMA sd_ext CASCADE;
+NOTICE:  drop cascades to extension citext
+ERROR:  cannot drop type sd_ext.citext because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+DROP DOMAIN public.sd_pos;
+ERROR:  cannot drop type sd_pos because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+DROP DOMAIN public.sd_pos CASCADE;
+ERROR:  cannot drop type sd_pos because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+DROP FUNCTION public.sd_one();
+ERROR:  cannot drop function sd_one() because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+DROP TABLE public.sd_plain;
+ERROR:  cannot drop table sd_plain because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+ALTER TABLE public.sd_plain DROP COLUMN a;
+ERROR:  cannot drop column a of table sd_plain because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+ALTER TABLE public.sd_plain DROP COLUMN a CASCADE;
+ERROR:  cannot drop column a of table sd_plain because objects on branch "sd_side" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+-- a column nothing on sd_side uses can go
+ALTER TABLE public.sd_plain DROP COLUMN b;
+-- sd_side still reads and writes
+SELECT dolt_checkout('sd_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'sd_side'"}
+(1 row)
+
+SELECT id, name, n FROM sd.t ORDER BY id;
+ id | name | n 
+----+------+---
+  1 | Hi   | 1
+(1 row)
+
+INSERT INTO sd.t (id, name) VALUES (2, 'Yo');
+SELECT id, name, n FROM sd.t ORDER BY id;
+ id | name | n 
+----+------+---
+  1 | Hi   | 1
+  2 | Yo   | 1
+(2 rows)
+
+SELECT * FROM sd.v;
+ id | a 
+----+---
+(0 rows)
+
+-- dependents on two other branches
+SELECT dolt_branch('sd_third');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sd_third');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'sd_third'"}
+(1 row)
+
+CREATE TABLE sd.t3 (id int PRIMARY KEY, name sd_ext.citext);
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP EXTENSION citext;
+ERROR:  cannot drop type sd_ext.citext because objects on branch "sd_side" depend on it
+DETAIL:  Objects on 2 branches other than the session's depend on it.
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+SELECT dolt_checkout('sd_third');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'sd_third'"}
+(1 row)
+
+DROP TABLE sd.t3;
+-- the other way round: from sd_side, a dependent on main refuses too
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+CREATE TABLE sd.m (id int PRIMARY KEY, n public.sd_pos);
+SELECT dolt_checkout('sd_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'sd_side'"}
+(1 row)
+
+DROP TABLE sd.t;
+DROP DOMAIN public.sd_pos;
+ERROR:  cannot drop type sd_pos because objects on branch "main" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- dependents on the session's own branch: stock RESTRICT and CASCADE
+CREATE TABLE sd.own (id int PRIMARY KEY, name sd_ext.citext);
+DROP FUNCTION public.sd_one();	-- sd_side dropped sd.t, its only user
+DROP TABLE sd.m;
+DROP DOMAIN public.sd_pos;		-- sd.m and sd_side's sd.t, its users, are gone
+SELECT dolt_checkout('sd_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'sd_side'"}
+(1 row)
+
+DROP VIEW sd.v;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP TABLE public.sd_plain;
+DROP EXTENSION citext;			-- RESTRICT: sd.own's column depends on it
+ERROR:  cannot drop extension citext because other objects depend on it
+DETAIL:  column name of table sd.own depends on type sd_ext.citext
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+SET client_min_messages = warning;
+DROP EXTENSION citext CASCADE;	-- drops sd.own's column, on main only
+RESET client_min_messages;
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'sd.own'::regclass AND attnum > 0 AND NOT attisdropped
+ ORDER BY attnum;
+ attname 
+---------
+ id
+(1 row)
+
+SELECT dolt_branch('-D', 'sd_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'sd_third');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sd CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table sd.base
+drop cascades to table sd.own
+DROP SCHEMA sd_ext;
