@@ -122,6 +122,14 @@ values before fitting them to the current types, so distinct old values that
 both display as NULL still differ. The temporary sort can spill to disk. A rename alone with unchanged
 data roots still produces no row diff. Following column identity across renames
 is tracked separately in [#699](https://github.com/coffeegoddd/postgres/issues/699).
+Columns present under the same name in both historical versions also participate
+in comparison when that name is absent today. A keyed row whose value changed is
+reported as modified even if its displayed rows are identical (both values read
+as NULL); a keyless change retains its removed and added copies. This applies to
+columns subsequently dropped as well as renamed, without matching different
+historical names by position or inferring column identity. Diff statistics count
+these modified rows, while changed-cell counts still compare the displayed cells
+(D20).
 
 The manifest also records deferred cases, each with a concrete reason: an
 intended divergence (for example, a hard reset restores a versioned
