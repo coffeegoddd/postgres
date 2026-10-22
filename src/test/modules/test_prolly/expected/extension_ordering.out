@@ -1,0 +1,520 @@
+-- Extension opclasses ordering prolly keys require their exact version.
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/ordering-' || txid_current() AS url \gset
+CREATE DATABASE regress_ordering_src;
+\c regress_ordering_src
+CREATE SCHEMA tools;
+CREATE EXTENSION test_prolly SCHEMA tools;
+CREATE EXTENSION test_prolly_ordering VERSION '1.0';
+CREATE SCHEMA ord VERSIONED;
+CREATE TABLE ord.nonkey (id int PRIMARY KEY, k test_ordering);
+CREATE TABLE ord.keyless (k test_ordering);
+CREATE TABLE ord.deferred (k test_ordering PRIMARY KEY DEFERRABLE);
+CREATE INDEX nonkey_idx ON ord.nonkey (k);
+INSERT INTO ord.nonkey VALUES (1, ROW(10));
+INSERT INTO ord.keyless VALUES (ROW(10));
+INSERT INTO ord.deferred VALUES (ROW(10));
+SELECT (dolt_commit('-Am', 'no ordered extension keys'))[1] AS nonkey \gset
+SELECT replace(d, E'\t', ' | ') AS dependency
+ FROM unnest(tools.test_commit_dependencies(:'nonkey')) d ORDER BY 1;
+                   dependency                   
+------------------------------------------------
+ extension test_prolly_ordering => {1.0,public}
+(1 row)
+
+-- Either component of a composite primary key can require the guard.
+CREATE TABLE ord.composite (id int, k test_ordering, n int, PRIMARY KEY (id, k));
+INSERT INTO ord.composite VALUES (1, ROW(1), 10), (1, ROW(2), 20), (2, ROW(1), 30);
+SELECT (dolt_commit('-Am', 'ordered extension keys'))[1] AS ordered \gset
+SELECT replace(d, E'\t', ' | ') AS dependency
+ FROM unnest(tools.test_commit_dependencies(:'ordered')) d ORDER BY 1;
+                       dependency                        
+---------------------------------------------------------
+ extension test_prolly_ordering => {1.0,public,ordering}
+(1 row)
+
+SELECT tools.test_check_dependencies(ARRAY[:'ordered'], false);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+CREATE TABLE ord.single (k test_ordering PRIMARY KEY, n int);
+INSERT INTO ord.single VALUES (ROW(3), 3), (ROW(1), 1), (ROW(2), 2);
+SELECT length(dolt_commit('-Am', 'single column key')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main');
+         dolt_push         
+---------------------------
+ {0,"main -> origin/main"}
+(1 row)
+
+-- A fresh clone installs the exact version, even though the default is newer.
+\c :db
+CREATE DATABASE regress_ordering_dst;
+\c regress_ordering_dst
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT extversion FROM pg_extension WHERE extname = 'test_prolly_ordering';
+ extversion 
+------------
+ 1.0
+(1 row)
+
+SELECT * FROM ord.composite ORDER BY id, k;
+ id |  k  | n  
+----+-----+----
+  1 | (1) | 10
+  1 | (2) | 20
+  2 | (1) | 30
+(3 rows)
+
+CREATE SCHEMA tools;
+CREATE EXTENSION test_prolly SCHEMA tools;
+SELECT prolly_root_hash('HEAD') = tools.test_fold_root(true) AS portable_root;
+ portable_root 
+---------------
+ t
+(1 row)
+
+ALTER EXTENSION test_prolly_ordering UPDATE TO '1.1';
+SELECT * FROM dolt_at('HEAD', NULL::ord.composite) ORDER BY id, k;
+ id |  k  | n  
+----+-----+----
+  1 | (2) | 20
+  1 | (1) | 10
+  2 | (1) | 30
+(3 rows)
+
+-- An installed newer version is NOT compatible for key ordering.
+\c :db
+CREATE DATABASE regress_ordering_wrong;
+\c regress_ordering_wrong
+CREATE EXTENSION test_prolly_ordering;
+SELECT dolt_clone(:'url');
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: orders keys at version 1.0, and the database has 1.1
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+SELECT to_regclass('ord.composite') IS NULL AS untouched;
+ untouched 
+-----------
+ t
+(1 row)
+
+\c regress_ordering_src
+SELECT dolt_checkout('-b', 'side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+UPDATE ord.composite SET n = 21 WHERE id = 1 AND (k).v = 2;
+SELECT (dolt_commit('-Am', 'side'))[1] AS side \gset
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('old', :'side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('-b', 'dropped');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'dropped'"}
+(1 row)
+
+DROP TABLE ord.composite, ord.single;
+SELECT (dolt_commit('-Am', 'drop ordered keys'))[1] AS dropped \gset
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'dropped');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT tools.test_fold_root() AS before_upgrade \gset
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+ALTER EXTENSION test_prolly_ordering UPDATE TO '1.1';
+-- Postgres's native indexes also need rebuilding after a comparator change.
+REINDEX TABLE ord.nonkey;
+REINDEX TABLE ord.deferred;
+REINDEX TABLE ord.composite;
+REINDEX TABLE ord.single;
+-- With no row writes, the changed ordering dependency forces a fresh fold.
+SELECT tools.test_fold_root() AS after_upgrade \gset
+SELECT :'after_upgrade' = tools.test_fold_root(true) AS same_as_full,
+ :'after_upgrade' <> :'before_upgrade' AS reordered;
+ same_as_full | reordered 
+--------------+-----------
+ t            | t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value > 0 AS changed_shape FROM pg_stat_prolly WHERE name = 'fold_full_shape_changed';
+ changed_shape 
+---------------
+ t
+(1 row)
+
+-- A non-key use (including a secondary index and deferrable PK) permits updates.
+SELECT tools.test_check_dependencies(ARRAY[:'nonkey'], false);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+-- Historical reads re-sort this table, without blocking unrelated tables.
+SELECT * FROM dolt_at(:'ordered', NULL::ord.composite) ORDER BY id, k;
+ id |  k  | n  
+----+-----+----
+  1 | (2) | 20
+  1 | (1) | 10
+  2 | (1) | 30
+(3 rows)
+
+SELECT * FROM dolt_diff(:'ordered', :'side', NULL::ord.composite);
+ diff_type |   from_row   |    to_row    
+-----------+--------------+--------------
+ modified  | (1,"(2)",20) | (1,"(2)",21)
+(1 row)
+
+SELECT * FROM dolt_at(:'nonkey', NULL::ord.nonkey);
+ id |  k   
+----+------
+  1 | (10)
+(1 row)
+
+-- Mismatches fail before changing the head or the rows.
+SELECT dolt_checkout('old');
+ERROR:  the branch's first use needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: orders keys at version 1.0, and the database has 1.1
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+SELECT dolt_reset('--hard', :'side');
+ERROR:  the reset needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: orders keys at version 1.0, and the database has 1.1
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+SELECT dolt_reset('--hard');
+ERROR:  the reset needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: orders keys at version 1.0, and the database has 1.1
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+-- Auto-commit must refold rather than apply row changes to the stale head.
+SET dolt.transaction_commit = on;
+UPDATE ord.composite SET n = 31 WHERE id = 2;
+SET dolt.transaction_commit = off;
+SELECT dolt_hashof('HEAD') AS newer \gset
+SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;
+ verify_mismatches 
+-------------------
+                 0
+(1 row)
+
+-- Moving forward from a stale head checks only the target's ordering.
+SELECT dolt_reset('--soft', :'side');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_reset('--hard', :'newer');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-f', 'old', :'newer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('old') = :'newer' AS moved_forward;
+ moved_forward 
+---------------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'old');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('old', :'side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Read operations re-sort the old merge base and incoming rows.
+SELECT (dolt_merge(:'side'))[2:] AS merged;
+          merged          
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM ord.composite ORDER BY id, k;
+ id |  k  | n  
+----+-----+----
+  1 | (2) | 21
+  1 | (1) | 10
+  2 | (1) | 31
+(3 rows)
+
+SELECT dolt_reset('--hard', :'newer');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT (dolt_cherry_pick(:'side'))[2:] AS picked;
+ picked  
+---------
+ {0,0,0}
+(1 row)
+
+SELECT * FROM ord.composite ORDER BY id, k;
+ id |  k  | n  
+----+-----+----
+  1 | (2) | 21
+  1 | (1) | 10
+  2 | (1) | 31
+(3 rows)
+
+SELECT dolt_reset('--hard', :'newer');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('dropped', :'dropped');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('dropped'))[2:] AS merged;
+ERROR:  merge of branch "dropped" can't combine the rows of table ord.composite yet
+DETAIL:  One side changed its definition, or dropped it, and the other its rows.
+ROLLBACK;
+SELECT dolt_branch('-D', 'dropped');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('HEAD') = :'newer' AS unchanged;
+ unchanged 
+-----------
+ t
+(1 row)
+
+SELECT * FROM ord.composite ORDER BY id, k;
+ id |  k  | n  
+----+-----+----
+  1 | (2) | 20
+  1 | (1) | 10
+  2 | (1) | 31
+(3 rows)
+
+SELECT replace(d, E'\t', ' | ') AS dependency
+ FROM unnest(tools.test_commit_dependencies(:'newer')) d ORDER BY 1;
+                       dependency                        
+---------------------------------------------------------
+ extension test_prolly_ordering => {1.1,public,ordering}
+(1 row)
+
+-- A clone with incompatible head requirements cannot choose the newest one.
+SELECT dolt_push('origin', 'main');
+         dolt_push         
+---------------------------
+ {0,"main -> origin/main"}
+(1 row)
+
+SELECT dolt_push('origin', 'old');
+        dolt_push        
+-------------------------
+ {0,"old -> origin/old"}
+(1 row)
+
+\c :db
+CREATE DATABASE regress_ordering_conflict;
+\c regress_ordering_conflict
+SELECT dolt_clone(:'url');
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: orders keys at versions 1.1, 1.0, which differ
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+SELECT count(*) AS not_installed FROM pg_extension WHERE extname = 'test_prolly_ordering';
+ not_installed 
+---------------
+             0
+(1 row)
+
+-- A minimum requirement must not silently override an exact ordering version.
+CREATE SCHEMA tools;
+CREATE EXTENSION test_prolly SCHEMA tools;
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.0,public,ordering}']) AS exact_old \gset
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.1,public}']) AS minimum_new \gset
+SELECT tools.test_check_dependencies(ARRAY[:'exact_old', :'minimum_new'], true);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: version 1.1 is needed, but keys require version 1.0
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+SELECT count(*) AS not_installed FROM pg_extension WHERE extname = 'test_prolly_ordering';
+ not_installed 
+---------------
+             0
+(1 row)
+
+-- Exact versions must agree, and flags have one canonical order.
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.1,public,ordering}']) AS exact_new \gset
+SELECT tools.test_check_dependencies(ARRAY[:'exact_old', :'exact_new'], false);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ordering: orders keys at versions 1.0, 1.1, which differ
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.1,public,ordering,versioned}']) AS bad_flags \gset
+SELECT tools.test_check_dependencies(ARRAY[:'bad_flags'], false);
+ERROR:  invalid extension dependency "{1.1,public,ordering,versioned}"
+-- An older minimum plus a newer exact version is compatible.
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.1,public,ordering}']) AS exact_new \gset
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.0,public}']) AS minimum_old \gset
+SELECT tools.test_check_dependencies(ARRAY[:'exact_new', :'minimum_old'], true);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+SELECT extversion FROM pg_extension WHERE extname = 'test_prolly_ordering';
+ extversion 
+------------
+ 1.1
+(1 row)
+
+-- Both flags survive when the extension itself lives in a versioned schema.
+\c :db
+CREATE DATABASE regress_ordering_versioned;
+\c regress_ordering_versioned
+CREATE SCHEMA tools;
+CREATE EXTENSION test_prolly SCHEMA tools;
+CREATE SCHEMA ord VERSIONED;
+CREATE EXTENSION test_prolly_ordering SCHEMA ord VERSION '1.0';
+CREATE TABLE ord.t (k ord.test_ordering PRIMARY KEY);
+INSERT INTO ord.t VALUES (ROW(1));
+SELECT length(dolt_commit('-Am', 'versioned extension')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT replace(d, E'\t', ' | ') AS dependency
+ FROM unnest(tools.test_commit_dependencies(dolt_hashof('HEAD'))) d ORDER BY 1;
+                           dependency                           
+----------------------------------------------------------------
+ extension test_prolly_ordering => {1.0,ord,versioned,ordering}
+(1 row)
+
+SELECT tools.test_check_dependencies(ARRAY[dolt_hashof('HEAD')], false);
+ test_check_dependencies 
+-------------------------
+ 
+(1 row)
+
+SELECT dolt_remote('add', 'origin', :'url' || '-versioned');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main');
+         dolt_push         
+---------------------------
+ {0,"main -> origin/main"}
+(1 row)
+
+\c :db
+CREATE DATABASE regress_ordering_versioned_clone;
+\c regress_ordering_versioned_clone
+SELECT dolt_clone(:'url' || '-versioned');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT extversion, extnamespace::regnamespace FROM pg_extension WHERE extname = 'test_prolly_ordering';
+ extversion | extnamespace 
+------------+--------------
+ 1.0        | ord
+(1 row)
+
+SELECT * FROM ord.t;
+  k  
+-----
+ (1)
+(1 row)
+
+\c :db
+DROP DATABASE regress_ordering_versioned_clone;
+DROP DATABASE regress_ordering_versioned;
+DROP DATABASE regress_ordering_conflict;
+DROP DATABASE regress_ordering_wrong;
+DROP DATABASE regress_ordering_dst;
+DROP DATABASE regress_ordering_src;

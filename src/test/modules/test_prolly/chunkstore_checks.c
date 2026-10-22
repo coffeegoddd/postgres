@@ -714,7 +714,7 @@ test_fold_trees(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 	fold_in_full(&root);
-	PROLLY_CALL(prolly_canon_lookup("folded"), tables, &root, tree_row, rsinfo);
+	PROLLY_CALL(prolly_canon_lookup("folded"), tables, &root, NULL, tree_row, rsinfo);
 	return (Datum) 0;
 }
 

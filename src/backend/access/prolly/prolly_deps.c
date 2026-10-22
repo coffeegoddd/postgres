@@ -45,6 +45,7 @@ typedef struct NeededExtension
 	char	   *name;			/* unquoted */
 	List	   *versions;		/* String, distinct; none for "any" */
 	List	   *schemas;		/* String, distinct */
+	List	   *ordering_versions; /* String, exact versions ordering keys */
 	bool		versioned;		/* its schema is a versioned one */
 } NeededExtension;
 
@@ -60,6 +61,7 @@ typedef struct Needs
 	List	   *extensions;
 	List	   *objects;
 	List	   *except;			/* "name\nvalue": already needed, not checked */
+	bool		read;			/* historical rows can be re-sorted */
 } Needs;
 
 /* An extension to create. */
@@ -116,6 +118,35 @@ text_array_elements(const char *literal, int n, const char *what)
 	return text_array_elements_upto(literal, n, 0, NULL, what);
 }
 
+/* Canonical order: versioned, then ordering; either may be absent. */
+static Datum *
+extension_parts(const char *value, bool *versioned, bool *ordering)
+{
+	int			nparts;
+	Datum	   *parts = text_array_elements_upto(value, 2, 2, &nparts,
+												 "extension");
+
+	*versioned = *ordering = false;
+	for (int i = 2; i < nparts; i++)
+	{
+		char	   *flag = TextDatumGetCString(parts[i]);
+
+		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering)
+			*versioned = true;
+		else if (strcmp(flag, "ordering") == 0 && !*ordering)
+			*ordering = true;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid extension dependency \"%s\"", value)));
+	}
+	if (*ordering && TextDatumGetCString(parts[0])[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("an ordering extension dependency must record a version")));
+	return parts;
+}
+
 static NeededExtension *
 find_extension(Needs *needs, const char *name)
 {
@@ -131,11 +162,36 @@ find_extension(Needs *needs, const char *name)
 	return NULL;
 }
 
+static void note_need(const char *name, const char *value, void *arg);
+
+/* Ordinary dependencies need not still exist just to read historical rows. */
+static bool
+is_ordering_dependency(const char *name, const char *value)
+{
+	bool		versioned;
+	bool		ordering;
+
+	if (strncmp(name, EXTENSION_PREFIX, strlen(EXTENSION_PREFIX)) != 0)
+		return false;
+	(void) extension_parts(value, &versioned, &ordering);
+	return ordering;
+}
+
+static void
+note_ordering(const char *name, const char *value, void *arg)
+{
+	if (is_ordering_dependency(name, value))
+		note_need(name, value, arg);
+}
+
 static void
 note_except(const char *name, const char *value, void *arg)
 {
 	Needs	   *needs = arg;
 
+	/* Moves must check the target's ordering even when the old head agrees. */
+	if (!needs->read && is_ordering_dependency(name, value))
+		return;
 	needs->except = lappend(needs->except, psprintf("%s\n%s", name, value));
 }
 
@@ -157,12 +213,11 @@ note_need(const char *name, const char *value, void *arg)
 	if (strncmp(name, EXTENSION_PREFIX, strlen(EXTENSION_PREFIX)) == 0)
 	{
 		char	   *quoted = pstrdup(name + strlen(EXTENSION_PREFIX));
-		int			nparts;
-		Datum	   *parts = text_array_elements_upto(value, 2, 1, &nparts,
-													 "extension");
+		bool		versioned;
+		bool		ordering;
+		Datum	   *parts = extension_parts(value, &versioned, &ordering);
 		char	   *version = TextDatumGetCString(parts[0]);
 		char	   *schema = TextDatumGetCString(parts[1]);
-		bool		versioned = false;
 		List	   *names;
 		NeededExtension *e;
 
@@ -170,14 +225,6 @@ note_need(const char *name, const char *value, void *arg)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid extension dependency \"%s\"", name)));
-		if (nparts == 3)
-		{
-			if (strcmp(TextDatumGetCString(parts[2]), "versioned") != 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid extension dependency \"%s\"", name)));
-			versioned = true;
-		}
 		e = find_extension(needs, linitial(names));
 		if (e == NULL)
 		{
@@ -187,6 +234,9 @@ note_need(const char *name, const char *value, void *arg)
 		}
 		if (version[0] != '\0' && !list_member(e->versions, makeString(version)))
 			e->versions = lappend(e->versions, makeString(version));
+		if (ordering && !needs->read &&
+			!list_member(e->ordering_versions, makeString(version)))
+			e->ordering_versions = lappend(e->ordering_versions, makeString(version));
 		if (!list_member(e->schemas, makeString(schema)))
 			e->schemas = lappend(e->schemas, makeString(schema));
 		e->versioned = e->versioned || versioned;
@@ -381,12 +431,25 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 						 e->name, string_list(e->schemas));
 		return NULL;
 	}
+	if (list_length(e->ordering_versions) > 1)
+	{
+		appendStringInfo(missing, "\nextension %s: orders keys at versions %s, which differ",
+						 e->name, string_list(e->ordering_versions));
+		return NULL;
+	}
 	if (installed(e->name, &have, &have_schema))
 	{
 		if (strcmp(have_schema, schema) != 0)
 		{
 			appendStringInfo(missing, "\nextension %s: in schema %s, and the database has it in %s",
 							 e->name, schema, have_schema);
+		}
+		if (e->ordering_versions &&
+			strcmp(strVal(linitial(e->ordering_versions)), have) != 0)
+		{
+			appendStringInfo(missing, "\nextension %s: orders keys at version %s, and the database has %s",
+							 e->name, strVal(linitial(e->ordering_versions)), have);
+			return NULL;
 		}
 		if (only_version(e->versions, have))
 			return NULL;
@@ -416,6 +479,17 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 						 e->name, string_list(e->versions));
 		return NULL;
 	}
+
+	/* An ordinary dependency may be older, but must not require an upgrade. */
+	if (e->ordering_versions &&
+		!updates_to(paths, newest, strVal(linitial(e->ordering_versions))))
+	{
+		appendStringInfo(missing, "\nextension %s: version %s is needed, but keys require version %s",
+						 e->name, newest, strVal(linitial(e->ordering_versions)));
+		return NULL;
+	}
+	if (e->ordering_versions)
+		newest = strVal(linitial(e->ordering_versions));
 
 	if (have)
 	{
@@ -591,6 +665,7 @@ check_needs(Needs *needs, bool install, const char *what)
 	List	   *installs = NIL;
 	ListCell   *lc;
 	bool		any_extension = false;
+	bool		ordering_extension = false;
 
 	if (needs->extensions == NIL && needs->objects == NIL)
 		return;
@@ -604,6 +679,7 @@ check_needs(Needs *needs, bool install, const char *what)
 		char	   *version = check_extension(e, &missing, &any_extension,
 											  install);
 
+		ordering_extension |= e->ordering_versions != NIL;
 		if (version == NULL)
 			continue;
 		if (!install)
@@ -636,6 +712,8 @@ check_needs(Needs *needs, bool install, const char *what)
 				 errmsg("the %s needs what this database lacks", what),
 				 errdetail_internal("Needed from outside the versioned schemas:%s",
 									missing.data),
+				 ordering_extension ?
+				 errhint("Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.") :
 				 any_extension ?
 				 errhint("Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.") :
 				 errhint("Make what is missing, then try again.")));
@@ -683,7 +761,7 @@ check_needs(Needs *needs, bool install, const char *what)
 void
 prolly_check_dependencies(List *trees, bool install, const char *what)
 {
-	Needs		needs = {NIL, NIL, NIL};
+	Needs		needs = {0};
 
 	collect_trees(trees, &needs);
 	check_needs(&needs, install, what);
@@ -691,18 +769,71 @@ prolly_check_dependencies(List *trees, bool install, const char *what)
 
 void
 prolly_check_commit_dependencies(const ProllyCommitInfo *commit,
-								 const ProllyCommitInfo *since, const char *what)
+								 const ProllyCommitInfo *since, const char *what, bool read)
 {
 	ProllyDatabaseComponents dc;
-	Needs		needs = {NIL, NIL, NIL};
+	Needs		needs = {0};
 
-	if (!commit->has_dependencies)
-		return;
+	needs.read = read;
 	prolly_database_components(&dc);
 	if (since && since->has_dependencies)
 		PROLLY_CALL(dc.canonicalizer, dependencies, &since->dependencies,
 					note_except, &needs);
-	PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
-				note_need, &needs);
+	if (commit->has_dependencies)
+		PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
+					note_need, &needs);
 	check_needs(&needs, false, what);
+}
+
+/* A row-only commit must fall back to folding if its head's order is stale. */
+bool
+prolly_ordering_dependencies_match(const ProllyCommitInfo *commit)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef current;
+	Needs		needs = {0};
+	Needs		old = {0};
+	ListCell   *lc;
+	bool		match = true;
+
+	prolly_database_components(&dc);
+	/* The usual case: write_commit() will reuse this cached dependency tree. */
+	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &current);
+	if (commit->has_dependencies &&
+		current.hash.len == commit->dependencies.hash.len &&
+		memcmp(current.hash.bytes, commit->dependencies.hash.bytes,
+			   current.hash.len) == 0)
+		return true;
+	PROLLY_CALL(dc.canonicalizer, dependencies, &current, note_ordering, &needs);
+	if (commit->has_dependencies)
+	{
+		PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
+					note_ordering, &needs);
+		PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
+					note_need, &old);
+	}
+	if (needs.extensions == NIL)
+		return true;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	foreach(lc, needs.extensions)
+	{
+		NeededExtension *e = lfirst(lc);
+		char	   *version;
+		char	   *schema;
+		NeededExtension *before = find_extension(&old, e->name);
+
+		if (before == NULL || before->versions == NIL ||
+			!installed(e->name, &version, &schema) ||
+			!only_version(before->versions, version) ||
+			!only_version(before->schemas, schema) ||
+			!only_version(e->ordering_versions, version) ||
+			!only_version(e->schemas, schema))
+		{
+			match = false;
+			break;
+		}
+	}
+	SPI_finish();
+	return match;
 }

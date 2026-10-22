@@ -26,6 +26,7 @@
  * against those installed and available, in the schema recorded.  An
  * extension several commits record at different versions needs the
  * newest, by its update paths; one recorded without a version, any.
+ * An extension marked as ordering keys requires its exact version instead.
  * Anything missing is an error naming all of it, before anything is made.
  * With install, an extension the database lacks is then created at that
  * version in its schema, after the recorded ones it requires (and with
@@ -42,11 +43,18 @@ extern void prolly_check_dependencies(List *trees, bool install,
  * branch's, so a move doesn't make or change one.  With since, only what
  * the commit needs that since doesn't (a merge's incoming head against the
  * merge base: what its changes bring in, not what it keeps of what the
- * branch already let go).  A commit that didn't record its dependencies
- * isn't checked; since one that didn't, as none.
+ * branch already let go).  A move (read = false) pins the target's ordering,
+ * even if since agrees, but never pins the old head's ordering.  A history
+ * operation (read = true) checks ordinary minimum versions; each table's
+ * recorded ordering is checked/re-sorted when its rows are opened.  A commit
+ * that didn't record its dependencies isn't checked; since one that didn't,
+ * as none.
  */
 extern void prolly_check_commit_dependencies(const ProllyCommitInfo *commit,
 											 const ProllyCommitInfo *since,
-											 const char *what);
+											 const char *what, bool read);
+
+/* Whether a row-only commit can still apply changes to its head safely. */
+extern bool prolly_ordering_dependencies_match(const ProllyCommitInfo *commit);
 
 #endif							/* PROLLY_DEPS_H */

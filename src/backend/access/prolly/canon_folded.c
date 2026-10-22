@@ -10,6 +10,8 @@
  *
  *	"!:format"			-> the format its items and data trees are in,
  *						   FOLDED_FORMAT
+ *	"!:ordering " table -> row-layout fingerprint, newline, then the extensions
+ *						   ordering its keys and their versions (text[])
  *	"c:" collation		-> its provider, locale, ICU rules, whether it is
  *						   deterministic and its library's version, a line
  *						   each ("default": the database's)
@@ -95,6 +97,16 @@
  * update or an object's rename shows in the next.  A function's body is
  * text, and what it names isn't in pg_depend: the list can't be complete.
  *
+ * An extension whose opclass or support function orders a primary key,
+ * including through container types, records an "ordering" dependency flag.
+ * Clone and move checks require that exact version.  Historical reads check
+ * each table's ordering metadata and re-sort under the installed comparator
+ * when its definition and row types still match.  Ordinary uses
+ * keep minimum-version semantics.  The baseline shape records the ordering
+ * version too: updating the extension requires sorting the table afresh.
+ * Keyless tables (including deferrable or unsupported primary keys) order
+ * by content bytes, so their extension dependencies are not pinned for this.
+ *
  * Each collation that orders a table's keys is recorded, and a table whose
  * keys are ordered by a collation that differs now from what a root
  * recorded can't have that root's rows read: its tree's keys may be in
@@ -128,6 +140,7 @@
 #include "parser/parse_relation.h"
 #include "parser/parser.h"
 #include "access/htup_details.h"
+#include "access/nbtree.h"
 #include "access/prolly_applier.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
@@ -233,8 +246,9 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "15", a foreign table's definition a
- * line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
+ * The format a folded root is in: "16", per-table ordering metadata and
+ * ordering dependency flags (not readable by older servers); "15", a foreign
+ * table's definition a line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
  * TABLE's tail, and was the first with a value of a type whose binary I/O
  * may change (an extension's) tagged with the form it is in, its send
  * format or its text form (prolly_datum.c); "13" had such values untagged;
@@ -265,7 +279,8 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"15"
+#define FOLDED_FORMAT	"16"
+#define ORDERING_PREFIX "!:ordering "
 
 /*
  * The format versions of the encoders FOLDED_FORMAT's trees are written
@@ -1351,6 +1366,214 @@ empty_root(Canon *cn, ProllyNodeRef *root)
 	PROLLY_CALL(cn->tree, build_finish, b, root);
 }
 
+static Oid extension_of(Oid classid, Oid objid);
+static char *extension_version(Oid extoid);
+static char *text_array_literal(List *strings);
+
+/* Both an opclass and its comparator can belong to extensions. */
+static List *
+ordering_opclass(List *out, Oid opclass)
+{
+	Oid			ext;
+	Oid			type;
+	Oid			proc;
+
+	if (!OidIsValid(opclass))
+		return out;
+	ext = extension_of(OperatorClassRelationId, opclass);
+	if (OidIsValid(ext))
+		out = list_append_unique_oid(out, ext);
+	type = get_opclass_input_type(opclass);
+	proc = get_opfamily_proc(get_opclass_family(opclass), type, type,
+							 BTORDER_PROC);
+	ext = extension_of(ProcedureRelationId, proc);
+	if (OidIsValid(ext))
+		out = list_append_unique_oid(out, ext);
+	return out;
+}
+
+/* Core container comparators delegate to the contained types' comparators. */
+static List *
+ordering_type(List *out, Oid type, List *seen)
+{
+	Oid			nested;
+	TypeCacheEntry *tc;
+
+	check_stack_depth();
+	if (list_member_oid(seen, type))
+		return out;
+	seen = lappend_oid(list_copy(seen), type);
+	out = ordering_opclass(out, GetDefaultOpClass(type, BTREE_AM_OID));
+	nested = getBaseType(type);
+	if (nested != type)
+		return ordering_type(out, nested, seen);
+	nested = get_element_type(type);
+	if (OidIsValid(nested))
+		return ordering_type(out, nested, seen);
+	if (type_is_multirange(type))
+		return ordering_type(out, get_multirange_range(type), seen);
+	if (type_is_range(type))
+	{
+		Oid			ext;
+
+		tc = lookup_type_cache(type, TYPECACHE_RANGE_INFO);
+		ext = extension_of(ProcedureRelationId, tc->rng_cmp_proc_finfo.fn_oid);
+		if (OidIsValid(ext))
+			out = list_append_unique_oid(out, ext);
+		return ordering_type(out, tc->rngelemtype->type_id, seen);
+	}
+	if (type_is_rowtype(type))
+	{
+		tc = lookup_type_cache(type, TYPECACHE_TUPDESC);
+		if (tc->tupDesc)
+			for (int i = 0; i < tc->tupDesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tc->tupDesc, i);
+
+				if (!att->attisdropped)
+					out = ordering_type(out, att->atttypid, seen);
+			}
+	}
+	return out;
+}
+
+/* Extensions whose comparators actually order this table's prolly keys. */
+static List *
+ordering_extensions(Relation rel)
+{
+	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
+	ProllyComponents c;
+	ProllyKeying *k;
+	Relation	pk;
+	List	   *out = NIL;
+	bool		keyless;
+
+	if (!OidIsValid(pkoid))
+		return NIL;
+	prolly_components_for_relation(rel, &c);
+	k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+	keyless = PROLLY_CALL(c.keying, keyless, k);
+	PROLLY_CALL(c.keying, close, k);
+	if (keyless)
+		return NIL;
+	pk = index_open(pkoid, AccessShareLock);
+	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(pk); i++)
+	{
+		out = ordering_opclass(out, get_index_column_opclass(pkoid, i + 1));
+		out = ordering_type(out,
+							TupleDescAttr(RelationGetDescr(rel),
+										  pk->rd_index->indkey.values[i] - 1)->atttypid, NIL);
+	}
+	index_close(pk, AccessShareLock);
+	return out;
+}
+
+/* Stable across databases: no catalog OIDs in the baseline shape. */
+static char *
+ordering_versions(Relation rel)
+{
+	List	   *extensions = ordering_extensions(rel);
+	List	   *versions = NIL;
+	ListCell   *lc;
+
+	foreach(lc, extensions)
+	{
+		Oid			ext = lfirst_oid(lc);
+
+		versions = lappend(versions, get_extension_name(ext));
+		versions = lappend(versions, extension_version(ext));
+	}
+	return versions ? text_array_literal(versions) : NULL;
+}
+
+static void describe_type(Canon *cn, Form_pg_type typ);
+
+/* Type definitions in canonical names and labels, never database-local OIDs. */
+static void
+ordering_type_layout(StringInfo out, Oid type, List *seen)
+{
+	HeapTuple	tup;
+	Form_pg_type typ;
+	Canon		cn = {0};
+	ListCell   *lc;
+	Oid			nested;
+
+	check_stack_depth();
+	append_field(out, format_type_be_qualified(type));
+	appendStringInfoChar(out, '\n');
+	if (list_member_oid(seen, type))
+		return;
+	seen = lappend_oid(list_copy(seen), type);
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type);
+	typ = (Form_pg_type) GETSTRUCT(tup);
+	describe_type(&cn, typ);
+	foreach(lc, cn.items)
+	{
+		CanonItem  *it = lfirst(lc);
+
+		appendBinaryStringInfo(out, it->value.data, it->value.len);
+	}
+	nested = getBaseType(type);
+	if (nested != type)
+		ordering_type_layout(out, nested, seen);
+	else if (OidIsValid(nested = get_element_type(type)))
+		ordering_type_layout(out, nested, seen);
+	else if (typ->typtype == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(type, -1);
+
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+
+			appendStringInfoChar(out, att->attisdropped ? 'd' : 'a');
+			if (!att->attisdropped)
+				ordering_type_layout(out, att->atttypid, seen);
+		}
+		ReleaseTupleDesc(desc);
+	}
+	else if (typ->typtype == TYPTYPE_RANGE)
+		ordering_type_layout(out, get_range_subtype(type), seen);
+	else if (typ->typtype == TYPTYPE_MULTIRANGE)
+		ordering_type_layout(out, get_multirange_range(type), seen);
+	ReleaseSysCache(tup);
+}
+
+/* A portable description of the rows whose encoded keys we can re-sort. */
+static char *
+ordering_layout(Canon *cn, Relation rel, const StringInfoData *description)
+{
+	StringInfoData shape;
+	ProllyHash	hash;
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	initStringInfo(&shape);
+	appendBinaryStringInfo(&shape, description->data, description->len);
+	for (int i = 0; i < desc->natts; i++)
+		if (!TupleDescAttr(desc, i)->attisdropped)
+			ordering_type_layout(&shape, TupleDescAttr(desc, i)->atttypid, NIL);
+	content_hash(cn, shape.data, shape.len, &hash);
+	pfree(shape.data);
+	return prolly_hash_hex(&hash);
+}
+
+static void
+record_ordering(Canon *cn, Relation rel, const StringInfoData *description)
+{
+	char	   *versions = ordering_versions(rel);
+
+	if (versions)
+	{
+		CanonItem  *it = add_item(cn, ORDERING_PREFIX,
+								  qualified(RelationGetNamespace(rel), RelationGetRelationName(rel)));
+
+		appendStringInfo(&it->value, "%s\n", ordering_layout(cn, rel, description));
+		append_utf8(&it->value, versions);
+	}
+}
+
 /*
  * What a baseline's tree is kept for, appended to shape: what its rows'
  * keys and canonical bytes depend on, so DDL that changes no row's bytes
@@ -1373,6 +1596,7 @@ baseline_shape(Canon *cn, Relation rel, const StringInfoData *description,
 	TupleDesc	desc = RelationGetDescr(rel);
 	ProllyComponents c;
 	const ProllyImplInfo *encoders[3];
+	char	   *ordering = ordering_versions(rel);
 
 	prolly_components_for_relation(rel, &c);
 	if (PROLLY_HAS(c.keying, row_shape))
@@ -1423,6 +1647,9 @@ baseline_shape(Canon *cn, Relation rel, const StringInfoData *description,
 							   (const char *) &encoders[i]->format_version,
 							   sizeof(encoders[i]->format_version));
 	}
+	/* A changed comparator requires sorting afresh, even with no row writes. */
+	if (ordering)
+		appendStringInfoString(shape, ordering);
 }
 
 /*
@@ -2779,7 +3006,6 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 	ReleaseSysCache(tup);
 }
 
-static Oid	extension_of(Oid classid, Oid objid);
 
 /* Members of an extension come with it. */
 static bool
@@ -3433,7 +3659,7 @@ dependency_cmp(const ListCell *a, const ListCell *b)
  * object's address.
  */
 static Dependency *
-describe_dependency(const ObjectAddress *addr)
+describe_dependency(const ObjectAddress *addr, List *ordering)
 {
 	Dependency *dep = palloc(sizeof(Dependency));
 	char	   *type = getObjectTypeDescription(addr, false);
@@ -3451,6 +3677,8 @@ describe_dependency(const ObjectAddress *addr)
 		/* (a clone makes a versioned schema before the extension in it) */
 		if (namespace_is_versioned(nsp))
 			value = lappend(value, "versioned");
+		if (list_member_oid(ordering, addr->objectId))
+			value = lappend(value, "ordering");
 		append_utf8(&dep->value, text_array_literal(value));
 	}
 	else
@@ -3516,6 +3744,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	HASHCTL		ctl;
 	HTAB	   *seen;
 	List	   *deps = NIL;
+	List	   *ordering = NIL;
 	ListCell   *lc;
 	ProllyTreeBuilder *b;
 	uint64		epoch;
@@ -3539,6 +3768,29 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	ctl.hcxt = CurrentMemoryContext;
 	seen = hash_create("prolly dependencies", 64, &ctl,
 					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/*
+	 * Core polymorphic opclasses have no pg_depend entry on the extension
+	 * comparators they call.  Inspect every canonical table's key types.
+	 */
+	rel = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+		if (form->relkind == RELKIND_RELATION &&
+			form->relam == PROLLY_TABLE_AM_OID && canon_namespace(form->relnamespace) &&
+			!in_extension(RelationRelationId, form->oid))
+		{
+			Relation table = table_open(form->oid, AccessShareLock);
+
+			ordering = list_concat_unique_oid(ordering, ordering_extensions(table));
+			table_close(table, AccessShareLock);
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
 
 	rel = table_open(DependRelationId, AccessShareLock);
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
@@ -3565,10 +3817,25 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			ObjectAddressSet(referenced, ExtensionRelationId, ext);
 		(void) hash_search(seen, &referenced, HASH_ENTER, &found);
 		if (!found)
-			deps = lappend(deps, describe_dependency(&referenced));
+			deps = lappend(deps, hash_search(seen, &referenced, HASH_FIND, NULL));
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+
+	/* Include key opclasses even when their extension's schema is versioned. */
+	foreach(lc, ordering)
+	{
+		ObjectAddress addr;
+		void	   *entry;
+		bool		found;
+
+		ObjectAddressSet(addr, ExtensionRelationId, lfirst_oid(lc));
+		entry = hash_search(seen, &addr, HASH_ENTER, &found);
+		if (!found)
+			deps = lappend(deps, entry);
+	}
+	foreach(lc, deps)
+		lfirst(lc) = describe_dependency(lfirst(lc), ordering);
 
 	list_sort(deps, dependency_cmp);
 	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
@@ -3923,6 +4190,7 @@ collect(Canon *cn)
 					it = add_item(cn, "t:", qualified(form->relnamespace, name));
 					initStringInfo(&desc);
 					table_description(cn, rel, &desc, &dh);
+					record_ordering(cn, rel, &desc);
 					table_root(cn, it, rel, &desc, &dh, &root);
 					put_hash(&it->value, &root.hash);
 					appendBinaryStringInfo(&it->value, desc.data, desc.len);
@@ -5159,9 +5427,122 @@ folded_format(StringInfo out)
 	appendStringInfoString(out, FOLDED_FORMAT);
 }
 
+/* Whether a table's recorded ordering extensions are still installed. */
+static bool
+ordering_current(const char *literal)
+{
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	deconstruct_array_builtin(DatumGetArrayTypeP(OidInputFunctionCall(F_ARRAY_IN,
+																	  (char *) literal, TEXTOID, -1)),
+							  TEXTOID, &values, &nulls, &n);
+	if (n == 0 || n % 2)
+		elog(ERROR, "invalid historical ordering metadata");
+	for (int i = 0; i < n; i += 2)
+	{
+		Oid			ext;
+
+		if (nulls[i] || nulls[i + 1])
+			elog(ERROR, "invalid historical ordering metadata");
+		ext = get_extension_oid(TextDatumGetCString(values[i]), true);
+		if (!OidIsValid(ext) ||
+			strcmp(extension_version(ext), TextDatumGetCString(values[i + 1])) != 0)
+			return false;
+	}
+	return true;
+}
+
+static int
+ordering_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	ProllyKeyingRefs *refs = arg;
+
+	return PROLLY_CALL(refs->routine, compare, refs->keying, a, b);
+}
+
+/*
+ * A changed extension needn't make unrelated tables unreadable.  If this
+ * table's row layout is unchanged, sort its encoded keys under the installed
+ * comparator before anyone seeks or diffs them.  No stored commit is changed.
+ * A simultaneous schema/type change is refused: its old codec is not proven
+ * compatible with the current comparator.
+ */
+static const char *
+read_ordering(Canon *cn, const ProllyNodeRef *root, const char *name,
+			  const ProllyValue *description, ProllyNodeRef *data)
+{
+	StringInfoData value;
+	char	   *keyname = psprintf("%s%s", ORDERING_PREFIX, name);
+	ProllyKey	key = {(const uint8 *) keyname, strlen(keyname)};
+	char	   *recorded;
+	char	   *versions;
+	char	   *server_name;
+	Oid			relid;
+	Relation	rel;
+	StringInfoData desc;
+	bool		compatible = false;
+	bool		unique = true;
+	int			nestlevel;
+
+	initStringInfo(&value);
+	if (!PROLLY_CALL(cn->tree, get, &cn->env, root, &key, &value))
+		return NULL;
+	recorded = pg_any_to_server(value.data, value.len, PG_UTF8);
+	versions = strchr(recorded, '\n');
+	if (versions == NULL)
+		elog(ERROR, "invalid historical ordering metadata");
+	*versions++ = '\0';
+	if (ordering_current(versions))
+		return NULL;
+	server_name = pg_any_to_server(name, strlen(name), PG_UTF8);
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(server_name, NULL)),
+							 AccessShareLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		return "ordering extension changed and the historical table has no compatible current definition";
+	rel = table_open(relid, NoLock);
+	initStringInfo(&desc);
+	nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	PG_TRY();
+	{
+		describe_table(cn, rel, &desc);
+		compatible = desc.len == description->len &&
+			memcmp(desc.data, description->data, desc.len) == 0 &&
+			strcmp(recorded, ordering_layout(cn, rel, &desc)) == 0;
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, nestlevel);
+	}
+	PG_END_TRY();
+	if (compatible)
+	{
+		ProllyComponents components;
+		ProllyKeying *k;
+		ProllyKeyingRefs refs;
+		ProllyTreeEnv env = cn->env;
+
+		prolly_components_for_relation(rel, &components);
+		k = PROLLY_CALL(components.keying, open, rel, CurrentMemoryContext);
+		env.compare = ordering_compare;
+		env.compare_arg = &refs;
+		prolly_keying_use_env(&refs, components.keying, k, cn->tree, &env);
+		unique = prolly_fold_reorder(components.keying, k, cn->tree, &env, data, data);
+		PROLLY_CALL(components.keying, close, k);
+	}
+	table_close(rel, AccessShareLock);
+	if (!unique)
+		return "ordering extension now considers distinct historical primary keys equal";
+	return compatible ? NULL :
+		"ordering extension changed together with the historical table's definition or row types";
+}
+
 static void
-folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
-			 void *arg)
+folded_trees(const ProllyNodeRef *root, char kind, const char *only,
+			 ProllyCanonTableVisit visit, void *arg)
 {
 	Canon		cn;
 	ProllyTreeCursor *c;
@@ -5183,6 +5564,14 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("materialized views' rows of a commit made by an older format can't be read"),
 				 errhint("Commit the branch to write it in the current format.")));
+	if (only)
+	{
+		char *seek = psprintf("%c:%s", kind,
+			pg_server_to_any(only, strlen(only), PG_UTF8));
+
+		from.data = (const uint8 *) seek;
+		from.len = strlen(seek);
+	}
 	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
 	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
 	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
@@ -5190,16 +5579,22 @@ folded_trees(const ProllyNodeRef *root, char kind, ProllyCanonTableVisit visit,
 		ProllyNodeRef data;
 		ProllyValue description;
 		char	   *name;
+		const char *unreadable = NULL;
 
 		if (k.len < 2 || memcmp(k.data, prefix, 2) != 0)
 			break;
+		if (only && (k.len != from.len || memcmp(k.data, from.data, from.len) != 0))
+			break;
 		(void) tree_item(&k, &v, &data, &description);
 		name = pnstrdup((const char *) k.data + 2, k.len - 2);
-		visit(name, &data, &description,
-			  kind != 't' ? NULL :
-			  !current ? PROLLY_UNREADABLE_OLDER_FORMAT :
-			  table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale),
-			  arg);
+		if (kind == 't')
+		{
+			unreadable = !current ? PROLLY_UNREADABLE_OLDER_FORMAT :
+				table_unreadable(pg_any_to_server(name, strlen(name), PG_UTF8), stale);
+			if (unreadable == NULL)
+				unreadable = read_ordering(&cn, root, name, &description, &data);
+		}
+		visit(name, &data, &description, unreadable, arg);
 		pfree(name);
 	}
 	PROLLY_CALL(cn.tree, cursor_close, c);
@@ -5285,10 +5680,10 @@ folded_type_definitions(const ProllyNodeRef *root)
 
 /* The tables of a folded root: its "t:" items. */
 static void
-folded_tables(const ProllyNodeRef *root, ProllyCanonTableVisit visit,
-			  void *arg)
+folded_tables(const ProllyNodeRef *root, const char *name,
+			  ProllyCanonTableVisit visit, void *arg)
 {
-	folded_trees(root, 't', visit, arg);
+	folded_trees(root, 't', name, visit, arg);
 }
 
 /* Its materialized views: its "m:" items. */
@@ -5296,7 +5691,7 @@ static void
 folded_materialized_views(const ProllyNodeRef *root,
 						  ProllyCanonTableVisit visit, void *arg)
 {
-	folded_trees(root, 'm', visit, arg);
+	folded_trees(root, 'm', NULL, visit, arg);
 }
 
 /* An item's value without the data tree a table's or view's starts with. */
@@ -5354,15 +5749,25 @@ folded_sequences(const ProllyNodeRef *root, ProllyCanonSequenceVisit visit,
 	PROLLY_CALL(cn.tree, cursor_close, c);
 }
 
-/*
- * The next item that defines an object: collations' items are left out,
- * as what the fold notes of the tables (checked when rows are read).
- */
+/* Ordering metadata is not schema and must not create schema conflicts. */
+static bool
+next_schema_item(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
+{
+	while (PROLLY_CALL(cn->tree, cursor_next, c, k, v))
+		if (!(k->len >= strlen(ORDERING_PREFIX) &&
+			  memcmp(k->data, ORDERING_PREFIX, strlen(ORDERING_PREFIX)) == 0))
+			return true;
+	return false;
+}
+
+/* Objects exclude ordering metadata and the recorded collation versions. */
 static bool
 next_object(Canon *cn, ProllyTreeCursor *c, ProllyKey *k, ProllyValue *v)
 {
 	while (PROLLY_CALL(cn->tree, cursor_next, c, k, v))
-		if (!(k->len >= 2 && k->data[0] == 'c' && k->data[1] == ':'))
+		if (!(k->len >= 2 && k->data[0] == 'c' && k->data[1] == ':') &&
+			!(k->len >= strlen(ORDERING_PREFIX) &&
+			  memcmp(k->data, ORDERING_PREFIX, strlen(ORDERING_PREFIX)) == 0))
 			return true;
 	return false;
 }
@@ -5929,7 +6334,9 @@ move_items(Canon *cn, const ProllyNodeRef *root)
 		MoveItem   *it;
 		ProllyValue def;
 
-		if (k.len < 2 || k.data[1] != ':' || k.data[0] == 'c')
+		if (k.len < 2 || k.data[1] != ':' || k.data[0] == 'c' ||
+			(k.len >= strlen(ORDERING_PREFIX) &&
+			 memcmp(k.data, ORDERING_PREFIX, strlen(ORDERING_PREFIX)) == 0))
 			continue;
 		definition_of(&k, &v, &def);
 		it = palloc0(sizeof(MoveItem));
@@ -10211,7 +10618,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 	for (int i = 0; i < 3; i++)
 	{
 		PROLLY_CALL(cn.tree, cursor_seek, cur[i], NULL, ForwardScanDirection);
-		more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+		more[i] = next_schema_item(&cn, cur[i], &k[i], &v[i]);
 	}
 	b = PROLLY_CALL(cn.tree, build_begin, &cn.root_env, CurrentMemoryContext);
 	while (more[0] || more[1] || more[2])
@@ -10308,10 +10715,10 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		/* (the least key last: the others point into its cursor's node) */
 		for (int i = 0; i < 3; i++)
 			if (has[i] && &k[i] != least)
-				more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+				more[i] = next_schema_item(&cn, cur[i], &k[i], &v[i]);
 		for (int i = 0; i < 3; i++)
 			if (has[i] && &k[i] == least)
-				more[i] = PROLLY_CALL(cn.tree, cursor_next, cur[i], &k[i], &v[i]);
+				more[i] = next_schema_item(&cn, cur[i], &k[i], &v[i]);
 	}
 	PROLLY_CALL(cn.tree, build_finish, b, merged);
 	for (int i = 0; i < 3; i++)
@@ -10856,9 +11263,14 @@ names_table(const ProllyKey *k, List *tables)
 	char	   *name;
 	ListCell   *lc;
 
-	if (k->len < 2 || k->data[0] != 't' || k->data[1] != ':')
+	if (k->len >= strlen(ORDERING_PREFIX) &&
+		memcmp(k->data, ORDERING_PREFIX, strlen(ORDERING_PREFIX)) == 0)
+		name = from_utf8(k->data + strlen(ORDERING_PREFIX),
+						 k->len - strlen(ORDERING_PREFIX));
+	else if (k->len >= 2 && k->data[0] == 't' && k->data[1] == ':')
+		name = from_utf8(k->data + 2, k->len - 2);
+	else
 		return false;
-	name = from_utf8(k->data + 2, k->len - 2);
 	foreach(lc, tables)
 		if (strcmp(lfirst(lc), name) == 0)
 			return true;

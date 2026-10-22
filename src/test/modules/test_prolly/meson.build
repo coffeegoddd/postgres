@@ -25,6 +25,9 @@ test_prolly = shared_module('test_prolly',
 test_install_libs += test_prolly
 
 test_install_data += files(
+  'test_prolly_ordering.control',
+  'test_prolly_ordering--1.0.sql',
+  'test_prolly_ordering--1.0--1.1.sql',
   'test_prolly.control',
   'test_prolly--1.0.sql',
   'test_prolly_a.control',
@@ -117,6 +120,8 @@ tests += {
       'commit_heights',
       'dependencies',
       'dependency_moves',
+      'extension_ordering',
+      'extension_ordering_nested',
       'shared_drops',
       'shared_alters',
       'versioned_extensions',

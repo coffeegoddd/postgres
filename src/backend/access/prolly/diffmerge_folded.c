@@ -344,7 +344,7 @@ static void
 read_tables(const ProllyNodeRef *root, Tables *ts)
 {
 	ts->types = type_defs(root);
-	PROLLY_CALL(components().canonicalizer, tables, root, add_table, ts);
+	PROLLY_CALL(components().canonicalizer, tables, root, NULL, add_table, ts);
 }
 
 /*
@@ -411,7 +411,9 @@ root_tables(const ProllyNodeRef *root, const char *ref, Oid relid)
 {
 	Tables		ts = {NIL};
 
-	read_tables(root, &ts);
+	ts.types = type_defs(root);
+	PROLLY_CALL(components().canonicalizer, tables, root,
+				OidIsValid(relid) ? table_name(relid) : NULL, add_table, &ts);
 	types_of_ref(ts.types, ref);
 	if (OidIsValid(relid))
 	{
@@ -566,6 +568,12 @@ require_readable(const Table *t)
 				 errmsg("the rows of table %s in this version can't be read here", t->name),
 				 errdetail("The %s.", t->unreadable),
 				 errhint("Commit the branch to write it in the current one.")));
+	if (t && t->unreadable && strncmp(t->unreadable, "ordering extension", 18) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the rows of table %s in this version can't be read here", t->name),
+				 errdetail("The %s.", t->unreadable),
+				 errhint("Read this version in a database with its recorded extension version, or restore its table and row type definitions before reading it.")));
 	if (t && t->unreadable)
 		ereport(ERROR,
 				(errcode(ERRCODE_COLLATION_MISMATCH),
@@ -7421,7 +7429,7 @@ check_needs(const ProllyHash *commit, const ProllyHash *since, const char *what)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("prolly commit is missing")));
-	prolly_check_commit_dependencies(&info, since ? &before : NULL, what);
+	prolly_check_commit_dependencies(&info, since ? &before : NULL, what, true);
 }
 
 /* A commit's canonical root. */
@@ -10084,7 +10092,7 @@ folded_row_count(const char *ref, Oid relid, double *rows)
 	name = get_rel_name(relid) ? table_name(relid) : NULL;
 	if (name == NULL)
 		return false;
-	PROLLY_CALL(dc.canonicalizer, tables, &info.root, add_table, &ts);
+	PROLLY_CALL(dc.canonicalizer, tables, &info.root, name, add_table, &ts);
 	t = find_table(ts.tables, name);
 	if (t == NULL || t->unreadable)
 		return false;

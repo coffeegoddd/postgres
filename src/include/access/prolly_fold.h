@@ -140,6 +140,11 @@ extern void prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 							const ProllyTreeEnv *env, ProllyNodeRef *data,
 							ProllyFullFold *done);
 
+/* Re-sort historical keys, spilling; false (data unset) if keys now coincide. */
+extern bool prolly_fold_reorder(const ProllyKeyingRoutine *kr, ProllyKeying *k,
+								const ProllyTreeRoutine *tree, const ProllyTreeEnv *env,
+								const ProllyNodeRef *from, ProllyNodeRef *data);
+
 /*
  * A baseline's tree, from, whose rows were folded under the row shape old
  * (rel's keying's row_shape() then), mapped to rel's rows as they are now

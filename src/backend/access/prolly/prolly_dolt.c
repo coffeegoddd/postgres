@@ -1409,14 +1409,14 @@ checkout_tables(const char *ref, char **names, int nnames)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch has no working set")));
-	PROLLY_CALL(canonicalizer(), tables, &from, collect_table_name, &from_tables);
+	PROLLY_CALL(canonicalizer(), tables, &from, NULL, collect_table_name, &from_tables);
 	{
 		ProllyHash	head;
 		ProllyNodeRef head_root;
 
 		if (PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
 			PROLLY_CALL(refs(), commit_working_set, &head, &head_root))
-			PROLLY_CALL(canonicalizer(), tables, &head_root, collect_table_name,
+			PROLLY_CALL(canonicalizer(), tables, &head_root, NULL, collect_table_name,
 						&head_tables);
 	}
 	for (int i = 0; i < nnames; i++)
@@ -2693,10 +2693,11 @@ dolt_reset(PG_FUNCTION_ARGS)
 					 errhint("A soft reset moves the head to a commit; there is no staging area to reset a table in.")));
 	}
 	/*
-	 * What the target needs that the head doesn't, checked (a reset to the
-	 * head moves nothing new in, as an abort's doesn't; a soft one, none).
+	 * What the target needs that the head doesn't.  Even a reset to HEAD
+	 * must check ordering dependencies: an extension may have changed since
+	 * its trees were built.  A soft reset reads no rows.
 	 */
-	if (ref && hard)
+	if (hard)
 	{
 		ProllyHash	head;
 		ProllyHash	target;
@@ -2704,13 +2705,12 @@ dolt_reset(PG_FUNCTION_ARGS)
 		ProllyCommitInfo before;
 		bool		has_head = PROLLY_CALL(refs(), resolve, "HEAD", &head);
 
-		if (PROLLY_CALL(refs(), resolve, ref, &target) &&
-			(!has_head || !same_hash(&head, &target)) &&
+		if (PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target) &&
 			PROLLY_CALL(refs(), commit_get, &target, &info))
 			prolly_check_commit_dependencies(&info,
 											 has_head &&
 											 PROLLY_CALL(refs(), commit_get, &head, &before) ?
-											 &before : NULL, "reset");
+											 &before : NULL, "reset", false);
 	}
 	/*
 	 * (a protected branch moved to another commit loses what it holds: the

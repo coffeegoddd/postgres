@@ -185,8 +185,9 @@ typedef struct ProllyCanonRoutine
 	void		(*fold) (const ProllyNodeRef *baseline, ProllyNodeRef *root,
 						 ProllyNodeRef *next_baseline, bool commit);
 
-	void		(*tables) (const ProllyNodeRef *root, ProllyCanonTableVisit visit,
-						   void *arg);
+	/* NULL name: all tables; otherwise only that qualified, server-encoded name. */
+	void		(*tables) (const ProllyNodeRef *root, const char *name,
+						   ProllyCanonTableVisit visit, void *arg);
 	/* Its materialized views' rows, as tables' (never unreadable). */
 	void		(*materialized_views) (const ProllyNodeRef *root,
 									   ProllyCanonTableVisit visit, void *arg);
