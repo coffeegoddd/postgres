@@ -88,6 +88,74 @@ CREATE TRIGGER noop BEFORE INSERT ON ft.g FOR EACH ROW EXECUTE FUNCTION remote.n
 SELECT dolt_commit('-Am', 'a trigger');
 DROP TRIGGER noop ON ft.g;
 
+-- what depends on a foreign table (a materialized view, a SQL-body
+-- function) stays through a move changing its options, which alters it in
+-- place; its checks and defaults are described as they print read back,
+-- so a move leaves nothing to commit
+CREATE FOREIGN TABLE ft.m (id int NOT NULL, c varchar CHECK (c IN ('a', 'b')),
+						   d numeric DEFAULT 1.50)
+  SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+CREATE MATERIALIZED VIEW ft.mmv AS SELECT id FROM ft.m;
+CREATE FUNCTION ft.mcount() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM ft.m; END;
+SELECT length(dolt_commit('-Am', 'm and what uses it')::text) AS committed;
+SELECT dolt_checkout('-b', 'ft_m');
+ALTER FOREIGN TABLE ft.m OPTIONS (SET table_name 'src2');
+ALTER FOREIGN TABLE ft.m ALTER COLUMN id OPTIONS (ADD column_name 'id');
+SELECT length(dolt_commit('-Am', 'm elsewhere')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT length(dolt_merge('ft_m')::text) > 0 AS merged;
+SELECT ftoptions FROM pg_foreign_table WHERE ftrelid = 'ft.m'::regclass;
+SELECT ft.mcount() AS remote_rows, to_regclass('ft.mmv') IS NOT NULL AS matview;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+SELECT dolt_hashof('HEAD') AS merged \gset
+SELECT dolt_reset('--hard', :'merged');
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+
+-- a column added can't be altered in: the move makes the table again,
+-- and what uses it with it
+SELECT dolt_checkout('-b', 'ft_m2');
+ALTER FOREIGN TABLE ft.m ADD COLUMN v text;
+SELECT length(dolt_commit('-Am', 'm with v')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT length(dolt_merge('ft_m2')::text) > 0 AS merged;
+SELECT ft.mcount() AS remote_rows, to_regclass('ft.mmv') IS NOT NULL AS matview,
+	   (SELECT count(*) FROM ft.mmv) AS matview_rows;
+SELECT attname FROM pg_attribute WHERE attrelid = 'ft.m'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+
+-- options given in another order are the same definition
+SELECT dolt_checkout('-b', 'ft_order');
+CREATE FOREIGN TABLE ft.o (id int) SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+SELECT length(dolt_commit('-Am', 'o one way')::text) AS committed;
+SELECT dolt_checkout('main');
+CREATE FOREIGN TABLE ft.o (id int) SERVER loop OPTIONS (table_name 'src', schema_name 'remote');
+SELECT length(dolt_commit('-Am', 'o the other')::text) AS committed;
+SELECT length(dolt_merge('ft_order')::text) > 0 AS merged;
+
+-- a type a foreign table's column uses, changed by a move: it is made
+-- again with the type
+CREATE TYPE ft.mood AS ENUM ('a', 'b');
+CREATE FOREIGN TABLE ft.h (id int, m ft.mood) SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+SELECT length(dolt_commit('-Am', 'mood')::text) AS committed;
+SELECT dolt_checkout('-b', 'ft_h');
+DROP FOREIGN TABLE ft.h;
+DROP TYPE ft.mood;
+CREATE TYPE ft.mood AS ENUM ('a', 'b', 'c');
+CREATE FOREIGN TABLE ft.h (id int, m ft.mood) SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+SELECT length(dolt_commit('-Am', 'mood with c')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT length(dolt_merge('ft_h')::text) > 0 AS merged;
+SELECT enum_range(NULL::ft.mood) AS labels, to_regclass('ft.h') IS NOT NULL AS h;
+
+-- not described yet, so refused at a commit
+CREATE STATISTICS ft.mst ON id, c FROM ft.m;
+SELECT dolt_commit('-Am', 'statistics');
+DROP STATISTICS ft.mst;
+ALTER FOREIGN TABLE ft.m ALTER COLUMN c SET STATISTICS 50;
+SELECT dolt_commit('-Am', 'a statistics target');
+ALTER FOREIGN TABLE ft.m ALTER COLUMN c SET STATISTICS DEFAULT;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+
 -- a clone needs the server, made first
 SELECT dolt_remote('add', 'origin', :'url');
 SELECT dolt_push('origin', 'main');

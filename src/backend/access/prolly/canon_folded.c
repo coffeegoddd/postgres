@@ -20,11 +20,11 @@
  *						   settings, a line each, then its query
  *	"n:" schema			-> nothing: a versioned schema, there whether or not
  *						   anything is in it
- *	"r:" foreign table	-> its definition, as CREATE FOREIGN TABLE takes it
- *						   after the name: its columns (type, options,
- *						   collation, NOT NULL, default or generation), its
- *						   CHECK constraints by name, its server and options.
- *						   No rows: they are the server's
+ *	"r:" foreign table	-> its definition, a line each: its server, its
+ *						   options, its columns (type, collation, NOT NULL,
+ *						   default or generation), their options, its CHECK
+ *						   constraints (describe_foreign_table()).  No rows:
+ *						   they are the server's
  *	"s:" sequence		-> its definition, then a line of its own, its
  *						   value: the last value, and whether it was given
  *						   out ("t" or "f")
@@ -304,6 +304,10 @@ typedef struct Canon
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
 static void append_statistics(StringInfo out, Relation rel);
+static char *printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
+						  Form_pg_type domain, ParseExprKind kind);
+static char *constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain);
+static bool list_has_string(List *list, const char *s);
 
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
@@ -532,129 +536,6 @@ typedef struct Refused
  * move may discard it); when committing, it is refused once every object
  * has been read (check_refused()).
  */
-/* OPTIONS (...) for a foreign object's options (DefElem *), if any */
-static void
-append_fdw_options(StringInfo out, List *options)
-{
-	ListCell   *lc;
-
-	if (options == NIL)
-		return;
-	appendStringInfoString(out, " OPTIONS (");
-	foreach(lc, options)
-	{
-		DefElem    *d = lfirst(lc);
-
-		appendStringInfo(out, "%s%s %s", foreach_current_index(lc) > 0 ? ", " : "",
-						 quote_identifier(d->defname),
-						 quote_literal_cstr(defGetString(d)));
-	}
-	appendStringInfoChar(out, ')');
-}
-
-/*
- * A foreign table's definition, as CREATE FOREIGN TABLE takes it after the
- * name: its columns, each with its type (qualified), options, collation if
- * not the type's, NOT NULL and default or generation expression; its CHECK
- * constraints by name; its server and its options.  Options as stored, in
- * their order.
- */
-static char *
-describe_foreign_table(Oid relid)
-{
-	Relation	rel = relation_open(relid, AccessShareLock);
-	TupleDesc	desc = RelationGetDescr(rel);
-	ForeignTable *ft = GetForeignTable(relid);
-	ForeignServer *server = GetForeignServer(ft->serverid);
-	StringInfoData out;
-	Relation	conrel;
-	ScanKeyData key;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	List	   *checks = NIL;
-	ListCell   *lc;
-	bool		first = true;
-
-	initStringInfo(&out);
-	appendStringInfoChar(&out, '(');
-	for (int i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(desc, i);
-
-		if (att->attisdropped)
-			continue;
-		appendStringInfo(&out, "%s%s %s", first ? "" : ", ",
-						 quote_identifier(NameStr(att->attname)),
-						 format_type_extended(att->atttypid, att->atttypmod,
-											  FORMAT_TYPE_TYPEMOD_GIVEN |
-											  FORMAT_TYPE_FORCE_QUALIFY));
-		first = false;
-		append_fdw_options(&out, GetForeignColumnOptions(relid, att->attnum));
-		if (OidIsValid(att->attcollation) &&
-			att->attcollation != get_typcollation(att->atttypid))
-		{
-			HeapTuple	ctup = SearchSysCache1(COLLOID, ObjectIdGetDatum(att->attcollation));
-			Form_pg_collation c;
-
-			if (!HeapTupleIsValid(ctup))
-				elog(ERROR, "cache lookup failed for collation %u", att->attcollation);
-			c = (Form_pg_collation) GETSTRUCT(ctup);
-			appendStringInfo(&out, " COLLATE %s",
-							 qualified(c->collnamespace, NameStr(c->collname)));
-			ReleaseSysCache(ctup);
-		}
-		if (att->attnotnull)
-			appendStringInfoString(&out, " NOT NULL");
-		if (att->atthasdef && desc->constr)
-		{
-			char	   *expr = NULL;
-
-			for (int d = 0; d < desc->constr->num_defval; d++)
-				if (desc->constr->defval[d].adnum == att->attnum)
-					expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
-																   CStringGetTextDatum(desc->constr->defval[d].adbin),
-																   ObjectIdGetDatum(relid)));
-			if (expr == NULL)
-				elog(ERROR, "default of column \"%s\" not found", NameStr(att->attname));
-
-			if (att->attgenerated == ATTRIBUTE_GENERATED_STORED)
-				appendStringInfo(&out, " GENERATED ALWAYS AS (%s) STORED", expr);
-			else if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
-				appendStringInfo(&out, " GENERATED ALWAYS AS (%s) VIRTUAL", expr);
-			else
-				appendStringInfo(&out, " DEFAULT %s", expr);
-		}
-	}
-
-	/* its CHECK constraints, by name */
-	conrel = table_open(ConstraintRelationId, AccessShareLock);
-	ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
-				F_OIDEQ, ObjectIdGetDatum(relid));
-	scan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
-							  NULL, 1, &key);
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-	{
-		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
-
-		if (con->contype != CONSTRAINT_CHECK)
-			continue;
-		checks = lappend(checks,
-						 psprintf("CONSTRAINT %s %s", quote_identifier(NameStr(con->conname)),
-								  TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
-																		  ObjectIdGetDatum(con->oid)))));
-	}
-	systable_endscan(scan);
-	table_close(conrel, AccessShareLock);
-	list_sort(checks, cstring_cmp);
-	foreach(lc, checks)
-		appendStringInfo(&out, "%s%s", first && foreach_current_index(lc) == 0 ? "" : ", ",
-						 (char *) lfirst(lc));
-	appendStringInfo(&out, ") SERVER %s", quote_identifier(server->servername));
-	append_fdw_options(&out, ft->options);
-	relation_close(rel, AccessShareLock);
-	return out.data;
-}
-
 static bool
 uncovered(Canon *cn, const char *what, const char *name,
 		  const ObjectAddress *addr)
@@ -679,6 +560,522 @@ uncovered(Canon *cn, const char *what, const char *name,
 		cn->refused = lappend(cn->refused, r);
 	}
 	return true;
+}
+
+/* ------------------------------------------------------------------------
+ * Foreign tables
+ *
+ * A foreign table's definition, a line each (fields tab-separated, escaped):
+ * "server", its server; "option", each of its options, by name; "column",
+ * each live column in order: its name and type (quoted, qualified), its
+ * collation if not its type's, "t" if NOT NULL, and "d", "s" or "v" with
+ * its default or generation expression (stored, virtual) as it prints read
+ * back; "colopt", each column's options, by name; "check", each CHECK
+ * constraint, by name, as it prints read back.  Option names are unique per
+ * object, so ordered by them the lines don't depend on the order options
+ * were given in.
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct ForeignColumn
+{
+	char	   *name;			/* quoted */
+	char	   *type;
+	char	   *collation;		/* "" if the type's */
+	bool		notnull;
+	char		defkind;		/* '\0', 'd', 's' or 'v' */
+	char	   *expr;
+	List	   *options;		/* "name\tvalue", by name */
+} ForeignColumn;
+
+typedef struct ForeignDef
+{
+	char	   *server;			/* quoted */
+	List	   *options;		/* "name\tvalue", by name */
+	List	   *columns;		/* ForeignColumn * */
+	List	   *checks;			/* "name\tdefinition", by name (quoted) */
+} ForeignDef;
+
+/* an object's options (DefElem *), as "option" or "colopt" lines, by name */
+static void
+append_fdw_option_lines(StringInfo out, const char *kind, const char *column,
+						List *options)
+{
+	List	   *lines = NIL;
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *d = lfirst(lc);
+		StringInfoData line;
+
+		initStringInfo(&line);
+		appendStringInfoString(&line, kind);
+		if (column)
+		{
+			appendStringInfoChar(&line, '\t');
+			append_field(&line, column);
+		}
+		appendStringInfoChar(&line, '\t');
+		append_field(&line, d->defname);
+		appendStringInfoChar(&line, '\t');
+		append_field(&line, defGetString(d));
+		appendStringInfoChar(&line, '\n');
+		lines = lappend(lines, line.data);
+	}
+	list_sort(lines, cstring_cmp);
+	foreach(lc, lines)
+		appendStringInfoString(out, lfirst(lc));
+}
+
+/* the definition of foreign table relid, as above, appended to out */
+static void
+describe_foreign_table(Oid relid, StringInfo out)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	ForeignTable *ft = GetForeignTable(relid);
+	ForeignServer *server = GetForeignServer(ft->serverid);
+	StringInfoData colopts;
+	Relation	conrel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *checks = NIL;
+	ListCell   *lc;
+
+	appendStringInfoString(out, "server\t");
+	append_field(out, quote_identifier(server->servername));
+	appendStringInfoChar(out, '\n');
+	append_fdw_option_lines(out, "option", NULL, ft->options);
+	initStringInfo(&colopts);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		const char *colname;
+
+		if (att->attisdropped)
+			continue;
+		colname = quote_identifier(NameStr(att->attname));
+		appendStringInfoString(out, "column\t");
+		append_field(out, colname);
+		appendStringInfoChar(out, '\t');
+		append_field(out, format_type_extended(att->atttypid, att->atttypmod,
+											   FORMAT_TYPE_TYPEMOD_GIVEN |
+											   FORMAT_TYPE_FORCE_QUALIFY));
+		appendStringInfoChar(out, '\t');
+		if (OidIsValid(att->attcollation) &&
+			att->attcollation != get_typcollation(att->atttypid))
+		{
+			HeapTuple	ctup = SearchSysCache1(COLLOID, ObjectIdGetDatum(att->attcollation));
+			Form_pg_collation c;
+
+			if (!HeapTupleIsValid(ctup))
+				elog(ERROR, "cache lookup failed for collation %u", att->attcollation);
+			c = (Form_pg_collation) GETSTRUCT(ctup);
+			append_field(out, qualified(c->collnamespace, NameStr(c->collname)));
+			ReleaseSysCache(ctup);
+		}
+		appendStringInfo(out, "\t%s\t", att->attnotnull ? "t" : "f");
+		if (att->atthasdef && desc->constr)
+		{
+			char	   *expr = NULL;
+
+			for (int d = 0; d < desc->constr->num_defval; d++)
+				if (desc->constr->defval[d].adnum == att->attnum)
+					expr = printed_expr(CStringGetTextDatum(desc->constr->defval[d].adbin),
+										rel, att, NULL,
+										att->attgenerated ? EXPR_KIND_GENERATED_COLUMN :
+										EXPR_KIND_COLUMN_DEFAULT);
+			if (expr == NULL)
+				elog(ERROR, "default of column \"%s\" not found", NameStr(att->attname));
+			appendStringInfoChar(out, att->attgenerated == ATTRIBUTE_GENERATED_STORED ? 's' :
+								 att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ? 'v' : 'd');
+			appendStringInfoChar(out, '\t');
+			append_field(out, expr);
+		}
+		else
+			appendStringInfoChar(out, '\t');
+		appendStringInfoChar(out, '\n');
+		append_fdw_option_lines(&colopts, "colopt", colname,
+								GetForeignColumnOptions(relid, att->attnum));
+	}
+	appendStringInfoString(out, colopts.data);
+
+	/* its CHECK constraints, by name */
+	conrel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+							  NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+		StringInfoData line;
+
+		if (con->contype != CONSTRAINT_CHECK)
+			continue;
+		initStringInfo(&line);
+		appendStringInfoString(&line, "check\t");
+		append_field(&line, quote_identifier(NameStr(con->conname)));
+		appendStringInfoChar(&line, '\t');
+		append_field(&line, constraint_text(tup, rel, NULL));
+		appendStringInfoChar(&line, '\n');
+		checks = lappend(checks, line.data);
+	}
+	systable_endscan(scan);
+	table_close(conrel, AccessShareLock);
+	list_sort(checks, cstring_cmp);
+	foreach(lc, checks)
+		appendStringInfoString(out, lfirst(lc));
+	relation_close(rel, AccessShareLock);
+}
+
+/*
+ * What of a foreign table a commit doesn't describe yet, or NULL: extended
+ * statistics on it, and columns' statistics targets, storage and options.
+ */
+static const char *
+foreign_table_undescribed(Oid relid)
+{
+	Relation	rel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		any;
+	TupleDesc	desc;
+
+	rel = table_open(StatisticExtRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_statistic_ext_stxrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, StatisticExtRelidIndexId, true, NULL, 1, &key);
+	any = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	if (any)
+		return "extended statistics on foreign tables";
+
+	rel = relation_open(relid, AccessShareLock);
+	desc = RelationGetDescr(rel);
+	for (int i = 0; i < desc->natts && !any; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		HeapTuple	atup;
+		bool		isnull;
+
+		if (att->attisdropped)
+			continue;
+		if (att->attstorage != get_typstorage(att->atttypid))
+			any = true;
+		atup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(att->attnum));
+		if (HeapTupleIsValid(atup))
+		{
+			(void) SysCacheGetAttr(ATTNUM, atup, Anum_pg_attribute_attstattarget, &isnull);
+			if (!isnull)
+				any = true;
+			(void) SysCacheGetAttr(ATTNUM, atup, Anum_pg_attribute_attoptions, &isnull);
+			if (!isnull)
+				any = true;
+			ReleaseSysCache(atup);
+		}
+	}
+	relation_close(rel, AccessShareLock);
+	return any ? "column statistics targets, storage or options on foreign tables" : NULL;
+}
+
+/*
+ * Has relation relid a trigger?  (relhastriggers stays set once one is
+ * dropped, until a VACUUM.)
+ */
+static bool
+has_triggers(Oid relid)
+{
+	Relation	rel = table_open(TriggerRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	bool		any;
+
+	ScanKeyInit(&key, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, TriggerRelidNameIndexId, true, NULL, 1, &key);
+	any = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return any;
+}
+
+/* the fields of one line of a foreign table's definition */
+static List *
+foreign_fields(char *line)
+{
+	List	   *fields = NIL;
+	char	   *f = line;
+
+	for (;;)
+	{
+		char	   *tab = strchr(f, '\t');
+
+		if (tab)
+			*tab = '\0';
+		fields = lappend(fields, unescape_field(f));
+		if (!tab)
+			break;
+		f = tab + 1;
+	}
+	return fields;
+}
+
+static void
+parse_foreign_def(const char *def, ForeignDef *fd)
+{
+	char	   *copy = pstrdup(def);
+	char	   *line;
+	char	   *next;
+
+	memset(fd, 0, sizeof(*fd));
+	for (line = copy; line && *line; line = next)
+	{
+		List	   *f;
+		const char *kind;
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		f = foreign_fields(line);
+		kind = linitial(f);
+		if (strcmp(kind, "server") == 0 && list_length(f) == 2)
+			fd->server = lsecond(f);
+		else if (strcmp(kind, "option") == 0 && list_length(f) == 3)
+			fd->options = lappend(fd->options, psprintf("%s\t%s", (char *) lsecond(f),
+														(char *) lthird(f)));
+		else if (strcmp(kind, "column") == 0 && list_length(f) == 7)
+		{
+			ForeignColumn *c = palloc0(sizeof(ForeignColumn));
+
+			c->name = lsecond(f);
+			c->type = lthird(f);
+			c->collation = lfourth(f);
+			c->notnull = strcmp(list_nth(f, 4), "t") == 0;
+			c->defkind = ((char *) list_nth(f, 5))[0];
+			c->expr = list_nth(f, 6);
+			fd->columns = lappend(fd->columns, c);
+		}
+		else if (strcmp(kind, "colopt") == 0 && list_length(f) == 4)
+		{
+			ListCell   *lc;
+
+			foreach(lc, fd->columns)
+			{
+				ForeignColumn *c = lfirst(lc);
+
+				if (strcmp(c->name, lsecond(f)) == 0)
+					c->options = lappend(c->options, psprintf("%s\t%s", (char *) lthird(f),
+															  (char *) lfourth(f)));
+			}
+		}
+		else if (strcmp(kind, "check") == 0 && list_length(f) == 3)
+			fd->checks = lappend(fd->checks, psprintf("%s\t%s", (char *) lsecond(f),
+													  (char *) lthird(f)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid foreign table definition line \"%s\"", line)));
+	}
+	if (fd->server == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("foreign table definition without its server")));
+}
+
+/* "name\tvalue" lines as OPTIONS (name 'value', ...), if any */
+static void
+append_options_sql(StringInfo out, List *options)
+{
+	ListCell   *lc;
+
+	if (options == NIL)
+		return;
+	appendStringInfoString(out, " OPTIONS (");
+	foreach(lc, options)
+	{
+		char	   *o = pstrdup(lfirst(lc));
+		char	   *tab = strchr(o, '\t');
+
+		*tab = '\0';
+		appendStringInfo(out, "%s%s %s", foreach_current_index(lc) > 0 ? ", " : "",
+						 quote_identifier(o), quote_literal_cstr(tab + 1));
+	}
+	appendStringInfoChar(out, ')');
+}
+
+/* the statement making foreign table name (quoted, qualified) as def has it */
+static char *
+create_foreign_table_sql(const char *name, const char *def)
+{
+	ForeignDef	fd;
+	StringInfoData out;
+	ListCell   *lc;
+	bool		first = true;
+
+	parse_foreign_def(def, &fd);
+	initStringInfo(&out);
+	appendStringInfo(&out, "CREATE FOREIGN TABLE %s (", name);
+	foreach(lc, fd.columns)
+	{
+		ForeignColumn *c = lfirst(lc);
+
+		appendStringInfo(&out, "%s%s %s", first ? "" : ", ", c->name, c->type);
+		first = false;
+		append_options_sql(&out, c->options);
+		if (*c->collation)
+			appendStringInfo(&out, " COLLATE %s", c->collation);
+		if (c->notnull)
+			appendStringInfoString(&out, " NOT NULL");
+		if (c->defkind == 'd')
+			appendStringInfo(&out, " DEFAULT %s", c->expr);
+		else if (c->defkind == 's' || c->defkind == 'v')
+			appendStringInfo(&out, " GENERATED ALWAYS AS (%s) %s", c->expr,
+							 c->defkind == 's' ? "STORED" : "VIRTUAL");
+	}
+	foreach(lc, fd.checks)
+	{
+		char	   *k = pstrdup(lfirst(lc));
+		char	   *tab = strchr(k, '\t');
+
+		*tab = '\0';
+		appendStringInfo(&out, "%sCONSTRAINT %s %s", first ? "" : ", ", k, tab + 1);
+		first = false;
+	}
+	appendStringInfo(&out, ") SERVER %s", fd.server);
+	append_options_sql(&out, fd.options);
+	return out.data;
+}
+
+/* an OPTIONS (ADD/SET/DROP ...) clause from options from to to, or NULL */
+static char *
+alter_options_sql(List *from, List *to)
+{
+	StringInfoData out;
+	ListCell   *lc;
+	bool		any = false;
+
+	initStringInfo(&out);
+	appendStringInfoString(&out, " OPTIONS (");
+#define OPTION_NAME(o) pnstrdup((o), strchr((o), '\t') - (o))
+	foreach(lc, from)
+	{
+		char	   *n = OPTION_NAME((char *) lfirst(lc));
+		bool		kept = false;
+		ListCell   *lt;
+
+		foreach(lt, to)
+			if (strcmp(OPTION_NAME((char *) lfirst(lt)), n) == 0)
+				kept = true;
+		if (!kept)
+		{
+			appendStringInfo(&out, "%sDROP %s", any ? ", " : "", quote_identifier(n));
+			any = true;
+		}
+	}
+	foreach(lc, to)
+	{
+		char	   *o = lfirst(lc);
+		char	   *n = OPTION_NAME(o);
+		const char *had = NULL;
+		ListCell   *lf;
+
+		foreach(lf, from)
+			if (strcmp(OPTION_NAME((char *) lfirst(lf)), n) == 0)
+				had = lfirst(lf);
+		if (had && strcmp(had, o) == 0)
+			continue;
+		appendStringInfo(&out, "%s%s %s %s", any ? ", " : "", had ? "SET" : "ADD",
+						 quote_identifier(n), quote_literal_cstr(strchr(o, '\t') + 1));
+		any = true;
+	}
+#undef OPTION_NAME
+	appendStringInfoChar(&out, ')');
+	return any ? out.data : NULL;
+}
+
+/*
+ * The statements changing foreign table name from def from to def to in
+ * place: its options, its columns' options, NOT NULL and defaults, its
+ * checks.  NIL with *remake set if it must be made again instead (another
+ * server; columns added, dropped, reordered or of another type, collation
+ * or generation).
+ */
+static List *
+alter_foreign_table_sql(const char *name, const char *from, const char *to,
+						bool *remake)
+{
+	ForeignDef	f;
+	ForeignDef	t;
+	List	   *stmts = NIL;
+	char	   *opts;
+	ListCell   *lf;
+	ListCell   *lt;
+
+	parse_foreign_def(from, &f);
+	parse_foreign_def(to, &t);
+	*remake = strcmp(f.server, t.server) != 0 ||
+		list_length(f.columns) != list_length(t.columns);
+	forboth(lf, f.columns, lt, t.columns)
+	{
+		ForeignColumn *fc = lfirst(lf);
+		ForeignColumn *tc = lfirst(lt);
+
+		if (*remake)
+			break;
+		if (strcmp(fc->name, tc->name) != 0 || strcmp(fc->type, tc->type) != 0 ||
+			strcmp(fc->collation, tc->collation) != 0 ||
+			((fc->defkind == 's' || fc->defkind == 'v' ||
+			  tc->defkind == 's' || tc->defkind == 'v') &&
+			 (fc->defkind != tc->defkind || strcmp(fc->expr, tc->expr) != 0)))
+			*remake = true;
+	}
+	if (*remake)
+		return NIL;
+
+	if ((opts = alter_options_sql(f.options, t.options)) != NULL)
+		stmts = lappend(stmts, psprintf("ALTER FOREIGN TABLE %s%s", name, opts));
+	forboth(lf, f.columns, lt, t.columns)
+	{
+		ForeignColumn *fc = lfirst(lf);
+		ForeignColumn *tc = lfirst(lt);
+
+		if ((opts = alter_options_sql(fc->options, tc->options)) != NULL)
+			stmts = lappend(stmts, psprintf("ALTER FOREIGN TABLE %s ALTER COLUMN %s%s",
+											name, tc->name, opts));
+		if (fc->notnull != tc->notnull)
+			stmts = lappend(stmts, psprintf("ALTER FOREIGN TABLE %s ALTER COLUMN %s %s NOT NULL",
+											name, tc->name, tc->notnull ? "SET" : "DROP"));
+		if (fc->defkind != tc->defkind || strcmp(fc->expr, tc->expr) != 0)
+			stmts = lappend(stmts, tc->defkind == 'd' ?
+							psprintf("ALTER FOREIGN TABLE %s ALTER COLUMN %s SET DEFAULT %s",
+									 name, tc->name, tc->expr) :
+							psprintf("ALTER FOREIGN TABLE %s ALTER COLUMN %s DROP DEFAULT",
+									 name, tc->name));
+	}
+	foreach(lf, f.checks)
+		if (!list_has_string(t.checks, lfirst(lf)))
+		{
+			char	   *k = pstrdup(lfirst(lf));
+
+			*strchr(k, '\t') = '\0';
+			stmts = lcons(psprintf("ALTER FOREIGN TABLE %s DROP CONSTRAINT IF EXISTS %s",
+								   name, k), stmts);
+		}
+	foreach(lt, t.checks)
+		if (!list_has_string(f.checks, lfirst(lt)))
+		{
+			char	   *k = pstrdup(lfirst(lt));
+			char	   *tab = strchr(k, '\t');
+
+			*tab = '\0';
+			stmts = lappend(stmts, psprintf("ALTER FOREIGN TABLE %s ADD CONSTRAINT %s %s",
+											name, k, tab + 1));
+		}
+	return stmts;
 }
 
 static int
@@ -3598,16 +3995,18 @@ collect(Canon *cn)
 						what = "foreign tables that are partitions";
 					else if (has_superclass(form->oid))
 						what = "foreign tables that inherit";
-					else if (form->relhastriggers)
+					else if (form->relhastriggers && has_triggers(form->oid))
 						what = "triggers on foreign tables";
 					else if (form->relrowsecurity)
 						what = "row security on foreign tables";
+					else
+						what = foreign_table_undescribed(form->oid);
 					if (what)
 						(void) uncovered(cn, what, qualified(form->relnamespace, name),
 										 &self);
 					else
-						append_utf8(&add_item(cn, "r:", qualified(form->relnamespace, name))->value,
-									describe_foreign_table(form->oid));
+						describe_foreign_table(form->oid,
+											   &add_item(cn, "r:", qualified(form->relnamespace, name))->value);
 				}
 				break;
 			case RELKIND_PARTITIONED_TABLE:
@@ -7521,6 +7920,62 @@ converted_value(const char *expr, const char *old_def, const char *new_def,
 static bool is_aggregate(const MoveItem *it);
 static char *drop_routine_sql(const MoveItem *it);
 
+/*
+ * The routines (with SQL-standard bodies) using foreign table name, which
+ * goes to be made again: each dropped (appended to drops) before it, and
+ * made again after as to defines it, if it does (appended to makes).
+ */
+static void
+foreign_table_routines(const char *name, List *from, List *to,
+					   List **drops, List **makes)
+{
+	Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+										 NoLock, true);
+	Relation	pg_depend;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	if (!OidIsValid(relid))
+		return;
+	pg_depend = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_depend, DependReferenceIndexId, true, NULL, 2, key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
+		HeapTuple	pt;
+		Form_pg_proc proc;
+		char	   *fname;
+		MoveItem   *fp;
+		MoveItem   *tp;
+
+		if (d->classid != ProcedureRelationId)
+			continue;
+		pt = SearchSysCache1(PROCOID, ObjectIdGetDatum(d->objid));
+		if (!HeapTupleIsValid(pt))
+			elog(ERROR, "cache lookup failed for function %u", d->objid);
+		proc = (Form_pg_proc) GETSTRUCT(pt);
+		fname = psprintf("%s(%s)",
+						 qualified(proc->pronamespace, NameStr(proc->proname)),
+						 TextDatumGetCString(DirectFunctionCall1(pg_get_function_identity_arguments,
+																 ObjectIdGetDatum(d->objid))));
+		ReleaseSysCache(pt);
+		fp = find_item(from, 'f', fname);
+		tp = find_item(to, 'f', fname);
+		if (fp == NULL || list_has_string(*drops, drop_routine_sql(fp)))
+			continue;
+		*drops = lappend(*drops, drop_routine_sql(fp));
+		if (tp)
+			*makes = lappend(*makes, tp->def);
+	}
+	systable_endscan(scan);
+	table_close(pg_depend, AccessShareLock);
+}
+
 typedef struct TypeMoves
 {
 	List	   *before;			/* what uses them dropped; then each renamed
@@ -7536,6 +7991,8 @@ typedef struct TypeMoves
 	List	   *after;			/* what used them, made again */
 	List	   *aggregate_drops;	/* (before the functions they use; made
 									 * again with the others, after them) */
+	List	   *foreign_remakes;	/* foreign tables using them, dropped
+									 * before and made again (qualified) */
 	bool		any;
 } TypeMoves;
 
@@ -7780,6 +8237,15 @@ type_moves(List *from, List *to)
 
 					if (kind == RELKIND_VIEW || kind == RELKIND_MATVIEW)
 						handled = true; /* (they go, and come again) */
+					else if (kind == RELKIND_FOREIGN_TABLE && versioned)
+					{
+						/* (no rows: it goes, and is made again) */
+						char	   *rel = qualified(get_rel_namespace(d->objid), get_rel_name(d->objid));
+
+						if (!list_has_string(tm.foreign_remakes, rel))
+							tm.foreign_remakes = lappend(tm.foreign_remakes, rel);
+						handled = true;
+					}
 					else if (kind == RELKIND_COMPOSITE_TYPE)
 					{
 						Oid			ct = get_rel_type_id(d->objid);
@@ -7907,6 +8373,18 @@ type_moves(List *from, List *to)
 						handled = true;
 					}
 					else if (OidIsValid(con->conrelid) &&
+							 get_rel_relkind(con->conrelid) == RELKIND_FOREIGN_TABLE &&
+							 namespace_is_versioned(get_rel_namespace(con->conrelid)))
+					{
+						/* (a foreign table's: made again with it) */
+						char	   *rel = qualified(get_rel_namespace(con->conrelid),
+													get_rel_name(con->conrelid));
+
+						if (!list_has_string(tm.foreign_remakes, rel))
+							tm.foreign_remakes = lappend(tm.foreign_remakes, rel);
+						handled = true;
+					}
+					else if (OidIsValid(con->conrelid) &&
 							 namespace_is_versioned(get_rel_namespace(con->conrelid)))
 					{
 						char	   *tname = qualified(get_rel_namespace(con->conrelid),
@@ -7930,7 +8408,19 @@ type_moves(List *from, List *to)
 					ObjectAddress col = GetAttrDefaultColumnAddress(d->objid);
 
 					if (OidIsValid(col.objectId) &&
+						get_rel_relkind(col.objectId) == RELKIND_FOREIGN_TABLE &&
 						namespace_is_versioned(get_rel_namespace(col.objectId)))
+					{
+						/* (a foreign table's: made again with it) */
+						char	   *rel = qualified(get_rel_namespace(col.objectId),
+													get_rel_name(col.objectId));
+
+						if (!list_has_string(tm.foreign_remakes, rel))
+							tm.foreign_remakes = lappend(tm.foreign_remakes, rel);
+						handled = true;
+					}
+					else if (OidIsValid(col.objectId) &&
+							 namespace_is_versioned(get_rel_namespace(col.objectId)))
 					{
 						char	   *tname = qualified(get_rel_namespace(col.objectId),
 													  get_rel_name(col.objectId));
@@ -8455,6 +8945,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
 	List	   *foreign_makes = NIL;	/* foreign tables made, after those going */
+	List	   *foreign_alters = NIL;	/* foreign tables changed in place */
+	List	   *foreign_routines = NIL; /* routines using those made again,
+										 * made again after them */
+	bool		foreign_remade = false; /* one went to be made again */
 	List	   *routines = NIL;
 	List	   *aggregates_made = NIL;
 	List	   *policy_drops = NIL;
@@ -8481,6 +8975,24 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	from = move_items(&cn, from_root);
 	to = move_items(&cn, to_root);
 	tm = type_moves(from, to);
+
+	/*
+	 * Foreign tables using a type the move changes go before it does (they
+	 * hold no rows), and are made again after, as to defines them.
+	 */
+	foreach(lc, tm.foreign_remakes)
+	{
+		MoveItem   *t = find_item(to, 'r', lfirst(lc));
+
+		List	   *drops = NIL;
+
+		foreign_table_routines(lfirst(lc), from, to, &drops, &foreign_routines);
+		tm.before = list_concat(drops,
+								lcons(psprintf("DROP FOREIGN TABLE IF EXISTS %s", (char *) lfirst(lc)),
+									  tm.before));
+		if (t)
+			foreign_makes = lappend(foreign_makes, create_foreign_table_sql(t->name, t->def));
+	}
 
 	/* Going: views first, as they may use anything; then tables, routines, the rest. */
 	foreach(lc, from)
@@ -8547,12 +9059,30 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 								  sm.before);
 				break;
 			case 'r':
-				/*
-				 * A foreign table going or changed goes (it holds no rows:
-				 * they are its server's), after the views using it, and is
-				 * made again as to defines it.
-				 */
-				late = lappend(late, psprintf("DROP FOREIGN TABLE IF EXISTS %s", f->name));
+				{
+					/*
+					 * A foreign table changed is altered in place where it
+					 * can be; going, or changed in what can't be altered,
+					 * it goes after the views (and materialized views) using
+					 * it, and is made again as to defines it (it holds no
+					 * rows: they are its server's).  One a type move remakes
+					 * goes with that.
+					 */
+					bool		remake = (t == NULL);
+
+					if (list_has_string(tm.foreign_remakes, f->name))
+						break;
+					if (t)
+						foreign_alters = list_concat(foreign_alters,
+													 alter_foreign_table_sql(f->name, f->def,
+																			 t->def, &remake));
+					if (remake)
+					{
+						foreign_table_routines(f->name, from, to, &late, &foreign_routines);
+						late = lappend(late, psprintf("DROP FOREIGN TABLE IF EXISTS %s", f->name));
+						foreign_remade = true;
+					}
+				}
 				break;
 			case 'y':
 			case 'm':
@@ -8752,8 +9282,16 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
 										 t->name, sequence_options_sql(t->def)));
 		else if (t->kind == 'r')
-			foreign_makes = lappend(foreign_makes,
-									psprintf("CREATE FOREIGN TABLE %s %s", t->name, t->def));
+		{
+			bool		remake = (f == NULL);
+
+			if (list_has_string(tm.foreign_remakes, t->name))
+				continue;		/* (above) */
+			if (f)
+				(void) alter_foreign_table_sql(t->name, f->def, t->def, &remake);
+			if (remake)
+				foreign_makes = lappend(foreign_makes, create_foreign_table_sql(t->name, t->def));
+		}
 		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v' && t->kind != 'x')
 			goto unsupported;
 	}
@@ -8887,7 +9425,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * if any changes, or a view or a type they may use does: all of them,
 	 * each after those it uses (one going takes no other with it).
 	 */
-	matviews_change = tm.any || view_drops != NIL;
+	matviews_change = tm.any || view_drops != NIL || foreign_remade;
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);
@@ -8996,6 +9534,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	sql_bodies = try_statements(sql_bodies);
 	run_statements(list_concat(sm.changes, late));
 	run_statements(foreign_makes);	/* (after those going; before the views) */
+	run_statements(foreign_alters);
+	run_statements(foreign_routines);
 	sql_bodies = try_statements(sql_bodies);
 	make_views(type_drops);
 	run_statements(collation_drops);
@@ -10278,7 +10818,7 @@ folded_render(char object, const char *name, const ProllyValue *item,
 			append_statement(out, def);
 			break;
 		case 'r':
-			append_statement(out, psprintf("CREATE FOREIGN TABLE %s %s", name, def));
+			append_statement(out, create_foreign_table_sql(name, def));
 			break;
 		case 'y':
 			{
