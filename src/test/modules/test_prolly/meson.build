@@ -112,6 +112,7 @@ tests += {
       'dependencies',
       'dependency_moves',
       'shared_drops',
+      'shared_alters',
       'canonical_escapes',
       'aggregates',
       'policies',

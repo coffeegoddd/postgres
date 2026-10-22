@@ -53,6 +53,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
+#include "catalog/versioned.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
@@ -3181,6 +3182,26 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 }
 
 /*
+ * A domain shared by every branch can't have a constraint checked against
+ * another branch's columns from here: refuse if there are any.
+ */
+static void
+check_domain_other_branches(Oid domainoid)
+{
+	ObjectAddress domain;
+	char	   *branch;
+
+	ObjectAddressSet(domain, TypeRelationId, domainoid);
+	branch = other_branch_dependent(&domain, true);
+	if (branch)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot check a constraint of domain %s because columns on branch \"%s\" use it",
+						format_type_be(domainoid), branch),
+				 errhint("The domain is shared by every branch, and the columns on other branches can't be checked from here.")));
+}
+
+/*
  * Verify that all columns currently using the domain are not null.
  */
 static void
@@ -3192,6 +3213,7 @@ validateDomainNotNullConstraint(Oid domainoid)
 	/* Fetch relation list with attributes based on this domain */
 	/* ShareLock is sufficient to prevent concurrent data changes */
 
+	check_domain_other_branches(domainoid);
 	rels = get_rels_with_domain(domainoid, ShareLock);
 
 	foreach(rt, rels)
@@ -3269,6 +3291,7 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
 	/* Fetch relation list with attributes based on this domain */
 	/* ShareLock is sufficient to prevent concurrent data changes */
 
+	check_domain_other_branches(domainoid);
 	rels = get_rels_with_domain(domainoid, ShareLock);
 
 	foreach(rt, rels)
