@@ -1253,6 +1253,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 						 const char *schemaName)
 {
 	bool		switch_to_superuser = false;
+	List	   *let_go;
 	char	   *filename;
 	Oid			save_userid = 0;
 	int			save_sec_context = 0;
@@ -1371,6 +1372,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 	 */
 	creating_extension = true;
 	CurrentExtensionObject = extensionOid;
+	let_go = extension_script_begin();
 	PG_TRY();
 	{
 		char	   *c_sql = read_extension_script_file(control, filename);
@@ -1490,13 +1492,20 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 		c_sql = text_to_cstring(DatumGetTextPP(t_sql));
 
 		execute_sql_string(c_sql, filename);
+
+		/* (what it let go of in a versioned schema: dropped, or a member) */
+		extension_script_end(let_go, true);
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
+		extension_script_end(let_go, false);
 		creating_extension = false;
 		CurrentExtensionObject = InvalidOid;
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	creating_extension = false;
+	CurrentExtensionObject = InvalidOid;
 
 	/*
 	 * Restore the GUC variables we set above.
@@ -3846,7 +3855,8 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 						   stmt->object, relation);
 
 	/* a versioned schema's objects are each branch's, members are shared */
-	check_versioned_extension_member(&object, stmt->action > 0);
+	check_versioned_extension_member(&object, stmt->action > 0,
+									 extension.objectId);
 
 	/* Do the update, recursing to any dependent objects */
 	ExecAlterExtensionContentsRecurse(stmt, extension, object);

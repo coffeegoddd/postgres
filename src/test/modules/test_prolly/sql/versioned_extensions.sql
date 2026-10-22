@@ -151,5 +151,23 @@ SELECT count(*) FILTER (WHERE probranch <> 0) AS versioned_members
  WHERE d.deptype = 'e' AND d.refobjid IN (SELECT oid FROM pg_extension WHERE extname IN ('cube', 'seg'));
 ALTER EXTENSION seg DROP FUNCTION v.seg_size(v.seg);
 
+-- a script that lets one of its objects go and keeps it is refused (it
+-- would be shared yet no extension's); one that adds it again keeps it a
+-- shared member
+CREATE EXTENSION test_prolly_ext_detach SCHEMA v;
+SELECT count(*) AS detached_left FROM pg_proc WHERE proname IN ('test_prolly_detached', 'test_prolly_kept');
+CREATE EXTENSION test_prolly_ext_readd SCHEMA v;
+SELECT p.proname, p.probranch = 0 AS shared, e.extname
+  FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid
+ WHERE p.proname = 'test_prolly_readded';
+SELECT dolt_checkout('side');
+SELECT v.test_prolly_readded() AS on_side;
+SELECT dolt_checkout('main');
+-- a user's ADD of the branch's own function is refused, as before
+CREATE FUNCTION v.mine() RETURNS int LANGUAGE sql RETURN 1;
+ALTER EXTENSION test_prolly_ext_readd ADD FUNCTION v.mine();
+DROP FUNCTION v.mine();
+
 \c contrib_regression
 DROP DATABASE regress_versioned_extensions2;
