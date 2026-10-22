@@ -873,5 +873,48 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- ... and with a definition changed since, not committed: the commits'
+-- rows read as the table is defined now (w, which neither had, null),
+-- still no row of the working set folded.
+ALTER TABLE fc.t ADD COLUMN w int;
+UPDATE fc.t SET v = 'dirty', w = 1 WHERE id = 7;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).id, (to_row).v, (to_row).w
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+ diff_type | id |     v      | w 
+-----------+----+------------+---
+ modified  |  5 | left       |  
+ modified  |  6 | left again |  
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS redefined_history_diff_rows;
+ redefined_history_diff_rows 
+-----------------------------
+                           0
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 \c contrib_regression
 DROP DATABASE regress_fold_caches;

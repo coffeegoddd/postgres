@@ -258,5 +258,18 @@ FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
 SELECT pg_temp.since('fold_rows_read') AS working_diff_rows;
 SELECT dolt_reset('--hard');
 
+-- ... and with a definition changed since, not committed: the commits'
+-- rows read as the table is defined now (w, which neither had, null),
+-- still no row of the working set folded.
+ALTER TABLE fc.t ADD COLUMN w int;
+UPDATE fc.t SET v = 'dirty', w = 1 WHERE id = 7;
+:flush
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+SELECT diff_type, (from_row).id, (to_row).v, (to_row).w
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+:flush
+SELECT pg_temp.since('fold_rows_read') AS redefined_history_diff_rows;
+SELECT dolt_reset('--hard');
+
 \c contrib_regression
 DROP DATABASE regress_fold_caches;

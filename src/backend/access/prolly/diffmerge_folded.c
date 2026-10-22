@@ -399,21 +399,16 @@ string_cmp(const ListCell *a, const ListCell *b)
 	return strcmp(lfirst(a), lfirst(b));
 }
 
+/*
+ * root's tables, its types ref's; with relid valid, relid's table alone.
+ * (What every read of a ref's tables does once it has the root.)
+ */
 static List *
-tables_of_reading(const char *ref, Oid relid, List **left_out,
-				  ProllyNodeRef *root_out)
+root_tables(const ProllyNodeRef *root, const char *ref, Oid relid)
 {
-	ProllyNodeRef root;
 	Tables		ts = {NIL};
 
-	if (is_working(ref))
-		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid,
-						   &root, left_out);
-	else
-		root_of(ref, &root);
-	if (root_out)
-		*root_out = root;
-	read_tables(&root, &ts);
+	read_tables(root, &ts);
 	types_of_ref(ts.types, ref);
 	if (OidIsValid(relid))
 	{
@@ -422,6 +417,22 @@ tables_of_reading(const char *ref, Oid relid, List **left_out,
 		return t ? list_make1(t) : NIL;
 	}
 	return ts.tables;
+}
+
+static List *
+tables_of_reading(const char *ref, Oid relid, List **left_out,
+				  ProllyNodeRef *root_out)
+{
+	ProllyNodeRef root;
+
+	if (is_working(ref))
+		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid,
+						   &root, left_out);
+	else
+		root_of(ref, &root);
+	if (root_out)
+		*root_out = root;
+	return root_tables(&root, ref, relid);
 }
 
 static List *
@@ -440,20 +451,11 @@ tables_defined_now(Oid relid)
 {
 	const ProllyRefsRoutine *refs = components().refs;
 	ProllyNodeRef root;
-	Tables		ts = {NIL};
 
 	if (!PROLLY_HAS(refs, read_definitions))
 		return tables_of("WORKING", relid);
 	refs->read_definitions(&root, NULL);
-	read_tables(&root, &ts);
-	types_of_ref(ts.types, "WORKING");
-	if (OidIsValid(relid))
-	{
-		Table	   *t = find_table(ts.tables, table_name(relid));
-
-		return t ? list_make1(t) : NIL;
-	}
-	return ts.tables;
+	return root_tables(&root, "WORKING", relid);
 }
 
 static bool
