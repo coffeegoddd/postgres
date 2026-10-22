@@ -133,6 +133,8 @@ typedef struct Copy
 	char	   *row;			/* a candidate's: its entry's tuple */
 	uint32		rowlen;
 	int64		delta;
+	ItemPointerData tid;		/* a candidate's: where its key's version is
+								 * (invalid: not known), as the log says */
 } Copy;
 
 typedef struct Finder
@@ -151,6 +153,7 @@ typedef struct Finder
 	AttrNumber	keyattrs[INDEX_MAX_KEYS];
 	RegProcedure eqproc[INDEX_MAX_KEYS];
 	StrategyNumber eqstrat[INDEX_MAX_KEYS];
+	BlockNumber nblocks;		/* the table's, as the finder opened */
 	TupleTableSlot *keyslot;	/* virtual: the key columns, else nulls */
 	TupleTableSlot *rowslot;
 	Datum	   *values;
@@ -395,6 +398,7 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->env.compare_arg = f;
 	prolly_keying_use_env(&f->krefs, f->kr, f->k, f->tree, &f->env);
 	f->desc = RelationGetDescr(rel);
+	f->nblocks = RelationGetNumberOfBlocks(rel);
 	f->ccxt = AllocSetContextCreate(CurrentMemoryContext, "log fold copies",
 									ALLOCSET_DEFAULT_SIZES);
 	/* (more rows changed than the table holds: reading it all is less) */
@@ -470,6 +474,8 @@ compact_copies(Finder *f)
 								(const uint8 *) c->key, c->keylen))
 		{
 			f->c[u - 1].delta += c->delta;
+			if (!ItemPointerIsValid(&f->c[u - 1].tid))
+				f->c[u - 1].tid = c->tid;
 			pfree(c->key);
 			pfree(c->row);
 			continue;
@@ -493,7 +499,7 @@ compact_copies(Finder *f)
 
 static void
 add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
-		 int64 delta)
+		 int64 delta, const ItemPointerData *tid)
 {
 	Copy	   *c;
 
@@ -539,6 +545,10 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 	c->row = MemoryContextAlloc(f->ccxt, Max(rowlen, 1));
 	memcpy(c->row, row, rowlen);
 	c->delta = delta;
+	if (tid != NULL)
+		c->tid = *tid;
+	else
+		ItemPointerSetInvalid(&c->tid);
 }
 
 /* A whole row's copy: the tuple's key and encoded row, counted delta. */
@@ -550,7 +560,7 @@ row_copy(Finder *f, HeapTuple tup, int64 delta)
 	resetStringInfo(&f->row);
 	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
 	ExecClearTuple(f->rowslot);
-	add_copy(f, &f->key, f->row.data, f->row.len, delta);
+	add_copy(f, &f->key, f->row.data, f->row.len, delta, NULL);
 }
 
 /*
@@ -622,7 +632,8 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 			f->reason = PROLLY_FULL_KEYING_CHANGED;
 			return false;
 		}
-		add_copy(f, &f->key, (const char *) entry->t_data, entry->t_len, 0);
+		add_copy(f, &f->key, (const char *) entry->t_data, entry->t_len, 0,
+				 &entry->t_self);
 	}
 	CHECK_FOR_INTERRUPTS();
 	return !f->give_up;
@@ -658,6 +669,33 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
 {
 	HeapTupleData entry;
 	ScanKeyData skey[INDEX_MAX_KEYS];
+
+	/*
+	 * (where the log says the key's version is: the row, if the snapshot
+	 * sees the version there and it has the key, as a table with a key has
+	 * one row by a key a snapshot sees; else, updated since, deleted, or
+	 * its place reused, the key looked up)
+	 */
+	if (ItemPointerIsValid(&c->tid) &&
+		ItemPointerGetBlockNumber(&c->tid) < f->nblocks &&
+		table_tuple_fetch_row_version(f->rel, (ItemPointer) &c->tid, f->snap,
+									  f->rowslot))
+	{
+		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
+		ProllyKey	nk;
+
+		resetStringInfo(&f->key);
+		resetStringInfo(&f->row);
+		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
+		ExecClearTuple(f->rowslot);
+		nk.data = (const uint8 *) f->key.data;
+		nk.len = f->key.len;
+		if (keying_compare(&nk, &ck, f) == 0)
+		{
+			pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_LOCATED, 1);
+			return true;
+		}
+	}
 
 	entry.t_data = (HeapTupleHeader) c->row;
 	entry.t_len = c->rowlen;

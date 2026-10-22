@@ -14,8 +14,10 @@
  *	xid		int8	the writing transaction's top-level FullTransactionId
  *	entries	bytea	entries, each a count delta (int4: 0 for a key's, the
  *					sum of +1s and -1s for a keyless row's), an image's
- *					length (uint4; all ones: read the table in full) and
- *					the image (the entry's tuple from t_infomask2 on)
+ *					length (uint4; all ones: read the table in full; its
+ *					top bit set: the image follows the location of the
+ *					version the key was last written as, an ItemPointer),
+ *					and the image (the entry's tuple from t_infomask2 on)
  *
  * with a btree on xid.  A log of format 1 (an image and a delta a row, no
  * index) is taken as none: the table is folded in full until one is made
@@ -107,6 +109,23 @@
 
 /* The longest image an entry holds: one entry, alone in a row. */
 #define MAX_IMAGE_LEN		(MAX_ROW_ENTRIES - 2 * sizeof(uint32))
+
+/*
+ * A key's entry's length with this bit set: its image follows where the
+ * version it was last written as is (an ItemPointerData), so a fold can
+ * read the row there rather than look its key up.  (Never a full read's or
+ * an emptying's: those lengths are their own.)
+ */
+#define TID_FLAG			0x80000000
+#define ENTRY_TID_LEN		sizeof(ItemPointerData)
+
+/* An entry's image length, and whether a location comes before it. */
+static inline uint32
+entry_image_len(uint32 len, bool *tid)
+{
+	*tid = len != FULL_LEN && len != EMPTIED_LEN && (len & TID_FLAG) != 0;
+	return *tid ? len & ~TID_FLAG : len;
+}
 
 #define LOG_PREFIX			"pg_prolly_log_"
 
@@ -400,7 +419,17 @@ typedef struct BufEntry
 	BufKey		key;			/* hash key */
 	int32		delta;
 	bool		row;			/* a keyless row's (counted), not a key's */
+	bool		has_tid;		/* a key's: where the version it was last
+								 * written as is, after key.data's bytes */
 } BufEntry;
+
+/* Where a key's entry says its version is (NULL: not known). */
+static inline const ItemPointerData *
+entry_tid(const BufEntry *be)
+{
+	return be->has_tid ? (const ItemPointerData *) (be->key.data + be->key.len) :
+		NULL;
+}
 
 typedef struct BufTag
 {
@@ -513,7 +542,8 @@ buffer_init(LogBuffer *b)
 
 /* Add an entry to a buffer: true if it holds no entry of the same bytes. */
 static bool
-buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row)
+buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row,
+		   const ItemPointerData *tid)
 {
 	BufKey		key = {len, data};
 	BufEntry   *be;
@@ -522,17 +552,25 @@ buffer_add(LogBuffer *b, const char *data, uint32 len, int32 delta, bool row)
 	be = hash_search(b->entries, &key, HASH_ENTER, &found);
 	if (!found)
 	{
-		char	   *copy = MemoryContextAlloc(b->cxt, Max(len, 1));
+		/* (room after the key for where its version is) */
+		char	   *copy = MemoryContextAlloc(b->cxt, len + ENTRY_TID_LEN);
 
 		memcpy(copy, data, len);
 		be->key.data = copy;
 		be->key.len = len;
 		be->delta = 0;
 		be->row = false;
-		b->bytes += 2 * sizeof(uint32) + len;
+		be->has_tid = false;
+		b->bytes += 2 * sizeof(uint32) + ENTRY_TID_LEN + len;
 	}
 	be->delta += delta;
 	be->row = be->row || row;
+	/* (a key written again: the version written last) */
+	if (tid != NULL && ItemPointerIsValid(tid))
+	{
+		memcpy((char *) be->key.data + be->key.len, tid, ENTRY_TID_LEN);
+		be->has_tid = true;
+	}
 	return !found;
 }
 
@@ -545,7 +583,8 @@ buffer_merge(LogBuffer *dst, const LogBuffer *src)
 
 	hash_seq_init(&seq, src->entries);
 	while ((be = hash_seq_search(&seq)) != NULL)
-		(void) buffer_add(dst, be->key.data, be->key.len, be->delta, be->row);
+		(void) buffer_add(dst, be->key.data, be->key.len, be->delta, be->row,
+						  entry_tid(be));
 	dst->full = dst->full || src->full;
 	dst->emptied = dst->emptied || src->emptied;
 }
@@ -835,7 +874,10 @@ buffer_entries(Entries *e)
 			h = (HeapTupleHeader) (bytes - IMAGE_SKIP);
 			h->t_infomask2 &= ~HEAP2_XACT_MASK;
 			h->t_infomask &= ~HEAP_XACT_MASK;
-			if (buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0))
+			/* (a key's version, where it is: see TID_FLAG) */
+			if (buffer_add(b, bytes, len, e->deltas[i], e->deltas[i] != 0,
+						   e->deltas[i] == 0 && len + ENTRY_TID_LEN <= MAX_IMAGE_LEN ?
+						   &image->t_self : NULL))
 				added++;
 			pfree(bytes);
 		}
@@ -893,15 +935,22 @@ insert_row_packed(Relation log, Relation index, IndexInfo *ii, StringInfo packed
 /* Append an entry to the row being packed, starting another when full. */
 static void
 pack_entry(Relation log, Relation index, IndexInfo *ii, StringInfo packed,
-		   int32 delta, uint32 len, const char *data)
+		   int32 delta, uint32 len, const char *data,
+		   const ItemPointerData *tid)
 {
+	bool		with_tid = tid != NULL && ItemPointerIsValid(tid) &&
+		len != FULL_LEN && len != EMPTIED_LEN;
 	uint32		need = 2 * sizeof(uint32) +
-		(len == FULL_LEN || len == EMPTIED_LEN ? 0 : len);
+		(len == FULL_LEN || len == EMPTIED_LEN ? 0 : len) +
+		(with_tid ? ENTRY_TID_LEN : 0);
+	uint32		stored = with_tid ? len | TID_FLAG : len;
 
 	if (packed->len > 0 && packed->len + need > MAX_ROW_ENTRIES)
 		insert_row_packed(log, index, ii, packed);
 	appendBinaryStringInfo(packed, (const char *) &delta, sizeof(delta));
-	appendBinaryStringInfo(packed, (const char *) &len, sizeof(len));
+	appendBinaryStringInfo(packed, (const char *) &stored, sizeof(stored));
+	if (with_tid)
+		appendBinaryStringInfo(packed, (const char *) tid, ENTRY_TID_LEN);
 	if (len != FULL_LEN && len != EMPTIED_LEN)
 		appendBinaryStringInfo(packed, data, len);
 }
@@ -938,9 +987,9 @@ flush_buffer(LogBuffer *b)
 	BRANCH_WRITES_HUSHED(
 	{
 		if (b->full)
-			pack_entry(log, index, ii, &packed, 0, FULL_LEN, NULL);
+			pack_entry(log, index, ii, &packed, 0, FULL_LEN, NULL, NULL);
 		if (b->emptied)
-			pack_entry(log, index, ii, &packed, 0, EMPTIED_LEN, NULL);
+			pack_entry(log, index, ii, &packed, 0, EMPTIED_LEN, NULL, NULL);
 		hash_seq_init(&seq, b->entries);
 		while ((be = hash_seq_search(&seq)) != NULL)
 		{
@@ -948,7 +997,7 @@ flush_buffer(LogBuffer *b)
 			if (be->row && be->delta == 0)
 				continue;
 			pack_entry(log, index, ii, &packed, be->delta, be->key.len,
-					   be->key.data);
+					   be->key.data, be->row ? NULL : entry_tid(be));
 		}
 		if (packed.len > 0)
 			insert_row_packed(log, index, ii, &packed);
@@ -1123,6 +1172,9 @@ note_versions(Relation rel, Entries *e, HeapTuple old, HeapTuple *made,
 		{
 			HeapTuple	newkey = key_image(rel, made[i], keyattrs);
 
+			/* (the version's location, for a fold to read it there) */
+			newkey->t_self = made[i]->t_self;
+
 			/* (an update that kept its key: the key once) */
 			if (oldkey && !same_image(oldkey, newkey))
 				insert_key(e, oldkey);
@@ -1256,11 +1308,26 @@ visit_row(Relation rel, HeapTuple tup, TupleDesc desc,
 		HeapTuple	image;
 		bool		go;
 
+		ItemPointerData tid;
+		bool		has_tid;
+
 		memcpy(&delta, p, sizeof(delta));
 		memcpy(&len, p + sizeof(delta), sizeof(len));
 		p += 2 * sizeof(uint32);
 		if (len == FULL_LEN)
 			return false;		/* read the table in full */
+		len = entry_image_len(len, &has_tid);
+		ItemPointerSetInvalid(&tid);
+		if (has_tid)
+		{
+			if (ENTRY_TID_LEN > (uint32) (end - p))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("corrupt change log row in \"%s\"",
+								RelationGetRelationName(rel))));
+			memcpy(&tid, p, ENTRY_TID_LEN);
+			p += ENTRY_TID_LEN;
+		}
 		if (len == EMPTIED_LEN)
 		{
 			if (!visit(NULL, 0, arg))
@@ -1278,7 +1345,7 @@ visit_row(Relation rel, HeapTuple tup, TupleDesc desc,
 		image->t_data = (HeapTupleHeader) ((char *) image + HEAPTUPLESIZE);
 		memcpy((char *) image->t_data + IMAGE_SKIP, p, len);
 		image->t_tableOid = RelationGetRelid(rel);
-		ItemPointerSetInvalid(&image->t_self);
+		image->t_self = tid;	/* (where the key's version is, if known) */
 		p += len;
 		go = visit(image, delta, arg);
 		pfree(image);
@@ -1653,6 +1720,8 @@ relation_pending(Relation rel)
 			{
 				uint32		len;
 
+				bool		has_tid;
+
 				memcpy(&len, p + sizeof(int32), sizeof(len));
 				p += 2 * sizeof(uint32);
 				if (len == FULL_LEN)
@@ -1660,6 +1729,9 @@ relation_pending(Relation rel)
 					full = true;
 					break;
 				}
+				len = entry_image_len(len, &has_tid);
+				if (has_tid)
+					p += ENTRY_TID_LEN;
 				if (len != EMPTIED_LEN)
 					p += len;
 				entries++;

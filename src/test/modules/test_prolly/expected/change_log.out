@@ -684,7 +684,7 @@ SELECT value AS log_rows_read FROM pg_stat_prolly WHERE name = 'log_pages_read';
 SELECT pg_temp.log_vacuum_score() AS default_score;
  default_score 
 ---------------
-          0.05
+          0.07
 (1 row)
 
 ALTER TABLE clv.vac SET (autovacuum_vacuum_threshold = 40000);
@@ -698,7 +698,7 @@ ALTER TABLE clv.vac RESET (autovacuum_vacuum_threshold);
 SELECT pg_temp.log_vacuum_score() AS reset_score;
  reset_score 
 -------------
-        0.05
+        0.07
 (1 row)
 
 VACUUM clv.vac;

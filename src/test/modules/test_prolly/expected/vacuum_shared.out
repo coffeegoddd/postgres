@@ -65,7 +65,7 @@ SELECT pg_stat_force_next_flush();
 SELECT value AS copied_by_vacuum FROM pg_stat_prolly WHERE name = 'page_copies_shared';
  copied_by_vacuum 
 ------------------
-                6
+                7
 (1 row)
 
 VACUUM (FREEZE) vs.t;

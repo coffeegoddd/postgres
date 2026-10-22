@@ -131,6 +131,7 @@ tests += {
       'fold_verify',
       'fold_caches',
       'fold_on_commit',
+      'row_locations',
       'describe_caches',
       'nearest_source',
       'keyless_toast_folds',
