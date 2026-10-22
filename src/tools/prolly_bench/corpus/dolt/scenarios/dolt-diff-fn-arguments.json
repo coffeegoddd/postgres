@@ -129,7 +129,7 @@
       ],
       "sql": "SELECT * FROM dolt_diff(NULL, NULL, NULL)",
       "expect": {
-        "sqlstate": "42804"
+        "sqlstate": "22004"
       }
     },
     {
