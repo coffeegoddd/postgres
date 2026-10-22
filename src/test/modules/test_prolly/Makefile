@@ -23,7 +23,7 @@ REGRESS_OPTS = --temp-config $(top_srcdir)/src/test/modules/test_prolly/test_pro
 TAP_TESTS = 1
 # (no autovacuum folds but where a test turns them on: autofold_off.conf,
 # below)
-EXTRA_INSTALL = contrib/amcheck contrib/btree_gist contrib/cube contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_rows contrib/pg_buffercache contrib/pageinspect contrib/pg_prewarm \
+EXTRA_INSTALL = contrib/amcheck contrib/btree_gist contrib/cube contrib/seg contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_rows contrib/pg_buffercache contrib/pageinspect contrib/pg_prewarm \
 	contrib/pg_walinspect contrib/test_decoding \
 	src/test/modules/injection_points src/test/modules/dummy_seclabel
 
