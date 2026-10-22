@@ -649,18 +649,11 @@ static uint32 gc_record(Segment *g, uint64 offset, uint64 size, char **rec,
  * ----------------------------------------------------------------
  */
 
-/*
- * A table by chunk hash (a ProllyHash, hash_key()'s): its first bytes are
- * spread evenly already, its hash in the table with nothing to compute.
- */
+/* A table by chunk hash (a ProllyHash, hash_key()'s). */
 static uint32
 chunk_hash_key_hash(const void *key, Size keysize)
 {
-	const ProllyHash *h = key;
-	uint32		v;
-
-	memcpy(&v, h->bytes, sizeof(v));
-	return v;
+	return prolly_hash_bucket(((const ProllyHash *) key)->bytes);
 }
 
 static void

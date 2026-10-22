@@ -58,6 +58,7 @@ typedef struct ConformanceCase
 static void check_identity(const ProllyImplInfo *impl);
 static void hash_deterministic(const ProllyImplInfo *impl);
 static void hash_incremental(const ProllyImplInfo *impl);
+static void hash_buckets_spread(const ProllyImplInfo *impl);
 
 /*
  * The suites.  Case names describe the contract they will check, taken from
@@ -91,6 +92,8 @@ static const ConformanceCase cases[] = {
 	hash_deterministic},
 	{PROLLY_IFACE_CONTENT_HASH, "incremental_equals_one_shot",
 	"begin update finish", hash_incremental},
+	{PROLLY_IFACE_CONTENT_HASH, "buckets_spread", "begin update finish",
+	hash_buckets_spread},
 
 	/* key encoder */
 	{PROLLY_IFACE_KEY_ENCODER, "order_matches_opclass",
@@ -271,6 +274,33 @@ hash_incremental(const ProllyImplInfo *impl)
 	hash_once(hash, data, sizeof(data), 7, &pieces);
 	if (!hash_equal(&whole, &pieces))
 		elog(ERROR, "hashing in pieces differs from hashing at once");
+}
+
+/*
+ * Digests' first four bytes spread evenly (prolly_hash_bucket()): 1024
+ * inputs over 64 buckets by the low bits (dynahash's) and by the high
+ * (dshash's), none empty and none past three times its share.
+ */
+static void
+hash_buckets_spread(const ProllyImplInfo *impl)
+{
+	const ProllyHashRoutine *hash = (const ProllyHashRoutine *) impl;
+	int			low[64] = {0};
+	int			high[64] = {0};
+
+	for (uint32 i = 0; i < 1024; i++)
+	{
+		ProllyHash	h;
+		uint32		b;
+
+		hash_once(hash, (const uint8 *) &i, sizeof(i), sizeof(i), &h);
+		b = prolly_hash_bucket(h.bytes);
+		low[b % 64]++;
+		high[b >> 26]++;
+	}
+	for (int i = 0; i < 64; i++)
+		if (low[i] == 0 || low[i] > 48 || high[i] == 0 || high[i] > 48)
+			elog(ERROR, "digests' first four bytes don't spread evenly");
 }
 
 /* ------------------------------------------------------------------------

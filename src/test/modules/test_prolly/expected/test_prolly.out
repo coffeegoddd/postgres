@@ -71,14 +71,17 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  content_hash  | sha256         | identity                       | pass
  content_hash  | sha256         | deterministic                  | pass
  content_hash  | sha256         | incremental_equals_one_shot    | pass
+ content_hash  | sha256         | buckets_spread                 | pass
  content_hash  | sha256         | complete                       | pass
  content_hash  | blake3         | identity                       | pass
  content_hash  | blake3         | deterministic                  | pass
  content_hash  | blake3         | incremental_equals_one_shot    | pass
+ content_hash  | blake3         | buckets_spread                 | pass
  content_hash  | blake3         | complete                       | pass
  content_hash  | stub           | identity                       | pass
  content_hash  | stub           | deterministic                  | not implemented (missing begin, update, finish)
  content_hash  | stub           | incremental_equals_one_shot    | not implemented (missing begin, update, finish)
+ content_hash  | stub           | buckets_spread                 | not implemented (missing begin, update, finish)
  content_hash  | stub           | complete                       | not implemented (3 of 3 callbacks missing)
  key_encoder   | ordered        | identity                       | pass
  key_encoder   | ordered        | order_matches_opclass          | pass
@@ -241,7 +244,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (15 of 15 callbacks missing)
-(181 rows)
+(184 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -275,24 +278,29 @@ SELECT * FROM prolly_conformance('content_hash');
  content_hash | sha256         | identity                    | pass
  content_hash | sha256         | deterministic               | pass
  content_hash | sha256         | incremental_equals_one_shot | pass
+ content_hash | sha256         | buckets_spread              | pass
  content_hash | sha256         | complete                    | pass
  content_hash | blake3         | identity                    | pass
  content_hash | blake3         | deterministic               | pass
  content_hash | blake3         | incremental_equals_one_shot | pass
+ content_hash | blake3         | buckets_spread              | pass
  content_hash | blake3         | complete                    | pass
  content_hash | stub           | identity                    | pass
  content_hash | stub           | deterministic               | not implemented (missing begin, update, finish)
  content_hash | stub           | incremental_equals_one_shot | not implemented (missing begin, update, finish)
+ content_hash | stub           | buckets_spread              | not implemented (missing begin, update, finish)
  content_hash | stub           | complete                    | not implemented (3 of 3 callbacks missing)
  content_hash | test_fnv       | identity                    | pass
  content_hash | test_fnv       | deterministic               | pass
  content_hash | test_fnv       | incremental_equals_one_shot | pass
+ content_hash | test_fnv       | buckets_spread              | pass
  content_hash | test_fnv       | complete                    | pass
  content_hash | test_broken    | identity                    | pass
  content_hash | test_broken    | deterministic               | pass
  content_hash | test_broken    | incremental_equals_one_shot | fail: hashing in pieces differs from hashing at once
+ content_hash | test_broken    | buckets_spread              | pass
  content_hash | test_broken    | complete                    | pass
-(20 rows)
+(25 rows)
 
 SELECT * FROM prolly_conformance('no_such_interface');
 ERROR:  unknown prolly interface "no_such_interface"
