@@ -191,8 +191,8 @@ SELECT * FROM dolt_at('HEAD~', NULL::dh.rpk) ORDER BY v;
 SELECT diff_type, count(*) FROM dolt_diff_table(NULL::dh.rpk, 'HEAD~', 'HEAD')
 GROUP BY diff_type ORDER BY diff_type;
 SELECT count(*) FROM dolt_history_table(NULL::dh.rpk);
--- Neither historical version has the current key's name.  They cannot
--- be matched by that key, but equal projected copies cancel.
+-- The historical versions use different key names (pk and pk2), neither
+-- current.  Do not infer rename identity: equal projected copies cancel.
 ALTER TABLE dh.rpk RENAME COLUMN pk2 TO pk3;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'before_rename', 'HEAD', NULL::dh.rpk)
@@ -202,9 +202,9 @@ SELECT diff_type, from_row, to_row
 FROM dolt_diff('HEAD', :'before_rename', NULL::dh.rpk)
 ORDER BY diff_type, (from_row).v, (to_row).v;
 
--- Both commits predate a single rename.  Copies that become identical
--- still cancel one-for-one, while a partial composite key retains its
--- surviving component.
+-- Both commits predate a single rename and share their old definition.
+-- Match stored primary keys: the edit is modified, while the inserted and
+-- deleted keys remain added/removed.  Partial composite keys work too.
 CREATE TABLE dh.oldpk (pk int PRIMARY KEY, v int);
 CREATE TABLE dh.oldcpk (a int, b int, v int, PRIMARY KEY (a, b));
 INSERT INTO dh.oldpk VALUES (1, 7), (2, 7), (3, 8), (4, 8);
@@ -228,6 +228,12 @@ FROM dolt_diff(:'old_keys_base', :'old_keys_changed', NULL::dh.oldcpk)
 ORDER BY diff_type;
 SELECT table_name, rows_added, rows_deleted, rows_modified
 FROM dolt_diff_stat(:'old_keys_base', :'old_keys_changed', 'dh.oldpk');
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'old_keys_changed', :'old_keys_base', NULL::dh.oldpk)
+ORDER BY diff_type, (from_row).v, (to_row).v;
+SELECT diff_type, count(*)
+FROM dolt_diff_table(NULL::dh.oldpk, :'old_keys_base', :'old_keys_changed')
+GROUP BY diff_type ORDER BY diff_type;
 
 -- Keyless-origin counts cancel without expanding copies into sort entries.
 -- Distinct values that both fit to NULL must not cancel each other.
@@ -324,6 +330,13 @@ SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'hidden_before', :'hidden_after', NULL::dh.hk) ORDER BY diff_type;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'hidden_before', :'hidden_after', NULL::dh.hl) ORDER BY (to_row).b;
+-- The same stored composite key also matches when a current key component
+-- is absent.  A hidden edit is modified even with identical displayed rows.
+ALTER TABLE dh.hl RENAME COLUMN b TO b_now;
+SELECT diff_type, (from_row).a AS from_a, (to_row).a AS to_a,
+       (from_row).b_now IS NULL AND (to_row).b_now IS NULL AS missing_key,
+       from_row IS NOT DISTINCT FROM to_row AS same_display
+FROM dolt_diff(:'hidden_before', :'hidden_after', NULL::dh.hl);
 -- Ordinary historical reads still return every projected row, once.
 SELECT count(*) FROM dolt_at(:'hidden_before', NULL::dh.hk);
 

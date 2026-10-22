@@ -542,8 +542,8 @@ SELECT count(*) FROM dolt_history_table(NULL::dh.rpk);
      6
 (1 row)
 
--- Neither historical version has the current key's name.  They cannot
--- be matched by that key, but equal projected copies cancel.
+-- The historical versions use different key names (pk and pk2), neither
+-- current.  Do not infer rename identity: equal projected copies cancel.
 ALTER TABLE dh.rpk RENAME COLUMN pk2 TO pk3;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'before_rename', 'HEAD', NULL::dh.rpk)
@@ -563,9 +563,9 @@ ORDER BY diff_type, (from_row).v, (to_row).v;
  removed   | (,9)     | 
 (2 rows)
 
--- Both commits predate a single rename.  Copies that become identical
--- still cancel one-for-one, while a partial composite key retains its
--- surviving component.
+-- Both commits predate a single rename and share their old definition.
+-- Match stored primary keys: the edit is modified, while the inserted and
+-- deleted keys remain added/removed.  Partial composite keys work too.
 CREATE TABLE dh.oldpk (pk int PRIMARY KEY, v int);
 CREATE TABLE dh.oldcpk (a int, b int, v int, PRIMARY KEY (a, b));
 INSERT INTO dh.oldpk VALUES (1, 7), (2, 7), (3, 8), (4, 8);
@@ -602,26 +602,44 @@ ORDER BY diff_type, (from_row).v, (to_row).v;
  diff_type | from_row | to_row 
 -----------+----------+--------
  added     |          | (,9)
- added     |          | (,9)
- removed   | (,7)     | 
+ modified  | (,7)     | (,9)
  removed   | (,8)     | 
-(4 rows)
+(3 rows)
 
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'old_keys_base', :'old_keys_changed', NULL::dh.oldcpk)
 ORDER BY diff_type;
  diff_type | from_row | to_row 
 -----------+----------+--------
- added     |          | (1,,9)
- removed   | (1,,7)   | 
-(2 rows)
+ modified  | (1,,7)   | (1,,9)
+(1 row)
 
 SELECT table_name, rows_added, rows_deleted, rows_modified
 FROM dolt_diff_stat(:'old_keys_base', :'old_keys_changed', 'dh.oldpk');
  table_name | rows_added | rows_deleted | rows_modified 
 ------------+------------+--------------+---------------
- dh.oldpk   |          2 |            2 |             0
+ dh.oldpk   |          1 |            1 |             1
 (1 row)
+
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'old_keys_changed', :'old_keys_base', NULL::dh.oldpk)
+ORDER BY diff_type, (from_row).v, (to_row).v;
+ diff_type | from_row | to_row 
+-----------+----------+--------
+ added     |          | (,8)
+ modified  | (,9)     | (,7)
+ removed   | (,9)     | 
+(3 rows)
+
+SELECT diff_type, count(*)
+FROM dolt_diff_table(NULL::dh.oldpk, :'old_keys_base', :'old_keys_changed')
+GROUP BY diff_type ORDER BY diff_type;
+ diff_type | count 
+-----------+-------
+ added     |     1
+ modified  |     1
+ removed   |     1
+(3 rows)
 
 -- Keyless-origin counts cancel without expanding copies into sort entries.
 -- Distinct values that both fit to NULL must not cancel each other.
@@ -693,9 +711,8 @@ SELECT diff_type, count(*) FROM dolt_diff(:'spill_base', :'spill_changed', NULL:
 GROUP BY diff_type ORDER BY diff_type;
  diff_type | count 
 -----------+-------
- added     |     1
- removed   |     1
-(2 rows)
+ modified  |     1
+(1 row)
 
 RESET work_mem;
 -- An absent key added to a keyless version must retain its row counts;
@@ -859,6 +876,20 @@ WARNING:  2 values of column "visible" of table "hl" don't convert from characte
  diff_type | from_row | to_row  
 -----------+----------+---------
  modified  | (1,1,,)  | (1,1,,)
+(1 row)
+
+-- The same stored composite key also matches when a current key component
+-- is absent.  A hidden edit is modified even with identical displayed rows.
+ALTER TABLE dh.hl RENAME COLUMN b TO b_now;
+SELECT diff_type, (from_row).a AS from_a, (to_row).a AS to_a,
+       (from_row).b_now IS NULL AND (to_row).b_now IS NULL AS missing_key,
+       from_row IS NOT DISTINCT FROM to_row AS same_display
+FROM dolt_diff(:'hidden_before', :'hidden_after', NULL::dh.hl);
+WARNING:  2 values of column "visible" of table "hl" don't convert from character varying(20) to character varying(3): shown as null
+WARNING:  2 values of column "visible" of table "hl" don't convert from character varying(20) to character varying(3): shown as null
+ diff_type | from_a | to_a | missing_key | same_display 
+-----------+--------+------+-------------+--------------
+ modified  |      1 |    1 | t           | t
 (1 row)
 
 -- Ordinary historical reads still return every projected row, once.
