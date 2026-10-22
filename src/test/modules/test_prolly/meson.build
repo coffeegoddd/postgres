@@ -117,6 +117,7 @@ tests += {
       'shared_alters',
       'versioned_extensions',
       'extension_moves',
+      'extension_clone',
       'canonical_escapes',
       'aggregates',
       'policies',

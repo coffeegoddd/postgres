@@ -57,5 +57,34 @@ my $pubcheck = q{
 is($node->safe_psql('pubdst', $pubcheck), 'true,prolly,1,true',
 	'the restored public schema is versioned, with its prolly table and grants');
 
+# An extension in a versioned schema: the dump makes the schema versioned
+# before it makes the extension there, whose objects are shared again.
+$node->safe_psql('postgres', q{
+	CREATE DATABASE extsrc;
+	CREATE DATABASE extdst;
+});
+$node->safe_psql('extsrc', q{
+	DROP SCHEMA public;
+	CREATE SCHEMA public VERSIONED;
+	CREATE EXTENSION citext SCHEMA public;
+	CREATE TABLE public.t (id integer PRIMARY KEY, name public.citext);
+	INSERT INTO public.t VALUES (1, 'Hi');
+});
+my $extdump = $node->basedir . '/extdump.sql';
+command_ok([ 'pg_dump', '--file' => $extdump, '--dbname' => $node->connstr('extsrc') ],
+	'pg_dump of an extension in a versioned schema');
+command_ok([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1', '--quiet',
+		'--file' => $extdump, '--dbname' => $node->connstr('extdst') ],
+	'the dump of an extension in a versioned schema restores');
+is($node->safe_psql('extdst', q{
+	SELECT n.nspversioned || ',' || e.extname || ',' ||
+	  (SELECT typbranch = 0 FROM pg_type WHERE typname = 'citext'
+	     AND typnamespace = 'public'::regnamespace) || ',' ||
+	  (SELECT count(*) FROM public.t WHERE name = 'HI'::public.citext)
+	FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+	WHERE e.extname = 'citext'}),
+	'true,citext,true,1',
+	'the restored extension is in the versioned schema, shared, and its table reads');
+
 $node->stop;
 done_testing();
