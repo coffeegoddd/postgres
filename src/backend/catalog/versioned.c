@@ -345,9 +345,39 @@ check_versioned_dependencies(const ObjectAddress *depender,
 }
 
 /*
+ * Does a branch other than the session's have copies?  Only then can a
+ * catalog row of another branch exist.  Asked of pg_branch, not of the
+ * schemas: those the session sees are its own branch's, so a branch that
+ * has dropped every versioned schema would answer for all of them.
+ */
+bool
+other_branches_have_copies(void)
+{
+	Relation	rel = table_open(BranchRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL,
+										  0, NULL);
+	HeapTuple	tup;
+	bool		found = false;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		if (((Form_pg_branch) GETSTRUCT(tup))->oid != MyBranch)
+		{
+			found = true;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+
+/*
  * Error if an object on a branch other than the session's depends on
  * object, which is about to be dropped.  Only a shared object can have
  * such dependents: a versioned one is the session's branch's own copy.
+ * Callers dropping many objects ask other_branches_have_copies() once
+ * first.
  */
 void
 check_other_branch_dependents(const ObjectAddress *object)
@@ -360,7 +390,7 @@ check_other_branch_dependents(const ObjectAddress *object)
 	HeapTuple	tup;
 	List	   *others = NIL;
 
-	if (!database_has_versioned_schemas() || object_is_versioned(object))
+	if (object_is_versioned(object))
 		return;
 
 	info = catalog_branch_info(DependRelationId);

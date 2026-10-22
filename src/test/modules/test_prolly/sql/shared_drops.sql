@@ -83,3 +83,28 @@ SELECT dolt_branch('-D', 'sd_side');
 SELECT dolt_branch('-D', 'sd_third');
 DROP SCHEMA sd CASCADE;
 DROP SCHEMA sd_ext;
+
+-- the session's branch has no versioned schema left, another branch still
+-- does: its dependents still refuse the drop (in a database of its own, so
+-- no other test's versioned schemas are on main)
+CREATE DATABASE regress_shared_drops;
+\c regress_shared_drops
+CREATE DOMAIN public.sd_pos2 AS int CHECK (VALUE > 0);
+CREATE SCHEMA sd2 VERSIONED;
+CREATE TABLE sd2.t (id int PRIMARY KEY, n public.sd_pos2);
+INSERT INTO sd2.t VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'sd2')::text) AS committed;
+SELECT dolt_checkout('-b', 'sd_left');
+SELECT dolt_checkout('main');
+SET client_min_messages = warning;
+DROP SCHEMA sd2 CASCADE;
+RESET client_min_messages;
+SELECT count(*) AS versioned_here FROM pg_namespace WHERE nspversioned;
+DROP DOMAIN public.sd_pos2 CASCADE;
+SELECT dolt_checkout('sd_left');
+SELECT * FROM sd2.t;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('-D', 'sd_left');
+DROP DOMAIN public.sd_pos2;
+\c contrib_regression
+DROP DATABASE regress_shared_drops;
