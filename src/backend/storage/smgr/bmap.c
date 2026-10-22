@@ -1000,6 +1000,32 @@ alloc_exists(RelFileLocator rel)
 }
 
 /*
+ * An allocator's first page can exist without its initialization record:
+ * extension writes zeroes before INIT is logged, and a crash or error can
+ * leave them there.  File length alone does not mean it is ready to use.
+ * Read under the buffer lock so a concurrent initializer can finish first.
+ */
+static bool
+alloc_initialized(RelFileLocator rel)
+{
+	Buffer		buf;
+	Page		page;
+	bool		initialized;
+
+	if (!alloc_exists(rel))
+		return false;
+	buf = alloc_read(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	initialized = !PageIsNew(page) || !pg_memory_is_all_zeros(page, BLCKSZ);
+	if (initialized)
+		check_page(page, BMAP_PAGE_META,
+				   with_relnumber(rel, BMAP_ALLOC_RELNUMBER), MAIN_FORKNUM, 0);
+	UnlockReleaseBuffer(buf);
+	return initialized;
+}
+
+/*
  * Make sure the tablespace and database of 'rel' have an allocator and a
  * page store.
  */
@@ -1008,12 +1034,12 @@ ensure_alloc(RelFileLocator rel)
 {
 	LOCKTAG		tag;
 
-	if (alloc_exists(rel))
+	if (alloc_initialized(rel))
 		return;
 
 	SET_LOCKTAG_RELATION(tag, rel.dbOid, BMAP_ALLOC_RELNUMBER);
 	LockAcquire(&tag, AccessExclusiveLock, false, false);
-	if (!alloc_exists(rel))
+	if (!alloc_initialized(rel))
 	{
 		RelFileLocator aloc = with_relnumber(rel, BMAP_ALLOC_RELNUMBER);
 		RelFileLocator sloc = with_relnumber(rel, BMAP_STORE_RELNUMBER);
@@ -1040,11 +1066,30 @@ ensure_alloc(RelFileLocator rel)
 			log_smgrcreate(&aloc, MAIN_FORKNUM);
 		}
 
-		buf = alloc_new_page(rel);
+		/*
+		 * Reuse only an interrupted first initialization.  An allocator
+		 * with bitmap pages or a nonempty store/count file must not be
+		 * reset: doing so could allocate blocks that still hold rows.
+		 */
+		if (smgrnblocks(asrel, MAIN_FORKNUM) > 1 ||
+			smgrnblocks(ssrel, MAIN_FORKNUM) != 0 ||
+			smgrnblocks(rsrel, MAIN_FORKNUM) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cannot initialize block map allocator \"%s\" with existing storage",
+							relpathperm(aloc, MAIN_FORKNUM).str)));
+		if (smgrnblocks(asrel, MAIN_FORKNUM) == 0)
+			buf = alloc_new_page(rel);
+		else
+		{
+			buf = alloc_read(rel, 0);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		}
 		if (BufferGetBlockNumber(buf) != 0)
 			elog(ERROR, "block map allocator of database %u begins at block %u",
 				 rel.dbOid, BufferGetBlockNumber(buf));
 		page = BufferGetPage(buf);
+		INJECTION_POINT("bmap-alloc-extended", NULL);
 
 		START_CRIT_SECTION();
 		init_meta(page);
@@ -1052,6 +1097,13 @@ ensure_alloc(RelFileLocator rel)
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT | REGBUF_STANDARD);
 		PageSetLSN(page, XLogInsert(RM_BMAP_ID, XLOG_BMAP_INIT));
+		/*
+		 * Before anyone can extend the allocator or page store, make INIT
+		 * durable.  Otherwise a crash could lose INIT after those files grew,
+		 * leaving more than the empty first page we can safely retry above.
+		 * This is paid once per database/tablespace, not per relation.
+		 */
+		XLogFlush(PageGetLSN(page));
 		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buf);
 	}
