@@ -64,6 +64,10 @@ class Engine:
     def diff_sql(self, a, b):
         return f"SELECT count(*) FROM dolt_diff({literal(a)},{literal(b)},'bench_rows')"
 
+    def ids_in(self, ids):
+        """The predicate that the benchmark table's id is one of ids."""
+        return "id IN (" + ",".join(str(int(i)) for i in ids) + ")"
+
     def create_table(self, sql, ddl):
         """Make the benchmark table from its column DDL."""
         sql.query(ddl)
@@ -165,6 +169,16 @@ class Doltgres(GoEngine):
 
     def server_config(self, root, c):
         return super().server_config(root, c) + "user:\n  name: postgres\n  password: password\n"
+
+    def ids_in(self, ids):
+        # Doltgres plans a literal IN list in time quadratic in its length
+        # (1,000 ids: about 0.3 s, nearly all planning, for a 1 ms read);
+        # a subquery over a VALUES list is planned in linear time (an
+        # UPDATE of 1,000 rows: 286 ms to 45 ms).  Its VALUES columns have
+        # no default names, so the list is aliased.  (= ANY(ARRAY[...]) and
+        # UPDATE ... FROM (VALUES ...) are slower still.)
+        return ("id IN (SELECT id FROM (VALUES " +
+                ",".join(f"({int(i)})" for i in ids) + ") v(id))")
 
 
 class Prolly(Engine):

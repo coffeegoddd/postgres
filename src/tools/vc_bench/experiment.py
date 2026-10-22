@@ -38,8 +38,8 @@ def verify_dirty(sql, n, count, revision, latest):
 def update(sql, n, k, revision):
     ids = changed_ids(n, k)
     for start in range(0, k, 1000):
-        sql.query(f"UPDATE bench_rows SET revision={revision} WHERE id IN (" +
-                  ','.join(map(str, ids[start:start+1000])) + ")")
+        sql.query(f"UPDATE bench_rows SET revision={revision} WHERE " +
+                  sql.ids_in(ids[start:start+1000]))
 
 
 def expect(actual, expected, what):
@@ -58,8 +58,8 @@ def integer(value):
 def probe(sql, n, k, revision):
     ids = changed_ids(n, k)
     picks = sorted({ids[0], ids[len(ids)//2], ids[-1]})
-    rows = sql.query("SELECT id,revision FROM bench_rows WHERE id IN (" +
-                     ','.join(map(str, picks)) + ") ORDER BY id")["rows"]
+    rows = sql.query("SELECT id,revision FROM bench_rows WHERE " +
+                     sql.ids_in(picks) + " ORDER BY id")["rows"]
     expect(rows, [[str(i), str(revision)] for i in picks], "working rows")
 
 
