@@ -1047,6 +1047,9 @@ ensure_alloc(RelFileLocator rel)
 		SMgrRelation asrel = alloc_smgr(rel);
 		SMgrRelation ssrel = store_smgr(rel);
 		SMgrRelation rsrel = refs_smgr(rel);
+		BlockNumber nalloc;
+		BlockNumber nstore;
+		BlockNumber nrefs;
 		Buffer		buf;
 		Page		page;
 
@@ -1071,14 +1074,18 @@ ensure_alloc(RelFileLocator rel)
 		 * with bitmap pages or a nonempty store/count file must not be
 		 * reset: doing so could allocate blocks that still hold rows.
 		 */
-		if (smgrnblocks(asrel, MAIN_FORKNUM) > 1 ||
-			smgrnblocks(ssrel, MAIN_FORKNUM) != 0 ||
-			smgrnblocks(rsrel, MAIN_FORKNUM) != 0)
+		nalloc = smgrnblocks(asrel, MAIN_FORKNUM);
+		nstore = smgrnblocks(ssrel, MAIN_FORKNUM);
+		nrefs = smgrnblocks(rsrel, MAIN_FORKNUM);
+		if (nalloc > 1 || nstore != 0 || nrefs != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("cannot initialize block map allocator \"%s\" with existing storage",
-							relpathperm(aloc, MAIN_FORKNUM).str)));
-		if (smgrnblocks(asrel, MAIN_FORKNUM) == 0)
+							relpathperm(aloc, MAIN_FORKNUM).str),
+					 errdetail("The allocator header is missing or zeroed, but storage already exists (allocator: %u blocks, page store: %u blocks, reference counts: %u blocks).",
+							   nalloc, nstore, nrefs),
+					 errhint("Restore the affected database from a known-good backup.")));
+		if (nalloc == 0)
 			buf = alloc_new_page(rel);
 		else
 		{
