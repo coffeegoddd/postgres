@@ -30,9 +30,9 @@
       "id": "setup-1",
       "session": "a",
       "op": "exec",
-      "sql": "INSERT INTO t1 VALUES (1, 1)",
+      "sql": "INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 3)",
       "expect": {
-        "tag": "INSERT 0 1"
+        "tag": "INSERT 0 3"
       }
     },
     {
@@ -48,9 +48,9 @@
       "id": "setup-3",
       "session": "a",
       "op": "exec",
-      "sql": "INSERT INTO t2 VALUES (1, 1, 1)",
+      "sql": "INSERT INTO t2 VALUES (1, 1, 1), (1, 2, 2), (2, 1, 3)",
       "expect": {
-        "tag": "INSERT 0 1"
+        "tag": "INSERT 0 3"
       }
     },
     {
@@ -75,7 +75,7 @@
       "id": "setup-7",
       "session": "a",
       "op": "exec",
-      "sql": "UPDATE t1 SET col1 = 100",
+      "sql": "UPDATE t1 SET col1 = 100 WHERE pk2 = 1",
       "expect": {
         "tag": "UPDATE 1"
       }
@@ -102,7 +102,7 @@
       "id": "setup-10",
       "session": "a",
       "op": "exec",
-      "sql": "UPDATE t2 SET col1 = 100",
+      "sql": "UPDATE t2 SET col1 = 100 WHERE pk2a = 1 AND pk2b = 1",
       "expect": {
         "tag": "UPDATE 1"
       }
@@ -139,6 +139,34 @@
             null,
             "1",
             "removed"
+          ],
+          [
+            "2",
+            "2",
+            null,
+            null,
+            "added"
+          ],
+          [
+            "3",
+            "3",
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            "2",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "3",
+            "removed"
           ]
         ],
         "order": "bag"
@@ -166,6 +194,34 @@
             null,
             null,
             "1",
+            "removed"
+          ],
+          [
+            "2",
+            "2",
+            null,
+            null,
+            "added"
+          ],
+          [
+            "3",
+            "3",
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            "2",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            "3",
             "removed"
           ]
         ],
@@ -199,6 +255,42 @@
             null,
             "1",
             "removed"
+          ],
+          [
+            "1",
+            "2",
+            "2",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "2",
+            "1",
+            "3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            "3",
+            "removed"
           ]
         ],
         "order": "bag"
@@ -230,6 +322,42 @@
             null,
             null,
             "1",
+            "removed"
+          ],
+          [
+            "1",
+            "2",
+            "2",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            "2",
+            "1",
+            "3",
+            null,
+            null,
+            null,
+            "added"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            "2",
+            "removed"
+          ],
+          [
+            null,
+            null,
+            null,
+            null,
+            null,
+            "3",
             "removed"
           ]
         ],
