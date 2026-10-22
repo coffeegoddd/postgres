@@ -166,6 +166,31 @@ for my $db (qw(one two three))
 		"and ${db}'s writes folded, one database after another");
 }
 
+# A database the worker is folding in, copied as a template: the worker
+# gives way (as autovacuum does), so the copy neither waits for it nor
+# fails as the database is accessed by others.
+SKIP:
+{
+	skip 'injection points not supported by this build', 2
+	  if $ENV{enable_injection_points} ne 'yes';
+	sql(q{CREATE DATABASE tmpl});
+	$node->safe_psql('tmpl', q{CREATE EXTENSION injection_points;
+		CREATE SCHEMA tp VERSIONED;
+		CREATE TABLE tp.t (id int PRIMARY KEY, v text)});
+	$node->safe_psql('tmpl',
+		q{SELECT injection_points_attach('prolly-fold-worker-fold', 'wait')});
+	$node->safe_psql('tmpl', q{INSERT INTO tp.t VALUES (1, 'x')});
+	ok( $node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+			WHERE backend_type = 'prolly fold worker' AND datname = 'tmpl'
+			AND wait_event = 'prolly-fold-worker-fold'}),
+		'a worker folding in the template database');
+	my $start = time;
+	sql(q{CREATE DATABASE copied TEMPLATE tmpl});
+	cmp_ok(time - $start, '<', 4, 'the copy doesn\'t wait for the worker');
+	$node->safe_psql('tmpl',
+		q{SELECT injection_points_detach('prolly-fold-worker-fold')});
+}
+
 # Off: nothing folds in the background.
 $node->append_conf('postgresql.conf', 'prolly_fold_worker = off');
 $node->reload;

@@ -91,8 +91,15 @@ start_worker(Oid dboid, BackgroundWorkerHandle **handle)
 	BackgroundWorker bgw;
 
 	memset(&bgw, 0, sizeof(bgw));
+
+	/*
+	 * (it gives way as autovacuum does: a CREATE DATABASE copying its
+	 * database, or an ALTER or DROP of it, ends it rather than waiting for
+	 * it, or failing because it's connected; its fold rolled back, the
+	 * branch stays to be folded)
+	 */
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
-		BGWORKER_BACKEND_DATABASE_CONNECTION;
+		BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_INTERRUPTIBLE;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ProllyFolderWorkerMain");

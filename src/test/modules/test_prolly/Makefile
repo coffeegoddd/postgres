@@ -21,9 +21,8 @@ DATA = test_prolly--1.0.sql test_prolly_a--1.0.sql test_prolly_b--1.0.sql \
 REGRESS = test_prolly content_hashes prolly_tables versioned_schemas catalog_branch_column branch_catalogs bmap_sharing bmap_copy_on_write bmap_folds branches fold commits branch_writes writer_modes transaction_commits transaction_commit_cases txn_commit_baselines commit_messages status_diff schema_diffs diff_stat diff_history diff_by_name as_of collations applier move_heads merge cell_merges conflict_rows cherry_pick merge_options revert_series branch_rename schema_moves sequences schema_merges merge_truth table_files conjoin_choice incremental_folds change_log log_folds checkpoints format_freeze dirty_merges constraint_violations keyless_violations verify_constraints domain_violations redefined_merges retyped_merges type_moves detached_checkout branch_start keyless_moves head_only_branches clean_checkouts keyless_keys walks remotes stored_chunks remote_clone clone_whole transfer_spill dependencies dependency_moves canonical_escapes remote_serve commit_heights aggregates policies partitions append_check journal_segments journal_compression gc gc_full gc_spill gc_declared gc_file_size page_sweep truncated_blocks large_values large_keys jsonb_canonical float_canonical hash_pointers toast_by_content toast_folds redefined_rows enum_history range_types undescribed_objects statistics_casts doltgres_vc doltgres_objects doltgres_fks_auth matview_merges described_properties table_settings stat_prolly chunk_cache vacuum_shared eager_freeze full_folds shape_folds truncate_folds bulk_notes fold_verify fold_caches fold_on_commit describe_caches nearest_source keyless_toast_folds store_sizes storage_breakdown get_many put_batches index_tablespaces diff_memory stash reset_modes checkout_tables branch_maps reflog bulk_moves retype_moves
 REGRESS_OPTS = --temp-config $(top_srcdir)/src/test/modules/test_prolly/test_prolly.conf
 TAP_TESTS = 1
-# (no autovacuum folds but where a test turns them on: autofold_off.conf)
-TEMP_CONFIG ?= $(abs_top_srcdir)/$(subdir)/autofold_off.conf
-export TEMP_CONFIG
+# (no autovacuum folds but where a test turns them on: autofold_off.conf,
+# below)
 EXTRA_INSTALL = contrib/amcheck contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_rows contrib/pg_buffercache contrib/pageinspect contrib/pg_prewarm \
 	contrib/pg_walinspect contrib/test_decoding \
 	src/test/modules/injection_points src/test/modules/dummy_seclabel
@@ -41,3 +40,14 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+# (an environment's TEMP_CONFIG, as CI's, kept, with these settings after
+# it: TEMP_CONFIG ?= would let it replace them)
+# (a make this one runs inherits it as made: not made again from itself)
+TAP_TEMP_CONFIG := $(abs_top_builddir)/$(subdir)/tap_temp.conf
+ifneq ($(TEMP_CONFIG),$(TAP_TEMP_CONFIG))
+$(shell mkdir -p '$(dir $(TAP_TEMP_CONFIG))' && { $(if $(TEMP_CONFIG),cat '$(TEMP_CONFIG)' &&) cat '$(abs_top_srcdir)/$(subdir)/autofold_off.conf'; } > '$(TAP_TEMP_CONFIG).new' && mv '$(TAP_TEMP_CONFIG).new' '$(TAP_TEMP_CONFIG)')
+endif
+override TEMP_CONFIG := $(TAP_TEMP_CONFIG)
+export TEMP_CONFIG
+
