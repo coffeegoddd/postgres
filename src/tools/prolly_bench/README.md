@@ -39,11 +39,11 @@ src/tools/prolly_bench/system/system_restore.sh
 src/tools/prolly_bench/prolly_bench table            # S suite; --suite V for V
 ```
 
-`table` takes the most recent result set per label under `specs/results/`
+`table` takes the most recent result set per label under `engine-results/`
 (or the result sets you name), prints Markdown tables (throughput, latency
 percentiles, WAL and device bytes per transaction, CPU, hit ratio, space,
 VACUUM, recovery) with each S number's ratio to B0, and writes
-`specs/results/summary-S.md` and `summary-S.html`.  In the HTML page, cells
+`engine-results/summary-S.md` and `summary-S.html`.  In the HTML page, cells
 are colored only for benchmark-quality paired repetitions whose 95% bootstrap
 interval clears a 5% practical effect threshold. Smoke ratios are descriptive.
 Each cell includes its spread and validity details. `compare BASELINE_DIR DIR` gives one result set's ratios
@@ -127,7 +127,7 @@ src/tools/prolly_bench/prolly_bench run C --am heap,prolly
 src/tools/prolly_bench/prolly_bench run C --am heap,prolly --config src/tools/prolly_bench/configs/c_smoke.toml
 
 src/tools/prolly_bench/prolly_bench table --suite C          # latest per label
-src/tools/prolly_bench/prolly_bench cdiff specs/results/<B0 dir> specs/results/<engine dir>
+src/tools/prolly_bench/prolly_bench cdiff engine-results/<B0 dir> engine-results/<engine dir>
 ```
 
 The corpus is Dolthub's sqllogictest (`~/cursor_src/sqllogictest`, set in
@@ -308,7 +308,7 @@ src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V8 --config sr
 ## Write amplification
 
 `configs/s_write_amp.toml` runs the standard procedure's workloads with the
-`write_amp` collector (specs/20-write-amplification.md): for heap and
+`write_amp` collector: for heap and
 prolly alike, the bytes the server wrote per byte of row data the
 workload wrote.
 
@@ -585,7 +585,7 @@ The `s-nightly` artifact retains its complete tree, with `report.html` at
 its root. Existing sticky comment markers, size limits and gate policies
 are unchanged.
 
-`specs/results/<date>-<suite>-<label>/`:
+`engine-results/<date>-<suite>-<label>/`:
 
 | File | Contents |
 |---|---|
@@ -629,8 +629,9 @@ window (`write_amp`).
 
 ## Tests
 
-CI (`.github/workflows/correctness.yml`, on every pull request, every push
-to `master` and nightly) runs the full C corpus in shards: one build, then
+CI (`.github/workflows/correctness.yml`, currently nightly and manually
+dispatched; pull-request and push triggers are disabled) runs the full C
+corpus in shards: one build, then
 per shard heap and `prolly`, and
 
 ```sh
@@ -639,15 +640,13 @@ src/tools/prolly_bench/prolly_bench cbaseline check BASELINE_DIR
 ```
 
 then the **C suite gate** job runs `creport` over every shard and fails on
-any finding or on a missing shard. A pull request changing only `specs/`
-passes the gate without building, and its comment says the suite didn't
-run. The gate leaves the comment as an artifact, and
+any finding or on a missing shard. The gate leaves the comment as an artifact, and
 `correctness-comment.yml` (a `workflow_run` workflow, with the only write
 permission) posts it or updates it in place, unless the run tested an
 older commit than the pull request's head. A cancelled run reports
 nothing. A failure on `master` or in the nightly run opens or updates one
-issue labelled `ci-failure`, and the next pass closes it. Both workflows
-use `.github/actions/specs-only` to decide what is specs-only.
+issue labelled `ci-failure`, and the next pass closes it. There is no
+exemption based on documentation paths.
 
 All C reporting and gate commands now use the same validation and exit unsuccessfully for missing or
 duplicate workloads, empty results, incomplete runs, missing digests,
