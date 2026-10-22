@@ -124,6 +124,7 @@ tests += {
       'extension_clone',
       'text_types',
       'versioned_event_triggers',
+      'foreign_tables',
       'canonical_escapes',
       'aggregates',
       'policies',

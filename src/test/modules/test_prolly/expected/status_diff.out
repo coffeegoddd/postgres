@@ -244,10 +244,11 @@ SELECT * FROM dolt_status ORDER BY table_name;
 \c contrib_regression
 DROP DATABASE sd_win1251;
 -- Reading what changed doesn't need what a commit does: objects the
--- canonical form doesn't describe (a foreign table) are left out of status
--- and diff, and only a commit refuses them.
+-- canonical form doesn't describe (a trigger on a foreign table) are left
+-- out of status and diff, and only a commit refuses them.
 CREATE FOREIGN DATA WRAPPER sd_fdw;
 CREATE SERVER sd_srv FOREIGN DATA WRAPPER sd_fdw;
+CREATE FUNCTION public.sd_noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
 CREATE SCHEMA sdu VERSIONED;
 CREATE TABLE sdu.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
@@ -259,6 +260,7 @@ SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
 -- They are changes a commit can't hold: listed as not covered, and the
 -- branch is dirty with them alone.
 CREATE FOREIGN TABLE sdu.ft (id int) SERVER sd_srv;
+CREATE TRIGGER noop BEFORE INSERT ON sdu.ft FOR EACH ROW EXECUTE FUNCTION public.sd_noop();
 SELECT name, dirty FROM dolt_branches WHERE name = 'main';
  name | dirty 
 ------+-------
@@ -292,7 +294,7 @@ SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 (1 row)
 
 SELECT dolt_commit('-am', 'refused');
-ERROR:  prolly commits don't cover foreign tables yet: sdu.ft
+ERROR:  prolly commits don't cover triggers on foreign tables yet: sdu.ft
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 DROP SCHEMA sdu CASCADE;
 NOTICE:  drop cascades to 2 other objects
@@ -508,10 +510,11 @@ SELECT diff_type, length((from_row).big), left((from_row).big, 1),
  modified  |   6000 | a    |   7000 | b
 (1 row)
 
--- a foreign table makes a commit fail
+-- a foreign table with a trigger makes a commit fail
 CREATE FOREIGN TABLE sdt.ft (id int) SERVER sd_srv;
+CREATE TRIGGER noop BEFORE INSERT ON sdt.ft FOR EACH ROW EXECUTE FUNCTION public.sd_noop();
 SELECT dolt_commit('-Am', 'foreign table');
-ERROR:  prolly commits don't cover foreign tables yet: sdt.ft
+ERROR:  prolly commits don't cover triggers on foreign tables yet: sdt.ft
 DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
 DROP FOREIGN TABLE sdt.ft;
 DROP SCHEMA sdt CASCADE;
@@ -667,6 +670,7 @@ SELECT length(dolt_commit('-Am', 'sdq gone')::text) AS committed;
 
 DROP SERVER sd_srv;
 DROP FOREIGN DATA WRAPPER sd_fdw;
+DROP FUNCTION public.sd_noop();
 -- Before the branch's first commit: its changes against the empty root,
 -- as Dolt's are against its initial commit (dolt_log('HEAD') has none).
 SELECT current_database() AS db \gset

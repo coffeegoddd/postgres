@@ -8633,6 +8633,8 @@ item_label(const ProllyKey *key)
 			return "Materialized view";
 		case 'v':
 			return "View";
+		case 'r':
+			return "Foreign table";
 		case 'f':
 			return "Function";
 		case 'y':

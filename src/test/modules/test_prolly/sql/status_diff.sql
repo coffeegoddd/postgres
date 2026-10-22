@@ -100,16 +100,18 @@ SELECT * FROM dolt_status ORDER BY table_name;
 DROP DATABASE sd_win1251;
 
 -- Reading what changed doesn't need what a commit does: objects the
--- canonical form doesn't describe (a foreign table) are left out of status
--- and diff, and only a commit refuses them.
+-- canonical form doesn't describe (a trigger on a foreign table) are left
+-- out of status and diff, and only a commit refuses them.
 CREATE FOREIGN DATA WRAPPER sd_fdw;
 CREATE SERVER sd_srv FOREIGN DATA WRAPPER sd_fdw;
+CREATE FUNCTION public.sd_noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
 CREATE SCHEMA sdu VERSIONED;
 CREATE TABLE sdu.t (id int PRIMARY KEY, v text);
 SELECT length(dolt_commit('-Am', 'sdu')::text) AS committed;
 -- They are changes a commit can't hold: listed as not covered, and the
 -- branch is dirty with them alone.
 CREATE FOREIGN TABLE sdu.ft (id int) SERVER sd_srv;
+CREATE TRIGGER noop BEFORE INSERT ON sdu.ft FOR EACH ROW EXECUTE FUNCTION public.sd_noop();
 SELECT name, dirty FROM dolt_branches WHERE name = 'main';
 SELECT * FROM dolt_status WHERE table_name LIKE 'sdu.%';
 INSERT INTO sdu.t VALUES (1, 'one');
@@ -198,8 +200,9 @@ SELECT diff_type, length((from_row).big), left((from_row).big, 1),
 	length((to_row).big), left((to_row).big, 1)
   FROM dolt_diff('HEAD', 'WORKING', NULL::sdt.t);
 
--- a foreign table makes a commit fail
+-- a foreign table with a trigger makes a commit fail
 CREATE FOREIGN TABLE sdt.ft (id int) SERVER sd_srv;
+CREATE TRIGGER noop BEFORE INSERT ON sdt.ft FOR EACH ROW EXECUTE FUNCTION public.sd_noop();
 SELECT dolt_commit('-Am', 'foreign table');
 DROP FOREIGN TABLE sdt.ft;
 DROP SCHEMA sdt CASCADE;
@@ -251,6 +254,7 @@ DROP SCHEMA sdq CASCADE;
 SELECT length(dolt_commit('-Am', 'sdq gone')::text) AS committed;
 DROP SERVER sd_srv;
 DROP FOREIGN DATA WRAPPER sd_fdw;
+DROP FUNCTION public.sd_noop();
 
 -- Before the branch's first commit: its changes against the empty root,
 -- as Dolt's are against its initial commit (dolt_log('HEAD') has none).

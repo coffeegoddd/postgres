@@ -20,6 +20,11 @@
  *						   settings, a line each, then its query
  *	"n:" schema			-> nothing: a versioned schema, there whether or not
  *						   anything is in it
+ *	"r:" foreign table	-> its definition, as CREATE FOREIGN TABLE takes it
+ *						   after the name: its columns (type, options,
+ *						   collation, NOT NULL, default or generation), its
+ *						   CHECK constraints by name, its server and options.
+ *						   No rows: they are the server's
  *	"s:" sequence		-> its definition, then a line of its own, its
  *						   value: the last value, and whether it was given
  *						   out ("t" or "f")
@@ -63,7 +68,9 @@
  * functions, procedures and aggregates; enum, domain and composite types;
  * sequences.
  * Ordinary schemas and extensions are every branch's, not the commit's.
- * Anything else in versioned schemas (window functions, foreign tables,
+ * Foreign tables' definitions are covered, not their rows (the server's).
+ * Anything else in versioned schemas (window functions, foreign tables
+ * that are partitions, inherit or have triggers or row security,
  * partitions apart from their partitioned tables, other types) makes a
  * commit fail: never a hash that might depend on history.  So does a
  * column whose values are local OIDs (type_holds_oids()): never a hash of
@@ -193,6 +200,7 @@
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
+#include "foreign/foreign.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
@@ -524,6 +532,129 @@ typedef struct Refused
  * move may discard it); when committing, it is refused once every object
  * has been read (check_refused()).
  */
+/* OPTIONS (...) for a foreign object's options (DefElem *), if any */
+static void
+append_fdw_options(StringInfo out, List *options)
+{
+	ListCell   *lc;
+
+	if (options == NIL)
+		return;
+	appendStringInfoString(out, " OPTIONS (");
+	foreach(lc, options)
+	{
+		DefElem    *d = lfirst(lc);
+
+		appendStringInfo(out, "%s%s %s", foreach_current_index(lc) > 0 ? ", " : "",
+						 quote_identifier(d->defname),
+						 quote_literal_cstr(defGetString(d)));
+	}
+	appendStringInfoChar(out, ')');
+}
+
+/*
+ * A foreign table's definition, as CREATE FOREIGN TABLE takes it after the
+ * name: its columns, each with its type (qualified), options, collation if
+ * not the type's, NOT NULL and default or generation expression; its CHECK
+ * constraints by name; its server and its options.  Options as stored, in
+ * their order.
+ */
+static char *
+describe_foreign_table(Oid relid)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	ForeignTable *ft = GetForeignTable(relid);
+	ForeignServer *server = GetForeignServer(ft->serverid);
+	StringInfoData out;
+	Relation	conrel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *checks = NIL;
+	ListCell   *lc;
+	bool		first = true;
+
+	initStringInfo(&out);
+	appendStringInfoChar(&out, '(');
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		appendStringInfo(&out, "%s%s %s", first ? "" : ", ",
+						 quote_identifier(NameStr(att->attname)),
+						 format_type_extended(att->atttypid, att->atttypmod,
+											  FORMAT_TYPE_TYPEMOD_GIVEN |
+											  FORMAT_TYPE_FORCE_QUALIFY));
+		first = false;
+		append_fdw_options(&out, GetForeignColumnOptions(relid, att->attnum));
+		if (OidIsValid(att->attcollation) &&
+			att->attcollation != get_typcollation(att->atttypid))
+		{
+			HeapTuple	ctup = SearchSysCache1(COLLOID, ObjectIdGetDatum(att->attcollation));
+			Form_pg_collation c;
+
+			if (!HeapTupleIsValid(ctup))
+				elog(ERROR, "cache lookup failed for collation %u", att->attcollation);
+			c = (Form_pg_collation) GETSTRUCT(ctup);
+			appendStringInfo(&out, " COLLATE %s",
+							 qualified(c->collnamespace, NameStr(c->collname)));
+			ReleaseSysCache(ctup);
+		}
+		if (att->attnotnull)
+			appendStringInfoString(&out, " NOT NULL");
+		if (att->atthasdef && desc->constr)
+		{
+			char	   *expr = NULL;
+
+			for (int d = 0; d < desc->constr->num_defval; d++)
+				if (desc->constr->defval[d].adnum == att->attnum)
+					expr = TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
+																   CStringGetTextDatum(desc->constr->defval[d].adbin),
+																   ObjectIdGetDatum(relid)));
+			if (expr == NULL)
+				elog(ERROR, "default of column \"%s\" not found", NameStr(att->attname));
+
+			if (att->attgenerated == ATTRIBUTE_GENERATED_STORED)
+				appendStringInfo(&out, " GENERATED ALWAYS AS (%s) STORED", expr);
+			else if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+				appendStringInfo(&out, " GENERATED ALWAYS AS (%s) VIRTUAL", expr);
+			else
+				appendStringInfo(&out, " DEFAULT %s", expr);
+		}
+	}
+
+	/* its CHECK constraints, by name */
+	conrel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+							  NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+		if (con->contype != CONSTRAINT_CHECK)
+			continue;
+		checks = lappend(checks,
+						 psprintf("CONSTRAINT %s %s", quote_identifier(NameStr(con->conname)),
+								  TextDatumGetCString(DirectFunctionCall1(pg_get_constraintdef,
+																		  ObjectIdGetDatum(con->oid)))));
+	}
+	systable_endscan(scan);
+	table_close(conrel, AccessShareLock);
+	list_sort(checks, cstring_cmp);
+	foreach(lc, checks)
+		appendStringInfo(&out, "%s%s", first && foreach_current_index(lc) == 0 ? "" : ", ",
+						 (char *) lfirst(lc));
+	appendStringInfo(&out, ") SERVER %s", quote_identifier(server->servername));
+	append_fdw_options(&out, ft->options);
+	relation_close(rel, AccessShareLock);
+	return out.data;
+}
+
 static bool
 uncovered(Canon *cn, const char *what, const char *name,
 		  const ObjectAddress *addr)
@@ -3459,10 +3590,24 @@ collect(Canon *cn)
 			case RELKIND_FOREIGN_TABLE:
 				{
 					ObjectAddress self;
+					const char *what = NULL;
 
+					/* (what CREATE FOREIGN TABLE alone doesn't make: not yet) */
 					ObjectAddressSet(self, RelationRelationId, form->oid);
-					(void) uncovered(cn, "foreign tables", qualified(form->relnamespace, name),
-									 &self);
+					if (form->relispartition)
+						what = "foreign tables that are partitions";
+					else if (has_superclass(form->oid))
+						what = "foreign tables that inherit";
+					else if (form->relhastriggers)
+						what = "triggers on foreign tables";
+					else if (form->relrowsecurity)
+						what = "row security on foreign tables";
+					if (what)
+						(void) uncovered(cn, what, qualified(form->relnamespace, name),
+										 &self);
+					else
+						append_utf8(&add_item(cn, "r:", qualified(form->relnamespace, name))->value,
+									describe_foreign_table(form->oid));
 				}
 				break;
 			case RELKIND_PARTITIONED_TABLE:
@@ -8309,6 +8454,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *keyed;
 	List	   *identities;
 	List	   *late = NIL;		/* what the changes stop using, dropped */
+	List	   *foreign_makes = NIL;	/* foreign tables made, after those going */
 	List	   *routines = NIL;
 	List	   *aggregates_made = NIL;
 	List	   *policy_drops = NIL;
@@ -8399,6 +8545,14 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 				/* (before the routines and types it uses go) */
 				sm.before = lcons(psprintf("DROP CAST IF EXISTS (%s)", f->name),
 								  sm.before);
+				break;
+			case 'r':
+				/*
+				 * A foreign table going or changed goes (it holds no rows:
+				 * they are its server's), after the views using it, and is
+				 * made again as to defines it.
+				 */
+				late = lappend(late, psprintf("DROP FOREIGN TABLE IF EXISTS %s", f->name));
 				break;
 			case 'y':
 			case 'm':
@@ -8597,6 +8751,9 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			sm.before = lappend(sm.before,
 								psprintf("%s SEQUENCE %s %s", f ? "ALTER" : "CREATE",
 										 t->name, sequence_options_sql(t->def)));
+		else if (t->kind == 'r')
+			foreign_makes = lappend(foreign_makes,
+									psprintf("CREATE FOREIGN TABLE %s %s", t->name, t->def));
 		else if (t->kind != 'f' && t->kind != 't' && t->kind != 'v' && t->kind != 'x')
 			goto unsupported;
 	}
@@ -8838,6 +8995,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(sm.before);
 	sql_bodies = try_statements(sql_bodies);
 	run_statements(list_concat(sm.changes, late));
+	run_statements(foreign_makes);	/* (after those going; before the views) */
 	sql_bodies = try_statements(sql_bodies);
 	make_views(type_drops);
 	run_statements(collation_drops);
@@ -10118,6 +10276,9 @@ folded_render(char object, const char *name, const ProllyValue *item,
 			break;
 		case 'f':
 			append_statement(out, def);
+			break;
+		case 'r':
+			append_statement(out, psprintf("CREATE FOREIGN TABLE %s %s", name, def));
 			break;
 		case 'y':
 			{

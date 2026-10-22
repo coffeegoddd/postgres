@@ -47,6 +47,7 @@
 #include "catalog/pg_depend.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_enum.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
@@ -163,6 +164,7 @@ static const CatalogBranchInfo branch_catalogs[] = {
 	{DefaultAclRelationId, offsetof(FormData_pg_default_acl, defaclbranch), Anum_pg_default_acl_defaclbranch},
 	{RangeRelationId, offsetof(FormData_pg_range, rngbranch), Anum_pg_range_rngbranch},
 	{CastRelationId, offsetof(FormData_pg_cast, castbranch), Anum_pg_cast_castbranch},
+	{ForeignTableRelationId, offsetof(FormData_pg_foreign_table, ftbranch), Anum_pg_foreign_table_ftbranch},
 };
 
 /* every branch-aware catalog's OID is below this; a table indexes them */
@@ -451,6 +453,9 @@ row_branch(Relation rel, HeapTuple tup)
 		case PartitionedRelationId:
 			return catalog_object_branch(RelationRelationId,
 										 ((Form_pg_partitioned_table) form)->partrelid);
+		case ForeignTableRelationId:
+			return catalog_object_branch(RelationRelationId,
+										 ((Form_pg_foreign_table) form)->ftrelid);
 		case EnumRelationId:
 			return catalog_object_branch(TypeRelationId,
 										 ((Form_pg_enum) form)->enumtypid);

@@ -80,8 +80,11 @@ SELECT * FROM dolt_diff_summary('HEAD', 'WORKING', 'app.vw2');
 CREATE FOREIGN DATA WRAPPER sdiff_fdw;
 CREATE SERVER sdiff_srv FOREIGN DATA WRAPPER sdiff_fdw;
 CREATE FOREIGN TABLE app.ft (id int) SERVER sdiff_srv;
+CREATE FUNCTION public.sdiff_noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TRIGGER noop BEFORE INSERT ON app.ft FOR EACH ROW EXECUTE FUNCTION public.sdiff_noop();
 SELECT * FROM dolt_diff_summary('HEAD', 'WORKING') WHERE diff_type = 'not covered';
 DROP FOREIGN TABLE app.ft;
+DROP FUNCTION public.sdiff_noop();
 
 -- refs that aren't
 SELECT * FROM dolt_diff_summary('HEAD', 'no_such_ref');
