@@ -14,7 +14,9 @@
 #ifndef VERSIONED_H
 #define VERSIONED_H
 
+#include "access/htup.h"
 #include "catalog/objectaddress.h"
+#include "utils/relcache.h"
 
 /* does the database have any versioned schema?  (cheap after the first call) */
 extern bool database_has_versioned_schemas(void);
@@ -51,6 +53,9 @@ extern Oid	extension_in_namespace(Oid nspid);
 
 /* error if an extension can't be created in schema nspid */
 extern void check_versioned_extension_schema(Oid nspid);
+
+/* error if an extension's new shared row has another branch's object's identity */
+extern void check_extension_member_identity(Relation rel, HeapTuple tup);
 
 /* error if a versioned schema holding an extension would be dropped or renamed */
 extern void check_versioned_schema_change(Oid nspid, const char *what);

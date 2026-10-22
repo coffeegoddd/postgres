@@ -313,8 +313,15 @@ extension_member_row(Relation rel, HeapTuple tup)
 static Oid
 namespace_branch(Relation rel, HeapTuple tup, Oid nspid)
 {
-	if (!namespace_is_versioned(nspid) || extension_member_row(rel, tup))
+	if (!namespace_is_versioned(nspid))
 		return InvalidOid;
+	if (extension_member_row(rel, tup))
+	{
+		/* (an extension's script making it: no other branch's name taken) */
+		if (creating_extension)
+			check_extension_member_identity(rel, tup);
+		return InvalidOid;
+	}
 	return MyBranch;
 }
 
@@ -348,19 +355,25 @@ row_branch(Relation rel, HeapTuple tup)
 
 				if (c->relam == PROLLY_TABLE_AM_OID)
 					return MyBranch;
-				if (namespace_is_versioned(c->relnamespace))
-					return namespace_branch(rel, tup, c->relnamespace);
+
 				/*
 				 * An index belongs where its table does (a TOAST table's,
-				 * too): the table index_create is making it for, or, once
-				 * made, the one its pg_index row names.
+				 * too), whatever its schema: the table index_create is
+				 * making it for, or, once made, the one its pg_index row
+				 * names.  (A shared table in a versioned schema, an
+				 * extension's, has shared indexes.)
 				 */
 				if (c->relkind == RELKIND_INDEX ||
 					c->relkind == RELKIND_PARTITIONED_INDEX)
-					return catalog_object_branch(RelationRelationId,
-												 OidIsValid(CatalogBranchIndexTable) ?
-												 CatalogBranchIndexTable :
-												 index_table(c->oid));
+				{
+					Oid			table = OidIsValid(CatalogBranchIndexTable) ?
+						CatalogBranchIndexTable : index_table(c->oid);
+
+					if (OidIsValid(table))
+						return catalog_object_branch(RelationRelationId, table);
+				}
+				if (namespace_is_versioned(c->relnamespace))
+					return namespace_branch(rel, tup, c->relnamespace);
 				return InvalidOid;
 			}
 		case TypeRelationId:
@@ -386,9 +399,25 @@ row_branch(Relation rel, HeapTuple tup)
 		case TSTemplateRelationId:
 			return namespace_branch(rel, tup, ((Form_pg_ts_template) form)->tmplnamespace);
 		case StatisticExtRelationId:
-			return namespace_branch(rel, tup, ((Form_pg_statistic_ext) form)->stxnamespace);
+			{
+				/* where its table is (a shared one's are shared) */
+				Form_pg_statistic_ext x = (Form_pg_statistic_ext) form;
+
+				if (OidIsValid(x->stxrelid))
+					return catalog_object_branch(RelationRelationId, x->stxrelid);
+				return namespace_branch(rel, tup, x->stxnamespace);
+			}
 		case ConstraintRelationId:
-			return namespace_branch(rel, tup, ((Form_pg_constraint) form)->connamespace);
+			{
+				/* where its table or domain is (a shared one's are shared) */
+				Form_pg_constraint con = (Form_pg_constraint) form;
+
+				if (OidIsValid(con->conrelid))
+					return catalog_object_branch(RelationRelationId, con->conrelid);
+				if (OidIsValid(con->contypid))
+					return catalog_object_branch(TypeRelationId, con->contypid);
+				return namespace_branch(rel, tup, con->connamespace);
+			}
 		case DefaultAclRelationId:
 			/* a schema's default privileges; global ones (no schema) are shared */
 			return namespace_branch(rel, tup, ((Form_pg_default_acl) form)->defaclnamespace);

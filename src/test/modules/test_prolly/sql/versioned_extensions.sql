@@ -92,3 +92,52 @@ DROP SCHEMA ve CASCADE;
 
 \c contrib_regression
 DROP DATABASE regress_versioned_extensions;
+
+-- An index added to an extension's shared table later is shared too, so
+-- every branch's writes keep it; and a script can't make an object whose
+-- identity another branch's object has.
+CREATE DATABASE regress_versioned_extensions2;
+\c regress_versioned_extensions2
+CREATE SCHEMA v VERSIONED;
+CREATE TABLE v.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+CREATE EXTENSION test_prolly_ext_table SCHEMA v;
+SELECT dolt_checkout('-b', 'side');
+SELECT dolt_checkout('main');
+CREATE UNIQUE INDEX ext_unique ON v.test_prolly_ext_rows (v);
+SELECT relbranch = 0 AS shared FROM pg_class WHERE relname = 'ext_unique';
+SELECT dolt_checkout('side');
+INSERT INTO v.test_prolly_ext_rows VALUES (10);
+SELECT dolt_checkout('main');
+SET enable_seqscan = off;
+SELECT * FROM v.test_prolly_ext_rows WHERE v = 10;
+RESET enable_seqscan;
+ALTER TABLE v.test_prolly_ext_rows ADD CONSTRAINT ext_small CHECK (v < 100);
+SELECT dolt_checkout('side');
+INSERT INTO v.test_prolly_ext_rows VALUES (500);	-- the constraint is shared
+SELECT conname FROM pg_constraint WHERE conrelid = 'v.test_prolly_ext_rows'::regclass ORDER BY 1;
+
+-- side's own type and function take names the extensions would make
+SELECT dolt_checkout('main');
+DROP EXTENSION test_prolly_ext_table;
+SELECT dolt_checkout('side');
+CREATE TYPE v.citext AS ENUM ('red');
+CREATE FUNCTION v.test_prolly_ext_count() RETURNS bigint LANGUAGE sql RETURN 0;
+SELECT dolt_checkout('main');
+CREATE EXTENSION citext SCHEMA v;
+CREATE EXTENSION test_prolly_ext_table SCHEMA v;
+SELECT count(*) AS installed FROM pg_extension WHERE extname IN ('citext', 'test_prolly_ext_table');
+SELECT dolt_checkout('side');
+SELECT 'red'::v.citext AS sides_enum;
+DROP TYPE v.citext;
+DROP FUNCTION v.test_prolly_ext_count();
+SELECT dolt_checkout('main');
+CREATE EXTENSION citext SCHEMA v;		-- nothing in the way now
+CREATE EXTENSION test_prolly_ext_table SCHEMA v;
+SELECT dolt_checkout('side');
+SET search_path = public, v;
+SELECT 'Red'::v.citext = 'RED'::v.citext AS shared_citext, v.test_prolly_ext_count() AS rows;
+SELECT dolt_checkout('main');
+
+\c contrib_regression
+DROP DATABASE regress_versioned_extensions2;
