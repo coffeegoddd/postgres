@@ -38,9 +38,14 @@ CATALOG(pg_event_trigger,3466,EventTriggerRelationId)
 												 * called */
 	char		evtenabled;		/* trigger's firing configuration WRT
 								 * session_replication_role */
+	Oid			evtfuncowner BKI_DEFAULT(0);	/* a function in a versioned
+												 * schema: its owner; else 0 */
 
 #ifdef CATALOG_VARLEN
 	text		evttags[];		/* command TAGs this event trigger targets */
+	text		evtfuncname BKI_DEFAULT(_null_);	/* a function in a
+													 * versioned schema: its
+													 * qualified name */
 #endif
 } FormData_pg_event_trigger;
 

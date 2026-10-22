@@ -64,9 +64,21 @@ CREATE TABLE public.e (id int PRIMARY KEY);
 SELECT dolt_reset('--hard', :'with_functions');
 CREATE TABLE public.f (id int PRIMARY KEY);
 
--- a branch from before the function existed
+-- a branch from before the function existed: skipped, and so it is when
+-- someone else makes a function of its name there (never run as the
+-- trigger's)
+CREATE ROLE regress_evt_alice;
+GRANT CREATE, USAGE ON SCHEMA public TO regress_evt_alice;
 SELECT dolt_checkout('evt_old');
 CREATE TABLE public.g (id int PRIMARY KEY);
+SET ROLE regress_evt_alice;
+CREATE FUNCTION public.note_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+	RAISE NOTICE 'alice''s note_ddl, as superuser: %', current_setting('is_superuser');
+END $$;
+RESET ROLE;
+CREATE TABLE public.g2 (id int PRIMARY KEY);
+DROP FUNCTION public.note_ddl();
 SELECT dolt_checkout('main');
 CREATE TABLE public.h (id int PRIMARY KEY);
 
@@ -84,3 +96,27 @@ CREATE INDEX ON public.h (id);
 DROP EVENT TRIGGER evt_ddl, evt_rewrite, evt_plain;
 \c contrib_regression
 DROP DATABASE regress_versioned_evtrig;
+DROP ROLE regress_evt_alice;
+
+-- the function's OID gone from every branch (a move made it again): found
+-- by the name the trigger noted (which \dy and pg_dump print)
+CREATE DATABASE regress_versioned_evtrig2;
+\c regress_versioned_evtrig2
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+CREATE FUNCTION public.note_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+	RAISE NOTICE 'note_ddl: %', tg_tag;
+END $$;
+CREATE EVENT TRIGGER evt_ddl ON ddl_command_end WHEN TAG IN ('CREATE TABLE')
+  EXECUTE FUNCTION public.note_ddl();
+SELECT length(dolt_commit('-Am', 'the function')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS with_function \gset
+DROP FUNCTION public.note_ddl();
+SELECT dolt_reset('--hard', :'with_function');
+SELECT count(*) AS original_oid_left FROM pg_proc p JOIN pg_event_trigger e ON e.evtfoid = p.oid;
+CREATE TABLE public.t (id int PRIMARY KEY);
+SELECT evtname, evtfuncname FROM pg_event_trigger;
+DROP EVENT TRIGGER evt_ddl;
+\c contrib_regression
+DROP DATABASE regress_versioned_evtrig2;

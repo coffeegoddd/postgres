@@ -306,6 +306,36 @@ insert_event_trigger_tuple(const char *trigname, const char *eventname, Oid evtO
 	values[Anum_pg_event_trigger_evtfoid - 1] = ObjectIdGetDatum(funcoid);
 	values[Anum_pg_event_trigger_evtenabled - 1] =
 		CharGetDatum(TRIGGER_FIRES_ON_ORIGIN);
+
+	/*
+	 * A function in a versioned schema is each branch's: its name and owner
+	 * are noted, for a branch whose copy has another OID (one a move made
+	 * again), and no dependency on it is recorded below.
+	 */
+	{
+		ObjectAddress fn;
+
+		ObjectAddressSet(fn, ProcedureRelationId, funcoid);
+		if (object_is_versioned(&fn))
+		{
+			HeapTuple	ptup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+			Form_pg_proc p;
+
+			if (!HeapTupleIsValid(ptup))
+				elog(ERROR, "cache lookup failed for function %u", funcoid);
+			p = (Form_pg_proc) GETSTRUCT(ptup);
+			values[Anum_pg_event_trigger_evtfuncowner - 1] = ObjectIdGetDatum(p->proowner);
+			values[Anum_pg_event_trigger_evtfuncname - 1] =
+				CStringGetTextDatum(quote_qualified_identifier(get_namespace_name(p->pronamespace),
+															   NameStr(p->proname)));
+			ReleaseSysCache(ptup);
+		}
+		else
+		{
+			values[Anum_pg_event_trigger_evtfuncowner - 1] = ObjectIdGetDatum(InvalidOid);
+			nulls[Anum_pg_event_trigger_evtfuncname - 1] = true;
+		}
+	}
 	if (taglist == NIL)
 		nulls[Anum_pg_event_trigger_evttags - 1] = true;
 	else
@@ -652,6 +682,7 @@ EventTriggerCommonSetup(Node *parsetree,
 	List	   *cachelist;
 	ListCell   *lc;
 	List	   *runlist = NIL;
+	List	   *planned = NIL;
 
 	/*
 	 * We want the list of command tags for which this procedure is actually
@@ -711,8 +742,27 @@ EventTriggerCommonSetup(Node *parsetree,
 		if (unfiltered || filter_event_trigger(tag, item))
 		{
 			/* We must plan to fire this trigger. */
-			runlist = lappend_oid(runlist, item->fnoid);
+			EventTriggerCacheItem *copy = palloc_object(EventTriggerCacheItem);
+
+			*copy = *item;
+			copy->fnname = item->fnname ? pstrdup(item->fnname) : NULL;
+			planned = lappend(planned, copy);
 		}
+	}
+
+	/*
+	 * Each one's function, as the session's branch has it (one in a
+	 * versioned schema is each branch's); one the branch hasn't is skipped.
+	 */
+	foreach(lc, planned)
+	{
+		EventTriggerCacheItem *item = lfirst(lc);
+		Oid			fn = item->fnname ?
+			event_trigger_function(item->fnoid, item->fnname, item->fnowner,
+								   item->owner) : item->fnoid;
+
+		if (OidIsValid(fn))
+			runlist = lappend_oid(runlist, fn);
 	}
 
 	/* Don't spend any more time on this if no functions to run */
@@ -1105,13 +1155,9 @@ EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata)
 	foreach(lc, fn_oid_list)
 	{
 		LOCAL_FCINFO(fcinfo, 0);
-		Oid			fnoid = event_trigger_function(lfirst_oid(lc));
+		Oid			fnoid = lfirst_oid(lc);
 		FmgrInfo	flinfo;
 		PgStat_FunctionCallUsage fcusage;
-
-		/* (the session's branch hasn't its function: skipped, warned of) */
-		if (!OidIsValid(fnoid))
-			continue;
 
 		elog(DEBUG1, "EventTriggerInvoke %u", fnoid);
 

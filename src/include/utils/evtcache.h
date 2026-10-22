@@ -29,6 +29,9 @@ typedef enum
 typedef struct
 {
 	Oid			fnoid;			/* function to be called */
+	char	   *fnname;			/* one in a versioned schema: its qualified name */
+	Oid			fnowner;		/* ... and its owner */
+	Oid			owner;			/* the trigger's owner */
 	char		enabled;		/* as SESSION_REPLICATION_ROLE_* */
 	Bitmapset  *tagset;			/* command tags, or NULL if empty */
 } EventTriggerCacheItem;

@@ -4763,7 +4763,7 @@ listEventTriggers(const char *pattern, bool verbose)
 					  "  when 'R' then '%s'"
 					  "  when 'A' then '%s'"
 					  "  when 'D' then '%s' end as \"%s\",\n"
-					  " e.evtfoid::pg_catalog.regproc as \"%s\", "
+					  " coalesce(pg_catalog.to_jsonb(e) ->> 'evtfuncname', e.evtfoid::pg_catalog.regproc::pg_catalog.text) as \"%s\", "
 					  "pg_catalog.array_to_string(array(select x"
 					  " from pg_catalog.unnest(evttags) as t(x)), ', ') as \"%s\"",
 					  gettext_noop("Name"),
