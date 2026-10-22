@@ -18,6 +18,92 @@ from human_report import render
 import preflight
 
 
+class FakeVersionedSQL:
+    """An engine run_cell() can drive, in memory: commit i holds the fixture's
+    changed rows at revision i (the rest at 0), each branch a head and a
+    working set.  It answers the statements run_cell() sends, so a case's
+    validation and restore run against it; keep_dirty_on_hard_reset makes a
+    hard reset that leaves the working set as it was, a bug to be caught."""
+    def __init__(self, n, k, commits, branch, keep_dirty_on_hard_reset=False):
+        from experiment import changed_ids
+        self.commits, self.changed = commits, changed_ids(n, k)
+        self.branches = {branch: [len(commits) - 1, self.rows(len(commits) - 1)]}
+        self.current, self.keep_dirty = branch, keep_dirty_on_hard_reset
+        self.statements = []
+
+    def rows(self, i):
+        return {r: i for r in self.changed}
+
+    def state(self, ref):
+        head, work = self.branches[self.current]
+        if ref == 'WORKING':
+            return work
+        if ref == 'HEAD':
+            return self.rows(head)
+        return self.rows(self.commits.index(ref))
+
+    def vc_sql(self, op, *args):
+        return 'VC ' + json.dumps([op, *args])
+
+    def vc(self, op, *args):
+        return self.query(self.vc_sql(op, *args))
+
+    def hash_sql(self, ref='HEAD'):
+        return 'HASH ' + ref
+
+    def hash(self, ref='HEAD'):
+        return self.scalar(self.hash_sql(ref))
+
+    def diff_sql(self, a, b):
+        return 'DIFF ' + json.dumps([a, b])
+
+    def ids_in(self, ids):
+        return 'id IN (' + ','.join(map(str, ids)) + ')'
+
+    def scalar(self, q):
+        return self.query(q)['rows'][0][0]
+
+    def query(self, q):
+        import re
+        self.statements.append(q)
+        out = [['1']]
+        if q.startswith('VC '):
+            op, *args = json.loads(q[3:])
+            if op == 'branch' and args[0] == '-D':
+                del self.branches[args[1]]
+            elif op == 'branch':
+                i = self.commits.index(args[1])
+                self.branches[args[0]] = [i, self.rows(i)]
+            elif op == 'checkout':
+                assert args[0] in self.branches, args[0]
+                self.current = args[0]
+            elif op == 'reset':
+                b = self.branches[self.current]
+                b[0] = self.commits.index(args[1])
+                if args[0] == '--hard' and not self.keep_dirty:
+                    b[1] = self.rows(b[0])
+        elif q.startswith('HASH '):
+            ref = q[5:]
+            head = self.branches[self.current][0]
+            if ref in self.branches:
+                head = self.branches[ref][0]
+            elif ref.startswith('HEAD~'):
+                head -= int(ref[5:])
+            out = [[self.commits[head]]]
+        elif q.startswith('DIFF '):
+            a, b = (self.state(r) for r in json.loads(q[5:]))
+            out = [[str(sum(a.get(i, 0) != b.get(i, 0) for i in set(a) | set(b)))]]
+        elif q.startswith('UPDATE'):
+            rev, ids = re.match(r'UPDATE bench_rows SET revision=(\d+) WHERE id IN \(([\d,]+)\)', q).groups()
+            for i in ids.split(','):
+                self.branches[self.current][1][int(i)] = int(rev)
+        elif q.startswith('SELECT id,revision'):
+            ids = re.search(r'id IN \(([\d,]+)\)', q).group(1).split(',')
+            work = self.branches[self.current][1]
+            out = [[i, str(work.get(int(i), 0))] for i in ids]
+        return {'rows': out, 'elapsed_ns': 1000}
+
+
 class BenchTests(unittest.TestCase):
     def test_dirty_sizes_validate_and_do_not_clamp(self):
         self.assertEqual(core.dirty_rows({'fraction': .0001}, 10000), 1)
@@ -42,7 +128,7 @@ class BenchTests(unittest.TestCase):
         keys = {(case['operation'], case['distance'], case['working_set']) for case in plan}
         self.assertEqual(len(keys), len(plan))
         for size in ('clean', 'small', 'medium', 'large'):
-            for op in ('branch', 'checkout', 'reset_soft'):
+            for op in ('branch', 'checkout', 'reset_soft', 'reset_hard'):
                 for depth in (0, 1, 4):
                     self.assertIn((op, depth, size), keys)
         clean_only = cases({'history_depths': [1], 'dirty_sizes': {}})
@@ -249,6 +335,37 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(core.ENGINES[name].ids_in(ids), 'id IN (1,962,1923)')
         self.assertEqual(core.ENGINES['doltgres'].ids_in(ids),
                          'id IN (SELECT id FROM (VALUES (1),(962),(1923)) v(id))')
+
+    def _run_cell(self, sql, n, k, commits):
+        import random
+        from experiment import run_cell
+        c = {'passes': ['timing'], 'warmups': 1, 'repetitions': 1, 'history_depths': [1, 3],
+             'sample_interval_ms': 10, 'payload_bytes': 16,
+             'dirty_sizes': {'small': {'rows': 3}, 'half': {'fraction': 0.5}}}
+        out = io.StringIO()
+        run_cell(None, c, 'doltgres', n, k, sql, None, {'commits': commits, 'branch': 'fixture'},
+                 out, random.Random(7))
+        return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    def test_every_case_validates_and_restores_against_a_model_engine(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        records = self._run_cell(sql, n, k, commits)
+        self.assertTrue(records and all(r['status'] == 'ok' for r in records))
+        hard = [r for r in records if r['operation'] == 'reset_hard']
+        # each depth (0, 1, 3) clean and with each dirty size, twice (warmup + 1)
+        self.assertEqual(len(hard), 3 * 3 * 2)
+        self.assertEqual(sum(r['sql'].startswith('VC ["reset", "--hard"') for r in hard), len(hard))
+        # the fixture branch is left as it was, and only it
+        self.assertEqual(list(sql.branches), ['fixture'])
+        self.assertEqual(sql.current, 'fixture')
+
+    def test_a_hard_reset_that_keeps_dirty_rows_is_caught(self):
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture', keep_dirty_on_hard_reset=True)
+        with self.assertRaises(RuntimeError) as e:
+            self._run_cell(sql, n, k, commits)
+        self.assertRegex(str(e.exception), 'working rows|hard reset leaves no working changes|preserved dirty')
 
     def test_go_engines_both_disable_auto_gc(self):
         with tempfile.TemporaryDirectory() as d:

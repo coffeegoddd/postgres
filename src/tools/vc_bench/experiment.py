@@ -150,16 +150,18 @@ def cases(c):
               {"operation": "branch", "distance": 0},
               {"operation": "checkout", "distance": 0},
               {"operation": "reset_soft", "distance": 0},
+              {"operation": "reset_hard", "distance": 0},
               {"operation": "diff_equal", "distance": 0},
               {"operation": "diff_working", "distance": 0}]
     for d in sorted(set(c["history_depths"])):
-        for op in ("branch", "checkout", "reset_soft", "diff_history", "diff_working_history", "resolve_ancestor"):
+        for op in ("branch", "checkout", "reset_soft", "reset_hard", "diff_history",
+                   "diff_working_history", "resolve_ancestor"):
             result.append({"operation": op, "distance": d})
     for case in result:
         case['working_set'] = 'diff' if case['operation'] in ('diff_working', 'diff_working_history') else 'clean'
     for label in c.get('dirty_sizes', default_dirty_sizes()):
         for d in [0, *sorted(set(c['history_depths']))]:
-            for op in ('branch', 'checkout', 'reset_soft'):
+            for op in ('branch', 'checkout', 'reset_soft', 'reset_hard'):
                 result.append({'operation': op, 'distance': d, 'working_set': label})
     return result
 
@@ -202,6 +204,8 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                         query = sql.vc_sql("checkout", targets[d])
                     elif op == "reset_soft":
                         query = sql.vc_sql("reset", "--soft", old)
+                    elif op == "reset_hard":
+                        query = sql.vc_sql("reset", "--hard", old)
                     elif op == "resolve_ancestor":
                         query = sql.hash_sql(f"HEAD~{d}")
                     elif op == "diff_equal":
@@ -268,12 +272,24 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             sql.vc("reset", "--soft", latest)
                             if dirty:
                                 verify_dirty(sql, n, count, h+1, latest)
+                        elif op == "reset_hard":
+                            # The head at the commit, the working set its rows
+                            # alone: the dirty rows discarded, the commits since
+                            # taken out.  Moved back after (the dirty rows are
+                            # gone already: this is the case's restore too).
+                            expect(sql.hash(), old, "hard-reset HEAD")
+                            probe(sql, n, k, h-d)
+                            expect(int(sql.scalar(sql.diff_sql("HEAD", "WORKING"))), 0,
+                                   "hard reset leaves no working changes")
+                            if d:
+                                sql.vc("reset", "--hard", latest)
+                            probe(sql, n, k, h)
                         elif op == "resolve_ancestor":
                             expect(result["rows"][0][0], old, "ancestor resolution")
                         elif op.startswith("diff_"):
                             expect(int(result["rows"][0][0]), 0 if op == "diff_equal" else k, "diff cardinality")
                             record["diff_rows"] = int(result["rows"][0][0])
-                        if dirty:
+                        if dirty and op != "reset_hard":
                             sql.vc("reset", "--hard", latest)
                             probe(sql, n, k, h)
                         record["status"] = "ok"
