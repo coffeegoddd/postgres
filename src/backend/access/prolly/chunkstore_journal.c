@@ -900,8 +900,12 @@ chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
  * only chunks of the store's GC generation now, which must be the one the
  * transaction began in: none was dropped since.
  * Only chunks read as the transaction has pending ones are taken in (a
- * read-only transaction pays nothing); the set goes with the transaction.
+ * read-only transaction pays nothing), at most TRUSTED_MAX_CHUNKS (a
+ * reference past them is probed for, as without the set); the set goes
+ * with the transaction.
  */
+#define TRUSTED_MAX_CHUNKS	(256 * 1024)	/* about 24 MB */
+
 static bool xact_straddles(ProllyChunkStore *s);
 
 static HTAB *trusted = NULL;	/* in TopTransactionContext */
@@ -912,6 +916,8 @@ trust_ref(const ProllyHash *ref, void *arg)
 {
 	ProllyHash	key;
 
+	if (hash_get_num_entries(trusted) >= TRUSTED_MAX_CHUNKS)
+		return;
 	hash_key(&key, ref);
 	(void) hash_search(trusted, &key, HASH_ENTER, NULL);
 }
@@ -4963,8 +4969,12 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		if (tables_read(s, &key, out, stored))
 		{
 			if (!stored && s == session_store)
+			{
 				chunk_cache_put(&key, out->data + start, out->len - start,
 								s->gc_generation);
+				trust_named(s, out->data + start, out->len - start,
+							s->gc_generation);
+			}
 			return true;
 		}
 		scan_journal(s);
@@ -4974,8 +4984,12 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			if (tables_read(s, &key, out, stored))
 			{
 				if (!stored && s == session_store)
+				{
 					chunk_cache_put(&key, out->data + start, out->len - start,
+									s->gc_generation);
+					trust_named(s, out->data + start, out->len - start,
 								s->gc_generation);
+				}
 				return true;
 			}
 			if (s->through == NULL)

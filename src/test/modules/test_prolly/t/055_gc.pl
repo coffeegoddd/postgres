@@ -118,6 +118,43 @@ $w->{stderr} = '';
 $g->query_until(qr/done/, '');
 $g->quit;
 
+# What a stored chunk a writer read names is trusted to be stored, so a
+# chunk naming it needs no index probe: but not once a swap lands after
+# the read, which may drop both.  A node and its child nothing reaches,
+# the node read (from the files, or the cache) by a writer with a chunk
+# pending; then a collection's swap; then the writer names the child.
+my $case = 0;
+for my $from ('files', 'cache')
+{
+	$case++;
+	sql("SELECT test_chunk_put('trusted orphan $case')");
+	my $child = sql(qq{SELECT test_content_hash('trusted orphan $case')});
+	my $node_hash = sql(qq{SELECT test_chunk_put_node(1, ARRAY['$child'])});
+	if ($from eq 'cache')
+	{
+		# (read twice before: kept by the cache, the third read its)
+		$w->query_safe(qq{SELECT test_chunk_get('$node_hash') IS NOT NULL}) for 1 .. 2;
+	}
+	$w->query_safe(qq{BEGIN; SELECT test_chunk_put('pending $case');
+		SELECT test_chunk_get('$node_hash') IS NOT NULL});
+	$g = $node->background_psql('gcdb');
+	$g->query_until(qr/started/, q{
+		\echo started
+		SELECT kept || ' ' || freed FROM test_chunk_gc(false);
+		\echo done
+	});
+	$node->poll_query_until('gcdb', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'virtualxid'}) or die 'the collection did not wait for the writer';
+	$w->query(qq{SELECT test_chunk_put_node(1, ARRAY['$child']); COMMIT});
+	# (refused by the probe the trust skipped before the swap, not only by
+	# the dropped hashes' check behind it)
+	like($w->{stderr}, qr/which it names, is not in the chunk store/,
+		"a writer naming a child it trusted (its node read from the $from) after a swap is refused");
+	$w->{stderr} = '';
+	$g->query_until(qr/done/, '');
+	$g->quit;
+}
+
 # A root moved to (an older one, say), that a swap since the transaction
 # began dropped, is refused, though the transaction puts nothing.
 sql("SELECT test_chunk_put('orphan root')");
