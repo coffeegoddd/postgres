@@ -76,14 +76,13 @@ pg_stat_reset_shared
                     
 (1 row)
 
-step a_leave: SELECT (dolt_checkout('vcm_other'))[1] AS status; <waiting ...>
-step b_commit: COMMIT;
-step a_leave: <... completed>
+step a_leave: SELECT (dolt_checkout('vcm_other'))[1] AS status;
 status
 ------
      0
 (1 row)
 
+step b_commit: COMMIT;
 step b_flush: SELECT pg_stat_force_next_flush();
 pg_stat_force_next_flush
 ------------------------

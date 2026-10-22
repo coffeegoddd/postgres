@@ -4,10 +4,11 @@
 # behind it, folds by a snapshot taken once it has them: incrementally,
 # from the checkpoint's baseline, not every table in full (which would
 # leave each baseline unsettled, for the next commit to read in full
-# again).  A session leaving the branch so, behind the checkpoint, leaves
-# the checkpoint's baseline: its own checkpoint, by its older snapshot,
-# would read every table in full and replace that one with an unsettled
-# one.
+# again).  A session leaving the branch so leaves the checkpoint's
+# baseline: leaving takes no checkpoint where the change finder keeps
+# nothing for one (the log's, #656), so it doesn't wait for the refs; one
+# by its older snapshot would read every table in full and replace the
+# checkpoint's baseline with an unsettled one.
 
 setup		{ CREATE SCHEMA vcm VERSIONED; }
 setup
@@ -63,6 +64,7 @@ step b_flush	{ SELECT pg_stat_force_next_flush(); }
 # taken before b's commit; then a commits again
 permutation a_write b_begin b_write b_ckpt a_reset a_dcommit b_commit b_flush a_write2 a_dcommit2 a_flush a_full
 
-# b checkpoints, holding the refs; a leaves its dirty main, waiting for
-# them, its snapshot taken before b's commit; then a comes back and commits
+# b checkpoints, holding the refs; a leaves its dirty main, its snapshot
+# taken before b's commit, and takes no checkpoint, so it doesn't wait for
+# them; then a comes back and commits, folding from b's baseline
 permutation a_write b_begin b_write b_ckpt a_reset a_leave b_commit b_flush a_back a_write2 a_dcommit2 a_flush a_full
