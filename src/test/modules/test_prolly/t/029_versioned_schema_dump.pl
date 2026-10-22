@@ -86,5 +86,37 @@ is($node->safe_psql('extdst', q{
 	'true,citext,true,1',
 	'the restored extension is in the versioned schema, shared, and its table reads');
 
+# An event trigger on a function in a versioned schema, whose OID a move
+# made anew: the dump names the function as the trigger noted it.
+$node->safe_psql('postgres', q{
+	CREATE DATABASE evtsrc;
+	CREATE DATABASE evtdst;
+});
+$node->safe_psql('evtsrc', q{
+	DROP SCHEMA public;
+	CREATE SCHEMA public VERSIONED;
+	CREATE FUNCTION public.note_ddl() RETURNS event_trigger LANGUAGE plpgsql
+	  AS $$ BEGIN RAISE NOTICE 'note_ddl'; END $$;
+	CREATE EVENT TRIGGER evt_ddl ON ddl_command_end
+	  EXECUTE FUNCTION public.note_ddl();
+});
+my $with_function = $node->safe_psql('evtsrc', q{
+	SELECT dolt_commit('-Am', 'the function') IS NOT NULL;
+	SELECT dolt_hashof('HEAD');
+});
+($with_function) = (split /\n/, $with_function)[-1];
+$node->safe_psql('evtsrc', qq{
+	DROP FUNCTION public.note_ddl();
+	SELECT dolt_reset('--hard', '$with_function');
+});
+my $evtdump = $node->basedir . '/evtdump.sql';
+command_ok([ 'pg_dump', '--file' => $evtdump, '--dbname' => $node->connstr('evtsrc') ],
+	'pg_dump of an event trigger whose function was made anew');
+like(slurp_file($evtdump), qr/EXECUTE FUNCTION public\.note_ddl\(\);/,
+	'the dump names the event trigger\'s function');
+command_ok([ 'psql', '--no-psqlrc', '--set' => 'ON_ERROR_STOP=1', '--quiet',
+		'--file' => $evtdump, '--dbname' => $node->connstr('evtdst') ],
+	'the dump of the event trigger restores');
+
 $node->stop;
 done_testing();

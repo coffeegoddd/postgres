@@ -106,7 +106,11 @@ SELECT dolt_reset('--hard', :'with_functions');
 
 CREATE TABLE public.f (id int PRIMARY KEY);
 NOTICE:  main's note_ddl: CREATE TABLE
--- a branch from before the function existed
+-- a branch from before the function existed: skipped, and so it is when
+-- someone else makes a function of its name there (never run as the
+-- trigger's)
+CREATE ROLE regress_evt_alice;
+GRANT CREATE, USAGE ON SCHEMA public TO regress_evt_alice;
 SELECT dolt_checkout('evt_old');
            dolt_checkout            
 ------------------------------------
@@ -115,6 +119,16 @@ SELECT dolt_checkout('evt_old');
 
 CREATE TABLE public.g (id int PRIMARY KEY);
 WARNING:  event trigger function public.note_ddl() isn't on branch "evt_old": the trigger is skipped
+SET ROLE regress_evt_alice;
+CREATE FUNCTION public.note_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+	RAISE NOTICE 'alice''s note_ddl, as superuser: %', current_setting('is_superuser');
+END $$;
+RESET ROLE;
+CREATE TABLE public.g2 (id int PRIMARY KEY);
+WARNING:  event trigger function public.note_ddl() isn't on branch "evt_old": the trigger is skipped
+DETAIL:  A function of that name is there, but it isn't the trigger's: another owner's, or not an event trigger function.
+DROP FUNCTION public.note_ddl();
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
@@ -140,3 +154,47 @@ NOTICE:  plain note: CREATE INDEX
 DROP EVENT TRIGGER evt_ddl, evt_rewrite, evt_plain;
 \c contrib_regression
 DROP DATABASE regress_versioned_evtrig;
+DROP ROLE regress_evt_alice;
+-- the function's OID gone from every branch (a move made it again): found
+-- by the name the trigger noted (which \dy and pg_dump print)
+CREATE DATABASE regress_versioned_evtrig2;
+\c regress_versioned_evtrig2
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+CREATE FUNCTION public.note_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+	RAISE NOTICE 'note_ddl: %', tg_tag;
+END $$;
+CREATE EVENT TRIGGER evt_ddl ON ddl_command_end WHEN TAG IN ('CREATE TABLE')
+  EXECUTE FUNCTION public.note_ddl();
+SELECT length(dolt_commit('-Am', 'the function')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS with_function \gset
+DROP FUNCTION public.note_ddl();
+SELECT dolt_reset('--hard', :'with_function');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS original_oid_left FROM pg_proc p JOIN pg_event_trigger e ON e.evtfoid = p.oid;
+ original_oid_left 
+-------------------
+                 0
+(1 row)
+
+CREATE TABLE public.t (id int PRIMARY KEY);
+NOTICE:  note_ddl: CREATE TABLE
+SELECT evtname, evtfuncname FROM pg_event_trigger;
+ evtname |   evtfuncname   
+---------+-----------------
+ evt_ddl | public.note_ddl
+(1 row)
+
+DROP EVENT TRIGGER evt_ddl;
+\c contrib_regression
+DROP DATABASE regress_versioned_evtrig2;

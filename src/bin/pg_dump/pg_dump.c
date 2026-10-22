@@ -8824,7 +8824,7 @@ getEventTriggers(Archive *fout)
 						 "array_to_string(array("
 						 "select quote_literal(x) "
 						 " from unnest(evttags) as t(x)), ', ') as evttags, "
-						 "e.evtfoid::regproc as evtfname "
+						 "coalesce(pg_catalog.to_jsonb(e) ->> 'evtfuncname', e.evtfoid::regproc::pg_catalog.text) as evtfname "
 						 "FROM pg_event_trigger e "
 						 "ORDER BY e.oid");
 

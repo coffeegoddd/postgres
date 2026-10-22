@@ -176,6 +176,16 @@ BuildEventTriggerCache(void)
 		item = palloc0_object(EventTriggerCacheItem);
 		item->fnoid = form->evtfoid;
 		item->enabled = form->evtenabled;
+		item->owner = form->evtowner;
+		item->fnowner = form->evtfuncowner;
+		{
+			bool		isnull;
+			Datum		name = heap_getattr(tup, Anum_pg_event_trigger_evtfuncname,
+											RelationGetDescr(rel), &isnull);
+
+			if (!isnull)
+				item->fnname = TextDatumGetCString(name);
+		}
 
 		/* Decode and sort tags array. */
 		evttags = heap_getattr(tup, Anum_pg_event_trigger_evttags,
