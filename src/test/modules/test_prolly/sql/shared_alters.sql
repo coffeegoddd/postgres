@@ -83,5 +83,34 @@ ALTER TYPE public.sa_comp ALTER ATTRIBUTE y TYPE bigint;
 ALTER TABLE public.sa_row ALTER COLUMN v TYPE bigint;
 ALTER TYPE public.sa_typed ADD ATTRIBUTE y int;
 
+-- a shared domain over a shared one: a constraint on the base can't be
+-- checked against sa_side's column of the domain over it
+CREATE DOMAIN public.sa_d1 AS int;
+CREATE DOMAIN public.sa_d2 AS public.sa_d1;
+SELECT dolt_checkout('sa_side');
+CREATE TABLE sa.dt (id int PRIMARY KEY, n public.sa_d2);
+INSERT INTO sa.dt VALUES (1, -5);
+SELECT dolt_checkout('main');
+ALTER DOMAIN public.sa_d1 ADD CONSTRAINT pos CHECK (VALUE > 0);
+ALTER DOMAIN public.sa_d1 SET NOT NULL;
+SELECT dolt_checkout('sa_side');
+SELECT * FROM sa.dt;
+DROP TABLE sa.dt;
+SELECT dolt_checkout('main');
+ALTER DOMAIN public.sa_d1 ADD CONSTRAINT pos CHECK (VALUE > 0);
+
+-- a versioned type is each branch's, its typed tables too: main's change
+-- goes through, and sa_k's type and table are as they were
+CREATE TYPE sa.kind AS (x int);
+CREATE TABLE sa.tk OF sa.kind (PRIMARY KEY (x));
+SELECT length(dolt_commit('-Am', 'kind')::text) AS committed;
+SELECT dolt_checkout('-b', 'sa_k');
+SELECT dolt_checkout('main');
+ALTER TYPE sa.kind ADD ATTRIBUTE y int CASCADE;
+SELECT attname FROM pg_attribute WHERE attrelid = 'sa.tk'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT dolt_checkout('sa_k');
+SELECT attname FROM pg_attribute WHERE attrelid = 'sa.tk'::regclass AND attnum > 0 ORDER BY attnum;
+SELECT dolt_checkout('main');
+
 \c contrib_regression
 DROP DATABASE regress_shared_alters;

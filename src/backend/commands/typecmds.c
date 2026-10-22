@@ -3183,22 +3183,62 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 
 /*
  * A domain shared by every branch can't have a constraint checked against
- * another branch's columns from here: refuse if there are any.
+ * another branch's columns from here: refuse if there are any, through the
+ * shared domains over it too, which get_rels_with_domain() follows as the
+ * session's branch sees them.  (A versioned domain over it is each branch's
+ * own, and its dependency on this one is that branch's row, which the scan
+ * of this one's dependents sees.)
  */
 static void
-check_domain_other_branches(Oid domainoid)
+check_domain_other_branches(Oid domainoid, Oid checking)
 {
 	ObjectAddress domain;
 	char	   *branch;
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *derived = NIL;
+	ListCell   *lc;
 
+	check_stack_depth();
 	ObjectAddressSet(domain, TypeRelationId, domainoid);
 	branch = other_branch_dependent(&domain, true);
 	if (branch)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot check a constraint of domain %s because columns on branch \"%s\" use it",
-						format_type_be(domainoid), branch),
+						format_type_be(checking), branch),
+				 domainoid != checking ?
+				 errdetail("They use domain %s, which is over it.",
+						   format_type_be(domainoid)) : 0,
 				 errhint("The domain is shared by every branch, and the columns on other branches can't be checked from here.")));
+
+	/* the shared domains over it */
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(TypeRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(domainoid));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (dep->classid == TypeRelationId &&
+			get_typtype(dep->objid) == TYPTYPE_DOMAIN)
+			derived = list_append_unique_oid(derived, dep->objid);
+	}
+	systable_endscan(scan);
+	table_close(depRel, AccessShareLock);
+	foreach(lc, derived)
+	{
+		ObjectAddress sub;
+
+		ObjectAddressSet(sub, TypeRelationId, lfirst_oid(lc));
+		if (!object_is_versioned(&sub))
+			check_domain_other_branches(lfirst_oid(lc), checking);
+	}
 }
 
 /*
@@ -3213,7 +3253,7 @@ validateDomainNotNullConstraint(Oid domainoid)
 	/* Fetch relation list with attributes based on this domain */
 	/* ShareLock is sufficient to prevent concurrent data changes */
 
-	check_domain_other_branches(domainoid);
+	check_domain_other_branches(domainoid, domainoid);
 	rels = get_rels_with_domain(domainoid, ShareLock);
 
 	foreach(rt, rels)
@@ -3291,7 +3331,7 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin)
 	/* Fetch relation list with attributes based on this domain */
 	/* ShareLock is sufficient to prevent concurrent data changes */
 
-	check_domain_other_branches(domainoid);
+	check_domain_other_branches(domainoid, domainoid);
 	rels = get_rels_with_domain(domainoid, ShareLock);
 
 	foreach(rt, rels)

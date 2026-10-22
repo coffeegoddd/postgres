@@ -507,8 +507,11 @@ other_branch_typed_table(Oid typeOid)
 	SysScanDesc scan;
 	HeapTuple	tup;
 	Oid			other = InvalidOid;
+	ObjectAddress type;
 
-	if (!other_branches_have_copies())
+	/* a versioned type's typed tables are each branch's, with their type */
+	ObjectAddressSet(type, TypeRelationId, typeOid);
+	if (!other_branches_have_copies() || object_is_versioned(&type))
 		return NULL;
 	info = catalog_branch_info(RelationRelationId);
 	rel = table_open(RelationRelationId, AccessShareLock);
