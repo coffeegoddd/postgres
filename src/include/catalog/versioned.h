@@ -30,6 +30,9 @@ extern void check_versioned_dependencies(const ObjectAddress *depender,
 										 const ObjectAddress *referenced,
 										 int nreferenced);
 
+/* error if an object on another branch depends on object, being dropped */
+extern void check_other_branch_dependents(const ObjectAddress *object);
+
 /* the access method a new relation in namespace nspid gets */
 extern Oid	versioned_relation_am(Oid nspid, Oid amoid, char relkind,
 								  char relpersistence, bool explicit);

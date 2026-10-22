@@ -66,6 +66,7 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "catalog/versioned.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -212,6 +213,19 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 				EventTriggerSQLDropAddObject(thisobj, original, normal);
 			}
 		}
+	}
+
+	/*
+	 * A shared object is every branch's: refuse before deleting anything if
+	 * an object on another branch, which CASCADE can't reach, depends on
+	 * one of them.
+	 */
+	for (i = 0; i < targetObjects->numrefs; i++)
+	{
+		if ((flags & PERFORM_DELETION_SKIP_ORIGINAL) &&
+			(targetObjects->extras[i].flags & DEPFLAG_ORIGINAL))
+			continue;
+		check_other_branch_dependents(&targetObjects->refs[i]);
 	}
 
 	/*

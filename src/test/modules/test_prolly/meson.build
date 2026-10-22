@@ -111,6 +111,7 @@ tests += {
       'commit_heights',
       'dependencies',
       'dependency_moves',
+      'shared_drops',
       'canonical_escapes',
       'aggregates',
       'policies',

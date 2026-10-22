@@ -17,6 +17,12 @@
  * records a dependency, so foreign keys, column types, defaults, views,
  * triggers and function bodies are covered alike.
  *
+ * Since a shared object is the same on every branch, dropping one has to
+ * respect every branch's dependents, not only the session's: a column
+ * type, default or view on another branch would otherwise be left naming
+ * an object that is gone.  CASCADE can't reach them (a session changes
+ * only its own branch), so a dependent on another branch refuses the drop.
+ *
  * Tables in a versioned schema are prolly tables, and prolly tables live
  * only in versioned schemas.
  *
@@ -37,15 +43,18 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/branch.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_attrdef.h"
+#include "catalog/pg_branch.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_default_acl.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
@@ -332,6 +341,86 @@ check_versioned_dependencies(const ObjectAddress *depender,
 						 errmsg("an object outside a versioned schema can't depend on %s, which is versioned", ref),
 						 errdetail("Objects outside a versioned schema are shared by every branch, and can't depend on an object that exists per branch.")));
 		}
+	}
+}
+
+/*
+ * Error if an object on a branch other than the session's depends on
+ * object, which is about to be dropped.  Only a shared object can have
+ * such dependents: a versioned one is the session's branch's own copy.
+ */
+void
+check_other_branch_dependents(const ObjectAddress *object)
+{
+	const CatalogBranchInfo *info;
+	Relation	depRel;
+	ScanKeyData key[3];
+	int			nkeys;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *others = NIL;
+
+	if (!database_has_versioned_schemas() || object_is_versioned(object))
+		return;
+
+	info = catalog_branch_info(DependRelationId);
+	depRel = table_open(DependRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(object->classId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(object->objectId));
+	if (object->objectSubId != 0)
+	{
+		/* a column: only what depends on that column */
+		ScanKeyInit(&key[2], Anum_pg_depend_refobjsubid,
+					BTEqualStrategyNumber, F_INT4EQ,
+					Int32GetDatum(object->objectSubId));
+		nkeys = 3;
+	}
+	else
+		nkeys = 2;
+
+	/* the scan builds no cache entry, so it may see every branch's rows */
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+								  NULL, nkeys, key);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Oid			branch = catalog_row_branch(info, tup);
+
+			if (!OidIsValid(branch) || branch == MyBranch)
+				continue;
+			others = list_append_unique_oid(others, branch);
+		}
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(depRel, AccessShareLock);
+
+	if (others != NIL)
+	{
+		Oid			other = linitial_oid(others);
+		HeapTuple	btup = SearchSysCache1(BRANCHOID, ObjectIdGetDatum(other));
+		char	   *name = HeapTupleIsValid(btup) ?
+			pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(btup))->brname)) :
+			psprintf("%u", other);
+
+		if (HeapTupleIsValid(btup))
+			ReleaseSysCache(btup);
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot drop %s because objects on branch \"%s\" depend on it",
+						getObjectDescription(object, false), name),
+				 list_length(others) > 1 ?
+				 errdetail("Objects on %d branches other than the session's depend on it.",
+						   list_length(others)) : 0,
+				 errhint("It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.")));
 	}
 }
 
