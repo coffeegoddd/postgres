@@ -46,6 +46,7 @@ SELECT length(dolt_merge('tt_b')::text) > 0 AS merged;
 SELECT id, c, s FROM tt.shapes ORDER BY id;
 
 -- a primary key of such a type
+SELECT dolt_hashof('HEAD') AS before_keys \gset
 CREATE TABLE tt.keyed (k tt.cube PRIMARY KEY, n int);
 INSERT INTO tt.keyed VALUES ('(2)', 2), ('(1)', 1), ('(1,2)', 3);
 SELECT length(dolt_commit('-Am', 'keyed by cube')::text) AS committed;
@@ -87,27 +88,29 @@ DROP TABLE tt.r;
 SELECT dolt_reset('--hard');
 SELECT id, r FROM tt.r;
 
--- a type that gains binary send and receive (cube's update to 1.5): what
--- commits hold is read back as written (each value is tagged with its
--- form), and keys it orders are keyed as before; values written from then
--- on are in their binary form, so a diff across the update shows a row
--- written again since as modified, with the same values
+-- A type that gains binary send and receive (cube's update to 1.5):
+-- values retain their recorded form.  Non-key history can still be read,
+-- but the key-ordering guard conservatively refuses old keyed commits,
+-- even though this particular upgrade preserves comparison semantics.
 SELECT dolt_hashof('HEAD') AS before_update \gset
 ALTER EXTENSION cube UPDATE TO '1.5';
 SELECT typname, typsend <> 0 AS binary FROM pg_type WHERE typname = 'cube';
+SELECT id, c FROM dolt_at(:'before_keys', NULL::tt.shapes) ORDER BY id;
 SELECT table_name, status FROM dolt_status() WHERE table_name IN ('tt.f', 'tt.keyed') ORDER BY 1;
 SELECT length(dolt_commit('-Am', 'cube 1.5', '--allow-empty')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS after_update \gset
 DROP TABLE tt.f, tt.keyed;
 SELECT dolt_reset('--hard', :'before_update');
-SELECT id, c FROM tt.f ORDER BY id;
-SELECT k, n FROM tt.keyed ORDER BY k;
-SELECT k, n FROM tt.keyed WHERE k = '(1,2)';
+SELECT to_regclass('tt.keyed') IS NULL AS untouched;
 SELECT dolt_reset('--hard', :'after_update');
+SELECT id, c FROM tt.f ORDER BY id;
+SELECT k, n FROM tt.keyed WHERE k = '(1,2)';
 SELECT k, n FROM tt.keyed ORDER BY k;
 UPDATE tt.keyed SET n = n + 10 WHERE k = '(2)';
 SELECT diff_type, (from_row).k::text AS k, (from_row).n AS from_n, (to_row).n AS to_n
   FROM dolt_diff(:'before_update', 'WORKING', NULL::tt.keyed) ORDER BY 2;
+SELECT diff_type, (from_row).k::text AS k, (from_row).n AS from_n, (to_row).n AS to_n
+  FROM dolt_diff(:'after_update', 'WORKING', NULL::tt.keyed) ORDER BY 2;
 
 \c contrib_regression
 DROP DATABASE regress_text_types;

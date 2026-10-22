@@ -2778,6 +2778,9 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 		if (!same)
 			return -1;
 	}
+	/* An extension update can change the order without changing the schema. */
+	if (!prolly_ordering_dependencies_match(&info))
+		return -1;
 	prolly_database_components(&dc);
 	if (!PROLLY_CALL(dc.canonicalizer, fold_rows, &info.root, changes, nchanges,
 					 sequences, nsequences, &root))

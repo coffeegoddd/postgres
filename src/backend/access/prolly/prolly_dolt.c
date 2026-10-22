@@ -2693,10 +2693,11 @@ dolt_reset(PG_FUNCTION_ARGS)
 					 errhint("A soft reset moves the head to a commit; there is no staging area to reset a table in.")));
 	}
 	/*
-	 * What the target needs that the head doesn't, checked (a reset to the
-	 * head moves nothing new in, as an abort's doesn't; a soft one, none).
+	 * What the target needs that the head doesn't.  Even a reset to HEAD
+	 * must check ordering dependencies: an extension may have changed since
+	 * its trees were built.  A soft reset reads no rows.
 	 */
-	if (ref && hard)
+	if (hard)
 	{
 		ProllyHash	head;
 		ProllyHash	target;
@@ -2704,8 +2705,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 		ProllyCommitInfo before;
 		bool		has_head = PROLLY_CALL(refs(), resolve, "HEAD", &head);
 
-		if (PROLLY_CALL(refs(), resolve, ref, &target) &&
-			(!has_head || !same_hash(&head, &target)) &&
+		if (PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target) &&
 			PROLLY_CALL(refs(), commit_get, &target, &info))
 			prolly_check_commit_dependencies(&info,
 											 has_head &&

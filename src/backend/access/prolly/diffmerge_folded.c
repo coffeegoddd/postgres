@@ -305,6 +305,7 @@ root_of(const char *ref, ProllyNodeRef *root)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
+	prolly_check_ordering_dependencies(&info);
 	*root = info.root;
 }
 
@@ -7434,6 +7435,7 @@ commit_root(const ProllyHash *id, ProllyNodeRef *root)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("prolly commit is missing")));
+	prolly_check_ordering_dependencies(&info);
 	*root = info.root;
 }
 

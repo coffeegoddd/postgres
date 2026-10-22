@@ -95,6 +95,14 @@
  * update or an object's rename shows in the next.  A function's body is
  * text, and what it names isn't in pg_depend: the list can't be complete.
  *
+ * An extension whose opclass orders a primary key also records an "ordering"
+ * flag in its dependency entry.  Clone and move checks require that exact
+ * version, even when a merge base has the same dependency.  Ordinary uses
+ * keep minimum-version semantics.  The baseline shape records the ordering
+ * version too: updating the extension requires sorting the table afresh.
+ * Keyless tables (including deferrable or unsupported primary keys) order
+ * by content bytes, so their extension dependencies are not pinned for this.
+ *
  * Each collation that orders a table's keys is recorded, and a table whose
  * keys are ordered by a collation that differs now from what a root
  * recorded can't have that root's rows read: its tree's keys may be in
@@ -1351,6 +1359,62 @@ empty_root(Canon *cn, ProllyNodeRef *root)
 	PROLLY_CALL(cn->tree, build_finish, b, root);
 }
 
+static Oid extension_of(Oid classid, Oid objid);
+static char *extension_version(Oid extoid);
+static char *text_array_literal(List *strings);
+
+/* Extensions whose opclasses actually order this table's prolly keys. */
+static List *
+ordering_extensions(Relation rel)
+{
+	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, false);
+	ProllyComponents c;
+	ProllyKeying *k;
+	Relation	pk;
+	List	   *out = NIL;
+	bool		keyless;
+
+	if (!OidIsValid(pkoid))
+		return NIL;
+	pk = index_open(pkoid, AccessShareLock);
+	for (int i = 0; i < IndexRelationGetNumberOfKeyAttributes(pk); i++)
+	{
+		Oid			ext = extension_of(OperatorClassRelationId,
+									 get_index_column_opclass(pkoid, i + 1));
+
+		if (OidIsValid(ext))
+			out = list_append_unique_oid(out, ext);
+	}
+	index_close(pk, AccessShareLock);
+	if (out == NIL)
+		return NIL;
+	prolly_components_for_relation(rel, &c);
+	k = PROLLY_CALL(c.keying, open, rel, CurrentMemoryContext);
+	keyless = PROLLY_CALL(c.keying, keyless, k);
+	PROLLY_CALL(c.keying, close, k);
+	if (keyless)
+		return NIL;
+	return out;
+}
+
+/* Stable across databases: no catalog OIDs in the baseline shape. */
+static char *
+ordering_versions(Relation rel)
+{
+	List	   *extensions = ordering_extensions(rel);
+	List	   *versions = NIL;
+	ListCell   *lc;
+
+	foreach(lc, extensions)
+	{
+		Oid			ext = lfirst_oid(lc);
+
+		versions = lappend(versions, get_extension_name(ext));
+		versions = lappend(versions, extension_version(ext));
+	}
+	return versions ? text_array_literal(versions) : NULL;
+}
+
 /*
  * What a baseline's tree is kept for, appended to shape: what its rows'
  * keys and canonical bytes depend on, so DDL that changes no row's bytes
@@ -1373,6 +1437,7 @@ baseline_shape(Canon *cn, Relation rel, const StringInfoData *description,
 	TupleDesc	desc = RelationGetDescr(rel);
 	ProllyComponents c;
 	const ProllyImplInfo *encoders[3];
+	char	   *ordering = ordering_versions(rel);
 
 	prolly_components_for_relation(rel, &c);
 	if (PROLLY_HAS(c.keying, row_shape))
@@ -1423,6 +1488,9 @@ baseline_shape(Canon *cn, Relation rel, const StringInfoData *description,
 							   (const char *) &encoders[i]->format_version,
 							   sizeof(encoders[i]->format_version));
 	}
+	/* A changed comparator requires sorting afresh, even with no row writes. */
+	if (ordering)
+		appendStringInfoString(shape, ordering);
 }
 
 /*
@@ -2779,7 +2847,6 @@ describe_sequence(Canon *cn, Oid seqid, Oid nsp, const char *name)
 	ReleaseSysCache(tup);
 }
 
-static Oid	extension_of(Oid classid, Oid objid);
 
 /* Members of an extension come with it. */
 static bool
@@ -3433,7 +3500,7 @@ dependency_cmp(const ListCell *a, const ListCell *b)
  * object's address.
  */
 static Dependency *
-describe_dependency(const ObjectAddress *addr)
+describe_dependency(const ObjectAddress *addr, List *ordering)
 {
 	Dependency *dep = palloc(sizeof(Dependency));
 	char	   *type = getObjectTypeDescription(addr, false);
@@ -3451,6 +3518,8 @@ describe_dependency(const ObjectAddress *addr)
 		/* (a clone makes a versioned schema before the extension in it) */
 		if (namespace_is_versioned(nsp))
 			value = lappend(value, "versioned");
+		if (list_member_oid(ordering, addr->objectId))
+			value = lappend(value, "ordering");
 		append_utf8(&dep->value, text_array_literal(value));
 	}
 	else
@@ -3516,6 +3585,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	HASHCTL		ctl;
 	HTAB	   *seen;
 	List	   *deps = NIL;
+	List	   *ordering = NIL;
 	ListCell   *lc;
 	ProllyTreeBuilder *b;
 	uint64		epoch;
@@ -3557,6 +3627,26 @@ folded_fold_dependencies(ProllyNodeRef *out)
 		ObjectAddressSet(depender, d->classid, d->objid);
 		if (!depender_is_canonical(&depender))
 			continue;
+		/* A primary index's opclass may belong to a versioned extension. */
+		if (d->classid == RelationRelationId &&
+			d->refclassid == OperatorClassRelationId)
+		{
+			HeapTuple	itup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(d->objid));
+
+			if (HeapTupleIsValid(itup))
+			{
+				Form_pg_index idx = (Form_pg_index) GETSTRUCT(itup);
+
+				if (idx->indisprimary && idx->indimmediate)
+				{
+					Relation	table = table_open(idx->indrelid, AccessShareLock);
+
+					ordering = list_concat_unique_oid(ordering, ordering_extensions(table));
+					table_close(table, AccessShareLock);
+				}
+				ReleaseSysCache(itup);
+			}
+		}
 		ObjectAddressSet(referenced, d->refclassid, d->refobjid);
 		if (object_is_versioned(&referenced))
 			continue;
@@ -3565,10 +3655,25 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			ObjectAddressSet(referenced, ExtensionRelationId, ext);
 		(void) hash_search(seen, &referenced, HASH_ENTER, &found);
 		if (!found)
-			deps = lappend(deps, describe_dependency(&referenced));
+			deps = lappend(deps, hash_search(seen, &referenced, HASH_FIND, NULL));
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
+
+	/* Include key opclasses even when their extension's schema is versioned. */
+	foreach(lc, ordering)
+	{
+		ObjectAddress addr;
+		void	   *entry;
+		bool		found;
+
+		ObjectAddressSet(addr, ExtensionRelationId, lfirst_oid(lc));
+		entry = hash_search(seen, &addr, HASH_ENTER, &found);
+		if (!found)
+			deps = lappend(deps, entry);
+	}
+	foreach(lc, deps)
+		lfirst(lc) = describe_dependency(lfirst(lc), ordering);
 
 	list_sort(deps, dependency_cmp);
 	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
