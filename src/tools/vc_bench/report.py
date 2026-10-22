@@ -7,8 +7,63 @@ from pathlib import Path
 import random
 import statistics
 
-from core import write_json
+from core import PASSES, write_json
 from human_report import render
+
+# What each instrumented pass reports.  Results from before the cpu and io
+# passes recorded every counter in the memory pass: it reports all of them.
+PASS_FIELDS = {
+    "memory": ("pss_bytes_baseline", "pss_bytes_peak", "pss_bytes_peak_delta", "pss_bytes_retained_delta",
+               "rss_bytes_peak", "private_bytes_peak_delta"),
+    "cpu": ("cpu_seconds_delta", "major_faults_delta", "minor_faults_delta"),
+    "io": ("read_bytes_delta", "write_bytes_delta"),
+}
+LEGACY_MEMORY_FIELDS = PASS_FIELDS["memory"] + PASS_FIELDS["cpu"] + PASS_FIELDS["io"]
+
+
+def merge(paths, results_root):
+    """One results directory holding the samples of several complete runs of one
+    configuration, each of other passes (run --passes ...), for report()."""
+    import datetime
+    import shutil
+    import uuid
+    manifests = [json.loads((Path(p) / "manifest.json").read_text()) for p in paths]
+    for p, m in zip(paths, manifests):
+        if m["status"] != "complete":
+            raise ValueError(f"{p}: run is incomplete or failed; refusing to merge it")
+    def same(m):
+        c = dict(m["config"])
+        c.pop("passes", None)
+        return c
+    base = same(manifests[0])
+    for p, m in zip(paths[1:], manifests[1:]):
+        if same(m) != base:
+            raise ValueError(f"{p}: configuration differs from {paths[0]} beyond its passes; refusing to merge")
+    passes = [x for m in manifests for x in m["config"]["passes"]]
+    if len(set(passes)) != len(passes):
+        raise ValueError("the runs measure a pass more than once; merge runs of different passes")
+    binaries = {}
+    for p, m in zip(paths, manifests):
+        for engine, b in m["binaries"].items():
+            if engine in binaries and binaries[engine]["sha256"] != b["sha256"]:
+                raise ValueError(f"{p}: {engine} binary differs from another run's; refusing to merge")
+            binaries.setdefault(engine, b)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+    out = Path(results_root) / f"merged-{stamp}"
+    out.mkdir(parents=True)
+    merged = dict(manifests[0])
+    merged["config"] = dict(manifests[0]["config"], passes=[x for x in PASSES if x in passes])
+    merged["binaries"] = binaries
+    merged["planned_samples"] = sum(m["planned_samples"] for m in manifests)
+    merged["merged_from"] = [str(Path(p).resolve()) for p in paths]
+    with (out / "samples.jsonl").open("w") as f:
+        for p in paths:
+            f.write((Path(p) / "samples.jsonl").read_text())
+    for name in Path(paths[0]).iterdir():
+        if name.name.endswith(("-fixture.json", "-server.log")) or name.name == "prolly-settings.json":
+            shutil.copyfile(name, out / name.name)
+    write_json(out / "manifest.json", merged)
+    return out
 
 
 def slope(points):
@@ -47,6 +102,7 @@ def report(path):
     good = [r for r in rows if r["status"] == "ok" and not r["warmup"]]
     if manifest["status"] != "complete" or len(good) != manifest["planned_samples"]:
         raise ValueError("Run is incomplete or failed; refusing to report a successful comparison. Inspect samples.jsonl and manifest.json.")
+    legacy = not ({"cpu", "io"} & set(manifest.get("config", {}).get("passes", ())))
     for row in good:
         # Preserve compatibility with results recorded before dirty VC scenarios.
         was_dirty = row['operation'] in ('diff_working', 'diff_working_history')
@@ -63,13 +119,13 @@ def report(path):
         times = [r["elapsed_ns"]/1e6 for r in records]
         summary.update(repetitions=len(records), median_ms=statistics.median(times),
                        min_ms=min(times), max_ms=max(times))
-        if key[-1] == "memory":
-            for k in ("pss_bytes_baseline", "pss_bytes_peak", "pss_bytes_peak_delta", "pss_bytes_retained_delta",
-                      "rss_bytes_peak", "private_bytes_peak_delta", "cpu_seconds_delta", "major_faults_delta",
-                      "minor_faults_delta", "read_bytes_delta", "write_bytes_delta"):
+        if key[-1] in PASS_FIELDS:
+            measured = (LEGACY_MEMORY_FIELDS if key[-1] == "memory" and legacy else PASS_FIELDS[key[-1]])
+            for k in measured:
                 values = [r["memory"][k] for r in records if r["memory"][k] is not None]
                 summary["median_"+k] = statistics.median(values) if len(values) == len(records) else None
-            summary["short_memory_observations"] = sum(r["memory"]["short_operation"] for r in records)
+            if key[-1] == "memory":
+                summary["short_memory_observations"] = sum(r["memory"]["short_operation"] for r in records)
         summaries.append(summary)
     columns = list(dict.fromkeys(k for s in summaries for k in s))
     with (path / "summary.csv").open("w") as f:

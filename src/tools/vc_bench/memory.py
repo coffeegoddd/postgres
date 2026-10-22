@@ -53,17 +53,22 @@ def snapshot(pid):
 
 
 class Sampler:
+    """Snapshots of the server tree around an operation: every interval_ms while
+    it runs, or (interval_ms None) only before and after, for counters that
+    sampling in between would perturb."""
     def __init__(self, pid, interval_ms):
         self.pid = pid
-        self.interval = interval_ms / 1000
+        self.interval = interval_ms / 1000 if interval_ms is not None else None
         self.done = threading.Event()
         self.samples = []
         self.error = None
+        self.thread = None
 
     def start(self):
         self.samples.append(snapshot(self.pid))
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        if self.interval is not None:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
 
     def _run(self):
         try:
@@ -74,15 +79,19 @@ class Sampler:
 
     def finish(self, elapsed_ns):
         self.done.set()
-        self.thread.join()
+        if self.thread is not None:
+            self.thread.join()
         if self.error:
             raise self.error
         periodic = len(self.samples)-1
         self.samples.append(snapshot(self.pid))
         first, last = self.samples[0], self.samples[-1]
-        result = {"interval_ms": self.interval*1000, "periodic_samples": periodic,
+        sampled = self.interval is not None
+        result = {"interval_ms": self.interval*1000 if sampled else None,
+                  "periodic_samples": periodic,
                   "peak_is_lower_bound": True,
-                  "short_operation": elapsed_ns < self.interval*1e9 or periodic == 0,
+                  # (without sampling, peaks are of the two snapshots alone)
+                  "short_operation": (elapsed_ns < self.interval*1e9 or periodic == 0) if sampled else True,
                   "process_set_changed": first["pids"] != last["pids"],
                   "samples": self.samples}
         for field in ("rss_bytes", "pss_bytes", "private_bytes", "swap_bytes"):

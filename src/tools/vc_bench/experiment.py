@@ -228,7 +228,9 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                               "dirty_rows": count, "dirty_row_logical_bytes": count*(c['payload_bytes']+16),
                               "pass": mode, "repetition": rep, "warmup": rep < 0,
                               "sql": query, "status": "started"}
-                    sampler = Sampler(pid, c["sample_interval_ms"]) if mode == "memory" and rep >= 0 else None
+                    # (only the memory pass samples while the operation runs)
+                    sampler = (Sampler(pid, c["sample_interval_ms"] if mode == "memory" else None)
+                               if mode != "timing" and rep >= 0 else None)
                     result = {}
                     try:
                         if sampler:
@@ -314,7 +316,7 @@ def run(root, c, engines):
                 "platform": platform.platform(), "cpu_count": __import__('os').cpu_count(),
                 "memory_info": Path('/proc/meminfo').read_text(), "binaries": {},
                 "planned_samples": len(engines)*len(c['row_counts'])*len(c['changes'])*len(cases(c))*len(c['passes'])*c['repetitions'],
-                "method": "persistent SQL; warm caches; one engine at a time; server process tree PSS/RSS in separate pass"}
+                "method": "persistent SQL; warm caches; one engine at a time; memory, CPU and I/O of the server process tree in passes of their own"}
     write_json(out / "manifest.json", manifest)
     try:
         for engine in engine_order:

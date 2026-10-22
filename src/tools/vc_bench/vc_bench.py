@@ -33,14 +33,25 @@ def main():
         if name == "check":
             s.add_argument("--for", dest="stage", choices=("build", "prepare", "run", "start"),
                            default="prepare", help="prerequisites to check without starting work")
+        if name == "run":
+            s.add_argument("--passes", default=None,
+                           help="comma-separated passes to run instead of the config's (" +
+                                ", ".join(core.PASSES) + "); merge separate runs with report")
     s = sub.add_parser("report")
-    s.add_argument("directory", type=Path, help="results directory containing manifest.json")
+    s.add_argument("directory", type=Path, nargs="+",
+                   help="results directory containing manifest.json; several (separate runs' passes "
+                        "of one configuration) are merged into one report")
+    s.add_argument("--out", type=Path, default=None,
+                   help="where a merge of several runs is written (default: ROOT/results/merged-STAMP)")
     args = p.parse_args()
     if args.command == "init":
         core.init(args.root, args.smoke)
         return
     if args.command == "report":
-        report.report(args.directory)
+        if len(args.directory) == 1:
+            report.report(args.directory[0])
+        else:
+            report.report(report.merge(args.directory, args.out or args.root / "results"))
         return
     engines = args.engines.split(',')
     if len(set(engines)) != len(engines) or set(engines)-set(core.ENGINES):
@@ -68,6 +79,9 @@ def main():
             preflight.check(args.root, c, engines, 'prepare')
             experiment.prepare(args.root, c, engines)
         elif args.command == "run":
+            if args.passes:
+                c["passes"] = [p for p in args.passes.split(",") if p]
+                core.check_passes(c["passes"])
             preflight.check(args.root, c, engines, 'run')
             out = experiment.run(args.root, c, engines)
             report.report(out)

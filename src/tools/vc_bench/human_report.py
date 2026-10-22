@@ -144,7 +144,7 @@ def render(path, manifest, summaries, fits):
     doc.table(['Engine', 'Source revision', 'Binary SHA-256 prefix'], info)
     doc.paragraph("Latency is a persistent SQL request through complete result consumption, with warm caches. "
                   "Engine and operation order are seeded. SQL setup, validation, and restoration are outside measurement. "
-                  "Memory and resource counters use a separate instrumented pass; its latency is excluded here.")
+                  "Memory, CPU and I/O counters come from instrumented passes of their own; their latency is excluded here.")
     doc.paragraph('Clean and dirty working sets are reported separately. Historical changes K and pending dirty rows Q '
                   'are independent dimensions. Small, medium, and large name configurable dirty profiles; exact row counts '
                   'appear in each table heading. Dirty SQL writes are transaction-committed but not version-committed. '
@@ -209,34 +209,49 @@ def render(path, manifest, summaries, fits):
                 'memory', lambda r: memory_cell(r, ('pss_bytes_baseline', 'pss_bytes_peak'), 'MiB', 1024**2))
 
     doc.heading(2, 'CPU, I/O, and additional memory')
-    doc.paragraph('These counters cover the whole server tree in the memory pass, including asynchronous activity. '
-                  'Counter deltas are unavailable when the process set changes. CPU has kernel clock-tick resolution. '
-                  'I/O is kernel process read/write bytes, not all buffered traffic. RSS double-counts shared mappings; '
-                  'use PSS for total footprint comparisons. Short-observation flags above also apply to RSS and private-memory peaks.')
-    metrics = [('RSS sampled peak', 'rss_bytes_peak', 'MiB', 1024**2),
-               ('Private resident peak growth', 'private_bytes_peak_delta', 'KiB', 1024),
-               ('CPU time', 'cpu_seconds_delta', 'ms', .001),
-               ('Minor faults', 'minor_faults_delta', '', 1),
-               ('Major faults', 'major_faults_delta', '', 1),
-               ('Read bytes', 'read_bytes_delta', 'KiB', 1024),
-               ('Write bytes', 'write_bytes_delta', 'KiB', 1024)]
+    doc.paragraph('These counters cover the whole server tree, including asynchronous activity. CPU time and faults '
+                  'come from the cpu pass and read/write bytes from the io pass: each from one snapshot before the '
+                  'operation and one after, nothing sampled in between. (Results recorded before those passes took '
+                  'them from the memory pass.) Counter deltas are unavailable when the process set changes. CPU has '
+                  'kernel clock-tick resolution. I/O is kernel process read/write bytes, not all buffered traffic. '
+                  'RSS double-counts shared mappings; use PSS for total footprint comparisons. Short-observation '
+                  'flags above also apply to RSS and private-memory peaks.')
+    metrics = [('RSS sampled peak', 'rss_bytes_peak', 'MiB', 1024**2, 'memory'),
+               ('Private resident peak growth', 'private_bytes_peak_delta', 'KiB', 1024, 'memory'),
+               ('CPU time', 'cpu_seconds_delta', 'ms', .001, 'cpu'),
+               ('Minor faults', 'minor_faults_delta', '', 1, 'cpu'),
+               ('Major faults', 'major_faults_delta', '', 1, 'cpu'),
+               ('Read bytes', 'read_bytes_delta', 'KiB', 1024, 'io'),
+               ('Write bytes', 'write_bytes_delta', 'KiB', 1024, 'io')]
+
+    def measured_in(cases, case, metric, pass_):
+        """The engines' rows measuring metric for case: its own pass's, else
+        (results from before that pass) the memory pass's if it recorded it."""
+        for mode in (pass_, 'memory'):
+            engines = cases.get((mode, case))
+            if engines and any(('median_' + metric) in r for r in engines.values()):
+                return engines
+        return None
+
     has_resources = False
     for fixture, cases in sorted(fixtures.items(), key=fixture_order):
-        selected = sorted((case for pass_, case in cases if pass_ == 'memory'), key=case_order)
-        if not selected:
-            continue
-        has_resources = True
-        doc.heading(3, fixture_title(fixture))
+        selected = sorted({case for pass_, case in cases if pass_ in ('memory', 'cpu', 'io')}, key=case_order)
         rows = []
         for case in selected:
-            engines = cases[('memory', case)]
-            for label, metric, unit, scale in metrics:
+            for label, metric, unit, scale, pass_ in metrics:
+                engines = measured_in(cases, case, metric, pass_)
+                if engines is None:
+                    continue
                 rows.append([OPERATIONS.get(case[0], case[0]), case[1], label,
                              *[number(engines[e].get('median_' + metric), unit, scale)
                                if e in engines else '—' for e in ENGINES]])
+        if not rows:
+            continue
+        has_resources = True
+        doc.heading(3, fixture_title(fixture))
         doc.table(['Operation', 'Distance', 'Metric', *ENGINE_NAMES], rows)
     if not has_resources:
-        doc.paragraph('The memory pass was not measured.')
+        doc.paragraph('No memory, cpu or io pass was measured.')
 
     doc.heading(2, 'Empirical scaling')
     doc.paragraph('Each cell: fitted exponent [95% bootstrap interval]; R² in log space. '

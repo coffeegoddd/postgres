@@ -205,6 +205,82 @@ class BenchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'smallest'):
                 core.config(root)
 
+    def test_passes_validate(self):
+        for ok in (['timing'], ['memory'], ['cpu', 'io'], list(core.PASSES)):
+            core.check_passes(ok)
+        for bad in ([], ['timing', 'timing'], ['memory', 'disk']):
+            with self.assertRaises(ValueError):
+                core.check_passes(bad)
+
+    def _run(self, root, name, passes, cells, sha='a'):
+        """A complete run directory of the given passes: one cell, two reps."""
+        path = root/name
+        path.mkdir()
+        records = []
+        for pass_ in passes:
+            for rep in range(2):
+                r = dict(engine='dolt', operation='branch', rows=1000, changed_rows=10, history_commits=4,
+                         distance=0, working_set='clean', dirty_rows=0, repetition=rep, elapsed_ns=1_000_000,
+                         status='ok', warmup=False, **{'pass': pass_})
+                if pass_ != 'timing':
+                    r['memory'] = dict(cells, short_operation=pass_ != 'memory')
+                records.append(r)
+        core.write_json(path/'manifest.json', {
+            'status': 'complete', 'planned_samples': len(records),
+            'config': {'rows': [1000], 'passes': passes, 'payload_bytes': 16},
+            'binaries': {'dolt': {'sha256': sha}}})
+        (path/'samples.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+        return path
+
+    def test_separate_pass_runs_merge_into_one_report(self):
+        cells = dict(pss_bytes_baseline=1, pss_bytes_peak=2, pss_bytes_peak_delta=1, pss_bytes_retained_delta=0,
+                     rss_bytes_peak=3, private_bytes_peak_delta=0, cpu_seconds_delta=0.25,
+                     major_faults_delta=0, minor_faults_delta=7, read_bytes_delta=4096, write_bytes_delta=8192)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runs = [self._run(root, 'a', ['timing'], cells), self._run(root, 'b', ['memory'], cells),
+                    self._run(root, 'c', ['cpu'], cells), self._run(root, 'd', ['io'], cells)]
+            from report import merge
+            out = merge(runs, root/'results')
+            with contextlib.redirect_stdout(io.StringIO()):
+                report(out)
+            manifest = json.loads((out/'manifest.json').read_text())
+            self.assertEqual(manifest['config']['passes'], list(core.PASSES))
+            rows = list(__import__('csv').DictReader(open(out/'summary.csv')))
+            by_pass = {r['pass']: r for r in rows}
+            self.assertEqual(set(by_pass), set(core.PASSES))
+            # each pass reports its own counters, not the others'
+            self.assertEqual(by_pass['cpu']['median_cpu_seconds_delta'], '0.25')
+            self.assertEqual(by_pass['cpu']['median_read_bytes_delta'], '')
+            self.assertEqual(float(by_pass['io']['median_write_bytes_delta']), 8192)
+            self.assertEqual(by_pass['memory']['median_cpu_seconds_delta'], '')
+            text = (out/'report.md').read_text()
+            self.assertIn('CPU time | 250.00 ms', text)
+            self.assertIn('Write bytes | 8.00 KiB', text)
+
+    def test_merge_refuses_mismatched_runs(self):
+        cells = dict(cpu_seconds_delta=0, major_faults_delta=0, minor_faults_delta=0)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            from report import merge
+            a = self._run(root, 'a', ['timing'], cells)
+            twice = self._run(root, 'b', ['timing'], cells)
+            with self.assertRaisesRegex(ValueError, 'more than once'):
+                merge([a, twice], root/'results')
+            other = self._run(root, 'c', ['cpu'], cells, sha='b')
+            with self.assertRaisesRegex(ValueError, 'binary differs'):
+                merge([a, other], root/'results')
+
+    @unittest.skipUnless(Path('/proc/self/smaps_rollup').exists(), 'Linux procfs required')
+    def test_unsampled_counters_take_two_snapshots(self):
+        sampler = Sampler(os.getpid(), None)
+        sampler.start()
+        sum(range(2_000_000))
+        result = sampler.finish(50_000_000)
+        self.assertEqual(result['periodic_samples'], 0)
+        self.assertEqual(len(result['samples']), 2)
+        self.assertIsNotNone(result['cpu_seconds_delta'])
+
     @unittest.skipUnless(Path('/proc/self/smaps_rollup').exists(), 'Linux procfs required')
     def test_memory_sampling_catches_child_allocation(self):
         # The child faults in and holds 32 MiB. This tests the real OS collector,

@@ -193,7 +193,7 @@ Branch creation, checkout, and soft reset each run with a clean source branch
 and with three sizes of **pending, uncommitted version-control changes**. SQL
 transactions have committed their UPDATEs, but no `dolt_commit` has been made.
 These cases run at D=0 and every configured historical distance, on every table
-size and historical change count K, in both latency and memory passes.
+size and historical change count K, in the latency and memory passes.
 
 The default `dirty_sizes` configuration is:
 
@@ -266,24 +266,52 @@ commits, Go GC, OS reclaim, and normal engine activity can still affect results.
 
 ## Memory, CPU, and I/O
 
-There are separate `timing` and `memory` passes. Primary latency uses Go's
-monotonic clock around one request on a persistent SQL connection, through full
-result consumption. It excludes client process startup and Python IPC. Memory
-pass timings include sampling interference and must not be used as primary
-latency comparisons.
+There are four passes, each a separate set of measured observations:
 
-On Linux, the memory pass samples `/proc/PID/smaps_rollup` for the server and all
-descendants, including PostgreSQL backends. It records:
+| Pass | Measures | How |
+|---|---|---|
+| `timing` | latency | nothing else runs |
+| `memory` | RSS, **PSS**, private and swap memory | `/proc/PID/smaps_rollup` sampled every `sample_interval_ms` |
+| `cpu` | CPU time, minor and major faults | one snapshot before the operation, one after |
+| `io` | kernel process read and write bytes | one snapshot before the operation, one after |
 
-- RSS and **PSS**, before/peak/immediately after the operation. Summed RSS counts
-  shared mappings multiple times; PSS apportions them and is the better measure
-  of the server tree's resident footprint.
-- Peak growth above baseline, immediate retained growth (which can be negative),
-  private resident memory, and swap. Raw timestamped samples are retained.
-- CPU time, minor/major faults, and kernel process read/write-byte deltas.
-  These include the whole server tree and asynchronous work. Counter deltas are
-  withheld if the process set changes. CPU time has kernel clock-tick resolution;
-  I/O counters do not include all buffered I/O or prove durability.
+Primary latency uses Go's monotonic clock around one request on a persistent
+SQL connection, through full result consumption. It excludes client process
+startup and Python IPC. Instrumented passes' timings include their snapshots'
+interference and must not be used as primary latency comparisons; the `cpu` and
+`io` passes sample nothing in between, so the memory pass's sampling thread
+doesn't perturb their counters.
+
+Every pass runs by default (`passes` in `config.json`). A run can select some
+instead, and separate runs of one configuration can be merged into one report:
+
+```sh
+python3 "$B" run --passes timing          # results/STAMP-a
+python3 "$B" run --passes memory          # results/STAMP-b
+python3 "$B" run --passes cpu,io          # results/STAMP-c
+python3 "$B" report results/STAMP-a results/STAMP-b results/STAMP-c
+# -> results/merged-STAMP (or --out DIR), with report.md, report.html, CSVs
+```
+
+A merge refuses runs whose configurations differ beyond their passes, runs
+measuring a pass twice, incomplete runs, and runs of different binaries.
+
+On Linux, each instrumented pass reads the server and all its descendants,
+including PostgreSQL backends:
+
+- **memory:** RSS and PSS, before, peak and immediately after the operation.
+  Summed RSS counts shared mappings multiple times; PSS apportions them and is
+  the better measure of the server tree's resident footprint. Also peak growth
+  above baseline, immediate retained growth (which can be negative), private
+  resident memory, and swap. Raw timestamped samples are retained.
+- **cpu** and **io:** CPU time, minor/major faults, and kernel process
+  read/write-byte deltas. These include the whole server tree and asynchronous
+  work. Counter deltas are withheld if the process set changes. CPU time has
+  kernel clock-tick resolution; I/O counters do not include all buffered I/O or
+  prove durability.
+
+Results recorded before the `cpu` and `io` passes existed took those counters
+from the memory pass; reports of them still show them.
 
 Sampling peaks are lower bounds. Operations shorter than the configured interval,
 or without a periodic sample, are flagged. A peak that rises and falls between

@@ -14,6 +14,18 @@ import time
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 ENGINES = ("dolt", "doltgres", "prolly")
+# Each pass is a separate set of measured observations; any subset may run, and
+# separate runs' passes can be merged into one report (report DIR DIR...).
+# timing: latency alone. memory: server-tree PSS/RSS/private memory, sampled
+# every sample_interval_ms. cpu: CPU time and page faults; io: kernel read and
+# write bytes -- both from one snapshot before and one after, nothing sampled
+# in between to perturb them.
+PASSES = ("timing", "memory", "cpu", "io")
+
+
+def check_passes(passes):
+    if not passes or set(passes) - set(PASSES) or len(set(passes)) != len(passes):
+        raise ValueError("passes must select distinct passes among " + ", ".join(PASSES))
 
 
 def default_dirty_sizes():
@@ -81,7 +93,7 @@ def init(root, smoke):
         "dirty_sizes": default_dirty_sizes(),
         "history_depths": [1, 4] if smoke else [1, 4, 16, 32],
         "repetitions": 2 if smoke else 7, "warmups": 1,
-        "passes": ["timing", "memory"], "sample_interval_ms": 10,
+        "passes": list(PASSES), "sample_interval_ms": 10,
         "batch_rows": 1000, "timeout_seconds": 3600, "seed": 20261021,
         "engines": {
             "dolt": {"source": str(sources / "dolt"), "binary": str(root / "bin/dolt"), "port": 13360},
@@ -118,8 +130,7 @@ def config(root):
             raise ValueError(f"{k} must be a positive integer")
     if c["batch_rows"] > 10000 or c["warmups"] < 1 or c["sample_interval_ms"] < 1:
         raise ValueError("batch_rows <= 10000, warmups >= 1, sample_interval_ms >= 1 required")
-    if not c["passes"] or set(c["passes"]) - {"timing", "memory"}:
-        raise ValueError("passes must select timing and/or memory")
+    check_passes(c["passes"])
     ports = [e["port"] for e in c["engines"].values()]
     if len(set(ports)) != len(ports) or any(not 1024 <= p <= 65535 for p in ports):
         raise ValueError("engines need distinct unprivileged ports")
