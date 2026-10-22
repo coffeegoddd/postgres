@@ -205,13 +205,51 @@ class BenchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'smallest'):
                 core.config(root)
 
+    def test_default_dirty_profiles_can_fit_both_axes(self):
+        # Four table sizes, the default fraction profiles: a fit across the
+        # profiles at each size, and one across sizes for each profile.
+        records = []
+        for n in (100000, 1000000, 10000000, 100000000):
+            for profile, spec in core.default_dirty_sizes().items():
+                q = core.dirty_rows(spec, n)
+                for rep in range(5):
+                    records.append(dict(engine='dolt', operation='branch', rows=n, changed_rows=10,
+                                        history_commits=4, distance=0, working_set=profile, dirty_rows=q,
+                                        repetition=rep, elapsed_ns=q*1000, status='ok', warmup=False,
+                                        **{'pass': 'timing'}))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            core.write_json(path/'manifest.json', {'status': 'complete', 'planned_samples': len(records)})
+            (path/'samples.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+            with contextlib.redirect_stdout(io.StringIO()):
+                report(path)
+            fits = [f for f in json.loads((path/'scaling.json').read_text()) if f['metric'] == 'elapsed_ns']
+            dirty = [f for f in fits if f['axis'] == 'dirty_rows']
+            self.assertEqual(len(dirty), 4)
+            self.assertTrue(all(f['status'] == 'descriptive' for f in dirty))
+            sizes = [f for f in fits if f['axis'] == 'rows']
+            self.assertEqual(sorted(f['working_set'] for f in sizes), sorted(core.default_dirty_sizes()))
+            for f in sizes:
+                self.assertEqual(f['status'], 'descriptive')
+                self.assertAlmostEqual(f['exponent'], 1, places=2)
+
+    def test_short_cpu_observations_are_flagged(self):
+        cells = dict(cpu_seconds_delta=0.01, major_faults_delta=0, minor_faults_delta=1)
+        with tempfile.TemporaryDirectory() as d:
+            path = self._run(Path(d), 'a', ['cpu'], cells)
+            with contextlib.redirect_stdout(io.StringIO()):
+                report(path)
+            rows = list(__import__('csv').DictReader(open(path/'summary.csv')))
+            self.assertEqual(rows[0]['short_cpu_observations'], '2')
+            self.assertIn('[short 2/2]', (path/'report.md').read_text())
+
     def test_go_engines_both_disable_auto_gc(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             core.init(root, True)
             c = core.config(root)
             for engine in ('dolt', 'doltgres'):
-                cfg = core.go_server_config(root, c, engine)
+                cfg = core.ENGINES[engine].server_config(root, c)
                 self.assertIn('behavior:\n  auto_gc_behavior:\n    enable: false\n', cfg, engine)
                 self.assertEqual(cfg.count('\nbehavior:'), 1, engine)
 

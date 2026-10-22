@@ -10,7 +10,7 @@ import shutil
 import time
 import uuid
 
-from core import (SQL, default_dirty_sizes, dirty_rows, disk_size, log, server, sha256,
+from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, log, server, sha256,
                   write_json)
 from memory import Sampler
 
@@ -80,9 +80,7 @@ def prepare(root, c, engines):
                 state = json.loads(path.read_text()) if path.exists() else {"signature": signature(c, n), "fixtures": {}}
                 expect(state["signature"], signature(c, n), "fixture configuration")
                 with SQL(root, c, engine) as admin:
-                    db_query = ("SELECT schema_name FROM information_schema.schemata" if engine == "dolt"
-                                else "SELECT datname FROM pg_database")
-                    databases = {row[0] for row in admin.query(db_query)["rows"]}
+                    databases = {row[0] for row in admin.query(ENGINES[engine].databases_sql)["rows"]}
                     if db in databases and not path.exists():
                         raise RuntimeError(f"Refusing to use unmanaged database {db}")
                     write_json(path, state)
@@ -90,16 +88,8 @@ def prepare(root, c, engines):
                         admin.query(f"CREATE DATABASE {db}")
                 with SQL(root, c, engine, db) as sql:
                     if "base" not in state:
-                        if engine == "prolly":
-                            versioned = sql.scalar("SELECT nspversioned FROM pg_namespace WHERE nspname='public'")
-                            if versioned not in ("true", "t"):
-                                sql.query("DROP SCHEMA public")
-                                sql.query("CREATE SCHEMA public VERSIONED")
-                        sql.query("CREATE TABLE IF NOT EXISTS bench_rows (id BIGINT PRIMARY KEY, revision BIGINT NOT NULL, payload TEXT NOT NULL)" +
-                                  (" USING prolly" if engine == "prolly" else ""))
-                        if engine == "prolly":
-                            expect(sql.scalar("SELECT amname FROM pg_class c JOIN pg_am a ON a.oid=c.relam WHERE c.oid='bench_rows'::regclass"),
-                                   "prolly", "table access method")
+                        ENGINES[engine].create_table(sql, "CREATE TABLE IF NOT EXISTS bench_rows (id BIGINT PRIMARY KEY, "
+                                                          "revision BIGINT NOT NULL, payload TEXT NOT NULL)")
                         count, low, high = map(int, sql.query(
                             "SELECT count(*),coalesce(min(id),0),coalesce(max(id),0) FROM bench_rows")["rows"][0])
                         if count != high or low != (1 if count else 0) or count > n:
@@ -213,8 +203,7 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                     elif op == "reset_soft":
                         query = sql.vc_sql("reset", "--soft", old)
                     elif op == "resolve_ancestor":
-                        fn = "dolt_hashof" if engine == "prolly" else "hashof"
-                        query = f"SELECT {fn}('HEAD~{d}')"
+                        query = sql.hash_sql(f"HEAD~{d}")
                     elif op == "diff_equal":
                         query = sql.diff_sql(latest, latest)
                     elif op == "diff_working":
@@ -339,9 +328,9 @@ def run(root, c, engines):
                         expect(state["signature"], signature(c, n), "fixture configuration")
                         write_json(out / f"{engine}-n{n}-fixture.json", state)
                         with SQL(root, c, engine, f"bench_n{n}") as sql:
-                            if engine == "prolly":
-                                settings = sql.query("SELECT name,setting FROM pg_settings WHERE name IN ('shared_buffers','work_mem','fsync','synchronous_commit','full_page_writes','autovacuum','max_wal_size','checkpoint_timeout')")["rows"]
-                                write_json(out / "prolly-settings.json", settings)
+                            settings = ENGINES[engine].settings(sql)
+                            if settings is not None:
+                                write_json(out / f"{engine}-settings.json", settings)
                             for k in c["changes"]:
                                 f = state["fixtures"][f"k{k}_h{max(c['history_depths'])}"]
                                 if not f.get("ready"):

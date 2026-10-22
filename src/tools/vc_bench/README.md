@@ -154,7 +154,7 @@ change counts to an existing root and run `prepare` again.
 |---|---|---|
 | Table size N | `sizes_gb` or explicit `rows` | 0.01, 0.1, 1, 10 GB |
 | Changed rows K | `changes` | 1,000 |
-| Pending dirty rows Q | `dirty_sizes` | small 0.01%, medium 1%, large 10% of N |
+| Pending dirty rows Q | `dirty_sizes` | xsmall 0.001%, small 0.01%, medium 1%, large 10% of N |
 | Distance D from current HEAD | `history_depths` | 1, 4, 16, 32 commits |
 | Repetitions | `repetitions`, `warmups` | 7 measured, 1 discarded per pass |
 | Memory sampling | `sample_interval_ms` | 10 ms |
@@ -187,10 +187,10 @@ the maximum configured distance and is recorded in every sample.
 | `diff_working_history` | Full count of old hash versus dirty WORKING |
 | `resolve_ancestor` | Resolve `HEAD~D` without a diff |
 
-### Dirty working sets: small, medium, large
+### Dirty working sets: xsmall, small, medium, large
 
 Branch creation, checkout, and soft reset each run with a clean source branch
-and with three sizes of **pending, uncommitted version-control changes**. SQL
+and with four sizes of **pending, uncommitted version-control changes**. SQL
 transactions have committed their UPDATEs, but no `dolt_commit` has been made.
 These cases run at D=0 and every configured historical distance, on every table
 size and historical change count K, in the latency and memory passes.
@@ -199,6 +199,7 @@ The default `dirty_sizes` configuration is:
 
 ```json
 {
+  "xsmall": {"fraction": 0.00001},
   "small": {"fraction": 0.0001},
   "medium": {"fraction": 0.01},
   "large": {"fraction": 0.1}
@@ -206,12 +207,18 @@ The default `dirty_sizes` configuration is:
 ```
 
 Fractions are rounded up to a whole row. For the 9,615,384-row / 10 GB table,
-these are 962, 96,154, and 961,539 dirty rows. To hold the dirty count fixed
+these are 97, 962, 96,154, and 961,539 dirty rows. To hold the dirty count fixed
 while varying table size, use `{"rows": 10}`, `{"rows": 100}`, etc. instead
 of `fraction`. Counts must fit every configured table; oversized values fail
 configuration validation instead of being clamped. Set `"dirty_sizes": {}`
 to disable the additional dirty VC cases. Older configurations that omit the
-field inherit the three default profiles.
+field inherit the four default profiles.
+
+Four profiles are the fewest a dirty-row scaling fit takes (see "Results and
+empirical complexity"):
+across profiles, a fit holds the table size fixed and varies Q.  Across table
+sizes, a fit holds each profile by its label, so a fraction profile's slope is
+of its Q growing with N, and a fixed-count profile's of N alone.
 
 Each dirty setup updates Q evenly spaced primary keys to revision H+1, independently
 of the K keys changed by the committed history. Only the revision column changes;
@@ -382,3 +389,13 @@ Use your own branch for manual writes, preserving the `fixture_*` branches and
 saved baseline commits. Manually started servers are yours to stop. To remove
 data, stop the servers and remove the chosen root yourself; the harness provides
 no automatic destructive cleanup command.
+
+## Adding or changing an engine
+
+Everything engine-specific is in `engines.py`: one `Engine` per engine, with
+its default config, build command and prerequisites, server start/stop (and
+server config), connection, and the SQL of its version-control operations,
+hashes, diffs, benchmark table and recorded settings. The runner, the fixture
+loader and preflight call the engine's methods and never test its name, so a
+setting that must match across engines (automatic GC, for one) or a new engine
+is a change to that file alone.

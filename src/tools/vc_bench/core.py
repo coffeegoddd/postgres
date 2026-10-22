@@ -13,7 +13,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
-ENGINES = ("dolt", "doltgres", "prolly")
+from engines import ENGINES, literal
 # Each pass is a separate set of measured observations; any subset may run, and
 # separate runs' passes can be merged into one report (report DIR DIR...).
 # timing: latency alone. memory: server-tree PSS/RSS/private memory, sampled
@@ -29,8 +29,9 @@ def check_passes(passes):
 
 
 def default_dirty_sizes():
-    return {"small": {"fraction": 0.0001}, "medium": {"fraction": 0.01},
-            "large": {"fraction": 0.1}}
+    # (four sizes: the least a dirty-row scaling fit takes)
+    return {"xsmall": {"fraction": 0.00001}, "small": {"fraction": 0.0001},
+            "medium": {"fraction": 0.01}, "large": {"fraction": 0.1}}
 
 
 def dirty_rows(spec, n):
@@ -82,9 +83,6 @@ def init(root, smoke):
     if any((root / name).exists() for name in reserved):
         raise ValueError(f"init would overlap existing benchmark files in {root}; choose another root")
     sources = Path.home() / "cursor_src"
-    dg = sources / "doltgres"
-    if not dg.exists():
-        dg = sources / "doltgresql"
     config = {
         "schema_version": 1, "payload_bytes": 128 if smoke else 1024,
         "rows": [128, 512, 2048, 8192] if smoke else [],
@@ -95,11 +93,7 @@ def init(root, smoke):
         "repetitions": 2 if smoke else 7, "warmups": 1,
         "passes": list(PASSES), "sample_interval_ms": 10,
         "batch_rows": 1000, "timeout_seconds": 3600, "seed": 20261021,
-        "engines": {
-            "dolt": {"source": str(sources / "dolt"), "binary": str(root / "bin/dolt"), "port": 13360},
-            "doltgres": {"source": str(dg), "binary": str(root / "bin/doltgres"), "port": 15432},
-            "prolly": {"source": str(REPO), "binary": str(root / "build/postgres/inst/bin/postgres"), "port": 15433},
-        },
+        "engines": {name: e.default_config(root, sources) for name, e in ENGINES.items()},
     }
     write_json(root / "config.json", config)
     log(f"Created {root / 'config.json'}")
@@ -142,16 +136,7 @@ def build(root, c, engines, jobs):
     (root / "build").mkdir(exist_ok=True)
     commands = [("driver", ["go", "build", "-trimpath", "-o", str(root / "bin/sql-driver"), "."], HERE / "driver")]
     for engine in engines:
-        e = c["engines"][engine]
-        source = Path(e["source"])
-        if engine == "prolly":
-            commands.append((engine, ["python3", str(REPO / "src/tools/prolly_bench/build_postgres.py"),
-                                     "--source", str(source), "--build-dir", str(root / "build/postgres"),
-                                     "--jobs", str(jobs), "--", "--with-openssl", "CFLAGS=-O2"], REPO))
-        else:
-            commands.append((engine, ["go", "build", "-trimpath", "-o", e["binary"],
-                                      "./cmd/dolt" if engine == "dolt" else "./cmd/doltgres"],
-                             source / "go" if engine == "dolt" else source))
+        commands.append((engine, *ENGINES[engine].build_command(root, c, jobs)))
     for name, cmd, cwd in commands:
         log(f"Building {name}; log: {root / 'build' / (name+'.log')}")
         before = source_info(c["engines"][name]["source"]) if name != "driver" else None
@@ -195,27 +180,7 @@ def start(root, c, engine):
         s.bind(("127.0.0.1", e["port"]))  # Never connect to an unrelated server on this port.
     home = root / engine
     home.mkdir(exist_ok=True)
-    data = home / "data"
-    if engine == "prolly":
-        pg_bin = binary.parent
-        if not data.exists():
-            subprocess.run([str(pg_bin / "initdb"), "-D", str(data), "-U", "postgres",
-                            "--auth-local=trust", "--auth-host=trust", "--no-locale", "-E", "UTF8"],
-                           check=True, stdout=subprocess.DEVNULL)
-            with (data / "postgresql.conf").open("a") as f:
-                f.write(f"\nlisten_addresses = '127.0.0.1'\nport = {e['port']}\n"
-                        "unix_socket_directories = ''\nshared_buffers = '256MB'\n"
-                        "autovacuum = off\nmax_wal_size = '8GB'\ncheckpoint_timeout = '30min'\n")
-        cmd = [str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(home / "server.log"), "-w", "start"]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-        pid = int((data / "postmaster.pid").read_text().splitlines()[0])
-    else:
-        data.mkdir(exist_ok=True)
-        (home / "server.yaml").write_text(go_server_config(root, c, engine))
-        cmd = [str(binary), *( ["sql-server", "--config"] if engine == "dolt" else ["-config"]), str(home / "server.yaml")]
-        with (home / "server.log").open("a") as f:
-            p = subprocess.Popen(cmd, cwd=home, stdout=f, stderr=f, start_new_session=True)
-        pid = p.pid
+    pid, cmd = ENGINES[engine].start(root, c, home, binary)
     write_json(home / "server.json", {"pid": pid, "start_ticks": identity(pid), "command": cmd})
     for _ in range(300):
         if not running(root, engine):
@@ -230,39 +195,11 @@ def start(root, c, engine):
     raise RuntimeError(f"{engine} failed to start; see {home / 'server.log'}")
 
 
-def go_server_config(root, c, engine):
-    """A Go engine's server.yaml.  Automatic GC is off for both: each reads
-    behavior.auto_gc_behavior, and treats its absence as enabled."""
-    home = root / engine
-    cfg = (f"log_level: warning\nlistener:\n  host: 127.0.0.1\n  port: {c['engines'][engine]['port']}\n"
-           f"data_dir: {json.dumps(str(home / 'data'))}\ncfg_dir: {json.dumps(str(home / '.doltcfg'))}\n"
-           "behavior:\n  auto_gc_behavior:\n    enable: false\n")
-    if engine == "doltgres":
-        cfg += "user:\n  name: postgres\n  password: password\n"
-    return cfg
-
-
 def stop(root, c, engine):
     info = running(root, engine)
     if not info:
         return
-    if engine == "prolly":
-        subprocess.run([str(Path(c["engines"][engine]["binary"]).parent / "pg_ctl"),
-                        "-D", str(root / engine / "data"), "-m", "fast", "-w", "stop"],
-                       check=True, stdout=subprocess.DEVNULL)
-    else:
-        os.kill(info["pid"], signal.SIGTERM)
-        for _ in range(600):
-            stat = Path(f"/proc/{info['pid']}/stat")
-            if not running(root, engine) or (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"):
-                break
-            time.sleep(.1)
-        else:
-            raise RuntimeError(f"{engine} did not exit; retained server.json for inspection")
-        try:
-            os.waitpid(info["pid"], os.WNOHANG)
-        except ChildProcessError:
-            pass
+    ENGINES[engine].stop(root, c, info, lambda: running(root, engine))
     (root / engine / "server.json").unlink(missing_ok=True)
 
 
@@ -279,11 +216,8 @@ def server(root, c, engine):
 class SQL:
     def __init__(self, root, c, engine, db=None):
         self.engine, self.timeout = engine, c["timeout_seconds"]
-        port = c["engines"][engine]["port"]
-        if engine == "dolt":
-            driver, dsn = "mysql", f"root@tcp(127.0.0.1:{port})/{db or ''}?timeout=15s"
-        else:
-            driver, dsn = "pgx", f"postgres://postgres:password@127.0.0.1:{port}/{db or 'postgres'}?sslmode=disable&default_query_exec_mode=simple_protocol"
+        self.adapter = ENGINES[engine]
+        driver, dsn = self.adapter.connection(c["engines"][engine]["port"], db)
         self.p = subprocess.Popen([str(root / "bin/sql-driver"), driver, dsn],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
 
@@ -317,23 +251,19 @@ class SQL:
         return self.query(sql)["rows"][0][0]
 
     def vc_sql(self, op, *args):
-        prefix = "CALL" if self.engine == "dolt" else "SELECT"
-        return f"{prefix} dolt_{op}({','.join(literal(a) for a in args)})"
+        return self.adapter.vc_sql(op, args)
 
     def vc(self, op, *args):
         return self.query(self.vc_sql(op, *args))
 
+    def hash_sql(self, ref="HEAD"):
+        return self.adapter.hash_sql(ref)
+
     def hash(self, ref="HEAD"):
-        fn = "dolt_hashof" if self.engine == "prolly" else "hashof"
-        return self.scalar(f"SELECT {fn}({literal(ref)})")
+        return self.scalar(self.hash_sql(ref))
 
     def diff_sql(self, a, b):
-        table = "NULL::bench_rows" if self.engine == "prolly" else "'bench_rows'"
-        return f"SELECT count(*) FROM dolt_diff({literal(a)},{literal(b)},{table})"
-
-
-def literal(value):
-    return "'" + str(value).replace("'", "''") + "'"
+        return self.adapter.diff_sql(a, b)
 
 
 def disk_size(path):

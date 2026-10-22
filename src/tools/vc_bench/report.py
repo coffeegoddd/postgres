@@ -1,6 +1,7 @@
 """Descriptive summaries and bootstrap log-log slopes, never Big-O proofs."""
 import collections
 import csv
+import os
 import json
 import math
 from pathlib import Path
@@ -19,6 +20,7 @@ PASS_FIELDS = {
     "io": ("read_bytes_delta", "write_bytes_delta"),
 }
 LEGACY_MEMORY_FIELDS = PASS_FIELDS["memory"] + PASS_FIELDS["cpu"] + PASS_FIELDS["io"]
+CPU_SHORT_TICKS = 3
 
 
 def merge(paths, results_root):
@@ -60,7 +62,7 @@ def merge(paths, results_root):
         for p in paths:
             f.write((Path(p) / "samples.jsonl").read_text())
     for name in Path(paths[0]).iterdir():
-        if name.name.endswith(("-fixture.json", "-server.log")) or name.name == "prolly-settings.json":
+        if name.name.endswith(("-fixture.json", "-server.log", "-settings.json")):
             shutil.copyfile(name, out / name.name)
     write_json(out / "manifest.json", merged)
     return out
@@ -126,6 +128,12 @@ def report(path):
                 summary["median_"+k] = statistics.median(values) if len(values) == len(records) else None
             if key[-1] == "memory":
                 summary["short_memory_observations"] = sum(r["memory"]["short_operation"] for r in records)
+            if key[-1] in ("cpu", "memory") and "cpu_seconds_delta" in measured:
+                # CPU time is counted in clock ticks: an operation of a few
+                # ticks or less mostly measures as 0 or one tick.
+                tick_ns = 1e9 / os.sysconf("SC_CLK_TCK")
+                summary["short_cpu_observations"] = sum(r["elapsed_ns"] < CPU_SHORT_TICKS * tick_ns
+                                                        for r in records)
         summaries.append(summary)
     columns = list(dict.fromkeys(k for s in summaries for k in s))
     with (path / "summary.csv").open("w") as f:
@@ -148,8 +156,12 @@ def report(path):
         writer.writerows(comparisons.values())
     fits = []
     for axis in ("rows", "changed_rows", "distance", "dirty_rows"):
+        # (a dirty profile is held fixed by its label: its count varies with
+        # the table's size if it's a fraction, so a size sweep holds the
+        # fraction; across profiles, the count varies, not the label)
         fixed = [f for f in fields if f not in (axis, "pass")
-                 and not (axis == 'dirty_rows' and f == 'working_set')]
+                 and not (axis == 'dirty_rows' and f == 'working_set')
+                 and not (axis == 'rows' and f == 'dirty_rows')]
         for metric in ("elapsed_ns", "pss_bytes_peak_delta", "pss_bytes_peak"):
             buckets = collections.defaultdict(lambda: collections.defaultdict(list))
             undersampled = set()

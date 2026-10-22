@@ -37,6 +37,13 @@ def memory_cell(row, fields, unit, scale):
     return value
 
 
+def resource_cell(row, metric, unit, scale):
+    value = number(row.get('median_' + metric), unit, scale)
+    if metric == 'cpu_seconds_delta' and row.get('short_cpu_observations'):
+        value += f" [short {row['short_cpu_observations']}/{row['repetitions']}]"
+    return value
+
+
 def fit_cell(item):
     if item["status"] == "descriptive":
         lo, hi = item["bootstrap_95_percent"]
@@ -169,7 +176,7 @@ def render(path, manifest, summaries, fits):
 
     def fixture_order(item):
         fixture = item[0]
-        labels = ['clean', 'diff', 'small', 'medium', 'large']
+        labels = ['clean', 'diff', 'xsmall', 'small', 'medium', 'large']
         profile = fixture[3]
         return (*fixture[:3], labels.index(profile) if profile in labels else 5, profile, fixture[4])
 
@@ -215,7 +222,12 @@ def render(path, manifest, summaries, fits):
                   'them from the memory pass.) Counter deltas are unavailable when the process set changes. CPU has '
                   'kernel clock-tick resolution. I/O is kernel process read/write bytes, not all buffered traffic. '
                   'RSS double-counts shared mappings; use PSS for total footprint comparisons. Short-observation '
-                  'flags above also apply to RSS and private-memory peaks.')
+                  'flags above also apply to RSS and private-memory peaks. [short x/n] on CPU time marks '
+                  'operations shorter than three clock ticks (usually 30 ms): their CPU time mostly reads as 0 '
+                  'or one tick. Write bytes are not like-for-like across engines: PostgreSQL writes most data '
+                  'through shared buffers, reaching the kernel later (eviction, the background writer, the '
+                  'checkpointer), often outside this operation\'s window or in a later one\'s; the Go engines '
+                  'mostly write within the request.')
     metrics = [('RSS sampled peak', 'rss_bytes_peak', 'MiB', 1024**2, 'memory'),
                ('Private resident peak growth', 'private_bytes_peak_delta', 'KiB', 1024, 'memory'),
                ('CPU time', 'cpu_seconds_delta', 'ms', .001, 'cpu'),
@@ -243,7 +255,7 @@ def render(path, manifest, summaries, fits):
                 if engines is None:
                     continue
                 rows.append([OPERATIONS.get(case[0], case[0]), case[1], label,
-                             *[number(engines[e].get('median_' + metric), unit, scale)
+                             *[resource_cell(engines[e], metric, unit, scale)
                                if e in engines else '—' for e in ENGINES]])
         if not rows:
             continue
@@ -265,7 +277,8 @@ def render(path, manifest, summaries, fits):
     names = {'elapsed_ns': 'Latency', 'pss_bytes_peak_delta': 'PSS peak growth', 'pss_bytes_peak': 'PSS total peak'}
     for axis, title in axes.items():
         fixed = [field for field in ('rows', 'changed_rows', 'history_commits', 'distance', 'working_set', 'dirty_rows')
-                 if field != axis and not (axis == 'dirty_rows' and field == 'working_set')]
+                 if field != axis and not (axis == 'dirty_rows' and field == 'working_set')
+                 and not (axis == 'rows' and field == 'dirty_rows')]
         grouped = defaultdict(dict)
         for item in fits:
             if item['axis'] == axis:

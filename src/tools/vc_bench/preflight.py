@@ -116,18 +116,9 @@ def available_port(root, engine, port):
 def installed(root, c, engine):
     binary = Path(c['engines'][engine]['binary'])
     require_executable(binary)
-    args = ['version'] if engine == 'dolt' else ['-version'] if engine == 'doltgres' else ['--version']
-    probe([str(binary), *args], timeout=20)
-    if engine == 'prolly':
-        if os.geteuid() == 0:
-            raise ValueError('PostgreSQL cannot run as root; use a non-root account')
-        for name in ('initdb', 'pg_ctl', 'pg_config'):
-            tool = binary.parent / name
-            require_executable(tool)
-            probe([str(tool), '--version'])
-        share = Path(probe([str(binary.parent / 'pg_config'), '--sharedir']).strip())
-        if not (share / 'postgres.bki').is_file():
-            raise ValueError(f'PostgreSQL install is incomplete: missing {share / "postgres.bki"}; run make install')
+    adapter = core.ENGINES[engine]
+    probe([str(binary), *adapter.version_args], timeout=20)
+    adapter.preflight_installed(binary, probe, require_executable)
     provenance = root / 'build' / (engine + '.json')
     if provenance.exists():
         expected = json.loads(provenance.read_text())['sha256']
@@ -165,20 +156,10 @@ def check(root, c, engines, stage):
         for engine in engines:
             e = c['engines'][engine]
             checkout = Path(e['source'])
-            entry = 'configure' if engine == 'prolly' else 'go/go.mod' if engine == 'dolt' else 'go.mod'
-            source_ok = checks.test(f'{engine} source', lambda: source(checkout, entry))
+            adapter = core.ENGINES[engine]
+            source_ok = checks.test(f'{engine} source', lambda: source(checkout, adapter.source_entry))
             checks.test(f'{engine} binary destination', lambda: writable(Path(e['binary']).parent))
-            if engine == 'prolly':
-                tools_ok_pg = checks.test('PostgreSQL build tools', lambda: require_tools(['make', 'bison', 'flex', 'perl', 'pkg-config']))
-                if source_ok and tools_ok_pg:
-                    core.log('Checking PostgreSQL configure dependencies in a temporary directory')
-                    checks.test('PostgreSQL configure dependencies', lambda: postgres_dependencies(root, checkout))
-            elif source_ok and tools_ok:
-                directory = checkout / 'go' if engine == 'dolt' else checkout
-                target = './cmd/dolt' if engine == 'dolt' else './cmd/doltgres'
-                core.log(f'Checking {engine} Go modules and C/C++/ICU toolchain')
-                checks.test(f'{engine} Go dependencies', lambda: go_dependencies(directory, target))
-                checks.test(f'{engine} C/C++ and ICU development libraries', lambda: go_compilers(directory))
+            adapter.preflight_build(checks, root, checkout, source_ok, tools_ok)
     else:
         if stage in ('prepare', 'run'):
             def driver():
