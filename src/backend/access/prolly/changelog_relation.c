@@ -468,12 +468,11 @@ static HTAB *own_logs = NULL;	/* OwnLog; the transaction's */
 /*
  * A bulk write stops being noted (#499): past this many distinct entries of
  * a log in a transaction (a key written again is the same entry), or a
- * quarter of its table's rows if more (as table_rows() estimates them),
- * its entries are dropped for one
- * saying to read the table in full, writing and reading back so many
- * costing about what that read does; a table made in the transaction (no
- * baseline to fold from) isn't noted at all.  Per (sub)transaction, so a
- * rollback of the bulk write takes the switch back.
+ * quarter of its table's rows if more (as table_rows() estimates them), its
+ * entries are dropped for one saying to read the table in full, writing and
+ * reading back so many costing about what that read does; a table made in
+ * the transaction (no baseline to fold from) isn't noted at all.  Per
+ * (sub)transaction, so a rollback of the bulk write takes the switch back.
  */
 #define BULK_NOTES			65536
 
@@ -763,8 +762,9 @@ notes_stopped(Oid logid)
  * A table's rows, about, as they were before the transaction: its
  * statistics' density (reltuples a page) at its size now, or, a table
  * never vacuumed or analyzed having none, the rows on a few of its pages
- * spread over it, those live or being deleted (the versions the
- * transaction replaced are counted, not those it made, nor any dead).  The
+ * spread over it, those live or being deleted, but not made by the
+ * transaction (the versions it replaced are counted, not those it made,
+ * even those it replaced again, nor any dead).  The
  * planner's estimate without statistics takes a value its type's average
  * width, many times the rows of a table of long values.
  */
@@ -811,6 +811,12 @@ table_rows(Relation rel)
 				tup.t_len = ItemIdGetLength(id);
 				tup.t_tableOid = RelationGetRelid(rel);
 				ItemPointerSet(&tup.t_self, blk, off);
+				/*
+				 * (DELETE_IN_PROGRESS is also of a version the transaction
+				 * made and then replaced again: not a row before it)
+				 */
+				if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tup.t_data)))
+					continue;
 				r = HeapTupleSatisfiesVacuum(&tup, horizon, buf);
 				if (r == HEAPTUPLE_LIVE || r == HEAPTUPLE_DELETE_IN_PROGRESS)
 					tuples++;
