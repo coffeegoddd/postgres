@@ -545,6 +545,7 @@ map_pass(Map *m, const ProllyNodeRef *from, bool sorted, ProllyNodeRef *data)
 		MemoryContext old;
 		ProllyValue r;
 		uint64		count;
+
 		MemoryContextReset(m->rowcxt);
 		old = MemoryContextSwitchTo(m->rowcxt);
 		PROLLY_CALL(m->kr, parse_value, m->ok, &v_in, &r, &count);

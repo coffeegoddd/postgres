@@ -592,7 +592,6 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 	}
 	else
 	{
-
 		heap_deform_tuple(entry, f->desc, f->values, f->isnull);
 		ExecClearTuple(f->keyslot);
 		for (int i = 0; i < f->desc->natts; i++)
@@ -615,7 +614,10 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 		resetStringInfo(&f->key);
 		if (!PROLLY_CALL(f->kr, encode_key, f->k, f->keyslot, &f->key))
 		{
-			/* (a keying that keys rows by content: the table's keyed) */
+			/*
+			 * (the keying keys rows by content, though the table's read as
+			 * keyed: keyless() said otherwise; never, as keyings are)
+			 */
 			f->give_up = true;
 			f->reason = PROLLY_FULL_KEYING_CHANGED;
 			return false;
