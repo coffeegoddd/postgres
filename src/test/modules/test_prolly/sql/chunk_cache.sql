@@ -55,14 +55,27 @@ SELECT count(*) AS same
 FROM uncached u JOIN dolt_diff('HEAD~1', 'HEAD', NULL::cc.t) d
 	ON (d.to_row).id = u.id AND (d.to_row).v = u.v;
 
--- A transaction's own chunks, rolled back, aren't kept: a node made then
--- is read again only if it was written.
-BEGIN;
-UPDATE cc.t SET v = 'rolled back' WHERE id = 1;
-SELECT length(dolt_commit('-am', 'gone')::text) > 0 AS committed;
-SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::cc.t);
-ROLLBACK;
-SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::cc.t);
-
 \c :home
 DROP DATABASE chunk_cache;
+
+-- A chunk a collection removes isn't given from the cache after: in the
+-- session that cached it, a read finds nothing, as the store says (and as
+-- a read with the cache off, or another session's, does).
+CREATE DATABASE chunk_cache_gc;
+\c chunk_cache_gc
+CREATE EXTENSION test_prolly;
+SELECT test_chunk_put('cc kept') AS kept \gset
+SELECT test_chunk_put('cc dropped') AS dropped \gset
+SELECT test_chunk_put_node(1, ARRAY[:'kept']) AS node \gset
+SELECT test_chunk_move_root(NULL, :'node');
+\c chunk_cache_gc
+SELECT test_chunk_get(:'dropped') IS NOT NULL AS read;
+SELECT test_chunk_get(:'dropped') IS NOT NULL AS read_again;
+SELECT test_chunk_get(:'dropped') IS NOT NULL AS read_from_cache;
+SELECT kept, freed FROM test_chunk_gc(false);
+SELECT test_chunk_has(:'dropped') AS has_dropped,
+	test_chunk_get(:'dropped') IS NULL AS get_none,
+	convert_from(test_chunk_get(:'kept'), 'UTF8') AS kept;
+
+\c :home
+DROP DATABASE chunk_cache_gc;

@@ -661,9 +661,13 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
  * Decoded chunks the session's store read from its files, kept by hash for
  * the backend's later reads, least recently used dropped past
  * prolly_chunk_cache_size kB.  A chunk is named by its content, so one kept
- * is the chunk whatever happens to the store after: none is ever stale.
- * Only those read from the files (not the transaction's own, pending or
- * transient, which an abort takes back, nor one read through a source).
+ * is the chunk whatever happens to the store after; but not that the
+ * store still has it: a collection may remove it.  So the cache is of a
+ * collection's generation (the manifest's gc_generation), and let go of
+ * whole once a read sees another, as the store's own reads then find
+ * nothing of what was removed.  Only those read from the files (not the
+ * transaction's own, pending or transient, which an abort takes back, nor
+ * one read through a source).
  *
  * A chunk is kept the second time it is read from the files, not the
  * first: the hashes of those read once are remembered (as many as the
@@ -686,11 +690,17 @@ static HTAB *chunk_cache = NULL;
 static dlist_head chunk_cache_lru = DLIST_STATIC_INIT(chunk_cache_lru);
 static Size chunk_cache_bytes = 0;
 static MemoryContext chunk_cache_cxt = NULL;
+static uint32 chunk_cache_generation = 0;	/* what it holds is of */
 
-/* hashes read once, oldest first: a ring, and a set of what it holds */
+/*
+ * Hashes read once, oldest first: a ring, and a set of what it holds, each
+ * with its slot (a key found is let go of from the set, not the ring: its
+ * slot, reached again, lets go of the key only if it's still that slot's).
+ */
 typedef struct SeenChunk
 {
 	ProllyHash	key;
+	int			slot;
 } SeenChunk;
 
 static HTAB *chunk_seen = NULL;
@@ -736,12 +746,19 @@ chunk_seen_before(const ProllyHash *key, Size limit)
 		(void) hash_search(chunk_seen, key, HASH_REMOVE, NULL);
 		return true;
 	}
-	/* (the oldest let go of, if the ring is full) */
+	/* (the oldest let go of, if the ring is full and the set still has it) */
 	if (chunk_seen_ring[chunk_seen_next].len != 0)
-		(void) hash_search(chunk_seen, &chunk_seen_ring[chunk_seen_next],
-						   HASH_REMOVE, NULL);
+	{
+		SeenChunk  *old = hash_search(chunk_seen,
+									  &chunk_seen_ring[chunk_seen_next],
+									  HASH_FIND, NULL);
+
+		if (old != NULL && old->slot == chunk_seen_next)
+			(void) hash_search(chunk_seen, &old->key, HASH_REMOVE, NULL);
+	}
 	chunk_seen_ring[chunk_seen_next] = *key;
-	(void) hash_search(chunk_seen, key, HASH_ENTER, NULL);
+	((SeenChunk *) hash_search(chunk_seen, key, HASH_ENTER, NULL))->slot =
+		chunk_seen_next;
 	chunk_seen_next = (chunk_seen_next + 1) % chunk_seen_size;
 	return false;
 }
@@ -754,11 +771,35 @@ chunk_cache_limit(void)
 
 static void chunk_cache_evict(Size limit);
 
+/*
+ * The cache and the chunks read once let go of, if they're of another
+ * collection's generation than the store's now.
+ */
+static void
+chunk_cache_of(uint32 generation)
+{
+	if (generation == chunk_cache_generation)
+		return;
+	chunk_cache_generation = generation;
+	if (chunk_cache != NULL)
+		chunk_cache_evict(0);
+	if (chunk_seen != NULL)
+	{
+		hash_destroy(chunk_seen);
+		pfree(chunk_seen_ring);
+		chunk_seen = NULL;
+		chunk_seen_ring = NULL;
+		chunk_seen_size = 0;
+		chunk_seen_next = 0;
+	}
+}
+
 static bool
-chunk_cache_take(const ProllyHash *key, StringInfo out)
+chunk_cache_take(const ProllyHash *key, StringInfo out, uint32 generation)
 {
 	CachedChunk *c;
 
+	chunk_cache_of(generation);
 	if (chunk_cache == NULL)
 		return false;
 	/* (the setting lowered: what it no longer holds let go of first) */
@@ -789,11 +830,15 @@ chunk_cache_evict(Size limit)
 }
 
 static void
-chunk_cache_put(const ProllyHash *key, const char *data, uint32 len)
+chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
+				uint32 generation)
 {
 	Size		limit = chunk_cache_limit();
 	CachedChunk *c;
+	char	   *copy;
 	bool		found;
+
+	chunk_cache_of(generation);
 
 	/* (none past an eighth of the cache: one chunk mustn't empty it) */
 	if (limit == 0 || (Size) len + sizeof(CachedChunk) > limit / 8)
@@ -818,14 +863,17 @@ chunk_cache_put(const ProllyHash *key, const char *data, uint32 len)
 		chunk_cache = hash_create("prolly chunk cache", 1024, &ctl,
 								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
+	/* (copied first: an entry is made only once it can be filled) */
+	copy = MemoryContextAlloc(chunk_cache_cxt, Max(len, 1));
+	memcpy(copy, data, len);
 	c = hash_search(chunk_cache, key, HASH_ENTER, &found);
 	if (found)
 	{
+		pfree(copy);
 		dlist_move_head(&chunk_cache_lru, &c->lru);
 		return;
 	}
-	c->data = MemoryContextAlloc(chunk_cache_cxt, Max(len, 1));
-	memcpy(c->data, data, len);
+	c->data = copy;
 	c->len = len;
 	dlist_push_head(&chunk_cache_lru, &c->lru);
 	chunk_cache_bytes += len + sizeof(CachedChunk);
@@ -4807,10 +4855,15 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	}
 	if (!stored && ahead_take(s, &key, out))
 		return true;
-	if (!stored && s == session_store && chunk_cache_take(&key, out))
+	/* (the store's generation as of now: a collection since lets go of all) */
+	if (!stored && s == session_store)
 	{
-		xact_note(s);
-		return true;
+		refresh_segments(s);
+		if (chunk_cache_take(&key, out, s->gc_generation))
+		{
+			xact_note(s);
+			return true;
+		}
 	}
 	if (stored)
 	{
@@ -4834,7 +4887,8 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		if (tables_read(s, &key, out, stored))
 		{
 			if (!stored && s == session_store)
-				chunk_cache_put(&key, out->data + start, out->len - start);
+				chunk_cache_put(&key, out->data + start, out->len - start,
+								s->gc_generation);
 			return true;
 		}
 		scan_journal(s);
@@ -4844,7 +4898,8 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			if (tables_read(s, &key, out, stored))
 			{
 				if (!stored && s == session_store)
-					chunk_cache_put(&key, out->data + start, out->len - start);
+					chunk_cache_put(&key, out->data + start, out->len - start,
+									s->gc_generation);
 				return true;
 			}
 			if (s->through == NULL)
@@ -4890,7 +4945,8 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	{
 		chunk_bytes_of(g->path, rec, len, &key, out);
 		if (s == session_store)
-			chunk_cache_put(&key, out->data + start, out->len - start);
+			chunk_cache_put(&key, out->data + start, out->len - start,
+							s->gc_generation);
 	}
 	pfree(rec);
 	return true;
