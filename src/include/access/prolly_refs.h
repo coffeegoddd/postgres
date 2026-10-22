@@ -429,6 +429,14 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*publish_definitions) (void *read, const ProllyNodeRef *root,
 										bool complete);
+
+	/*
+	 * Optional: the current transaction's own row changes to these tables
+	 * folded into the session branch's baseline as it commits (the
+	 * canonicalizer's advance_own()), under the refs: false, nothing moved,
+	 * if none could be, the changes left for the branch's next fold.
+	 */
+	bool		(*fold_own) (const ProllyRowChanges *changes, int nchanges);
 } ProllyRefsRoutine;
 
 /*
@@ -451,9 +459,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
-	"publish_definitions"
+	"publish_definitions", "fold_own"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK publish_definitions
+#define PROLLY_REFS_LAST_CALLBACK fold_own
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

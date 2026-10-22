@@ -3036,6 +3036,29 @@ copies_working_changes(Oid relid, ProllyNodeRef *data,
 	return dc.canonicalizer->table_changes(&baseline, relid, data, visit, arg);
 }
 
+/*
+ * The transaction's own row changes folded into the session branch's
+ * baseline, under the refs (so baselines move one transaction at a time).
+ */
+static bool
+copies_fold_own(const ProllyRowChanges *changes, int nchanges)
+{
+	char	   *name = branch_ops()->current();
+	ProllyNodeRef baseline;
+	ProllyNodeRef next;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, advance_own) || nchanges == 0)
+		return false;
+	lock_refs();
+	if (!branch_baseline(name, &baseline) ||
+		!dc.canonicalizer->advance_own(&baseline, changes, nchanges, &next))
+		return false;
+	branch_set_baseline(name, &next, NULL);
+	return true;
+}
+
 static void
 copies_publish_definitions(void *read, const ProllyNodeRef *root,
 						   bool complete)
@@ -4438,6 +4461,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.read_definitions = copies_read_definitions,
 	.working_changes = copies_working_changes,
 	.publish_definitions = copies_publish_definitions,
+	.fold_own = copies_fold_own,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

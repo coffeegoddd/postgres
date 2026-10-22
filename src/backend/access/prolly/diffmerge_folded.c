@@ -1106,9 +1106,12 @@ first_change(ProllyDiffKind kind, const ProllyKey *key,
 /*
  * Whether the working set's rows of table t (as the definitions-only read
  * describes it, its data the baseline's) differ from ref's (r: as ref has
- * it), without a fold: where the baseline holds ref's rows, they do if the
- * change finder finds a change since.  False in *known where that can't be
- * told so: the caller folds.
+ * it), without a fold, from the change finder's record since the baseline:
+ * with no change since, the working set's rows are the baseline's, which
+ * differ from ref's if their trees do (trees are canonical); with one, they
+ * differ if the baseline holds ref's rows.  False in *known where it can't
+ * be told so (changes, on a baseline not ref's; or none read): the caller
+ * folds.
  */
 static bool
 working_rows_differ(const Table *r, const Table *t, bool *known)
@@ -1118,10 +1121,10 @@ working_rows_differ(const Table *r, const Table *t, bool *known)
 	ProllyNodeRef base;
 	bool		any = false;
 
-	*known = OidIsValid(relid) && same_hash(&r->data.hash, &t->data.hash) &&
+	*known = OidIsValid(relid) &&
 		refs->working_changes(relid, &base, first_change, &any) &&
-		same_hash(&base.hash, &r->data.hash);
-	return any;
+		(!any || same_hash(&base.hash, &r->data.hash));
+	return any || !same_hash(&base.hash, &r->data.hash);
 }
 
 /*

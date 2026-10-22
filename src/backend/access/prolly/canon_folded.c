@@ -9880,6 +9880,123 @@ folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head
 	return true;
 }
 
+/*
+ * baseline with the current transaction's own row changes to these tables
+ * applied to its rows (the change finder's fold_rows() from each table's
+ * baseline tree, not a commit's) into *next, each table's finder state
+ * advanced past them (advance(): its record of them consumed), so the
+ * baseline holds what the transaction committed: a fold at its commit.
+ * A table whose baseline isn't of its shape now, or whose changes or state
+ * can't be applied or advanced so, keeps its entry, and its record of the
+ * changes, for the next fold.  Every table's tree is made first; only then
+ * are states advanced, each table's entry put only if its state was.
+ * False, next undefined, if no table's could be.
+ */
+static bool
+folded_advance_own(const ProllyNodeRef *baseline,
+				   const ProllyRowChanges *changes, int nchanges,
+				   ProllyNodeRef *next)
+{
+	Canon		cn;
+	ProllyEdit *edits = palloc_array(ProllyEdit, Max(nchanges, 1));
+	int			nedits = 0;
+	int			save_nestlevel;
+	typedef struct Applied
+	{
+		Relation	rel;
+		CanonItem  *it;
+		BaseTable  *bt;
+		ProllyNodeRef now;
+		ProllyHash	dh;
+		StringInfoData shape;
+	} Applied;
+	Applied    *ap = palloc0_array(Applied, Max(nchanges, 1));
+	int			nap = 0;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (!PROLLY_HAS(cn.finder, advance) || !PROLLY_HAS(cn.finder, fold_rows))
+		return false;
+	load_baseline(&cn, baseline);
+
+	/* (described as a commit describes them: every name qualified) */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		/* each table's rows applied to its baseline's tree */
+		for (int i = 0; i < nchanges; i++)
+		{
+			Relation	rel = try_table_open(changes[i].relid, AccessShareLock);
+			Applied    *a = &ap[nap];
+			StringInfoData desc;
+
+			if (rel == NULL)
+				continue;
+			a->rel = rel;
+			a->it = add_item(&cn, "t:", qualified(RelationGetNamespace(rel),
+												  RelationGetRelationName(rel)));
+			a->bt = find_base_table(&cn, &a->it->key);
+			initStringInfo(&desc);
+			describe_table(&cn, rel, &desc);
+			initStringInfo(&a->shape);
+			baseline_shape(&cn, rel, &desc, &a->shape);
+			content_hash(&cn, a->shape.data, a->shape.len, &a->dh);
+			pfree(desc.data);
+			if (a->bt == NULL || !same_hash(&a->dh, &a->bt->shape_hash) ||
+				!PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &a->bt->data,
+							 changes[i].tids, changes[i].ntids, &a->now))
+			{
+				table_close(rel, AccessShareLock);
+				continue;
+			}
+			nap++;
+		}
+
+		/* then each one's state advanced: its entry put only if it was */
+		for (int i = 0; i < nap; i++)
+		{
+			Applied    *a = &ap[i];
+			ProllyValue state = {(const uint8 *) a->bt->state.data,
+			a->bt->state.len};
+			StringInfoData ns;
+
+			initStringInfo(&ns);
+			if (PROLLY_CALL(cn.finder, advance, a->rel, &state, &ns))
+			{
+				resetStringInfo(&a->it->value);
+				put_hash(&a->it->value, &a->now.hash);
+				put_base_shape(&cn, &a->it->value, &a->dh, &a->shape, a->bt);
+				appendBinaryStringInfo(&a->it->value, ns.data, ns.len);
+				put_edit(edits, &nedits, a->it);
+			}
+			table_close(a->rel, AccessShareLock);
+			a->rel = NULL;
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+		AtEOXact_GUC(false, save_nestlevel);
+	}
+	PG_END_TRY();
+	if (nedits == 0)
+		return false;
+	{
+		ProllyTreeEnv benv = cn.env;
+
+		benv.chunk_refs = base_chunk_refs;
+		if (nedits > 1)
+			qsort(edits, nedits, sizeof(ProllyEdit), edit_key_cmp);
+		PROLLY_CALL(cn.tree, apply, &benv, baseline, edits, nedits, next);
+	}
+	return true;
+}
+
 /* A statement, its trailing space and ";" trimmed, ended by one. */
 static void
 append_statement(StringInfo out, const char *stmt)
@@ -10292,6 +10409,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,
+	.advance_own = folded_advance_own,
 	.splice = folded_splice,
 	.splice_baseline = folded_splice_baseline,
 	.tables = folded_tables,

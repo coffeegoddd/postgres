@@ -130,6 +130,7 @@ tests += {
       'truncate_folds',
       'fold_verify',
       'fold_caches',
+      'fold_on_commit',
       'describe_caches',
       'nearest_source',
       'keyless_toast_folds',

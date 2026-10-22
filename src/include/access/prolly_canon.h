@@ -341,6 +341,18 @@ typedef struct ProllyCanonRoutine
 	bool		(*table_changes) (const ProllyNodeRef *baseline, Oid relid,
 								  ProllyNodeRef *data,
 								  ProllyRowChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: baseline with the current transaction's own row changes to
+	 * these tables applied to its rows, and each table's change finder
+	 * state advanced past them, into *next: a fold of the transaction's
+	 * changes into the baseline as it commits.  A table it can't apply
+	 * them to keeps its entry and its finder's record of them.  False,
+	 * next undefined, if no table's could be.
+	 */
+	bool		(*advance_own) (const ProllyNodeRef *baseline,
+								const ProllyRowChanges *changes, int nchanges,
+								ProllyNodeRef *next);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -349,9 +361,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes"
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK table_changes
+#define PROLLY_CANON_LAST_CALLBACK advance_own
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,
