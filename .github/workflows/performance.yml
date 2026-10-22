@@ -10,12 +10,11 @@
 #   retried where a cell regresses; reported, not gated, on shared VMs.
 #
 # "S suite gate" always reports, so it can be a required check (it isn't
-# until the gate is calibrated: configs/s_gate.toml); it passes without
-# building for a pull request that changes only specs/.
+# until the gate is calibrated: configs/s_gate.toml).
 #
 # Pull requests and pushes run none of this unless the repository variable
 # S_SUITE_PRS is 'true' (it is off while the suite would hold up every pull
-# request): the gate passes without building, as for specs/ alone.  A pull
+# request): the gate passes without building. A pull
 # request labelled s-suite runs it anyway (adding the label starts a run).
 # The nightly and a run by hand are unaffected.
 #
@@ -72,7 +71,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 2
-      - name: Anything outside specs/?
+      - name: Select builds and suite enablement
         id: classify
         env:
           EVENT: ${{ github.event_name }}
@@ -87,11 +86,6 @@ jobs:
           if [ "$EVENT" = pull_request ]; then
             # (HEAD is the merge into the base: its first parent is the base)
             base=$(git rev-parse HEAD^1)
-            changed=$(git diff --name-only HEAD^1 HEAD)
-            printf '%s\n' "$changed"
-            if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qv '^specs/'; then
-              code=false
-            fi
           fi
           # (off for pull requests and pushes unless S_SUITE_PRS, or for a
           # pull request labelled s-suite: see above)
@@ -371,7 +365,7 @@ jobs:
     steps:
       - name: Nothing to compare
         if: needs.classify.result == 'success' && (needs.classify.outputs.code != 'true' || github.event_name != 'pull_request')
-        run: echo "A push, a pull request that changes only specs/, or the S suite off for pull requests (S_SUITE_PRS, no s-suite label); it doesn't compare anything."
+        run: echo "A push or the S suite off for pull requests (S_SUITE_PRS, no s-suite label); it doesn't compare anything."
 
       - name: Classification failed
         if: needs.classify.result != 'success'

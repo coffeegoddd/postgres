@@ -1,8 +1,7 @@
 # The C suite (SQL correctness: the pinned sqllogictest corpus) on every pull
 # request, every push to master and nightly: the full corpus in shards, heap
 # and prolly on each, then one gate over all of them.  "C suite gate" always
-# reports, so it can be a required check: it passes without building for a
-# pull request that changes only specs/.
+# reports, so it can be a required check when pull-request runs are enabled.
 #
 # The gate leaves the pull-request comment as an artifact; the workflow_run
 # commenter (correctness-comment.yml) posts it, so code from a pull request
@@ -38,26 +37,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      code: ${{ steps.classify.outputs.code }}
       shards: ${{ steps.classify.outputs.shards }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 2
-      - uses: ./.github/actions/specs-only
-        id: specs
-      - name: Classify
+      - name: Shard matrix
         id: classify
-        env:
-          CODE: ${{ steps.specs.outputs.code }}
         run: |
-          echo "code=$CODE" | tee -a "$GITHUB_OUTPUT"
           echo "shards=[$(seq -s , 1 "$SHARDS")]" | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: build
     needs: classify
-    if: needs.classify.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -179,38 +168,24 @@ jobs:
           echo "classify: ${{ needs.classify.result }}" >&2
           exit 1
 
-      # (a comment still, so an earlier one doesn't stand for this commit)
-      - name: Specs only
-        if: needs.classify.result == 'success' && needs.classify.outputs.code != 'true'
-        run: |
-          mkdir -p comment
-          { echo '<!-- c-suite -->'
-            echo '## C suite: not run'
-            echo
-            echo "This pull request changes only specs/ at ${{ github.event.pull_request.head.sha }}; the C suite doesn't run."
-          } > comment/comment.md
-
       - uses: actions/checkout@v5
-        if: needs.classify.outputs.code == 'true'
         with:
           fetch-depth: 2
 
       - uses: actions/download-artifact@v5
-        if: needs.classify.outputs.code == 'true' && needs.build.result == 'success'
+        if: needs.build.result == 'success'
         with:
           name: c-build
 
       - name: Unpack the build
-        if: needs.classify.outputs.code == 'true' && needs.build.result == 'success'
+        if: needs.build.result == 'success'
         run: tar -xzf c-build.tgz
 
       - name: Read the corpus pin
-        if: needs.classify.outputs.code == 'true'
         id: corpus
         run: echo "commit=$(cat "$PIN_FILE")" >> "$GITHUB_OUTPUT"
 
       - name: Cached corpus
-        if: needs.classify.outputs.code == 'true'
         id: cache
         uses: actions/cache/restore@v4
         with:
@@ -218,7 +193,7 @@ jobs:
           key: sqllogictest-${{ steps.corpus.outputs.commit }}
 
       - name: Fetch the pinned corpus
-        if: needs.classify.outputs.code == 'true' && steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/checkout@v5
         with:
           repository: dolthub/sqllogictest
@@ -226,13 +201,11 @@ jobs:
           path: slt-corpus
 
       - uses: actions/download-artifact@v5
-        if: needs.classify.outputs.code == 'true'
         with:
           pattern: c-shard-*
           path: shards
 
       - name: Report on every shard
-        if: needs.classify.outputs.code == 'true'
         id: report
         env:
           GH_TOKEN: ${{ github.token }}
@@ -284,7 +257,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v5
-        if: always() && needs.classify.outputs.code == 'true'
+        if: always()
         with:
           name: c-suite-report
           path: |
@@ -295,7 +268,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Verdict
-        if: needs.classify.outputs.code == 'true'
         env:
           STATUS: ${{ steps.report.outputs.status }}
         run: test "$STATUS" = 0

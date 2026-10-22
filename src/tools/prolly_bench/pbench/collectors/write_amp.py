@@ -1,5 +1,5 @@
 """Write amplification: the bytes the server wrote for each byte of row
-data the workload wrote (specs/20-write-amplification.md).
+data the workload wrote. Definitions are in the benchmark README.
 
 The collector has its own interval, wider than the window. Before the
 window it checkpoints, so the warm-up's dirty pages aren't charged to the

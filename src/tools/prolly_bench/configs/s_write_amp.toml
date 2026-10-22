@@ -1,4 +1,4 @@
-# Write amplification (specs/20-write-amplification.md): the standard
+# Write amplification (see the benchmark README): the standard
 # procedure's sizes, workloads and settings, with the write_amp collector,
 # which checkpoints before the window and, after it, has prolly fold its
 # working set (prolly_checkpoint()) and checkpoints again, so the bytes

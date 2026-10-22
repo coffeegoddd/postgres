@@ -44,7 +44,7 @@ jobs:
           esac
           { echo "artifact=$artifact"; echo "file=$file"; echo "marker=$marker"; } >> "$GITHUB_OUTPUT"
 
-      # (a cancelled run leaves none; a specs-only one leaves a short note)
+      # (a cancelled run leaves none)
       - uses: actions/download-artifact@v5
         id: download
         continue-on-error: true

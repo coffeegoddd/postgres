@@ -1,19 +1,30 @@
-# 18. Intended divergences from Dolt
+# Dolt compatibility and test adaptations
 
-**Status: decided by the user 2026-10-18, as recommended (the policy
-below); entries checked on `8faba578f9`.** The ways versioned schemas
-differ from Dolt on purpose, each with a stable ID that Dolt test ports
-cite (`corpus/dolt/ports.json`, a port's review note), so a port doesn't
-re-argue a difference and a bug isn't mistaken for one. The IDs are this
-file's (D1, D2, …), not the removed engine D1's name; an ID is never
-reused, and an entry that stops being a divergence is marked so, not
-deleted.
+This catalog records the behavior and test adaptations associated with the
+stable D1–D23 IDs in `ports.json`. IDs are never reused or renumbered; when
+a difference is removed, mark its entry as resolved and update the ports.
+These are divergence IDs, unrelated to the removed engine named D1.
 
-**Policy** (#153). A difference found while porting is fixed to match
-Dolt, unless Postgres semantics force it; then it gets an entry here,
-and the port cites it. The user is asked only when a decided spec
-conflicts. Scope (#164): every Dolt version-control feature is in scope
-except the staging area (D1); what isn't ported is D10.
+This catalog was moved from the former design specs. It is a record of
+existing contracts and adaptations, not a claim that all differences are
+permanent. GitHub issues track plans and changes:
+
+- [#153](https://github.com/coffeegoddd/postgres/issues/153) tracks parity:
+  every Dolt version-control feature is in scope except the staging area.
+  Fix differences unless PostgreSQL semantics require an adaptation.
+- [#701](https://github.com/coffeegoddd/postgres/issues/701) revisits D6's
+  schema-conflict errors.
+- [#702](https://github.com/coffeegoddd/postgres/issues/702) revisits D12/D13's
+  constraint-violation rows and artifacts.
+- [#700](https://github.com/coffeegoddd/postgres/issues/700) and
+  [#699](https://github.com/coffeegoddd/postgres/issues/699) revisit D17/D18's
+  table and column identity.
+- [#710](https://github.com/coffeegoddd/postgres/issues/710) tracks documenting
+  PostGIS NaN points' send/receive round trip; it is not assigned an ID here.
+
+Change the relevant entry and its tests together when an issue changes the
+behavior. Missing features in D10 remain work to implement, not exceptions
+to the parity goal.
 
 Each entry: what Dolt does, what prolly does, why, and how a port
 adapts.
@@ -58,7 +69,7 @@ adapts.
   and in commits (user, 2026-10-16, Doltgres's scope). Ordinary schemas,
   shared catalogs, roles and large objects are the cluster's or the
   database's, on every branch; dependencies go only from versioned
-  objects to shared ones (spec 11, part 1).
+  objects to shared ones ([historical schema design](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/11-pages-and-dolt-snapshots.md)).
 - **Why:** Postgres's own objects, extensions and ordinary tables keep
   working as they do in Postgres.
 - **Port:** create the case's tables in a versioned schema (the adapter
@@ -193,7 +204,7 @@ adapts.
 - **Dolt:** commit ids are 32-character base32 strings of a 20-byte
   hash.
 - **Prolly:** commit ids are 40 hex digits of BLAKE3's first 20 bytes
-  (64 hex digits of SHA-256 until spec 22's group A), canonical: the
+  (64 hex digits of SHA-256 until [historical design 22](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/22-chunk-store-parity.md)'s group A), canonical: the
   same history gives the same ids on every cluster.
 - **Why:** prolly's own format (Built for Postgres, not ported); ids
   are never compared with Dolt's.
@@ -209,7 +220,7 @@ adapts.
 - **Prolly:** Postgres's MVCC and row locks on the branch's shared
   working set (locks per branch, #91): a second writer to a row waits
   for the first, then proceeds (read committed) or fails with `40001`
-  (repeatable read, serializable). The writer modes (spec 11, 6.2) can
+  (repeatable read, serializable). The writer modes ([historical design 11](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/11-pages-and-dolt-snapshots.md), 6.2) can
   make one writer per working set.
 - **Why:** Postgres's concurrency semantics are what this fork keeps.
 - **Port:** multi-session cases are rederived under Postgres semantics
@@ -259,7 +270,7 @@ OF` are built in D18's shapes.
   starts on that branch; `dbname` alone starts on the database's
   default branch. A connection to a branch that doesn't exist is
   refused, SQLSTATE 42704, as `dolt_checkout`'s is; one naming
-  `detached/...`, a commit's hidden branch (spec 11), whether or not it
+  `detached/...`, a commit's hidden branch ([historical design 11](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/11-pages-and-dolt-snapshots.md)), whether or not it
   exists, is refused with 42939, as `dolt_checkout` refuses that
   name. A session's
   catalogs, `information_schema` included, are its branch's, as in
@@ -381,7 +392,7 @@ OF` are built in D18's shapes.
   (Doltgres finds an unqualified name in any schema). Arguments are any
   expressions of type text, as for any Postgres function; a wrong count
   or type is `42883` (no such function), a NULL ref `22004`.
-- **Why:** spec 21's decision (user, 2026-10-19): the other kinds are
+- **Why:** [historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md)'s decision (user, 2026-10-19): the other kinds are
   versioned too, and leaving them out would hide changes `dolt_status`
   shows. Functions resolve by argument types in Postgres.
 - **Port:** expect qualified names, and the rows of the other objects a
@@ -404,7 +415,7 @@ OF` are built in D18's shapes.
   (`CREATE INDEX ... USING btree (...)`), row security, policies,
   triggers, rules and statistics; other kinds the statement that makes
   them.
-- **Why:** Postgres's DDL, from what the commit holds (spec 21, 4.2);
+- **Why:** Postgres's DDL, from what the commit holds ([historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md), 4.2);
   constraints are named objects in Postgres, so they are statements of
   their own.
 - **Port:** expected statements are prolly's rendering of the case's
@@ -421,8 +432,8 @@ OF` are built in D18's shapes.
   (`data_change` false, `schema_change` true, as Dolt's); a rename that
   also changes rows or definition is a drop and an add. A name argument
   naming either side gives the one row, as in Dolt.
-- **Why:** spec 09's rule, a rename is a removal and an addition of
-  identical content (spec 21, 4.3); nothing else in a commit says two
+- **Why:** [historical design 09](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/09-versioned-catalogs.md)'s rule, a rename is a removal and an addition of
+  identical content ([historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md), 4.3); nothing else in a commit says two
   objects are one.
 - **Port:** a case renaming a table and changing its rows in one commit
   expects a `dropped` and an `added` row; one asking by either name
@@ -440,10 +451,10 @@ OF` are built in D18's shapes.
   `from_row` of `t`'s row type, the commits, their dates, `diff_type`),
   `dolt_history_table(NULL::t)` (`row`, `commit_hash`, `committer`,
   `commit_date`) and `dolt_at(ref, NULL::t)` (`SETOF t`; its planner
-  support estimates its rows from the commit's tree, spec 21). The `dolt_diff`
+  support estimates its rows from the commit's tree, [historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md)). The `dolt_diff`
   view, over `dolt_diff()`, is the system table, every kind of object
   listed (D15). Rows of other versions are decoded as the table is
-  defined now, by column name (spec 21, decision 3), where Dolt follows
+  defined now, by column name ([historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md), decision 3), where Dolt follows
   column tags: a column dropped changes no row (the rows read the
   same); a column renamed reads as NULL in versions before the rename,
   so a row diff across it shows the row modified (or a stat counts the
@@ -454,7 +465,7 @@ OF` are built in D18's shapes.
   table the session hasn't (#612): `dolt_diff_table('t' [, from_ref,
   to_ref])` and `dolt_history_table('t')`, the same columns with the
   rows as `jsonb`, each version's decoded as that version defines the
-  table, read from its tree (spec 21, part 8).
+  table, read from its tree ([historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md), part 8).
 - **Why:** Postgres's catalogs; the functions keep a table's own row
   type. The canonical form records no column tags.
 - **Port:** `SELECT * FROM dolt_diff_t` becomes `dolt_diff_table(NULL::t)`

@@ -24,7 +24,7 @@ METRICS = [("throughput", "TPS ratio", True),
            ("latency_p50_ms", "p50 ratio", False),
            ("latency_p99_ms", "p99 ratio", False)]
 
-THRESHOLD = 0.05       # the verdict `table` shows: spec 06's practical effect
+THRESHOLD = 0.05       # minimum practical effect for the verdict shown by `table`
 
 
 @dataclass

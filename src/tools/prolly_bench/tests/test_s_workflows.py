@@ -123,7 +123,7 @@ class PullRequestSwitchTest(unittest.TestCase):
         out.unlink(missing_ok=True)
         env = {**self.repos.env, 'GITHUB_OUTPUT': str(out), 'EVENT': 'pull_request', 'ACTION': 'opened',
                'ADDED_LABEL': '', 'LABELLED': 'false', 'S_SUITE_PRS': '', **env}
-        result = subprocess.run(['bash', '-e', '-c', step_script('performance.yml', 'Anything outside specs/?')],
+        result = subprocess.run(['bash', '-e', '-c', step_script('performance.yml', 'Select builds and suite enablement')],
                                 cwd=repo, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return outputs(out)['code']
@@ -147,8 +147,8 @@ class PullRequestSwitchTest(unittest.TestCase):
     def test_label_does_not_run_it_on_a_push(self):
         self.assertEqual(self.classify(EVENT='push', LABELLED='true'), 'false')
 
-    def test_specs_only_pull_request_does_not_run_it_with_the_label(self):
-        self.assertEqual(self.classify(changed='specs/x.md', LABELLED='true'), 'false')
+    def test_retired_specs_path_does_not_override_suite_enablement(self):
+        self.assertEqual(self.classify(changed='specs/x.md', LABELLED='true'), 'true')
 
     def test_label_event_is_a_trigger(self):
         text = (REPO / '.github/workflows/performance.yml').read_text()

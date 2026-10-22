@@ -25,8 +25,8 @@ EXACT = ("wal_bytes", "wal_records", "wal_fpi", "wal_fpi_bytes",
          # write_amp's totals that count work alike every run.  Not its
          # pages (nor so the server total): they sum every backend type,
          # and how often the background writer and the checkpointer write
-         # a page dirtied again is timing (specs/17 reads client backends
-         # for pg_stat_io's counters for that reason)
+         # a page dirtied again depends on timing. The pg_stat_io counters
+         # used for work comparisons read client backends for that reason.
          "wa.logical_bytes", "wa.wal.total_bytes", "wa.tree.file_bytes")
 # Instruction counts: close, never exact.
 INSTRUCTIONS = ("instructions_user", "instructions_kernel", "cachegrind_instructions")

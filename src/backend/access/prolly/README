@@ -23,8 +23,9 @@ those trees; remotes exchange their chunks.
 Interfaces and implementations
 ------------------------------
 
-Every component is an interface with implementations behind it, so any
-design choice can be changed later by writing a new implementation:
+The current engine uses the following interfaces and registered components.
+These describe the existing code; there is no plan to build alternative engines.
+Changes to this design are tracked in GitHub issues:
 
 	Interface         Header                  Implementations
 	chunker           prolly_chunker.h        bytes, stub
@@ -145,9 +146,11 @@ Commits
 Table keying (keying_pkprefix.c) keys a folded table by its primary key,
 or, without one, by its rows' leading bytes and content hash with a count
 of identical rows.  A commit folds each table's rows into its data tree:
-in full the first time, then from its baseline, re-reading only the rows on
-pages changed since (change finder "pages", changes_pages.c).  The refs
-("copies", refs_copies.c) keep branch heads, baselines, tags, remotes and
+in full the first time, then from its baseline using the per-table change
+log (the default finder "log", changes_log.c). The older "pages" finder
+(changes_pages.c) remains registered. Incremental folds can fall back to a
+full fold when the log or baseline cannot be used or a budget is exceeded.
+The refs ("copies", refs_copies.c) keep branch heads, baselines, tags, remotes and
 merge state in the chunk store's root.  Diff and merge ("folded",
 diffmerge_folded.c) compare canonical trees table by table, reading only
 subtrees that differ; moving a branch to another commit writes the

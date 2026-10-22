@@ -399,7 +399,7 @@ def main(argv=None) -> int:
                    help="the commit each build's provenance must name")
     r.add_argument("--work-dir", type=Path, default=REPO / "build-bench" / "work",
                    help="where clusters live: on the device under test")
-    r.add_argument("--out", type=Path, default=REPO / "specs" / "results")
+    r.add_argument("--out", type=Path, default=REPO / "engine-results")
     r.add_argument("--no-fio", action="store_true", help="skip the fio device baseline")
     r.add_argument("--shard", metavar="I/N",
                    help="C suite: run shard I of N of the corpus (see cshard)")
@@ -431,7 +431,7 @@ def main(argv=None) -> int:
     t.add_argument("dirs", type=Path, nargs="*",
                    help="result sets (default: the latest per label)")
     t.add_argument("--suite", choices=["S", "V", "C"], default="S")
-    t.add_argument("--results", type=Path, default=REPO / "specs" / "results")
+    t.add_argument("--results", type=Path, default=REPO / "engine-results")
     t.add_argument("-o", "--output", type=Path,
                    help="output path without extension (default RESULTS/summary-SUITE)")
     t.add_argument("--format", choices=["html", "markdown", "both"], default="both")

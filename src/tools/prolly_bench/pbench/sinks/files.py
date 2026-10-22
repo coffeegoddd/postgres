@@ -1,4 +1,4 @@
-"""Results on disk under specs/results/<date>-<suite>-<label>/:
+"""Results on disk under engine-results/<date>-<suite>-<label>/:
 
   config.json       the resolved configuration
   environment.json  machine, build and device (with fio baseline)

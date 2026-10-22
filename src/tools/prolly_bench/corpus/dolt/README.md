@@ -102,7 +102,8 @@ operations (there is no staging area: `dolt_add` stages nothing), call
 `dolt_*` functions with `SELECT`, capture returned commit IDs instead of
 MySQL variables, use PostgreSQL DDL, and check PostgreSQL SQLSTATEs instead
 of Dolt's error text. Each adaptation that follows from an intended
-divergence from Dolt cites that divergence by its ID (D1 no staging area,
+divergence from Dolt cites its stable ID in [the compatibility catalog](divergences.md)
+(D1 no staging area,
 D3 return shapes, D4 SQLSTATEs, D5 transactions, D6 merges and sequences,
 D11 branch-qualified databases, ...). Dolt's `USE mydb/branch` becomes the
 scenario's `connect` operation, and a reference to another branch's table
