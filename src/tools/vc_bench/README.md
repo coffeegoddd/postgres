@@ -261,7 +261,7 @@ observations**, not cold-cache or fully randomized interleaved engine trials.
 Use repeated runs with different seeds to assess between-run effects. The tool
 does not claim to equalize engine cache algorithms or memory limits. PostgreSQL
 uses 256 MB shared buffers with autovacuum disabled; durability remains enabled.
-Dolt automatic GC is disabled in the dedicated server config. Explicit setup
+Dolt and Doltgres automatic GC is disabled in their server configs. Explicit setup
 commits, Go GC, OS reclaim, and normal engine activity can still affect results.
 
 ## Memory, CPU, and I/O

@@ -211,13 +211,7 @@ def start(root, c, engine):
         pid = int((data / "postmaster.pid").read_text().splitlines()[0])
     else:
         data.mkdir(exist_ok=True)
-        cfg = (f"log_level: warning\nlistener:\n  host: 127.0.0.1\n  port: {e['port']}\n"
-               f"data_dir: {json.dumps(str(data))}\ncfg_dir: {json.dumps(str(home / '.doltcfg'))}\n")
-        if engine == "doltgres":
-            cfg += "user:\n  name: postgres\n  password: password\n"
-        else:
-            cfg += "behavior:\n  auto_gc_behavior:\n    enable: false\n"
-        (home / "server.yaml").write_text(cfg)
+        (home / "server.yaml").write_text(go_server_config(root, c, engine))
         cmd = [str(binary), *( ["sql-server", "--config"] if engine == "dolt" else ["-config"]), str(home / "server.yaml")]
         with (home / "server.log").open("a") as f:
             p = subprocess.Popen(cmd, cwd=home, stdout=f, stderr=f, start_new_session=True)
@@ -234,6 +228,18 @@ def start(root, c, engine):
             time.sleep(.1)
     stop(root, c, engine)
     raise RuntimeError(f"{engine} failed to start; see {home / 'server.log'}")
+
+
+def go_server_config(root, c, engine):
+    """A Go engine's server.yaml.  Automatic GC is off for both: each reads
+    behavior.auto_gc_behavior, and treats its absence as enabled."""
+    home = root / engine
+    cfg = (f"log_level: warning\nlistener:\n  host: 127.0.0.1\n  port: {c['engines'][engine]['port']}\n"
+           f"data_dir: {json.dumps(str(home / 'data'))}\ncfg_dir: {json.dumps(str(home / '.doltcfg'))}\n"
+           "behavior:\n  auto_gc_behavior:\n    enable: false\n")
+    if engine == "doltgres":
+        cfg += "user:\n  name: postgres\n  password: password\n"
+    return cfg
 
 
 def stop(root, c, engine):

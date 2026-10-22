@@ -205,6 +205,16 @@ class BenchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'smallest'):
                 core.config(root)
 
+    def test_go_engines_both_disable_auto_gc(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            core.init(root, True)
+            c = core.config(root)
+            for engine in ('dolt', 'doltgres'):
+                cfg = core.go_server_config(root, c, engine)
+                self.assertIn('behavior:\n  auto_gc_behavior:\n    enable: false\n', cfg, engine)
+                self.assertEqual(cfg.count('\nbehavior:'), 1, engine)
+
     def test_passes_validate(self):
         for ok in (['timing'], ['memory'], ['cpu', 'io'], list(core.PASSES)):
             core.check_passes(ok)
