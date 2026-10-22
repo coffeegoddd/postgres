@@ -40,6 +40,9 @@
  * XLOG_BMAP_SHARE		part of a map copied into another relation's, sharing
  *						its blocks: block 0 is the copy's map page, then the
  *						reference-count pages of the blocks
+ * XLOG_BMAP_PRESERVE	before a private block is shared: block 0 is the
+ *						source's page image, main data its physical BlockNumber;
+ *						redo restores both the source buffer and that store block
  * XLOG_BMAP_SHARED		a map's sharing ends: block 0 is the source's header
  *						(its epoch raised), block 1 the copy's (its length)
  * XLOG_BMAP_UNREF		references dropped: reference-count pages, after a
@@ -71,6 +74,7 @@
 #define XLOG_BMAP_CHANGES		0xB0
 #define XLOG_BMAP_SHARE_CHANGES	0xC0
 #define XLOG_BMAP_SHRINK		0xD0
+#define XLOG_BMAP_PRESERVE		0xE0
 
 /* main data of CREATE, TRUNCATE and FREE */
 typedef struct xl_bmap_rel
