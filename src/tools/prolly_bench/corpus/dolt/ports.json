@@ -36845,7 +36845,7 @@
       "index": 2,
       "name": "invalid arguments",
       "source_sha256": "ea4afe3f099ad9fe74c62dfd310da4565a4bb9952c988cc11e174682215edad1",
-      "scenario_sha256": "43ed588a7f12d35ae0cbad954c46360c72a2b972e329556b93b2c961cc9b1079",
+      "scenario_sha256": "13aad552f7ab7637bcbad11609da20a411e2ac3a207cb3277b43c0c01b7500c2",
       "setup": [
         {
           "index": 0,
@@ -36931,7 +36931,7 @@
           "steps": [
             "assert-4"
           ],
-          "note": "Three NULLs leave the table argument's polymorphic type unknown: SQLSTATE 42804 (datatype mismatch), Dolt's ErrInvalidArgumentDetails. (D4)"
+          "note": "Three NULLs resolve to dolt_diff(text, text, text), the table named, which takes no NULL: SQLSTATE 22004 (null value not allowed), Dolt's ErrInvalidArgumentDetails. (D4)"
         },
         {
           "index": 5,
