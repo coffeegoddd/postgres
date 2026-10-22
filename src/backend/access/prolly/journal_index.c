@@ -54,6 +54,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include "access/prolly_hash.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "common/relpath.h"
@@ -147,6 +148,19 @@ static const dshash_parameters registry_params = {
 	0							/* (the registry's own) */
 };
 
+/*
+ * A chunk's key is its content hash, whose first bytes are its hash in the
+ * table (prolly_hash_bucket()).  (A hash of it, dshash_memhash()'s, cost as
+ * much as the rest of a probe; every chunk a commit writes probes for each
+ * chunk it names.)
+ */
+static dshash_hash
+chunk_key_hash(const void *v, size_t size, void *arg)
+{
+	Assert(size >= sizeof(uint32));
+	return prolly_hash_bucket(v);
+}
+
 static dshash_parameters
 chunk_params(void)
 {
@@ -154,7 +168,7 @@ chunk_params(void)
 		JINDEX_MAX_HASH,
 		sizeof(Chunk),
 		dshash_memcmp,
-		dshash_memhash,
+		chunk_key_hash,
 		dshash_memcpy,
 		tranche
 	};

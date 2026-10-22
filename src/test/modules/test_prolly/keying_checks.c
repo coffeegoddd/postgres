@@ -170,6 +170,30 @@ key_alone(const ProllyKeyingRoutine *kr, ProllyKeying *k, Relation rel,
 	return same;
 }
 
+/*
+ * Whether encode_row() without a content hash to give (content NULL) gives
+ * rel's row the key and row bytes it did with one: a keyless keying still
+ * keys the row by its content.
+ */
+static bool
+without_content(const ProllyKeyingRoutine *kr, ProllyKeying *k, Relation rel,
+				int id, const char *t, int n, const EncodedRow *er)
+{
+	TupleTableSlot *slot = row_slot(rel, id, t, n);
+	StringInfoData key;
+	StringInfoData row;
+	bool		same;
+
+	initStringInfo(&key);
+	initStringInfo(&row);
+	PROLLY_CALL(kr, encode_row, k, slot, &key, &row, NULL);
+	same = same_bytes(&key, &er->key) && same_bytes(&row, &er->row);
+	ExecDropSingleTupleTableSlot(slot);
+	pfree(key.data);
+	pfree(row.data);
+	return same;
+}
+
 static bool
 same_hash(const ProllyHash *a, const ProllyHash *b)
 {
@@ -255,6 +279,8 @@ keying_keys_and_content_body(const ProllyImplInfo *impl)
 		elog(ERROR, "different rows got the same content hash");
 	if (!key_alone(kr, kp, pk, 5, "two", 2, &b))
 		elog(ERROR, "a row's key alone is not the key its row was encoded with");
+	if (!without_content(kr, kp, pk, 5, "two", 2, &b))
+		elog(ERROR, "a keyed row encoded without its content hash got another key or row");
 
 	/* Keyless: the key is the content; identical rows share it. */
 	encode(kr, kn, none, 5, "one", 1, &a);
@@ -264,6 +290,8 @@ keying_keys_and_content_body(const ProllyImplInfo *impl)
 		elog(ERROR, "identical keyless rows got different keys");
 	if (same_bytes(&a.key, &c.key))
 		elog(ERROR, "different keyless rows got the same key");
+	if (!without_content(kr, kn, none, 5, "one", 1, &a))
+		elog(ERROR, "a keyless row encoded without its content hash got another key or row");
 	{
 		TupleTableSlot *slot = row_slot(none, 5, "one", 1);
 		StringInfoData key;

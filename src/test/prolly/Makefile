@@ -34,7 +34,8 @@ export PROLLY_AM
 prolly_am.conf: FORCE
 	@{ echo "default_table_access_method = '$(PROLLY_AM)'"; \
 	   echo "max_prepared_transactions = 10"; \
-	   echo "prolly.autofold_threshold = 0"; } > $@
+	   echo "prolly.autofold_threshold = 0"; \
+	   echo "prolly_fold_worker = off"; } > $@
 
 # Version control of branches made by copying: only the page-based engine
 # keeps branches as copies, so these tests' tables are prolly's whatever
@@ -42,11 +43,20 @@ prolly_am.conf: FORCE
 vc.conf: FORCE
 	@{ echo "default_table_access_method = 'prolly'"; \
 	   echo "max_prepared_transactions = 10"; \
-	   echo "prolly.autofold_threshold = 0"; } > $@
+	   echo "prolly.autofold_threshold = 0"; \
+	   echo "prolly_fold_worker = off"; } > $@
 
 # The TAP tests' instances (TEMP_CONFIG), no autovacuum folds either.
-TEMP_CONFIG ?= $(abs_top_srcdir)/$(subdir)/autofold_off.conf
+# (an environment's TEMP_CONFIG, as CI's, kept, with these settings after
+# it: TEMP_CONFIG ?= would let it replace them)
+# (a make this one runs inherits it as made: not made again from itself)
+TAP_TEMP_CONFIG := $(abs_top_builddir)/$(subdir)/tap_temp.conf
+ifneq ($(TEMP_CONFIG),$(TAP_TEMP_CONFIG))
+$(shell mkdir -p '$(dir $(TAP_TEMP_CONFIG))' && { $(if $(TEMP_CONFIG),cat '$(TEMP_CONFIG)' &&) cat '$(abs_top_srcdir)/$(subdir)/autofold_off.conf'; } > '$(TAP_TEMP_CONFIG).new' && mv '$(TAP_TEMP_CONFIG).new' '$(TAP_TEMP_CONFIG)')
+endif
+override TEMP_CONFIG := $(TAP_TEMP_CONFIG)
 export TEMP_CONFIG
+
 
 # Heap tables in block-mapped storage instead (debug_block_mapped_heap).
 bmap.conf: FORCE
@@ -132,7 +142,7 @@ require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
 
 clean distclean:
-	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf output_iso
+	rm -rf $(pg_regress_clean_files) prolly_am.conf bmap.conf vc.conf tap_temp.conf output_iso
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \

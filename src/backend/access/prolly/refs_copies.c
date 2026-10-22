@@ -2555,18 +2555,76 @@ copies_checkpoint(ProllyNodeRef *root)
 }
 
 /*
- * Leaving a branch with changes takes a working-set checkpoint of it, so
- * the pages it changed needn't be kept until its next commit: if its
- * working set isn't its head's, nor what its baseline's fold made already.
- * Not in a transaction that can't write, nor in a transaction block (the
- * refs, held to the transaction's end, would hold up others' commits), nor
- * if the branch's head moved unseen by the snapshot (its fold wouldn't be
- * the branch's), nor its baseline (another's checkpoint or fold, which the
- * snapshot can't fold from: it would read every table in full, and replace
- * that one's baseline with an unsettled one).  (A session choosing its
- * first branch, as it connects, leaves none.)  A working set known (#482)
- * is compared without a fold; one not known is folded once, as the
- * checkpoint, kept even if clean (its fold took its log's entries).
+ * copies_checkpoint(), the fold made before the refs are taken: they are
+ * held (to the transaction's end) only to see that neither the head nor
+ * the baseline moved since the fold began, and to set the baseline, and
+ * taken only if free.  If either moved, or another holds the refs,
+ * nothing is set, and the caller rolls back what the fold consumed; held
+ * by another as it begins, nothing is folded at all.  The fold is by a
+ * snapshot taken after the baseline and head are read: one taken before
+ * would see none of a fold that moved the baseline in between (the check
+ * then passing), and read every table in full.
+ */
+static bool
+copies_checkpoint_unless_moved(ProllyNodeRef *root)
+{
+	char	   *name = branch_ops()->current();
+	ProllyNodeRef baseline;
+	ProllyNodeRef now;
+	ProllyNodeRef next;
+	ProllyHash	head;
+	ProllyHash	head_now;
+	bool		had;
+	bool		had_head;
+	bool		has;
+	bool		has_head;
+
+	refs_init();
+	if (PROLLY_HAS(env.chunk_store, root_free) &&
+		!env.chunk_store->root_free(env.chunks))
+		return false;
+	had = branch_baseline(name, &baseline);
+	had_head = branch_head(name, &head);
+	PushActiveSnapshot(GetLatestSnapshot());
+	fold_from_baseline(root, &next, false);
+	PopActiveSnapshot();
+
+	/*
+	 * (never waiting for the refs: the fold deleted the log's entries it
+	 * consumed, which whoever holds the refs may be waiting to delete too;
+	 * held by another, it rolls back and folds again later)
+	 */
+	if (PROLLY_HAS(env.chunk_store, try_hold_root) &&
+		!env.chunk_store->try_hold_root(env.chunks))
+		return false;
+	lock_refs();
+	has = branch_baseline(name, &now);
+	has_head = branch_head(name, &head_now);
+	if (has != had || (had && !same_hash(&baseline.hash, &now.hash)) ||
+		has_head != had_head || (had_head && !same_hash(&head, &head_now)))
+		return false;
+	branch_set_baseline(name, &next, root);
+	return true;
+}
+
+/*
+ * Leaving a branch leaves its changes in its copies, unfolded: its next
+ * fold (a commit, a status, another session's read) reads them from its
+ * change finder's record, as it would have had the session stayed.  Only a
+ * change finder that keeps what it reads changes from until a fold (old
+ * versions of pages, fold_on_leave()) takes a working-set checkpoint of a
+ * branch with changes as it is left, so what it keeps is freed then: if
+ * its working set isn't its head's, nor what its baseline's fold made
+ * already.  Not in a transaction that can't write, nor in a transaction
+ * block (the refs, held to the transaction's end, would hold up others'
+ * commits), nor if the branch's head moved unseen by the snapshot (its
+ * fold wouldn't be the branch's), nor its baseline (another's checkpoint
+ * or fold, which the snapshot can't fold from: it would read every table
+ * in full, and replace that one's baseline with an unsettled one).  (A
+ * session choosing its first branch, as it connects, leaves none.)  A
+ * working set known (#482) is compared without a fold; one not known is
+ * folded once, as the checkpoint, kept even if clean (its fold took the
+ * finder's record of its changes).
  */
 static void
 copies_checkout(const char *name)
@@ -2574,6 +2632,7 @@ copies_checkout(const char *name)
 	char	   *current = branch_ops()->current();
 	Oid			oid = strcmp(current, name) != 0 ? branch_oid(name) : InvalidOid;
 	ProllyHash	only_head;
+	const ProllyChangeFinderRoutine *finder = prolly_change_finder();
 
 	/* (one with only a head gets its copies, a connection's too) */
 	if (strcmp(current, name) != 0 && !OidIsValid(oid) &&
@@ -2602,7 +2661,8 @@ copies_checkout(const char *name)
 				 errhint("The transaction might succeed if retried.")));
 	if (strcmp(current, name) != 0 && ActiveSnapshotSet() &&
 		!XactReadOnly && !RecoveryInProgress() && !IsTransactionBlock() &&
-		OidIsValid(oid))
+		OidIsValid(oid) && PROLLY_HAS(finder, fold_on_leave) &&
+		finder->fold_on_leave())
 	{
 		ProllyNodeRef working;
 		ProllyNodeRef kept;
@@ -2945,6 +3005,129 @@ copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
 		return true;
 	branch_ops()->run_on(branch, read_fold_into, &rf);
 	return true;
+}
+
+/* What a read of definitions began at, for publishing its root. */
+typedef struct DefinitionsRead
+{
+	BranchFoldStamp stamp;
+	Snapshot	snap;
+	bool		have;
+	ProllyNodeRef baseline;
+} DefinitionsRead;
+
+/*
+ * The session branch's definitions: its working set known if any (the rows
+ * in it are right too), else a fold of no table's rows.  That isn't the
+ * working set, unless no table's rows changed since: *read says what the
+ * read began at, for publish_definitions() to publish it then.
+ */
+static void
+copies_read_definitions(ProllyNodeRef *root, List **left_out, bool *rows,
+						void **read)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	char	   *name = branch_ops()->current();
+	bool		have = branch_baseline(name, &baseline);
+
+	if (rows)
+		*rows = true;
+	if (read)
+		*read = NULL;
+	if (known_working_set(name, MyBranch, have ? &baseline : NULL, true,
+						  root))
+		return;
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, read_definitions))
+	{
+		ReadFold	rf = {InvalidOid, root, left_out, false};
+
+		read_fold_into(&rf);
+		return;
+	}
+	if (rows)
+		*rows = false;
+	if (read)
+	{
+		DefinitionsRead *dr = palloc0(sizeof(DefinitionsRead));
+
+		branch_fold_stamp(MyBranch, &dr->stamp);
+		dr->snap = fold_snapshot();
+		dr->have = have;
+		if (have)
+			dr->baseline = baseline;
+		*read = dr;
+	}
+	dc.canonicalizer->read_definitions(have ? &baseline : NULL, root,
+									   left_out);
+}
+
+/*
+ * The session branch's changes to table relid since its baseline, read
+ * without a fold; none if its working set is known, which a read takes
+ * as it is.
+ */
+static bool
+copies_working_changes(Oid relid, ProllyNodeRef *data,
+					   ProllyRowChangeVisit visit, void *arg)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	ProllyNodeRef known;
+	char	   *name = branch_ops()->current();
+
+	/* (asked without taking it: the read that follows takes it) */
+	if (!branch_baseline(name, &baseline) ||
+		(fold_caches_usable() &&
+		 branch_fold_known(MyBranch, fold_snapshot(), &baseline.hash, true,
+						   &known.hash)))
+		return false;
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, table_changes))
+		return false;
+	return dc.canonicalizer->table_changes(&baseline, relid, data, visit, arg);
+}
+
+/*
+ * The transaction's own row changes folded into the session branch's
+ * baseline, under the refs (so baselines move one transaction at a time).
+ * Only if they're free: the fold is an optimization a commit mustn't wait
+ * for (nor deadlock or time out on); held by another, the changes are left
+ * to the next fold, as without it.
+ */
+static bool
+copies_fold_own(const ProllyRowChanges *changes, int nchanges)
+{
+	char	   *name = branch_ops()->current();
+	ProllyNodeRef baseline;
+	ProllyNodeRef next;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, advance_own) || nchanges == 0)
+		return false;
+	refs_init();
+	if (!PROLLY_HAS(env.chunk_store, try_hold_root) ||
+		!env.chunk_store->try_hold_root(env.chunks))
+		return false;
+	lock_refs();
+	if (!branch_baseline(name, &baseline) ||
+		!dc.canonicalizer->advance_own(&baseline, changes, nchanges, &next))
+		return false;
+	branch_set_baseline(name, &next, NULL);
+	return true;
+}
+
+static void
+copies_publish_definitions(void *read, const ProllyNodeRef *root,
+						   bool complete)
+{
+	DefinitionsRead *dr = read;
+
+	if (dr != NULL)
+		publish_fold(&dr->stamp, dr->snap, dr->have ? &dr->baseline : NULL,
+					 root, complete);
 }
 
 static bool
@@ -4335,6 +4518,15 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.branches = copies_branches,
 	.working_set = copies_working_set,
 	.read_working_set = copies_read_working_set,
+	.read_definitions = copies_read_definitions,
+	.working_changes = copies_working_changes,
+	.publish_definitions = copies_publish_definitions,
+	.fold_own = copies_fold_own,
+	.checkpoint_unless_moved = copies_checkpoint_unless_moved,
+	.moved_databases = branch_generations_moved_databases,
+	.moved_branches = branch_generations_moved,
+	.saw_branch = branch_generations_saw,
+	.saw_database = branch_generations_saw_database,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

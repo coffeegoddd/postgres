@@ -64,7 +64,7 @@ typedef struct ProllyKeyingRoutine
 
 	/*
 	 * Encode slot's row: append its canonical encoding to row and its key to
-	 * key, and set its content hash.
+	 * key, and set its content hash (content NULL: not wanted).
 	 */
 	void		(*encode_row) (ProllyKeying *k, TupleTableSlot *slot,
 							   StringInfo key, StringInfo row,

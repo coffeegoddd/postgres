@@ -155,6 +155,17 @@ typedef struct ProllyTreeCursor ProllyTreeCursor;
 typedef bool (*ProllyTreeVisitNode) (const ProllyNodeRef *node, uint16 level,
 									 void *arg);
 
+/*
+ * Called for each row a read of changes finds (the change finder's
+ * changes()), as a tree's diff() calls ProllyTreeVisitChange: false stops
+ * the read there.
+ */
+typedef bool (*ProllyRowChangeVisit) (ProllyDiffKind kind,
+									  const ProllyKey *key,
+									  const ProllyValue *before,	/* NULL if added */
+									  const ProllyValue *after,	/* NULL if removed */
+									  void *arg);
+
 /* Called for each key that differs between two trees (diff). */
 typedef void (*ProllyTreeVisitChange) (ProllyDiffKind kind,
 									   const ProllyKey *key,

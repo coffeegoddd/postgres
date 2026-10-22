@@ -133,6 +133,8 @@ typedef struct Copy
 	char	   *row;			/* a candidate's: its entry's tuple */
 	uint32		rowlen;
 	int64		delta;
+	ItemPointerData tid;		/* a candidate's: where its key's version is
+								 * (invalid: not known), as the log says */
 } Copy;
 
 typedef struct Finder
@@ -151,6 +153,7 @@ typedef struct Finder
 	AttrNumber	keyattrs[INDEX_MAX_KEYS];
 	RegProcedure eqproc[INDEX_MAX_KEYS];
 	StrategyNumber eqstrat[INDEX_MAX_KEYS];
+	BlockNumber nblocks;		/* the table's, as the finder opened */
 	TupleTableSlot *keyslot;	/* virtual: the key columns, else nulls */
 	TupleTableSlot *rowslot;
 	Datum	   *values;
@@ -395,6 +398,7 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->env.compare_arg = f;
 	prolly_keying_use_env(&f->krefs, f->kr, f->k, f->tree, &f->env);
 	f->desc = RelationGetDescr(rel);
+	f->nblocks = RelationGetNumberOfBlocks(rel);
 	f->ccxt = AllocSetContextCreate(CurrentMemoryContext, "log fold copies",
 									ALLOCSET_DEFAULT_SIZES);
 	/* (more rows changed than the table holds: reading it all is less) */
@@ -470,6 +474,8 @@ compact_copies(Finder *f)
 								(const uint8 *) c->key, c->keylen))
 		{
 			f->c[u - 1].delta += c->delta;
+			if (!ItemPointerIsValid(&f->c[u - 1].tid))
+				f->c[u - 1].tid = c->tid;
 			pfree(c->key);
 			pfree(c->row);
 			continue;
@@ -493,7 +499,7 @@ compact_copies(Finder *f)
 
 static void
 add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
-		 int64 delta)
+		 int64 delta, const ItemPointerData *tid)
 {
 	Copy	   *c;
 
@@ -539,20 +545,22 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 	c->row = MemoryContextAlloc(f->ccxt, Max(rowlen, 1));
 	memcpy(c->row, row, rowlen);
 	c->delta = delta;
+	if (tid != NULL)
+		c->tid = *tid;
+	else
+		ItemPointerSetInvalid(&c->tid);
 }
 
 /* A whole row's copy: the tuple's key and encoded row, counted delta. */
 static void
 row_copy(Finder *f, HeapTuple tup, int64 delta)
 {
-	ProllyHash	content;
-
 	ExecForceStoreHeapTuple(tup, f->rowslot, false);
 	resetStringInfo(&f->key);
 	resetStringInfo(&f->row);
-	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, &content);
+	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
 	ExecClearTuple(f->rowslot);
-	add_copy(f, &f->key, f->row.data, f->row.len, delta);
+	add_copy(f, &f->key, f->row.data, f->row.len, delta, NULL);
 }
 
 /*
@@ -594,8 +602,6 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 	}
 	else
 	{
-		ProllyHash	content;
-
 		heap_deform_tuple(entry, f->desc, f->values, f->isnull);
 		ExecClearTuple(f->keyslot);
 		for (int i = 0; i < f->desc->natts; i++)
@@ -616,9 +622,18 @@ entry_visit(HeapTuple entry, int32 delta, void *arg)
 		}
 		ExecStoreVirtualTuple(f->keyslot);
 		resetStringInfo(&f->key);
-		resetStringInfo(&f->row);
-		PROLLY_CALL(f->kr, encode_row, f->k, f->keyslot, &f->key, &f->row, &content);
-		add_copy(f, &f->key, (const char *) entry->t_data, entry->t_len, 0);
+		if (!PROLLY_CALL(f->kr, encode_key, f->k, f->keyslot, &f->key))
+		{
+			/*
+			 * (the keying keys rows by content, though the table's read as
+			 * keyed: keyless() said otherwise; never, as keyings are)
+			 */
+			f->give_up = true;
+			f->reason = PROLLY_FULL_KEYING_CHANGED;
+			return false;
+		}
+		add_copy(f, &f->key, (const char *) entry->t_data, entry->t_len, 0,
+				 &entry->t_self);
 	}
 	CHECK_FOR_INTERRUPTS();
 	return !f->give_up;
@@ -654,7 +669,33 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
 {
 	HeapTupleData entry;
 	ScanKeyData skey[INDEX_MAX_KEYS];
-	ProllyHash	content;
+
+	/*
+	 * (where the log says the key's version is: the row, if the snapshot
+	 * sees the version there and it has the key, as a table with a key has
+	 * one row by a key a snapshot sees; else, updated since, deleted, or
+	 * its place reused, the key looked up)
+	 */
+	if (ItemPointerIsValid(&c->tid) &&
+		ItemPointerGetBlockNumber(&c->tid) < f->nblocks &&
+		table_tuple_fetch_row_version(f->rel, (ItemPointer) &c->tid, f->snap,
+									  f->rowslot))
+	{
+		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
+		ProllyKey	nk;
+
+		resetStringInfo(&f->key);
+		resetStringInfo(&f->row);
+		PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
+		ExecClearTuple(f->rowslot);
+		nk.data = (const uint8 *) f->key.data;
+		nk.len = f->key.len;
+		if (keying_compare(&nk, &ck, f) == 0)
+		{
+			pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_LOCATED, 1);
+			return true;
+		}
+	}
 
 	entry.t_data = (HeapTupleHeader) c->row;
 	entry.t_len = c->rowlen;
@@ -673,7 +714,7 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
 		return false;
 	resetStringInfo(&f->key);
 	resetStringInfo(&f->row);
-	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, &content);
+	PROLLY_CALL(f->kr, encode_row, f->k, f->rowslot, &f->key, &f->row, NULL);
 	ExecClearTuple(f->rowslot);
 	return true;
 }
@@ -721,18 +762,12 @@ merge_build(Finder *f, const ProllyTableFold *baseline, const ProllyEdit *edits,
 	f->work.merges++;
 }
 
-/* Each candidate's old and new rows; the pairs that differ are edits. */
+/* The candidates kept once per key, as the keying tells keys apart. */
 static void
-fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
+unique_keys(Finder *f)
 {
-	ProllyEdit *edits;
-	int			nedits = 0;
-	int			u = 0;
-	ProllyTreeCursor *cur;
-	IndexScanDesc scan;
-	StringInfoData value;
+	int64		u = 0;
 
-	/* (each key once, as the keying tells keys apart) */
 	if (f->n > 1)
 		qsort_arg(f->c, f->n, sizeof(Copy), copy_cmp, f);
 	for (int64 i = 0; i < f->n; i++)
@@ -747,15 +782,38 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	f->n = u;
 	f->work.candidates += f->n;
 	f->work.rows_read += f->n;
+}
 
-	edits = MemoryContextAllocHuge(CurrentMemoryContext,
-								   Max(f->n, 1) * sizeof(ProllyEdit));
-	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, &baseline->data,
+/*
+ * A candidate that differs: the row data has by its key (kind REMOVED or
+ * MODIFIED: before), and the row the snapshot sees (ADDED or MODIFIED:
+ * after, with its own key's bytes; REMOVED: the candidate's key).  What
+ * they point to is valid during the call only, but a REMOVED one's key,
+ * which is the candidate's.
+ */
+typedef bool (*ChangeEmit) (Finder *f, ProllyDiffKind kind,
+							const ProllyKey *key, const ProllyValue *before,
+							const ProllyValue *after, void *arg);
+
+/*
+ * Each candidate (unique_keys()'s, in key order) looked up in data and in
+ * the heap, by the finder's snapshot; those that differ emitted, until an
+ * emit returns false.
+ */
+static void
+each_change(Finder *f, const ProllyNodeRef *data, ChangeEmit emit, void *arg)
+{
+	ProllyTreeCursor *cur;
+	IndexScanDesc scan;
+	StringInfoData value;
+	bool		go = true;
+
+	cur = PROLLY_CALL(f->tree, cursor_open, &f->env, data,
 					  CurrentMemoryContext);
 	scan = index_beginscan(f->rel, f->pk, false, f->snap, NULL, f->nkeys, 0,
 						   SO_NONE);
 	initStringInfo(&value);
-	for (int64 i = 0; i < f->n; i++)
+	for (int64 i = 0; go && i < f->n; i++)
 	{
 		Copy	   *c = &f->c[i];
 		ProllyKey	ck = {(const uint8 *) c->key, c->keylen};
@@ -781,29 +839,68 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 			;					/* the same row */
 		else if (has)
 		{
-			ProllyEdit *e = &edits[nedits++];
-			char	   *kb = palloc(Max(f->key.len, 1));
-			char	   *vb = palloc(Max(value.len, 1));
+			ProllyKey	nk = {(const uint8 *) f->key.data, f->key.len};
+			ProllyValue nv = {(const uint8 *) value.data, value.len};
 
-			memcpy(kb, f->key.data, f->key.len);
-			memcpy(vb, value.data, value.len);
-			e->key.data = (const uint8 *) kb;
-			e->key.len = f->key.len;
-			e->value.data = (const uint8 *) vb;
-			e->value.len = value.len;
-			e->is_delete = false;
+			go = emit(f, had ? PROLLY_DIFF_MODIFIED : PROLLY_DIFF_ADDED, &nk,
+					  had ? &v : NULL, &nv, arg);
 		}
 		else if (had)
-		{
-			ProllyEdit *e = &edits[nedits++];
-
-			e->key = ck;
-			e->is_delete = true;
-		}
+			go = emit(f, PROLLY_DIFF_REMOVED, &ck, &v, NULL, arg);
 		CHECK_FOR_INTERRUPTS();
 	}
 	index_endscan(scan);
 	PROLLY_CALL(f->tree, cursor_close, cur);
+}
+
+typedef struct Edits
+{
+	ProllyEdit *edits;
+	int			nedits;
+} Edits;
+
+static bool
+edit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
+		  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	Edits	   *ed = arg;
+	ProllyEdit *e = &ed->edits[ed->nedits++];
+
+	if (kind == PROLLY_DIFF_REMOVED)
+	{
+		e->key = *key;
+		e->is_delete = true;
+	}
+	else
+	{
+		char	   *kb = palloc(Max(key->len, 1));
+		char	   *vb = palloc(Max(after->len, 1));
+
+		memcpy(kb, key->data, key->len);
+		memcpy(vb, after->data, after->len);
+		e->key.data = (const uint8 *) kb;
+		e->key.len = key->len;
+		e->value.data = (const uint8 *) vb;
+		e->value.len = after->len;
+		e->is_delete = false;
+	}
+	return true;
+}
+
+/* Each candidate's old and new rows; the pairs that differ are edits. */
+static void
+fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
+{
+	Edits		ed = {NULL, 0};
+	int			nedits;
+	ProllyEdit *edits;
+
+	unique_keys(f);
+	ed.edits = MemoryContextAllocHuge(CurrentMemoryContext,
+									  Max(f->n, 1) * sizeof(ProllyEdit));
+	each_change(f, &baseline->data, edit_emit, &ed);
+	edits = ed.edits;
+	nedits = ed.nedits;
 	f->work.rows_written += nedits;
 	/* (many edits: merged, a pass over the baseline; else each applied) */
 	if (nedits > 0 &&
@@ -1126,6 +1223,22 @@ own_copies(Finder *f, ItemPointerData *tids, int ntids)
 	}
 }
 
+/* What a fold or a read of changes did, counted. */
+static void
+count_work(const Finder *f)
+{
+	counters.pages += f->work.pages;
+	counters.candidates += f->work.candidates;
+	counters.full += f->work.full;
+	counters.rows_read += f->work.rows_read;
+	counters.rows_written += f->work.rows_written;
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f->work.candidates);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f->work.full);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_READ, f->work.rows_read);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_WRITTEN, f->work.rows_written);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MERGE_BUILDS, f->work.merges);
+}
+
 /* ----------------------------------------------------------------
  * Callbacks
  * ----------------------------------------------------------------
@@ -1212,16 +1325,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 							   (int64) f.work.rows_read,
 							   INSTR_TIME_GET_MILLISEC(took));
 	}
-	counters.pages += f.work.pages;
-	counters.candidates += f.work.candidates;
-	counters.full += f.work.full;
-	counters.rows_read += f.work.rows_read;
-	counters.rows_written += f.work.rows_written;
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f.work.candidates);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f.work.full);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_READ, f.work.rows_read);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_ROWS_WRITTEN, f.work.rows_written);
-	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_MERGE_BUILDS, f.work.merges);
+	count_work(&f);
 	if (next)
 	{
 		State		ns = {0};
@@ -1236,6 +1340,86 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 	finder_close(&f);
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(cxt);
+}
+
+/*
+ * Leaving a branch folds nothing: the log keeps nothing a fold frees but
+ * its entries, which the branch's next fold reads.
+ */
+static bool
+log_fold_on_leave(void)
+{
+	return false;
+}
+
+typedef struct VisitChanges
+{
+	ProllyRowChangeVisit visit;
+	void	   *arg;
+} VisitChanges;
+
+static bool
+visit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
+		   const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	VisitChanges *vc = arg;
+
+	return vc->visit(kind, key, before, after, vc->arg);
+}
+
+/*
+ * The rows that differ from the baseline's, from the log's entries since,
+ * as a fold from the baseline finds them, without the tree: only where that
+ * fold would read nothing else (not in full, not for a snapshot that
+ * doesn't see the baseline's fold, nor from a baseline unsettled, nor for a
+ * keyless table, whose rows are counts, nor after the table was emptied).
+ */
+static bool
+log_changes(Relation rel, const ProllyTreeEnv *env,
+			const ProllyTableFold *baseline, ProllyRowChangeVisit visit,
+			void *arg)
+{
+	Finder		f;
+	State		st;
+	ProllyComponents c;
+	uint64		identity = 0;
+	bool		ok;
+	MemoryContext cxt;
+	MemoryContext old;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "log changes",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	finder_open(&f, rel, env);
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log)
+		identity = PROLLY_CALL(c.change_log, identity, rel);
+	ok = !f.keyless && !f.give_up && !prolly_full_fold_wanted(&f.reason) &&
+		identity != 0 && parse_state(&baseline->state, &st) &&
+		st.log == identity && sees_fold(f.snap, &st) &&
+		!(st.flags & STATE_UNSETTLED) && !storage_unseen(rel, f.snap);
+	if (ok)
+	{
+		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
+
+		f.compact = true;
+		ok = PROLLY_CALL(c.change_log, read, f.rel, f.snap, &pos, entry_visit,
+						 &f) &&
+			!f.give_up && !f.emptied;
+	}
+	if (ok)
+	{
+		VisitChanges vc = {visit, arg};
+
+		compact_copies(&f);
+		unique_keys(&f);
+		each_change(&f, &baseline->data, visit_emit, &vc);
+		count_work(&f);
+	}
+	finder_close(&f);
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return ok;
 }
 
 /* A state holds no nodes: the log's entries are rows, not chunks. */
@@ -1281,6 +1465,33 @@ log_fold_rows(Relation rel, const ProllyTreeEnv *env,
 	return ok;
 }
 
+/* Would log_advance() take rel's state as it is?  (Into c, identity, st.) */
+static bool
+advance_holds(Relation rel, const ProllyValue *state, ProllyComponents *c,
+			  uint64 *identity, State *st)
+{
+	Snapshot	snap = GetActiveSnapshot();
+
+	prolly_components_for_relation(rel, c);
+	if (c->change_log == NULL || !PROLLY_HAS(c->change_log, consume_own))
+		return false;
+	*identity = PROLLY_CALL(c->change_log, identity, rel);
+	return *identity != 0 && parse_state(state, st) && st->log == *identity &&
+		!(st->flags & STATE_UNSETTLED) && sees_fold(snap, st) &&
+		!storage_unseen(rel, snap);
+}
+
+/* can_advance(): log_advance()'s checks, consuming nothing. */
+static bool
+log_can_advance(Relation rel, const ProllyValue *state)
+{
+	ProllyComponents c;
+	uint64		identity = 0;
+	State		st;
+
+	return advance_holds(rel, state, &c, &identity, &st);
+}
+
 /*
  * The state of a baseline that holds rel's last baseline's rows with the
  * transaction's own changes applied (a commit of them alone), into next:
@@ -1303,13 +1514,7 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 	ProllyLogPosition rest = {0};
 	Snapshot	snap = GetActiveSnapshot();
 
-	prolly_components_for_relation(rel, &c);
-	if (c.change_log == NULL || !PROLLY_HAS(c.change_log, consume_own))
-		return false;
-	identity = PROLLY_CALL(c.change_log, identity, rel);
-	if (identity == 0 || !parse_state(state, &st) || st.log != identity ||
-		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
-		storage_unseen(rel, snap))
+	if (!advance_holds(rel, state, &c, &identity, &st))
 		return false;
 	{
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
@@ -1359,4 +1564,7 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.fold_rows = log_fold_rows,
 	.state_refs = log_state_refs,
 	.advance = log_advance,
+	.can_advance = log_can_advance,
+	.fold_on_leave = log_fold_on_leave,
+	.changes = log_changes,
 };

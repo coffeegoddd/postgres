@@ -123,5 +123,44 @@ SELECT * FROM entries('bn.h');
 SELECT same_as_full() AS hot;
 COMMIT;
 
+-- a quarter of a table never vacuumed or analyzed (no reltuples): its rows
+-- counted from its pages, so 70000 entries of 300000 rows' table are
+-- noted, and 85000, past a quarter, aren't
+CREATE TABLE bn.e (id int PRIMARY KEY, v text);
+INSERT INTO bn.e SELECT g, 'v' FROM generate_series(1, 300000) g;
+SELECT length(dolt_commit('-Am', 'estimated')::text) AS committed;
+SELECT reltuples < 0 AS never_counted FROM pg_class WHERE oid = 'bn.e'::regclass;
+BEGIN;
+UPDATE bn.e SET v = 'w' WHERE id <= 70000;
+SELECT * FROM entries('bn.e');
+SELECT same_as_full() AS quarter_under;
+ROLLBACK;
+BEGIN;
+UPDATE bn.e SET v = 'w' WHERE id <= 85000;
+SELECT (entries('bn.e')).full_read AS quarter_past;
+ROLLBACK;
+-- ... counting the rows as they were before the transaction: versions it
+-- made and replaced again (1000 keys written 60 times, still 1000 entries)
+-- aren't rows of the table's, so 85000 entries are still past a quarter
+BEGIN;
+DO $$ BEGIN FOR i IN 1..60 LOOP UPDATE bn.e SET v = 'hot' || i WHERE id <= 1000; END LOOP; END $$;
+SELECT * FROM entries('bn.e');
+UPDATE bn.e SET v = 'w' WHERE id > 1000 AND id <= 85000;
+SELECT (entries('bn.e')).full_read AS rewritten_quarter_past;
+ROLLBACK;
+
+-- With statistics, their density at the table's size now: analyzed at
+-- 100000 rows, then grown to 300000, 70000 entries are under a quarter
+CREATE TABLE bn.s (id int PRIMARY KEY, v text);
+INSERT INTO bn.s SELECT g, 'v' FROM generate_series(1, 100000) g;
+ANALYZE bn.s;
+INSERT INTO bn.s SELECT g, 'v' FROM generate_series(100001, 300000) g;
+SELECT length(dolt_commit('-Am', 'analyzed, then grown')::text) AS committed;
+SELECT reltuples::int8 AS analyzed_rows FROM pg_class WHERE oid = 'bn.s'::regclass;
+BEGIN;
+UPDATE bn.s SET v = 'w' WHERE id <= 70000;
+SELECT * FROM entries('bn.s');
+ROLLBACK;
+
 \c contrib_regression
 DROP DATABASE regress_bulk_notes;

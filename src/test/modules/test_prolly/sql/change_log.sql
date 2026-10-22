@@ -114,10 +114,10 @@ SELECT * FROM pg_temp.entries('cl.keyed');
 ROLLBACK;
 SELECT length(dolt_commit('-am', 'long')::text) AS committed;
 
--- Leaving a branch with changes folds it as its baseline, which consumes
--- its entries; a branch's first use moves its copy of the table (and of
--- the log) to its head, and the move's fold consumes the move's.  Then
--- each branch's log is its own.
+-- Leaving a branch with changes leaves its entries, for its next fold; a
+-- branch's first use moves its copy of the table (and of the log) to its
+-- head, and the move's fold consumes the move's.  Then each branch's log
+-- is its own.
 INSERT INTO cl.keyed VALUES (10, 'j');
 SELECT dolt_branch('cl_other');
 SELECT dolt_checkout('cl_other');

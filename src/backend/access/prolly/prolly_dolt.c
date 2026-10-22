@@ -104,6 +104,14 @@ static LocalTransactionId txn_commit_lxid = InvalidLocalTransactionId;
 static bool txn_commit_on = false;
 
 /*
+ * prolly.fold_on_commit: each transaction's own row changes folded into
+ * its branch's baseline as it commits, as the transaction's first write
+ * found the setting (txn_fold_on), dolt.transaction_commit's mode aside.
+ */
+static bool prolly_fold_on_commit = false;
+static bool txn_fold_on = false;
+
+/*
  * Its own row changes, as it makes them (the TIDs of the versions each
  * write made or replaced), by table; up to dolt.transaction_commit_max_changes,
  * past which it commits its working set instead.
@@ -248,6 +256,14 @@ prolly_session_init(const char *branch)
 		prolly_writers_init();
 		RegisterBranchWriteCallback(writers_note_write, NULL);
 		writer_branch_hooks();
+		DefineCustomBoolVariable("prolly.fold_on_commit",
+								 "Folds each transaction's own row changes into its branch's baseline as it commits.",
+								 "Status, diffs and commits then fold only what other transactions left unfolded; each transaction that changes a versioned table pays its tree's writes as it commits.",
+								 &prolly_fold_on_commit,
+								 false,
+								 PGC_USERSET,
+								 0,
+								 NULL, NULL, NULL);
 		DefineCustomBoolVariable("dolt.allow_commit_conflicts",
 								 "Lets a transaction commit with unresolved merge conflicts.",
 								 "They stay to be resolved later; until then the branch can't commit.",
@@ -538,7 +554,8 @@ writers_note_write(Oid branch, void *arg)
 	{
 		txn_commit_lxid = MyProc->vxid.lxid;
 		txn_commit_on = dolt_transaction_commit;
-		if (txn_commit_on)
+		txn_fold_on = !txn_commit_on && prolly_fold_on_commit;
+		if (txn_commit_on || txn_fold_on)
 			PROLLY_CALL(refs(), open);
 	}
 }
@@ -638,7 +655,8 @@ static void
 note_own_change(Relation rel, const ItemPointerData *oldtid,
 				const ItemPointerData *newtid)
 {
-	if (txn_commit_lxid != MyProc->vxid.lxid || !txn_commit_on ||
+	if (txn_commit_lxid != MyProc->vxid.lxid ||
+		!(txn_commit_on || txn_fold_on) ||
 		(own_changes_lxid == MyProc->vxid.lxid && own_changes_over))
 		return;
 	if (own_changes_lxid != MyProc->vxid.lxid)
@@ -668,6 +686,54 @@ note_own_change(Relation rel, const ItemPointerData *oldtid,
 }
 
 /*
+ * As a transaction that changed its branch commits in prolly.fold_on_commit's
+ * mode: its own row changes folded into the branch's baseline, so the next
+ * fold of the branch (a status, a diff, a commit) reads only what others
+ * left unfolded.  Nothing is folded, the changes left to the next fold as
+ * without the mode, where the transaction is prepared, changed definitions
+ * or more rows than it keeps, changed another branch than the session's,
+ * or a merge is in progress, or another transaction holds the refs (a
+ * commit never waits for them for this).
+ */
+static void
+fold_on_commit_at_end(bool prepare)
+{
+	List	   *branches;
+	ProllyMergeState ms;
+	ProllyRowChanges *changes;
+	int			nchanges = 0;
+	HASH_SEQ_STATUS hs;
+	OwnChanges *oc;
+	bool		pushed;
+
+	if (prepare || own_changes_lxid != MyProc->vxid.lxid ||
+		own_changes == NULL || own_changes_over || branch_catalog_written() ||
+		(settled_lxid == MyProc->vxid.lxid && settle_undone))
+		return;
+	branches = branches_written();
+	if (list_length(branches) != 1 || linitial_oid(branches) != MyBranch ||
+		PROLLY_CALL(refs(), merge_state, &ms) ||
+		!PROLLY_HAS(refs(), fold_own))
+		return;
+	changes = palloc_array(ProllyRowChanges,
+						   Max(hash_get_num_entries(own_changes), 1));
+	hash_seq_init(&hs, own_changes);
+	while ((oc = hash_seq_search(&hs)) != NULL)
+	{
+		changes[nchanges].relid = oc->relid;
+		changes[nchanges].tids = oc->tids;
+		changes[nchanges].ntids = oc->n;
+		nchanges++;
+	}
+	pushed = !ActiveSnapshotSet();
+	if (pushed)
+		PushActiveSnapshot(GetTransactionSnapshot());
+	BRANCH_WRITES_HUSHED((void) refs()->fold_own(changes, nchanges));
+	if (pushed)
+		PopActiveSnapshot();
+}
+
+/*
  * As a transaction that changed a branch commits in dolt.transaction_commit's
  * mode: a Dolt commit of the branch, unless nothing changed (an insert
  * deleted again, a commit already made of it all).  Changes to two branches,
@@ -685,6 +751,11 @@ transaction_commit_at_end(bool prepare)
 	ProllyHash	id;
 	bool		pushed;
 
+	if (txn_commit_lxid == MyProc->vxid.lxid && txn_fold_on)
+	{
+		fold_on_commit_at_end(prepare);
+		return;
+	}
 	if (txn_commit_lxid != MyProc->vxid.lxid || !txn_commit_on)
 		return;
 	undone = settled_lxid == MyProc->vxid.lxid && settle_undone;

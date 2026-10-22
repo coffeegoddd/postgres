@@ -398,6 +398,70 @@ typedef struct ProllyRefsRoutine
 	void		(*note_write) (Oid branch);
 	void		(*forget_folds) (void);
 	void		(*prepared_ended) (FullTransactionId xid);
+
+	/*
+	 * Optional: the session branch's working set for its definitions
+	 * alone, as read_working_set() would read them, its rows not read
+	 * (the canonicalizer's read_definitions()): a root to read objects'
+	 * definitions from, not rows, unless *rows is set (the working set
+	 * was known, rows and all; rows may be NULL).  Where it isn't, *read
+	 * (if not NULL) is what the read began at, for publish_definitions().
+	 */
+	void		(*read_definitions) (ProllyNodeRef *root, List **left_out,
+									 bool *rows, void **read);
+
+	/*
+	 * Optional: the rows of the session branch's table relid that differ
+	 * between its baseline (its data tree for the table put in *data) and
+	 * its working set, visited without folding them (the canonicalizer's
+	 * table_changes()).  False, having visited nothing, where they can't be
+	 * read so, or where the working set is known (read_working_set() takes
+	 * it, folding nothing): the caller reads the working set.
+	 */
+	bool		(*working_changes) (Oid relid, ProllyNodeRef *data,
+									ProllyRowChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: read_definitions()'s root, begun at read, found to be the
+	 * working set (no table's rows changed since the baseline, as
+	 * working_changes() read them): published as a fold of it would be,
+	 * for later reads to take; complete if it left nothing out.
+	 */
+	void		(*publish_definitions) (void *read, const ProllyNodeRef *root,
+										bool complete);
+
+	/*
+	 * Optional: the current transaction's own row changes to these tables
+	 * folded into the session branch's baseline as it commits (the
+	 * canonicalizer's advance_own()), under the refs: false, nothing moved,
+	 * if none could be, the changes left for the branch's next fold.
+	 */
+	bool		(*fold_own) (const ProllyRowChanges *changes, int nchanges);
+
+	/*
+	 * Optional: checkpoint(), but folded before the refs are taken, so they
+	 * are held only to set the baseline, not through the fold, and taken
+	 * only if free (never waited for): false, nothing set, if another holds
+	 * them or the branch's head or baseline moved meanwhile, and then the
+	 * caller must roll its transaction back (the fold consumed the change
+	 * finder's record of what it folded).
+	 */
+	bool		(*checkpoint_unless_moved) (ProllyNodeRef *root);
+
+	/*
+	 * Optional, together, for a background folder (prolly_folder.c), from
+	 * shared memory, needing no database: the databases with a branch
+	 * written since the folder last saw it (at most max, their count); the
+	 * current database's such branches, each with the generation it's at;
+	 * that the folder saw branch at generation (written again since: still
+	 * moved); and that it can't fold any branch of database (gone, or
+	 * accepting no connections), so that none of its branches counts as
+	 * moved until written again.
+	 */
+	int			(*moved_databases) (Oid *databases, int max);
+	int			(*moved_branches) (Oid *branches, uint64 *generations, int max);
+	void		(*saw_branch) (Oid branch, uint64 generation);
+	void		(*saw_database) (Oid database);
 } ProllyRefsRoutine;
 
 /*
@@ -419,9 +483,11 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
-	"forget_folds", "prepared_ended"
+	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
+	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
+	"moved_databases", "moved_branches", "saw_branch", "saw_database"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK prepared_ended
+#define PROLLY_REFS_LAST_CALLBACK saw_database
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

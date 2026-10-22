@@ -126,12 +126,42 @@ typedef struct ProllyChangeFinderRoutine
 	 */
 	bool		(*advance) (Relation rel, const ProllyValue *state,
 							StringInfo next);
+
+	/*
+	 * True if a branch's changes should be folded as it is left: for a
+	 * finder that keeps what it reads changes from until the next fold (old
+	 * versions of pages), so what it keeps for them is freed then rather
+	 * than at its next commit.  False for one that keeps nothing a fold
+	 * frees but its own record of the changes, which can wait.
+	 */
+	bool		(*fold_on_leave) (void);
+
+	/*
+	 * Optional: the rows of rel that differ from baseline's, as fold() from
+	 * it would find them, visited each once in the keying's order as a
+	 * tree's diff() visits a change, without making a tree (what they point
+	 * to valid during the visit only), until a visit returns false.  False,
+	 * having visited nothing, where fold() would read more than its record
+	 * of the changes (the table in full, or what the baseline's state can't
+	 * tell it): the caller folds instead.  Needs an active snapshot.
+	 */
+	bool		(*changes) (Relation rel, const ProllyTreeEnv *env,
+							const ProllyTableFold *baseline,
+							ProllyRowChangeVisit visit, void *arg);
+
+	/*
+	 * Optional, with advance(): false if advance() would refuse rel's
+	 * baseline state as it is, asked before the trees advance() is for are
+	 * made (so none is made only to be thrown away).  Needs an active
+	 * snapshot, advance()'s.
+	 */
+	bool		(*can_advance) (Relation rel, const ProllyValue *state);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
-	"state_refs", "advance"
+	"state_refs", "advance", "fold_on_leave", "changes", "can_advance"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK advance
+#define PROLLY_CHANGES_LAST_CALLBACK can_advance
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

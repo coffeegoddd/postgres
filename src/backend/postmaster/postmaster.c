@@ -89,6 +89,7 @@
 #include <pthread.h>
 #endif
 
+#include "access/prolly_folder.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
@@ -923,6 +924,9 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/* Register the prolly fold launcher, if built-in. */
+	ProllyFolderRegister();
 
 	/*
 	 * Register the shared memory needs of all core subsystems.

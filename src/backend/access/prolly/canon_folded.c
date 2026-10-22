@@ -4122,15 +4122,16 @@ build_baseline(Canon *cn, const ProllyNodeRef *baseline, ProllyNodeRef *next)
 
 static List *
 fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
-		   ProllyNodeRef *next_baseline, bool reading, Oid only)
+		   ProllyNodeRef *next_baseline, bool reading, Oid only, bool no_rows)
 {
 	Canon		cn;
 
 	/* (a baseline holds every table's state: never made from one alone) */
-	Assert(!OidIsValid(only) || next_baseline == NULL);
+	Assert((!OidIsValid(only) && !no_rows) || next_baseline == NULL);
 	memset(&cn, 0, sizeof(cn));
 	cn.reading = reading;
 	cn.only = only;
+	cn.no_rows = no_rows;
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
 	cn.advance = next_baseline != NULL;
@@ -4168,7 +4169,8 @@ static void
 folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 			ProllyNodeRef *next_baseline, bool commit)
 {
-	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid);
+	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid,
+					  false);
 }
 
 /*
@@ -4213,10 +4215,122 @@ static void
 folded_read_fold(const ProllyNodeRef *baseline, Oid only, ProllyNodeRef *root,
 				 List **left_out)
 {
-	List	   *l = fold_canon(baseline, root, NULL, true, only);
+	List	   *l = fold_canon(baseline, root, NULL, true, only, false);
 
 	if (left_out)
 		*left_out = list_concat(*left_out, l);
+}
+
+static void
+folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
+						List **left_out)
+{
+	List	   *l = fold_canon(baseline, root, NULL, true, InvalidOid, true);
+
+	if (left_out)
+		*left_out = list_concat(*left_out, l);
+}
+
+/*
+ * Table relid's rows that differ from the baseline's, read by the change
+ * finder from what it recorded, as table_root() would fold them: only for
+ * a table collect() describes as a table and reads (not a partition, nor
+ * one with columns of types that hold OIDs), whose baseline is of its
+ * definition now.
+ */
+static bool
+folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
+					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
+					 void *arg)
+{
+	Canon		cn;
+	Relation	rel;
+	Form_pg_class form;
+	bool		ok = false;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (!PROLLY_HAS(cn.finder, changes))
+		return false;
+	load_baseline(&cn, baseline);
+
+	/* (the fold's snapshot: the transaction's writes, this statement's too) */
+	if (!IsInParallelMode())
+		CommandCounterIncrement();
+	if (ActiveSnapshotSet())
+		PushCopiedSnapshot(GetActiveSnapshot());
+	else
+		PushActiveSnapshot(GetTransactionSnapshot());
+	if (!IsInParallelMode())
+		UpdateActiveSnapshotCommandId();
+	rel = table_open(relid, AccessShareLock);
+	PG_TRY();
+	{
+		form = rel->rd_rel;
+		if (form->relkind == RELKIND_RELATION &&
+			form->relam == PROLLY_TABLE_AM_OID && !form->relispartition &&
+			canon_namespace(form->relnamespace) &&
+			!in_extension(RelationRelationId, relid) &&
+			!oid_columns(&cn, rel))
+		{
+			StringInfoData key;
+			StringInfoData desc;
+			ProllyHash	dh;
+			BaseTable  *bt;
+			int			save_nestlevel;
+
+			initStringInfo(&key);
+			appendStringInfoString(&key, "t:");
+			append_utf8(&key, qualified(form->relnamespace,
+										NameStr(form->relname)));
+			/* (described as collect() describes it: see build_canonical()) */
+			fold_caches_begin();
+			check_deparse_settings();
+			cn.cached = true;
+			save_nestlevel = NewGUCNestLevel();
+			(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
+									 false);
+			initStringInfo(&desc);
+			table_description(&cn, rel, &desc, &dh);
+
+			/*
+			 * (its rows folded under the shape they have now, as table_root()
+			 * takes a baseline, not one it would map)
+			 */
+			bt = find_base_table(&cn, &key);
+			if (bt && !(bt->shape_hash.len == dh.len &&
+						memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0))
+			{
+				StringInfoData shape = {0};
+
+				if (!shape_holds(rel, base_shape(&cn, bt),
+								 table_shape_bytes(&cn, rel, &desc, &shape)))
+					bt = NULL;
+			}
+			AtEOXact_GUC(false, save_nestlevel);
+			if (bt)
+			{
+				ProllyTableFold tf;
+
+				memset(&tf, 0, sizeof(tf));
+				tf.data = bt->data;
+				tf.state.data = (const uint8 *) bt->state.data;
+				tf.state.len = bt->state.len;
+				*data = bt->data;
+				ok = cn.finder->changes(rel, &cn.env, &tf, visit, arg);
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+	return ok;
 }
 
 /*
@@ -9766,6 +9880,129 @@ folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head
 	return true;
 }
 
+/*
+ * baseline with the current transaction's own row changes to these tables
+ * applied to its rows (the change finder's fold_rows() from each table's
+ * baseline tree, not a commit's) into *next, each table's finder state
+ * advanced past them (advance(): its record of them consumed), so the
+ * baseline holds what the transaction committed: a fold at its commit.
+ * A table whose baseline isn't of its shape now, or whose changes or state
+ * can't be applied or advanced so, keeps its entry, and its record of the
+ * changes, for the next fold.  Every table's tree is made first (of those
+ * whose state the finder can advance, can_advance() says, so none is made
+ * for nothing); only then are states advanced, each table's entry put only
+ * if its state was.
+ * False, next undefined, if no table's could be.
+ */
+static bool
+folded_advance_own(const ProllyNodeRef *baseline,
+				   const ProllyRowChanges *changes, int nchanges,
+				   ProllyNodeRef *next)
+{
+	Canon		cn;
+	ProllyEdit *edits = palloc_array(ProllyEdit, Max(nchanges, 1));
+	int			nedits = 0;
+	int			save_nestlevel;
+	typedef struct Applied
+	{
+		Relation	rel;
+		CanonItem  *it;
+		BaseTable  *bt;
+		ProllyNodeRef now;
+		ProllyHash	dh;
+		StringInfoData shape;
+	} Applied;
+	Applied    *ap = palloc0_array(Applied, Max(nchanges, 1));
+	int			nap = 0;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (!PROLLY_HAS(cn.finder, advance) || !PROLLY_HAS(cn.finder, fold_rows))
+		return false;
+	load_baseline(&cn, baseline);
+
+	/* (described as a commit describes them: every name qualified) */
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	CommandCounterIncrement();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		/* each table's rows applied to its baseline's tree */
+		for (int i = 0; i < nchanges; i++)
+		{
+			Relation	rel = try_table_open(changes[i].relid, AccessShareLock);
+			Applied    *a = &ap[nap];
+			StringInfoData desc;
+
+			if (rel == NULL)
+				continue;
+			a->rel = rel;
+			a->it = add_item(&cn, "t:", qualified(RelationGetNamespace(rel),
+												  RelationGetRelationName(rel)));
+			a->bt = find_base_table(&cn, &a->it->key);
+			initStringInfo(&desc);
+			describe_table(&cn, rel, &desc);
+			initStringInfo(&a->shape);
+			baseline_shape(&cn, rel, &desc, &a->shape);
+			content_hash(&cn, a->shape.data, a->shape.len, &a->dh);
+			pfree(desc.data);
+			if (a->bt == NULL || !same_hash(&a->dh, &a->bt->shape_hash) ||
+				(PROLLY_HAS(cn.finder, can_advance) &&
+				 !cn.finder->can_advance(rel, &(ProllyValue)
+										 {(const uint8 *) a->bt->state.data,
+										  a->bt->state.len})) ||
+				!PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &a->bt->data,
+							 changes[i].tids, changes[i].ntids, &a->now))
+			{
+				table_close(rel, AccessShareLock);
+				continue;
+			}
+			nap++;
+		}
+
+		/* then each one's state advanced: its entry put only if it was */
+		for (int i = 0; i < nap; i++)
+		{
+			Applied    *a = &ap[i];
+			ProllyValue state = {(const uint8 *) a->bt->state.data,
+			a->bt->state.len};
+			StringInfoData ns;
+
+			initStringInfo(&ns);
+			if (PROLLY_CALL(cn.finder, advance, a->rel, &state, &ns))
+			{
+				resetStringInfo(&a->it->value);
+				put_hash(&a->it->value, &a->now.hash);
+				put_base_shape(&cn, &a->it->value, &a->dh, &a->shape, a->bt);
+				appendBinaryStringInfo(&a->it->value, ns.data, ns.len);
+				put_edit(edits, &nedits, a->it);
+			}
+			table_close(a->rel, AccessShareLock);
+			a->rel = NULL;
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+		AtEOXact_GUC(false, save_nestlevel);
+	}
+	PG_END_TRY();
+	if (nedits == 0)
+		return false;
+	{
+		ProllyTreeEnv benv = cn.env;
+
+		benv.chunk_refs = base_chunk_refs;
+		if (nedits > 1)
+			qsort(edits, nedits, sizeof(ProllyEdit), edit_key_cmp);
+		PROLLY_CALL(cn.tree, apply, &benv, baseline, edits, nedits, next);
+	}
+	return true;
+}
+
 /* A statement, its trailing space and ";" trimmed, ended by one. */
 static void
 append_statement(StringInfo out, const char *stmt)
@@ -10173,9 +10410,12 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.walk_changes = folded_walk_changes,
 	.fold = folded_fold,
 	.read_fold = folded_read_fold,
+	.read_definitions = folded_read_definitions,
+	.table_changes = folded_table_changes,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,
+	.advance_own = folded_advance_own,
 	.splice = folded_splice,
 	.splice_baseline = folded_splice_baseline,
 	.tables = folded_tables,

@@ -331,7 +331,7 @@ SELECT length(dolt_commit('-am', 'truncated')::text) > 0 AS committed;
 (1 row)
 
 -- a branch switched to: its own working set (none of its statuses taken;
--- the two checkouts take the working sets of the branches they leave)
+-- main's, back on it, is: leaving a branch reads nothing of it)
 SELECT dolt_checkout('other');
           dolt_checkout           
 ----------------------------------
@@ -370,7 +370,7 @@ SELECT * FROM dolt_status;
 SELECT pg_temp.since('folds_reused') AS after_switch;
  after_switch 
 --------------
-            2
+            1
 (1 row)
 
 -- the transaction's own writes and DDL: seen at once, taken from no fold
@@ -541,8 +541,9 @@ SELECT pg_temp.since('folds_reused') AS forced_full;
            0
 (1 row)
 
--- No fold around moves: a checkout and a hard reset take the working set
--- known.  Leaving a clean branch, and back: nothing folded.
+-- No fold around moves: a hard reset takes the working set known, and a
+-- checkout reads none.  Leaving a clean branch, and back: nothing taken,
+-- nothing folded.
 SELECT length(dolt_commit('-am', 'on other')::text) > 0 AS committed
 FROM (SELECT dolt_checkout('other')) c;
  committed 
@@ -597,7 +598,7 @@ SELECT pg_temp.since('folds_reused') AS clean_checkouts,
 	pg_temp.since('bytes_hashed') AS bytes_hashed;
  clean_checkouts | bytes_hashed 
 -----------------+--------------
-               2 |            0
+               0 |            0
 (1 row)
 
 RESET debug_prolly_verify_fold_caches;
@@ -713,13 +714,29 @@ SELECT pg_temp.since('folds_reused') AS fast_forward_taken;
                   2
 (1 row)
 
--- Leaving a branch with changes known: its checkpoint, folded once, keeps
--- them.
+-- Leaving a branch with changes: no checkpoint (the change log keeps
+-- nothing a fold frees), nothing read or folded; they stay the branch's,
+-- for its next fold.
 UPDATE fc.t SET v = 'left' WHERE id = 5;
 SELECT * FROM dolt_status;
  table_name | staged |  status  
 ------------+--------+----------
  fc.t       | t      | modified
+(1 row)
+
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting,
+	pg_temp.since('bytes_hashed') IS NOT NULL AS hashing,
+	pg_temp.since('chunks_appended') IS NOT NULL AS appending;
+ counting | hashing | appending 
+----------+---------+-----------
+ t        | t       | t
 (1 row)
 
 SELECT dolt_checkout('other');
@@ -734,6 +751,21 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS dirty_leave_rows,
+	pg_temp.since('bytes_hashed') AS dirty_leave_hashed,
+	pg_temp.since('chunks_appended') AS dirty_leave_chunks;
+ dirty_leave_rows | dirty_leave_hashed | dirty_leave_chunks 
+------------------+--------------------+--------------------
+                0 |                  0 |                  0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
 SELECT * FROM dolt_status;
  table_name | staged |  status  
 ------------+--------+----------
@@ -746,10 +778,318 @@ SELECT v FROM fc.t WHERE id = 5;
  left
 (1 row)
 
+UPDATE fc.t SET v = 'left again' WHERE id = 6;
+BEGIN;
+SELECT dolt_checkout('other');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'other'"}
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+COMMIT;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT v FROM fc.t WHERE id = 6;
+     v      
+------------
+ left again
+(1 row)
+
+-- A diff of two commits reads the working set's definitions, not its rows:
+-- nothing of its changes folded (none read), as the diff from WORKING
+-- does.
 SELECT length(dolt_commit('-am', 'left')::text) > 0 AS committed;
  committed 
 -----------
  t
+(1 row)
+
+UPDATE fc.t SET v = 'dirty' WHERE id IN (7, 8);
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+ diff_type | id |     v      
+-----------+----+------------
+ modified  |  5 | left
+ modified  |  6 | left again
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS history_diff_rows;
+ history_diff_rows 
+-------------------
+                 0
+(1 row)
+
+-- A diff into WORKING folds nothing either: its rows are read from the
+-- change log's entries against the baseline, the changed rows alone, no
+-- tree made (no chunk written); one from another commit merges them with
+-- the tree diff from it to the baseline.  (The check, on, diffs a fold
+-- too and compares.)
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending;
+ appending 
+-----------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
+ diff_type | id |   v   
+-----------+----+-------
+ modified  |  7 | dirty
+ modified  |  8 | dirty
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS working_diff_rows,
+	pg_temp.since('chunks_appended') AS working_diff_chunks;
+ working_diff_rows | working_diff_chunks 
+-------------------+---------------------
+                 2 |                   0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).v
+FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY 2;
+ diff_type | id | v  |     v      
+-----------+----+----+------------
+ modified  |  5 | v5 | left
+ modified  |  6 | v6 | left again
+ modified  |  7 | v7 | dirty
+ modified  |  8 | v8 | dirty
+(4 rows)
+
+SELECT diff_type, (from_row).id, (to_row).v
+FROM dolt_diff('HEAD', 'WORKING', NULL::fc.t) ORDER BY 2;
+ diff_type | id |   v   
+-----------+----+-------
+ modified  |  7 | dirty
+ modified  |  8 | dirty
+(2 rows)
+
+UPDATE fc.t SET v = 'left' WHERE id = 7;
+DELETE FROM fc.t WHERE id = 6;
+INSERT INTO fc.t VALUES (2000, 'new');
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
+ diff_type | id | v  |  id  |   v   
+-----------+----+----+------+-------
+ modified  |  5 | v5 |    5 | left
+ removed   |  6 | v6 |      | 
+ modified  |  7 | v7 |    7 | left
+ modified  |  8 | v8 |    8 | dirty
+ added     |    |    | 2000 | new
+(5 rows)
+
+-- So does a status: a table defined as at the head, whose baseline holds
+-- the head's rows, changed if its change log has a change since (the first
+-- found is enough), no tree made.  (The check, on, folds too and compares.)
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('chunks_appended') IS NOT NULL AS appending,
+	pg_temp.since('fold_rows_written') IS NOT NULL AS writing;
+ appending | writing 
+-----------+---------
+ t         | t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('chunks_appended') AS status_chunks,
+	pg_temp.since('fold_rows_written') AS status_rows_folded;
+ status_chunks | status_rows_folded 
+---------------+--------------------
+             0 |                  0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE fc.t SET v = v WHERE id = 9;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- ... and, no table changed, what that status read is the working set,
+-- published: the next one takes it as it is, folding and writing nothing.
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS reusing,
+	pg_temp.since('chunks_appended') IS NOT NULL AS appending,
+	pg_temp.since('fold_rows_written') IS NOT NULL AS writing;
+ reusing | appending | writing 
+---------+-----------+---------
+ t       | t         | t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS clean_status_reused,
+	pg_temp.since('chunks_appended') AS clean_status_chunks,
+	pg_temp.since('fold_rows_written') AS clean_status_rows;
+ clean_status_reused | clean_status_chunks | clean_status_rows 
+---------------------+---------------------+-------------------
+                   1 |                   0 |                 0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+ALTER TABLE fc.t ADD COLUMN w int;
+SELECT * FROM dolt_status;
+ table_name | staged |  status  
+------------+--------+----------
+ fc.t       | t      | modified
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- Changes that cancel out send no row: a row the working set puts back as
+-- the first version has it, and one a commit since added that the working
+-- set deletes.  (The commit is taken back after.)
+INSERT INTO fc.t VALUES (3000, 'added');
+SELECT length(dolt_commit('-am', 'added')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE fc.t SET v = 'v5' WHERE id = 5;
+DELETE FROM fc.t WHERE id = 3000;
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~2', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
+ diff_type | id | v  | id |     v      
+-----------+----+----+----+------------
+ modified  |  6 | v6 |  6 | left again
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- ... and with a definition changed since, not committed: the commits'
+-- rows read as the table is defined now (w, which neither had, null),
+-- still no row of the working set folded.
+ALTER TABLE fc.t ADD COLUMN w int;
+UPDATE fc.t SET v = 'dirty', w = 1 WHERE id = 7;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT diff_type, (from_row).id, (to_row).v, (to_row).w
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+ diff_type | id |     v      | w 
+-----------+----+------------+---
+ modified  |  5 | left       |  
+ modified  |  6 | left again |  
+(2 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS redefined_history_diff_rows;
+ redefined_history_diff_rows 
+-----------------------------
+                           0
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
 (1 row)
 
 \c contrib_regression

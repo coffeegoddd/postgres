@@ -320,6 +320,39 @@ typedef struct ProllyCanonRoutine
 	void		(*splice_baseline) (const ProllyNodeRef *into,
 									const ProllyNodeRef *from, List *tables,
 									ProllyNodeRef *out);
+
+	/*
+	 * Optional: read_fold() of no table's rows, for reading definitions
+	 * alone: every object described as it is now, each table's rows the
+	 * baseline's (none if it hasn't the table as defined now).  root is
+	 * read for definitions, never rows, nor taken for the working set.
+	 */
+	void		(*read_definitions) (const ProllyNodeRef *baseline,
+									 ProllyNodeRef *root, List **left_out);
+
+	/*
+	 * Optional: the rows of the session branch's table relid that differ
+	 * from baseline's, without folding them: the change finder's changes()
+	 * from the baseline's data tree for the table as defined now, which is
+	 * put in *data.  False, having visited nothing, where the baseline
+	 * hasn't the table as defined now, the canonical form wouldn't read it
+	 * as a table, or the finder can't: the caller folds.
+	 */
+	bool		(*table_changes) (const ProllyNodeRef *baseline, Oid relid,
+								  ProllyNodeRef *data,
+								  ProllyRowChangeVisit visit, void *arg);
+
+	/*
+	 * Optional: baseline with the current transaction's own row changes to
+	 * these tables applied to its rows, and each table's change finder
+	 * state advanced past them, into *next: a fold of the transaction's
+	 * changes into the baseline as it commits.  A table it can't apply
+	 * them to keeps its entry and its finder's record of them.  False,
+	 * next undefined, if no table's could be.
+	 */
+	bool		(*advance_own) (const ProllyNodeRef *baseline,
+								const ProllyRowChanges *changes, int nchanges,
+								ProllyNodeRef *next);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -328,9 +361,9 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline"
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK splice_baseline
+#define PROLLY_CANON_LAST_CALLBACK advance_own
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

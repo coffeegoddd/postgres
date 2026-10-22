@@ -163,6 +163,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "journal_index.h"
+#include "lib/ilist.h"
 #include "commands/vacuum.h"
 #include "catalog/pg_tablespace_d.h"
 #include "common/hashfn.h"
@@ -648,12 +649,309 @@ static uint32 gc_record(Segment *g, uint64 offset, uint64 size, char **rec,
  * ----------------------------------------------------------------
  */
 
+/* A table by chunk hash (a ProllyHash, hash_key()'s). */
+static uint32
+chunk_hash_key_hash(const void *key, Size keysize)
+{
+	return prolly_hash_bucket(((const ProllyHash *) key)->bytes);
+}
+
 static void
 hash_key(ProllyHash *key, const ProllyHash *hash)
 {
 	memset(key, 0, sizeof(ProllyHash));
 	key->len = hash->len;
 	memcpy(key->bytes, hash->bytes, hash->len);
+}
+
+/*
+ * Decoded chunks the session's store read from its files, kept by hash for
+ * the backend's later reads, least recently used dropped past
+ * prolly_chunk_cache_size kB.  A chunk is named by its content, so one kept
+ * is the chunk whatever happens to the store after; but not that the
+ * store still has it: a collection may remove it.  So the cache is of a
+ * collection's generation (the manifest's gc_generation), and let go of
+ * whole once a read sees another, as the store's own reads then find
+ * nothing of what was removed.  Only those read from the files (not the
+ * transaction's own, pending or transient, which an abort takes back, nor
+ * one read through a source).
+ *
+ * A chunk is kept the second time it is read from the files, not the
+ * first: the hashes of those read once are remembered (as many as the
+ * cache holds chunks), so a read of many chunks once each, as a fold of
+ * many rows reads leaves, neither churns the cache nor pays to fill it,
+ * while the nodes reads keep coming back to (upper levels, rows read
+ * again) are kept from their second read on.
+ */
+int			prolly_chunk_cache_size = 16384;
+
+typedef struct CachedChunk
+{
+	ProllyHash	key;			/* hash_key()'s */
+	char	   *data;
+	uint32		len;
+	dlist_node	lru;			/* most recent first */
+} CachedChunk;
+
+static HTAB *chunk_cache = NULL;
+static dlist_head chunk_cache_lru = DLIST_STATIC_INIT(chunk_cache_lru);
+static Size chunk_cache_bytes = 0;
+static MemoryContext chunk_cache_cxt = NULL;
+static uint32 chunk_cache_generation = 0;	/* what it holds is of */
+
+/*
+ * Hashes read once, oldest first: a ring, and a set of what it holds, each
+ * with its slot (a key found is let go of from the set, not the ring: its
+ * slot, reached again, lets go of the key only if it's still that slot's).
+ */
+typedef struct SeenChunk
+{
+	ProllyHash	key;
+	int			slot;
+} SeenChunk;
+
+static HTAB *chunk_seen = NULL;
+static ProllyHash *chunk_seen_ring = NULL;
+static int	chunk_seen_size = 0;
+static int	chunk_seen_next = 0;
+
+/* (about as many as the cache holds chunks of a node's target size) */
+#define CHUNK_SEEN_SIZE(limit) ((int) Min(Max((limit) / 4096, 64), 1 << 20))
+
+/*
+ * Has key been read from the files once already, lately?  If not, it is
+ * remembered as read once.
+ */
+static bool
+chunk_seen_before(const ProllyHash *key, Size limit)
+{
+	bool		found;
+	int			want = CHUNK_SEEN_SIZE(limit);
+
+	if (chunk_seen == NULL || chunk_seen_size != want)
+	{
+		HASHCTL		ctl;
+
+		if (chunk_seen != NULL)
+		{
+			hash_destroy(chunk_seen);
+			pfree(chunk_seen_ring);
+		}
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.entrysize = sizeof(SeenChunk);
+		ctl.hcxt = chunk_cache_cxt;
+		chunk_seen = hash_create("prolly chunks read once", want, &ctl,
+								 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+		chunk_seen_ring = MemoryContextAllocZero(chunk_cache_cxt,
+												 want * sizeof(ProllyHash));
+		chunk_seen_size = want;
+		chunk_seen_next = 0;
+	}
+	(void) hash_search(chunk_seen, key, HASH_FIND, &found);
+	if (found)
+	{
+		(void) hash_search(chunk_seen, key, HASH_REMOVE, NULL);
+		return true;
+	}
+	/* (the oldest let go of, if the ring is full and the set still has it) */
+	if (chunk_seen_ring[chunk_seen_next].len != 0)
+	{
+		SeenChunk  *old = hash_search(chunk_seen,
+									  &chunk_seen_ring[chunk_seen_next],
+									  HASH_FIND, NULL);
+
+		if (old != NULL && old->slot == chunk_seen_next)
+			(void) hash_search(chunk_seen, &old->key, HASH_REMOVE, NULL);
+	}
+	chunk_seen_ring[chunk_seen_next] = *key;
+	((SeenChunk *) hash_search(chunk_seen, key, HASH_ENTER, NULL))->slot =
+		chunk_seen_next;
+	chunk_seen_next = (chunk_seen_next + 1) % chunk_seen_size;
+	return false;
+}
+
+static Size
+chunk_cache_limit(void)
+{
+	return (Size) prolly_chunk_cache_size * 1024;
+}
+
+static void chunk_cache_evict(Size limit);
+
+/*
+ * The cache and the chunks read once let go of, if they're of another
+ * collection's generation than the store's now.
+ */
+static void
+chunk_cache_of(uint32 generation)
+{
+	if (generation == chunk_cache_generation)
+		return;
+	chunk_cache_generation = generation;
+	if (chunk_cache != NULL)
+		chunk_cache_evict(0);
+	if (chunk_seen != NULL)
+	{
+		hash_destroy(chunk_seen);
+		pfree(chunk_seen_ring);
+		chunk_seen = NULL;
+		chunk_seen_ring = NULL;
+		chunk_seen_size = 0;
+		chunk_seen_next = 0;
+	}
+}
+
+static bool
+chunk_cache_take(const ProllyHash *key, StringInfo out, uint32 generation)
+{
+	CachedChunk *c;
+
+	chunk_cache_of(generation);
+	if (chunk_cache == NULL)
+		return false;
+	/* (the setting lowered: what it no longer holds let go of first) */
+	if (chunk_cache_bytes > chunk_cache_limit())
+		chunk_cache_evict(chunk_cache_limit());
+	c = hash_search(chunk_cache, key, HASH_FIND, NULL);
+	if (c == NULL)
+		return false;
+	dlist_move_head(&chunk_cache_lru, &c->lru);
+	appendBinaryStringInfo(out, c->data, c->len);
+	pgstat_count_prolly(PGSTAT_PROLLY_CHUNK_CACHE_HITS, 1);
+	return true;
+}
+
+static void
+chunk_cache_evict(Size limit)
+{
+	while (chunk_cache_bytes > limit && !dlist_is_empty(&chunk_cache_lru))
+	{
+		CachedChunk *c = dlist_container(CachedChunk, lru,
+										 dlist_tail_node(&chunk_cache_lru));
+
+		dlist_delete(&c->lru);
+		chunk_cache_bytes -= c->len + sizeof(CachedChunk);
+		pfree(c->data);
+		(void) hash_search(chunk_cache, &c->key, HASH_REMOVE, NULL);
+	}
+}
+
+static void
+chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
+				uint32 generation)
+{
+	Size		limit = chunk_cache_limit();
+	CachedChunk *c;
+	char	   *copy;
+	bool		found;
+
+	chunk_cache_of(generation);
+
+	/* (none past an eighth of the cache: one chunk mustn't empty it) */
+	if (limit == 0 || (Size) len + sizeof(CachedChunk) > limit / 8)
+	{
+		if (chunk_cache != NULL)
+			chunk_cache_evict(limit);
+		return;
+	}
+	if (chunk_cache_cxt == NULL)
+		chunk_cache_cxt = AllocSetContextCreate(TopMemoryContext,
+												"prolly chunk cache",
+												ALLOCSET_DEFAULT_SIZES);
+	if (!chunk_seen_before(key, limit))
+		return;
+	if (chunk_cache == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.entrysize = sizeof(CachedChunk);
+		ctl.hcxt = chunk_cache_cxt;
+		chunk_cache = hash_create("prolly chunk cache", 1024, &ctl,
+								  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+	}
+	/* (copied first: an entry is made only once it can be filled) */
+	copy = MemoryContextAlloc(chunk_cache_cxt, Max(len, 1));
+	memcpy(copy, data, len);
+	c = hash_search(chunk_cache, key, HASH_ENTER, &found);
+	if (found)
+	{
+		pfree(copy);
+		dlist_move_head(&chunk_cache_lru, &c->lru);
+		return;
+	}
+	c->data = copy;
+	c->len = len;
+	dlist_push_head(&chunk_cache_lru, &c->lru);
+	chunk_cache_bytes += len + sizeof(CachedChunk);
+	chunk_cache_evict(limit);
+}
+
+/*
+ * Chunks a transaction that writes knows are stored without asking the
+ * index: those a stored chunk it read names.  The store never holds a
+ * chunk without what it names, and only a collection's swap drops one, so
+ * while none happened since the transaction began (xact_straddles()),
+ * what a chunk it read from the store's files names is the store's still,
+ * and a pending chunk naming it needs no index probe for it
+ * (check_reference()).  A chunk from the cache counts too: the cache holds
+ * only chunks of the store's GC generation now, which must be the one the
+ * transaction began in: none was dropped since.
+ * Only chunks read as the transaction has pending ones are taken in (a
+ * read-only transaction pays nothing), at most TRUSTED_MAX_CHUNKS (a
+ * reference past them is probed for, as without the set); the set goes
+ * with the transaction.
+ */
+#define TRUSTED_MAX_CHUNKS	(256 * 1024)	/* about 24 MB */
+
+static bool xact_straddles(ProllyChunkStore *s);
+
+static HTAB *trusted = NULL;	/* in TopTransactionContext */
+static LocalTransactionId trusted_lxid = InvalidLocalTransactionId;
+
+static void
+trust_ref(const ProllyHash *ref, void *arg)
+{
+	ProllyHash	key;
+
+	if (hash_get_num_entries(trusted) >= TRUSTED_MAX_CHUNKS)
+		return;
+	hash_key(&key, ref);
+	(void) hash_search(trusted, &key, HASH_ENTER, NULL);
+}
+
+/* What chunk (read stored, in GC generation generation) names, trusted. */
+static void
+trust_named(ProllyChunkStore *s, const char *chunk, Size len,
+			uint32 generation)
+{
+	if (s != session_store || hash_get_num_entries(s->pending_index) == 0 ||
+		MyProc->vxid.lxid != s->xact_lxid ||
+		generation != s->xact_generation || xact_straddles(s))
+		return;
+	if (trusted == NULL || trusted_lxid != MyProc->vxid.lxid)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.hcxt = TopTransactionContext;
+		trusted = hash_create("prolly trusted chunks", 1024, &ctl,
+							  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+		trusted_lxid = MyProc->vxid.lxid;
+	}
+	prolly_chunk_references(chunk, len, trust_ref, NULL);
+}
+
+static bool
+trusted_has(ProllyChunkStore *s, const ProllyHash *key)
+{
+	return trusted != NULL && trusted_lxid == MyProc->vxid.lxid &&
+		!xact_straddles(s) &&
+		hash_search(trusted, key, HASH_FIND, NULL) != NULL;
 }
 
 /* Append a record of kind with payload (head, then tail) to buf. */
@@ -1376,10 +1674,11 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(ProllyHash);
 		ctl.hcxt = TopTransactionContext;
 		kept_here = hash_create("prolly chunks kept", 64, &ctl,
-								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 		kept_here_begun = begun;
 	}
 	(void) hash_search(kept_here, &key, HASH_FIND, &found);
@@ -2215,7 +2514,7 @@ check_reference(const ProllyHash *ref, void *arg)
 
 	hash_key(&key, ref);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		stored_has(s, &key))
+		trusted_has(s, &key) || stored_has(s, &key))
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -3694,10 +3993,11 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 		return false;
 	}
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
 	seen = hash_create("prolly table file chunks", 1024, &ctl,
-					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+					   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 
 	fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
@@ -3998,10 +4298,11 @@ journal_open(Oid dboid, Oid spcoid)
 	s->dboid = dboid;
 	s->spcoid = spcoid;
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(IndexEntry);
 	s->ix = jindex_attach(dboid, spcoid, 2 * append_ranges(), &made);
 	s->pending_index = hash_create("prolly journal pending", 256, &ctl,
-								   HASH_ELEM | HASH_BLOBS);
+								   HASH_ELEM | HASH_FUNCTION);
 	initStringInfo(&s->pending);
 	MemoryContextSwitchTo(old);
 
@@ -4154,10 +4455,11 @@ transient_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(TransientChunk);
 		ctl.hcxt = TopTransactionContext;
 		s->transient = hash_create("prolly transient chunks", 256, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	}
 	t = hash_search(s->transient, &key, HASH_ENTER, &found);
 	t->data = palloc(Max(len, 1));
@@ -4314,10 +4616,11 @@ ahead_put(int i, const char *data, Size len, void *arg)
 		else
 			MemoryContextReset(s->ahead_cxt);
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(AheadEntry);
 		ctl.hcxt = s->ahead_cxt;
 		s->ahead = hash_create("prolly journal read-ahead", 256, &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+							   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 		s->ahead_bytes = 0;
 	}
 	e = hash_search(s->ahead, &af->hashes[i], HASH_ENTER, &found);
@@ -4605,6 +4908,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	uint64		segment;
 	uint64		offset;
 	uint32		len;
+	int			start;
 
 	hash_key(&key, hash);
 	e = hash_search(s->pending_index, &key, HASH_FIND, NULL);
@@ -4630,6 +4934,19 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	}
 	if (!stored && ahead_take(s, &key, out))
 		return true;
+	/* (the store's generation as of now: a collection since lets go of all) */
+	if (!stored && s == session_store)
+	{
+		refresh_segments(s);
+		start = out->len;
+		if (chunk_cache_take(&key, out, s->gc_generation))
+		{
+			xact_note(s);
+			trust_named(s, out->data + start, out->len - start,
+						s->gc_generation);
+			return true;
+		}
+	}
 	if (stored)
 	{
 		StringInfoData ahead;
@@ -4646,16 +4963,35 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	}
 	refresh_segments(s);
 	xact_note(s);
+	start = out->len;
 	if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 	{
 		if (tables_read(s, &key, out, stored))
+		{
+			if (!stored && s == session_store)
+			{
+				chunk_cache_put(&key, out->data + start, out->len - start,
+								s->gc_generation);
+				trust_named(s, out->data + start, out->len - start,
+							s->gc_generation);
+			}
 			return true;
+		}
 		scan_journal(s);
 		if (!jindex_find(s->ix, &key, true, &segment, &offset, &len))
 		{
 			load_tables(s, false);
 			if (tables_read(s, &key, out, stored))
+			{
+				if (!stored && s == session_store)
+				{
+					chunk_cache_put(&key, out->data + start, out->len - start,
+									s->gc_generation);
+					trust_named(s, out->data + start, out->len - start,
+								s->gc_generation);
+				}
 				return true;
+			}
 			if (s->through == NULL)
 				return false;
 			if (!stored)
@@ -4696,7 +5032,16 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 		record_framed(g->path, rec, len, out);
 	}
 	else
+	{
 		chunk_bytes_of(g->path, rec, len, &key, out);
+		if (s == session_store)
+		{
+			chunk_cache_put(&key, out->data + start, out->len - start,
+							s->gc_generation);
+			trust_named(s, out->data + start, out->len - start,
+						s->gc_generation);
+		}
+	}
 	pfree(rec);
 	return true;
 }
@@ -4728,6 +5073,33 @@ journal_root(ProllyChunkStore *s, ProllyHash *root)
 	}
 	scan_journal(s);
 	*root = s->root;
+}
+
+/* The lock journal_move_root() takes, if free; false if another holds it. */
+static bool
+journal_try_hold_root(ProllyChunkStore *s)
+{
+	LOCKTAG		tag;
+
+	if (s->moving)
+		return true;
+	SET_LOCKTAG_OBJECT(tag, s->dboid, ROOT_LOCK_CLASSID, 0, 0);
+	return LockAcquire(&tag, ExclusiveLock, false, true) != LOCKACQUIRE_NOT_AVAIL;
+}
+
+/* Is journal_move_root()'s lock free now?  (Taken and let go of at once.) */
+static bool
+journal_root_free(ProllyChunkStore *s)
+{
+	LOCKTAG		tag;
+
+	if (s->moving)
+		return true;
+	SET_LOCKTAG_OBJECT(tag, s->dboid, ROOT_LOCK_CLASSID, 0, 0);
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+	LockRelease(&tag, ExclusiveLock, false);
+	return true;
 }
 
 static bool
@@ -6490,10 +6862,11 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	cs.s = s;
 	cs.hash = prolly_content_hash();
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
 	cs.seen = hash_create("prolly conjoin", 1024, &ctl,
-						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+						  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	initStringInfo(&cs.bytes);
 	initStringInfo(&cs.chunk);
 
@@ -7238,10 +7611,11 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	gc->next_id = gc->m.last_id + 1;
 
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(GcSlot);
 	ctl.hcxt = cxt;
 	gc->slots = hash_create("prolly collection slots", 1024, &ctl,
-							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+							HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	gc->files = palloc0(sizeof(GcFile) * (gc->m.nsegments + gc->m.nfiles));
 
 	/*
@@ -8544,4 +8918,6 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.roots = journal_roots,
 	.redo_consistent = journal_redo_consistent,
 	.other_bytes = journal_other_bytes,
+	.try_hold_root = journal_try_hold_root,
+	.root_free = journal_root_free,
 };

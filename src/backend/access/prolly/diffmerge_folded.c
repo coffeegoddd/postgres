@@ -57,6 +57,7 @@
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_datum.h"
+#include "access/prolly_fold.h"
 #include "access/prolly_xact.h"
 #include "access/table.h"
 #include "access/transam.h"
@@ -399,21 +400,16 @@ string_cmp(const ListCell *a, const ListCell *b)
 	return strcmp(lfirst(a), lfirst(b));
 }
 
+/*
+ * root's tables, its types ref's; with relid valid, relid's table alone.
+ * (What every read of a ref's tables does once it has the root.)
+ */
 static List *
-tables_of_reading(const char *ref, Oid relid, List **left_out,
-				  ProllyNodeRef *root_out)
+root_tables(const ProllyNodeRef *root, const char *ref, Oid relid)
 {
-	ProllyNodeRef root;
 	Tables		ts = {NIL};
 
-	if (is_working(ref))
-		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid,
-						   &root, left_out);
-	else
-		root_of(ref, &root);
-	if (root_out)
-		*root_out = root;
-	read_tables(&root, &ts);
+	read_tables(root, &ts);
 	types_of_ref(ts.types, ref);
 	if (OidIsValid(relid))
 	{
@@ -425,9 +421,42 @@ tables_of_reading(const char *ref, Oid relid, List **left_out,
 }
 
 static List *
+tables_of_reading(const char *ref, Oid relid, List **left_out,
+				  ProllyNodeRef *root_out)
+{
+	ProllyNodeRef root;
+
+	if (is_working(ref))
+		(void) PROLLY_CALL(components().refs, read_working_set, NULL, relid,
+						   &root, left_out);
+	else
+		root_of(ref, &root);
+	if (root_out)
+		*root_out = root;
+	return root_tables(&root, ref, relid);
+}
+
+static List *
 tables_of(const char *ref, Oid relid)
 {
 	return tables_of_reading(ref, relid, NULL, NULL);
+}
+
+/*
+ * The session branch's tables as defined now, for reading other versions'
+ * rows as they are defined: WORKING's definitions, its rows not folded
+ * where the refs can read definitions alone.
+ */
+static List *
+tables_defined_now(Oid relid)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	ProllyNodeRef root;
+
+	if (!PROLLY_HAS(refs, read_definitions))
+		return tables_of("WORKING", relid);
+	refs->read_definitions(&root, NULL, NULL, NULL);
+	return root_tables(&root, "WORKING", relid);
 }
 
 static bool
@@ -589,6 +618,272 @@ diff_rows(Oid relid, const Table *from, const Table *to,
 	table_close(rel, AccessShareLock);
 }
 
+/*
+ * A diff into WORKING without folding it: the change finder's record of
+ * the changes since the session branch's baseline, read against the
+ * baseline's tree; and where the diff is from a version other than the
+ * baseline's, the tree diff from it to the baseline merged with them, by
+ * key.
+ */
+
+/* A row change, its key and values copied. */
+typedef struct BufferedChange
+{
+	ProllyDiffKind kind;
+	ProllyKey	key;
+	ProllyValue before;			/* .data NULL: none (added) */
+	ProllyValue after;			/* .data NULL: none (removed) */
+} BufferedChange;
+
+typedef struct BufferedChanges
+{
+	BufferedChange *c;
+	int64		n;
+	int64		max;
+	MemoryContext cxt;
+} BufferedChanges;
+
+static void
+buffer_bytes(MemoryContext cxt, const uint8 *data, uint32 len,
+		   const uint8 **out_data, uint32 *out_len)
+{
+	uint8	   *b = MemoryContextAlloc(cxt, Max(len, 1));
+
+	memcpy(b, data, len);
+	*out_data = b;
+	*out_len = len;
+}
+
+static bool
+buffer_change(ProllyDiffKind kind, const ProllyKey *key,
+			  const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	BufferedChanges *bc = arg;
+	BufferedChange *c;
+
+	if (bc->n == bc->max)
+	{
+		bc->max = Max(64, bc->max * 2);
+		bc->c = bc->c ?
+			repalloc_huge(bc->c, bc->max * sizeof(BufferedChange)) :
+			MemoryContextAllocHuge(bc->cxt, bc->max * sizeof(BufferedChange));
+	}
+	c = &bc->c[bc->n++];
+	memset(c, 0, sizeof(*c));
+	c->kind = kind;
+	buffer_bytes(bc->cxt, key->data, key->len, &c->key.data, &c->key.len);
+	if (before)
+		buffer_bytes(bc->cxt, before->data, before->len, &c->before.data,
+				   &c->before.len);
+	if (after)
+		buffer_bytes(bc->cxt, after->data, after->len, &c->after.data,
+					 &c->after.len);
+	return true;
+}
+
+/* A sink that buffers every change, for comparing two ways of a diff. */
+typedef struct BufferSink
+{
+	ProllyDiffSink sink;
+	BufferedChanges bc;
+} BufferSink;
+
+static void
+buffer_sink_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
+				   const ProllyKey *key, const ProllyValue *before,
+				   const ProllyValue *after)
+{
+	(void) buffer_change(kind, key, before, after, &((BufferSink *) self)->bc);
+}
+
+static void
+emit_buffered(RowDiff *rd, const BufferedChange *c)
+{
+	row_change(c->kind, &c->key, c->before.data ? &c->before : NULL,
+			   c->after.data ? &c->after : NULL, rd);
+}
+
+/*
+ * The tree diff from the diff's first version to the baseline, merged with
+ * the changes since the baseline (in key order, the same keying's).
+ */
+typedef struct MergeWorking
+{
+	RowDiff    *rd;
+	const BufferedChanges *bc;
+	int64		i;
+} MergeWorking;
+
+static void
+merge_working_change(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	MergeWorking *mc = arg;
+	const BufferedChanges *bc = mc->bc;
+	const BufferedChange *c;
+	const ProllyValue *b;
+	const ProllyValue *a;
+
+	while (mc->i < bc->n && keying_compare(&bc->c[mc->i].key, key, mc->rd) < 0)
+		emit_buffered(mc->rd, &bc->c[mc->i++]);
+	if (mc->i >= bc->n || keying_compare(&bc->c[mc->i].key, key, mc->rd) != 0)
+	{
+		row_change(kind, key, before, after, mc->rd);
+		return;
+	}
+
+	/* (changed both ways: from the first version's row to the working set's) */
+	c = &bc->c[mc->i++];
+	b = before;
+	a = c->after.data ? &c->after : NULL;
+	if (b == NULL && a == NULL)
+		return;
+	if (b == NULL)
+		row_change(PROLLY_DIFF_ADDED, &c->key, NULL, a, mc->rd);
+	else if (a == NULL)
+		row_change(PROLLY_DIFF_REMOVED, key, b, NULL, mc->rd);
+	else if (b->len != a->len || memcmp(b->data, a->data, a->len) != 0 ||
+			 key->len != c->key.len ||
+			 memcmp(key->data, c->key.data, key->len) != 0)
+		row_change(PROLLY_DIFF_MODIFIED, &c->key, b, a, mc->rd);
+}
+
+/*
+ * diff_rows() of from (NULL: none) to the working set's table relid, from
+ * the changes since the baseline (whose tree of the table is base) instead
+ * of a fold.
+ */
+static void
+diff_rows_changes(Oid relid, const Table *from, const ProllyNodeRef *base,
+				  const BufferedChanges *bc, ProllyDiffSink *sink)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyKeyingRefs krefs;
+	RowDiff		rd = {0};
+	Relation	rel;
+
+	rel = table_open(relid, AccessShareLock);
+	rd.kr = keying_of(rel);
+	rd.k = PROLLY_CALL(rd.kr, open, rel, CurrentMemoryContext);
+	rd.relid = relid;
+	rd.sink = sink;
+	if (from && same_hash(&from->data.hash, &base->hash))
+	{
+		for (int64 i = 0; i < bc->n; i++)
+			emit_buffered(&rd, &bc->c[i]);
+	}
+	else
+	{
+		MergeWorking mc = {&rd, bc, 0};
+		ProllyNodeRef empty;
+		ProllyTreeBuilder *b;
+
+		chunk_env(&env);
+		env.compare = keying_compare;
+		env.compare_arg = &rd;
+		prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
+		b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+		PROLLY_CALL(tree, build_finish, b, &empty);
+		PROLLY_CALL(tree, diff, &env, from ? &from->data : &empty, base,
+					merge_working_change, &mc);
+		while (mc.i < bc->n)
+			emit_buffered(&rd, &bc->c[mc.i++]);
+	}
+	PROLLY_CALL(rd.kr, close, rd.k);
+	table_close(rel, AccessShareLock);
+}
+
+static bool
+same_buffered(const BufferedChanges *x, const BufferedChanges *y)
+{
+	if (x->n != y->n)
+		return false;
+	for (int64 i = 0; i < x->n; i++)
+	{
+		const BufferedChange *a = &x->c[i];
+		const BufferedChange *b = &y->c[i];
+
+		if (a->kind != b->kind || a->key.len != b->key.len ||
+			memcmp(a->key.data, b->key.data, a->key.len) != 0 ||
+			(a->before.data == NULL) != (b->before.data == NULL) ||
+			(a->after.data == NULL) != (b->after.data == NULL) ||
+			a->before.len != b->before.len || a->after.len != b->after.len ||
+			(a->before.data &&
+			 memcmp(a->before.data, b->before.data, a->before.len) != 0) ||
+			(a->after.data &&
+			 memcmp(a->after.data, b->after.data, a->after.len) != 0))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Table relid's rows from from_ref (not the working set) to the working
+ * set, read from the changes since the baseline: false, nothing sent, where
+ * they can't be (the refs can't, or the working set is known, or the first
+ * version defines the table otherwise than it is now): the caller folds.
+ * With debug_prolly_verify_fold_caches, also diffed from a fold and
+ * compared.
+ */
+static bool
+diff_working_from_changes(const char *from_ref, Oid relid,
+						  ProllyDiffSink *sink)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	List	   *from;
+	List	   *now;
+	Table	   *f;
+	Table	   *n;
+	ProllyNodeRef base;
+	BufferedChanges bc = {NULL, 0, 0, NULL};
+	bool		ok;
+
+	if (!PROLLY_HAS(refs, working_changes))
+		return false;
+
+	/*
+	 * (the changes held until they're sent, then let go of; asked first, as
+	 * a working set known declines at once, reading none, where reading the
+	 * definitions first would read the known working set twice: a table
+	 * defined otherwise now, which reads changes only to let them go, is
+	 * one changed by uncommitted DDL)
+	 */
+	bc.cxt = AllocSetContextCreate(CurrentMemoryContext, "working changes",
+								   ALLOCSET_DEFAULT_SIZES);
+	ok = refs->working_changes(relid, &base, buffer_change, &bc);
+	if (ok)
+	{
+		from = tables_of(from_ref, relid);
+		now = tables_defined_now(relid);
+		f = from ? linitial(from) : NULL;
+		n = now ? linitial(now) : NULL;
+		ok = n != NULL && !n->unreadable && !(f && f->unreadable) &&
+			!(f && !same_description(f, n));
+	}
+	if (ok && debug_prolly_verify_fold_caches)
+	{
+		BufferSink	got = {{buffer_sink_change}, {NULL, 0, 0, bc.cxt}};
+		BufferSink	folded = {{buffer_sink_change}, {NULL, 0, 0, bc.cxt}};
+		List	   *to = tables_of("WORKING", relid);
+
+		diff_rows_changes(relid, f, &base, &bc, &got.sink);
+		diff_rows_now(relid, f, to ? linitial(to) : NULL, to ? linitial(to) : NULL,
+					  &folded.sink);
+		if (!same_buffered(&got.bc, &folded.bc))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly diff of table \"%s\" read from its changes differs from its fold's",
+							get_rel_name(relid)),
+					 errdetail("%lld changes read, %lld folded.",
+							   (long long) got.bc.n, (long long) folded.bc.n)));
+	}
+	if (ok)
+		diff_rows_changes(relid, f, &base, &bc, sink);
+	MemoryContextDelete(bc.cxt);
+	return ok;
+}
+
 /* A versioned table of the session branch's, by qualified name. */
 static Oid
 rel_named(const char *name, bool missing_ok)
@@ -733,10 +1028,16 @@ static void
 folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 			ProllyDiffSink *sink)
 {
-	List	   *from = tables_of(from_ref, relid);
+	List	   *from;
 	List	   *to;
 	List	   *now;
 	ListCell   *lc;
+
+	/* (into WORKING, one table: from what changed since the baseline) */
+	if (OidIsValid(relid) && is_working(to_ref) && !is_working(from_ref) &&
+		diff_working_from_changes(from_ref, relid, sink))
+		return;
+	from = tables_of(from_ref, relid);
 
 	/* (WORKING folded once) */
 	to = is_working(to_ref) && is_working(from_ref) ? from :
@@ -744,7 +1045,8 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 
 	/*
 	 * Rows are read as the tables are defined now: the working set's
-	 * definitions, folded only if a version may define one otherwise.
+	 * definitions, read only if a version may define one otherwise, and
+	 * without its rows when neither version is the working set.
 	 */
 	if (is_working(to_ref))
 		now = to;
@@ -753,7 +1055,7 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 	else if (!tables_differ(from, to, relid))
 		return;
 	else
-		now = tables_of("WORKING", relid);
+		now = tables_defined_now(relid);
 
 	if (OidIsValid(relid))
 	{
@@ -792,9 +1094,146 @@ object_change(const char *name, ProllyDiffKind kind, char object, void *arg)
 	oc->visit(name, kind, object, oc->arg);
 }
 
+/* A read of changes stopped at the first: is there any? */
+static bool
+first_change(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	*(bool *) arg = true;
+	return false;
+}
+
+/*
+ * Whether the working set's rows of table t (as the definitions-only read
+ * describes it, its data the baseline's) differ from ref's (r: as ref has
+ * it), without a fold, from the change finder's record since the baseline:
+ * with no change since, the working set's rows are the baseline's, which
+ * differ from ref's if their trees do (trees are canonical); with one, they
+ * differ if the baseline holds ref's rows.  False in *known where it can't
+ * be told so (changes, on a baseline not ref's; or none read): the caller
+ * folds.
+ */
+static bool
+working_rows_differ(const Table *r, const Table *t, bool *known)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	Oid			relid = table_named(t->name);
+	ProllyNodeRef base;
+	bool		any = false;
+
+	*known = OidIsValid(relid) &&
+		refs->working_changes(relid, &base, first_change, &any) &&
+		(!any || same_hash(&base.hash, &r->data.hash));
+	return any || !same_hash(&base.hash, &r->data.hash);
+}
+
+/*
+ * folded_tables() from a version to the working set, from its definitions
+ * read without its rows: a table defined alike whose baseline holds the
+ * version's rows changed if the change finder finds a change since.  False
+ * where the refs can't read definitions alone, or a table's rows can't be
+ * told so (the caller folds them all, discarding what was visited).  The
+ * working set known (rows and all) is compared as it is.
+ */
+static bool
+tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
+					void *arg, bool *read_changes)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	List	   *left_out = NIL;
+	ListCell   *lc;
+	ProllyNodeRef from_root;
+	ProllyNodeRef to_root;
+	List	   *from;
+	Tables		ts = {NIL};
+	bool		rows;
+	ListCell   *a;
+	ListCell   *b;
+	void	   *read = NULL;
+	int			ntables = 0;	/* tables visited as changed */
+
+	/* (folds forced to read in full: nothing read otherwise) */
+	if (!PROLLY_HAS(refs, read_definitions) ||
+		!PROLLY_HAS(refs, working_changes) || debug_prolly_force_full_fold)
+		return false;
+	from = tables_of_reading(from_ref, InvalidOid, &left_out, &from_root);
+	refs->read_definitions(&to_root, &left_out, &rows, &read);
+	*read_changes = !rows;
+	read_tables(&to_root, &ts);
+	types_of_ref(ts.types, "WORKING");
+	a = list_head(from);
+	b = list_head(ts.tables);
+	while (a || b)
+	{
+		Table	   *ta = a ? lfirst(a) : NULL;
+		Table	   *tb = b ? lfirst(b) : NULL;
+		int			c = !ta ? 1 : !tb ? -1 : strcmp(ta->utf8, tb->utf8);
+
+		if (c < 0)
+		{
+			visit(ta->name, PROLLY_DIFF_REMOVED, PROLLY_OBJECT_TABLE, arg);
+			ntables++;
+			a = lnext(from, a);
+		}
+		else if (c > 0)
+		{
+			visit(tb->name, PROLLY_DIFF_ADDED, PROLLY_OBJECT_TABLE, arg);
+			ntables++;
+			b = lnext(ts.tables, b);
+		}
+		else
+		{
+			bool		known = true;
+			bool		differ = !same_description(ta, tb);
+
+			if (!differ)
+				differ = rows ? !same_hash(&ta->data.hash, &tb->data.hash) :
+					working_rows_differ(ta, tb, &known);
+			if (!known)
+				return false;	/* (what was visited, the caller discards:
+								 * see below) */
+			if (differ)
+			{
+				visit(ta->name, PROLLY_DIFF_MODIFIED, PROLLY_OBJECT_TABLE, arg);
+				ntables++;
+			}
+			a = lnext(from, a);
+			b = lnext(ts.tables, b);
+		}
+	}
+
+	/* the other objects (the definitions' are the working set's) */
+	if (PROLLY_HAS(components().canonicalizer, objects) &&
+		!same_hash(&from_root.hash, &to_root.hash))
+	{
+		ObjectChanges oc = {visit, arg, left_out};
+
+		PROLLY_CALL(components().canonicalizer, objects, &from_root, &to_root,
+					object_change, &oc);
+	}
+
+	/*
+	 * (the definitions the version's, every table's rows its too, as no
+	 * table has a change since a baseline holding them: the definitions'
+	 * root is the working set, for later reads to take)
+	 */
+	else if (!rows && ntables == 0 && left_out == NIL &&
+			 same_hash(&from_root.hash, &to_root.hash) &&
+			 PROLLY_HAS(refs, publish_definitions))
+		refs->publish_definitions(read, &to_root, true);
+	list_sort(left_out, string_cmp);
+	foreach(lc, left_out)
+	{
+		if (foreach_current_index(lc) == 0 ||
+			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
+			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, PROLLY_OBJECT_UNKNOWN, arg);
+	}
+	return true;
+}
+
 static void
-folded_tables(const char *from_ref, const char *to_ref,
-			  ProllyTableChangeVisit visit, void *arg)
+tables_of_both(const char *from_ref, const char *to_ref,
+			   ProllyTableChangeVisit visit, void *arg)
 {
 	List	   *left_out = NIL;
 	ListCell   *lc;
@@ -860,6 +1299,99 @@ folded_tables(const char *from_ref, const char *to_ref,
 		if (foreach_current_index(lc) == 0 ||
 			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
 			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, PROLLY_OBJECT_UNKNOWN, arg);
+	}
+}
+
+/* A change visited, kept for comparing two reads and for visiting again. */
+typedef struct NotedChange
+{
+	char	   *name;
+	ProllyDiffKind kind;
+	char		object;
+} NotedChange;
+
+static void
+note_table_change(const char *name, ProllyDiffKind kind, char object,
+				  void *arg)
+{
+	List	  **l = arg;
+	NotedChange *c = palloc(sizeof(NotedChange));
+
+	c->name = pstrdup(name);
+	c->kind = kind;
+	c->object = object;
+	*l = lappend(*l, c);
+}
+
+static bool
+same_noted(const NotedChange *a, const NotedChange *b)
+{
+	return a->kind == b->kind && a->object == b->object &&
+		strcmp(a->name, b->name) == 0;
+}
+
+/*
+ * What differs between two refs, table by table, then the other objects.
+ * Into the working set, from its definitions and the changes since its
+ * baseline where they can be read so; with debug_prolly_verify_fold_caches,
+ * read from a fold too, and compared.
+ */
+static void
+folded_tables(const char *from_ref, const char *to_ref,
+			  ProllyTableChangeVisit visit, void *arg)
+{
+	List	   *got = NIL;
+	List	   *folded = NIL;
+	ListCell   *a;
+	ListCell   *b;
+	bool		read_changes = false;
+
+	if (!is_working(to_ref) || is_working(from_ref))
+	{
+		tables_of_both(from_ref, to_ref, visit, arg);
+		return;
+	}
+	/*
+	 * (its changes held until it has answered for every table; checked
+	 * against a fold only if it read the change finder's, not the working
+	 * set known, which is checked as it is taken)
+	 */
+	if (!tables_into_working(from_ref, note_table_change, &got,
+							 &read_changes))
+	{
+		tables_of_both(from_ref, to_ref, visit, arg);
+		return;
+	}
+	if (!debug_prolly_verify_fold_caches || !read_changes)
+	{
+		foreach(a, got)
+		{
+			NotedChange *c = lfirst(a);
+
+			visit(c->name, c->kind, c->object, arg);
+		}
+		return;
+	}
+	tables_of_both(from_ref, to_ref, note_table_change, &folded);
+	if (list_length(got) != list_length(folded))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly changes into the working set read from its change finder differ from its fold's"),
+				 errdetail("%d read, %d folded.", list_length(got),
+						   list_length(folded))));
+	forboth(a, got, b, folded)
+		if (!same_noted(lfirst(a), lfirst(b)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly changes into the working set read from its change finder differ from its fold's"),
+					 errdetail("Read %s, folded %s.",
+							   ((NotedChange *) lfirst(a))->name,
+							   ((NotedChange *) lfirst(b))->name)));
+	foreach(a, got)
+	{
+		NotedChange *c = lfirst(a);
+
+		visit(c->name, c->kind, c->object, arg);
 	}
 }
 
