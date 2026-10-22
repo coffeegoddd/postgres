@@ -1,0 +1,141 @@
+-- A versioned schema an extension is in stays on every branch.  A move to a
+-- state without it (a reset, a checkout, a branch's first use from such a
+-- commit) keeps it, empty but for the extension's objects, which are every
+-- branch's; dolt_status then shows it as a schema the commit lacks.  (In a
+-- database of its own, so the branches here are the only ones.)
+CREATE DATABASE regress_extension_moves;
+\c regress_extension_moves
+CREATE SCHEMA em VERSIONED;
+CREATE TABLE em.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'without ve')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('em_old');			-- head-only, at the commit without ve
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE SCHEMA ve VERSIONED;
+CREATE EXTENSION citext SCHEMA ve;
+CREATE TABLE ve.t (id int PRIMARY KEY, name ve.citext);
+INSERT INTO ve.t VALUES (1, 'Hi');
+SELECT length(dolt_commit('-Am', 'with ve')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS with_ve \gset
+-- back to the commit without ve: the table goes, the schema and the
+-- extension stay
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT nspname FROM pg_namespace WHERE nspname = 've';
+ nspname 
+---------
+ ve
+(1 row)
+
+SELECT extname, extnamespace::regnamespace FROM pg_extension WHERE extname = 'citext';
+ extname | extnamespace 
+---------+--------------
+ citext  | ve
+(1 row)
+
+SELECT to_regclass('ve.t') AS t;
+ t 
+---
+ 
+(1 row)
+
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+ table_name |   status   
+------------+------------
+ ve         | new schema
+(1 row)
+
+SELECT 'x'::ve.citext::text AS still_usable;
+ still_usable 
+--------------
+ x
+(1 row)
+
+-- forward again
+SELECT dolt_reset('--hard', :'with_ve');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id, name FROM ve.t;
+ id | name 
+----+------
+  1 | Hi
+(1 row)
+
+-- a branch's first use, at a commit without ve: it has ve too
+SELECT dolt_checkout('em_old');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'em_old'"}
+(1 row)
+
+SELECT nspname FROM pg_namespace WHERE nspname = 've';
+ nspname 
+---------
+ ve
+(1 row)
+
+CREATE TABLE ve.u (id int PRIMARY KEY, name ve.citext);
+INSERT INTO ve.u VALUES (1, 'There');
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- still refused: dropping the schema, or the extension under em_old's table
+DROP SCHEMA ve CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to extension citext
+drop cascades to table ve.t
+ERROR:  cannot drop schema "ve" because extension "citext" is in it
+DETAIL:  An extension in a versioned schema is shared by every branch, and every branch keeps the schema.
+HINT:  Drop the extension first.
+DROP EXTENSION citext CASCADE;
+NOTICE:  drop cascades to column name of table ve.t
+ERROR:  cannot drop type ve.citext because objects on branch "em_old" depend on it
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+SELECT dolt_checkout('em_old');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'em_old'"}
+(1 row)
+
+DROP TABLE ve.u;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'em_old');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP TABLE ve.t;
+DROP EXTENSION citext;
+DROP SCHEMA ve, em CASCADE;
+NOTICE:  drop cascades to table em.base
+\c contrib_regression
+DROP DATABASE regress_extension_moves;
