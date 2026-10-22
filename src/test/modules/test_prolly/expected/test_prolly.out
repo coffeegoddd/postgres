@@ -16,9 +16,9 @@ FROM prolly_implementations();
  content_hash  | stub         |       0 |              0
  content_hash  | test_fnv     |    9001 |              0
  content_hash  | test_broken  |    9002 |              0
- key_encoder   | ordered      |       1 |              4
+ key_encoder   | ordered      |       1 |              5
  key_encoder   | stub         |       0 |              0
- value_encoder | canonical    |       2 |              4
+ value_encoder | canonical    |       2 |              5
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0

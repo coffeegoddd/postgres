@@ -329,6 +329,32 @@ prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 				 errhint("Key the table by a shorter value, such as a hash of this one.")));
 }
 
+/*
+ * A column added to rel with a missing value (a default that no row is
+ * written with): the value is checked as a row's would be, refused if it
+ * holds a type kept as its text form whose text doesn't read back as it.
+ */
+void
+prolly_check_missing_value(Relation rel, AttrNumber attnum, Datum value)
+{
+	Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "prolly missing value",
+											  ALLOCSET_SMALL_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	ProllyDatumCodec *codec = prolly_datum_codec(att->atttypid, att->atttypmod, cxt);
+
+	if (prolly_datum_codec_checks(codec))
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		prolly_datum_encode(codec, value, &buf);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+}
+
 void
 prolly_check_table_keys(Relation rel)
 {

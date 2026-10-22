@@ -225,7 +225,9 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "12", every chunk and hash pointer named
+ * The format a folded root is in: "14", a value of a type whose binary I/O
+ * may change (an extension's) tagged with the form it is in, its send
+ * format or its text form (prolly_datum.c); "13" had such values untagged; "12", every chunk and hash pointer named
  * by BLAKE3's first 20 bytes; "11" named them by SHA-256, and was the
  * first with primary keys whose opfamily
  * compares them as a type they're binary-coercible to (varchar as text,
@@ -253,7 +255,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"13"
+#define FOLDED_FORMAT	"14"
 
 /*
  * The format versions of the encoders FOLDED_FORMAT's trees are written
@@ -264,8 +266,8 @@ typedef struct BaseTable BaseTable;
  * FOLDED_FORMAT too, and these with it: a fold refuses to run till they
  * agree (folded_encoders_checked()).
  */
-#define FOLDED_KEY_ENCODER		4
-#define FOLDED_VALUE_ENCODER	4
+#define FOLDED_KEY_ENCODER		5
+#define FOLDED_VALUE_ENCODER	5
 #define FOLDED_KEYING			1
 
 typedef struct Canon
@@ -1120,6 +1122,20 @@ canon_namespace(Oid nsp)
 	canon = !is_system_namespace(nsp) && namespace_is_versioned(nsp);
 	namespace_learned(nsp, canon, epoch);
 	return canon;
+}
+
+/*
+ * Is this object one a commit describes: in a versioned schema, and the
+ * branch's own (an extension's members there are shared, and aren't)?
+ */
+static bool
+canon_object(Oid classid, Oid objid)
+{
+	ObjectAddress obj;
+
+	ObjectAddressSet(obj, classid, objid);
+	return canon_namespace(get_object_namespace(&obj)) &&
+		object_is_versioned(&obj);
 }
 
 static int
@@ -1987,21 +2003,16 @@ describe_range(Canon *cn, Form_pg_type typ)
 		return;
 	}
 	if (OidIsValid(rng->rngsubdiff) &&
-		canon_namespace(get_func_namespace(rng->rngsubdiff)))
+		canon_object(ProcedureRelationId, rng->rngsubdiff))
 	{
 		ReleaseSysCache(tup);
 		(void) uncovered(cn, "range types whose subtype difference function is versioned", name, &self);
 		return;
 	}
 	{
-		ObjectAddress opc;
-		ObjectAddress coll;
-
-		ObjectAddressSet(opc, OperatorClassRelationId, rng->rngsubopc);
-		ObjectAddressSet(coll, CollationRelationId, rng->rngcollation);
-		if (canon_namespace(get_object_namespace(&opc)) ||
+		if (canon_object(OperatorClassRelationId, rng->rngsubopc) ||
 			(OidIsValid(rng->rngcollation) &&
-			 canon_namespace(get_object_namespace(&coll))))
+			 canon_object(CollationRelationId, rng->rngcollation)))
 		{
 			ReleaseSysCache(tup);
 			(void) uncovered(cn, "range types whose operator class or collation is versioned", name, &self);

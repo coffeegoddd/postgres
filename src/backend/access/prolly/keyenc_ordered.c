@@ -217,17 +217,13 @@ classify(Oid opfamily, Oid type, Oid collation, ColumnKind *kind,
 	}
 	else
 	{
-		/* Any other type, if it has a binary send and receive format. */
-		HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base));
-		bool		binary_io;
-
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "cache lookup failed for type %u", base);
-		binary_io = OidIsValid(((Form_pg_type) GETSTRUCT(tup))->typsend) &&
-			OidIsValid(((Form_pg_type) GETSTRUCT(tup))->typreceive);
-		ReleaseSysCache(tup);
-		if (!binary_io)
-			return false;
+		/*
+		 * Any other type, as its canonical bytes (prolly_datum.c): its send
+		 * format, or for a type without binary send and receive its text
+		 * form, tagged where the type's I/O may change.  Whether a type
+		 * keys a table never depends on which it has, which an extension's
+		 * update may change.
+		 */
 		*kind = KIND_SEND;
 		*memcmp_ordered = false;
 	}
@@ -554,7 +550,7 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 		.iface = PROLLY_IFACE_KEY_ENCODER,
 		.impl_id = 1,
 		/* (pinned by canon_folded.c: change FOLDED_FORMAT with it) */
-		.format_version = 4,		/* 3: NaNs canonical; 4: varchar keys */
+		.format_version = 5,		/* 3: NaNs canonical; 4: varchar keys; 5: tagged values */
 		.name = "ordered",
 		.description = "memcmp-ordered integers, bools and C-collation text; "
 		"other types by canonical bytes and their comparison function",

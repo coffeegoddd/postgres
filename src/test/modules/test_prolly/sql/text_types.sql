@@ -60,5 +60,54 @@ UPDATE tt.shapes SET p = ROW(NULL, '1.23456789') WHERE id = 1;
 SELECT count(*) AS rows FROM tt.shapes;
 SELECT table_name, status FROM dolt_status() ORDER BY 1;	-- nothing left behind
 
+-- the text form is written with fixed settings: a session's
+-- extra_float_digits changes nothing a commit holds
+CREATE TABLE tt.f (id int PRIMARY KEY, c tt.cube);
+INSERT INTO tt.f VALUES (1, '(5e-324)'), (2, '(0.12345678901234568)');
+SELECT length(dolt_commit('-Am', 'denormal and 17 digits')::text) AS committed;
+SET extra_float_digits = 0;
+UPDATE tt.f SET id = id;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+RESET extra_float_digits;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+
+-- a column added with a default no row is written with: checked too
+ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.23456789';
+ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.5';
+SELECT id, s FROM tt.f ORDER BY id;
+SELECT length(dolt_commit('-Am', 'a seg column')::text) AS committed;
+
+-- a range over such a type is kept as its text form too
+CREATE TYPE tt.segr AS RANGE (subtype = tt.seg);
+CREATE TABLE tt.r (id int PRIMARY KEY, r tt.segr);
+INSERT INTO tt.r VALUES (1, tt.segr('1', '2'));
+INSERT INTO tt.r VALUES (2, tt.segr('1.23456789', '2'));
+SELECT length(dolt_commit('-Am', 'a range of seg')::text) AS committed;
+DROP TABLE tt.r;
+SELECT dolt_reset('--hard');
+SELECT id, r FROM tt.r;
+
+-- a type that gains binary send and receive (cube's update to 1.5): what
+-- commits hold is read back as written (each value is tagged with its
+-- form), and keys it orders are keyed as before; values written from then
+-- on are in their binary form, so a diff across the update shows a row
+-- written again since as modified, with the same values
+SELECT dolt_hashof('HEAD') AS before_update \gset
+ALTER EXTENSION cube UPDATE TO '1.5';
+SELECT typname, typsend <> 0 AS binary FROM pg_type WHERE typname = 'cube';
+SELECT table_name, status FROM dolt_status() WHERE table_name IN ('tt.f', 'tt.keyed') ORDER BY 1;
+SELECT length(dolt_commit('-Am', 'cube 1.5', '--allow-empty')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS after_update \gset
+DROP TABLE tt.f, tt.keyed;
+SELECT dolt_reset('--hard', :'before_update');
+SELECT id, c FROM tt.f ORDER BY id;
+SELECT k, n FROM tt.keyed ORDER BY k;
+SELECT k, n FROM tt.keyed WHERE k = '(1,2)';
+SELECT dolt_reset('--hard', :'after_update');
+SELECT k, n FROM tt.keyed ORDER BY k;
+UPDATE tt.keyed SET n = n + 10 WHERE k = '(2)';
+SELECT diff_type, (from_row).k::text AS k, (from_row).n AS from_n, (to_row).n AS to_n
+  FROM dolt_diff(:'before_update', 'WORKING', NULL::tt.keyed) ORDER BY 2;
+
 \c contrib_regression
 DROP DATABASE regress_text_types;
