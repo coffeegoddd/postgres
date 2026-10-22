@@ -889,6 +889,65 @@ chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
 	chunk_cache_evict(limit);
 }
 
+/*
+ * Chunks a transaction that writes knows are stored without asking the
+ * index: those a stored chunk it read names.  The store never holds a
+ * chunk without what it names, and only a collection's swap drops one, so
+ * while none happened since the transaction began (xact_straddles()),
+ * what a chunk it read from the store's files names is the store's still,
+ * and a pending chunk naming it needs no index probe for it
+ * (check_reference()).  A chunk from the cache counts too: the cache holds
+ * only chunks of the store's GC generation now, which must be the one the
+ * transaction began in: none was dropped since.
+ * Only chunks read as the transaction has pending ones are taken in (a
+ * read-only transaction pays nothing); the set goes with the transaction.
+ */
+static bool xact_straddles(ProllyChunkStore *s);
+
+static HTAB *trusted = NULL;	/* in TopTransactionContext */
+static LocalTransactionId trusted_lxid = InvalidLocalTransactionId;
+
+static void
+trust_ref(const ProllyHash *ref, void *arg)
+{
+	ProllyHash	key;
+
+	hash_key(&key, ref);
+	(void) hash_search(trusted, &key, HASH_ENTER, NULL);
+}
+
+/* What chunk (read stored, in GC generation generation) names, trusted. */
+static void
+trust_named(ProllyChunkStore *s, const char *chunk, Size len,
+			uint32 generation)
+{
+	if (s != session_store || hash_get_num_entries(s->pending_index) == 0 ||
+		MyProc->vxid.lxid != s->xact_lxid ||
+		generation != s->xact_generation || xact_straddles(s))
+		return;
+	if (trusted == NULL || trusted_lxid != MyProc->vxid.lxid)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(ProllyHash);
+		ctl.entrysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
+		ctl.hcxt = TopTransactionContext;
+		trusted = hash_create("prolly trusted chunks", 1024, &ctl,
+							  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+		trusted_lxid = MyProc->vxid.lxid;
+	}
+	prolly_chunk_references(chunk, len, trust_ref, NULL);
+}
+
+static bool
+trusted_has(ProllyChunkStore *s, const ProllyHash *key)
+{
+	return trusted != NULL && trusted_lxid == MyProc->vxid.lxid &&
+		!xact_straddles(s) &&
+		hash_search(trusted, key, HASH_FIND, NULL) != NULL;
+}
+
 /* Append a record of kind with payload (head, then tail) to buf. */
 static void
 record_append(StringInfo buf, uint8 kind, const void *head, Size headlen,
@@ -2449,7 +2508,7 @@ check_reference(const ProllyHash *ref, void *arg)
 
 	hash_key(&key, ref);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL ||
-		stored_has(s, &key))
+		trusted_has(s, &key) || stored_has(s, &key))
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -4873,9 +4932,12 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	if (!stored && s == session_store)
 	{
 		refresh_segments(s);
+		start = out->len;
 		if (chunk_cache_take(&key, out, s->gc_generation))
 		{
 			xact_note(s);
+			trust_named(s, out->data + start, out->len - start,
+						s->gc_generation);
 			return true;
 		}
 	}
@@ -4913,7 +4975,7 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 			{
 				if (!stored && s == session_store)
 					chunk_cache_put(&key, out->data + start, out->len - start,
-									s->gc_generation);
+								s->gc_generation);
 				return true;
 			}
 			if (s->through == NULL)
@@ -4959,8 +5021,12 @@ journal_read(ProllyChunkStore *s, const ProllyHash *hash, StringInfo out,
 	{
 		chunk_bytes_of(g->path, rec, len, &key, out);
 		if (s == session_store)
+		{
 			chunk_cache_put(&key, out->data + start, out->len - start,
 							s->gc_generation);
+			trust_named(s, out->data + start, out->len - start,
+						s->gc_generation);
+		}
 	}
 	pfree(rec);
 	return true;
