@@ -192,11 +192,75 @@ SELECT diff_type, count(*) FROM dolt_diff_table(NULL::dh.rpk, 'HEAD~', 'HEAD')
 GROUP BY diff_type ORDER BY diff_type;
 SELECT count(*) FROM dolt_history_table(NULL::dh.rpk);
 -- Neither historical version has the current key's name.  They cannot
--- be matched by that key, but all rows must still be reported.
+-- be matched by that key, but equal projected copies cancel.
 ALTER TABLE dh.rpk RENAME COLUMN pk2 TO pk3;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'before_rename', 'HEAD', NULL::dh.rpk)
 ORDER BY diff_type, (from_row).v, (to_row).v;
+
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD', :'before_rename', NULL::dh.rpk)
+ORDER BY diff_type, (from_row).v, (to_row).v;
+
+-- Both commits predate a single rename.  Copies that become identical
+-- still cancel one-for-one, while a partial composite key retains its
+-- surviving component.
+CREATE TABLE dh.oldpk (pk int PRIMARY KEY, v int);
+CREATE TABLE dh.oldcpk (a int, b int, v int, PRIMARY KEY (a, b));
+INSERT INTO dh.oldpk VALUES (1, 7), (2, 7), (3, 8), (4, 8);
+INSERT INTO dh.oldcpk VALUES (1, 1, 7), (1, 2, 7), (2, 1, 8);
+SELECT length(dolt_commit('-Am', 'old keys base')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS old_keys_base \gset
+UPDATE dh.oldpk SET v = 9 WHERE pk = 1;
+DELETE FROM dh.oldpk WHERE pk = 3;
+INSERT INTO dh.oldpk VALUES (5, 9);
+UPDATE dh.oldcpk SET v = 9 WHERE a = 1 AND b = 1;
+SELECT length(dolt_commit('-am', 'old keys changed')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS old_keys_changed \gset
+ALTER TABLE dh.oldpk RENAME COLUMN pk TO id;
+ALTER TABLE dh.oldcpk RENAME COLUMN b TO b2;
+SELECT length(dolt_commit('-am', 'old keys renamed')::text) AS committed;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'old_keys_base', :'old_keys_changed', NULL::dh.oldpk)
+ORDER BY diff_type, (from_row).v, (to_row).v;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'old_keys_base', :'old_keys_changed', NULL::dh.oldcpk)
+ORDER BY diff_type;
+SELECT table_name, rows_added, rows_deleted, rows_modified
+FROM dolt_diff_stat(:'old_keys_base', :'old_keys_changed', 'dh.oldpk');
+
+-- Keyless-origin counts cancel without expanding copies into sort entries.
+-- Distinct values that both fit to NULL must not cancel each other.
+CREATE TABLE dh.oldbag (v varchar(20));
+INSERT INTO dh.oldbag VALUES ('same'), ('same'), ('same'), ('too long old');
+SELECT length(dolt_commit('-Am', 'old bag base')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS old_bag_base \gset
+DELETE FROM dh.oldbag WHERE ctid IN (SELECT ctid FROM dh.oldbag WHERE v = 'same' LIMIT 1);
+UPDATE dh.oldbag SET v = 'too long new' WHERE v = 'too long old';
+SELECT length(dolt_commit('-am', 'old bag changed')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS old_bag_changed \gset
+ALTER TABLE dh.oldbag ADD COLUMN id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY;
+ALTER TABLE dh.oldbag ALTER COLUMN v TYPE varchar(4) USING left(v, 4);
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'old_bag_base', :'old_bag_changed', NULL::dh.oldbag)
+ORDER BY diff_type, (from_row).v;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'old_bag_changed', :'old_bag_base', NULL::dh.oldbag)
+ORDER BY diff_type, (to_row).v;
+
+-- A whole historical table can lack the current key: sort within work_mem.
+CREATE TABLE dh.spillpk (pk int PRIMARY KEY, v text);
+INSERT INTO dh.spillpk SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'spill base')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS spill_base \gset
+UPDATE dh.spillpk SET v = 'changed' WHERE pk = 1;
+SELECT length(dolt_commit('-am', 'spill changed')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS spill_changed \gset
+ALTER TABLE dh.spillpk RENAME COLUMN pk TO id;
+SET work_mem = '64kB';
+SELECT diff_type, count(*) FROM dolt_diff(:'spill_base', :'spill_changed', NULL::dh.spillpk)
+GROUP BY diff_type ORDER BY diff_type;
+RESET work_mem;
 
 -- An absent key added to a keyless version must retain its row counts;
 -- old values that cannot fit the current row type still show as NULL.

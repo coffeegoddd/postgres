@@ -115,8 +115,11 @@ bypass.
 Historical row ports retain the current by-name projection (D18). A renamed
 primary-key column is NULL in an older version that lacks its current name.
 When the stored rows differ, such rows cannot be matched by the current key:
-each is reported separately as removed or added, including identical projected
-rows and composite keys with a missing component. A rename alone with unchanged
+equal projected rows on opposite sides cancel by copy count, and the remaining
+rows are reported separately as removed or added. This retains duplicate rows
+and composite keys with a missing component. Cancellation uses the compared
+values before fitting them to the current types, so distinct old values that
+both display as NULL still differ. The temporary sort can spill to disk. A rename alone with unchanged
 data roots still produces no row diff. Following column identity across renames
 is tracked separately in [#699](https://github.com/coffeegoddd/postgres/issues/699).
 

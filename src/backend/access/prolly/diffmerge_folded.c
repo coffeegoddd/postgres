@@ -68,6 +68,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/typcache.h"
+#include "utils/tuplesort.h"
 #include "catalog/versioned.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
@@ -81,6 +82,7 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_operator_d.h"
 #include "access/xact.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
@@ -5859,12 +5861,144 @@ fit_row(const ColumnRead *reads, const int *from, TupleTableSlot *xs,
 	ExecStoreVirtualTuple(fs);
 }
 
-/* Rows a diff cannot match using the current key, sent separately. */
+/* Rows without a usable current key, sorted by their compared row bytes. */
 typedef struct UnmatchedRows
 {
-	ProllyDiffSink *sink;
-	ProllyDiffKind kind;
+	MemoryContext context;
+	TupleDesc	desc;
+	Tuplesortstate *sort;
+	TupleTableSlot *input;
+	TupleTableSlot *slot;
+	uint64		count;
 } UnmatchedRows;
+
+/* Keep copy counts compact and let a whole-table projection spill to disk. */
+static void
+save_unmatched(UnmatchedRows *rows, const ProllyKey *key,
+			   const ProllyValue *compared, const ProllyValue *shown, uint64 count)
+{
+	Datum	   *values;
+
+	if (rows->sort == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(rows->context);
+		AttrNumber	attnum = 1;
+		Oid			operator = ByteaLessOperator;
+		Oid			collation = InvalidOid;
+		bool		nulls_first = false;
+
+		rows->desc = CreateTemplateTupleDesc(4);
+		TupleDescInitEntry(rows->desc, 1, "compared", BYTEAOID, -1, 0);
+		TupleDescInitEntry(rows->desc, 2, "key", BYTEAOID, -1, 0);
+		TupleDescInitEntry(rows->desc, 3, "shown", BYTEAOID, -1, 0);
+		TupleDescInitEntry(rows->desc, 4, "copies", INT8OID, -1, 0);
+		TupleDescFinalize(rows->desc);
+		rows->sort = tuplesort_begin_heap(rows->desc, 1, &attnum, &operator,
+										 &collation, &nulls_first, work_mem, NULL,
+										 TUPLESORT_NONE);
+		rows->input = MakeSingleTupleTableSlot(rows->desc, &TTSOpsVirtual);
+		rows->slot = MakeSingleTupleTableSlot(rows->desc, &TTSOpsMinimalTuple);
+		MemoryContextSwitchTo(old);
+	}
+	values = rows->input->tts_values;
+	memset(rows->input->tts_isnull, 0, 4 * sizeof(bool));
+	/* bytea and text share the same length-delimited representation. */
+	values[0] = PointerGetDatum(cstring_to_text_with_len((const char *) compared->data,
+														  compared->len));
+	values[1] = PointerGetDatum(cstring_to_text_with_len((const char *) key->data,
+														  key->len));
+	values[2] = PointerGetDatum(cstring_to_text_with_len((const char *) shown->data,
+														  shown->len));
+	/* The count is an opaque uint64 here, never compared as a SQL int8. */
+	values[3] = UInt64GetDatum(count);
+	ExecStoreVirtualTuple(rows->input);
+	tuplesort_puttupleslot(rows->sort, rows->input);
+	ExecClearTuple(rows->input);
+}
+
+static void
+next_unmatched(UnmatchedRows *rows)
+{
+	rows->count = 0;
+	if (rows->sort &&
+		tuplesort_gettupleslot(rows->sort, true, false, rows->slot, NULL))
+	{
+		slot_getallattrs(rows->slot);
+		rows->count = DatumGetUInt64(rows->slot->tts_values[3]);
+		Assert(rows->count > 0);
+	}
+}
+
+static void
+emit_unmatched(UnmatchedRows *rows, Oid relid, ProllyDiffKind kind,
+			   ProllyDiffSink *sink)
+{
+	bytea	   *key = DatumGetByteaPP(rows->slot->tts_values[1]);
+	bytea	   *shown = DatumGetByteaPP(rows->slot->tts_values[2]);
+	ProllyKey	k = {(const uint8 *) VARDATA_ANY(key), VARSIZE_ANY_EXHDR(key)};
+	ProllyValue v = {(const uint8 *) VARDATA_ANY(shown), VARSIZE_ANY_EXHDR(shown)};
+
+	while (rows->count > 0)
+	{
+		sink->change(sink, relid, kind, &k,
+					 kind == PROLLY_DIFF_REMOVED ? &v : NULL,
+					 kind == PROLLY_DIFF_ADDED ? &v : NULL);
+		rows->count--;
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/* Cancel equal copies without assuming that a projected NULL key is unique. */
+static void
+diff_unmatched(UnmatchedRows *removed, UnmatchedRows *added, Oid relid,
+			   ProllyDiffSink *sink)
+{
+	UnmatchedRows *sides[2] = {removed, added};
+
+	for (int i = 0; i < 2; i++)
+	{
+		if (sides[i]->sort)
+			tuplesort_performsort(sides[i]->sort);
+		next_unmatched(sides[i]);
+	}
+	while (removed->count || added->count)
+	{
+		int			cmp;
+
+		CHECK_FOR_INTERRUPTS();
+		if (removed->count == 0)
+			cmp = 1;
+		else if (added->count == 0)
+			cmp = -1;
+		else
+			cmp = DatumGetInt32(DirectFunctionCall2(byteacmp,
+													  removed->slot->tts_values[0],
+													  added->slot->tts_values[0]));
+		if (cmp == 0)
+		{
+			uint64		copies = Min(removed->count, added->count);
+
+			removed->count -= copies;
+			added->count -= copies;
+		}
+		else if (cmp < 0)
+			emit_unmatched(removed, relid, PROLLY_DIFF_REMOVED, sink);
+		else
+			emit_unmatched(added, relid, PROLLY_DIFF_ADDED, sink);
+		if (removed->count == 0)
+			next_unmatched(removed);
+		if (added->count == 0)
+			next_unmatched(added);
+	}
+	for (int i = 0; i < 2; i++)
+		if (sides[i]->sort)
+		{
+			ExecDropSingleTupleTableSlot(sides[i]->input);
+			ExecDropSingleTupleTableSlot(sides[i]->slot);
+			tuplesort_end(sides[i]->sort);
+			FreeTupleDesc(sides[i]->desc);
+		}
+}
 
 /*
  * A version x of table rel's rows as rel defines them now (now: the
@@ -5895,8 +6029,9 @@ typedef struct UnmatchedRows
  * can't hold, as an INSERT does.
  *
  * Where unmatched is supplied (a diff), a row whose current key contains
- * a NULL for a column absent in x cannot be matched by that key.  Send it
- * directly as an addition or removal, leaving it out of *out and *shown.
+ * a NULL for a column absent in x cannot be matched by that key.  Buffer it
+ * separately, leaving it out of *out and *shown, and cancel equal copies
+ * from the two versions before emitting the remaining additions/removals.
  * In particular, a renamed key must not collapse all of x's rows onto
  * one NULL key, even when their projected values are identical.
  *
@@ -6218,6 +6353,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		if (unmatchable)
 		{
 			ProllyKey	ck = {(const uint8 *) key.data, key.len};
+			ProllyValue compared = {(const uint8 *) crow.data, crow.len};
 			ProllyValue cr = {(const uint8 *) (fitting ? frow.data : crow.data),
 				fitting ? frow.len : crow.len};
 			StringInfoData value;
@@ -6228,14 +6364,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			PROLLY_CALL(rd.kr, make_value, rd.k, &cr, 1, &value);
 			val.data = (const uint8 *) value.data;
 			val.len = value.len;
-			for (uint64 copy = 0; copy < count; copy++)
-			{
-				unmatched->sink->change(unmatched->sink, RelationGetRelid(rel),
-										unmatched->kind, &ck,
-										unmatched->kind == PROLLY_DIFF_REMOVED ? &val : NULL,
-										unmatched->kind == PROLLY_DIFF_ADDED ? &val : NULL);
-				CHECK_FOR_INTERRUPTS();
-			}
+			save_unmatched(unmatched, &ck, &compared, &val, count);
+			CHECK_FOR_INTERRUPTS();
 			MemoryContextSwitchTo(outer);
 			MemoryContextReset(rowcxt);
 			continue;
@@ -6616,8 +6746,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	const Table *tp;
 	ProllyNodeRef fs;
 	ProllyNodeRef ts;
-	UnmatchedRows removed = {sink, PROLLY_DIFF_REMOVED};
-	UnmatchedRows added = {sink, PROLLY_DIFF_ADDED};
+	UnmatchedRows removed = {.context = CurrentMemoryContext};
+	UnmatchedRows added = {.context = CurrentMemoryContext};
 
 	/*
 	 * (the same rows: none changed, whatever the definitions say, as rows
@@ -6639,6 +6769,7 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 						NULL, &added);
 	table_close(rel, AccessShareLock);
 	diff_rows(relid, fp, tp, &fs, &ts, sink);
+	diff_unmatched(&removed, &added, relid, sink);
 }
 
 /* What a merge across definitions writes, once they're merged. */
