@@ -6603,6 +6603,20 @@ note_lacking(const char *branch, const ProllyHash *head, void *arg)
  * which a commit doesn't hold, are noted in *replaced for the new one.
  * Otherwise the move is refused, naming it and what uses it.
  */
+/*
+ * Does an extension live in versioned schema name?  Then every branch keeps
+ * the schema, and a move to a state without it leaves it, empty but for the
+ * extension's objects, which are every branch's.
+ */
+static bool
+holds_extension(const char *name)
+{
+	char	   *plain = strVal(linitial(stringToQualifiedNameList(name, NULL)));
+	Oid			nsp = get_namespace_oid(plain, true);
+
+	return OidIsValid(nsp) && OidIsValid(extension_in_namespace(nsp));
+}
+
 static List *
 make_schema(Canon *cn, const char *name, List **replaced)
 {
@@ -8523,7 +8537,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	{
 		MoveItem   *f = lfirst(lc);
 
-		if (f->kind == 'n' && find_item(to, 'n', f->name) == NULL)
+		if (f->kind == 'n' && find_item(to, 'n', f->name) == NULL &&
+			!holds_extension(f->name))
 			schema_drops = lappend(schema_drops,
 								   psprintf("DROP SCHEMA IF EXISTS %s CASCADE", f->name));
 	}
