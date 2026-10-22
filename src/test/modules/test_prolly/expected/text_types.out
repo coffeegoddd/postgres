@@ -1,0 +1,171 @@
+-- A type without binary send and receive (an extension's) is kept in a
+-- versioned table as its text form, which must read back as the same value:
+-- cube before 1.5 and seg have none.  cube's text form is exact, so its
+-- values commit, branch, merge, move and key a table; a seg whose text form
+-- drops digits is refused where it would be written, and nothing else is
+-- disturbed.  (In a database of its own, so the branches here are the only
+-- ones.)
+CREATE DATABASE regress_text_types;
+\c regress_text_types
+CREATE SCHEMA tt VERSIONED;
+CREATE EXTENSION cube VERSION '1.4' SCHEMA tt;
+CREATE EXTENSION seg SCHEMA tt;
+SET search_path = tt, public;
+SELECT typname, typsend <> 0 AS binary FROM pg_type
+ WHERE typname IN ('cube', 'seg') ORDER BY 1;
+ typname | binary 
+---------+--------
+ cube    | f
+ seg     | f
+(2 rows)
+
+CREATE DOMAIN tt.box_d AS tt.cube CHECK (tt.cube_dim(VALUE) <= 3);
+CREATE TYPE tt.pair AS (a tt.cube, b tt.seg);
+CREATE TABLE tt.shapes (id int PRIMARY KEY, c tt.cube, cs tt.cube[], d tt.box_d,
+						p tt.pair, s tt.seg);
+INSERT INTO tt.shapes VALUES
+  (1, '(1,2),(3,4)', ARRAY['(1)', '(2,3)']::tt.cube[], '(1,1,1)', ROW('(5)', '1 .. 2'), '1.5 .. 2.5'),
+  (2, '(0.1, 1.2345678901234567)', NULL, NULL, NULL, '<0.1'),
+  (3, NULL, '{}', '(0,0)', ROW(NULL, '6.02e23'), NULL);
+SELECT length(dolt_commit('-Am', 'text-form types')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- read back from the commit: a new branch, and the table made again from it
+SELECT dolt_checkout('-b', 'tt_b');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'tt_b'"}
+(1 row)
+
+SELECT id, c, cs, d, p, s FROM tt.shapes ORDER BY id;
+ id |             c             |       cs       |     d     |        p         |     s      
+----+---------------------------+----------------+-----------+------------------+------------
+  1 | (1, 2),(3, 4)             | {(1),"(2, 3)"} | (1, 1, 1) | ("(5)","1 .. 2") | 1.5 .. 2.5
+  2 | (0.1, 1.2345678901234567) |                |           |                  | <0.1
+  3 |                           | {}             | (0, 0)    | (,6.02e+23)      | 
+(3 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP TABLE tt.shapes;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id, c, cs, d, p, s FROM tt.shapes ORDER BY id;
+ id |             c             |       cs       |     d     |        p         |     s      
+----+---------------------------+----------------+-----------+------------------+------------
+  1 | (1, 2),(3, 4)             | {(1),"(2, 3)"} | (1, 1, 1) | ("(5)","1 .. 2") | 1.5 .. 2.5
+  2 | (0.1, 1.2345678901234567) |                |           |                  | <0.1
+  3 |                           | {}             | (0, 0)    | (,6.02e+23)      | 
+(3 rows)
+
+-- changes, diffs and a merge
+UPDATE tt.shapes SET c = '(9,9)' WHERE id = 1;
+SELECT diff_type, (from_row).c::text AS from_c, (to_row).c::text AS to_c
+  FROM dolt_diff('HEAD', 'WORKING', NULL::tt.shapes);
+ diff_type |    from_c     |  to_c  
+-----------+---------------+--------
+ modified  | (1, 2),(3, 4) | (9, 9)
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'main moves 1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('tt_b');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'tt_b'"}
+(1 row)
+
+UPDATE tt.shapes SET s = '3 .. 4' WHERE id = 2;
+SELECT length(dolt_commit('-Am', 'tt_b changes 2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT length(dolt_merge('tt_b')::text) > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT id, c, s FROM tt.shapes ORDER BY id;
+ id |             c             |     s      
+----+---------------------------+------------
+  1 | (9, 9)                    | 1.5 .. 2.5
+  2 | (0.1, 1.2345678901234567) | 3 .. 4
+  3 |                           | 
+(3 rows)
+
+-- a primary key of such a type
+CREATE TABLE tt.keyed (k tt.cube PRIMARY KEY, n int);
+INSERT INTO tt.keyed VALUES ('(2)', 2), ('(1)', 1), ('(1,2)', 3);
+SELECT length(dolt_commit('-Am', 'keyed by cube')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+DROP TABLE tt.keyed;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT k, n FROM tt.keyed ORDER BY k;
+   k    | n 
+--------+---
+ (1)    | 1
+ (1, 2) | 3
+ (2)    | 2
+(3 rows)
+
+SELECT k, n FROM tt.keyed WHERE k = '(1,2)';
+   k    | n 
+--------+---
+ (1, 2) | 3
+(1 row)
+
+-- a value whose text form doesn't read back is refused where it's written
+INSERT INTO tt.shapes (id, s) VALUES (10, '1.23456789');
+ERROR:  value of type seg can't be stored in a versioned table: its text form doesn't read back as the same value
+DETAIL:  The value is "1.23457".
+HINT:  The type has no binary send and receive functions, so a versioned table keeps its values as text.
+UPDATE tt.shapes SET p = ROW(NULL, '1.23456789') WHERE id = 1;
+ERROR:  value of type seg can't be stored in a versioned table: its text form doesn't read back as the same value
+DETAIL:  The value is "1.23457".
+HINT:  The type has no binary send and receive functions, so a versioned table keeps its values as text.
+SELECT count(*) AS rows FROM tt.shapes;
+ rows 
+------
+    3
+(1 row)
+
+SELECT table_name, status FROM dolt_status() ORDER BY 1;	-- nothing left behind
+ table_name | status 
+------------+--------
+(0 rows)
+
+\c contrib_regression
+DROP DATABASE regress_text_types;

@@ -122,6 +122,7 @@ tests += {
       'versioned_extensions',
       'extension_moves',
       'extension_clone',
+      'text_types',
       'canonical_escapes',
       'aggregates',
       'policies',
