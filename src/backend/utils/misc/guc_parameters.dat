@@ -2479,6 +2479,22 @@
   max => 'MAX_KILOBYTES',
 },
 
+{ name => 'prolly_fold_worker', type => 'bool', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Folds branches\' working sets in the background soon after they are written.',
+  long_desc => 'A status, a diff into the working set or a commit then folds only what came since the last background fold.',
+  variable => 'prolly_fold_worker',
+  boot_val => 'false',
+},
+
+{ name => 'prolly_fold_worker_naptime', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Time to sleep between the fold worker\'s passes.',
+  flags => 'GUC_UNIT_MS',
+  variable => 'prolly_fold_worker_naptime',
+  boot_val => '200',
+  min => '10',
+  max => '600000',
+},
+
 { name => 'prolly_serve_uncompressed', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_OTHER',
   short_desc => 'Has this server send the session chunks uncompressed, as a remote.',
   long_desc => 'A client built without LZ4 sets it on its connection to a remote, which would otherwise send chunks as it stores them.',

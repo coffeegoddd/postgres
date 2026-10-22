@@ -167,6 +167,9 @@
 #block_map_replay_entries = 65536       # blocks of block-mapped relations
                                         # recovery remembers a later remap of
                                         # (change requires restart)
+#prolly_fold_worker = off                # fold branches' working sets in the
+                                        # background after they're written
+#prolly_fold_worker_naptime = 200ms     # time between its passes
 #prolly_chunk_cache_size = 16MB         # decoded chunks each backend keeps
 #prolly_value_memo_entries = 8192       # values in versioned tables' TOAST
                                         # relations whose references a fold

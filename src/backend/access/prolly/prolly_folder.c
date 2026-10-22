@@ -1,0 +1,316 @@
+/*-------------------------------------------------------------------------
+ *
+ * prolly_folder.c
+ *	  The fold worker: branches' working sets folded in the background,
+ *	  soon after they're written, so a status, a diff or a commit folds
+ *	  only what came since.
+ *
+ * Folds are lazy: a branch's changes are folded when something asks for
+ * its working set, every row changed since its baseline then.  With
+ * prolly_fold_worker on, a launcher (a background worker of its own, from
+ * the end of recovery) wakes every prolly_fold_worker_naptime and starts a
+ * worker in each database with a branch written since a worker last saw
+ * it (the branch's generation moved: see refs_generations.c).  The worker
+ * takes a working-set checkpoint of each such branch (the refs'
+ * checkpoint(), the branch's fold its baseline from then on), one branch to
+ * a transaction so the refs are held no longer than its fold, and exits
+ * once no branch moved for two passes.
+ * Writers pay nothing: what a fold costs is the worker's, off their
+ * transactions.  A worker's error is reported, and the branch passed over
+ * until it is written again.
+ *
+ * IDENTIFICATION
+ *	  src/backend/access/prolly/prolly_folder.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/prolly_builtins.h"
+#include "access/prolly_config.h"
+#include "access/prolly_folder.h"
+#include "access/xact.h"
+#include "catalog/branch.h"
+#include "catalog/branch_ops.h"
+#include "miscadmin.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "refs_generations.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "tcop/tcopprot.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
+#include "utils/snapmgr.h"
+#include "utils/timeout.h"
+#include "utils/wait_event.h"
+
+bool		prolly_fold_worker = false;
+int			prolly_fold_worker_naptime = 200;
+
+/* The most databases, and branches of one, a pass looks at. */
+#define FOLDER_MAX_DATABASES	64
+#define FOLDER_MAX_BRANCHES		256
+
+/* The launcher, once a server, from the end of recovery. */
+void
+ProllyFolderRegister(void)
+{
+	BackgroundWorker bgw;
+
+	if (IsBinaryUpgrade)
+		return;
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ProllyFolderLauncherMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "prolly fold launcher");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "prolly fold launcher");
+	bgw.bgw_restart_time = 5;
+	RegisterBackgroundWorker(&bgw);
+}
+
+/* A worker for database dboid; false if none could be started. */
+static bool
+start_worker(Oid dboid, BackgroundWorkerHandle **handle)
+{
+	BackgroundWorker bgw;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "ProllyFolderWorkerMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "prolly fold worker for database %u",
+			 dboid);
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "prolly fold worker");
+	bgw.bgw_restart_time = BGW_NEVER_RESTART;
+	bgw.bgw_notify_pid = MyProcPid;
+	bgw.bgw_main_arg = ObjectIdGetDatum(dboid);
+	return RegisterDynamicBackgroundWorker(&bgw, handle);
+}
+
+typedef struct Running
+{
+	Oid			dboid;
+	BackgroundWorkerHandle *handle;
+} Running;
+
+void
+ProllyFolderLauncherMain(Datum main_arg)
+{
+	Running		running[FOLDER_MAX_DATABASES];
+	int			nrunning = 0;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+
+	for (;;)
+	{
+		Oid			databases[FOLDER_MAX_DATABASES];
+		int			n;
+		int			kept = 0;
+
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 prolly_fold_worker_naptime, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		/* (those whose worker exited let go of) */
+		for (int i = 0; i < nrunning; i++)
+		{
+			pid_t		pid;
+
+			if (GetBackgroundWorkerPid(running[i].handle, &pid) == BGWH_STOPPED)
+				pfree(running[i].handle);
+			else
+				running[kept++] = running[i];
+		}
+		nrunning = kept;
+		if (!prolly_fold_worker)
+			continue;
+
+		n = branch_generations_moved_databases(databases, lengthof(databases));
+		for (int i = 0; i < n && nrunning < FOLDER_MAX_DATABASES; i++)
+		{
+			bool		busy = false;
+			BackgroundWorkerHandle *handle;
+
+			for (int j = 0; j < nrunning && !busy; j++)
+				busy = running[j].dboid == databases[i];
+			if (busy || !start_worker(databases[i], &handle))
+				continue;
+			running[nrunning].dboid = databases[i];
+			running[nrunning].handle = handle;
+			nrunning++;
+		}
+	}
+}
+
+/*
+ * (run on a branch: its checkpoint, folded before the refs are taken, so a
+ * commit, a reset or a merge waits for no fold of the worker's: if the
+ * branch moved meanwhile, *folded is false and the transaction is rolled
+ * back, to fold again next pass.  Whether its logs hold entries isn't asked
+ * first: their estimate samples pages, and misses a few entries on a log
+ * of many pages; a checkpoint with nothing to fold reads its logs by their
+ * index, and consumes nothing, so moves no generation again.)
+ */
+static void
+fold_branch(void *arg)
+{
+	bool	   *folded = arg;
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef root;
+
+	prolly_database_components(&dc);
+	if (PROLLY_HAS(dc.refs, checkpoint_unless_moved))
+		*folded = dc.refs->checkpoint_unless_moved(&root);
+	else
+	{
+		PROLLY_CALL(dc.refs, checkpoint, &root);
+		*folded = true;
+	}
+}
+
+typedef struct Moved
+{
+	Oid		   *branches;
+	uint64	   *generations;
+	int			n;
+	char	  **names;			/* found by the visit, NULL: none */
+} Moved;
+
+static void
+name_moved(const char *name, Oid branch, void *arg)
+{
+	Moved	   *m = arg;
+
+	/* (kept past the transaction that read them) */
+	for (int i = 0; i < m->n; i++)
+		if (m->branches[i] == branch)
+			m->names[i] = MemoryContextStrdup(TopMemoryContext, name);
+}
+
+/*
+ * One pass over the database's branches written since the last: each
+ * folded in a transaction of its own.  False if none was.
+ */
+static bool
+fold_pass(void)
+{
+	Oid			branches[FOLDER_MAX_BRANCHES];
+	uint64		generations[FOLDER_MAX_BRANCHES];
+	char	   *names[FOLDER_MAX_BRANCHES];
+	Moved		m = {branches, generations, 0, names};
+	bool		any = false;
+
+	m.n = branch_generations_moved(branches, generations, lengthof(branches));
+	if (m.n == 0)
+		return false;
+	memset(names, 0, sizeof(names));
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	branch_ops()->branches(name_moved, &m);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	for (int i = 0; i < m.n; i++)
+	{
+		bool		folded = false;
+
+		if (names[i] == NULL && branches[i] != MyBranch)
+		{
+			branch_generations_saw(branches[i], generations[i]);
+			continue;
+		}
+		StartTransactionCommand();
+		PG_TRY();
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			/* (the worker's own branch, the database's default, as it is) */
+			if (branches[i] == MyBranch)
+				fold_branch(&folded);
+			else
+				branch_ops()->run_on(names[i], fold_branch, &folded);
+			PopActiveSnapshot();
+			if (folded)
+			{
+				CommitTransactionCommand();
+
+				/*
+				 * (seen as of before its fold read: a write since is seen
+				 * again next pass; one not folded stays to be folded)
+				 */
+				branch_generations_saw(branches[i], generations[i]);
+			}
+			else
+			{
+				/*
+				 * (moved meanwhile, or the refs held by another: what this
+				 * fold consumed given back, the branch not seen, so it's
+				 * folded again next pass)
+				 */
+				AbortCurrentTransaction();
+			}
+		}
+		PG_CATCH();
+		{
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			AbortOutOfAnyTransaction();
+			FlushErrorState();
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
+		any = any || folded;
+	}
+	for (int i = 0; i < m.n; i++)
+		if (names[i] != NULL)
+			pfree(names[i]);
+	return any;
+}
+
+void
+ProllyFolderWorkerMain(Datum main_arg)
+{
+	Oid			dboid = DatumGetObjectId(main_arg);
+	int			idle = 0;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+	SetConfigOption("application_name", "prolly fold worker", PGC_USERSET,
+					PGC_S_SESSION);
+
+	/* (until two passes in a row fold nothing) */
+	while (idle < 2)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		if (!prolly_fold_worker)
+			break;
+		idle = fold_pass() ? 0 : idle + 1;
+		pgstat_report_stat(true);
+		if (idle < 2)
+			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 prolly_fold_worker_naptime, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+	}
+	proc_exit(0);
+}

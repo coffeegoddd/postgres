@@ -2555,6 +2555,48 @@ copies_checkpoint(ProllyNodeRef *root)
 }
 
 /*
+ * copies_checkpoint(), the fold made before the refs are taken: they are
+ * held (to the transaction's end) only to see that neither the head nor
+ * the baseline moved since the fold began, and to set the baseline, and
+ * taken only if free.  If either moved, or another holds the refs,
+ * nothing is set, and the caller rolls back what the fold consumed.
+ */
+static bool
+copies_checkpoint_unless_moved(ProllyNodeRef *root)
+{
+	char	   *name = branch_ops()->current();
+	ProllyNodeRef baseline;
+	ProllyNodeRef now;
+	ProllyNodeRef next;
+	ProllyHash	head;
+	ProllyHash	head_now;
+	bool		had = branch_baseline(name, &baseline);
+	bool		had_head = branch_head(name, &head);
+	bool		has;
+	bool		has_head;
+
+	fold_from_baseline(root, &next, false);
+
+	/*
+	 * (never waiting for the refs: the fold deleted the log's entries it
+	 * consumed, which whoever holds the refs may be waiting to delete too;
+	 * held by another, it rolls back and folds again later)
+	 */
+	refs_init();
+	if (PROLLY_HAS(env.chunk_store, try_hold_root) &&
+		!env.chunk_store->try_hold_root(env.chunks))
+		return false;
+	lock_refs();
+	has = branch_baseline(name, &now);
+	has_head = branch_head(name, &head_now);
+	if (has != had || (had && !same_hash(&baseline.hash, &now.hash)) ||
+		has_head != had_head || (had_head && !same_hash(&head, &head_now)))
+		return false;
+	branch_set_baseline(name, &next, root);
+	return true;
+}
+
+/*
  * Leaving a branch leaves its changes in its copies, unfolded: its next
  * fold (a commit, a status, another session's read) reads them from its
  * change finder's record, as it would have had the session stayed.  Only a
@@ -4469,6 +4511,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_changes = copies_working_changes,
 	.publish_definitions = copies_publish_definitions,
 	.fold_own = copies_fold_own,
+	.checkpoint_unless_moved = copies_checkpoint_unless_moved,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

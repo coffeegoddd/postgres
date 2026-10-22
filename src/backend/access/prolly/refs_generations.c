@@ -90,6 +90,7 @@ typedef struct BranchGeneration
 	uint64		overflow;
 	ProllyHash	baseline;		/* folded from (len 0: none) */
 	ProllyHash	root;
+	uint64		seen;			/* the generation the fold worker last saw */
 } BranchGeneration;
 
 typedef struct BranchGenerations
@@ -638,4 +639,79 @@ branch_fold_unchanged(const BranchFoldStamp *at)
 		pg_atomic_read_u64(&g->epoch) == at->epoch;
 	LWLockRelease(&g->lock);
 	return unchanged;
+}
+
+/*
+ * The fold worker's view (prolly_folder.c): the databases with a branch
+ * whose generation moved since the worker last saw it, into databases (at
+ * most max), and their count.  Without shared memory, none.
+ */
+int
+branch_generations_moved_databases(Oid *databases, int max)
+{
+	BranchGenerations *g = shared();
+	int			n = 0;
+
+	if (g == NULL)
+		return 0;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	for (int i = 0; i < BRANCH_GENERATIONS && n < max; i++)
+	{
+		BranchGeneration *e = &g->entries[i];
+		bool		listed = false;
+
+		if (!OidIsValid(e->branch) || e->generation == e->seen)
+			continue;
+		for (int j = 0; j < n && !listed; j++)
+			listed = databases[j] == e->database;
+		if (!listed)
+			databases[n++] = e->database;
+	}
+	LWLockRelease(&g->lock);
+	return n;
+}
+
+/*
+ * The current database's branches whose generation moved since the fold
+ * worker last saw it, each with its generation now, into branches and
+ * generations (at most max); their count.
+ */
+int
+branch_generations_moved(Oid *branches, uint64 *generations, int max)
+{
+	BranchGenerations *g = shared();
+	int			n = 0;
+
+	if (g == NULL)
+		return 0;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	for (int i = 0; i < BRANCH_GENERATIONS && n < max; i++)
+	{
+		BranchGeneration *e = &g->entries[i];
+
+		if (!OidIsValid(e->branch) || e->database != MyDatabaseId ||
+			e->generation == e->seen)
+			continue;
+		branches[n] = e->branch;
+		generations[n] = e->generation;
+		n++;
+	}
+	LWLockRelease(&g->lock);
+	return n;
+}
+
+/* The fold worker saw branch at generation (no later one: kept as moved). */
+void
+branch_generations_saw(Oid branch, uint64 generation)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+
+	if (g == NULL)
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	e = find_entry(g, branch);
+	if (e != NULL && e->seen < generation && generation <= e->generation)
+		e->seen = generation;
+	LWLockRelease(&g->lock);
 }

@@ -437,6 +437,16 @@ typedef struct ProllyRefsRoutine
 	 * if none could be, the changes left for the branch's next fold.
 	 */
 	bool		(*fold_own) (const ProllyRowChanges *changes, int nchanges);
+
+	/*
+	 * Optional: checkpoint(), but folded before the refs are taken, so they
+	 * are held only to set the baseline, not through the fold, and taken
+	 * only if free (never waited for): false, nothing set, if another holds
+	 * them or the branch's head or baseline moved meanwhile, and then the
+	 * caller must roll its transaction back (the fold consumed the change
+	 * finder's record of what it folded).
+	 */
+	bool		(*checkpoint_unless_moved) (ProllyNodeRef *root);
 } ProllyRefsRoutine;
 
 /*
@@ -459,9 +469,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
-	"publish_definitions", "fold_own"
+	"publish_definitions", "fold_own", "checkpoint_unless_moved"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK fold_own
+#define PROLLY_REFS_LAST_CALLBACK checkpoint_unless_moved
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

@@ -57,4 +57,14 @@ extern bool branch_fold_known_at(Oid branch, Snapshot snap,
 								 ProllyHash *root, BranchFoldStamp *at);
 extern bool branch_fold_unchanged(const BranchFoldStamp *at);
 
+/*
+ * The fold worker's view: the databases, and the current database's
+ * branches (with their generation), whose generation moved since it last
+ * saw them; and what it saw.
+ */
+extern int	branch_generations_moved_databases(Oid *databases, int max);
+extern int	branch_generations_moved(Oid *branches, uint64 *generations,
+									 int max);
+extern void branch_generations_saw(Oid branch, uint64 generation);
+
 #endif							/* REFS_GENERATIONS_H */
