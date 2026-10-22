@@ -59,6 +59,14 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->src.relNumber, xlrec->dst.relNumber);
 				break;
 			}
+		case XLOG_BMAP_PRESERVE:
+			{
+				BlockNumber phys;
+
+				memcpy(&phys, rec, sizeof(phys));
+				appendStringInfo(buf, "block %u", phys);
+				break;
+			}
 		case XLOG_BMAP_REMAP:
 			{
 				xl_bmap_remap *xlrec = (xl_bmap_remap *) rec;
@@ -128,6 +136,8 @@ bmap_identify(uint8 info)
 			return "SHARE_CHANGES";
 		case XLOG_BMAP_SHRINK:
 			return "SHRINK";
+		case XLOG_BMAP_PRESERVE:
+			return "PRESERVE";
 	}
 	return NULL;
 }

@@ -3780,6 +3780,41 @@ share_changes(SMgrRelation src, SMgrRelation dst)
  */
 
 /*
+ * Before a private block is shared, log its contents with its physical
+ * address.  A base backup may have read the page store before our flush,
+ * and the source's map after a later remap.  Redo then skips the source's
+ * older changes, so flushing alone cannot preserve the copy's rows.
+ *
+ * Blocks already held by another map or changes list have been preserved
+ * by their first share or REMAP, and cannot change in place.  Do not read
+ * or log them again.  The caller holds the source's header exclusively
+ * and keeps its writers out, but has not locked the destination map page.
+ */
+static void
+preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys)
+{
+	RelFileLocator rel = src->smgr_rlocator.locator;
+	PGIOAlignedBlock copy;
+	Buffer		buf;
+
+	/* Without online backups or standbys, the share's flush is sufficient. */
+	if (!XLogIsNeeded() || lookup_ref(rel, phys) > 0)
+		return;
+
+	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno,
+								   RBM_NORMAL, NULL, true);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
+	UnlockReleaseBuffer(buf);
+
+	XLogBeginInsert();
+	XLogRegisterData(&phys, sizeof(phys));
+	XLogRegisterBlock(0, &rel, MAIN_FORKNUM, blkno, copy.data,
+					 REGBUF_FORCE_IMAGE);
+	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
+}
+
+/*
  * Copy map page 'mapblk' of 'src' into a new map page of 'dst', for the
  * blocks below 'nblocks', counting one more reference to each block.
  * src's header is locked exclusively, so its entries can't change.
@@ -3807,6 +3842,7 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 
 		if (blk >= nblocks || !BlockNumberIsValid(entries[slot].block))
 			continue;
+		preserve_shared_page(src, blk, entries[slot].block);
 		items[nitems].slot = slot;
 		items[nitems].block = entries[slot].block;
 		items[nitems].epoch = entries[slot].epoch;
@@ -3986,13 +4022,13 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	MarkBufferedRelationShared(src, MAIN_FORKNUM);
 
 	/*
-	 * The shared blocks get src's latest pages, durably: recovery can't make
-	 * them again, since replaying src's changes writes its pages through
-	 * whatever map pages are on disk, which may already send them to the
-	 * blocks src moved to later.  A page src changes from here on is copied
-	 * first, its old contents written to the shared block if they were only
-	 * in its buffer.  So only the sync waits for src to be let change again:
-	 * the blocks hold what dst starts from either way, and it only has to
+	 * The shared blocks get src's latest pages, durably.  PRESERVE records
+	 * can reconstruct them even if a base backup has older store pages and
+	 * newer maps, which make redo skip the source's earlier changes.  A page
+	 * src changes from here on is copied first, its old contents written to
+	 * the shared block if they were only in its buffer.  So only the sync
+	 * waits for src to be let change again: the blocks hold what dst starts
+	 * from either way, and it only has to
 	 * be durable by the time dst is, at commit (bmapsyncshares()).
 	 */
 	FlushRelationsAllBuffers(&src, 1);
@@ -6550,6 +6586,39 @@ bmap_redo(XLogReaderState *record)
 					store_written(xlrec->locator, xlrec->old_block, 1);
 				}
 				XLogReplaceBlock(xlrec->locator, MAIN_FORKNUM, xlrec->blkno);
+				break;
+			}
+		case XLOG_BMAP_PRESERVE:
+			{
+				BlockNumber phys;
+				RelFileLocator rel;
+				ForkNumber	forknum;
+				BlockNumber blkno;
+				Buffer		buf;
+				PGIOAlignedBlock copy;
+
+				memcpy(&phys, XLogRecGetData(record), sizeof(phys));
+				XLogRecGetBlockTag(record, 0, &rel, &forknum, &blkno);
+				Assert(forknum == MAIN_FORKNUM);
+
+				/*
+				 * Restore the source buffer too: SHARED flushes it, and must
+				 * not overwrite the preserved block with incomplete redo.
+				 * A newer map sends this buffer nowhere until its remap.
+				 */
+				buf = XLogReadBufferExtended(rel, forknum, blkno,
+											RBM_ZERO_AND_LOCK, InvalidBuffer);
+				if (!RestoreBlockImage(record, 0, BufferGetPage(buf)))
+					elog(PANIC, "%s", record->errormsg_buf);
+				/* Sharing changes no page contents, including its LSN. */
+				MarkBufferDirty(buf);
+				memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
+				UnlockReleaseBuffer(buf);
+
+				/* The physical address is independent of every map's age. */
+				PageSetChecksum((Page) copy.data, blkno);
+				smgrwrite(store_smgr(rel), MAIN_FORKNUM, phys, copy.data, false);
+				store_written(rel, phys, 1);
 				break;
 			}
 		case XLOG_BMAP_SHARED:
