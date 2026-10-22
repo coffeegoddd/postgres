@@ -26207,7 +26207,7 @@
       "index": 7,
       "name": "schema modification: rename columns",
       "source_sha256": "8d1d824e2985d2492d45d72536aa6a4564c907f912efd20af713b5a4cee48ba2",
-      "scenario_sha256": "9c0382095c439c4c9b4f9c2325bb546e8a7fdb5578900235b91e2f83b2cf53b9",
+      "scenario_sha256": "e59d9990d87af1d717e8a35a1fe368cfe24e8135712d6037da857dce18acd1d8",
       "setup": [
         {
           "index": 0,
@@ -26356,7 +26356,7 @@
           "steps": [
             "assert-2"
           ],
-          "note": "Preserved upstream counts; the table named qualified. (D15) Dolt follows the column by its tag through both renames; prolly reads each version's rows as the table is defined now, by column name (D18, D20): commit3's and commit4's column is c3, which the table now has as c2: read as NULL on both sides, pk 1's update to it isn't seen."
+          "note": "The table is named qualified (D15). The stored update to pk 1 is counted as a modified row even though its historical c3 projects to NULL as current c2 on both sides (#654). Row counts now match Dolt; cells_modified remains zero because cells are compared as displayed by name (D18, D20), without rename identity."
         },
         {
           "index": 3,
@@ -38126,7 +38126,7 @@
       "index": 9,
       "name": "schema modification: rename columns",
       "source_sha256": "e299d5aa91cb8e51c63c8f3d3a659cb9789af3548c6cf88fbbb3384973735a3b",
-      "scenario_sha256": "96e2d57e0e9356baf324771bda2d776071e51bae3f7af7ae7847584651844bde",
+      "scenario_sha256": "759d0b708e6a37c54d23715ef4bb843ea5eaec2398951e288436e1e14fcc5bc2",
       "setup": [
         {
           "index": 0,
@@ -38279,8 +38279,10 @@
         },
         {
           "index": 3,
-          "steps": [],
-          "note": "Left out: the column is c2 now, and commit3's and commit4's versions call it c3, so both read it as NULL by name (D18) and row 1's change of c3 from -1 to 1 doesn't show: prolly's dolt_diff returns no row for a row whose stored value changed. Dolt follows the tag and has row 1 modified and row 3's -3. Whether such a change is shown is undecided (#654)."
+          "steps": [
+            "assert-3"
+          ],
+          "note": "The historical versions both call the column c3, while the current row type calls it c2. Values project to NULL by name (D18), but the stored change is retained: row 1 is modified and row 3 added (#654)."
         },
         {
           "index": 4,
@@ -38317,7 +38319,7 @@
         "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
         "Rows are read as the table is defined now, by column name: a column renamed or dropped and added again reads as NULL in versions without it. (D18)",
         "The rows are the table's row type now: a column a version calls otherwise reads as NULL there, not refused, and a name the table no longer has is 42703. (D4, D18)",
-        "A diff between two versions that both call a column otherwise than the table does now reads it as NULL on both sides, hiding a change to it (#654); that assertion is left out."
+        "Columns shared by both historical versions but absent from the current row type still participate in comparison. A stored change is reported even when both displayed values are NULL by name (D18, #654); following rename identity remains #699."
       ]
     },
     {

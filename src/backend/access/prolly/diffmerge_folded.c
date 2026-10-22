@@ -5861,7 +5861,7 @@ fit_row(const ColumnRead *reads, const int *from, TupleTableSlot *xs,
 	ExecStoreVirtualTuple(fs);
 }
 
-/* Rows without a usable current key, sorted by their compared row bytes. */
+/* Rows without a usable current key, sorted by old key or compared row. */
 typedef struct UnmatchedRows
 {
 	MemoryContext context;
@@ -5870,12 +5870,52 @@ typedef struct UnmatchedRows
 	TupleTableSlot *input;
 	TupleTableSlot *slot;
 	uint64		count;
+	bool		by_key;			/* identical historical definitions and keyed */
 } UnmatchedRows;
+
+/* How a diff projects rows, retaining changes hidden by that projection. */
+typedef struct DiffProjection
+{
+	UnmatchedRows unmatched;
+	List	   *hidden;			/* shared historical column names absent now */
+} DiffProjection;
+
+/* Columns both historical versions have, but today's row cannot show. */
+static List *
+diff_hidden_columns(const Table *from, const Table *to, const Table *now)
+{
+	List	   *out = NIL;
+	List	   *tc;
+	List	   *nc;
+	ListCell   *lc;
+	bool		keyed;
+
+	if (from == NULL || to == NULL)
+		return NIL;
+	tc = version_columns(to, &keyed);
+	nc = version_columns(now, &keyed);
+	foreach(lc, version_columns(from, &keyed))
+	{
+		VersionColumn *c = lfirst(lc);
+		ListCell   *other;
+		bool		in_to = false;
+		bool		in_now = false;
+
+		foreach(other, tc)
+			in_to |= strcmp(c->name, ((VersionColumn *) lfirst(other))->name) == 0;
+		foreach(other, nc)
+			in_now |= strcmp(c->name, ((VersionColumn *) lfirst(other))->name) == 0;
+		if (in_to && !in_now)
+			out = lappend(out, c->name);
+	}
+	return out;
+}
 
 /* Keep copy counts compact and let a whole-table projection spill to disk. */
 static void
 save_unmatched(UnmatchedRows *rows, const ProllyKey *key,
-			   const ProllyValue *compared, const ProllyValue *shown, uint64 count)
+			   const ProllyValue *compared, const ProllyValue *shown, uint64 count,
+			   const ProllyKey *old_key)
 {
 	Datum	   *values;
 
@@ -5887,11 +5927,12 @@ save_unmatched(UnmatchedRows *rows, const ProllyKey *key,
 		Oid			collation = InvalidOid;
 		bool		nulls_first = false;
 
-		rows->desc = CreateTemplateTupleDesc(4);
-		TupleDescInitEntry(rows->desc, 1, "compared", BYTEAOID, -1, 0);
+		rows->desc = CreateTemplateTupleDesc(5);
+		TupleDescInitEntry(rows->desc, 1, "identity", BYTEAOID, -1, 0);
 		TupleDescInitEntry(rows->desc, 2, "key", BYTEAOID, -1, 0);
 		TupleDescInitEntry(rows->desc, 3, "shown", BYTEAOID, -1, 0);
 		TupleDescInitEntry(rows->desc, 4, "copies", INT8OID, -1, 0);
+		TupleDescInitEntry(rows->desc, 5, "compared", BYTEAOID, -1, 0);
 		TupleDescFinalize(rows->desc);
 		rows->sort = tuplesort_begin_heap(rows->desc, 1, &attnum, &operator,
 										 &collation, &nulls_first, work_mem, NULL,
@@ -5901,10 +5942,22 @@ save_unmatched(UnmatchedRows *rows, const ProllyKey *key,
 		MemoryContextSwitchTo(old);
 	}
 	values = rows->input->tts_values;
-	memset(rows->input->tts_isnull, 0, 4 * sizeof(bool));
+	memset(rows->input->tts_isnull, 0, 5 * sizeof(bool));
 	/* bytea and text share the same length-delimited representation. */
-	values[0] = PointerGetDatum(cstring_to_text_with_len((const char *) compared->data,
-														  compared->len));
+	if (rows->by_key)
+	{
+		Assert(count == 1);
+		values[0] = PointerGetDatum(cstring_to_text_with_len((const char *) old_key->data,
+															  old_key->len));
+		values[4] = PointerGetDatum(cstring_to_text_with_len((const char *) compared->data,
+															  compared->len));
+	}
+	else
+	{
+		values[0] = PointerGetDatum(cstring_to_text_with_len((const char *) compared->data,
+															  compared->len));
+		rows->input->tts_isnull[4] = true;
+	}
 	values[1] = PointerGetDatum(cstring_to_text_with_len((const char *) key->data,
 														  key->len));
 	values[2] = PointerGetDatum(cstring_to_text_with_len((const char *) shown->data,
@@ -5948,12 +6001,29 @@ emit_unmatched(UnmatchedRows *rows, Oid relid, ProllyDiffKind kind,
 	}
 }
 
-/* Cancel equal copies without assuming that a projected NULL key is unique. */
+/* Same historical key, but differing comparison rows: show a modification. */
+static void
+modify_unmatched(UnmatchedRows *removed, UnmatchedRows *added, Oid relid,
+				 ProllyDiffSink *sink)
+{
+	bytea	   *key = DatumGetByteaPP(removed->slot->tts_values[1]);
+	bytea	   *before = DatumGetByteaPP(removed->slot->tts_values[2]);
+	bytea	   *after = DatumGetByteaPP(added->slot->tts_values[2]);
+	ProllyKey	k = {(const uint8 *) VARDATA_ANY(key), VARSIZE_ANY_EXHDR(key)};
+	ProllyValue bv = {(const uint8 *) VARDATA_ANY(before), VARSIZE_ANY_EXHDR(before)};
+	ProllyValue av = {(const uint8 *) VARDATA_ANY(after), VARSIZE_ANY_EXHDR(after)};
+
+	sink->change(sink, relid, PROLLY_DIFF_MODIFIED, &k, &bv, &av);
+}
+
+/* Cancel equal copies, or match identical historical keys where available. */
 static void
 diff_unmatched(UnmatchedRows *removed, UnmatchedRows *added, Oid relid,
 			   ProllyDiffSink *sink)
 {
 	UnmatchedRows *sides[2] = {removed, added};
+
+	Assert(removed->by_key == added->by_key);
 
 	for (int i = 0; i < 2; i++)
 	{
@@ -5978,6 +6048,14 @@ diff_unmatched(UnmatchedRows *removed, UnmatchedRows *added, Oid relid,
 		{
 			uint64		copies = Min(removed->count, added->count);
 
+			if (removed->by_key)
+			{
+				Assert(removed->count == 1 && added->count == 1);
+				if (DatumGetInt32(DirectFunctionCall2(byteacmp,
+														removed->slot->tts_values[4],
+														added->slot->tts_values[4])) != 0)
+					modify_unmatched(removed, added, relid, sink);
+			}
 			removed->count -= copies;
 			added->count -= copies;
 		}
@@ -6028,10 +6106,18 @@ diff_unmatched(UnmatchedRows *removed, UnmatchedRows *added, Oid relid,
  * would write is what's shown, and resolving refuses a value the column
  * can't hold, as an INSERT does.
  *
- * Where unmatched is supplied (a diff), a row whose current key contains
+ * A diff also retains the columns named in projection->hidden in extended
+ * comparison rows, never in shown.  The same names and order are used
+ * on both sides, independent of their physical column positions.  A
+ * change in a column both versions have is then visible even when neither
+ * displayed row has its name.  For keyless rows these values also qualify
+ * the comparison key, so projection cannot collapse distinct old rows.
+ *
+ * Where projection is supplied (a diff), a row whose current key contains
  * a NULL for a column absent in x cannot be matched by that key.  Buffer it
- * separately, leaving it out of *out and *shown, and cancel equal copies
- * from the two versions before emitting the remaining additions/removals.
+ * separately, leaving it out of *out and *shown.  Identically defined
+ * keyed versions match by stored key bytes and report modifications;
+ * otherwise equal copies cancel before emitting additions/removals.
  * In particular, a renamed key must not collapse all of x's rows onto
  * one NULL key, even when their projected values are identical.
  *
@@ -6047,7 +6133,7 @@ static Table *
 as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			   ProllyNodeRef *shown, List *retyped, List *both_retyped,
 			   bool refuse, Table *out, UnsureRows *unsure,
-			   UnmatchedRows *unmatched)
+			   DiffProjection *projection)
 {
 	bool		fit = shown != NULL;
 	bool		fitting = false;	/* a column is fitted */
@@ -6090,6 +6176,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	MemoryContext outer;
 	int			nunsure = 0;
 	int			maxunsure = 0;
+	TupleTableSlot *hs = NULL;	/* comparison row, including hidden columns */
+	ProllyValueEncoder *he = NULL;
+	int		   *hidden_from = NULL;
+	Datum		hidden_types = (Datum) 0;
+	bool		separate_shown;
 
 	if (unsure)
 		memset(unsure, 0, sizeof(UnsureRows));
@@ -6144,6 +6235,51 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	xs = vr.slot;
 	xd = xs->tts_tupleDescriptor;
 	ms = MakeSingleTupleTableSlot(md, &TTSOpsVirtual);
+
+	if (projection && projection->hidden != NIL)
+	{
+		TupleDesc	hd = CreateTemplateTupleDesc(md->natts + 1 +
+												list_length(projection->hidden));
+		StringInfoData types;
+		ListCell   *lc;
+		int			a = 0;
+
+		Assert(shown != NULL && read == READ_SHOWN && !refuse);
+		hidden_from = palloc_array(int, list_length(projection->hidden));
+		for (int j = 0; j < md->natts; j++)
+		{
+			TupleDescCopyEntry(hd, j + 1, md, j + 1);
+			TupleDescAttr(hd, j)->atthasmissing = false;
+		}
+		TupleDescInitEntry(hd, md->natts + 1, "historical_types", BYTEAOID, -1, 0);
+		initStringInfo(&types);
+		foreach(lc, projection->hidden)
+		{
+			int			j;
+			Form_pg_attribute att;
+			char	   *type;
+
+			for (j = 0; j < xd->natts; j++)
+				if (strcmp(NameStr(TupleDescAttr(xd, j)->attname), lfirst(lc)) == 0)
+					break;
+			if (j == xd->natts)
+				elog(ERROR, "historical column \"%s\" not found in row descriptor for table \"%s\"",
+					 (char *) lfirst(lc), RelationGetRelationName(rel));
+			hidden_from[a] = j;
+			att = TupleDescAttr(xd, j);
+			TupleDescInitEntry(hd, md->natts + 2 + a++, NameStr(att->attname),
+							  att->atttypid, att->atttypmod, 0);
+			/* Equal bytes of different types need not be equal values. */
+			type = format_type_be_qualified(att->atttypid);
+			prolly_put_varint(&types, strlen(type));
+			appendStringInfoString(&types, type);
+		}
+		hidden_types = PointerGetDatum(cstring_to_text_with_len(types.data, types.len));
+		TupleDescFinalize(hd);
+		hs = MakeSingleTupleTableSlot(hd, &TTSOpsVirtual);
+		he = PROLLY_CALL(ve, begin, hd, CurrentMemoryContext);
+		PROLLY_CALL(ve, set_values, he, &krefs.values);
+	}
 
 	/* each column of rel's: which of x's it comes from, and how */
 	from = palloc_array(int, md->natts);
@@ -6222,8 +6358,9 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 				(!enums_changed ||
 				 !type_uses_enums(TupleDescAttr(xd, from[a])->atttypid, enum_names, NIL));
 
+	separate_shown = fitting || he != NULL;
 	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
-	if (fitting)
+	if (separate_shown)
 	{
 		fs = MakeSingleTupleTableSlot(md, &TTSOpsVirtual);
 		sb = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
@@ -6345,7 +6482,44 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			initStringInfo(&frow);
 			PROLLY_CALL(rd.kr, encode_row, rd.k, fs, &fkey, &frow, &fcontent);
 		}
-		if (unmatched && keyed_now)
+		if (he)
+		{
+			/* Keep the displayed row, then encode the extended comparison row. */
+			if (!fitting)
+			{
+				initStringInfo(&frow);
+				appendBinaryStringInfo(&frow, crow.data, crow.len);
+			}
+			ExecClearTuple(hs);
+			for (int a = 0; a < md->natts; a++)
+			{
+				hs->tts_values[a] = ms->tts_values[a];
+				hs->tts_isnull[a] = ms->tts_isnull[a];
+			}
+			hs->tts_values[md->natts] = hidden_types;
+			hs->tts_isnull[md->natts] = false;
+			for (int a = md->natts + 1; a < hs->tts_tupleDescriptor->natts; a++)
+			{
+				int			j = hidden_from[a - md->natts - 1];
+
+				hs->tts_values[a] = xs->tts_values[j];
+				hs->tts_isnull[a] = xs->tts_isnull[j];
+			}
+			ExecStoreVirtualTuple(hs);
+			resetStringInfo(&crow);
+			PROLLY_CALL(ve, encode, he, hs, &crow);
+			if (!keyed_now)
+			{
+				const ProllyHashRoutine *hash = prolly_content_hash();
+				ProllyHashCtx *ctx = PROLLY_CALL(hash, begin, CurrentMemoryContext);
+				ProllyHash	digest;
+
+				PROLLY_CALL(hash, update, ctx, (const uint8 *) crow.data, crow.len);
+				PROLLY_CALL(hash, finish, ctx, &digest);
+				appendBinaryStringInfo(&key, digest.bytes, digest.len);
+			}
+		}
+		if (projection && keyed_now)
 			for (int a = 0; a < md->natts; a++)
 				if (bms_is_member(a + 1 - FirstLowInvalidHeapAttributeNumber, pk) &&
 					from[a] < 0 && ms->tts_isnull[a])
@@ -6354,8 +6528,8 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		{
 			ProllyKey	ck = {(const uint8 *) key.data, key.len};
 			ProllyValue compared = {(const uint8 *) crow.data, crow.len};
-			ProllyValue cr = {(const uint8 *) (fitting ? frow.data : crow.data),
-				fitting ? frow.len : crow.len};
+			ProllyValue cr = {(const uint8 *) (separate_shown ? frow.data : crow.data),
+				separate_shown ? frow.len : crow.len};
 			StringInfoData value;
 			ProllyValue val;
 
@@ -6364,7 +6538,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			PROLLY_CALL(rd.kr, make_value, rd.k, &cr, 1, &value);
 			val.data = (const uint8 *) value.data;
 			val.len = value.len;
-			save_unmatched(unmatched, &ck, &compared, &val, count);
+			save_unmatched(&projection->unmatched, &ck, &compared, &val, count, &k);
 			CHECK_FOR_INTERRUPTS();
 			MemoryContextSwitchTo(outer);
 			MemoryContextReset(rowcxt);
@@ -6401,7 +6575,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			val.data = (const uint8 *) value.data;
 			val.len = value.len;
 			PROLLY_CALL(tree, build_add, b, &ck, &val);
-			if (fitting)
+			if (separate_shown)
 			{
 				ProllyValue fr = {(const uint8 *) frow.data, frow.len};
 
@@ -6423,7 +6597,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 			r->key.len = key.len;
 			r->row.data = dup_bytes(crow.data, crow.len);
 			r->row.len = crow.len;
-			if (fitting)
+			if (separate_shown)
 			{
 				r->shown.data = dup_bytes(frow.data, frow.len);
 				r->shown.len = frow.len;
@@ -6500,7 +6674,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		val.data = (const uint8 *) value.data;
 		val.len = value.len;
 		PROLLY_CALL(tree, build_add, b, &rows[i]->key, &val);
-		if (fitting)
+		if (separate_shown)
 		{
 			resetStringInfo(&value);
 			PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->shown, count, &value);
@@ -6514,7 +6688,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	PROLLY_CALL(tree, build_finish, b, &out->data);
 	if (shown)
 		*shown = out->data;
-	if (fitting)
+	if (separate_shown)
 	{
 		PROLLY_CALL(tree, build_finish, sb, shown);
 		ExecDropSingleTupleTableSlot(fs);
@@ -6530,6 +6704,11 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		qsort_arg(unsure->rows, nunsure, sizeof(UnsureRow *), unsure_row_cmp, &rd);
 	if (unsure)
 		unsure->n = nunsure;
+	if (he)
+	{
+		PROLLY_CALL(ve, end, he);
+		ExecDropSingleTupleTableSlot(hs);
+	}
 	MemoryContextDelete(rowcxt);
 	out->text = now->text;
 	out->textlen = now->textlen;
@@ -6746,8 +6925,8 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 	const Table *tp;
 	ProllyNodeRef fs;
 	ProllyNodeRef ts;
-	UnmatchedRows removed = {.context = CurrentMemoryContext};
-	UnmatchedRows added = {.context = CurrentMemoryContext};
+	DiffProjection removed = {.unmatched = {.context = CurrentMemoryContext}};
+	DiffProjection added = {.unmatched = {.context = CurrentMemoryContext}};
 
 	/*
 	 * (the same rows: none changed, whatever the definitions say, as rows
@@ -6762,6 +6941,20 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 		diff_rows(relid, from, to, NULL, NULL, sink);
 		return;
 	}
+	removed.hidden = added.hidden = diff_hidden_columns(from, to, now);
+	/*
+	 * Identical historical definitions guarantee the same key encoding and
+	 * identity.  Match the stored keys' bytes, as diff_unordered() does,
+	 * without guessing which differently named historical keys correspond.
+	 * Keyless versions must instead keep cancelling equal row copies.
+	 */
+	if (from && to && same_description(from, to))
+	{
+		bool		keyed;
+
+		(void) version_columns(from, &keyed);
+		removed.unmatched.by_key = added.unmatched.by_key = keyed;
+	}
 	rel = table_open(relid, AccessShareLock);
 	fp = as_defined_now(rel, from, now, READ_SHOWN, &fs, NIL, NIL, false, &f,
 						NULL, &removed);
@@ -6769,7 +6962,7 @@ diff_rows_now(Oid relid, const Table *from, const Table *to, const Table *now,
 						NULL, &added);
 	table_close(rel, AccessShareLock);
 	diff_rows(relid, fp, tp, &fs, &ts, sink);
-	diff_unmatched(&removed, &added, relid, sink);
+	diff_unmatched(&removed.unmatched, &added.unmatched, relid, sink);
 }
 
 /* What a merge across definitions writes, once they're merged. */
