@@ -181,7 +181,7 @@ the maximum configured distance and is recorded in every sample.
 | `checkout`, D=0 | Switch to another branch with the same root |
 | `checkout`, D>0 | Switch to a branch with an older root |
 | `reset_soft` | Reset a scratch branch's HEAD to the current/older commit, retaining its working rows |
-| `reset_hard` | Reset a scratch branch's HEAD and working set to the current/older commit, discarding its working rows (with a dirty working set at D=0: discard the pending changes) |
+| `reset_hard` | Reset a scratch branch's HEAD and working set to the current/older commit, discarding its working rows (with a dirty working set at D=0: discard the pending changes; see below for D>0) |
 | `diff_equal` | Full count of row diff between identical commit hashes |
 | `diff_working` | Full count of HEAD versus dirty WORKING |
 | `diff_history` | Full count of old hash versus current hash |
@@ -195,6 +195,10 @@ and with four sizes of **pending, uncommitted version-control changes**. SQL
 transactions have committed their UPDATEs, but no `dolt_commit` has been made.
 These cases run at D=0 and every configured historical distance, on every table
 size and historical change count K, in the latency and memory passes.
+
+A dirty `reset_hard` at D>0 times both costs at once: discarding the Q dirty
+rows and moving the branch back D commits. To tell them apart, read the dirty
+cell at D=0 (the discard alone) and the clean cell at D>0 (the move alone).
 
 The default `dirty_sizes` configuration is:
 
