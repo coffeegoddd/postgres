@@ -159,5 +159,57 @@ SELECT length(dolt_commit('-am', 'kl keyed')::text) AS committed;
 SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.kl, 'HEAD~1', 'HEAD');
 SELECT * FROM dolt_at('HEAD~1', NULL::dh.kl) ORDER BY i;
 
+-- A renamed key is absent when older rows are read by name.  Every old
+-- row must survive, even when the projected rows are identical (#653).
+CREATE TABLE dh.rpk (pk int PRIMARY KEY, v int);
+INSERT INTO dh.rpk VALUES (1, 7), (2, 7), (3, 7);
+CREATE TABLE dh.rcpk (a numeric, b int, v int, PRIMARY KEY (a, b));
+INSERT INTO dh.rcpk VALUES (1, 1, 7), (1, 2, 7), (2, 1, 8);
+SELECT length(dolt_commit('-Am', 'before key rename')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS before_rename \gset
+ALTER TABLE dh.rpk RENAME COLUMN pk TO pk2;
+ALTER TABLE dh.rcpk RENAME COLUMN b TO b2;
+-- A rename alone still changes no stored row.
+SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::dh.rpk);
+UPDATE dh.rpk SET v = 9 WHERE pk2 = 1;
+UPDATE dh.rcpk SET v = 9 WHERE a = 1 AND b2 = 1;
+-- WORKING and committed diffs, in both directions.
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD', 'WORKING', NULL::dh.rpk)
+ORDER BY diff_type, (to_row).pk2, (from_row).v;
+SELECT length(dolt_commit('-am', 'after key rename')::text) AS committed;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD~', 'HEAD', NULL::dh.rpk)
+ORDER BY diff_type, (to_row).pk2, (from_row).v;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD', 'HEAD~', NULL::dh.rpk)
+ORDER BY diff_type, (from_row).pk2, (to_row).v;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD~', 'HEAD', NULL::dh.rcpk)
+ORDER BY diff_type, (to_row).a, (to_row).b2, (from_row).a, (from_row).v;
+SELECT * FROM dolt_at('HEAD~', NULL::dh.rpk) ORDER BY v;
+SELECT diff_type, count(*) FROM dolt_diff_table(NULL::dh.rpk, 'HEAD~', 'HEAD')
+GROUP BY diff_type ORDER BY diff_type;
+SELECT count(*) FROM dolt_history_table(NULL::dh.rpk);
+-- Neither historical version has the current key's name.  They cannot
+-- be matched by that key, but all rows must still be reported.
+ALTER TABLE dh.rpk RENAME COLUMN pk2 TO pk3;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'before_rename', 'HEAD', NULL::dh.rpk)
+ORDER BY diff_type, (from_row).v, (to_row).v;
+
+-- An absent key added to a keyless version must retain its row counts;
+-- old values that cannot fit the current row type still show as NULL.
+CREATE TABLE dh.rkl (v varchar(20));
+INSERT INTO dh.rkl VALUES ('too long'), ('too long'), ('too long');
+SELECT length(dolt_commit('-Am', 'keyless copies')::text) AS committed;
+ALTER TABLE dh.rkl ADD COLUMN id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY;
+ALTER TABLE dh.rkl ALTER COLUMN v TYPE varchar(3) USING left(v, 3);
+SELECT length(dolt_commit('-am', 'copies given keys')::text) AS committed;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD~', 'HEAD', NULL::dh.rkl)
+ORDER BY diff_type, (to_row).id;
+SELECT * FROM dolt_at('HEAD~', NULL::dh.rkl);
+
 \c contrib_regression
 DROP DATABASE regress_diff_history;

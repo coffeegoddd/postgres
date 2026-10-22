@@ -112,6 +112,14 @@ Upstream `SkipResultsCheck` becomes operation success plus a check of the
 resulting state (on checkout, the active branch); it is not propagated as a
 bypass.
 
+Historical row ports retain the current by-name projection (D18). A renamed
+primary-key column is NULL in an older version that lacks its current name.
+When the stored rows differ, such rows cannot be matched by the current key:
+each is reported separately as removed or added, including identical projected
+rows and composite keys with a missing component. A rename alone with unchanged
+data roots still produces no row diff. Following column identity across renames
+is tracked separately in [#699](https://github.com/coffeegoddd/postgres/issues/699).
+
 The manifest also records deferred cases, each with a concrete reason: an
 intended divergence (for example, a hard reset restores a versioned
 schema's sequences to the commit's values, since they are per branch and in

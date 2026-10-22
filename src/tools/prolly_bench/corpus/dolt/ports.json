@@ -38658,7 +38658,7 @@
       "index": 14,
       "name": "Renaming a primary key column shows PK values in both the to and from columns",
       "source_sha256": "f6ed3213657f593c01b0bd91869e28cd3490e602f686808185ec07861707d377",
-      "scenario_sha256": "5890bb308b408d5c06fdc442436b4136d4eba742746719a091cc08ff67d6d250",
+      "scenario_sha256": "8d4381c16e324d61ed64c40cdc9e2119e9ffd13ee6eedd8aba625aedf669a2b4",
       "setup": [
         {
           "index": 0,
@@ -38672,7 +38672,7 @@
           "steps": [
             "setup-1"
           ],
-          "note": "Preserved SQL."
+          "note": "Expanded to three rows, with only the first updated, to check that a renamed key loses no historical rows (#653)."
         },
         {
           "index": 2,
@@ -38686,7 +38686,7 @@
           "steps": [
             "setup-3"
           ],
-          "note": "Preserved SQL."
+          "note": "Expanded to three rows, with only the first updated, to check that a renamed key loses no historical rows (#653)."
         },
         {
           "index": 4,
@@ -38714,7 +38714,7 @@
           "steps": [
             "setup-7"
           ],
-          "note": "Preserved SQL."
+          "note": "Expanded to three rows, with only the first updated, to check that a renamed key loses no historical rows (#653)."
         },
         {
           "index": 8,
@@ -38735,7 +38735,7 @@
           "steps": [
             "setup-10"
           ],
-          "note": "Preserved SQL."
+          "note": "Expanded to three rows, with only the first updated, to check that a renamed key loses no historical rows (#653)."
         },
         {
           "index": 11,
@@ -38751,28 +38751,28 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added. With one row per table this is every row; with more, the older rows' NULL keys collide as the key is defined now, and all but one are dropped (#653)."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added. With one row per table this is every row; with more, the older rows' NULL keys collide as the key is defined now, and all but one are dropped (#653)."
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added. With one row per table this is every row; with more, the older rows' NULL keys collide as the key is defined now, and all but one are dropped (#653)."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added. With one row per table this is every row; with more, the older rows' NULL keys collide as the key is defined now, and all but one are dropped (#653)."
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
         }
       ],
       "adaptations": [
@@ -38780,7 +38780,7 @@
         "No staging area: dolt_add stages nothing and -am/-Am add nothing. (D1)",
         "dolt_diff(from, to, 't') becomes dolt_diff(from, to, NULL::t), the table named by its row type; to_<col> and from_<col> become (to_row).col and (from_row).col. (D3, D18)",
         "dolt_diff takes two refs, no range: Dolt's 'a..b' becomes the refs a and b, and 'a...b' dolt_merge_base(a, b) and b, as Dolt reads them.",
-        "Rows are read as the table is defined now, by column name: a key column renamed reads as NULL in versions before the rename, so its row there is another row. (D18) The fixtures have one row each; more would collide on the NULL key and drop rows (#653)."
+        "Rows are read as the table is defined now, by column name: a renamed key column reads as NULL in older versions. These rows cannot be matched by the current key, so each is reported separately as removed or added, even if projected rows are identical (D18, #653). Fixtures expanded to three rows per table and only one updated."
       ]
     },
     {
