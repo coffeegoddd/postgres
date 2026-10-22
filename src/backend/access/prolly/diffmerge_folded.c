@@ -841,7 +841,13 @@ diff_working_from_changes(const char *from_ref, Oid relid,
 	if (!PROLLY_HAS(refs, working_changes))
 		return false;
 
-	/* (the changes held until they're sent, then let go of) */
+	/*
+	 * (the changes held until they're sent, then let go of; asked first, as
+	 * a working set known declines at once, reading none, where reading the
+	 * definitions first would read the known working set twice: a table
+	 * defined otherwise now, which reads changes only to let them go, is
+	 * one changed by uncommitted DDL)
+	 */
 	bc.cxt = AllocSetContextCreate(CurrentMemoryContext, "working changes",
 								   ALLOCSET_DEFAULT_SIZES);
 	ok = refs->working_changes(relid, &base, buffer_change, &bc);

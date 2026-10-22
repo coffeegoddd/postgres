@@ -278,6 +278,17 @@ SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
 FROM dolt_diff('HEAD~1', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
 SELECT dolt_reset('--hard');
 
+-- Changes that cancel out send no row: a row the working set puts back as
+-- the first version has it, and one a commit since added that the working
+-- set deletes.  (The commit is taken back after.)
+INSERT INTO fc.t VALUES (3000, 'added');
+SELECT length(dolt_commit('-am', 'added')::text) > 0 AS committed;
+UPDATE fc.t SET v = 'v5' WHERE id = 5;
+DELETE FROM fc.t WHERE id = 3000;
+SELECT diff_type, (from_row).id, (from_row).v, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~2', 'WORKING', NULL::fc.t) ORDER BY coalesce((from_row).id, (to_row).id);
+SELECT dolt_reset('--hard', 'HEAD~1');
+
 -- ... and with a definition changed since, not committed: the commits'
 -- rows read as the table is defined now (w, which neither had, null),
 -- still no row of the working set folded.
