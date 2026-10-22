@@ -641,27 +641,38 @@ check_needs(Needs *needs, bool install, const char *what)
 				 errhint("Make what is missing, then try again.")));
 
 	/*
-	 * A versioned schema an extension is to be made in is made first, as
-	 * the move that makes the rest would make it (in place of an ordinary
-	 * one of its name, such as a new database's public).
+	 * The versioned schemas extensions are to be made in are made first,
+	 * together, as the move that makes the rest would make them (in place
+	 * of an ordinary one of a name, such as a new database's public).
 	 */
-	foreach(lc, installs)
 	{
-		Install    *i = lfirst(lc);
-		Oid			nsp = get_namespace_oid(i->schema, true);
+		List	   *schemas = NIL;
 
-		if (i->versioned && (!OidIsValid(nsp) || !namespace_is_versioned(nsp)))
+		foreach(lc, installs)
+		{
+			Install    *i = lfirst(lc);
+			Oid			nsp = get_namespace_oid(i->schema, true);
+			char	   *quoted = pstrdup(quote_identifier(i->schema));
+
+			if (i->versioned && (!OidIsValid(nsp) || !namespace_is_versioned(nsp)) &&
+				!list_member(schemas, makeString(quoted)))
+				schemas = lappend(schemas, makeString(quoted));
+		}
+		if (schemas != NIL)
 		{
 			ProllyDatabaseComponents dc;
+			List	   *names = NIL;
+			ListCell   *sc;
 
 			prolly_database_components(&dc);
-			if (dc.canonicalizer->make_versioned_schema == NULL)
+			if (dc.canonicalizer->make_versioned_schemas == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("the %s needs versioned schema %s for extension %s, which this canonicalizer can't make first",
-								what, i->schema, i->name)));
-			PROLLY_CALL(dc.canonicalizer, make_versioned_schema,
-						quote_identifier(i->schema));
+						 errmsg("the %s needs versioned schemas for its extensions, which this canonicalizer can't make first",
+								what)));
+			foreach(sc, schemas)
+				names = lappend(names, strVal(lfirst(sc)));
+			PROLLY_CALL(dc.canonicalizer, make_versioned_schemas, names);
 		}
 	}
 	foreach(lc, installs)

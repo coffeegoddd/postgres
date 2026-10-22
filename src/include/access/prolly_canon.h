@@ -356,13 +356,15 @@ typedef struct ProllyCanonRoutine
 								ProllyNodeRef *next);
 
 	/*
-	 * Optional: make versioned schema name (quoted) in the session's
-	 * branch, as a move making it would: in place of an ordinary one of its
-	 * name where a move would replace it, keeping its owner, privileges and
-	 * comment; refused where a move would be.  For a clone, which makes the
-	 * extensions in versioned schemas before the move that makes the rest.
+	 * Optional: make the versioned schemas names (quoted, char *) in the
+	 * session's branch, as a move making them would: each in place of an
+	 * ordinary one of its name where a move would replace it, keeping its
+	 * owner, privileges and comment; refused where a move would be.  All are
+	 * judged against the database as it is before any is made, as a move
+	 * judges the schemas it makes.  For a clone, which makes the extensions
+	 * in versioned schemas before the move that makes the rest.
 	 */
-	void		(*make_versioned_schema) (const char *name);
+	void		(*make_versioned_schemas) (List *names);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -372,9 +374,9 @@ typedef struct ProllyCanonRoutine
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
-	"make_versioned_schema"
+	"make_versioned_schemas"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK make_versioned_schema
+#define PROLLY_CANON_LAST_CALLBACK make_versioned_schemas
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,
