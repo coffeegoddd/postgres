@@ -3785,6 +3785,10 @@ share_changes(SMgrRelation src, SMgrRelation dst)
  * and the source's map after a later remap.  Redo then skips the source's
  * older changes, so flushing alone cannot preserve the copy's rows.
  *
+ * At replica/logical WAL levels, preserve even when no backup is active:
+ * a backup could start between such a check and the share's flush.  Skipping
+ * images safely would require an interlock with backup startup.
+ *
  * Blocks already held by another map or changes list have been preserved
  * by their first share or REMAP, and cannot change in place.  Do not read
  * or log them again.  The caller holds the source's header exclusively
@@ -3810,7 +3814,7 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys)
 	XLogBeginInsert();
 	XLogRegisterData(&phys, sizeof(phys));
 	XLogRegisterBlock(0, &rel, MAIN_FORKNUM, blkno, copy.data,
-					 REGBUF_FORCE_IMAGE);
+					 REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
 }
 

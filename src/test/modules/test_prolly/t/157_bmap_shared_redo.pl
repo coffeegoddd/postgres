@@ -18,6 +18,7 @@ debug_block_mapped_heap = on
 autovacuum = off
 checkpoint_timeout = 1h
 wal_consistency_checking = 'all'
+wal_compression = off
 });
 $node->start;
 
@@ -52,7 +53,18 @@ is(sql(qq{SELECT (ctid::text::point)[0] FROM t WHERE a = $key}), '10',
 is(sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
 	FROM pg_buffercache WHERE relfilenode = $rel AND relforknumber = 0}),
 	't', 'sharing reads the source pages after eviction');
+my $first_start = sql(q{SELECT pg_current_wal_insert_lsn()});
 my $copy = sql(qq{SELECT test_bmap_share($rel)});
+my $first_end = sql(q{SELECT pg_current_wal_insert_lsn()});
+# With compression disabled, the smaller image must come from hole removal.
+# The recovery check below then exercises restoring that omitted free space.
+is(sql(qq{SELECT count(*) = 1 AND bool_and(
+		block_fpi_length > 0 AND block_fpi_length < current_setting('block_size')::int
+		AND 'HAS_HOLE' = ANY(block_fpi_info))
+	FROM pg_get_wal_block_info('$first_start', '$first_end', false)
+	WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'
+		AND relfilenode = $rel AND relblocknumber = 10}),
+	't', 'preservation omits the free-space hole of a partly filled page');
 my $rows = sql(qq{SELECT test_bmap_rows_digest($copy)});
 
 # Repeated sharing of an immutable page must work too.
@@ -68,6 +80,17 @@ sql(qq{SELECT test_bmap_truncate($rel, 10)});
 sql(qq{SELECT test_bmap_extend($rel, 1)});
 isnt(sql(qq{SELECT phys FROM test_bmap_map($rel) WHERE blkno = 10}), $phys,
 	'the source gets a different physical block');
+# An uninitialized page has no valid hole and must still be logged whole.
+my $zero_start = sql(q{SELECT pg_current_wal_insert_lsn()});
+my $zero_copy = sql(qq{SELECT test_bmap_share($rel)});
+my $zero_end = sql(q{SELECT pg_current_wal_insert_lsn()});
+is(sql(qq{SELECT count(*) = 1 AND bool_and(
+		block_fpi_length = current_setting('block_size')::int
+		AND NOT ('HAS_HOLE' = ANY(block_fpi_info)))
+	FROM pg_get_wal_block_info('$zero_start', '$zero_end', false)
+	WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'
+		AND relfilenode = $rel AND relblocknumber = 10}),
+	't', 'preservation retains the full image of an uninitialized page');
 is(sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
 	FROM pg_buffercache WHERE relfilenode = $rel AND relforknumber = 4}),
 	't', 'the newer source map reaches disk');
@@ -86,6 +109,10 @@ is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $rows,
 	'the shared copy recovers all changes missing from the backup page');
 is(sql(qq{SELECT test_bmap_rows_digest($copy2)}), $rows,
 	'the second copy recovers the same shared page');
+is(sql(qq{SELECT test_bmap_read_old($zero_copy, blkno, phys) =
+		decode(repeat('00', current_setting('block_size')::int), 'hex')
+	FROM test_bmap_map($zero_copy) WHERE blkno = 10}),
+	't', 'the uninitialized shared page recovers as all zeroes');
 $node->stop;
 
 done_testing();
