@@ -196,7 +196,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
- canonicalizer | stub           | complete                       | not implemented (28 of 28 callbacks missing)
+ canonicalizer | stub           | complete                       | not implemented (29 of 29 callbacks missing)
  chunk_store   | journal        | identity                       | pass
  chunk_store   | journal        | complete                       | pass
  chunk_format  | basic          | identity                       | pass

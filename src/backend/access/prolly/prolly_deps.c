@@ -27,6 +27,7 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "catalog/versioned.h"
 #include "executor/spi.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -44,6 +45,7 @@ typedef struct NeededExtension
 	char	   *name;			/* unquoted */
 	List	   *versions;		/* String, distinct; none for "any" */
 	List	   *schemas;		/* String, distinct */
+	bool		versioned;		/* its schema is a versioned one */
 } NeededExtension;
 
 /* An object the commits need. */
@@ -66,6 +68,7 @@ typedef struct Install
 	char	   *name;
 	char	   *version;
 	char	   *schema;
+	bool		versioned;		/* the schema is to be made versioned first */
 	bool		started;		/* (what it requires is being created) */
 } Install;
 
@@ -76,9 +79,13 @@ typedef struct UpdatePath
 	char	   *to;
 } UpdatePath;
 
-/* The elements of a text[] literal; an error unless there are n. */
+/*
+ * The elements of a text[] literal; an error unless there are n, or, with
+ * more, up to more past n (how many in *got).
+ */
 static Datum *
-text_array_elements(const char *literal, int n, const char *what)
+text_array_elements_upto(const char *literal, int n, int more, int *got,
+						 const char *what)
 {
 	Datum	   *elems;
 	bool	   *nulls;
@@ -88,16 +95,25 @@ text_array_elements(const char *literal, int n, const char *what)
 																	  (char *) literal,
 																	  TEXTOID, -1)),
 							  TEXTOID, &elems, &nulls, &nelems);
-	if (nelems != n)
+	if (nelems < n || nelems > n + more)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid %s dependency \"%s\"", what, literal)));
-	for (int i = 0; i < n; i++)
+	if (got)
+		*got = nelems;
+	for (int i = 0; i < nelems; i++)
 		if (nulls[i])
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid %s dependency \"%s\"", what, literal)));
 	return elems;
+}
+
+/* The elements of a text[] literal; an error unless there are n. */
+static Datum *
+text_array_elements(const char *literal, int n, const char *what)
+{
+	return text_array_elements_upto(literal, n, 0, NULL, what);
 }
 
 static NeededExtension *
@@ -141,9 +157,12 @@ note_need(const char *name, const char *value, void *arg)
 	if (strncmp(name, EXTENSION_PREFIX, strlen(EXTENSION_PREFIX)) == 0)
 	{
 		char	   *quoted = pstrdup(name + strlen(EXTENSION_PREFIX));
-		Datum	   *parts = text_array_elements(value, 2, "extension");
+		int			nparts;
+		Datum	   *parts = text_array_elements_upto(value, 2, 1, &nparts,
+													 "extension");
 		char	   *version = TextDatumGetCString(parts[0]);
 		char	   *schema = TextDatumGetCString(parts[1]);
+		bool		versioned = false;
 		List	   *names;
 		NeededExtension *e;
 
@@ -151,6 +170,14 @@ note_need(const char *name, const char *value, void *arg)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid extension dependency \"%s\"", name)));
+		if (nparts == 3)
+		{
+			if (strcmp(TextDatumGetCString(parts[2]), "versioned") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("invalid extension dependency \"%s\"", name)));
+			versioned = true;
+		}
 		e = find_extension(needs, linitial(names));
 		if (e == NULL)
 		{
@@ -162,6 +189,7 @@ note_need(const char *name, const char *value, void *arg)
 			e->versions = lappend(e->versions, makeString(version));
 		if (!list_member(e->schemas, makeString(schema)))
 			e->schemas = lappend(e->schemas, makeString(schema));
+		e->versioned = e->versioned || versioned;
 		return;
 	}
 	foreach(lc, needs->objects)
@@ -337,7 +365,8 @@ only_version(List *versions, const char *version)
  * NULL otherwise.
  */
 static char *
-check_extension(NeededExtension *e, StringInfo missing, bool *any_extension)
+check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
+				bool install)
 {
 	char	   *schema = strVal(linitial(e->schemas));
 	char	   *have;
@@ -404,9 +433,17 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension)
 						 e->name, newest);
 		return NULL;
 	}
+	if (e->versioned && install)
+		return newest;			/* (the schema made, versioned, first) */
 	if (!OidIsValid(get_namespace_oid(schema, true)))
 	{
 		appendStringInfo(missing, "\nextension %s: schema %s, not in this database",
+						 e->name, schema);
+		return NULL;
+	}
+	if (e->versioned && !namespace_is_versioned(get_namespace_oid(schema, false)))
+	{
+		appendStringInfo(missing, "\nextension %s: schema %s, which isn't versioned in this database",
 						 e->name, schema);
 		return NULL;
 	}
@@ -564,7 +601,8 @@ check_needs(Needs *needs, bool install, const char *what)
 	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
-		char	   *version = check_extension(e, &missing, &any_extension);
+		char	   *version = check_extension(e, &missing, &any_extension,
+											  install);
 
 		if (version == NULL)
 			continue;
@@ -581,6 +619,7 @@ check_needs(Needs *needs, bool install, const char *what)
 			add->name = e->name;
 			add->version = version;
 			add->schema = strVal(linitial(e->schemas));
+			add->versioned = e->versioned;
 			installs = lappend(installs, add);
 		}
 	}
@@ -601,6 +640,30 @@ check_needs(Needs *needs, bool install, const char *what)
 				 errhint("Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.") :
 				 errhint("Make what is missing, then try again.")));
 
+	/*
+	 * A versioned schema an extension is to be made in is made first, as
+	 * the move that makes the rest would make it (in place of an ordinary
+	 * one of its name, such as a new database's public).
+	 */
+	foreach(lc, installs)
+	{
+		Install    *i = lfirst(lc);
+		Oid			nsp = get_namespace_oid(i->schema, true);
+
+		if (i->versioned && (!OidIsValid(nsp) || !namespace_is_versioned(nsp)))
+		{
+			ProllyDatabaseComponents dc;
+
+			prolly_database_components(&dc);
+			if (dc.canonicalizer->make_versioned_schema == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the %s needs versioned schema %s for extension %s, which this canonicalizer can't make first",
+								what, i->schema, i->name)));
+			PROLLY_CALL(dc.canonicalizer, make_versioned_schema,
+						quote_identifier(i->schema));
+		}
+	}
 	foreach(lc, installs)
 		create_extension(installs, lfirst(lc));
 	SPI_finish();

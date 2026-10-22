@@ -37,7 +37,8 @@
  * - fold_dependencies() builds the tree of what the session branch's
  *   versioned objects need from outside the versioned schemas, for a
  *   commit to record beside its root: keyed by kind and identity
- *   ("extension hstore"), an extension valued by its version and schema,
+ *   ("extension hstore"), an extension valued by its version and schema
+ *   (and "versioned" after them if the schema is),
  *   another object by its address (its type, names and arguments, as
  *   pg_identify_object_as_address() gives them), each a text[] literal.
  *   Not roles.  It is no part of the root, so what changes outside never
@@ -353,6 +354,15 @@ typedef struct ProllyCanonRoutine
 	bool		(*advance_own) (const ProllyNodeRef *baseline,
 								const ProllyRowChanges *changes, int nchanges,
 								ProllyNodeRef *next);
+
+	/*
+	 * Optional: make versioned schema name (quoted) in the session's
+	 * branch, as a move making it would: in place of an ordinary one of its
+	 * name where a move would replace it, keeping its owner, privileges and
+	 * comment; refused where a move would be.  For a clone, which makes the
+	 * extensions in versioned schemas before the move that makes the rest.
+	 */
+	void		(*make_versioned_schema) (const char *name);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -361,9 +371,10 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own"
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
+	"make_versioned_schema"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK advance_own
+#define PROLLY_CANON_LAST_CALLBACK make_versioned_schema
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

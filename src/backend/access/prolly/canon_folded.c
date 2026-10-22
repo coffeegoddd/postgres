@@ -2904,9 +2904,13 @@ describe_dependency(const ObjectAddress *addr)
 	{
 		Oid			nsp = get_extension_schema(addr->objectId);
 
-		append_utf8(&dep->value,
-					text_array_literal(list_make2(extension_version(addr->objectId),
-												  get_namespace_name(nsp))));
+		List	   *value = list_make2(extension_version(addr->objectId),
+										   get_namespace_name(nsp));
+
+		/* (a clone makes a versioned schema before the extension in it) */
+		if (namespace_is_versioned(nsp))
+			value = lappend(value, "versioned");
+		append_utf8(&dep->value, text_array_literal(value));
 	}
 	else
 	{
@@ -10412,6 +10416,29 @@ folded_splice_baseline(const ProllyNodeRef *into, const ProllyNodeRef *from,
 	pfree(edits);
 }
 
+/*
+ * Make versioned schema name (quoted) as a move making it would, before the
+ * move: for a clone, which makes the extensions in versioned schemas first.
+ */
+static void
+folded_make_versioned_schema(const char *name)
+{
+	Canon		cn;
+	List	   *replaced = NIL;
+	List	   *stmts;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	stmts = make_schema(&cn, name, &replaced);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	run_statements(stmts);
+	SPI_finish();
+	CommandCounterIncrement();
+	carry_over(replaced);
+	CommandCounterIncrement();
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -10440,6 +10467,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.changes = folded_changes,
 	.render = folded_render,
 	.move_schema = folded_move_schema,
+	.make_versioned_schema = folded_make_versioned_schema,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,
 	.dependencies = folded_dependencies,
