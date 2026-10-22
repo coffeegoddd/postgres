@@ -46,6 +46,22 @@ extern char *other_branch_dependent(const ObjectAddress *object,
 /* the name of another branch with a typed table of typeOid, or NULL */
 extern char *other_branch_typed_table(Oid typeOid);
 
+/* the first extension in schema nspid, or InvalidOid */
+extern Oid	extension_in_namespace(Oid nspid);
+
+/* error if an extension can't be created in schema nspid */
+extern void check_versioned_extension_schema(Oid nspid);
+
+/* error if a versioned schema holding an extension would be dropped or renamed */
+extern void check_versioned_schema_change(Oid nspid, const char *what);
+
+/* error if an object would move between an extension and a versioned schema */
+extern void check_versioned_extension_member(const ObjectAddress *object,
+											 bool adding);
+
+/* error if an extension would move into or out of a versioned schema */
+extern void check_versioned_extension_move(Oid oldnspid, Oid newnspid);
+
 /* the access method a new relation in namespace nspid gets */
 extern Oid	versioned_relation_am(Oid nspid, Oid amoid, char relkind,
 								  char relpersistence, bool explicit);

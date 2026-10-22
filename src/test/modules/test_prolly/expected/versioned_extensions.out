@@ -1,0 +1,231 @@
+-- An extension can be installed in a versioned schema, and isn't versioned
+-- by it: what its script makes there is shared, every branch's, with one
+-- OID, as an extension in an ordinary schema is.  The schema's own objects
+-- stay the branch's.  A table the script makes there is a shared heap table.
+-- While an extension is in it, the schema can't be dropped or renamed on any
+-- branch, and objects can't move between the extension and the schema's
+-- versioned objects.  (In a database of its own, so the branches here are
+-- the only ones.)
+CREATE DATABASE regress_versioned_extensions;
+\c regress_versioned_extensions
+CREATE SCHEMA ve VERSIONED;
+CREATE TABLE ve.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('ve_before');		-- made before the extension
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE EXTENSION citext SCHEMA ve;
+CREATE EXTENSION hstore SCHEMA ve;
+CREATE EXTENSION btree_gist SCHEMA ve;
+CREATE EXTENSION test_prolly_ext_table SCHEMA ve;
+SET search_path = public, ve;
+-- installing them changed nothing a commit holds
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+ table_name | status 
+------------+--------
+(0 rows)
+
+-- the members' rows are shared (branch 0); the schema's own table isn't
+SELECT count(*) FILTER (WHERE typbranch <> 0) AS versioned_types,
+	   count(*) FILTER (WHERE typbranch = 0) > 0 AS shared_types
+  FROM pg_type WHERE typnamespace = 've'::regnamespace AND typname IN ('citext', 'hstore');
+ versioned_types | shared_types 
+-----------------+--------------
+               0 | t
+(1 row)
+
+SELECT relname, relbranch = 0 AS shared, amname
+  FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+ WHERE relnamespace = 've'::regnamespace AND relkind = 'r'
+ ORDER BY relname;
+       relname        | shared | amname 
+----------------------+--------+--------
+ base                 | f      | prolly
+ test_prolly_ext_rows | t      | heap
+(2 rows)
+
+-- versioned tables use them, on two branches
+CREATE TABLE ve.t (id int PRIMARY KEY, name ve.citext, attrs ve.hstore,
+				   during int4range,
+				   EXCLUDE USING gist (id WITH =, during WITH &&));
+INSERT INTO ve.t VALUES (1, 'Hi', 'a=>1', '[1,5)');
+SELECT length(dolt_commit('-Am', 'with extensions')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ve_before');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 've_before'"}
+(1 row)
+
+SELECT 'x'::ve.citext = 'X'::ve.citext AS same_type_here;
+ same_type_here 
+----------------
+ t
+(1 row)
+
+CREATE TABLE ve.u (id int PRIMARY KEY, name ve.citext);
+INSERT INTO ve.u VALUES (1, 'There');
+SELECT dolt_checkout('-b', 've_after', 'main');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 've_after'"}
+(1 row)
+
+SELECT id, name, attrs -> 'a' AS a FROM ve.t;
+ id | name | a 
+----+------+---
+  1 | Hi   | 1
+(1 row)
+
+INSERT INTO ve.t VALUES (2, 'Yo', 'a=>2', '[1,5)');
+INSERT INTO ve.t VALUES (3, 'No', 'a=>3', '[2,3)');	-- the exclusion holds
+SELECT length(dolt_commit('-Am', 'on after')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT length(dolt_merge('ve_after')::text) > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT id, name FROM ve.t ORDER BY id;
+ id | name 
+----+------
+  1 | Hi
+  2 | Yo
+  3 | No
+(3 rows)
+
+-- the extension's table is the same on every branch, and never committed
+INSERT INTO ve.test_prolly_ext_rows VALUES (10);
+SELECT dolt_checkout('ve_before');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 've_before'"}
+(1 row)
+
+SELECT * FROM ve.test_prolly_ext_rows;
+ v  
+----
+  1
+ 10
+(2 rows)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT table_name FROM dolt_status() ORDER BY 1;
+ table_name 
+------------
+(0 rows)
+
+-- refused while the extensions are in the schema
+SET client_min_messages = warning;
+DROP SCHEMA ve CASCADE;
+ERROR:  cannot drop schema "ve" because extension "citext" is in it
+DETAIL:  An extension in a versioned schema is shared by every branch, and every branch keeps the schema.
+HINT:  Drop the extension first.
+SELECT dolt_checkout('ve_before');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 've_before'"}
+(1 row)
+
+DROP SCHEMA ve CASCADE;
+ERROR:  cannot drop schema "ve" because extension "citext" is in it
+DETAIL:  An extension in a versioned schema is shared by every branch, and every branch keeps the schema.
+HINT:  Drop the extension first.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+RESET client_min_messages;
+ALTER SCHEMA ve RENAME TO ve2;
+ERROR:  cannot rename schema "ve" because extension "citext" is in it
+DETAIL:  An extension in a versioned schema is shared by every branch, and every branch keeps the schema.
+HINT:  Drop the extension first.
+ALTER EXTENSION citext DROP FUNCTION ve.citext(boolean);
+ERROR:  cannot remove function citext(boolean) from its extension: it is in versioned schema "ve"
+DETAIL:  An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.
+CREATE FUNCTION ve.mine() RETURNS int LANGUAGE sql RETURN 1;
+ALTER EXTENSION citext ADD FUNCTION ve.mine();
+ERROR:  cannot add function mine() to an extension: it is in versioned schema "ve"
+DETAIL:  An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.
+CREATE SCHEMA plain_ext;
+ALTER EXTENSION hstore SET SCHEMA plain_ext;
+ERROR:  cannot move an extension into or out of a versioned schema
+HINT:  Drop the extension and create it in the schema wanted.
+CREATE EXTENSION ltree SCHEMA plain_ext;
+ALTER EXTENSION ltree SET SCHEMA ve;
+ERROR:  cannot move an extension into or out of a versioned schema
+HINT:  Drop the extension and create it in the schema wanted.
+-- a versioned schema only some branches have can't take an extension
+CREATE SCHEMA ve_main_only VERSIONED;
+CREATE EXTENSION cube SCHEMA ve_main_only;
+ERROR:  cannot create an extension in schema "ve_main_only", which branch "ve_before" doesn't have
+DETAIL:  An extension is shared by every branch, and so is what it makes in a versioned schema.
+HINT:  Install it in a schema every branch has.
+-- dropping an extension still sees every branch's dependents
+DROP TABLE ve.t;
+SELECT length(dolt_commit('-Am', 'tables gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+DROP EXTENSION citext;		-- ve_before's ve.u, ve_after's ve.t
+ERROR:  cannot drop type citext because objects on branch "ve_before" depend on it
+DETAIL:  Objects on 2 branches other than the session's depend on it.
+HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
+SELECT dolt_branch('-D', 've_after');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('ve_before');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 've_before'"}
+(1 row)
+
+DROP TABLE ve.u;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+DROP EXTENSION citext, hstore, btree_gist, test_prolly_ext_table;
+DROP SCHEMA ve CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table base
+drop cascades to function mine()
+\c contrib_regression
+DROP DATABASE regress_versioned_extensions;

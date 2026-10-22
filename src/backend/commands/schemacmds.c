@@ -25,6 +25,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/versioned.h"
 #include "commands/event_trigger.h"
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
@@ -268,6 +269,9 @@ RenameSchema(const char *oldname, const char *newname)
 
 	nspform = (Form_pg_namespace) GETSTRUCT(tup);
 	nspOid = nspform->oid;
+
+	/* (a versioned schema an extension is in keeps its name) */
+	check_versioned_schema_change(nspOid, "rename");
 
 	/* make sure the new name doesn't exist */
 	if (OidIsValid(get_namespace_oid(newname, true)))

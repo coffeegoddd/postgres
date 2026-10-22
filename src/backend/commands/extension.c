@@ -2004,12 +2004,11 @@ CreateExtensionInternal(char *extensionName,
 	if (isTempNamespace(schemaOid))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
-	/* extensions are shared by every branch */
-	if (namespace_is_versioned(schemaOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("extensions can't be created in a versioned schema"),
-				 errdetail("An extension is shared by every branch.")));
+	/*
+	 * An extension is shared by every branch, and so is what it makes in a
+	 * versioned schema: every branch must have the schema.
+	 */
+	check_versioned_extension_schema(schemaOid);
 
 	/*
 	 * We don't check creation rights on the target namespace here.  If the
@@ -3353,6 +3352,9 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 	/* store the OID of the namespace to-be-changed */
 	oldNspOid = extForm->extnamespace;
 
+	/* (shared objects can't move into or out of a versioned schema) */
+	check_versioned_extension_move(oldNspOid, nspOid);
+
 	/*
 	 * Scan pg_depend to find objects that depend directly on the extension,
 	 * and alter each one's schema.
@@ -3842,6 +3844,9 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 	/* Permission check: must own target object, too */
 	check_object_ownership(GetUserId(), stmt->objtype, object,
 						   stmt->object, relation);
+
+	/* a versioned schema's objects are each branch's, members are shared */
+	check_versioned_extension_member(&object, stmt->action > 0);
 
 	/* Do the update, recursing to any dependent objects */
 	ExecAlterExtensionContentsRecurse(stmt, extension, object);

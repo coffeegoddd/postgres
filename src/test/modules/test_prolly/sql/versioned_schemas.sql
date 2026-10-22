@@ -99,9 +99,13 @@ CREATE FUNCTION plain.count_t() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) 
 INSERT INTO app.t VALUES (1, 'one'), (2, 'two');
 SELECT plain.count_t();
 
--- Extensions are shared.
+-- Extensions are shared, in a versioned schema too: what they make there
+-- isn't versioned.
 DROP EXTENSION IF EXISTS tsm_system_rows;
 CREATE EXTENSION tsm_system_rows SCHEMA app;
+SELECT pronamespace::regnamespace AS schema, probranch = 0 AS shared
+  FROM pg_proc WHERE proname = 'system_rows';
+DROP EXTENSION tsm_system_rows;
 CREATE EXTENSION tsm_system_rows;
 
 DROP SCHEMA app CASCADE;
