@@ -61,6 +61,7 @@ typedef struct Needs
 	List	   *extensions;
 	List	   *objects;
 	List	   *except;			/* "name\nvalue": already needed, not checked */
+	bool		read;			/* historical rows can be re-sorted */
 } Needs;
 
 /* An extension to create. */
@@ -117,7 +118,7 @@ text_array_elements(const char *literal, int n, const char *what)
 	return text_array_elements_upto(literal, n, 0, NULL, what);
 }
 
-/* Optional flags are independent: an extension may have both roles. */
+/* Canonical order: versioned, then ordering; either may be absent. */
 static Datum *
 extension_parts(const char *value, bool *versioned, bool *ordering)
 {
@@ -130,7 +131,7 @@ extension_parts(const char *value, bool *versioned, bool *ordering)
 	{
 		char	   *flag = TextDatumGetCString(parts[i]);
 
-		if (strcmp(flag, "versioned") == 0 && !*versioned)
+		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering)
 			*versioned = true;
 		else if (strcmp(flag, "ordering") == 0 && !*ordering)
 			*ordering = true;
@@ -188,12 +189,9 @@ note_except(const char *name, const char *value, void *arg)
 {
 	Needs	   *needs = arg;
 
-	/* The base's keys are read too, even if the incoming side drops them. */
-	if (is_ordering_dependency(name, value))
-	{
-		note_need(name, value, arg);
+	/* Moves must check the target's ordering even when the old head agrees. */
+	if (!needs->read && is_ordering_dependency(name, value))
 		return;
-	}
 	needs->except = lappend(needs->except, psprintf("%s\n%s", name, value));
 }
 
@@ -236,7 +234,8 @@ note_need(const char *name, const char *value, void *arg)
 		}
 		if (version[0] != '\0' && !list_member(e->versions, makeString(version)))
 			e->versions = lappend(e->versions, makeString(version));
-		if (ordering && !list_member(e->ordering_versions, makeString(version)))
+		if (ordering && !needs->read &&
+			!list_member(e->ordering_versions, makeString(version)))
 			e->ordering_versions = lappend(e->ordering_versions, makeString(version));
 		if (!list_member(e->schemas, makeString(schema)))
 			e->schemas = lappend(e->schemas, makeString(schema));
@@ -666,6 +665,7 @@ check_needs(Needs *needs, bool install, const char *what)
 	List	   *installs = NIL;
 	ListCell   *lc;
 	bool		any_extension = false;
+	bool		ordering_extension = false;
 
 	if (needs->extensions == NIL && needs->objects == NIL)
 		return;
@@ -679,6 +679,7 @@ check_needs(Needs *needs, bool install, const char *what)
 		char	   *version = check_extension(e, &missing, &any_extension,
 											  install);
 
+		ordering_extension |= e->ordering_versions != NIL;
 		if (version == NULL)
 			continue;
 		if (!install)
@@ -711,6 +712,8 @@ check_needs(Needs *needs, bool install, const char *what)
 				 errmsg("the %s needs what this database lacks", what),
 				 errdetail_internal("Needed from outside the versioned schemas:%s",
 									missing.data),
+				 ordering_extension ?
+				 errhint("Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.") :
 				 any_extension ?
 				 errhint("Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.") :
 				 errhint("Make what is missing, then try again.")));
@@ -758,7 +761,7 @@ check_needs(Needs *needs, bool install, const char *what)
 void
 prolly_check_dependencies(List *trees, bool install, const char *what)
 {
-	Needs		needs = {NIL, NIL, NIL};
+	Needs		needs = {0};
 
 	collect_trees(trees, &needs);
 	check_needs(&needs, install, what);
@@ -766,11 +769,12 @@ prolly_check_dependencies(List *trees, bool install, const char *what)
 
 void
 prolly_check_commit_dependencies(const ProllyCommitInfo *commit,
-								 const ProllyCommitInfo *since, const char *what)
+								 const ProllyCommitInfo *since, const char *what, bool read)
 {
 	ProllyDatabaseComponents dc;
-	Needs		needs = {NIL, NIL, NIL};
+	Needs		needs = {0};
 
+	needs.read = read;
 	prolly_database_components(&dc);
 	if (since && since->has_dependencies)
 		PROLLY_CALL(dc.canonicalizer, dependencies, &since->dependencies,
@@ -781,43 +785,33 @@ prolly_check_commit_dependencies(const ProllyCommitInfo *commit,
 	check_needs(&needs, false, what);
 }
 
-/* Before opening a historical tree, check only what can change key order. */
-void
-prolly_check_ordering_dependencies(const ProllyCommitInfo *commit)
-{
-	ProllyDatabaseComponents dc;
-	Needs		needs = {NIL, NIL, NIL};
-
-	if (!commit->has_dependencies)
-		return;
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
-				note_ordering, &needs);
-	if (needs.extensions != NIL)
-		check_needs(&needs, false, "historical read");
-}
-
 /* A row-only commit must fall back to folding if its head's order is stale. */
 bool
 prolly_ordering_dependencies_match(const ProllyCommitInfo *commit)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef current;
-	Needs		needs = {NIL, NIL, NIL};
+	Needs		needs = {0};
+	Needs		old = {0};
 	ListCell   *lc;
 	bool		match = true;
 
-	if (!commit->has_dependencies)
-		return true;
 	prolly_database_components(&dc);
 	/* The usual case: write_commit() will reuse this cached dependency tree. */
 	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &current);
-	if (current.hash.len == commit->dependencies.hash.len &&
+	if (commit->has_dependencies &&
+		current.hash.len == commit->dependencies.hash.len &&
 		memcmp(current.hash.bytes, commit->dependencies.hash.bytes,
 			   current.hash.len) == 0)
 		return true;
-	PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
-				note_ordering, &needs);
+	PROLLY_CALL(dc.canonicalizer, dependencies, &current, note_ordering, &needs);
+	if (commit->has_dependencies)
+	{
+		PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
+					note_ordering, &needs);
+		PROLLY_CALL(dc.canonicalizer, dependencies, &commit->dependencies,
+					note_need, &old);
+	}
 	if (needs.extensions == NIL)
 		return true;
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -827,8 +821,12 @@ prolly_ordering_dependencies_match(const ProllyCommitInfo *commit)
 		NeededExtension *e = lfirst(lc);
 		char	   *version;
 		char	   *schema;
+		NeededExtension *before = find_extension(&old, e->name);
 
-		if (!installed(e->name, &version, &schema) ||
+		if (before == NULL || before->versions == NIL ||
+			!installed(e->name, &version, &schema) ||
+			!only_version(before->versions, version) ||
+			!only_version(before->schemas, schema) ||
 			!only_version(e->ordering_versions, version) ||
 			!only_version(e->schemas, schema))
 		{

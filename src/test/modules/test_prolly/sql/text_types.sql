@@ -89,12 +89,12 @@ SELECT dolt_reset('--hard');
 SELECT id, r FROM tt.r;
 
 -- A type that gains binary send and receive (cube's update to 1.5):
--- values retain their recorded form.  Non-key history can still be read,
--- but the key-ordering guard conservatively refuses old keyed commits,
--- even though this particular upgrade preserves comparison semantics.
+-- values retain their recorded form.  Historical keyed rows are re-sorted
+-- under the installed comparator; unrelated history remains readable.
 SELECT dolt_hashof('HEAD') AS before_update \gset
 ALTER EXTENSION cube UPDATE TO '1.5';
 SELECT typname, typsend <> 0 AS binary FROM pg_type WHERE typname = 'cube';
+SELECT k, n FROM dolt_at(:'before_update', NULL::tt.keyed) ORDER BY k;
 SELECT id, c FROM dolt_at(:'before_keys', NULL::tt.shapes) ORDER BY id;
 SELECT table_name, status FROM dolt_status() WHERE table_name IN ('tt.f', 'tt.keyed') ORDER BY 1;
 SELECT length(dolt_commit('-Am', 'cube 1.5', '--allow-empty')::text) AS committed;

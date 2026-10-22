@@ -127,7 +127,7 @@ prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit, void *arg)
 		PopActiveSnapshot();
 		return 0;
 	}
-	PROLLY_CALL(dc.canonicalizer, tables, &incremental, collect_table, &folded);
+	PROLLY_CALL(dc.canonicalizer, tables, &incremental, NULL, collect_table, &folded);
 	foreach(lc, folded)
 	{
 		FoldedTable *t = lfirst(lc);
@@ -155,7 +155,7 @@ prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit, void *arg)
 			prolly_fold_verifying = false;
 		}
 		PG_END_TRY();
-		PROLLY_CALL(dc.canonicalizer, tables, &full, collect_table, &fulls);
+		PROLLY_CALL(dc.canonicalizer, tables, &full, NULL, collect_table, &fulls);
 		ft = find_table(fulls, t->name);
 		matches = ft != NULL && same_tree(&ft->data, &t->data);
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_VERIFIED, 1);

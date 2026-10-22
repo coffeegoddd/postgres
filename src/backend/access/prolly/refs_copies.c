@@ -1133,8 +1133,8 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		return false;
 
 	/* the tables whose rows differ, where sharing costs less */
-	PROLLY_CALL(dc.canonicalizer, tables, working, note_table, &ours);
-	PROLLY_CALL(dc.canonicalizer, tables, target, note_table, &theirs);
+	PROLLY_CALL(dc.canonicalizer, tables, working, NULL, note_table, &ours);
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (list_length(ours) != list_length(theirs))
 		return false;
 	prolly_folded_tree_env(&denv);
@@ -1494,7 +1494,7 @@ materialize(const char *name)
 	 * the head moved meanwhile.
 	 */
 	if (branch_head(name, &checked) && copies_commit_get(&checked, &info))
-		prolly_check_commit_dependencies(&info, NULL, "branch's first use");
+		prolly_check_commit_dependencies(&info, NULL, "branch's first use", false);
 	else
 		memset(&checked, 0, sizeof(checked));
 
@@ -1516,7 +1516,7 @@ materialize(const char *name)
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the head commit of branch \"%s\" is missing", name)));
 		if (!same_hash(&head, &checked))
-			prolly_check_commit_dependencies(&info, NULL, "branch's first use");
+			prolly_check_commit_dependencies(&info, NULL, "branch's first use", false);
 		ns.root = &info.root.hash;
 		ns.snap = IsolationUsesXactSnapshot() ? GetActiveSnapshot() :
 			GetLatestSnapshot();
@@ -4203,7 +4203,7 @@ branch_dirty(const char *name, const ProllyHash *head)
 
 		PROLLY_CALL(tree, build_finish, b, &empty);
 		prolly_database_components(&dc);
-		PROLLY_CALL(dc.canonicalizer, tables, &ws, count_table, &n);
+		PROLLY_CALL(dc.canonicalizer, tables, &ws, NULL, count_table, &n);
 		PROLLY_CALL(dc.canonicalizer, objects, &empty, &ws, count_object, &n);
 		return n > 0;
 	}
@@ -4289,7 +4289,7 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 
 				prolly_check_commit_dependencies(&info,
 												 at.len > 0 && copies_commit_get(&at, &was) ?
-												 &was : NULL, "push");
+												 &was : NULL, "push", false);
 			}
 			if (head == NULL)
 				;

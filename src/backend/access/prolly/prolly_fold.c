@@ -207,6 +207,67 @@ fold_sort_next(Tuplesortstate *state)
 }
 
 /*
+ * Rebuild a keyed historical tree under today's comparator.  Walk from the
+ * beginning, without seeking by key in the old order, and preserve encoded
+ * rows and their long-value references.  The sort spills at maintenance_work_mem.
+ */
+bool
+prolly_fold_reorder(const ProllyKeyingRoutine *kr, ProllyKeying *k,
+					const ProllyTreeRoutine *tree, const ProllyTreeEnv *env,
+					const ProllyNodeRef *from, ProllyNodeRef *data)
+{
+	FoldSortArg arg = {kr, k};
+	Tuplesortstate *sort = fold_sort_begin(&arg);
+	ProllyTreeCursor *cur;
+	ProllyTreeBuilder *builder;
+	ProllyKey	key;
+	ProllyValue value;
+	StringInfoData prev;
+	const FoldTuple *t;
+	bool		unique = true;
+	ProllyNodeRef reordered;
+
+	cur = PROLLY_CALL(tree, cursor_open, env, from, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, cur, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, cur, &key, &value))
+	{
+		StringInfoData kb = {(char *) key.data, key.len, key.len, 0};
+		StringInfoData vb = {(char *) value.data, value.len, value.len, 0};
+
+		fold_sort_put(sort, &kb, &vb, 1);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(tree, cursor_close, cur);
+	tuplesort_performsort(sort);
+	initStringInfo(&prev);
+	builder = PROLLY_CALL(tree, build_begin, env, CurrentMemoryContext);
+	while ((t = fold_sort_next(sort)) != NULL)
+	{
+		ProllyKey	before = {(const uint8 *) prev.data, prev.len};
+
+		key.data = (const uint8 *) t->data;
+		key.len = t->keylen;
+		value.data = (const uint8 *) t->data + t->keylen;
+		value.len = t->rowlen;
+		if (prev.len && PROLLY_CALL(kr, compare, k, &before, &key) == 0)
+		{
+			unique = false;
+			break;
+		}
+		PROLLY_CALL(tree, build_add, builder, &key, &value);
+		resetStringInfo(&prev);
+		appendBinaryStringInfo(&prev, (const char *) key.data, key.len);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(tree, build_finish, builder, &reordered);
+	if (unique)
+		*data = reordered;
+	pfree(prev.data);
+	tuplesort_end(sort);
+	return unique;
+}
+
+/*
  * The sorted rows built into *data, in key order: a keyless row's copies,
  * one after another, counted.  False at a keyed table's second row of a
  * key, *data then the part built before it, not to be used.  done gets

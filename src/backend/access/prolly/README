@@ -89,6 +89,39 @@ and composites.  valenc_canonical.c stores live columns only, without
 trailing NULLs, and decodes rows encoded under an earlier layout.
 
 
+Extension ordering and history compatibility
+-------------------------------------------
+
+Folded format 16 records the extensions ordering each table's primary key,
+including comparators reached through arrays, composites, ranges, multiranges
+and domains.  A dependency's optional flags have one order: "versioned", then
+"ordering".  Clone and move targets require the exact recorded ordering
+versions; ordinary dependencies continue to require a compatible minimum.
+A move checks the target, not the old head that it replaces.
+
+Historical reads and merges check ordering per table.  After an extension
+upgrade, a table whose definition and row types still match can be read by
+re-sorting its encoded keys under the installed comparator.  This spills at
+maintenance_work_mem and preserves row/value bytes and long-value references;
+no commit is rewritten.  A concurrent definition or row-type change is
+refused for that table.  Unrelated history remains readable.  Upgrades must
+still preserve the ability to decode the stored values; there is no general
+extension binary-compatibility certificate.  Re-sort results are not cached.
+
+An upgrade invalidates baseline ordering and the row-only autocommit shortcut,
+including a legacy head missing ordering flags.  Rebuild native indexes when
+the extension's comparator changes, then commit to record its new ordering.
+Hard reset to a target recording the old version remains refused (including
+HEAD); a forward reset to a compatible new target is allowed.
+
+This is a deliberate history format change.  Earlier servers cannot read
+format-16 commits or the new dependency flags, so these commits must not be
+sent to an older server or used after downgrading.  Current code still parses
+legacy dependency entries, but it does not retroactively certify legacy key
+ordering.  Older root formats retain the existing recommit requirement;
+committing a branch writes its current working state in the new format.
+
+
 Trees and chunks
 ----------------
 

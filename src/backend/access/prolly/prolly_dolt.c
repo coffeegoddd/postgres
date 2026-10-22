@@ -1409,14 +1409,14 @@ checkout_tables(const char *ref, char **names, int nnames)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the current branch has no working set")));
-	PROLLY_CALL(canonicalizer(), tables, &from, collect_table_name, &from_tables);
+	PROLLY_CALL(canonicalizer(), tables, &from, NULL, collect_table_name, &from_tables);
 	{
 		ProllyHash	head;
 		ProllyNodeRef head_root;
 
 		if (PROLLY_CALL(refs(), resolve, "HEAD", &head) &&
 			PROLLY_CALL(refs(), commit_working_set, &head, &head_root))
-			PROLLY_CALL(canonicalizer(), tables, &head_root, collect_table_name,
+			PROLLY_CALL(canonicalizer(), tables, &head_root, NULL, collect_table_name,
 						&head_tables);
 	}
 	for (int i = 0; i < nnames; i++)
@@ -2710,7 +2710,7 @@ dolt_reset(PG_FUNCTION_ARGS)
 			prolly_check_commit_dependencies(&info,
 											 has_head &&
 											 PROLLY_CALL(refs(), commit_get, &head, &before) ?
-											 &before : NULL, "reset");
+											 &before : NULL, "reset", false);
 	}
 	/*
 	 * (a protected branch moved to another commit loses what it holds: the

@@ -238,9 +238,8 @@ SELECT id, r FROM tt.r;
 (1 row)
 
 -- A type that gains binary send and receive (cube's update to 1.5):
--- values retain their recorded form.  Non-key history can still be read,
--- but the key-ordering guard conservatively refuses old keyed commits,
--- even though this particular upgrade preserves comparison semantics.
+-- values retain their recorded form.  Historical keyed rows are re-sorted
+-- under the installed comparator; unrelated history remains readable.
 SELECT dolt_hashof('HEAD') AS before_update \gset
 ALTER EXTENSION cube UPDATE TO '1.5';
 SELECT typname, typsend <> 0 AS binary FROM pg_type WHERE typname = 'cube';
@@ -248,6 +247,14 @@ SELECT typname, typsend <> 0 AS binary FROM pg_type WHERE typname = 'cube';
 ---------+--------
  cube    | t
 (1 row)
+
+SELECT k, n FROM dolt_at(:'before_update', NULL::tt.keyed) ORDER BY k;
+   k    | n 
+--------+---
+ (1)    | 1
+ (1, 2) | 3
+ (2)    | 2
+(3 rows)
 
 SELECT id, c FROM dolt_at(:'before_keys', NULL::tt.shapes) ORDER BY id;
  id |             c             
@@ -258,10 +265,11 @@ SELECT id, c FROM dolt_at(:'before_keys', NULL::tt.shapes) ORDER BY id;
 (3 rows)
 
 SELECT table_name, status FROM dolt_status() WHERE table_name IN ('tt.f', 'tt.keyed') ORDER BY 1;
-ERROR:  the historical read needs what this database lacks
-DETAIL:  Needed from outside the versioned schemas:
-extension cube: orders keys at version 1.4, and the database has 1.5
-HINT:  Make what is missing, then try again.
+ table_name |  status  
+------------+----------
+ tt.keyed   | modified
+(1 row)
+
 SELECT length(dolt_commit('-Am', 'cube 1.5', '--allow-empty')::text) AS committed;
  committed 
 -----------
@@ -273,8 +281,8 @@ DROP TABLE tt.f, tt.keyed;
 SELECT dolt_reset('--hard', :'before_update');
 ERROR:  the reset needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
-extension cube: orders keys at versions 1.5, 1.4, which differ
-HINT:  Make what is missing, then try again.
+extension cube: orders keys at version 1.4, and the database has 1.5
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
 SELECT to_regclass('tt.keyed') IS NULL AS untouched;
  untouched 
 -----------
@@ -311,10 +319,13 @@ SELECT k, n FROM tt.keyed ORDER BY k;
 UPDATE tt.keyed SET n = n + 10 WHERE k = '(2)';
 SELECT diff_type, (from_row).k::text AS k, (from_row).n AS from_n, (to_row).n AS to_n
   FROM dolt_diff(:'before_update', 'WORKING', NULL::tt.keyed) ORDER BY 2;
-ERROR:  the historical read needs what this database lacks
-DETAIL:  Needed from outside the versioned schemas:
-extension cube: orders keys at version 1.4, and the database has 1.5
-HINT:  Make what is missing, then try again.
+ diff_type |   k    | from_n | to_n 
+-----------+--------+--------+------
+ modified  | (1)    |      1 |    1
+ modified  | (1, 2) |      3 |    3
+ modified  | (2)    |      2 |   12
+(3 rows)
+
 SELECT diff_type, (from_row).k::text AS k, (from_row).n AS from_n, (to_row).n AS to_n
   FROM dolt_diff(:'after_update', 'WORKING', NULL::tt.keyed) ORDER BY 2;
  diff_type |  k  | from_n | to_n 

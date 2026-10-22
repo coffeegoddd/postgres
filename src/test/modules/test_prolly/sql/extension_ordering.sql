@@ -39,6 +39,11 @@ CREATE DATABASE regress_ordering_dst;
 SELECT dolt_clone(:'url');
 SELECT extversion FROM pg_extension WHERE extname = 'test_prolly_ordering';
 SELECT * FROM ord.composite ORDER BY id, k;
+CREATE SCHEMA tools;
+CREATE EXTENSION test_prolly SCHEMA tools;
+SELECT prolly_root_hash('HEAD') = tools.test_fold_root(true) AS portable_root;
+ALTER EXTENSION test_prolly_ordering UPDATE TO '1.1';
+SELECT * FROM dolt_at('HEAD', NULL::ord.composite) ORDER BY id, k;
 
 -- An installed newer version is NOT compatible for key ordering.
 \c :db
@@ -77,25 +82,39 @@ SELECT pg_stat_force_next_flush();
 SELECT value > 0 AS changed_shape FROM pg_stat_prolly WHERE name = 'fold_full_shape_changed';
 -- A non-key use (including a secondary index and deferrable PK) permits updates.
 SELECT tools.test_check_dependencies(ARRAY[:'nonkey'], false);
--- Direct history reads must not bypass the move guard.
-SELECT * FROM dolt_at(:'ordered', NULL::ord.composite);
+-- Historical reads re-sort this table, without blocking unrelated tables.
+SELECT * FROM dolt_at(:'ordered', NULL::ord.composite) ORDER BY id, k;
 SELECT * FROM dolt_diff(:'ordered', :'side', NULL::ord.composite);
 SELECT * FROM dolt_at(:'nonkey', NULL::ord.nonkey);
 -- Mismatches fail before changing the head or the rows.
 SELECT dolt_checkout('old');
 SELECT dolt_reset('--hard', :'side');
 SELECT dolt_reset('--hard');
-SELECT dolt_cherry_pick(:'side');
--- The incoming and merge-base dependencies are identical: still check ordering.
 -- Auto-commit must refold rather than apply row changes to the stale head.
 SET dolt.transaction_commit = on;
 UPDATE ord.composite SET n = 31 WHERE id = 2;
 SET dolt.transaction_commit = off;
 SELECT dolt_hashof('HEAD') AS newer \gset
 SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;
-SELECT dolt_merge(:'side');
--- The base still needs its old ordering when the incoming side drops the keys.
-SELECT dolt_merge(:'dropped');
+-- Moving forward from a stale head checks only the target's ordering.
+SELECT dolt_reset('--soft', :'side');
+SELECT dolt_reset('--hard', :'newer');
+SELECT dolt_branch('-f', 'old', :'newer');
+SELECT dolt_hashof('old') = :'newer' AS moved_forward;
+SELECT dolt_branch('-D', 'old');
+SELECT dolt_branch('old', :'side');
+-- Read operations re-sort the old merge base and incoming rows.
+SELECT (dolt_merge(:'side'))[2:] AS merged;
+SELECT * FROM ord.composite ORDER BY id, k;
+SELECT dolt_reset('--hard', :'newer');
+SELECT (dolt_cherry_pick(:'side'))[2:] AS picked;
+SELECT * FROM ord.composite ORDER BY id, k;
+SELECT dolt_reset('--hard', :'newer');
+SELECT dolt_branch('dropped', :'dropped');
+BEGIN;
+SELECT (dolt_merge('dropped'))[2:] AS merged;
+ROLLBACK;
+SELECT dolt_branch('-D', 'dropped');
 SELECT dolt_hashof('HEAD') = :'newer' AS unchanged;
 SELECT * FROM ord.composite ORDER BY id, k;
 SELECT replace(d, E'\t', ' | ') AS dependency
@@ -119,6 +138,13 @@ SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_p
  ARRAY['{1.1,public}']) AS minimum_new \gset
 SELECT tools.test_check_dependencies(ARRAY[:'exact_old', :'minimum_new'], true);
 SELECT count(*) AS not_installed FROM pg_extension WHERE extname = 'test_prolly_ordering';
+-- Exact versions must agree, and flags have one canonical order.
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.1,public,ordering}']) AS exact_new \gset
+SELECT tools.test_check_dependencies(ARRAY[:'exact_old', :'exact_new'], false);
+SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
+ ARRAY['{1.1,public,ordering,versioned}']) AS bad_flags \gset
+SELECT tools.test_check_dependencies(ARRAY[:'bad_flags'], false);
 -- An older minimum plus a newer exact version is compatible.
 SELECT tools.test_commit_needing(tools.test_fold_root(), ARRAY['extension test_prolly_ordering'],
  ARRAY['{1.1,public,ordering}']) AS exact_new \gset

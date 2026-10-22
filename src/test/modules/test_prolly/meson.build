@@ -121,6 +121,7 @@ tests += {
       'dependencies',
       'dependency_moves',
       'extension_ordering',
+      'extension_ordering_nested',
       'shared_drops',
       'shared_alters',
       'versioned_extensions',
