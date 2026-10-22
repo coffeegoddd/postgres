@@ -14,6 +14,7 @@
 
 #include "access/htup_details.h"
 #include "access/prolly_datum.h"
+#include "access/transam.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
@@ -23,7 +24,9 @@
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/datum.h"
+#include "utils/float.h"
 #include "utils/geo_decls.h"
+#include "utils/guc.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -51,8 +54,14 @@ typedef enum CodecKind
 	CODEC_OUTPUT,				/* a type without binary send/receive */
 } CodecKind;
 
-/* The version byte of a CODEC_OUTPUT value's canonical bytes. */
-#define OUTPUT_VERSION 1
+/*
+ * The tag a value of a type whose binary I/O may change starts with: which
+ * form the rest is, so a value is read back as it was written whatever the
+ * type has now (an extension's update may give it send and receive, or
+ * take them away).
+ */
+#define TAG_SEND	0			/* its binary send format */
+#define TAG_OUTPUT	1			/* its text form */
 
 /*
  * The floats a CODEC_SEND value holds, whose NaNs are made canonical
@@ -93,11 +102,17 @@ struct ProllyDatumCodec
 	TypeCacheEntry *floats_range;	/* FLOATS_*RANGE: the range type's */
 	int16		floats_len;		/* FLOATS_GEOMETRIC: typlen */
 
-	/* CODEC_OUTPUT (ioparam above too) */
+	/*
+	 * CODEC_OUTPUT (ioparam above too); and a tagged CODEC_SEND's, to read
+	 * a value written in its text form
+	 */
 	FmgrInfo	output;
 	FmgrInfo	input;
+	Oid			input_ioparam;
 	int16		typlen;
 	bool		typbyval;
+	bool		tagged;			/* values start with TAG_SEND or TAG_OUTPUT */
+	bool		has_recv;		/* CODEC_OUTPUT: a TAG_SEND value is readable */
 
 	/* CODEC_ARRAY */
 	ElemInfo	elem;
@@ -507,19 +522,53 @@ send_floats(ProllyDatumCodec *c, Datum value)
  */
 
 /*
- * A CODEC_OUTPUT value: a version byte, then its text form in UTF-8.  The
- * text must read back as the value, byte for byte (datum_image_eq), or the
- * value isn't stored: a type whose text form drops precision (PostGIS's
- * box2d, at 15 significant digits) can't be kept this way, and it is
- * refused where it would be written rather than changed.
+ * Settings a type's text form may depend on, fixed while one is written or
+ * read: the shortest exact float output (extra_float_digits 1), ISO dates
+ * in MDY order, the postgres interval style.  A nest level to end, or -1 if
+ * they were so already.
+ */
+static int
+fixed_text_settings(void)
+{
+	int			nest;
+
+	if (extra_float_digits == 1 && DateStyle == USE_ISO_DATES &&
+		DateOrder == DATEORDER_MDY && IntervalStyle == INTSTYLE_POSTGRES)
+		return -1;
+	nest = NewGUCNestLevel();
+	(void) set_config_option("extra_float_digits", "1", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("datestyle", "ISO, MDY", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("intervalstyle", "postgres", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	return nest;
+}
+
+static void
+end_text_settings(int nest)
+{
+	if (nest >= 0)
+		AtEOXact_GUC(true, nest);
+}
+
+/*
+ * A CODEC_OUTPUT value: TAG_OUTPUT, then its text form in UTF-8, written
+ * with fixed settings.  The text must read back as the value, byte for
+ * byte (datum_image_eq), or the value isn't stored: a type whose text form
+ * drops precision (PostGIS's box2d, at 15 significant digits) can't be
+ * kept this way, and it is refused where it would be written rather than
+ * changed.
  */
 static void
 encode_output(ProllyDatumCodec *c, Datum value, StringInfo out)
 {
+	int			nest = fixed_text_settings();
 	char	   *text = OutputFunctionCall(&c->output, value);
 	Datum		back = InputFunctionCall(&c->input, text, c->ioparam, c->typmod);
 	char	   *utf8;
 
+	end_text_settings(nest);
 	if (!datum_image_eq(value, back, c->typbyval, c->typlen))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -528,26 +577,29 @@ encode_output(ProllyDatumCodec *c, Datum value, StringInfo out)
 				 errdetail("The value is \"%s\".", text),
 				 errhint("The type has no binary send and receive functions, so a versioned table keeps its values as text.")));
 	utf8 = pg_server_to_any(text, strlen(text), PG_UTF8);
-	appendStringInfoChar(out, OUTPUT_VERSION);
+	appendStringInfoChar(out, TAG_OUTPUT);
 	appendBinaryStringInfo(out, utf8, strlen(utf8));
 	if (utf8 != text)
 		pfree(utf8);
 	pfree(text);
 }
 
+/* a value's text form (after its tag), read with fixed settings */
 static Datum
-decode_output(ProllyDatumCodec *c, const char *data, int len)
+decode_text(ProllyDatumCodec *c, const char *data, int len)
 {
-	char	   *text;
+	char	   *text = pnstrdup(data, len);
 	char	   *server;
+	int			nest;
+	Datum		result;
 
-	if (len < 1 || (uint8) data[0] != OUTPUT_VERSION)
-		bad_value("text form without its version");
-	text = pnstrdup(data + 1, len - 1);
-	if (strlen(text) != len - 1)
+	if (strlen(text) != len)
 		bad_value("text form contains a zero byte");
-	server = pg_any_to_server(text, len - 1, PG_UTF8);
-	return InputFunctionCall(&c->input, server, c->ioparam, c->typmod);
+	server = pg_any_to_server(text, len, PG_UTF8);
+	nest = fixed_text_settings();
+	result = InputFunctionCall(&c->input, server, c->input_ioparam, c->typmod);
+	end_text_settings(nest);
+	return result;
 }
 
 static bytea *
@@ -594,6 +646,70 @@ recv_utf8(ProllyDatumCodec *c, const char *data, int len)
  * Codec construction
  * ------------------------------------------------------------------------
  */
+
+/* a type's receive function, or InvalidOid */
+static Oid
+get_type_receive(Oid type)
+{
+	HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	Oid			recv;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type);
+	recv = ((Form_pg_type) GETSTRUCT(tup))->typreceive;
+	ReleaseSysCache(tup);
+	return recv;
+}
+
+/* a range's or multirange's subtype (domains looked through), or InvalidOid */
+static Oid
+range_subtype(Oid base)
+{
+	if (type_is_range(base))
+		return getBaseType(get_range_subtype(base));
+	if (type_is_multirange(base))
+		return getBaseType(get_range_subtype(get_multirange_range(base)));
+	return InvalidOid;
+}
+
+/*
+ * Has base type (domains looked through) no binary send or receive, or is it
+ * a range over one?  (Arrays and composites are their elements'.)
+ */
+static bool
+lacks_binary_io(Oid base)
+{
+	HeapTuple	tup;
+	Form_pg_type typ;
+	bool		lacks;
+	Oid			sub = range_subtype(base);
+
+	if (OidIsValid(sub))
+		return lacks_binary_io(sub);
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", base);
+	typ = (Form_pg_type) GETSTRUCT(tup);
+	lacks = typ->typtype == TYPTYPE_BASE &&
+		(!OidIsValid(typ->typsend) || !OidIsValid(typ->typreceive));
+	ReleaseSysCache(tup);
+	return lacks;
+}
+
+/*
+ * May base type's binary I/O change: a base type initdb didn't make (an
+ * extension's, whose update may give it send and receive or take them
+ * away), or a range over one?  initdb's types' I/O is fixed.
+ */
+static bool
+io_may_change(Oid base)
+{
+	Oid			sub = range_subtype(base);
+
+	if (OidIsValid(sub))
+		return io_may_change(sub);
+	return base >= FirstNormalObjectId && get_typtype(base) == TYPTYPE_BASE;
+}
 
 static void
 elem_info_init(ElemInfo *ei, Oid elemtype, int32 typmod, MemoryContext mcxt)
@@ -690,33 +806,39 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 	}
 
 	/*
-	 * A type without binary send or receive (an extension's, say) is
-	 * stored as its text form, which encoding checks reads back as the
-	 * value it came from.
+	 * A type without binary send or receive (an extension's, say), or a
+	 * range over one, is stored as its text form, which encoding checks
+	 * reads back as the value it came from.  A type whose binary I/O may
+	 * change (one initdb didn't make, or a range over one) has its values
+	 * tagged with the form they're in.
 	 */
 	{
-		HeapTuple	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base));
-		Form_pg_type typ;
-		bool		binary;
+		Oid			input;
+		bool		varlena;
 
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "cache lookup failed for type %u", base);
-		typ = (Form_pg_type) GETSTRUCT(tup);
-		binary = OidIsValid(typ->typsend) && OidIsValid(typ->typreceive);
-		c->typlen = typ->typlen;
-		c->typbyval = typ->typbyval;
-		ReleaseSysCache(tup);
-		if (!binary)
+		get_typlenbyval(base, &c->typlen, &c->typbyval);
+		c->tagged = io_may_change(base);
+		getTypeInputInfo(base, &input, &c->input_ioparam);
+		fmgr_info_cxt(input, &c->input, mcxt);
+		if (lacks_binary_io(base))
 		{
 			Oid			output;
-			Oid			input;
-			bool		varlena;
+			Oid			recv;
 
 			c->kind = CODEC_OUTPUT;
+			c->tagged = true;
+			c->ioparam = c->input_ioparam;
 			getTypeOutputInfo(base, &output, &varlena);
-			getTypeInputInfo(base, &input, &c->ioparam);
 			fmgr_info_cxt(output, &c->output, mcxt);
-			fmgr_info_cxt(input, &c->input, mcxt);
+			recv = get_type_receive(base);
+			if (OidIsValid(recv))
+			{
+				Oid			ioparam;
+
+				getTypeBinaryInputInfo(base, &recv, &ioparam);
+				fmgr_info_cxt(recv, &c->recv, mcxt);
+				c->has_recv = true;
+			}
 			return c;
 		}
 	}
@@ -1552,6 +1674,8 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 				Datum		canon = send_floats(c, value);
 				bytea	   *b = send_utf8(&c->send, canon);
 
+				if (c->tagged)
+					appendStringInfoChar(out, TAG_SEND);
 				appendBinaryStringInfo(out, VARDATA(b), VARSIZE(b) - VARHDRSZ);
 				pfree(b);
 				if (canon != value)
@@ -1635,9 +1759,30 @@ prolly_datum_decode(ProllyDatumCodec *c, const char *data, int len)
 				utf8 = pg_server_to_any(mapped, strlen(mapped), PG_UTF8);
 				return recv_utf8(c, utf8, strlen(utf8));
 			}
+			if (c->tagged)
+			{
+				if (len < 1)
+					bad_value("a tagged value without its tag");
+				if ((uint8) data[0] == TAG_OUTPUT)
+					return decode_text(c, data + 1, len - 1);
+				if ((uint8) data[0] != TAG_SEND)
+					bad_value("an unknown tag");
+				return recv_utf8(c, data + 1, len - 1);
+			}
 			return recv_utf8(c, data, len);
 		case CODEC_OUTPUT:
-			return decode_output(c, data, len);
+			if (len < 1)
+				bad_value("a tagged value without its tag");
+			if ((uint8) data[0] == TAG_OUTPUT)
+				return decode_text(c, data + 1, len - 1);
+			if ((uint8) data[0] != TAG_SEND)
+				bad_value("an unknown tag");
+			if (!c->has_recv)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("a value of type %s was stored in its binary form, and the type has no binary receive function now",
+								format_type_be(c->type))));
+			return recv_utf8(c, data + 1, len - 1);
 		default:
 			elog(ERROR, "unrecognized prolly datum codec kind %d", c->kind);
 			return (Datum) 0;	/* keep compiler quiet */

@@ -31,6 +31,7 @@
 
 #include "access/genam.h"
 #include "access/multixact.h"
+#include "access/prolly_keying.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -2072,6 +2073,10 @@ StoreAttrMissingVal(Relation rel, AttrNumber attnum, Datum missingval)
 
 	/* This is only supported for plain tables */
 	Assert(rel->rd_rel->relkind == RELKIND_RELATION);
+
+	/* (a prolly table's commits hold it as a row's value) */
+	if (rel->rd_rel->relam == PROLLY_TABLE_AM_OID)
+		prolly_check_missing_value(rel, attnum, missingval);
 
 	/* Fetch the pg_attribute row */
 	attrrel = table_open(AttributeRelationId, RowExclusiveLock);

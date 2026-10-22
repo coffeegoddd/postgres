@@ -167,5 +167,151 @@ SELECT table_name, status FROM dolt_status() ORDER BY 1;	-- nothing left behind
 ------------+--------
 (0 rows)
 
+-- the text form is written with fixed settings: a session's
+-- extra_float_digits changes nothing a commit holds
+CREATE TABLE tt.f (id int PRIMARY KEY, c tt.cube);
+INSERT INTO tt.f VALUES (1, '(5e-324)'), (2, '(0.12345678901234568)');
+SELECT length(dolt_commit('-Am', 'denormal and 17 digits')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SET extra_float_digits = 0;
+UPDATE tt.f SET id = id;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+ table_name | status 
+------------+--------
+(0 rows)
+
+RESET extra_float_digits;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+ table_name | status 
+------------+--------
+(0 rows)
+
+-- a column added with a default no row is written with: checked too
+ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.23456789';
+ERROR:  value of type seg can't be stored in a versioned table: its text form doesn't read back as the same value
+DETAIL:  The value is "1.23457".
+HINT:  The type has no binary send and receive functions, so a versioned table keeps its values as text.
+ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.5';
+SELECT id, s FROM tt.f ORDER BY id;
+ id |  s  
+----+-----
+  1 | 1.5
+  2 | 1.5
+(2 rows)
+
+SELECT length(dolt_commit('-Am', 'a seg column')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- a range over such a type is kept as its text form too
+CREATE TYPE tt.segr AS RANGE (subtype = tt.seg);
+CREATE TABLE tt.r (id int PRIMARY KEY, r tt.segr);
+INSERT INTO tt.r VALUES (1, tt.segr('1', '2'));
+INSERT INTO tt.r VALUES (2, tt.segr('1.23456789', '2'));
+ERROR:  value of type segr can't be stored in a versioned table: its text form doesn't read back as the same value
+DETAIL:  The value is "[1.23457,2)".
+HINT:  The type has no binary send and receive functions, so a versioned table keeps its values as text.
+SELECT length(dolt_commit('-Am', 'a range of seg')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+DROP TABLE tt.r;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id, r FROM tt.r;
+ id |   r   
+----+-------
+  1 | [1,2)
+(1 row)
+
+-- a type that gains binary send and receive (cube's update to 1.5): what
+-- commits hold is read back as written (each value is tagged with its
+-- form), and keys it orders are keyed as before; values written from then
+-- on are in their binary form, so a diff across the update shows a row
+-- written again since as modified, with the same values
+SELECT dolt_hashof('HEAD') AS before_update \gset
+ALTER EXTENSION cube UPDATE TO '1.5';
+SELECT typname, typsend <> 0 AS binary FROM pg_type WHERE typname = 'cube';
+ typname | binary 
+---------+--------
+ cube    | t
+(1 row)
+
+SELECT table_name, status FROM dolt_status() WHERE table_name IN ('tt.f', 'tt.keyed') ORDER BY 1;
+ table_name | status 
+------------+--------
+(0 rows)
+
+SELECT length(dolt_commit('-Am', 'cube 1.5', '--allow-empty')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS after_update \gset
+DROP TABLE tt.f, tt.keyed;
+SELECT dolt_reset('--hard', :'before_update');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id, c FROM tt.f ORDER BY id;
+ id |           c           
+----+-----------------------
+  1 | (5e-324)
+  2 | (0.12345678901234568)
+(2 rows)
+
+SELECT k, n FROM tt.keyed ORDER BY k;
+   k    | n 
+--------+---
+ (1)    | 1
+ (1, 2) | 3
+ (2)    | 2
+(3 rows)
+
+SELECT k, n FROM tt.keyed WHERE k = '(1,2)';
+   k    | n 
+--------+---
+ (1, 2) | 3
+(1 row)
+
+SELECT dolt_reset('--hard', :'after_update');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT k, n FROM tt.keyed ORDER BY k;
+   k    | n 
+--------+---
+ (1)    | 1
+ (1, 2) | 3
+ (2)    | 2
+(3 rows)
+
+UPDATE tt.keyed SET n = n + 10 WHERE k = '(2)';
+SELECT diff_type, (from_row).k::text AS k, (from_row).n AS from_n, (to_row).n AS to_n
+  FROM dolt_diff(:'before_update', 'WORKING', NULL::tt.keyed) ORDER BY 2;
+ diff_type |   k    | from_n | to_n 
+-----------+--------+--------+------
+ modified  | (1)    |      1 |    1
+ modified  | (1, 2) |      3 |    3
+ modified  | (2)    |      2 |   12
+(3 rows)
+
 \c contrib_regression
 DROP DATABASE regress_text_types;

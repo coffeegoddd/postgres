@@ -215,6 +215,13 @@ extern void prolly_keying_use_env_rows(ProllyKeyingRefs *refs,
  */
 extern void prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 								 HeapTuple tuple);
+
+/*
+ * error if a column's missing value (added with a default no row is
+ * written with) is one no commit could hold
+ */
+extern void prolly_check_missing_value(Relation rel, AttrNumber attnum,
+									   Datum value);
 extern void prolly_check_table_keys(Relation rel);
 
 /*

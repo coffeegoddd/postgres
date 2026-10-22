@@ -32,13 +32,22 @@
  *					(after its varlena header), its strings in UTF-8: in a
  *					UTF-8 database, the bytes the value holds.  Version 1,
  *					jsonb's send format, is still read.
- *	a type without binary send and receive
- *					a version byte (1), then its text form (its output
- *					function's) in UTF-8, read back with its input function
- *					and the column's typmod.  A value whose text doesn't read
- *					back as the same value (datum_image_eq) isn't stored:
+ *	a type whose binary I/O may change
+ *					(a base type initdb didn't make, an extension's, or a
+ *					range over one): a tag, then the value in that form.
+ *					Tag 0: its binary send format, as below; tag 1: its
+ *					text form.  A value is read back by its tag, whatever
+ *					the type's functions are now.
+ *	a type without binary send and receive (or a range over one)
+ *					tag 1, then its text form (its output function's) in
+ *					UTF-8, written with the settings it may depend on fixed
+ *					(extra_float_digits 1, DateStyle ISO, MDY, IntervalStyle
+ *					postgres), read back with its input function and the
+ *					column's typmod.  A value whose text doesn't read back
+ *					as the same value (datum_image_eq) isn't stored:
  *					encoding refuses it, and so do writes to a versioned
- *					table (prolly_check_row_key()).
+ *					table (prolly_check_row_key(), and a column's missing
+ *					value when it is added).
  *	anything else	the type's binary send format, produced with the client
  *					encoding fixed to UTF-8, so text-like values are UTF-8
  *					whatever the session's client_encoding or the server
