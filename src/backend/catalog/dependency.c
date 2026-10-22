@@ -220,12 +220,15 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 	 * an object on another branch, which CASCADE can't reach, depends on
 	 * one of them.
 	 */
-	for (i = 0; i < targetObjects->numrefs; i++)
+	if (other_branches_have_copies())
 	{
-		if ((flags & PERFORM_DELETION_SKIP_ORIGINAL) &&
-			(targetObjects->extras[i].flags & DEPFLAG_ORIGINAL))
-			continue;
-		check_other_branch_dependents(&targetObjects->refs[i]);
+		for (i = 0; i < targetObjects->numrefs; i++)
+		{
+			if ((flags & PERFORM_DELETION_SKIP_ORIGINAL) &&
+				(targetObjects->extras[i].flags & DEPFLAG_ORIGINAL))
+				continue;
+			check_other_branch_dependents(&targetObjects->refs[i]);
+		}
 	}
 
 	/*
