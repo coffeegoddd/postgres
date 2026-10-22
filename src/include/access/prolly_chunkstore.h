@@ -398,6 +398,13 @@ typedef struct ProllyChunkStoreRoutine
 	 * that's only worth doing now, or that holds what others may wait for.
 	 */
 	bool		(*try_hold_root) (ProllyChunkStore *store);
+
+	/*
+	 * Optional: whether no one else holds what move_root() takes now,
+	 * taking nothing (asked before work that would need it, so as not to do
+	 * the work only to find it held).
+	 */
+	bool		(*root_free) (ProllyChunkStore *store);
 } ProllyChunkStoreRoutine;
 
 #define PROLLY_CHUNKSTORE_CALLBACK_NAMES \
@@ -411,9 +418,10 @@ typedef struct ProllyChunkStoreRoutine
 	"keep", "gc_kept", "gc_retained", "drop_database", "sync_file", "roots", \
 	"get_stored", "add_stored_table_file", "file_chunks", "receive_file", \
 	"received_file", "received_get", "received_chunks", "adopt_received", \
-	"forget_received", "redo_consistent", "other_bytes", "try_hold_root"
+	"forget_received", "redo_consistent", "other_bytes", "try_hold_root", \
+	"root_free"
 #define PROLLY_CHUNKSTORE_FIRST_CALLBACK open
-#define PROLLY_CHUNKSTORE_LAST_CALLBACK try_hold_root
+#define PROLLY_CHUNKSTORE_LAST_CALLBACK root_free
 
 static inline const ProllyChunkStoreRoutine *
 prolly_chunkstore_lookup(const char *name)

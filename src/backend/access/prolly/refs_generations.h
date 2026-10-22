@@ -66,5 +66,6 @@ extern int	branch_generations_moved_databases(Oid *databases, int max);
 extern int	branch_generations_moved(Oid *branches, uint64 *generations,
 									 int max);
 extern void branch_generations_saw(Oid branch, uint64 generation);
+extern void branch_generations_saw_database(Oid database);
 
 #endif							/* REFS_GENERATIONS_H */

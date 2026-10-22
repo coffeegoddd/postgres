@@ -10,8 +10,9 @@
 #ifndef PROLLY_FOLDER_H
 #define PROLLY_FOLDER_H
 
-/* prolly_fold_worker, prolly_fold_worker_naptime (ms) */
+/* prolly_fold_worker, prolly_fold_worker_max_workers, _naptime (ms) */
 extern PGDLLIMPORT bool prolly_fold_worker;
+extern PGDLLIMPORT int prolly_fold_worker_max_workers;
 extern PGDLLIMPORT int prolly_fold_worker_naptime;
 
 extern void ProllyFolderRegister(void);

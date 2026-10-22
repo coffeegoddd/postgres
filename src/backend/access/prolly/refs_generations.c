@@ -700,6 +700,28 @@ branch_generations_moved(Oid *branches, uint64 *generations, int max)
 	return n;
 }
 
+/*
+ * The fold worker can't fold database's branches (gone, or accepting no
+ * connections): each seen as it is, moved again only once written again.
+ */
+void
+branch_generations_saw_database(Oid database)
+{
+	BranchGenerations *g = shared();
+
+	if (g == NULL)
+		return;
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < BRANCH_GENERATIONS; i++)
+	{
+		BranchGeneration *e = &g->entries[i];
+
+		if (OidIsValid(e->branch) && e->database == database)
+			e->seen = e->generation;
+	}
+	LWLockRelease(&g->lock);
+}
+
 /* The fold worker saw branch at generation (no later one: kept as moved). */
 void
 branch_generations_saw(Oid branch, uint64 generation)

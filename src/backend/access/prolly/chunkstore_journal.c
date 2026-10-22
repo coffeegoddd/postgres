@@ -5007,6 +5007,21 @@ journal_try_hold_root(ProllyChunkStore *s)
 	return LockAcquire(&tag, ExclusiveLock, false, true) != LOCKACQUIRE_NOT_AVAIL;
 }
 
+/* Is journal_move_root()'s lock free now?  (Taken and let go of at once.) */
+static bool
+journal_root_free(ProllyChunkStore *s)
+{
+	LOCKTAG		tag;
+
+	if (s->moving)
+		return true;
+	SET_LOCKTAG_OBJECT(tag, s->dboid, ROOT_LOCK_CLASSID, 0, 0);
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+	LockRelease(&tag, ExclusiveLock, false);
+	return true;
+}
+
 static bool
 journal_move_root(ProllyChunkStore *s, const ProllyHash *expected,
 				  const ProllyHash *root)
@@ -8824,4 +8839,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.redo_consistent = journal_redo_consistent,
 	.other_bytes = journal_other_bytes,
 	.try_hold_root = journal_try_hold_root,
+	.root_free = journal_root_free,
 };

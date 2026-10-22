@@ -447,6 +447,21 @@ typedef struct ProllyRefsRoutine
 	 * finder's record of what it folded).
 	 */
 	bool		(*checkpoint_unless_moved) (ProllyNodeRef *root);
+
+	/*
+	 * Optional, together, for a background folder (prolly_folder.c), from
+	 * shared memory, needing no database: the databases with a branch
+	 * written since the folder last saw it (at most max, their count); the
+	 * current database's such branches, each with the generation it's at;
+	 * that the folder saw branch at generation (written again since: still
+	 * moved); and that it can't fold any branch of database (gone, or
+	 * accepting no connections), so that none of its branches counts as
+	 * moved until written again.
+	 */
+	int			(*moved_databases) (Oid *databases, int max);
+	int			(*moved_branches) (Oid *branches, uint64 *generations, int max);
+	void		(*saw_branch) (Oid branch, uint64 generation);
+	void		(*saw_database) (Oid database);
 } ProllyRefsRoutine;
 
 /*
@@ -469,9 +484,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
-	"publish_definitions", "fold_own", "checkpoint_unless_moved"
+	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
+	"moved_databases", "moved_branches", "saw_branch", "saw_database"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK checkpoint_unless_moved
+#define PROLLY_REFS_LAST_CALLBACK saw_database
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

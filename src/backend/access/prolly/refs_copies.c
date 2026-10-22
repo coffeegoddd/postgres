@@ -2559,7 +2559,11 @@ copies_checkpoint(ProllyNodeRef *root)
  * held (to the transaction's end) only to see that neither the head nor
  * the baseline moved since the fold began, and to set the baseline, and
  * taken only if free.  If either moved, or another holds the refs,
- * nothing is set, and the caller rolls back what the fold consumed.
+ * nothing is set, and the caller rolls back what the fold consumed; held
+ * by another as it begins, nothing is folded at all.  The fold is by a
+ * snapshot taken after the baseline and head are read: one taken before
+ * would see none of a fold that moved the baseline in between (the check
+ * then passing), and read every table in full.
  */
 static bool
 copies_checkpoint_unless_moved(ProllyNodeRef *root)
@@ -2570,19 +2574,26 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	ProllyNodeRef next;
 	ProllyHash	head;
 	ProllyHash	head_now;
-	bool		had = branch_baseline(name, &baseline);
-	bool		had_head = branch_head(name, &head);
+	bool		had;
+	bool		had_head;
 	bool		has;
 	bool		has_head;
 
+	refs_init();
+	if (PROLLY_HAS(env.chunk_store, root_free) &&
+		!env.chunk_store->root_free(env.chunks))
+		return false;
+	had = branch_baseline(name, &baseline);
+	had_head = branch_head(name, &head);
+	PushActiveSnapshot(GetLatestSnapshot());
 	fold_from_baseline(root, &next, false);
+	PopActiveSnapshot();
 
 	/*
 	 * (never waiting for the refs: the fold deleted the log's entries it
 	 * consumed, which whoever holds the refs may be waiting to delete too;
 	 * held by another, it rolls back and folds again later)
 	 */
-	refs_init();
 	if (PROLLY_HAS(env.chunk_store, try_hold_root) &&
 		!env.chunk_store->try_hold_root(env.chunks))
 		return false;
@@ -4512,6 +4523,10 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.publish_definitions = copies_publish_definitions,
 	.fold_own = copies_fold_own,
 	.checkpoint_unless_moved = copies_checkpoint_unless_moved,
+	.moved_databases = branch_generations_moved_databases,
+	.moved_branches = branch_generations_moved,
+	.saw_branch = branch_generations_saw,
+	.saw_database = branch_generations_saw_database,
 	.reset = copies_reset,
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,

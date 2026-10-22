@@ -2486,6 +2486,15 @@
   boot_val => 'false',
 },
 
+{ name => 'prolly_fold_worker_max_workers', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
+  short_desc => 'Maximum number of fold workers running at once, one to a database.',
+  long_desc => 'Each takes one of max_worker_processes while its database\'s branches are being written; the launcher takes one more.',
+  variable => 'prolly_fold_worker_max_workers',
+  boot_val => '2',
+  min => '1',
+  max => '64',
+},
+
 { name => 'prolly_fold_worker_naptime', type => 'int', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Time to sleep between the fold worker\'s passes.',
   flags => 'GUC_UNIT_MS',
