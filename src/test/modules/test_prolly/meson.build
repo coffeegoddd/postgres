@@ -123,6 +123,7 @@ tests += {
       'extension_moves',
       'extension_clone',
       'text_types',
+      'versioned_event_triggers',
       'canonical_escapes',
       'aggregates',
       'policies',

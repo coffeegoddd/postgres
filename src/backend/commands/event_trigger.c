@@ -37,6 +37,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_type.h"
+#include "catalog/versioned.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/trigger.h"
@@ -333,7 +334,13 @@ insert_event_trigger_tuple(const char *trigname, const char *eventname, Oid evtO
 	referenced.classId = ProcedureRelationId;
 	referenced.objectId = funcoid;
 	referenced.objectSubId = 0;
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+	/*
+	 * (but not on one in a versioned schema: each branch has its own, the
+	 * trigger calls the session's branch's, and a branch may drop its own)
+	 */
+	if (!object_is_versioned(&referenced))
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 
 	/* Depend on extension, if any. */
 	recordDependencyOnCurrentExtension(&myself, false);
@@ -1098,9 +1105,13 @@ EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata)
 	foreach(lc, fn_oid_list)
 	{
 		LOCAL_FCINFO(fcinfo, 0);
-		Oid			fnoid = lfirst_oid(lc);
+		Oid			fnoid = event_trigger_function(lfirst_oid(lc));
 		FmgrInfo	flinfo;
 		PgStat_FunctionCallUsage fcusage;
+
+		/* (the session's branch hasn't its function: skipped, warned of) */
+		if (!OidIsValid(fnoid))
+			continue;
 
 		elog(DEBUG1, "EventTriggerInvoke %u", fnoid);
 

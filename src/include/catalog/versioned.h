@@ -72,6 +72,12 @@ extern void extension_script_end(List *outer, bool check);
 /* error if an extension would move into or out of a versioned schema */
 extern void check_versioned_extension_move(Oid oldnspid, Oid newnspid);
 
+/*
+ * the function an event trigger names by fnoid, on the session's branch, or
+ * InvalidOid (warned of) if the branch hasn't it
+ */
+extern Oid	event_trigger_function(Oid fnoid);
+
 /* the access method a new relation in namespace nspid gets */
 extern Oid	versioned_relation_am(Oid nspid, Oid amoid, char relkind,
 								  char relpersistence, bool explicit);

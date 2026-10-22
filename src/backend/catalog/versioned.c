@@ -67,11 +67,14 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "commands/extension.h"
+#include "parser/parse_func.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -899,6 +902,78 @@ check_versioned_extension_move(Oid oldnspid, Oid newnspid)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot move an extension into or out of a versioned schema"),
 				 errhint("Drop the extension and create it in the schema wanted.")));
+}
+
+/*
+ * The function an event trigger names by fnoid, as the session's branch has
+ * it.  An event trigger is shared by every branch; its function may be in a
+ * versioned schema, each branch's, which records no dependency of the
+ * trigger on it (so a branch can change or drop its own).  A branch's copy
+ * keeps the function's OID; one a move made again (from a commit, which
+ * names objects) has another, and is found by the name the OID has on a
+ * branch that still has it.  A branch without the function skips the
+ * trigger, with a warning: InvalidOid.
+ */
+Oid
+event_trigger_function(Oid fnoid)
+{
+	Relation	rel;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	char	   *proname = NULL;
+	Oid			pronamespace = InvalidOid;
+	char	   *nspname = NULL;
+	Oid			found = InvalidOid;
+
+	if (SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(fnoid)) ||
+		!database_has_versioned_schemas())
+		return fnoid;
+
+	/* its name, from a branch that has it (no cache entry is built) */
+	rel = table_open(ProcedureRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_proc_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(fnoid));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(rel, ProcedureOidIndexId, true, NULL, 1, key);
+		if (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
+
+			proname = pstrdup(NameStr(p->proname));
+			pronamespace = p->pronamespace;
+		}
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+
+	if (proname)
+		nspname = get_namespace_name(pronamespace);
+	if (nspname)
+	{
+		found = LookupFuncName(list_make2(makeString(nspname), makeString(proname)),
+							   0, NULL, true);
+		if (OidIsValid(found) && get_func_rettype(found) != EVENT_TRIGGEROID)
+			found = InvalidOid;
+	}
+	if (!OidIsValid(found))
+		ereport(WARNING,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 proname ?
+				 errmsg("event trigger function %s() isn't on branch \"%s\": the trigger is skipped",
+						nspname ? quote_qualified_identifier(nspname, proname) :
+						quote_identifier(proname),
+						branch_name_for_message(MyBranch)) :
+				 errmsg("event trigger function %u is on no branch: the trigger is skipped",
+						fnoid)));
+	return found;
 }
 
 Oid
