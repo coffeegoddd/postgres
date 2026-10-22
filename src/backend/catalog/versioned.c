@@ -17,6 +17,14 @@
  * records a dependency, so foreign keys, column types, defaults, views,
  * triggers and function bodies are covered alike.
  *
+ * An extension may be installed in a versioned schema, and isn't versioned
+ * by it: what its script makes there is shared, as it would be in an
+ * ordinary schema.  Such an object's catalog rows say so (branch 0), and
+ * those rows are what answer whether an object in a versioned schema is
+ * versioned.  A table the script makes there is a shared heap table.  While
+ * an extension is in a versioned schema, the schema can't be dropped or
+ * renamed, so every branch keeps it.
+ *
  * Since a shared object is the same on every branch, dropping one has to
  * respect every branch's dependents, not only the session's: a column
  * type, default or view on another branch would otherwise be left naming
@@ -55,6 +63,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_policy.h"
@@ -62,8 +71,10 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
+#include "commands/extension.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -167,6 +178,18 @@ namespace_is_versioned(Oid nspid)
 	return versioned;
 }
 
+/*
+ * Is this row of an object in a versioned schema a branch's, not shared?
+ * An extension's members there are shared, and their rows say so.
+ */
+static bool
+row_on_a_branch(Oid classid, HeapTuple tup)
+{
+	const CatalogBranchInfo *info = catalog_branch_info(classid);
+
+	return info == NULL || OidIsValid(catalog_row_branch(info, tup));
+}
+
 static bool
 relation_is_versioned(Oid relid)
 {
@@ -177,8 +200,9 @@ relation_is_versioned(Oid relid)
 	if (!HeapTupleIsValid(tup))
 		return false;
 	form = (Form_pg_class) GETSTRUCT(tup);
-	versioned = namespace_is_versioned(form->relnamespace) ||
-		form->relam == PROLLY_TABLE_AM_OID;
+	versioned = form->relam == PROLLY_TABLE_AM_OID ||
+		(namespace_is_versioned(form->relnamespace) &&
+		 row_on_a_branch(RelationRelationId, tup));
 
 	/* an index is versioned if its table is (a TOAST table's index, too) */
 	if (!versioned &&
@@ -217,6 +241,9 @@ object_is_versioned(const ObjectAddress *object)
 
 	switch (object->classId)
 	{
+		case ExtensionRelationId:
+			/* shared by every branch, whatever its schema */
+			return false;
 		case NamespaceRelationId:
 			return namespace_is_versioned(object->objectId);
 		case RelationRelationId:
@@ -299,7 +326,8 @@ object_is_versioned(const ObjectAddress *object)
 									   &isnull);
 
 		if (!isnull)
-			versioned = namespace_is_versioned(DatumGetObjectId(nsp));
+			versioned = namespace_is_versioned(DatumGetObjectId(nsp)) &&
+				row_on_a_branch(object->classId, tup);
 		table_close(rel, AccessShareLock);
 		heap_freetuple(tup);
 	}
@@ -320,6 +348,16 @@ check_versioned_dependencies(const ObjectAddress *depender,
 	for (int i = 0; i < nreferenced; i++)
 	{
 		if (!object_is_versioned(&referenced[i]))
+			continue;
+
+		/*
+		 * An extension, and what it makes, may depend on the versioned
+		 * schema it is in: every branch keeps that schema while it is.
+		 */
+		if (referenced[i].classId == NamespaceRelationId &&
+			(depender->classId == ExtensionRelationId || creating_extension ||
+			 OidIsValid(getExtensionOfObject(depender->classId,
+											 depender->objectId))))
 			continue;
 		if (depender_versioned < 0)
 			depender_versioned = object_is_versioned(depender) ? 1 : 0;
@@ -542,12 +580,169 @@ other_branch_typed_table(Oid typeOid)
 	return OidIsValid(other) ? branch_name_for_message(other) : NULL;
 }
 
+/* the first extension in schema nspid, or InvalidOid */
+Oid
+extension_in_namespace(Oid nspid)
+{
+	Relation	rel = table_open(ExtensionRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL,
+										  0, NULL);
+	HeapTuple	tup;
+	Oid			ext = InvalidOid;
+
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_extension e = (Form_pg_extension) GETSTRUCT(tup);
+
+		if (e->extnamespace == nspid)
+		{
+			ext = e->oid;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return ext;
+}
+
+/*
+ * Error if an extension can't be created in schema nspid: a versioned
+ * schema must be on every branch that has copies, since what the extension
+ * makes in it is every branch's.
+ */
+void
+check_versioned_extension_schema(Oid nspid)
+{
+	const CatalogBranchInfo *info;
+	Relation	rel;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *having = NIL;
+	Oid			lacking = InvalidOid;
+
+	if (!namespace_is_versioned(nspid) || !other_branches_have_copies())
+		return;
+
+	info = catalog_branch_info(NamespaceRelationId);
+	rel = table_open(NamespaceRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_namespace_oid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(nspid));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(rel, NamespaceOidIndexId, true, NULL, 1, key);
+		while ((tup = systable_getnext(scan)) != NULL)
+			having = lappend_oid(having, catalog_row_branch(info, tup));
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+
+	rel = table_open(BranchRelationId, AccessShareLock);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Oid			branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
+
+		if (!list_member_oid(having, branch))
+		{
+			lacking = branch;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	if (OidIsValid(lacking))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create an extension in schema \"%s\", which branch \"%s\" doesn't have",
+						get_namespace_name(nspid), branch_name_for_message(lacking)),
+				 errdetail("An extension is shared by every branch, and so is what it makes in a versioned schema."),
+				 errhint("Install it in a schema every branch has.")));
+}
+
+/*
+ * Error if a versioned schema is being dropped or renamed while an
+ * extension is in it: the extension's objects are every branch's, and
+ * every branch keeps the schema they are in.
+ */
+void
+check_versioned_schema_change(Oid nspid, const char *what)
+{
+	Oid			ext;
+
+	if (!namespace_is_versioned(nspid))
+		return;
+	ext = extension_in_namespace(nspid);
+	if (OidIsValid(ext))
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot %s schema \"%s\" because extension \"%s\" is in it",
+						what, get_namespace_name(nspid), get_extension_name(ext)),
+				 errdetail("An extension in a versioned schema is shared by every branch, and every branch keeps the schema."),
+				 errhint("Drop the extension first.")));
+}
+
+/*
+ * Error if an object would move between an extension and a versioned
+ * schema's versioned objects (ALTER EXTENSION ... ADD or DROP), or an
+ * extension between a versioned schema and another (ALTER EXTENSION ...
+ * SET SCHEMA): one is shared, the other each branch's.
+ */
+void
+check_versioned_extension_member(const ObjectAddress *object, bool adding)
+{
+	Oid			nsp = get_object_namespace(object);
+
+	if (OidIsValid(nsp) && namespace_is_versioned(nsp))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 adding ?
+				 errmsg("cannot add %s to an extension: it is in versioned schema \"%s\"",
+						getObjectDescription(object, false), get_namespace_name(nsp)) :
+				 errmsg("cannot remove %s from its extension: it is in versioned schema \"%s\"",
+						getObjectDescription(object, false), get_namespace_name(nsp)),
+				 errdetail("An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.")));
+}
+
+void
+check_versioned_extension_move(Oid oldnspid, Oid newnspid)
+{
+	if (oldnspid != newnspid &&
+		(namespace_is_versioned(oldnspid) || namespace_is_versioned(newnspid)))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move an extension into or out of a versioned schema"),
+				 errhint("Drop the extension and create it in the schema wanted.")));
+}
+
 Oid
 versioned_relation_am(Oid nspid, Oid amoid, char relkind, char relpersistence,
 					  bool explicit)
 {
 	if (!RELKIND_HAS_TABLE_AM(relkind) && relkind != RELKIND_PARTITIONED_TABLE)
 		return amoid;
+
+	if (namespace_is_versioned(nspid) && creating_extension)
+	{
+		/* an extension's table is shared: an ordinary heap table */
+		if (amoid == PROLLY_TABLE_AM_OID)
+		{
+			if (explicit)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("an extension's tables can't be prolly tables"),
+						 errdetail("An extension is shared by every branch, and so are its tables.")));
+			return HEAP_TABLE_AM_OID;
+		}
+		return amoid;
+	}
 
 	if (namespace_is_versioned(nspid))
 	{

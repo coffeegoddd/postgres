@@ -164,12 +164,19 @@ SELECT plain.count_t();
        2
 (1 row)
 
--- Extensions are shared.
+-- Extensions are shared, in a versioned schema too: what they make there
+-- isn't versioned.
 DROP EXTENSION IF EXISTS tsm_system_rows;
 NOTICE:  extension "tsm_system_rows" does not exist, skipping
 CREATE EXTENSION tsm_system_rows SCHEMA app;
-ERROR:  extensions can't be created in a versioned schema
-DETAIL:  An extension is shared by every branch.
+SELECT pronamespace::regnamespace AS schema, probranch = 0 AS shared
+  FROM pg_proc WHERE proname = 'system_rows';
+ schema | shared 
+--------+--------
+ app    | t
+(1 row)
+
+DROP EXTENSION tsm_system_rows;
 CREATE EXTENSION tsm_system_rows;
 DROP SCHEMA app CASCADE;
 NOTICE:  drop cascades to 13 other objects

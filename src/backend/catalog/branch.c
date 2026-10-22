@@ -72,6 +72,7 @@
 #include "catalog/versioned.h"
 #include "access/xact.h"
 #include "executor/tuptable.h"
+#include "commands/extension.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -282,10 +283,39 @@ index_table(Oid indexid)
 	return relid;
 }
 
-static Oid
-namespace_branch(Oid nspid)
+/*
+ * Is this row an extension member's?  An extension's objects are shared
+ * even in a versioned schema: those its script makes (while it runs, before
+ * their membership is recorded) and, later, any whose membership is.  A
+ * branch's row being changed stays the branch's.
+ */
+static bool
+extension_member_row(Relation rel, HeapTuple tup)
 {
-	return namespace_is_versioned(nspid) ? MyBranch : InvalidOid;
+	const CatalogBranchInfo *info = catalog_branch_info(RelationGetRelid(rel));
+	AttrNumber	oidattno;
+	bool		isnull;
+	Datum		oid;
+
+	if (info != NULL && !heap_attisnull(tup, info->attnum, RelationGetDescr(rel)) &&
+		OidIsValid(catalog_row_branch(info, tup)))
+		return false;
+	if (creating_extension)
+		return true;
+	oidattno = get_object_attnum_oid(RelationGetRelid(rel));
+	oid = heap_getattr(tup, oidattno, RelationGetDescr(rel), &isnull);
+	return !isnull &&
+		OidIsValid(getExtensionOfObject(RelationGetRelid(rel),
+										DatumGetObjectId(oid)));
+}
+
+/* the branch of a row of an object in schema nspid */
+static Oid
+namespace_branch(Relation rel, HeapTuple tup, Oid nspid)
+{
+	if (!namespace_is_versioned(nspid) || extension_member_row(rel, tup))
+		return InvalidOid;
+	return MyBranch;
 }
 
 /*
@@ -316,9 +346,10 @@ row_branch(Relation rel, HeapTuple tup)
 			{
 				Form_pg_class c = (Form_pg_class) form;
 
-				if (namespace_is_versioned(c->relnamespace) ||
-					c->relam == PROLLY_TABLE_AM_OID)
+				if (c->relam == PROLLY_TABLE_AM_OID)
 					return MyBranch;
+				if (namespace_is_versioned(c->relnamespace))
+					return namespace_branch(rel, tup, c->relnamespace);
 				/*
 				 * An index belongs where its table does (a TOAST table's,
 				 * too): the table index_create is making it for, or, once
@@ -333,34 +364,34 @@ row_branch(Relation rel, HeapTuple tup)
 				return InvalidOid;
 			}
 		case TypeRelationId:
-			return namespace_branch(((Form_pg_type) form)->typnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_type) form)->typnamespace);
 		case ProcedureRelationId:
-			return namespace_branch(((Form_pg_proc) form)->pronamespace);
+			return namespace_branch(rel, tup, ((Form_pg_proc) form)->pronamespace);
 		case OperatorRelationId:
-			return namespace_branch(((Form_pg_operator) form)->oprnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_operator) form)->oprnamespace);
 		case OperatorClassRelationId:
-			return namespace_branch(((Form_pg_opclass) form)->opcnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_opclass) form)->opcnamespace);
 		case OperatorFamilyRelationId:
-			return namespace_branch(((Form_pg_opfamily) form)->opfnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_opfamily) form)->opfnamespace);
 		case CollationRelationId:
-			return namespace_branch(((Form_pg_collation) form)->collnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_collation) form)->collnamespace);
 		case ConversionRelationId:
-			return namespace_branch(((Form_pg_conversion) form)->connamespace);
+			return namespace_branch(rel, tup, ((Form_pg_conversion) form)->connamespace);
 		case TSConfigRelationId:
-			return namespace_branch(((Form_pg_ts_config) form)->cfgnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_ts_config) form)->cfgnamespace);
 		case TSDictionaryRelationId:
-			return namespace_branch(((Form_pg_ts_dict) form)->dictnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_ts_dict) form)->dictnamespace);
 		case TSParserRelationId:
-			return namespace_branch(((Form_pg_ts_parser) form)->prsnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_ts_parser) form)->prsnamespace);
 		case TSTemplateRelationId:
-			return namespace_branch(((Form_pg_ts_template) form)->tmplnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_ts_template) form)->tmplnamespace);
 		case StatisticExtRelationId:
-			return namespace_branch(((Form_pg_statistic_ext) form)->stxnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_statistic_ext) form)->stxnamespace);
 		case ConstraintRelationId:
-			return namespace_branch(((Form_pg_constraint) form)->connamespace);
+			return namespace_branch(rel, tup, ((Form_pg_constraint) form)->connamespace);
 		case DefaultAclRelationId:
 			/* a schema's default privileges; global ones (no schema) are shared */
-			return namespace_branch(((Form_pg_default_acl) form)->defaclnamespace);
+			return namespace_branch(rel, tup, ((Form_pg_default_acl) form)->defaclnamespace);
 		case AttributeRelationId:
 			return catalog_object_branch(RelationRelationId,
 										 ((Form_pg_attribute) form)->attrelid);

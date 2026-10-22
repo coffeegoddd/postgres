@@ -215,6 +215,13 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 		}
 	}
 
+	/* a versioned schema an extension is in stays on every branch */
+	for (i = 0; i < targetObjects->numrefs; i++)
+	{
+		if (targetObjects->refs[i].classId == NamespaceRelationId)
+			check_versioned_schema_change(targetObjects->refs[i].objectId, "drop");
+	}
+
 	/*
 	 * A shared object is every branch's: refuse before deleting anything if
 	 * an object on another branch, which CASCADE can't reach, depends on
