@@ -167,7 +167,7 @@
 #block_map_replay_entries = 65536       # blocks of block-mapped relations
                                         # recovery remembers a later remap of
                                         # (change requires restart)
-#prolly_fold_worker = off                # fold branches' working sets in the
+#prolly_fold_worker = on                 # fold branches' working sets in the
                                         # background after they're written
 #prolly_fold_worker_max_workers = 2     # fold workers at once, one to a
                                         # database

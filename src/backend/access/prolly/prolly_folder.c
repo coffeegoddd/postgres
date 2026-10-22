@@ -55,7 +55,7 @@
 #include "utils/timeout.h"
 #include "utils/wait_event.h"
 
-bool		prolly_fold_worker = false;
+bool		prolly_fold_worker = true;
 int			prolly_fold_worker_max_workers = 2;
 int			prolly_fold_worker_naptime = 200;
 
