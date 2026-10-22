@@ -686,22 +686,14 @@ note_own_change(Relation rel, const ItemPointerData *oldtid,
 }
 
 /*
- * As a transaction that changed a branch commits in dolt.transaction_commit's
- * mode: a Dolt commit of the branch, unless nothing changed (an insert
- * deleted again, a commit already made of it all).  Changes to two branches,
- * or to one the session has left, can't be committed so, and a transaction
- * that would commit can't be prepared.  With conflicts kept (allowed by
- * dolt.allow_commit_conflicts) the transaction commits without one, as the
- * conflicts are to be resolved before the branch can commit.
- */
-/*
  * As a transaction that changed its branch commits in prolly.fold_on_commit's
  * mode: its own row changes folded into the branch's baseline, so the next
  * fold of the branch (a status, a diff, a commit) reads only what others
  * left unfolded.  Nothing is folded, the changes left to the next fold as
  * without the mode, where the transaction is prepared, changed definitions
  * or more rows than it keeps, changed another branch than the session's,
- * or a merge is in progress.
+ * or a merge is in progress, or another transaction holds the refs (a
+ * commit never waits for them for this).
  */
 static void
 fold_on_commit_at_end(bool prepare)
@@ -741,6 +733,15 @@ fold_on_commit_at_end(bool prepare)
 		PopActiveSnapshot();
 }
 
+/*
+ * As a transaction that changed a branch commits in dolt.transaction_commit's
+ * mode: a Dolt commit of the branch, unless nothing changed (an insert
+ * deleted again, a commit already made of it all).  Changes to two branches,
+ * or to one the session has left, can't be committed so, and a transaction
+ * that would commit can't be prepared.  With conflicts kept (allowed by
+ * dolt.allow_commit_conflicts) the transaction commits without one, as the
+ * conflicts are to be resolved before the branch can commit.
+ */
 static void
 transaction_commit_at_end(bool prepare)
 {

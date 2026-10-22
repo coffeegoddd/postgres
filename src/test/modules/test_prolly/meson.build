@@ -264,6 +264,7 @@ tests += {
       't/155_bmap_truncated_blocks.pl',
       't/156_bmap_redo_newer_entries.pl',
       't/160_first_use_lock.pl',
+      't/161_fold_on_commit_sessions.pl',
     ],
   },
 }

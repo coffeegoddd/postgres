@@ -3039,6 +3039,9 @@ copies_working_changes(Oid relid, ProllyNodeRef *data,
 /*
  * The transaction's own row changes folded into the session branch's
  * baseline, under the refs (so baselines move one transaction at a time).
+ * Only if they're free: the fold is an optimization a commit mustn't wait
+ * for (nor deadlock or time out on); held by another, the changes are left
+ * to the next fold, as without it.
  */
 static bool
 copies_fold_own(const ProllyRowChanges *changes, int nchanges)
@@ -3050,6 +3053,10 @@ copies_fold_own(const ProllyRowChanges *changes, int nchanges)
 
 	prolly_database_components(&dc);
 	if (!PROLLY_HAS(dc.canonicalizer, advance_own) || nchanges == 0)
+		return false;
+	refs_init();
+	if (!PROLLY_HAS(env.chunk_store, try_hold_root) ||
+		!env.chunk_store->try_hold_root(env.chunks))
 		return false;
 	lock_refs();
 	if (!branch_baseline(name, &baseline) ||

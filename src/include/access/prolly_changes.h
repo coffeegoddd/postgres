@@ -148,12 +148,20 @@ typedef struct ProllyChangeFinderRoutine
 	bool		(*changes) (Relation rel, const ProllyTreeEnv *env,
 							const ProllyTableFold *baseline,
 							ProllyRowChangeVisit visit, void *arg);
+
+	/*
+	 * Optional, with advance(): false if advance() would refuse rel's
+	 * baseline state as it is, asked before the trees advance() is for are
+	 * made (so none is made only to be thrown away).  Needs an active
+	 * snapshot, advance()'s.
+	 */
+	bool		(*can_advance) (Relation rel, const ProllyValue *state);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
-	"state_refs", "advance", "fold_on_leave", "changes"
+	"state_refs", "advance", "fold_on_leave", "changes", "can_advance"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK changes
+#define PROLLY_CHANGES_LAST_CALLBACK can_advance
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

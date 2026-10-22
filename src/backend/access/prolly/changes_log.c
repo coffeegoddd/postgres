@@ -1427,6 +1427,33 @@ log_fold_rows(Relation rel, const ProllyTreeEnv *env,
 	return ok;
 }
 
+/* Would log_advance() take rel's state as it is?  (Into c, identity, st.) */
+static bool
+advance_holds(Relation rel, const ProllyValue *state, ProllyComponents *c,
+			  uint64 *identity, State *st)
+{
+	Snapshot	snap = GetActiveSnapshot();
+
+	prolly_components_for_relation(rel, c);
+	if (c->change_log == NULL || !PROLLY_HAS(c->change_log, consume_own))
+		return false;
+	*identity = PROLLY_CALL(c->change_log, identity, rel);
+	return *identity != 0 && parse_state(state, st) && st->log == *identity &&
+		!(st->flags & STATE_UNSETTLED) && sees_fold(snap, st) &&
+		!storage_unseen(rel, snap);
+}
+
+/* can_advance(): log_advance()'s checks, consuming nothing. */
+static bool
+log_can_advance(Relation rel, const ProllyValue *state)
+{
+	ProllyComponents c;
+	uint64		identity = 0;
+	State		st;
+
+	return advance_holds(rel, state, &c, &identity, &st);
+}
+
 /*
  * The state of a baseline that holds rel's last baseline's rows with the
  * transaction's own changes applied (a commit of them alone), into next:
@@ -1449,13 +1476,7 @@ log_advance(Relation rel, const ProllyValue *state, StringInfo next)
 	ProllyLogPosition rest = {0};
 	Snapshot	snap = GetActiveSnapshot();
 
-	prolly_components_for_relation(rel, &c);
-	if (c.change_log == NULL || !PROLLY_HAS(c.change_log, consume_own))
-		return false;
-	identity = PROLLY_CALL(c.change_log, identity, rel);
-	if (identity == 0 || !parse_state(state, &st) || st.log != identity ||
-		(st.flags & STATE_UNSETTLED) || !sees_fold(snap, &st) ||
-		storage_unseen(rel, snap))
+	if (!advance_holds(rel, state, &c, &identity, &st))
 		return false;
 	{
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
@@ -1505,6 +1526,7 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.fold_rows = log_fold_rows,
 	.state_refs = log_state_refs,
 	.advance = log_advance,
+	.can_advance = log_can_advance,
 	.fold_on_leave = log_fold_on_leave,
 	.changes = log_changes,
 };

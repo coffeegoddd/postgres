@@ -4995,6 +4995,18 @@ journal_root(ProllyChunkStore *s, ProllyHash *root)
 	*root = s->root;
 }
 
+/* The lock journal_move_root() takes, if free; false if another holds it. */
+static bool
+journal_try_hold_root(ProllyChunkStore *s)
+{
+	LOCKTAG		tag;
+
+	if (s->moving)
+		return true;
+	SET_LOCKTAG_OBJECT(tag, s->dboid, ROOT_LOCK_CLASSID, 0, 0);
+	return LockAcquire(&tag, ExclusiveLock, false, true) != LOCKACQUIRE_NOT_AVAIL;
+}
+
 static bool
 journal_move_root(ProllyChunkStore *s, const ProllyHash *expected,
 				  const ProllyHash *root)
@@ -8811,4 +8823,5 @@ const ProllyChunkStoreRoutine prolly_chunkstore_journal = {
 	.roots = journal_roots,
 	.redo_consistent = journal_redo_consistent,
 	.other_bytes = journal_other_bytes,
+	.try_hold_root = journal_try_hold_root,
 };

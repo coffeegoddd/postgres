@@ -9888,8 +9888,10 @@ folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head
  * baseline holds what the transaction committed: a fold at its commit.
  * A table whose baseline isn't of its shape now, or whose changes or state
  * can't be applied or advanced so, keeps its entry, and its record of the
- * changes, for the next fold.  Every table's tree is made first; only then
- * are states advanced, each table's entry put only if its state was.
+ * changes, for the next fold.  Every table's tree is made first (of those
+ * whose state the finder can advance, can_advance() says, so none is made
+ * for nothing); only then are states advanced, each table's entry put only
+ * if its state was.
  * False, next undefined, if no table's could be.
  */
 static bool
@@ -9948,6 +9950,10 @@ folded_advance_own(const ProllyNodeRef *baseline,
 			content_hash(&cn, a->shape.data, a->shape.len, &a->dh);
 			pfree(desc.data);
 			if (a->bt == NULL || !same_hash(&a->dh, &a->bt->shape_hash) ||
+				(PROLLY_HAS(cn.finder, can_advance) &&
+				 !cn.finder->can_advance(rel, &(ProllyValue)
+										 {(const uint8 *) a->bt->state.data,
+										  a->bt->state.len})) ||
 				!PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &a->bt->data,
 							 changes[i].tids, changes[i].ntids, &a->now))
 			{

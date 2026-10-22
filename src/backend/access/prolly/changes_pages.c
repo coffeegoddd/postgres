@@ -1985,10 +1985,16 @@ pages_counters(ProllyChangeCounters *out, bool reset)
 /*
  * A baseline isn't advanced past a commit of the transaction's own rows:
  * its state is the pages as of its fold, which a commit of rows alone
- * doesn't move.
+ * doesn't move.  (So can_advance() says so, before any tree is made.)
  */
 static bool
 pages_advance(Relation rel, const ProllyValue *state, StringInfo next)
+{
+	return false;
+}
+
+static bool
+pages_can_advance(Relation rel, const ProllyValue *state)
 {
 	return false;
 }
@@ -2030,6 +2036,7 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.fold_rows = pages_fold_rows,
 	.state_refs = pages_state_refs,
 	.advance = pages_advance,
+	.can_advance = pages_can_advance,
 	.fold_on_leave = pages_fold_on_leave,
 	.changes = pages_changes,
 };
