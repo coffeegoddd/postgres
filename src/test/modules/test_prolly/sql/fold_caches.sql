@@ -293,6 +293,19 @@ SELECT * FROM dolt_status;
 SELECT dolt_reset('--hard');
 UPDATE fc.t SET v = v WHERE id = 9;
 SELECT * FROM dolt_status;
+-- ... and, no table changed, what that status read is the working set,
+-- published: the next one takes it as it is, folding and writing nothing.
+SET debug_prolly_verify_fold_caches = off;
+:flush
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS reusing,
+	pg_temp.since('chunks_appended') IS NOT NULL AS appending,
+	pg_temp.since('fold_rows_written') IS NOT NULL AS writing;
+SELECT * FROM dolt_status;
+:flush
+SELECT pg_temp.since('folds_reused') AS clean_status_reused,
+	pg_temp.since('chunks_appended') AS clean_status_chunks,
+	pg_temp.since('fold_rows_written') AS clean_status_rows;
+RESET debug_prolly_verify_fold_caches;
 ALTER TABLE fc.t ADD COLUMN w int;
 SELECT * FROM dolt_status;
 SELECT dolt_reset('--hard');

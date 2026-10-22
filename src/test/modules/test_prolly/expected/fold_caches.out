@@ -974,6 +974,43 @@ SELECT * FROM dolt_status;
 ------------+--------+--------
 (0 rows)
 
+-- ... and, no table changed, what that status read is the working set,
+-- published: the next one takes it as it is, folding and writing nothing.
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') IS NOT NULL AS reusing,
+	pg_temp.since('chunks_appended') IS NOT NULL AS appending,
+	pg_temp.since('fold_rows_written') IS NOT NULL AS writing;
+ reusing | appending | writing 
+---------+-----------+---------
+ t       | t         | t
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('folds_reused') AS clean_status_reused,
+	pg_temp.since('chunks_appended') AS clean_status_chunks,
+	pg_temp.since('fold_rows_written') AS clean_status_rows;
+ clean_status_reused | clean_status_chunks | clean_status_rows 
+---------------------+---------------------+-------------------
+                   1 |                   0 |                 0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
 ALTER TABLE fc.t ADD COLUMN w int;
 SELECT * FROM dolt_status;
  table_name | staged |  status  

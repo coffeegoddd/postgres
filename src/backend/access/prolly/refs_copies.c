@@ -2954,11 +2954,6 @@ copies_read_working_set(const char *branch, Oid only, ProllyNodeRef *root,
 	return true;
 }
 
-/*
- * The session branch's definitions: its working set known if any (the rows
- * in it are right too), else a fold of no table's rows, which is never
- * published: it isn't the working set.
- */
 /* What a read of definitions began at, for publishing its root. */
 typedef struct DefinitionsRead
 {
@@ -2968,6 +2963,12 @@ typedef struct DefinitionsRead
 	ProllyNodeRef baseline;
 } DefinitionsRead;
 
+/*
+ * The session branch's definitions: its working set known if any (the rows
+ * in it are right too), else a fold of no table's rows.  That isn't the
+ * working set, unless no table's rows changed since: *read says what the
+ * read began at, for publish_definitions() to publish it then.
+ */
 static void
 copies_read_definitions(ProllyNodeRef *root, List **left_out, bool *rows,
 						void **read)

@@ -1187,7 +1187,8 @@ tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
 				differ = rows ? !same_hash(&ta->data.hash, &tb->data.hash) :
 					working_rows_differ(ta, tb, &known);
 			if (!known)
-				return false;	/* (nothing visited yet: see below) */
+				return false;	/* (what was visited, the caller discards:
+								 * see below) */
 			if (differ)
 			{
 				visit(ta->name, PROLLY_DIFF_MODIFIED, PROLLY_OBJECT_TABLE, arg);
