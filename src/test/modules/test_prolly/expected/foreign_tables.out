@@ -1,0 +1,279 @@
+-- A foreign table in a versioned schema: a commit holds its definition
+-- (columns with their options, CHECK constraints, server and options),
+-- never its rows, which are its server's.  Moves make, change and drop it;
+-- diffs and merges see its definition; a clone needs its server, which
+-- holds connection settings a commit doesn't, made first.  Writes through it
+-- change nothing a commit holds.  Not yet: foreign tables that are
+-- partitions, inherit, or have triggers or row security.  (In a database of
+-- its own; its rows come from an ordinary schema there, over postgres_fdw.)
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/foreign-' || txid_current() AS url \gset
+CREATE DATABASE regress_foreign_tables;
+\c regress_foreign_tables
+CREATE EXTENSION postgres_fdw;
+DO $d$ BEGIN
+	EXECUTE $$CREATE SERVER loop FOREIGN DATA WRAPPER postgres_fdw
+	  OPTIONS (dbname '$$ || current_database() || $$', port '$$ || current_setting('port') || $$')$$;
+END $d$;
+CREATE USER MAPPING FOR CURRENT_USER SERVER loop;
+CREATE SCHEMA remote;
+CREATE TABLE remote.src (id int, v text);
+CREATE TABLE remote.src2 (id int, v text);
+INSERT INTO remote.src VALUES (1, 'one'), (2, 'two');
+INSERT INTO remote.src2 VALUES (10, 'ten');
+CREATE SCHEMA ft VERSIONED;
+CREATE TABLE ft.base (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS base \gset
+CREATE FOREIGN TABLE ft.f (
+	id int OPTIONS (column_name 'id') NOT NULL,
+	v text COLLATE "C" DEFAULT 'none',
+	CONSTRAINT pos CHECK (id > 0))
+  SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+CREATE VIEW ft.fv AS SELECT id, upper(v) AS v FROM ft.f;
+SELECT * FROM ft.fv ORDER BY id;
+ id |  v  
+----+-----
+  1 | ONE
+  2 | TWO
+(2 rows)
+
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+ table_name |  status   
+------------+-----------
+ ft.f       | new table
+ ft.fv      | new table
+(2 rows)
+
+SELECT length(dolt_commit('-Am', 'foreign table')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS with_foreign \gset
+SELECT from_create_statement IS NULL AS made, to_create_statement
+  FROM dolt_schema_diff(:'base', :'with_foreign', 'ft.f');
+ made |                                                                                                           to_create_statement                                                                                                            
+------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ f    | CREATE FOREIGN TABLE ft.f (id integer OPTIONS (column_name 'id') NOT NULL, v pg_catalog.text COLLATE pg_catalog."C" DEFAULT 'none'::text, CONSTRAINT pos CHECK ((id > 0))) SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+(1 row)
+
+-- a branch points it elsewhere; main still reads src
+SELECT dolt_checkout('-b', 'ft_b');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'ft_b'"}
+(1 row)
+
+ALTER FOREIGN TABLE ft.f OPTIONS (SET table_name 'src2');
+SELECT * FROM ft.fv ORDER BY id;
+ id |  v  
+----+-----
+ 10 | TEN
+(1 row)
+
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+ table_name |  status  
+------------+----------
+ ft.f       | modified
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'src2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT * FROM ft.fv ORDER BY id;
+ id |  v  
+----+-----
+  1 | ONE
+  2 | TWO
+(2 rows)
+
+SELECT length(dolt_merge('ft_b')::text) > 0 AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT * FROM ft.fv ORDER BY id;
+ id |  v  
+----+-----
+ 10 | TEN
+(1 row)
+
+SELECT ftoptions FROM pg_foreign_table WHERE ftrelid = 'ft.f'::regclass;
+              ftoptions               
+--------------------------------------
+ {schema_name=remote,table_name=src2}
+(1 row)
+
+-- both sides change it differently: a schema conflict
+SELECT dolt_checkout('-b', 'ft_c');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'ft_c'"}
+(1 row)
+
+ALTER FOREIGN TABLE ft.f OPTIONS (SET table_name 'src');
+SELECT length(dolt_commit('-Am', 'back to src')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+ALTER FOREIGN TABLE ft.f ADD COLUMN extra int;
+SELECT length(dolt_commit('-Am', 'a column')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_merge('ft_c');
+ERROR:  schema conflict: ft.f was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+-- moves: back to before it, and forward again (the view with it)
+SELECT dolt_hashof('HEAD') AS tip \gset
+SELECT dolt_reset('--hard', :'base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT to_regclass('ft.f') AS f, to_regclass('ft.fv') AS fv;
+ f | fv 
+---+----
+   | 
+(1 row)
+
+SELECT dolt_reset('--hard', :'tip');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id, v FROM ft.fv ORDER BY id;
+ id |  v  
+----+-----
+ 10 | TEN
+(1 row)
+
+\d ft.f
+                            Foreign table "ft.f"
+ Column |  Type   | Collation | Nullable |   Default    |    FDW options     
+--------+---------+-----------+----------+--------------+--------------------
+ id     | integer |           | not null |              | (column_name 'id')
+ v      | text    | C         |          | 'none'::text | 
+ extra  | integer |           |          |              | 
+Check constraints:
+    "pos" CHECK (id > 0)
+Server: loop
+FDW options: (schema_name 'remote', table_name 'src2')
+
+-- writes through it change nothing a commit holds
+ALTER TABLE remote.src2 ADD COLUMN extra int;
+SET dolt.transaction_commit = on;
+SELECT count(*) AS commits_before FROM dolt_log;
+ commits_before 
+----------------
+              4
+(1 row)
+
+INSERT INTO ft.f (id, v) VALUES (11, 'eleven');
+SELECT count(*) AS commits_after_write FROM dolt_log;
+ commits_after_write 
+---------------------
+                   4
+(1 row)
+
+CREATE FOREIGN TABLE ft.g (id int) SERVER loop OPTIONS (schema_name 'remote', table_name 'src');
+SELECT count(*) AS commits_after_create FROM dolt_log;
+ commits_after_create 
+----------------------
+                    5
+(1 row)
+
+SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 1;
+      message       
+--------------------
+ Transaction commit
+(1 row)
+
+RESET dolt.transaction_commit;
+SELECT * FROM remote.src2 ORDER BY id;
+ id |   v    | extra 
+----+--------+-------
+ 10 | ten    |      
+ 11 | eleven |      
+(2 rows)
+
+-- not yet
+CREATE FUNCTION remote.noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+CREATE TRIGGER noop BEFORE INSERT ON ft.g FOR EACH ROW EXECUTE FUNCTION remote.noop();
+SELECT dolt_commit('-Am', 'a trigger');
+ERROR:  prolly commits don't cover triggers on foreign tables yet: ft.g
+DETAIL:  A commit's root hash must depend only on what it holds, and the canonical form doesn't describe this object.
+DROP TRIGGER noop ON ft.g;
+-- a clone needs the server, made first
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main');
+         dolt_push         
+---------------------------
+ {0,"main -> origin/main"}
+(1 row)
+
+\c :db
+CREATE DATABASE regress_foreign_clone;
+\c regress_foreign_clone
+SELECT dolt_clone(:'url');
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+server loop: not in this database
+HINT:  Make what is missing, then try again.
+CREATE EXTENSION postgres_fdw;
+DO $d$ BEGIN
+	EXECUTE $$CREATE SERVER loop FOREIGN DATA WRAPPER postgres_fdw
+	  OPTIONS (dbname 'regress_foreign_tables', port '$$ || current_setting('port') || $$')$$;
+END $d$;
+CREATE USER MAPPING FOR CURRENT_USER SERVER loop;
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT id, v FROM ft.fv ORDER BY id;
+ id |   v    
+----+--------
+ 10 | TEN
+ 11 | ELEVEN
+(2 rows)
+
+\c :db
+DROP DATABASE regress_foreign_clone;
+DROP DATABASE regress_foreign_tables;
