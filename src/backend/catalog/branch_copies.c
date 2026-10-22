@@ -482,7 +482,8 @@ delete_here(void *arg)
  * refspec, and so on: a branch so named couldn't be named again.  As in
  * Dolt, a name is ASCII, and may begin with "-" (given after "--") but
  * isn't "-" alone (git's previous branch), nor, as in git, "--" (the end
- * of the options); "HEAD", in any case, the
+ * of the options: divergence D14 in src/tools/prolly_bench/corpus/dolt/
+ * divergences.md); "HEAD", in any case, the
  * session branch's head, isn't a branch's name.  (Nor is a commit's id:
  * the refs, which know commits, refuse that.)
  */
