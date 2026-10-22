@@ -42,7 +42,7 @@ class BenchTests(unittest.TestCase):
         keys = {(case['operation'], case['distance'], case['working_set']) for case in plan}
         self.assertEqual(len(keys), len(plan))
         for size in ('clean', 'small', 'medium', 'large'):
-            for op in ('branch', 'checkout', 'reset_soft'):
+            for op in ('branch', 'checkout', 'reset_soft', 'reset_hard'):
                 for depth in (0, 1, 4):
                     self.assertIn((op, depth, size), keys)
         clean_only = cases({'history_depths': [1], 'dirty_sizes': {}})

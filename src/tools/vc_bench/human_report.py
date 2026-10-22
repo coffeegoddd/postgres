@@ -10,6 +10,7 @@ OPERATIONS = {
     "branch": "Create branch",
     "checkout": "Checkout",
     "reset_soft": "Soft reset",
+    "reset_hard": "Hard reset",
     "diff_equal": "Diff identical roots",
     "diff_working": "Diff HEAD → working",
     "diff_history": "Diff old → HEAD",
