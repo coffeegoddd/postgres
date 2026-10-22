@@ -407,5 +407,52 @@ SELECT count(*) FILTER (WHERE probranch <> 0) AS versioned_members
 ALTER EXTENSION seg DROP FUNCTION v.seg_size(v.seg);
 ERROR:  cannot remove function seg_size(seg) from its extension: it is in versioned schema "v"
 DETAIL:  An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.
+-- a script that lets one of its objects go and keeps it is refused (it
+-- would be shared yet no extension's); one that adds it again keeps it a
+-- shared member
+CREATE EXTENSION test_prolly_ext_detach SCHEMA v;
+ERROR:  extension "test_prolly_ext_detach"'s script let function test_prolly_detached() go without dropping it, in versioned schema "v"
+DETAIL:  An object in a versioned schema is an extension's, shared by every branch, or a branch's own; a script may let one of its objects go only to drop it or to add it again.
+HINT:  Install the extension in a schema that isn't versioned.
+SELECT count(*) AS detached_left FROM pg_proc WHERE proname IN ('test_prolly_detached', 'test_prolly_kept');
+ detached_left 
+---------------
+             0
+(1 row)
+
+CREATE EXTENSION test_prolly_ext_readd SCHEMA v;
+SELECT p.proname, p.probranch = 0 AS shared, e.extname
+  FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid
+ WHERE p.proname = 'test_prolly_readded';
+       proname       | shared |        extname        
+---------------------+--------+-----------------------
+ test_prolly_readded | t      | test_prolly_ext_readd
+(1 row)
+
+SELECT dolt_checkout('side');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'side'"}
+(1 row)
+
+SELECT v.test_prolly_readded() AS on_side;
+ on_side 
+---------
+       3
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- a user's ADD of the branch's own function is refused, as before
+CREATE FUNCTION v.mine() RETURNS int LANGUAGE sql RETURN 1;
+ALTER EXTENSION test_prolly_ext_readd ADD FUNCTION v.mine();
+ERROR:  cannot add function mine() to an extension: it is in versioned schema "v"
+DETAIL:  An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.
+DROP FUNCTION v.mine();
 \c contrib_regression
 DROP DATABASE regress_versioned_extensions2;

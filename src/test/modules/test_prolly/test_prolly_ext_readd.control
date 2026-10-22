@@ -1,0 +1,3 @@
+comment = 'An extension whose script lets one of its functions go and adds it again'
+default_version = '1.0'
+relocatable = false

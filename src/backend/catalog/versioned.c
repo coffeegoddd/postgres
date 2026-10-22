@@ -75,6 +75,7 @@
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -798,23 +799,42 @@ check_versioned_schema_change(Oid nspid, const char *what)
 }
 
 /*
+ * The objects in versioned schemas the running extension script let go of
+ * (ALTER EXTENSION ... DROP), in TopTransactionContext: each must be gone,
+ * or a member again, when the script ends.
+ */
+static List *script_let_go = NIL;
+
+/*
  * Error if an object would move between an extension and a versioned
  * schema's versioned objects (ALTER EXTENSION ... ADD or DROP), or an
  * extension between a versioned schema and another (ALTER EXTENSION ...
  * SET SCHEMA): one is shared, the other each branch's.  An object an
- * extension's script makes is shared already, so its script may add it;
- * and its script may let one of its objects go (update scripts do, before
- * dropping it), which stays shared until it is dropped.
+ * extension's script makes is shared already, so a script may add it.  A
+ * script may let one of its own extension's objects go (update scripts do,
+ * before dropping it), and the object is noted: when the script ends it
+ * must be dropped, or a member again (extension_script_end()).
  */
 void
-check_versioned_extension_member(const ObjectAddress *object, bool adding)
+check_versioned_extension_member(const ObjectAddress *object, bool adding,
+								 Oid extension)
 {
 	Oid			nsp = get_object_namespace(object);
 
 	if (!OidIsValid(nsp) || !namespace_is_versioned(nsp))
 		return;
-	if (adding ? !object_is_versioned(object) : creating_extension)
+	if (adding && !object_is_versioned(object))
 		return;
+	if (!adding && creating_extension && extension == CurrentExtensionObject)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		ObjectAddress *a = palloc(sizeof(ObjectAddress));
+
+		*a = *object;
+		script_let_go = lappend(script_let_go, a);
+		MemoryContextSwitchTo(old);
+		return;
+	}
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 adding ?
@@ -823,6 +843,51 @@ check_versioned_extension_member(const ObjectAddress *object, bool adding)
 			 errmsg("cannot remove %s from its extension: it is in versioned schema \"%s\"",
 					getObjectDescription(object, false), get_namespace_name(nsp)),
 			 errdetail("An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.")));
+}
+
+/*
+ * An extension script begins: what an enclosing one let go is set aside
+ * (returned), to be given back to extension_script_end().
+ */
+List *
+extension_script_begin(void)
+{
+	List	   *outer = script_let_go;
+
+	script_let_go = NIL;
+	return outer;
+}
+
+/*
+ * An extension script ends (succeeded, if check): each object it let go in
+ * a versioned schema must be dropped, or a member again.  One left over
+ * would be shared by every branch yet no extension's, which a branch's
+ * moves would treat as their own.
+ */
+void
+extension_script_end(List *outer, bool check)
+{
+	List	   *let_go = script_let_go;
+	ListCell   *lc;
+
+	script_let_go = outer;
+	if (!check)
+		return;
+	foreach(lc, let_go)
+	{
+		ObjectAddress *a = lfirst(lc);
+		char	   *desc = getObjectDescription(a, true);
+
+		if (desc == NULL || OidIsValid(getExtensionOfObject(a->classId, a->objectId)))
+			continue;
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("extension \"%s\"'s script let %s go without dropping it, in versioned schema \"%s\"",
+						get_extension_name(CurrentExtensionObject), desc,
+						get_namespace_name(get_object_namespace(a))),
+				 errdetail("An object in a versioned schema is an extension's, shared by every branch, or a branch's own; a script may let one of its objects go only to drop it or to add it again."),
+				 errhint("Install the extension in a schema that isn't versioned.")));
+	}
 }
 
 void

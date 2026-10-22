@@ -16,6 +16,7 @@
 
 #include "access/htup.h"
 #include "catalog/objectaddress.h"
+#include "nodes/pg_list.h"
 #include "utils/relcache.h"
 
 /* does the database have any versioned schema?  (cheap after the first call) */
@@ -62,7 +63,11 @@ extern void check_versioned_schema_change(Oid nspid, const char *what);
 
 /* error if an object would move between an extension and a versioned schema */
 extern void check_versioned_extension_member(const ObjectAddress *object,
-											 bool adding);
+											 bool adding, Oid extension);
+
+/* an extension script begins and ends: what it let go is checked at its end */
+extern List *extension_script_begin(void);
+extern void extension_script_end(List *outer, bool check);
 
 /* error if an extension would move into or out of a versioned schema */
 extern void check_versioned_extension_move(Oid oldnspid, Oid newnspid);

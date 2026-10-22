@@ -35,6 +35,10 @@ test_install_data += files(
   'test_prolly_b--1.1.sql',
   'test_prolly_ext_table.control',
   'test_prolly_ext_table--1.0.sql',
+  'test_prolly_ext_detach.control',
+  'test_prolly_ext_detach--1.0.sql',
+  'test_prolly_ext_readd.control',
+  'test_prolly_ext_readd--1.0.sql',
 )
 
 tests += {
