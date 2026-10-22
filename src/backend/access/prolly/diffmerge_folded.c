@@ -7608,8 +7608,9 @@ mark_foreign_key_validated(Relation pg_constraint, Oid conoid)
  * taken away and recorded as violations, as the rows it couldn't write
  * are, so that the constraints validate.  The rows breaking one may be the
  * branch's own as well as those merged: Dolt records them either way,
- * and takes a NOT NULL's out as well, but keeps a check's in the table.
- * (No trigger fires for the rows taken away, as none
+ * and takes a NOT NULL's out as well, but keeps a check's in the table
+ * (a divergence on purpose: D13 in src/tools/prolly_bench/corpus/dolt/
+ * divergences.md).  (No trigger fires for the rows taken away, as none
  * does for those written.)
  * A foreign key it added is marked validated, its table's rows checked
  * against it as the merge checks every foreign key of the tables it wrote:

@@ -11,7 +11,9 @@ permanent. GitHub issues track plans and changes:
 
 - [#153](https://github.com/coffeegoddd/postgres/issues/153) tracks parity:
   every Dolt version-control feature is in scope except the staging area.
-  Fix differences unless PostgreSQL semantics require an adaptation.
+  Fix differences unless PostgreSQL semantics require an adaptation. A new
+  required adaptation gets the next ID here (decided in its issue), and the
+  ports cite it.
 - [#701](https://github.com/coffeegoddd/postgres/issues/701) revisits D6's
   schema-conflict errors.
 - [#702](https://github.com/coffeegoddd/postgres/issues/702) revisits D12/D13's

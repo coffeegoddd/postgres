@@ -1,6 +1,7 @@
-# The C suite (SQL correctness: the pinned sqllogictest corpus) on every pull
-# request, every push to master and nightly: the full corpus in shards, heap
-# and prolly on each, then one gate over all of them.  "C suite gate" always
+# The C suite (SQL correctness: the pinned sqllogictest corpus) nightly and
+# by hand (pull-request and push runs are off for now: see below): the full
+# corpus in shards, heap and prolly on each, then one gate over all of
+# them.  "C suite gate" always
 # reports, so it can be a required check when pull-request runs are enabled.
 #
 # The gate leaves the pull-request comment as an artifact; the workflow_run

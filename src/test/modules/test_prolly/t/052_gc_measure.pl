@@ -6,7 +6,7 @@
 # appends off (its window) under a commit load.  Small by default, as a
 # test; PROLLY_GC_MEASURE_SCALE multiplies the rows and changes, and
 # PROLLY_GC_MEASURE_BRANCHES sets the branches, for a measurement whose
-# numbers (printed as notes) go in the spec.
+# numbers (printed as notes) go in the issue that tracks them (#749).
 
 use strict;
 use warnings FATAL => 'all';
