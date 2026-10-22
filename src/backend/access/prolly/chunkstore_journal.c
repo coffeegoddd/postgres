@@ -649,6 +649,20 @@ static uint32 gc_record(Segment *g, uint64 offset, uint64 size, char **rec,
  * ----------------------------------------------------------------
  */
 
+/*
+ * A table by chunk hash (a ProllyHash, hash_key()'s): its first bytes are
+ * spread evenly already, its hash in the table with nothing to compute.
+ */
+static uint32
+chunk_hash_key_hash(const void *key, Size keysize)
+{
+	const ProllyHash *h = key;
+	uint32		v;
+
+	memcpy(&v, h->bytes, sizeof(v));
+	return v;
+}
+
 static void
 hash_key(ProllyHash *key, const ProllyHash *hash)
 {
@@ -731,10 +745,11 @@ chunk_seen_before(const ProllyHash *key, Size limit)
 			pfree(chunk_seen_ring);
 		}
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(SeenChunk);
 		ctl.hcxt = chunk_cache_cxt;
 		chunk_seen = hash_create("prolly chunks read once", want, &ctl,
-								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 		chunk_seen_ring = MemoryContextAllocZero(chunk_cache_cxt,
 												 want * sizeof(ProllyHash));
 		chunk_seen_size = want;
@@ -858,10 +873,11 @@ chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(CachedChunk);
 		ctl.hcxt = chunk_cache_cxt;
 		chunk_cache = hash_create("prolly chunk cache", 1024, &ctl,
-								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	}
 	/* (copied first: an entry is made only once it can be filled) */
 	copy = MemoryContextAlloc(chunk_cache_cxt, Max(len, 1));
@@ -1600,10 +1616,11 @@ journal_keep(ProllyChunkStore *s, const ProllyHash *hash)
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(ProllyHash);
 		ctl.hcxt = TopTransactionContext;
 		kept_here = hash_create("prolly chunks kept", 64, &ctl,
-								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 		kept_here_begun = begun;
 	}
 	(void) hash_search(kept_here, &key, HASH_FIND, &found);
@@ -3918,10 +3935,11 @@ write_file(ProllyChunkStore *s, uint64 id, ProllyChunkNext next, void *arg,
 		return false;
 	}
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
 	seen = hash_create("prolly table file chunks", 1024, &ctl,
-					   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+					   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 
 	fd = OpenTransientFile(path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
@@ -4222,10 +4240,11 @@ journal_open(Oid dboid, Oid spcoid)
 	s->dboid = dboid;
 	s->spcoid = spcoid;
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(IndexEntry);
 	s->ix = jindex_attach(dboid, spcoid, 2 * append_ranges(), &made);
 	s->pending_index = hash_create("prolly journal pending", 256, &ctl,
-								   HASH_ELEM | HASH_BLOBS);
+								   HASH_ELEM | HASH_FUNCTION);
 	initStringInfo(&s->pending);
 	MemoryContextSwitchTo(old);
 
@@ -4378,10 +4397,11 @@ transient_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 		HASHCTL		ctl;
 
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(TransientChunk);
 		ctl.hcxt = TopTransactionContext;
 		s->transient = hash_create("prolly transient chunks", 256, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	}
 	t = hash_search(s->transient, &key, HASH_ENTER, &found);
 	t->data = palloc(Max(len, 1));
@@ -4538,10 +4558,11 @@ ahead_put(int i, const char *data, Size len, void *arg)
 		else
 			MemoryContextReset(s->ahead_cxt);
 		ctl.keysize = sizeof(ProllyHash);
+		ctl.hash = chunk_hash_key_hash;
 		ctl.entrysize = sizeof(AheadEntry);
 		ctl.hcxt = s->ahead_cxt;
 		s->ahead = hash_create("prolly journal read-ahead", 256, &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+							   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 		s->ahead_bytes = 0;
 	}
 	e = hash_search(s->ahead, &af->hashes[i], HASH_ENTER, &found);
@@ -6741,10 +6762,11 @@ journal_conjoin(ProllyChunkStore *s, int max_files)
 	cs.s = s;
 	cs.hash = prolly_content_hash();
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(ProllyHash);
 	ctl.hcxt = CurrentMemoryContext;
 	cs.seen = hash_create("prolly conjoin", 1024, &ctl,
-						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+						  HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	initStringInfo(&cs.bytes);
 	initStringInfo(&cs.chunk);
 
@@ -7489,10 +7511,11 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	gc->next_id = gc->m.last_id + 1;
 
 	ctl.keysize = sizeof(ProllyHash);
+	ctl.hash = chunk_hash_key_hash;
 	ctl.entrysize = sizeof(GcSlot);
 	ctl.hcxt = cxt;
 	gc->slots = hash_create("prolly collection slots", 1024, &ctl,
-							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+							HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 	gc->files = palloc0(sizeof(GcFile) * (gc->m.nsegments + gc->m.nfiles));
 
 	/*
