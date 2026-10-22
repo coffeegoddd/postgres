@@ -233,10 +233,12 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "14", a value of a type whose binary I/O
+ * The format a folded root is in: "15", a foreign table's definition a
+ * line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
+ * TABLE's tail, and was the first with a value of a type whose binary I/O
  * may change (an extension's) tagged with the form it is in, its send
- * format or its text form (prolly_datum.c); "13" had such values untagged; "12", every chunk and hash pointer named
- * by BLAKE3's first 20 bytes; "11" named them by SHA-256, and was the
+ * format or its text form (prolly_datum.c); "13" had such values untagged;
+ * "12", every chunk and hash pointer named by BLAKE3's first 20 bytes; "11" named them by SHA-256, and was the
  * first with primary keys whose opfamily
  * compares them as a type they're binary-coercible to (varchar as text,
  * cidr as inet) ordered by that comparison, rather than rows keyed by
@@ -263,7 +265,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"14"
+#define FOLDED_FORMAT	"15"
 
 /*
  * The format versions of the encoders FOLDED_FORMAT's trees are written
