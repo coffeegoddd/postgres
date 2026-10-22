@@ -44,3 +44,34 @@ SELECT name = 'HI' AS citext_compares FROM public.t;
 \c :db
 DROP DATABASE regress_extclone_dst;
 DROP DATABASE regress_extclone_src;
+
+-- the same with the extensions the other way round: whichever schema an
+-- extension needs comes first, public is still replaced and geo made
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/extclone2-' || txid_current() AS url2 \gset
+CREATE DATABASE regress_extclone_src2;
+\c regress_extclone_src2
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+CREATE SCHEMA geo VERSIONED;
+CREATE EXTENSION hstore SCHEMA public;
+CREATE EXTENSION citext SCHEMA geo;
+CREATE TABLE public.t (id int PRIMARY KEY, attrs public.hstore);
+CREATE TABLE geo.g (id int PRIMARY KEY, name geo.citext);
+INSERT INTO public.t VALUES (1, 'a=>1');
+INSERT INTO geo.g VALUES (1, 'Hi');
+SELECT length(dolt_commit('-Am', 'the other way round')::text) AS committed;
+SELECT dolt_remote('add', 'origin', :'url2');
+SELECT dolt_push('origin', 'main');
+\c :db
+CREATE DATABASE regress_extclone_dst2;
+\c regress_extclone_dst2
+SELECT dolt_clone(:'url2');
+SELECT nspname, nspversioned FROM pg_namespace
+ WHERE nspname IN ('public', 'geo') ORDER BY 1;
+SELECT extname, extnamespace::regnamespace AS schema FROM pg_extension
+ WHERE extname IN ('citext', 'hstore') ORDER BY 1;
+SELECT id, attrs FROM public.t;
+SELECT id, name FROM geo.g;
+\c :db
+DROP DATABASE regress_extclone_dst2;
+DROP DATABASE regress_extclone_src2;

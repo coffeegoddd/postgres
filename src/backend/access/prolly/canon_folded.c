@@ -10417,19 +10417,26 @@ folded_splice_baseline(const ProllyNodeRef *into, const ProllyNodeRef *from,
 }
 
 /*
- * Make versioned schema name (quoted) as a move making it would, before the
- * move: for a clone, which makes the extensions in versioned schemas first.
+ * Make versioned schemas names (quoted) as a move making them would, before
+ * the move: for a clone, which makes the extensions in versioned schemas
+ * first.  Each is judged before any is made, as a move judges the schemas it
+ * makes (make_schema() replaces an ordinary one only while the database has
+ * no versioned schema).
  */
 static void
-folded_make_versioned_schema(const char *name)
+folded_make_versioned_schemas(List *names)
 {
 	Canon		cn;
 	List	   *replaced = NIL;
-	List	   *stmts;
+	List	   *stmts = NIL;
+	ListCell   *lc;
 
+	if (names == NIL)
+		return;
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
-	stmts = make_schema(&cn, name, &replaced);
+	foreach(lc, names)
+		stmts = list_concat(stmts, make_schema(&cn, lfirst(lc), &replaced));
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	run_statements(stmts);
@@ -10467,7 +10474,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.changes = folded_changes,
 	.render = folded_render,
 	.move_schema = folded_move_schema,
-	.make_versioned_schema = folded_make_versioned_schema,
+	.make_versioned_schemas = folded_make_versioned_schemas,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,
 	.dependencies = folded_dependencies,
