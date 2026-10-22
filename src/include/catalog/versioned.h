@@ -36,6 +36,16 @@ extern bool other_branches_have_copies(void);
 /* error if an object on another branch depends on object, being dropped */
 extern void check_other_branch_dependents(const ObjectAddress *object);
 
+/*
+ * the name of another branch whose objects depend on object (with
+ * data_only, only those that can hold its values), or NULL
+ */
+extern char *other_branch_dependent(const ObjectAddress *object,
+									bool data_only);
+
+/* the name of another branch with a typed table of typeOid, or NULL */
+extern char *other_branch_typed_table(Oid typeOid);
+
 /* the access method a new relation in namespace nspid gets */
 extern Oid	versioned_relation_am(Oid nspid, Oid amoid, char relkind,
 								  char relpersistence, bool explicit);

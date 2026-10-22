@@ -7064,6 +7064,34 @@ find_composite_type_dependencies(Oid typeOid, Relation origRelation,
 	check_stack_depth();
 
 	/*
+	 * Columns of a shared type on another branch can't be checked from
+	 * here: refuse if there are any.
+	 */
+	{
+		ObjectAddress type;
+		char	   *branch;
+
+		ObjectAddressSet(type, TypeRelationId, typeOid);
+		branch = other_branch_dependent(&type, true);
+		if (branch)
+		{
+			if (origTypeName || origRelation->rd_rel->relkind == RELKIND_COMPOSITE_TYPE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot alter type \"%s\" because columns on branch \"%s\" use it",
+								origTypeName ? origTypeName :
+								RelationGetRelationName(origRelation), branch),
+						 errhint("The type is shared by every branch.")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot alter table \"%s\" because columns on branch \"%s\" use its row type",
+								RelationGetRelationName(origRelation), branch),
+						 errhint("The table is shared by every branch.")));
+		}
+	}
+
+	/*
 	 * We scan pg_depend to find those things that depend on the given type.
 	 * (We assume we can ignore refobjsubid for a type.)
 	 */
@@ -7217,6 +7245,16 @@ find_typed_table_dependencies(Oid typeOid, const char *typeName, DropBehavior be
 	TableScanDesc scan;
 	HeapTuple	tuple;
 	List	   *result = NIL;
+	char	   *branch;
+
+	/* another branch's typed tables can't be altered from here */
+	branch = other_branch_typed_table(typeOid);
+	if (branch)
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot alter type \"%s\" because it is the type of a typed table on branch \"%s\"",
+						typeName, branch),
+				 errhint("The type is shared by every branch.")));
 
 	classRel = table_open(RelationRelationId, AccessShareLock);
 
@@ -15595,6 +15633,27 @@ RememberAllDependentForRebuilding(AlteredTableInfo *tab, AlterTableType subtype,
 	HeapTuple	depTup;
 
 	Assert(subtype == AT_AlterColumnType || subtype == AT_SetExpression);
+
+	/*
+	 * What depends on a shared table's column on another branch can't be
+	 * rebuilt from here.
+	 */
+	{
+		ObjectAddress col;
+		char	   *branch;
+
+		ObjectAddressSubSet(col, RelationRelationId, RelationGetRelid(rel), attnum);
+		branch = other_branch_dependent(&col, false);
+		if (branch)
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 subtype == AT_AlterColumnType ?
+					 errmsg("cannot alter type of column \"%s\" because objects on branch \"%s\" depend on it",
+							colName, branch) :
+					 errmsg("cannot alter generation expression of column \"%s\" because objects on branch \"%s\" depend on it",
+							colName, branch),
+					 errhint("The table is shared by every branch.  Drop or change what depends on the column on each branch first.")));
+	}
 
 	depRel = table_open(DependRelationId, RowExclusiveLock);
 

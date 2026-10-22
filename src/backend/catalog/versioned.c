@@ -60,6 +60,7 @@
 #include "catalog/pg_policy.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_trigger.h"
+#include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
@@ -372,17 +373,32 @@ other_branches_have_copies(void)
 	return found;
 }
 
-/*
- * Error if an object on a branch other than the session's depends on
- * object, which is about to be dropped.  Only a shared object can have
- * such dependents: a versioned one is the session's branch's own copy.
- * Callers dropping many objects ask other_branches_have_copies() once
- * first.
- */
-void
-check_other_branch_dependents(const ObjectAddress *object)
+/* a branch's name for a message */
+static char *
+branch_name_for_message(Oid branch)
 {
-	const CatalogBranchInfo *info;
+	HeapTuple	tup = SearchSysCache1(BRANCHOID, ObjectIdGetDatum(branch));
+	char	   *name;
+
+	if (!HeapTupleIsValid(tup))
+		return psprintf("%u", branch);
+	name = pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+	ReleaseSysCache(tup);
+	return name;
+}
+
+/*
+ * The branches other than the session's whose objects depend on object
+ * (on that column, for a column).  With data_only, only those that can
+ * hold its values: a column, a typed table, or a type built on it (a
+ * domain, array, range or composite), whose own uses there can't be
+ * followed from here.  The scan builds no cache entry, so it may see every
+ * branch's rows.
+ */
+static List *
+branches_depending(const ObjectAddress *object, bool data_only)
+{
+	const CatalogBranchInfo *info = catalog_branch_info(DependRelationId);
 	Relation	depRel;
 	ScanKeyData key[3];
 	int			nkeys;
@@ -390,10 +406,6 @@ check_other_branch_dependents(const ObjectAddress *object)
 	HeapTuple	tup;
 	List	   *others = NIL;
 
-	if (object_is_versioned(object))
-		return;
-
-	info = catalog_branch_info(DependRelationId);
 	depRel = table_open(DependRelationId, AccessShareLock);
 	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber,
 				F_OIDEQ, ObjectIdGetDatum(object->classId));
@@ -410,7 +422,6 @@ check_other_branch_dependents(const ObjectAddress *object)
 	else
 		nkeys = 2;
 
-	/* the scan builds no cache entry, so it may see every branch's rows */
 	CatalogAllBranches = true;
 	PG_TRY();
 	{
@@ -418,9 +429,13 @@ check_other_branch_dependents(const ObjectAddress *object)
 								  NULL, nkeys, key);
 		while (HeapTupleIsValid(tup = systable_getnext(scan)))
 		{
+			Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
 			Oid			branch = catalog_row_branch(info, tup);
 
 			if (!OidIsValid(branch) || branch == MyBranch)
+				continue;
+			if (data_only && dep->classid != TypeRelationId &&
+				dep->classid != RelationRelationId)
 				continue;
 			others = list_append_unique_oid(others, branch);
 		}
@@ -432,26 +447,96 @@ check_other_branch_dependents(const ObjectAddress *object)
 	}
 	PG_END_TRY();
 	table_close(depRel, AccessShareLock);
+	return others;
+}
 
+/*
+ * Error if an object on a branch other than the session's depends on
+ * object, which is about to be dropped.  Only a shared object can have
+ * such dependents: a versioned one is the session's branch's own copy.
+ * Callers dropping many objects ask other_branches_have_copies() once
+ * first.
+ */
+void
+check_other_branch_dependents(const ObjectAddress *object)
+{
+	List	   *others;
+
+	if (object_is_versioned(object))
+		return;
+	others = branches_depending(object, false);
 	if (others != NIL)
-	{
-		Oid			other = linitial_oid(others);
-		HeapTuple	btup = SearchSysCache1(BRANCHOID, ObjectIdGetDatum(other));
-		char	   *name = HeapTupleIsValid(btup) ?
-			pstrdup(NameStr(((Form_pg_branch) GETSTRUCT(btup))->brname)) :
-			psprintf("%u", other);
-
-		if (HeapTupleIsValid(btup))
-			ReleaseSysCache(btup);
 		ereport(ERROR,
 				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 				 errmsg("cannot drop %s because objects on branch \"%s\" depend on it",
-						getObjectDescription(object, false), name),
+						getObjectDescription(object, false),
+						branch_name_for_message(linitial_oid(others))),
 				 list_length(others) > 1 ?
 				 errdetail("Objects on %d branches other than the session's depend on it.",
 						   list_length(others)) : 0,
 				 errhint("It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.")));
+}
+
+/*
+ * The name of a branch other than the session's whose objects depend on
+ * object (only those that can hold its values, with data_only), or NULL if
+ * there is none: for changes to a shared object that check or rebuild its
+ * dependents, which can only be done on their own branch.
+ */
+char *
+other_branch_dependent(const ObjectAddress *object, bool data_only)
+{
+	List	   *others;
+
+	if (!other_branches_have_copies() || object_is_versioned(object))
+		return NULL;
+	others = branches_depending(object, data_only);
+	return others != NIL ? branch_name_for_message(linitial_oid(others)) : NULL;
+}
+
+/*
+ * The name of a branch other than the session's that has a typed table of
+ * composite type typeOid, or NULL if none has.
+ */
+char *
+other_branch_typed_table(Oid typeOid)
+{
+	const CatalogBranchInfo *info;
+	Relation	rel;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	Oid			other = InvalidOid;
+
+	if (!other_branches_have_copies())
+		return NULL;
+	info = catalog_branch_info(RelationRelationId);
+	rel = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_class_reloftype, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(typeOid));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, key);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Oid			branch = catalog_row_branch(info, tup);
+
+			if (OidIsValid(branch) && branch != MyBranch)
+			{
+				other = branch;
+				break;
+			}
+		}
+		systable_endscan(scan);
 	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+	return OidIsValid(other) ? branch_name_for_message(other) : NULL;
 }
 
 Oid
