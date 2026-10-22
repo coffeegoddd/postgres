@@ -243,6 +243,13 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(rows[0]['short_cpu_observations'], '2')
             self.assertIn('[short 2/2]', (path/'report.md').read_text())
 
+    def test_id_sets_doltgres_plans_in_linear_time(self):
+        ids = [1, 962, 1923]
+        for name in ('dolt', 'prolly'):
+            self.assertEqual(core.ENGINES[name].ids_in(ids), 'id IN (1,962,1923)')
+        self.assertEqual(core.ENGINES['doltgres'].ids_in(ids),
+                         'id IN (SELECT id FROM (VALUES (1),(962),(1923)) v(id))')
+
     def test_go_engines_both_disable_auto_gc(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

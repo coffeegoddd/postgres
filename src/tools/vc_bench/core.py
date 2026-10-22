@@ -265,6 +265,9 @@ class SQL:
     def diff_sql(self, a, b):
         return self.adapter.diff_sql(a, b)
 
+    def ids_in(self, ids):
+        return self.adapter.ids_in(ids)
+
 
 def disk_size(path):
     apparent = allocated = 0
