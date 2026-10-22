@@ -468,7 +468,8 @@ static HTAB *own_logs = NULL;	/* OwnLog; the transaction's */
 /*
  * A bulk write stops being noted (#499): past this many distinct entries of
  * a log in a transaction (a key written again is the same entry), or a
- * quarter of its table's rows if more, its entries are dropped for one
+ * quarter of its table's rows if more (as table_rows() estimates them),
+ * its entries are dropped for one
  * saying to read the table in full, writing and reading back so many
  * costing about what that read does; a table made in the transaction (no
  * baseline to fold from) isn't noted at all.  Per (sub)transaction, so a
@@ -491,6 +492,7 @@ typedef struct LogNotes
 	NoteLevel  *levels;
 	int64		noted;			/* the levels' summed */
 	int			nstopped;		/* levels stopped */
+	double		rows;			/* its table's estimated, -1: not asked yet */
 } LogNotes;
 
 static HTAB *notes = NULL;		/* LogNotes; the transaction's */
@@ -758,6 +760,70 @@ notes_stopped(Oid logid)
 }
 
 /*
+ * A table's rows, about, as they were before the transaction: its
+ * statistics' density (reltuples a page) at its size now, or, a table
+ * never vacuumed or analyzed having none, the rows on a few of its pages
+ * spread over it, those live or being deleted (the versions the
+ * transaction replaced are counted, not those it made, nor any dead).  The
+ * planner's estimate without statistics takes a value its type's average
+ * width, many times the rows of a table of long values.
+ */
+#define ROWS_SAMPLE_PAGES	64
+
+static double
+table_rows(Relation rel)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	BufferAccessStrategy strategy;
+	BlockNumber sampled = 0;
+	double		tuples = 0;
+	TransactionId horizon;
+
+	if (nblocks == 0)
+		return 0;
+	if (rel->rd_rel->reltuples >= 0 && rel->rd_rel->relpages > 0)
+		return rel->rd_rel->reltuples / rel->rd_rel->relpages * nblocks;
+	horizon = GetOldestNonRemovableTransactionId(rel);
+	strategy = GetAccessStrategy(BAS_BULKREAD);
+	for (BlockNumber i = 0; i < Min(nblocks, ROWS_SAMPLE_PAGES); i++)
+	{
+		BlockNumber blk = (BlockNumber) ((uint64) i * nblocks /
+										 Min(nblocks, ROWS_SAMPLE_PAGES));
+		Buffer		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blk,
+											 RBM_NORMAL, strategy);
+		Page		page;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!PageIsNew(page))
+		{
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+			for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				ItemId		id = PageGetItemId(page, off);
+				HeapTupleData tup;
+				HTSV_Result r;
+
+				if (!ItemIdIsNormal(id))
+					continue;
+				tup.t_data = (HeapTupleHeader) PageGetItem(page, id);
+				tup.t_len = ItemIdGetLength(id);
+				tup.t_tableOid = RelationGetRelid(rel);
+				ItemPointerSet(&tup.t_self, blk, off);
+				r = HeapTupleSatisfiesVacuum(&tup, horizon, buf);
+				if (r == HEAPTUPLE_LIVE || r == HEAPTUPLE_DELETE_IN_PROGRESS)
+					tuples++;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+		sampled++;
+	}
+	FreeAccessStrategy(strategy);
+	return tuples / sampled * nblocks;
+}
+
+/*
  * Count a write's n entries of rel's log its buffer didn't hold (the
  * entries a fold would read, not the writes: a key updated many times is
  * one); past the bulk limit (or for a table made in the transaction),
@@ -793,6 +859,7 @@ notes_count(Relation rel, Oid logid, int n)
 										ln->max * sizeof(NoteLevel));
 		ln->noted = 0;
 		ln->nstopped = 0;
+		ln->rows = -1;
 	}
 	if (ln->n == 0 || ln->levels[ln->n - 1].subid != cur)
 	{
@@ -806,8 +873,14 @@ notes_count(Relation rel, Oid logid, int n)
 	top = &ln->levels[ln->n - 1];
 	top->noted += n;
 	ln->noted += n;
-	if (rel->rd_rel->reltuples > 0)
-		limit = Max(limit, 0.25 * rel->rd_rel->reltuples);
+	if (rel->rd_createSubid == InvalidSubTransactionId &&
+		(double) ln->noted > limit)
+	{
+		/* (asked once the entries pass the least limit, then kept) */
+		if (ln->rows < 0)
+			ln->rows = table_rows(rel);
+		limit = Max(limit, 0.25 * ln->rows);
+	}
 	if (rel->rd_createSubid == InvalidSubTransactionId &&
 		(double) ln->noted <= limit)
 		return;

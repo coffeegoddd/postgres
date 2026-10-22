@@ -273,5 +273,46 @@ SELECT same_as_full() AS hot;
 (1 row)
 
 COMMIT;
+-- a quarter of a table never vacuumed or analyzed (no reltuples): its rows
+-- counted from its pages, so 70000 entries of 300000 rows' table are
+-- noted, and 85000, past a quarter, aren't
+CREATE TABLE bn.e (id int PRIMARY KEY, v text);
+INSERT INTO bn.e SELECT g, 'v' FROM generate_series(1, 300000) g;
+SELECT length(dolt_commit('-Am', 'estimated')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT reltuples < 0 AS never_counted FROM pg_class WHERE oid = 'bn.e'::regclass;
+ never_counted 
+---------------
+ t
+(1 row)
+
+BEGIN;
+UPDATE bn.e SET v = 'w' WHERE id <= 70000;
+SELECT * FROM entries('bn.e');
+   n   | full_read 
+-------+-----------
+ 70000 | f
+(1 row)
+
+SELECT same_as_full() AS quarter_under;
+ quarter_under 
+---------------
+ t
+(1 row)
+
+ROLLBACK;
+BEGIN;
+UPDATE bn.e SET v = 'w' WHERE id <= 85000;
+SELECT (entries('bn.e')).full_read AS quarter_past;
+ quarter_past 
+--------------
+ t
+(1 row)
+
+ROLLBACK;
 \c contrib_regression
 DROP DATABASE regress_bulk_notes;
