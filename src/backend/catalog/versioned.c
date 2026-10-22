@@ -801,22 +801,28 @@ check_versioned_schema_change(Oid nspid, const char *what)
  * Error if an object would move between an extension and a versioned
  * schema's versioned objects (ALTER EXTENSION ... ADD or DROP), or an
  * extension between a versioned schema and another (ALTER EXTENSION ...
- * SET SCHEMA): one is shared, the other each branch's.
+ * SET SCHEMA): one is shared, the other each branch's.  An object an
+ * extension's script makes is shared already, so its script may add it;
+ * and its script may let one of its objects go (update scripts do, before
+ * dropping it), which stays shared until it is dropped.
  */
 void
 check_versioned_extension_member(const ObjectAddress *object, bool adding)
 {
 	Oid			nsp = get_object_namespace(object);
 
-	if (OidIsValid(nsp) && namespace_is_versioned(nsp))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 adding ?
-				 errmsg("cannot add %s to an extension: it is in versioned schema \"%s\"",
-						getObjectDescription(object, false), get_namespace_name(nsp)) :
-				 errmsg("cannot remove %s from its extension: it is in versioned schema \"%s\"",
-						getObjectDescription(object, false), get_namespace_name(nsp)),
-				 errdetail("An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.")));
+	if (!OidIsValid(nsp) || !namespace_is_versioned(nsp))
+		return;
+	if (adding ? !object_is_versioned(object) : creating_extension)
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 adding ?
+			 errmsg("cannot add %s to an extension: it is in versioned schema \"%s\"",
+					getObjectDescription(object, false), get_namespace_name(nsp)) :
+			 errmsg("cannot remove %s from its extension: it is in versioned schema \"%s\"",
+					getObjectDescription(object, false), get_namespace_name(nsp)),
+			 errdetail("An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.")));
 }
 
 void

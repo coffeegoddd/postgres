@@ -139,5 +139,17 @@ SET search_path = public, v;
 SELECT 'Red'::v.citext = 'RED'::v.citext AS shared_citext, v.test_prolly_ext_count() AS rows;
 SELECT dolt_checkout('main');
 
+-- an extension's own scripts may let its objects go (cube's and seg's do,
+-- installing and updating), in a versioned schema too; a user's ALTER
+-- EXTENSION ... DROP there is still refused
+CREATE EXTENSION cube VERSION '1.4' SCHEMA v;
+ALTER EXTENSION cube UPDATE TO '1.5';
+CREATE EXTENSION seg SCHEMA v;
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('cube', 'seg') ORDER BY 1;
+SELECT count(*) FILTER (WHERE probranch <> 0) AS versioned_members
+  FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+ WHERE d.deptype = 'e' AND d.refobjid IN (SELECT oid FROM pg_extension WHERE extname IN ('cube', 'seg'));
+ALTER EXTENSION seg DROP FUNCTION v.seg_size(v.seg);
+
 \c contrib_regression
 DROP DATABASE regress_versioned_extensions2;

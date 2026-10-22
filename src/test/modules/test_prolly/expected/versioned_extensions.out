@@ -383,5 +383,29 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- an extension's own scripts may let its objects go (cube's and seg's do,
+-- installing and updating), in a versioned schema too; a user's ALTER
+-- EXTENSION ... DROP there is still refused
+CREATE EXTENSION cube VERSION '1.4' SCHEMA v;
+ALTER EXTENSION cube UPDATE TO '1.5';
+CREATE EXTENSION seg SCHEMA v;
+SELECT extname, extversion FROM pg_extension WHERE extname IN ('cube', 'seg') ORDER BY 1;
+ extname | extversion 
+---------+------------
+ cube    | 1.5
+ seg     | 1.4
+(2 rows)
+
+SELECT count(*) FILTER (WHERE probranch <> 0) AS versioned_members
+  FROM pg_proc p JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+ WHERE d.deptype = 'e' AND d.refobjid IN (SELECT oid FROM pg_extension WHERE extname IN ('cube', 'seg'));
+ versioned_members 
+-------------------
+                 0
+(1 row)
+
+ALTER EXTENSION seg DROP FUNCTION v.seg_size(v.seg);
+ERROR:  cannot remove function seg_size(seg) from its extension: it is in versioned schema "v"
+DETAIL:  An extension's objects are shared by every branch; a versioned schema's other objects are each branch's.
 \c contrib_regression
 DROP DATABASE regress_versioned_extensions2;
