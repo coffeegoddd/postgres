@@ -3034,8 +3034,25 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 static void
 copies_set_head(const ProllyHash *commit_id)
 {
+	char	   *name = branch_ops()->current();
+	ProllyHash	head;
+	bool		have_head;
+	StringInfoData anchor;
+	bool		anchored;
+
 	lock_refs();
-	branch_set_head(branch_ops()->current(), commit_id);
+	have_head = branch_head(name, &head);
+	initStringInfo(&anchor);
+	anchored = anchor_of(name, have_head ? &head : NULL, &anchor);
+	branch_set_head(name, commit_id);
+
+	/*
+	 * (the working set's relations, and what they are, are as they were:
+	 * its anchor is still theirs, now as of the head moved to)
+	 */
+	if (anchored)
+		note_anchor(name, commit_id, &anchor);
+	pfree(anchor.data);
 }
 
 /*

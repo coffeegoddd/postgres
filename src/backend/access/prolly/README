@@ -166,10 +166,15 @@ A branch's working set finds its identities through its own relations
 and attribute numbers, which a rename keeps and a drop and an add don't.
 The refs keep an anchor for each branch ('I'), written by each commit and
 after each move.  The anchor is valid only for the head it was made at.
-Each live table and column is found in the anchor, then by its name in
-the head's identity record, then given its own name's identity.  A column
-dropped and another of its name added gets the dropped column's identity,
-as Dolt's tags do.
+Each live table and column is found in the anchor; one the anchor hasn't
+is new since and gets its own name's identity (the first of that name's
+that no live object holds).  Without an anchor of the head (the branch
+moved without one made), each is found by its name in the head's identity
+record.  So a column dropped and another of its name added gets the
+dropped column's identity if that was its own name's, as Dolt's tags do,
+but never the identity of a column renamed into the name.  Identities are
+read from the catalogs, without opening (or locking) any relation, and a
+read of one table identifies that table alone.
 
 Reads match versions by identity.  dolt_at, dolt_history_table,
 dolt_diff_table, row diffs, and a merge's conflict listing read each

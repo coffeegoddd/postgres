@@ -193,6 +193,65 @@ ALTER TABLE app.p RENAME COLUMN v TO renamed_again;
 SELECT * FROM dolt_at('HEAD', NULL::app.p);
 SELECT dolt_reset('--hard');
 
+-- One side renames a column (and a table), the other names them in new
+-- definitions: an index and a check on the column, an index on the table.
+CREATE TABLE app.i (id int PRIMARY KEY, v text);
+CREATE TABLE app.j (id int PRIMARY KEY, w text);
+INSERT INTO app.i VALUES (1, 'one');
+INSERT INTO app.j VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'i base')::text) AS committed;
+SELECT dolt_branch('i_theirs');
+ALTER TABLE app.i RENAME COLUMN v TO val;
+ALTER TABLE app.j RENAME TO j2;
+SELECT length(dolt_commit('-Am', 'i ours renames')::text) AS committed;
+SELECT dolt_checkout('i_theirs');
+CREATE INDEX i_v_idx ON app.i (v);
+ALTER TABLE app.i ADD CONSTRAINT i_v_check CHECK (v <> '');
+CREATE INDEX j_w_idx ON app.j (lower(w));
+UPDATE app.i SET v = 'uno';
+SELECT length(dolt_commit('-Am', 'i theirs definitions')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('i_theirs'))[3] AS conflicts;
+SELECT * FROM app.i;
+SELECT pg_get_indexdef('app.i_v_idx'::regclass) AS index_on_val,
+	   pg_get_constraintdef(oid) AS check_on_val
+FROM pg_constraint WHERE conname = 'i_v_check';
+SELECT pg_get_indexdef('app.j_w_idx'::regclass) AS index_on_j2;
+SELECT * FROM dolt_status;
+
+-- A soft reset past a rename keeps it a rename (the working set's
+-- identities are as they were, of the head moved to).
+CREATE TABLE app.b (id int PRIMARY KEY, email text);
+INSERT INTO app.b VALUES (1, 'b1');
+SELECT length(dolt_commit('-Am', 'b base')::text) AS committed;
+SELECT dolt_branch('b_theirs');
+ALTER TABLE app.b RENAME COLUMN email TO address;
+SELECT length(dolt_commit('-Am', 'b renamed')::text) AS committed;
+SELECT dolt_reset('--soft', 'HEAD~1');
+SELECT * FROM dolt_at('HEAD', NULL::app.b);
+SELECT position(E'c\tapp.b\taddress\temail' IN test_working_identity()) > 0
+	AS still_renamed;
+SELECT length(dolt_commit('-Am', 'b renamed again')::text) AS committed;
+SELECT dolt_checkout('b_theirs');
+UPDATE app.b SET email = 'b2';
+SELECT length(dolt_commit('-Am', 'b theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('b_theirs'))[3] AS conflicts;
+SELECT * FROM app.b;
+
+-- A column dropped since a commit and made again under the name a rename
+-- gave it is another column: it doesn't take the renamed one's identity.
+CREATE TABLE app.re (id int PRIMARY KEY, email text);
+INSERT INTO app.re VALUES (1, 'old');
+SELECT length(dolt_commit('-Am', 're base')::text) AS committed;
+ALTER TABLE app.re RENAME COLUMN email TO address;
+SELECT length(dolt_commit('-Am', 're renamed')::text) AS committed;
+ALTER TABLE app.re DROP COLUMN address;
+ALTER TABLE app.re ADD COLUMN address text;
+SELECT * FROM dolt_at('HEAD', NULL::app.re);
+SELECT * FROM dolt_at('HEAD~1', NULL::app.re);
+SELECT dolt_reset('--hard');
+
 -- The same tables and rows reached by other renames are the same root;
 -- only the identities their commits record differ.
 SELECT dolt_checkout('-b', 'plain', 'HEAD');

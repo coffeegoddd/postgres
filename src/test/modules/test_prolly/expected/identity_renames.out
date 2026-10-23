@@ -700,6 +700,201 @@ SELECT dolt_reset('--hard');
  {0}
 (1 row)
 
+-- One side renames a column (and a table), the other names them in new
+-- definitions: an index and a check on the column, an index on the table.
+CREATE TABLE app.i (id int PRIMARY KEY, v text);
+CREATE TABLE app.j (id int PRIMARY KEY, w text);
+INSERT INTO app.i VALUES (1, 'one');
+INSERT INTO app.j VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'i base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('i_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.i RENAME COLUMN v TO val;
+ALTER TABLE app.j RENAME TO j2;
+SELECT length(dolt_commit('-Am', 'i ours renames')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('i_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'i_theirs'"}
+(1 row)
+
+CREATE INDEX i_v_idx ON app.i (v);
+ALTER TABLE app.i ADD CONSTRAINT i_v_check CHECK (v <> '');
+CREATE INDEX j_w_idx ON app.j (lower(w));
+UPDATE app.i SET v = 'uno';
+SELECT length(dolt_commit('-Am', 'i theirs definitions')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('i_theirs'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.i;
+ id | val 
+----+-----
+  1 | uno
+(1 row)
+
+SELECT pg_get_indexdef('app.i_v_idx'::regclass) AS index_on_val,
+	   pg_get_constraintdef(oid) AS check_on_val
+FROM pg_constraint WHERE conname = 'i_v_check';
+                  index_on_val                   |       check_on_val        
+-------------------------------------------------+---------------------------
+ CREATE INDEX i_v_idx ON app.i USING btree (val) | CHECK ((val <> ''::text))
+(1 row)
+
+SELECT pg_get_indexdef('app.j_w_idx'::regclass) AS index_on_j2;
+                      index_on_j2                      
+-------------------------------------------------------
+ CREATE INDEX j_w_idx ON app.j2 USING btree (lower(w))
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A soft reset past a rename keeps it a rename (the working set's
+-- identities are as they were, of the head moved to).
+CREATE TABLE app.b (id int PRIMARY KEY, email text);
+INSERT INTO app.b VALUES (1, 'b1');
+SELECT length(dolt_commit('-Am', 'b base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('b_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.b RENAME COLUMN email TO address;
+SELECT length(dolt_commit('-Am', 'b renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_reset('--soft', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM dolt_at('HEAD', NULL::app.b);
+ id | address 
+----+---------
+  1 | b1
+(1 row)
+
+SELECT position(E'c\tapp.b\taddress\temail' IN test_working_identity()) > 0
+	AS still_renamed;
+ still_renamed 
+---------------
+ t
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'b renamed again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('b_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'b_theirs'"}
+(1 row)
+
+UPDATE app.b SET email = 'b2';
+SELECT length(dolt_commit('-Am', 'b theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('b_theirs'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.b;
+ id | address 
+----+---------
+  1 | b2
+(1 row)
+
+-- A column dropped since a commit and made again under the name a rename
+-- gave it is another column: it doesn't take the renamed one's identity.
+CREATE TABLE app.re (id int PRIMARY KEY, email text);
+INSERT INTO app.re VALUES (1, 'old');
+SELECT length(dolt_commit('-Am', 're base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE app.re RENAME COLUMN email TO address;
+SELECT length(dolt_commit('-Am', 're renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE app.re DROP COLUMN address;
+ALTER TABLE app.re ADD COLUMN address text;
+SELECT * FROM dolt_at('HEAD', NULL::app.re);
+ id | address 
+----+---------
+  1 | 
+(1 row)
+
+SELECT * FROM dolt_at('HEAD~1', NULL::app.re);
+ id | address 
+----+---------
+  1 | 
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
 -- The same tables and rows reached by other renames are the same root;
 -- only the identities their commits record differ.
 SELECT dolt_checkout('-b', 'plain', 'HEAD');

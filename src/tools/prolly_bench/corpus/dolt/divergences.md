@@ -461,7 +461,8 @@ OF` are built in D18's shapes.
   versions before the rename. A column
   dropped changes no row (the rows read the same); one dropped and
   another of its name added has the dropped one's identity, as Dolt's
-  tags do. A column of another type in an older version is converted to
+  tags do (unless the dropped one had been renamed into the name: then
+  the new one is another column). A column of another type in an older version is converted to
   today's type (text `'3'` reads as integer 3, where Dolt gives NULL).
   History of an older folded format (17 or before) isn't read: its rows
   are unreadable here. A table's

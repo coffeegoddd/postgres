@@ -391,12 +391,13 @@ typedef struct ProllyCanonRoutine
 	 * Optional: the identity of the session branch's tables and columns,
 	 * into *identity, as a commit records it beside its root; and what to
 	 * find it from next time, into *next_anchor (by the branch's own
-	 * relations and attributes, which a rename keeps).  Each table and
-	 * column is found in anchor (a next_anchor given before; NULL: none),
-	 * else by its name in known (an identity record, NULL: none), else
-	 * given its own name's identity: anchor NULL and known a root's record
-	 * for a working set just made that root's.  With only valid, only that
-	 * table is identified (and next_anchor is NULL).
+	 * relations and attributes, which a rename keeps).  With an anchor (a
+	 * next_anchor given before), each table and column is found in it, and
+	 * one it hasn't, new since, is given its own name's identity (the first
+	 * of that name's free).  With none (NULL), each is found by its name in
+	 * known (an identity record, NULL: none): a working set just made what
+	 * known describes.  Read from the catalogs, no relation opened.  With
+	 * only valid, only that table is identified (and next_anchor is NULL).
 	 */
 	void		(*identify) (const ProllyValue *anchor, const ProllyValue *known,
 							 Oid only, StringInfo identity,

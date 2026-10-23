@@ -11942,64 +11942,100 @@ identity_record(List *tables, StringInfo out)
 }
 
 /*
- * The session branch's tables and columns, each found as its anchor
- * entry says (its relation and attribute numbers kept through renames),
- * else by name in known, else by its own name: its identity is that of
- * the object it was before, so a rename since the commit known is of keeps
- * it, and a column added (of a name another had, or not) has a new one.
+ * A relation of the session branch's that identities are kept for (a
+ * prolly table or a partitioned table, in a versioned schema, not an
+ * extension's), with its live columns, as an IdObject; NULL if it isn't
+ * one.  Read from the catalogs alone, without opening (or locking) the
+ * relation: identities are worked out for reads of any table, which
+ * mustn't wait for another's locks.
  */
-static void
-folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
-				StringInfo identity, StringInfo next_anchor)
+static IdObject *
+identified_relation(Form_pg_class form)
 {
-	List	   *anchors = identity_entries(anchor, true);
-	List	   *entries = identity_entries(known, false);
-	List	   *tables = NIL;
-	Relation	pg_class;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	ListCell   *lc;
+	IdObject   *t;
 
-	pg_class = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
-	while ((tup = systable_getnext(scan)) != NULL)
+	if (!((form->relkind == RELKIND_RELATION &&
+		   form->relam == PROLLY_TABLE_AM_OID) ||
+		  form->relkind == RELKIND_PARTITIONED_TABLE) ||
+		!canon_namespace(form->relnamespace) ||
+		in_extension(RelationRelationId, form->oid))
+		return NULL;
+	t = palloc0(sizeof(IdObject));
+	t->name = qualified(form->relnamespace, NameStr(form->relname));
+	t->relid = form->oid;
+	for (AttrNumber a = 1; a <= form->relnatts; a++)
 	{
-		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
-		IdObject   *t;
-		Relation	rel;
-		TupleDesc	desc;
+		HeapTuple	at = SearchSysCache2(ATTNUM, ObjectIdGetDatum(form->oid),
+										 Int16GetDatum(a));
+		Form_pg_attribute att;
+		IdObject   *col;
 
-		if (OidIsValid(only) && form->oid != only)
+		if (!HeapTupleIsValid(at))
 			continue;
-		if (!((form->relkind == RELKIND_RELATION &&
-			   form->relam == PROLLY_TABLE_AM_OID) ||
-			  form->relkind == RELKIND_PARTITIONED_TABLE) ||
-			!canon_namespace(form->relnamespace) ||
-			in_extension(RelationRelationId, form->oid))
-			continue;
-		t = palloc0(sizeof(IdObject));
-		t->name = qualified(form->relnamespace, NameStr(form->relname));
-		t->relid = form->oid;
-		rel = relation_open(form->oid, AccessShareLock);
-		desc = RelationGetDescr(rel);
-		for (int i = 0; i < desc->natts; i++)
+		att = (Form_pg_attribute) GETSTRUCT(at);
+		if (!att->attisdropped)
 		{
-			Form_pg_attribute att = TupleDescAttr(desc, i);
-			IdObject   *col;
-
-			if (att->attisdropped)
-				continue;
 			col = palloc0(sizeof(IdObject));
 			col->name = pstrdup(NameStr(att->attname));
 			col->relid = form->oid;
 			col->attnum = att->attnum;
 			t->columns = lappend(t->columns, col);
 		}
-		relation_close(rel, AccessShareLock);
-		tables = lappend(tables, t);
+		ReleaseSysCache(at);
 	}
-	systable_endscan(scan);
-	table_close(pg_class, AccessShareLock);
+	return t;
+}
+
+/*
+ * The session branch's tables and columns (only's alone, if valid), each
+ * found as its anchor entry says (its relation and attribute numbers kept
+ * through renames), its identity that of the object it was before, so a
+ * rename since keeps it.  With an anchor, one it hasn't is new since:
+ * given its own name's identity (or, held, the first of that name's free),
+ * never another's that its name had (an object dropped since and made
+ * again under the name a rename gave the old one is another).  With none
+ * (the working set just made what known describes, or moved since), each
+ * is found by name in known.
+ */
+static void
+folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
+				StringInfo identity, StringInfo next_anchor)
+{
+	List	   *anchors = identity_entries(anchor, true);
+	List	   *entries = anchor ? NIL : identity_entries(known, false);
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	if (OidIsValid(only))
+	{
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(only));
+
+		if (HeapTupleIsValid(tup))
+		{
+			IdObject   *t = identified_relation((Form_pg_class) GETSTRUCT(tup));
+
+			if (t)
+				tables = lappend(tables, t);
+			ReleaseSysCache(tup);
+		}
+	}
+	else
+	{
+		Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+		SysScanDesc scan = systable_beginscan(pg_class, InvalidOid, false,
+											  NULL, 0, NULL);
+		HeapTuple	tup;
+
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			IdObject   *t = identified_relation((Form_pg_class) GETSTRUCT(tup));
+
+			if (t)
+				tables = lappend(tables, t);
+		}
+		systable_endscan(scan);
+		table_close(pg_class, AccessShareLock);
+	}
 
 	/* (in name order, so that a name's identities are given alike everywhere) */
 	list_sort(tables, id_object_cmp);
@@ -12395,8 +12431,326 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 }
 
 /*
- * A table's description (UTF-8, as its item holds it) with its columns
- * renamed as renames say for table, into out.
+ * A token of SQL as the deparser prints it, for renaming the tables and
+ * columns it names: an identifier (quoted or not, its name in value), a
+ * literal or anything else, copied as it is.
+ */
+typedef struct SqlToken
+{
+	int			start;
+	int			end;
+	bool		ident;
+	bool		quoted;
+	char	   *value;			/* (an identifier's name) */
+} SqlToken;
+
+/* The tokens of sql, in order. */
+static List *
+sql_tokens(const char *sql)
+{
+	List	   *tokens = NIL;
+	int			n = strlen(sql);
+	int			i = 0;
+
+	while (i < n)
+	{
+		SqlToken   *t = palloc0(sizeof(SqlToken));
+		unsigned char c = (unsigned char) sql[i];
+
+		t->start = i;
+		if (c == '\'' || ((c == 'E' || c == 'e') && sql[i + 1] == '\'' &&
+						  (i == 0 || !(isalnum((unsigned char) sql[i - 1]) ||
+									   sql[i - 1] == '_'))))
+		{
+			bool		escapes = c != '\'';
+
+			i += escapes ? 2 : 1;
+			while (i < n)
+			{
+				if (escapes && sql[i] == '\\' && i + 1 < n)
+					i += 2;
+				else if (sql[i] == '\'' && sql[i + 1] == '\'')
+					i += 2;
+				else if (sql[i] == '\'')
+				{
+					i++;
+					break;
+				}
+				else
+					i++;
+			}
+		}
+		else if (c == '$' && (sql[i + 1] == '$' || isalpha((unsigned char) sql[i + 1]) ||
+							  sql[i + 1] == '_'))
+		{
+			int			j = i + 1;
+			char	   *tag;
+			const char *close;
+
+			while (j < n && (isalnum((unsigned char) sql[j]) || sql[j] == '_'))
+				j++;
+			if (sql[j] != '$')
+				i = j;			/* (not a dollar quote) */
+			else
+			{
+				tag = pnstrdup(sql + i, j + 1 - i);
+				close = strstr(sql + j + 1, tag);
+				i = close ? (close - sql) + strlen(tag) : n;
+			}
+		}
+		else if (c == '"')
+		{
+			StringInfoData v;
+
+			initStringInfo(&v);
+			i++;
+			while (i < n)
+			{
+				if (sql[i] == '"' && sql[i + 1] == '"')
+				{
+					appendStringInfoChar(&v, '"');
+					i += 2;
+				}
+				else if (sql[i] == '"')
+				{
+					i++;
+					break;
+				}
+				else
+					appendStringInfoChar(&v, sql[i++]);
+			}
+			t->ident = true;
+			t->quoted = true;
+			t->value = v.data;
+		}
+		else if (isalpha(c) || c == '_' || c >= 0x80)
+		{
+			while (i < n && (isalnum((unsigned char) sql[i]) || sql[i] == '_' ||
+							 sql[i] == '$' || (unsigned char) sql[i] >= 0x80))
+				i++;
+			t->ident = true;
+			t->value = pnstrdup(sql + t->start, i - t->start);
+		}
+		else if (isdigit(c))
+		{
+			while (i < n && (isalnum((unsigned char) sql[i]) || sql[i] == '.' ||
+							 sql[i] == '_'))
+				i++;
+		}
+		else
+			i++;
+		t->end = i;
+		tokens = lappend(tokens, t);
+	}
+	return tokens;
+}
+
+/* Is token i of tokens (not an identifier) text? */
+static bool
+token_is(List *tokens, int i, const char *sql, const char *text)
+{
+	SqlToken   *t;
+
+	if (i < 0 || i >= list_length(tokens))
+		return false;
+	t = list_nth(tokens, i);
+	return !t->ident && t->end - t->start == (int) strlen(text) &&
+		strncmp(sql + t->start, text, t->end - t->start) == 0;
+}
+
+/* The next token after i that isn't blank, or -1. */
+static int
+next_token(List *tokens, int i, const char *sql)
+{
+	for (i++; i < list_length(tokens); i++)
+	{
+		SqlToken   *t = list_nth(tokens, i);
+
+		if (t->ident || !isspace((unsigned char) sql[t->start]))
+			return i;
+	}
+	return -1;
+}
+
+static int
+prev_token(List *tokens, int i, const char *sql)
+{
+	for (i--; i >= 0; i--)
+	{
+		SqlToken   *t = list_nth(tokens, i);
+
+		if (t->ident || !isspace((unsigned char) sql[t->start]))
+			return i;
+	}
+	return -1;
+}
+
+/* Is identifier token i an unquoted keyword among words? */
+static bool
+keyword_among(List *tokens, int i, const char *const *words)
+{
+	SqlToken   *t;
+
+	if (i < 0)
+		return false;
+	t = list_nth(tokens, i);
+	if (!t->ident || t->quoted)
+		return false;
+	for (; *words; words++)
+		if (pg_strcasecmp(t->value, *words) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * sql, a definition of table's (as a version names it: qualified,
+ * quoted) as the deparser printed it, with the tables and columns it names
+ * renamed as renames say, into out; false (out as sql) if none are.  A
+ * column is an unqualified name (or one qualified by NEW or OLD) that
+ * isn't a function's, a type's or an object's being named, table's, or,
+ * in a REFERENCES list, the referenced table's; a table is a name
+ * qualified by its schema.
+ */
+static bool
+rename_sql(const char *sql, const char *table, List *renames, StringInfo out)
+{
+	static const char *const named[] = {"INDEX", "CONSTRAINT", "TRIGGER", "RULE",
+	"POLICY", "STATISTICS", "COLLATE", "FUNCTION", "PROCEDURE", "TYPE", NULL};
+	static const char *const rows[] = {"NEW", "OLD", NULL};
+	static const char *const referencing[] = {"REFERENCES", NULL};
+	List	   *tokens = sql_tokens(sql);
+	const char *columns_of = table;
+	int			depth = 0;
+	int			referenced_depth = -1;
+	bool		changed = false;
+	int			at = 0;
+
+	for (int i = 0; i < list_length(tokens); i++)
+	{
+		SqlToken   *t = list_nth(tokens, i);
+		int			p;
+		int			nx;
+		const char *to = NULL;
+		int			last = i;
+
+		if (token_is(tokens, i, sql, "("))
+			depth++;
+		else if (token_is(tokens, i, sql, ")"))
+		{
+			if (--depth == referenced_depth)
+			{
+				columns_of = table;
+				referenced_depth = -1;
+			}
+		}
+		if (!t->ident)
+			continue;
+		p = prev_token(tokens, i, sql);
+		/* (a type after ::, an object's own name) */
+		if (token_is(tokens, p, sql, ":") || keyword_among(tokens, p, named))
+		{
+			while (token_is(tokens, last + 1, sql, ".") && last + 2 < list_length(tokens))
+				last += 2;
+			i = last;
+			continue;
+		}
+		if (token_is(tokens, i + 1, sql, ".") && i + 2 < list_length(tokens) &&
+			((SqlToken *) list_nth(tokens, i + 2))->ident)
+		{
+			SqlToken   *second = list_nth(tokens, i + 2);
+			char	   *qualified_name = quote_qualified_identifier(t->value,
+																	second->value);
+			bool		referenced = keyword_among(tokens, p, referencing);
+
+			last = i + 2;
+			if (keyword_among(tokens, i, rows))
+			{
+				to = renamed_to(renames, table, second->value);
+				if (to)
+				{
+					appendBinaryStringInfo(out, sql + at, second->start - at);
+					appendStringInfoString(out, quote_identifier(to));
+					at = second->end;
+					changed = true;
+				}
+				i = last;
+				continue;
+			}
+			to = renamed_to(renames, qualified_name, NULL);
+			if (referenced)
+			{
+				columns_of = pstrdup(qualified_name);
+				referenced_depth = depth;
+			}
+			if (to)
+			{
+				appendBinaryStringInfo(out, sql + at, t->start - at);
+				appendStringInfoString(out, to);
+				at = second->end;
+				changed = true;
+			}
+			/* (schema.table.column) */
+			if (token_is(tokens, i + 3, sql, ".") && i + 4 < list_length(tokens) &&
+				((SqlToken *) list_nth(tokens, i + 4))->ident)
+			{
+				SqlToken   *third = list_nth(tokens, i + 4);
+				const char *col = renamed_to(renames, qualified_name, third->value);
+
+				last = i + 4;
+				if (col)
+				{
+					appendBinaryStringInfo(out, sql + at, third->start - at);
+					appendStringInfoString(out, quote_identifier(col));
+					at = third->end;
+					changed = true;
+				}
+			}
+			i = last;
+			continue;
+		}
+		nx = next_token(tokens, i, sql);
+		/* (a function's name, or a name qualifying another) */
+		if (token_is(tokens, nx, sql, "(") || token_is(tokens, i + 1, sql, "."))
+			continue;
+		to = renamed_to(renames, columns_of, t->value);
+		if (to)
+		{
+			appendBinaryStringInfo(out, sql + at, t->start - at);
+			appendStringInfoString(out, quote_identifier(to));
+			at = t->end;
+			changed = true;
+		}
+	}
+	appendStringInfoString(out, sql + at);
+	return changed;
+}
+
+/*
+ * A field of a description (escaped, UTF-8) with what it names renamed
+ * (rename_sql()), appended to out.
+ */
+static void
+append_renamed_field(StringInfo out, const char *field, const char *table,
+					 List *renames)
+{
+	StringInfoData sql;
+
+	initStringInfo(&sql);
+	if (rename_sql(identity_field(field), table, renames, &sql))
+		append_field(out, sql.data);
+	else
+		appendStringInfoString(out, field);
+	pfree(sql.data);
+}
+
+/*
+ * A table's description (UTF-8, as its item holds it) with the tables and
+ * columns it names renamed as renames say (table its own name, as its
+ * root has it), into out: its columns' names, and what its definitions
+ * name (rename_sql()), as Postgres would print them had the renames been
+ * made, so that one side's renamed definitions merge with the other's.
+ * An object's own name (a constraint's, a statistic's) is left as it is,
+ * as are options.
  */
 static void
 rename_columns(const char *desc, int len, const char *table, List *renames,
@@ -12405,12 +12759,14 @@ rename_columns(const char *desc, int len, const char *table, List *renames,
 	char	   *copy = pnstrdup(desc, len);
 	char	   *line;
 	char	   *next;
-	bool		columns = false;
+	const char *section = NULL;
 
 	for (line = copy; line && *line; line = next)
 	{
-		char	   *tab = strchr(line, '\t');
-		const char *to = NULL;
+		bool		header = false;
+		char	   *field;
+		char	   *tab;
+		int			nfield = 0;
 
 		next = strchr(line, '\n');
 		if (next)
@@ -12418,22 +12774,46 @@ rename_columns(const char *desc, int len, const char *table, List *renames,
 		for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
 			if (strcmp(line, table_sections[s]) == 0)
 			{
-				columns = s == 0;
-				tab = NULL;
+				section = table_sections[s];
+				header = true;
 			}
-		if (columns && tab)
+		if (header || section == NULL || strcmp(section, "options") == 0)
+			appendStringInfoString(out, line);
+		else if (strcmp(section, "local") == 0 && strncmp(line, "column ", 7) == 0)
 		{
-			char	   *field = pnstrdup(line, tab - line);
+			const char *to = renamed_to(renames, table,
+										unquoted(identity_field(line + 7)));
 
-			to = renamed_to(renames, table, unquoted(identity_field(field)));
-		}
-		if (to)
-		{
-			append_field(out, quote_identifier(to));
-			appendStringInfoString(out, tab);
+			appendStringInfoString(out, "column ");
+			if (to)
+				append_field(out, quote_identifier(to));
+			else
+				appendStringInfoString(out, line + 7);
 		}
 		else
-			appendStringInfoString(out, line);
+			for (field = line; field; field = tab, nfield++)
+			{
+				tab = strchr(field, '\t');
+				if (tab)
+					*tab++ = '\0';
+				if (nfield > 0)
+					appendStringInfoChar(out, '\t');
+				if (nfield == 0 && strcmp(section, "columns") == 0)
+				{
+					const char *to = renamed_to(renames, table,
+												unquoted(identity_field(field)));
+
+					if (to)
+						append_field(out, quote_identifier(to));
+					else
+						appendStringInfoString(out, field);
+				}
+				else if (nfield == 0 && (strcmp(section, "constraints") == 0 ||
+										 strcmp(section, "statistics") == 0))
+					appendStringInfoString(out, field);
+				else
+					append_renamed_field(out, field, table, renames);
+			}
 		if (next)
 			appendStringInfoChar(out, '\n');
 	}

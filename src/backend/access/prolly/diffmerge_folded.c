@@ -538,6 +538,7 @@ typedef struct WorkingNames
 	LocalTransactionId lxid;
 	CommandId	cid;
 	Oid			branch;
+	Oid			only;			/* the table identified, or every one */
 	StringInfoData identity;
 	bool		have_root;		/* (read as it's first needed) */
 	ProllyNodeRef root;
@@ -546,14 +547,14 @@ typedef struct WorkingNames
 static WorkingNames working_names;
 
 static WorkingNames *
-working_names_now(void)
+working_names_now(Oid only)
 {
 	WorkingNames *w = &working_names;
 	const ProllyRefsRoutine *refs = components().refs;
 	CommandId	cid = GetCurrentCommandId(false);
 
 	if (w->identity.data != NULL && w->lxid == MyProc->vxid.lxid &&
-		w->cid == cid && w->branch == MyBranch)
+		w->cid == cid && w->branch == MyBranch && w->only == only)
 		return w;
 	w->identity.data = NULL;
 	{
@@ -566,13 +567,14 @@ working_names_now(void)
 		StringInfoData identity;
 
 		initStringInfo(&identity);
-		refs->working_identity(InvalidOid, &identity);
+		refs->working_identity(only, &identity);
 		appendBinaryStringInfo(&w->identity, identity.data, identity.len);
 	}
 	w->have_root = false;
 	w->lxid = MyProc->vxid.lxid;
 	w->cid = cid;
 	w->branch = MyBranch;
+	w->only = only;
 	return w;
 }
 
@@ -619,10 +621,13 @@ columns_only(List *renames)
 /*
  * The renames that read root (of identity record identity) as the working
  * set names its tables and columns; NIL if none.  (Both recording none,
- * every object has its own name's identity: none.)
+ * every object has its own name's identity: none.)  With only valid, the
+ * working set's identities are that table's alone, as a read of it needs:
+ * the renames of others aren't to be used.
  */
 static List *
-renames_to_working(const ProllyNodeRef *root, const StringInfoData *identity)
+renames_to_working(const ProllyNodeRef *root, const StringInfoData *identity,
+				   Oid only)
 {
 	const ProllyRefsRoutine *refs = components().refs;
 	WorkingNames *w;
@@ -631,7 +636,7 @@ renames_to_working(const ProllyNodeRef *root, const StringInfoData *identity)
 
 	if (!identities_known())
 		return NIL;
-	w = working_names_now();
+	w = working_names_now(only);
 	if (identity->len == 0 && w->identity.len == 0)
 		return NIL;
 	if (!w->have_root)
@@ -724,7 +729,7 @@ version_tables(const char *ref, Oid relid)
 	root_of(ref, &root);
 	initStringInfo(&identity);
 	commit_identity(&id, &identity);
-	renames = renames_to_working(&root, &identity);
+	renames = renames_to_working(&root, &identity, relid);
 	if (renames == NIL)
 		return root_tables(&root, ref, relid);
 	tables = renamed_tables(root_tables(&root, ref, InvalidOid), renames);
@@ -748,7 +753,7 @@ tables_at_now(const ProllyHash *id)
 	initStringInfo(&identity);
 	commit_identity(id, &identity);
 	return renamed_tables(tables_in_root(&root, id, true),
-						  renames_to_working(&root, &identity));
+						  renames_to_working(&root, &identity, InvalidOid));
 }
 
 /* ------------------------------------------------------------------------
