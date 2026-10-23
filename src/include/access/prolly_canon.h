@@ -309,11 +309,10 @@ typedef struct ProllyCanonRoutine
 	 * rest, by name; a table renames (ProllyRename *, of tables, from's
 	 * names to to's: renames()'s) says was renamed, dropped by its name in
 	 * from and added by its name in to, as one renamed (its rows and
-	 * definition perhaps changed too).  Where either root is of the format
-	 * before identities were recorded, a dropped and an added object of a
-	 * kind whose items are the same (definition and rows), and the only
-	 * such pair, is one renamed too.  Read from the roots' tree diff: equal
-	 * subtrees skipped.
+	 * definition perhaps changed too).  A dropped and an added object
+	 * other than a table, of a kind whose items are the same (definition
+	 * and rows), and the only such pair, is one renamed too.  Read from the
+	 * roots' tree diff: equal subtrees skipped.
 	 */
 	void		(*changes) (const ProllyNodeRef *from, const ProllyNodeRef *to,
 							List *renames, ProllyCanonChangeVisit visit,

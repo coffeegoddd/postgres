@@ -182,12 +182,11 @@ version's columns under the names the working set gives the same columns.
 Diffs read its tables that way too, and a summary (the canonicalizer's
 changes()) pairs a table renamed as one renamed table, its rows and
 definition perhaps changed too.  dolt_at and dolt_history_table read a
-version's table by its name, as Dolt's AS OF and history do.  Between
-roots of format 17, which tell no renames, a dropped and an added table
-alike but for their names are still one renamed.  The canonicalizer's
-renames() works out the renames and rename_description() applies them in
-memory, so nothing is written.  A
-merge names base, ours and theirs as one, using merge_renames().  An
+version's table by its name, as Dolt's AS OF and history do.  Tables
+alike but unrelated are never paired.  The canonicalizer's renames()
+works out the renames and rename_description() applies them in memory,
+so nothing is written.  A merge names base, ours and theirs as one, using
+merge_renames().  An
 object renamed on one side takes that side's name.  Renamed differently
 on both sides, or two kept objects given one name, is a schema conflict.
 The branch's own tables and columns are renamed to the merged names first

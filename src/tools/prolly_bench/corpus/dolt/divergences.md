@@ -434,11 +434,10 @@ OF` are built in D18's shapes.
   and `data_change` if its rows changed too), in summaries, statistics
   and row diffs, by either name, as in Dolt; an unrelated table made with
   its old name is another, added. Tables alike but unrelated, one dropped
-  and another made, are a drop and an add. Commits made before identities
-  were recorded (format 17) tell no renames: between them, as before, a
-  dropped and an added table of equal definitions (but for their names)
-  and data, the only such pair, are one renamed. Other objects (views,
-  routines) have no identity and are still matched so.
+  and another made, are a drop and an add. Other objects (views,
+  routines) have no identity: a dropped and an added one of equal
+  definitions (but for their names), the only such pair, are one
+  renamed.
   `dolt_status` lists tables by name, so a table renamed there is
   `deleted` and `new table`. `dolt_at` and `dolt_history_table` read a
   version's table by its name, as Dolt's `AS OF` and `dolt_history_<t>`

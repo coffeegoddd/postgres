@@ -6162,11 +6162,10 @@ typedef struct ContentMatch
  * diff gives (equal subtrees skipped); a table renames says was renamed
  * (by identity, which a rename keeps), dropped by one name and added by
  * another, made one renamed, its rows and definition perhaps changed too.
- * Objects of a kind dropped and added with the same item (but for their
- * own names), and the only such pair, are made one renamed: tables only
- * where either root is of the format before identities were recorded,
- * which tells no renames, so that unrelated tables that happen to be
- * alike aren't, where identities are known.
+ * Other objects (views, routines), which have no identity, of a kind
+ * dropped and added with the same item (but for their own names), and the
+ * only such pair, are made one renamed; tables never are, so that
+ * unrelated tables that happen to be alike aren't.
  */
 static void folded_render(char object, const char *name, const ProllyValue *item,
 						  StringInfo out);
@@ -6243,26 +6242,10 @@ split_changed(ChangesWalk *w, const char *name)
 	return false;
 }
 
-/* Is a folded root of the format before identities were recorded? */
-static bool
-root_before_identities(Canon *cn, const ProllyNodeRef *root)
-{
-	StringInfoData v;
-	ProllyKey	want = {(const uint8 *) "!:format", 8};
-	bool		before;
-
-	initStringInfo(&v);
-	before = PROLLY_CALL(cn->tree, get, &cn->env, root, &want, &v) &&
-		strcmp(v.data, FOLDED_FORMAT_READ) == 0;
-	pfree(v.data);
-	return before;
-}
-
 static void
 folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 			   List *renames, ProllyCanonChangeVisit visit, void *arg)
 {
-	bool		tables_known;
 	Canon		cn;
 	ChangesWalk w = {NIL, false};
 	HTAB	   *matches;
@@ -6311,9 +6294,6 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 		d->schema_change = true;
 		w.changed = list_delete_ptr(w.changed, a);
 	}
-	tables_known = !root_before_identities(&cn, from) &&
-		!root_before_identities(&cn, to);
-
 	/*
 	 * renames: a dropped and an added object of one content, alone (not a
 	 * table, where identities tell renames)
@@ -6328,8 +6308,7 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 		Changed    *c = lfirst(lc);
 		bool		found;
 
-		if ((c->from_name && c->to_name) ||
-			(tables_known && c->object == PROLLY_OBJECT_TABLE))
+		if ((c->from_name && c->to_name) || c->object == PROLLY_OBJECT_TABLE)
 			continue;
 		m = hash_search(matches, &c->content, HASH_ENTER, &found);
 		if (!found)
