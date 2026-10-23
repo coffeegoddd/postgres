@@ -118,6 +118,10 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_FOLD_OBJECTS] = "fold_objects",
 	[PGSTAT_PROLLY_FOLD_TABLES] = "fold_tables",
 	[PGSTAT_PROLLY_FOLD_INCREMENTAL] = "fold_incremental",
+	[PGSTAT_PROLLY_BMAP_RELEASE_QUEUED] = "bmap_release_queued",
+	[PGSTAT_PROLLY_BMAP_RELEASE_DRAINED] = "bmap_release_drained",
+	[PGSTAT_PROLLY_BMAP_RELEASE_BLOCKS_FREED] = "bmap_release_blocks_freed",
+	[PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES] = "bmap_release_refcount_updates",
 };
 
 /*

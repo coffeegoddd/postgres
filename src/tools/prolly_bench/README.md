@@ -263,8 +263,12 @@ told apart: map work, rows written back, and catalog work.
 | Counter | Counts |
 |---|---|
 | `bmap_map_pages_copied` | block-map pages a share copied (a branch's first use shares every relation's blocks) |
-| `bmap_refcount_updates` | page-store blocks' reference counts set: shares, drops, copies on write, truncations, sweeps |
-| `bmap_blocks_freed` | page-store blocks given back to the allocator |
+| `bmap_refcount_updates` | page-store blocks' reference counts set: shares, copies on write, truncations, sweeps |
+| `bmap_blocks_freed` | page-store blocks given back to the allocator, but by the release queue's drain |
+| `bmap_release_queued` | release queue entries pushed: a dropped map's subtrees and blocks (a drop's only map work), and a drained node's children |
+| `bmap_release_drained` | release queue entries the background drain let go of |
+| `bmap_release_blocks_freed` | blocks the drain freed |
+| `bmap_release_refcount_updates` | reference counts the drain set |
 | `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
 | `apply_index_tuples` | index entries those writes made: for each row inserted or updated, one in each index whose predicate the row meets (summarizing indexes alone for a heap-only update), and a load's index builds' |
 | `catalog_rows_copied` | catalog rows a branch's copies were made of (first use) |
@@ -370,8 +374,9 @@ src/tools/prolly_bench/prolly_bench vshape G/*-V-prolly --known src/tools/prolly
 ```
 
 What the checks don't cover yet: conflicts and memory in merges; the rows
-a historical point read decodes (no counter counts them; #697); a
-release's background drain (#768); snapshot roots and kept snapshots
+a historical point read decodes (no counter counts them; #697); the
+release queue's background drain (counted in `bmap_release_*`, which no
+check gates); snapshot roots and kept snapshots
 (#717, #767); reuse of earlier materializations (#725). Large
 confirmation runs, that the counters predict wall time, WAL and storage
 at terabyte scale, need the dedicated host (#247).
