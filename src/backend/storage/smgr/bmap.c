@@ -5336,8 +5336,47 @@ snapshot_slot(SMgrRelation reln, uint64 id, BmapRoot *root)
  * blocks then hold what the snapshot holds, which redo skipping a page's
  * records from before a copy of its path relies on (tree_find()).
  */
+static uint64 snapshot_take_slot(SMgrRelation reln);
+
 uint64
 bmap_snapshot_take(SMgrRelation reln)
+{
+	uint64		id = snapshot_take_slot(reln);
+
+	/* as after a share (bmapshare()), but synced before it is relied on */
+	MarkBufferedRelationShared(reln, MAIN_FORKNUM);
+	FlushRelationsAllBuffers(&reln, 1);
+	mdimmedsync(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM);
+	INJECTION_POINT("bmap-snapshot-taken", NULL);
+	return id;
+}
+
+/*
+ * bmap_snapshot_take() of each of rels[] (n of them), their ids into ids[]:
+ * their pages written out in one pass over the buffers, and their page
+ * stores synced once each, as the transaction commits (bmapsyncshares()),
+ * as a share's are.  For a caller that relies on the snapshots only once
+ * its transaction has committed: until then a crash leaves them unsynced,
+ * kept by nobody.
+ */
+void
+bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
+{
+	for (int i = 0; i < n; i++)
+		ids[i] = snapshot_take_slot(rels[i]);
+	for (int i = 0; i < n; i++)
+		MarkBufferedRelationShared(rels[i], MAIN_FORKNUM);
+	if (n > 0)
+		FlushRelationsAllBuffers(rels, n);
+	for (int i = 0; i < n; i++)
+		sync_store_later(rels[i]->smgr_rlocator.locator);
+	if (n > 0)
+		INJECTION_POINT("bmap-snapshot-taken", NULL);
+}
+
+/* A snapshot's slot of reln set, the map's epoch raised: its id. */
+static uint64
+snapshot_take_slot(SMgrRelation reln)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -5445,12 +5484,6 @@ bmap_snapshot_take(SMgrRelation reln)
 	ReleaseBuffer(rootbuf);
 	UnlockReleaseBuffer(headerbuf);
 	LockRelease(&sweeptag, ShareLock, false);
-
-	/* as after a share (bmapshare()), but synced before it is relied on */
-	MarkBufferedRelationShared(reln, MAIN_FORKNUM);
-	FlushRelationsAllBuffers(&reln, 1);
-	mdimmedsync(store_smgr(rel), MAIN_FORKNUM);
-	INJECTION_POINT("bmap-snapshot-taken", NULL);
 	return id;
 }
 

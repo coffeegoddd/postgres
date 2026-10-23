@@ -1198,19 +1198,60 @@ kept_locator(const BranchKeptRelation *k)
 /* (a relation keeping more than this many snapshots is kept by none more) */
 #define KEEP_SNAPSHOTS_MAX	(BMAP_SNAPSHOTS_MAX - 4)
 
-/* Keep a relation's pages as they are, by a new snapshot. */
-static void
-keep_now(Form_pg_class c, BranchKeptRelation *k)
+/*
+ * Snapshots to take, together (bmap_snapshot_take_many(): one pass over
+ * the buffers, and each page store synced once as the transaction
+ * commits, which the refs naming them commit with): each one's storage
+ * and where its id goes.
+ */
+typedef struct Taking
 {
-	RelFileLocator loc = class_locator(c, c->relfilenode);
-	SMgrRelation srel = smgropen(loc, INVALID_PROC_NUMBER);
+	SMgrRelation *rels;
+	BranchKeptRelation **into;
+	int			n;
+} Taking;
 
+static void
+taking_begin(Taking *t, int max)
+{
+	t->rels = palloc_array(SMgrRelation, Max(max, 1));
+	t->into = palloc_array(BranchKeptRelation *, Max(max, 1));
+	t->n = 0;
+}
+
+static void
+taking_add(Taking *t, RelFileLocator loc, BranchKeptRelation *k)
+{
+	t->rels[t->n] = smgropen(loc, INVALID_PROC_NUMBER);
+	t->into[t->n] = k;
+	t->n++;
+}
+
+static void
+taking_end(Taking *t)
+{
+	uint64	   *ids = palloc_array(uint64, Max(t->n, 1));
+
+	bmap_snapshot_take_many(t->rels, t->n, ids);
+	for (int i = 0; i < t->n; i++)
+	{
+		t->into[i]->snapshot = ids[i];
+		note_taken(t->rels[i]->smgr_rlocator.locator, ids[i]);
+	}
+	pfree(ids);
+	pfree(t->rels);
+	pfree(t->into);
+}
+
+/* Keep a relation's pages as they are, by a new snapshot (of t's). */
+static void
+keep_now(Form_pg_class c, BranchKeptRelation *k, Taking *t)
+{
 	k->tablespace = c->reltablespace;
 	k->relfilenumber = c->relfilenode;
 	k->frozenxid = c->relfrozenxid;
 	k->minmxid = c->relminmxid;
-	k->snapshot = bmap_snapshot_take(srel);
-	note_taken(loc, k->snapshot);
+	taking_add(t, class_locator(c, c->relfilenode), k);
 	pgstat_count_prolly(PGSTAT_PROLLY_PAGES_KEPT, 1);
 }
 
@@ -1244,10 +1285,12 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 	List	   *rows = NIL;
 	bool		ok = true;
 	int			i = 0;
+	Taking		taking;
 
 	let_go_of_abandoned();
 	if (relids == NIL)
 		return true;
+	taking_begin(&taking, list_length(relids));
 	if (OidIsValid(lock_all_or_none(relids, ShareLock)))
 		return false;
 	PG_TRY();
@@ -1296,8 +1339,10 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 				}
 			}
 			if (!again)
-				keep_now(c, k);
+				keep_now(c, k, &taking);
 		}
+		if (ok)
+			taking_end(&taking);
 
 		/*
 		 * (let go of with the relations held against a copy made of kept
@@ -1363,6 +1408,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	bool	   *changed = palloc0_array(bool, Max(nkept, 1));
 	bool		any = false;
 	bool		ok = true;
+	Taking		taking;
 
 	let_go_of_abandoned();
 	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
@@ -1373,6 +1419,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	ReleaseSysCache(dbtup);
 
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	taking_begin(&taking, nkept);
 
 	/* (each checked before any is restored) */
 	for (int i = 0; i < nkept && ok; i++)
@@ -1407,20 +1454,18 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		HeapTuple	o = rows[i];
 		Form_pg_class oc = (Form_pg_class) GETSTRUCT(o);
 		RelFileNumber relnumber;
-		SMgrRelation nrel;
 
 		renewed[i] = *k;
 		if (!changed[i])
 			continue;
 		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
 										oc->relpersistence);
-		nrel = RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
+		(void) RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
 												 smgropen(kept_locator(k),
 														  INVALID_PROC_NUMBER),
 												 k->snapshot, false, true);
 		renewed[i].relfilenumber = relnumber;
-		renewed[i].snapshot = bmap_snapshot_take(nrel);
-		note_taken(class_locator(oc, relnumber), renewed[i].snapshot);
+		taking_add(&taking, class_locator(oc, relnumber), &renewed[i]);
 		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
 		oc->relfilenode = relnumber;
 		if (TransactionIdIsNormal(k->frozenxid))
@@ -1432,6 +1477,8 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		CatalogTupleUpdate(pg_class, &o->t_self, o);
 		pgstat_count_prolly(PGSTAT_PROLLY_RELATIONS_RESTORED, 1);
 	}
+	if (ok && any)
+		taking_end(&taking);
 	if (ok && any)
 		CommandCounterIncrement();
 	table_close(pg_class, RowExclusiveLock);
