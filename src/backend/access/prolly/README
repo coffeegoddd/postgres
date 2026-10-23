@@ -302,6 +302,11 @@ Remotes
 Transfer ("chunks", transfer_chunks.c) moves the chunks a commit reaches
 that the other side lacks, re-hashing each chunk it receives.  A remote
 ("file", remote_file.c) is a directory of table files and a manifest.
+What a transfer has seen (prolly_seen.c) is a map held to its share of
+maintenance_work_mem: past it, sorted runs in temporary files, merged
+four of a level into one, each with a Bloom filter folded smaller as the
+map grows, so its memory stays within budget and a lookup checks a number
+of runs logarithmic in its size.
 
 
 SQL
