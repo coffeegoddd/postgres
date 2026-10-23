@@ -185,16 +185,30 @@ static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
 static int	keep_violations(void);
 static List *matviews_in_root(const ProllyNodeRef *root);
-static List *foreign_key_violations(List *relids, List *changed);
+/*
+ * Where the constraint checks put each violation they find: its table, kind,
+ * row (as JSON) and what it breaks; each string is good only during the
+ * call.
+ */
+typedef void (*ViolationFound) (Oid relid, const char *type, const char *row,
+								const char *info, void *arg);
+
+static void foreign_key_violations(List *relids, List *changed,
+								   ViolationFound found, void *arg);
+static List *foreign_key_violation_list(List *relids, List *changed);
 static void violating_rows(List *queries, const char *type, bool removing,
-						   List **found);
+						   ViolationFound found, void *arg);
+static void found_kept(Oid relid, const char *type, const char *row,
+					   const char *info, void *arg);
+static void found_listed(Oid relid, const char *type, const char *row,
+						 const char *info, void *arg);
 static bool changed_rows_of(List *changed, Oid relid, List **now, List **was);
 static bool primary_key_columns(Oid relid, const char *alias, StringInfo cols,
 								StringInfo defs);
 static void key_columns(Oid relid, const int16 *attnums, int n, const char *alias,
 						StringInfo cols, StringInfo defs);
-static void key_queries(List *qi, List *keys, const char *cols, const char *defs,
-						List **queries);
+static struct CheckQuery *key_query(struct CheckQuery *q, List *keys,
+									const char *cols, const char *defs);
 static List *distinct_violations(List *found);
 static void take_breaking_rows(List *added, void *arg);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
@@ -1993,14 +2007,6 @@ violation_record(Oid relid, const char *type, const char *row,
 	return recorded->nattempt++;
 }
 
-/* Keep violations found, outside any attempt. */
-static void
-violations_keep(List *found)
-{
-	foreach_ptr(ProllyViolation, pv, found)
-		violation_keep(pv->relid, pv->type, pv->row, pv->info);
-}
-
 /* Forget the attempt's violation of handle h: the row it refused fits. */
 static void
 violation_forget(int h)
@@ -2052,7 +2058,6 @@ merge_recording(const ProllyNodeRef *roots, const MergeCommits *commits,
 				List **conflicted, int *nviolations)
 {
 	int			conflicts;
-	List	   *found = NIL;
 
 	recording = true;
 	recorded = NULL;
@@ -2064,8 +2069,7 @@ merge_recording(const ProllyNodeRef *roots, const MergeCommits *commits,
 		conflicts = merge_roots(roots, commits, fail_on_conflict, what, name,
 								conflicted);
 		recording = false;
-		found = foreign_key_violations(written, NIL);
-		violations_keep(found);
+		foreign_key_violations(written, NIL, found_kept, NULL);
 		*nviolations = keep_violations();
 	}
 	PG_FINALLY();
@@ -8637,22 +8641,72 @@ rel_owner(Oid relid)
 }
 
 /*
- * The rows of the session branch's tables of relids (NIL: every one) that
- * break a foreign key, theirs or one referencing them, as violations: a
- * row whose key, all of it set (MATCH SIMPLE: any of it null passes), or,
- * MATCH FULL, some of it set, has no referenced row.  With changed (the
- * rows changed since the head, changed_since_head()'s; NIL: every row),
- * only the rows changed, and those referencing a row the referenced table
- * removed or changed, unless either table is checked whole.
+ * A query finding the rows that break a constraint, as JSON: sql, a query
+ * whose WHERE clause's condition ends it, run once; or, with keys (KeySpool
+ * *: rows changed, as changed_since_head() spools them), once for each
+ * batch of them, matching the rows whose columns cols (definitions defs,
+ * as key_columns() gives them) are one of the batch's.  Each batch's
+ * query is made as it is run, so neither the keys nor the queries are all
+ * held at once.
  */
-static List *
-foreign_key_violations(List *relids, List *changed)
+typedef struct CheckQuery
+{
+	char	   *sql;
+	char	   *info;			/* what a row it finds breaks, as JSON */
+	Oid			relid;			/* the table checked */
+	List	   *keys;
+	char	   *cols;
+	char	   *defs;
+} CheckQuery;
+
+static CheckQuery *
+check_query(char *sql, char *info, Oid relid)
+{
+	CheckQuery *q = palloc0(sizeof(CheckQuery));
+
+	q->sql = sql;
+	q->info = info;
+	q->relid = relid;
+	return q;
+}
+
+/* A violation found, kept by the merge recording them. */
+static void
+found_kept(Oid relid, const char *type, const char *row, const char *info,
+		   void *arg)
+{
+	violation_keep(relid, type, row, info);
+}
+
+/* A violation found, appended to *(List **) arg. */
+static void
+found_listed(Oid relid, const char *type, const char *row, const char *info,
+			 void *arg)
+{
+	List	  **list = arg;
+
+	*list = lappend(*list, violation(relid, type, pstrdup(row), pstrdup(info)));
+}
+
+/*
+ * The rows of the session branch's tables of relids (NIL: every one) that
+ * break a foreign key, theirs or one referencing them, as violations given
+ * to found as they are found: a row whose key, all of it set (MATCH
+ * SIMPLE: any of it null passes), or, MATCH FULL, some of it set, has no
+ * referenced row.  With changed (the rows changed since the head,
+ * changed_since_head()'s; NIL: every row), only the rows changed, and
+ * those referencing a row the referenced table removed or changed, unless
+ * either table is checked whole.  (A row matched by two batches, by its own
+ * key and by its parent's, say, is found twice.)
+ */
+static void
+foreign_key_violations(List *relids, List *changed, ViolationFound found,
+					   void *arg)
 {
 	Relation	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
 	SysScanDesc scan = systable_beginscan(pg_constraint, InvalidOid, false,
 										  NULL, 0, NULL);
 	HeapTuple	tup;
-	List	   *found = NIL;
 	List	   *queries = NIL;
 
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -8674,7 +8728,7 @@ foreign_key_violations(List *relids, List *changed)
 		char	   *parent;
 		List	   *child_now = NIL;
 		List	   *parent_was = NIL;
-		List	   *qi;
+		CheckQuery *qi;
 
 		/* (a partition's clone of its parent's is checked as the parent's) */
 		if (con->contype != CONSTRAINT_FOREIGN || OidIsValid(con->conparentid) ||
@@ -8738,7 +8792,7 @@ foreign_key_violations(List *relids, List *changed)
 			appendStringInfo(&q, "(%s)", any.data);
 		else
 			appendStringInfo(&q, "(%s)", set.data);
-		qi = list_make3(q.data, info.data, (void *) (uintptr_t) con->conrelid);
+		qi = check_query(q.data, info.data, con->conrelid);
 		if (child_now == NIL && parent_was == NIL)
 		{
 			queries = lappend(queries, qi);
@@ -8757,7 +8811,8 @@ foreign_key_violations(List *relids, List *changed)
 				queries = lappend(queries, qi); /* (no key: whole) */
 				continue;
 			}
-			key_queries(qi, child_now, cols.data, defs.data, &queries);
+			queries = lappend(queries, key_query(qi, child_now, cols.data,
+												 defs.data));
 		}
 		if (parent_was != NIL)
 		{
@@ -8771,71 +8826,299 @@ foreign_key_violations(List *relids, List *changed)
 			key_columns(con->conrelid, cks, n, "c", &cols, &unused);
 			resetStringInfo(&unused);
 			key_columns(con->confrelid, pks, n, "w", &unused, &defs);
-			key_queries(qi, parent_was, cols.data, defs.data, &queries);
+			queries = lappend(queries, key_query(qi, parent_was, cols.data,
+												 defs.data));
 		}
 	}
 	systable_endscan(scan);
 	table_close(pg_constraint, AccessShareLock);
 
-	violating_rows(queries, "foreign key", false, &found);
+	violating_rows(queries, "foreign key", false, found, arg);
+}
+
+/* foreign_key_violations()'s, as a list, each once. */
+static List *
+foreign_key_violation_list(List *relids, List *changed)
+{
+	List	   *found = NIL;
+
+	foreign_key_violations(relids, changed, found_listed, &found);
 	return distinct_violations(found);
 }
 
+/* The most keys one query matches: more are matched a batch at a time. */
+#define CHANGED_BATCH_ROWS 1000
+#define CHANGED_BATCH_BYTES (1024 * 1024)
+
 /*
- * Run each query (sql, info, relid), appending a violation of type for each
- * row it returns (as JSON) to *found: with a snapshot that sees what was
- * written before (a merge's writes), as the table's owner, its rows and
- * those it references seen whatever their row security says, as a foreign
- * key's own checks see them.  Removing: the queries delete the rows they
- * return.
+ * Keys of rows changed (JSON objects), spooled to a temporary file as they
+ * are found and read back a batch at a time, so that how many changed
+ * takes no memory.
  */
-static void
-violating_rows(List *queries, const char *type, bool removing, List **found)
+typedef struct KeySpool
 {
-	MemoryContext cxt = CurrentMemoryContext;
-	ListCell   *lc;
+	BufFile    *file;
+	int64		count;
+} KeySpool;
 
-	if (queries == NIL)
-		return;
-	CommandCounterIncrement();
-	SPI_connect();
-	foreach(lc, queries)
+/* Append key to *sp, made on the first. */
+static void
+key_spool_put(KeySpool **sp, const char *key)
+{
+	uint32		len = strlen(key);
+
+	if (*sp == NULL)
 	{
-		List	   *qi = lfirst(lc);
-		Oid			relid = (Oid) (uintptr_t) lthird(qi);
-		Oid			save_userid;
-		int			save_sec;
-		int			ret;
-
-		INJECTION_POINT("prolly-merge-foreign-keys", NULL);
-		GetUserIdAndSecContext(&save_userid, &save_sec);
-		SetUserIdAndSecContext(rel_owner(relid),
-							   save_sec | SECURITY_LOCAL_USERID_CHANGE |
-							   SECURITY_NOFORCE_RLS);
-		ret = SPI_execute(linitial(qi), false, 0);
-		SetUserIdAndSecContext(save_userid, save_sec);
-		if (ret != (removing ? SPI_OK_DELETE_RETURNING : SPI_OK_SELECT))
-			elog(ERROR, "could not check a constraint: %s", (char *) linitial(qi));
-		for (uint64 r = 0; r < SPI_processed; r++)
-		{
-			char	   *row = SPI_getvalue(SPI_tuptable->vals[r],
-										   SPI_tuptable->tupdesc, 1);
-			MemoryContext spi = MemoryContextSwitchTo(cxt);
-
-			*found = lappend(*found, violation(relid, type, pstrdup(row),
-											   pstrdup(lsecond(qi))));
-			MemoryContextSwitchTo(spi);
-		}
+		*sp = palloc0(sizeof(KeySpool));
+		(*sp)->file = BufFileCreateTemp(false);
 	}
-	SPI_finish();
+	BufFileWrite((*sp)->file, &len, sizeof(len));
+	BufFileWrite((*sp)->file, key, len);
+	(*sp)->count++;
+}
+
+static void
+key_spool_free(KeySpool *sp)
+{
+	if (sp == NULL)
+		return;
+	BufFileClose(sp->file);
+	pfree(sp);
+}
+
+/* Reading the keys of spools (KeySpool *) in turn, a batch at a time. */
+typedef struct KeyBatches
+{
+	List	   *spools;
+	int			next;			/* the spool being read */
+	int64		left;			/* its keys still to read */
+	StringInfoData key;			/* (one read, not yet in a batch) */
+	bool		have_key;
+} KeyBatches;
+
+static bool
+key_batches_read(KeyBatches *kb)
+{
+	uint32		len;
+
+	while (kb->left == 0)
+	{
+		KeySpool   *sp;
+
+		if (kb->next >= list_length(kb->spools))
+			return false;
+		sp = list_nth(kb->spools, kb->next++);
+		if (BufFileSeek(sp->file, 0, 0, SEEK_SET) != 0)
+			elog(ERROR, "could not rewind the keys of rows changed");
+		kb->left = sp->count;
+	}
+	BufFileReadExact(((KeySpool *) list_nth(kb->spools, kb->next - 1))->file,
+					 &len, sizeof(len));
+	resetStringInfo(&kb->key);
+	enlargeStringInfo(&kb->key, len);
+	BufFileReadExact(((KeySpool *) list_nth(kb->spools, kb->next - 1))->file,
+					 kb->key.data, len);
+	kb->key.len = len;
+	kb->key.data[len] = '\0';
+	kb->left--;
+	return true;
 }
 
 /*
- * The query (sql, info, relid) finding the rows of con's table that break
- * it, a check or not-null constraint, as JSON (removing: deleting them);
- * *check: whether it's a check.
+ * The next batch of keys, as a JSON array literal quoted, into *literal:
+ * no more than so many keys, or so many bytes (but for one key alone), so
+ * no one query's grows with how much changed.  False: none left.
  */
-static List *
+static bool
+key_batches_next(KeyBatches *kb, StringInfo literal)
+{
+	StringInfoData buf;
+	int			n = 0;
+	char	   *quoted;
+
+	initStringInfo(&buf);
+	for (;;)
+	{
+		if (!kb->have_key)
+			kb->have_key = key_batches_read(kb);
+		if (!kb->have_key)
+			break;
+		if (n > 0 && (n >= CHANGED_BATCH_ROWS ||
+					  buf.len + kb->key.len > CHANGED_BATCH_BYTES))
+			break;
+		appendStringInfoString(&buf, n ? ", " : "[");
+		appendBinaryStringInfo(&buf, kb->key.data, kb->key.len);
+		kb->have_key = false;
+		n++;
+	}
+	if (n == 0)
+	{
+		pfree(buf.data);
+		return false;
+	}
+	appendStringInfoChar(&buf, ']');
+	quoted = quote_literal_cstr(buf.data);
+	resetStringInfo(literal);
+	appendStringInfoString(literal, quoted);
+	pfree(quoted);
+	pfree(buf.data);
+	return true;
+}
+
+/*
+ * A DestReceiver giving each row a check's query returns (its one column,
+ * the row as JSON text) to found as it comes, so that no query's result
+ * is held whole.
+ */
+typedef struct FoundReceiver
+{
+	DestReceiver pub;			/* must be first */
+	ViolationFound found;
+	void	   *arg;
+	MemoryContext cxt;			/* found's, outlasting the query */
+	Oid			relid;
+	const char *type;
+	const char *info;
+	uint64		count;
+} FoundReceiver;
+
+static bool
+found_receive(TupleTableSlot *slot, DestReceiver *self)
+{
+	FoundReceiver *fr = (FoundReceiver *) self;
+	bool		isnull;
+	Datum		d = slot_getattr(slot, 1, &isnull);
+	char	   *row;
+	MemoryContext old;
+
+	if (isnull)
+		elog(ERROR, "a constraint's check returned no row");
+	row = TextDatumGetCString(d);
+	old = MemoryContextSwitchTo(fr->cxt);
+	fr->found(fr->relid, fr->type, row, fr->info, fr->arg);
+	MemoryContextSwitchTo(old);
+	pfree(row);
+	fr->count++;
+	return true;
+}
+
+static void
+found_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+}
+
+static void
+found_shutdown(DestReceiver *self)
+{
+}
+
+static void
+found_destroy(DestReceiver *self)
+{
+}
+
+/* Run sql, as a check of query q, its rows to fr. */
+static void
+run_check(const char *sql, const CheckQuery *q, bool removing,
+		  FoundReceiver *fr)
+{
+	SPIExecuteOptions options;
+	Oid			save_userid;
+	int			save_sec;
+	int			ret;
+
+	memset(&options, 0, sizeof(options));
+	options.read_only = false;
+	options.allow_nonatomic = false;
+	options.must_return_tuples = false;
+	options.tcount = 0;
+	options.dest = (DestReceiver *) fr;
+	fr->relid = q->relid;
+	fr->info = q->info;
+	INJECTION_POINT("prolly-merge-foreign-keys", NULL);
+	GetUserIdAndSecContext(&save_userid, &save_sec);
+	SetUserIdAndSecContext(rel_owner(q->relid),
+						   save_sec | SECURITY_LOCAL_USERID_CHANGE |
+						   SECURITY_NOFORCE_RLS);
+	ret = SPI_execute_extended(sql, &options);
+	SetUserIdAndSecContext(save_userid, save_sec);
+	if (ret != (removing ? SPI_OK_DELETE_RETURNING : SPI_OK_SELECT))
+		elog(ERROR, "could not check a constraint: %s", sql);
+	INJECTION_POINT("prolly-merge-constraint-checked", NULL);
+}
+
+/*
+ * Run each query (CheckQuery *), giving found a violation of type for each
+ * row it returns, as it returns it: with a snapshot that sees what was
+ * written before (a merge's writes), as the table's owner, its rows and
+ * those it references seen whatever their row security says, as a foreign
+ * key's own checks see them.  A keyed query is made and run a batch of its
+ * keys at a time.  Removing: the queries delete the rows they return.
+ */
+static void
+violating_rows(List *queries, const char *type, bool removing,
+			   ViolationFound found, void *arg)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	MemoryContext batch_cxt;
+	FoundReceiver fr;
+
+	if (queries == NIL)
+		return;
+	memset(&fr, 0, sizeof(fr));
+	fr.pub.receiveSlot = found_receive;
+	fr.pub.rStartup = found_startup;
+	fr.pub.rShutdown = found_shutdown;
+	fr.pub.rDestroy = found_destroy;
+	/* (any but DestNone, whose results SPI takes to be discarded) */
+	fr.pub.mydest = DestTuplestore;
+	fr.found = found;
+	fr.arg = arg;
+	fr.cxt = cxt;
+	fr.type = type;
+	batch_cxt = AllocSetContextCreate(cxt, "constraint check batch",
+									  ALLOCSET_DEFAULT_SIZES);
+	CommandCounterIncrement();
+	SPI_connect();
+	foreach_ptr(CheckQuery, q, queries)
+	{
+		MemoryContext old = MemoryContextSwitchTo(batch_cxt);
+
+		if (q->keys == NIL)
+			run_check(q->sql, q, removing, &fr);
+		else
+		{
+			KeyBatches kb;
+			StringInfoData literal;
+			StringInfoData sql;
+
+			memset(&kb, 0, sizeof(kb));
+			kb.spools = q->keys;
+			initStringInfo(&kb.key);
+			initStringInfo(&literal);
+			initStringInfo(&sql);
+			while (key_batches_next(&kb, &literal))
+			{
+				resetStringInfo(&sql);
+				appendStringInfo(&sql, "%s AND (%s) IN (SELECT * FROM json_to_recordset(%s::json) AS w(%s))",
+								 q->sql, q->cols, literal.data, q->defs);
+				run_check(sql.data, q, removing, &fr);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(batch_cxt);
+	}
+	SPI_finish();
+	MemoryContextDelete(batch_cxt);
+}
+
+/*
+ * The query finding the rows of con's table that break it, a check or
+ * not-null constraint, as JSON (removing: deleting them); *check: whether
+ * it's a check.
+ */
+static CheckQuery *
 breaking_query(Relation pg_constraint, HeapTuple tup, bool removing,
 			   bool *check)
 {
@@ -8874,7 +9157,7 @@ breaking_query(Relation pg_constraint, HeapTuple tup, bool removing,
 	else
 		appendStringInfo(&q, "SELECT row_to_json(c.*)::text FROM %s%s c WHERE %s",
 						 only_unless_partitioned(con->conrelid), table, cond);
-	return list_make3(q.data, info.data, (void *) (uintptr_t) con->conrelid);
+	return check_query(q.data, info.data, con->conrelid);
 }
 
 /*
@@ -8898,7 +9181,7 @@ unvalidated_violations(List *relids, List *changed)
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
-		List	   *qi;
+		CheckQuery *qi;
 		List	   *now = NIL;
 		bool		check;
 
@@ -8925,19 +9208,16 @@ unvalidated_violations(List *relids, List *changed)
 		{
 			StringInfoData cols;
 			StringInfoData defs;
-			List	   *batches = NIL;
 
 			initStringInfo(&cols);
 			initStringInfo(&defs);
 			/* (the rows changed, by key; no key: whole) */
 			if (primary_key_columns(con->conrelid, "c", &cols, &defs))
-				key_queries(qi, now, cols.data, defs.data, &batches);
-			else
-				batches = list_make1(qi);
+				qi = key_query(qi, now, cols.data, defs.data);
 			if (check)
-				checks = list_concat(checks, batches);
+				checks = lappend(checks, qi);
 			else
-				notnulls = list_concat(notnulls, batches);
+				notnulls = lappend(notnulls, qi);
 			continue;
 		}
 		if (check)
@@ -8947,8 +9227,8 @@ unvalidated_violations(List *relids, List *changed)
 	}
 	systable_endscan(scan);
 	table_close(pg_constraint, AccessShareLock);
-	violating_rows(checks, "check constraint", false, &found);
-	violating_rows(notnulls, "not null", false, &found);
+	violating_rows(checks, "check constraint", false, found_listed, &found);
+	violating_rows(notnulls, "not null", false, found_listed, &found);
 	return found;
 }
 
@@ -9004,7 +9284,6 @@ take_breaking_rows(List *added, void *arg)
 	Relation	pg_constraint;
 	List	   *checks = NIL;
 	List	   *notnulls = NIL;
-	List	   *found = NIL;
 	ListCell   *lc;
 	int			save_nestlevel;
 
@@ -9017,7 +9296,7 @@ take_breaking_rows(List *added, void *arg)
 		char	   *name = strVal(linitial(stringToQualifiedNameList(ac->name, NULL)));
 		Oid			conoid = get_relation_constraint_oid(relid, name, false);
 		HeapTuple	tup;
-		List	   *qi;
+		CheckQuery *qi;
 		bool		check;
 
 		note_written(relid);
@@ -9041,10 +9320,8 @@ take_breaking_rows(List *added, void *arg)
 	save_nestlevel = NewGUCNestLevel();
 	(void) set_config_option("session_replication_role", "replica", PGC_SUSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-	violating_rows(checks, "check constraint", true, &found);
-	violating_rows(notnulls, "not null", true, &found);
-	violations_keep(found);
-	list_free_deep(found);
+	violating_rows(checks, "check constraint", true, found_kept, NULL);
+	violating_rows(notnulls, "not null", true, found_kept, NULL);
 	AtEOXact_GUC(true, save_nestlevel);
 }
 
@@ -9067,8 +9344,8 @@ typedef struct ChangedTable
 	Oid			relid;
 	List	   *ancestors;		/* its partitioned tables', if a partition */
 	bool		whole;			/* every row is to be checked */
-	List	   *now;			/* char *, keys as JSON objects */
-	List	   *was;			/* char * */
+	KeySpool   *now;			/* keys as JSON objects (NULL: none) */
+	KeySpool   *was;
 } ChangedTable;
 
 typedef struct ChangedRows
@@ -9077,6 +9354,7 @@ typedef struct ChangedRows
 	List	   *tables;			/* ChangedTable * */
 	List	   *relevant;		/* the tables to check, and those their
 								 * foreign keys join (NIL: every one) */
+	MemoryContext rowcxt;		/* a row's, reset for the next */
 	ChangedTable *cur;			/* the table being read, as: */
 	Relation	rel;
 	const ProllyKeyingRoutine *kr;
@@ -9088,10 +9366,6 @@ typedef struct ChangedRows
 	bool	   *kept;			/* (decoding: the columns left unread) */
 	TupleTableSlot *slot;
 } ChangedRows;
-
-/* The most keys one query matches: more are matched a batch at a time. */
-#define CHANGED_BATCH_ROWS 1000
-#define CHANGED_BATCH_BYTES (1024 * 1024)
 
 static ChangedTable *changed_table(List **tables, Oid relid);
 
@@ -9236,9 +9510,9 @@ static void
 changed_whole(ChangedTable *ct)
 {
 	ct->whole = true;
-	list_free_deep(ct->now);
-	list_free_deep(ct->was);
-	ct->now = ct->was = NIL;
+	key_spool_free(ct->now);
+	key_spool_free(ct->was);
+	ct->now = ct->was = NULL;
 }
 
 static void
@@ -9251,6 +9525,7 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	uint64		nafter = 0;
 	char	   *was = NULL;
 	char	   *now = NULL;
+	MemoryContext old;
 
 	/* (a table's rows come together) */
 	if (cr->cur == NULL || cr->cur->relid != relid)
@@ -9281,22 +9556,40 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	}
 	if (cr->rel == NULL || cr->cur->whole)
 		return;
+	/* (the spools are made in the caller's context: a row's is reset) */
+	old = MemoryContextSwitchTo(cr->rowcxt);
 	if (before)
 		was = changed_key(cr, before, &nbefore);
 	if (after)
 		now = changed_key(cr, after, &nafter);
+	MemoryContextSwitchTo(old);
 	if (cr->keyless)
 	{
 		if (nafter > nbefore)
-			cr->cur->now = lappend(cr->cur->now, now);
+			key_spool_put(&cr->cur->now, now);
 		else
-			cr->cur->was = lappend(cr->cur->was, was);
-		return;
+			key_spool_put(&cr->cur->was, was);
 	}
-	if (now)
-		cr->cur->now = lappend(cr->cur->now, now);
-	if (was)
-		cr->cur->was = lappend(cr->cur->was, was);
+	else
+	{
+		if (now)
+			key_spool_put(&cr->cur->now, now);
+		if (was)
+			key_spool_put(&cr->cur->was, was);
+	}
+	MemoryContextReset(cr->rowcxt);
+}
+
+/* The keys changed_since_head() spooled, their files closed. */
+static void
+changed_free(List *changed)
+{
+	foreach_ptr(ChangedTable, ct, changed)
+	{
+		key_spool_free(ct->now);
+		key_spool_free(ct->was);
+		ct->now = ct->was = NULL;
+	}
 }
 
 /*
@@ -9344,6 +9637,8 @@ changed_since_head(List *relids)
 
 	memset(&cr, 0, sizeof(cr));
 	cr.sink.change = changed_row;
+	cr.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "changed row",
+									  ALLOCSET_DEFAULT_SIZES);
 	cr.relevant = joined_tables(relids);
 	/* (those made or redefined, or with violations recorded, first) */
 	foreach(lc, tables_of("WORKING", InvalidOid))
@@ -9365,6 +9660,7 @@ changed_since_head(List *relids)
 	}
 	folded_diff("HEAD", "WORKING", InvalidOid, &cr.sink);
 	changed_close(&cr);
+	MemoryContextDelete(cr.rowcxt);
 	return cr.tables;
 }
 
@@ -9388,8 +9684,9 @@ changed_table(List **tables, Oid relid)
 
 /*
  * Table relid's rows in changed (its partitions' too, if it's
- * partitioned), appended to *now and *was (where not NULL).  Returns
- * whether it (or a partition of it) is checked whole: every row.
+ * partitioned), their spools (KeySpool *) appended to *now and *was (where
+ * not NULL).  Returns whether it (or a partition of it) is checked whole:
+ * every row.
  */
 static bool
 changed_rows_of(List *changed, Oid relid, List **now, List **was)
@@ -9404,10 +9701,10 @@ changed_rows_of(List *changed, Oid relid, List **now, List **was)
 		if (ct->relid != relid && !list_member_oid(ct->ancestors, relid))
 			continue;
 		whole |= ct->whole;
-		if (now)
-			*now = list_concat(*now, ct->now);
-		if (was)
-			*was = list_concat(*was, ct->was);
+		if (now && ct->now)
+			*now = lappend(*now, ct->now);
+		if (was && ct->was)
+			*was = lappend(*was, ct->was);
 	}
 	return whole;
 }
@@ -9463,62 +9760,18 @@ primary_key_columns(Oid relid, const char *alias, StringInfo cols,
 }
 
 /*
- * Keys (char *, JSON objects) as quoted JSON array literals, a batch of
- * them each, so that no one query's grows with how much changed.
+ * Keyed query q, matching the rows of keys (KeySpool *) a batch at a time
+ * (violating_rows()).
  */
-static List *
-key_batches(List *keys)
+static CheckQuery *
+key_query(CheckQuery *q, List *keys, const char *cols, const char *defs)
 {
-	List	   *out = NIL;
-	StringInfoData buf;
-	int			n = 0;
-	ListCell   *lc;
+	CheckQuery *k = check_query(q->sql, q->info, q->relid);
 
-	initStringInfo(&buf);
-	foreach(lc, keys)
-	{
-		const char *key = lfirst(lc);
-
-		if (n > 0 && (n >= CHANGED_BATCH_ROWS ||
-					  buf.len + strlen(key) > CHANGED_BATCH_BYTES))
-		{
-			appendStringInfoChar(&buf, ']');
-			out = lappend(out, quote_literal_cstr(buf.data));
-			resetStringInfo(&buf);
-			n = 0;
-		}
-		appendStringInfoString(&buf, n ? ", " : "[");
-		appendStringInfoString(&buf, key);
-		n++;
-	}
-	if (n > 0)
-	{
-		appendStringInfoChar(&buf, ']');
-		out = lappend(out, quote_literal_cstr(buf.data));
-	}
-	return out;
-}
-
-/*
- * Query (sql, info, relid) qi once for each batch of keys: its rows whose
- * columns cols (definitions defs, as key_columns() gives them) are one of
- * the batch's, each query appended to *queries.  (sql ends in a WHERE
- * clause's condition.)
- */
-static void
-key_queries(List *qi, List *keys, const char *cols, const char *defs,
-			List **queries)
-{
-	ListCell   *lc;
-
-	foreach(lc, key_batches(keys))
-	{
-		char	   *sql = psprintf("%s AND (%s) IN (SELECT * FROM json_to_recordset(%s::json) AS w(%s))",
-								   (char *) linitial(qi), cols,
-								   (char *) lfirst(lc), defs);
-
-		*queries = lappend(*queries, list_make3(sql, lsecond(qi), lthird(qi)));
-	}
+	k->keys = keys;
+	k->cols = pstrdup(cols);
+	k->defs = pstrdup(defs);
+	return k;
 }
 
 /*
@@ -9603,8 +9856,9 @@ verify_constraints(List *relids, bool all)
 	if (partial)
 		changed = changed_since_head(relids);
 	if (!partial || changed != NIL)
-		found = list_concat(foreign_key_violations(relids, changed),
+		found = list_concat(foreign_key_violation_list(relids, changed),
 							unvalidated_violations(relids, changed));
+	changed_free(changed);
 	AtEOXact_GUC(true, save_nestlevel);
 	return found;
 }
@@ -10274,7 +10528,7 @@ put_back(const Local *l, const char *what)
 							   item_server_name(&e->key), what),
 					 errhint("Commit the changes, or reset the branch, first.")));
 	}
-	if (relids != NIL && (broken = foreign_key_violations(relids, NIL)) != NIL)
+	if (relids != NIL && (broken = foreign_key_violation_list(relids, NIL)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot %s with uncommitted changes when the %s conflicts",
@@ -10324,7 +10578,7 @@ fast_forward_local(const Local *l, const ProllyHash *theirs, bool squash)
 	}
 	/* materialized views theirs refreshed (check_local(): not these) */
 	apply_matview_rows(&l->head, &target);
-	if (relids != NIL && (broken = foreign_key_violations(relids, NIL)) != NIL)
+	if (relids != NIL && (broken = foreign_key_violation_list(relids, NIL)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot merge with uncommitted changes when the merge conflicts"),

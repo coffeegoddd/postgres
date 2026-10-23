@@ -287,6 +287,19 @@ build doesn't read such a value but refuses it, with a hint to reset the
 branch, which removes it.  The violations' inspection functions and the
 checks before a commit still read a branch's violations whole.
 
+The constraint checks (a merge's foreign keys, the check and not-null rows
+a merge's added constraints take away, dolt_verify_constraints()) run each
+query through SPI_execute_extended() with a DestReceiver that hands each
+row found to its consumer as the executor returns it: the merge's
+violation sort, or a list for verification, which sets the branch's
+violations whole.  No query's result is held as an SPI tuple table.  The
+keys of the rows changed since the head, which verification matches a
+batch at a time, are spooled to a temporary file per table and side as the
+diff finds them, and each batch's JSON literal and query are made only as
+that batch runs.  A merge still checks every foreign key of the tables it
+wrote whole, by query; the executor's own sorts and hashes spill under
+work_mem as for any query.
+
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the
