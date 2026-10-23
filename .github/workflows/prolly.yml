@@ -146,6 +146,16 @@ jobs:
             --accept src/tools/prolly_bench/configs/v_growth_accept.toml \
             --json "$PWD/engine-results/v-growth/vgrowth.json"
 
+      - name: V suite growth-shape gate
+        run: |
+          src/tools/prolly_bench/prolly_bench run V --am prolly \
+            --workloads V9 --config src/tools/prolly_bench/configs/v_shape.toml \
+            --work-dir "$RUNNER_TEMP/v-shape" --out "$PWD/engine-results/v-shape"
+          src/tools/prolly_bench/prolly_bench vshape "$PWD"/engine-results/v-shape/*-V-prolly \
+            --known src/tools/prolly_bench/configs/v_shape_known.toml \
+            --json "$PWD/engine-results/v-shape/vshape.json" \
+            --markdown "$PWD/engine-results/v-shape/vshape.md"
+
       - name: Upload benchmark evidence
         if: always()
         uses: actions/upload-artifact@v5

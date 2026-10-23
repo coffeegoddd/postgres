@@ -2011,6 +2011,26 @@ stopped_outside_block(const char *what, const char *What, const char *between,
 			 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
 }
 
+static void
+count_violation(const ProllyViolation *pv, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+/*
+ * How many constraint violations the session's branch keeps, counted as
+ * they are visited, not loaded: those of tables since dropped too, so the
+ * difference of two counts is what a merge or pick added.
+ */
+static int
+violations_kept(void)
+{
+	int			n = 0;
+
+	PROLLY_CALL(refs(), visit_violations, count_violation, &n);
+	return n;
+}
+
 /*
  * A pick or revert starts only on a branch without constraint violations,
  * as Dolt's only on a clean working set (which holds them): the ones it
@@ -2133,7 +2153,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
-	known = list_length(PROLLY_CALL(refs(), violations));
+	known = violations_kept();
 	date_given = dated;
 	PG_TRY();
 	{
@@ -2149,7 +2169,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	if (conflicts > 0)
 	{
 		/* (the violations it found, besides those the branch had) */
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		int			nviolations = violations_kept() - known;
 
 		conflicts -= nviolations;
 		stopped_outside_block("merge", "Merge", "branches", conflicts, nviolations);
@@ -3423,7 +3443,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+		int			nviolations = violations_kept();
 		int			ctables;
 		int			vtables;
 
@@ -3459,7 +3479,7 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 	must_commit(stopped, "a revert");
 	if (stopped > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+		int			nviolations = violations_kept();
 		int			ctables;
 		int			vtables;
 
@@ -6281,8 +6301,16 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 	bool		from_ok = r->from_item == NULL;
 	bool		to_ok = r->to_item == NULL;
 	bool		some = false;
+	bool		reads_all;
 	const char *name;
 
+	/*
+	 * (one who may read every version needs no lineage: walking it reads
+	 * what the working set changed since the head, a fold of its rows,
+	 * whatever the refs diffed)
+	 */
+	reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
 	for (int i = 0; i < 2; i++)
 	{
 		Oid			relid;
@@ -6300,15 +6328,15 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 		check_history_rls(relid, fn);
 		some = true;
+		if (reads_all)
+			continue;
 		l = name_lineage(lineages, names[i]);
 		if (!from_ok)
 			from_ok = lineage_has(l, from_ref, r->from_name);
 		if (!to_ok)
 			to_ok = lineage_has(l, to_ref, r->to_name);
 	}
-	if ((from_ok && to_ok) ||
-		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
-		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+	if ((from_ok && to_ok) || reads_all)
 		return;
 	name = !from_ok ? r->from_name : r->to_name;
 	if (some)

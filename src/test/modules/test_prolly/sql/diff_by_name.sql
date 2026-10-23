@@ -46,8 +46,8 @@ SELECT c.message, h.row FROM dolt_history_table('dn.t1') h
 JOIN dolt_log c ON c.commit_hash = h.commit_hash
 ORDER BY c.date, h.row->>'a';
 
--- renamed (rows changed too, so matched as a drop and an add): by its old
--- name in the version that has it, and by its new
+-- renamed, rows changed too (one table, by its identity, as Dolt's tags
+-- match it): by its old name or its new, the row added alone
 CREATE TABLE dn.r1 (pk int PRIMARY KEY, v text);
 INSERT INTO dn.r1 VALUES (1, 'one');
 SELECT length(dolt_commit('-Am', 'r1')::text) AS committed;
@@ -148,6 +148,20 @@ SET ROLE regress_dn_reader;
 SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD~', 'k2');
 SELECT count(*) FROM dolt_diff_table('k2');
 RESET ROLE;
+
+-- a diff of two commits by name beside uncommitted changes: the
+-- database's owner reads no working-set row (no lineage to walk); a
+-- reader with a grant gets the same rows
+INSERT INTO dn.k2 VALUES (2, 'two');
+SELECT length(dolt_commit('-am', 'k2 two')::text) AS committed;
+INSERT INTO dn.k2 SELECT g, 'dirty' FROM generate_series(10, 509) g;
+SELECT count(*) AS reset FROM test_fold_counters(true);
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~', 'HEAD', 'k2');
+SELECT pages, candidates, full_tables FROM test_fold_counters(true);
+SET ROLE regress_dn_reader;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~', 'HEAD', 'k2');
+RESET ROLE;
+DELETE FROM dn.k2 WHERE id >= 10;
 DROP OWNED BY regress_dn_reader;
 DROP ROLE regress_dn_reader;
 

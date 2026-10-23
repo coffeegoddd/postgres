@@ -76,6 +76,16 @@ class Engine:
         """Server settings worth recording with a run, or None."""
         return None
 
+    # (the counters pass runs only for an engine that keeps work counters)
+    has_counters = False
+
+    def counters(self, sql):
+        """The engine's cumulative work counters, {name: integer}, with all
+        the session's work so far counted by the time they're read; the
+        counters pass reports their differences across an operation.  None
+        for an engine that keeps none."""
+        return None
+
 
 def literal(value):
     return "'" + str(value).replace("'", "''") + "'"
@@ -256,6 +266,16 @@ class Prolly(Engine):
                         "WHERE c.oid='bench_rows'::regclass")
         if am != "prolly":
             raise RuntimeError(f"table access method: expected 'prolly', got {am!r}")
+
+    has_counters = True
+
+    def counters(self, sql):
+        # pg_stat_prolly is per database, and a session's counts reach it
+        # only when its statistics are flushed: forced at the end of the
+        # first statement, so the read after it sees all the work before.
+        sql.query("SELECT pg_stat_force_next_flush()")
+        return {name: int(value) for name, value in
+                sql.query("SELECT name, value FROM pg_stat_prolly")["rows"]}
 
     def settings(self, sql):
         names = ",".join(literal(s) for s in self.SETTINGS)

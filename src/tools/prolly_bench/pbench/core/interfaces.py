@@ -218,10 +218,10 @@ class Window(abc.ABC):
 # ---------------------------------------------------------------------------
 
 class Workload(abc.ABC):
-    """One S, V or C workload."""
+    """One workload of a suite (pbench/suites/)."""
 
-    id: ClassVar[str]               # "S1", "V3", ...
-    suite: ClassVar[str]            # "S", "V" or "C"
+    id: ClassVar[str]               # "S1", "V3", "GV2", ...: the suite's letter and a number
+    suite: ClassVar[str]            # "S", "V", "C", "G", "GV", ...
     title: ClassVar[str]
 
     def variants(self, params: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:

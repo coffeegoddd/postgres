@@ -1,0 +1,280 @@
+-- A rewrite of a versioned table (ALTER TABLE ... TYPE, REFRESH
+-- MATERIALIZED VIEW) folds its branch as a checkpoint as it ends
+-- (prolly.fold_on_rewrite), so the commit after reads none of its rows
+-- again, the fold worker off or not; and dolt_pending_full_folds() says
+-- which tables the next fold will read in full, and why.
+CREATE DATABASE regress_rewrite_folds;
+\c regress_rewrite_folds
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA rf VERSIONED;
+CREATE TABLE rf.t (id int PRIMARY KEY, k int, v text);
+INSERT INTO rf.t SELECT g, g, 'v' || g FROM generate_series(1, 1000) g;
+CREATE MATERIALIZED VIEW rf.m AS SELECT id, v FROM rf.t WHERE id <= 100;
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked, the session's counts flushed first (:flush, a statement of its
+-- own).
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+-- Never folded: every table's first fold reads it in full.
+SELECT table_name, reason, estimated_rows IS NOT NULL AS estimated
+FROM dolt_pending_full_folds() ORDER BY 1;
+ table_name |   reason    | estimated 
+------------+-------------+-----------
+ rf.t       | no_baseline | f
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'base')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_pending_full_folds();
+ table_name | reason | estimated_rows 
+------------+--------+----------------
+(0 rows)
+
+ANALYZE rf.t;
+-- The checkpoint off: a rewrite leaves the table's rows to the commit,
+-- which reads every one, as the pending list said it would.
+SET debug_prolly_verify_fold_caches = off;
+SET prolly.fold_on_rewrite = off;
+ALTER TABLE rf.t ALTER COLUMN k TYPE bigint;
+SELECT * FROM dolt_pending_full_folds();
+ table_name |    reason     | estimated_rows 
+------------+---------------+----------------
+ rf.t       | shape_changed |               
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting,
+	pg_temp.since('fold_full_tables') IS NOT NULL AS counting_full;
+ counting | counting_full 
+----------+---------------
+ t        | t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'retyped, unfolded')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS commit_rows_read,
+	pg_temp.since('fold_full_tables') AS commit_full_tables;
+ commit_rows_read | commit_full_tables 
+------------------+--------------------
+             1000 |                  1
+(1 row)
+
+-- On (the default): the rewrite folds, and the commit after reads no row.
+RESET prolly.fold_on_rewrite;
+ALTER TABLE rf.t ALTER COLUMN k TYPE int;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_full_tables') AS rewrite_full_tables,
+	pg_temp.since('fold_rows_read') AS rewrite_rows_read;
+ rewrite_full_tables | rewrite_rows_read 
+---------------------+-------------------
+                   1 |              1000
+(1 row)
+
+SELECT * FROM dolt_pending_full_folds();
+ table_name | reason | estimated_rows 
+------------+--------+----------------
+(0 rows)
+
+SELECT length(dolt_commit('-am', 'retyped')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS commit_rows_read,
+	pg_temp.since('fold_full_tables') AS commit_full_tables;
+ commit_rows_read | commit_full_tables 
+------------------+--------------------
+                0 |                  0
+(1 row)
+
+-- The rewrite and the commit in one transaction: the same (counted by
+-- the session's change finder, as the transaction's counts are flushed
+-- only once it ends).
+BEGIN;
+ALTER TABLE rf.t ALTER COLUMN k TYPE bigint;
+SELECT 1 FROM test_fold_counters(true);
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT length(dolt_commit('-am', 'retyped in one')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT candidates, full_tables FROM test_fold_counters();
+ candidates | full_tables 
+------------+-------------
+          0 |           0
+(1 row)
+
+COMMIT;
+-- A materialized view refreshed: folded as it is rewritten too.
+UPDATE rf.t SET v = 'new' WHERE id <= 10;
+REFRESH MATERIALIZED VIEW rf.m;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT length(dolt_commit('-am', 'refreshed')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_rows_read') AS commit_rows_read;
+ commit_rows_read 
+------------------
+                0
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+-- Each commit holds what a fold of everything holds.
+SELECT test_fold_root(true) = prolly_root_hash('main') AS head_rows;
+ head_rows 
+-----------
+ t
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 'new') AS refreshed FROM rf.m;
+ refreshed 
+-----------
+        10
+(1 row)
+
+-- A table made since, and every fold forced: pending, with why.
+CREATE TABLE rf.u (id int PRIMARY KEY);
+SELECT * FROM dolt_pending_full_folds();
+ table_name |   reason    | estimated_rows 
+------------+-------------+----------------
+ rf.u       | no_baseline |               
+(1 row)
+
+SET debug_prolly_force_full_fold = on;
+SELECT table_name, reason FROM dolt_pending_full_folds() ORDER BY 1;
+ table_name | reason 
+------------+--------
+ rf.t       | forced
+ rf.u       | forced
+(2 rows)
+
+RESET debug_prolly_force_full_fold;
+SELECT length(dolt_commit('-Am', 'u')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT * FROM dolt_pending_full_folds();
+ table_name | reason | estimated_rows 
+------------+--------+----------------
+(0 rows)
+
+-- A rewrite of a table that isn't versioned, with a versioned prolly
+-- child rewritten with it: the child's branch is folded.
+CREATE TABLE public.rf_parent (k int);
+CREATE TABLE rf.child () INHERITS (public.rf_parent);
+INSERT INTO rf.child SELECT g FROM generate_series(1, 10) g;
+SELECT length(dolt_commit('-Am', 'child')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TABLE public.rf_parent ALTER COLUMN k TYPE bigint;
+SELECT * FROM dolt_pending_full_folds();
+ table_name | reason | estimated_rows 
+------------+--------+----------------
+(0 rows)
+
+SELECT length(dolt_commit('-am', 'child retyped')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+DROP TABLE rf.child;
+DROP TABLE public.rf_parent;
+SELECT length(dolt_commit('-Am', 'child gone')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- A rewrite made by history work (a reset moving a retyped column back)
+-- isn't the session's: no checkpoint of its own, and the move's result
+-- is what the head holds.
+ALTER TABLE rf.t ALTER COLUMN k TYPE int;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'rf.t'::regclass AND attname = 'k';
+ format_type 
+-------------
+ bigint
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+\c contrib_regression
+DROP DATABASE regress_rewrite_folds;

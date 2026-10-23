@@ -30,6 +30,7 @@
 #include "access/prolly_types.h"
 #include "access/transam.h"
 #include "datatype/timestamp.h"
+#include "utils/snapshot.h"
 
 #define PROLLY_MAX_PARENTS 2
 
@@ -65,6 +66,15 @@ typedef struct ProllyCommitInfo
 	 */
 	bool		has_height;
 	int64		height;
+
+	/*
+	 * The identity of its root's tables and columns, which their renames
+	 * keep (the canonicalizer's identify()): an identity record, palloc'd,
+	 * or NULL where every object has its own name's (nothing in its
+	 * history was renamed).
+	 */
+	char	   *identity;
+	int			identity_len;
 } ProllyCommitInfo;
 
 /*
@@ -107,6 +117,10 @@ typedef struct ProllyViolation
 	char	   *row;
 	char	   *info;
 } ProllyViolation;
+
+/* Visits one violation; it is good only during the visit. */
+typedef void (*ProllyViolationVisit) (const ProllyViolation *violation,
+									  void *arg);
 
 /*
  * A tag: a name for a commit, with who made it, when and why, as Dolt's
@@ -172,6 +186,18 @@ typedef void (*ProllyRootRefVisit) (const char *ref, const ProllyHash *commit,
 /* Visits a remote-tracking branch: the remote, its branch, the commit. */
 typedef void (*ProllyTrackingVisit) (const char *remote, const char *branch,
 									 const ProllyHash *commit, void *arg);
+
+/*
+ * What a fold of a branch's working set was made at (written_since()):
+ * opaque to all but the refs.
+ */
+typedef struct ProllyFoldMark
+{
+	Oid			branch;
+	uint64		generation;
+	uint64		overflow;
+	uint64		epoch;
+} ProllyFoldMark;
 
 typedef struct ProllyRefsRoutine
 {
@@ -304,6 +330,15 @@ typedef struct ProllyRefsRoutine
 	 */
 	List	   *(*violations) (void);
 	void		(*set_violations) (List *violations);
+
+	/*
+	 * The session branch's violations visited in the order they were
+	 * added, those of tables since dropped too, without holding them all;
+	 * and violations (n of them) added after them, with the transaction,
+	 * the others neither read nor written again.
+	 */
+	void		(*visit_violations) (ProllyViolationVisit visit, void *arg);
+	void		(*add_violations) (ProllyViolation *const *violations, int n);
 
 	/*
 	 * working_set() for reading what changed, never to commit or move from:
@@ -518,6 +553,50 @@ typedef struct ProllyRefsRoutine
 	void		(*saw_database) (Oid database);
 
 	/*
+	 * Optional, together: which tables' rows may have changed since a fold
+	 * of a branch, for a canonicalizer that works out again only what
+	 * changed.  note_relation() is told, as note_write() is (and after
+	 * it), of each relation whose rows a write to branch changes.
+	 * fold_mark() marks a fold by snap of branch, before it reads anything:
+	 * false where nothing could be known of it later (in recovery, while a
+	 * transaction is prepared, after the transaction's catalog changes, or
+	 * by a snapshot that doesn't see every writer of the branch that ended).
+	 * written_since() puts in *relids (*nrelids of them, palloc'd) every
+	 * relation whose rows a transaction that ended since mark, or this
+	 * one, wrote on mark's branch, as snap reads them: false where that
+	 * isn't known (a catalog change or collection since, a writer that
+	 * wrote too many relations or found no room to be told of, a prepared
+	 * transaction ended, the branch forgotten, a snapshot that doesn't see
+	 * every writer that ended, or another writer of the branch not ended
+	 * yet: others see its commit before its relations are kept), and then
+	 * everything may have changed.
+	 * Catalog changes and sequences' values aren't relations' rows: a
+	 * catalog change moves what fold_mark() takes, and a sequence is read
+	 * each time.
+	 */
+	void		(*note_relation) (Oid branch, Oid relid);
+	bool		(*fold_mark) (Oid branch, Snapshot snap, ProllyFoldMark *mark);
+	bool		(*written_since) (const ProllyFoldMark *mark, Snapshot snap,
+								  Oid **relids, int *nrelids);
+
+	/*
+	 * Optional: visit each table of the session branch whose next fold
+	 * would read it in full, with why (the canonicalizer's pending_full()
+	 * from the branch's baseline).
+	 */
+	void		(*pending_full_folds) (ProllyPendingFullVisit visit, void *arg);
+
+	/*
+	 * Optional, together: the identity record of the session branch's
+	 * working set (with only valid, of that table alone), as the commit it
+	 * would make records it; and the session branch's working set made
+	 * what identity (an identity record) describes, by name (a move to a
+	 * root whose identity it is), for later renames to be told by.
+	 */
+	void		(*working_identity) (Oid only, StringInfo identity);
+	void		(*anchor_identity) (const ProllyValue *identity);
+
+	/*
 	 * Optional, together: tags.  tag_write() writes a tag object of commit,
 	 * by tagger, with message, dated now, and sets *tag to its id; it names
 	 * nothing.  tag_get() reads a tag object (false: tag isn't one).
@@ -563,7 +642,8 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "lock", "walk", "checkpoint", "set_head", "violations", \
-	"set_violations", "read_working_set", "walk_commit", "remote_set", \
+	"set_violations", "visit_violations", "add_violations", \
+	"read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
@@ -571,7 +651,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
 	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
-	"tag_write", "tag_get", "tag_lookup", "tag_set", "tags", \
+	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
+	"working_identity", "anchor_identity", "tag_write", "tag_get", \
+	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK set_rebase_state

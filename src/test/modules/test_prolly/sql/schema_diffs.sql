@@ -55,7 +55,8 @@ SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', '"T"');
 SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'F()');
 RESET search_path;
 
--- a rename that changed the rows too is a drop and an add
+-- a rename that changed the rows too is one renamed table, by its
+-- identity, which the rename keeps (as Dolt's tags)
 ALTER TABLE app.new_name RENAME TO newer_name;
 UPDATE app.newer_name SET v = 'changed';
 CREATE TABLE app.twin_a (id int PRIMARY KEY);
@@ -64,9 +65,7 @@ CREATE TABLE app.same_a (v int);
 CREATE TABLE app.same_b (v int);
 SELECT length(dolt_commit('-Am', 'twins')::text) AS committed;
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD');
--- two renamed at once, told apart by what else names them (their keys'
--- indexes keep their names); two of one content renamed can't be told
--- apart, so they stay dropped and added
+-- two renamed at once, each told by its identity, even two of one content
 ALTER TABLE app.twin_a RENAME TO twin_c;
 ALTER TABLE app.twin_b RENAME TO twin_d;
 ALTER TABLE app.same_a RENAME TO same_c;

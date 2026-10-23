@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pbench import bcompare, report, table
-from pbench.core import registry
+from pbench.core import registry, suites
 from pbench.core.validation import cell_problems, compatible, validate_run
 from pbench.presentation import Document, Section, Value, link
 
@@ -49,9 +49,10 @@ def metrics(suite: str, keys: set[str]) -> list[Metric]:
         definitions.setdefault(key, (key.replace("_", " ").capitalize(), unit))
     for key, title in report.WA_COMPONENTS:
         definitions.setdefault(key, ("Write amplification: " + title, "bytes per completed unit"))
-    preferred = ([k for k, *_ in table.S_TABLES] + report.S_METRICS if suite == "S" else
-                 [k for k, *_ in table.V_TABLES] + report.V_METRICS if suite == "V" else
-                 report.C_METRICS)
+    layout = suites.layout(suite)
+    preferred = ([k for k, *_ in table.S_TABLES] + report.S_METRICS if layout == suites.STORAGE else
+                 [k for k, *_ in table.V_TABLES] + report.V_METRICS
+                 if layout == suites.VERSION_CONTROL else report.C_METRICS)
     wanted = list(dict.fromkeys(preferred + sorted(keys)))
     return [Metric(k, *definitions.get(k, (k, "unit unspecified")),
                    "higher" if k in report.HIGHER_IS_BETTER | {"throughput"} else
@@ -149,12 +150,13 @@ def load(path: Path) -> Source:
 
 def _key_errors(key: dict, suite: str | None) -> list[str]:
     errors = []
-    if not isinstance(key.get("workload"), str) or not re.fullmatch(r"[SVC][1-9][0-9]*", key["workload"]):
+    if not suites.is_workload_id(key.get("workload")):
         errors.append("missing or invalid workload in cell key")
     for name, kind in (("size", str), ("variant", str), ("clients", int), ("rep", int)):
         # Older C evidence names only the workload. Build comparisons need the
         # complete S/V key; never fill in missing repetition IDs for inference.
-        if (suite in ("S", "V") or name in key) and type(key.get(name)) is not kind:
+        if (suites.layout(suite) in (suites.STORAGE, suites.VERSION_CONTROL) or name in key) \
+                and type(key.get(name)) is not kind:
             errors.append(f"missing or invalid {name} in cell key")
     return errors
 
@@ -315,13 +317,14 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
         raise ValueError("no result sets")
     if len({s.label for s in sources}) != len(sources):
         raise ValueError("result labels must be unique; supply exact runs, not merged retries or shards")
-    suites = {s.run.get("suite") for s in sources} - {None}
-    if len(suites) > 1:
+    letters = {s.run.get("suite") for s in sources} - {None}
+    if len(letters) > 1:
         raise ValueError("give result sets of one suite")
-    suite = next(iter(suites), "?")
+    suite = next(iter(letters), "?")
+    layout = suites.layout(suite)
     if baseline is not None:
-        if suite != "S":
-            raise ValueError("an explicit baseline is supported only for the S suite")
+        if layout != suites.STORAGE:
+            raise ValueError("an explicit baseline is supported only for storage suites, as the S suite")
         if sum(s.path.resolve() == baseline.resolve() for s in sources) != 1:
             raise ValueError("the explicit baseline must name exactly one loaded result set")
     sources = sorted(sources, key=lambda s: (s.run.get("table_am") != "heap", s.label))
@@ -333,7 +336,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     groups = {s.label: _groups(s) for s in sources}
     keys = sorted({k for g in groups.values() for k in g}, key=lambda k: tuple(_natural(v) for v in k))
     found = {k for s in sources for r in s.results for k in r["metrics"]}
-    if suite == "S":
+    if layout == suites.STORAGE:
         found.add("throughput")
     definitions = metrics(suite, found)
     # Infer applicability per workload variant, across engines/client counts.
@@ -351,8 +354,9 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     def applicable(metric: Metric, key: tuple) -> bool:
         return not producers[metric.key] or (key[0], key[2]) in producers[metric.key]
     overview_keys = ({"throughput", "latency_p99_ms", "wal_bytes_per_operation", "wa_server",
-                      "cluster_allocated_bytes_including_wal"} if suite == "S" else
-                     {k for k in found if k.endswith("_ms")} | {"background_tps"} if suite == "V" else
+                      "cluster_allocated_bytes_including_wal"} if layout == suites.STORAGE else
+                     {k for k in found if k.endswith("_ms")} | {"background_tps"}
+                     if layout == suites.VERSION_CONTROL else
                      {"records", "pass_percent", "crashed", "timeout", "did_not_run"})
     overview_metrics = [m for m in definitions if m.key in overview_keys]
     overview = Section("Workload overview", ["Workload", "Size", "Variant", "Clients", "Engine/build", "Repetitions"] +
@@ -370,7 +374,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     document.sections.append(overview)
     for s in sources:
         document.sections.append(_coverage(s, output_dir))
-    if suite == "C":
+    if layout == suites.CORRECTNESS:
         _correctness(sources, document)
     # Choose a heap reference within each build, never across builds. Explicit
     # compare commands may nominate an arbitrary reference result set.
@@ -378,7 +382,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
     for s in sources:
         candidates = [b for b in sources if b.path.resolve() == baseline.resolve()] if baseline else [
             b for b in sources if b.run.get("table_am") == "heap" and b.run.get("build", "") == s.run.get("build", "")]
-        if suite == "S" and len(candidates) == 1 and candidates[0] is not s:
+        if layout == suites.STORAGE and len(candidates) == 1 and candidates[0] is not s:
             b = candidates[0]
             vary = "build" if b.run.get("build", "") != s.run.get("build", "") else "engine"
             problems = compatible(b.path, s.path, vary)
@@ -387,7 +391,7 @@ def build(sources: list[Source], output_dir: Path, *, baseline: Path | None = No
                 document.passed = False
             else:
                 references[s.label] = b
-        elif suite == "S" and len(candidates) > 1:
+        elif layout == suites.STORAGE and len(candidates) > 1:
             document.notes.append(f"{s.label}: comparison withheld: ambiguous heap baseline")
             document.passed = False
     additional = {}

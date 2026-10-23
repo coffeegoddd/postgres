@@ -112,10 +112,13 @@ Upstream `SkipResultsCheck` becomes operation success plus a check of the
 resulting state (on checkout, the active branch); it is not propagated as a
 bypass.
 
-Historical row ports retain the current by-name projection (D18). A renamed
-primary-key column is NULL in an older version that lacks its current name.
-Such rows cannot be matched by the current key. When both keyed historical
-versions have identical definitions, their stored
+Historical row ports read each version as the table is defined now, its
+columns matched by identity, which renames keep (D18, #699): a renamed column,
+primary-key columns included, reads its values in versions before the rename,
+as Dolt's tags do. A column an older version lacks (a key made anew of a column
+added since, say) reads as NULL there, and such rows cannot be matched by the
+current key. When both
+keyed historical versions have identical definitions, their stored
 key bytes match rows and edits are reported as modified. Otherwise, equal
 projected rows on opposite sides cancel by copy count, and the remaining rows
 are reported separately as removed or added. Matching key bytes follows the
@@ -124,14 +127,13 @@ bytes, remain a removal and an addition. This retains duplicate rows
 and composite keys with a missing component. Cancellation uses the compared
 values before fitting them to the current types, so distinct old values that
 both display as NULL still differ. The temporary sort can spill to disk.
-A rename alone with unchanged data roots still produces no row diff. Following column identity across renames
-is tracked separately in [#699](https://github.com/coffeegoddd/postgres/issues/699).
+A rename alone with unchanged data roots still produces no row diff.
 Columns present under the same name in both historical versions also participate
 in comparison when that name is absent today. A keyed row whose value changed is
 reported as modified even if its displayed rows are identical (both values read
 as NULL); a keyless change retains its removed and added copies. This applies to
 columns subsequently dropped as well as renamed, without matching different
-historical names by position or inferring column identity. Diff statistics count
+historical names by position. Diff statistics count
 these modified rows, while changed-cell counts still compare the displayed cells
 (D20).
 

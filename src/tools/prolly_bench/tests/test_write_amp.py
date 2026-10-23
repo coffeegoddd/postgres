@@ -461,7 +461,7 @@ class RunnerOrderTest(unittest.TestCase):
             r.keep_failed, r.bin_dir = False, Path(d)
             r._make_cluster = lambda instance: cluster
             with mock.patch.object(runner_mod.registry.collectors, "get", lambda name: Probe), \
-                    mock.patch.object(runner_mod.targets, "for_am", lambda am: target), \
+                    mock.patch.object(runner_mod.targets, "for_am", lambda am, extensions=(): target), \
                     mock.patch.object(runner_mod.env_mod, "build_provenance", lambda b: None), \
                     mock.patch.object(runner_mod.config_mod, "server_settings", lambda c: {}), \
                     mock.patch.object(runner_mod.correctness, "verify",

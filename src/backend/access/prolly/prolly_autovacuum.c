@@ -151,6 +151,14 @@ prolly_autovacuum_init(void)
 							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("prolly.fold_on_rewrite",
+							 "Folds the branch of a versioned table a rewrite (ALTER TABLE, REFRESH MATERIALIZED VIEW) read and wrote every row of, as a checkpoint, as the rewrite ends.",
+							 "So the next commit folds only what changed since; the rewrite pays for the fold.",
+							 &prolly_fold_on_rewrite,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.log_full_folds",
 							"Logs each fold that reads its table in full, with why, once it reads at least this many rows.",
 							"-1 logs none; 0 logs every one.",

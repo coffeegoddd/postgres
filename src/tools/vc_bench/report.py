@@ -22,6 +22,81 @@ PASS_FIELDS = {
 LEGACY_MEMORY_FIELDS = PASS_FIELDS["memory"] + PASS_FIELDS["cpu"] + PASS_FIELDS["io"]
 CPU_SHORT_TICKS = 3
 
+# A series drifts when its samples, in run order, rise or fall together
+# more than chance allows: a two-sided Mann-Kendall test below DRIFT_P.  A
+# report holds hundreds of series, so the bar is high; a cell's seven
+# default repetitions rising every time clear it (p 0.0004), six of them
+# don't.  Too few samples can't.
+DRIFT_P = 0.001
+DRIFT_MIN_SAMPLES = 5
+
+
+def _mahonian(n):
+    """Permutations of n items by their number of inversions."""
+    counts = [1]
+    for m in range(1, n + 1):
+        out = [0] * (len(counts) + m - 1)
+        for k, c in enumerate(counts):
+            for j in range(m):
+                out[k + j] += c
+        counts = out
+    return counts
+
+
+def trend(values):
+    """Mann-Kendall trend of values in their order: (S, tau, two-sided p),
+    or None when every value is the same.  Exact without ties; with them
+    (common for counters), the normal approximation with its tie
+    correction."""
+    n = len(values)
+    pairs = n * (n - 1) // 2
+    s = sum((b > a) - (b < a) for i, a in enumerate(values) for b in values[i + 1:])
+    groups = collections.Counter(values).values()
+    if len(groups) == 1:
+        return None
+    if len(groups) == n and n <= 50:
+        counts = _mahonian(n)
+        # (S = pairs - 2 * inversions; symmetric about 0)
+        extreme = sum(counts[:(pairs - abs(s)) // 2 + 1])
+        p = min(1.0, 2 * extreme / math.factorial(n))
+    else:
+        var = (n * (n - 1) * (2 * n + 5) - sum(t * (t - 1) * (2 * t + 5) for t in groups)) / 18
+        z = max(0, abs(s) - 1) / math.sqrt(var)
+        p = math.erfc(z / math.sqrt(2))
+    return s, s / pairs, p
+
+
+def drift(rows, fields):
+    """Series whose measured samples drift with run order (rows in the order
+    they were measured): each cell's latency (timing pass) and each of its
+    engine counters (counters pass), where any trend at all is work that
+    depends on what ran before, since the same operation counts the same."""
+    series = collections.defaultdict(list)
+    for row in rows:
+        key = tuple(row[k] for k in fields)
+        if row["pass"] == "timing":
+            series[key + ("elapsed_ns",)].append(row["elapsed_ns"])
+        elif row["pass"] == "counters":
+            series[key + ("counters",)].append(row.get("counters") or {})
+    flags = []
+    for key, samples in sorted(series.items(), key=lambda item: str(item[0])):
+        if key[-1] == "elapsed_ns":
+            named = [("elapsed_ns", samples)]
+        else:
+            names = sorted({name for s in samples for name in s})
+            named = [("counter_" + name, [s.get(name, 0) for s in samples]) for name in names]
+        for metric, values in named:
+            if len(values) < DRIFT_MIN_SAMPLES:
+                continue
+            result = trend(values)
+            if result is None or result[2] >= DRIFT_P:
+                continue
+            s, tau, p = result
+            flags.append({**dict(zip(fields, key[:-1])), "metric": metric, "samples": len(values),
+                          "direction": "rising" if s > 0 else "falling", "kendall_tau": tau,
+                          "p_value": p, "first": values[0], "last": values[-1]})
+    return flags
+
 
 def merge(paths, results_root):
     """One results directory holding the samples of several complete runs of one
@@ -134,7 +209,20 @@ def report(path):
                 tick_ns = 1e9 / os.sysconf("SC_CLK_TCK")
                 summary["short_cpu_observations"] = sum(r["elapsed_ns"] < CPU_SHORT_TICKS * tick_ns
                                                         for r in records)
+        if key[-1] == "counters":
+            # (a counter an operation didn't move was recorded as nothing: 0)
+            for name in sorted({n for r in records for n in r["counters"]}):
+                values = [r["counters"].get(name, 0) for r in records]
+                summary["median_counter_" + name] = statistics.median(values)
+                summary["min_counter_" + name] = min(values)
+                summary["max_counter_" + name] = max(values)
         summaries.append(summary)
+    flags = drift(good, fields)
+    write_json(path / "drift.json", flags)
+    with (path / "drift.csv").open("w") as f:
+        writer = csv.DictWriter(f, list(dict.fromkeys(k for s in flags for k in s)) or ["metric"])
+        writer.writeheader()
+        writer.writerows(flags)
     columns = list(dict.fromkeys(k for s in summaries for k in s))
     with (path / "summary.csv").open("w") as f:
         writer = csv.DictWriter(f, columns)
@@ -184,7 +272,7 @@ def report(path):
         writer = csv.DictWriter(f, columns)
         writer.writeheader()
         writer.writerows(fits)
-    render(path, manifest, summaries, fits)
+    render(path, manifest, summaries, fits, flags)
     text = ["VC benchmark results", "", "Latency: persistent SQL request through complete result consumption; warm caches.",
             "Memory: separate instrumented pass, server-tree PSS/RSS. Sampled peaks are lower bounds.",
             "PSS peak delta measures resident growth, not total bytes allocated. Retained delta is immediate after the operation.",
@@ -199,5 +287,10 @@ def report(path):
             text.append(f"{item['engine']} {item['operation']} vs {item['axis']}: exponent={item['exponent']:.3f}, CI={item['bootstrap_95_percent']}")
     if not any(f['status'] == 'descriptive' for f in fits):
         text.append("No sweep meets the sample/size requirements. Smoke runs test correctness only.")
+    text += ["", f"Run-order drift (drift.csv): {len(flags)} series flagged."]
+    for flag in flags:
+        text.append(f"{flag['engine']} {flag['operation']} D={flag['distance']} {flag['working_set']} "
+                    f"{flag['pass']} {flag['metric']}: {flag['direction']}, tau={flag['kendall_tau']:.2f}, "
+                    f"p={flag['p_value']:.2g}")
     (path / "report.txt").write_text('\n'.join(text) + '\n')
     print('\n'.join(text))

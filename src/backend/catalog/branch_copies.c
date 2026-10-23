@@ -389,6 +389,7 @@ copy_rows(Oid target)
 			}
 			PG_END_TRY();
 			heap_freetuple(copy);
+			pgstat_count_prolly(PGSTAT_PROLLY_CATALOG_ROWS_COPIED, 1);
 		}
 		systable_endscan(scan);
 		CatalogCloseIndexes(indstate);
