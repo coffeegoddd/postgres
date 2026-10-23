@@ -1257,14 +1257,24 @@ taking_add(Taking *t, RelFileLocator loc, BranchKeptRelation *k)
 static void
 taking_end(Taking *t)
 {
-	uint64	   *ids = palloc_array(uint64, Max(t->n, 1));
+	uint64	   *ids = palloc0_array(uint64, Max(t->n, 1));
 
-	bmap_snapshot_take_many(t->rels, t->n, ids);
-	for (int i = 0; i < t->n; i++)
+	/* (those taken noted even if a later one fails: to be let go of) */
+	PG_TRY();
 	{
-		t->into[i]->snapshot = ids[i];
-		note_taken(t->rels[i]->smgr_rlocator.locator, ids[i]);
+		bmap_snapshot_take_many(t->rels, t->n, ids);
 	}
+	PG_FINALLY();
+	{
+		for (int i = 0; i < t->n; i++)
+		{
+			if (ids[i] != 0)
+				note_taken(t->rels[i]->smgr_rlocator.locator, ids[i]);
+		}
+	}
+	PG_END_TRY();
+	for (int i = 0; i < t->n; i++)
+		t->into[i]->snapshot = ids[i];
 	pfree(ids);
 	pfree(t->rels);
 	pfree(t->into);
