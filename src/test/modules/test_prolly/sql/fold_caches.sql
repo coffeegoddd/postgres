@@ -339,8 +339,9 @@ SELECT dolt_reset('--hard');
 -- is the branch's baseline, and after the move the baseline is advanced
 -- to the target, the move's own writes taken as folded, not folded again.
 -- 40 dirty rows reset: 40 candidates, not 80 (the check, which folds again,
--- off to count it).  The working set is then the head's, taken as known,
--- and the next commit holds exactly the rows written after.
+-- off to count it).  The next status folds again (the move wrote the
+-- branch), reading nothing: the move's entries were consumed.  The next
+-- commit holds exactly the rows written after.
 UPDATE fc.t SET v = 'dirty' WHERE id <= 40;
 SET debug_prolly_verify_fold_caches = off;
 :flush
