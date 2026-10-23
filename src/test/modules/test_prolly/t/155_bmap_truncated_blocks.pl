@@ -123,8 +123,8 @@ my $freed = free_blocks($node);
 cmp_ok($freed - $free_before, '>=', 90, 'freeing its blocks past the length');
 sql(q{CREATE TABLE g (a int, b text);
 	INSERT INTO g SELECT g, repeat('z', 500) FROM generate_series(1, 1500) g});
-# (and its TOAST index's metapage)
-is($freed - free_blocks($node), nblocks('g') + 1, 'another table is given them');
+# (and its TOAST index's metapage, and the leaves of both maps)
+is($freed - free_blocks($node), nblocks('g') + 3, 'another table is given them');
 my $g = sql(q{SELECT count(*), sum(a), md5(string_agg(b, '' ORDER BY a)) FROM g});
 my $k = sql(q{SELECT count(*), sum(a), md5(string_agg(b, '' ORDER BY a)) FROM k});
 my $free_now = free_blocks($node);

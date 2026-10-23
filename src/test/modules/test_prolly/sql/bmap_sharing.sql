@@ -1,6 +1,7 @@
 -- Block-mapped storage shares pages between copies: a copy's map holds its
--- source's physical blocks, each counted once more, and a block is freed
--- only when the last map holding it goes.
+-- source's subtrees, each counted once more (test_bmap_map()'s refs adds up
+-- the counts on a block's path: the maps besides this one that reach it),
+-- and a block is freed only when the last map holding it goes.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -15,6 +16,11 @@ SELECT pg_relation_size('cow.t') / 8192 AS nblocks \gset
 -- (and its change log's, its index's too, its own)
 SELECT (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)) / 8192
 	AS tlog \gset
+-- (the nodes of their maps, which are blocks of the page store too)
+SELECT (SELECT count(DISTINCT block) FROM test_bmap_tree(pg_relation_filenode(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass))) +
+	(SELECT count(DISTINCT block) FROM test_bmap_tree(pg_relation_filenode(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)))
+	AS tlog_nodes \gset
+SELECT count(DISTINCT block) AS src_nodes FROM test_bmap_tree(:src) \gset
 
 -- A copy reads the same pages, from the same blocks, each now counted once.
 SELECT test_bmap_share(:src) AS copy \gset
@@ -31,13 +37,14 @@ SELECT bool_and(epoch < 1) AS entries_older FROM test_bmap_map(:copy);
 SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT test_bmap_digest(:copy) AS copy_digest \gset
 DROP TABLE cow.t;
-SELECT test_bmap_free_blocks() - :free_before = :tlog AS nothing_freed;
+SELECT test_bmap_free_blocks() - :free_before = :tlog + :tlog_nodes AS nothing_freed;
 SELECT test_bmap_digest(:copy) = :'copy_digest' AS copy_intact;
 SELECT bool_and(refs = 0) AS copy_holds_alone FROM test_bmap_map(:copy);
 
 -- Dropping the copy, the last holder, frees them.
 SELECT test_bmap_unlink(:copy);
-SELECT test_bmap_free_blocks() - :free_before = :nblocks + :tlog AS all_freed;
+SELECT test_bmap_free_blocks() - :free_before =
+	:nblocks + :tlog + :tlog_nodes + :src_nodes AS all_freed;
 
 -- A copy of a copy: three maps hold the blocks.
 CREATE TABLE cow.u (v text);

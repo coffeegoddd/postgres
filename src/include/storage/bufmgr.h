@@ -305,6 +305,8 @@ extern void DropRelationBuffers(SMgrRelation smgr_reln,
 extern void DropRelationsAllBuffers(SMgrRelation *smgr_reln,
 									int nlocators);
 extern void DropDatabaseBuffers(Oid dbid);
+extern void DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
+							BlockNumber blkno);
 
 #define RelationGetNumberOfBlocks(reln) \
 	RelationGetNumberOfBlocksInFork(reln, MAIN_FORKNUM)

@@ -48,7 +48,6 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->old_hw, xlrec->new_hw, xlrec->nreused);
 				break;
 			}
-		case XLOG_BMAP_SHARE:
 		case XLOG_BMAP_SHARED:
 		case XLOG_BMAP_SHARE_CHANGES:
 			{
@@ -91,6 +90,30 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 								 (xlrec->flags & BMAP_UNREF_MAP) ? "; map" : "");
 				break;
 			}
+		case XLOG_BMAP_TREE:
+			{
+				xl_bmap_tree *xlrec = (xl_bmap_tree *) rec;
+
+				appendStringInfo(buf, "rel %u/%u/%u; ",
+								 xlrec->locator.spcOid, xlrec->locator.dbOid,
+								 xlrec->locator.relNumber);
+				if (xlrec->op == BMAP_TREE_NODE)
+					appendStringInfo(buf, "node %u%s; hw %u -> %u",
+									 xlrec->node,
+									 (xlrec->flags & BMAP_TREE_INSTALL) ? " (installed)" : "",
+									 xlrec->old_hw, xlrec->new_hw);
+				else if (xlrec->op == BMAP_TREE_HOLD)
+					appendStringInfo(buf, "hold children of %u", xlrec->from);
+				else if (xlrec->op == BMAP_TREE_COPY)
+					appendStringInfo(buf, "copy %u -> %u; hw %u -> %u",
+									 xlrec->from, xlrec->node,
+									 xlrec->old_hw, xlrec->new_hw);
+				else if (xlrec->op == BMAP_TREE_SHARE)
+					appendStringInfo(buf, "share of %u", xlrec->from);
+				else
+					appendStringInfo(buf, "op %u", xlrec->op);
+				break;
+			}
 		case XLOG_BMAP_SHRINK:
 			{
 				xl_bmap_shrink *xlrec = (xl_bmap_shrink *) rec;
@@ -120,8 +143,6 @@ bmap_identify(uint8 info)
 			return "TRUNCATE";
 		case XLOG_BMAP_FREE:
 			return "FREE";
-		case XLOG_BMAP_SHARE:
-			return "SHARE";
 		case XLOG_BMAP_SHARED:
 			return "SHARED";
 		case XLOG_BMAP_UNREF:
@@ -138,6 +159,8 @@ bmap_identify(uint8 info)
 			return "SHRINK";
 		case XLOG_BMAP_PRESERVE:
 			return "PRESERVE";
+		case XLOG_BMAP_TREE:
+			return "TREE";
 	}
 	return NULL;
 }

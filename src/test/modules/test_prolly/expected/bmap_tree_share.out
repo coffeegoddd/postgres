@@ -1,0 +1,286 @@
+-- Sharing a block map copies its root page
+-- alone: the map work of a share, and of dropping the copy, is the same
+-- whatever the relation's size.  The first change under a shared node
+-- copies the path to it, a node a level, and the leaf's blocks are then
+-- copied as any shared block is.
+-- A database of its own, so nothing else counts in it.
+SELECT current_database() AS home \gset
+CREATE DATABASE bmap_tree_share;
+\c bmap_tree_share
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SET debug_block_mapped_heap = on;
+-- The work of one statement, counted: the counters it moved.
+CREATE FUNCTION pg_temp.counted() RETURNS TABLE (name text, value bigint)
+LANGUAGE sql AS $$
+	SELECT n, coalesce((SELECT p.value FROM pg_stat_prolly p WHERE p.name = n), -1)
+	FROM unnest('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}'::text[]) n
+$$;
+-- two tables, of about 1000 and 10000 blocks, each over two subtrees
+CREATE TABLE small (a int, b text) WITH (fillfactor = 10);
+INSERT INTO small SELECT g, repeat('s', 200) FROM generate_series(1, 3000) g;
+CREATE TABLE big (a int, b text) WITH (fillfactor = 10);
+INSERT INTO big SELECT g, repeat('b', 200) FROM generate_series(1, 30000) g;
+SELECT pg_relation_filenode('small') AS small, pg_relation_filenode('big') AS big \gset
+SELECT pg_relation_size('small') / 8192 > 509 AS small_two_subtrees,
+	pg_relation_size('big') / 8192 > 9 * pg_relation_size('small') / 8192 AS big_ten_times;
+ small_two_subtrees | big_ten_times 
+--------------------+---------------
+ t                  | t
+(1 row)
+
+SELECT test_bmap_rows_digest(:small) AS small_rows,
+	test_bmap_rows_digest(:big) AS big_rows \gset
+SELECT * FROM prolly_page_sweep();
+ freed | recounted | truncated 
+-------+-----------+-----------
+     0 |         0 |         0
+(1 row)
+
+-- a share: one map page, a count for each subtree
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_share(:small) AS small_copy \gset
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM pg_temp.counted();
+         name          | value 
+-----------------------+-------
+ bmap_map_pages_copied |     1
+ bmap_refcount_updates |     2
+ bmap_blocks_freed     |     0
+(3 rows)
+
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_share(:big) AS big_copy \gset
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM pg_temp.counted();
+         name          | value 
+-----------------------+-------
+ bmap_map_pages_copied |     1
+ bmap_refcount_updates |     2
+ bmap_blocks_freed     |     0
+(3 rows)
+
+SELECT test_bmap_rows_digest(:small_copy) = :'small_rows' AS small_same,
+	test_bmap_rows_digest(:big_copy) = :'big_rows' AS big_same;
+ small_same | big_same 
+------------+----------
+ t          | t
+(1 row)
+
+-- (the copy's subtrees are the source's, each held twice)
+SELECT level, first, refs FROM test_bmap_tree(:big_copy)
+WHERE level = 1 OR first = 0 ORDER BY first, level;
+ level | first | refs 
+-------+-------+------
+     0 |     0 |    1
+     1 |   509 |    1
+(2 rows)
+
+-- the first change under the shared subtree copies its node and the leaf:
+-- two map pages, a count for each child of each, and the block's own copy
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_write(:big, 600, 1);
+ test_bmap_write 
+-----------------
+ 
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, CASE WHEN name = 'bmap_refcount_updates'
+	THEN value - (SELECT count(*) FROM test_bmap_tree(:big) WHERE level = 0 AND first >= 509)
+		- (SELECT count(*) FROM test_bmap_map(:big) WHERE blkno BETWEEN 509 AND 1017)
+	ELSE value END AS value
+FROM pg_temp.counted();
+         name          | value 
+-----------------------+-------
+ bmap_map_pages_copied |     2
+ bmap_refcount_updates |     3
+ bmap_blocks_freed     |     0
+(3 rows)
+
+-- the next change on the same leaf copies no map page
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_write(:big, 601, 1);
+ test_bmap_write 
+-----------------
+ 
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM pg_temp.counted();
+         name          | value 
+-----------------------+-------
+ bmap_map_pages_copied |     0
+ bmap_refcount_updates |     1
+ bmap_blocks_freed     |     0
+(3 rows)
+
+-- the copy is as it was; the source's path is its own, the copy's shared no more
+SELECT test_bmap_rows_digest(:big_copy) = :'big_rows' AS copy_unchanged;
+ copy_unchanged 
+----------------
+ t
+(1 row)
+
+SELECT (SELECT refs FROM test_bmap_tree(:big) WHERE level = 1) AS source_node_refs,
+	(SELECT refs FROM test_bmap_tree(:big_copy) WHERE level = 1) AS copy_node_refs;
+ source_node_refs | copy_node_refs 
+------------------+----------------
+                0 |              0
+(1 row)
+
+SELECT * FROM prolly_page_sweep();
+ freed | recounted | truncated 
+-------+-----------+-----------
+     0 |         0 |         0
+(1 row)
+
+-- dropping a copy: a count less for each subtree, whatever the size
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_unlink(:small_copy);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM pg_temp.counted();
+         name          | value 
+-----------------------+-------
+ bmap_map_pages_copied |     0
+ bmap_refcount_updates |     2
+ bmap_blocks_freed     |     0
+(3 rows)
+
+SELECT test_bmap_rows_digest(:small) = :'small_rows' AS small_unchanged;
+ small_unchanged 
+-----------------
+ t
+(1 row)
+
+-- the big copy: the subtree the source copied away is the copy's alone, so
+-- it is freed with the copy, down to the blocks only it held
+SELECT pg_stat_reset_shared('prolly');
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT test_bmap_unlink(:big_copy);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, value > 0 AS moved FROM pg_temp.counted();
+         name          | moved 
+-----------------------+-------
+ bmap_map_pages_copied | f
+ bmap_refcount_updates | t
+ bmap_blocks_freed     | t
+(3 rows)
+
+SELECT * FROM prolly_page_sweep();
+ freed | recounted | truncated 
+-------+-----------+-----------
+     0 |         0 |         0
+(1 row)
+
+-- copies of copies, the first dropped first
+SELECT test_bmap_share(:small) AS c1 \gset
+SELECT test_bmap_share(:c1) AS c2 \gset
+SELECT test_bmap_write(:c1, 3, 1);
+ test_bmap_write 
+-----------------
+ 
+(1 row)
+
+SELECT test_bmap_unlink(:c1);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
+SELECT test_bmap_rows_digest(:c2) = :'small_rows' AS c2_same;
+ c2_same 
+---------
+ t
+(1 row)
+
+SELECT test_bmap_unlink(:c2);
+ test_bmap_unlink 
+------------------
+ 
+(1 row)
+
+SELECT * FROM prolly_page_sweep();
+ freed | recounted | truncated 
+-------+-----------+-----------
+     0 |         0 |         0
+(1 row)
+
+\c :home
+DROP DATABASE bmap_tree_share;

@@ -18,9 +18,10 @@ LANGUAGE sql AS $$
 	FROM unnest(names) n
 $$;
 
--- Sharing a relation's blocks copies each of its map pages and counts each
--- block once more; dropping the copy counts each down again, and frees none
--- (the source holds them).  (Fixed-width columns: no TOAST table.)
+-- Sharing a relation's blocks copies its map's root page alone, and counts
+-- each subtree under it once more (a table this size has one); dropping
+-- the copy counts each down again, and frees none (the source holds them).
+-- (Fixed-width columns: no TOAST table.)
 CREATE SCHEMA sm VERSIONED;
 CREATE TABLE sm.b (a int8, b int8, c int8, d int8);
 INSERT INTO sm.b SELECT g, g, g, g FROM generate_series(1, 20000) g;
@@ -30,16 +31,12 @@ SELECT pg_stat_force_next_flush();
 SELECT pg_stat_reset_shared('prolly');
 SELECT test_bmap_share(:src) AS copy \gset
 SELECT pg_stat_force_next_flush();
-SELECT name, CASE WHEN name = 'bmap_refcount_updates' THEN value - :nblocks
-	ELSE value END AS value
-FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}');
+SELECT * FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}');
 SELECT pg_stat_reset_shared('prolly');
 SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT test_bmap_unlink(:copy);
 SELECT pg_stat_force_next_flush();
-SELECT name, CASE WHEN name = 'bmap_refcount_updates' THEN value - :nblocks
-	ELSE value END AS value
-FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}');
+SELECT * FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}');
 -- Dropping the source, the last holder, frees every block, counting none
 -- down.
 SELECT pg_stat_reset_shared('prolly');
@@ -90,8 +87,9 @@ BEGIN
 	RETURN total;
 END $$;
 SELECT pg_temp.branch_rows((SELECT oid FROM pg_branch WHERE brname = 'main')) AS main_rows \gset
--- (a map page for each relation with blocks, none with more blocks than
--- one map page maps: the tables, their indexes and their change logs)
+-- (a root page for each relation with blocks, and a count for each of its
+-- subtrees, a relation this size having one: the tables, their indexes and
+-- their change logs)
 SELECT count(*) AS relations, sum(pg_relation_size(oid)) / current_setting('block_size')::int
 	AS blocks
 FROM pg_class
@@ -105,8 +103,8 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'catalog_rows_copied') = :
 	AS each_catalog_row_copied,
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_map_pages_copied') = :relations
 	AS each_map_page_copied,
-	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_refcount_updates') = :blocks
-	AS each_block_counted;
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_refcount_updates') = :relations
+	AS each_subtree_counted;
 SELECT name, value FROM pg_temp.counted('{apply_rows,apply_index_tuples,bmap_blocks_freed}');
 
 -- A hard reset writes the dirty rows back: three updated, two inserted

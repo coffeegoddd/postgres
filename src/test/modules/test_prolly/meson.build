@@ -190,6 +190,7 @@ tests += {
       'reflog',
       'bulk_moves',
       'retype_moves',
+      'bmap_tree_share',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -296,6 +297,8 @@ tests += {
       't/162_fold_worker.pl',
       't/163_merge_plan_spill.pl',
       't/168_bmap_truncation_record.pl',
+      't/190_bmap_tree.pl',
+      't/191_bmap_tree_share.pl',
     ],
   },
 }

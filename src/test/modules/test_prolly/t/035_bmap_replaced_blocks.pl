@@ -16,7 +16,9 @@ use Test::More;
 
 # (the tables have no change logs: a log's pages, allocated as its table's
 # rows are written, would take the freed blocks each scenario arranges for
-# the tables)
+# the tables.  A copy dropped frees the leaf of its map with the block it
+# held, the leaf first in the store, and so first taken again: a table,
+# fill, extended by a block, takes it.)
 
 # $s_page: the logical block of s that gets r's old block (r's is 0).
 sub scenario
@@ -38,6 +40,9 @@ full_page_writes = off
 		CREATE EXTENSION test_prolly;
 		CREATE EXTENSION pg_buffercache;
 		CREATE SCHEMA cow VERSIONED;
+		CREATE TABLE cow.fill (a int8);
+		SELECT test_drop_change_log('cow.fill');
+		INSERT INTO cow.fill VALUES (1);
 		CREATE TABLE cow.q (a int8);
 		SELECT test_drop_change_log('cow.q');
 	});
@@ -52,6 +57,7 @@ full_page_writes = off
 	});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
 	my $s = $sql->(q{SELECT pg_relation_filenode('cow.s')});
+	my $fill = $sql->(q{SELECT pg_relation_filenode('cow.fill')});
 	my $r_block = $sql->(qq{SELECT phys FROM test_bmap_map($r) WHERE blkno = 0});
 	is($sql->(q{SELECT max(ctid) FROM cow.r}), '(0,150)', "$name: r is one page");
 
@@ -99,6 +105,7 @@ full_page_writes = off
 	$sql->(qq{INSERT INTO cow.s SELECT g, 'y' FROM generate_series(1, $first) g})
 	  if $first > 0;
 	$sql->(qq{SELECT test_bmap_unlink($rcopy)});
+	$sql->(qq{SELECT test_bmap_extend($fill, 1)});
 	$sql->(qq{INSERT INTO cow.s VALUES ($first + 1, 'y')});
 	is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = $s_page}), $r_block,
 		"$name: s's page $s_page has r's old block");
@@ -201,6 +208,9 @@ full_page_writes = off
 		CREATE EXTENSION test_prolly;
 		CREATE EXTENSION pg_buffercache;
 		CREATE SCHEMA cow VERSIONED;
+		CREATE TABLE cow.fill (a int8);
+		SELECT test_drop_change_log('cow.fill');
+		INSERT INTO cow.fill VALUES (1);
 		CREATE TABLE cow.r (a int8, b int8);
 		SELECT test_drop_change_log('cow.r');
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
@@ -208,6 +218,7 @@ full_page_writes = off
 		SELECT test_drop_change_log('cow.s');
 		INSERT INTO cow.s SELECT g, 'x' FROM generate_series(1, 4) g;
 	});
+	my $fill = $sql->(q{SELECT pg_relation_filenode('cow.fill')});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
 	my $s = $sql->(q{SELECT pg_relation_filenode('cow.s')});
 	my $r_block = $sql->(qq{SELECT phys FROM test_bmap_map($r) WHERE blkno = 0});
@@ -221,6 +232,7 @@ full_page_writes = off
 	my $copy = $sql->(qq{SELECT test_bmap_share($r)});
 	$sql->(q{UPDATE cow.r SET b = 0 WHERE a = 1});
 	$sql->(qq{SELECT test_bmap_unlink($copy)});
+	$sql->(qq{SELECT test_bmap_extend($fill, 1)});
 	$sql->(q{INSERT INTO cow.s VALUES (5, 'y')});
 	is($sql->(qq{SELECT phys FROM test_bmap_map($s) WHERE blkno = 1}), $r_block,
 		'copied_away: s\'s second page has r\'s old block');

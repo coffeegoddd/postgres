@@ -124,6 +124,10 @@ extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
 extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);
 extern uint32 bmap_inspect_epoch(SMgrRelation reln);
+typedef void (*BmapNodeInspect) (uint16 level, BlockNumber first,
+								 BlockNumber block, uint32 refs, void *arg);
+extern void bmap_inspect_tree(SMgrRelation reln, BmapNodeInspect visit,
+							  void *arg);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);
 

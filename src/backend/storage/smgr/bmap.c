@@ -18,17 +18,35 @@
  * they aren't shared: a relation made as a share of another gets copies of
  * them (RelationCreateStorageShared()), as they are small.
  *
- * The map fork.  Block 0 is a header holding the relation's logical length
- * and epoch.  Logical block L's entry is at slot L % BMAP_FANOUT of map page
- * 1 + L / BMAP_FANOUT: found without following any pointer.  An entry is a
- * physical block, the epoch it was born in (one born before its map's epoch
- * may be shared with another map), and the WAL position since which it has
- * that block.  Its block changes only while nothing else can change the
- * logical block: when a shared page is copied before it changes (its
- * buffer locked exclusively), or when an entry left past the relation's end
- * by a truncation is let go because another map shares its block.  The map
- * fork's existence is the relation's; smgropen() chooses this storage
- * manager by it.
+ * The map.  Block 0 of the map fork is a header holding the relation's
+ * logical length and epoch, and block 1 its root page (BmapRoot), the
+ * relation's alone, pointing to four subtrees of fixed range.  A subtree's
+ * nodes are pages of the page store, read through shared buffers under the
+ * store's own file number: a node points to nodes a level down, and a leaf
+ * holds the entries of BMAP_TREE_FANOUT consecutive logical blocks.  An
+ * entry is a physical block, the epoch it was born in (one born before its
+ * map's epoch may be shared with another map), and the WAL position since
+ * which it has that block.  Its block changes only while nothing else can
+ * change the logical block: when a shared page is copied before it changes
+ * (its buffer locked exclusively), or when an entry left past the
+ * relation's end by a truncation is let go because another map shares its
+ * block.  The map fork's existence is the relation's; smgropen() chooses
+ * this storage manager by it.
+ *
+ * Sharing.  A node is held by every page that points to it, and a data
+ * block by every leaf (and changes list) holding it, the reference counts
+ * saying how many besides the first.  A share copies the root page alone,
+ * each subtree gaining a holder; the first change under a shared node copies
+ * the path down to the leaf (tree_copy_node()), each copy's children
+ * gaining a holder, and the data block is then copied as any shared block
+ * is.  A drop lets go of each subtree: a count less where another holds it,
+ * else freed, its children let go of the same way.  A node is an
+ * incarnation of its block, which the pointer to it names by the record
+ * that made it: a lookup that finds another there (a node freed and made
+ * something else under it; in recovery, a version written before a crash)
+ * looks again, or in recovery takes the subtree for replaced after the
+ * record (tree_find()).  A map, or page store, of an older format (the flat
+ * maps of version 1) is refused, not read (refuse_version()).
  *
  * Recovery reads map pages that can be from different moments: one written
  * after the point redo has reached, another not yet written.  A version
@@ -52,11 +70,11 @@
  * between leaves them mapped past the length, where a later truncation or
  * extension lets go of them, or dropping the relation frees them.
  *
- * Locking.  Lookups read the header and a map page under share locks, one
- * at a time.  Extension holds the header exclusively (serializing the
- * relation's extensions and its map fork's growth): it reads the map page,
- * takes blocks under the allocator's metapage and bitmap pages' locks, and
- * then locks the map page exclusively.  Truncation takes the header's.
+ * Locking.  Lookups read the root page and the nodes down to a leaf under
+ * share locks, one at a time.  Extension holds the header exclusively
+ * (serializing the relation's extensions and the tree's growth): it reads
+ * the leaf, takes blocks under the allocator's metapage and bitmap pages'
+ * locks, and then locks the leaf exclusively.  Truncation takes the header's.
  * Writing a page out looks it up without loading map pages into shared
  * buffers (see read_node()), but share-locks a map page it finds cached,
  * so a write may wait for a change of that page.  Any buffer read may be
@@ -64,9 +82,12 @@
  * locked for a change reads no buffer: a change reads every buffer it
  * needs (the changes list's, the reference counts', the allocator's)
  * first and locks the map page last (map_lock(), which assert-enabled
- * builds check at every read).  The one exception is a map page just
- * added, or found all zeroes: it maps no page a write could look up, so an
- * extension keeps it locked while it allocates.
+ * builds check at every read).  The one exception is a node just made: it
+ * maps no page a write could look up until the page that points to it is
+ * locked, last.  Nodes are made and copied under the header held
+ * exclusively (a change prepared under it held shared lets go and takes it
+ * so to copy a path); a write looks its page up from the root page, never
+ * the header, which the backend writing it out may hold exclusively.
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
  * four cases: a crash between a drop's commit and the records freeing its
@@ -83,7 +104,12 @@
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
  * read before.  A dropped
- * relation's map stays until the next checkpoint, and counts until then.
+ * relation's map stays until the next checkpoint, and counts until then
+ * (a tree's root page is written out with no subtrees first, as the nodes
+ * it named are freed).  A tree's node counts once for each page pointing to
+ * it, its children once however many reach it.  A path copy (not held off)
+ * adds holders only to blocks held already; one adding a holder to a stuck
+ * count makes a sweep under way leave the stuck counts as they are.
  *
  * Scans (bmap_scan_store()).  A scan of a page store reads every block
  * allocated, or only the ranges of blocks written or freed since an
@@ -153,15 +179,23 @@ int			block_map_replay_entries = 65536;
  */
 
 #define BMAP_MAGIC			0x424D4150	/* "BMAP" */
-#define BMAP_VERSION		1
+/*
+ * The format's version, which headers, allocators' metapages and changes
+ * lists' headers carry.  Version 1 maps were flat, an entry per logical
+ * block in the relation's own map fork; this server reads only version 2,
+ * whose maps are trees of pages of the page store, and refuses anything
+ * older (refuse_version()).
+ */
+#define BMAP_VERSION		2
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
-#define BMAP_PAGE_NODE		3
 #define BMAP_PAGE_BITMAP	4
 #define BMAP_PAGE_REFS		5
 #define BMAP_PAGE_CHANGES_HEAD	6
 #define BMAP_PAGE_CHANGES	7
+#define BMAP_PAGE_ROOT		8		/* a tree's root page: block 1 */
+#define BMAP_PAGE_TREE		9		/* a tree's node, in the page store */
 
 typedef struct BmapPageOpaqueData
 {
@@ -216,8 +250,6 @@ typedef struct BmapMeta
 
 #define BMAP_CONTENT_SIZE \
 	(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(BmapPageOpaqueData)))
-#define BMAP_FANOUT \
-	((uint32) (BMAP_CONTENT_SIZE / sizeof(BmapEntry)))
 #define BMAP_MAX_BITMAPS \
 	((uint32) ((BMAP_CONTENT_SIZE - offsetof(BmapMeta, bitmap)) / sizeof(BlockNumber)))
 #define BMAP_BITS_PER_PAGE \
@@ -244,9 +276,56 @@ typedef struct BmapMeta
 #define REF_PAGE(phys)		((BlockNumber) ((phys) / BMAP_REFS_PER_PAGE))
 #define REF_SLOT(phys)		((uint32) ((phys) % BMAP_REFS_PER_PAGE))
 
-/* the map page and slot of logical block 'blk' */
-#define MAP_PAGE(blk)		((BlockNumber) (1 + (blk) / BMAP_FANOUT))
-#define MAP_SLOT(blk)		((uint32) ((blk) % BMAP_FANOUT))
+
+/*
+ * A tree's node: a page of the page store, read through shared buffers under
+ * the store's file number (data pages never are: theirs are logical), whose
+ * special space says what it is.  A node is an incarnation of its block:
+ * 'born' is the WAL position of the record that made it, which the pointer
+ * to it carries as its 'since', and no other node of the block has (a block
+ * is made a node again only after it was freed).  Level 0 is a leaf, whose
+ * entries map logical blocks to physical ones; a node of level k > 0
+ * points to nodes of level k - 1, with entries of the same shape (the child's block, the epoch
+ * the pointer was set in, the child's birth).
+ */
+typedef struct BmapTreeOpaqueData
+{
+	uint16		type;			/* BMAP_PAGE_TREE */
+	uint16		level;
+	uint32		magic;
+	XLogRecPtr	born;
+	BlockNumber first;			/* the first logical block it maps */
+	uint32		unused;
+} BmapTreeOpaqueData;
+
+#define BMAP_TREE_SPECIAL	MAXALIGN(sizeof(BmapTreeOpaqueData))
+#define BMAP_TREE_FANOUT \
+	((uint32) ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - BMAP_TREE_SPECIAL) / \
+			   sizeof(BmapEntry)))
+
+#define PageGetBmapTreeOpaque(page) \
+	((BmapTreeOpaqueData *) PageGetSpecialPointer(page))
+
+/*
+ * A tree's root page, block 1 of its map fork, the relation's own: a pointer
+ * to each of its subtrees.  Subtree k, of level k, maps BMAP_TREE_FANOUT^(k+1)
+ * logical blocks from where subtree k - 1's end: a relation of fewer blocks
+ * than a leaf maps has one level, and the four together map every block a
+ * relation can have.  No subtree ever gets a level above it, so a pointer's
+ * node is replaced only by its copy, by a node made where there was none,
+ * or by nothing (see tree_find()).
+ */
+#define BMAP_TREE_TOPS		4
+
+typedef struct BmapRoot
+{
+	BmapEntry	top[BMAP_TREE_TOPS];
+} BmapRoot;
+
+#define PageGetBmapRoot(page)	((BmapRoot *) PageGetContents(page))
+
+/* a map fork's pages, a tree's: its header and its root page */
+#define BMAP_TREE_MAP_PAGES	2
 
 /* blocks allocated by one record at most */
 #define BMAP_PIECE			64
@@ -256,7 +335,7 @@ typedef struct BmapMeta
 #define PageGetBmapOpaque(page) \
 	((BmapPageOpaqueData *) PageGetSpecialPointer(page))
 #define PageGetBmapHeader(page)	((BmapHeader *) PageGetContents(page))
-/* a map page's contents are BMAP_FANOUT entries */
+/* a node's or a root page's contents are entries */
 #define PageGetBmapEntries(page)	((BmapEntry *) PageGetContents(page))
 #define PageGetBmapMeta(page)	((BmapMeta *) PageGetContents(page))
 #define PageGetBmapBits(page)	((uint64 *) PageGetContents(page))
@@ -318,6 +397,7 @@ typedef struct BmapWatch
 typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
+	pg_atomic_uint64 stuck_held;	/* holders a stuck count gained, ever */
 	pg_atomic_uint64 watch_key[BMAP_WATCHED_MAX];
 	slock_t		mutex;			/* protects what follows */
 	int			nlisted;
@@ -340,12 +420,14 @@ static BmapShared *bmap_shared = NULL;
 /*
  * A logical block whose map page recovery replaced with an older image, and
  * the WAL position since which the version replaced gave it its physical
- * block (see remember_ahead()).
+ * block (see remember_ahead()), named by its page store, the block of its
+ * leaf (which relations may share) and its slot there.
  */
 typedef struct BmapAheadKey
 {
 	RelFileLocator rel;
 	BlockNumber blkno;
+	uint32		slot;
 } BmapAheadKey;
 
 typedef struct BmapAhead
@@ -376,6 +458,7 @@ static void
 BmapShmemInit(void *arg)
 {
 	pg_atomic_init_u32(&bmap_shared->sweeps, 0);
+	pg_atomic_init_u64(&bmap_shared->stuck_held, 0);
 	SpinLockInit(&bmap_shared->mutex);
 	bmap_shared->nlisted = 0;
 	bmap_shared->unlisted = 0;
@@ -575,13 +658,16 @@ const ShmemCallbacks BmapShmemCallbacks = {
 	.init_fn = BmapShmemInit,
 };
 
-static void list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
-					   BlockNumber old_block,
-					   uint32 epoch);
-static void unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
+struct MapPage;
+static void list_stale(SMgrRelation reln, const struct MapPage *mp,
+					   Buffer mapbuf, BlockNumber blkno,
+					   BlockNumber old_block, uint32 epoch);
+static void unshare_stale(SMgrRelation reln, const struct MapPage *leaf,
+						  uint32 epoch, uint32 fold_epoch,
 						  BlockNumber from, BlockNumber to,
 						  bool release);
 static void share_changes(SMgrRelation src, SMgrRelation dst);
+static void create_map(SMgrRelation reln);
 
 /* ----------------------------------------------------------------
  * Files
@@ -638,6 +724,21 @@ bmap_relation_exists(RelFileLocator rel)
  * ----------------------------------------------------------------
  */
 
+/*
+ * A block map, or a page store, made by a server of an older format, which
+ * this one doesn't read: its pages would be taken for something else.
+ */
+static void
+refuse_version(uint32 version, RelFileLocator rel, ForkNumber fork)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("\"%s\" is block-mapped storage of format version %u, which this server does not read",
+					relpathperm(rel, fork).str, version),
+			 errdetail("This server reads format version %u only.", BMAP_VERSION),
+			 errhint("Recreate the database from a dump made by the server that wrote it.")));
+}
+
 static void
 check_page(Page page, uint16 type, RelFileLocator rel, ForkNumber fork,
 		   BlockNumber blkno)
@@ -656,25 +757,46 @@ check_page(Page page, uint16 type, RelFileLocator rel, ForkNumber fork,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("block %u of \"%s\" is not a block map page of the expected kind",
 						blkno, relpathperm(rel, fork).str)));
+
+	/* (the pages that say their version: the first word of their contents) */
+	if ((type == BMAP_PAGE_HEADER || type == BMAP_PAGE_META ||
+		 type == BMAP_PAGE_CHANGES_HEAD) &&
+		*(uint32 *) PageGetContents(page) != BMAP_VERSION)
+		refuse_version(*(uint32 *) PageGetContents(page), rel, fork);
 }
 
 /*
  * A map page locked for a change, and the rule that comes with it: while a
  * backend holds one locked it reads no buffer, as any read may evict a page
  * the map page maps, whose write would look it up there (read_node()).  A
- * map page just added, or found all zeroes, maps nothing, and is exempt.
+ * map page just added, or found all zeroes, maps nothing, and is exempt:
+ * so is a tree's node just made, which nothing points to yet, and which may
+ * stay locked while the page that is to point to it is locked last.
  * Assert-enabled builds check the rule at each of this file's buffer reads,
  * whether or not a read happens to evict such a page; the resource owner
  * forgets the lock if an error releases it.
  */
 #ifdef USE_ASSERT_CHECKING
-static Buffer map_locked = InvalidBuffer;
-static bool map_locked_new = false;
+#define MAP_LOCKED_MAX	2
+
+static Buffer map_locked[MAP_LOCKED_MAX] = {InvalidBuffer, InvalidBuffer};
+static bool map_locked_new[MAP_LOCKED_MAX];
+
+static void
+map_locked_forget(Buffer buf)
+{
+	for (int i = 0; i < MAP_LOCKED_MAX; i++)
+		if (map_locked[i] == buf)
+		{
+			map_locked[i] = InvalidBuffer;
+			return;
+		}
+}
 
 static void
 map_locked_release(Datum res)
 {
-	map_locked = InvalidBuffer;
+	map_locked_forget(DatumGetInt32(res));
 }
 
 static const ResourceOwnerDesc map_locked_desc = {
@@ -684,6 +806,28 @@ static const ResourceOwnerDesc map_locked_desc = {
 	.ReleaseResource = map_locked_release,
 	.DebugPrint = NULL
 };
+
+static void
+map_locked_note(Buffer buf, bool isnew)
+{
+	int			free = -1;
+
+	if (!CurrentResourceOwner)
+		return;
+	for (int i = 0; i < MAP_LOCKED_MAX; i++)
+	{
+		/* (at most one changing page, beside new ones) */
+		Assert(!BufferIsValid(map_locked[i]) || map_locked_new[i] || isnew);
+		if (!BufferIsValid(map_locked[i]) && free < 0)
+			free = i;
+	}
+	Assert(free >= 0);
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+	ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(buf),
+						  &map_locked_desc);
+	map_locked[free] = buf;
+	map_locked_new[free] = isnew;
+}
 #endif
 
 static void
@@ -691,32 +835,16 @@ map_lock(Buffer buf, bool isnew)
 {
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 #ifdef USE_ASSERT_CHECKING
-	Assert(!BufferIsValid(map_locked));
-	if (CurrentResourceOwner)
-	{
-		ResourceOwnerEnlarge(CurrentResourceOwner);
-		ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(buf),
-							  &map_locked_desc);
-		map_locked = buf;
-		map_locked_new = isnew;
-	}
+	map_locked_note(buf, isnew);
 #endif
 }
 
-/* (a page map_new_page() returned, locked already) */
+/* (a page map_new_page() or tree_new_page() returned, locked already) */
 static void
 map_locked_as_new(Buffer buf)
 {
 #ifdef USE_ASSERT_CHECKING
-	Assert(!BufferIsValid(map_locked));
-	if (CurrentResourceOwner)
-	{
-		ResourceOwnerEnlarge(CurrentResourceOwner);
-		ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(buf),
-							  &map_locked_desc);
-		map_locked = buf;
-		map_locked_new = true;
-	}
+	map_locked_note(buf, true);
 #endif
 }
 
@@ -724,13 +852,14 @@ static void
 map_unlock(Buffer buf)
 {
 #ifdef USE_ASSERT_CHECKING
-	if (BufferIsValid(map_locked))
-	{
-		Assert(map_locked == buf);
-		ResourceOwnerForget(CurrentResourceOwner, Int32GetDatum(buf),
-							&map_locked_desc);
-		map_locked = InvalidBuffer;
-	}
+	for (int i = 0; i < MAP_LOCKED_MAX; i++)
+		if (map_locked[i] == buf)
+		{
+			ResourceOwnerForget(CurrentResourceOwner, Int32GetDatum(buf),
+								&map_locked_desc);
+			map_locked[i] = InvalidBuffer;
+			break;
+		}
 #endif
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 }
@@ -740,7 +869,8 @@ static inline void
 check_may_read(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	Assert(!BufferIsValid(map_locked) || map_locked_new);
+	for (int i = 0; i < MAP_LOCKED_MAX; i++)
+		Assert(!BufferIsValid(map_locked[i]) || map_locked_new[i]);
 #endif
 }
 
@@ -826,21 +956,79 @@ init_page(Page page, uint16 type)
 }
 
 static void
-init_node(Page page)
-{
-	BmapEntry  *entries;
-
-	init_page(page, BMAP_PAGE_NODE);
-	entries = PageGetBmapEntries(page);
-	for (uint32 i = 0; i < BMAP_FANOUT; i++)
-		entries[i].block = InvalidBlockNumber;
-}
-
-static void
 init_header(Page page)
 {
 	init_page(page, BMAP_PAGE_HEADER);
 	PageGetBmapHeader(page)->version = BMAP_VERSION;
+}
+
+static void
+init_root(Page page)
+{
+	BmapRoot   *root;
+
+	init_page(page, BMAP_PAGE_ROOT);
+	root = PageGetBmapRoot(page);
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		root->top[k].block = InvalidBlockNumber;
+}
+
+/* a tree's node of 'level', mapping from logical block 'first', no entries */
+static void
+init_tree_node(Page page, uint16 level, BlockNumber first, XLogRecPtr born)
+{
+	BmapTreeOpaqueData *opaque;
+	BmapEntry  *entries;
+
+	PageInit(page, BLCKSZ, sizeof(BmapTreeOpaqueData));
+	opaque = PageGetBmapTreeOpaque(page);
+	opaque->type = BMAP_PAGE_TREE;
+	opaque->level = level;
+	opaque->magic = BMAP_MAGIC;
+	opaque->born = born;
+	opaque->first = first;
+	opaque->unused = 0;
+	entries = PageGetBmapEntries(page);
+	memset(entries, 0, BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+		entries[i].block = InvalidBlockNumber;
+	/* the contents fill the page; nothing for a full-page image to skip */
+	((PageHeader) page)->pd_lower = ((PageHeader) page)->pd_upper;
+}
+
+/*
+ * Is 'page' a tree's node of 'level' mapping from 'first', born at 'born':
+ * the incarnation of its block a pointer to it names?  A page of zeroes, one
+ * that fails verification, another kind of page, or another incarnation (a
+ * block freed and made something else since the pointer was read; in
+ * recovery, a version written before a crash) is not.
+ */
+static bool
+tree_node_is(const PageData *page, uint16 level, BlockNumber first,
+			 XLogRecPtr born)
+{
+	const BmapTreeOpaqueData *opaque;
+
+	if (PageIsNew(page) ||
+		((const PageHeaderData *) page)->pd_special != BLCKSZ - BMAP_TREE_SPECIAL)
+		return false;
+	opaque = (const BmapTreeOpaqueData *) PageGetSpecialPointer(page);
+	return opaque->magic == BMAP_MAGIC && opaque->type == BMAP_PAGE_TREE &&
+		opaque->level == level && opaque->first == first &&
+		opaque->born == born;
+}
+
+/* is 'page' a tree's node, of any incarnation? */
+static bool
+tree_node_any(const PageData *page)
+{
+	const BmapTreeOpaqueData *opaque;
+
+	if (PageIsNew(page) ||
+		((const PageHeaderData *) page)->pd_special != BLCKSZ - BMAP_TREE_SPECIAL)
+		return false;
+	opaque = (const BmapTreeOpaqueData *) PageGetSpecialPointer(page);
+	return opaque->magic == BMAP_MAGIC && opaque->type == BMAP_PAGE_TREE;
 }
 
 static void
@@ -880,17 +1068,12 @@ apply_node_delta(Page page, const xl_bmap_node_delta *delta)
 	BmapEntry  *entries;
 	bool		changed = false;
 
-	if (delta->flags & BMAP_DELTA_INIT)
-	{
-		init_node(page);
-		changed = true;
-	}
 	entries = PageGetBmapEntries(page);
 	for (uint32 i = 0; i < delta->nentries; i++)
 	{
 		BmapEntry  *e = &entries[ent[i].slot];
 
-		Assert(ent[i].slot < BMAP_FANOUT);
+		Assert(ent[i].slot < BMAP_TREE_FANOUT);
 		/* (in redo, an entry kept from a newer page: see redo_block()) */
 		if (e->since > delta->since)
 			continue;
@@ -959,6 +1142,22 @@ apply_meta_delta(Page page, const xl_bmap_meta_delta *delta)
 		if (meta->nbitmap >= BMAP_MAX_BITMAPS)
 			elog(PANIC, "block map allocator has too many bitmap pages");
 		meta->bitmap[meta->nbitmap++] = added[i];
+	}
+}
+
+static void
+apply_root_delta(Page page, const xl_bmap_root_delta *delta)
+{
+	BmapRoot   *root;
+
+	init_root(page);
+	root = PageGetBmapRoot(page);
+	Assert(delta->ntops <= BMAP_TREE_TOPS);
+	for (uint32 k = 0; k < delta->ntops; k++)
+	{
+		root->top[k].block = delta->tops[k].block;
+		root->top[k].epoch = delta->tops[k].epoch;
+		root->top[k].since = delta->tops[k].since;
 	}
 }
 
@@ -1166,41 +1365,421 @@ refs_nblocks(RelFileLocator rel)
  */
 
 /*
- * Logical block 'blkno''s entry, read under a share lock.  False if it has
- * none: past the map, or on a map page left blank (added to the map fork
- * by an extension that failed or whose record a crash lost).
+ * Tree lookups.  A tree map's root page is block 1 of its map fork (see
+ * BmapRoot), so a map fork of two pages whose block 1 is a root page is a
+ * tree's.
+ * Lookups read the root page and the nodes down to the leaf one at a time,
+ * each under a share lock, with no lock held while the next is read: a
+ * node a lookup can reach is either the relation's own, changed only under
+ * its buffer lock, or shared and so unchanging.  A node freed and made
+ * something else under a lookup that had read the pointer to it isn't the
+ * incarnation the pointer names (tree_node_is()), and the lookup begins
+ * again from the root page.  In recovery the map read is as it stands,
+ * pages of it maybe newer than the replay; a pointer whose node isn't there
+ * (made after the replay point, or made something else since) means the
+ * subtree was replaced or let go of after the record being replayed: see
+ * tree_find().
  */
+
+/* the path from the root page to logical block 'blkno''s leaf entry */
+typedef struct TreePath
+{
+	int			top;			/* the root page's pointer */
+	uint32		slot[BMAP_TREE_TOPS];	/* the entry at each level */
+	BlockNumber first[BMAP_TREE_TOPS];	/* the first block each node maps */
+} TreePath;
+
+/* the logical blocks a node of 'level' maps */
+static inline uint64
+tree_span(int level)
+{
+	uint64		span = BMAP_TREE_FANOUT;
+
+	for (int l = 0; l < level; l++)
+		span *= BMAP_TREE_FANOUT;
+	return span;
+}
+
+static void
+tree_path(BlockNumber blkno, TreePath *path)
+{
+	uint64		base = 0;
+	uint64		off;
+	int			k = 0;
+
+	while (k < BMAP_TREE_TOPS - 1 && blkno >= base + tree_span(k))
+	{
+		base += tree_span(k);
+		k++;
+	}
+	path->top = k;
+	off = blkno - base;
+	for (int l = k; l >= 0; l--)
+	{
+		uint64		unit = l == 0 ? 1 : tree_span(l - 1);
+
+		path->slot[l] = (uint32) ((off / unit) % BMAP_TREE_FANOUT);
+		path->first[l] = (BlockNumber) (base + off / (unit * BMAP_TREE_FANOUT) *
+										(unit * BMAP_TREE_FANOUT));
+	}
+}
+
+/* the page store's buffer of a tree's node, read */
+static Buffer
+tree_read(RelFileLocator rel, BlockNumber node, ReadBufferMode mode)
+{
+	check_may_read();
+	return ReadBufferWithoutRelcache(with_relnumber(rel, BMAP_STORE_RELNUMBER),
+									 MAIN_FORKNUM, node, mode, NULL, true);
+}
+
+/* What read_entries() found. */
+typedef enum PageRead
+{
+	PAGE_READ,					/* the page, read */
+	PAGE_NOT_CACHED,			/* not in shared buffers (cached_only) */
+	PAGE_TORN,					/* read from disk, it failed verification */
+} PageRead;
+
+/*
+ * Read a page of a map: block 'blk' of reln's map fork if !node, else of
+ * its page store (a tree's node).  Into *page_out a copy of the page's
+ * header and special space (enough for the checks above), and into dst its
+ * entries [slot, slot + n).  See read_node() for 'for_write': with it, or
+ * 'cached_only', a page not cached isn't loaded into shared buffers; with
+ * 'cached_only' it isn't read at all.  A node that fails verification reads
+ * as zeroes (it may be a block made a data page since, whose checksum is of
+ * a logical block number).
+ */
+static PageRead
+read_entries(SMgrRelation reln, bool node, BlockNumber blk, bool for_write,
+			 bool cached_only, uint32 slot, uint32 n, BmapEntry *dst,
+			 PGIOAlignedBlock *page_out)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	SMgrRelation fsrel = node ? store_smgr(rel) : reln;
+	ForkNumber	fork = node ? MAIN_FORKNUM : BMAP_FORKNUM;
+	RelFileLocator floc = node ? with_relnumber(rel, BMAP_STORE_RELNUMBER) : rel;
+	Buffer		buf = InvalidBuffer;
+	char	   *page;
+
+	if (for_write || cached_only)
+	{
+		PrefetchBufferResult r = PrefetchSharedBuffer(fsrel, fork, blk);
+
+		if (BufferIsValid(r.recent_buffer) &&
+			ReadRecentBuffer(floc, fork, blk, r.recent_buffer))
+		{
+			buf = r.recent_buffer;
+			/* a change keeping the page locked (map_lock()) can't be waited for */
+			if (BufferIsLockedByMe(buf))
+			{
+				ReleaseBuffer(buf);
+				if (cached_only)
+					return PAGE_NOT_CACHED;
+				elog(ERROR, "map page %u of \"%s\" is locked by the backend writing a page it maps",
+					 blk, relpathperm(floc, fork).str);
+			}
+		}
+		else if (cached_only)
+			return PAGE_NOT_CACHED;
+		else
+		{
+			void	   *dstpage = page_out->data;
+
+			mdreadv(fsrel, fork, blk, &dstpage, 1);
+			if (!PageIsVerified(page_out->data, blk, 0, NULL))
+			{
+				if (!node)
+					return PAGE_TORN;
+				memset(page_out->data, 0, BLCKSZ);
+			}
+			memcpy(dst, PageGetBmapEntries(page_out->data) + slot,
+				   n * sizeof(BmapEntry));
+			return PAGE_READ;
+		}
+	}
+	else if (node)
+		buf = tree_read(rel, blk, RBM_ZERO_ON_ERROR);
+	else
+		buf = map_read(rel, blk);
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	memcpy(page_out->data, page, MAXALIGN(SizeOfPageHeaderData));
+	memcpy(page_out->data + BLCKSZ - BMAP_TREE_SPECIAL,
+		   page + BLCKSZ - BMAP_TREE_SPECIAL, BMAP_TREE_SPECIAL);
+	memcpy(dst, PageGetBmapEntries(page) + slot, n * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	return PAGE_READ;
+}
+
+/* Does a page read_entries() read say it is of 'type' (a map fork's)? */
+static bool
+map_page_is(const PGIOAlignedBlock *page, uint16 type)
+{
+	const BmapPageOpaqueData *opaque;
+
+	if (PageIsNew(page->data) ||
+		((const PageHeaderData *) page->data)->pd_special !=
+		BLCKSZ - MAXALIGN(sizeof(BmapPageOpaqueData)))
+		return false;
+	opaque = (const BmapPageOpaqueData *) PageGetSpecialPointer(page->data);
+	return opaque->magic == BMAP_MAGIC && opaque->type == type;
+}
+
+/* What tree_find() found. */
+typedef enum TreeFound
+{
+	TREE_LEAF,					/* the leaf, its entries read */
+	TREE_NO_LEAF,				/* no leaf maps the block */
+	TREE_NOT_CACHED,			/* a page wasn't cached (cached_only) */
+	TREE_UNAVAILABLE,			/* in recovery: see tree_find() */
+} TreeFound;
+
+/* the leaf tree_find() found */
+typedef struct TreeLeaf
+{
+	BlockNumber node;
+	XLogRecPtr	born;
+	BlockNumber first;			/* the first block it maps */
+	uint32		slot;			/* the block's */
+} TreeLeaf;
+
+/* tries of a lookup that finds a node changed under it, outside recovery */
+#define TREE_FIND_TRIES		8
+
+/*
+ * Look up logical block 'blkno' in reln's map, if it is a tree: its leaf
+ * into *leaf, and the leaf's entries from the block's on, at most n (and
+ * none past the leaf), into entries[].  See read_entries() for 'for_write'
+ * and 'cached_only'.
+ *
+ * In recovery a node may not be the incarnation the pointer to it names,
+ * however often it is read: the pointer is of a version of its page newer
+ * than the replay, and the node it names was made after the replay point
+ * (and not yet written out before a crash), or made something else after
+ * it was let go of.  Either way the subtree that held the block when the
+ * record being replayed was made was replaced or let go of since: copied
+ * because it was shared, and then its relation's pages were written and
+ * synced before the share committed, so its blocks have what the records
+ * before then changed; or let go of by a truncation, a drop or a root
+ * swap, after which nothing reads its pages.  (A subtree never gets a level
+ * above it, which would replace a pointer with one to a node that still
+ * needs the old.)  So the block's records from before then are skipped,
+ * and its pages go nowhere: TREE_UNAVAILABLE.
+ */
+static TreeFound
+tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
+		  bool cached_only, uint32 n, BmapEntry *entries, TreeLeaf *leaf)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	TreePath	path;
+	int			mismatches = 0;
+
+	tree_path(blkno, &path);
+	n = Min(n, BMAP_TREE_FANOUT - path.slot[0]);
+	Assert(n > 0);
+	for (;;)
+	{
+		PGIOAlignedBlock page;
+		BmapEntry	ptr;
+		PageRead	r;
+		int			level;
+
+		r = read_entries(reln, false, 1, for_write, cached_only, path.top, 1,
+						 &ptr, &page);
+		if (r == PAGE_NOT_CACHED)
+			return TREE_NOT_CACHED;
+		if (r == PAGE_TORN)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of \"%s\"",
+							1, relpathperm(rel, BMAP_FORKNUM).str)));
+		/* (a map of an older format has something else there) */
+		if (!map_page_is(&page, BMAP_PAGE_ROOT))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("block 1 of \"%s\" is not the root page of a block map of format version %u, which this server reads only",
+							relpathperm(rel, BMAP_FORKNUM).str, BMAP_VERSION),
+					 errhint("Recreate the database from a dump made by the server that wrote it.")));
+
+		for (level = path.top; level >= 0; level--)
+		{
+			BmapEntry	next;
+
+			if (!BlockNumberIsValid(ptr.block))
+				return TREE_NO_LEAF;
+			/* (in recovery, a pointer of a newer page may be past the store) */
+			if (RecoveryInProgress() && !cached_only &&
+				ptr.block >= mdnblocks(store_smgr(rel), MAIN_FORKNUM))
+				break;
+			r = read_entries(reln, true, ptr.block, for_write, cached_only,
+							 path.slot[level], level == 0 ? n : 1,
+							 level == 0 ? entries : &next, &page);
+			if (r == PAGE_NOT_CACHED)
+				return TREE_NOT_CACHED;
+			if (!tree_node_is(page.data, level, path.first[level], ptr.since))
+				break;
+			if (level == 0)
+			{
+				leaf->node = ptr.block;
+				leaf->born = ptr.since;
+				leaf->first = path.first[0];
+				leaf->slot = path.slot[0];
+				return TREE_LEAF;
+			}
+			ptr = next;
+		}
+
+		/* a node not the one its pointer names */
+		mismatches++;
+		if (RecoveryInProgress() && mismatches > 1)
+			return TREE_UNAVAILABLE;
+		if (mismatches >= TREE_FIND_TRIES)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("block map of \"%s\" points to block %u of its page store, which is not the node it names",
+							relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
+							ptr.block)));
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * The leaf a logical block's entry is on.  What changes an entry reads and
+ * locks it through this.
+ */
+typedef struct MapPage
+{
+	BlockNumber blk;			/* the leaf's block */
+	BlockNumber first;			/* the logical block of its first entry */
+	uint32		nslots;
+	XLogRecPtr	born;			/* a leaf's */
+} MapPage;
+
+#define MP_SLOT(mp, blkno)	((uint32) ((blkno) - (mp)->first))
+
+static void
+mp_leaf(const TreeLeaf *leaf, MapPage *mp)
+{
+	mp->blk = leaf->node;
+	mp->first = leaf->first;
+	mp->nslots = BMAP_TREE_FANOUT;
+	mp->born = leaf->born;
+}
+
+static Buffer
+mp_read(SMgrRelation reln, const MapPage *mp)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+
+	return tree_read(rel, mp->blk, RBM_NORMAL);
+}
+
+/* Verify a locked leaf, which is what it was found to be. */
+static void
+mp_check(SMgrRelation reln, const MapPage *mp, Page page)
+{
+	if (!tree_node_is(page, 0, mp->first, mp->born))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the leaf of its block map it was",
+						mp->blk, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+}
+
+/*
+ * Logical block 'blkno''s entry, read under a share lock, and in *mp (if
+ * given) the leaf it is on.  False if it has none: no leaf maps it, or its
+ * entry maps no block; in recovery, also if *unavailable is set (see
+ * tree_find()).  'entry' gets the entry found on a leaf even if it maps no
+ * block (a cleared entry keeps its position).
+ */
+static bool
+lookup_entry_at(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry,
+				MapPage *mp, bool *unavailable)
+{
+	TreeLeaf	leaf;
+
+	if (unavailable)
+		*unavailable = false;
+	switch (tree_find(reln, blkno, false, false, 1, entry, &leaf))
+	{
+		case TREE_LEAF:
+			if (mp)
+				mp_leaf(&leaf, mp);
+			return BlockNumberIsValid(entry->block);
+		case TREE_UNAVAILABLE:
+			if (unavailable)
+				*unavailable = true;
+			pg_fallthrough;
+		default:
+			entry->block = InvalidBlockNumber;
+			entry->since = InvalidXLogRecPtr;
+			return false;
+	}
+}
 static bool
 lookup_entry(SMgrRelation reln, BlockNumber blkno, BmapEntry *entry)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
-	bool		found = false;
-
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM))
-		return false;
-	buf = map_read(rel, MAP_PAGE(blkno));
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	if (!PageIsNew(BufferGetPage(buf)))
-	{
-		check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-				   MAP_PAGE(blkno));
-		*entry = PageGetBmapEntries(BufferGetPage(buf))[MAP_SLOT(blkno)];
-		found = BlockNumberIsValid(entry->block);
-	}
-	UnlockReleaseBuffer(buf);
-	return found;
+	return lookup_entry_at(reln, blkno, entry, NULL, NULL);
 }
 
-/* the logical blocks the map's pages have entries for, past its length too */
+/*
+ * The logical blocks a tree's leaves map: up to the end of its last leaf
+ * (past its relation's length too).  The rightmost pointer of each node,
+ * from the last subtree that has one.
+ */
+static uint64
+tree_map_blocks(SMgrRelation reln)
+{
+	PGIOAlignedBlock page;
+	BmapEntry	tops[BMAP_TREE_TOPS];
+	uint64		base = 0;
+	uint64		end = 0;
+
+	(void) read_entries(reln, false, 1, false, false, 0, BMAP_TREE_TOPS, tops,
+						&page);
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		BmapEntry	ptr = tops[k];
+		uint64		first = base;
+
+		base += tree_span(k);
+		if (!BlockNumberIsValid(ptr.block))
+			continue;
+		for (int level = k; level >= 0; level--)
+		{
+			BmapEntry	entries[BMAP_TREE_FANOUT];
+			int			last = -1;
+
+			(void) read_entries(reln, true, ptr.block, false, false, 0,
+								BMAP_TREE_FANOUT, entries, &page);
+			if (!tree_node_is(page.data, level, (BlockNumber) first, ptr.since))
+				break;
+			if (level == 0)
+			{
+				end = first + BMAP_TREE_FANOUT;
+				break;
+			}
+			for (int i = BMAP_TREE_FANOUT - 1; i >= 0 && last < 0; i--)
+				if (BlockNumberIsValid(entries[i].block))
+					last = i;
+			if (last < 0)
+				break;
+			first += (uint64) last * tree_span(level - 1);
+			ptr = entries[last];
+		}
+	}
+	return Min(end, (uint64) MaxBlockNumber + 1);
+}
+
+/* the logical blocks the map's leaves have entries for, past its length too */
 static uint64
 map_blocks(SMgrRelation reln)
 {
-	BlockNumber mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
-
-	return mapnblocks > 1 ? (uint64) (mapnblocks - 1) * BMAP_FANOUT : 0;
+	return tree_map_blocks(reln);
 }
-
 /* the map's epoch, read under a share lock */
 static uint32
 lookup_epoch(SMgrRelation reln)
@@ -1369,65 +1948,49 @@ header_nblocks(SMgrRelation reln, bool for_write, XLogRecPtr *lsn)
 
 /*
  * Has logical block 'blkno' no entry, let go of after 'lsn'?  (A cleared
- * entry keeps the position of the record that cleared it.)  See read_node()
- * for 'for_write'.
+ * entry keeps the position of the record that cleared it.)  In recovery, a
+ * block whose subtree was replaced or let go of after the record being
+ * replayed was let go of too (see tree_find()).  See read_node() for
+ * 'for_write'.
  */
 static bool
 let_go_after(SMgrRelation reln, BlockNumber blkno, bool for_write,
 			 XLogRecPtr lsn)
 {
-	PGIOAlignedBlock copy;
-	BmapEntry  *e;
+	BmapEntry	entry;
+	TreeLeaf	leaf;
 
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM) ||
-		!read_node_ext(reln, MAP_PAGE(blkno), for_write, copy.data,
-					   BMAP_PAGE_NODE, true))
-		return false;
-	e = &PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)];
-	return !BlockNumberIsValid(e->block) && e->since > lsn;
+	switch (tree_find(reln, blkno, for_write, false, 1, &entry, &leaf))
+	{
+		case TREE_LEAF:
+			return !BlockNumberIsValid(entry.block) && entry.since > lsn;
+		case TREE_UNAVAILABLE:
+			return true;
+		default:
+			return false;
+	}
 }
-
 /*
- * The physical block of logical block 'blkno', and in *run how many logical
- * blocks from it (at most 'maxrun') are physically consecutive.  If the
- * block has no entry, returns InvalidBlockNumber when 'missing_ok', with
- * *run how many blocks from it have none on its map page, else fails.  See
- * read_node() for 'for_write'.
- *
- * In recovery, a lookup that may miss finds no entries on a map page of
- * zeroes: the map's header on disk may cover a page an extension added
- * whose buffer wasn't written out before a crash, until the extension's
- * record is replayed (see bmapprefetch()).  Outside recovery such a page
- * under the length is a write that was lost, and fails verification.
+ * The physical block of the first of entries[0 .. avail), the entries of
+ * consecutive logical blocks from 'blkno' on one map page, and in *run how
+ * many of them are physically consecutive; if it has none, how many from
+ * it have none.  'entries' NULL: the page has no entries (or there is none).
  */
 static BlockNumber
-lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
-		   BlockNumber *run, bool missing_ok, bool for_write)
+entries_run(SMgrRelation reln, BlockNumber blkno, const BmapEntry *entries,
+			uint32 avail, BlockNumber *run, bool missing_ok)
 {
-	PGIOAlignedBlock copy;
-	BmapEntry  *entries = PageGetBmapEntries(copy.data);
-	uint32		slot = MAP_SLOT(blkno);
-	BlockNumber phys;
+	BlockNumber phys = entries ? entries[0].block : InvalidBlockNumber;
 	BlockNumber n;
 
-	if (MAP_PAGE(blkno) >= mdnblocks(reln, BMAP_FORKNUM) ||
-		!read_node_ext(reln, MAP_PAGE(blkno), for_write, copy.data,
-					   BMAP_PAGE_NODE, missing_ok && InRecovery))
-	{
-		phys = InvalidBlockNumber;
-		n = Min(maxrun, BMAP_FANOUT - slot);
-	}
-	else
-	{
-		phys = entries[slot].block;
-		n = 1;
-		while (!BlockNumberIsValid(phys) && n < maxrun &&
-			   slot + n < BMAP_FANOUT &&
-			   !BlockNumberIsValid(entries[slot + n].block))
-			n++;
-	}
 	if (!BlockNumberIsValid(phys))
 	{
+		n = 1;
+		if (entries == NULL)
+			n = avail;
+		else
+			while (n < avail && !BlockNumberIsValid(entries[n].block))
+				n++;
 		if (missing_ok)
 		{
 			if (run)
@@ -1441,15 +2004,37 @@ lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 						blkno)));
 	}
 	n = 1;
-	while (n < maxrun && slot + n < BMAP_FANOUT &&
-		   entries[slot + n].block == phys + n)
+	while (n < avail && entries[n].block == phys + n)
 		n++;
-
 	if (run)
 		*run = n;
 	return phys;
 }
 
+/*
+ * The physical block of logical block 'blkno', and in *run how many logical
+ * blocks from it (at most 'maxrun') are physically consecutive.  If the
+ * block has no entry, returns InvalidBlockNumber when 'missing_ok', with
+ * *run how many blocks from it have none on its leaf, else fails.  See
+ * read_node() for 'for_write'.  In recovery, a block whose subtree isn't
+ * there (see tree_find()) has no entry.
+ */
+static BlockNumber
+lookup_ext(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
+		   BlockNumber *run, bool missing_ok, bool for_write)
+{
+	BmapEntry	found[BMAP_TREE_FANOUT];
+	TreeLeaf	leaf;
+	TreePath	path;
+	uint32		avail;
+	TreeFound	f;
+
+	tree_path(blkno, &path);
+	avail = Min(maxrun, BMAP_TREE_FANOUT - path.slot[0]);
+	f = tree_find(reln, blkno, for_write, false, avail, found, &leaf);
+	return entries_run(reln, blkno, f == TREE_LEAF ? found : NULL, avail, run,
+					   missing_ok);
+}
 static BlockNumber
 lookup(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 	   BlockNumber *run)
@@ -1458,49 +2043,26 @@ lookup(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 }
 
 /*
- * As lookup_ext() with 'missing_ok', but only from a map page that is
- * cached: InvalidBlockNumber if it isn't.  For hints, which may come after
- * the map's buffers were dropped without being written (a dropped
- * database's), when the map page on disk may be stale or all zeroes.
+ * As lookup_ext() with 'missing_ok', but only from a path every page of
+ * which is cached: InvalidBlockNumber if it isn't.  For hints, which may
+ * come after the map's buffers were dropped without being written (a
+ * dropped database's), when the pages on disk may be stale or all zeroes.
  */
 static BlockNumber
 lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
 			  BlockNumber *run)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	PGIOAlignedBlock copy;
-	BmapEntry  *entries = PageGetBmapEntries(copy.data);
-	uint32		slot = MAP_SLOT(blkno);
-	PrefetchBufferResult r;
-	BlockNumber phys;
-	BlockNumber n;
+	BmapEntry	found[BMAP_TREE_FANOUT];
+	TreeLeaf	leaf;
+	TreePath	path;
+	uint32		avail;
 
-	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, MAP_PAGE(blkno));
-	if (!BufferIsValid(r.recent_buffer) ||
-		!ReadRecentBuffer(rel, BMAP_FORKNUM, MAP_PAGE(blkno), r.recent_buffer))
+	tree_path(blkno, &path);
+	avail = Min(maxrun, BMAP_TREE_FANOUT - path.slot[0]);
+	if (tree_find(reln, blkno, false, true, avail, found, &leaf) != TREE_LEAF)
 		return InvalidBlockNumber;
-
-	/* a change keeping the page locked (map_lock()) can't be waited for */
-	if (BufferIsLockedByMe(r.recent_buffer) ||
-		!copy_node(rel, r.recent_buffer, MAP_PAGE(blkno), copy.data,
-				   BMAP_PAGE_NODE, true))
-	{
-		ReleaseBuffer(r.recent_buffer);
-		return InvalidBlockNumber;
-	}
-	ReleaseBuffer(r.recent_buffer);
-
-	phys = entries[slot].block;
-	if (!BlockNumberIsValid(phys))
-		return InvalidBlockNumber;
-	n = 1;
-	while (n < maxrun && slot + n < BMAP_FANOUT &&
-		   entries[slot + n].block == phys + n)
-		n++;
-	*run = n;
-	return phys;
+	return entries_run(reln, blkno, found, avail, run, true);
 }
-
 /* ----------------------------------------------------------------
  * Allocation
  * ----------------------------------------------------------------
@@ -1514,6 +2076,10 @@ lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
  * 'counter': the block map's own page-store writes, shared buffers' extends
  * (which pg_stat_io counts as extends too) or bulk writes' (which nothing
  * else counts) by what the blocks are for.
+ *
+ * A reused block may have been a tree's node, whose page may still be in a
+ * buffer, dirty: it is dropped first, so that it is never written over what
+ * the block holds now.  Its incarnation was let go of, so nothing reads it.
  */
 static void
 prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
@@ -1528,6 +2094,8 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 	{
 		const void *page = zero_block.data;
 
+		DropBufferBlock(with_relnumber(rel, BMAP_STORE_RELNUMBER),
+						MAIN_FORKNUM, reused[i]);
 		if (skip_existing && reused[i] < store_cur)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, reused[i], &page, 1, false);
@@ -1547,10 +2115,35 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 	if (blk < new_hw)
 	{
 		mdzeroextend(ssrel, MAIN_FORKNUM, blk, new_hw - blk, false);
+		/* (a node's buffer is read with the store's length, in recovery) */
+		ssrel->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 		store_written(rel, blk, new_hw - blk);
 		pgstat_count_prolly(counter,
 							(uint64) (new_hw - blk) * BLCKSZ);
 	}
+}
+
+/*
+ * Make the page store reach 'node', a block just allocated to be a tree's
+ * node, the high-water mark going from 'old_hw' to 'new_hw': extended, but
+ * nothing written over a block it has.  The node is made through its
+ * buffer, from the record's image, in redo too, where the version on disk
+ * may be newer than the record (see redo_block()).
+ */
+static void
+prepare_node_store(RelFileLocator rel, BlockNumber node, BlockNumber old_hw,
+				   BlockNumber new_hw)
+{
+	SMgrRelation ssrel = store_smgr(rel);
+	BlockNumber store_cur = mdnblocks(ssrel, MAIN_FORKNUM);
+
+	if (store_cur < new_hw)
+	{
+		mdzeroextend(ssrel, MAIN_FORKNUM, store_cur, new_hw - store_cur, false);
+		ssrel->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+		store_written(rel, store_cur, new_hw - store_cur);
+	}
+	store_written(rel, node, 1);
 }
 
 typedef struct BitsChange
@@ -1771,21 +2364,291 @@ alloc_release(Allocation *a)
 }
 
 /*
- * Extend 'reln' by the blocks [from, to), all on one map page, with
- * 'content' written to block to - 1 if given.  The header is locked
- * exclusively, and the relation is 'from' blocks long.
+ * A page whose entry is to point to a tree's node: the root page (block 1
+ * of the map fork), or a node, the relation's own, known to be 'level',
+ * mapping from 'first', born at 'born'; and the entry, 'slot'.
+ */
+typedef struct TreeParent
+{
+	bool		root;
+	BlockNumber blk;			/* the node's (!root) */
+	uint16		level;
+	BlockNumber first;
+	XLogRecPtr	born;
+	uint32		slot;
+} TreeParent;
+
+static Buffer
+parent_read(SMgrRelation reln, const TreeParent *parent)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+
+	return parent->root ? map_read(rel, 1) :
+		tree_read(rel, parent->blk, RBM_NORMAL);
+}
+
+/* Verify a parent, locked, which the header's lock keeps as it was found. */
+static void
+parent_check(SMgrRelation reln, const TreeParent *parent, Page page)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+
+	if (parent->root)
+		check_page(page, BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	else if (!tree_node_is(page, parent->level, parent->first, parent->born))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						parent->blk,
+						relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+}
+
+/*
+ * Make a tree's node of 'level', mapping from logical block 'first', its
+ * entries 'entries' (NULL: none), and point 'parent''s entry to it, if
+ * given; the pointer, set in 'epoch', is returned.  One record allocates the
+ * block, makes the node (as an image) and points the parent to it, so the
+ * node is never allocated and unreachable but by a crash before the record.
+ * The header is held exclusively: the relation's tree changes no other way
+ * meanwhile.  The node's buffer is locked as it is read, before the parent
+ * is: nothing points to it yet (map_lock()).  A parent's lock comes last,
+ * after the allocator's pages are read.
+ */
+static BmapEntry
+tree_make_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
+			   uint16 level, BlockNumber first, const BmapEntry *entries)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		parentbuf = InvalidBuffer;
+	Buffer		nodebuf;
+	BlockNumber node;
+	Allocation	alloc;
+	xl_bmap_tree xlrec;
+	struct
+	{
+		xl_bmap_node_delta d;
+		xl_bmap_entry_delta e;
+	}			pdelta;
+	BmapEntry	ptr;
+	Page		page;
+	XLogRecPtr	lsn;
+	int			id = 0;
+
+	if (parent)
+		parentbuf = parent_read(reln, parent);
+
+	alloc_take(rel, 1, &node, &alloc);
+	prepare_node_store(rel, node, alloc.old_hw, alloc.new_hw);
+	nodebuf = tree_read(rel, node, RBM_ZERO_AND_LOCK);
+	map_locked_as_new(nodebuf);
+	if (parent)
+	{
+		map_lock(parentbuf, false);
+		parent_check(reln, parent, BufferGetPage(parentbuf));
+	}
+
+	xlrec.locator = rel;
+	xlrec.op = BMAP_TREE_NODE;
+	xlrec.flags = parent ? BMAP_TREE_INSTALL : 0;
+	xlrec.node = node;
+	xlrec.from = InvalidBlockNumber;
+	xlrec.old_hw = alloc.old_hw;
+	xlrec.new_hw = alloc.new_hw;
+
+	XLogEnsureRecordSpace(2 + BMAP_ALLOC_MAX_PAGES, 0);
+	ptr.block = node;
+	ptr.epoch = epoch;
+	ptr.since = GetXLogInsertRecPtr();
+	pdelta.d.kind = BMAP_DELTA_NODE;
+	pdelta.d.flags = 0;
+	pdelta.d.nentries = 1;
+	pdelta.d.since = ptr.since;
+	pdelta.e.slot = parent ? parent->slot : 0;
+	pdelta.e.block = node;
+	pdelta.e.epoch = epoch;
+
+	START_CRIT_SECTION();
+	page = BufferGetPage(nodebuf);
+	init_tree_node(page, level, first, ptr.since);
+	if (entries)
+		memcpy(PageGetBmapEntries(page), entries,
+			   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	MarkBufferDirty(nodebuf);
+	if (parent)
+	{
+		apply_node_delta(BufferGetPage(parentbuf), &pdelta.d);
+		MarkBufferDirty(parentbuf);
+	}
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	if (parent)
+	{
+		XLogRegisterBuffer(id, parentbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(id, &pdelta, sizeof(pdelta));
+		id++;
+	}
+	XLogRegisterBuffer(id, nodebuf, REGBUF_FORCE_IMAGE);
+	id++;
+	alloc_apply_register(&alloc, id);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(page, lsn);
+	if (parent)
+		PageSetLSN(BufferGetPage(parentbuf), lsn);
+	alloc_set_lsn(&alloc, lsn);
+	END_CRIT_SECTION();
+
+	alloc_release(&alloc);
+	if (parent)
+	{
+		map_unlock(parentbuf);
+		ReleaseBuffer(parentbuf);
+	}
+	map_unlock(nodebuf);
+	ReleaseBuffer(nodebuf);
+	INJECTION_POINT("bmap-tree-node-made", NULL);
+	return ptr;
+}
+
+static BmapEntry tree_copy_node(SMgrRelation reln, const TreeParent *parent,
+								uint32 epoch, uint16 level, BlockNumber first,
+								const BmapEntry *ptr);
+
+/*
+ * Is the node 'ptr' points to the relation's own, its parent being so: set
+ * in the map's epoch (no share since, every one raising it), or held by its
+ * parent alone?  A node under one another holds is shared through it.
+ */
+static bool
+tree_node_own(RelFileLocator rel, const BmapEntry *ptr, uint32 epoch,
+			  bool parent_own)
+{
+	return parent_own &&
+		(ptr->epoch >= epoch || lookup_ref(rel, ptr->block) == 0);
+}
+
+/*
+ * The leaf of logical block 'blkno' in reln's tree, into *mp, the nodes on
+ * its path made if 'make' and there are none (false if there is none and
+ * not 'make'), and, with 'own', those shared copied (tree_copy_node()), from
+ * the top down, so that the leaf and every node above it is the relation's
+ * own.  The header 'headerbuf' is locked exclusively, so the path stays as
+ * found.
+ */
+static bool
+tree_leaf_for(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
+			  bool make, bool own, MapPage *mp)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	uint32		epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
+	TreePath	path;
+	TreeParent	parent;
+	BmapEntry	ptr;
+	Buffer		buf;
+	bool		owned = true;
+
+	Assert(own || !make);
+	tree_path(blkno, &path);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	ptr = PageGetBmapRoot(BufferGetPage(buf))->top[path.top];
+	UnlockReleaseBuffer(buf);
+	parent.root = true;
+	parent.slot = path.top;
+
+	for (int level = path.top;; level--)
+	{
+		if (!BlockNumberIsValid(ptr.block))
+		{
+			if (!make)
+				return false;
+			ptr = tree_make_node(reln, &parent, epoch, level,
+								 path.first[level], NULL);
+		}
+		else if (own)
+		{
+			if (!tree_node_own(rel, &ptr, epoch, owned))
+				ptr = tree_copy_node(reln, &parent, epoch, level,
+									 path.first[level], &ptr);
+			owned = true;
+		}
+		parent.root = false;
+		parent.blk = ptr.block;
+		parent.level = level;
+		parent.first = path.first[level];
+		parent.born = ptr.since;
+		buf = tree_read(rel, ptr.block, RBM_NORMAL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		parent_check(reln, &parent, BufferGetPage(buf));
+		if (level == 0)
+		{
+			UnlockReleaseBuffer(buf);
+			mp->blk = ptr.block;
+			mp->first = path.first[0];
+			mp->nslots = BMAP_TREE_FANOUT;
+			mp->born = ptr.since;
+			return true;
+		}
+		parent.slot = path.slot[level];
+		ptr = PageGetBmapEntries(BufferGetPage(buf))[parent.slot];
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+/*
+ * Is the path to logical block 'blkno''s leaf in reln's tree the relation's
+ * own, every node on it (see tree_node_own())?  Read under share locks; the
+ * caller holds the header, at least shared, so no share or copy of the
+ * relation's begins meanwhile.
+ */
+static bool
+tree_path_own(SMgrRelation reln, BlockNumber blkno, uint32 epoch)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	TreePath	path;
+	BmapEntry	ptr;
+	Buffer		buf;
+
+	tree_path(blkno, &path);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	ptr = PageGetBmapRoot(BufferGetPage(buf))->top[path.top];
+	UnlockReleaseBuffer(buf);
+	for (int level = path.top;; level--)
+	{
+		if (!BlockNumberIsValid(ptr.block))
+			return true;
+		if (!tree_node_own(rel, &ptr, epoch, true))
+			return false;
+		if (level == 0)
+			return true;
+		buf = tree_read(rel, ptr.block, RBM_NORMAL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!tree_node_is(BufferGetPage(buf), level, path.first[level], ptr.since))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+							ptr.block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+		ptr = PageGetBmapEntries(BufferGetPage(buf))[path.slot[level]];
+		UnlockReleaseBuffer(buf);
+	}
+}
+
+/*
+ * Extend 'reln' by the blocks [from, to), all on one leaf, 'leaf', the
+ * relation's own (tree_leaf_for()), with 'content' written to block to - 1
+ * if given.  The header is locked exclusively, and the relation is 'from'
+ * blocks long.
  */
 static void
-extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
-			 BlockNumber to, const void *content, bool skipFsync,
-			 PgStat_ProllyCounter counter)
+extend_piece(SMgrRelation reln, Buffer headerbuf, const MapPage *leaf,
+			 BlockNumber from, BlockNumber to, const void *content,
+			 bool skipFsync, PgStat_ProllyCounter counter)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	uint32		n = to - from;
-	BlockNumber mapblk = MAP_PAGE(from);
-	BlockNumber mapnblocks;
 	Buffer		mapbuf;
-	bool		mapnew;
 	BlockNumber phys[BMAP_PIECE];
 	bool		need[BMAP_PIECE];
 	uint32		nneed = 0;
@@ -1800,69 +2663,32 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	xl_bmap_extend xlrec;
 	XLogRecPtr	lsn;
 	uint32		epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
+	const MapPage *mp = leaf;
 
 	Assert(n > 0 && n <= BMAP_PIECE);
-	Assert(MAP_PAGE(to - 1) == mapblk);
+	Assert(to - 1 - mp->first < mp->nslots);
 
 	/*
-	 * The map page, added if the map fork doesn't reach it yet.  An existing
-	 * page is read now and locked only after the allocator's pages have been
-	 * read: a read may write out one of this relation's pages, which looks
-	 * it up on this map page.  Its entries in [from, to) can't change
-	 * meanwhile, since the header serializes the relation's extensions.  A
-	 * new page (or one of zeroes) maps no page a write could look up, so it
-	 * stays locked while the allocator's pages are read: the exception
-	 * map_lock() allows.
+	 * The leaf is read now and locked only after the allocator's pages have
+	 * been read: a read may write out one of this relation's pages, which
+	 * looks it up on this leaf.  Its entries in [from, to) can't change
+	 * meanwhile, since the header serializes the relation's extensions.
 	 */
-	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
-	mapnew = mapnblocks <= mapblk;
-	if (mapnew)
-	{
-		/* blocks are added in order, so the map fork ends just before */
-		if (mapnblocks != mapblk)
-			elog(ERROR, "map of \"%s\" has %u pages, and none for block %u",
-				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
-				 mapnblocks, from);
-		mapbuf = map_new_page(reln);
-		map_locked_as_new(mapbuf);
-		if (BufferGetBlockNumber(mapbuf) != mapblk)
-			elog(ERROR, "map of \"%s\" extended to block %u, expected %u",
-				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
-				 BufferGetBlockNumber(mapbuf), mapblk);
-	}
-	else
-	{
-		mapbuf = map_read(rel, mapblk);
-
-		/*
-		 * A page added to the map fork by an extension whose record a crash
-		 * lost is all zeroes; nothing refers to it, so it is used as new.
-		 */
-		map_lock(mapbuf, true);
-		if (PageIsNew(BufferGetPage(mapbuf)))
-			mapnew = true;
-		else
-		{
-			map_unlock(mapbuf);
-			LockBuffer(mapbuf, BUFFER_LOCK_SHARE);
-			check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel,
-					   BMAP_FORKNUM, mapblk);
-		}
-	}
+	mapbuf = mp_read(reln, mp);
+	LockBuffer(mapbuf, BUFFER_LOCK_SHARE);
+	mp_check(reln, mp, BufferGetPage(mapbuf));
 
 	/* which blocks need a physical block: the map may hold stale ones */
 	for (uint32 i = 0; i < n; i++)
 	{
-		phys[i] = mapnew ? InvalidBlockNumber :
-			PageGetBmapEntries(BufferGetPage(mapbuf))[MAP_SLOT(from + i)].block;
+		phys[i] = PageGetBmapEntries(BufferGetPage(mapbuf))[MP_SLOT(mp, from + i)].block;
 		need[i] = !BlockNumberIsValid(phys[i]);
 		if (need[i])
 			nneed++;
 		else
 			reused[nreused++] = phys[i];
 	}
-	if (!mapnew)
-		LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
 
 	/* allocate under the allocator's metapage lock */
 	alloc_take(rel, nneed, taken, &alloc);
@@ -1880,9 +2706,8 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 		}
 	}
 
-	/* every read is done; now the map page can be locked for the update */
-	if (!mapnew)
-		map_lock(mapbuf, false);
+	/* every read is done; now the leaf can be locked for the update */
+	map_lock(mapbuf, false);
 
 	/* the page store before the record */
 	prepare_store(rel, old_hw, new_hw, reused, nreused, false, counter);
@@ -1904,15 +2729,13 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 	hdelta.fold_epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch;
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + n * sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
-	if (mapnew)
-		ndelta->flags |= BMAP_DELTA_INIT;
 	for (uint32 i = 0; i < n; i++)
 	{
 		xl_bmap_entry_delta *ent = (xl_bmap_entry_delta *) (ndelta + 1);
 
 		if (!need[i])
 			continue;
-		ent[ndelta->nentries].slot = MAP_SLOT(from + i);
+		ent[ndelta->nentries].slot = MP_SLOT(mp, from + i);
 		ent[ndelta->nentries].block = phys[i];
 		ent[ndelta->nentries].epoch = epoch;
 		ndelta->nentries++;
@@ -1938,8 +2761,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, BlockNumber from,
 		XLogRegisterData(reused, nreused * sizeof(BlockNumber));
 	XLogRegisterBuffer(0, headerbuf, REGBUF_STANDARD);
 	XLogRegisterBufData(0, &hdelta, sizeof(hdelta));
-	XLogRegisterBuffer(1, mapbuf, REGBUF_STANDARD |
-					   (mapnew ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBuffer(1, mapbuf, REGBUF_STANDARD);
 	XLogRegisterBufData(1, ndelta, node_delta_size(ndelta));
 	alloc_apply_register(&alloc, 2);
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_EXTEND);
@@ -2113,6 +2935,7 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 	{
 		BlockNumber nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
 		BlockNumber end;
+		MapPage		leaf;
 
 		if (nblocks >= to)
 		{
@@ -2130,17 +2953,20 @@ extend_to(SMgrRelation reln, BlockNumber to, const void *content,
 			break;
 		}
 
+		/* the leaf of the blocks, the relation's own */
+		(void) tree_leaf_for(reln, headerbuf, nblocks, true, true, &leaf);
 		end = Min(to, nblocks + BMAP_PIECE);
-		end = Min(end, (nblocks / BMAP_FANOUT + 1) * BMAP_FANOUT);
+		end = Min(end, leaf.first + leaf.nslots);
 		/* a map never shared has no entry born before its epoch */
 		if (PageGetBmapHeader(BufferGetPage(headerbuf))->epoch > 0)
 		{
-			unshare_stale(reln, PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
+			unshare_stale(reln, &leaf,
+						  PageGetBmapHeader(BufferGetPage(headerbuf))->epoch,
 						  PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch,
 						  nblocks, end, false);
 			INJECTION_POINT("bmap-unshared", NULL);
 		}
-		extend_piece(reln, headerbuf, nblocks, end,
+		extend_piece(reln, headerbuf, &leaf, nblocks, end,
 					 end == to ? content : NULL, skipFsync, counter);
 	}
 	UnlockReleaseBuffer(headerbuf);
@@ -2519,6 +3345,232 @@ unref_blocks(RelFileLocator rel, const BlockNumber *blocks, uint32 n,
 	return nfree;
 }
 
+/*
+ * One holder more of each of the blocks phys[0 .. n), on the pages rp
+ * locked; a stuck count stays, and says so: a sweep counting holders
+ * meanwhile can't rewrite stuck counts from what it counted.
+ */
+static void
+refs_add_holders(RefsPages *rp, const BlockNumber *phys, uint32 n)
+{
+	for (uint32 k = 0; k < n; k++)
+	{
+		uint8		c = refs_get(rp, phys[k]);
+
+		if (c != BMAP_REFS_STUCK)
+			refs_set(rp, phys[k], c + 1);
+		else
+			pg_atomic_fetch_add_u64(&bmap_shared->stuck_held, 1);
+	}
+}
+
+/* how many reference-count pages the sorted blocks phys[0 .. n) are on */
+static uint32
+refs_pages_of(const BlockNumber *phys, uint32 n)
+{
+	uint32		pages = 0;
+
+	for (uint32 k = 0; k < n; k++)
+		if (k == 0 || REF_PAGE(phys[k]) != REF_PAGE(phys[k - 1]))
+			pages++;
+	return pages;
+}
+
+/*
+ * Copy a tree's shared node, which 'ptr' in 'parent' (the relation's own)
+ * points to, of 'level', mapping from 'first', into a new node that is the
+ * relation's own, and point 'parent' to it; the new pointer, set in
+ * 'epoch', is returned.  The copy holds each of the node's children, which
+ * gain a holder; the node loses the parent's.  The header is held
+ * exclusively, so the relation's tree changes no other way meanwhile, and a
+ * sweep reads it before the copy or after (sweep_relation()).
+ *
+ * The children's counts go first, in records of as many count pages as one
+ * holds (HOLD), and the last of them with the copy itself (COPY): the
+ * copy's allocation, its image, the parent's pointer, the node's count.  A
+ * crash before the COPY leaves children counted once too often, held by
+ * nothing more: they are freed a sweep later than they would be, and never
+ * too early.  Locks: the count pages, the allocator's, the copy's new
+ * buffer, then the parent last (map_lock()).
+ */
+static BmapEntry
+tree_copy_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
+			   uint16 level, BlockNumber first, const BmapEntry *ptr)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapEntry  *entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	BlockNumber *children = palloc((BMAP_TREE_FANOUT + 1) * sizeof(BlockNumber));
+	uint32		n = 0;
+	uint32		i = 0;
+	Buffer		buf;
+	Buffer		parentbuf;
+	Buffer		nodebuf;
+	BlockNumber node;
+	Allocation	alloc;
+	RefsPages	rp;
+	xl_bmap_tree xlrec;
+	struct
+	{
+		xl_bmap_node_delta d;
+		xl_bmap_entry_delta e;
+	}			pdelta;
+	BmapEntry	copy;
+	Page		page;
+	XLogRecPtr	lsn;
+	int			id;
+	uint8		c;
+	uint32		hold_pages;
+
+	/* the node, as it stays while shared */
+	buf = tree_read(rel, ptr->block, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	for (uint32 k = 0; k < BMAP_TREE_FANOUT; k++)
+		if (BlockNumberIsValid(entries[k].block))
+			children[n++] = entries[k].block;
+	qsort(children, n, sizeof(BlockNumber), cmp_block);
+	/* (a leaf may map one block twice, a child is pointed to once) */
+	{
+		uint32		u = 0;
+
+		for (uint32 k = 0; k < n; k++)
+			if (u == 0 || children[u - 1] != children[k])
+				children[u++] = children[k];
+		n = u;
+	}
+
+	xlrec.locator = rel;
+	xlrec.flags = 0;
+	xlrec.node = InvalidBlockNumber;
+	xlrec.from = ptr->block;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
+
+	/*
+	 * The children's counts, all but the last pages'.  (A test makes every
+	 * child's count go first, which a node of children close together, as
+	 * a test's are, otherwise never needs.)
+	 */
+	hold_pages = IS_INJECTION_POINT_ATTACHED("bmap-tree-hold-first") ?
+		1 : BMAP_REFS_PER_RECORD;
+	while (i < n && refs_pages_of(children + i, n - i) >= hold_pages)
+	{
+		uint32		covered = refs_lock(rel, children + i, n - i, &rp);
+
+		refs_add_holders(&rp, children + i, covered);
+		xlrec.op = BMAP_TREE_HOLD;
+		log_refs_record(XLOG_BMAP_TREE, &xlrec, sizeof(xlrec), InvalidBuffer,
+						NULL, 0, &rp);
+		refs_release(&rp);
+		i += covered;
+		INJECTION_POINT("bmap-tree-held", NULL);
+	}
+
+	/* the last of them, and the node's own, with the copy */
+	parentbuf = parent_read(reln, parent);
+	{
+		uint32		rest = n - i;
+		uint32		k = 0;
+		uint32		j = 0;
+		BlockNumber *all = palloc((rest + 1) * sizeof(BlockNumber));
+		bool		placed = false;
+
+		/* (the node in order among them, for the count pages' order) */
+		while (j < rest || !placed)
+		{
+			if (!placed && (j == rest || ptr->block < children[i + j]))
+			{
+				all[k++] = ptr->block;
+				placed = true;
+			}
+			else
+				all[k++] = children[i + j++];
+		}
+		if (refs_lock(rel, all, rest + 1, &rp) != rest + 1)
+			elog(ERROR, "children of a node of \"%s\" span too many count pages",
+				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+		pfree(all);
+	}
+	refs_add_holders(&rp, children + i, n - i);
+	c = refs_get(&rp, ptr->block);
+	if (c == 0)
+		elog(ERROR, "node %u of the page store of \"%s\" is copied but held once",
+			 ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+	if (c != BMAP_REFS_STUCK)
+		refs_set(&rp, ptr->block, c - 1);
+	else
+		stuck_released(rel);
+
+	alloc_take(rel, 1, &node, &alloc);
+	prepare_node_store(rel, node, alloc.old_hw, alloc.new_hw);
+	nodebuf = tree_read(rel, node, RBM_ZERO_AND_LOCK);
+	map_locked_as_new(nodebuf);
+	map_lock(parentbuf, false);
+	parent_check(reln, parent, BufferGetPage(parentbuf));
+	if (PageGetBmapEntries(BufferGetPage(parentbuf))[parent->slot].block != ptr->block)
+		elog(ERROR, "the pointer to node %u of \"%s\" changed while it was copied",
+			 ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+
+	xlrec.op = BMAP_TREE_COPY;
+	xlrec.flags = BMAP_TREE_INSTALL;
+	xlrec.node = node;
+	xlrec.old_hw = alloc.old_hw;
+	xlrec.new_hw = alloc.new_hw;
+
+	XLogEnsureRecordSpace(2 + BMAP_ALLOC_MAX_PAGES + BMAP_REFS_PER_RECORD,
+						  3 + BMAP_ALLOC_MAX_PAGES + BMAP_REFS_PER_RECORD);
+	copy.block = node;
+	copy.epoch = epoch;
+	copy.since = GetXLogInsertRecPtr();
+	pdelta.d.kind = BMAP_DELTA_NODE;
+	pdelta.d.flags = 0;
+	pdelta.d.nentries = 1;
+	pdelta.d.since = copy.since;
+	pdelta.e.slot = parent->slot;
+	pdelta.e.block = node;
+	pdelta.e.epoch = epoch;
+
+	START_CRIT_SECTION();
+	page = BufferGetPage(nodebuf);
+	init_tree_node(page, level, first, copy.since);
+	memcpy(PageGetBmapEntries(page), entries,
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	MarkBufferDirty(nodebuf);
+	apply_node_delta(BufferGetPage(parentbuf), &pdelta.d);
+	MarkBufferDirty(parentbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, parentbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &pdelta, sizeof(pdelta));
+	XLogRegisterBuffer(1, nodebuf, REGBUF_FORCE_IMAGE);
+	id = alloc_apply_register(&alloc, 2);
+	refs_apply_register(&rp, id);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(page, lsn);
+	PageSetLSN(BufferGetPage(parentbuf), lsn);
+	alloc_set_lsn(&alloc, lsn);
+	refs_set_lsn(&rp, lsn);
+	END_CRIT_SECTION();
+
+	refs_release(&rp);
+	alloc_release(&alloc);
+	map_unlock(parentbuf);
+	ReleaseBuffer(parentbuf);
+	map_unlock(nodebuf);
+	ReleaseBuffer(nodebuf);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED, 1);
+	pfree(entries);
+	pfree(children);
+	INJECTION_POINT("bmap-tree-copied", NULL);
+	return copy;
+}
+
 /* an entry of a map page, with its slot, for sorting by physical block */
 typedef struct SlotEntry
 {
@@ -2537,23 +3589,25 @@ cmp_slot_entry(const void *a, const void *b)
 }
 
 /*
- * Before an extension reuses the entries of blocks [from, to), on one map
- * page, that a truncation left past the relation's end: those born before
+ * Before an extension reuses the entries of blocks [from, to), on one leaf
+ * ('leaf', the relation's own), that a truncation left past the relation's
+ * end: those born before
  * the map's epoch may be shared.  One no other map holds is claimed (born
  * again in this epoch); one another map holds is let go (its count drops)
  * and cleared, to be allocated anew.  With 'release', once a truncation is
  * done (bmapposttruncate()), every entry is let go of, and a block no other
  * map holds is freed.  The header is locked exclusively, so those entries
- * can't change meanwhile; the map page is locked only after each record's
+ * can't change meanwhile; the leaf is locked only after each record's
  * other pages, since reading them may write out one of this relation's
- * pages, which looks it up on the map page.
+ * pages, which looks it up on the leaf.
  */
 static void
-unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
-			  BlockNumber from, BlockNumber to, bool release)
+unshare_stale(SMgrRelation reln, const MapPage *leaf, uint32 epoch,
+			  uint32 fold_epoch, BlockNumber from, BlockNumber to,
+			  bool release)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
-	BlockNumber mapblk = MAP_PAGE(from);
+	const MapPage *mp = leaf;
 	Buffer		mapbuf;
 	PGIOAlignedBlock copy;
 	BmapEntry	stale[BMAP_PIECE];
@@ -2565,15 +3619,14 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 	BlockNumber nrefpages;
 	uint32		i = 0;
 
-	if (mapblk >= mdnblocks(reln, BMAP_FORKNUM))
-		return;
-	mapbuf = map_read(rel, mapblk);
-	if (!copy_node(rel, mapbuf, mapblk, copy.data, BMAP_PAGE_NODE, true))
-	{
-		ReleaseBuffer(mapbuf);
-		return;
-	}
-	memcpy(stale, &PageGetBmapEntries(copy.data)[MAP_SLOT(from)],
+	Assert(to - from <= BMAP_PIECE);
+	mapbuf = mp_read(reln, mp);
+	LockBuffer(mapbuf, BUFFER_LOCK_SHARE);
+	mp_check(reln, mp, BufferGetPage(mapbuf));
+	memcpy(copy.data, BufferGetPage(mapbuf), BLCKSZ);
+	LockBuffer(mapbuf, BUFFER_LOCK_UNLOCK);
+	Assert(to - 1 - mp->first < mp->nslots);
+	memcpy(stale, &PageGetBmapEntries(copy.data)[MP_SLOT(mp, from)],
 		   (to - from) * sizeof(BmapEntry));
 	for (BlockNumber blk = from; blk < to; blk++)
 	{
@@ -2587,10 +3640,10 @@ unshare_stale(SMgrRelation reln, uint32 epoch, uint32 fold_epoch,
 		 * takes the map's reference: the fold's state still has it.
 		 */
 		if (e->epoch < fold_epoch)
-			list_stale(reln, mapbuf, blk, e->block, epoch);
+			list_stale(reln, mp, mapbuf, blk, e->block, epoch);
 		else if (e->epoch < epoch || release)
 		{
-			items[nitems].slot = MAP_SLOT(blk);
+			items[nitems].slot = MP_SLOT(mp, blk);
 			items[nitems].block = e->block;
 			items[nitems].epoch = e->epoch;
 			nitems++;
@@ -2730,12 +3783,13 @@ bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum)
  */
 
 /*
- * The latest position since which logical block 'blkno' of 'rel' has its
- * physical block, as a version of its map page that an older image replaced
- * in recovery said: InvalidXLogRecPtr if none is remembered.
+ * The latest position since which the logical block whose entry is 'slot'
+ * of leaf 'leaf' (a block of the page store 'store') has its physical
+ * block, as a version of the leaf that an older image replaced in recovery
+ * said: InvalidXLogRecPtr if none is remembered.
  */
 static XLogRecPtr
-remap_ahead(RelFileLocator rel, BlockNumber blkno)
+remap_ahead(RelFileLocator store, BlockNumber leaf, uint32 slot)
 {
 	BmapAheadKey key;
 	BmapAhead  *a;
@@ -2750,8 +3804,9 @@ remap_ahead(RelFileLocator rel, BlockNumber blkno)
 	if (pg_atomic_read_u32(&bmap_shared->nahead) == 0)
 		return InvalidXLogRecPtr;
 	memset(&key, 0, sizeof(key));
-	key.rel = rel;
-	key.blkno = blkno;
+	key.rel = store;
+	key.blkno = leaf;
+	key.slot = slot;
 	LWLockAcquire(&bmap_shared->ahead_lock, LW_SHARED);
 	a = hash_search(bmap_ahead, &key, HASH_FIND, NULL);
 	if (a != NULL)
@@ -2779,18 +3834,18 @@ forget_passed(XLogRecPtr lsn)
 }
 
 /*
- * Remember the entries of map page 'mappage' of 'rel', in a version that an
- * image from the record at 'lsn' is about to replace, whose positions are
- * ahead of the record.
+ * Remember the entries of leaf 'leaf' (a block of the page store 'store'),
+ * in a version that an image from the record at 'lsn' is about to replace,
+ * whose positions are ahead of the record.
  */
 static void
-remember_ahead(RelFileLocator rel, BlockNumber mappage,
+remember_ahead(RelFileLocator store, BlockNumber leaf,
 			   const BmapEntry *entries, XLogRecPtr lsn)
 {
 	bool		passed = false;
 
 	LWLockAcquire(&bmap_shared->ahead_lock, LW_EXCLUSIVE);
-	for (uint32 slot = 0; slot < BMAP_FANOUT; slot++)
+	for (uint32 slot = 0; slot < BMAP_TREE_FANOUT; slot++)
 	{
 		BmapAheadKey key;
 		BmapAhead  *a;
@@ -2800,8 +3855,9 @@ remember_ahead(RelFileLocator rel, BlockNumber mappage,
 			entries[slot].since <= lsn)
 			continue;
 		memset(&key, 0, sizeof(key));
-		key.rel = rel;
-		key.blkno = (mappage - 1) * BMAP_FANOUT + slot;
+		key.rel = store;
+		key.blkno = leaf;
+		key.slot = slot;
 		a = hash_search(bmap_ahead, &key, HASH_ENTER_NULL, &found);
 		if (a == NULL && !passed)
 		{
@@ -2816,8 +3872,8 @@ remember_ahead(RelFileLocator rel, BlockNumber mappage,
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("recovery needs to remember more remapped blocks of block-mapped relations than \"block_map_replay_entries\" (%d) holds",
 							block_map_replay_entries),
-					 errdetail("A full-page image of map page %u of \"%s\" is older than the version it replaces.",
-							   mappage, relpathperm(rel, MAIN_FORKNUM).str),
+					 errdetail("A full-page image of block map leaf %u of \"%s\" is older than the version it replaces.",
+							   leaf, relpathperm(store, MAIN_FORKNUM).str),
 					 errhint("Increase \"block_map_replay_entries\" and restart the server.")));
 		}
 		if (!found)
@@ -2833,59 +3889,15 @@ remember_ahead(RelFileLocator rel, BlockNumber mappage,
 
 /*
  * In recovery, before a full-page image from the record at 'lsn' of block
- * 'blocknum' of the map fork is restored: remember the entries of the
- * version it replaces that are ahead of the record (see above).
+ * 'blocknum' of the map fork is restored.  The map fork holds the header and
+ * the root page, whose pointers redo_block() keeps from a newer version;
+ * the leaves, whose entries are remembered (remember_ahead()), are the page
+ * store's, and redo_block() remembers them before restoring an image.
  */
 void
 bmapprerestore(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			   XLogRecPtr lsn)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	PGIOAlignedBlock copy;
-	Page		page = (Page) copy.data;
-	PrefetchBufferResult r;
-
-	/* block 0 is the header; the others are map pages */
-	if (forknum != BMAP_FORKNUM || blocknum == 0 ||
-		!mdexists(reln, BMAP_FORKNUM) ||
-		blocknum >= mdnblocks(reln, BMAP_FORKNUM))
-		return;
-
-	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, blocknum);
-	if (BufferIsValid(r.recent_buffer) &&
-		ReadRecentBuffer(rel, BMAP_FORKNUM, blocknum, r.recent_buffer))
-	{
-		if (BufferIsLockedByMe(r.recent_buffer))
-			elog(ERROR, "map page %u of \"%s\" is locked by the process restoring its image",
-				 blocknum, relpathperm(rel, MAIN_FORKNUM).str);
-		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
-		memcpy(copy.data, BufferGetPage(r.recent_buffer), BLCKSZ);
-		UnlockReleaseBuffer(r.recent_buffer);
-	}
-	else
-	{
-		void	   *dst = copy.data;
-
-		/*
-		 * Not cached: the version on disk, which may be the newer one.  A
-		 * page torn by the crash, which fails verification, says nothing
-		 * reliable; it is why the image is restored.
-		 */
-		mdreadv(reln, BMAP_FORKNUM, blocknum, &dst, 1);
-		if (!PageIsVerified(page, blocknum, 0, NULL))
-			return;
-	}
-
-	if (PageIsNew(page) ||
-		((PageHeader) page)->pd_special != BLCKSZ - MAXALIGN(sizeof(BmapPageOpaqueData)) ||
-		PageGetBmapOpaque(page)->magic != BMAP_MAGIC ||
-		PageGetBmapOpaque(page)->type != BMAP_PAGE_NODE)
-		return;
-
-	/* an entry's position is before the end of the record that set it */
-	if (PageGetLSN(page) <= lsn)
-		return;
-	remember_ahead(rel, blocknum, PageGetBmapEntries(page), lsn);
 }
 
 /*
@@ -2899,12 +3911,32 @@ bool
 bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  XLogRecPtr lsn)
 {
+	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BmapEntry	entry;
+	MapPage		mp;
+	bool		unavailable;
 
-	if (remap_ahead(reln->smgr_rlocator.locator, blocknum) > lsn)
-		return true;
-	if (lookup_entry(reln, blocknum, &entry))
+	if (lookup_entry_at(reln, blocknum, &entry, &mp, &unavailable))
+	{
+		if (remap_ahead(with_relnumber(rel, BMAP_STORE_RELNUMBER), mp.blk,
+						MP_SLOT(&mp, blocknum)) > lsn)
+			return true;
 		return entry.since > lsn;
+	}
+
+	/*
+	 * Its subtree replaced or let go of since (see tree_find()): the block
+	 * on disk has every change the records before then made, written out and
+	 * synced before its subtree came to be shared.  Its buffer, though, may
+	 * hold an image an earlier record restored, to which this record (and
+	 * those like it) would never be applied: it is dropped, so that the
+	 * page is read from the block again once the subtree is there.
+	 */
+	if (unavailable)
+	{
+		DropBufferBlock(rel, forknum, blocknum);
+		return true;
+	}
 
 	/* (its entry let go of after the record, whatever the header says) */
 	if (InRecovery && let_go_after(reln, blocknum, false, lsn))
@@ -3124,14 +4156,14 @@ changes_append_finish(ChangesAppend *ca, XLogRecPtr lsn)
 }
 
 /*
- * Move logical block 'blkno''s entry, block 'old_block' in map page 'mapbuf'
- * (pinned), to reln's changes list: a copy of the page, which the list
- * holds as it was.  The map's entry is left empty.  The map page is locked
- * after the list's pages.
+ * Move logical block 'blkno''s entry, block 'old_block' on map page 'mp'
+ * (pinned in 'mapbuf'), to reln's changes list: a copy of the page, which
+ * the list holds as it was.  The map's entry is left empty.  The map page
+ * is locked after the list's pages.
  */
 static void
-list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
-		   BlockNumber old_block, uint32 epoch)
+list_stale(SMgrRelation reln, const MapPage *mp, Buffer mapbuf,
+		   BlockNumber blkno, BlockNumber old_block, uint32 epoch)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	ChangesAppend ca = {InvalidBuffer, InvalidBuffer};
@@ -3152,7 +4184,7 @@ list_stale(SMgrRelation reln, Buffer mapbuf, BlockNumber blkno,
 	ndelta->kind = BMAP_DELTA_NODE;
 	ndelta->nentries = 1;
 	ent = (xl_bmap_entry_delta *) (ndelta + 1);
-	ent->slot = MAP_SLOT(blkno);
+	ent->slot = MP_SLOT(mp, blkno);
 	ent->block = InvalidBlockNumber;
 	ent->epoch = 0;
 	xlrec.locator = rel;
@@ -3880,101 +4912,149 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys)
 }
 
 /*
- * Copy map page 'mapblk' of 'src' into a new map page of 'dst', for the
- * blocks below 'nblocks', counting one more reference to each block.
- * src's header is locked exclusively, so its entries can't change.
+ * Before a tree is shared, preserve (preserve_shared_page()) the blocks of
+ * its own leaves, under its length: those of shared ones were preserved when
+ * they came to be shared, and can't change in place since.  So a share that
+ * follows another walks only what changed in between.  The header is held
+ * exclusively.
  */
 static void
-share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
-			   BlockNumber nblocks)
+tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
+				   BlockNumber first, BlockNumber nblocks, uint32 epoch)
+{
+	RelFileLocator rel = src->smgr_rlocator.locator;
+	BmapEntry  *entries;
+	Buffer		buf;
+
+	if (first >= nblocks || !tree_node_own(rel, ptr, epoch, true))
+		return;
+	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	buf = tree_read(rel, ptr->block, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						ptr->block, relpath(src->smgr_rlocator, MAIN_FORKNUM).str)));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+	{
+		uint64		child = (uint64) first + (level == 0 ? i :
+											   i * tree_span(level - 1));
+
+		if (!BlockNumberIsValid(entries[i].block) || child >= nblocks)
+			continue;
+		if (level == 0)
+			preserve_shared_page(src, (BlockNumber) child, entries[i].block);
+		else
+			tree_preserve_node(src, &entries[i], level - 1,
+							   (BlockNumber) child, nblocks, epoch);
+	}
+	pfree(entries);
+}
+
+static void
+tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch)
+{
+	RelFileLocator rel = src->smgr_rlocator.locator;
+	BmapRoot	root;
+	Buffer		buf;
+	uint64		first = 0;
+
+	/* (preserve_shared_page() logs nothing without online backups) */
+	if (!XLogIsNeeded())
+		return;
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	for (int k = 0; k < BMAP_TREE_TOPS && first < nblocks; k++)
+	{
+		if (BlockNumberIsValid(root.top[k].block))
+			tree_preserve_node(src, &root.top[k], k, (BlockNumber) first,
+							   nblocks, epoch);
+		first += tree_span(k);
+	}
+}
+
+/*
+ * A tree shared: dst's root page (made with no subtrees) gets src's
+ * pointers, and each subtree a holder more, in one record.  That is all the
+ * map a share copies: the subtrees stay shared until either relation
+ * changes something under one, which copies the path to it.
+ */
+static void
+tree_share_root(SMgrRelation src, SMgrRelation dst)
 {
 	RelFileLocator srel = src->smgr_rlocator.locator;
 	RelFileLocator drel = dst->smgr_rlocator.locator;
-	PGIOAlignedBlock copy;
-	BmapEntry  *entries = PageGetBmapEntries(copy.data);
-	SlotEntry  *items = palloc(BMAP_FANOUT * sizeof(SlotEntry));
-	BlockNumber *phys = palloc(BMAP_FANOUT * sizeof(BlockNumber));
-	uint32		nitems = 0;
-	Buffer		mapbuf;
-	BlockNumber nrefpages = refs_nblocks(srel);
-	uint32		i = 0;
-	bool		first = true;
+	BmapRoot	root;
+	BlockNumber tops[BMAP_TREE_TOPS];
+	uint32		ntops = 0;
+	Buffer		buf;
+	RefsPages	rp;
+	xl_bmap_root_delta rdelta;
+	xl_bmap_tree xlrec;
+	XLogRecPtr	lsn;
+	int			id;
 
-	read_node(src, mapblk, false, copy.data, BMAP_PAGE_NODE);
-	for (uint32 slot = 0; slot < BMAP_FANOUT; slot++)
+	buf = map_read(srel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, srel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+
+	memset(&rdelta, 0, sizeof(rdelta));
+	rdelta.kind = BMAP_DELTA_ROOT;
+	rdelta.flags = BMAP_DELTA_INIT;
+	rdelta.ntops = BMAP_TREE_TOPS;
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
-		BlockNumber blk = (mapblk - 1) * BMAP_FANOUT + slot;
-
-		if (blk >= nblocks || !BlockNumberIsValid(entries[slot].block))
-			continue;
-		preserve_shared_page(src, blk, entries[slot].block);
-		items[nitems].slot = slot;
-		items[nitems].block = entries[slot].block;
-		items[nitems].epoch = entries[slot].epoch;
-		nitems++;
+		rdelta.tops[k].block = root.top[k].block;
+		rdelta.tops[k].epoch = root.top[k].epoch;
+		rdelta.tops[k].since = root.top[k].since;
+		if (BlockNumberIsValid(root.top[k].block))
+			tops[ntops++] = root.top[k].block;
 	}
-	qsort(items, nitems, sizeof(SlotEntry), cmp_slot_entry);
-	for (uint32 k = 0; k < nitems; k++)
-	{
-		phys[k] = items[k].block;
-		/* refs_cover() reached the high-water mark first */
-		if (REF_PAGE(phys[k]) >= nrefpages)
-			elog(ERROR, "block %u of the page store of database %u has no reference count",
-				 phys[k], srel.dbOid);
-	}
+	qsort(tops, ntops, sizeof(BlockNumber), cmp_block);
+	rp.n = 0;
+	if (ntops > 0 && refs_lock(srel, tops, ntops, &rp) != ntops)
+		elog(ERROR, "the subtrees of \"%s\" span too many count pages",
+			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
+	refs_add_holders(&rp, tops, ntops);
 
-	/* the copy's maps are added in order, so this is its next page */
-	mapbuf = map_new_page(dst);
-	map_locked_as_new(mapbuf);
-	if (BufferGetBlockNumber(mapbuf) != mapblk)
-		elog(ERROR, "map of \"%s\" extended to block %u, expected %u",
-			 relpath(dst->smgr_rlocator, MAIN_FORKNUM).str,
-			 BufferGetBlockNumber(mapbuf), mapblk);
+	buf = map_read(drel, 1);
+	map_lock(buf, false);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, drel, BMAP_FORKNUM, 1);
 
-	/* a page with no entries is still made, in one record */
-	while (first || i < nitems)
-	{
-		RefsPages	rp;
-		xl_bmap_node_delta *ndelta;
-		xl_bmap_entry_delta *ent;
-		xl_bmap_share xlrec;
-		uint32		covered = 0;
+	xlrec.locator = drel;
+	xlrec.op = BMAP_TREE_SHARE;
+	xlrec.flags = 0;
+	xlrec.node = InvalidBlockNumber;
+	xlrec.from = srel.relNumber;
+	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
 
-		ndelta = palloc0(sizeof(xl_bmap_node_delta) + nitems * sizeof(xl_bmap_entry_delta));
-		ndelta->kind = BMAP_DELTA_NODE;
-		if (first)
-			ndelta->flags |= BMAP_DELTA_INIT;
-		ent = (xl_bmap_entry_delta *) (ndelta + 1);
+	XLogEnsureRecordSpace(1 + BMAP_TREE_TOPS, 2 + BMAP_TREE_TOPS);
+	START_CRIT_SECTION();
+	apply_root_delta(BufferGetPage(buf), &rdelta);
+	MarkBufferDirty(buf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+	XLogRegisterBufData(0, &rdelta, sizeof(rdelta));
+	id = refs_apply_register(&rp, 1);
+	(void) id;
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(BufferGetPage(buf), lsn);
+	refs_set_lsn(&rp, lsn);
+	END_CRIT_SECTION();
 
-		rp.n = 0;
-		if (i < nitems)
-			covered = refs_lock(srel, phys + i, nitems - i, &rp);
-		for (uint32 k = i; k < i + covered; k++)
-		{
-			uint8		c = refs_get(&rp, phys[k]);
-
-			if (c != BMAP_REFS_STUCK)
-				refs_set(&rp, phys[k], c + 1);
-			ent[ndelta->nentries].slot = items[k].slot;
-			ent[ndelta->nentries].block = items[k].block;
-			ent[ndelta->nentries].epoch = items[k].epoch;
-			ndelta->nentries++;
-		}
-
-		xlrec.src = srel;
-		xlrec.dst = drel;
-		log_refs_record(XLOG_BMAP_SHARE, &xlrec, sizeof(xlrec), mapbuf, ndelta,
-						first ? REGBUF_WILL_INIT : 0, &rp);
-
-		refs_release(&rp);
-		pfree(ndelta);
-		i += covered;
-		first = false;
-	}
-	map_unlock(mapbuf);
-	ReleaseBuffer(mapbuf);
-	pfree(items);
-	pfree(phys);
+	refs_release(&rp);
+	map_unlock(buf);
+	ReleaseBuffer(buf);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED, 1);
 }
 
@@ -3982,7 +5062,9 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
  * Make 'dst', a new relation file number in the same tablespace and
  * database, a copy of 'src' that shares its blocks: dst's map holds src's
  * entries, and its changes list src's, each block's count grows by one,
- * and both maps' epochs pass the entries' births.  src's dirty buffers are
+ * and both maps' epochs pass the entries' births.  A tree's copy holds its
+ * subtrees instead, each of which gains a holder (tree_share_root()).
+ * src's dirty buffers are
  * written, so the blocks hold what both copies start from; the page store is
  * synced by bmapsyncshares(), at the latest when the transaction commits.
  *
@@ -4023,7 +5105,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	refs_cover(srel, PageGetBmapMeta(BufferGetPage(metabuf))->hw);
 	UnlockReleaseBuffer(metabuf);
 
-	bmapcreate(dst, MAIN_FORKNUM, false);
+	create_map(dst);
 
 	/* src's header, held until the epochs are raised: no change meanwhile */
 	sheader = map_read(srel, 0);
@@ -4032,12 +5114,10 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	nblocks = PageGetBmapHeader(BufferGetPage(sheader))->nblocks;
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 
-	if (nblocks > 0)
-		for (BlockNumber mapblk = 1; mapblk <= MAP_PAGE(nblocks - 1); mapblk++)
-		{
-			share_map_page(src, dst, mapblk, nblocks);
-			INJECTION_POINT("bmap-share-map-page", NULL);
-		}
+	/* src's own blocks preserved, its subtrees a holder more */
+	tree_preserve(src, nblocks, epoch);
+	tree_share_root(src, dst);
+	INJECTION_POINT("bmap-share-map-page", NULL);
 
 	/* the copy has the same changes since src's last fold */
 	share_changes(src, dst);
@@ -4184,15 +5264,18 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 {
 	uint32		epoch;
 	BmapEntry	entry;
+	MapPage		mp;
 	bool		shared;
 
 	*copies = false;
 	if (forknum != MAIN_FORKNUM)
 		return false;
 	epoch = lookup_epoch(reln);
-	if (!lookup_entry(reln, blkno, &entry) || entry.epoch >= epoch)
+	if (!lookup_entry_at(reln, blkno, &entry, &mp, NULL) || entry.epoch >= epoch)
 		return false;
-	shared = lookup_ref(reln->smgr_rlocator.locator, entry.block) > 0;
+	/* (a tree's block is shared too if its leaf is, through any node) */
+	shared = lookup_ref(reln->smgr_rlocator.locator, entry.block) > 0 ||
+		!tree_path_own(reln, blkno, epoch);
 	*copies = shared || entry.epoch < changes_fold_epoch(reln);
 	return shared;
 }
@@ -4211,6 +5294,11 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
  * zeroes, which its caller is about to initialize, needs no image.  Before
  * the copy, contents only in the buffer are written to the old block,
  * which other maps still read.
+ *
+ * A tree's entry is changed on a leaf that is the relation's own: a leaf
+ * another map shares, or one under a shared node, has its path copied first
+ * (tree_leaf_for()), which gives each of the leaf's blocks a holder more, so
+ * a block on a leaf just copied is copied in turn as one another map holds.
  *
  * Locks: the header shared (so the relation's extensions and sharing wait),
  * the old block's reference-count page, the allocator's pages, the changes
@@ -4235,6 +5323,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	XLogRecPtr	lsn;
 	bool		as_of_fold;
 	bool		listed;
+	MapPage		mp;
 
 	if (forknum != MAIN_FORKNUM)
 		return;
@@ -4245,13 +5334,28 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		return;
 
 	headerbuf = map_read(rel, 0);
-	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
-	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
-	if (!lookup_entry(reln, blkno, &entry) || entry.epoch >= epoch)
+	for (;;)
 	{
-		UnlockReleaseBuffer(headerbuf);
-		return;
+		LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+		epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
+		if (!lookup_entry_at(reln, blkno, &entry, &mp, NULL) || entry.epoch >= epoch)
+		{
+			UnlockReleaseBuffer(headerbuf);
+			return;
+		}
+		if (tree_path_own(reln, blkno, epoch))
+			break;
+
+		/*
+		 * A tree's leaf shared, or a node above it: the path is copied
+		 * first, under the header held exclusively (tree_leaf_for()), and
+		 * the block looked up again.
+		 */
+		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
+		LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+		(void) tree_leaf_for(reln, headerbuf, blkno, false, true, &mp);
+		LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
 	}
 	old_block = entry.block;
 	as_of_fold = entry.epoch <
@@ -4270,7 +5374,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 	ndelta->kind = BMAP_DELTA_NODE;
 	ndelta->nentries = 1;
 	ent = (xl_bmap_entry_delta *) (ndelta + 1);
-	ent->slot = MAP_SLOT(blkno);
+	ent->slot = MP_SLOT(&mp, blkno);
 	ent->epoch = epoch;
 
 	/*
@@ -4298,10 +5402,9 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 
 		/* no other map holds it: claim it */
 		ent->block = old_block;
-		mapbuf = map_read(rel, MAP_PAGE(blkno));
+		mapbuf = mp_read(reln, &mp);
 		map_lock(mapbuf, false);
-		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-				   MAP_PAGE(blkno));
+		mp_check(reln, &mp, BufferGetPage(mapbuf));
 
 		/* its count is zero already: only the map page changes */
 		norefs.n = 0;
@@ -4374,10 +5477,9 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			changes_append_lock(reln, &ca, &c);
 		}
 
-		mapbuf = map_read(rel, MAP_PAGE(blkno));
+		mapbuf = mp_read(reln, &mp);
 		map_lock(mapbuf, false);
-		check_page(BufferGetPage(mapbuf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-				   MAP_PAGE(blkno));
+		mp_check(reln, &mp, BufferGetPage(mapbuf));
 
 		xlrec.locator = rel;
 		xlrec.blkno = blkno;
@@ -4501,6 +5603,213 @@ set_length_listed(SMgrRelation reln, RelFileLocator rel, Buffer headerbuf,
 }
 
 /*
+ * Walking a tree: every node reached from the root page told to
+ * visit_node(), whose children (if it says to go on) are visited too, and
+ * every entry of a leaf so visited told to visit_entry(), with its logical
+ * block.  Each node is read under a share lock, and must be the incarnation
+ * its pointer names: the caller holds the header, so none is replaced or
+ * let go of meanwhile.
+ */
+typedef bool (*TreeNodeVisit) (BlockNumber node, uint16 level,
+							   BlockNumber first, void *arg);
+typedef void (*TreeEntryVisit) (const BmapEntry *entry, BlockNumber blkno,
+								void *arg);
+
+static void
+tree_walk_node(SMgrRelation reln, const BmapEntry *ptr, uint16 level,
+			   BlockNumber first, TreeNodeVisit visit_node,
+			   TreeEntryVisit visit_entry, void *arg)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapEntry  *entries;
+	Buffer		buf;
+
+	if (!visit_node(ptr->block, level, first, arg))
+		return;
+	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	buf = tree_read(rel, ptr->block, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						ptr->block, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	CHECK_FOR_INTERRUPTS();
+
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+	{
+		if (!BlockNumberIsValid(entries[i].block))
+			continue;
+		if (level == 0)
+			visit_entry(&entries[i], first + i, arg);
+		else
+			tree_walk_node(reln, &entries[i], level - 1,
+						   (BlockNumber) Min((uint64) first +
+											 i * tree_span(level - 1),
+											 (uint64) MaxBlockNumber),
+						   visit_node, visit_entry, arg);
+	}
+	pfree(entries);
+}
+
+static void
+tree_walk(SMgrRelation reln, TreeNodeVisit visit_node,
+		  TreeEntryVisit visit_entry, void *arg)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapRoot	root;
+	Buffer		buf = map_read(rel, 1);
+	uint64		first = 0;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		if (BlockNumberIsValid(root.top[k].block))
+			tree_walk_node(reln, &root.top[k], k, (BlockNumber) first,
+						   visit_node, visit_entry, arg);
+		first += tree_span(k);
+	}
+}
+
+static int
+cmp_entry_block(const void *a, const void *b)
+{
+	return pg_cmp_u32(((const BmapEntry *) a)->block,
+					  ((const BmapEntry *) b)->block);
+}
+
+/*
+ * Let go of a tree's node that nothing else holds (its count was zero when
+ * its holder let go of it): each child loses this node's reference, a node
+ * child no other holds let go of the same way, a leaf's blocks no other map
+ * holds freed; then the node is freed.  A crash partway leaves blocks
+ * allocated that nothing holds, for a sweep.
+ */
+static void
+tree_release_own(SMgrRelation reln, BlockNumber node, uint16 level,
+				 BlockNumber first, XLogRecPtr born)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapEntry  *entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	BlockNumber *blocks = palloc(BMAP_TREE_FANOUT * sizeof(BlockNumber));
+	BlockNumber *tofree = palloc(BMAP_TREE_FANOUT * sizeof(BlockNumber));
+	uint32		n = 0;
+	uint32		nfree;
+	Buffer		buf;
+
+	buf = tree_read(rel, node, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, born))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						node, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+	{
+		BmapEntry  *e = &PageGetBmapEntries(BufferGetPage(buf))[i];
+
+		if (!BlockNumberIsValid(e->block))
+			continue;
+		entries[n] = *e;
+		/* (a child's first block, kept in its epoch's place while sorted) */
+		entries[n].epoch = (uint32) i;
+		n++;
+	}
+	UnlockReleaseBuffer(buf);
+
+	/* the children, each once: those no other holds are this node's to let go */
+	qsort(entries, n, sizeof(BmapEntry), cmp_entry_block);
+	for (uint32 i = 0; i < n; i++)
+		blocks[i] = entries[i].block;
+	nfree = unref_blocks(rel, blocks, n, tofree);
+	if (level == 0)
+		free_blocks(rel, tofree, nfree);
+	else
+	{
+		for (uint32 i = 0; i < nfree; i++)
+		{
+			BmapEntry	key;
+			BmapEntry  *child;
+
+			key.block = tofree[i];
+			child = bsearch(&key, entries, n, sizeof(BmapEntry), cmp_entry_block);
+			Assert(child != NULL);
+			tree_release_own(reln, child->block, level - 1,
+							 (BlockNumber) Min((uint64) first + child->epoch *
+											   tree_span(level - 1),
+											   (uint64) MaxBlockNumber),
+							 child->since);
+		}
+	}
+	free_blocks(rel, &node, 1);
+	pfree(entries);
+	pfree(blocks);
+	pfree(tofree);
+}
+
+/*
+ * Let go of the subtree 'ptr' points to, of 'level' from 'first': one
+ * reference less if another holds it, else all of it that no other holds.
+ */
+static void
+tree_release(SMgrRelation reln, const BmapEntry *ptr, uint16 level,
+			 BlockNumber first)
+{
+	BlockNumber node = ptr->block;
+	BlockNumber own;
+
+	if (unref_blocks(reln->smgr_rlocator.locator, &node, 1, &own) == 0)
+		return;
+	tree_release_own(reln, node, level, first, ptr->since);
+}
+
+/*
+ * drop_blocks() of a tree: each subtree let go of.  The map stays until the
+ * relation is unlinked, and a sweep reads it until then (see sweep_relation()),
+ * but the nodes it points to are freed, and may be made something else: so
+ * its root page is first written out with no subtrees, under the header's
+ * lock (which a sweep reads it under), and with no record, the relation's
+ * drop being logged already (redo removes the map).
+ */
+static void
+tree_drop(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapRoot	root;
+	Buffer		headerbuf = map_read(rel, 0);
+	Buffer		buf;
+	PGIOAlignedBlock copy;
+	void	   *pages[1] = {copy.data};
+	uint64		first = 0;
+
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		PageGetBmapRoot(BufferGetPage(buf))->top[k].block = InvalidBlockNumber;
+	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
+	PageSetChecksum((Page) copy.data, 1);
+	mdwritev(reln, BMAP_FORKNUM, 1, (const void **) pages, 1, false);
+	UnlockReleaseBuffer(buf);
+	UnlockReleaseBuffer(headerbuf);
+
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		if (BlockNumberIsValid(root.top[k].block))
+			tree_release(reln, &root.top[k], k, (BlockNumber) first);
+		first += tree_span(k);
+	}
+}
+
+/*
  * Free every physical block a dropped relation's map or changes list holds
  * that no other map holds too; the others lose a reference.  The records
  * name only the allocator's pages: a standby has removed the relation's map
@@ -4519,43 +5828,8 @@ drop_blocks(SMgrRelation reln)
 	CurrentResourceOwner = owner;
 	PG_TRY();
 	{
-		BlockNumber mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
-		BlockNumber *blocks = palloc(BMAP_FANOUT * sizeof(BlockNumber));
-		BlockNumber *tofree = palloc(BMAP_FANOUT * sizeof(BlockNumber));
-
-		for (BlockNumber mapblk = 1; mapblk < mapnblocks; mapblk++)
-		{
-			Buffer		buf = map_read(rel, mapblk);
-			BmapEntry  *entries;
-			uint32		n = 0;
-
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-					   mapblk);
-			entries = PageGetBmapEntries(BufferGetPage(buf));
-			for (uint32 i = 0; i < BMAP_FANOUT; i++)
-				if (BlockNumberIsValid(entries[i].block))
-					blocks[n++] = entries[i].block;
-			UnlockReleaseBuffer(buf);
-
-#ifdef USE_ASSERT_CHECKING
-			/* the relation's pages have left shared buffers (bmappredrop) */
-			for (uint32 i = 0; i < BMAP_FANOUT; i++)
-			{
-				BlockNumber blk = (mapblk - 1) * BMAP_FANOUT + i;
-				PrefetchBufferResult r = PrefetchSharedBuffer(reln, MAIN_FORKNUM, blk);
-
-				Assert(!BufferIsValid(r.recent_buffer));
-			}
-#endif
-
-			/* a block another map still holds only loses a reference */
-			qsort(blocks, n, sizeof(BlockNumber), cmp_block);
-			n = unref_blocks(rel, blocks, n, tofree);
-			free_blocks(rel, tofree, n);
-		}
-		pfree(blocks);
-		pfree(tofree);
+		/* the tree's subtrees */
+		tree_drop(reln);
 
 		/* and those the changes list holds */
 		{
@@ -4614,15 +5888,57 @@ hold(uint16 *holders, BlockNumber b)
 		holders[b]++;
 }
 
+typedef struct SweepHolders
+{
+	uint16	   *holders;
+	uint64	   *reached;		/* the nodes reached, a bit each */
+	BlockNumber hw;
+} SweepHolders;
+
+/*
+ * A tree's node, one holder more: one for each page that points to it.  Its
+ * children are counted only the first time it is reached, as it holds each
+ * once, whichever relations reach it.  That it was reached is kept apart
+ * from its holders: a dropped relation's changes list, read until its map
+ * is unlinked, may still list the block, freed and made a node since, and
+ * the node's children are counted all the same.  (A node past the blocks
+ * the sweep may free is read again each time: counting more holders is
+ * safe.)
+ */
+static bool
+sweep_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	SweepHolders *sh = arg;
+	uint64		bit = UINT64CONST(1) << (node % 64);
+
+	if (node >= sh->hw)
+		return true;
+	hold(sh->holders, node);
+	if (sh->reached[node / 64] & bit)
+		return false;
+	sh->reached[node / 64] |= bit;
+	return true;
+}
+
+static void
+sweep_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	SweepHolders *sh = arg;
+
+	if (entry->block < sh->hw)
+		hold(sh->holders, entry->block);
+}
+
 /*
  * Count, in holders[], each physical block a relation holds: its map's
- * entries (those past its length too) and its changes list's old blocks.
+ * entries (those past its length too; a tree's nodes too) and its changes list's old blocks.
  * Its header is held exclusively meanwhile, so no extension, remap,
  * truncation or prune of it runs: a block they allocated is mapped or
  * listed by the time it is read.
  */
 static void
-sweep_relation(SMgrRelation reln, uint16 *holders, BlockNumber hw)
+sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
+			   BlockNumber hw)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BlockNumber mapnblocks;
@@ -4648,24 +5964,10 @@ sweep_relation(SMgrRelation reln, uint16 *holders, BlockNumber hw)
 		return;
 	}
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
-	for (BlockNumber mapblk = 1; mapblk < mapnblocks; mapblk++)
 	{
-		Buffer		buf = map_read(rel, mapblk);
-		BmapEntry  *entries;
+		SweepHolders sh = {holders, reached, hw};
 
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (!PageIsNew(BufferGetPage(buf)))
-		{
-			check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-					   mapblk);
-			entries = PageGetBmapEntries(BufferGetPage(buf));
-			for (uint32 i = 0; i < BMAP_FANOUT; i++)
-				if (BlockNumberIsValid(entries[i].block) && entries[i].block < hw)
-					hold(holders, entries[i].block);
-		}
-		UnlockReleaseBuffer(buf);
-		CHECK_FOR_INTERRUPTS();
+		tree_walk(reln, sweep_node, sweep_entry, &sh);
 	}
 	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
 	if (changes != NULL)
@@ -5085,10 +6387,48 @@ bmap_scan_store(Oid spcOid, Oid dbOid, uint64 since, uint64 *token,
 	return nread;
 }
 
+typedef struct SizeBits
+{
+	uint64	   *mapped;
+	uint64	   *listed;
+	BlockNumber hw;
+	BlockNumber nblocks;
+} SizeBits;
+
+/* a tree's node is held otherwise, not mapped; its children are read once */
+static bool
+size_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	SizeBits   *sb = arg;
+	uint64		bit = UINT64CONST(1) << (node % 64);
+
+	if (node >= sb->hw)
+		return true;
+	if (sb->listed[node / 64] & bit)
+		return false;
+	sb->listed[node / 64] |= bit;
+	return true;
+}
+
+static void
+size_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	SizeBits   *sb = arg;
+	BlockNumber b = entry->block;
+
+	if (b >= sb->hw)
+		return;
+	if (blkno < sb->nblocks)
+		sb->mapped[b / 64] |= UINT64CONST(1) << (b % 64);
+	else
+		sb->listed[b / 64] |= UINT64CONST(1) << (b % 64);
+}
+
 /*
  * Mark, in mapped[] and listed[] (bits of the store's blocks below hw), the
  * blocks a relation holds: its map's entries under its length, and the
- * rest (entries past it, its changes list's old blocks).  Its header is
+ * rest (entries past it, its changes list's old blocks, a tree's nodes).
+ * Its header is
  * held shared meanwhile, so no extension, truncation or prune of it runs.
  * Its length, or 0 if it was dropped since the directory was read.
  */
@@ -5097,7 +6437,6 @@ size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
 			  BlockNumber hw)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
-	BlockNumber mapnblocks;
 	BlockNumber nblocks;
 	Buffer		headerbuf;
 	BmapChangesHead head;
@@ -5115,33 +6454,10 @@ size_relation(SMgrRelation reln, uint64 *mapped, uint64 *listed,
 	}
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
-	mapnblocks = mdnblocks(reln, BMAP_FORKNUM);
-	for (BlockNumber mapblk = 1; mapblk < mapnblocks; mapblk++)
 	{
-		Buffer		buf = map_read(rel, mapblk);
-		BmapEntry  *entries;
+		SizeBits	sb = {mapped, listed, hw, nblocks};
 
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		if (!PageIsNew(BufferGetPage(buf)))
-		{
-			check_page(BufferGetPage(buf), BMAP_PAGE_NODE, rel, BMAP_FORKNUM,
-					   mapblk);
-			entries = PageGetBmapEntries(BufferGetPage(buf));
-			for (uint32 i = 0; i < BMAP_FANOUT; i++)
-			{
-				BlockNumber b = entries[i].block;
-				uint64		blk = (uint64) (mapblk - 1) * BMAP_FANOUT + i;
-
-				if (!BlockNumberIsValid(b) || b >= hw)
-					continue;
-				if (blk < nblocks)
-					mapped[b / 64] |= UINT64CONST(1) << (b % 64);
-				else
-					listed[b / 64] |= UINT64CONST(1) << (b % 64);
-			}
-		}
-		UnlockReleaseBuffer(buf);
-		CHECK_FOR_INTERRUPTS();
+		tree_walk(reln, size_node, size_entry, &sb);
 	}
 	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
 	if (changes != NULL)
@@ -5324,14 +6640,17 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	BlockNumber hw;
 	uint64	   *allocated;
 	uint16	   *holders;
+	uint64	   *reached;
 	DIR		   *dir;
 	struct dirent *de;
 	BlockList	tofree = {0};
 	BlockList	stuck = {0};
 	BlockNumber nrefpages;
+	uint64		stuck_held;
 
 	SET_LOCKTAG_OBJECT(tag, dbOid, BMAP_SWEEP_CLASSID, spcOid, 0);
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+	stuck_held = pg_atomic_read_u64(&bmap_shared->stuck_held);
 
 	/* the blocks allocated as it begins: the only ones it may free */
 	metabuf = alloc_read(rel, 0);
@@ -5360,6 +6679,9 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	holders = MemoryContextAllocHuge(CurrentMemoryContext,
 									 (hw + 1) * sizeof(uint16));
 	memset(holders, 0, (hw + 1) * sizeof(uint16));
+	reached = MemoryContextAllocHuge(CurrentMemoryContext,
+									 (hw / 64 + 1) * sizeof(uint64));
+	memset(reached, 0, (hw / 64 + 1) * sizeof(uint64));
 	dir = AllocateDir(path);
 	while ((de = ReadDir(dir, path)) != NULL)
 	{
@@ -5371,7 +6693,7 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 		if (end == de->d_name || strcmp(end, "_bmap") != 0)
 			continue;
 		reln = smgropen(with_relnumber(rel, relnumber), INVALID_PROC_NUMBER);
-		sweep_relation(reln, holders, hw);
+		sweep_relation(reln, holders, reached, hw);
 		result->relations++;
 	}
 	FreeDir(dir);
@@ -5397,6 +6719,27 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 		}
 	}
 	INJECTION_POINT("bmap-sweep-counted", NULL);
+
+	/*
+	 * A tree's node copied meanwhile (which this lock doesn't hold off) gave
+	 * its children a holder each, after their relation was counted; one whose
+	 * count was stuck stayed so, but a count rewritten from what was counted
+	 * would be a holder short.  Then the stuck counts are left as they are
+	 * (those of blocks nothing holds, which no copy reaches, still go).
+	 */
+	if (pg_atomic_read_u64(&bmap_shared->stuck_held) != stuck_held)
+	{
+		uint32		kept = 0;
+
+		for (uint32 k = 0; k < stuck.n; k++)
+		{
+			if (holders[stuck.blocks[k]] == 0)
+				stuck.blocks[kept++] = stuck.blocks[k];
+			else
+				result->stuck++;
+		}
+		stuck.n = kept;
+	}
 	result->recounted = sweep_recount(rel, stuck.blocks, stuck.n, holders);
 	LockRelease(&tag, ExclusiveLock, false);
 
@@ -5406,6 +6749,7 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 
 	pfree(allocated);
 	pfree(holders);
+	pfree(reached);
 	if (tofree.blocks)
 		pfree(tofree.blocks);
 	if (stuck.blocks)
@@ -5471,14 +6815,21 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 
 /*
  * Logical block 'blkno' of a block-mapped relation: its physical block
- * (InvalidBlockNumber if unmapped), the entry's birth epoch and the
- * block's reference count.
+ * (InvalidBlockNumber if unmapped), the entry's birth epoch, and how many
+ * other maps reach the block: its own count and the counts of the nodes on
+ * its path, added up (a node shared by k maps more shares every block under
+ * it with them; at most BMAP_REFS_STUCK).
  */
 void
 bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
 				   uint32 *epoch, uint32 *refs)
 {
+	RelFileLocator rel = reln->smgr_rlocator.locator;
 	BmapEntry	entry;
+	TreePath	path;
+	BmapEntry	ptr;
+	Buffer		buf;
+	uint32		n;
 
 	*phys = InvalidBlockNumber;
 	*epoch = 0;
@@ -5487,7 +6838,64 @@ bmap_inspect_block(SMgrRelation reln, BlockNumber blkno, BlockNumber *phys,
 		return;
 	*phys = entry.block;
 	*epoch = entry.epoch;
-	*refs = lookup_ref(reln->smgr_rlocator.locator, entry.block);
+	n = lookup_ref(rel, entry.block);
+
+	tree_path(blkno, &path);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	ptr = PageGetBmapRoot(BufferGetPage(buf))->top[path.top];
+	UnlockReleaseBuffer(buf);
+	for (int level = path.top; level >= 0 && BlockNumberIsValid(ptr.block); level--)
+	{
+		n += lookup_ref(rel, ptr.block);
+		if (level == 0)
+			break;
+		buf = tree_read(rel, ptr.block, RBM_NORMAL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		ptr = PageGetBmapEntries(BufferGetPage(buf))[path.slot[level]];
+		UnlockReleaseBuffer(buf);
+	}
+	*refs = Min(n, BMAP_REFS_STUCK);
+}
+typedef struct InspectTree
+{
+	RelFileLocator rel;
+	BmapNodeInspect visit;
+	void	   *arg;
+} InspectTree;
+
+static bool
+inspect_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	InspectTree *it = arg;
+
+	it->visit(level, first, node, lookup_ref(it->rel, node), it->arg);
+	return true;
+}
+
+static void
+inspect_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+}
+
+/*
+ * Every node of a block-mapped relation's map, told to 'visit' with its
+ * level, the first logical block it maps, its block and its reference count,
+ * each time it is reached.  The header is held meanwhile, so the tree
+ * changes no other way.
+ */
+void
+bmap_inspect_tree(SMgrRelation reln, BmapNodeInspect visit, void *arg)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	InspectTree it = {rel, visit, arg};
+	Buffer		headerbuf;
+
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	tree_walk(reln, inspect_node, inspect_entry, &it);
+	UnlockReleaseBuffer(headerbuf);
 }
 
 /* the logical blocks a block-mapped relation's map pages have entries for */
@@ -5562,11 +6970,6 @@ bmapclose(SMgrRelation reln, ForkNumber forknum)
 void
 bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
-	Page		page;
-	xl_bmap_header_delta delta;
-
 	if (forknum != MAIN_FORKNUM)
 	{
 		mdcreate(reln, forknum, isRedo);
@@ -5583,13 +6986,27 @@ bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 				 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
 		return;
 	}
+	create_map(reln);
+}
+
+/* Make reln's map: its header and its root page, of no subtrees, in one record */
+static void
+create_map(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	Buffer		rootbuf;
+	Page		page;
+	xl_bmap_header_delta delta;
+	xl_bmap_root_delta rdelta;
+	XLogRecPtr	lsn;
+
 	if (mdexists(reln, BMAP_FORKNUM))
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %s",
 						relpath(reln->smgr_rlocator, BMAP_FORKNUM).str,
 						"File exists")));
-
 	ensure_alloc(rel);
 
 	mdcreate(reln, BMAP_FORKNUM, false);
@@ -5599,24 +7016,42 @@ bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
 			 BufferGetBlockNumber(buf));
 	page = BufferGetPage(buf);
+	rootbuf = map_new_page(reln);
+	if (BufferGetBlockNumber(rootbuf) != 1)
+		elog(ERROR, "map of \"%s\" has its root page at block %u",
+			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str,
+			 BufferGetBlockNumber(rootbuf));
 
 	delta.kind = BMAP_DELTA_HEADER;
 	delta.flags = BMAP_DELTA_INIT;
 	delta.nblocks = 0;
 	delta.epoch = 0;
 	delta.fold_epoch = 0;
+	memset(&rdelta, 0, sizeof(rdelta));
+	rdelta.kind = BMAP_DELTA_ROOT;
+	rdelta.flags = BMAP_DELTA_INIT;
+	rdelta.ntops = BMAP_TREE_TOPS;
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		rdelta.tops[k].block = InvalidBlockNumber;
 
 	START_CRIT_SECTION();
 	apply_header_delta(page, &delta);
 	MarkBufferDirty(buf);
+	apply_root_delta(BufferGetPage(rootbuf), &rdelta);
+	MarkBufferDirty(rootbuf);
 	XLogBeginInsert();
 	XLogRegisterData(&rel, sizeof(xl_bmap_rel));
 	XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT | REGBUF_STANDARD);
 	XLogRegisterBufData(0, &delta, sizeof(delta));
-	PageSetLSN(page, XLogInsert(RM_BMAP_ID, XLOG_BMAP_CREATE));
+	XLogRegisterBuffer(1, rootbuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+	XLogRegisterBufData(1, &rdelta, sizeof(rdelta));
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_CREATE);
+	PageSetLSN(page, lsn);
+	PageSetLSN(BufferGetPage(rootbuf), lsn);
 	END_CRIT_SECTION();
 
 	UnlockReleaseBuffer(buf);
+	UnlockReleaseBuffer(rootbuf);
 }
 
 /*
@@ -5715,6 +7150,7 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 	DropRelationBuffers(reln, &fork, 1, &first);
 	INJECTION_POINT("bmap-predrop", NULL);
 	drop_blocks(reln);
+	INJECTION_POINT("bmap-dropped", NULL);
 }
 
 /*
@@ -5895,23 +7331,26 @@ bmapstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
  * records from before its entry's block was set: it is of the block it had
  * then, which needs nothing from it (what it should keep was written out
  * before the change), while the block it has now may still be another
- * relation's.
+ * relation's.  So were pages of a block whose subtree was replaced or let
+ * go of since (see tree_find()).
  */
 static bool
 page_predates_entry(SMgrRelation reln, BlockNumber blkno, const void *page)
 {
-	PGIOAlignedBlock copy;
-	BmapEntry  *entry = &PageGetBmapEntries(copy.data)[MAP_SLOT(blkno)];
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapEntry	found;
+	TreeLeaf	leaf;
 	XLogRecPtr	since;
 
-	read_node(reln, MAP_PAGE(blkno), true, copy.data, BMAP_PAGE_NODE);
+	if (tree_find(reln, blkno, true, false, 1, &found, &leaf) != TREE_LEAF)
+		return true;
 
 	/* (or a later position, of a version an older image replaced) */
-	since = Max(entry->since,
-				remap_ahead(reln->smgr_rlocator.locator, blkno));
+	since = Max(found.since,
+				remap_ahead(with_relnumber(rel, BMAP_STORE_RELNUMBER),
+							leaf.node, leaf.slot));
 	return PageGetLSN((const PageData *) page) < since;
 }
-
 void
 bmapwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
@@ -6328,24 +7767,27 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 }
 
 /*
- * The first of blocks [from, to), on one map page, with an entry, and in
+ * The first of blocks [from, to), on one leaf 'leaf', with an entry, and in
  * *last the one after the last; false if none has one.
  */
 static bool
-mapped_span(SMgrRelation reln, uint64 from, uint64 to, uint64 *first,
-			uint64 *last)
+mapped_span(SMgrRelation reln, const MapPage *leaf, uint64 from, uint64 to,
+			uint64 *first, uint64 *last)
 {
 	PGIOAlignedBlock copy;
 	const BmapEntry *entries;
 	bool		found = false;
+	const MapPage *mp = leaf;
+	Buffer		buf = mp_read(reln, mp);
 
-	if (!read_node_ext(reln, MAP_PAGE(from), false, copy.data, BMAP_PAGE_NODE,
-					   true))
-		return false;
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	mp_check(reln, mp, BufferGetPage(buf));
+	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
+	UnlockReleaseBuffer(buf);
 	entries = PageGetBmapEntries(copy.data);
 	for (uint64 blk = from; blk < to; blk++)
 	{
-		if (!BlockNumberIsValid(entries[MAP_SLOT(blk)].block))
+		if (!BlockNumberIsValid(entries[MP_SLOT(mp, blk)].block))
 			continue;
 		if (!found)
 			*first = blk;
@@ -6388,22 +7830,32 @@ bmapposttruncate(SMgrRelation reln, ForkNumber forknum)
 	end = map_blocks(reln);
 	for (uint64 page = header->nblocks; page < end;)
 	{
-		uint64		pageend = Min(end, (page / BMAP_FANOUT + 1) * BMAP_FANOUT);
+		uint64		pageend;
 		uint64		from;
 		uint64		last;
+		MapPage		leaf;
+		TreePath	path;
+
+		tree_path((BlockNumber) page, &path);
+		pageend = Min(end, (uint64) path.first[0] + BMAP_TREE_FANOUT);
 
 		/*
-		 * The map never shrinks, so most of its pages past the length have
+		 * The map never shrinks, so most of its leaves past the length have
 		 * nothing left after the first truncation: each is read once, not
-		 * copied for every piece.
+		 * copied for every piece, and a shared one is copied (the path to it,
+		 * the relation's own from then on) only to let go of entries on it.
 		 */
-		if (mapped_span(reln, page, pageend, &from, &last))
+		if (tree_leaf_for(reln, headerbuf, (BlockNumber) page, false, false,
+						  &leaf) &&
+			mapped_span(reln, &leaf, page, pageend, &from, &last))
 		{
+			(void) tree_leaf_for(reln, headerbuf, (BlockNumber) page, false,
+								 true, &leaf);
 			while (from < last)
 			{
 				uint64		to = Min(last, from + BMAP_PIECE);
 
-				unshare_stale(reln, header->epoch, header->fold_epoch,
+				unshare_stale(reln, &leaf, header->epoch, header->fold_epoch,
 							  (BlockNumber) from, (BlockNumber) to, true);
 				from = to;
 			}
@@ -6551,7 +8003,42 @@ newer_map_page(XLogReaderState *record, RelFileLocator rlocator,
 		PageGetSpecialSize(dst) != MAXALIGN(sizeof(BmapPageOpaqueData)))
 		return false;
 	opaque = PageGetBmapOpaque(dst);
-	return opaque->magic == BMAP_MAGIC && opaque->type == BMAP_PAGE_NODE;
+	return opaque->magic == BMAP_MAGIC && opaque->type == BMAP_PAGE_ROOT;
+}
+
+/*
+ * The same for a tree's node, block 'blkno' of the page store 'rlocator':
+ * true if there is a version of a node there newer than the record.  Of
+ * the node the record names, or of another incarnation of its block (made
+ * since it was let go of), which the caller tells apart by its birth.
+ */
+static bool
+newer_tree_node(XLogReaderState *record, RelFileLocator rlocator,
+				BlockNumber blkno, char *dst)
+{
+	SMgrRelation ssrel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	PrefetchBufferResult r;
+
+	if (!smgrexists(ssrel, MAIN_FORKNUM) ||
+		blkno >= mdnblocks(ssrel, MAIN_FORKNUM))
+		return false;
+	r = PrefetchSharedBuffer(ssrel, MAIN_FORKNUM, blkno);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(rlocator, MAIN_FORKNUM, blkno, r.recent_buffer))
+	{
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
+		memcpy(dst, BufferGetPage(r.recent_buffer), BLCKSZ);
+		UnlockReleaseBuffer(r.recent_buffer);
+	}
+	else
+	{
+		void	   *page = dst;
+
+		mdreadv(ssrel, MAIN_FORKNUM, blkno, &page, 1);
+		if (!PageIsVerified(dst, blkno, 0, NULL))
+			return false;
+	}
+	return tree_node_any(dst) && PageGetLSN(dst) > record->ReadRecPtr;
 }
 
 /* keep the entries of 'newer' changed after those of the restored page */
@@ -6562,8 +8049,12 @@ keep_newer_entries(Buffer buf, char *newer)
 	BmapEntry  *entries = PageGetBmapEntries(page);
 	const BmapEntry *kept = PageGetBmapEntries(newer);
 	bool		any = false;
+	uint32		nslots = BMAP_TREE_FANOUT;
 
-	for (uint32 i = 0; i < BMAP_FANOUT; i++)
+	/* (a root page has its pointers, a node its entries) */
+	if (map_page_is((const PGIOAlignedBlock *) newer, BMAP_PAGE_ROOT))
+		nslots = BMAP_TREE_TOPS;
+	for (uint32 i = 0; i < nslots; i++)
 	{
 		if (kept[i].since > entries[i].since)
 		{
@@ -6593,12 +8084,37 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	BlockNumber blkno;
 	PGIOAlignedBlock newer;
 	bool		have_newer = false;
+	bool		node;
 
 	/* a map page's image restored: the page it replaces, if newer */
 	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	node = forknum == MAIN_FORKNUM && rlocator.relNumber == BMAP_STORE_RELNUMBER;
 	if (forknum == BMAP_FORKNUM && blkno > 0 &&
 		XLogRecBlockImageApply(record, block_id))
 		have_newer = newer_map_page(record, rlocator, blkno, newer.data);
+
+	/*
+	 * A tree's node's image restored over a newer version of the same node
+	 * (written out before a crash, copied by a base backup): the newer one's
+	 * later entries are kept (keep_newer_entries()), and a leaf's are
+	 * remembered first (remember_ahead()).  A newer version of another
+	 * incarnation of the block, made after this one was let go of, keeps
+	 * nothing: this record's node is the one replay needs until then.
+	 */
+	if (node && XLogRecBlockImageApply(record, block_id) &&
+		newer_tree_node(record, rlocator, blkno, newer.data))
+	{
+		PGIOAlignedBlock image;
+
+		if (!RestoreBlockImage(record, block_id, image.data))
+			elog(PANIC, "%s", record->errormsg_buf);
+		have_newer = tree_node_any(image.data) &&
+			PageGetBmapTreeOpaque(image.data)->born ==
+			PageGetBmapTreeOpaque(newer.data)->born;
+		if (have_newer && PageGetBmapTreeOpaque(newer.data)->level == 0)
+			remember_ahead(rlocator, blkno,
+						   PageGetBmapEntries(newer.data), record->ReadRecPtr);
+	}
 
 	/* a full-page image leaves out the block's data, and needs none */
 	if (data == NULL)
@@ -6637,9 +8153,26 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	 * from a base backup warns of, and most such deltas change nothing.
 	 */
 	if (action == BLK_DONE && kind == BMAP_DELTA_NODE &&
-		forknum == BMAP_FORKNUM)
+		forknum == BMAP_FORKNUM &&
+		map_page_is((const PGIOAlignedBlock *) BufferGetPage(buf),
+					BMAP_PAGE_ROOT))
 	{
 		if (apply_node_delta(BufferGetPage(buf), (xl_bmap_node_delta *) copy))
+			MarkBufferDirty(buf);
+	}
+
+	/*
+	 * So does a tree's node, if it is the node the record changes: a newer
+	 * page of another incarnation of its block (born after the record) is
+	 * left as it is.
+	 */
+	else if (action == BLK_DONE && kind == BMAP_DELTA_NODE && node)
+	{
+		Page		page = BufferGetPage(buf);
+
+		if (tree_node_any(page) &&
+			PageGetBmapTreeOpaque(page)->born <= record->ReadRecPtr &&
+			apply_node_delta(page, (xl_bmap_node_delta *) copy))
 			MarkBufferDirty(buf);
 	}
 	else if (action == BLK_NEEDS_REDO)
@@ -6652,7 +8185,13 @@ redo_block(XLogReaderState *record, uint8 block_id)
 				apply_header_delta(page, (xl_bmap_header_delta *) copy);
 				break;
 			case BMAP_DELTA_NODE:
+				if (node && !tree_node_any(page))
+					elog(PANIC, "block %u of page store %u/%u, changed by a record, is no block map node",
+						 blkno, rlocator.spcOid, rlocator.dbOid);
 				apply_node_delta(page, (xl_bmap_node_delta *) copy);
+				break;
+			case BMAP_DELTA_ROOT:
+				apply_root_delta(page, (xl_bmap_root_delta *) copy);
 				break;
 			case BMAP_DELTA_BITS:
 				apply_bits_delta(page, (xl_bmap_bits_delta *) copy);
@@ -6711,8 +8250,9 @@ bmap_redo(XLogReaderState *record)
 				xl_bmap_rel *xlrec = (xl_bmap_rel *) XLogRecGetData(record);
 				SMgrRelation reln;
 
-				/* making the header creates the map fork */
-				redo_block(record, 0);
+				/* making the header creates the map fork (a tree's root too) */
+				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
+					redo_block(record, id);
 				forget_recovery_length(xlrec->locator);
 
 				/* an earlier open of this relation may have chosen md.c */
@@ -6763,8 +8303,19 @@ bmap_redo(XLogReaderState *record)
 								 &xlrec->new_hw);
 				break;
 			}
+		case XLOG_BMAP_TREE:
+			{
+				xl_bmap_tree *xlrec = (xl_bmap_tree *) XLogRecGetData(record);
+
+				/* the store reaches a node made, which its image makes */
+				if (xlrec->op == BMAP_TREE_NODE || xlrec->op == BMAP_TREE_COPY)
+					prepare_node_store(xlrec->locator, xlrec->node,
+									   xlrec->old_hw, xlrec->new_hw);
+				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
+					redo_block(record, id);
+				break;
+			}
 		case XLOG_BMAP_FREE:
-		case XLOG_BMAP_SHARE:
 		case XLOG_BMAP_UNREF:
 		case XLOG_BMAP_FOLD:
 		case XLOG_BMAP_CHANGES:

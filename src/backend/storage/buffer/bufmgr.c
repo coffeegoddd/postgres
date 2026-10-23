@@ -4972,6 +4972,23 @@ drop_in_pass(const DropPasses *passes, ForkNumber forknum, int pass)
 }
 
 /* ---------------------------------------------------------------------
+ *		DropBufferBlock
+ *
+ *		Remove one block's page from the buffer pool, if it is there, without
+ *		writing it, waiting for whoever has it pinned.  For storage that is
+ *		to hold something else at that block, which a stale page written out
+ *		later would overwrite.  The caller makes sure nothing reads or dirties
+ *		the page again meanwhile.
+ * --------------------------------------------------------------------
+ */
+void
+DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
+				BlockNumber blkno)
+{
+	FindAndDropRelationBuffers(rlocator, forkNum, blkno + 1, blkno);
+}
+
+/* ---------------------------------------------------------------------
  *		DropRelationsAllBuffers
  *
  *		This function removes from the buffer pool all the pages of all

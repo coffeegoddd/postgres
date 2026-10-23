@@ -183,6 +183,18 @@ CREATE FUNCTION test_bmap_read_old(relnumber oid, blkno int8, old_block int8)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A map's nodes, each time one is reached from the root page.
+CREATE FUNCTION test_bmap_tree(relnumber oid,
+	OUT level int4, OUT first int8, OUT block int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Look up every logical block of the storage 'loops' times, as reading its
+-- pages does (from cached map pages): the microseconds it took.
+CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)
+RETURNS float8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The server's chunk store, from SQL: chunks are named by the server's
 -- content hash, in hex.
 CREATE FUNCTION test_chunk_put(data bytea)
