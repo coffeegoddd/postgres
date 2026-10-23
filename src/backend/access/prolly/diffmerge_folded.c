@@ -94,6 +94,7 @@
 #include "common/int.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "storage/buffile.h"
 #include "nodes/miscnodes.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
@@ -3090,7 +3091,7 @@ typedef enum WalkMode
 {
 	WALK_MERGE,					/* write it, unless it conflicts */
 	WALK_LIST,					/* report it if it conflicts */
-	WALK_PLAN,					/* collect outcomes without writing rows */
+	WALK_PLAN,					/* spool outcomes without writing rows */
 	WALK_TAKE_THEIRS			/* if it conflicts, make the row theirs */
 } WalkMode;
 
@@ -3101,6 +3102,68 @@ typedef struct MergeOutcome
 	StringInfoData value;
 	bool		conflict;
 } MergeOutcome;
+
+/* Ordered outcomes on temporary storage, with only the current record live. */
+typedef struct MergePlan
+{
+	BufFile    *file;
+	StringInfoData key;
+	MergeOutcome current;
+	bool		has_current;
+} MergePlan;
+
+static void
+merge_plan_begin(MergePlan *plan)
+{
+	memset(plan, 0, sizeof(*plan));
+	plan->file = BufFileCreateTemp(false);
+	initStringInfo(&plan->key);
+	initStringInfo(&plan->current.value);
+}
+
+static void
+merge_plan_put(MergePlan *plan, const MergeOutcome *out)
+{
+	/* Private scratch format: lengths, conflict flag, key, encoded value. */
+	uint32		header[3] = {out->key.len, out->value.len, out->conflict};
+
+	BufFileWrite(plan->file, header, sizeof(header));
+	BufFileWrite(plan->file, out->key.data, out->key.len);
+	BufFileWrite(plan->file, out->value.data, out->value.len);
+}
+
+static void
+merge_plan_next(MergePlan *plan)
+{
+	uint32		header[3];
+	StringInfo	key = &plan->key;
+	StringInfo	value = &plan->current.value;
+
+	plan->has_current = BufFileReadMaybeEOF(plan->file, header, sizeof(header), true) != 0;
+	if (!plan->has_current)
+		return;
+	resetStringInfo(key);
+	resetStringInfo(value);
+	enlargeStringInfo(key, header[0]);
+	enlargeStringInfo(value, header[1]);
+	BufFileReadExact(plan->file, key->data, header[0]);
+	BufFileReadExact(plan->file, value->data, header[1]);
+	key->len = header[0];
+	value->len = header[1];
+	key->data[key->len] = '\0';
+	value->data[value->len] = '\0';
+	plan->current.key.data = (const uint8 *) key->data;
+	plan->current.key.len = key->len;
+	plan->current.conflict = header[2] != 0;
+}
+
+static void
+merge_plan_rewind(MergePlan *plan)
+{
+	if (BufFileSeek(plan->file, 0, 0, SEEK_SET) != 0)
+		elog(ERROR, "could not rewind merge outcome stream");
+	merge_plan_next(plan);
+}
 
 static const ProllyValue *
 value_or_null(const StringInfoData *s, ProllyValue *v)
@@ -3872,11 +3935,10 @@ typedef struct MergeWalk
 	const UnsureRows *unsure;	/* NULL: none */
 	WalkMode	mode;
 	ProllyConflictSink *sink;
-	List	  **plan;
+	MergePlan  *plan;
 	bool		keyless;
 	bool		in_place;
 	CellMerge	cm;
-	MemoryContext cxt;			/* merge_table()'s */
 	MemoryContext rowcxt;		/* a key's, reset for the next */
 	StringInfoData theirs_key;	/* (a key's: theirs' change, copied out) */
 	StringInfoData theirs_before;
@@ -3966,14 +4028,12 @@ merge_key(MergeWalk *mw, const ProllyKey *tk, const StringInfoData *tbefore,
 
 	if (mw->mode == WALK_PLAN)
 	{
-		MemoryContext old = MemoryContextSwitchTo(mw->cxt);
-		MergeOutcome *out = palloc0(sizeof(MergeOutcome));
+		MergeOutcome out = {0};
 
-		out->key.len = tk->len;
-		out->key.data = (const uint8 *) palloc(tk->len);
-		memcpy(unconstify(uint8 *, out->key.data), tk->data, tk->len);
-		out->conflict = conflict;
-		initStringInfo(&out->value);
+		/* Encoded in rowcxt, then forgotten as soon as it is spooled. */
+		out.key = *tk;
+		out.conflict = conflict;
+		initStringInfo(&out.value);
 		if (!conflict && want > 0)
 		{
 			ProllyValue value = {(const uint8 *) row->data, row->len};
@@ -3981,10 +4041,9 @@ merge_key(MergeWalk *mw, const ProllyKey *tk, const StringInfoData *tbefore,
 			uint64		count;
 
 			PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &value, &decoded, &count);
-			PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &decoded, want, &out->value);
+			PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &decoded, want, &out.value);
 		}
-		*mw->plan = lappend(*mw->plan, out);
-		MemoryContextSwitchTo(old);
+		merge_plan_put(mw->plan, &out);
 		return;
 	}
 
@@ -4173,7 +4232,7 @@ check_taken(KeyWriter *kw, KeyWrite *w)
  * merge in progress): a conflict's row on the branch is its row there,
  * none if it was deleted since, not ours'.  unsure, if not NULL, is base's
  * rows with an unsure value (as_defined_now()): each side that has such a
- * row changed it, in those columns.  WALK_PLAN collects outcomes in *plan
+ * row changed it, in those columns.  WALK_PLAN spools outcomes to plan
  * without applying or recording writes.  Writing (WALK_MERGE,
  * WALK_TAKE_THEIRS), theirs is walked once for each of write_keys()'
  * passes (and once before, taking theirs, to check the rows taken).
@@ -4182,7 +4241,7 @@ check_taken(KeyWriter *kw, KeyWrite *w)
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
 			const Table *theirs, WalkMode mode, ProllyConflictSink *sink,
-			const Table *current, const UnsureRows *unsure, List **plan)
+			const Table *current, const UnsureRows *unsure, MergePlan *plan)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
@@ -4231,7 +4290,6 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 	mw.plan = plan;
 	mw.keyless = keyless;
 	mw.in_place = !keyless && updates_in_place(rel);
-	mw.cxt = CurrentMemoryContext;
 	mw.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "merge row",
 									  ALLOCSET_DEFAULT_SIZES);
 	initStringInfo(&mw.theirs_key);
@@ -4322,10 +4380,12 @@ check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 					 const Table *ours, const Table *theirs,
 					 const UnsureRows *text_unsure, const UnsureRows *cast_unsure)
 {
-	List	   *text_plan = NIL;
-	List	   *cast_plan = NIL;
-	ListCell   *a;
-	ListCell   *b;
+	MergePlan	text_plan;
+	MergePlan	cast_plan;
+	MemoryContext plans = AllocSetContextCreate(CurrentMemoryContext,
+												"merge outcome streams",
+												ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
 	Relation	rel = table_open(relid, AccessShareLock);
 	RowDiff		rd;
 	ProllyTreeEnv env;
@@ -4333,6 +4393,11 @@ check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	StringInfoData unchanged;
 
+	/* Files and reusable read buffers belong to this bounded scratch scope. */
+	old = MemoryContextSwitchTo(plans);
+	merge_plan_begin(&text_plan);
+	merge_plan_begin(&cast_plan);
+	MemoryContextSwitchTo(old);
 	(void) merge_table(relid, text_base, ours, theirs, WALK_PLAN, NULL, NULL,
 					   text_unsure, &text_plan);
 	(void) merge_table(relid, cast_base, ours, theirs, WALK_PLAN, NULL, NULL,
@@ -4344,38 +4409,43 @@ check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 	env.compare_arg = &rd;
 	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
 	initStringInfo(&unchanged);
-	a = list_head(text_plan);
-	b = list_head(cast_plan);
-	while (a || b)
+	merge_plan_rewind(&text_plan);
+	merge_plan_rewind(&cast_plan);
+	while (text_plan.has_current || cast_plan.has_current)
 	{
-		MergeOutcome *x = a ? lfirst(a) : NULL;
-		MergeOutcome *y = b ? lfirst(b) : NULL;
+		MergeOutcome *x = text_plan.has_current ? &text_plan.current : NULL;
+		MergeOutcome *y = cast_plan.has_current ? &cast_plan.current : NULL;
 		int			cmp = !x ? 1 : !y ? -1 : keying_compare(&x->key, &y->key, &rd);
 		const ProllyKey *key = cmp <= 0 ? &x->key : &y->key;
 
-		if (cmp <= 0)
-			a = lnext(text_plan, a);
-		else
+		if (cmp > 0)
 			x = NULL;
-		if (cmp >= 0)
-			b = lnext(cast_plan, b);
-		else
+		if (cmp < 0)
 			y = NULL;
-		if (x && x->conflict)
-			continue;
-		resetStringInfo(&unchanged);
-		if (!x || !y)
-			(void) PROLLY_CALL(tree, get, &env, &ours->data, key, &unchanged);
-		if ((y && y->conflict) ||
-			!same_bytes(x ? &x->value : &unchanged, y ? &y->value : &unchanged))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("rows of table \"%s\" can't be merged across an ambiguous type change",
-							RelationGetRelationName(rel)),
-					 errdetail("Reading the merge base through the cast or through its text form gives different merge results."),
-					 errhint("Merge the row changes before changing the column types.")));
+		if (!(x && x->conflict))
+		{
+			resetStringInfo(&unchanged);
+			if (!x || !y)
+				(void) PROLLY_CALL(tree, get, &env, &ours->data, key, &unchanged);
+			if ((y && y->conflict) ||
+				!same_bytes(x ? &x->value : &unchanged, y ? &y->value : &unchanged))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("rows of table \"%s\" can't be merged across an ambiguous type change",
+								RelationGetRelationName(rel)),
+						 errdetail("Reading the merge base through the cast or through its text form gives different merge results."),
+						 errhint("Merge the row changes before changing the column types.")));
+		}
+		if (cmp <= 0)
+			merge_plan_next(&text_plan);
+		if (cmp >= 0)
+			merge_plan_next(&cast_plan);
 		CHECK_FOR_INTERRUPTS();
 	}
+	INJECTION_POINT("prolly-merge-plans-compared", NULL);
+	BufFileClose(text_plan.file);
+	BufFileClose(cast_plan.file);
+	MemoryContextDelete(plans);
 	pfree(unchanged.data);
 	PROLLY_CALL(rd.kr, close, rd.k);
 	table_close(rel, AccessShareLock);
