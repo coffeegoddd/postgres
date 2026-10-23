@@ -48,6 +48,7 @@ Changes to this design are tracked in GitHub issues:
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub
 	writers           prolly_writers.h        modes, stub
+	move_planner      prolly_moveplan.h       costs, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -393,7 +394,28 @@ A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the
 canonicalizer's splice_baseline()); a branch's first use copies the branch
-nearest its head.
+nearest its head.  With none at its head, the move planner (moveplan_costs.c)
+costs moving each branch's copies there, from the root its working set is
+known or thought to be: each table's rows that differ, estimated from its
+trees by diff_estimate() in a bounded number of nodes, and the tables
+redefined, made or dropped (materialized views' rows as tables'), each
+planned on its own branch.  The session's branch and at most 16 others are
+weighed, each stopped once it costs more than the best yet; the cheapest is
+copied, the session's on a tie.  Another branch is copied only if none of
+its writers is in the middle of a change (make()'s nowait): waiting for one,
+with the refs held, would hold up the session's branch's commits for as long
+as that writer's transaction lasts.  Else the session's branch is copied,
+waiting for its writers, as ever (pg_stat_prolly's first_use_sources_busy).
+The copies are new in the transaction, so no other sees them: a table of the chosen plan whose rows differ by more
+than reloading it costs (past about an eighth of them) begins empty instead
+(branch operations' make(), its emptied tables: new storage, as TRUNCATE
+gives it, no page shared, its change log told), and the move loads the
+head's rows into it, its indexes built once after them (the row applier's
+load).  Not a table with a deferrable unique, primary key or exclusion
+constraint, whose rows the applier rechecks a row at a time.  A table the
+head hasn't begins empty too, so the move drops it without its pages
+having been shared (and, for pages no other map held, logged) first.  A
+table whose definition differs keeps its pages: the move may keep its rows.
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call
