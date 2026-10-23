@@ -463,9 +463,8 @@ OF` are built in D18's shapes.
   another of its name added has the dropped one's identity, as Dolt's
   tags do. A column of another type in an older version is converted to
   today's type (text `'3'` reads as integer 3, where Dolt gives NULL).
-  History made before identities were recorded (format 17) has every
-  object under its own name's identity, so a rename there reads as a
-  drop and an add: the renamed column as NULL before it. A table's
+  History of an older folded format (17 or before) isn't read: its rows
+  are unreadable here. A table's
   history is followed by its name: one dropped and made again has both
   tables' rows. Each also takes the table's name as text, for a
   table the session hasn't (#612): `dolt_diff_table('t' [, from_ref,

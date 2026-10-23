@@ -1044,23 +1044,6 @@ test_working_identity(PG_FUNCTION_ARGS)
 													  PG_UTF8)));
 }
 
-/*
- * test_anchor_by_name(): anchor the session branch's working set as if
- * every table and column had its own name's identity, as history made
- * before identities were recorded has them: a rename since reads as a drop
- * and an add, by name.
- */
-PG_FUNCTION_INFO_V1(test_anchor_by_name);
-Datum
-test_anchor_by_name(PG_FUNCTION_ARGS)
-{
-	ProllyDatabaseComponents dc;
-
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.refs, anchor_identity, NULL);
-	PG_RETURN_VOID();
-}
-
 /* test_refs_set_head(ref): make ref's commit the session branch's head */
 PG_FUNCTION_INFO_V1(test_refs_set_head);
 Datum

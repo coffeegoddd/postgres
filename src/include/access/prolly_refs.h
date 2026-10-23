@@ -69,8 +69,7 @@ typedef struct ProllyCommitInfo
 	/*
 	 * The identity of its root's tables and columns, which their renames
 	 * keep (the canonicalizer's identify()): an identity record, palloc'd,
-	 * or NULL where every object has its own name's (one that recorded
-	 * none: made before identities were recorded, or nothing in its
+	 * or NULL where every object has its own name's (nothing in its
 	 * history was renamed).
 	 */
 	char	   *identity;

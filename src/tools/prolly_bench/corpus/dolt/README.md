@@ -115,10 +115,9 @@ bypass.
 Historical row ports read each version as the table is defined now, its
 columns matched by identity, which renames keep (D18, #699): a renamed column,
 primary-key columns included, reads its values in versions before the rename,
-as Dolt's tags do. Where a version names a column otherwise with no identity to
-follow, as history made before identities were recorded does, rows project by
-name. A renamed primary-key column is then NULL in an older version that lacks
-its current name, and such rows cannot be matched by the current key. When both
+as Dolt's tags do. A column an older version lacks (a key made anew of a column
+added since, say) reads as NULL there, and such rows cannot be matched by the
+current key. When both
 keyed historical versions have identical definitions, their stored
 key bytes match rows and edits are reported as modified. Otherwise, equal
 projected rows on opposite sides cancel by copy count, and the remaining rows

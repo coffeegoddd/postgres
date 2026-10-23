@@ -247,11 +247,10 @@ typedef struct BaseTable BaseTable;
 
 /*
  * The format a folded root is in: "18", whose commits record their
- * objects' identities beside it (folded_identify()), which an older server
- * would read past, matching renamed objects by name: its bytes are
- * otherwise "17"'s, so a "17" root is read, moved to and merged as one of
- * this format, its objects each of its own name's identity; "17",
- * extension send values normalized by binary receive/send; "16", per-table ordering metadata and
+ * objects' identities beside it (folded_identify()), which a server of an
+ * earlier format would read past, matching renamed objects by name; "17"
+ * had none, and was the first with extension send values normalized by
+ * binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
  * table's definition a line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
  * TABLE's tail, and was the first with a value of a type whose binary I/O
@@ -280,12 +279,11 @@ typedef struct BaseTable BaseTable;
  * long rows out of line; "3" keyed value trees' chunks by offset, and was
  * the first with its definitions' fields escaped (append_field()); "2" was
  * keyless rows keyed by their first bytes and their hash, and a root
- * without the item keyed them by the hash alone.  A root in another (but
- * FOLDED_FORMAT_READ) has its tables' rows unreadable here, and is neither
- * moved to nor merged: its definitions or row keying aren't this format's.
+ * without the item keyed them by the hash alone.  A root in another has
+ * its tables' rows unreadable here, and is neither moved to nor merged:
+ * its definitions, row keying or identities aren't this format's.
  */
 #define FOLDED_FORMAT	"18"
-#define FOLDED_FORMAT_READ "17"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -331,7 +329,6 @@ static char *printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
 						  Form_pg_type domain, ParseExprKind kind);
 static char *constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain);
 static bool list_has_string(List *list, const char *s);
-static bool readable_format(const ProllyValue *v);
 
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
@@ -5384,20 +5381,7 @@ folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	}
 }
 
-/*
- * Is a "!:format" item's value the current format, or the one before,
- * whose roots are the same but for the item?
- */
-static bool
-readable_format(const ProllyValue *v)
-{
-	return (v->len == strlen(FOLDED_FORMAT) &&
-			memcmp(v->data, FOLDED_FORMAT, v->len) == 0) ||
-		(v->len == strlen(FOLDED_FORMAT_READ) &&
-		 memcmp(v->data, FOLDED_FORMAT_READ, v->len) == 0);
-}
-
-/* Is a folded root in the current format (its "!:format" item readable)? */
+/* Is a folded root in the current format (its "!:format" item)? */
 static bool
 root_in_format(Canon *cn, const ProllyNodeRef *root)
 {
@@ -5411,7 +5395,8 @@ root_in_format(Canon *cn, const ProllyNodeRef *root)
 	PROLLY_CALL(cn->tree, cursor_seek, c, &want, ForwardScanDirection);
 	current = PROLLY_CALL(cn->tree, cursor_next, c, &k, &v) &&
 		k.len == want.len && memcmp(k.data, want.data, want.len) == 0 &&
-		readable_format(&v);
+		v.len == strlen(FOLDED_FORMAT) &&
+		memcmp(v.data, FOLDED_FORMAT, v.len) == 0;
 	PROLLY_CALL(cn->tree, cursor_close, c);
 	return current;
 }
@@ -5877,8 +5862,6 @@ same_definition_pair(const ProllyKey *ka, const ProllyValue *va,
 
 	if (ka == NULL || kb == NULL)
 		*same = false;
-	else if (ka->len == 8 && memcmp(ka->data, "!:format", 8) == 0)
-		*same = readable_format(va) && readable_format(vb);
 	else
 	{
 		definition_of(ka, va, &da);
@@ -11612,11 +11595,10 @@ folded_make_versioned_schemas(List *names)
  *	c <table> <column> <origin> <n>
  *	t <table> <origin> <n>
  *
- * So a commit whose objects were never renamed records nothing, and one
- * made before identities were recorded reads as such.  An anchor, the
- * working set's, has a line for each table and column, by the branch's own
- * relation and attribute number (0 for the table), which a rename keeps:
- * relid, attnum, origin, n.
+ * So a commit whose objects were never renamed records nothing.  An
+ * anchor, the working set's, has a line for each table and column, by the
+ * branch's own relation and attribute number (0 for the table), which a
+ * rename keeps: relid, attnum, origin, n.
  */
 typedef struct IdObject
 {

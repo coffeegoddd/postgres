@@ -158,8 +158,7 @@ new one takes its old name).  A root holds no identities, so the same
 tables, columns and rows give the same root however they were named
 before.  A commit records its root's identities beside it (its "identity"
 item): only those that differ from the object's own name with 0, so a
-commit whose objects were never renamed records nothing, and commits made
-before identities were recorded read the same way.  Commit ids already
+commit whose objects were never renamed records nothing.  Commit ids already
 depend on history, through their parents and metadata; two commits with
 the same root can still record different identities.
 
@@ -186,10 +185,13 @@ The branch's own tables and columns are renamed to the merged names first
 are and only the other side's changes are written.  The anchor is then the
 merge's.
 
-Folded format 18 is format 17 with identities recorded in commits.  Its
-roots differ from format 17's only in the "!:format" item, so this build
-reads, moves to and merges both.  An older server refuses format 18
-instead of matching renamed objects by name.
+Folded format 18 records identities in commits.  Formats are not kept
+compatible while the prototype iterates: this build reads, moves to and
+merges format 18 alone, and a root of format 17 or older has its tables'
+rows unreadable and is refused for moves and merges ("a commit made in an
+older format of prolly's history can't be ..."); commit the branch again to
+write it in format 18.  A server of an earlier format refuses format 18
+likewise, rather than matching renamed objects by name.
 
 
 Internal DDL and event triggers

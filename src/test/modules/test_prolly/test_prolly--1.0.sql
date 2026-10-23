@@ -336,12 +336,6 @@ CREATE FUNCTION test_working_identity()
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
--- The working set's objects each given its own name's identity, as history
--- made before identities were recorded has them.
-CREATE FUNCTION test_anchor_by_name()
-RETURNS void
-AS 'MODULE_PATHNAME' LANGUAGE C;
-
 CREATE FUNCTION test_refs_set_head(ref text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
