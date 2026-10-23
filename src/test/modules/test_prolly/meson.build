@@ -295,6 +295,7 @@ tests += {
       't/161_fold_on_commit_sessions.pl',
       't/162_fold_worker.pl',
       't/163_merge_plan_spill.pl',
+      't/168_bmap_truncation_record.pl',
     ],
   },
 }
