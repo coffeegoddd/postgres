@@ -3,7 +3,6 @@
 # A base backup can copy a page-store block before it is shared, and its
 # source's map after a later remap.  Recovery skips the source's older WAL
 # through that newer map, but must still reconstruct the shared copy (#665).
-# A share logs the images that needs while a backup runs, as one does here.
 
 use strict;
 use warnings FATAL => 'all';
@@ -36,10 +35,6 @@ my $store = $node->data_dir . '/base/'
   . sql(q{SELECT oid FROM pg_database WHERE datname = current_database()})
   . '/9421';
 
-# (a backup runs from here to the crash: the shares log their images)
-my $backup = $node->background_psql('postgres');
-$backup->query_safe(q{SELECT pg_backup_start('fuzzy', true)});
-
 sql('CHECKPOINT');
 open(my $fh, '<:raw', $store) or die "open $store: $!";
 seek($fh, $phys * 8192, 0) or die "seek $store: $!";
@@ -58,9 +53,16 @@ is(sql(qq{SELECT (ctid::text::point)[0] FROM t WHERE a = $key}), '10',
 is(sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
 	FROM pg_buffercache WHERE relfilenode = $rel AND relforknumber = 0}),
 	't', 'sharing reads the source pages after eviction');
+my $preserved =
+  q{SELECT pg_stat_force_next_flush(); SELECT value FROM pg_stat_prolly WHERE name = 'bmap_pages_preserved'};
+my $preserved_before = sql($preserved);
 my $first_start = sql(q{SELECT pg_current_wal_insert_lsn()});
 my $copy = sql(qq{SELECT test_bmap_share($rel)});
 my $first_end = sql(q{SELECT pg_current_wal_insert_lsn()});
+is(sql($preserved) - $preserved_before,
+	sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$first_start', '$first_end')
+		WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'}),
+	'pg_stat_prolly counts each page image a share logs');
 # With compression disabled, the smaller image must come from hole removal.
 # The recovery check below then exercises restoring that omitted free space.
 is(sql(qq{SELECT count(*) = 1 AND bool_and(
@@ -100,7 +102,6 @@ is(sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
 	FROM pg_buffercache WHERE relfilenode = $rel AND relforknumber = 4}),
 	't', 'the newer source map reaches disk');
 $node->stop('immediate');
-$backup->quit;
 
 # Reproduce the two reads of a fuzzy backup deterministically: the older
 # store page and newer map.  Keep the page's valid checksum, of logical

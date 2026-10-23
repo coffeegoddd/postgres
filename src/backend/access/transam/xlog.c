@@ -86,7 +86,6 @@
 #include "replication/snapbuild.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
-#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -10074,9 +10073,6 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 	XLogCtl->Insert.runningBackups++;
 	WALInsertLockRelease();
 
-	/* (on a standby, a share replayed from here on fails the backup) */
-	state->bmap_shares = bmap_shares_replayed();
-
 	/*
 	 * Ensure we decrement runningBackups if we fail below. NB -- for this to
 	 * work correctly, it is critical that sessionBackupState is only updated
@@ -10464,19 +10460,6 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 							 "is corrupt and should not be used. "
 							 "Enable \"full_page_writes\" and run CHECKPOINT on the primary, "
 							 "and then try an online backup again.")));
-
-		/*
-		 * A share of block-mapped relations' blocks replayed meanwhile may
-		 * need images of them that the primary didn't log.
-		 */
-		if (bmap_shares_replayed_since(state->bmap_shares))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("a share of block-mapped relations' blocks was replayed "
-							"during online backup"),
-					 errhint("This means that the backup being taken on the standby "
-							 "is corrupt and should not be used. "
-							 "Try the online backup again.")));
 
 
 		LWLockAcquire(ControlFileLock, LW_SHARED);

@@ -412,8 +412,6 @@ typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
 	pg_atomic_uint64 stuck_held;	/* holders a stuck count gained, ever */
-	pg_atomic_uint64 shares_replayed;	/* twice the shares replayed, odd
-										 * while one's blocks are written */
 	pg_atomic_uint64 watch_key[BMAP_WATCHED_MAX];
 	slock_t		mutex;			/* protects what follows */
 	int			nlisted;
@@ -475,7 +473,6 @@ BmapShmemInit(void *arg)
 {
 	pg_atomic_init_u32(&bmap_shared->sweeps, 0);
 	pg_atomic_init_u64(&bmap_shared->stuck_held, 0);
-	pg_atomic_init_u64(&bmap_shared->shares_replayed, 0);
 	SpinLockInit(&bmap_shared->mutex);
 	bmap_shared->nlisted = 0;
 	bmap_shared->unlisted = 0;
@@ -4921,12 +4918,14 @@ share_changes(SMgrRelation src, SMgrRelation dst)
  */
 
 /*
- * Before a private block is shared while an online backup runs, log its
- * contents with its physical address.  The backup may have read the page
- * store before our flush, and the source's map after a later remap.  Redo
- * then skips the source's older changes, so flushing alone cannot preserve
- * the copy's rows.  With no backup running, the share logs no images
- * (bmapshare()).
+ * Before a private block is shared, log its contents with its physical
+ * address.  A base backup may have read the page store before our flush,
+ * and the source's map after a later remap.  Redo then skips the source's
+ * older changes, so flushing alone cannot preserve the copy's rows.
+ *
+ * At replica/logical WAL levels, preserve even when no backup is active:
+ * a backup could start between such a check and the share's flush.  Skipping
+ * images safely would require an interlock with backup startup.
  *
  * Blocks already held by another map or changes list have been preserved
  * by their first share or REMAP, and cannot change in place.  Do not read
@@ -5145,19 +5144,6 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
  * writers): a change made to one of src's buffers before the epochs are
  * raised would be written to a block dst shares.  An error partway leaves
  * dst with some of src's blocks counted; dropping dst gives them back.
- *
- * WAL: O(1) in src's size, but while an online backup runs.  The shared
- * blocks need what src's records wrote to them before the share, and redo
- * skips those records once src's map has moved past them (a copy on write,
- * a truncation, a drop).  Crash recovery and a standby's replay find the
- * blocks as the share's flush (and the replay's, which flushes and syncs
- * the same) left them, durable before src's map can move on.  A backup
- * that starts after the flush reads them only after it too, and they never
- * change in place again; one already running may have read them before, so
- * its redo needs their images (preserve_shared_page()).  A backup that
- * starts between the two (asked again once the flush is done) fails the
- * share, which can be tried again.  A backup taken from a standby that
- * replays a share meanwhile fails instead (bmap_shares_replayed()).
  */
 void
 bmapshare(SMgrRelation src, SMgrRelation dst)
@@ -5174,7 +5160,6 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	xl_bmap_share xlrec;
 	XLogRecPtr	lsn;
 	LOCKTAG		sweeptag;
-	bool		preserved;
 
 	if (srel.spcOid != drel.spcOid || srel.dbOid != drel.dbOid)
 		elog(ERROR, "block-mapped relation %s can't share the blocks of %s, in another page store",
@@ -5201,10 +5186,8 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	nblocks = PageGetBmapHeader(BufferGetPage(sheader))->nblocks;
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 
-	/* src's own blocks preserved for a backup running, its subtrees a holder more */
-	preserved = XLogIsNeeded() && XLogBackupInProgress();
-	if (preserved)
-		tree_preserve(src, nblocks, epoch);
+	/* src's own blocks preserved, its subtrees a holder more */
+	tree_preserve(src, nblocks, epoch);
 	tree_share_root(src, dst, NULL, NULL);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
@@ -5257,10 +5240,9 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	MarkBufferedRelationShared(src, MAIN_FORKNUM);
 
 	/*
-	 * The shared blocks get src's latest pages, durably.  PRESERVE records,
-	 * logged while a backup runs, can reconstruct them even if it has older
-	 * store pages and newer maps, which make redo skip the source's earlier
-	 * changes.  A page
+	 * The shared blocks get src's latest pages, durably.  PRESERVE records
+	 * can reconstruct them even if a base backup has older store pages and
+	 * newer maps, which make redo skip the source's earlier changes.  A page
 	 * src changes from here on is copied first, its old contents written to
 	 * the shared block if they were only in its buffer.  So only the sync
 	 * waits for src to be let change again: the blocks hold what dst starts
@@ -5269,15 +5251,6 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	 */
 	FlushRelationsAllBuffers(&src, 1);
 	sync_store_later(srel);
-	INJECTION_POINT("bmap-share-flushed", NULL);
-
-	/* a backup begun before the flush may have read the blocks before it */
-	if (!preserved && XLogIsNeeded() && XLogBackupInProgress())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("could not share the blocks of %s: an online backup started meanwhile",
-						relpath(src->smgr_rlocator, MAIN_FORKNUM).str),
-				 errhint("Try again.")));
 }
 
 /*
@@ -5323,27 +5296,6 @@ bmapsyncshares(bool isCommit)
 			n_unsynced_stores--;
 		}
 	n_unsynced_stores = 0;
-}
-
-/*
- * Shares replayed: a token for a backup taken from a standby to take as it
- * starts, and to give bmap_shares_replayed_since() as it stops.  A share
- * replayed while the backup ran wrote the blocks it shares then, and may
- * have left the backup a copy of them older than its redo needs (the
- * primary logs their images only while a backup runs on the primary
- * itself), so the backup can't be used.
- */
-uint64
-bmap_shares_replayed(void)
-{
-	return pg_atomic_read_u64(&bmap_shared->shares_replayed);
-}
-
-bool
-bmap_shares_replayed_since(uint64 token)
-{
-	return (token & 1) != 0 ||
-		pg_atomic_read_u64(&bmap_shared->shares_replayed) != token;
 }
 
 /* ----------------------------------------------------------------
@@ -8899,15 +8851,10 @@ bmap_redo(XLogReaderState *record)
 
 				/*
 				 * As the primary did: the shared blocks get the source's
-				 * pages as of this record, durably.  A backup taken from
-				 * here meanwhile may have read them before, and its redo
-				 * may need images the primary didn't log: it fails
-				 * (bmap_shares_replayed()).
+				 * pages as of this record, durably.
 				 */
-				pg_atomic_fetch_add_u64(&bmap_shared->shares_replayed, 1);
 				FlushRelationsAllBuffers(&src, 1);
 				mdimmedsync(store_smgr(xlrec->src), MAIN_FORKNUM);
-				pg_atomic_fetch_add_u64(&bmap_shared->shares_replayed, 1);
 				break;
 			}
 		default:

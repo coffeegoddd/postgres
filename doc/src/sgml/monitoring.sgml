@@ -5815,8 +5815,8 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        took the last canonical tree the backend built and worked out again
        only the tables written since and the sequences, as nothing else had
        changed); <literal>bmap_pages_preserved</literal> (page images a
-       share of a relation's blocks logged of the blocks it shares, which
-       it does only while an online backup runs, for the backup's redo).
+       share of a relation's blocks logged of the blocks the relation alone
+       held, so that recovery and backups' redo can restore them).
        Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk

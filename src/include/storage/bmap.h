@@ -39,8 +39,6 @@ extern void bmapcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern bool bmapexists(SMgrRelation reln, ForkNumber forknum);
 extern void bmapshare(SMgrRelation src, SMgrRelation dst);
 extern void bmapsyncshares(bool isCommit);
-extern uint64 bmap_shares_replayed(void);
-extern bool bmap_shares_replayed_since(uint64 token);
 extern bool bmapreplacesblocks(SMgrRelation reln, ForkNumber forknum);
 extern bool bmapreplacedafter(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, XLogRecPtr lsn);
