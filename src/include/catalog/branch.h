@@ -151,6 +151,9 @@ extern bool check_out_branch(Oid branch);
 /* lock a branch to delete it; false if a session is on it */
 extern bool lock_branch_for_delete(Oid branch);
 
+/* is another session on a branch now (its lock tried, not waited for)? */
+extern bool branch_in_use(Oid branch);
+
 /*
  * hold a branch against deletion until the transaction ends, as a session
  * on it does, without waiting; false if it is gone or being deleted

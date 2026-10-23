@@ -1302,8 +1302,9 @@ typedef struct Sweep
 
 /*
  * Delete hidden branch name, in a subtransaction, if it is still one no
- * session is on: true if it was.  One a session is on, or that the session
- * may not delete, is left; any other error is the checkout's.
+ * session is on: true if it is gone, deleted now or (a commit's hidden
+ * branch) by another sweep meanwhile.  One a session is on, or that the
+ * session may not delete, is left; any other error is the checkout's.
  *
  * Another checkout can delete a candidate, or a session write on a writer
  * branch and leave it, while this one waits for the refs.  Each is asked
@@ -1334,9 +1335,15 @@ sweep_one(const char *name, void *arg)
 							NULL, NULL);
 			ReleaseCurrentSubTransaction();
 			deleted = true;
+			if (detached_branch(name))
+				pgstat_count_prolly(PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED, 1);
 		}
 		else
+		{
 			RollbackAndReleaseCurrentSubTransaction();
+			/* (a commit's hidden branch no longer one is gone: another's sweep) */
+			deleted = detached_branch(name);
+		}
 		MemoryContextSwitchTo(sw->cxt);
 		CurrentResourceOwner = sw->owner;
 	}
@@ -1414,13 +1421,13 @@ has_detached_branches(void)
 	return found;
 }
 
-void
+bool
 prolly_let_go_of_kept_states(void)
 {
 	int			budget = prolly_kept_checkouts;
 
 	if (!IsTransactionState() || RecoveryInProgress() || !has_detached_branches())
-		return;
+		return false;
 	prolly_kept_checkouts = 0;
 	PG_TRY();
 	{
@@ -1431,6 +1438,19 @@ prolly_let_go_of_kept_states(void)
 		prolly_kept_checkouts = budget;
 	}
 	PG_END_TRY();
+	return true;
+}
+
+/*
+ * (objects of other databases, which may be their kept states', or of a
+ * commit's hidden branch here, one a session is on)
+ */
+bool
+prolly_kept_states_named(const char *detail)
+{
+	return detail != NULL &&
+		(strstr(detail, " in database ") != NULL ||
+		 strstr(detail, "branch \"" PROLLY_DETACHED_PREFIX) != NULL);
 }
 
 
