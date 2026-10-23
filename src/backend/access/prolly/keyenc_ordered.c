@@ -84,6 +84,7 @@ typedef struct KeyColumn
 	Oid			collation;
 	FmgrInfo	cmp;			/* if !memcmp_ordered */
 	ProllyDatumCodec *codec;	/* KIND_SEND */
+	bool		normalizes;		/* receive may change an extension value */
 } KeyColumn;
 
 struct ProllyKeyEncoder
@@ -273,7 +274,10 @@ ordered_begin(const ProllyKeyDesc *desc, MemoryContext mcxt)
 			fmgr_info_cxt(cmpproc, &col->cmp, mcxt);
 		}
 		if (col->kind == KIND_SEND)
+		{
 			col->codec = prolly_datum_codec(desc->types[i], -1, mcxt);
+			col->normalizes = prolly_datum_codec_normalizes(col->codec);
+		}
 	}
 	return enc;
 }
@@ -354,6 +358,29 @@ ordered_encode(ProllyKeyEncoder *enc, const Datum *values, const bool *isnull,
 
 					initStringInfo(&b);
 					prolly_datum_encode(col->codec, values[i], &b);
+
+					/*
+					 * A stored key must still find its heap row through the
+					 * native index.  A receive function may normalize values,
+					 * but not across this primary key's comparison classes.
+					 */
+					if (col->normalizes)
+					{
+						Datum		decoded = prolly_datum_decode(col->codec,
+																  b.data, b.len);
+						int32		cmp = DatumGetInt32(FunctionCall2Coll(&col->cmp,
+																		  col->collation,
+																		  values[i], decoded));
+
+						if (!col->byval)
+							pfree(DatumGetPointer(decoded));
+						if (cmp != 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("binary normalization changes a prolly primary key's comparison value"),
+									 errdetail("Primary key column %d does not compare equal to its stored representation.", i + 1),
+									 errhint("Use a primary key whose values compare equal after binary receive.")));
+					}
 					append_be(out, b.len, 4);
 					appendBinaryStringInfo(out, b.data, b.len);
 					pfree(b.data);

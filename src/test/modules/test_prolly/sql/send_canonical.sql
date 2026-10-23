@@ -27,19 +27,23 @@ SELECT prolly_canonical_value(ARRAY['ABC', NULL]::test_normalizing[]) =
 CREATE TABLE sn.t (id int PRIMARY KEY, v test_normalizing, n int);
 CREATE TABLE sn.keyed (k test_normalizing PRIMARY KEY, n int);
 CREATE TABLE sn.keyless (v test_normalizing);
+CREATE TABLE sn.composite_key (k test_normalizing[], n int, PRIMARY KEY (k, n));
 INSERT INTO sn.t VALUES (1, 'base', 0);
 INSERT INTO sn.keyed VALUES ('base', 0);
 INSERT INTO sn.keyless VALUES ('base'), ('base');
+INSERT INTO sn.composite_key VALUES (ARRAY['base']::test_normalizing[], 1);
 SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
 SELECT dolt_branch('upper');
 UPDATE sn.t SET v = 'abc';
 UPDATE sn.keyed SET k = 'abc';
 UPDATE sn.keyless SET v = 'abc';
+UPDATE sn.composite_key SET k = ARRAY['abc']::test_normalizing[];
 SELECT length(dolt_commit('-Am', 'lower spelling')::text) AS committed;
 SELECT dolt_checkout('upper');
 UPDATE sn.t SET v = 'ABC';
 UPDATE sn.keyed SET k = 'ABC';
 UPDATE sn.keyless SET v = 'ABC';
+UPDATE sn.composite_key SET k = ARRAY['ABC']::test_normalizing[];
 SELECT length(dolt_commit('-Am', 'upper spelling')::text) AS committed;
 SELECT prolly_root_hash('main') = prolly_root_hash('upper') AS same_root;
 SELECT count(*) AS differences FROM dolt_diff('main', 'upper', NULL::sn.t);
@@ -70,6 +74,16 @@ DROP TABLE sn.t;
 SELECT dolt_reset('--hard');
 SELECT id, left(v::text, 3), length(v::text), n FROM sn.t ORDER BY id;
 SELECT test_fold_root(true) = :'before_rebuild' AS rebuild_same_root;
+-- Normalization must preserve equality under the actual primary-key opclass.
+CREATE TABLE sn.unsafe (k test_raw PRIMARY KEY);
+INSERT INTO sn.unsafe VALUES ('ABC');
+INSERT INTO sn.unsafe VALUES ('abc');
+UPDATE sn.unsafe SET k = 'ABC';
+SELECT k FROM sn.unsafe;
+CREATE TABLE sn.later_key (k test_raw);
+INSERT INTO sn.later_key VALUES ('ABC');
+ALTER TABLE sn.later_key ADD PRIMARY KEY (k);
+DROP TABLE sn.unsafe, sn.later_key;
 -- Format 16's pre-normalized data must never be reused as a new baseline.
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '16'),
     'old binary bytes') AS old_format \gset

@@ -563,3 +563,20 @@ OF` are built in D18's shapes.
   where work is counted.
 - **Port:** a case reads the counters before and after a collection
   for what it did, not `dolt_gc()`'s result.
+
+## D24. Extension values reconstruct through their binary receive function
+
+- **Prolly:** a value stored through an extension's binary I/O comes back
+  as `receive(send(value))` defines it. For example, PostGIS points with
+  either positive or negative NaN coordinates reconstruct as `POINT EMPTY`
+  after reset, clone, or materialization from a commit. The working heap
+  may retain the original spelling until it is reconstructed.
+- **Why:** the extension's wire format may discard physical distinctions.
+  This follows PostgreSQL dump/restore and binary COPY behavior, without
+  a PostGIS-specific lossless format. Format 17 stores normalized send
+  bytes, so those spellings also have the same canonical content hash.
+  Primary keys must compare equal before and after normalization under
+  their operator class; unsafe keys are refused.
+- **Port:** compare reconstructed values using the receiver's semantics.
+  The generic normalizing-type regression covers hashes, cell merges and
+  reset; the PostGIS-specific regression remains tracked in #689/#710.

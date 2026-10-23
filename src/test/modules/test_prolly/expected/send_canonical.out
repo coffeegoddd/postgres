@@ -1,0 +1,226 @@
+-- Binary receive can normalize two different send spellings to one value.
+-- Canonical keys and values must store that normalized representation.
+CREATE DATABASE regress_send_canonical;
+\c regress_send_canonical
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA sn VERSIONED;
+CREATE EXTENSION test_prolly_normalizing SCHEMA sn;
+SET search_path = sn, public;
+CREATE DOMAIN sn.normal_domain AS sn.test_normalizing;
+CREATE TYPE sn.normal_pair AS (v sn.test_normalizing, n int);
+CREATE TYPE sn.normal_range AS RANGE (subtype = sn.test_normalizing);
+SELECT test_normalizing_send('ABC') <> test_normalizing_send('abc') AS distinct_send,
+    prolly_canonical_value('ABC'::test_normalizing) =
+    prolly_canonical_value('abc'::test_normalizing) AS same_canonical,
+    prolly_canonical_round_trip('ABC'::test_normalizing)::text AS normalized;
+ distinct_send | same_canonical | normalized 
+---------------+----------------+------------
+ t             | t              | abc
+(1 row)
+
+SELECT prolly_canonical_value(ARRAY['ABC', NULL]::test_normalizing[]) =
+    prolly_canonical_value(ARRAY['abc', NULL]::test_normalizing[]) AS same_array,
+    prolly_canonical_value('ABC'::normal_domain) =
+    prolly_canonical_value('abc'::normal_domain) AS same_domain,
+    prolly_canonical_value(ROW('ABC', 1)::normal_pair) =
+    prolly_canonical_value(ROW('abc', 1)::normal_pair) AS same_composite,
+    prolly_canonical_value('[A,C)'::normal_range) =
+    prolly_canonical_value('[a,c)'::normal_range) AS same_range,
+    prolly_canonical_value('{[A,C)}'::normal_multirange) =
+    prolly_canonical_value('{[a,c)}'::normal_multirange) AS same_multirange;
+ same_array | same_domain | same_composite | same_range | same_multirange 
+------------+-------------+----------------+------------+-----------------
+ t          | t           | t              | t          | t
+(1 row)
+
+CREATE TABLE sn.t (id int PRIMARY KEY, v test_normalizing, n int);
+CREATE TABLE sn.keyed (k test_normalizing PRIMARY KEY, n int);
+CREATE TABLE sn.keyless (v test_normalizing);
+CREATE TABLE sn.composite_key (k test_normalizing[], n int, PRIMARY KEY (k, n));
+INSERT INTO sn.t VALUES (1, 'base', 0);
+INSERT INTO sn.keyed VALUES ('base', 0);
+INSERT INTO sn.keyless VALUES ('base'), ('base');
+INSERT INTO sn.composite_key VALUES (ARRAY['base']::test_normalizing[], 1);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('upper');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE sn.t SET v = 'abc';
+UPDATE sn.keyed SET k = 'abc';
+UPDATE sn.keyless SET v = 'abc';
+UPDATE sn.composite_key SET k = ARRAY['abc']::test_normalizing[];
+SELECT length(dolt_commit('-Am', 'lower spelling')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('upper');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'upper'"}
+(1 row)
+
+UPDATE sn.t SET v = 'ABC';
+UPDATE sn.keyed SET k = 'ABC';
+UPDATE sn.keyless SET v = 'ABC';
+UPDATE sn.composite_key SET k = ARRAY['ABC']::test_normalizing[];
+SELECT length(dolt_commit('-Am', 'upper spelling')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT prolly_root_hash('main') = prolly_root_hash('upper') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT count(*) AS differences FROM dolt_diff('main', 'upper', NULL::sn.t);
+ differences 
+-------------
+           0
+(1 row)
+
+SELECT test_fold_root(true) = prolly_root_hash('HEAD') AS full_matches;
+ full_matches 
+--------------
+ t
+(1 row)
+
+-- Replacing the working spelling alone is not a change or a merge conflict.
+UPDATE sn.t SET v = 'abc';
+SELECT count(*) AS working_differences FROM dolt_diff('HEAD', 'WORKING', NULL::sn.t);
+ working_differences 
+---------------------
+                   0
+(1 row)
+
+SELECT count(*) AS dirty_tables FROM dolt_status();
+ dirty_tables 
+--------------
+            0
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+-- A cell merge folds the working side before comparing it with tree values.
+SELECT dolt_branch('cells');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE sn.t SET v = 'XYZ';
+SELECT length(dolt_commit('-Am', 'change value')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('cells');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'cells'"}
+(1 row)
+
+UPDATE sn.t SET n = 1;
+SELECT length(dolt_commit('-Am', 'change other cell')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('upper'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT id, v, n FROM sn.t;
+ id |  v  | n 
+----+-----+---
+  1 | xyz | 1
+(1 row)
+
+SELECT count(*) AS conflicts FROM dolt_conflicts(NULL::sn.t);
+ conflicts 
+-----------
+         0
+(1 row)
+
+-- Out-of-line values go through the same normalization, and a rebuild is
+-- idempotent: it decodes the already normalized wire form.
+INSERT INTO sn.t VALUES (2, repeat('AB', 5000)::test_normalizing, 2);
+SELECT length(dolt_commit('-Am', 'large')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT test_fold_root() AS before_rebuild \gset
+DROP TABLE sn.t;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id, left(v::text, 3), length(v::text), n FROM sn.t ORDER BY id;
+ id | left | length | n 
+----+------+--------+---
+  1 | xyz  |      3 | 1
+  2 | aba  |  10000 | 2
+(2 rows)
+
+SELECT test_fold_root(true) = :'before_rebuild' AS rebuild_same_root;
+ rebuild_same_root 
+-------------------
+ t
+(1 row)
+
+-- Normalization must preserve equality under the actual primary-key opclass.
+CREATE TABLE sn.unsafe (k test_raw PRIMARY KEY);
+INSERT INTO sn.unsafe VALUES ('ABC');
+ERROR:  binary normalization changes a prolly primary key's comparison value
+DETAIL:  Primary key column 1 does not compare equal to its stored representation.
+HINT:  Use a primary key whose values compare equal after binary receive.
+INSERT INTO sn.unsafe VALUES ('abc');
+UPDATE sn.unsafe SET k = 'ABC';
+ERROR:  binary normalization changes a prolly primary key's comparison value
+DETAIL:  Primary key column 1 does not compare equal to its stored representation.
+HINT:  Use a primary key whose values compare equal after binary receive.
+SELECT k FROM sn.unsafe;
+  k  
+-----
+ abc
+(1 row)
+
+CREATE TABLE sn.later_key (k test_raw);
+INSERT INTO sn.later_key VALUES ('ABC');
+ALTER TABLE sn.later_key ADD PRIMARY KEY (k);
+ERROR:  binary normalization changes a prolly primary key's comparison value
+DETAIL:  Primary key column 1 does not compare equal to its stored representation.
+HINT:  Use a primary key whose values compare equal after binary receive.
+DROP TABLE sn.unsafe, sn.later_key;
+-- Format 16's pre-normalized data must never be reused as a new baseline.
+SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '16'),
+    'old binary bytes') AS old_format \gset
+SELECT dolt_reset('--hard', :'old_format');
+ERROR:  a commit made in an older format of prolly's history can't be moved to
+HINT:  Commit the branch to write it in the current one.
+\c contrib_regression
+DROP DATABASE regress_send_canonical;

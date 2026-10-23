@@ -1599,6 +1599,27 @@ decode_jsonb(ProllyDatumCodec *c, const char *data, int len)
 }
 
 bool
+prolly_datum_codec_normalizes(const ProllyDatumCodec *c)
+{
+	switch (c->kind)
+	{
+		case CODEC_SEND:
+			return c->tagged;
+		case CODEC_ARRAY:
+			return prolly_datum_codec_normalizes(c->elem.codec);
+		case CODEC_COMPOSITE:
+			for (int i = 0; i < c->tupdesc->natts; i++)
+				if (c->attcodecs[i] && prolly_datum_codec_normalizes(c->attcodecs[i]))
+					return true;
+			return false;
+		case CODEC_ANYARRAY:
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool
 prolly_datum_codec_checks(const ProllyDatumCodec *c)
 {
 	switch (c->kind)
@@ -1684,7 +1705,7 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 				if (c->tagged)
 				{
 					Datum		roundtrip = recv_utf8(c, VARDATA(b),
-												 VARSIZE(b) - VARHDRSZ);
+													  VARSIZE(b) - VARHDRSZ);
 					bytea	   *normalized = send_utf8(&c->send, roundtrip);
 
 					pfree(b);
