@@ -10,7 +10,7 @@ import shutil
 import time
 import uuid
 
-from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, log, server, sha256,
+from core import (ENGINES, SQL, default_dirty_sizes, dirty_rows, disk_size, engine_passes, log, server, sha256,
                   write_json)
 from memory import Sampler
 
@@ -28,6 +28,18 @@ def union_count(n, a, b):
         j = (zero_based_id*b + n-1)//n
         overlap += j < b and j*n//b == zero_based_id
     return a+b-overlap
+
+
+def counter_deltas(before, after):
+    """Each counter's growth across an operation: the counters it moved
+    (a counter it didn't is 0; one that moved backwards was reset meanwhile,
+    which fails the sample rather than reporting a negative amount of work)."""
+    if set(before) != set(after):
+        raise RuntimeError("the engine's counters changed names during an operation")
+    deltas = {name: after[name] - before[name] for name in after}
+    if any(d < 0 for d in deltas.values()):
+        raise RuntimeError("an engine counter went backwards during an operation (reset?)")
+    return {name: d for name, d in sorted(deltas.items()) if d}
 
 
 def verify_dirty(sql, n, count, revision, latest):
@@ -180,7 +192,7 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
             name = f"target_{token}_d{d}"
             sql.vc("branch", name, fixture["commits"][h-d])
             targets[d] = name
-        for mode in c["passes"]:
+        for mode in engine_passes(c, engine):
             for rep in range(-c["warmups"], c["repetitions"]):
                 order = cases(c)
                 rng.shuffle(order)
@@ -223,9 +235,12 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                               "sql": query, "status": "started"}
                     # (only the memory pass samples while the operation runs)
                     sampler = (Sampler(pid, c["sample_interval_ms"] if mode == "memory" else None)
-                               if mode != "timing" and rep >= 0 else None)
+                               if mode in ("memory", "cpu", "io") and rep >= 0 else None)
                     result = {}
                     try:
+                        # (read after the setup, so its work isn't the operation's,
+                        # and again before validation, whose isn't either)
+                        before = sql.counters() if mode == "counters" else None
                         if sampler:
                             sampler.start()
                         try:
@@ -234,6 +249,8 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                             if sampler:
                                 record["memory"] = sampler.finish(result.get("elapsed_ns", 0))
                         record["elapsed_ns"] = result["elapsed_ns"]
+                        if mode == "counters":
+                            record["counters"] = counter_deltas(before, sql.counters())
                         # Validation and restoration are deliberately outside timing
                         # AND memory sampling. Mutations must demonstrate their effect.
                         if op == "branch":
@@ -310,6 +327,13 @@ def run_cell(root, c, engine, n, k, sql, pid, fixture, output, rng):
                 sql.vc("branch", "-D", name)
 
 
+def planned_samples(c, engines):
+    """Measured samples a run makes: each engine's passes (engine_passes())
+    of every case, size and change count."""
+    return sum(len(engine_passes(c, e)) for e in engines) * \
+        len(c['row_counts'])*len(c['changes'])*len(cases(c))*c['repetitions']
+
+
 def run(root, c, engines):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
     out = root / "results" / stamp
@@ -320,7 +344,7 @@ def run(root, c, engines):
     manifest = {"status": "running", "config": c, "engine_order": engine_order,
                 "platform": platform.platform(), "cpu_count": __import__('os').cpu_count(),
                 "memory_info": Path('/proc/meminfo').read_text(), "binaries": {},
-                "planned_samples": len(engines)*len(c['row_counts'])*len(c['changes'])*len(cases(c))*len(c['passes'])*c['repetitions'],
+                "planned_samples": planned_samples(c, engines),
                 "method": "persistent SQL; warm caches; one engine at a time; memory, CPU and I/O of the server process tree in passes of their own"}
     write_json(out / "manifest.json", manifest)
     try:
