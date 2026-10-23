@@ -46,6 +46,28 @@ sub memory_of
 	return \%bytes;
 }
 
+# Bytes the statement's contexts hold: its portal's and its transaction's,
+# with those under them, but for the chunk store's caches ("prolly ...").
+sub statement_memory
+{
+	my ($db, $pid) = @_;
+	my $offset = -s $node->logfile;
+	$node->safe_psql($db, "SELECT pg_log_backend_memory_contexts($pid)");
+	$node->wait_for_log(qr/Grand total: \d+ bytes/, $offset);
+	my $log = substr(slurp_file($node->logfile), $offset);
+	my ($bytes, $under) = (0, undef);
+	while ($log =~ /level: (\d+); ([^:]+): (\d+) total/g)
+	{
+		my ($level, $name, $total) = ($1, $2, $3);
+		$under = undef if defined $under && $level <= $under;
+		$under = $level
+		  if !defined $under
+		  && ($name eq 'TopPortalContext' || $name eq 'TopTransactionContext');
+		$bytes += $total if defined $under && $name !~ /^prolly /;
+	}
+	return $bytes;
+}
+
 sub temp_bytes
 {
 	my ($db, $pid) = @_;
@@ -56,7 +78,7 @@ sub temp_bytes
 # Theirs' changes to b take values rows of ours hold: each is refused and
 # recorded.  A second branch makes the same changes again (the same
 # violations, which the branch has by then) and inserts n rows refused too.
-my (@first, @second, @disk);
+my (@first, @second, @adding, @statement, @disk);
 for my $n (5000, 50000)
 {
 	my $db = "violations$n";
@@ -88,7 +110,8 @@ for my $n (5000, 50000)
 	my $s = $node->background_psql($db, on_error_stop => 0);
 	my $pid = $s->query_safe('SELECT pg_backend_pid()');
 	$s->query_safe(q{SELECT injection_points_set_local();
-		SELECT injection_points_attach('prolly-merge-publishing-violations', 'wait')});
+		SELECT injection_points_attach('prolly-merge-publishing-violations', 'wait');
+		SELECT injection_points_attach('prolly-merge-violations-added', 'wait')});
 	$s->query_until(qr/merging/, q{\echo merging
 		SELECT dolt_merge('side');
 	});
@@ -99,6 +122,15 @@ for my $n (5000, 50000)
 	cmp_ok($m->{'merge violations'}, '<', 512 * 1024,
 		"$n violations: the merge holds less than 512kB of them");
 	$node->safe_psql($db, q{SELECT injection_points_wakeup('prolly-merge-publishing-violations')});
+	# Publishing: the identity sort read back into the found-order sort, a
+	# batch of them added to the branch's.
+	$node->wait_for_event('client backend', 'prolly-merge-violations-added');
+	$m = memory_of($db, $pid);
+	push @adding, $m->{'merge violations'};
+	cmp_ok($m->{'merge violations'}, '<', 1536 * 1024,
+		"$n violations: publishing them holds less than 1.5MB");
+	$node->safe_psql($db, q{SELECT injection_points_detach('prolly-merge-violations-added');
+		SELECT injection_points_wakeup('prolly-merge-violations-added')});
 	$s->query_safe('SELECT 1');
 	is($s->query_safe(q{SELECT count(*) FROM dolt_constraint_violations('s.t')}),
 		$n, "$n violations: each is recorded");
@@ -119,6 +151,8 @@ for my $n (5000, 50000)
 	$node->wait_for_event('client backend', 'prolly-merge-publishing-violations');
 	$m = memory_of($db, $pid);
 	push @second, $m->{'merge violations'};
+	# (nor does the statement count the branch's violations by loading them)
+	push @statement, statement_memory($db, $pid);
 	cmp_ok($m->{'merge violations'}, '<', 512 * 1024,
 		"$n violations: merged again, the merge holds less than 512kB of them");
 	$node->safe_psql($db, q{SELECT injection_points_detach('prolly-merge-publishing-violations');
@@ -142,7 +176,11 @@ cmp_ok($first[1], '<=', $first[0] * 1.5,
 	'ten times as many violations do not take ten times the memory');
 cmp_ok($second[1], '<=', $second[0] * 1.5,
 	'nor do ten times as many the branch has');
+cmp_ok($adding[1], '<=', $adding[0] * 1.5,
+	'nor does publishing ten times as many');
+cmp_ok($statement[1], '<=', $statement[0] * 1.5,
+	'nor does the merge statement, the branch having ten times as many');
 cmp_ok($disk[1], '>', $disk[0], 'more violations go to temporary files');
-note("violations held: @first and @second bytes; on disk: @disk bytes");
+note("violations held: @first and @second bytes, @adding publishing, statement @statement; on disk: @disk bytes");
 $node->stop;
 done_testing();

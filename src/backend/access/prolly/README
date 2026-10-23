@@ -277,7 +277,9 @@ spilling past it).  To publish them, the branch's violations are visited
 into the same sort, which orders them by what they are and then the
 branch's first: the first of each is kept only if it is new, and the new
 ones are sorted again into the order found and added to the branch's a
-batch at a time.  The refs keep a branch's violations one entry each, keyed
+batch at a time (1000, or work_mem's worth of bytes up to 1MB).  A merge or
+pick counts the branch's violations, to report how many it added, by
+visiting them, not loading them.  The refs keep a branch's violations one entry each, keyed
 by the branch and a place, after an entry holding the next place, so adding
 some reads and writes none of the others (the refs' format version 2).
 Format version 1 kept them all in one value under the branch's key; this

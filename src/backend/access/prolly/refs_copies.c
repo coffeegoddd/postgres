@@ -2444,7 +2444,7 @@ static void
 copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
-	TAG_MERGE_NAMES, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
+	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
 	TAG_NAMES};
 	ListCell   *lc;
 
@@ -2478,7 +2478,11 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->check_drop(name);
 		branch_ops()->check_create(newname);
 	}
-	/* (violations, kept one entry each, moved apart from the tags') */
+	/*
+	 * (violations, kept one entry each, moved apart from the tags'; the
+	 * tags' move an earlier format's value with the branch, to be refused
+	 * there, not left for a branch made again of this name)
+	 */
 	violations_clear(newname);
 	violations_move(name, newname);
 	for (int i = 0; i < lengthof(tags); i++)

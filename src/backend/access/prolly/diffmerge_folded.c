@@ -1851,9 +1851,12 @@ recorded_end(void)
 	recorded = NULL;
 }
 
-/* Violations added to the branch's at a time: so many, or so many bytes. */
+/*
+ * Violations added to the branch's at a time: so many, or so many bytes
+ * (no more than work_mem's worth).
+ */
 #define VIOLATIONS_BATCH		1000
-#define VIOLATIONS_BATCH_BYTES	(1024 * 1024)
+#define VIOLATIONS_BATCH_BYTES	Min(1024 * 1024, (Size) work_mem * 1024)
 
 /* A violation's lengths, then its strings, in an attempt's file. */
 typedef struct AttemptViolation
@@ -9686,6 +9689,8 @@ keep_violations(void)
 		if (nbatch == VIOLATIONS_BATCH || batch_bytes >= VIOLATIONS_BATCH_BYTES)
 		{
 			PROLLY_CALL(refs, add_violations, batch, nbatch);
+			/* (a batch's copies, and both sorts', held at once) */
+			INJECTION_POINT("prolly-merge-violations-added", NULL);
 			MemoryContextReset(batch_cxt);
 			nbatch = 0;
 			batch_bytes = 0;
