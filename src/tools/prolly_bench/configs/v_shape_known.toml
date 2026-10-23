@@ -99,23 +99,3 @@ counter = "nodes_read"
 current = "linear"
 issue = "#697"
 reason = "dolt_at reads every row of the table at the commit; no key access path"
-
-# A commit's fold reads the changed rows the table's change log names,
-# until their candidates pass maintenance_work_mem (v_shape.toml sets
-# 1MB, which the delta sweep's 70% change passes): then it reads every
-# row of the table.  A merge folds the working set first, the same way.
-[[known]]
-check = "commit"
-sweep = "delta"
-counter = "fold_rows_read"
-current = "super"
-issue = "#730"
-reason = "past the candidate budget the fold reads all N rows (fold_full_memory_budget), a jump from the Δ it read below it"
-
-[[known]]
-check = "merge"
-sweep = "delta"
-counter = "fold_rows_read"
-current = "super"
-issue = "#730"
-reason = "the merge's fold of the working set passes the candidate budget too, and reads all N rows"
