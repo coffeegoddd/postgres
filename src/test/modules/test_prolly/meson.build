@@ -304,6 +304,7 @@ tests += {
       't/181_merge_attempt_bounds.pl',
       't/182_merge_violation_sink.pl',
       't/183_merge_constraint_streams.pl',
+      't/184_merge_conversion_spill.pl',
     ],
   },
 }

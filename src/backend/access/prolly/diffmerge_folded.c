@@ -1523,6 +1523,8 @@ changes_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 /*
  * A merge base's rows with a value that's unsure (see ReadFor), and in
  * which columns, in key order: a side that has the row has changed those.
+ * They are kept in a temporary file in key order, and read back one at a
+ * time as a merge walk reaches them (unsure_rewind(), unsure_next()).
  */
 typedef struct UnsureRow
 {
@@ -1532,18 +1534,225 @@ typedef struct UnsureRow
 
 typedef struct UnsureRows
 {
-	int			n;
-	UnsureRow **rows;
+	int64		n;
 	bool		alternative;	/* a key or keyless row has two readings */
+	MemoryContext cxt;			/* its file's and buffers (NULL: none) */
+	MemoryContext rowcxt;		/* cur's columns */
+	BufFile    *file;
+	UnsureRow	cur;			/* the one read last, if has_cur */
+	bool		has_cur;
+	StringInfoData key;			/* (cur's) */
 } UnsureRows;
 
-static int
-unsure_row_cmp(const void *a, const void *b, void *arg)
+/*
+ * A record sorted by its key under a table's keying (as_defined_now()'s
+ * converted rows, and its unsure rows): its place among those put (ties
+ * come out in the order put), a count, the key, then two byte strings
+ * (a row and the row shown; or an unsure row's columns).  A tuplesort of
+ * their own, which spills past work_mem, so a table's rows converted to
+ * another key order take no more memory however many there are.
+ */
+typedef struct ConvTuple
 {
-	const UnsureRow *x = *(UnsureRow *const *) a;
-	const UnsureRow *y = *(UnsureRow *const *) b;
+	int64		place;
+	uint64		count;
+	uint32		keylen;
+	uint32		len1;
+	int32		len2;			/* -1: none */
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} ConvTuple;
 
-	return keying_compare(&x->key, &y->key, arg);
+#define CONV_KEY(t) ((const uint8 *) (t)->data)
+#define CONV_FIRST(t) ((t)->data + (t)->keylen)
+#define CONV_SECOND(t) ((t)->data + (t)->keylen + (t)->len1)
+#define CONV_SIZE(t) \
+	(offsetof(ConvTuple, data) + (t)->keylen + (t)->len1 + Max((t)->len2, 0))
+
+static int
+comparetup_conv(const SortTuple *a, const SortTuple *b, Tuplesortstate *state)
+{
+	const ConvTuple *x = a->tuple;
+	const ConvTuple *y = b->tuple;
+	ProllyKey	kx = {CONV_KEY(x), x->keylen};
+	ProllyKey	ky = {CONV_KEY(y), y->keylen};
+	int			c = keying_compare(&kx, &ky, TuplesortstateGetPublic(state)->arg);
+
+	if (c != 0)
+		return c;
+	return x->place < y->place ? -1 : x->place > y->place ? 1 : 0;
+}
+
+static void
+writetup_conv(Tuplesortstate *state, LogicalTape *tape, SortTuple *stup)
+{
+	const ConvTuple *t = stup->tuple;
+	unsigned int tuplen = CONV_SIZE(t);
+	unsigned int written = tuplen + sizeof(unsigned int);
+
+	LogicalTapeWrite(tape, &written, sizeof(written));
+	LogicalTapeWrite(tape, t, tuplen);
+}
+
+static void
+readtup_conv(Tuplesortstate *state, SortTuple *stup, LogicalTape *tape,
+			 unsigned int len)
+{
+	unsigned int tuplen = len - sizeof(unsigned int);
+	ConvTuple  *t = tuplesort_readtup_alloc(state, tuplen);
+
+	LogicalTapeReadExact(tape, t, tuplen);
+	stup->tuple = t;
+	stup->datum1 = (Datum) 0;
+	stup->isnull1 = true;
+}
+
+static void
+removeabbrev_conv(Tuplesortstate *state, SortTuple *stups, int count)
+{
+}
+
+/*
+ * A sort of ConvTuples by their keys, under rd's keying, in work_mem of its
+ * own (a version read may have two open: its rows' and its unsure rows').
+ */
+static Tuplesortstate *
+conv_sort_begin(RowDiff *rd)
+{
+	Tuplesortstate *state = tuplesort_begin_common(work_mem, NULL,
+												   TUPLESORT_NONE);
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+
+	base->nKeys = 1;
+	base->removeabbrev = removeabbrev_conv;
+	base->comparetup = comparetup_conv;
+	base->comparetup_tiebreak = comparetup_conv;
+	base->writetup = writetup_conv;
+	base->readtup = readtup_conv;
+	base->haveDatum1 = false;
+	base->tuples = true;
+	base->arg = rd;
+	return state;
+}
+
+static void
+conv_sort_put(Tuplesortstate *state, int64 place, uint64 count,
+			  const char *key, int keylen, const char *first, int len1,
+			  const char *second, int len2)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext old = MemoryContextSwitchTo(base->tuplecontext);
+	Size		size = offsetof(ConvTuple, data) + keylen + len1 + Max(len2, 0);
+	ConvTuple  *t = palloc(size);
+	SortTuple	stup;
+
+	t->place = place;
+	t->count = count;
+	t->keylen = keylen;
+	t->len1 = len1;
+	t->len2 = len2;
+	memcpy(t->data, key, keylen);
+	memcpy(t->data + keylen, first, len1);
+	if (len2 > 0)
+		memcpy(t->data + keylen + len1, second, len2);
+	stup.tuple = t;
+	stup.datum1 = (Datum) 0;
+	stup.isnull1 = true;
+	/* (the tuple context is a bump allocator, which knows no chunk sizes) */
+	tuplesort_puttuple_common(state, &stup, false,
+							  TupleSortUseBumpTupleCxt(base->sortopt) ?
+							  MAXALIGN(size) : GetMemoryChunkSpace(t));
+	MemoryContextSwitchTo(old);
+}
+
+/* The next ConvTuple, in key order: good until the next is read. */
+static const ConvTuple *
+conv_sort_next(Tuplesortstate *state)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext old = MemoryContextSwitchTo(base->sortcontext);
+	SortTuple	stup;
+	bool		got = tuplesort_gettuple_common(state, true, &stup);
+
+	MemoryContextSwitchTo(old);
+	return got ? stup.tuple : NULL;
+}
+
+/*
+ * Unsure rows (as_defined_now()'s), sorted, written to their file in key
+ * order for reading back as each merge walk goes (unsure_rewind()).
+ */
+static void
+unsure_write_sorted(UnsureRows *u, Tuplesortstate *sort)
+{
+	const ConvTuple *t;
+	MemoryContext old;
+
+	tuplesort_performsort(sort);
+	old = MemoryContextSwitchTo(u->cxt);
+	u->file = BufFileCreateTemp(false);
+	MemoryContextSwitchTo(old);
+	while ((t = conv_sort_next(sort)) != NULL)
+	{
+		uint32		header[2] = {t->keylen, t->len1};
+
+		BufFileWrite(u->file, header, sizeof(header));
+		BufFileWrite(u->file, t->data, t->keylen + t->len1);
+		CHECK_FOR_INTERRUPTS();
+	}
+	tuplesort_end(sort);
+}
+
+/* Read u's next unsure row into u->cur (u->has_cur: there was one). */
+static void
+unsure_next(UnsureRows *u)
+{
+	uint32		header[2];
+	int32	   *cols;
+
+	u->has_cur = u->file != NULL &&
+		BufFileReadMaybeEOF(u->file, header, sizeof(header), true) != 0;
+	if (!u->has_cur)
+		return;
+	MemoryContextReset(u->rowcxt);
+	resetStringInfo(&u->key);
+	enlargeStringInfo(&u->key, header[0]);
+	BufFileReadExact(u->file, u->key.data, header[0]);
+	u->key.len = header[0];
+	cols = MemoryContextAlloc(u->rowcxt, Max(header[1], 1));
+	BufFileReadExact(u->file, cols, header[1]);
+	u->cur.key.data = (const uint8 *) u->key.data;
+	u->cur.key.len = header[0];
+	u->cur.cols = NULL;
+	{
+		MemoryContext old = MemoryContextSwitchTo(u->rowcxt);
+
+		for (int i = 0; i < header[1] / sizeof(int32); i++)
+			u->cur.cols = bms_add_member(u->cur.cols, cols[i]);
+		MemoryContextSwitchTo(old);
+	}
+}
+
+/* Read u from its first unsure row. */
+static void
+unsure_rewind(UnsureRows *u)
+{
+	if (u->file && BufFileSeek(u->file, 0, 0, SEEK_SET) != 0)
+		elog(ERROR, "could not rewind a merge base's unsure rows");
+	unsure_next(u);
+}
+
+/* u's file closed and its memory released. */
+static void
+unsure_free(UnsureRows *u)
+{
+	if (u->file)
+		BufFileClose(u->file);
+	u->file = NULL;
+	if (u->cxt)
+		MemoryContextDelete(u->cxt);
+	u->cxt = NULL;
+	u->n = 0;
+	u->has_cur = false;
 }
 
 /* A copy of len bytes, sized to them (none: empty). */
@@ -4870,7 +5079,7 @@ typedef struct MergeWalk
 	const Table *ours;
 	const Table *theirs;
 	const Table *current;		/* NULL: none */
-	const UnsureRows *unsure;	/* NULL: none */
+	UnsureRows *unsure;			/* NULL: none */
 	WalkMode	mode;
 	ProllyConflictSink *sink;
 	MergePlan  *plan;
@@ -4886,7 +5095,6 @@ typedef struct MergeWalk
 	/* (a walk's:) */
 	KeyWriter  *kw;
 	KeyWriteVisit visit;		/* each write, or NULL: none */
-	int			ui;				/* unsure's next row */
 	int			conflicts;
 } MergeWalk;
 
@@ -5049,7 +5257,7 @@ merge_key(MergeWalk *mw, const ProllyKey *tk, const StringInfoData *tbefore,
 static void
 merge_unsure_row(MergeWalk *mw)
 {
-	const UnsureRow *u = mw->unsure->rows[mw->ui++];
+	const UnsureRow *u = &mw->unsure->cur;
 	MemoryContext old;
 	StringInfoData row;
 
@@ -5060,6 +5268,7 @@ merge_unsure_row(MergeWalk *mw)
 		elog(ERROR, "an unsure row of a merge's base is missing from it");
 	merge_key(mw, &u->key, &row, &row, u->cols, true);
 	MemoryContextSwitchTo(old);
+	unsure_next(mw->unsure);
 }
 
 /*
@@ -5087,13 +5296,13 @@ merge_change(ProllyDiffKind kind, const ProllyKey *key,
 	tk.data = (const uint8 *) mw->theirs_key.data;
 	tk.len = mw->theirs_key.len;
 
-	while (mw->unsure && mw->ui < mw->unsure->n &&
-		   changes_compare(&mw->unsure->rows[mw->ui]->key, &tk, mw->c) < 0)
+	while (mw->unsure && mw->unsure->has_cur &&
+		   changes_compare(&mw->unsure->cur.key, &tk, mw->c) < 0)
 		merge_unsure_row(mw);
-	if (mw->unsure && mw->ui < mw->unsure->n &&
-		changes_compare(&mw->unsure->rows[mw->ui]->key, &tk, mw->c) == 0)
+	if (mw->unsure && mw->unsure->has_cur &&
+		changes_compare(&mw->unsure->cur.key, &tk, mw->c) == 0)
 	{
-		cols = mw->unsure->rows[mw->ui++]->cols;
+		cols = mw->unsure->cur.cols;
 		unsure_key = true;
 	}
 	MemoryContextReset(mw->rowcxt);
@@ -5101,6 +5310,9 @@ merge_change(ProllyDiffKind kind, const ProllyKey *key,
 	merge_key(mw, &tk, &mw->theirs_before, &mw->theirs_after, cols,
 			  unsure_key);
 	MemoryContextSwitchTo(old);
+	/* (its columns, read with it, are good until the next is read) */
+	if (unsure_key)
+		unsure_next(mw->unsure);
 }
 
 /*
@@ -5111,11 +5323,12 @@ static int
 walk_theirs(MergeWalk *mw, KeyWriteVisit visit)
 {
 	mw->visit = visit;
-	mw->ui = 0;
+	if (mw->unsure)
+		unsure_rewind(mw->unsure);
 	mw->conflicts = 0;
 	PROLLY_CALL(mw->tree, diff, mw->env, &mw->base->data, &mw->theirs->data,
 				merge_change, mw);
-	while (mw->unsure && mw->ui < mw->unsure->n)
+	while (mw->unsure && mw->unsure->has_cur)
 		merge_unsure_row(mw);
 	MemoryContextReset(mw->rowcxt);
 	return mw->conflicts;
@@ -5179,7 +5392,7 @@ check_taken(KeyWriter *kw, KeyWrite *w)
 static int
 merge_table(Oid relid, const Table *base, const Table *ours,
 			const Table *theirs, WalkMode mode, ProllyConflictSink *sink,
-			const Table *current, const UnsureRows *unsure, MergePlan *plan)
+			const Table *current, UnsureRows *unsure, MergePlan *plan)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	const ProllyApplierRoutine *ar = prolly_applier_lookup("replication");
@@ -5316,7 +5529,7 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 static void
 check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 					 const Table *ours, const Table *theirs,
-					 const UnsureRows *text_unsure, const UnsureRows *cast_unsure)
+					 UnsureRows *text_unsure, UnsureRows *cast_unsure)
 {
 	MergePlan	text_plan;
 	MergePlan	cast_plan;
@@ -6222,33 +6435,6 @@ generation_of(List *cols, const char *name)
 			return c->generated ? c->generated : "";
 	}
 	return "";
-}
-
-typedef struct ConvRow
-{
-	ProllyKey	key;
-	ProllyValue row;
-	ProllyValue shown;			/* (fitting) the row shown */
-	uint64		count;
-} ConvRow;
-
-static int
-conv_row_cmp(const void *a, const void *b, void *arg)
-{
-	const ConvRow *x = *(ConvRow *const *) a;
-	const ConvRow *y = *(ConvRow *const *) b;
-
-	return keying_compare(&x->key, &y->key, arg);
-}
-
-/* A copy of len bytes, exactly. */
-static const uint8 *
-dup_bytes(const char *data, int len)
-{
-	uint8	   *p = palloc(Max(len, 1));
-
-	memcpy(p, data, len);
-	return p;
 }
 
 /*
@@ -7173,10 +7359,9 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	ProllyTreeCursor *cur;
 	ProllyKey	k;
 	ProllyValue v;
-	ConvRow   **rows = NULL;
-	int			n = 0;
-	int			max = 0;
-	int			i;
+	Tuplesortstate *rows = NULL;	/* (keys not kept) converted rows */
+	Tuplesortstate *unsure_sort = NULL;
+	int64		n = 0;
 	ProllyTreeBuilder *b;
 	EState	   *estate = NULL;	/* (casts, and generated columns computed) */
 	List	   *generated = NIL;	/* those computed, and their expressions */
@@ -7189,8 +7374,7 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 	Bitmapset  *pk;
 	MemoryContext rowcxt;
 	MemoryContext outer;
-	int			nunsure = 0;
-	int			maxunsure = 0;
+	int64		nunsure = 0;
 	TupleTableSlot *hs = NULL;	/* comparison row, including hidden columns */
 	ProllyValueEncoder *he = NULL;
 	int		   *hidden_from = NULL;
@@ -7561,21 +7745,18 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		}
 		if (unsure_cols != NULL)
 		{
-			UnsureRow  *u;
+			int			ncols = bms_num_members(unsure_cols);
+			int32	   *cols = palloc(sizeof(int32) * Max(ncols, 1));
+			int			col = -1;
+			int			c = 0;
 
+			while ((col = bms_next_member(unsure_cols, col)) >= 0)
+				cols[c++] = col;
 			MemoryContextSwitchTo(outer);
-			u = palloc(sizeof(UnsureRow));
-			u->key.data = dup_bytes(key.data, key.len);
-			u->key.len = key.len;
-			u->cols = bms_copy(unsure_cols);
-			if (nunsure == maxunsure)
-			{
-				maxunsure = Max(16, maxunsure * 2);
-				unsure->rows = unsure->rows ?
-					repalloc_array(unsure->rows, UnsureRow *, maxunsure) :
-					palloc_array(UnsureRow *, maxunsure);
-			}
-			unsure->rows[nunsure++] = u;
+			if (unsure_sort == NULL)
+				unsure_sort = conv_sort_begin(&rd);
+			conv_sort_put(unsure_sort, nunsure++, 0, key.data, key.len,
+						  (const char *) cols, sizeof(int32) * ncols, NULL, -1);
 			MemoryContextSwitchTo(rowcxt);
 		}
 		if (keys_kept)
@@ -7604,27 +7785,12 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 		}
 		else
 		{
-			ConvRow    *r;
-
 			MemoryContextSwitchTo(outer);
-			r = palloc(sizeof(ConvRow));
-			r->key.data = dup_bytes(key.data, key.len);
-			r->key.len = key.len;
-			r->row.data = dup_bytes(crow.data, crow.len);
-			r->row.len = crow.len;
-			if (separate_shown)
-			{
-				r->shown.data = dup_bytes(frow.data, frow.len);
-				r->shown.len = frow.len;
-			}
-			r->count = count;
-			if (n == max)
-			{
-				max = Max(64, max * 2);
-				rows = rows ? repalloc_array(rows, ConvRow *, max) :
-					palloc_array(ConvRow *, max);
-			}
-			rows[n++] = r;
+			if (rows == NULL)
+				rows = conv_sort_begin(&rd);
+			conv_sort_put(rows, n++, count, key.data, key.len, crow.data,
+						  crow.len, separate_shown ? frow.data : NULL,
+						  separate_shown ? frow.len : -1);
 		}
 		MemoryContextReset(rowcxt);
 		CHECK_FOR_INTERRUPTS();
@@ -7645,60 +7811,87 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 															TupleDescAttr(md, a)->atttypmod))));
 	if (estate)
 		FreeExecutorState(estate);
-	if (n > 1)
-		qsort_arg(rows, n, sizeof(ConvRow *), conv_row_cmp, &rd);
-
-	for (i = 0; i < n;)
+	if (rows)
 	{
-		int			j = i + 1;
-		uint64		count = rows[i]->count;
-		StringInfoData value;
-		ProllyValue val;
+		const ConvTuple *t;
+		ConvTuple  *first = NULL;
+		MemoryContext group = AllocSetContextCreate(CurrentMemoryContext,
+													"converted row",
+													ALLOCSET_DEFAULT_SIZES);
 
-		/*
-		 * (rows that become the same: copies of one, or a key twice: shown,
-		 * the first of those, the rest counted and warned of)
-		 */
-		while (j < n && conv_row_cmp(&rows[i], &rows[j], &rd) == 0)
+		tuplesort_performsort(rows);
+		INJECTION_POINT("prolly-merge-rows-converted", NULL);
+		t = conv_sort_next(rows);
+		while (t != NULL)
 		{
-			if (keyed_now && read == READ_SHOWN && !refuse)
-				shared += rows[j]->count;
-			else if (keyed_now)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNIQUE_VIOLATION),
-						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
-								RelationGetRelationName(rel))));
-			else
-				count += rows[j]->count;
-			j++;
-		}
-		/* (a keyless version's copies of a row, one row keyed) */
-		if (keyed_now && count > 1)
-		{
-			if (read == READ_SHOWN && !refuse)
-				shared += count - 1;
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_UNIQUE_VIOLATION),
-						 errmsg("rows of table \"%s\" share a primary key as it is defined now",
-								RelationGetRelationName(rel))));
-			count = 1;
-		}
-		initStringInfo(&value);
-		PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->row, count, &value);
-		val.data = (const uint8 *) value.data;
-		val.len = value.len;
-		PROLLY_CALL(tree, build_add, b, &rows[i]->key, &val);
-		if (separate_shown)
-		{
-			resetStringInfo(&value);
-			PROLLY_CALL(rd.kr, make_value, rd.k, &rows[i]->shown, count, &value);
+			uint64		count;
+			StringInfoData value;
+			ProllyValue val;
+			ProllyKey	fk;
+			ProllyValue fr;
+
+			/* (the first of those of a key, copied: the next read replaces it) */
+			MemoryContextReset(group);
+			first = MemoryContextAlloc(group, CONV_SIZE(t));
+			memcpy(first, t, CONV_SIZE(t));
+			fk.data = CONV_KEY(first);
+			fk.len = first->keylen;
+			count = first->count;
+
+			/*
+			 * (rows that become the same: copies of one, or a key twice:
+			 * shown, the first of those, the rest counted and warned of)
+			 */
+			while ((t = conv_sort_next(rows)) != NULL)
+			{
+				ProllyKey	tk = {CONV_KEY(t), t->keylen};
+
+				if (keying_compare(&fk, &tk, &rd) != 0)
+					break;
+				if (keyed_now && read == READ_SHOWN && !refuse)
+					shared += t->count;
+				else if (keyed_now)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNIQUE_VIOLATION),
+							 errmsg("rows of table \"%s\" share a primary key as it is defined now",
+									RelationGetRelationName(rel))));
+				else
+					count += t->count;
+			}
+			/* (a keyless version's copies of a row, one row keyed) */
+			if (keyed_now && count > 1)
+			{
+				if (read == READ_SHOWN && !refuse)
+					shared += count - 1;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_UNIQUE_VIOLATION),
+							 errmsg("rows of table \"%s\" share a primary key as it is defined now",
+									RelationGetRelationName(rel))));
+				count = 1;
+			}
+			initStringInfo(&value);
+			fr.data = (const uint8 *) CONV_FIRST(first);
+			fr.len = first->len1;
+			PROLLY_CALL(rd.kr, make_value, rd.k, &fr, count, &value);
 			val.data = (const uint8 *) value.data;
 			val.len = value.len;
-			PROLLY_CALL(tree, build_add, sb, &rows[i]->key, &val);
+			PROLLY_CALL(tree, build_add, b, &fk, &val);
+			if (separate_shown)
+			{
+				fr.data = (const uint8 *) CONV_SECOND(first);
+				fr.len = Max(first->len2, 0);
+				resetStringInfo(&value);
+				PROLLY_CALL(rd.kr, make_value, rd.k, &fr, count, &value);
+				val.data = (const uint8 *) value.data;
+				val.len = value.len;
+				PROLLY_CALL(tree, build_add, sb, &fk, &val);
+			}
+			pfree(value.data);
+			CHECK_FOR_INTERRUPTS();
 		}
-		pfree(value.data);
-		i = j;
+		tuplesort_end(rows);
+		MemoryContextDelete(group);
 	}
 	PROLLY_CALL(tree, build_finish, b, &out->data);
 	if (shown)
@@ -7715,8 +7908,23 @@ as_defined_now(Relation rel, const Table *x, const Table *now, ReadFor read,
 							   "%llu rows of a version of table \"%s\" share a primary key with others as the key is defined now: each key shown once",
 							   shared, (unsigned long long) shared,
 							   RelationGetRelationName(rel))));
-	if (nunsure > 1)
-		qsort_arg(unsure->rows, nunsure, sizeof(UnsureRow *), unsure_row_cmp, &rd);
+	if (unsure_sort)
+	{
+		unsure->cxt = AllocSetContextCreate(CurrentMemoryContext,
+											"merge unsure rows",
+											ALLOCSET_SMALL_SIZES);
+		unsure->rowcxt = AllocSetContextCreate(unsure->cxt,
+											   "merge unsure row",
+											   ALLOCSET_SMALL_SIZES);
+		unsure->key.data = NULL;
+		{
+			MemoryContext old = MemoryContextSwitchTo(unsure->cxt);
+
+			initStringInfo(&unsure->key);
+			MemoryContextSwitchTo(old);
+		}
+		unsure_write_sorted(unsure, unsure_sort);
+	}
 	if (unsure)
 		unsure->n = nunsure;
 	if (he)
@@ -8391,6 +8599,7 @@ merge_rows(void *arg)
 									  true, &alternative, &alternative_unsure, NULL);
 				check_merge_readings(relid, &bn, &alternative, &on, &tn,
 									 &unsure, &alternative_unsure);
+				unsure_free(&alternative_unsure);
 				MemoryContextSwitchTo(old);
 				MemoryContextDelete(check);
 			}
@@ -8406,6 +8615,7 @@ merge_rows(void *arg)
 				row_conflicts(mr, relid,
 							  merge_table(relid, &bn, &on, &tn, WALK_MERGE, NULL, NULL,
 										  &unsure, NULL));
+			unsure_free(&unsure);
 			continue;
 		}
 		else
@@ -11393,6 +11603,7 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 		tp = &nt;
 	}
 	(void) merge_table(relid, bp, op, tp, mode, sink, now, &unsure, NULL);
+	unsure_free(&unsure);
 }
 
 static void
