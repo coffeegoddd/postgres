@@ -53,9 +53,16 @@ is(sql(qq{SELECT (ctid::text::point)[0] FROM t WHERE a = $key}), '10',
 is(sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
 	FROM pg_buffercache WHERE relfilenode = $rel AND relforknumber = 0}),
 	't', 'sharing reads the source pages after eviction');
+my $preserved =
+  q{SELECT pg_stat_force_next_flush(); SELECT value FROM pg_stat_prolly WHERE name = 'bmap_pages_preserved'};
+my $preserved_before = sql($preserved);
 my $first_start = sql(q{SELECT pg_current_wal_insert_lsn()});
 my $copy = sql(qq{SELECT test_bmap_share($rel)});
 my $first_end = sql(q{SELECT pg_current_wal_insert_lsn()});
+is(sql($preserved) - $preserved_before,
+	sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$first_start', '$first_end')
+		WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'}),
+	'pg_stat_prolly counts each page image a share logs');
 # With compression disabled, the smaller image must come from hole removal.
 # The recovery check below then exercises restoring that omitted free space.
 is(sql(qq{SELECT count(*) = 1 AND bool_and(
@@ -76,6 +83,21 @@ is(sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$start', '$end')
 	'0', 'sharing an already shared page logs no further preservation images');
 is(sql(qq{SELECT test_bmap_rows_digest($copy2)}), $rows,
 	'the second copy has the same rows');
+
+# A snapshot of a relation's pages preserves its own blocks as a share
+# does, and counts the same.
+sql(q{CREATE TABLE snap (a int, b text);
+	INSERT INTO snap SELECT g, repeat('s', 500) FROM generate_series(1, 50) g});
+my $snaprel = sql(q{SELECT pg_relation_filenode('snap')});
+$preserved_before = sql($preserved);
+my $snap_start = sql(q{SELECT pg_current_wal_insert_lsn()});
+sql(qq{SELECT test_bmap_snapshot_take($snaprel)});
+my $snap_end = sql(q{SELECT pg_current_wal_insert_lsn()});
+my $snap_images = sql(qq{SELECT count(*) FROM pg_get_wal_records_info('$snap_start', '$snap_end')
+	WHERE resource_manager = 'BlockMap' AND record_type = 'PRESERVE'});
+cmp_ok($snap_images, '>', 0, 'a snapshot logs the images of its own blocks');
+is(sql($preserved) - $preserved_before, $snap_images,
+	'pg_stat_prolly counts each page image a snapshot logs');
 sql(qq{SELECT test_bmap_truncate($rel, 10)});
 sql(qq{SELECT test_bmap_extend($rel, 1)});
 isnt(sql(qq{SELECT phys FROM test_bmap_map($rel) WHERE blkno = 10}), $phys,
