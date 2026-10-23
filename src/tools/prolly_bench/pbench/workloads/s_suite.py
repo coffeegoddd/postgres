@@ -100,7 +100,7 @@ class S4(Workload):
             CREATE TABLE public.s4_src USING heap AS
               SELECT g::bigint AS id, (g * 7919 % {rows})::int AS k,
                      md5(g::text) || md5((g + 1)::text) AS payload
-              FROM generate_series(1, {rows}) g;
+              FROM generate_series(1::bigint, {rows}) g;
             COPY public.s4_src TO '{self._file(ctx)}';
             DROP TABLE public.s4_src;
             CREATE TABLE s4 (id bigint, k int, payload text);

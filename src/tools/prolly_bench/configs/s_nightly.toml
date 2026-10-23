@@ -34,6 +34,11 @@ synchronous_commit = "off"
 fsync = "on"
 full_page_writes = "on"
 max_connections = 32
+# Serializable TPC-C exhausts the default shared predicate-lock pool at
+# eight clients. Keep the original per-relation promotion threshold while
+# enlarging the pool, so this does not change lock granularity.
+max_pred_locks_per_transaction = 1024
+max_pred_locks_per_relation = 32
 
 [sizes.nightly]
 pgbench_scale = 10
