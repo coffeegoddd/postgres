@@ -253,6 +253,44 @@ SELECT rows_digest() = :'unkept' AS as_committed, clean();
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'kb2');
 
+-- an AFTER trigger's event queued in the transaction holds a row's
+-- location in a table's storage: the table isn't given its pages, its rows
+-- are written (and the event finds its row as the reset left it)
+CREATE FUNCTION public.kp_seen() RETURNS trigger LANGUAGE plpgsql AS
+$$BEGIN RETURN NULL; END$$;
+CREATE CONSTRAINT TRIGGER t_deferred AFTER UPDATE ON kp.t
+	DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.kp_seen();
+SELECT dolt_commit('-Am', 'with a trigger') IS NOT NULL AS committed;
+SELECT rows_digest() AS with_trigger \gset
+DELETE FROM kp.t WHERE id BETWEEN 940 AND 960;
+BEGIN;
+UPDATE kp.t SET v = -v WHERE id = 970;
+SELECT dolt_reset('--hard');
+COMMIT;
+SELECT rows_digest() = :'with_trigger' AS as_committed, clean(), indexes_valid();
+DROP TRIGGER t_deferred ON kp.t;
+SELECT dolt_commit('-am', 'without the trigger') IS NOT NULL AS committed;
+
+-- a commit in a transaction rolled back by a session that then exits: the
+-- snapshots it took are let go of as the session exits
+SELECT kept('kp.t') AS kept_before \gset
+\c kept_pages
+SELECT pg_backend_pid() AS gone \gset
+UPDATE kp.t SET v = 15 WHERE id <= 10;
+BEGIN;
+SELECT dolt_commit('-am', 'rolled back') IS NOT NULL AS committed;
+ROLLBACK;
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+\c kept_pages
+CREATE FUNCTION pg_temp.wait_gone(pid int) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	WHILE EXISTS (SELECT FROM pg_stat_activity a WHERE a.pid = wait_gone.pid) LOOP
+		PERFORM pg_sleep(0.01);
+	END LOOP;
+END $$;
+SELECT pg_temp.wait_gone(:gone);
+SELECT kept('kp.t') = :kept_before AS none_left;
+
 -- every block the stores hold is held by a map or a snapshot kept
 CHECKPOINT;
 SELECT freed FROM prolly_page_sweep();
