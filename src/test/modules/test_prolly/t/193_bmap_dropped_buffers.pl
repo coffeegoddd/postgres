@@ -129,6 +129,9 @@ BEGIN
 			AND relforknumber = 0 AND relfilenode = $big;
 			IF blk IS NOT NULL THEN
 				UPDATE big SET b = 'changed' WHERE ctid = format('(%s,1)', blk)::tid;
+				-- (kept in the buffer until the drop goes on)
+				PERFORM pg_prewarm('big', 'buffer', 'main', blk, blk)
+				FROM generate_series(1, 5);
 				RETURN;
 			END IF;
 		END LOOP;
@@ -145,8 +148,10 @@ $node->safe_psql('postgres',
 $node->safe_psql('postgres',
 	q{SELECT injection_points_wakeup('drop-buffer-block-found')});
 $drop->quit;
-is(sql(q{SELECT count(*) FROM big WHERE b = 'changed'}),
-	'1', 'that other block\'s change is not dropped with block 0\'s page');
+is( sql(q{SELECT count(*) || ' rows, ' || count(*) FILTER (WHERE b = 'changed')
+	|| ' changed' FROM big}),
+	'2000 rows, 1 changed',
+	'that other block\'s change is not dropped with block 0\'s page');
 
 # a reader's pin, held by a cursor stopped on the page, is waited for as
 # a cleanup lock waits, and the page is dropped once it is let go of
