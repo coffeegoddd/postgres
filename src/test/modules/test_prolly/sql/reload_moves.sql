@@ -106,3 +106,41 @@ SELECT * FROM pg_temp.indexes_valid();
 
 \c contrib_regression
 DROP DATABASE regress_reload_moves;
+
+-- Whether a table can be loaded is the source's to say, not the session
+-- branch's: here only the source and the head give d a deferrable unique
+-- constraint, so d, though every row differs, isn't emptied (its load
+-- would be refused, every row then written alone).
+CREATE DATABASE regress_reload_deferred;
+\c regress_reload_deferred
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE FUNCTION pg_temp.written() RETURNS TABLE (relname name, ins int8, upd int8, del int8)
+  LANGUAGE sql AS $$
+	SELECT relname, n_tup_ins, n_tup_upd, n_tup_del FROM pg_stat_xact_user_tables
+	WHERE schemaname = 'rm' ORDER BY relname
+  $$;
+CREATE SCHEMA rm VERSIONED;
+CREATE TABLE rm.d (id int PRIMARY KEY, v text, u int);
+INSERT INTO rm.d SELECT g, 'd' || g, g FROM generate_series(1, 4000) g;
+SELECT length(dolt_commit('-Am', 'plain')::text) > 0 AS committed;
+SELECT dolt_branch('src');
+SELECT dolt_checkout('src');
+ALTER TABLE rm.d ADD CONSTRAINT d_u UNIQUE (u) DEFERRABLE;
+SELECT length(dolt_commit('-am', 'deferrable')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS head \gset
+UPDATE rm.d SET v = 'changed';
+SELECT length(dolt_commit('-am', 'changed')::text) > 0 AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('tgt', :'head');
+BEGIN;
+SELECT dolt_checkout('tgt');
+SELECT ins = 4000 AND del = 0 AS emptied FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT count(*) FILTER (WHERE v = 'd' || id) AS d_as_head FROM rm.d;
+
+\c contrib_regression
+DROP DATABASE regress_reload_deferred;
