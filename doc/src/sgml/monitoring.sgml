@@ -5789,6 +5789,20 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        instead of the chunk store's files);
        <literal>fold_rows_located</literal> (rows a fold read where the
        table's change log said they are, instead of by their key);
+       <literal>bmap_map_pages_copied</literal> (block-map pages a share of
+       a relation's blocks copied, as a branch's first use makes its copies);
+       <literal>bmap_refcount_updates</literal> (page-store blocks'
+       reference counts set: by shares, drops, copies on write, truncations
+       and page sweeps); <literal>bmap_blocks_freed</literal> (page-store
+       blocks given back to the allocator);
+       <literal>apply_rows</literal> (rows the row applier inserted,
+       updated or deleted, moving a working set to a commit);
+       <literal>apply_index_tuples</literal> (index entries those writes
+       made: for each row inserted or updated, one in each index whose
+       predicate the row meets, in summarizing indexes alone for a
+       heap-only update; and those the builds after a load made);
+       <literal>catalog_rows_copied</literal> (catalog rows of versioned
+       objects copied to make a branch's copies);
        <literal>fold_changes_spilled</literal> (folds from a table's
        baseline whose changes passed
        <varname>maintenance_work_mem</varname>: sorted, spilling to disk,
