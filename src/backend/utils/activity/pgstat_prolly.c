@@ -118,6 +118,9 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_FOLD_OBJECTS] = "fold_objects",
 	[PGSTAT_PROLLY_FOLD_TABLES] = "fold_tables",
 	[PGSTAT_PROLLY_FOLD_INCREMENTAL] = "fold_incremental",
+	[PGSTAT_PROLLY_MOVE_TABLES_SHARED] = "move_tables_shared",
+	[PGSTAT_PROLLY_KEPT_CHECKOUTS_REUSED] = "kept_checkouts_reused",
+	[PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED] = "kept_checkouts_evicted",
 };
 
 /*

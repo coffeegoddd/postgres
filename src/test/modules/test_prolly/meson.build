@@ -100,6 +100,8 @@ tests += {
       'format_freeze',
       'dirty_merges',
       'commit_root',
+      'kept_checkouts',
+      'share_layouts',
       'constraint_violations',
       'keyless_violations',
       'verify_constraints',

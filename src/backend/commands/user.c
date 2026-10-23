@@ -14,6 +14,7 @@
 
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/prolly_matcache.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
@@ -1107,6 +1108,12 @@ DropRole(DropRoleStmt *stmt)
 				 errmsg("permission denied to drop role"),
 				 errdetail("Only roles with the %s attribute and the %s option on the target roles may drop roles.",
 						   "CREATEROLE", "ADMIN")));
+
+	/*
+	 * The database's kept checkouts no session is on go first: a cache's
+	 * copies of objects shouldn't keep a role they name from being dropped.
+	 */
+	prolly_let_go_of_kept_states();
 
 	/*
 	 * Scan the pg_authid relation to find the Oid of the role(s) to be

@@ -766,6 +766,29 @@ lock_branch_for_delete(Oid branch)
 		LOCKACQUIRE_NOT_AVAIL;
 }
 
+/*
+ * Hold a branch against deletion until the transaction ends: its lock
+ * taken as a session on it takes it, but for the transaction alone, and
+ * not waited for (a deletion holds it until it commits).  False if it
+ * isn't free, or the branch is gone.
+ */
+bool
+pin_branch(Oid branch)
+{
+	LOCKTAG		tag;
+
+	if (branch != BRANCH_MAIN_OID)
+	{
+		branch_locktag(&tag, branch);
+		if (LockAcquire(&tag, AccessShareLock, false, true) ==
+			LOCKACQUIRE_NOT_AVAIL)
+			return false;
+		/* a deletion that held the lock has committed or not: see which */
+		AcceptInvalidationMessages();
+	}
+	return SearchSysCacheExists1(BRANCHOID, ObjectIdGetDatum(branch));
+}
+
 /* (a transaction's lock on a branch, kept by it once prepared) */
 static void
 branch_xact_locktag(LOCKTAG *tag, Oid branch)

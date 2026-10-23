@@ -48,6 +48,7 @@ Changes to this design are tracked in GitHub issues:
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub
 	writers           prolly_writers.h        modes, stub
+	matcache          prolly_matcache.h       branches, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -394,11 +395,34 @@ comes to change other refs moves the root from then on.  So an operation
 reading another branch's head (a branch made from it, a merge of it)
 reads the head as last committed, not a commit still open there.
 
-A move to a root another branch's working set is known to be gives the
-tables whose rows differ that branch's storage instead, where sharing their
-blocks costs less than writing the rows (branch operations' share(), the
-canonicalizer's splice_baseline()); a branch's first use copies the branch
-nearest its head.
+A move (or a first use's move of its copies) gives each table whose rows
+differ from the target's the storage of another state that holds the
+target's table, where sharing costs less than writing the rows (branch
+operations' share(), the canonicalizer's splice_baseline()); a branch's
+first use copies the branch nearest its head.  A source is a branch whose
+working set is known (folded, nobody writing it since), or a kept
+materialization (matcache_branches.c): the hidden branch of a detached
+checkout, kept once its sessions leave, which nothing writes again.  Its
+root must hold the target's table, the same data tree and description,
+and its relations must be the same ones (by id) stored alike: the same
+access method, columns as stored (dropped ones, and the values a short
+tuple's missing columns read as, included), TOAST table and index
+definitions.  Sharing a tree-mapped relation copies its root page, so its
+cost doesn't grow with the table; the source is held against deletion to
+the transaction's end.  A kept source is used only by a snapshot that sees
+it made, so every tuple on its pages is one the snapshot sees as committed
+or aborted, and only while its commit's ordering dependencies match the
+installed extensions, under which its indexes were built.
+
+Kept materializations (prolly.kept_checkouts, 4 by default, per database)
+make a later checkout of the commit a branch switch, its dependencies
+checked as a first use checks them.  A checkout's sweep lets go of those
+past the budget, the least recently checked out first (recency is kept in
+shared memory; after a restart, older branches go first), passing over one
+a session is on; a detached checkout's sweep doesn't count the one it is
+on.  Letting go of one is deleting its branch, which releases its
+relations' maps.  Writer branches done with are swept as before, apart
+from the budget.
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call

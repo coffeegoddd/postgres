@@ -35,6 +35,8 @@ OBJS = \
 	keyenc_stub.o \
 	keying_pkprefix.o \
 	keying_stub.o \
+	matcache_branches.o \
+	matcache_stub.o \
 	memo_shared.o \
 	memo_stub.o \
 	merge_stub.o \

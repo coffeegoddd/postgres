@@ -1553,72 +1553,37 @@ settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 }
 
 /*
- * Sharing pages instead of writing rows (#491).  A move to a root another
- * branch's working set is known to be (nobody writing it, every writer
- * that ended seen) gives each table whose rows differ that branch's
- * storage instead, the table's with its indexes', TOAST table's and change
- * log's, when sharing their blocks costs less than writing the rows that
- * differ (about 10 us a block against 11 a row): its pages, maps and log
- * then are that branch's, and the baseline takes that branch's entry for
- * it, which its log goes on from.  Only a move of rows (the two roots
- * define the same objects), only of tables whose relations are that
- * branch's too (made from the same, so the same ids), and only where the
- * locks are free now (share()'s: this branch's copies as TRUNCATE locks
- * them, that branch's against its writers), that branch still known at
- * the root as it was known once they are held (the first table shared
- * changes pg_class, after which nothing new is known in the transaction).
- * Not at a first use: the copies' catalog rows, made in the transaction,
- * keep anything from being known after them, and a branch known at the
- * root was copied already.  As TRUNCATE, it isn't MVCC-safe: a snapshot
- * taken before the move commits reads the shared storage after.
+ * Sharing pages instead of writing rows (#491).  A move whose target has a
+ * table whose rows differ from the working set's gives the table the
+ * storage of another state that holds the target's (the table's with its
+ * indexes', TOAST table's and change log's), when sharing costs less than
+ * writing the rows that differ: its pages, maps and log then are that
+ * state's, and the baseline takes that state's entry for it, which its log
+ * goes on from.  A source is a branch other than the session's whose
+ * working set is a root known: one known as folded (nobody writing it,
+ * every writer that ended seen), or a kept materialization (the
+ * materialization cache's: immutable, made before the snapshot), whose
+ * root has the target's table, the same data tree and definition.  Only a
+ * move of rows (the two roots define the same objects), only of tables
+ * whose relations are the source's too (made from the same, so the same
+ * ids) and stored alike, and only where the locks are free now (share()'s:
+ * this branch's copies as TRUNCATE locks them, the source's against its
+ * writers and its deletion), a known source still known at its root as it
+ * was known once they are held (the first table shared changes pg_class,
+ * after which nothing new is known in the transaction).  At a first use
+ * only kept sources serve: the copies' catalog rows, made in the
+ * transaction, keep anything from being known after them.  As TRUNCATE,
+ * it isn't MVCC-safe: a snapshot taken before the move commits reads the
+ * shared storage after.
+ *
+ * Sharing a block-mapped relation copies its map's root page, each subtree
+ * gaining a holder, and its free space and visibility maps: a constant for
+ * each relation, and a little for each block those maps cover, against
+ * about 11 us for each row written.
  */
 #define MOVE_ROW_USEC		11
-#define SHARE_BLOCK_USEC	10
-
-/* A branch other than the session's whose working set is known to be root. */
-typedef struct CleanAt
-{
-	const ProllyHash *root;
-	Snapshot	snap;
-	char	   *name;
-	Oid			branch;
-	ProllyNodeRef baseline;
-	BranchFoldStamp at;			/* what it was known at */
-} CleanAt;
-
-static void
-find_clean_at(const char *name, Oid branch, void *arg)
-{
-	CleanAt    *ca = arg;
-	ProllyNodeRef baseline;
-	ProllyHash	h;
-
-	if (ca->name != NULL || branch == MyBranch ||
-		!branch_baseline(name, &baseline))
-		return;
-	if (branch_fold_known_at(branch, ca->snap, &baseline.hash, false, &h,
-							 &ca->at) &&
-		same_hash(&h, ca->root))
-	{
-		ca->name = pstrdup(name);
-		ca->branch = branch;
-		ca->baseline = baseline;
-	}
-}
-
-/*
- * Is ca's branch still at its root, as it was known to be?  Asked of what
- * was known then: the first table shared changes pg_class, after which
- * nothing new is known in the transaction, though nothing about the other
- * branch changed.
- */
-static bool
-still_clean(void *arg)
-{
-	CleanAt    *ca = arg;
-
-	return branch_fold_unchanged(&ca->at);
-}
+#define SHARE_RELATION_USEC	300
+#define SHARE_BLOCKS_PER_USEC	64
 
 /* A root's table, as tables() visits it. */
 typedef struct NamedTree
@@ -1626,18 +1591,36 @@ typedef struct NamedTree
 	char	   *name;
 	ProllyNodeRef data;
 	bool		readable;
+	char	   *description;	/* its description's bytes, and their length */
+	uint32		description_len;
 } NamedTree;
 
 static void
 note_table(const char *name, const ProllyNodeRef *data,
 		   const ProllyValue *description, const char *unreadable, void *arg)
 {
-	NamedTree  *t = palloc(sizeof(NamedTree));
+	NamedTree  *t = palloc0(sizeof(NamedTree));
 
 	t->name = pstrdup(name);
 	t->data = *data;
 	t->readable = unreadable == NULL;
+	if (description != NULL)
+	{
+		t->description = palloc(Max(description->len, 1));
+		memcpy(t->description, description->data, description->len);
+		t->description_len = description->len;
+	}
 	*(List **) arg = lappend(*(List **) arg, t);
+}
+
+/* Are two roots' tables the same: name, rows and definition? */
+static bool
+same_table(const NamedTree *a, const NamedTree *b)
+{
+	return a->readable && b->readable && strcmp(a->name, b->name) == 0 &&
+		same_hash(&a->data.hash, &b->data.hash) &&
+		a->description_len == b->description_len &&
+		memcmp(a->description, b->description, a->description_len) == 0;
 }
 
 static void
@@ -1679,41 +1662,142 @@ stored_with(Oid relid, uint64 *blocks)
 	return relids;
 }
 
+/* A state another branch holds, whose tables a move can share. */
+typedef struct ShareSource
+{
+	char	   *name;
+	Oid			branch;
+	ProllyNodeRef root;			/* its working set */
+	ProllyNodeRef baseline;
+	bool		kept;			/* a kept materialization; else known: */
+	BranchFoldStamp at;			/* what it was known at */
+	List	   *tables;			/* NamedTree *: root's, once read */
+	bool		read;
+	List	   *shared;			/* names of the tables shared from it */
+} ShareSource;
+
+typedef struct ShareSources
+{
+	Snapshot	snap;
+	List	   *sources;		/* ShareSource * */
+} ShareSources;
+
+static void
+find_known_source(const char *name, Oid branch, void *arg)
+{
+	ShareSources *ss = arg;
+	ShareSource *s;
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	BranchFoldStamp at;
+
+	if (branch == MyBranch || !branch_baseline(name, &baseline) ||
+		!branch_fold_known_at(branch, ss->snap, &baseline.hash, false, &h,
+							  &at))
+		return;
+	s = palloc0(sizeof(ShareSource));
+	s->name = pstrdup(name);
+	s->branch = branch;
+	ref_of(&h, &s->root);
+	s->baseline = baseline;
+	s->at = at;
+	ss->sources = lappend(ss->sources, s);
+}
+
+static void
+find_kept_source(const ProllyKeptState *state, void *arg)
+{
+	ShareSources *ss = arg;
+	ShareSource *s;
+	ProllyNodeRef baseline;
+
+	foreach_ptr(ShareSource, known, ss->sources)
+		if (known->branch == state->branch)
+			return;
+	if (!branch_baseline(state->name, &baseline))
+		return;
+	s = palloc0(sizeof(ShareSource));
+	s->name = pstrdup(state->name);
+	s->branch = state->branch;
+	s->root = state->root;
+	s->baseline = baseline;
+	s->kept = true;
+	ss->sources = lappend(ss->sources, s);
+}
+
+/*
+ * Is source still at its root: a known one as it was known (asked of what
+ * was known then: the first table shared changes pg_class, after which
+ * nothing new is known in the transaction, though nothing about the other
+ * branch changed), a kept one always (share() holds it against deletion).
+ */
+static bool
+still_at_root(void *arg)
+{
+	ShareSource *s = arg;
+
+	return s->kept || branch_fold_unchanged(&s->at);
+}
+
+/* The source with table t as the target has it, or NULL. */
+static ShareSource *
+source_of(List *sources, const NamedTree *t)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	foreach_ptr(ShareSource, s, sources)
+	{
+		if (!s->read)
+		{
+			PROLLY_CALL(dc.canonicalizer, tables, &s->root, NULL, note_table,
+						&s->tables);
+			s->read = true;
+		}
+		foreach_ptr(NamedTree, theirs, s->tables)
+			if (same_table(theirs, t))
+				return s;
+	}
+	return NULL;
+}
+
 /*
  * The tables of the session's branch whose rows differ from target's made
- * the copies another branch has where that costs less (true: some were);
+ * the copies another state has where that costs less (true: some were);
  * *working is then the branch's working set, folded as its baseline.
  */
 static bool
 share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 {
 	ProllyDatabaseComponents dc;
-	CleanAt		ca = {0};
+	ShareSources ss = {0};
 	List	   *ours = NIL;
 	List	   *theirs = NIL;
 	List	   *chosen = NIL;	/* NamedTree *, then each one's relations */
 	List	   *relations = NIL;
-	List	   *shared = NIL;
+	List	   *from = NIL;		/* and its source */
 	ProllyTreeEnv denv;
 	ProllyNodeRef baseline;
-	ProllyNodeRef spliced;
 	ProllyNodeRef next;
 	ListCell   *a;
 	ListCell   *b;
+	ListCell   *c;
 	char	   *current = branch_ops()->current();
+	int			nshared = 0;
 
 	prolly_database_components(&dc);
 	if (branch_ops()->share == NULL || dc.canonicalizer->splice_baseline == NULL ||
 		!fold_caches_usable() || !branch_baseline(current, &baseline))
 		return false;
-	ca.root = &target->hash;
-	ca.snap = fold_snapshot();
-	branch_ops()->branches(find_clean_at, &ca);
-	if (ca.name == NULL ||
+	ss.snap = fold_snapshot();
+	branch_ops()->branches(find_known_source, &ss);
+	if (dc.matcache && PROLLY_HAS(dc.matcache, visit))
+		PROLLY_CALL(dc.matcache, visit, ss.snap, find_kept_source, &ss);
+	if (ss.sources == NIL ||
 		!PROLLY_CALL(dc.canonicalizer, same_schema, working, target))
 		return false;
 
-	/* the tables whose rows differ, where sharing costs less */
+	/* the tables whose rows differ, where a source has them and sharing costs less */
 	PROLLY_CALL(dc.canonicalizer, tables, working, NULL, note_table, &ours);
 	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (list_length(ours) != list_length(theirs))
@@ -1723,6 +1807,7 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	{
 		NamedTree  *o = lfirst(a);
 		NamedTree  *t = lfirst(b);
+		ShareSource *s;
 		uint64		changes = 0;
 		uint64		blocks;
 		Oid			relid;
@@ -1735,36 +1820,56 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			continue;
 		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(o->name, NULL)),
 								 NoLock, true);
-		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION ||
+			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
 		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
 					&changes);
-		if ((double) changes * MOVE_ROW_USEC <= (double) blocks * SHARE_BLOCK_USEC)
+		if ((double) changes * MOVE_ROW_USEC <=
+			(double) list_length(relids) * SHARE_RELATION_USEC +
+			(double) blocks / SHARE_BLOCKS_PER_USEC)
 			continue;
 		chosen = lappend(chosen, o);
 		relations = lappend(relations, relids);
+		from = lappend(from, s);
 	}
 	if (chosen == NIL)
 		return false;
 	if (debug_prolly_verify_fold_caches)
-		verify_known(ca.name, false, target);
+		foreach_ptr(ShareSource, s, ss.sources)
+			if (list_member_ptr(from, s))
+				verify_known(s->name, false, &s->root);
 
 	/*
-	 * (each shared if nobody uses it now, and the other branch is still at
-	 * the target with it locked: none of its writers ended since, nor can
-	 * write it now)
+	 * (each shared if nobody uses it now, and its source is still at its
+	 * root with it locked: none of its writers ended since, nor can write it
+	 * now)
 	 */
-	forboth(a, chosen, b, relations)
+	forthree(a, chosen, b, relations, c, from)
 	{
-		if (branch_ops()->share(ca.branch, lfirst(b), still_clean, &ca))
-			shared = lappend(shared, ((NamedTree *) lfirst(a))->name);
+		ShareSource *s = lfirst(c);
+
+		if (branch_ops()->share(s->branch, lfirst(b), still_at_root, s))
+		{
+			s->shared = lappend(s->shared, ((NamedTree *) lfirst(a))->name);
+			nshared++;
+		}
 	}
-	if (shared == NIL)
+	if (nshared == 0)
 		return false;
-	PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &ca.baseline,
-				shared, &spliced);
-	branch_set_baseline(current, &spliced, NULL);
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, nshared);
+	foreach_ptr(ShareSource, s, ss.sources)
+	{
+		ProllyNodeRef spliced;
+
+		if (s->shared == NIL)
+			continue;
+		PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &s->baseline,
+					s->shared, &spliced);
+		baseline = spliced;
+	}
+	branch_set_baseline(current, &baseline, NULL);
 	fold_from_baseline(working, &next, false);
 	branch_set_baseline(current, &next, working);
 	return true;

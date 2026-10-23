@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF0
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF1
 
 typedef struct PgStat_ArchiverStats
 {
@@ -719,9 +719,16 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_TABLES,	/* tables whose rows folds folded */
 	PGSTAT_PROLLY_FOLD_INCREMENTAL, /* folds that worked out again only
 									 * what changed since the last */
+	PGSTAT_PROLLY_MOVE_TABLES_SHARED,	/* tables a move or first use gave
+										 * another state's storage instead
+										 * of writing their rows */
+	PGSTAT_PROLLY_KEPT_CHECKOUTS_REUSED,	/* checkouts of a commit whose
+											 * hidden branch was kept */
+	PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED,	/* kept hidden branches let go
+											 * of past the budget */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_INCREMENTAL + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED + 1)
 
 typedef struct PgStat_ProllyStats
 {
