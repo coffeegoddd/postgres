@@ -146,5 +146,56 @@ for my $n (5000, 50000)
 cmp_ok($verify[1], '<', $verify[0] + 64 * 1024,
 	'ten times as many rows changed take no more memory');
 note("statement memory at the first batch: @verify bytes");
+# One row changed in each of many tables: the keys of all of them share one
+# store of keys now and one as they were, in memory while they fit, so the
+# number of tables changed takes neither a file nor a buffer each; and what
+# reading a table's changed rows takes is released before the next's.
+my (@tables_memory, @tables_files);
+for my $n (40, 400)
+{
+	my $db = "tables$n";
+	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	$node->safe_psql($db, qq{
+		CREATE EXTENSION test_prolly;
+		CREATE EXTENSION injection_points;
+		CREATE SCHEMA s VERSIONED;
+		DO \$\$BEGIN
+			FOR i IN 1 .. $n LOOP
+				EXECUTE format('CREATE TABLE s.t%s (id int PRIMARY KEY, v int)', i);
+				EXECUTE format('INSERT INTO s.t%s VALUES (1, 1)', i);
+				EXECUTE format('ALTER TABLE s.t%s ADD CONSTRAINT pos CHECK (v > 0) NOT VALID', i);
+			END LOOP;
+		END\$\$;
+		SELECT dolt_commit('-Am', 'base');
+		DO \$\$BEGIN
+			FOR i IN 1 .. $n LOOP
+				EXECUTE format('UPDATE s.t%s SET v = 2', i);
+			END LOOP;
+		END\$\$;
+	});
+	my $s = $node->background_psql($db, on_error_stop => 0);
+	my $pid = $s->query_safe('SELECT pg_backend_pid()');
+	$s->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-merge-constraint-checked', 'wait')});
+	$s->query_until(qr/verifying/, q{\echo verifying
+		SELECT dolt_verify_constraints();
+	});
+	$node->wait_for_event('client backend', 'prolly-merge-constraint-checked');
+	push @tables_memory, statement_memory($db, $pid);
+	push @tables_files, $node->safe_psql($db, qq{SELECT count(*) FROM pg_ls_tmpdir()
+		WHERE name LIKE 'pgsql_tmp$pid.%'});
+	$node->safe_psql($db, q{SELECT injection_points_detach('prolly-merge-constraint-checked');
+		SELECT injection_points_wakeup('prolly-merge-constraint-checked')});
+	$s->query_safe('SELECT 1');
+	is($s->query_safe(q{SELECT count(*) FROM dolt_constraint_violations()}), 0,
+		"$n tables changed: none breaks its check");
+	$s->quit;
+}
+is("@tables_files", '0 0', 'a few keys of many tables take no temporary file');
+# (what reading each table's rows took is released with it; the rest of
+# a table's cost, about 60kB, is the working set's diff's, not the keys')
+cmp_ok($tables_memory[1], '<', $tables_memory[0] + 360 * 68 * 1024,
+	'nor a buffer each, nor what reading its rows took');
+note("statement memory at the first check, by tables changed: @tables_memory bytes");
 $node->stop;
 done_testing();

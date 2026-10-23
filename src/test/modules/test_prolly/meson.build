@@ -295,9 +295,9 @@ tests += {
       't/161_fold_on_commit_sessions.pl',
       't/162_fold_worker.pl',
       't/163_merge_plan_spill.pl',
-      't/166_merge_constraint_streams.pl',
       't/181_merge_attempt_bounds.pl',
       't/182_merge_violation_sink.pl',
+      't/183_merge_constraint_streams.pl',
     ],
   },
 }

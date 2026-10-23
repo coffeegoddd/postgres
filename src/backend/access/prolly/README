@@ -294,9 +294,12 @@ row found to its consumer as the executor returns it: the merge's
 violation sort, or a list for verification, which sets the branch's
 violations whole.  No query's result is held as an SPI tuple table.  The
 keys of the rows changed since the head, which verification matches a
-batch at a time, are spooled to a temporary file per table and side as the
-diff finds them, and each batch's JSON literal and query are made only as
-that batch runs.  A merge still checks every foreign key of the tables it
+batch at a time, go to two stores shared by every table (keys now, and as
+they were), each held in memory up to half of work_mem and then moved to
+a temporary file; a table's keys of a side are a segment of its store, as
+the diff gives a table's rows together.  What reading a table's rows takes
+is released before the next table's, and each batch's JSON literal and
+query are made only as that batch runs.  A merge still checks every foreign key of the tables it
 wrote whole, by query; the executor's own sorts and hashes spill under
 work_mem as for any query.
 

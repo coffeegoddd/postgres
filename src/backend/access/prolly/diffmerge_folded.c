@@ -8851,39 +8851,96 @@ foreign_key_violation_list(List *relids, List *changed)
 #define CHANGED_BATCH_BYTES (1024 * 1024)
 
 /*
- * Keys of rows changed (JSON objects), spooled to a temporary file as they
- * are found and read back a batch at a time, so that how many changed
- * takes no memory.
+ * Keys of rows changed (JSON objects), each with its length, in a store
+ * shared by every table's: held in memory while they fit its budget, then
+ * all of them moved to a temporary file, and the rest appended there.  A
+ * table's keys of one side come together (the diff gives a table's rows
+ * together), so they are a segment of the store (KeySpool), read back a
+ * batch at a time.  So neither how many rows changed nor how many tables
+ * did takes more than the budget, and a check of few changes makes no
+ * file.
  */
+typedef struct KeyStore
+{
+	StringInfoData mem;			/* while they fit */
+	BufFile    *file;			/* past it, all of them */
+	int64		bytes;			/* written, either way */
+	Size		budget;
+} KeyStore;
+
 typedef struct KeySpool
 {
-	BufFile    *file;
+	KeyStore   *store;
+	int64		start;			/* the segment's first byte */
+	int64		end;			/* and the byte past its last */
 	int64		count;
 } KeySpool;
 
-/* Append key to *sp, made on the first. */
+/* A store of keys, its memory budget budget bytes. */
+static KeyStore *
+key_store_make(Size budget)
+{
+	KeyStore   *ks = palloc0(sizeof(KeyStore));
+
+	initStringInfo(&ks->mem);
+	ks->budget = budget;
+	return ks;
+}
+
 static void
-key_spool_put(KeySpool **sp, const char *key)
+key_store_write(KeyStore *ks, const void *data, Size len)
+{
+	if (ks->file == NULL && ks->mem.len + len > ks->budget)
+	{
+		ks->file = BufFileCreateTemp(false);
+		BufFileWrite(ks->file, ks->mem.data, ks->mem.len);
+		pfree(ks->mem.data);
+		ks->mem.data = NULL;
+	}
+	if (ks->file)
+		BufFileWrite(ks->file, data, len);
+	else
+		appendBinaryStringInfo(&ks->mem, data, len);
+	ks->bytes += len;
+}
+
+/* The store's file closed, its memory released. */
+static void
+key_store_free(KeyStore *ks)
+{
+	if (ks->file)
+		BufFileClose(ks->file);
+	ks->file = NULL;
+	if (ks->mem.data)
+		pfree(ks->mem.data);
+	ks->mem.data = NULL;
+}
+
+/* Append key to *sp (made on the first, in store), a table's keys' last. */
+static void
+key_spool_put(KeySpool **sp, KeyStore *store, const char *key)
 {
 	uint32		len = strlen(key);
 
 	if (*sp == NULL)
 	{
 		*sp = palloc0(sizeof(KeySpool));
-		(*sp)->file = BufFileCreateTemp(false);
+		(*sp)->store = store;
+		(*sp)->start = (*sp)->end = store->bytes;
 	}
-	BufFileWrite((*sp)->file, &len, sizeof(len));
-	BufFileWrite((*sp)->file, key, len);
+	if ((*sp)->end != store->bytes)
+		elog(ERROR, "the keys of a table's rows changed didn't come together");
+	key_store_write(store, &len, sizeof(len));
+	key_store_write(store, key, len);
+	(*sp)->end = store->bytes;
 	(*sp)->count++;
 }
 
 static void
 key_spool_free(KeySpool *sp)
 {
-	if (sp == NULL)
-		return;
-	BufFileClose(sp->file);
-	pfree(sp);
+	if (sp)
+		pfree(sp);
 }
 
 /* Reading the keys of spools (KeySpool *) in turn, a batch at a time. */
@@ -8891,10 +8948,25 @@ typedef struct KeyBatches
 {
 	List	   *spools;
 	int			next;			/* the spool being read */
+	KeySpool   *cur;			/* (the one being read) */
+	int64		pos;			/* its next key's place in its store */
 	int64		left;			/* its keys still to read */
 	StringInfoData key;			/* (one read, not yet in a batch) */
 	bool		have_key;
 } KeyBatches;
+
+/* len bytes at kb's place in its spool's store, into buf. */
+static void
+key_batches_bytes(KeyBatches *kb, void *buf, Size len)
+{
+	KeyStore   *ks = kb->cur->store;
+
+	if (ks->file)
+		BufFileReadExact(ks->file, buf, len);
+	else
+		memcpy(buf, ks->mem.data + kb->pos, len);
+	kb->pos += len;
+}
 
 static bool
 key_batches_read(KeyBatches *kb)
@@ -8903,21 +8975,18 @@ key_batches_read(KeyBatches *kb)
 
 	while (kb->left == 0)
 	{
-		KeySpool   *sp;
-
 		if (kb->next >= list_length(kb->spools))
 			return false;
-		sp = list_nth(kb->spools, kb->next++);
-		if (BufFileSeek(sp->file, 0, 0, SEEK_SET) != 0)
-			elog(ERROR, "could not rewind the keys of rows changed");
-		kb->left = sp->count;
+		kb->cur = list_nth(kb->spools, kb->next++);
+		kb->pos = kb->cur->start;
+		kb->left = kb->cur->count;
+		if (kb->cur->store->file)
+			buffile_seek_to(kb->cur->store->file, kb->pos);
 	}
-	BufFileReadExact(((KeySpool *) list_nth(kb->spools, kb->next - 1))->file,
-					 &len, sizeof(len));
+	key_batches_bytes(kb, &len, sizeof(len));
 	resetStringInfo(&kb->key);
 	enlargeStringInfo(&kb->key, len);
-	BufFileReadExact(((KeySpool *) list_nth(kb->spools, kb->next - 1))->file,
-					 kb->key.data, len);
+	key_batches_bytes(kb, kb->key.data, len);
 	kb->key.len = len;
 	kb->key.data[len] = '\0';
 	kb->left--;
@@ -9355,6 +9424,9 @@ typedef struct ChangedRows
 	List	   *relevant;		/* the tables to check, and those their
 								 * foreign keys join (NIL: every one) */
 	MemoryContext rowcxt;		/* a row's, reset for the next */
+	MemoryContext tablecxt;		/* the table's being read */
+	KeyStore   *now_keys;		/* every table's keys now, and as they were */
+	KeyStore   *was_keys;
 	ChangedTable *cur;			/* the table being read, as: */
 	Relation	rel;
 	const ProllyKeyingRoutine *kr;
@@ -9380,11 +9452,11 @@ changed_close(ChangedRows *cr)
 	if (cr->k != NULL)
 		PROLLY_CALL(cr->kr, close, cr->k);
 	table_close(cr->rel, AccessShareLock);
-	bms_free(cr->keycols);
 	cr->keycols = NULL;
 	cr->slot = NULL;
 	cr->k = NULL;
 	cr->rel = NULL;
+	MemoryContextReset(cr->tablecxt);
 }
 
 /*
@@ -9535,11 +9607,14 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		/* (a table checked whole, or not at all: its rows aren't read) */
 		if (cr->cur->whole || !changed_relevant(cr, cr->cur))
 			return;
+		/* (what reading a table's rows takes, released with it) */
+		old = MemoryContextSwitchTo(cr->tablecxt);
 		cr->rel = table_open(relid, AccessShareLock);
 		cr->keycols = match_columns(cr->rel, cr->cur->ancestors);
 		if (bms_is_empty(cr->keycols))
 		{
 			/* (no key to match its rows by) */
+			MemoryContextSwitchTo(old);
 			changed_close(cr);
 			changed_whole(cr->cur);
 			return;
@@ -9553,6 +9628,7 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 		cr->kept = palloc0_array(bool, RelationGetDescr(cr->rel)->natts);
 		cr->slot = MakeSingleTupleTableSlot(RelationGetDescr(cr->rel),
 											&TTSOpsVirtual);
+		MemoryContextSwitchTo(old);
 	}
 	if (cr->rel == NULL || cr->cur->whole)
 		return;
@@ -9566,23 +9642,23 @@ changed_row(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	if (cr->keyless)
 	{
 		if (nafter > nbefore)
-			key_spool_put(&cr->cur->now, now);
+			key_spool_put(&cr->cur->now, cr->now_keys, now);
 		else
-			key_spool_put(&cr->cur->was, was);
+			key_spool_put(&cr->cur->was, cr->was_keys, was);
 	}
 	else
 	{
 		if (now)
-			key_spool_put(&cr->cur->now, now);
+			key_spool_put(&cr->cur->now, cr->now_keys, now);
 		if (was)
-			key_spool_put(&cr->cur->was, was);
+			key_spool_put(&cr->cur->was, cr->was_keys, was);
 	}
 	MemoryContextReset(cr->rowcxt);
 }
 
-/* The keys changed_since_head() spooled, their files closed. */
+/* The keys changed_since_head() kept (in stores), their files closed. */
 static void
-changed_free(List *changed)
+changed_free(List *changed, List *stores)
 {
 	foreach_ptr(ChangedTable, ct, changed)
 	{
@@ -9590,6 +9666,8 @@ changed_free(List *changed)
 		key_spool_free(ct->was);
 		ct->now = ct->was = NULL;
 	}
+	foreach_ptr(KeyStore, ks, stores)
+		key_store_free(ks);
 }
 
 /*
@@ -9626,10 +9704,11 @@ joined_tables(List *relids)
 
 /*
  * What changed since the head (for the tables of relids, NIL: every
- * one), as ChangedTables.
+ * one), as ChangedTables; *stores gets the stores their keys are kept in
+ * (changed_free()), which share work_mem.
  */
 static List *
-changed_since_head(List *relids)
+changed_since_head(List *relids, List **stores)
 {
 	ChangedRows cr;
 	List	   *head = tables_of("HEAD", InvalidOid);
@@ -9639,6 +9718,11 @@ changed_since_head(List *relids)
 	cr.sink.change = changed_row;
 	cr.rowcxt = AllocSetContextCreate(CurrentMemoryContext, "changed row",
 									  ALLOCSET_DEFAULT_SIZES);
+	cr.tablecxt = AllocSetContextCreate(CurrentMemoryContext, "changed table",
+										ALLOCSET_DEFAULT_SIZES);
+	cr.now_keys = key_store_make((Size) work_mem * 1024 / 2);
+	cr.was_keys = key_store_make((Size) work_mem * 1024 / 2);
+	*stores = list_make2(cr.now_keys, cr.was_keys);
 	cr.relevant = joined_tables(relids);
 	/* (those made or redefined, or with violations recorded, first) */
 	foreach(lc, tables_of("WORKING", InvalidOid))
@@ -9661,6 +9745,7 @@ changed_since_head(List *relids)
 	folded_diff("HEAD", "WORKING", InvalidOid, &cr.sink);
 	changed_close(&cr);
 	MemoryContextDelete(cr.rowcxt);
+	MemoryContextDelete(cr.tablecxt);
 	return cr.tables;
 }
 
@@ -9840,6 +9925,7 @@ static List *
 verify_constraints(List *relids, bool all)
 {
 	List	   *changed = NIL;
+	List	   *stores = NIL;
 	List	   *found = NIL;
 	ProllyHash	head;
 	bool		partial;
@@ -9854,11 +9940,11 @@ verify_constraints(List *relids, bool all)
 	/* (a branch with no commit yet: every row is a change) */
 	partial = !all && PROLLY_CALL(components().refs, resolve, "HEAD", &head);
 	if (partial)
-		changed = changed_since_head(relids);
+		changed = changed_since_head(relids, &stores);
 	if (!partial || changed != NIL)
 		found = list_concat(foreign_key_violation_list(relids, changed),
 							unvalidated_violations(relids, changed));
-	changed_free(changed);
+	changed_free(changed, stores);
 	AtEOXact_GUC(true, save_nestlevel);
 	return found;
 }
