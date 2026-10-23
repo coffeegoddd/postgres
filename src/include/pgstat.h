@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF2
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF3
 
 typedef struct PgStat_ArchiverStats
 {
@@ -701,7 +701,8 @@ typedef enum PgStat_ProllyCounter
 											 * shares, drops, copies on write,
 											 * truncations, sweeps */
 	PGSTAT_PROLLY_BMAP_BLOCKS_FREED,	/* page-store blocks given back to
-										 * the allocator */
+										 * the allocator (but by the
+										 * release queue's drain) */
 	PGSTAT_PROLLY_APPLY_ROWS,	/* rows the row applier inserted, updated
 								 * or deleted */
 	PGSTAT_PROLLY_APPLY_INDEX_TUPLES,	/* index entries its writes made,
@@ -728,9 +729,16 @@ typedef enum PgStat_ProllyCounter
 											 * session's branch, the one
 											 * chosen having a writer in
 											 * flight */
+	PGSTAT_PROLLY_BMAP_RELEASE_QUEUED,	/* release queue entries pushed:
+										 * dropped maps' subtrees and
+										 * blocks, a node's children */
+	PGSTAT_PROLLY_BMAP_RELEASE_DRAINED, /* and those its drain popped */
+	PGSTAT_PROLLY_BMAP_RELEASE_BLOCKS_FREED,	/* blocks the drain freed */
+	PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES,	/* and the counts it
+													 * set */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES + 1)
 
 typedef struct PgStat_ProllyStats
 {

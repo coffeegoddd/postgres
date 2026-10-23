@@ -47,6 +47,7 @@ SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT count(test_bmap_unlink(copy)) FROM (SELECT copy FROM copies LIMIT 5) c;
 SELECT DISTINCT refs FROM test_bmap_map(:src);
 DROP TABLE cow.t;
+SELECT entries > 0 AS drained FROM test_bmap_release_drain();
 SELECT test_bmap_free_blocks() - :free_before =
 	:nblocks + :tlog + :tlog_nodes + :src_nodes AS freed_by_drop;
 
@@ -66,6 +67,7 @@ SELECT test_bmap_share(:u) AS copy FROM generate_series(1, 260);
 SELECT count(test_bmap_unlink(copy)) FROM ucopies;
 SELECT test_bmap_free_blocks() AS free_before \gset
 DROP TABLE cow.u;
+SELECT entries > 0 AS drained FROM test_bmap_release_drain();
 SELECT test_bmap_free_blocks() - :free_before = :ulog + :ulog_nodes AS stuck_left_allocated;
 SELECT (pg_stat_file(format('base/%s/9421', :db))).size / 8192 AS store_before \gset
 CHECKPOINT;

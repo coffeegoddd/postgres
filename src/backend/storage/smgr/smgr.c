@@ -156,6 +156,14 @@ typedef struct f_smgr
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 
 	/*
+	 * One step of letting go of what dropped storage still holds in the
+	 * relation's store (pages it may share with the relation, which count as
+	 * shared until then): how many of what it held were let go of, 0 if
+	 * nothing was.  May be NULL.
+	 */
+	uint32		(*smgr_releasestep) (SMgrRelation reln);
+
+	/*
 	 * May writing out a page of one of a relation's forks read the
 	 * relation's buffers of 'forknum'?  May be NULL (never).
 	 */
@@ -243,6 +251,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_prepareforchange = bmapprepareforchange,
 		.smgr_pageisshared = bmappageisshared,
 		.smgr_predrop = bmappredrop,
+		.smgr_releasestep = bmapreleasestep,
 		.smgr_writesread = bmapwritesread,
 		.smgr_unlink = bmapunlink,
 		.smgr_extend = bmapextend,
@@ -821,6 +830,21 @@ bool
 smgrcanshare(SMgrRelation reln)
 {
 	return smgrsw[reln->smgr_which].smgr_share != NULL;
+}
+
+/*
+ * smgrreleasestep() -- Let go of some of what dropped storage still holds
+ *						in the relation's store.
+ *
+ * Returns how much was let go of, 0 if nothing was (or nothing is held).
+ * In a transaction.
+ */
+uint32
+smgrreleasestep(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_releasestep == NULL)
+		return 0;
+	return smgrsw[reln->smgr_which].smgr_releasestep(reln);
 }
 
 /*

@@ -74,6 +74,7 @@ catch_up();
 is($standby->safe_psql('postgres', $leaf_dirty), 't',
 	'and in the standby\'s, replayed');
 sql('DROP TABLE x');
+sql(q{SELECT * FROM test_bmap_release_drain()});
 
 # copies on write take the freed blocks, the leaf's among them
 sql(q{UPDATE t SET b = 'u' WHERE a IN (1, 100)});

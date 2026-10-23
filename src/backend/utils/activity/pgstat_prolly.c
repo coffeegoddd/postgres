@@ -121,6 +121,10 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_BMAP_PAGES_PRESERVED] = "bmap_pages_preserved",
 	[PGSTAT_PROLLY_MOVE_PLANS] = "move_plans",
 	[PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY] = "first_use_sources_busy",
+	[PGSTAT_PROLLY_BMAP_RELEASE_QUEUED] = "bmap_release_queued",
+	[PGSTAT_PROLLY_BMAP_RELEASE_DRAINED] = "bmap_release_drained",
+	[PGSTAT_PROLLY_BMAP_RELEASE_BLOCKS_FREED] = "bmap_release_blocks_freed",
+	[PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES] = "bmap_release_refcount_updates",
 };
 
 /*

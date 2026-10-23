@@ -14,6 +14,9 @@ CREATE FUNCTION counted(name text) RETURNS bigint LANGUAGE sql AS $$
 $$;
 \set reset 'SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly'');'
 \set flush 'SELECT pg_stat_force_next_flush();'
+-- (each session's counts flushed before it reconnects: a session's last
+-- counts, flushed only as it exits, could reach the view after the next
+-- session's reset, and be counted as that session's)
 SELECT count(test_chunk_put(test_noise('in the journal ' || g, 500)))
 FROM generate_series(1, 10) g;
  count 
@@ -30,6 +33,12 @@ FROM generate_series(1, 10) g;
 
 -- Ten the journal has, ten a table file has, five new, each put twice:
 -- the five are appended, once each.
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
 \c puts_db
 SELECT journal_bytes() AS before \gset
 :reset
@@ -85,6 +94,12 @@ FROM generate_series(1, 12) g;
     12
 (1 row)
 
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
 \c puts_db
 SELECT journal_bytes() AS before \gset
 :reset
@@ -134,6 +149,12 @@ SELECT counted('chunks_appended') AS appended;
 -- A savepoint after chunks the store has, a batch of them all dropped
 -- (nothing appended), then a chunk put and rolled back to the savepoint:
 -- the chunk is gone with it, and the commit appends nothing.
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
 \c puts_db
 SELECT journal_bytes() AS before \gset
 BEGIN;
@@ -164,6 +185,12 @@ SELECT journal_bytes() = :before AS nothing_appended;
  nothing_appended 
 ------------------
  t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
 (1 row)
 
 \c puts_db

@@ -2022,6 +2022,9 @@ do_autovacuum(void)
 	bool		found_concurrent_worker = false;
 	int			i;
 
+	/* the pass's VACUUMs let go of dropped storage within one budget */
+	VacuumReleaseBudgetReset();
+
 	/*
 	 * StartTransactionCommand and CommitTransactionCommand will automatically
 	 * switch to other contexts.  We need this one to keep the list of

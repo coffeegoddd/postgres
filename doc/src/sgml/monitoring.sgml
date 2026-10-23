@@ -5792,9 +5792,10 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>bmap_map_pages_copied</literal> (block-map pages a share of
        a relation's blocks copied, as a branch's first use makes its copies);
        <literal>bmap_refcount_updates</literal> (page-store blocks'
-       reference counts set: by shares, drops, copies on write, truncations
+       reference counts set: by shares, copies on write, truncations
        and page sweeps); <literal>bmap_blocks_freed</literal> (page-store
-       blocks given back to the allocator);
+       blocks given back to the allocator, but by the release queue's
+       drain);
        <literal>apply_rows</literal> (rows the row applier inserted,
        updated or deleted, moving a working set to a commit);
        <literal>apply_index_tuples</literal> (index entries those writes
@@ -5821,7 +5822,14 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        costed: each branch a branch's first use weighed copying, when no
        branch is at its head) and <literal>first_use_sources_busy</literal>
        (first uses that copied the session's branch instead of the one
-       chosen, a writer of that one being in the middle of a change).  Bytes are counted when
+       chosen, a writer of that one being in the middle of a change); <literal>bmap_release_queued</literal> and
+       <literal>bmap_release_drained</literal> (entries pushed onto and let
+       go of from a page store's release queue: a dropped relation's
+       block-map subtrees and blocks, queued by the drop and let go of in
+       the background by autovacuum, a node's children queued in its place),
+       <literal>bmap_release_blocks_freed</literal> and
+       <literal>bmap_release_refcount_updates</literal> (the blocks that
+       drain freed and the reference counts it set).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected
