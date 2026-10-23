@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCED
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCEE
 
 typedef struct PgStat_ArchiverStats
 {
@@ -695,9 +695,13 @@ typedef enum PgStat_ProllyCounter
 									 * instead of the store's files */
 	PGSTAT_PROLLY_FOLD_ROWS_LOCATED,	/* rows a fold read where the change
 										 * log said, not by their key */
+	PGSTAT_PROLLY_FOLD_CHANGES_SPILLED, /* folds from a baseline whose
+										 * changes passed
+										 * maintenance_work_mem: sorted,
+										 * spilling, not read in full */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_ROWS_LOCATED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_CHANGES_SPILLED + 1)
 
 typedef struct PgStat_ProllyStats
 {

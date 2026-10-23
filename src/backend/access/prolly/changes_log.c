@@ -27,10 +27,15 @@
  * an entry says to (a row the log couldn't hold, or the table truncated or
  * rewritten), when a keyless table has a key's entry, a row's count would
  * go below none (the keying changed meanwhile) or a key column of an
- * entry is null (it was written under another key), or when what it holds
- * of the changes passes maintenance_work_mem.  Many changes (past a tenth
+ * entry is null (it was written under another key), or when a keyless
+ * table has more rows changed than it holds.  Many changes (past a tenth
  * of the baseline's rows) are merged with the baseline in one pass, not
- * applied one by one.  A hot standby folds from the baseline as the
+ * applied one by one.  Changes past maintenance_work_mem are sorted,
+ * spilling to disk (prolly_change_sort_begin()), and read back a part at a
+ * time, each part's edits applied to the tree so far, or merged with it
+ * once they pass that tenth: the parts follow each other in key order, and
+ * a row's copies are never split between them, so the fold's work is still
+ * that of the rows changed.  A hot standby folds from the baseline as the
  * primary does: its log and baseline are replayed, its snapshots real; a
  * fold there only reads.  A branch's copy of a table has its
  * source's baseline and a copy of its log, so it folds from them.  Its
@@ -56,7 +61,11 @@
  *
  * The entries a fold reads are kept once per row (a key's, or a keyless
  * row's with its count summed), so the memory a fold takes is of the rows
- * changed, not of the writes.
+ * changed, not of the writes, and at most about maintenance_work_mem for
+ * the sort and half as much for the part read back.  A transaction's own
+ * changes (fold_rows) and a read of changes are wanted all at once: past
+ * maintenance_work_mem, they give up instead (the working set committed,
+ * or the trees compared).
  *
  * A baseline's state: a tag and version, flags, the log's identity, and the
  * fold's snapshot's xmax, the fold's own transaction (if it had written)
@@ -167,6 +176,18 @@ typedef struct Finder
 								 * folded in full, keyless */
 	bool		merge;			/* merge the changes with the baseline */
 	Size		bytes;			/* what the copies take */
+	bool		spillable;		/* past maintenance_work_mem: sorted, not
+								 * given up on */
+	ProllyChangeSort *spill;	/* the copies, once past it */
+	/* reading the sorted copies back: a row's copies, made one */
+	bool		pending;
+	StringInfoData pkey;
+	StringInfoData prow;
+	int64		pdelta;
+	ItemPointerData ptid;
+	bool		have_last;		/* the last row read back's key */
+	StringInfoData last;
+	int64		rows_back;		/* rows read back */
 	bool		give_up;
 	bool		unsettled;		/* undid rows its position can't find again */
 	bool		emptied;		/* an entry's transaction emptied the table */
@@ -412,6 +433,9 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	f->rowslot = table_slot_create(rel, NULL);
 	initStringInfo(&f->key);
 	initStringInfo(&f->row);
+	initStringInfo(&f->pkey);
+	initStringInfo(&f->prow);
+	initStringInfo(&f->last);
 
 	if (!f->keyless)
 	{
@@ -441,9 +465,19 @@ finder_open(Finder *f, Relation rel, const ProllyTreeEnv *env)
 	}
 }
 
+/* The sort of the copies, if any, ended: its files removed. */
+static void
+spill_end(Finder *f)
+{
+	if (f->spill)
+		prolly_change_sort_end(f->spill, NULL);
+	f->spill = NULL;
+}
+
 static void
 finder_close(Finder *f)
 {
+	spill_end(f);
 	if (f->pk)
 		index_close(f->pk, AccessShareLock);
 	ExecDropSingleTupleTableSlot(f->keyslot);
@@ -497,12 +531,44 @@ compact_copies(Finder *f)
 	f->n = u;
 }
 
+/*
+ * The copies held so far moved into a sort, which takes the rest: past
+ * maintenance_work_mem, the changes are sorted there, spilling, and read
+ * back a part at a time (next_part()).
+ */
+static void
+start_spill(Finder *f)
+{
+	if (f->compact)
+		compact_copies(f);
+	f->spill = prolly_change_sort_begin(f->kr, f->k);
+	for (int64 i = 0; i < f->n; i++)
+	{
+		ProllyKey	k = {(const uint8 *) f->c[i].key, f->c[i].keylen};
+
+		prolly_change_sort_put(f->spill, &k, f->c[i].row, f->c[i].rowlen,
+							   f->c[i].delta, &f->c[i].tid);
+	}
+	MemoryContextReset(f->ccxt);
+	f->c = NULL;
+	f->n = f->max = 0;
+	f->bytes = 0;
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CHANGES_SPILLED, 1);
+}
+
 static void
 add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 		 int64 delta, const ItemPointerData *tid)
 {
 	Copy	   *c;
 
+	if (f->spill)
+	{
+		ProllyKey	k = {(const uint8 *) key->data, key->len};
+
+		prolly_change_sort_put(f->spill, &k, row, rowlen, delta, tid);
+		return;
+	}
 	if (f->n == f->max)
 	{
 		if (f->compact && f->n >= COMPACT_AT)
@@ -529,12 +595,22 @@ add_copy(Finder *f, const StringInfoData *key, const char *row, uint32 rowlen,
 				MemoryContextAllocHuge(f->ccxt, f->max * sizeof(Copy));
 		}
 	}
-	/* (more than a full fold's sort would take: that, instead) */
+	/*
+	 * (more than maintenance_work_mem: sorted, spilling, where the fold can
+	 * read them back in parts; else, where the reader needs them all at
+	 * once, given up on)
+	 */
 	f->bytes += sizeof(Copy) + key->len + rowlen;
 	if (f->bytes > (Size) maintenance_work_mem * 1024)
 	{
-		f->give_up = true;
-		f->reason = PROLLY_FULL_MEMORY_BUDGET;
+		if (!f->spillable)
+		{
+			f->give_up = true;
+			f->reason = PROLLY_FULL_MEMORY_BUDGET;
+			return;
+		}
+		start_spill(f);
+		add_copy(f, key, row, rowlen, delta, tid);
 		return;
 	}
 	c = &f->c[f->n++];
@@ -723,43 +799,75 @@ lookup(Finder *f, IndexScanDesc scan, const Copy *c)
  * The baseline's rows and the edits (in key order), merged into a new tree
  * in one pass over each: a row the edits name, as they have it (or not, a
  * delete), the rest as the baseline has them.  Many edits cost a pass over
- * the baseline, not a lookup into it each.
+ * the baseline, not a lookup into it each.  The edits can come in parts,
+ * each after the last in key order (merge_add()).
  */
+typedef struct Merge
+{
+	ProllyTreeBuilder *b;
+	ProllyTreeCursor *cur;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		more;
+} Merge;
+
+static void
+merge_begin(Finder *f, Merge *m, const ProllyNodeRef *from)
+{
+	m->b = PROLLY_CALL(f->tree, build_begin, &f->env, CurrentMemoryContext);
+	m->cur = PROLLY_CALL(f->tree, cursor_open, &f->env, from,
+						 CurrentMemoryContext);
+	PROLLY_CALL(f->tree, cursor_seek, m->cur, NULL, ForwardScanDirection);
+	m->more = PROLLY_CALL(f->tree, cursor_next, m->cur, &m->k, &m->v);
+}
+
+static void
+merge_add(Finder *f, Merge *m, const ProllyEdit *edits, int nedits)
+{
+	int			e = 0;
+
+	while (e < nedits)
+	{
+		int			c = !m->more ? 1 : keying_compare(&m->k, &edits[e].key, f);
+
+		if (c < 0)
+			PROLLY_CALL(f->tree, build_add, m->b, &m->k, &m->v);
+		else
+		{
+			if (!edits[e].is_delete)
+				PROLLY_CALL(f->tree, build_add, m->b, &edits[e].key,
+							&edits[e].value);
+			e++;
+		}
+		if (c <= 0)
+			m->more = PROLLY_CALL(f->tree, cursor_next, m->cur, &m->k, &m->v);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+static void
+merge_finish(Finder *f, Merge *m, ProllyNodeRef *data)
+{
+	while (m->more)
+	{
+		PROLLY_CALL(f->tree, build_add, m->b, &m->k, &m->v);
+		m->more = PROLLY_CALL(f->tree, cursor_next, m->cur, &m->k, &m->v);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(f->tree, cursor_close, m->cur);
+	PROLLY_CALL(f->tree, build_finish, m->b, data);
+	f->work.merges++;
+}
+
 static void
 merge_build(Finder *f, const ProllyTableFold *baseline, const ProllyEdit *edits,
 			int nedits, ProllyNodeRef *data)
 {
-	ProllyTreeBuilder *b = PROLLY_CALL(f->tree, build_begin, &f->env,
-									   CurrentMemoryContext);
-	ProllyTreeCursor *cur = PROLLY_CALL(f->tree, cursor_open, &f->env,
-										&baseline->data, CurrentMemoryContext);
-	ProllyKey	k;
-	ProllyValue v;
-	bool		more;
-	int			e = 0;
+	Merge		m;
 
-	PROLLY_CALL(f->tree, cursor_seek, cur, NULL, ForwardScanDirection);
-	more = PROLLY_CALL(f->tree, cursor_next, cur, &k, &v);
-	while (more || e < nedits)
-	{
-		int			c = !more ? 1 : e >= nedits ? -1 :
-			keying_compare(&k, &edits[e].key, f);
-
-		if (c < 0)
-			PROLLY_CALL(f->tree, build_add, b, &k, &v);
-		else
-		{
-			if (!edits[e].is_delete)
-				PROLLY_CALL(f->tree, build_add, b, &edits[e].key, &edits[e].value);
-			e++;
-		}
-		if (c <= 0)
-			more = PROLLY_CALL(f->tree, cursor_next, cur, &k, &v);
-		CHECK_FOR_INTERRUPTS();
-	}
-	PROLLY_CALL(f->tree, cursor_close, cur);
-	PROLLY_CALL(f->tree, build_finish, b, data);
-	f->work.merges++;
+	merge_begin(f, &m, &baseline->data);
+	merge_add(f, &m, edits, nedits);
+	merge_finish(f, &m, data);
 }
 
 /* The candidates kept once per key, as the keying tells keys apart. */
@@ -887,6 +995,167 @@ edit_emit(Finder *f, ProllyDiffKind kind, const ProllyKey *key,
 	return true;
 }
 
+/* The row read back so far (f->pkey, its copies made one) put in the part. */
+static void
+part_put(Finder *f)
+{
+	ProllyKey	k = {(const uint8 *) f->pkey.data, f->pkey.len};
+	Copy	   *c;
+
+	f->pending = false;
+	if (f->keyless && f->pdelta == 0)
+		return;
+	if (f->have_last)
+	{
+		ProllyKey	lk = {(const uint8 *) f->last.data, f->last.len};
+
+		/*
+		 * (keys the keying calls equal: with a key, the first kept, as
+		 * unique_keys() keeps it; without, rows written under another
+		 * keying, as apply_copies() finds them)
+		 */
+		if (keying_compare(&lk, &k, f) == 0)
+		{
+			if (f->keyless)
+			{
+				f->give_up = true;
+				f->reason = PROLLY_FULL_KEYING_CHANGED;
+			}
+			return;
+		}
+	}
+	/* (more rows changed than the table holds: reading it all is less) */
+	if (f->keyless && ++f->rows_back > f->limit)
+	{
+		f->give_up = true;
+		f->reason = PROLLY_FULL_TOO_MANY;
+		return;
+	}
+	if (f->n == f->max)
+	{
+		f->max = Max(64, f->max * 2);
+		f->c = f->c ? repalloc_huge(f->c, f->max * sizeof(Copy)) :
+			MemoryContextAllocHuge(f->ccxt, f->max * sizeof(Copy));
+	}
+	c = &f->c[f->n++];
+	c->keylen = f->pkey.len;
+	c->key = MemoryContextAlloc(f->ccxt, Max(f->pkey.len, 1));
+	memcpy(c->key, f->pkey.data, f->pkey.len);
+	c->rowlen = f->prow.len;
+	c->row = MemoryContextAlloc(f->ccxt, Max(f->prow.len, 1));
+	memcpy(c->row, f->prow.data, f->prow.len);
+	c->delta = f->pdelta;
+	c->tid = f->ptid;
+	f->bytes += sizeof(Copy) + c->keylen + c->rowlen;
+	resetStringInfo(&f->last);
+	appendBinaryStringInfo(&f->last, f->pkey.data, f->pkey.len);
+	f->have_last = true;
+}
+
+/*
+ * The next part of the sorted copies into f->c, in key order, kept once
+ * per row as compact_copies() and unique_keys() keep them, a row's copies
+ * never split between parts: up to half maintenance_work_mem, as the sort
+ * holds about as much.  False once none are left, or on giving up.
+ */
+static bool
+next_part(Finder *f)
+{
+	Size		budget = (Size) maintenance_work_mem * 1024 / 2;
+	ProllySortedChange ch;
+
+	MemoryContextReset(f->ccxt);
+	f->c = NULL;
+	f->n = f->max = 0;
+	f->bytes = 0;
+	while (!f->give_up && f->bytes < budget &&
+		   prolly_change_sort_next(f->spill, &ch))
+	{
+		if (f->pending && same_bytes(f->pkey.data, f->pkey.len, ch.key.data,
+									 ch.key.len))
+		{
+			f->pdelta += ch.delta;
+			if (!ItemPointerIsValid(&f->ptid))
+				f->ptid = ch.tid;
+		}
+		else
+		{
+			if (f->pending)
+				part_put(f);
+			resetStringInfo(&f->pkey);
+			appendBinaryStringInfo(&f->pkey, (const char *) ch.key.data,
+								   ch.key.len);
+			resetStringInfo(&f->prow);
+			appendBinaryStringInfo(&f->prow, ch.row, ch.rowlen);
+			f->pdelta = ch.delta;
+			f->ptid = ch.tid;
+			f->pending = true;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	/* (the sort's end: the last row's copies are all read) */
+	if (f->pending && !f->give_up && f->bytes < budget)
+		part_put(f);
+	return !f->give_up && (f->n > 0 || f->pending);
+}
+
+/*
+ * fold_keys() for changes past maintenance_work_mem, read back from their
+ * sort a part at a time: each part's edits applied to the tree so far, or,
+ * once the edits pass a tenth of the baseline's rows, merged with it in
+ * one pass, as fold_keys() chooses.  The parts follow each other in key
+ * order, so each part's rows are the baseline's in the tree so far.
+ */
+static void
+fold_keys_spilled(Finder *f, const ProllyTableFold *baseline,
+				  ProllyNodeRef *data)
+{
+	uint64		rows = PROLLY_CALL(f->tree, count, &f->env, &baseline->data);
+	ProllyNodeRef cur = baseline->data;
+	MemoryContext pcxt = AllocSetContextCreate(CurrentMemoryContext,
+											   "log fold part",
+											   ALLOCSET_DEFAULT_SIZES);
+	Merge		m = {0};
+	bool		merging = false;
+	uint64		total = 0;
+
+	prolly_change_sort_done(f->spill);
+	while (next_part(f))
+	{
+		MemoryContext old = MemoryContextSwitchTo(pcxt);
+		Edits		ed = {NULL, 0};
+
+		f->work.candidates += f->n;
+		f->work.rows_read += f->n;
+		ed.edits = MemoryContextAllocHuge(pcxt, Max(f->n, 1) * sizeof(ProllyEdit));
+		each_change(f, &baseline->data, edit_emit, &ed);
+		MemoryContextSwitchTo(old);
+		f->work.rows_written += ed.nedits;
+		total += ed.nedits;
+		if (!merging && ed.nedits > 0 &&
+			(f->merge || total * MERGE_FRACTION > rows))
+		{
+			merge_begin(f, &m, &cur);
+			merging = true;
+		}
+		if (merging)
+			merge_add(f, &m, ed.edits, ed.nedits);
+		else if (ed.nedits > 0)
+		{
+			ProllyNodeRef next;
+
+			PROLLY_CALL(f->tree, apply, &f->env, &cur, ed.edits, ed.nedits,
+						&next);
+			cur = next;
+		}
+		MemoryContextReset(pcxt);
+	}
+	if (merging)
+		merge_finish(f, &m, &cur);
+	MemoryContextDelete(pcxt);
+	*data = cur;
+}
+
 /* Each candidate's old and new rows; the pairs that differ are edits. */
 static void
 fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
@@ -895,6 +1164,11 @@ fold_keys(Finder *f, const ProllyTableFold *baseline, ProllyNodeRef *data)
 	int			nedits;
 	ProllyEdit *edits;
 
+	if (f->spill)
+	{
+		fold_keys_spilled(f, baseline, data);
+		return;
+	}
 	unique_keys(f);
 	ed.edits = MemoryContextAllocHuge(CurrentMemoryContext,
 									  Max(f->n, 1) * sizeof(ProllyEdit));
@@ -1032,6 +1306,39 @@ apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 	return ok;
 }
 
+/*
+ * apply_copies() for copies past maintenance_work_mem, read back from
+ * their sort a part at a time, each part applied to the tree so far: a
+ * row's copies are never split between parts, so each count is the
+ * baseline's with every copy counted.
+ */
+static bool
+apply_spilled(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
+{
+	ProllyNodeRef cur = *data_in;
+	MemoryContext pcxt = AllocSetContextCreate(CurrentMemoryContext,
+											   "log fold part",
+											   ALLOCSET_DEFAULT_SIZES);
+	bool		ok = true;
+
+	prolly_change_sort_done(f->spill);
+	while (ok && next_part(f))
+	{
+		MemoryContext old = MemoryContextSwitchTo(pcxt);
+		ProllyNodeRef next;
+
+		ok = apply_copies(f, &cur, &next);
+		MemoryContextSwitchTo(old);
+		cur = next;
+		MemoryContextReset(pcxt);
+	}
+	MemoryContextDelete(pcxt);
+	if (!ok || f->give_up)
+		return false;
+	*data = cur;
+	return true;
+}
+
 
 /*
  * Every row the snapshot sees, folded into a data tree: each row's key and
@@ -1080,6 +1387,7 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 	ProllyTableFold from;
 
 	f->compact = true;
+	f->spillable = true;
 	if (f->give_up)
 		return false;
 
@@ -1138,10 +1446,12 @@ fold_changed(Finder *f, const ProllyTableFold *baseline, const State *st,
 		fold_keys(f, &from, data);
 		return true;
 	}
-	if (!apply_copies(f, &from.data, data))
+	if (f->spill ? !apply_spilled(f, &from.data, data) :
+		!apply_copies(f, &from.data, data))
 	{
 		/* (a row's count below none: written under another keying) */
-		f->reason = PROLLY_FULL_KEYING_CHANGED;
+		if (!f->give_up)
+			f->reason = PROLLY_FULL_KEYING_CHANGED;
 		return false;
 	}
 	return true;
@@ -1218,6 +1528,8 @@ own_copies(Finder *f, ItemPointerData *tids, int ntids)
 		{
 			row_copy(f, copy, made ? 1 : -1);
 			heap_freetuple(copy);
+			if (f->give_up)
+				break;
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1310,6 +1622,7 @@ log_fold(Relation rel, const ProllyTreeEnv *env,
 
 		/* (what the fold from the baseline read is thrown away) */
 		memset(&f.work, 0, sizeof(f.work));
+		spill_end(&f);
 		MemoryContextReset(f.ccxt);
 		f.c = NULL;
 		f.n = f.max = 0;
@@ -1458,7 +1771,12 @@ log_fold_rows(Relation rel, const ProllyTreeEnv *env,
 	old = MemoryContextSwitchTo(cxt);
 	finder_open(&f, rel, env);
 	own_copies(&f, tids, ntids);
-	ok = apply_copies(&f, data_in, data);
+
+	/*
+	 * (copies past maintenance_work_mem weren't kept: the transaction's
+	 * working set is committed instead, folded from the baseline)
+	 */
+	ok = !f.give_up && apply_copies(&f, data_in, data);
 	finder_close(&f);
 	MemoryContextSwitchTo(old);
 	MemoryContextDelete(cxt);

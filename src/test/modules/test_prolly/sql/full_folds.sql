@@ -174,8 +174,8 @@ RESET debug_prolly_force_full_fold;
 :flush
 SELECT value > 0 AS counted_spilled FROM pg_stat_prolly WHERE name = 'fold_full_spilled';
 
--- the changes an incremental fold holds past maintenance_work_mem: in full,
--- as that costs no more
+-- the changes an incremental fold holds past maintenance_work_mem: sorted,
+-- spilling, and folded from the baseline, not in full (spilled_folds)
 SELECT length(dolt_commit('-Am', 'big')::text) AS committed;
 UPDATE ff.big SET v = 'changed' WHERE id <= 5000;
 :reset
@@ -184,6 +184,7 @@ SELECT test_fold_root() IS NOT NULL AS folded;
 RESET maintenance_work_mem;
 :flush
 SELECT * FROM full_folds();
+SELECT value AS changes_spilled FROM pg_stat_prolly WHERE name = 'fold_changes_spilled';
 
 -- many rows changed: merged with the baseline in one pass, not applied a
 -- row at a time, nor read in full; the same tree as a full fold

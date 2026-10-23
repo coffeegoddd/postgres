@@ -5696,8 +5696,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>too_many</literal> (more rows changed than reading it all
        costs), <literal>keying_changed</literal> (changes written under
        another key), <literal>unsupported_key</literal> (a key rows can't
-       be looked up by), <literal>memory_budget</literal> (the changes it
-       held passed <varname>maintenance_work_mem</varname>) and
+       be looked up by), <literal>memory_budget</literal> (kept for earlier
+       statistics: changes past <varname>maintenance_work_mem</varname> are
+       sorted instead, counted by <literal>fold_changes_spilled</literal>) and
        <literal>forced</literal>
        (<varname>debug_prolly_force_full_fold</varname>) and
        <literal>verify</literal> (the fold verifier's), with
@@ -5780,7 +5781,11 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        cache of decoded chunks, <varname>prolly_chunk_cache_size</varname>,
        instead of the chunk store's files);
        <literal>fold_rows_located</literal> (rows a fold read where the
-       table's change log said they are, instead of by their key).  Bytes are counted when
+       table's change log said they are, instead of by their key);
+       <literal>fold_changes_spilled</literal> (folds from a table's
+       baseline whose changes passed
+       <varname>maintenance_work_mem</varname>: sorted, spilling to disk,
+       and applied a part at a time, not read in full).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

@@ -107,6 +107,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_APPLY_LOADS] = "apply_loads",
 	[PGSTAT_PROLLY_CHUNK_CACHE_HITS] = "chunk_cache_hits",
 	[PGSTAT_PROLLY_FOLD_ROWS_LOCATED] = "fold_rows_located",
+	[PGSTAT_PROLLY_FOLD_CHANGES_SPILLED] = "fold_changes_spilled",
 };
 
 /*

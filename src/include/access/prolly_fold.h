@@ -50,7 +50,9 @@ typedef enum ProllyFullFoldReason
 	PROLLY_FULL_KEYING_CHANGED, /* entries written under another keying */
 	PROLLY_FULL_UNSUPPORTED_KEY,	/* a key it can't look rows up by */
 	PROLLY_FULL_MEMORY_BUDGET,	/* the changes held passed
-								 * maintenance_work_mem */
+								 * maintenance_work_mem (no longer: a
+								 * fold sorts them; kept for the
+								 * counters' order) */
 	PROLLY_FULL_FORCED,			/* debug_prolly_force_full_fold */
 	PROLLY_FULL_VERIFY,			/* the verifier's, to compare with */
 } ProllyFullFoldReason;
@@ -139,6 +141,37 @@ extern void prolly_fold_all(Relation rel, Snapshot snap, TupleTableSlot *slot,
 							bool keyless, const ProllyTreeRoutine *tree,
 							const ProllyTreeEnv *env, ProllyNodeRef *data,
 							ProllyFullFold *done);
+
+/*
+ * A change finder's changed rows sorted in maintenance_work_mem, spilling
+ * past it: each put with its key, its row (an entry's tuple, or an
+ * encoded row), a delta and where the row is (invalid: not known), and
+ * read back in the keying's order, keys the keying calls equal by their
+ * bytes.  So a fold from the baseline whose changes outgrow memory reads
+ * them back in order, a part at a time, rather than reading every row.
+ */
+typedef struct ProllyChangeSort ProllyChangeSort;
+
+typedef struct ProllySortedChange
+{
+	ProllyKey	key;			/* valid until the next read */
+	const char *row;
+	uint32		rowlen;
+	int64		delta;
+	ItemPointerData tid;
+} ProllySortedChange;
+
+extern ProllyChangeSort *prolly_change_sort_begin(const ProllyKeyingRoutine *kr,
+												  ProllyKeying *k);
+extern void prolly_change_sort_put(ProllyChangeSort *s, const ProllyKey *key,
+								   const char *row, uint32 rowlen, int64 delta,
+								   const ItemPointerData *tid);
+/* The changes put sorted: none may be put after. */
+extern void prolly_change_sort_done(ProllyChangeSort *s);
+extern bool prolly_change_sort_next(ProllyChangeSort *s,
+									ProllySortedChange *change);
+/* The sort ended, its files removed; *spilled: whether it went to disk. */
+extern void prolly_change_sort_end(ProllyChangeSort *s, bool *spilled);
 
 /* Re-sort historical keys, spilling; false (data unset) if keys now coincide. */
 extern bool prolly_fold_reorder(const ProllyKeyingRoutine *kr, ProllyKeying *k,

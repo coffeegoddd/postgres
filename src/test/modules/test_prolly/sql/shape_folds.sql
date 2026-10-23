@@ -193,9 +193,8 @@ INSERT INTO sf.k VALUES (2, 3);
 ALTER TABLE sf.t ADD COLUMN rnd float8 DEFAULT random();
 :check
 
--- a fold that gives up on the baseline (here, its changes past
--- maintenance_work_mem) reads the table in full and maps nothing: the
--- baseline is mapped only once the finder folds from it
+-- changes past maintenance_work_mem are sorted, spilling, and folded from
+-- the mapped baseline all the same
 CREATE TABLE sf.kb (a int, b text);
 INSERT INTO sf.kb SELECT g, 'kb' || g FROM generate_series(1, 3000) g;
 SELECT length(dolt_commit('-Am', 'kb')::text) > 0 AS committed;
@@ -206,6 +205,17 @@ COMMIT;
 SET maintenance_work_mem = '64kB';
 :check
 RESET maintenance_work_mem;
+
+-- a fold that gives up on the baseline (here, a keyless table emptied,
+-- whose counts can't be told apart) reads the table in full and maps
+-- nothing: the baseline is mapped only once the finder folds from it
+BEGIN;
+ALTER TABLE sf.kb ADD COLUMN n int DEFAULT 4;
+DELETE FROM sf.kb WHERE a > 10;
+TRUNCATE sf.kb;
+INSERT INTO sf.kb VALUES (1, 'again');
+COMMIT;
+:check
 
 -- the change finder "pages" folds from a mapped baseline too
 SET debug_prolly_change_finder = pages;

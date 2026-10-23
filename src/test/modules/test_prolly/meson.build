@@ -147,6 +147,7 @@ tests += {
       'get_many',
       'put_batches',
       'full_folds',
+      'spilled_folds',
       'bulk_notes',
       'shape_folds',
       'truncate_folds',
