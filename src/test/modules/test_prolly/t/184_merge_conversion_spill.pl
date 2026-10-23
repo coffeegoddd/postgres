@@ -103,5 +103,45 @@ cmp_ok($memory[1], '<', $memory[0] + 128 * 1024,
 	'ten times as many rows converted take no more memory');
 cmp_ok($disk[1], '>', $disk[0] * 5, 'the rows converted go to temporary files');
 note("statement memory while converting: @memory bytes; temporary files: @disk bytes");
+# Rows that come together under the definition now, sorted past work_mem:
+# shown (dolt_at()), a keyed table's rows sharing a key are each shown once
+# and the rest counted, and a keyless table's rows made alike are one row
+# with their copies counted; the same rows however the sort spilled.
+{
+	my $n = 50000;
+	my $db = 'dups';
+	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	$node->safe_psql($db, qq{
+		CREATE EXTENSION test_prolly;
+		CREATE SCHEMA s VERSIONED;
+		CREATE TABLE s.kl (i int, j int, pad text);
+		INSERT INTO s.kl SELECT g, j, repeat(md5((g * j)::text), 2)
+		  FROM generate_series(1, $n) g, generate_series(1, 2) j;
+		CREATE TABLE s.kd (i int, j int);
+		INSERT INTO s.kd SELECT g, j FROM generate_series(1, $n) g, generate_series(1, 2) j;
+		SELECT dolt_commit('-Am', 'keyless');
+		DELETE FROM s.kl WHERE j = 2;
+		ALTER TABLE s.kl ADD PRIMARY KEY (i);
+		ALTER TABLE s.kd DROP COLUMN j;
+		SELECT dolt_commit('-Am', 'kl keyed, kd without j');
+	});
+	my $shown = q{SELECT count(*), md5(string_agg(format('%s:%s:%s', i, j, pad), ' ' ORDER BY i))
+		FROM dolt_at('HEAD~1', NULL::s.kl)};
+	my ($ret, $spilled, $err) = $node->psql($db, $shown);
+	like($err, qr/$n rows of a version of table "kl" share a primary key with others as the key is defined now: each key shown once/,
+		'shown, the rows sharing a key are counted');
+	($ret, my $in_memory) = $node->psql($db, "SET work_mem = '256MB'; $shown");
+	like($spilled, qr/^$n\|/, 'each key is shown once');
+	is($spilled, $in_memory, 'the rows shown are those an unspilled sort shows');
+	# (a keyless row's key leads with its values: of a key's rows, j = 1's
+	# is read first)
+	is($node->safe_psql($db, q{SELECT count(*) FILTER (WHERE j = 1)
+		FROM dolt_at('HEAD~1', NULL::s.kl)}), $n, "each key's first row read is the one shown");
+	my $copies = q{SELECT count(*), count(DISTINCT i) FROM dolt_at('HEAD~1', NULL::s.kd)};
+	is($node->safe_psql($db, $copies), 2 * $n . "|$n",
+		'a keyless row made alike is counted with its copies');
+	is($node->safe_psql($db, "SET work_mem = '256MB'; $copies"), 2 * $n . "|$n",
+		'as an unspilled sort counts them');
+}
 $node->stop;
 done_testing();

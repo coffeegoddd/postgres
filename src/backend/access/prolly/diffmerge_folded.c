@@ -1597,7 +1597,10 @@ removeabbrev_conv(Tuplesortstate *state, SortTuple *stups, int count)
 {
 }
 
-/* A sort of ConvTuples by their keys, under rd's keying. */
+/*
+ * A sort of ConvTuples by their keys, under rd's keying, in work_mem of its
+ * own (a version read may have two open: its rows' and its unsure rows').
+ */
 static Tuplesortstate *
 conv_sort_begin(RowDiff *rd)
 {

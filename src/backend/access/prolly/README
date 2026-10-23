@@ -261,6 +261,9 @@ and streamed into the tree builder, copies of a row counted and a key found
 twice refused or, shown, warned of, as before.  The base's rows with an
 unsure value are sorted the same way and written to a temporary file in key
 order, which each merge walk reads from its start alongside theirs' changes.
+While a version's rows are read, the converted rows' sort and the unsure
+rows' sort can both be open, each with its own work_mem: the conversion
+uses up to twice work_mem, plus each sort's merge buffers.
 
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
