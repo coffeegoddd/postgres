@@ -240,6 +240,21 @@ diffmerge_folded.c) compare canonical trees table by table, reading only
 subtrees that differ; moving a branch to another commit writes the
 differences back through the row applier (applier_replication.c), as
 logical replication's apply worker writes rows.
+
+When a type change admits both text and cast readings of the base, merge
+validates both interpretations before applying rows.  Each outcome walk
+spools its ordered keys, conflict flags and canonical values to a temporary
+BufFile.  Comparison holds one outcome from each stream and the unchanged
+row, rather than two complete lists.  Outcome memory is two file buffers
+plus reusable buffers sized to the largest records (and BufFile segment
+metadata); temporary I/O grows with the outcomes.  Files close on success
+and their resource owner removes them on error, savepoint rollback or
+cancellation.  Ordinary merges do not create these files, but every such
+validation creates both, however small the table, so it uses temporary
+space: it counts against temp_file_limit and is reported by log_temp_files.
+Earlier schema conversion and uncertainty buffers are separate and can still
+grow with table size; this does not bound the entire merge's memory.
+
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the
