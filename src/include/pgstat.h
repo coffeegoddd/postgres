@@ -726,7 +726,8 @@ typedef enum PgStat_ProllyCounter
 											 * hidden branch was kept */
 	PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED,	/* kept hidden branches let go
 											 * of past the budget */
-	PGSTAT_PROLLY_MOVE_TABLES_WRITTEN,	/* tables a move wrote rows into */
+	PGSTAT_PROLLY_MOVE_TABLES_WRITTEN,	/* tables and materialized views a
+										 * move wrote rows into */
 } PgStat_ProllyCounter;
 
 #define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MOVE_TABLES_WRITTEN + 1)

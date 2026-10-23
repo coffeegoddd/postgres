@@ -173,9 +173,68 @@ SELECT (dolt_checkout('main'))[2];
  Already on branch 'main'
 (1 row)
 
+-- A materialized view whose rows a move writes is counted as written too.
+CREATE TABLE cw.src (id int PRIMARY KEY, v int);
+INSERT INTO cw.src SELECT g, g FROM generate_series(1, 200) g;
+CREATE MATERIALIZED VIEW cw.mv AS SELECT id, v FROM cw.src;
+SELECT (dolt_commit('-Am', 'with mv'))[1] AS with_mv \gset
+UPDATE cw.src SET v = -v WHERE id <= 100;
+REFRESH MATERIALIZED VIEW cw.mv;
+SELECT length(dolt_commit('-am', 'mv refreshed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT count(*) >= 0 AS counting FROM pg_temp.work();
+ counting 
+----------
+ t
+(1 row)
+
+SELECT dolt_checkout(:'with_mv') IS NOT NULL AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counter, grew FROM pg_temp.work()
+WHERE counter IN ('move_tables_written', 'move_tables_shared');
+       counter       | grew 
+---------------------+------
+ move_tables_written |    2
+ move_tables_shared  |    0
+(2 rows)
+
+SELECT count(*) FILTER (WHERE v < 0) AS mv_changed FROM cw.mv;
+ mv_changed 
+------------
+          0
+(1 row)
+
+SELECT (dolt_checkout('main'))[2];
+       dolt_checkout       
+---------------------------
+ Switched to branch 'main'
+(1 row)
+
 RESET prolly.kept_checkouts;
 DROP SCHEMA cw CASCADE;
-NOTICE:  drop cascades to 3 other objects
+NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table cw.a
 drop cascades to table cw.b
 drop cascades to table cw.same
+drop cascades to table cw.src
+drop cascades to materialized view cw.mv

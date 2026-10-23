@@ -4224,13 +4224,14 @@ lookup_sequence(HTAB *h, const char *name)
 
 /*
  * Write every materialized view's rows that differ from target's, from's
- * as the branch has them: those both have.
+ * as the branch has them: those both have.  Returns how many were written.
  */
-static void
+static int
 apply_matview_rows(const ProllyNodeRef *from, const ProllyNodeRef *target)
 {
 	List	   *fs = matviews_in_root(from);
 	ListCell   *lc;
+	int			written = 0;
 
 	foreach(lc, matviews_in_root(target))
 	{
@@ -4238,8 +4239,12 @@ apply_matview_rows(const ProllyNodeRef *from, const ProllyNodeRef *target)
 		Table	   *f = find_table(fs, t->name);
 
 		if (f != NULL && !same_hash(&f->data.hash, &t->data.hash))
+		{
 			apply_rows(table_named(t->name), f, t);
+			written++;
+		}
 	}
+	return written;
 }
 
 /*
@@ -4281,7 +4286,8 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 	 * Materialized views' rows too, as the commit holds them: those there
 	 * are (one being made again is written once it is).
 	 */
-	apply_matview_rows(working, target);
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_WRITTEN,
+						apply_matview_rows(working, target));
 
 	/* and every sequence's value */
 	{
@@ -11274,7 +11280,7 @@ fast_forward_local(const Local *l, const ProllyHash *theirs, bool squash)
 		}
 	}
 	/* materialized views theirs refreshed (check_local(): not these) */
-	apply_matview_rows(&l->head, &target);
+	(void) apply_matview_rows(&l->head, &target);
 	if (relids != NIL && (broken = foreign_key_violation_list(relids, NIL)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

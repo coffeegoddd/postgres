@@ -65,5 +65,22 @@ SELECT (dolt_checkout('main'))[2];
 SELECT dolt_tag('-d', 'other_tag');
 SET prolly.kept_checkouts = 0;
 SELECT (dolt_checkout('main'))[2];
+
+-- A materialized view whose rows a move writes is counted as written too.
+CREATE TABLE cw.src (id int PRIMARY KEY, v int);
+INSERT INTO cw.src SELECT g, g FROM generate_series(1, 200) g;
+CREATE MATERIALIZED VIEW cw.mv AS SELECT id, v FROM cw.src;
+SELECT (dolt_commit('-Am', 'with mv'))[1] AS with_mv \gset
+UPDATE cw.src SET v = -v WHERE id <= 100;
+REFRESH MATERIALIZED VIEW cw.mv;
+SELECT length(dolt_commit('-am', 'mv refreshed')::text) AS committed;
+:flush
+SELECT count(*) >= 0 AS counting FROM pg_temp.work();
+SELECT dolt_checkout(:'with_mv') IS NOT NULL AS detached;
+:flush
+SELECT counter, grew FROM pg_temp.work()
+WHERE counter IN ('move_tables_written', 'move_tables_shared');
+SELECT count(*) FILTER (WHERE v < 0) AS mv_changed FROM cw.mv;
+SELECT (dolt_checkout('main'))[2];
 RESET prolly.kept_checkouts;
 DROP SCHEMA cw CASCADE;

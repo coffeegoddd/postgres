@@ -416,7 +416,8 @@ it made, so every tuple on its pages is one the snapshot sees as committed
 or aborted, and only while its commit's ordering dependencies match the
 installed extensions, under which its indexes were built.  pg_stat_prolly
 counts the tables a move gave another state's storage (move_tables_shared)
-and those whose rows it wrote (move_tables_written): a checkout's work,
+and the tables and materialized views whose rows it wrote
+(move_tables_written): a checkout's work,
 table by table.
 
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
