@@ -1,0 +1,703 @@
+-- dolt_rebase: a branch's commits replayed onto another commit, as
+-- Dolt's: at once, or interactively by a plan in the dolt_rebase view
+-- (pick, reword, squash, fixup, drop, edit), stopping at conflicts and
+-- edits until --continue; --abort puts the branch back.
+-- (a database of its own: its history is the test's alone)
+CREATE DATABASE regress_rebase;
+\c regress_rebase
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SET dolt.author = 'Rebaser <r@example.com>';
+-- refused: nothing in progress, nothing to rebase, bad arguments
+SELECT dolt_rebase('--abort');
+ERROR:  no rebase in progress
+SELECT dolt_rebase('--continue');
+ERROR:  no rebase in progress
+SELECT dolt_rebase('main');
+ERROR:  branch not found: main
+SELECT dolt_rebase('-i');
+ERROR:  not enough args
+SELECT dolt_rebase('-i', 'main1', 'main2');
+ERROR:  rebase takes at most one positional argument.
+SELECT dolt_rebase('--abrot');
+ERROR:  error: unknown option `abrot'
+SELECT dolt_rebase('-i', 'doesnotexist');
+ERROR:  branch not found: doesnotexist
+SELECT dolt_rebase('--empty=sometimes', 'main');
+ERROR:  unsupported option for the empty flag (sometimes); only 'keep' or 'drop' are allowed
+SELECT * FROM dolt_rebase;
+ERROR:  table not found: dolt_rebase
+DETAIL:  No rebase is in progress.
+CREATE SCHEMA rb VERSIONED;
+CREATE TABLE rb.t (pk int PRIMARY KEY, v text);
+SELECT dolt_commit('-Am', 'creating table t') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('feature');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO rb.t VALUES (0, 'main');
+SELECT dolt_commit('-am', 'main row 0') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- a non-interactive rebase: the branch's commits on main's head
+SELECT dolt_checkout('feature') IS NOT NULL AS on_feature;
+ on_feature 
+------------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (1, 'f');
+SELECT dolt_commit('-am', 'feature row 1') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (2, 'f');
+SELECT dolt_commit('-am', 'feature row 2') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS before \gset
+SELECT dolt_rebase('main');
+                        dolt_rebase                        
+-----------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/feature"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ feature
+(1 row)
+
+SELECT pk FROM rb.t ORDER BY pk;
+ pk 
+----
+  0
+  1
+  2
+(3 rows)
+
+SELECT message, committer FROM dolt_log ORDER BY commit_order DESC;
+     message      | committer 
+------------------+-----------
+ feature row 2    | Rebaser
+ feature row 1    | Rebaser
+ main row 0       | Rebaser
+ creating table t | Rebaser
+(4 rows)
+
+SELECT dolt_hashof('feature~2') = dolt_hashof('main') AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT name FROM dolt_branches ORDER BY name;
+  name   
+---------
+ feature
+ main
+(2 rows)
+
+-- refused over uncommitted changes
+INSERT INTO rb.t VALUES (3, 'dirty');
+SELECT dolt_rebase('main');
+ERROR:  cannot start a rebase with uncommitted changes
+DELETE FROM rb.t WHERE pk = 3;
+-- an interactive rebase, every action
+SELECT dolt_checkout('-b', 'b1', 'main~1') IS NOT NULL AS on_b1;
+ on_b1 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (10, 'x');
+SELECT dolt_commit('-am', 'row 10') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (11, 'x');
+SELECT dolt_commit('-am', 'row 11') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (12, 'x');
+SELECT dolt_commit('-am', 'row 12') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (13, 'x');
+SELECT dolt_commit('-am', 'row 13') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (14, 'x');
+SELECT dolt_commit('-am', 'row 14') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (15, 'x');
+SELECT dolt_commit('-am', 'row 15') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main');
+                                                                               dolt_rebase                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {0,"interactive rebase started on branch dolt_rebase_b1; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')"}
+(1 row)
+
+SELECT active_branch();
+ active_branch  
+----------------
+ dolt_rebase_b1
+(1 row)
+
+SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+ rebase_order | action | commit_message 
+--------------+--------+----------------
+         1.00 | pick   | row 10
+         2.00 | pick   | row 11
+         3.00 | pick   | row 12
+         4.00 | pick   | row 13
+         5.00 | pick   | row 14
+         6.00 | pick   | row 15
+(6 rows)
+
+-- (the plan names the branch's commits)
+SELECT bool_and(r.commit_hash = l.commit_hash) AS commits
+	FROM dolt_rebase r JOIN dolt_log('b1') l ON l.message = r.commit_message;
+ commits 
+---------
+ t
+(1 row)
+
+UPDATE dolt_rebase SET rebase_order = 6.1 WHERE rebase_order = 6;
+UPDATE dolt_rebase SET action = 'squash' WHERE rebase_order IN (2, 3);
+UPDATE dolt_rebase SET action = 'drop' WHERE rebase_order = 4;
+UPDATE dolt_rebase SET action = 'reword', commit_message = 'reworded!' WHERE rebase_order = 5;
+UPDATE dolt_rebase SET action = 'fixup' WHERE rebase_order = 6.10;
+UPDATE dolt_rebase SET action = 'shuffle' WHERE rebase_order = 1;
+ERROR:  invalid rebase action "shuffle"
+HINT:  An action is pick, reword, squash, fixup, drop or edit.
+UPDATE dolt_rebase SET rebase_order = 2 WHERE rebase_order = 1;
+ERROR:  duplicate rebase_order 2.00 in the rebase plan
+SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+ rebase_order | action | commit_message 
+--------------+--------+----------------
+         1.00 | pick   | row 10
+         2.00 | squash | row 11
+         3.00 | squash | row 12
+         4.00 | drop   | row 13
+         5.00 | reword | reworded!
+         6.10 | fixup  | row 15
+(6 rows)
+
+SELECT dolt_rebase('--continue');
+                     dolt_rebase                      
+------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/b1"}
+(1 row)
+
+SELECT dolt_rebase('--continue');
+ERROR:  no rebase in progress
+SELECT * FROM dolt_rebase;
+ERROR:  table not found: dolt_rebase
+DETAIL:  No rebase is in progress.
+SELECT active_branch();
+ active_branch 
+---------------
+ b1
+(1 row)
+
+SELECT name FROM dolt_branches ORDER BY name;
+  name   
+---------
+ b1
+ feature
+ main
+(3 rows)
+
+SELECT message FROM dolt_log ORDER BY commit_order DESC;
+     message      
+------------------
+ reworded!
+ row 10          +
+                 +
+ row 11          +
+                 +
+ row 12
+ main row 0
+ creating table t
+(4 rows)
+
+SELECT pk FROM rb.t ORDER BY pk;
+ pk 
+----
+  0
+ 10
+ 11
+ 12
+ 14
+ 15
+(6 rows)
+
+-- an invalid plan: a squash with nothing picked before it
+SELECT dolt_checkout('-b', 'b2', 'main~1') IS NOT NULL AS on_b2;
+ on_b2 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (20, 'x');
+SELECT dolt_commit('-am', 'row 20') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (21, 'x');
+SELECT dolt_commit('-am', 'row 21') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+UPDATE dolt_rebase SET action = 'squash' WHERE rebase_order = 1;
+SELECT dolt_rebase('--continue');
+ERROR:  invalid rebase plan: squash and fixup actions must appear after a pick or reword action
+-- rows added to the plan and taken out of it
+UPDATE dolt_rebase SET action = 'pick' WHERE rebase_order = 1;
+DELETE FROM dolt_rebase WHERE rebase_order = 2;
+INSERT INTO dolt_rebase VALUES (0.5, 'pick', 'abc', 'x');
+ERROR:  invalid commit hash: abc
+SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+ rebase_order | action | commit_message 
+--------------+--------+----------------
+         1.00 | pick   | row 20
+(1 row)
+
+-- aborted: back on the branch as it was, the rebase's branch gone
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+SELECT active_branch();
+ active_branch 
+---------------
+ b2
+(1 row)
+
+SELECT pk FROM rb.t ORDER BY pk;
+ pk 
+----
+ 20
+ 21
+(2 rows)
+
+SELECT name FROM dolt_branches ORDER BY name;
+  name   
+---------
+ b1
+ b2
+ feature
+ main
+(4 rows)
+
+SELECT * FROM dolt_rebase;
+ERROR:  table not found: dolt_rebase
+DETAIL:  No rebase is in progress.
+-- a commit that becomes empty: dropped by default, kept with --empty=keep
+SELECT dolt_checkout('-b', 'b3', 'main~1') IS NOT NULL AS on_b3;
+ on_b3 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (0, 'main');
+SELECT dolt_commit('-am', 'same as main') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (30, 'x');
+SELECT dolt_commit('-am', 'row 30') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('b3keep');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_rebase('main');
+                     dolt_rebase                      
+------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/b3"}
+(1 row)
+
+SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 3;
+     message      
+------------------
+ row 30
+ main row 0
+ creating table t
+(3 rows)
+
+SELECT dolt_checkout('b3keep') IS NOT NULL AS on_b3keep;
+ on_b3keep 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('--empty=keep', 'main');
+                       dolt_rebase                        
+----------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/b3keep"}
+(1 row)
+
+SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 3;
+   message    
+--------------
+ row 30
+ same as main
+ main row 0
+(3 rows)
+
+-- an edit stops after its pick; changes made then are a commit of their own
+SELECT dolt_checkout('-b', 'b4', 'main~1') IS NOT NULL AS on_b4;
+ on_b4 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (40, 'x');
+SELECT dolt_commit('-am', 'row 40') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (41, 'x');
+SELECT dolt_commit('-am', 'row 41') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+UPDATE dolt_rebase SET action = 'edit' WHERE rebase_order = 1;
+SELECT (dolt_rebase('--continue'))[2] LIKE 'edit action paused at commit %' AS paused;
+ paused 
+--------
+ t
+(1 row)
+
+SELECT pk FROM rb.t ORDER BY pk;
+ pk 
+----
+  0
+ 40
+(2 rows)
+
+INSERT INTO rb.t VALUES (42, 'edited');
+SELECT dolt_rebase('--continue');
+                     dolt_rebase                      
+------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/b4"}
+(1 row)
+
+SELECT message FROM dolt_log ORDER BY commit_order DESC LIMIT 4;
+  message   
+------------
+ row 41
+ row 40
+ row 40
+ main row 0
+(4 rows)
+
+SELECT pk FROM rb.t ORDER BY pk;
+ pk 
+----
+  0
+ 40
+ 41
+ 42
+(4 rows)
+
+-- a conflict stops the rebase, in a transaction block; resolved, it goes on
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+UPDATE rb.t SET v = 'main' WHERE pk = 0;
+INSERT INTO rb.t VALUES (50, 'main');
+SELECT dolt_commit('-am', 'main row 50') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_checkout('-b', 'b5', 'main~1') IS NOT NULL AS on_b5;
+ on_b5 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (50, 'b5');
+SELECT dolt_commit('-am', 'b5 row 50') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (51, 'b5');
+SELECT dolt_commit('-am', 'b5 row 51') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- (outside a block a conflict rolls the whole rebase back, as Dolt aborts it)
+SELECT dolt_rebase('main');
+ERROR:  rebase conflict detected, transaction rolled back
+DETAIL:  1 row was changed differently on both sides.
+HINT:  Rebase in a transaction block to resolve the conflicts with dolt_conflicts_resolve() before committing, or set dolt.allow_commit_conflicts to keep them.
+SELECT active_branch();
+ active_branch 
+---------------
+ b5
+(1 row)
+
+BEGIN;
+SELECT r[1], r[2] LIKE 'data conflict detected while rebasing commit %' AS conflict
+	FROM dolt_rebase('main') r;
+ r | conflict 
+---+----------
+ 1 | t
+(1 row)
+
+SELECT active_branch();
+ active_branch  
+----------------
+ dolt_rebase_b5
+(1 row)
+
+SELECT dolt_rebase('--continue');
+ERROR:  conflicts detected in tables rb.t; resolve conflicts before continuing the rebase
+ROLLBACK;
+-- (stopped: another rebase, or a merge, refused; abort goes back)
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS stopped;
+ stopped 
+---------
+ 1
+(1 row)
+
+SELECT dolt_rebase('main');
+ERROR:  unable to start rebase while another rebase is in progress – abort the current rebase before proceeding
+ROLLBACK;
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS stopped;
+ stopped 
+---------
+ 1
+(1 row)
+
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+SELECT active_branch(), (SELECT count(*) FROM dolt_branches WHERE name = 'dolt_rebase_b5') AS left;
+ active_branch | left 
+---------------+------
+ b5            |    0
+(1 row)
+
+COMMIT;
+BEGIN;
+SELECT (dolt_rebase('main'))[1] AS stopped;
+ stopped 
+---------
+ 1
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'rb.t');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT dolt_rebase('--continue');
+                     dolt_rebase                      
+------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/b5"}
+(1 row)
+
+COMMIT;
+SELECT active_branch();
+ active_branch 
+---------------
+ b5
+(1 row)
+
+SELECT pk, v FROM rb.t WHERE pk >= 50 ORDER BY pk;
+ pk | v  
+----+----
+ 50 | b5
+ 51 | b5
+(2 rows)
+
+SELECT message, committer FROM dolt_log ORDER BY commit_order DESC LIMIT 3;
+   message   | committer 
+-------------+-----------
+ b5 row 51   | Rebaser
+ b5 row 50   | Rebaser
+ main row 50 | Rebaser
+(3 rows)
+
+-- the rebased branch moved meanwhile: refused at the end
+SELECT dolt_checkout('-b', 'b6', 'main~1') IS NOT NULL AS on_b6;
+ on_b6 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (60, 'x');
+SELECT dolt_commit('-am', 'row 60') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-f', 'b6', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_rebase('--continue');
+ERROR:  rebase aborted due to changes in branch b6
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+-- the working branch named already: refused
+SELECT dolt_checkout('-b', 'b7', 'main~1') IS NOT NULL AS on_b7;
+ on_b7 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (70, 'x');
+SELECT dolt_commit('-am', 'row 70') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('dolt_rebase_b7');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_rebase('main');
+ERROR:  fatal: A branch named 'dolt_rebase_b7' already exists.
+-- a rebase in progress outlives its session, and is the branch's
+\c regress_rebase
+SELECT dolt_checkout('b7') IS NOT NULL AS on_b7;
+ on_b7 
+-------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'dolt_rebase_b7');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+\c regress_rebase
+SELECT dolt_checkout('dolt_rebase_b7') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+SELECT action, commit_message FROM dolt_rebase;
+ action | commit_message 
+--------+----------------
+ pick   | row 70
+(1 row)
+
+SELECT dolt_rebase('--continue');
+                     dolt_rebase                      
+------------------------------------------------------
+ {0,"Successfully rebased and updated refs/heads/b7"}
+(1 row)
+
+\c postgres
+DROP DATABASE regress_rebase;

@@ -1,0 +1,200 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-empty-default",
+  "description": "Reviewed Dolt port: dolt_rebase: rebased commit becomes empty; --empty not specified",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase: rebased commit becomes empty; --empty not specified"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 0 on main",
+        "-a"
+      ],
+      "save": "m0"
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 0 on branch1",
+        "-a"
+      ],
+      "save": "b0"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (10)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 10 on branch1",
+        "-a"
+      ],
+      "save": "b10"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', 'main')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"interactive rebase started on branch dolt_rebase_branch1; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "dolt_rebase_branch1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Successfully rebased and updated refs/heads/branch1\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "inserting row 10 on branch1"
+          ],
+          [
+            "inserting row 0 on main"
+          ],
+          [
+            "creating table t"
+          ],
+          [
+            "Initialize data repository"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

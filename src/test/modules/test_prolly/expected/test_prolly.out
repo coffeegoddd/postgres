@@ -22,7 +22,7 @@ FROM prolly_implementations();
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
- refs          | copies       |       2 |              2
+ refs          | copies       |       2 |              3
  refs          | stub         |       0 |              0
  transfer      | chunks       |       1 |              1
  transfer      | stub         |       0 |              0
@@ -126,7 +126,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs          | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs          | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs          | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs          | stub           | complete                       | not implemented (61 of 61 callbacks missing)
+ refs          | stub           | complete                       | not implemented (63 of 63 callbacks missing)
  transfer      | chunks         | identity                       | pass
  transfer      | chunks         | receive_then_send              | no checks yet
  transfer      | chunks         | complete                       | pass

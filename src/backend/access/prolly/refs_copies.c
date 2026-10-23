@@ -51,6 +51,14 @@
  *				   length, hash each; the commit kept here too, so that
  *				   resolving a tag, or reading an old root's refs, reads
  *				   no tag object)
+ *	'E' name	-> the branch's rebase in progress: the branch rebased (a
+ *				   varint length, then the bytes), its head then and the
+ *				   commit replayed onto (hash length, hash each), a flags
+ *				   byte (1: keep commits that become empty), the order of
+ *				   the step last begun (a varint length, then the bytes; 0:
+ *				   none), the count of steps (a varint), then each step's
+ *				   order and action (varint length, bytes), commit (hash
+ *				   length, hash) and message (varint length, bytes)
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts, or write to a branch that has
@@ -165,13 +173,14 @@
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
 #define TAG_STASH		'Z'	/* a list of stashes, by name */
 #define TAG_TAG			'T'	/* a tag, by name */
+#define TAG_REBASE		'E'	/* a branch's rebase in progress */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
- * is refused, never read.  2: tags.
+ * is refused, never read.  2: tags; 3: rebases.
  */
-#define REFS_FORMAT		"2"
+#define REFS_FORMAT		"3"
 
 static bool ready = false;
 
@@ -226,6 +235,69 @@ declare_hashes(const char *p, const char *end, int n, StringInfo refs)
 			PROLLY_CALL(tree, value_reference, &h, 0, refs);
 	}
 	return p;
+}
+
+static ProllyHash *
+copy_hash_of(const ProllyHash *h)
+{
+	ProllyHash *c = palloc(sizeof(ProllyHash));
+
+	*c = *h;
+	return c;
+}
+
+/* A varint-length string at *p (palloc'd); NULL if it doesn't fit. */
+static char *
+get_short_text(const char **p, const char *end)
+{
+	uint64		len = prolly_get_varint(p, end);
+	char	   *s;
+
+	if (len > (uint64) (end - *p))
+		return NULL;
+	s = pnstrdup(*p, len);
+	*p += len;
+	return s;
+}
+
+/*
+ * A rebase state's entry, read; false if it is malformed (its hashes are
+ * still read as get_hash() reads them, which errors on a bad one).
+ */
+static bool
+rebase_decode(const char *p, const char *end, ProllyRebaseState *state)
+{
+	uint64		n;
+
+	memset(state, 0, sizeof(*state));
+	if ((state->branch = get_short_text(&p, end)) == NULL)
+		return false;
+	p = get_hash(p, end, &state->head);
+	p = get_hash(p, end, &state->onto);
+	if (p >= end)
+		return false;
+	state->keep_empty = (*p++ & 1) != 0;
+	if ((state->last_step = get_short_text(&p, end)) == NULL)
+		return false;
+	if (state->last_step[0] == '\0')
+		state->last_step = NULL;
+	n = prolly_get_varint(&p, end);
+	if (n > (uint64) (end - p))
+		return false;
+	state->steps = palloc0(sizeof(ProllyRebaseStep) * Max(n, 1));
+	for (uint64 i = 0; i < n; i++)
+	{
+		ProllyRebaseStep *s = &state->steps[i];
+
+		if ((s->order = get_short_text(&p, end)) == NULL ||
+			(s->action = get_short_text(&p, end)) == NULL)
+			return false;
+		p = get_hash(p, end, &s->commit);
+		if ((s->message = get_short_text(&p, end)) == NULL)
+			return false;
+		state->nsteps++;
+	}
+	return true;
 }
 
 /*
@@ -292,6 +364,18 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 					n = get_be32(p);
 					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
 				}
+			}
+			break;
+		case TAG_REBASE:
+			{
+				ProllyRebaseState rs;
+
+				if (!rebase_decode(p, end, &rs))
+					break;
+				PROLLY_CALL(tree, value_reference, &rs.head, 0, refs);
+				PROLLY_CALL(tree, value_reference, &rs.onto, 0, refs);
+				for (int i = 0; i < rs.nsteps; i++)
+					PROLLY_CALL(tree, value_reference, &rs.steps[i].commit, 0, refs);
 			}
 			break;
 		case TAG_STASH:
@@ -2521,6 +2605,10 @@ copies_branch_delete(const char *name, bool force)
 		resetStringInfo(&key);
 		names_key(&key, name);
 		refs_put(key.data, key.len, NULL);
+		resetStringInfo(&key);
+		appendStringInfoChar(&key, TAG_REBASE);
+		appendStringInfoString(&key, name);
+		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
 }
@@ -2535,7 +2623,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES};
+	TAG_NAMES, TAG_REBASE};
 	ListCell   *lc;
 
 	lock_refs();
@@ -4212,6 +4300,20 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		const char *end = p + v.len;
 		ProllyHash *h;
 
+		/* (a rebase: the head it began at, its onto, its steps' commits) */
+		if (k.len >= 1 && k.data[0] == TAG_REBASE)
+		{
+			ProllyRebaseState rs;
+
+			if (rebase_decode(p, end, &rs))
+			{
+				heads = lappend(heads, copy_hash_of(&rs.head));
+				heads = lappend(heads, copy_hash_of(&rs.onto));
+				for (int i = 0; i < rs.nsteps; i++)
+					heads = lappend(heads, copy_hash_of(&rs.steps[i].commit));
+			}
+			continue;
+		}
 		/* (a stash list: each one's commit, kept as a head is) */
 		if (k.len >= 1 && k.data[0] == TAG_STASH)
 		{
@@ -4660,6 +4762,79 @@ copies_tags(ProllyTagVisit visit, void *arg)
 }
 
 /* ------------------------------------------------------------------------
+ * Rebases: TAG_REBASE and the branch rebasing on -> its rebase state.
+ * ------------------------------------------------------------------------
+ */
+
+static void
+rebase_key(StringInfo key, const char *branch)
+{
+	appendStringInfoChar(key, TAG_REBASE);
+	appendStringInfoString(key, branch);
+}
+
+static void
+put_short_text(StringInfo out, const char *s)
+{
+	prolly_put_varint(out, strlen(s));
+	appendStringInfoString(out, s);
+}
+
+static bool
+copies_rebase_state(ProllyRebaseState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	rebase_key(&key, branch_ops()->current());
+	found = refs_get(key.data, key.len, &v);
+	if (found && !rebase_decode(v.data, v.data + v.len, state))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupt prolly rebase state")));
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+static void
+copies_set_rebase_state(const ProllyRebaseState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	rebase_key(&key, branch_ops()->current());
+	if (state)
+	{
+		put_short_text(&v, state->branch);
+		put_hash(&v, &state->head);
+		put_hash(&v, &state->onto);
+		appendStringInfoChar(&v, state->keep_empty ? 1 : 0);
+		put_short_text(&v, state->last_step ? state->last_step : "");
+		prolly_put_varint(&v, state->nsteps);
+		for (int i = 0; i < state->nsteps; i++)
+		{
+			const ProllyRebaseStep *s = &state->steps[i];
+
+			put_short_text(&v, s->order);
+			put_short_text(&v, s->action);
+			put_hash(&v, &s->commit);
+			put_short_text(&v, s->message);
+		}
+	}
+	refs_put(key.data, key.len, state ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* ------------------------------------------------------------------------
  * Stashes: TAG_STASH and a list's name, its entries newest first, each its
  * commit's hash, then its branch's name (a varint length, then the bytes).
  * ------------------------------------------------------------------------
@@ -4834,7 +5009,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
 		.impl_id = 2,
-		.format_version = 2,
+		.format_version = 3,
 		.name = "copies",
 		.description = "head commits of branches made by copying, and the "
 		"commits, in the chunk store",
@@ -4900,4 +5075,6 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_lookup = copies_tag_lookup,
 	.tag_set = copies_tag_set,
 	.tags = copies_tags,
+	.rebase_state = copies_rebase_state,
+	.set_rebase_state = copies_set_rebase_state,
 };

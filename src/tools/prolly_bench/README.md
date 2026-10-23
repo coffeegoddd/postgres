@@ -783,8 +783,9 @@ Capabilities are `sql` and the version-control groups in
 reset, log, status, hashof, connecting to a branch), `vc.merge`,
 `vc.conflicts`, `vc.violations`, `vc.cherrypick`, `vc.revert`,
 `vc.diff`, `vc.mergebase`, `vc.gc`, `vc.reflog`, `vc.remotes` (adding,
-listing and removing remotes), `vc.stash` and `vc.tags` (making, listing
-and deleting tags, and reading them as revisions). A scenario requires exactly what
+listing and removing remotes), `vc.stash`, `vc.tags` (making, listing
+and deleting tags, and reading them as revisions) and `vc.rebase` (dolt_rebase
+and its plan). A scenario requires exactly what
 its steps need, no more.
 
 SQL steps are `exec` (no result columns) or `query` (explicit expected rows).
@@ -858,7 +859,7 @@ database. It verifies the actual AM (and prolly's table/index/TOAST block-map
 forks); for any version-control capability, it runs the built-in history scenario, including
 branch isolation and restoration, and for any beyond `vc.core` a second
 one (`cases/vc-probe.json`) that finds a merge base, merges, diffs (rows, a summary, statements, a stat, a table's history and rows at a commit), picks, reverts, and reads a
-conflict and a constraint violation, reads the reflog, collects garbage, adds and removes a remote, pushes and pops a stash, and makes, reads and deletes a tag, each checked by its effect: a claimed
+conflict and a constraint violation, reads the reflog, collects garbage, adds and removes a remote, pushes and pops a stash, makes, reads and deletes a tag, and rebases a branch, each checked by its effect: a claimed
 capability that doesn't work fails targeting, not the case. Case fixtures therefore start with fresh
 history. The adapter also checks public tables' AMs after steps, deferring
 that check until rollback if a SQL error aborted the transaction. Scenario

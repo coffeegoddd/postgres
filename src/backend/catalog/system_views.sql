@@ -1606,6 +1606,16 @@ CREATE VIEW dolt_stashes AS
 CREATE VIEW dolt_tags AS
     SELECT * FROM dolt_tags();
 
+-- The rebase plan in progress, edited as Dolt's dolt_rebase table is.
+CREATE VIEW dolt_rebase AS
+    SELECT rebase_order::numeric(6,2) AS rebase_order, action, commit_hash,
+           commit_message
+    FROM dolt_rebase_plan();
+CREATE TRIGGER dolt_rebase_plan_change
+    INSTEAD OF INSERT OR UPDATE OR DELETE ON dolt_rebase
+    FOR EACH ROW EXECUTE FUNCTION dolt_rebase_plan_change();
+GRANT INSERT, UPDATE, DELETE ON dolt_rebase TO PUBLIC;
+
 CREATE VIEW dolt_remote_branches AS
     SELECT * FROM dolt_remote_branches();
 

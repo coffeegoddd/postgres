@@ -123,6 +123,32 @@ typedef struct ProllyTagInfo
 	char	   *message;		/* palloc'd */
 } ProllyTagInfo;
 
+/*
+ * A rebase in progress, as Dolt's: the branch being rebased (its head when
+ * the rebase began), the commit its commits are replayed onto, and the plan,
+ * steps in rebase order, each an action on one of the branch's commits.
+ * The session works on a branch of its own while it rebases; the state is
+ * that branch's.
+ */
+typedef struct ProllyRebaseStep
+{
+	char	   *order;			/* a numeric(6,2), as text (palloc'd) */
+	char	   *action;			/* pick, reword, squash, fixup, drop, edit */
+	ProllyHash	commit;
+	char	   *message;		/* (palloc'd) */
+} ProllyRebaseStep;
+
+typedef struct ProllyRebaseState
+{
+	char	   *branch;			/* the branch rebased (palloc'd) */
+	ProllyHash	head;			/* its head as the rebase began */
+	ProllyHash	onto;
+	bool		keep_empty;		/* keep a commit that becomes empty */
+	char	   *last_step;		/* the order of the step last begun, or NULL */
+	int			nsteps;
+	ProllyRebaseStep *steps;	/* (palloc'd) */
+} ProllyRebaseState;
+
 /* Visits a tag: its name, its tag object and that tag's commit. */
 typedef void (*ProllyTagVisit) (const char *name, const ProllyHash *tag,
 								const ProllyHash *commit, void *arg);
@@ -512,6 +538,15 @@ typedef struct ProllyRefsRoutine
 	bool		(*tag_set) (const char *name, const ProllyHash *expected,
 							const ProllyHash *tag);
 	void		(*tags) (ProllyTagVisit visit, void *arg);
+
+	/*
+	 * Optional, together: the session branch's rebase in progress (false:
+	 * none), and setting it (NULL: none), with the transaction.  It goes
+	 * with its branch when the branch is deleted, and is renamed with it.
+	 * The walk keeps the commits it names.
+	 */
+	bool		(*rebase_state) (ProllyRebaseState *state);
+	void		(*set_rebase_state) (const ProllyRebaseState *state);
 } ProllyRefsRoutine;
 
 /*
@@ -536,9 +571,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
 	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
-	"tag_write", "tag_get", "tag_lookup", "tag_set", "tags"
+	"tag_write", "tag_get", "tag_lookup", "tag_set", "tags", \
+	"rebase_state", "set_rebase_state"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK tags
+#define PROLLY_REFS_LAST_CALLBACK set_rebase_state
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

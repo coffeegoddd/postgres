@@ -51,6 +51,7 @@
 #include "catalog/versioned.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -3818,6 +3819,715 @@ all_log_entries(void)
 
 	PROLLY_CALL(refs(), branches, note_head, &starts);
 	return log_walk(starts);
+}
+
+/* ----------------------------------------------------------------
+ * Rebases
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * The branch a session rebases on, as Dolt's: a branch of its own, made at
+ * the commit replayed onto, which becomes the rebased branch's head once
+ * every step is done.  (Git rebases on a detached HEAD; Dolt has none.)
+ */
+#define REBASE_BRANCH_PREFIX "dolt_rebase_"
+
+/* numeric(6,2)'s typmod: a rebase order's */
+#define REBASE_ORDER_TYPMOD (((6 << 16) | 2) + VARHDRSZ)
+
+static const char *const rebase_actions[] = {
+	"pick", "reword", "squash", "fixup", "drop", "edit"
+};
+
+/* The refs, if they keep rebases: else an error. */
+static const ProllyRefsRoutine *
+rebase_refs(void)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	if (!PROLLY_HAS(r, rebase_state))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" can't rebase", r->info.name)));
+	return r;
+}
+
+/* A rebase order, as numeric(6,2) gives it ("1.00"): an error if it isn't one. */
+static char *
+rebase_order_text(Datum order)
+{
+	Datum		fitted = DirectFunctionCall2(numeric, order,
+											 Int32GetDatum(REBASE_ORDER_TYPMOD));
+
+	return DatumGetCString(DirectFunctionCall1(numeric_out, fitted));
+}
+
+static Datum
+rebase_order_datum(const char *order)
+{
+	return DirectFunctionCall3(numeric_in, CStringGetDatum(order),
+							   ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(REBASE_ORDER_TYPMOD));
+}
+
+static int
+rebase_order_cmp(const char *a, const char *b)
+{
+	return DatumGetInt32(DirectFunctionCall2(numeric_cmp, rebase_order_datum(a),
+											 rebase_order_datum(b)));
+}
+
+static int
+rebase_step_cmp(const void *a, const void *b)
+{
+	return rebase_order_cmp(((const ProllyRebaseStep *) a)->order,
+							((const ProllyRebaseStep *) b)->order);
+}
+
+static void
+check_rebase_action(const char *action)
+{
+	for (int i = 0; i < lengthof(rebase_actions); i++)
+		if (strcmp(action, rebase_actions[i]) == 0)
+			return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+			 errmsg("invalid rebase action \"%s\"", action),
+			 errhint("An action is pick, reword, squash, fixup, drop or edit.")));
+}
+
+static void
+no_rebase(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("no rebase in progress")));
+}
+
+/* Does the session branch's working set differ from its head's? */
+static bool
+working_set_dirty(void)
+{
+	ProllyNodeRef working;
+	ProllyNodeRef head_root;
+	ProllyHash	head;
+
+	if (!PROLLY_CALL(refs(), working_set, NULL, &working))
+		return false;
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
+		return true;
+	return !PROLLY_CALL(refs(), commit_working_set, &head, &head_root) ||
+		!same_hash(&working.hash, &head_root.hash);
+}
+
+/*
+ * The plan Dolt's makes: every commit head reaches that onto doesn't, but
+ * merge commits, oldest first, each picked, ordered 1, 2, ...
+ */
+static void
+default_rebase_plan(const ProllyHash *head, const ProllyHash *onto,
+					ProllyRebaseState *rs)
+{
+	List	   *theirs = log_walk(list_make1((void *) onto));
+	List	   *ours = log_walk(list_make1((void *) head));
+	HASHCTL		ctl = {0};
+	HTAB	   *reached;
+	ListCell   *lc;
+	List	   *picked = NIL;
+	int			n = 0;
+
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	reached = hash_create("dolt_rebase upstream", 256, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	foreach(lc, theirs)
+		(void) hash_search(reached, &((LogEntry *) lfirst(lc))->key, HASH_ENTER, NULL);
+	foreach(lc, ours)
+	{
+		LogEntry   *e = lfirst(lc);
+
+		if (e->info.nparents == 1 &&
+			hash_search(reached, &e->key, HASH_FIND, NULL) == NULL)
+			picked = lcons(e, picked);	/* (oldest first) */
+	}
+	rs->nsteps = list_length(picked);
+	rs->steps = palloc0(sizeof(ProllyRebaseStep) * Max(rs->nsteps, 1));
+	foreach(lc, picked)
+	{
+		LogEntry   *e = lfirst(lc);
+		ProllyRebaseStep *s = &rs->steps[n++];
+
+		s->order = rebase_order_text(DirectFunctionCall1(int4_numeric,
+														 Int32GetDatum(n)));
+		s->action = "pick";
+		s->commit = e->info.id;
+		s->message = e->info.message;
+	}
+}
+
+/*
+ * Start rebasing the session's branch onto upstream: refused over
+ * uncommitted changes, a merge, pick or revert in progress, or another
+ * rebase, as Dolt's.  The session is left on the rebase's own branch.
+ */
+static void
+rebase_start(const char *upstream, bool keep_empty)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+	char	   *branch = pstrdup(branch_ops()->current());
+	char	   *working = psprintf("%s%s", REBASE_BRANCH_PREFIX, branch);
+	ProllyRebaseState rs = {0};
+	ProllyMergeState ms;
+
+	if (PROLLY_CALL(r, rebase_state, &rs))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to start rebase while another rebase is in progress – abort the current rebase before proceeding")));
+	if (PROLLY_CALL(r, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to start rebase while a merge is in progress – abort the current merge before proceeding")));
+	/* (a branch with no commits has none to rebase: said below) */
+	if (PROLLY_CALL(r, resolve, "HEAD", &rs.head) && working_set_dirty())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot start a rebase with uncommitted changes")));
+	if (!PROLLY_CALL(r, resolve, upstream, &rs.onto))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch not found: %s", upstream)));
+	if (!PROLLY_CALL(r, resolve, "HEAD", &rs.head))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("didn't identify any commits!")));
+	default_rebase_plan(&rs.head, &rs.onto, &rs);
+	if (rs.nsteps == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("didn't identify any commits!")));
+	if (PROLLY_CALL(r, branch_lookup, working, &(ProllyBranchId) {0}))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("fatal: A branch named '%s' already exists.", working)));
+	rs.branch = branch;
+	rs.keep_empty = keep_empty;
+	create_branch(working, hash_hex(&rs.onto));
+	checkout_branch(working);
+	PROLLY_CALL(r, set_rebase_state, &rs);
+}
+
+/*
+ * Make the head commit just made (picked onto prev) one with prev's parent
+ * instead, its working set, message and author: a squash or fixup into
+ * prev, as Dolt's amend.  Or, with parent prev itself, a reword.
+ */
+static void
+rebase_amend(const ProllyHash *parent, const char *message, const char *author)
+{
+	ProllyHash	head;
+	ProllyHash	id;
+	ProllyNodeRef ws;
+
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+		!PROLLY_CALL(refs(), commit_working_set, &head, &ws))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the rebased commit's working set is missing")));
+	/* (the head the new commit's parent, as a commit on it is made) */
+	if (parent->len > 0)
+		PROLLY_CALL(refs(), set_head, parent);
+	author_override = author;
+	PG_TRY();
+	{
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), commit_with, message, parent,
+										 parent->len > 0 ? 1 : 0, &ws, &id));
+	}
+	PG_FINALLY();
+	{
+		author_override = NULL;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * The head commit a step's pick just made (on prev, the head before it):
+ * dropped if it changed nothing that its commit did change (unless kept),
+ * else reworded, or squashed or fixed up into prev, as the step's action
+ * says.
+ */
+static void
+rebase_after_pick(const ProllyRebaseState *rs, const ProllyRebaseStep *s,
+				  const ProllyHash *prev)
+{
+	ProllyHash	head;
+	ProllyCommitInfo made;
+	ProllyCommitInfo before;
+	ProllyCommitInfo orig;
+	ProllyCommitInfo orig_parent;
+
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+		!PROLLY_CALL(refs(), commit_get, &head, &made) ||
+		!PROLLY_CALL(refs(), commit_get, prev, &before) ||
+		!PROLLY_CALL(refs(), commit_get, &s->commit, &orig))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a commit of the rebase is missing")));
+
+	/*
+	 * A commit that becomes empty, its changes there already: dropped
+	 * unless --empty=keep.  One empty from the start is kept, as Dolt's.
+	 */
+	if (same_hash(&made.root.hash, &before.root.hash) && !rs->keep_empty &&
+		!(orig.nparents == 1 &&
+		  PROLLY_CALL(refs(), commit_get, &orig.parents[0], &orig_parent) &&
+		  same_hash(&orig.root.hash, &orig_parent.root.hash)))
+	{
+		PROLLY_CALL(refs(), set_head, prev);
+		return;
+	}
+	if (strcmp(s->action, "reword") == 0)
+		rebase_amend(prev, s->message, orig.author);
+	else if (strcmp(s->action, "squash") == 0)
+		rebase_amend(before.nparents > 0 ? &before.parents[0] : &(ProllyHash) {0},
+					 psprintf("%s\n\n%s", before.message, orig.message),
+					 before.author);
+	else if (strcmp(s->action, "fixup") == 0)
+		rebase_amend(before.nparents > 0 ? &before.parents[0] : &(ProllyHash) {0},
+					 before.message, before.author);
+}
+
+/*
+ * Commit the working set of a step stopped at (its conflicts resolved, or
+ * an edit's changes): a commit on the head, with the step's message, then
+ * reworded, squashed or fixed up as a pick would be.
+ */
+static void
+rebase_commit_stopped(const ProllyRebaseState *rs, const ProllyRebaseStep *s)
+{
+	ProllyHash	prev;
+	ProllyHash	id;
+	ProllyMergeState ms;
+	ProllyCommitInfo orig;
+	bool		picking = PROLLY_CALL(refs(), merge_state, &ms);
+
+	if (!PROLLY_CALL(refs(), commit_get, &s->commit, &orig))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("rebased commit %s is missing", hash_hex(&s->commit))));
+	/* (a pick stopped by conflicts: the head before it is the pick's base) */
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &prev))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the rebase branch has no head")));
+	note_integration();
+	author_override = picking ? orig.author : NULL;
+	PG_TRY();
+	{
+		BRANCH_WRITES_HUSHED((void) PROLLY_CALL(refs(), commit,
+												picking ? orig.message : s->message,
+												true, &id));
+	}
+	PG_FINALLY();
+	{
+		author_override = NULL;
+	}
+	PG_END_TRY();
+	/* (an edit's changes are a commit of their own, with its message) */
+	if (picking)
+		rebase_after_pick(rs, s, &prev);
+	settled();
+}
+
+/*
+ * Go on with the plan from the step after the last begun: each picked
+ * onto the rebase's branch and made what its action says.  A step that
+ * conflicts, or an edit, stops it (result: the status and why); the last
+ * done, the rebased branch is moved to the rebase's head, checked out, and
+ * the rebase's branch deleted.
+ */
+static void
+rebase_continue(const char **result)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+	ProllyRebaseState rs;
+	ProllyMergeState ms;
+	char	   *working;
+	bool		seen_pick = false;
+	ProllyHash	head;
+
+	if (!PROLLY_CALL(r, rebase_state, &rs))
+		no_rebase();
+	working = pstrdup(branch_ops()->current());
+
+	/* (Dolt validates the plan as each --continue loads it) */
+	qsort(rs.steps, rs.nsteps, sizeof(ProllyRebaseStep), rebase_step_cmp);
+	for (int i = 0; i < rs.nsteps; i++)
+	{
+		ProllyRebaseStep *s = &rs.steps[i];
+		ProllyCommitInfo info;
+
+		check_rebase_action(s->action);
+		if (strcmp(s->action, "pick") == 0 || strcmp(s->action, "reword") == 0)
+			seen_pick = true;
+		else if ((strcmp(s->action, "squash") == 0 ||
+				  strcmp(s->action, "fixup") == 0) && !seen_pick)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid rebase plan: squash and fixup actions must appear after a pick or reword action")));
+		if (!PROLLY_CALL(r, commit_get, &s->commit, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("unable to resolve commit hash %s: target commit not found", hash_hex(&s->commit))));
+	}
+
+	if (PROLLY_CALL(r, merge_state, &ms))
+	{
+		int			ctables;
+		int			vtables;
+
+		tables_left(&ctables, &vtables);
+		if (ctables > 0 || vtables > 0)
+		{
+			StringInfoData names;
+
+			initStringInfo(&names);
+			for (int i = 0; i < ms.ntables; i++)
+			{
+				char	   *n = ms.table_names && ms.table_names[i] ?
+					ms.table_names[i] : get_rel_name(ms.tables[i]);
+
+				appendStringInfo(&names, "%s%s", i ? ", " : "", n ? n : "?");
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("conflicts detected in tables %s; resolve conflicts before continuing the rebase",
+							names.data)));
+		}
+	}
+	PreventCommandIfReadOnly("dolt_rebase()");
+
+	/* a step stopped at: its resolution, or an edit's changes, committed */
+	if (rs.last_step != NULL &&
+		(PROLLY_CALL(r, merge_state, &ms) || working_set_dirty()))
+	{
+		for (int i = 0; i < rs.nsteps; i++)
+			if (rebase_order_cmp(rs.steps[i].order, rs.last_step) == 0)
+				rebase_commit_stopped(&rs, &rs.steps[i]);
+	}
+	else if (rs.last_step == NULL && working_set_dirty())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot start a rebase with uncommitted changes")));
+
+	for (int i = 0; i < rs.nsteps; i++)
+	{
+		ProllyRebaseStep *s = &rs.steps[i];
+		ProllyHash	prev;
+		ProllyHash	id;
+		const char *ref = hash_hex(&s->commit);
+		int			conflicts;
+
+		CHECK_FOR_INTERRUPTS();
+		if (rs.last_step != NULL && rebase_order_cmp(s->order, rs.last_step) <= 0)
+			continue;
+		rs.last_step = s->order;
+		PROLLY_CALL(r, set_rebase_state, &rs);
+		if (strcmp(s->action, "drop") == 0)
+			continue;
+		if (!PROLLY_CALL(r, resolve, "HEAD", &prev))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the rebase branch has no head")));
+		note_integration();
+		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
+													 &ref, 1, true, &id));
+		if (conflicts > 0)
+		{
+			int			nviolations = list_length(PROLLY_CALL(r, violations));
+
+			stopped_outside_block("rebase", "Rebase", "sides",
+								  conflicts - nviolations, nviolations);
+			result[0] = "1";
+			result[1] = psprintf("data conflict detected while rebasing commit %s (%s). \n\n"
+								 "Resolve the conflicts and remove them from the dolt_conflicts table, "
+								 "then continue the rebase by calling dolt_rebase('--continue')",
+								 ref, s->message);
+			return;
+		}
+		rebase_after_pick(&rs, s, &prev);
+		settled();
+		if (strcmp(s->action, "edit") == 0)
+		{
+			result[0] = "0";
+			result[1] = psprintf("edit action paused at commit %s (%s). \n\n"
+								 "You can now modify the working directory and stage changes. "
+								 "When ready, continue the rebase by calling dolt_rebase('--continue')",
+								 ref, s->message);
+			return;
+		}
+	}
+
+	/* every step done: the rebased branch, if it hasn't moved, moved here */
+	if (!PROLLY_CALL(r, resolve, rs.branch, &head) || !same_hash(&head, &rs.head))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("rebase aborted due to changes in branch %s", rs.branch)));
+	force_branch(rs.branch, working);
+	checkout_branch(rs.branch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
+	settled();
+	result[0] = "0";
+	result[1] = psprintf("Successfully rebased and updated refs/heads/%s", rs.branch);
+}
+
+/* Abort the rebase: back on the branch rebased, as it was; its branch gone. */
+static void
+rebase_abort(void)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+	ProllyRebaseState rs;
+	char	   *working;
+
+	if (!PROLLY_CALL(r, rebase_state, &rs))
+		no_rebase();
+	PreventCommandIfReadOnly("dolt_rebase()");
+	working = pstrdup(branch_ops()->current());
+	checkout_branch(rs.branch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
+	settled();
+}
+
+/*
+ * dolt_rebase(VARIADIC args text[]) returns text[]: {status, message}
+ *
+ * [-i/--interactive] [--empty=drop|keep] upstream: the session branch's
+ * commits that upstream doesn't reach (but merges), replayed onto it, as
+ * Dolt's; interactively, the plan is left in the dolt_rebase view to edit
+ * (actions pick, reword, squash, fixup, drop, edit, reordered by
+ * rebase_order) until --continue runs it.  A step whose pick conflicts
+ * stops the rebase, as a pick in progress: resolved, --continue commits it
+ * and goes on.  An edit stops after its pick: changes made then are
+ * committed by --continue.  --abort goes back to the branch as it was.
+ * The rebase works on a branch of its own, dolt_rebase_<branch>, which is
+ * deleted when it ends.
+ */
+Datum
+dolt_rebase(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		options = true;	/* until "--" */
+	bool		interactive = false;
+	bool		abort_rebase = false;
+	bool		continue_rebase = false;
+	bool		keep_empty = false;
+	char	   *upstream = NULL;
+	int			npositional = 0;
+	const char *result[2] = {"0", ""};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (options && strcmp(a, "--") == 0)
+			options = false;
+		else if (!options || a[0] != '-')
+		{
+			if (npositional++ == 0)
+				upstream = a;
+		}
+		else if (is_option(a, "i") || is_option(a, "interactive"))
+			interactive = true;
+		else if (is_option(a, "abort"))
+			abort_rebase = true;
+		else if (is_option(a, "continue"))
+			continue_rebase = true;
+		else if (strncmp(a, "--empty=", 8) == 0 || is_option(a, "empty"))
+		{
+			const char *v = strncmp(a, "--empty=", 8) == 0 ? a + 8 :
+				option_value(args, nargs, &i, "dolt_rebase");
+
+			if (pg_strcasecmp(v, "keep") == 0)
+				keep_empty = true;
+			else if (pg_strcasecmp(v, "drop") == 0)
+				keep_empty = false;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unsupported option for the empty flag (%s); only 'keep' or 'drop' are allowed",
+								v)));
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("error: unknown option `%s'", a + (a[1] == '-' ? 2 : 1))));
+	}
+	if (abort_rebase)
+	{
+		rebase_abort();
+		result[1] = "Interactive rebase aborted";
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	if (continue_rebase)
+	{
+		rebase_continue(result);
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	if (npositional == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("not enough args")));
+	if (npositional > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("rebase takes at most one positional argument.")));
+	PreventCommandIfReadOnly("dolt_rebase()");
+	rebase_start(upstream, keep_empty);
+	if (!interactive)
+	{
+		rebase_continue(result);
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	result[1] = psprintf("interactive rebase started on branch %s; "
+						 "adjust the rebase plan in the dolt_rebase table, then "
+						 "continue rebasing by calling dolt_rebase('--continue')",
+						 branch_ops()->current());
+	PG_RETURN_DATUM(text_array(2, result));
+}
+
+/*
+ * dolt_rebase_plan(OUT rebase_order numeric, OUT action text,
+ *					OUT commit_hash text, OUT commit_message text)
+ *					returns setof record
+ *
+ * The session branch's rebase plan, in rebase order, behind the dolt_rebase
+ * view; an error when no rebase is in progress, as Dolt's dolt_rebase table
+ * is there only during one.
+ */
+Datum
+dolt_rebase_plan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyRebaseState rs;
+
+	if (!PROLLY_HAS(refs(), rebase_state) || !PROLLY_CALL(refs(), rebase_state, &rs))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table not found: dolt_rebase"),
+				 errdetail("No rebase is in progress.")));
+	InitMaterializedSRF(fcinfo, 0);
+	qsort(rs.steps, rs.nsteps, sizeof(ProllyRebaseStep), rebase_step_cmp);
+	for (int i = 0; i < rs.nsteps; i++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+
+		values[0] = rebase_order_datum(rs.steps[i].order);
+		values[1] = CStringGetTextDatum(rs.steps[i].action);
+		values[2] = CStringGetTextDatum(hash_hex(&rs.steps[i].commit));
+		values[3] = CStringGetTextDatum(rs.steps[i].message);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* A row given to the dolt_rebase view, as a step. */
+static void
+rebase_step_of(HeapTuple tuple, TupleDesc desc, ProllyRebaseStep *s)
+{
+	bool		isnull[4];
+	Datum		v[4];
+
+	for (int i = 0; i < 4; i++)
+	{
+		v[i] = heap_getattr(tuple, i + 1, desc, &isnull[i]);
+		if (isnull[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NOT_NULL_VIOLATION),
+					 errmsg("a dolt_rebase step's %s can't be null",
+							NameStr(TupleDescAttr(desc, i)->attname))));
+	}
+	s->order = rebase_order_text(v[0]);
+	s->action = TextDatumGetCString(v[1]);
+	check_rebase_action(s->action);
+	if (!prolly_hash_from_hex(TextDatumGetCString(v[2]),
+							  strlen(TextDatumGetCString(v[2])), &s->commit))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid commit hash: %s", TextDatumGetCString(v[2]))));
+	s->message = TextDatumGetCString(v[3]);
+}
+
+/*
+ * dolt_rebase_plan_change() returns trigger
+ *
+ * The dolt_rebase view's INSTEAD OF trigger, row by row: an insert adds a
+ * step, an update changes the step of the old row's rebase order, a delete
+ * removes it, in the session branch's rebase state, with the transaction.
+ * Rebase orders are unique, as the plan's key.
+ */
+Datum
+dolt_rebase_plan_change(PG_FUNCTION_ARGS)
+{
+	TriggerData *td = (TriggerData *) fcinfo->context;
+	TupleDesc	desc;
+	ProllyRebaseState rs;
+	ProllyRebaseStep oldstep;
+	ProllyRebaseStep newstep;
+	bool		has_old;
+	bool		has_new;
+	int			at = -1;
+	HeapTuple	ret;
+
+	if (!CALLED_AS_TRIGGER(fcinfo) || !TRIGGER_FIRED_INSTEAD(td->tg_event) ||
+		!TRIGGER_FIRED_FOR_ROW(td->tg_event))
+		elog(ERROR, "dolt_rebase_plan_change: not called as an INSTEAD OF row trigger");
+	desc = RelationGetDescr(td->tg_relation);
+	if (desc->natts != 4)
+		elog(ERROR, "dolt_rebase_plan_change: the view has %d columns, not 4", desc->natts);
+	if (!PROLLY_HAS(refs(), rebase_state) || !PROLLY_CALL(refs(), rebase_state, &rs))
+		no_rebase();
+	PreventCommandIfReadOnly("dolt_rebase");
+	has_old = !TRIGGER_FIRED_BY_INSERT(td->tg_event);
+	has_new = !TRIGGER_FIRED_BY_DELETE(td->tg_event);
+	if (has_old)
+	{
+		rebase_step_of(td->tg_trigtuple, desc, &oldstep);
+		for (int i = 0; i < rs.nsteps; i++)
+			if (rebase_order_cmp(rs.steps[i].order, oldstep.order) == 0)
+				at = i;
+		if (at < 0)
+			PG_RETURN_POINTER(NULL);	/* (gone already: nothing done) */
+	}
+	if (has_new)
+	{
+		rebase_step_of(TRIGGER_FIRED_BY_UPDATE(td->tg_event) ?
+					   td->tg_newtuple : td->tg_trigtuple, desc, &newstep);
+		for (int i = 0; i < rs.nsteps; i++)
+			if (i != at && rebase_order_cmp(rs.steps[i].order, newstep.order) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("duplicate rebase_order %s in the rebase plan", newstep.order)));
+	}
+	if (has_old && has_new)
+		rs.steps[at] = newstep;
+	else if (has_new)
+	{
+		rs.steps = repalloc(rs.steps, sizeof(ProllyRebaseStep) * (rs.nsteps + 1));
+		rs.steps[rs.nsteps++] = newstep;
+	}
+	else
+	{
+		memmove(&rs.steps[at], &rs.steps[at + 1],
+				sizeof(ProllyRebaseStep) * (rs.nsteps - at - 1));
+		rs.nsteps--;
+	}
+	qsort(rs.steps, rs.nsteps, sizeof(ProllyRebaseStep), rebase_step_cmp);
+	PROLLY_CALL(refs(), set_rebase_state, &rs);
+	ret = TRIGGER_FIRED_BY_UPDATE(td->tg_event) ? td->tg_newtuple : td->tg_trigtuple;
+	PG_RETURN_POINTER(ret);
 }
 
 /*

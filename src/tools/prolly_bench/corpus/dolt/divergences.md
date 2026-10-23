@@ -163,7 +163,11 @@ adapts.
   commits. `WORKING` in `dolt_status` and
   `dolt_diff` is the branch's working set as the current transaction
   sees it, its own uncommitted writes included, as a Dolt session's
-  working root includes its own (#501).
+  working root includes its own (#501). A rebase whose step conflicts
+  stops there, in a transaction block (or with
+  `dolt.allow_commit_conflicts`), returning `{1, message}` rather than
+  Dolt's error, which here would roll the stop back; outside a block it
+  is an error that rolls the whole rebase back, as Dolt aborts it.
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is

@@ -325,6 +325,19 @@ arguments and results, so scripts written for Doltgres run here.  A tag
 (dolt_tag, the dolt_tags view) is a revision wherever one is read, after a
 branch of its name; checking one out, as checking out a commit's hash, is a
 read-only detached session at its commit.
+
+dolt_rebase replays a branch's commits onto another, as Dolt's: on a
+branch of its own, dolt_rebase_<branch>, made at the commit replayed onto,
+whose rebase state (the plan, the branch rebased and its head then) the
+refs keep with that branch.  Each step is a cherry-pick; a reword, squash
+or fixup then replaces the pick's commit with one of its working set, and
+a commit that became empty is dropped (unless --empty=keep).  The plan is
+edited through the dolt_rebase view, whose INSTEAD OF trigger changes the
+state.  A step that conflicts stops the rebase as a pick in progress
+(outside a transaction block, an error that rolls the whole rebase back),
+and --continue commits its resolution; the last step done, the rebased
+branch is moved to the rebase's head (refused if it moved meanwhile), and
+the rebase's branch deleted.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
 

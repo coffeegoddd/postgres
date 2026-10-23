@@ -26,6 +26,7 @@ var Capabilities = map[string]string{
 	"vc.remotes":    "dolt_remote, dolt_remotes",
 	"vc.stash":      "dolt_stash, dolt_stashes",
 	"vc.tags":       "dolt_tag, dolt_tags; tags as revisions",
+	"vc.rebase":     "dolt_rebase and its plan, the dolt_rebase view",
 }
 
 // What each dolt_* name (function, view or setting) a step's SQL mentions
@@ -67,6 +68,7 @@ var callCapability = map[string]string{
 	"dolt_stashes":                "vc.stash",
 	"dolt_tag":                    "vc.tags",
 	"dolt_tags":                   "vc.tags",
+	"dolt_rebase":                 "vc.rebase",
 }
 
 // A typed operation: the capability it needs, the dolt_* function it calls
