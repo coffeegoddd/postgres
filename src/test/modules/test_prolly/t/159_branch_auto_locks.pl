@@ -141,5 +141,100 @@ $writer->quit;
 is($node->safe_psql('postgres',
 	q{SELECT count(*) FROM dolt_branches() WHERE kind = 'writer'}),
 	'0', 'rollback discards the automatic branch');
+# Plain EXPLAIN does not run the write it explains, so it neither makes a
+# writer branch nor moves the session off the protected branch.
+for my $explain ('EXPLAIN (COSTS OFF)', 'EXPLAIN (ANALYZE false, COSTS OFF)')
+{
+	my $explainer = $node->background_psql('postgres');
+	$explainer->query_safe(
+		q{SET dolt.writer = 'explainer'; SET client_min_messages = warning});
+	$explainer->query_safe("$explain UPDATE app.t SET v = v + 1 WHERE id = 1");
+	is($explainer->query_safe('SELECT active_branch()'), 'main',
+		"$explain of an update stays on the protected branch");
+	$explainer->quit;
+	is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM dolt_branches() WHERE kind = 'writer'}),
+		'0', "$explain of an update makes no writer branch");
+}
+# A temporary CREATE TABLE AS whose query writes moves before analysis too:
+# queued behind refs, it holds no write lock on the source.
+{
+	my $gate = $node->background_psql('postgres');
+	$gate->query_safe("BEGIN; SELECT dolt_branch('gate_ctas')");
+	my $ctas = $node->background_psql('postgres');
+	my $ctas_pid = $ctas->query_safe('SELECT pg_backend_pid()');
+	$ctas->query_safe(q{
+SET dolt.writer = 'ctas';
+SET client_min_messages = warning;
+BEGIN;
+SELECT count(*) FROM app.t;
+});
+	$ctas->query_until(qr/ctas_queued/, q{
+\echo ctas_queued
+CREATE TEMP TABLE changed AS
+WITH m AS (UPDATE app.t SET v = v WHERE id = 3 RETURNING id) SELECT * FROM m;
+});
+	ok($node->poll_query_until('postgres', qq{
+SELECT wait_event = 'object' FROM pg_stat_activity WHERE pid = $ctas_pid
+}), 'temporary CREATE TABLE AS queues behind refs');
+	is($node->safe_psql('postgres', qq{
+SELECT count(*) FROM pg_locks WHERE pid = $ctas_pid
+AND locktype = 'relation' AND mode = 'RowExclusiveLock' AND granted
+AND relation = 'app.t'::regclass
+}), '0', 'queued CREATE TABLE AS holds no write lock on the source');
+	$gate->query_safe('ROLLBACK');
+	$gate->quit;
+	is($ctas->query_safe('SELECT active_branch()'), 'writer/ctas/main',
+		'temporary CREATE TABLE AS writes on its writer branch');
+	$ctas->query_safe('ROLLBACK');
+	$ctas->quit;
+}
+# A sweep holds only the refs, not a snapshot that must see the branch's
+# head: a repeatable read checkout still deletes a done writer branch after
+# another session moved main since its snapshot.
+my $done = $node->background_psql('postgres');
+$done->query_safe(q{
+SET dolt.writer = 'done';
+SET dolt.transaction_commit = on;
+SET client_min_messages = warning;
+UPDATE app.t SET v = v + 1 WHERE id = 1;
+SELECT dolt_integrate('-m', 'done');
+});
+$done->quit;
+is($node->safe_psql('postgres',
+	q{SELECT count(*) FROM dolt_branches() WHERE name = 'writer/done/main'}),
+	'1', 'a done writer branch is left for a sweep');
+my $rr = $node->background_psql('postgres', on_error_stop => 0);
+$rr->query_safe(
+	'BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM app.t');
+my $mover = $node->background_psql('postgres');
+$mover->query_safe(q{
+SET dolt.writer = 'mover';
+SET dolt.transaction_commit = on;
+SET client_min_messages = warning;
+UPDATE app.t SET v = v + 1 WHERE id = 2;
+SELECT dolt_integrate('-m', 'moved main');
+});
+my (undef, $failed) = $rr->query("SELECT dolt_checkout('main')");
+is($failed, 0, 'repeatable read checkout sweeps after main moved unseen');
+$rr->query('COMMIT');
+$rr->quit;
+is($node->safe_psql('postgres',
+	q{SELECT count(*) FROM dolt_branches() WHERE name = 'writer/done/main'}),
+	'0', 'the repeatable read sweep deletes the done writer branch');
+# A sweep that deletes nothing (its only candidate is in use) lets the
+# refs go: another session's branch creation does not wait for its COMMIT.
+my $blocker = $node->background_psql('postgres');
+$blocker->query_safe("BEGIN; SELECT dolt_checkout('main')");
+my $ret = $node->psql('postgres',
+	q{SET lock_timeout = '5s'; SELECT dolt_branch('free')});
+is($ret, 0, 'a sweep that deletes nothing holds up no other refs mover');
+$blocker->query_safe('COMMIT');
+$blocker->quit;
+$mover->query_safe("SELECT dolt_checkout('main')");
+$mover->quit;
+is($node->safe_psql('postgres',
+	q{SELECT count(*) FROM dolt_branches() WHERE kind = 'writer'}),
+	'0', 'leaving the in-use writer branch sweeps it');
 $node->stop;
 done_testing();

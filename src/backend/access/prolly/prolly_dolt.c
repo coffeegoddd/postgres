@@ -1256,6 +1256,8 @@ typedef struct DetachedBranches
 {
 	List	   *names;
 	char	   *current;
+	const char *only;			/* (non-NULL: is just this one still one?) */
+	bool		found;
 } DetachedBranches;
 
 static void
@@ -1263,9 +1265,14 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
 {
 	DetachedBranches *db = arg;
 
-	if (strcmp(name, db->current) == 0)
+	if (strcmp(name, db->current) == 0 ||
+		(db->only != NULL && strcmp(name, db->only) != 0))
 		return;
-	if (detached_branch(name) || done_writer_branch(name, head))
+	if (!(detached_branch(name) || done_writer_branch(name, head)))
+		return;
+	if (db->only != NULL)
+		db->found = true;
+	else
 		db->names = lappend(db->names, pstrdup(name));
 }
 
@@ -1276,16 +1283,21 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
  * checkout's.  Only in a transaction that can
  * write, or that is read-only only for the branch it started on (one
  * leaving a commit).
+ *
+ * Another checkout can delete a candidate, or a session write on a writer
+ * branch and leave it, while this one waits for the refs.  Each is asked
+ * again with the refs held, in its subtransaction: one no longer to be
+ * deleted, or one that is left, lets the refs go with the subtransaction,
+ * so a checkout that deletes nothing holds up no other mover.
  */
 static void
 sweep_detached(char *current)
 {
-	DetachedBranches db = {NIL, current};
+	DetachedBranches db = {NIL, current, NULL, false};
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	ListCell   *lc;
 	bool		was_read_only = XactReadOnly;
-	bool		pushed;
 
 	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
@@ -1293,28 +1305,29 @@ sweep_detached(char *current)
 	if (db.names == NIL)
 		return;
 	XactReadOnly = false;
-	/*
-	 * Another checkout can delete a candidate while we wait for refs.  Hold
-	 * them before choosing the final set, not just when deleting each name.
-	 * This also rechecks whether a writer branch is still clean and merged.
-	 */
-	pushed = PROLLY_CALL(refs(), hold);
-	AcceptInvalidationMessages();
-	list_free_deep(db.names);
-	db.names = NIL;
-	PROLLY_CALL(refs(), branches, add_detached, &db);
 	foreach(lc, db.names)
 	{
+		char	   *name = (char *) lfirst(lc);
+		DetachedBranches still = {NIL, current, name, false};
+
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
 		PG_TRY();
 		{
-			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
-											 (char *) lfirst(lc), true));
-			if (writer_branch_name((char *) lfirst(lc)))
-				PROLLY_CALL(writers(), set_writer_branch, (char *) lfirst(lc),
-							NULL, NULL);
-			ReleaseCurrentSubTransaction();
+			PROLLY_CALL(refs(), lock);
+			AcceptInvalidationMessages();
+			PROLLY_CALL(refs(), branches, add_detached, &still);
+			if (still.found)
+			{
+				BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
+												 name, true));
+				if (writer_branch_name(name))
+					PROLLY_CALL(writers(), set_writer_branch, name,
+								NULL, NULL);
+				ReleaseCurrentSubTransaction();
+			}
+			else
+				RollbackAndReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
 		}
@@ -1339,8 +1352,6 @@ sweep_detached(char *current)
 		}
 		PG_END_TRY();
 	}
-	if (pushed)
-		PopActiveSnapshot();
 	XactReadOnly = was_read_only;
 }
 
@@ -2325,7 +2336,18 @@ raw_statement_writes(Node *stmt)
 		case T_SelectStmt:
 			return raw_query_writes(stmt, NULL);
 		case T_ExplainStmt:
-			return raw_statement_writes(((ExplainStmt *) stmt)->query);
+			{
+				/* Only EXPLAIN ANALYZE runs the statement it explains. */
+				ExplainStmt *es = (ExplainStmt *) stmt;
+				bool		analyze = false;
+
+				foreach_node(DefElem, opt, es->options)
+				{
+					if (strcmp(opt->defname, "analyze") == 0)
+						analyze = defGetBoolean(opt);
+				}
+				return analyze && raw_statement_writes(es->query);
+			}
 		case T_CreateTableAsStmt:
 			return raw_statement_writes(((CreateTableAsStmt *) stmt)->query);
 		default:

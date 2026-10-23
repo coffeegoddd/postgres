@@ -4534,6 +4534,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.merge_state = copies_merge_state,
 	.set_merge_state = copies_set_merge_state,
 	.hold = copies_hold,
+	.lock = lock_refs,
 	.walk = copies_walk,
 	.checkpoint = copies_checkpoint,
 	.set_head = copies_set_head,

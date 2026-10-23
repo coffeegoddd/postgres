@@ -218,6 +218,13 @@ typedef struct ProllyRefsRoutine
 	bool		(*hold) (void);
 
 	/*
+	 * Hold the refs as hold() does, without the snapshot: for a caller that
+	 * reads only the refs themselves, whatever its isolation level.  Taken
+	 * in a subtransaction, they are let go again if it rolls back.
+	 */
+	void		(*lock) (void);
+
+	/*
 	 * Visit every node the refs keep alive, from the root of their own
 	 * store: for reclamation and
 	 * transfer.  A commit whose node the visitor declines isn't looked
@@ -477,7 +484,7 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "branches", "working_set", "reset", "merge_state", \
-	"set_merge_state", "hold", "walk", "checkpoint", "set_head", "violations", \
+	"set_merge_state", "hold", "lock", "walk", "checkpoint", "set_head", "violations", \
 	"set_violations", "read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
