@@ -2444,7 +2444,7 @@ static void
 copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
-	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
+	TAG_MERGE_NAMES, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
 	TAG_NAMES};
 	ListCell   *lc;
 
@@ -2478,7 +2478,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->check_drop(name);
 		branch_ops()->check_create(newname);
 	}
-	/* (violations kept one entry each, then those of any single value) */
+	/* (violations, kept one entry each, moved apart from the tags') */
 	violations_clear(newname);
 	violations_move(name, newname);
 	for (int i = 0; i < lengthof(tags); i++)
@@ -3434,12 +3434,11 @@ copies_set_merge_state(const ProllyMergeState *state)
  * bytes, big-endian), after an entry of that prefix alone, which holds the
  * next place: so violations are added at the end without the others being
  * read or written again, and read back in the order they were added.
- * Earlier versions kept them all in one value, keyed by the tag and the
- * branch's name; one written so is still read, before the entries, and is
- * replaced when the branch's violations are set again.  (A branch's name
- * holds no zero byte, so neither key is another branch's.)
+ * (A branch's name holds no zero byte, so no key is another branch's.)
+ * Format version 1 kept them all in one value, keyed by the tag and the
+ * branch's name alone; such a value isn't read, but refused, and is
+ * removed when the branch's violations are cleared (a reset).
  */
-bool		debug_prolly_violations_one_value = false;
 
 #define VIOLATIONS_BATCH		1000
 
@@ -3549,8 +3548,8 @@ violations_visit(const char *branch, ProllyViolationVisit visit, void *arg)
 		ProllyValue val;
 
 		/*
-		 * (one seek reads both: the one value's key comes right before the
-		 * entries', which extend it by a zero byte)
+		 * (the seek starts at the earlier format's key, which comes right
+		 * before the entries', so one written so is seen, and refused)
 		 */
 		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
 		while (PROLLY_CALL(tree, cursor_next, c, &k, &val) &&
@@ -3558,25 +3557,26 @@ violations_visit(const char *branch, ProllyViolationVisit visit, void *arg)
 			   (k.len == key.len || k.data[key.len] == '\0'))
 		{
 			const char *p = (const char *) val.data;
-			const char *end = p + val.len;
+			ProllyViolation pv;
 
+			if (k.len == key.len)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the constraint violations of branch \"%s\" are kept in an earlier format",
+								branch),
+						 errdetail("This build reads only format version 2 of a branch's violations."),
+						 errhint("Reset the branch with dolt_reset('--hard') to drop them.")));
 			/* (the prefix alone holds the next place) */
 			if (k.len == key.len + 1)
 				continue;
-			/* (the one value holds many, each entry one) */
-			while (p < end)
-			{
-				ProllyViolation pv;
-
-				get_violation(&p, end, &pv);
-				MemoryContextSwitchTo(old);
-				visit(&pv, arg);
-				MemoryContextSwitchTo(cxt);
-				pfree(pv.type);
-				pfree(pv.row);
-				pfree(pv.info);
-				CHECK_FOR_INTERRUPTS();
-			}
+			get_violation(&p, p + val.len, &pv);
+			MemoryContextSwitchTo(old);
+			visit(&pv, arg);
+			MemoryContextSwitchTo(cxt);
+			pfree(pv.type);
+			pfree(pv.row);
+			pfree(pv.info);
+			CHECK_FOR_INTERRUPTS();
 		}
 		PROLLY_CALL(tree, cursor_close, c);
 	}
@@ -3665,7 +3665,7 @@ violation_entries(const char *branch, StringInfoData *keys, int max)
 	return n;
 }
 
-/* Remove branch's constraint violations, in either form. */
+/* Remove branch's constraint violations (an earlier format's value too). */
 static void
 violations_clear(const char *branch)
 {
@@ -3872,47 +3872,28 @@ copies_add_violations(ProllyViolation *const *violations, int n)
 
 /*
  * Set the session branch's violations: those it had removed, these added,
- * a batch at a time (or, for testing, as one value, as earlier versions
- * kept them).
+ * a batch at a time.
  */
 static void
 copies_set_violations(List *violations)
 {
 	const char *branch = branch_ops()->current();
+	ProllyViolation **batch = palloc_array(ProllyViolation *, VIOLATIONS_BATCH);
+	int			n = 0;
 
 	refs_init();
 	violations_clear(branch);
-	if (violations != NIL && debug_prolly_violations_one_value)
+	foreach_ptr(ProllyViolation, pv, violations)
 	{
-		StringInfoData key;
-		StringInfoData v;
-
-		initStringInfo(&key);
-		initStringInfo(&v);
-		violations_key(&key, branch);
-		foreach_ptr(ProllyViolation, pv, violations)
-			put_violation(&v, pv);
-		refs_put(key.data, key.len, &v);
-		pfree(key.data);
-		pfree(v.data);
-	}
-	else
-	{
-		ProllyViolation **batch = palloc_array(ProllyViolation *, VIOLATIONS_BATCH);
-		int			n = 0;
-
-		foreach_ptr(ProllyViolation, pv, violations)
+		batch[n++] = pv;
+		if (n == VIOLATIONS_BATCH)
 		{
-			batch[n++] = pv;
-			if (n == VIOLATIONS_BATCH)
-			{
-				violations_append(branch, batch, n);
-				n = 0;
-			}
+			violations_append(branch, batch, n);
+			n = 0;
 		}
-		violations_append(branch, batch, n);
-		pfree(batch);
 	}
+	violations_append(branch, batch, n);
+	pfree(batch);
 	note_merge_changed(branch);
 }
 
@@ -4839,7 +4820,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
 		.impl_id = 2,
-		.format_version = 1,
+		.format_version = 2,
 		.name = "copies",
 		.description = "head commits of branches made by copying, and the "
 		"commits, in the chunk store",

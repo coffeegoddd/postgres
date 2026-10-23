@@ -762,13 +762,6 @@
   boot_val => 'false',
 },
 
-{ name => 'debug_prolly_violations_one_value', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
-  short_desc => 'Keeps a prolly branch\'s constraint violations in one value, as earlier versions did, when they are set, for testing.',
-  flags => 'GUC_NOT_IN_SAMPLE',
-  variable => 'debug_prolly_violations_one_value',
-  boot_val => 'false',
-},
-
 { name => 'debug_raw_expression_coverage_test', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Set this to force all raw parse trees for DML statements to be scanned by raw_expression_tree_walker(), to facilitate catching errors and omissions in that function.',
   flags => 'GUC_NOT_IN_SAMPLE',

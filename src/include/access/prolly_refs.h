@@ -112,12 +112,6 @@ typedef struct ProllyViolation
 typedef void (*ProllyViolationVisit) (const ProllyViolation *violation,
 									  void *arg);
 
-/*
- * Keep a branch's violations in one value, as earlier versions did, when
- * they are set (for testing that such a value is still read).
- */
-extern PGDLLIMPORT bool debug_prolly_violations_one_value;
-
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);

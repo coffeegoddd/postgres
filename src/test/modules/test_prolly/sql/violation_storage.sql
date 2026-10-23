@@ -1,8 +1,7 @@
 -- A branch's constraint violations are kept one entry each, added after
--- those it has; violations kept in one value, as earlier versions kept
--- them, are still read, first, and a merge finds them again only once.
--- A branch renamed takes both with it; a branch deleted, or reset, drops
--- them.
+-- those it has, and a merge finds those again only once.  Set again, they
+-- are replaced.  A branch renamed takes them with it; a branch deleted, or
+-- reset, drops them.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -33,10 +32,8 @@ SET dolt.allow_commit_conflicts = on;
 SELECT (dolt_merge('vs_theirs'))[3:4];
 SELECT violation_type, violating_row FROM dolt_constraint_violations('vs.child')
 ORDER BY 2::text;
--- Set again as one value, they read the same.
-SET debug_prolly_violations_one_value = on;
+-- Set again (checked again), they read the same.
 SELECT dolt_verify_constraints('vs.child');
-RESET debug_prolly_violations_one_value;
 SELECT violation_type, violating_row FROM dolt_constraint_violations('vs.child')
 ORDER BY 2::text;
 SELECT length(dolt_commit('-afm', 'vs merged')::text) AS committed;
@@ -61,7 +58,7 @@ SELECT split_part(t, '.', 2) AS t, violation_type, violating_row
 FROM unnest(ARRAY['vs.child', 'vs.u']) t,
 	LATERAL dolt_constraint_violations(t);
 
--- Set again (the rows fixed and checked), the one value goes too.
+-- Set again (the rows fixed and checked), those fixed go.
 DELETE FROM vs.child;
 SELECT dolt_verify_constraints('vs.child');
 SELECT split_part(t, '.', 2) AS t, violation_type, violating_row

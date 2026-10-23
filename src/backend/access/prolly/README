@@ -279,11 +279,11 @@ branch's first: the first of each is kept only if it is new, and the new
 ones are sorted again into the order found and added to the branch's a
 batch at a time.  The refs keep a branch's violations one entry each, keyed
 by the branch and a place, after an entry holding the next place, so adding
-some reads and writes none of the others.  Earlier versions kept them all in
-one value under the branch's key; such a value is still read, before the
-entries, and goes when the branch's violations are set again (verify,
-resolution).  The violations' inspection functions and the checks before a
-commit still read a branch's violations whole.
+some reads and writes none of the others (the refs' format version 2).
+Format version 1 kept them all in one value under the branch's key; this
+build doesn't read such a value but refuses it, with a hint to reset the
+branch, which removes it.  The violations' inspection functions and the
+checks before a commit still read a branch's violations whole.
 
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
