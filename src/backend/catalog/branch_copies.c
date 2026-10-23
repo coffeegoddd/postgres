@@ -48,6 +48,7 @@
 #include "access/genam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/relation.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -61,11 +62,13 @@
 #include "catalog/pg_database.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "commands/trigger.h"
 #include "catalog/versioned.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
+#include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -563,33 +566,22 @@ typedef struct MakeKept
 	bool	   *used;
 } MakeKept;
 
+static bool can_restore(Form_pg_class c, const BranchKeptRelation *k);
+
 /*
  * Is kept relation k still the session branch's relation with the storage
- * that keeps it, its snapshot there?
+ * that keeps it, its snapshot there, and its pages' transaction ids ones
+ * the database still knows (can_restore())?
  */
 static bool
 still_kept(Relation pg_class, const BranchKeptRelation *k)
 {
 	HeapTuple	t = class_row(pg_class, k->relid, MyBranch);
-	Form_pg_class c;
-	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
-	RelFileLocator loc;
-	bool		ok = false;
-	int			n;
+	bool		ok;
 
 	if (t == NULL)
 		return false;
-	c = (Form_pg_class) GETSTRUCT(t);
-	loc = class_locator(c, c->relfilenode);
-	if (c->relfilenode == k->relfilenumber && c->reltablespace == k->tablespace &&
-		c->relpersistence == RELPERSISTENCE_PERMANENT &&
-		bmap_relation_exists(loc))
-	{
-		n = bmap_snapshot_list(smgropen(loc, INVALID_PROC_NUMBER), snaps,
-							   BMAP_SNAPSHOTS_MAX);
-		for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX) && !ok; s++)
-			ok = snaps[s].id == k->snapshot;
-	}
+	ok = can_restore((Form_pg_class) GETSTRUCT(t), k);
 	heap_freetuple(t);
 	return ok;
 }
@@ -1084,7 +1076,8 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
  * would be kept by nobody, so each taken is remembered until its
  * transaction commits, and one whose transaction aborted is let go of the
  * next time this backend keeps or restores (letting go writes, which an
- * abort can't).
+ * abort can't), or, if it never does, as it exits.  (A crash in between
+ * leaves the snapshot to its storage, until the relation is dropped.)
  */
 typedef struct TakenSnapshot
 {
@@ -1143,6 +1136,8 @@ taken_subxact(SubXactEvent event, SubTransactionId mySubid,
 	}
 }
 
+static void let_go_at_exit(int code, Datum arg);
+
 static void
 note_taken(RelFileLocator locator, uint64 id)
 {
@@ -1153,6 +1148,7 @@ note_taken(RelFileLocator locator, uint64 id)
 	{
 		RegisterXactCallback(taken_xact, NULL);
 		RegisterSubXactCallback(taken_subxact, NULL);
+		before_shmem_exit(let_go_at_exit, (Datum) 0);
 		taken_callbacks = true;
 	}
 	t->locator = locator;
@@ -1168,6 +1164,37 @@ let_go_of(RelFileLocator locator, uint64 id)
 {
 	if (id != 0 && bmap_relation_exists(locator))
 		(void) bmap_snapshot_release(smgropen(locator, INVALID_PROC_NUMBER), id);
+}
+
+static void let_go_of_abandoned(void);
+
+/*
+ * As the backend exits: the snapshots of its aborted transactions (and of
+ * the one it is in, aborted now), let go of in a transaction of their own.
+ * Before the backend leaves its database; a failure is reported, not
+ * raised, the snapshots left to their storage.
+ */
+static void
+let_go_at_exit(int code, Datum arg)
+{
+	if (taken == NIL && abandoned == NIL)
+		return;
+	AbortOutOfAnyTransaction();
+	if (abandoned == NIL)
+		return;
+	PG_TRY();
+	{
+		StartTransactionCommand();
+		let_go_of_abandoned();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+	}
+	PG_END_TRY();
 }
 
 /* The snapshots of aborted (sub)transactions, let go of. */
@@ -1364,14 +1391,25 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 /*
  * Is relation c (its row k) still on the branch with the storage that kept
  * it, its snapshot there, and its rows' transaction ids ones the database
- * still knows?
+ * still knows (none older than its datfrozenxid and datminmxid, whose
+ * status may be gone)?  Asked before the pages kept are given back, and
+ * before a branch is made of them.
  */
 static bool
-can_restore(Form_pg_class c, const BranchKeptRelation *k,
-			TransactionId datfrozenxid, MultiXactId datminmxid)
+can_restore(Form_pg_class c, const BranchKeptRelation *k)
 {
 	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+	HeapTuple	dbtup;
+	TransactionId datfrozenxid;
+	MultiXactId datminmxid;
 	int			n;
+
+	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(dbtup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
+	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
+	ReleaseSysCache(dbtup);
 
 	if (c->relfilenode != k->relfilenumber ||
 		c->reltablespace != k->tablespace ||
@@ -1401,9 +1439,6 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 			   BranchKeptRelation *renewed)
 {
 	Relation	pg_class;
-	HeapTuple	dbtup;
-	TransactionId datfrozenxid;
-	MultiXactId datminmxid;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
 	bool	   *changed = palloc0_array(bool, Max(nkept, 1));
 	bool		any = false;
@@ -1411,13 +1446,6 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	Taking		taking;
 
 	let_go_of_abandoned();
-	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
-	if (!HeapTupleIsValid(dbtup))
-		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
-	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
-	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
-	ReleaseSysCache(dbtup);
-
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 	taking_begin(&taking, nkept);
 
@@ -1426,8 +1454,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	{
 		rows[i] = class_row(pg_class, kept[i].relid, MyBranch);
 		if (rows[i] == NULL ||
-			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i],
-						 datfrozenxid, datminmxid))
+			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]))
 			ok = false;
 		else if (!bmap_snapshot_unchanged(smgropen(kept_locator(&kept[i]),
 												   INVALID_PROC_NUMBER),
@@ -1446,6 +1473,21 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
 			ok = false;
 		changed[i] = true;
+	}
+
+	/*
+	 * (nor while this session still uses one's storage, as TRUNCATE
+	 * refuses to: a scan of it open, or an AFTER trigger's event queued
+	 * holding a location in it, which would then name a row of the restored
+	 * pages)
+	 */
+	for (int i = 0; i < nkept && ok && any; i++)
+	{
+		Relation	rel = relation_open(kept[i].relid, NoLock);
+
+		if (rel->rd_refcnt != 1 || AfterTriggerPendingOnRel(kept[i].relid))
+			ok = false;
+		relation_close(rel, NoLock);
 	}
 
 	for (int i = 0; i < nkept && ok; i++)

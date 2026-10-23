@@ -28,7 +28,8 @@ TAP_TESTS = 1
 # below)
 EXTRA_INSTALL = contrib/amcheck contrib/btree_gist contrib/cube contrib/seg contrib/citext contrib/hstore contrib/ltree contrib/tsm_system_rows contrib/pg_buffercache contrib/pageinspect contrib/pg_prewarm \
 	contrib/pg_walinspect contrib/postgres_fdw contrib/test_decoding \
-	src/test/modules/injection_points src/test/modules/dummy_seclabel
+	src/test/modules/injection_points src/test/modules/dummy_seclabel \
+	src/test/modules/xid_wraparound
 
 export enable_injection_points
 export with_ssl

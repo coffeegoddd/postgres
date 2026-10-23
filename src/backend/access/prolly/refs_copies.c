@@ -2145,16 +2145,19 @@ kept_holds(List *kept, const BranchKeptRelation *k)
  * May a retired commit's pages be let go of?  Once the transaction that
  * retired it committed, nobody reads it from the refs as kept any more,
  * but one may still be making a branch of them (make_kept()), which keep()
- * waits out.
+ * waits out.  The refs change with their transactions: a retiring the refs
+ * show is one that committed, or this transaction's own (or one of its
+ * subtransactions', whose ids follow its own).  So no transaction's status
+ * is asked, which, long ago, may be gone.
  */
 static bool
 kept_releasable(const KeptCommit *kc)
 {
-	TransactionId xid = XidFromFullTransactionId(kc->retired);
+	FullTransactionId top = GetTopFullTransactionIdIfAny();
 
 	return FullTransactionIdIsValid(kc->retired) &&
-		!TransactionIdIsCurrentTransactionId(xid) &&
-		TransactionIdDidCommit(xid);
+		(!FullTransactionIdIsValid(top) ||
+		 FullTransactionIdPrecedes(kc->retired, top));
 }
 
 /*
