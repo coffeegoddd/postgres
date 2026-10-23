@@ -1,0 +1,42 @@
+# The V suite's growth shapes (V9): each version-control operation's work,
+# counted in pg_stat_prolly, as the table grows (rows, Δ fixed) and as the
+# change grows (delta, N fixed, up to 70% of the rows), each point on a
+# fresh database.  vshape fits each counter's growth and gates it against
+# the operation's target; known exceptions, each owned by an issue, are in
+# v_shape_known.toml.  Counts, not timings: they repeat on any machine.
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["shapes"]
+workloads = ["V9"]
+fio_baseline = false
+seed = 1
+collectors = []
+
+[postgres]
+shared_buffers = "256MB"
+autovacuum = "off"
+checkpoint_timeout = "1d"
+max_wal_size = "16GB"
+max_connections = 32
+# (a small budget for a fold's change candidates, which the delta
+# sweep's largest change passes: a fold then reads every row)
+maintenance_work_mem = "1MB"
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+
+[sizes.shapes]
+
+[workloads.V9]
+background = ["none"]
+# N for the rows sweep (64x), with delta rows changed at each
+rows = [4000, 16000, 64000, 256000]
+delta = 10
+# Δ for the delta sweep (64x, to 70% of the rows), at delta_rows rows
+delta_rows = 64000
+deltas = [700, 2800, 11200, 44800]

@@ -1,0 +1,144 @@
+# Known exceptions to the V suite's growth-shape targets (vshape, V9): a
+# check's counter that grows faster than its target today, the shape it
+# has (current) and the issue that owns the work to meet the target.
+#
+# Each stays checked.  vshape fails when the counter grows faster than its
+# current shape (a regression), when it grows slower but still misses the
+# target (record the better shape here), and when it meets the target:
+# then the change that met it removes the entry, and the check is enforced
+# from then on.  An entry naming nothing the run checked fails too.
+
+# A branch's first use shares each relation's blocks: a map page copied
+# per map page and a reference count per block, so the map work grows
+# with the table's blocks.
+[[known]]
+check = "first_use"
+sweep = "rows"
+counter = "bmap_map_pages_copied"
+current = "linear"
+issue = "#717"
+reason = "the copy's map is a copy of every map page (hierarchical copy-on-write map; the source's writers wait meanwhile, #489)"
+
+[[known]]
+check = "first_use"
+sweep = "rows"
+counter = "bmap_refcount_updates"
+current = "linear"
+issue = "#717"
+reason = "every block's reference count goes up by one (map-page reference counts; the source's writers wait meanwhile, #489)"
+
+# A hard reset to the head writes the dirty rows back through the row
+# applier, with their index entries; once enough rows are dirty, it shares
+# another branch's storage instead, which copies the maps and drops the
+# replaced storage block by block.
+[[known]]
+check = "hard_reset"
+sweep = "rows"
+counter = "apply_rows"
+current = "flat"
+issue = "#767"
+reason = "the dirty rows are written back (restoring the head's pages writes none)"
+
+[[known]]
+check = "hard_reset"
+sweep = "rows"
+counter = "apply_index_tuples"
+current = "flat"
+issue = "#767"
+reason = "the rows written back make their index entries again"
+
+[[known]]
+check = "hard_reset"
+sweep = "delta"
+counter = "apply_rows"
+current = "linear"
+issue = "#767"
+reason = "a row written back per dirty row, until enough are dirty that the reset shares storage instead"
+
+[[known]]
+check = "hard_reset"
+sweep = "delta"
+counter = "apply_index_tuples"
+current = "linear"
+issue = "#767"
+reason = "an entry in each index per row written back"
+
+[[known]]
+check = "hard_reset"
+sweep = "delta"
+counter = "bmap_map_pages_copied"
+current = "linear"
+issue = "#717"
+reason = "past the switch to sharing another branch's storage, every map page is copied"
+
+[[known]]
+check = "hard_reset"
+sweep = "delta"
+counter = "bmap_refcount_updates"
+current = "super"
+issue = "#717"
+reason = "the switch to sharing storage counts every block of the table (a jump, from a few page copies' counts)"
+
+[[known]]
+check = "hard_reset"
+sweep = "delta"
+counter = "bmap_blocks_freed"
+current = "super"
+issue = "#768"
+reason = "the storage the share replaces is dropped at commit, block by block (a jump, from none)"
+
+# Deleting a branch drops its storage at commit: each block it shares is
+# counted down, each it alone holds freed, all in the foreground.
+[[known]]
+check = "branch_delete"
+sweep = "rows"
+counter = "bmap_refcount_updates"
+current = "linear"
+issue = "#768"
+reason = "a reference count down per shared block, at commit"
+
+[[known]]
+check = "branch_delete"
+sweep = "delta"
+counter = "bmap_refcount_updates"
+current = "linear"
+issue = "#768"
+reason = "a reference count down per block still shared, which the earlier resets' sharing moves"
+
+[[known]]
+check = "branch_delete"
+sweep = "delta"
+counter = "bmap_blocks_freed"
+current = "linear"
+issue = "#768"
+reason = "the branch's own blocks, those its changes copied, freed at commit rather than in the background"
+
+# A historical point read decodes the commit's whole table (dolt_at is a
+# full scan).
+[[known]]
+check = "point_read"
+sweep = "rows"
+counter = "nodes_read"
+current = "linear"
+issue = "#697"
+reason = "dolt_at reads every row of the table at the commit; no key access path"
+
+# A commit's fold reads the changed rows the table's change log names,
+# until their candidates pass maintenance_work_mem (v_shape.toml sets
+# 1MB, which the delta sweep's 70% change passes): then it reads every
+# row of the table.  A merge folds the working set first, the same way.
+[[known]]
+check = "commit"
+sweep = "delta"
+counter = "fold_rows_read"
+current = "super"
+issue = "#730"
+reason = "past the candidate budget the fold reads all N rows (fold_full_memory_budget), a jump from the Δ it read below it"
+
+[[known]]
+check = "merge"
+sweep = "delta"
+counter = "fold_rows_read"
+current = "super"
+issue = "#730"
+reason = "the merge's fold of the working set passes the candidate budget too, and reads all N rows"

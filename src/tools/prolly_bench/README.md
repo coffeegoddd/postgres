@@ -299,6 +299,76 @@ src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V7 --config sr
 src/tools/prolly_bench/prolly_bench vgrowth G/*-V-prolly --accept src/tools/prolly_bench/configs/v_growth_accept.toml
 ```
 
+### Growth shapes (V9)
+
+`configs/v_shape.toml` runs V9: each version-control operation's work, in
+`pg_stat_prolly`'s counters, as the table grows (the `rows` sweep: 4k to
+256k rows, 10 rows changed) and as the change grows (the `delta` sweep:
+700 to 44,800 changed rows of 64k, up to 70% dirty). Each point is a fresh
+database with one narrow table filled to a tenth of each page (so N rows
+are about N/10 blocks, and block-map work shows its shape at sizes CI can
+afford) and an index on the updated column (so rows written back make
+index entries). `maintenance_work_mem` is 1MB, so the largest change
+passes a fold's budget for change candidates and the fold falls back to
+reading every row, as larger tables do at the default. Each operation is
+counted alone: the counters are read after the statement before it and
+after it. Counts, not timings: a shape fitted to them is the code's, the
+same on any machine.
+
+`vshape` takes each counter's fastest growth between adjacent sizes, the
+slope of log(count) on log(size), counts below a small floor taken as the
+floor, and names its shape: `zero`, `flat` (≤ 0.1), `log` (≤ 0.35: a tree
+descent, whose depth grows as log N), `linear` (≤ 1.15) or `super`. The
+fastest growth between adjacent sizes, not one fit over all of them: a
+hard reset writes the dirty rows back while few changed and shares another
+branch's storage once many did, and a fit across the switch would average
+the two away. Each check must not grow faster than its target
+(`vshape.TARGETS`):
+
+| Check | Operation | Sweeps | Target |
+|---|---|---|---|
+| `create_branch` | `dolt_branch` from a dirty branch | rows, delta | every work counter flat |
+| `checkout_used` | `dolt_checkout` of a used branch, from a dirty one | rows, delta | every work counter flat |
+| `first_use` | `dolt_checkout` of a new branch | rows | every work counter flat: map work flat, catalog work in the versioned objects only |
+| `soft_reset` | `dolt_reset('--soft', 'HEAD~1')`, dirty | rows, delta | every work counter flat |
+| `hard_reset` | `dolt_reset('--hard')` to the head, dirty | rows, delta | no rows applied or index entries made; map work flat |
+| `branch_delete` | `dolt_branch('-D')` | rows, delta | map work flat in the foreground |
+| `point_read` | `dolt_at('HEAD~1')` with `WHERE id = 1` | rows | `nodes_read` log |
+| `commit` | `dolt_commit` of Δ rows | rows; delta | tree work log in N; at most linear in Δ |
+| `diff` | `dolt_diff` of that commit | rows; delta | `nodes_read` log in N; at most linear in Δ |
+| `merge` | `dolt_merge` of Δ rows, main changed elsewhere | rows; delta | tree work log and rows applied flat in N; both at most linear in Δ |
+
+The work counters are tree work (`nodes_read`, `nodes_written`,
+`chunks_appended`, `fold_rows_read`, `log_pages_read`), map work
+(`bmap_map_pages_copied`, `bmap_refcount_updates`, `bmap_blocks_freed`,
+`page_copies_shared`), rows applied (`apply_rows`, `apply_index_tuples`)
+and `catalog_rows_copied`. Byte and cache counters follow these or the
+caches' state, and aren't gated.
+
+A target not met today is a known exception in
+`configs/v_shape_known.toml`: the check, sweep and counter, the shape it
+has today (`current`), and the issue that owns the work to meet the target.
+It stays checked. `vshape` fails when it grows faster than its recorded
+shape (a regression), when it grows slower but still misses the target
+(record the better shape), and when it meets the target: the change that
+meets it removes the entry, and the check is enforced from then on. An
+entry that names nothing the run checked fails too. CI runs the gate on
+every pull request (`prolly.yml`'s release build). Each cell's series are
+in its raw directory (`v9-series.json`), with each point's script and
+output; `--markdown` writes every finding as a table.
+
+```sh
+src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V9 --config src/tools/prolly_bench/configs/v_shape.toml --out G
+src/tools/prolly_bench/prolly_bench vshape G/*-V-prolly --known src/tools/prolly_bench/configs/v_shape_known.toml --markdown shapes.md
+```
+
+What the checks don't cover yet: conflicts and memory in merges; the rows
+a historical point read decodes (no counter counts them; #697); a
+release's background drain (#768); snapshot roots and kept snapshots
+(#717, #767); reuse of earlier materializations (#725). Large
+confirmation runs, that the counters predict wall time, WAL and storage
+at terabyte scale, need the dedicated host (#247).
+
 ### Storage by component (V8)
 
 `configs/v_storage.toml` runs V8: a 1M-row keyed table, and beside it a
@@ -636,7 +706,7 @@ file; the driver doesn't change.
 
 | Interface | Implementations | Directory |
 |---|---|---|
-| `Workload` | S1-S10 and S13, V1-V4 and V6-V8, C1-C4 | `pbench/workloads/` |
+| `Workload` | S1-S10 and S13, V1-V4 and V6-V9, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |
