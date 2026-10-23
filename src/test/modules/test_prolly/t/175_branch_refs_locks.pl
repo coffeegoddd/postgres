@@ -195,6 +195,74 @@ $b->query_safe(q{RESET dolt.transaction_commit});
 roots_agree($a, 'main\'s head holds its rows');
 roots_agree($b, 'f\'s too');
 
+# A collection while a commit is open, after another branch's commit
+# moved the root past the refs that commit built on: the open commit's
+# changes still name chunks of that root, which the collection keeps, and
+# it commits.  (Enough branches that the refs tree has inner nodes, which
+# the open commit's tree shares with the root it built on.)
+sql(q{SELECT count(dolt_branch('many' || lpad(g::text, 4, '0')))
+	FROM generate_series(1, 600) g; SELECT dolt_branch('zzz')});
+$c->query_safe(q{SELECT dolt_checkout('zzz')});
+$a->query_safe(q{BEGIN; INSERT INTO app.t VALUES (12, 'main');
+	SELECT dolt_commit('-am', 'open across a collection')});
+$c->query_safe(q{INSERT INTO app.t VALUES (12, 'zzz');
+	SELECT dolt_commit('-am', 'zzz before the collection')});
+$d->query_until(qr/started/, q{
+	\echo started
+	SELECT test_chunk_gc(true);
+	\echo collected
+});
+ok($node->poll_query_until('postgres', q{
+	SELECT count(*) > 0 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+	WHERE NOT l.granted AND a.query LIKE '%test_chunk_gc%'}),
+	'the collection waits for the open commit');
+$a->query(q{COMMIT});
+is($a->{stderr}, '', 'a commit open across a collection commits');
+$a->{stderr} = '';
+$d->query_until(qr/collected/, '');
+like(log_of('main'), qr/^open across a collection,/, 'main has it');
+like(log_of('zzz'), qr/^zzz before the collection,/, 'zzz keeps its own');
+$c->query_safe(q{SELECT dolt_checkout('g')});
+roots_agree($a, 'main\'s head holds its rows after the collection');
+
+# A committer that escalates (makes a branch) in a savepoint rolled back:
+# its commit goes back to holding its branch alone, another branch's
+# commit doesn't wait for it, both are kept, and the branch is gone.
+$a->query_safe(q{BEGIN; INSERT INTO app.t VALUES (13, 'main');
+	SELECT dolt_commit('-am', 'kept past an escalation');
+	SAVEPOINT s; SELECT dolt_branch('escalated'); ROLLBACK TO s;
+	SELECT dolt_commit('--allow-empty', '-m', 'again past an escalation')});
+$c->query_safe(q{SET lock_timeout = '5s'});
+$c->query_safe(q{INSERT INTO app.t VALUES (13, 'g');
+	SELECT dolt_commit('-am', 'g past an escalation')});
+is($c->{stderr}, '', 'another branch\'s commit doesn\'t wait for it');
+$a->query_safe(q{COMMIT});
+like(log_of('main'), qr/^again past an escalation,kept past an escalation,/,
+	'the commits are kept');
+like(log_of('g'), qr/^g past an escalation,/, 'and the other branch\'s');
+is(sql(q{SELECT count(*) FROM dolt_branches WHERE name = 'escalated'}), '0',
+	'the branch made in the savepoint is gone');
+
+# The same, the escalation in an inner savepoint released into one rolled
+# back.
+$a->query_safe(q{BEGIN; INSERT INTO app.t VALUES (14, 'main');
+	SELECT dolt_commit('-am', 'kept past a nested escalation');
+	SAVEPOINT s1; SAVEPOINT s2; SELECT dolt_branch('escalated2');
+	RELEASE s2; ROLLBACK TO s1;
+	SELECT dolt_commit('--allow-empty', '-m', 'again past a nested escalation')});
+$c->query_safe(q{INSERT INTO app.t VALUES (14, 'g');
+	SELECT dolt_commit('-am', 'g past a nested escalation')});
+is($c->{stderr}, '', 'nor then');
+$a->query_safe(q{COMMIT});
+like(log_of('main'), qr/^again past a nested escalation,kept past a nested escalation,/,
+	'the commits are kept');
+like(log_of('g'), qr/^g past a nested escalation,/, 'and the other\'s');
+is(sql(q{SELECT count(*) FROM dolt_branches WHERE name = 'escalated2'}), '0',
+	'and the branch is gone');
+$c->query_safe(q{RESET lock_timeout});
+roots_agree($a, 'main\'s head holds its rows');
+roots_agree($c, 'g\'s too');
+
 # A transaction that committed can't be prepared, as before.
 $a->query(q{BEGIN; INSERT INTO app.t VALUES (10, 'prepared');
 	SELECT dolt_commit('-am', 'prepared'); PREPARE TRANSACTION 'p'});
