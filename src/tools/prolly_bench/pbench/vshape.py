@@ -47,14 +47,15 @@ BOUNDS = {"flat": 0.1, "log": 0.35, "linear": 1.15}
 # What each operation counts in: the work counters the checks gate.
 # (Bytes and cache counters follow the work, or the cache's state.)
 TREE = ("nodes_read", "nodes_written", "chunks_appended", "fold_rows_read", "log_pages_read")
-MAP = ("bmap_map_pages_copied", "bmap_refcount_updates", "bmap_blocks_freed", "page_copies_shared")
+MAP = ("bmap_map_pages_copied", "bmap_refcount_updates", "bmap_blocks_freed", "page_copies_shared",
+       "bmap_pages_preserved")
 APPLY = ("apply_rows", "apply_index_tuples")
 WORK = TREE + MAP + APPLY + ("catalog_rows_copied",)
 
 # Below these, a counter's values are noise to a fit.
 FLOORS = {name: 8.0 for name in WORK}
 FLOORS.update({"nodes_read": 32.0, "bmap_refcount_updates": 64.0, "bmap_blocks_freed": 64.0,
-               "page_copies_shared": 64.0})
+               "page_copies_shared": 64.0, "bmap_pages_preserved": 64.0})
 
 
 def _all(shape: str, names=WORK) -> dict[str, str]:
