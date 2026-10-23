@@ -5348,8 +5348,16 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 	bool		from_ok = r->from_item == NULL;
 	bool		to_ok = r->to_item == NULL;
 	bool		some = false;
+	bool		reads_all;
 	const char *name;
 
+	/*
+	 * (one who may read every version needs no lineage: walking it reads
+	 * what the working set changed since the head, a fold of its rows,
+	 * whatever the refs diffed)
+	 */
+	reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
 	for (int i = 0; i < 2; i++)
 	{
 		Oid			relid;
@@ -5367,15 +5375,15 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 		check_history_rls(relid, fn);
 		some = true;
+		if (reads_all)
+			continue;
 		l = name_lineage(lineages, names[i]);
 		if (!from_ok)
 			from_ok = lineage_has(l, from_ref, r->from_name);
 		if (!to_ok)
 			to_ok = lineage_has(l, to_ref, r->to_name);
 	}
-	if ((from_ok && to_ok) ||
-		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
-		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+	if ((from_ok && to_ok) || reads_all)
 		return;
 	name = !from_ok ? r->from_name : r->to_name;
 	if (some)

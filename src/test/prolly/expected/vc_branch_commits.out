@@ -1,0 +1,135 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_main s2_b s1_begin s1_commit s2_commit s1_end s2_back s3_branch s3_logs
+step s1_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s2_b: SELECT (dolt_checkout('vbc_b'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_commit: INSERT INTO vbc.t VALUES (2, 's1'); SELECT dolt_commit('-am', 'vbc s1') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s2_commit: INSERT INTO vbc.t VALUES (3, 's2'); SELECT dolt_commit('-am', 'vbc s2') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s1_end: COMMIT;
+step s2_back: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s3_branch: SELECT (dolt_branch('vbc_c'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s3_logs: 
+	SELECT (SELECT string_agg(message, ',') FROM
+			(SELECT message FROM dolt_log('main') WHERE message LIKE 'vbc %' LIMIT 3) l) AS main_log,
+		(SELECT string_agg(message, ',') FROM
+			(SELECT message FROM dolt_log('vbc_b') WHERE message LIKE 'vbc %' LIMIT 2) l) AS b_log,
+		dolt_hashof('vbc_c') = dolt_hashof('main') AS c_at_main;
+
+main_log       |b_log          |c_at_main
+---------------+---------------+---------
+vbc s1,vbc base|vbc s2,vbc base|t        
+(1 row)
+
+
+starting permutation: s1_main s2_main s1_begin s1_commit s2_commit s1_end s3_branch s3_logs
+step s1_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s2_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_commit: INSERT INTO vbc.t VALUES (2, 's1'); SELECT dolt_commit('-am', 'vbc s1') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s2_commit: INSERT INTO vbc.t VALUES (3, 's2'); SELECT dolt_commit('-am', 'vbc s2') IS NOT NULL AS ok; <waiting ...>
+step s1_end: COMMIT;
+step s2_commit: <... completed>
+ok
+--
+t 
+(1 row)
+
+step s3_branch: SELECT (dolt_branch('vbc_c'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s3_logs: 
+	SELECT (SELECT string_agg(message, ',') FROM
+			(SELECT message FROM dolt_log('main') WHERE message LIKE 'vbc %' LIMIT 3) l) AS main_log,
+		(SELECT string_agg(message, ',') FROM
+			(SELECT message FROM dolt_log('vbc_b') WHERE message LIKE 'vbc %' LIMIT 2) l) AS b_log,
+		dolt_hashof('vbc_c') = dolt_hashof('main') AS c_at_main;
+
+main_log              |b_log            |c_at_main
+----------------------+-----------------+---------
+vbc s2,vbc s1,vbc base|vbc base,vbc gone|t        
+(1 row)
+
+
+starting permutation: s1_main s1_begin s1_commit s3_branch s1_end s3_logs
+step s1_main: SELECT (dolt_checkout('main'))[1] = '0' AS ok;
+ok
+--
+t 
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_commit: INSERT INTO vbc.t VALUES (2, 's1'); SELECT dolt_commit('-am', 'vbc s1') IS NOT NULL AS ok;
+ok
+--
+t 
+(1 row)
+
+step s3_branch: SELECT (dolt_branch('vbc_c'))[1] = '0' AS ok; <waiting ...>
+step s1_end: COMMIT;
+step s3_branch: <... completed>
+ok
+--
+t 
+(1 row)
+
+step s3_logs: 
+	SELECT (SELECT string_agg(message, ',') FROM
+			(SELECT message FROM dolt_log('main') WHERE message LIKE 'vbc %' LIMIT 3) l) AS main_log,
+		(SELECT string_agg(message, ',') FROM
+			(SELECT message FROM dolt_log('vbc_b') WHERE message LIKE 'vbc %' LIMIT 2) l) AS b_log,
+		dolt_hashof('vbc_c') = dolt_hashof('main') AS c_at_main;
+
+main_log                |b_log            |c_at_main
+------------------------+-----------------+---------
+vbc s1,vbc base,vbc gone|vbc base,vbc gone|t        
+(1 row)
+

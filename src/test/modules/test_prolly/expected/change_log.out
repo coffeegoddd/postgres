@@ -3,6 +3,9 @@
 -- table with a primary key gets its changed keys (delta 0); one without
 -- gets each version made (+1) and replaced (-1).  A fold that begins a
 -- baseline consumes the entries it saw.
+-- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
+-- counted here is what the next fold reads after one)
+SET prolly.fold_on_rewrite = off;
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -622,6 +625,9 @@ SELECT length(dolt_commit('-Am', 'cml gone')::text) AS committed;
 -- (a database of its own: no other session's snapshot keeps the dead)
 CREATE DATABASE regress_log_vacuum;
 \c regress_log_vacuum
+-- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
+-- counted here is what the next fold reads after one)
+SET prolly.fold_on_rewrite = off;
 CREATE SCHEMA clv VERSIONED;
 CREATE TABLE clv.vac (id int PRIMARY KEY, v text);
 INSERT INTO clv.vac SELECT g, 'v' || g FROM generate_series(1, 20000) g;
@@ -709,4 +715,7 @@ SELECT pg_relation_size('pg_toast.pg_prolly_log_' || 'clv.vac'::regclass::oid) A
 (1 row)
 
 \c contrib_regression
+-- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
+-- counted here is what the next fold reads after one)
+SET prolly.fold_on_rewrite = off;
 DROP DATABASE regress_log_vacuum;

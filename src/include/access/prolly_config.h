@@ -132,6 +132,8 @@ extern Oid	prolly_change_log_relid(Oid relid, Oid relam);
  * called in critical sections, or with interrupts held, too.
  */
 extern void prolly_note_branch_write(Oid branch);
+/* ... and of a relation whose rows the write changes (InvalidOid: none). */
+extern void prolly_note_relation_write(Oid branch, Oid relid);
 extern void prolly_forget_folds(void);
 extern void prolly_note_prepared_ended(FullTransactionId xid);
 
