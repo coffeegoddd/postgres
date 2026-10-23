@@ -319,6 +319,7 @@ tests += {
       't/194_bmap_snapshot_redo.pl',
       't/210_bmap_release_queue.pl',
       't/211_bmap_release_autovacuum.pl',
+      't/212_vacuum_release_bounds.pl',
     ],
   },
 }

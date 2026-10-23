@@ -140,7 +140,7 @@ prolly_autovacuum_init(void)
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.release_max_per_pass",
-							"How many release queue entries (dropped storage's subtrees and blocks) one autovacuum pass lets go of at most, in each tablespace.",
+							"How many release queue entries (dropped storage's subtrees and blocks) one autovacuum pass's release step lets go of at most in each tablespace, and one VACUUM command (or one autovacuum pass's VACUUMs) before vacuuming.",
 							"-1 sets no limit.  Draining is paced by the cost-based vacuum delay either way.",
 							&prolly_release_max_per_pass,
 							1000000, -1, INT_MAX,
