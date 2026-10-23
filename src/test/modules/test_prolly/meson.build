@@ -131,6 +131,7 @@ tests += {
       'extension_clone',
       'text_types',
       'versioned_event_triggers',
+      'internal_move_events',
       'foreign_tables',
       'canonical_escapes',
       'aggregates',
