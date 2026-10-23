@@ -16,7 +16,6 @@ my $node = PostgreSQL::Test::Cluster->new('merge_plans');
 $node->init;
 $node->append_conf('postgresql.conf', q{
 autovacuum = off
-maintenance_work_mem = '1MB'
 });
 $node->start;
 my (@memory, @disk);

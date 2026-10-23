@@ -198,9 +198,11 @@ row, rather than two complete lists.  Outcome memory is two file buffers
 plus reusable buffers sized to the largest records (and BufFile segment
 metadata); temporary I/O grows with the outcomes.  Files close on success
 and their resource owner removes them on error, savepoint rollback or
-cancellation.  Ordinary merges do not create these files.  Earlier schema
-conversion and uncertainty buffers are separate and can still grow with
-table size; this does not bound the entire merge's memory.
+cancellation.  Ordinary merges do not create these files, but every such
+validation creates both, however small the table, so it uses temporary
+space: it counts against temp_file_limit and is reported by log_temp_files.
+Earlier schema conversion and uncertainty buffers are separate and can still
+grow with table size; this does not bound the entire merge's memory.
 
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
