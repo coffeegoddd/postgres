@@ -122,6 +122,51 @@ typedef struct ProllyViolation
 typedef void (*ProllyViolationVisit) (const ProllyViolation *violation,
 									  void *arg);
 
+/*
+ * A tag: a name for a commit, with who made it, when and why, as Dolt's
+ * (and git's annotated tags).  A tag is an object of its own, as a commit
+ * is, identified by its content's hash, so the same tag has the same id in
+ * every database (clone/push/fetch).
+ */
+typedef struct ProllyTagInfo
+{
+	ProllyHash	id;				/* the tag object's */
+	ProllyHash	commit;
+	TimestampTz tagged_at;
+	char	   *tagger;			/* palloc'd: "Name <email>" */
+	char	   *message;		/* palloc'd */
+} ProllyTagInfo;
+
+/*
+ * A rebase in progress, as Dolt's: the branch being rebased (its head when
+ * the rebase began), the commit its commits are replayed onto, and the plan,
+ * steps in rebase order, each an action on one of the branch's commits.
+ * The session works on a branch of its own while it rebases; the state is
+ * that branch's.
+ */
+typedef struct ProllyRebaseStep
+{
+	char	   *order;			/* a numeric(6,2), as text (palloc'd) */
+	char	   *action;			/* pick, reword, squash, fixup, drop, edit */
+	ProllyHash	commit;
+	char	   *message;		/* (palloc'd) */
+} ProllyRebaseStep;
+
+typedef struct ProllyRebaseState
+{
+	char	   *branch;			/* the branch rebased (palloc'd) */
+	ProllyHash	head;			/* its head as the rebase began */
+	ProllyHash	onto;
+	bool		keep_empty;		/* keep a commit that becomes empty */
+	char	   *last_step;		/* the order of the step last begun, or NULL */
+	int			nsteps;
+	ProllyRebaseStep *steps;	/* (palloc'd) */
+} ProllyRebaseState;
+
+/* Visits a tag: its name, its tag object and that tag's commit. */
+typedef void (*ProllyTagVisit) (const char *name, const ProllyHash *tag,
+								const ProllyHash *commit, void *arg);
+
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
@@ -178,10 +223,12 @@ typedef struct ProllyRefsRoutine
 						   ProllyHash *commit_id);
 
 	/*
-	 * Resolve a branch name, commit id or HEAD (the session branch's head
-	 * commit), each optionally followed by ancestry steps as in Dolt and
-	 * Git (~n: the nth first-parent ancestor; ^n: the nth parent), to a
-	 * commit id.
+	 * Resolve a branch name, tag name, commit id or HEAD (the session
+	 * branch's head commit), each optionally followed by ancestry steps as
+	 * in Dolt and Git (~n: the nth first-parent ancestor; ^n: the nth
+	 * parent), to a commit id.  A name is a branch's before a tag's, and a
+	 * tag's before a remote-tracking branch's, as in Dolt; "refs/heads/x"
+	 * and "refs/tags/x" name only a branch or only a tag.
 	 */
 	bool		(*resolve) (const char *refname, ProllyHash *commit_id);
 
@@ -391,9 +438,9 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * The refs a root of the chunk store named (one it was at, which may be
-	 * long past): each branch's head and remote-tracking branch's commit, by
-	 * full name ("refs/heads/main", "refs/remotes/origin/main"), in no
-	 * particular order.  False, visiting nothing, if the store no longer
+	 * long past): each branch's head, remote-tracking branch's commit and
+	 * tag's commit, by full name ("refs/heads/main",
+	 * "refs/remotes/origin/main", "refs/tags/v1"), in no particular order.  False, visiting nothing, if the store no longer
 	 * has that root's chunks.
 	 */
 	bool		(*root_refs) (const ProllyHash *root, ProllyRootRefVisit visit,
@@ -548,6 +595,37 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*working_identity) (Oid only, StringInfo identity);
 	void		(*anchor_identity) (const ProllyValue *identity);
+
+	/*
+	 * Optional, together: tags.  tag_write() writes a tag object of commit,
+	 * by tagger, with message, dated now, and sets *tag to its id; it names
+	 * nothing.  tag_get() reads a tag object (false: tag isn't one).
+	 * tag_lookup() finds the tag called name (false: none).  tag_set()
+	 * calls name tag, a tag object the store has (NULL: deletes the tag), as
+	 * a compare-and-swap: expected NULL takes whatever tag of that name
+	 * there is, an empty hash only none; false, nothing changed, if it isn't
+	 * so.  A new tag's name follows a branch's rules, and isn't a commit's
+	 * id.  tags() visits every tag, by name.  Changes are with the
+	 * transaction, as any change to the refs.  The walk keeps each tag
+	 * object and its commit, and walk_commit() given a tag object walks it
+	 * and then its commit.
+	 */
+	void		(*tag_write) (const ProllyHash *commit, const char *tagger,
+							  const char *message, ProllyHash *tag);
+	bool		(*tag_get) (const ProllyHash *tag, ProllyTagInfo *info);
+	bool		(*tag_lookup) (const char *name, ProllyHash *tag);
+	bool		(*tag_set) (const char *name, const ProllyHash *expected,
+							const ProllyHash *tag);
+	void		(*tags) (ProllyTagVisit visit, void *arg);
+
+	/*
+	 * Optional, together: the session branch's rebase in progress (false:
+	 * none), and setting it (NULL: none), with the transaction.  It goes
+	 * with its branch when the branch is deleted, and is renamed with it.
+	 * The walk keeps the commits it names.
+	 */
+	bool		(*rebase_state) (ProllyRebaseState *state);
+	void		(*set_rebase_state) (const ProllyRebaseState *state);
 } ProllyRefsRoutine;
 
 /*
@@ -574,9 +652,11 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
 	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
-	"working_identity", "anchor_identity"
+	"working_identity", "anchor_identity", "tag_write", "tag_get", \
+	"tag_lookup", "tag_set", "tags", \
+	"rebase_state", "set_rebase_state"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK anchor_identity
+#define PROLLY_REFS_LAST_CALLBACK set_rebase_state
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

@@ -8,6 +8,10 @@
  * - A store that has a chunk has every chunk it references: so what the
  *   other side has, and all below it, isn't sent, and what is received is
  *   checked to hold before the store takes it.
+ * - What receive(), send() and clone() are given may be tag objects as
+ *   well as commits (the refs' tag_get()): a tag's object moves, then its
+ *   commit, as the refs' walk_commit() reaches them, and the tag's commit
+ *   is checked as a given commit is.
  * - Only chunks move: refs (this database's remote-tracking branches, the
  *   remote's heads) are the caller's to move afterwards.  A receive that
  *   fails adds nothing; a send that fails adds nothing the remote reads.

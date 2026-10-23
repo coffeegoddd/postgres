@@ -48,6 +48,20 @@
  *	'I' name	-> the working set's identity anchor (the canonicalizer's
  *				   identify()), as of a head: the head's hash in hex (none
  *				   for a branch without commits), a newline, then the anchor
+ *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
+ *				   of another, are refused
+ *	'T' name	-> a tag: its tag object, then that tag's commit (hash
+ *				   length, hash each; the commit kept here too, so that
+ *				   resolving a tag, or reading an old root's refs, reads
+ *				   no tag object)
+ *	'E' name	-> the branch's rebase in progress: the branch rebased (a
+ *				   varint length, then the bytes), its head then and the
+ *				   commit replayed onto (hash length, hash each), a flags
+ *				   byte (1: keep commits that become empty), the order of
+ *				   the step last begun (a varint length, then the bytes; 0:
+ *				   none), the count of steps (a varint), then each step's
+ *				   order and action (varint length, bytes), commit (hash
+ *				   length, hash) and message (varint length, bytes)
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts, or write to a branch that has
@@ -74,9 +88,19 @@
  *				   form of the branch's versioned schemas, folded
  *	"time"		-> microseconds since the Postgres epoch, 8 bytes big-endian
  *
+ * A tag object is a tree of its own too, and its id that tree's root hash,
+ * so a tag's id is the same in every database it is cloned, pushed or
+ * fetched to; a commit has a "root" item, a tag object none:
+ *
+ *	"commit"	-> the tagged commit (length byte, hash)
+ *	"message"	-> the tag's message
+ *	"tagger"	-> who made it
+ *	"time"		-> when, as a commit's
+ *
  * The chunks a commit's items and the refs' entries name (its dependencies,
- * parents and root; a branch's head, baseline and working set, a merge's
- * commits, a remote branch's head) are declared to the tree as the
+ * parents and root; a tag's commit; a branch's head, baseline and working
+ * set, a merge's commits, a remote branch's head, a tag's object and
+ * commit) are declared to the tree as the
  * references to chunks its leaves hold (commit_chunk_refs(),
  * refs_chunk_refs()), so
  * a collection follows them without reading values.
@@ -171,6 +195,15 @@
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
 #define TAG_STASH		'Z'	/* a list of stashes, by name */
 #define TAG_IDENTITY	'I'	/* the working set's identity anchor */
+#define TAG_TAG			'T'	/* a tag, by name */
+#define TAG_REBASE		'E'	/* a branch's rebase in progress */
+#define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
+
+/*
+ * The refs tree's format, kept in it: a tree of another (an older build's)
+ * is refused, never read.  2: tags; 3: rebases.
+ */
+#define REFS_FORMAT		"3"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -230,6 +263,8 @@ static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
+static bool tag_entry(const char *name, ProllyHash *tag, ProllyHash *commit);
+static bool copies_tag_get(const ProllyHash *tag, ProllyTagInfo *info);
 static bool upstream_head(const char *branch, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
 static void copies_visit_violations(ProllyViolationVisit visit, void *arg);
@@ -264,7 +299,73 @@ declare_hashes(const char *p, const char *end, int n, StringInfo refs)
 	return p;
 }
 
-/* A commit's items: its dependencies, parents and root name chunks. */
+static ProllyHash *
+copy_hash_of(const ProllyHash *h)
+{
+	ProllyHash *c = palloc(sizeof(ProllyHash));
+
+	*c = *h;
+	return c;
+}
+
+/* A varint-length string at *p (palloc'd); NULL if it doesn't fit. */
+static char *
+get_short_text(const char **p, const char *end)
+{
+	uint64		len = prolly_get_varint(p, end);
+	char	   *s;
+
+	if (len > (uint64) (end - *p))
+		return NULL;
+	s = pnstrdup(*p, len);
+	*p += len;
+	return s;
+}
+
+/*
+ * A rebase state's entry, read; false if it is malformed (its hashes are
+ * still read as get_hash() reads them, which errors on a bad one).
+ */
+static bool
+rebase_decode(const char *p, const char *end, ProllyRebaseState *state)
+{
+	uint64		n;
+
+	memset(state, 0, sizeof(*state));
+	if ((state->branch = get_short_text(&p, end)) == NULL)
+		return false;
+	p = get_hash(p, end, &state->head);
+	p = get_hash(p, end, &state->onto);
+	if (p >= end)
+		return false;
+	state->keep_empty = (*p++ & 1) != 0;
+	if ((state->last_step = get_short_text(&p, end)) == NULL)
+		return false;
+	if (state->last_step[0] == '\0')
+		state->last_step = NULL;
+	n = prolly_get_varint(&p, end);
+	if (n > (uint64) (end - p))
+		return false;
+	state->steps = palloc0(sizeof(ProllyRebaseStep) * Max(n, 1));
+	for (uint64 i = 0; i < n; i++)
+	{
+		ProllyRebaseStep *s = &state->steps[i];
+
+		if ((s->order = get_short_text(&p, end)) == NULL ||
+			(s->action = get_short_text(&p, end)) == NULL)
+			return false;
+		p = get_hash(p, end, &s->commit);
+		if ((s->message = get_short_text(&p, end)) == NULL)
+			return false;
+		state->nsteps++;
+	}
+	return true;
+}
+
+/*
+ * A commit's items: its dependencies, parents and root name chunks; a tag
+ * object's: its commit.
+ */
 static void
 commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 				  StringInfo refs)
@@ -274,7 +375,8 @@ commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 
 #define KEY_IS(name) \
 	(key->len == strlen(name) && memcmp(key->data, name, key->len) == 0)
-	if (KEY_IS("dependencies") || KEY_IS("parents") || KEY_IS("root"))
+	if (KEY_IS("dependencies") || KEY_IS("parents") || KEY_IS("root") ||
+		KEY_IS("commit"))
 		(void) declare_hashes(p, end, INT_MAX, refs);
 #undef KEY_IS
 }
@@ -282,8 +384,8 @@ commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 /*
  * The refs' entries: a branch's head, a remote branch's, a baseline and the
  * working set its fold made, a merge's commits (theirs and the base; a
- * revert's series head and the commits it has left), and each stash's
- * commit.
+ * revert's series head and the commits it has left), each stash's commit,
+ * and each tag's object and commit.
  */
 static void
 refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
@@ -301,6 +403,7 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			(void) declare_hashes(p, end, 1, refs);
 			break;
 		case TAG_BASELINE:
+		case TAG_TAG:
 			(void) declare_hashes(p, end, 2, refs);
 			break;
 		case TAG_MERGE:
@@ -323,6 +426,18 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 					n = get_be32(p);
 					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
 				}
+			}
+			break;
+		case TAG_REBASE:
+			{
+				ProllyRebaseState rs;
+
+				if (!rebase_decode(p, end, &rs))
+					break;
+				PROLLY_CALL(tree, value_reference, &rs.head, 0, refs);
+				PROLLY_CALL(tree, value_reference, &rs.onto, 0, refs);
+				for (int i = 0; i < rs.nsteps; i++)
+					PROLLY_CALL(tree, value_reference, &rs.steps[i].commit, 0, refs);
 			}
 			break;
 		case TAG_STASH:
@@ -600,6 +715,39 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Refuse a refs tree of another format than REFS_FORMAT (an older one has
+ * no TAG_FORMAT entry): this build reads only its own.  Checked once a
+ * backend (a backend serves one database): every root after the one checked
+ * was made from it, by builds that keep the entry.
+ */
+static void
+check_refs_format(const ProllyNodeRef *root)
+{
+	static bool checked = false;
+	char		k = TAG_FORMAT;
+	ProllyKey	key = {(const uint8 *) &k, 1};
+	StringInfoData v;
+
+	if (checked)
+		return;
+	initStringInfo(&v);
+	if (!PROLLY_CALL(tree, get, &env, root, &key, &v))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's prolly refs are of an older format than %s",
+						REFS_FORMAT),
+				 errdetail("This build reads only refs of format %s.", REFS_FORMAT)));
+	if (strcmp(v.data, REFS_FORMAT) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's prolly refs are of format %s, not %s",
+						v.data, REFS_FORMAT),
+				 errdetail("This build reads only refs of format %s.", REFS_FORMAT)));
+	pfree(v.data);
+	checked = true;
+}
+
 /* Save the scoped changes for the subtransaction, before changing them. */
 static void
 scoped_save(void)
@@ -774,6 +922,7 @@ refs_root(ProllyNodeRef *root)
 	if (h.len == 0)
 		return false;
 	ref_of(&h, root);
+	check_refs_format(root);
 	return true;
 }
 
@@ -861,9 +1010,21 @@ lock_refs(void)
 			ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &env,
 											   CurrentMemoryContext);
 			ProllyNodeRef empty;
+			char		k = TAG_FORMAT;
+			ProllyKey	key = {(const uint8 *) &k, 1};
+			ProllyValue v = {(const uint8 *) REFS_FORMAT, strlen(REFS_FORMAT)};
 
+			/* (a new store's refs: only their format) */
+			PROLLY_CALL(tree, build_add, b, &key, &v);
 			PROLLY_CALL(tree, build_finish, b, &empty);
 			next = empty.hash;
+		}
+		else
+		{
+			ProllyNodeRef r;
+
+			ref_of(&cur, &r);
+			check_refs_format(&r);
 		}
 		if (PROLLY_CALL(env.chunk_store, move_root, env.chunks, &cur, &next))
 			break;
@@ -905,6 +1066,7 @@ branch_entry(const char *key, int keylen)
 		case TAG_MERGE_NAMES:
 		case TAG_VIOLATIONS:
 		case TAG_IDENTITY:
+		case TAG_REBASE:
 			return true;
 		default:
 			return false;
@@ -2396,6 +2558,7 @@ static bool
 resolve_base(const char *refname, ProllyHash *commit_id)
 {
 	ProllyCommitInfo info;
+	bool		branch_only = false;
 
 	/*
 	 * HEAD, in any case: the session branch's head commit, as in Dolt.  (A
@@ -2410,9 +2573,20 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 	 */
 	else if (strncmp(refname, "refs/heads/", 11) == 0 && refname[11] != '\0' &&
 			 !branch_exists(refname))
+	{
 		refname += 11;
+		branch_only = true;
+	}
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
+	if (branch_only)
+		return false;
+	/* a tag, by its name, or its full ref name (only a tag's) */
+	if (strncmp(refname, "refs/tags/", 10) == 0 && refname[10] != '\0' &&
+		!tag_entry(refname, NULL, NULL))
+		return tag_entry(refname + 10, NULL, commit_id);
+	if (tag_entry(refname, NULL, commit_id))
+		return true;
 	if (tracking_head(refname, commit_id))
 		return true;
 	return parse_commit_id(refname, commit_id) &&
@@ -3095,6 +3269,10 @@ copies_branch_delete(const char *name, bool force)
 		names_key(&key, name);
 		refs_put(key.data, key.len, NULL);
 		resetStringInfo(&key);
+		appendStringInfoChar(&key, TAG_REBASE);
+		appendStringInfoString(&key, name);
+		refs_put(key.data, key.len, NULL);
+		resetStringInfo(&key);
 		anchor_key(&key, name);
 		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
@@ -3111,7 +3289,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES, TAG_IDENTITY};
+	TAG_NAMES, TAG_IDENTITY, TAG_REBASE};
 	ListCell   *lc;
 
 	lock_branch(name);
@@ -4657,14 +4835,15 @@ root_ref_cmp(const void *a, const void *b)
 
 /*
  * The refs a root of the store named, whenever it was the store's root:
- * branches' heads and remote-tracking branches' commits, in the order of
- * their full names (as Dolt's: a tracking branch's key, remote then
- * branch, sorts otherwise where one remote's name begins another's).
+ * branches' heads, remote-tracking branches' commits and tags' commits, in
+ * the order of their full names (as Dolt's: a tracking branch's key, remote
+ * then branch, sorts otherwise where one remote's name begins another's).
+ * A tag's commit is the one its entry keeps.
  */
 static bool
 copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 {
-	static const char tags[] = {TAG_BRANCH, TAG_TRACKING};
+	static const char tags[] = {TAG_BRANCH, TAG_TRACKING, TAG_TAG};
 	ProllyNodeRef r;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
@@ -4692,9 +4871,10 @@ copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 			StringInfoData ref;
 
 			initStringInfo(&ref);
-			if (tags[t] == TAG_BRANCH)
+			if (tags[t] == TAG_BRANCH || tags[t] == TAG_TAG)
 			{
-				appendStringInfoString(&ref, "refs/heads/");
+				appendStringInfoString(&ref, tags[t] == TAG_BRANCH ?
+									   "refs/heads/" : "refs/tags/");
 				appendBinaryStringInfo(&ref, name, namelen);
 			}
 			else
@@ -4713,8 +4893,15 @@ copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 				refs = repalloc(refs, sizeof(RootRef) * maxrefs);
 			}
 			refs[nrefs].name = ref.data;
-			(void) get_hash((const char *) v.data, (const char *) v.data + v.len,
-							&refs[nrefs].commit);
+			{
+				const char *p = (const char *) v.data;
+				const char *end = p + v.len;
+
+				p = get_hash(p, end, &refs[nrefs].commit);
+				/* (a tag's object, then its commit) */
+				if (tags[t] == TAG_TAG)
+					(void) get_hash(p, end, &refs[nrefs].commit);
+			}
 			nrefs++;
 		}
 	}
@@ -5042,8 +5229,9 @@ typedef struct WalkState
 /*
  * Walk the commit id and its ancestors, each once: a work list, not
  * recursion (a history may be as long as it likes), and a hash set of the
- * commits seen.  A commit missing from the store is an error; a chunk that
- * isn't a commit is passed over, nothing of it visited.
+ * commits seen.  A commit missing from the store is an error; a tag object
+ * is walked, then its commit; another chunk that isn't a commit is passed
+ * over, nothing of it visited.
  */
 static void
 walk_commit(WalkState *ws, const ProllyHash *id)
@@ -5091,7 +5279,21 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(next))));
 		if (!copies_commit_get(next, &info))
+		{
+			ProllyTagInfo tag;
+
+			/* (a tag the visitor declines: it has seen its commit) */
+			ref_of(next, &ref);
+			if (copies_tag_get(next, &tag) &&
+				PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg))
+			{
+				ProllyHash *c = palloc(sizeof(ProllyHash));
+
+				*c = tag.commit;
+				todo = lappend(todo, c);
+			}
 			continue;
+		}
 
 		/* (a commit the visitor declines: it has seen its root and parents) */
 		ref_of(next, &ref);
@@ -5114,7 +5316,8 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 
 /*
  * The refs tree, every commit reachable from a head, a remote-tracking
- * branch or a merge in progress, with its root, and every baseline.
+ * branch, a merge in progress, a stash or a tag (with the tag's object),
+ * with its root, and every baseline.
  */
 static void
 copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
@@ -5138,6 +5341,20 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		const char *end = p + v.len;
 		ProllyHash *h;
 
+		/* (a rebase: the head it began at, its onto, its steps' commits) */
+		if (k.len >= 1 && k.data[0] == TAG_REBASE)
+		{
+			ProllyRebaseState rs;
+
+			if (rebase_decode(p, end, &rs))
+			{
+				heads = lappend(heads, copy_hash_of(&rs.head));
+				heads = lappend(heads, copy_hash_of(&rs.onto));
+				for (int i = 0; i < rs.nsteps; i++)
+					heads = lappend(heads, copy_hash_of(&rs.steps[i].commit));
+			}
+			continue;
+		}
 		/* (a stash list: each one's commit, kept as a head is) */
 		if (k.len >= 1 && k.data[0] == TAG_STASH)
 		{
@@ -5156,8 +5373,10 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 			continue;
 		}
 		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE &&
-						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING))
+						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING &&
+						  k.data[0] != TAG_TAG))
 			continue;
+		/* (a tag: its object, walked as a head is, then its commit) */
 		h = palloc(sizeof(ProllyHash));
 		p = get_hash(p, end, h);
 		if (k.data[0] == TAG_BASELINE)
@@ -5365,6 +5584,294 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 }
 
 /* ------------------------------------------------------------------------
+ * Tags: TAG_TAG and a tag's name -> its tag object, then its commit.
+ * ------------------------------------------------------------------------
+ */
+
+static void
+tag_key(const char *name, StringInfo key)
+{
+	appendStringInfoChar(key, TAG_TAG);
+	appendStringInfoString(key, name);
+}
+
+/*
+ * The tag called name: its object and its commit (each if not NULL); false
+ * if there is none.
+ */
+static bool
+tag_entry(const char *name, ProllyHash *tag, ProllyHash *commit)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tag_key(name, &key);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+		ProllyHash	t;
+		ProllyHash	c;
+
+		p = get_hash(p, end, &t);
+		(void) get_hash(p, end, &c);
+		if (tag)
+			*tag = t;
+		if (commit)
+			*commit = c;
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * Write a tag object of commit; its id is its tree's root hash.  It is
+ * dated now, as a commit is.
+ */
+static void
+copies_tag_write(const ProllyHash *commit, const char *tagger,
+				 const char *message, ProllyHash *tag)
+{
+	ProllyCommitInfo info;
+	ProllyTreeBuilder *b;
+	StringInfoData v;
+	ProllyNodeRef ref;
+
+	refs_init();
+	if (!copies_commit_get(commit, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("commit %s does not exist", prolly_hash_hex(commit))));
+	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
+
+	/* Keys in order: commit, message, tagger, time. */
+	initStringInfo(&v);
+	put_hash(&v, commit);
+	add_item(b, "commit", &v);
+	resetStringInfo(&v);
+	appendStringInfoString(&v, message);
+	add_item(b, "message", &v);
+	resetStringInfo(&v);
+	appendStringInfoString(&v, tagger);
+	add_item(b, "tagger", &v);
+	resetStringInfo(&v);
+	put_uint64(&v, (uint64) GetCurrentTimestamp());
+	add_item(b, "time", &v);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	*tag = ref.hash;
+	pfree(v.data);
+}
+
+/* A tag object, read; false if tag isn't one (a commit, say). */
+static bool
+copies_tag_get(const ProllyHash *tag, ProllyTagInfo *info)
+{
+	ProllyNodeRef ref;
+	StringInfoData v;
+
+	refs_init();
+	if (tag->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, tag))
+		return false;
+	ref_of(tag, &ref);
+	initStringInfo(&v);
+	if (!read_item(&ref, "commit", &v))
+	{
+		pfree(v.data);
+		return false;
+	}
+	memset(info, 0, sizeof(*info));
+	info->id = *tag;
+	(void) get_hash(v.data, v.data + v.len, &info->commit);
+	resetStringInfo(&v);
+	(void) read_item(&ref, "tagger", &v);
+	info->tagger = pstrdup(v.data);
+	resetStringInfo(&v);
+	(void) read_item(&ref, "message", &v);
+	info->message = pstrdup(v.data);
+	resetStringInfo(&v);
+	if (read_item(&ref, "time", &v))
+		(void) get_time(&v, &info->tagged_at);
+	pfree(v.data);
+	return true;
+}
+
+static bool
+copies_tag_lookup(const char *name, ProllyHash *tag)
+{
+	refs_init();
+	return tag_entry(name, tag, NULL);
+}
+
+/*
+ * Call name tag (NULL: delete it), if the tag called name is expected's
+ * (NULL: whatever it is; an empty hash: there is none).  The refs are held
+ * first, so no other session's change comes between the check and the
+ * change.
+ */
+static bool
+copies_tag_set(const char *name, const ProllyHash *expected,
+			   const ProllyHash *tag)
+{
+	ProllyHash	cur;
+	bool		exists;
+	ProllyTagInfo info;
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	lock_refs();
+	exists = tag_entry(name, &cur, NULL);
+	if (expected != NULL &&
+		(expected->len == 0 ? exists : !(exists && same_hash(&cur, expected))))
+		return false;
+	if (tag == NULL && !exists)
+		return false;
+	if (tag != NULL)
+	{
+		ProllyHash	id;
+		ProllyCommitInfo ci;
+
+		/*
+		 * A new tag's name follows a branch's rules, and isn't a commit's
+		 * id, which it would hide where refs are read.
+		 */
+		if (!exists &&
+			(!branch_ops()->name_ok(name) ||
+			 (parse_commit_id(name, &id) && copies_commit_get(&id, &ci))))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_NAME),
+					 errmsg("invalid tag name \"%s\"", name),
+					 errdetail("A tag's name follows a branch's rules, and isn't a commit's id.")));
+		if (!copies_tag_get(tag, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("tag object %s does not exist", prolly_hash_hex(tag))));
+	}
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tag_key(name, &key);
+	if (tag)
+	{
+		put_hash(&v, tag);
+		put_hash(&v, &info.commit);
+	}
+	refs_put(key.data, key.len, tag ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+	return true;
+}
+
+typedef struct TagVisit
+{
+	ProllyTagVisit visit;
+	void	   *arg;
+} TagVisit;
+
+static void
+visit_tag_entry(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	TagVisit   *tv = arg;
+	char	   *name = pnstrdup((const char *) k->data + 1, k->len - 1);
+	const char *p = (const char *) v->data;
+	const char *end = p + v->len;
+	ProllyHash	tag;
+	ProllyHash	commit;
+
+	p = get_hash(p, end, &tag);
+	(void) get_hash(p, end, &commit);
+	tv->visit(name, &tag, &commit, tv->arg);
+	pfree(name);
+}
+
+static void
+copies_tags(ProllyTagVisit visit, void *arg)
+{
+	TagVisit	tv = {visit, arg};
+	char		tag = TAG_TAG;
+
+	refs_init();
+	visit_prefix(&tag, 1, visit_tag_entry, &tv);
+}
+
+/* ------------------------------------------------------------------------
+ * Rebases: TAG_REBASE and the branch rebasing on -> its rebase state.
+ * ------------------------------------------------------------------------
+ */
+
+static void
+rebase_key(StringInfo key, const char *branch)
+{
+	appendStringInfoChar(key, TAG_REBASE);
+	appendStringInfoString(key, branch);
+}
+
+static void
+put_short_text(StringInfo out, const char *s)
+{
+	prolly_put_varint(out, strlen(s));
+	appendStringInfoString(out, s);
+}
+
+static bool
+copies_rebase_state(ProllyRebaseState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	rebase_key(&key, branch_ops()->current());
+	found = refs_get(key.data, key.len, &v);
+	if (found && !rebase_decode(v.data, v.data + v.len, state))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupt prolly rebase state")));
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+static void
+copies_set_rebase_state(const ProllyRebaseState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	rebase_key(&key, branch_ops()->current());
+	if (state)
+	{
+		put_short_text(&v, state->branch);
+		put_hash(&v, &state->head);
+		put_hash(&v, &state->onto);
+		appendStringInfoChar(&v, state->keep_empty ? 1 : 0);
+		put_short_text(&v, state->last_step ? state->last_step : "");
+		prolly_put_varint(&v, state->nsteps);
+		for (int i = 0; i < state->nsteps; i++)
+		{
+			const ProllyRebaseStep *s = &state->steps[i];
+
+			put_short_text(&v, s->order);
+			put_short_text(&v, s->action);
+			put_hash(&v, &s->commit);
+			put_short_text(&v, s->message);
+		}
+	}
+	refs_put(key.data, key.len, state ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* ------------------------------------------------------------------------
  * Stashes: TAG_STASH and a list's name, its entries newest first, each its
  * commit's hash, then its branch's name (a varint length, then the bytes).
  * ------------------------------------------------------------------------
@@ -5545,7 +6052,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
 		.impl_id = 2,
-		.format_version = 2,
+		.format_version = 3,
 		.name = "copies",
 		.description = "head commits of branches made by copying, and the "
 		"commits, in the chunk store",
@@ -5614,4 +6121,11 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.note_relation = branch_generations_note_relation,
 	.fold_mark = branch_fold_mark,
 	.written_since = branch_written_since,
+	.tag_write = copies_tag_write,
+	.tag_get = copies_tag_get,
+	.tag_lookup = copies_tag_lookup,
+	.tag_set = copies_tag_set,
+	.tags = copies_tags,
+	.rebase_state = copies_rebase_state,
+	.set_rebase_state = copies_set_rebase_state,
 };

@@ -1,7 +1,7 @@
 # Dolt compatibility and test adaptations
 
 This catalog records the behavior and test adaptations associated with the
-stable D1–D23 IDs in `ports.json`. IDs are never reused or renumbered; when
+stable D1–D25 IDs in `ports.json`. IDs are never reused or renumbered; when
 a difference is removed, mark its entry as resolved and update the ports.
 These are divergence IDs, unrelated to the removed engine named D1.
 
@@ -163,7 +163,11 @@ adapts.
   commits. `WORKING` in `dolt_status` and
   `dolt_diff` is the branch's working set as the current transaction
   sees it, its own uncommitted writes included, as a Dolt session's
-  working root includes its own (#501).
+  working root includes its own (#501). A rebase whose step conflicts
+  stops there, in a transaction block (or with
+  `dolt.allow_commit_conflicts`), returning `{1, message}` rather than
+  Dolt's error, which here would roll the stop back; outside a block it
+  is an error that rolls the whole rebase back, as Dolt aborts it.
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is
@@ -592,3 +596,18 @@ OF` are built in D18's shapes.
 - **Port:** compare reconstructed values using the receiver's semantics.
   The generic normalizing-type regression covers hashes, cell merges and
   reset; the PostGIS-specific regression remains tracked in #689/#710.
+
+## D25. Checking out a tag is a read-only detached session
+
+- **Dolt:** `dolt_checkout('v1')` of a tag (or a commit) is refused: Dolt
+  has no detached head in SQL, and suggests `dolt_checkout('v1', '-b',
+  name)`. A tag is read-only as a revision database, `USE mydb/v1`.
+- **Prolly:** a tag (or commit hash) that names no branch checks out as a
+  read-only session on the commit's hidden branch, `detached/<hash>`,
+  as a commit's hash already does; `-b` makes a branch there as in Dolt.
+- **Why:** a connection names a branch (D11), so the session a revision
+  database gives in Dolt is this checkout here; refusing it would leave
+  no way to read a tag's state as a session. Proposed in #704, open for
+  the user's review.
+- **Port:** an assertion of Dolt's refusal is omitted (the case is
+  partial); test_prolly's `tags` test checks the read-only checkout.

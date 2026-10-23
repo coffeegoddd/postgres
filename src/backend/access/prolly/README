@@ -483,12 +483,41 @@ four of a level into one, each with a Bloom filter folded smaller as the
 map grows, so its memory stays within budget and a lookup checks a number
 of runs logarithmic in its size.
 
+Tags are objects of their own, as commits are: a small tree naming the
+commit, its tagger, date and message, whose hash is the tag's id, so a tag
+is the same in every database.  The refs name each tag's object and keep
+its commit beside it, so resolving a tag reads no object.  A push of a tag
+sends its object and what that reaches, then moves the remote's tag; a
+fetch follows the remote's tags of commits it has (as Dolt's does), and a
+clone takes every tag.  A file remote's manifest lists tags on lines of
+their own.
+
+The refs tree records its format, and a file remote's manifest its
+version; while the prototype iterates, neither is kept readable across a
+change: refs or a manifest of another format are refused, never read.
+
 
 SQL
 ---
 
 prolly_dolt.c is the dolt_* functions and system views, with Doltgres's
-arguments and results, so scripts written for Doltgres run here.
+arguments and results, so scripts written for Doltgres run here.  A tag
+(dolt_tag, the dolt_tags view) is a revision wherever one is read, after a
+branch of its name; checking one out, as checking out a commit's hash, is a
+read-only detached session at its commit.
+
+dolt_rebase replays a branch's commits onto another, as Dolt's: on a
+branch of its own, dolt_rebase_<branch>, made at the commit replayed onto,
+whose rebase state (the plan, the branch rebased and its head then) the
+refs keep with that branch.  Each step is a cherry-pick; a reword, squash
+or fixup then replaces the pick's commit with one of its working set, and
+a commit that became empty is dropped (unless --empty=keep).  The plan is
+edited through the dolt_rebase view, whose INSTEAD OF trigger changes the
+state.  A step that conflicts stops the rebase as a pick in progress
+(outside a transaction block, an error that rolls the whole rebase back),
+and --continue commits its resolution; the last step done, the rebased
+branch is moved to the rebase's head (refused if it moved meanwhile), and
+the rebase's branch deleted.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
 
