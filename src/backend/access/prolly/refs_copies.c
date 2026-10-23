@@ -2148,8 +2148,10 @@ rank_source(const char *name, Oid branch, void *arg)
  * from without a branch's copies, as a kept materialization, would be
  * planned among these, by the root it holds.)  The copies are new in the
  * transaction, which no other sees: the tables of the chosen plan that
- * cost less emptied and loaded than moved row by row (#713) are added to
- * *emptied, for their copies to begin empty.
+ * cost less emptied and loaded than moved row by row (#713), and those the
+ * head hasn't, which the move drops (#714), are added to *emptied, for
+ * their copies to begin empty: no page of theirs is shared only to be
+ * written over or dropped.
  */
 #define SOURCE_CANDIDATES	16
 
@@ -2223,7 +2225,7 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied)
 	{
 		ProllyTableMove *m = lfirst(lc);
 
-		if (m->kind == PROLLY_TABLE_RELOAD)
+		if (m->kind == PROLLY_TABLE_RELOAD || m->kind == PROLLY_TABLE_DROPPED)
 			*emptied = lappend(*emptied, m->name);
 	}
 	return source;

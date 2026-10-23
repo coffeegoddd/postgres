@@ -163,6 +163,7 @@ tests += {
       'nearest_source',
       'near_sources',
       'reload_moves',
+      'discarded_storage',
       'keyless_toast_folds',
       'vacuum_shared',
       'eager_freeze',

@@ -407,7 +407,10 @@ than reloading it costs (past about an eighth of them) begins empty instead
 gives it, no page shared, its change log told), and the move loads the
 head's rows into it, its indexes built once after them (the row applier's
 load).  Not a table with a deferrable unique, primary key or exclusion
-constraint, whose rows the applier rechecks a row at a time.
+constraint, whose rows the applier rechecks a row at a time.  A table the
+head hasn't begins empty too, so the move drops it without its pages
+having been shared (and, for pages no other map held, logged) first.  A
+table whose definition differs keeps its pages: the move may keep its rows.
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call
