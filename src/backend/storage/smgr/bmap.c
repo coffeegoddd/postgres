@@ -7496,6 +7496,14 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		bmapunlink(rlocator, MAIN_FORKNUM, isRedo);
 		return;
 	}
+
+	/*
+	 * The map is the relation's main fork's to remove (below): callers that
+	 * go through every fork reach it too, and removing it here would free
+	 * the relation file number before the checkpoint.
+	 */
+	if (forknum == BMAP_FORKNUM)
+		return;
 	if (forknum != MAIN_FORKNUM)
 	{
 		mdunlink(rlocator, forknum, isRedo);
@@ -7523,6 +7531,13 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	reln = smgropen(rlocator.locator, INVALID_PROC_NUMBER);
 	if (!mdexists(reln, BMAP_FORKNUM))
 		return;
+
+	/* (a binary upgrade gives relation file numbers itself, as md.c says) */
+	if (IsBinaryUpgrade)
+	{
+		mdunlink(rlocator, BMAP_FORKNUM, false);
+		return;
+	}
 
 	/*
 	 * Keep the map until after the next checkpoint, as md.c keeps a main
@@ -8349,6 +8364,22 @@ bmapunlinkfiletag(const FileTag *ftag, char *path)
 		snprintf(segpath, sizeof(segpath), "%s.%d", base.str, segno);
 		if (unlink(segpath) < 0)
 			break;
+	}
+
+	/*
+	 * A sweep reads the maps it finds, a dropped one's too until now, and
+	 * leaves their pages (and its changes list's) in shared buffers, where a
+	 * relation given the file number next would find them.  They go once
+	 * the file has: a sweep that reads one later finds it gone, and drops
+	 * what it read itself (sweep_relation()).
+	 */
+	if (ret == 0)
+	{
+		ForkNumber	forks[2] = {BMAP_FORKNUM, BMAP_CHANGES_FORKNUM};
+		BlockNumber firsts[2] = {0, 0};
+
+		DropRelationBuffers(smgropen(ftag->rlocator, INVALID_PROC_NUMBER),
+							forks, 2, firsts);
 	}
 	return ret;
 }
