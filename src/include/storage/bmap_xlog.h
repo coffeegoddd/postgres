@@ -187,14 +187,22 @@ typedef struct xl_bmap_extend
  * BMAP_TREE_SHARE		a tree shared: 'locator' is the copy, made with the
  *						source's (relation 'from''s) pointers; block 0 is
  *						its root page, then the reference-count pages of the
- *						subtrees, each a holder more
+ *						subtrees, each a holder more; a copy of a snapshot
+ *						(BMAP_TREE_OF_SNAPSHOT) has its header last
+ * BMAP_TREE_SNAPSHOT	a snapshot of the tree kept, or let go of: block 0 is
+ *						the root page, whose slot changes, then (when kept)
+ *						the header (its epoch raised) and the
+ *						reference-count pages of the subtrees, each a holder
+ *						more
  */
 #define BMAP_TREE_NODE			1
 #define BMAP_TREE_HOLD			3
 #define BMAP_TREE_COPY			4
 #define BMAP_TREE_SHARE			5
+#define BMAP_TREE_SNAPSHOT		6
 
 #define BMAP_TREE_INSTALL		0x01
+#define BMAP_TREE_OF_SNAPSHOT	0x02
 
 typedef struct xl_bmap_tree
 {
@@ -219,6 +227,7 @@ typedef struct xl_bmap_tree
 #define BMAP_DELTA_CHANGES_HEAD	6
 #define BMAP_DELTA_CHANGES	7
 #define BMAP_DELTA_ROOT		8
+#define BMAP_DELTA_SNAPSHOT	9
 
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
@@ -277,6 +286,27 @@ typedef struct xl_bmap_root_delta
 	uint32		ntops;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
 } xl_bmap_root_delta;
+
+/*
+ * A snapshot a tree's root page keeps: its id (0: the slot is free), the
+ * relation's length and last fold's epoch then, and the subtrees it holds.
+ */
+typedef struct xl_bmap_snapshot
+{
+	uint64		id;
+	BlockNumber nblocks;
+	uint32		fold_epoch;
+	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
+} xl_bmap_snapshot;
+
+/* Block data of a tree's root page: a snapshot slot set (or cleared). */
+typedef struct xl_bmap_snapshot_delta
+{
+	uint16		kind;			/* BMAP_DELTA_SNAPSHOT */
+	uint16		flags;
+	uint32		slot;
+	xl_bmap_snapshot snap;
+} xl_bmap_snapshot_delta;
 
 /* Block data of a bitmap page: bits set to 'value'. */
 typedef struct xl_bmap_bits_delta

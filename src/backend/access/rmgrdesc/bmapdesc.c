@@ -109,7 +109,11 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 									 xlrec->from, xlrec->node,
 									 xlrec->old_hw, xlrec->new_hw);
 				else if (xlrec->op == BMAP_TREE_SHARE)
-					appendStringInfo(buf, "share of %u", xlrec->from);
+					appendStringInfo(buf, "share of %u%s", xlrec->from,
+									 (xlrec->flags & BMAP_TREE_OF_SNAPSHOT) ?
+									 "'s snapshot" : "");
+				else if (xlrec->op == BMAP_TREE_SNAPSHOT)
+					appendStringInfoString(buf, "snapshot");
 				else
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;

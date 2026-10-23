@@ -189,6 +189,26 @@ CREATE FUNCTION test_bmap_tree(relnumber oid,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A tree map's snapshots: kept (an id), let go of, listed, and copied into a
+-- new relation file number (its main fork alone), which test_bmap_unlink()
+-- drops.
+CREATE FUNCTION test_bmap_snapshot_take(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_snapshot_release(relnumber oid, id int8)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_snapshots(relnumber oid,
+	OUT id int8, OUT nblocks int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_share_snapshot(relnumber oid, id int8)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Look up every logical block of the storage 'loops' times, as reading its
 -- pages does (from cached map pages): the microseconds it took.
 CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)

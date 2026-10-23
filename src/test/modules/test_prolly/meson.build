@@ -191,6 +191,7 @@ tests += {
       'bulk_moves',
       'retype_moves',
       'bmap_tree_share',
+      'bmap_tree_snapshots',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -299,6 +300,7 @@ tests += {
       't/168_bmap_truncation_record.pl',
       't/190_bmap_tree.pl',
       't/191_bmap_tree_share.pl',
+      't/192_bmap_tree_snapshots.pl',
     ],
   },
 }
