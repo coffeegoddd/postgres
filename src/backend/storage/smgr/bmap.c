@@ -6009,6 +6009,19 @@ bmapnblocks(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * The number of the changes list entry the truncation being replayed adds,
+ * from the list's header: one less if an earlier replay of the record
+ * counted it (see pretruncate_in_recovery()).
+ */
+static uint32
+truncation_entry(Page head)
+{
+	uint32		n = PageGetBmapChangesHead(head)->nentries;
+
+	return PageGetLSN(head) == GetCurrentReplayRecPtr(NULL) ? n - 1 : n;
+}
+
+/*
  * A truncation writes two records: XLOG_SMGR_TRUNCATE, flushed before any
  * buffer is dropped, then the header's own (set_length()), which nothing
  * flushes.  A crash in between leaves only the first durable, whose replay
@@ -6018,9 +6031,11 @@ bmapnblocks(SMgrRelation reln, ForkNumber forknum)
  * first record's replay cuts the header itself, and lists the truncation
  * on a folded relation's changes list, as the second record does; that
  * one's replay, if it comes, applies the same again.  A page newer than
- * the first record means the second is durable (the header is held from
- * one record to the other, and the list changes only under it): then the
- * pages are left to it.
+ * the first record's end means the second is durable (the header is held
+ * from one record to the other, and the list changes only under it): then
+ * the pages are left to it.  A page at the record's end was changed by an
+ * earlier replay of it, which a crash interrupted with only some of the
+ * pages written: each page still older is changed, and none twice.
  *
  * In redo, before the truncation's critical section: the header, held
  * exclusively, and a folded relation's changes list's header and the page
@@ -6046,7 +6061,7 @@ pretruncate_in_recovery(SMgrRelation reln)
 		LockBuffer(head, BUFFER_LOCK_SHARE);
 		check_page(BufferGetPage(head), BMAP_PAGE_CHANGES_HEAD, rel,
 				   BMAP_CHANGES_FORKNUM, 0);
-		pageno = CHANGE_PAGE(PageGetBmapChangesHead(BufferGetPage(head))->nentries);
+		pageno = CHANGE_PAGE(truncation_entry(BufferGetPage(head)));
 		LockBuffer(head, BUFFER_LOCK_UNLOCK);
 		if (pageno < mdnblocks(reln, BMAP_CHANGES_FORKNUM))
 			page = chg_read(rel, pageno);
@@ -6060,6 +6075,8 @@ pretruncate_in_recovery(SMgrRelation reln)
 		reln->bmap_pretrunc_chg[1] = page;
 	}
 	reln->bmap_pretrunc = headerbuf;
+	/* (run in the truncation's critical section, which can't load it) */
+	INJECTION_POINT_LOAD("bmap-truncated-in-recovery");
 }
 
 /*
@@ -6090,59 +6107,80 @@ truncate_in_recovery(SMgrRelation reln, BlockNumber nblocks)
 		LockBuffer(chg[0], BUFFER_LOCK_EXCLUSIVE);
 		LockBuffer(chg[1], BUFFER_LOCK_EXCLUSIVE);
 	}
-	newer = PageGetLSN(hpage) >= end ||
+	newer = PageGetLSN(hpage) > end ||
 		(BufferIsValid(chg[0]) &&
-		 (PageGetLSN(BufferGetPage(chg[0])) >= end ||
-		  PageGetLSN(BufferGetPage(chg[1])) >= end));
-	if (!newer && nblocks < header->nblocks)
-	{
-		xl_bmap_header_delta delta;
+		 (PageGetLSN(BufferGetPage(chg[0])) > end ||
+		  PageGetLSN(BufferGetPage(chg[1])) > end));
 
+	/* (an earlier replay changed the header only if it cut it) */
+	if (!newer && (PageGetLSN(hpage) == end || nblocks < header->nblocks))
+	{
 		if (BufferIsValid(chg[0]))
 		{
-			BmapChangesHead *head = PageGetBmapChangesHead(BufferGetPage(chg[0]));
-			xl_bmap_changes_head_delta hdelta;
-			struct
-			{
-				xl_bmap_changes_delta d;
-				BmapChange	c;
-			}			pdelta;
+			Page		hp = BufferGetPage(chg[0]);
+			Page		pp = BufferGetPage(chg[1]);
+			BmapChangesHead *head = PageGetBmapChangesHead(hp);
+			uint32		n = truncation_entry(hp);
 
-			if (BufferGetBlockNumber(chg[1]) != CHANGE_PAGE(head->nentries))
+			if (BufferGetBlockNumber(chg[1]) != CHANGE_PAGE(n))
 				elog(PANIC, "changes list of \"%s\" grew while its truncation was prepared",
 					 relpathperm(rel, MAIN_FORKNUM).str);
-			hdelta.kind = BMAP_DELTA_CHANGES_HEAD;
-			hdelta.flags = 0;
-			hdelta.fold_epoch = head->fold_epoch;
-			hdelta.lineage = head->lineage;
-			hdelta.fold_nblocks = head->fold_nblocks;
-			hdelta.nentries = head->nentries + 1;
-			hdelta.pruned_epoch = head->pruned_epoch;
-			pdelta.d.kind = BMAP_DELTA_CHANGES;
-			pdelta.d.flags = CHANGE_SLOT(head->nentries) == 0 ? BMAP_DELTA_INIT : 0;
-			pdelta.d.first = CHANGE_SLOT(head->nentries);
-			pdelta.d.n = 1;
-			memset(&pdelta.c, 0, sizeof(pdelta.c));
-			pdelta.c.epoch = header->epoch;
-			pdelta.c.blkno = nblocks;
-			pdelta.c.old_block = InvalidBlockNumber;
-			pdelta.c.kind = BMAP_CHANGE_TRUNCATE;
-			apply_changes_head_delta(BufferGetPage(chg[0]), &hdelta);
-			apply_changes_delta(BufferGetPage(chg[1]), &pdelta.d);
-			for (int i = 0; i < 2; i++)
+			if (PageGetLSN(hp) < end)
 			{
-				PageSetLSN(BufferGetPage(chg[i]), end);
-				MarkBufferDirty(chg[i]);
+				xl_bmap_changes_head_delta hdelta;
+
+				hdelta.kind = BMAP_DELTA_CHANGES_HEAD;
+				hdelta.flags = 0;
+				hdelta.fold_epoch = head->fold_epoch;
+				hdelta.lineage = head->lineage;
+				hdelta.fold_nblocks = head->fold_nblocks;
+				hdelta.nentries = n + 1;
+				hdelta.pruned_epoch = head->pruned_epoch;
+				apply_changes_head_delta(hp, &hdelta);
+				PageSetLSN(hp, end);
+				MarkBufferDirty(chg[0]);
+			}
+			if (PageGetLSN(pp) < end)
+			{
+				struct
+				{
+					xl_bmap_changes_delta d;
+					BmapChange	c;
+				}			pdelta;
+
+				pdelta.d.kind = BMAP_DELTA_CHANGES;
+				pdelta.d.flags = CHANGE_SLOT(n) == 0 ? BMAP_DELTA_INIT : 0;
+				pdelta.d.first = CHANGE_SLOT(n);
+				pdelta.d.n = 1;
+				memset(&pdelta.c, 0, sizeof(pdelta.c));
+				pdelta.c.epoch = header->epoch;
+				pdelta.c.blkno = nblocks;
+				pdelta.c.old_block = InvalidBlockNumber;
+				pdelta.c.kind = BMAP_CHANGE_TRUNCATE;
+				apply_changes_delta(pp, &pdelta.d);
+				PageSetLSN(pp, end);
+				MarkBufferDirty(chg[1]);
 			}
 		}
-		delta.kind = BMAP_DELTA_HEADER;
-		delta.flags = 0;
-		delta.nblocks = nblocks;
-		delta.epoch = header->epoch;
-		delta.fold_epoch = header->fold_epoch;
-		apply_header_delta(hpage, &delta);
-		PageSetLSN(hpage, end);
-		MarkBufferDirty(headerbuf);
+		if (PageGetLSN(hpage) < end)
+		{
+			xl_bmap_header_delta delta;
+
+			delta.kind = BMAP_DELTA_HEADER;
+			delta.flags = 0;
+			delta.nblocks = nblocks;
+			delta.epoch = header->epoch;
+			delta.fold_epoch = header->fold_epoch;
+			apply_header_delta(hpage, &delta);
+			PageSetLSN(hpage, end);
+			MarkBufferDirty(headerbuf);
+		}
+		{
+			/* (the pages changed, still locked: header, list's header, page) */
+			Buffer		bufs[3] = {headerbuf, chg[0], chg[1]};
+
+			INJECTION_POINT_CACHED("bmap-truncated-in-recovery", bufs);
+		}
 	}
 	UnlockReleaseBuffer(headerbuf);
 	for (int i = 0; i < 2; i++)
