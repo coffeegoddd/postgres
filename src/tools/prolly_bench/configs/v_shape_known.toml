@@ -45,24 +45,6 @@ current = "linear"
 issue = "#767"
 reason = "an entry in each index per row written back"
 
-# Deleting a branch drops its storage at commit: each block it shares is
-# counted down, each it alone holds freed, all in the foreground.
-[[known]]
-check = "branch_delete"
-sweep = "rows"
-counter = "bmap_refcount_updates"
-current = "linear"
-issue = "#768"
-reason = "a reference count down per shared block, at commit"
-
-[[known]]
-check = "branch_delete"
-sweep = "delta"
-counter = "bmap_blocks_freed"
-current = "linear"
-issue = "#768"
-reason = "the branch's own blocks, those its changes copied, freed at commit rather than in the background"
-
 # A historical point read decodes the commit's whole table (dolt_at is a
 # full scan).
 [[known]]
