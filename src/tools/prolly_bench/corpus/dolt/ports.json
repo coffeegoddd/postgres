@@ -24231,7 +24231,7 @@
       "index": 10,
       "name": "renamed table",
       "source_sha256": "0f729b6da08fa0c15230030627bf06f1ba4ec4e2b4be2143e4070c61473d8dc7",
-      "scenario_sha256": "548e4b4e8bfc4f19b507f92b3edb8ca9e77c4f4451d11f502802ee293b75a2db",
+      "scenario_sha256": "a0797c3dd824cc001be4ebece927b9014522a9bf28516c548b7930eb481af069",
       "setup": [
         {
           "index": 0,
@@ -24296,42 +24296,42 @@
           "steps": [
             "assert-0"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the new name: its row. PostgreSQL booleans read t/f. (D15)"
+          "note": "Preserved upstream row: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). Tables named qualified; PostgreSQL booleans read t/f. (D15)"
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the new name: its row. PostgreSQL booleans read t/f. (D15)"
+          "note": "Preserved upstream row: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). Tables named qualified; PostgreSQL booleans read t/f. (D15)"
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). PostgreSQL booleans read t/f. (D15)"
+          "note": "Preserved upstream row: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). Tables named qualified; PostgreSQL booleans read t/f. (D15)"
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). PostgreSQL booleans read t/f. (D15)"
+          "note": "Preserved upstream row: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). Tables named qualified; PostgreSQL booleans read t/f. (D15)"
         },
         {
           "index": 4,
           "steps": [
             "assert-4"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the old name (a name only the older version has, as in Dolt): its row. PostgreSQL booleans read t/f. (D15)"
+          "note": "Preserved upstream row, asked by the old name: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). Tables named qualified; PostgreSQL booleans read t/f. (D15)"
         },
         {
           "index": 5,
           "steps": [
             "assert-5"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags and reports one renamed row; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the old name: its row. PostgreSQL booleans read t/f. (D15)"
+          "note": "Preserved upstream row, asked by the old name: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). Tables named qualified; PostgreSQL booleans read t/f. (D15)"
         }
       ],
       "adaptations": [
@@ -26207,7 +26207,7 @@
       "index": 7,
       "name": "schema modification: rename columns",
       "source_sha256": "8d1d824e2985d2492d45d72536aa6a4564c907f912efd20af713b5a4cee48ba2",
-      "scenario_sha256": "e59d9990d87af1d717e8a35a1fe368cfe24e8135712d6037da857dce18acd1d8",
+      "scenario_sha256": "0bb494443bb148945fa413ef5cd3b0c9e8cee6a9c02d32f0698a2e8957b7f043",
       "setup": [
         {
           "index": 0,
@@ -26356,14 +26356,14 @@
           "steps": [
             "assert-2"
           ],
-          "note": "The table is named qualified (D15). The stored update to pk 1 is counted as a modified row even though its historical c3 projects to NULL as current c2 on both sides (#654). Row counts now match Dolt; cells_modified remains zero because cells are compared as displayed by name (D18, D20), without rename identity."
+          "note": "Preserved upstream counts; the table named qualified (D15). The column renamed c2 to c3 keeps its identity, so its cells compare across the rename (D18, D20)."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "Preserved upstream counts; the table named qualified. (D15) Dolt follows the column by its tag through both renames; prolly reads each version's rows as the table is defined now, by column name (D18, D20): commit4's rows read the column (c3 then) as NULL and commit5's as c2: each of the three rows is modified in that cell."
+          "note": "Preserved upstream counts; the table named qualified (D15). The column renamed c3 back to c2 keeps its identity, as Dolt's tag does (D18, D20): no cell modified."
         },
         {
           "index": 4,
@@ -26520,7 +26520,7 @@
       "index": 10,
       "name": "renamed table",
       "source_sha256": "958ff5deb608b39c0e46db55c884dd5d4805cefcd93b172545c2733f2629c79e",
-      "scenario_sha256": "cd855734b72db6b5eb42792439c1875a40f75faee2e24bfec129c5b5ec1ec966",
+      "scenario_sha256": "b79a43f26733203750495869bb6d2a48b52a59368b3ba4afc3e00e9fb966ee6c",
       "setup": [
         {
           "index": 0,
@@ -26585,28 +26585,28 @@
           "steps": [
             "assert-0"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the new name: t2's rows, all added."
+          "note": "Preserved upstream counts; the table named qualified (D15). t1 renamed t2 keeps its identity, as Dolt's tags match it (D17): one table with a row added."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the new name: t2's rows, all added."
+          "note": "Preserved upstream counts; the table named qualified (D15). t1 renamed t2 keeps its identity, as Dolt's tags match it (D17): one table with a row added."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the old name: t1's row, deleted."
+          "note": "Preserved upstream counts, asked by the old name: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). The table is named qualified (D15), and as the newer version names it (t2), where Dolt echoes the name asked."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17). Asked by the old name: t1's row, deleted."
+          "note": "Prolly's dolt_diff_stat takes two refs, no range: 'a..b' is the refs a and b. Preserved upstream counts, asked by the old name: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17). The table is named qualified (D15), and as the newer version names it (t2), where Dolt echoes the name asked."
         }
       ],
       "adaptations": [
@@ -27913,7 +27913,7 @@
       "index": 7,
       "name": "column drop, then rename column with same type to same name",
       "source_sha256": "74e5f13a302ae9632f6cf6117efd095853936ac7caf38ab647e858bf6675b83b",
-      "scenario_sha256": "03199ee7f883d37714650d675168001358cc746aa35acb2f3654bc8ee00ed8e8",
+      "scenario_sha256": "c8dc4e0ecc10d96b373bb59bb164f616c6cdf5962fdecf24efeb28bc14453379",
       "setup": [
         {
           "index": 0,
@@ -28006,28 +28006,28 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name (D18): commit3's rows read c1 (c2 renamed) where commit2's had none, so rows 1 and 4 are modified there too: 7, not 5 (the answer Dolt's comment calls more correct)."
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Rows are read as the table is defined now, columns matched by identity (D18): today's c1 is the column made as c2, and the original c1, dropped, changes no row: two rows added at commit1 and one at commit3, 3, where Dolt counts the drop's two modifications too (5)."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Today's c1 is the column made as c2 (D18), so commit1's rows read its values (3, 6), where Dolt reads commit1's own c1 (2, 5). TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). The column dropped at commit2 is not today's c1 (the column made as c2, D18), and a column dropped changes no row: none, where Dolt shows each row modified. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name (D18): rows 1 and 4 read c1 as NULL at commit2 and as the renamed c2's values at commit3: modified, the rows Dolt's comment says it should return. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows: c1, renamed from c2, keeps c2's identity (D18), so rows 1 and 4 read alike before and after the rename. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
         }
       ],
       "adaptations": [
@@ -28044,7 +28044,7 @@
       "index": 11,
       "name": "multiple column renames",
       "source_sha256": "923821d570d63cae587031b53efec3627d1fe8d3a29ecd1d0f43630c097dc591",
-      "scenario_sha256": "a199773bcd9b067857634eb543eae03a74df526063fe11ba5e6c8a79eac30553",
+      "scenario_sha256": "1ad6d3bd08b8e2f54521b7483e35ab4b0acc72afc76be6871a46f231b42f05df",
       "setup": [
         {
           "index": 0,
@@ -28165,7 +28165,7 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name (D18): row 1 is modified at commit2 too (it read c2 as NULL before the rename): 6, not 5."
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Rows are read as the table is defined now, columns matched by identity (D18): today's c2 was added at commit4, another column than the c1 renamed c2 and dropped, so rows 1 and 3 are added without it, the drop changes no row, and row 100 is added: 3, where Dolt counts the drop's two modifications too (5)."
         },
         {
           "index": 1,
@@ -28179,14 +28179,14 @@
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name (D18): row 1's c1, renamed c2, reads as NULL at commit1 and 2 at commit2: modified. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Today's c2 is the column added at commit4 (D18): commit2's c2 (c1 renamed) is another column, read as NULL, so only row 3 is added, where Dolt shows it with commit2's c2 (4). TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). The column dropped at commit3 is not today's c2 (D18), and a column dropped changes no row: none, where Dolt shows rows 1 and 3 modified. TO_COMMIT=@Commit1 becomes to_commit = $1, the captured id. (D7)"
         },
         {
           "index": 4,
@@ -28667,7 +28667,7 @@
       "index": 18,
       "name": "Diff table shows diffs across primary key renames",
       "source_sha256": "fca6ee0b7dd9536fb2bbeafd7e1a0e79d33b7236b6991dd1b21f03520930a6c2",
-      "scenario_sha256": "02b98984c904174e39776055c8de4a7a4445e6333aeedf035865943025bf5777",
+      "scenario_sha256": "c3acbd90465cfa8395cf0c5fe3024a928771e36b71de90774ef3f7068d87bb34",
       "setup": [
         {
           "index": 0,
@@ -28746,14 +28746,14 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name (D18): the row added at 'initial' had its key column named pk1, so it reads pk2 as NULL there; Dolt follows the tag and shows 1. The rename changes no row, as in Dolt."
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows: the key column renamed pk1 to pk2 keeps its identity, as Dolt's tag does (D18), so the row added at 'initial' reads pk2 as 1. The rename changes no row, as in Dolt."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name (D18): the row added at 'initial' had its key columns named pk1a and pk1b, so it reads them as NULL; Dolt shows 2, 2."
+          "note": "dolt_diff_<t> is dolt_diff_table(NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D18). Preserved rows: the renamed key columns keep their identities, as Dolt's tags do (D18), so the row added at 'initial' reads 2, 2."
         }
       ],
       "adaptations": [
@@ -29536,7 +29536,7 @@
       "index": 5,
       "name": "primary key table: non-pk column drops and adds",
       "source_sha256": "15ae6edd683115d0d03f027b80d1e7042cb75fbfc07ce2ee9f58163ac3e8514f",
-      "scenario_sha256": "850e26d6672114e1881b781198e9766e13dafcb311be6c49a2564b91ccd738fa",
+      "scenario_sha256": "506842b6715c939e3cdadc262c15d4e8b658acde527c7051f63a5adafcf7a802",
       "setup": [
         {
           "index": 0,
@@ -29636,14 +29636,14 @@
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Dolt follows columns by their tags; prolly reads every version's rows as the table is defined now, by column name, converting a value to the column's current type (D18): commit1's own c2 ('3', '6') is read into today's c2 (an integer, c1 renamed), where Dolt gives NULL (another column by tag)."
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Rows are read as the table is defined now, columns matched by identity (D18): today's c2 is the column made as c1 (renamed), so commit1's rows read its values (2, 5), where Dolt gives NULL."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Preserved rows."
+          "note": "dolt_history_<t> is dolt_history_table(NULL::t), a column read as (row).col (D18). Today's c2 is the column made as c1 (renamed), so commit2's rows read its values (2, 5) by identity (D18), where Dolt gives NULL."
         },
         {
           "index": 4,
@@ -30177,7 +30177,7 @@
       "index": 2,
       "name": "renamed table",
       "source_sha256": "27f4515b0477d7e4dbe69fb83b59fdab9dd51a1ed91ccde23d6a0482823cd7dc",
-      "scenario_sha256": "353de2a8b8faa9cf9344a326311f53f6cff7f35f65493572ab2b41a33f90efcd",
+      "scenario_sha256": "82adfc0a63fcae5861ecbd3d44293efe3a7cbc795c2e163a335ce3a734a517ce",
       "setup": [
         {
           "index": 0,
@@ -30327,7 +30327,7 @@
           "steps": [
             "assert-0"
           ],
-          "note": "The dolt_diff system table is the dolt_diff view (D18), its objects named qualified (D15); booleans read t/f. Dolt's commit3 renames x and adds a row, one table by its tags; prolly matches renames by content, so x is dropped and x1 added there (D17). The initial commit standing for Dolt's adds the versioned schema public, an object of its own (D15): one row more than Dolt's. 7, not 5."
+          "note": "The dolt_diff system table is the dolt_diff view (D18), its objects named qualified (D15); booleans read t/f. Commit3 renames x and adds a row, one table by its identity, as Dolt's tags match it (D17). The initial commit standing for Dolt's adds the versioned schema public, an object of its own (D15): one row more than Dolt's. 6, not 5."
         },
         {
           "index": 1,
@@ -30348,7 +30348,7 @@
           "steps": [
             "assert-3"
           ],
-          "note": "The dolt_diff system table is the dolt_diff view (D18), its objects named qualified (D15); booleans read t/f. Dolt has the one row x1 (renamed and changed); prolly's rename by content makes x dropped and x1 added (D17), both with rows and definitions changed."
+          "note": "The dolt_diff system table is the dolt_diff view (D18), its objects named qualified (D15); booleans read t/f. Preserved row: x renamed x1 and changed is one table by its identity, as Dolt's tags match it (D17)."
         },
         {
           "index": 4,
@@ -35833,7 +35833,7 @@
       "index": 4,
       "name": "schema modification: column drop, rename column with same type to same name",
       "source_sha256": "d1878186c0533c88dd2a5618681a85c430a1b11085b20c8a28a10da29f31a08d",
-      "scenario_sha256": "72edbc2d281bea77b27c828adaa9e342643a22ab6fff6bcd114e71cae76ca2cf",
+      "scenario_sha256": "128f1589243e2ade4bebb8a85a6297dd2aeb88202046eaee4593eee21447009c",
       "setup": [
         {
           "index": 0,
@@ -35933,21 +35933,21 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows."
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Rows are read as the table is defined now, columns matched by identity (D18): today's c1 is the column made as c2, so commit1's rows read its values (3, 6) there, where Dolt reads commit1's own c1 (2, 5)."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: c1 is the column renamed from c2 now, read by name, so its dropped version's values are the old c1's, gone in commit2."
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Today's c1 is the column made as c2 (D18): commit1's c1, dropped in commit2, is another column, and a column dropped changes no row, so no rows, where Dolt shows each row's dropped c1 modified."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Rows read by name as the table is defined now (D18): c1, renamed from c2, reads as null in the version before the rename, so rows 1 and 4 show modified besides the added row, which Dolt's has alone (its own TODO calls its rows missing)."
+          "note": "dolt_commit_diff_<t> WHERE to_commit = @To AND from_commit = @From is dolt_diff(from, to, NULL::t), the captured ids as its refs; to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Preserved rows: c1, renamed from c2, keeps c2's identity (D18), so rows 1 and 4 read the same in both versions and only the added row differs."
         }
       ],
       "adaptations": [
@@ -38126,7 +38126,7 @@
       "index": 9,
       "name": "schema modification: rename columns",
       "source_sha256": "e299d5aa91cb8e51c63c8f3d3a659cb9789af3548c6cf88fbbb3384973735a3b",
-      "scenario_sha256": "759d0b708e6a37c54d23715ef4bb843ea5eaec2398951e288436e1e14fcc5bc2",
+      "scenario_sha256": "965083baebb623257c2a7d091793832a134c2fc82c8b40e2a48b8cbdf62defe9",
       "setup": [
         {
           "index": 0,
@@ -38282,14 +38282,14 @@
           "steps": [
             "assert-3"
           ],
-          "note": "The historical versions both call the column c3, while the current row type calls it c2. Values project to NULL by name (D18), but the stored change is retained: row 1 is modified and row 3 added (#654)."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). The column renamed c2 to c3 and back keeps its identity, so both versions' c3 read as today's c2 (D18): preserved rows, to_c3 and from_c3 read as (to_row).c2 and (from_row).c2."
         },
         {
           "index": 4,
           "steps": [
             "assert-4"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Dolt's from side calls the column c3 at commit4, so it refuses c2 (ErrColumnNotFound); prolly's rows are the table's row type now (D18): commit4's c3 reads as c2, NULL, and row 4's from row is NULL."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Dolt's from side calls the column c3 at commit4, so it refuses c2 (ErrColumnNotFound); prolly's rows are the table's row type now, and commit4's c3 is today's c2 by identity (D18): only row 4 differs, added, its from row NULL."
         },
         {
           "index": 5,
@@ -38303,7 +38303,7 @@
           "steps": [
             "assert-6"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_c3 is read as (from_row).c2 (D18), NULL in commit4's version, where the column was c3: rows 1 to 3 show modified besides row 4 added, which Dolt's has alone."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_c3 is read as (from_row).c2: commit4's c3 is today's c2 by identity (D18). Preserved rows."
         },
         {
           "index": 7,
@@ -38564,7 +38564,7 @@
       "index": 13,
       "name": "renamed table",
       "source_sha256": "c2f3234e7c759f20e21b2cb6840fbb9151d5c4c0e843f07ccb0e8640ca415d09",
-      "scenario_sha256": "9f73f0b506b7fe0a3dba359e84197ee83718d654503829880081b115040da188",
+      "scenario_sha256": "f1bc5da296a108513de25db2db2d9de4e6721fd6c1d7a2d6cf45c96737b883c1",
       "setup": [
         {
           "index": 0,
@@ -38629,14 +38629,14 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17): t2's rows, both added."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Preserved rows: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17), so only the row added differs."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Dolt matches t1 and t2 by their columns' tags, one table with a row added; prolly matches renames by content, and the commit added a row too, so t1 is dropped and t2 added (D17): t2's rows, both added."
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). Prolly's rows have no from_commit or to_commit, which in Dolt's echo the refs given (D3): left out of the select. Preserved rows: t1 renamed t2 keeps its identity, as Dolt's tags match it (D17), so only the row added differs."
         },
         {
           "index": 2,
@@ -38660,7 +38660,7 @@
       "index": 14,
       "name": "Renaming a primary key column shows PK values in both the to and from columns",
       "source_sha256": "f6ed3213657f593c01b0bd91869e28cd3490e602f686808185ec07861707d377",
-      "scenario_sha256": "8d4381c16e324d61ed64c40cdc9e2119e9ffd13ee6eedd8aba625aedf669a2b4",
+      "scenario_sha256": "b9dccd4050a8a0ef1920207d1c2a6fde6868178e135b62fad8fd6fc5196d3110",
       "setup": [
         {
           "index": 0,
@@ -38753,28 +38753,28 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now: the key column renamed pk to pk2 keeps its identity, as Dolt's tag does (D18). Preserved rows."
         },
         {
           "index": 1,
           "steps": [
             "assert-1"
           ],
-          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now. Dolt follows the key column's tag and shows the row modified; prolly reads every version by column name (D18): HEAD~'s key column was pk, so it reads pk2 as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk is (from_row).pk2, the key's name now: the key column renamed pk to pk2 keeps its identity, as Dolt's tag does (D18). Preserved rows."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
+          "note": "dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now: the renamed key columns keep their identities, as Dolt's tags do (D18). Preserved rows."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now. Dolt follows the tags and shows the row modified; prolly reads by column name (D18): HEAD~'s key columns were pk1a and pk1b, so they read as NULL there, a row of another key, removed, and HEAD's row added. All three older rows are removed and all three newer rows added; missing key columns do not collapse rows (#653)."
+          "note": "Prolly's dolt_diff takes two refs, no range: 'a..b' is the refs a and b. dolt_diff(from, to, 't') is dolt_diff(from, to, NULL::t), its to_<col> and from_<col> read as (to_row).col and (from_row).col (D3, D18). from_pk1a and from_pk1b are (from_row).pk2a and pk2b, the key's names now: the renamed key columns keep their identities, as Dolt's tags do (D18). Preserved rows."
         }
       ],
       "adaptations": [

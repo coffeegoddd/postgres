@@ -127,7 +127,7 @@
       "expect": {
         "rows": [
           [
-            "6"
+            "3"
           ]
         ],
         "order": "bag"
@@ -170,15 +170,8 @@
       "expect": {
         "rows": [
           [
-            "1",
-            "2",
-            "1",
-            null,
-            "modified"
-          ],
-          [
             "3",
-            "4",
+            null,
             null,
             null,
             "added"
@@ -201,22 +194,7 @@
       ],
       "sql": "SELECT (to_row).pk, (to_row).c2, (from_row).pk, (from_row).c2, diff_type FROM dolt_diff_table(NULL::t) WHERE to_commit = $1 ORDER BY (to_row).pk",
       "expect": {
-        "rows": [
-          [
-            "1",
-            null,
-            "1",
-            "2",
-            "modified"
-          ],
-          [
-            "3",
-            null,
-            "3",
-            "4",
-            "modified"
-          ]
-        ],
+        "rows": [],
         "order": "bag"
       },
       "params": [

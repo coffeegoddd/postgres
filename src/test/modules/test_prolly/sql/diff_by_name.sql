@@ -46,8 +46,8 @@ SELECT c.message, h.row FROM dolt_history_table('dn.t1') h
 JOIN dolt_log c ON c.commit_hash = h.commit_hash
 ORDER BY c.date, h.row->>'a';
 
--- renamed (rows changed too, so matched as a drop and an add): by its old
--- name in the version that has it, and by its new
+-- renamed, rows changed too (one table, by its identity, as Dolt's tags
+-- match it): by its old name or its new, the row added alone
 CREATE TABLE dn.r1 (pk int PRIMARY KEY, v text);
 INSERT INTO dn.r1 VALUES (1, 'one');
 SELECT length(dolt_commit('-Am', 'r1')::text) AS committed;

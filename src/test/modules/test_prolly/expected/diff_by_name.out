@@ -112,8 +112,8 @@ ORDER BY c.date, h.row->>'a';
  c added   | {"a": 5, "b": 6, "c": "x"}
 (6 rows)
 
--- renamed (rows changed too, so matched as a drop and an add): by its old
--- name in the version that has it, and by its new
+-- renamed, rows changed too (one table, by its identity, as Dolt's tags
+-- match it): by its old name or its new, the row added alone
 CREATE TABLE dn.r1 (pk int PRIMARY KEY, v text);
 INSERT INTO dn.r1 VALUES (1, 'one');
 SELECT length(dolt_commit('-Am', 'r1')::text) AS committed;
@@ -131,18 +131,17 @@ SELECT length(dolt_commit('-am', 'renamed')::text) AS committed;
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~', 'HEAD', 'r1');
- diff_type |       from_row        | to_row 
------------+-----------------------+--------
- removed   | {"v": "one", "pk": 1} | 
+ diff_type | from_row |        to_row         
+-----------+----------+-----------------------
+ added     |          | {"v": "two", "pk": 2}
 (1 row)
 
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~', 'HEAD', 'r2')
 ORDER BY to_row->>'pk';
  diff_type | from_row |        to_row         
 -----------+----------+-----------------------
- added     |          | {"v": "one", "pk": 1}
  added     |          | {"v": "two", "pk": 2}
-(2 rows)
+(1 row)
 
 -- renamed alone: the same rows, none differ
 ALTER TABLE dn.r2 RENAME TO r3;

@@ -154,7 +154,8 @@ SELECT from_table_name FROM dolt_diff_summary('HEAD~1', 'HEAD', 'F()');
 (1 row)
 
 RESET search_path;
--- a rename that changed the rows too is a drop and an add
+-- a rename that changed the rows too is one renamed table, by its
+-- identity, which the rename keeps (as Dolt's tags)
 ALTER TABLE app.new_name RENAME TO newer_name;
 UPDATE app.newer_name SET v = 'changed';
 CREATE TABLE app.twin_a (id int PRIMARY KEY);
@@ -170,17 +171,14 @@ SELECT length(dolt_commit('-Am', 'twins')::text) AS committed;
 SELECT * FROM dolt_diff_summary('HEAD~1', 'HEAD');
  from_table_name | to_table_name  | diff_type | data_change | schema_change 
 -----------------+----------------+-----------+-------------+---------------
- app.new_name    |                | dropped   | t           | t
-                 | app.newer_name | added     | t           | t
+ app.new_name    | app.newer_name | renamed   | t           | t
                  | app.same_a     | added     | f           | t
                  | app.same_b     | added     | f           | t
                  | app.twin_a     | added     | f           | t
                  | app.twin_b     | added     | f           | t
-(6 rows)
+(5 rows)
 
--- two renamed at once, told apart by what else names them (their keys'
--- indexes keep their names); two of one content renamed can't be told
--- apart, so they stay dropped and added
+-- two renamed at once, each told by its identity, even two of one content
 ALTER TABLE app.twin_a RENAME TO twin_c;
 ALTER TABLE app.twin_b RENAME TO twin_d;
 ALTER TABLE app.same_a RENAME TO same_c;
@@ -188,13 +186,11 @@ ALTER TABLE app.same_b RENAME TO same_d;
 SELECT * FROM dolt_diff_summary('HEAD', 'WORKING');
  from_table_name | to_table_name | diff_type | data_change | schema_change 
 -----------------+---------------+-----------+-------------+---------------
- app.same_a      |               | dropped   | f           | t
- app.same_b      |               | dropped   | f           | t
-                 | app.same_c    | added     | f           | t
-                 | app.same_d    | added     | f           | t
+ app.same_a      | app.same_c    | renamed   | f           | t
+ app.same_b      | app.same_d    | renamed   | f           | t
  app.twin_a      | app.twin_c    | renamed   | f           | t
  app.twin_b      | app.twin_d    | renamed   | f           | t
-(6 rows)
+(4 rows)
 
 -- a view renamed is one too
 ALTER VIEW app.vw RENAME TO vw2;
@@ -252,10 +248,8 @@ SELECT * FROM dolt_schema_diff('HEAD~1', 'HEAD');
                  |               |                                                                       | CREATE INDEX orders_qty ON app.orders USING btree (qty);                                                  +
                  |               |                                                                       | ALTER TABLE app.orders ENABLE ROW LEVEL SECURITY;                                                         +
                  |               |                                                                       | CREATE POLICY own_orders ON app.orders AS PERMISSIVE FOR ALL TO PUBLIC USING ((qty < 100));
- app.same_a      |               | CREATE TABLE app.same_a (v integer);                                  | 
- app.same_b      |               | CREATE TABLE app.same_b (v integer);                                  | 
-                 | app.same_c    |                                                                       | CREATE TABLE app.same_c (v integer);
-                 | app.same_d    |                                                                       | CREATE TABLE app.same_d (v integer);
+ app.same_a      | app.same_c    | CREATE TABLE app.same_a (v integer);                                  | CREATE TABLE app.same_c (v integer);
+ app.same_b      | app.same_d    | CREATE TABLE app.same_b (v integer);                                  | CREATE TABLE app.same_d (v integer);
  app.twin_a      | app.twin_c    | CREATE TABLE app.twin_a (id integer);                                +| CREATE TABLE app.twin_c (id integer);                                                                     +
                  |               | ALTER TABLE app.twin_a ADD CONSTRAINT twin_a_id_not_null NOT NULL id;+| ALTER TABLE app.twin_c ADD CONSTRAINT twin_a_id_not_null NOT NULL id;                                     +
                  |               | ALTER TABLE app.twin_a ADD CONSTRAINT twin_a_pkey PRIMARY KEY (id);   | ALTER TABLE app.twin_c ADD CONSTRAINT twin_a_pkey PRIMARY KEY (id);
@@ -265,7 +259,7 @@ SELECT * FROM dolt_schema_diff('HEAD~1', 'HEAD');
  app.vw          | app.vw2       | CREATE VIEW app.vw AS  SELECT id,                                    +| CREATE VIEW app.vw2 AS  SELECT id,                                                                        +
                  |               |     v                                                                +|     v                                                                                                     +
                  |               |    FROM app.t;                                                        |    FROM app.t;
-(9 rows)
+(7 rows)
 
 -- changed, renamed, dropped; a change of rows alone gives none
 ALTER TABLE app.orders ADD COLUMN placed date;

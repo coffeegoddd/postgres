@@ -66,6 +66,15 @@ typedef struct ProllyCommitInfo
 	 */
 	bool		has_height;
 	int64		height;
+
+	/*
+	 * The identity of its root's tables and columns, which their renames
+	 * keep (the canonicalizer's identify()): an identity record, palloc'd,
+	 * or NULL where every object has its own name's (nothing in its
+	 * history was renamed).
+	 */
+	char	   *identity;
+	int			identity_len;
 } ProllyCommitInfo;
 
 /*
@@ -529,6 +538,16 @@ typedef struct ProllyRefsRoutine
 	 * from the branch's baseline).
 	 */
 	void		(*pending_full_folds) (ProllyPendingFullVisit visit, void *arg);
+
+	/*
+	 * Optional, together: the identity record of the session branch's
+	 * working set (with only valid, of that table alone), as the commit it
+	 * would make records it; and the session branch's working set made
+	 * what identity (an identity record) describes, by name (a move to a
+	 * root whose identity it is), for later renames to be told by.
+	 */
+	void		(*working_identity) (Oid only, StringInfo identity);
+	void		(*anchor_identity) (const ProllyValue *identity);
 } ProllyRefsRoutine;
 
 /*
@@ -554,9 +573,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
 	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
-	"note_relation", "fold_mark", "written_since", "pending_full_folds"
+	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
+	"working_identity", "anchor_identity"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK pending_full_folds
+#define PROLLY_REFS_LAST_CALLBACK anchor_identity
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

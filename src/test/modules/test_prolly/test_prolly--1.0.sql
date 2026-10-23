@@ -326,6 +326,16 @@ CREATE FUNCTION test_commit_with(parent text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The identity record a commit holds beside its root (NULL: none), and the
+-- one the session branch's next commit would record.
+CREATE FUNCTION test_commit_identity(ref text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_working_identity()
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_refs_set_head(ref text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
