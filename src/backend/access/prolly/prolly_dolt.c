@@ -8624,7 +8624,8 @@ prolly_make_change_logs(PG_FUNCTION_ARGS)
 }
 
 /*
- * prolly_page_sweep(OUT freed int8, OUT recounted int8, OUT truncated int8)
+ * prolly_page_sweep(OUT freed int8, OUT recounted int8, OUT truncated int8,
+ *				   OUT moved int8)
  *
  * The current database's page stores swept (bmap_sweep()), in every
  * tablespace that has one: blocks nothing holds freed, stuck reference
@@ -8636,8 +8637,8 @@ Datum
 prolly_page_sweep(PG_FUNCTION_ARGS)
 {
 	TupleDesc	desc;
-	Datum		values[3];
-	bool		nulls[3] = {0};
+	Datum		values[4];
+	bool		nulls[4] = {0};
 	BmapSweep	r;
 
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
@@ -8654,6 +8655,7 @@ prolly_page_sweep(PG_FUNCTION_ARGS)
 	values[0] = Int64GetDatum((int64) r.freed);
 	values[1] = Int64GetDatum((int64) r.recounted);
 	values[2] = Int64GetDatum((int64) r.truncated);
+	values[3] = Int64GetDatum((int64) r.moved);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
 													  values, nulls)));
 }

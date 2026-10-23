@@ -1,14 +1,17 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# A page sweep moves the blocks past the page store's allocated count down
-# into the holes freeing left (a table's blocks among a dropped one's), and
-# shortens the store past them: its file is then as long as what it holds.
+# A page sweep moves the data pages past the page store's allocated count
+# down into the holes freeing left (a table's blocks among a dropped
+# one's), and shortens the store past them: its file then ends at its last
+# allocated block or the last tree node past the count, as nodes stay.
 # The moves are logged as copies before a change are: a standby replays
 # them, as does crash recovery, every page checked against the primary's
-# (wal_consistency_checking).  Blocks another relation shares stay, and a
-# crash, or an error, between a move and the freeing of its old block
-# leaves that block for the next sweep.  At wal_level minimal, a relation
-# its transaction hasn't committed (its data skipping WAL) isn't moved.
+# (wal_consistency_checking).  Blocks another relation shares stay, a
+# page whose room a concurrent allocation took stays (it isn't moved up),
+# and a crash, or an error, between a move and the freeing of its old
+# block leaves that block for the next sweep.  At wal_level minimal, a
+# relation its transaction hasn't committed (its data skipping WAL) isn't
+# moved.
 
 use strict;
 use warnings FATAL => 'all';
@@ -46,7 +49,7 @@ sub store_blocks
 	my ($n) = @_;
 	return (-s $n->data_dir . "/base/$dboid/9421") / 8192;
 }
-my $sweep = q{SELECT freed || ' ' || truncated FROM prolly_page_sweep()};
+my $sweep = q{SELECT freed || ' ' || truncated || ' ' || moved FROM prolly_page_sweep()};
 my $moved = q{SELECT pg_stat_force_next_flush();
 	SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_moved'};
 
@@ -69,6 +72,15 @@ sub interleave
 }
 my $digest = q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM keep};
 
+# Every block-mapped relation's tree nodes, and the last of them.
+my $mapped = q{(SELECT relfilenode FROM pg_class
+	WHERE relkind IN ('r', 'i', 't', 'm')
+	  AND (pg_stat_file(pg_relation_filepath(oid) || '_bmap', true)).size IS NOT NULL)};
+my $nodes = qq{SELECT string_agg(t.block::text, ',' ORDER BY t.block)
+	FROM $mapped m, LATERAL test_bmap_tree(m.relfilenode) t};
+my $last_node = qq{SELECT coalesce(max(t.block), -1)
+	FROM $mapped m, LATERAL test_bmap_tree(m.relfilenode) t};
+
 interleave('keep', 'gone', 400);
 my $want = sql($digest);
 sql('DROP TABLE gone');
@@ -80,10 +92,16 @@ my $want2 = q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) 
 my $want2v = sql($want2);
 sql('DROP TABLE gone2');
 my $file_before = store_blocks($node);
-my ($freed, $truncated) = split / /, sql($sweep);
-cmp_ok(sql($moved) - $before, '>', 0, 'a sweep moves blocks down');
+my $nodes_before = sql($nodes);
+my ($freed, $truncated, $nmoved) = split / /, sql($sweep);
+cmp_ok($nmoved, '>', 0, 'a sweep moves blocks down');
+is(sql($moved) - $before, $nmoved, 'pg_stat_prolly counts the moves the sweep returns');
 cmp_ok($truncated, '>', 0, 'and shortens the store past them');
-is(sql('SELECT test_bmap_free_blocks()'), '0', 'no free block is left in it');
+is(sql($nodes), $nodes_before, 'no tree node is moved');
+my $allocated = store_blocks($node) - sql('SELECT test_bmap_free_blocks()');
+my $end = sql($last_node) + 1;
+is(store_blocks($node), $allocated > $end ? $allocated : $end,
+	'the store ends at its allocated count, or a tree node past it');
 cmp_ok(store_blocks($node), '<', $file_before, 'its file is shorter');
 is(sql($digest), $want, 'the moved tables keep their rows');
 is(sql($want2), $want2v, 'both of them');
@@ -124,12 +142,43 @@ sql(q{SELECT injection_points_detach('bmap-compact-moved')});
 cmp_ok(sql('SELECT test_bmap_free_blocks()'), '>', 0,
 	'an error before the old blocks are freed leaves them');
 is(sql($want4), $want4v, 'the moved table has its rows');
-($freed, $truncated) = split / /, sql($sweep);
+($freed, $truncated, $nmoved) = split / /, sql($sweep);
 cmp_ok($freed, '>', 0, 'the next sweep frees what the moves left');
-is(sql('SELECT test_bmap_free_blocks()'), '0', 'and moves down into them');
+cmp_ok($truncated, '>', 0, 'and shortens the store past them');
 is(sql($want4), $want4v, 'the table still has its rows');
 $node->wait_for_replay_catchup($standby);
 is($standby->safe_psql('postgres', $want4), $want4v, 'on the standby too');
+
+# The room a page was to move to, taken meanwhile: the page stays, rather
+# than going up to a block the store grows by.
+interleave('keep5', 'gone5', 100);
+sql('DROP TABLE gone5');
+sql(q{SELECT * FROM prolly_page_sweep()});
+interleave('keep6', 'gone6', 100);
+sql('DROP TABLE gone6');
+my $sw = $node->background_psql('postgres');
+$sw->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-compact-room', 'wait')});
+$sw->query_until(qr/sweeping/, q{\echo sweeping
+	SELECT 'swept ' || freed || ' ' || truncated || ' ' || moved FROM prolly_page_sweep();
+});
+$node->wait_for_event('client backend', 'bmap-compact-room');
+# (every free block taken, by a table extended a page at a time)
+sql(q{CREATE TABLE filler (a int, b text) WITH (fillfactor = 10);
+	DO $$
+	BEGIN
+		WHILE test_bmap_free_blocks() > 0 LOOP
+			INSERT INTO filler SELECT g, repeat('f', 300) FROM generate_series(1, 10) g;
+		END LOOP;
+	END $$});
+my $full = store_blocks($node);
+sql(q{SELECT injection_points_detach('bmap-compact-room')});
+sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
+my $res = $sw->query_safe(q{SELECT 1});
+$sw->quit;
+like($res, qr/swept \d+ \d+ 0/, 'a page whose room was taken is not moved');
+cmp_ok(store_blocks($node), '<=', $full, 'and the store doesn\'t grow for it');
+is(sql(q{SELECT count(*) FROM keep6}), '1000', 'its table has its rows');
 
 $standby->stop;
 $node->stop;

@@ -347,6 +347,7 @@ prolly_sweep_page_stores(bool due_only, BmapSweep *total)
 		total->freed += r.freed;
 		total->recounted += r.recounted;
 		total->truncated += r.truncated;
+		total->moved += r.moved;
 		total->stuck += r.stuck;
 	}
 }
@@ -358,10 +359,11 @@ sweep(void)
 
 	prolly_sweep_page_stores(true, &r);
 	ereport(DEBUG1,
-			(errmsg_internal("automatic sweep of database \"%s\": %llu blocks freed, %llu counts rewritten, %llu blocks truncated",
+			(errmsg_internal("automatic sweep of database \"%s\": %llu blocks freed, %llu counts rewritten, %llu blocks moved, %llu blocks truncated",
 							 get_database_name(MyDatabaseId),
 							 (unsigned long long) r.freed,
 							 (unsigned long long) r.recounted,
+							 (unsigned long long) r.moved,
 							 (unsigned long long) r.truncated)));
 }
 

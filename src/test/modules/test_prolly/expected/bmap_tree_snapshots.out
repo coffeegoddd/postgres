@@ -78,9 +78,9 @@ FROM test_bmap_snapshots(:big);
 (1 row)
 
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         0
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |     0
 (1 row)
 
 -- the relation changes: each page changed is copied, the snapshot keeps it
@@ -147,9 +147,9 @@ SELECT test_bmap_rows_digest(:then) = :'big_rows' AS then_written;
 (1 row)
 
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |      1664
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |      1626 |     0
 (1 row)
 
 -- letting the snapshot go: what only it held is freed
@@ -205,9 +205,9 @@ SELECT count(*) FROM test_bmap_snapshots(:big);
 (1 row)
 
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |      1939
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         0 |   250
 (1 row)
 
 -- letting go of a snapshot of an unchanged relation frees nothing
@@ -255,9 +255,9 @@ SELECT count(*) FROM test_bmap_snapshots(:small);
 
 DROP TABLE small, big;
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |      9396
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |     11339 |     0
 (1 row)
 
 -- at most 16
@@ -278,9 +278,9 @@ END $$;
 NOTICE:  a 17th is refused
 DROP TABLE many;
 SELECT * FROM prolly_page_sweep();
- freed | recounted | truncated 
--------+-----------+-----------
-     0 |         0 |         2
+ freed | recounted | truncated | moved 
+-------+-----------+-----------+-------
+     0 |         0 |         2 |     0
 (1 row)
 
 \c :home
