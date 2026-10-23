@@ -86,6 +86,123 @@ SELECT to_regclass('mv.added') IS NULL AS nested_reset;
 DROP EVENT TRIGGER mv_nested;
 DROP SCHEMA outer_ddl;
 
+-- User code that history work runs (a constraint's check, a view's query)
+-- is the user's: DDL it runs fires event triggers, as the user's own does.
+SELECT dolt_checkout('main');
+SELECT (dolt_checkout('-b', 'user_code'))[1];
+CREATE FUNCTION mv.user_code(i int) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('test.user_code', true) = 'ddl' THEN
+    EXECUTE 'CREATE TABLE public.user_made (id int)';
+  ELSIF current_setting('test.user_code', true) = 'fail' THEN
+    RAISE EXCEPTION 'user code failed partway';
+  END IF;
+  RETURN true;
+END $$;
+CREATE TABLE mv.checked (id int PRIMARY KEY CHECK (mv.user_code(id)));
+INSERT INTO mv.checked VALUES (1);
+ALTER TABLE mv.checked ADD CONSTRAINT unchecked CHECK (mv.user_code(id)) NOT VALID;
+CREATE TABLE mv.plain (id int PRIMARY KEY);
+INSERT INTO mv.plain VALUES (1);
+CREATE MATERIALIZED VIEW mv.viewed AS SELECT id FROM mv.plain WHERE mv.user_code(id);
+SELECT length(dolt_commit('-Am', 'user code')::text) AS committed;
+SELECT set_config('test.user_code_head', dolt_hashof('HEAD'), false) IS NOT NULL AS saved;
+SELECT dolt_branch('user_other');
+INSERT INTO mv.plain VALUES (2);
+REFRESH MATERIALIZED VIEW mv.viewed;
+SELECT length(dolt_commit('-am', 'ours refreshed')::text) AS committed;
+SELECT dolt_checkout('user_other');
+INSERT INTO mv.plain VALUES (3);
+REFRESH MATERIALIZED VIEW mv.viewed;
+SELECT length(dolt_commit('-am', 'theirs refreshed')::text) AS committed;
+SELECT dolt_checkout('user_code');
+TRUNCATE public.events;
+SET test.guard_ddl = on;
+SET test.user_code = ddl;
+-- a check verified
+SELECT dolt_verify_constraints('--all');
+-- a view refreshed by a merge
+SELECT (dolt_merge('user_other'))[2:4];
+-- a check validated as a reset makes the table again
+SELECT dolt_reset('--hard', :'added');
+SELECT dolt_reset('--hard', current_setting('test.user_code_head'));
+SET test.user_code = '';
+SET test.guard_ddl = off;
+SELECT to_regclass('public.user_made') IS NULL AS not_made;
+SELECT count(*) AS internal_events FROM public.events;
+
+-- User code failing partway through a move, after its internal DDL ran,
+-- leaves user event triggers firing, as does that failure inside an outer
+-- user event, whose own commands are kept.
+SELECT dolt_reset('--hard', :'added');
+SET test.user_code = fail;
+SET test.guard_ddl = on;
+DO $$ BEGIN
+  PERFORM dolt_reset('--hard', current_setting('test.user_code_head'));
+EXCEPTION WHEN raise_exception THEN
+  RAISE NOTICE 'caught: %', SQLERRM;
+END $$;
+SELECT to_regclass('mv.checked') IS NULL AS rolled_back;
+CREATE TABLE mv.still_guarded (id int);
+SET test.guard_ddl = off;
+CREATE FUNCTION public.failed_move_inside_event() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE before_count int; after_count int;
+BEGIN
+  SELECT count(*) INTO before_count FROM pg_event_trigger_ddl_commands();
+  BEGIN
+    PERFORM dolt_reset('--hard', current_setting('test.user_code_head'));
+  EXCEPTION WHEN raise_exception THEN
+    RAISE NOTICE 'caught: %', SQLERRM;
+  END;
+  SELECT count(*) INTO after_count FROM pg_event_trigger_ddl_commands();
+  RAISE NOTICE 'outer commands before %, after %', before_count, after_count;
+END $$;
+CREATE EVENT TRIGGER mv_failed ON ddl_command_end WHEN TAG IN ('CREATE SCHEMA')
+  EXECUTE FUNCTION public.failed_move_inside_event();
+TRUNCATE public.events;
+CREATE SCHEMA outer_failed;
+SELECT event, tag FROM public.events ORDER BY event, tag;
+DROP EVENT TRIGGER mv_failed;
+DROP SCHEMA outer_failed;
+SET test.user_code = '';
+
+-- A move inside an outer sql_drop or table_rewrite event leaves that
+-- event's dropped objects and rewritten table as they were.
+CREATE FUNCTION public.move_inside_drop() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE before_count int; after_count int;
+BEGIN
+  SELECT count(*) INTO before_count FROM pg_event_trigger_dropped_objects();
+  PERFORM dolt_reset('--hard', current_setting('test.base'));
+  SELECT count(*) INTO after_count FROM pg_event_trigger_dropped_objects();
+  RAISE NOTICE 'outer drops before %, after %', before_count, after_count;
+END $$;
+CREATE EVENT TRIGGER mv_nested_drop ON sql_drop WHEN TAG IN ('DROP SCHEMA')
+  EXECUTE FUNCTION public.move_inside_drop();
+CREATE SCHEMA outer_drop;
+TRUNCATE public.events;
+DROP SCHEMA outer_drop;
+SELECT to_regclass('mv.added') IS NULL AS nested_reset;
+SELECT event, tag FROM public.events ORDER BY event, tag;
+DROP EVENT TRIGGER mv_nested_drop;
+CREATE FUNCTION public.move_inside_rewrite() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE rewritten oid := pg_event_trigger_table_rewrite_oid();
+BEGIN
+  PERFORM dolt_reset('--hard', current_setting('test.added'));
+  RAISE NOTICE 'outer rewrite of % kept: %', rewritten::regclass,
+    pg_event_trigger_table_rewrite_oid() = rewritten;
+END $$;
+CREATE EVENT TRIGGER mv_nested_rewrite ON table_rewrite
+  EXECUTE FUNCTION public.move_inside_rewrite();
+CREATE TABLE public.rewritten (id int);
+SELECT set_config('test.added', :'added', false) IS NOT NULL AS saved;
+TRUNCATE public.events;
+ALTER TABLE public.rewritten ALTER COLUMN id TYPE text;
+SELECT to_regclass('mv.added') IS NOT NULL AS nested_reset;
+SELECT event, tag FROM public.events ORDER BY event, tag;
+DROP EVENT TRIGGER mv_nested_rewrite;
+DROP TABLE public.rewritten;
+TRUNCATE public.events;
+
 -- Clone with a guarding event trigger already installed in the destination.
 SELECT dolt_checkout('main');
 \getenv abs_builddir PG_ABS_BUILDDIR

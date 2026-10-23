@@ -74,6 +74,7 @@
 #include "access/xact.h"
 #include "executor/tuptable.h"
 #include "commands/extension.h"
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -114,6 +115,15 @@ static Oid	last_written = InvalidOid;	/* (the last noted, still noted) */
 static List *hushes = NIL;		/* subtransaction of each hush in effect */
 static bool catalog_written = false;	/* a versioned catalog row, too */
 static List *sequences_written = NIL;	/* of Oid: versioned sequences */
+
+/*
+ * Each function call the fmgr hook sees, innermost last: the hushes in
+ * effect when a user-defined one began (user code: what it runs is the
+ * user's, not the history work's), or -1.
+ */
+static List *calls = NIL;
+static needs_fmgr_hook_type prev_needs_fmgr_hook = NULL;
+static fmgr_hook_type prev_fmgr_hook = NULL;
 
 static void note_catalog_write(Oid branch);
 
@@ -850,6 +860,9 @@ undo_new_branches(SubTransactionId subid)
 static List *returns = NIL;		/* of NewBranch, branch unused */
 
 static void register_branch_callbacks(void);
+static bool branch_needs_fmgr_hook(Oid fn_oid);
+static void branch_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo,
+							 Datum *arg);
 
 int
 branch_return_on_abort(void)
@@ -1128,10 +1141,26 @@ branch_writes_hush(void)
 	return depth;
 }
 
+/*
+ * Whether DDL run now is hushed history work's own: hushed, and not by
+ * user code that started within the hush (its DDL is the user's).
+ */
 bool
-branch_writes_hushed(void)
+branch_ddl_internal(void)
 {
-	return hushes != NIL;
+	int			floor = 0;
+
+	if (hushes == NIL)
+		return false;
+	for (int i = list_length(calls) - 1; i >= 0; i--)
+	{
+		if (list_nth_int(calls, i) >= 0)
+		{
+			floor = list_nth_int(calls, i);
+			break;
+		}
+	}
+	return list_length(hushes) > floor;
 }
 
 /* (back to depth: a hush inside, left by an error, goes too) */
@@ -1170,6 +1199,12 @@ forget_written(SubTransactionId subid)
 		if (subid == InvalidSubTransactionId ||
 			(SubTransactionId) lfirst_int(lc) == subid)
 			hushes = foreach_delete_current(hushes, lc);
+	}
+	/* (calls end by the hook, an error's too: a transaction's end is a guard) */
+	if (subid == InvalidSubTransactionId)
+	{
+		list_free(calls);
+		calls = NIL;
 	}
 	last_written = InvalidOid;
 }
@@ -1257,7 +1292,43 @@ register_branch_callbacks(void)
 		return;
 	RegisterXactCallback(branch_xact_callback, NULL);
 	RegisterSubXactCallback(branch_subxact_callback, NULL);
+	prev_needs_fmgr_hook = needs_fmgr_hook;
+	needs_fmgr_hook = branch_needs_fmgr_hook;
+	prev_fmgr_hook = fmgr_hook;
+	fmgr_hook = branch_fmgr_hook;
 	branch_callbacks_registered = true;
+}
+
+/*
+ * A user-defined function called while hushed (a constraint's check, a
+ * view's query, a trigger) is told to the hook, so that what it runs is
+ * known as the user's.
+ */
+static bool
+branch_needs_fmgr_hook(Oid fn_oid)
+{
+	if (prev_needs_fmgr_hook && prev_needs_fmgr_hook(fn_oid))
+		return true;
+	return hushes != NIL && fn_oid >= FirstNormalObjectId;
+}
+
+static void
+branch_fmgr_hook(FmgrHookEventType event, FmgrInfo *flinfo, Datum *arg)
+{
+	if (prev_fmgr_hook)
+		prev_fmgr_hook(event, flinfo, arg);
+	if (event == FHET_START)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		/* (an extension's script, made again, and what it calls: the work's) */
+		calls = lappend_int(calls,
+							flinfo->fn_oid >= FirstNormalObjectId &&
+							!creating_extension ? list_length(hushes) : -1);
+		MemoryContextSwitchTo(old);
+	}
+	else if (calls != NIL)
+		calls = list_delete_last(calls);
 }
 
 /*

@@ -100,8 +100,8 @@ extern void branch_forget_written(Oid branch);
 extern List *branches_written(void);
 extern int	branch_writes_hush(void);
 extern void branch_writes_unhush(int depth);
-/* Internal history work: neither user writes nor user DDL events. */
-extern bool branch_writes_hushed(void);
+/* hushed history work's own DDL (not user code's within it): no user events */
+extern bool branch_ddl_internal(void);
 
 /*
  * Run the statements hushed, unhushed however they end (an error caught

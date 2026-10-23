@@ -686,7 +686,7 @@ EventTriggerCommonSetup(Node *parsetree,
 	List	   *planned = NIL;
 
 	/* A history move reproduces state; its DDL is not a user's command. */
-	if (branch_writes_hushed())
+	if (branch_ddl_internal())
 		return NIL;
 
 	/*
@@ -1317,7 +1317,7 @@ bool
 trackDroppedObjectsNeeded(void)
 {
 	/* Direct dependency deletions, as well as SPI DDL, are internal. */
-	if (branch_writes_hushed())
+	if (branch_ddl_internal())
 		return false;
 
 	/*
@@ -1355,7 +1355,7 @@ EventTriggerSQLDropAddObject(const ObjectAddress *object, bool original, bool no
 	SQLDropObject *obj;
 	MemoryContext oldcxt;
 
-	if (!currentEventTriggerState || branch_writes_hushed())
+	if (!currentEventTriggerState || branch_ddl_internal())
 		return;
 
 	Assert(EventTriggerSupportsObject(object));
@@ -1756,7 +1756,7 @@ pg_event_trigger_table_rewrite_reason(PG_FUNCTION_ARGS)
 void
 EventTriggerInhibitCommandCollection(void)
 {
-	if (!currentEventTriggerState || branch_writes_hushed())
+	if (!currentEventTriggerState || branch_ddl_internal())
 		return;
 
 	currentEventTriggerState->commandCollectionInhibited = true;
@@ -1768,7 +1768,7 @@ EventTriggerInhibitCommandCollection(void)
 void
 EventTriggerUndoInhibitCommandCollection(void)
 {
-	if (!currentEventTriggerState || branch_writes_hushed())
+	if (!currentEventTriggerState || branch_ddl_internal())
 		return;
 
 	currentEventTriggerState->commandCollectionInhibited = false;
@@ -1796,7 +1796,7 @@ EventTriggerCollectSimpleCommand(ObjectAddress address,
 	CollectedCommand *command;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1832,7 +1832,7 @@ EventTriggerAlterTableStart(const Node *parsetree)
 	CollectedCommand *command;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1862,7 +1862,7 @@ EventTriggerAlterTableStart(const Node *parsetree)
 void
 EventTriggerAlterTableRelid(Oid objectId)
 {
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1884,7 +1884,7 @@ EventTriggerCollectAlterTableSubcmd(const Node *subcmd, ObjectAddress address)
 	CollectedATSubcmd *newsub;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1918,7 +1918,7 @@ EventTriggerAlterTableEnd(void)
 	CollectedCommand *parent;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1959,7 +1959,7 @@ EventTriggerCollectGrant(InternalGrant *istmt)
 	ListCell   *cell;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2002,7 +2002,7 @@ EventTriggerCollectAlterOpFam(const AlterOpFamilyStmt *stmt, Oid opfamoid,
 	CollectedCommand *command;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2035,7 +2035,7 @@ EventTriggerCollectCreateOpClass(const CreateOpClassStmt *stmt, Oid opcoid,
 	CollectedCommand *command;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2069,7 +2069,7 @@ EventTriggerCollectAlterTSConfig(const AlterTSConfigurationStmt *stmt, Oid cfgId
 	CollectedCommand *command;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2106,7 +2106,7 @@ EventTriggerCollectAlterDefPrivs(const AlterDefaultPrivilegesStmt *stmt)
 	CollectedCommand *command;
 
 	/* Ignore internal DDL even when an outer user command has a state. */
-	if (!currentEventTriggerState || branch_writes_hushed() ||
+	if (!currentEventTriggerState || branch_ddl_internal() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 

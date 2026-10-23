@@ -158,7 +158,12 @@ subtransaction-aware scope.  Event-trigger dispatch and command/drop
 collection ignore that scope, including when a move runs inside an outer
 user DDL event.  The outer event retains its own commands and dropped
 objects.  No session GUC is changed; normal user DDL still fires triggers
-once the internal scope ends, including after errors.
+once the internal scope ends, including after errors.  User code that the
+work runs within the scope (a constraint's check while verifying or
+validating it, a materialized view's query, a trigger) is the user's: a
+user-defined function called hushed is seen by the fmgr hook, and DDL it
+runs fires event triggers and is collected as the user's own is.  An
+extension's script, run to make the extension again, stays the work's.
 
 
 Trees and chunks
