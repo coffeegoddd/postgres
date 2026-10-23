@@ -8,25 +8,6 @@
 # then the change that met it removes the entry, and the check is enforced
 # from then on.  An entry naming nothing the run checked fails too.
 
-# A branch's first use shares each relation's blocks: a map page copied
-# per map page and a reference count per block, so the map work grows
-# with the table's blocks.
-[[known]]
-check = "first_use"
-sweep = "rows"
-counter = "bmap_map_pages_copied"
-current = "linear"
-issue = "#717"
-reason = "the copy's map is a copy of every map page (hierarchical copy-on-write map; the source's writers wait meanwhile, #489)"
-
-[[known]]
-check = "first_use"
-sweep = "rows"
-counter = "bmap_refcount_updates"
-current = "linear"
-issue = "#717"
-reason = "every block's reference count goes up by one (map-page reference counts; the source's writers wait meanwhile, #489)"
-
 # A hard reset to the head writes the dirty rows back through the row
 # applier, with their index entries.  (Where another branch's working set
 # is known to be the head, it may share that branch's storage instead; in
@@ -73,14 +54,6 @@ counter = "bmap_refcount_updates"
 current = "linear"
 issue = "#768"
 reason = "a reference count down per shared block, at commit"
-
-[[known]]
-check = "branch_delete"
-sweep = "delta"
-counter = "bmap_refcount_updates"
-current = "linear"
-issue = "#768"
-reason = "a reference count down per block still shared, which the earlier resets' sharing moves"
 
 [[known]]
 check = "branch_delete"
