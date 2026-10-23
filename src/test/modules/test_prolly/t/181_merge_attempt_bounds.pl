@@ -157,6 +157,69 @@ cmp_ok($held[1], '<=', $held[0] + 16384,
 cmp_ok($spooled[1], '>', $spooled[0] * 5, 'the rows held go to temporary files');
 note("memory left by passes rolled back: @leak bytes; rows held: @held bytes in memory, @spooled bytes on disk");
 
+# The rows refused while a row is pinned are tried again once it's updated,
+# and those that fit then are written, their violations forgotten.  Row 3's
+# new version needs the c row 2's takes, and its put-back the b row 2's
+# takes; row 2's put-back needs the b row 1's takes: so row 2 and then row 3
+# are ranked up, row 3 pinned.  In the pinned pass, row 3's old version
+# holds c = 300 until it is updated, last, and theirs' n other rows form a
+# chain, the first taking 300 and each next the c the one before it gives
+# up: each is refused, put back, and written when tried again.  Only rows 1
+# and 2 keep violations.
+for my $n (500, 5000)
+{
+	my $db = "retried$n";
+	$node->safe_psql('postgres', "CREATE DATABASE $db");
+	$node->safe_psql($db, qq{
+		CREATE EXTENSION test_prolly;
+		CREATE EXTENSION injection_points;
+		CREATE SCHEMA s VERSIONED;
+		CREATE TABLE s.a (pk int PRIMARY KEY, b int, c int);
+		INSERT INTO s.a VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+		INSERT INTO s.a SELECT 100 + g, 1000 + g, 100000 + g
+		  FROM generate_series(1, $n) g;
+		SELECT dolt_commit('-Am', 'base');
+		SELECT dolt_branch('side');
+		CREATE UNIQUE INDEX a_b ON s.a (b);
+		CREATE UNIQUE INDEX a_c ON s.a (c);
+		SELECT dolt_commit('-Am', 'ours');
+		SELECT dolt_checkout('side');
+		UPDATE s.a SET b = 20 WHERE pk = 1;
+		UPDATE s.a SET b = 30, c = 999 WHERE pk = 2;
+		UPDATE s.a SET b = 77, c = 999 WHERE pk = 3;
+		UPDATE s.a SET c = CASE pk WHEN 101 THEN 300 ELSE 100000 + pk - 101 END
+		  WHERE pk > 100;
+		SELECT dolt_commit('-Am', 'theirs');
+		SELECT dolt_checkout('main');
+	});
+	my $s = $node->background_psql($db, on_error_stop => 0);
+	my $pid = $s->query_safe('SELECT pg_backend_pid()');
+	$s->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-merge-retrying-refused', 'wait')});
+	$s->query_until(qr/merging/, q{\echo merging
+		BEGIN;
+		SELECT (dolt_merge('side'))[3:4];
+	});
+	$node->wait_for_event('client backend', 'prolly-merge-retrying-refused');
+	my ($files, $bytes) = split /\|/, temp_files($db, $pid);
+	cmp_ok($bytes, '>', $n * 20, "$n rows: the rows to try again are on disk");
+	$node->safe_psql($db, q{SELECT injection_points_detach('prolly-merge-retrying-refused');
+		SELECT injection_points_wakeup('prolly-merge-retrying-refused')});
+	$s->query_safe('SELECT 1');
+	is($s->query_safe(q{SELECT string_agg(violating_row->>'pk', ' ' ORDER BY violating_row->>'pk')
+		FROM dolt_constraint_violations('s.a')}), '1 2',
+		"$n rows: only the rows still refused have violations");
+	is($s->query_safe(q{SELECT string_agg(format('%s:%s:%s', pk, b, c), ' ' ORDER BY pk)
+		FROM s.a WHERE pk < 100}), '1:10:100 2:20:200 3:77:999',
+		"$n rows: the pinned row is written, the others put back");
+	is($s->query_safe(qq{SELECT count(*) FROM s.a WHERE pk > 100 AND
+		c = CASE pk WHEN 101 THEN 300 ELSE 100000 + pk - 101 END}), $n,
+		"$n rows: each row tried again is written");
+	is(temp_files($db, $pid), '0|0', "$n rows: the merge removes its files");
+	$s->query_safe('ROLLBACK');
+	$s->quit;
+}
+
 # A keyless table's rows removed hold values a NOT VALID domain constraint
 # allows; theirs' changed rows insert them again, which isn't checked.
 my (@removed, @removed_disk, @in_memory);
