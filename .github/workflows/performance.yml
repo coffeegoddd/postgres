@@ -729,8 +729,15 @@ jobs:
             fi
             exit 0
           fi
+          # (the judge's report, nightly/comment.md; a body without it still
+          # opens the issue)
           { echo "$MARKER"; echo "The S suite nightly confirmed a regression at $CANDIDATE against the last clean night, $BASE: $RUN_URL"; \
-            echo; head -c 60000 "$RUNNER_TEMP/nightly.md"; } > body.md
+            echo
+            if [ -f nightly/comment.md ]; then
+              head -c 60000 nightly/comment.md
+            else
+              echo "No report: the judge didn't write one."
+            fi; } > body.md
           if [ -n "$issue" ]; then
             gh issue edit "$issue" --body-file body.md
             gh issue comment "$issue" --body "Still regressed at $CANDIDATE: $RUN_URL"
