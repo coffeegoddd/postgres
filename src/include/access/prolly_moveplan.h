@@ -16,17 +16,18 @@
  *   writes (those alike in both are left out), each with what the move
  *   does with it, the rows that differ (an estimate never below the
  *   diff's count), the rows to has, and the estimated cost, in
- *   microseconds; plan->cost is their sum.  Tables are named by their
- *   qualified, server-encoded names, as the canonicalizer's tables()
- *   names them.
+ *   microseconds; plan->cost is their sum.  Tables (materialized views
+ *   among them) are named by their qualified, server-encoded names, as
+ *   the canonicalizer's tables() and materialized_views() name them.
  * - The work is bounded: a table's estimate reads a bounded number of
  *   tree nodes, whatever the size of its diff, and planning stops once
  *   the cost passes bound (plan->over then set, the tables after it not
  *   planned).
  * - It writes nothing, takes no lock, and reads only the session branch's
  *   catalogs (by its tables' names, for what writing their rows costs:
- *   their indexes).  A table the session branch hasn't is costed as one
- *   with a primary key alone.
+ *   their indexes), so a caller costing a move of another branch's copies
+ *   plans on that branch.  A table the session branch hasn't is costed as
+ *   one with a primary key alone.
  *
  * Provisional (v0).
  *

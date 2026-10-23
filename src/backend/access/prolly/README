@@ -398,9 +398,14 @@ nearest its head.  With none at its head, the move planner (moveplan_costs.c)
 costs moving each branch's copies there, from the root its working set is
 known or thought to be: each table's rows that differ, estimated from its
 trees by diff_estimate() in a bounded number of nodes, and the tables
-redefined, made or dropped.  The session's branch and at most 16 others are
+redefined, made or dropped (materialized views' rows as tables'), each
+planned on its own branch.  The session's branch and at most 16 others are
 weighed, each stopped once it costs more than the best yet; the cheapest is
-copied, the session's on a tie.
+copied, the session's on a tie.  Another branch is copied only if none of
+its writers is in the middle of a change (make()'s nowait): waiting for one,
+with the refs held, would hold up the session's branch's commits for as long
+as that writer's transaction lasts.  Else the session's branch is copied,
+waiting for its writers, as ever (pg_stat_prolly's first_use_sources_busy).
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call

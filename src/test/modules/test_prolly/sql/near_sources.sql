@@ -105,3 +105,46 @@ SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_target;
 
 \c contrib_regression
 DROP DATABASE regress_near_sources;
+
+-- A materialized view's rows are costed as a table's: a branch whose
+-- tables are the target's but whose view was refreshed over other rows
+-- (each of its 20000 to be written back) is further than main, 2000 of
+-- whose table's rows differ.
+CREATE DATABASE regress_near_views;
+\c regress_near_views
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE SCHEMA ns VERSIONED;
+CREATE TABLE ns.t (id int PRIMARY KEY, v text);
+INSERT INTO ns.t SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+CREATE MATERIALIZED VIEW ns.mv AS SELECT id, v FROM ns.t;
+SELECT length(dolt_commit('-Am', 'base')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS target \gset
+SELECT dolt_branch('refreshed');
+SELECT dolt_checkout('refreshed');
+UPDATE ns.t SET v = 'x' || id;
+REFRESH MATERIALIZED VIEW ns.mv;
+UPDATE ns.t SET v = 'v' || id;
+SELECT length(dolt_commit('-am', 'refreshed')::text) > 0 AS committed;
+SELECT dolt_checkout('main');
+UPDATE ns.t SET v = 'far' WHERE id <= 2000;
+SELECT length(dolt_commit('-am', 'far')::text) > 0 AS committed;
+:flush
+SELECT pg_temp.since('apply_rows') >= 0 AS counting;
+SELECT (dolt_checkout(:'target'))[1] AS status;
+:flush
+SELECT pg_temp.since('apply_rows') AS rows_written;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_target;
+SELECT count(*) FILTER (WHERE v = 'v' || id) AS as_committed FROM ns.mv;
+
+\c contrib_regression
+DROP DATABASE regress_near_views;

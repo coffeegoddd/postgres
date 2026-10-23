@@ -2143,7 +2143,8 @@ rank_source(const char *name, Oid branch, void *arg)
  * baseline's fold, else its head; one changed since is only a hint, the
  * move folding the copies as they are).  The session's branch is planned
  * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
- * after it, each stopped once it costs more than the best yet.  NULL if
+ * after it, each stopped once it costs more than the best yet, each planned
+ * on its own branch (its tables' indexes are its own).  NULL if
  * none is cheaper than the session's branch.  (A source a move could start
  * from without a branch's copies, as a kept materialization, would be
  * planned among these, by the root it holds.)
@@ -2186,6 +2187,24 @@ note_candidate(const char *name, Oid branch, void *arg)
 	sc->roots = lappend(sc->roots, root);
 }
 
+/* A plan made on a candidate's branch (run_on()). */
+typedef struct PlanOn
+{
+	const ProllyMovePlannerRoutine *planner;
+	const ProllyNodeRef *from;
+	const ProllyNodeRef *to;
+	double		bound;
+	ProllyMovePlan *plan;
+} PlanOn;
+
+static void
+plan_here(void *arg)
+{
+	PlanOn	   *po = arg;
+
+	PROLLY_CALL(po->planner, plan, po->from, po->to, po->bound, po->plan);
+}
+
 static char *
 estimated_source(const ProllyNodeRef *target, Snapshot snap)
 {
@@ -2206,7 +2225,9 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap)
 	best = plan.cost;
 	for (int i = 1; i < list_length(sc.names); i++)
 	{
-		PROLLY_CALL(planner, plan, list_nth(sc.roots, i), target, best, &plan);
+		PlanOn		po = {planner, list_nth(sc.roots, i), target, best, &plan};
+
+		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
 		if (!plan.over && plan.cost < best)
 		{
@@ -2281,7 +2302,24 @@ materialize(const char *name)
 		if (ns.rank == 0)
 			ns.name = estimated_source(&info.root, ns.snap);
 		source = ns.name != NULL ? ns.name : branch_ops()->current();
-		branch_ops()->make(name, ns.name != NULL ? source : NULL);
+
+		/*
+		 * (another branch's copies only if none of its writers is in the
+		 * middle of changing it: waiting for one, with the refs held, would
+		 * hold up every commit of the session's branch for as long as that
+		 * writer's transaction lasts; else the session's own, whose writers
+		 * a first use waits for, as ever)
+		 */
+		if (ns.name == NULL ||
+			!OidIsValid(branch_ops()->make(name, source, true)))
+		{
+			if (ns.name != NULL)
+				pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
+			ns.name = NULL;
+			ns.rank = 0;
+			source = branch_ops()->current();
+			branch_ops()->make(name, NULL, false);
+		}
 		branch_set_baseline(name,
 							branch_baseline(source, &baseline) ? &baseline : NULL,
 							NULL);

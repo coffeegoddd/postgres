@@ -234,9 +234,11 @@ lock_all_or_none(List *relids)
  *
  * The source's dirty pages are written first, outside the locks, so that
  * what the copy writes under them is only what changed meanwhile.
+ *
+ * nowait: tried once; if a writer holds one, none is taken and *busy set.
  */
 static List *
-lock_versioned_relations(void)
+lock_versioned_relations(bool nowait, bool *busy)
 {
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
 	SysScanDesc scan;
@@ -248,7 +250,7 @@ lock_versioned_relations(void)
 	int			maxsrels = 0;
 	TimestampTz start = 0;
 	long		delay = 1;
-	Oid			busy;
+	Oid			held;
 
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -294,15 +296,21 @@ lock_versioned_relations(void)
 	relids = list_concat(relids, toasts);
 	list_free(toasts);
 
-	while (OidIsValid(busy = lock_all_or_none(relids)))
+	while (OidIsValid(held = lock_all_or_none(relids)))
 	{
+		if (nowait)
+		{
+			*busy = true;
+			list_free(relids);
+			return NIL;
+		}
 		if (start == 0)
 			start = GetCurrentTimestamp();
 		else if (LockTimeout > 0 &&
 				 TimestampDifferenceExceeds(start, GetCurrentTimestamp(),
 											LockTimeout))
 		{
-			char	   *relname = get_rel_name(busy);
+			char	   *relname = get_rel_name(held);
 
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
@@ -453,9 +461,18 @@ on_branch(Oid branch, void (*fn) (void *arg), void *arg)
 	PG_END_TRY();
 }
 
+/* A branch's copies to make: the branch's id; and, nowait, whether a writer held them up. */
+typedef struct CopyTo
+{
+	Oid			branch;
+	bool		nowait;
+	bool		busy;
+} CopyTo;
+
 static void
 copy_from_here(void *arg)
 {
+	CopyTo	   *ct = arg;
 	List	   *locked;
 
 	/*
@@ -463,10 +480,12 @@ copy_from_here(void *arg)
 	 * the copy shares, written first: the copy's log holds them too)
 	 */
 	prolly_change_logs_flush();
-	locked = lock_versioned_relations();
+	locked = lock_versioned_relations(ct->nowait, &ct->busy);
+	if (ct->busy)
+		return;
 
-	copy_rows(*(Oid *) arg);
-	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
+	copy_rows(ct->branch);
+	copyBranchSharedDependencies(MyBranch, ct->branch);
 	unlock_relations(locked);
 }
 
@@ -546,11 +565,12 @@ copies_check_create(const char *name)
 }
 
 static Oid
-copies_make(const char *name, const char *start_point)
+copies_make(const char *name, const char *start_point, bool nowait)
 {
 	Relation	brel;
 	Oid			source;
 	Oid			branch;
+	CopyTo		ct = {0};
 	Datum		values[Natts_pg_branch];
 	bool		nulls[Natts_pg_branch] = {0};
 	NameData	brname;
@@ -571,10 +591,21 @@ copies_make(const char *name, const char *start_point)
 	nulls[Anum_pg_branch_browner - 1] = true;	/* (a new branch is clean) */
 	tup = heap_form_tuple(RelationGetDescr(brel), values, nulls);
 	CatalogTupleInsert(brel, tup);
-	heap_freetuple(tup);
 	CommandCounterIncrement();
 
-	on_branch(source, copy_from_here, &branch);
+	ct.branch = branch;
+	ct.nowait = nowait;
+	on_branch(source, copy_from_here, &ct);
+	if (ct.busy)
+	{
+		/* (nothing copied: the row taken back, as if never made) */
+		CatalogTupleDelete(brel, &tup->t_self);
+		heap_freetuple(tup);
+		CommandCounterIncrement();
+		table_close(brel, NoLock);
+		return InvalidOid;
+	}
+	heap_freetuple(tup);
 	CommandCounterIncrement();
 	note_new_branch(branch);
 
@@ -586,7 +617,7 @@ static Oid
 copies_create(const char *name, const char *start_point)
 {
 	copies_check_create(name);
-	return copies_make(name, start_point);
+	return copies_make(name, start_point, false);
 }
 
 static void
