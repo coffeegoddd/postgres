@@ -29,6 +29,7 @@
 #include "utils/tuplesort.h"
 
 bool		debug_prolly_force_full_fold = false;
+bool		prolly_fold_counted = true;
 int			prolly_log_full_folds = -1;
 ProllyFullFold prolly_last_full_fold;
 
@@ -204,6 +205,159 @@ fold_sort_next(Tuplesortstate *state)
 
 	MemoryContextSwitchTo(old);
 	return got ? stup.tuple : NULL;
+}
+
+/* ----------------------------------------------------------------
+ * Sorting a fold's changed rows: a tuplesort of their own
+ * ----------------------------------------------------------------
+ */
+
+/* A changed row to sort: its delta, where it is, its key's and row's lengths, then both. */
+typedef struct ChangeTuple
+{
+	int64		delta;
+	ItemPointerData tid;
+	uint32		keylen;
+	uint32		rowlen;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} ChangeTuple;
+
+struct ProllyChangeSort
+{
+	FoldSortArg arg;
+	Tuplesortstate *state;
+};
+
+/* By the keying's order, then by bytes, as a fold from the baseline orders its changes. */
+static int
+comparetup_change(const SortTuple *a, const SortTuple *b, Tuplesortstate *state)
+{
+	FoldSortArg *arg = TuplesortstateGetPublic(state)->arg;
+	const ChangeTuple *x = a->tuple;
+	const ChangeTuple *y = b->tuple;
+	ProllyKey	kx = {(const uint8 *) x->data, x->keylen};
+	ProllyKey	ky = {(const uint8 *) y->data, y->keylen};
+	int			r = PROLLY_CALL(arg->kr, compare, arg->k, &kx, &ky);
+
+	if (r == 0)
+		r = memcmp(x->data, y->data, Min(x->keylen, y->keylen));
+	return r != 0 ? r : (x->keylen > y->keylen) - (x->keylen < y->keylen);
+}
+
+static void
+writetup_change(Tuplesortstate *state, LogicalTape *tape, SortTuple *stup)
+{
+	const ChangeTuple *t = stup->tuple;
+	unsigned int tuplen = offsetof(ChangeTuple, data) + t->keylen + t->rowlen;
+	unsigned int written = tuplen + sizeof(unsigned int);
+
+	LogicalTapeWrite(tape, &written, sizeof(written));
+	LogicalTapeWrite(tape, t, tuplen);
+}
+
+static void
+readtup_change(Tuplesortstate *state, SortTuple *stup, LogicalTape *tape,
+			   unsigned int len)
+{
+	unsigned int tuplen = len - sizeof(unsigned int);
+	ChangeTuple *t = tuplesort_readtup_alloc(state, tuplen);
+
+	LogicalTapeReadExact(tape, t, tuplen);
+	stup->tuple = t;
+	stup->datum1 = (Datum) 0;
+	stup->isnull1 = true;
+}
+
+ProllyChangeSort *
+prolly_change_sort_begin(const ProllyKeyingRoutine *kr, ProllyKeying *k)
+{
+	ProllyChangeSort *s = palloc0(sizeof(ProllyChangeSort));
+	TuplesortPublic *base;
+
+	s->arg.kr = kr;
+	s->arg.k = k;
+	s->state = tuplesort_begin_common(maintenance_work_mem, NULL,
+									  TUPLESORT_NONE);
+	base = TuplesortstateGetPublic(s->state);
+	base->nKeys = 1;
+	base->removeabbrev = removeabbrev_fold;
+	base->comparetup = comparetup_change;
+	base->comparetup_tiebreak = comparetup_change;
+	base->writetup = writetup_change;
+	base->readtup = readtup_change;
+	base->haveDatum1 = false;
+	base->tuples = true;
+	base->arg = &s->arg;
+	return s;
+}
+
+void
+prolly_change_sort_put(ProllyChangeSort *s, const ProllyKey *key,
+					   const char *row, uint32 rowlen, int64 delta,
+					   const ItemPointerData *tid)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(s->state);
+	MemoryContext old = MemoryContextSwitchTo(base->tuplecontext);
+	Size		len = offsetof(ChangeTuple, data) + key->len + rowlen;
+	ChangeTuple *t = palloc(len);
+	SortTuple	stup;
+
+	t->delta = delta;
+	if (tid != NULL)
+		t->tid = *tid;
+	else
+		ItemPointerSetInvalid(&t->tid);
+	t->keylen = key->len;
+	t->rowlen = rowlen;
+	memcpy(t->data, key->data, key->len);
+	memcpy(t->data + key->len, row, rowlen);
+	stup.tuple = t;
+	stup.datum1 = (Datum) 0;
+	stup.isnull1 = true;
+	tuplesort_puttuple_common(s->state, &stup, false,
+							  TupleSortUseBumpTupleCxt(base->sortopt) ?
+							  MAXALIGN(len) : GetMemoryChunkSpace(t));
+	MemoryContextSwitchTo(old);
+}
+
+void
+prolly_change_sort_done(ProllyChangeSort *s)
+{
+	tuplesort_performsort(s->state);
+}
+
+bool
+prolly_change_sort_next(ProllyChangeSort *s, ProllySortedChange *change)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(s->state);
+	MemoryContext old = MemoryContextSwitchTo(base->sortcontext);
+	SortTuple	stup;
+	bool		got = tuplesort_gettuple_common(s->state, true, &stup);
+	const ChangeTuple *t;
+
+	MemoryContextSwitchTo(old);
+	if (!got)
+		return false;
+	t = stup.tuple;
+	change->key.data = (const uint8 *) t->data;
+	change->key.len = t->keylen;
+	change->row = t->data + t->keylen;
+	change->rowlen = t->rowlen;
+	change->delta = t->delta;
+	change->tid = t->tid;
+	return true;
+}
+
+void
+prolly_change_sort_end(ProllyChangeSort *s, bool *spilled)
+{
+	TuplesortInstrumentation stats;
+
+	tuplesort_get_stats(s->state, &stats);
+	if (spilled)
+		*spilled = stats.spaceType == SORT_SPACE_TYPE_DISK;
+	tuplesort_end(s->state);
+	pfree(s);
 }
 
 /*

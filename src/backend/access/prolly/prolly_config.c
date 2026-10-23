@@ -354,6 +354,17 @@ prolly_note_branch_write(Oid branch)
 }
 
 void
+prolly_note_relation_write(Oid branch, Oid relid)
+{
+	const ProllyRefsRoutine *refs = database_refs();
+
+	if (refs != NULL && refs->note_write != NULL)
+		refs->note_write(branch);
+	if (refs != NULL && refs->note_relation != NULL && OidIsValid(relid))
+		refs->note_relation(branch, relid);
+}
+
+void
 prolly_forget_folds(void)
 {
 	const ProllyRefsRoutine *refs = database_refs();

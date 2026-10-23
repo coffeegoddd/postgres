@@ -233,7 +233,12 @@ of identical rows.  A commit folds each table's rows into its data tree:
 in full the first time, then from its baseline using the per-table change
 log (the default finder "log", changes_log.c). The older "pages" finder
 (changes_pages.c) remains registered. Incremental folds can fall back to a
-full fold when the log or baseline cannot be used or a budget is exceeded.
+full fold when the log or baseline cannot be used, or when more rows
+changed than reading the table costs.  Changes past maintenance_work_mem
+are not a reason: they are sorted, spilling to disk, and applied a part at
+a time in key order, so the fold's work stays that of the rows changed
+(pg_stat_prolly's fold_changes_spilled).  A transaction commit's own
+changes past it commit the working set instead.
 The refs ("copies", refs_copies.c) keep branch heads, baselines, tags, remotes and
 merge state in the chunk store's root.  Diff and merge ("folded",
 diffmerge_folded.c) compare canonical trees table by table, reading only
@@ -270,9 +275,9 @@ the TIDs of the tuple versions each write made or replaced
 (branch_tuple_hook), and the change finder applies those the transaction
 made and didn't replace, or replaced and hadn't made, to the head's table
 trees (fold_rows), with no fold and no snapshot checked.  A transaction
-that changed definitions, or more rows than it keeps, or whose rows can't
-be applied so (a table the head describes otherwise), commits its working
-set instead.
+that changed definitions, or more rows than it keeps (or than
+maintenance_work_mem holds), or whose rows can't be applied so (a table
+the head describes otherwise), commits its working set instead.
 
 A fold isn't made again while nothing it reads has changed: the refs
 (refs_generations.c) keep in shared memory each branch's generation,
@@ -294,6 +299,25 @@ their changes, which have no syscache); which objects are extensions'
 members; and the last canonical tree's items, so the next is applied as
 the items that differ (the baseline's too, from the baseline folded from).
 debug_prolly_verify_fold_caches works each one taken out again too.
+
+A fold after another in the same backend works out again only what may
+have changed (fold_incremental): with no catalog change or collection
+since (the refs' mark, moved by every catalog change sent, and the
+backend's own catalog epoch), the same deparsing settings, and a snapshot
+that sees every writer of the branch that ended, it takes the last
+canonical tree's items and redoes those of the tables whose rows were
+written since, and every sequence's (their values change outside
+transactions), reading no catalog through.  The refs learn which tables:
+every row a writer changes names its relation (note_relation()), and as
+the writer ends the branch keeps them in shared memory, the last few with
+the generation they ended at (refs_generations.c).  A writer of too many
+relations, an eviction, a prepared transaction's end or anything else the
+mark doesn't cover folds everything.  A commit's fold begins the next
+baseline from the one this backend built last, only the written tables'
+entries changed.  debug_prolly_verify_fold_caches then folds everything
+else again (its work not counted) and compares.  dolt_status reads definitions
+without rows and asks each table's change finder, so it still visits
+every table.
 
 
 Remotes

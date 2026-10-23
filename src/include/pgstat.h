@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCEE
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF0
 
 typedef struct PgStat_ArchiverStats
 {
@@ -708,9 +708,20 @@ typedef enum PgStat_ProllyCounter
 										 * its loads' builds included */
 	PGSTAT_PROLLY_CATALOG_ROWS_COPIED,	/* catalog rows a branch's copies
 										 * were made of */
+	PGSTAT_PROLLY_FOLD_CHANGES_SPILLED, /* folds from a baseline whose
+										 * changes passed
+										 * maintenance_work_mem: sorted,
+										 * spilling, not read in full */
+	PGSTAT_PROLLY_FOLD_CATALOG_SCANS,	/* folds that read the catalogs
+										 * through for every versioned
+										 * object */
+	PGSTAT_PROLLY_FOLD_OBJECTS, /* versioned objects folds described */
+	PGSTAT_PROLLY_FOLD_TABLES,	/* tables whose rows folds folded */
+	PGSTAT_PROLLY_FOLD_INCREMENTAL, /* folds that worked out again only
+									 * what changed since the last */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_CATALOG_ROWS_COPIED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_INCREMENTAL + 1)
 
 typedef struct PgStat_ProllyStats
 {

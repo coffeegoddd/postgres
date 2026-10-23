@@ -1022,8 +1022,8 @@ SELECT value > 0 AS counted_spilled FROM pg_stat_prolly WHERE name = 'fold_full_
  t
 (1 row)
 
--- the changes an incremental fold holds past maintenance_work_mem: in full,
--- as that costs no more
+-- the changes an incremental fold holds past maintenance_work_mem: sorted,
+-- spilling, and folded from the baseline, not in full (spilled_folds)
 SELECT length(dolt_commit('-Am', 'big')::text) AS committed;
  committed 
 -----------
@@ -1057,11 +1057,15 @@ RESET maintenance_work_mem;
 (1 row)
 
 SELECT * FROM full_folds();
-    reason     | n 
----------------+---
- memory_budget | 1
- spilled       | 1
-(2 rows)
+ reason | n 
+--------+---
+(0 rows)
+
+SELECT value AS changes_spilled FROM pg_stat_prolly WHERE name = 'fold_changes_spilled';
+ changes_spilled 
+-----------------
+               1
+(1 row)
 
 -- many rows changed: merged with the baseline in one pass, not applied a
 -- row at a time, nor read in full; the same tree as a full fold

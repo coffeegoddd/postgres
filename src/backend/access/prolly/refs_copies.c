@@ -4564,4 +4564,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.note_write = branch_generations_note_write,
 	.forget_folds = branch_generations_forget,
 	.prepared_ended = branch_generations_prepared_ended,
+	.note_relation = branch_generations_note_relation,
+	.fold_mark = branch_fold_mark,
+	.written_since = branch_written_since,
 };

@@ -1880,11 +1880,14 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 								   (int64) f.work.rows_read,
 								   INSTR_TIME_GET_MILLISEC(took));
 		}
-		counters.pages += f.work.pages;
-		counters.candidates += f.work.candidates;
-		counters.full += f.work.full;
-		counters.rows_read += f.work.rows_read;
-		counters.rows_written += f.work.rows_written;
+		if (prolly_fold_counted)
+		{
+			counters.pages += f.work.pages;
+			counters.candidates += f.work.candidates;
+			counters.full += f.work.full;
+			counters.rows_read += f.work.rows_read;
+			counters.rows_written += f.work.rows_written;
+		}
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_PAGES, f.work.pages);
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f.work.candidates);
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f.work.full);

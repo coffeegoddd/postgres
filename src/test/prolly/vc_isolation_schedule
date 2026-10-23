@@ -11,3 +11,5 @@ test: vc_txn_branches
 test: vc_checkpoint_mover
 test: vc_txn_commit_baselines
 test: vc_stale_folds
+test: vc_stale_spilled_folds
+test: vc_incremental_canon
