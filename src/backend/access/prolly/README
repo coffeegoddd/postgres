@@ -252,8 +252,15 @@ and their resource owner removes them on error, savepoint rollback or
 cancellation.  Ordinary merges do not create these files, but every such
 validation creates both, however small the table, so it uses temporary
 space: it counts against temp_file_limit and is reported by log_temp_files.
-Earlier schema conversion and uncertainty buffers are separate and can still
-grow with table size; this does not bound the entire merge's memory.
+Reading a version as a table is defined now (as_defined_now()) keeps the
+rows in their stored order when the key columns are read as they are
+stored.  Otherwise (a key retyped, an enum relabelled, a keyless table) the
+converted rows go to a tuplesort of their own ordered by the keying, ties
+in the order read, which spills past work_mem; they are read back in order
+and streamed into the tree builder, copies of a row counted and a key found
+twice refused or, shown, warned of, as before.  The base's rows with an
+unsure value are sorted the same way and written to a temporary file in key
+order, which each merge walk reads from its start alongside theirs' changes.
 
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
