@@ -161,6 +161,7 @@ tests += {
       'row_locations',
       'describe_caches',
       'nearest_source',
+      'near_sources',
       'keyless_toast_folds',
       'vacuum_shared',
       'eager_freeze',
@@ -316,6 +317,7 @@ tests += {
       't/192_bmap_tree_snapshots.pl',
       't/193_bmap_dropped_buffers.pl',
       't/194_bmap_snapshot_redo.pl',
+      't/220_near_source_writes.pl',
     ],
   },
 }

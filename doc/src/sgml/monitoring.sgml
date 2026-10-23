@@ -5814,7 +5814,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        rows they folded) and <literal>fold_incremental</literal> (folds that
        took the last canonical tree the backend built and worked out again
        only the tables written since and the sequences, as nothing else had
-       changed).  Bytes are counted when
+       changed); <literal>move_plans</literal> (moves the move planner
+       costed: each branch a branch's first use weighed copying, when no
+       branch is at its head).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected

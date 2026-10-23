@@ -719,9 +719,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_TABLES,	/* tables whose rows folds folded */
 	PGSTAT_PROLLY_FOLD_INCREMENTAL, /* folds that worked out again only
 									 * what changed since the last */
+	PGSTAT_PROLLY_MOVE_PLANS,	/* moves the move planner costed: the
+								 * sources a branch's first use weighed */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_INCREMENTAL + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MOVE_PLANS + 1)
 
 typedef struct PgStat_ProllyStats
 {

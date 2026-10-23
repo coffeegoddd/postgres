@@ -135,6 +135,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include <ctype.h>
 
 #include "access/prolly_builtins.h"
@@ -2135,10 +2137,92 @@ rank_source(const char *name, Oid branch, void *arg)
 }
 
 /*
+ * With no branch at the root: the branch whose copies would cost least to
+ * move there, as the move planner estimates the move from what its working
+ * set is known or thought to be (its working set known, else its
+ * baseline's fold, else its head; one changed since is only a hint, the
+ * move folding the copies as they are).  The session's branch is planned
+ * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
+ * after it, each stopped once it costs more than the best yet.  NULL if
+ * none is cheaper than the session's branch.  (A source a move could start
+ * from without a branch's copies, as a kept materialization, would be
+ * planned among these, by the root it holds.)
+ */
+#define SOURCE_CANDIDATES	16
+
+typedef struct SourceCandidates
+{
+	Snapshot	snap;
+	bool		others;			/* the others noted now, not the session's */
+	List	   *names;			/* char *, the session's branch first */
+	List	   *roots;			/* ProllyNodeRef *, what each is thought to be */
+} SourceCandidates;
+
+static void
+note_candidate(const char *name, Oid branch, void *arg)
+{
+	SourceCandidates *sc = arg;
+	ProllyNodeRef *root = palloc(sizeof(ProllyNodeRef));
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	ProllyCommitInfo info;
+	BranchFoldStamp at;
+
+	if ((branch != MyBranch) != sc->others ||
+		list_length(sc->names) > SOURCE_CANDIDATES)
+		return;
+	if (fold_caches_usable() &&
+		branch_fold_known_at(branch, sc->snap,
+							 branch_baseline(name, &baseline) ? &baseline.hash : NULL,
+							 false, &h, &at))
+		ref_of(&h, root);
+	else if (branch_baseline_root(name, root))
+		;
+	else if (branch_head(name, &h) && copies_commit_get(&h, &info))
+		*root = info.root;
+	else
+		return;
+	sc->names = lappend(sc->names, pstrdup(name));
+	sc->roots = lappend(sc->roots, root);
+}
+
+static char *
+estimated_source(const ProllyNodeRef *target, Snapshot snap)
+{
+	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
+	SourceCandidates sc = {snap, false, NIL, NIL};
+	ProllyMovePlan plan;
+	double		best;
+	char	   *source = NULL;
+
+	/* (the session's branch first, then the others) */
+	branch_ops()->branches(note_candidate, &sc);
+	if (sc.names == NIL)
+		return NULL;
+	sc.others = true;
+	branch_ops()->branches(note_candidate, &sc);
+	PROLLY_CALL(planner, plan, linitial(sc.roots), target, INFINITY, &plan);
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+	best = plan.cost;
+	for (int i = 1; i < list_length(sc.names); i++)
+	{
+		PROLLY_CALL(planner, plan, list_nth(sc.roots, i), target, best, &plan);
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+		if (!plan.over && plan.cost < best)
+		{
+			best = plan.cost;
+			source = list_nth(sc.names, i);
+		}
+	}
+	return source;
+}
+
+/*
  * Make the copies of a branch that has only its head: a copy of the
- * nearest branch's to its head's root (#491), or else the session's (each
- * has the same changes since the same baseline as the copy), moved to the
- * root.
+ * nearest branch's to its head's root (#491), else of the branch the
+ * move planner estimates is cheapest to move there, or else the
+ * session's (each has the same changes since the same baseline as the
+ * copy), moved to the root.
  */
 static void
 materialize(const char *name)
@@ -2194,8 +2278,10 @@ materialize(const char *name)
 		ns.snap = IsolationUsesXactSnapshot() ? GetActiveSnapshot() :
 			GetLatestSnapshot();
 		branch_ops()->branches(rank_source, &ns);
-		source = ns.rank > 0 ? ns.name : branch_ops()->current();
-		branch_ops()->make(name, ns.rank > 0 ? source : NULL);
+		if (ns.rank == 0)
+			ns.name = estimated_source(&info.root, ns.snap);
+		source = ns.name != NULL ? ns.name : branch_ops()->current();
+		branch_ops()->make(name, ns.name != NULL ? source : NULL);
 		branch_set_baseline(name,
 							branch_baseline(source, &baseline) ? &baseline : NULL,
 							NULL);
