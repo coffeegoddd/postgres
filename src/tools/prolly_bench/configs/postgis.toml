@@ -1,0 +1,20 @@
+# The PostGIS build for the G and GV suites and the check-postgis
+# requirement tests (build_postgres.py --with-postgis, build_postgis.py).
+#
+# PostGIS master, because only master builds against this tree's
+# PostgreSQL development version.  Re-pin deliberately: on an upstream sync
+# that breaks the build, or to take a PostGIS fix.
+repository = "https://github.com/postgis/postgis.git"
+commit = "2b3ceb9f290a1d8427cebf48c2b9324284ec9a50"
+
+# Extra configure flags (raster and topology are always on; SFCGAL is on
+# when sfcgal-config is found).
+configure = []
+
+# The library versions the build must find.  They come from the system, so
+# this is a check, not a download: another version is refused unless
+# --postgis-allow-library-mismatch is given, and is recorded either way.
+[libraries]
+geos = "3.15.0"
+proj = "9.9.0"
+gdal = "3.13.3"

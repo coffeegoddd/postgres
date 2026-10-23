@@ -6,8 +6,10 @@ per-operation memory sampling and empirical scaling sweeps, see
 
 Benchmark harness for prolly storage: the S suite (storage, any table AM,
 compared with the fork's heap), the V suite (version control, prolly engines
-only) and the C suite (SQL correctness: sqllogictest, any table AM, compared
-with the fork's heap).
+only), the C suite (SQL correctness: sqllogictest, any table AM, compared
+with the fork's heap), and the G and GV suites (PostGIS: spatial storage
+against heap, and spatial version control; see [Suites](#suites) and
+[PostGIS builds](#postgis-builds)).
 
 Python 3.11+ standard library only.  It drives `psql`, `pgbench`, BenchBase
 (S9 and S13), sysbench (S10), `fio`, `perf`, and for the C suite a Go program,
@@ -499,6 +501,93 @@ read-write test at 8 clients, 5 repetitions, 5 s warm-up and 20 s measured.
 Its numbers only compare builds (`comparison_only`), so it may run with
 `synchronous_commit = off`; they are never reported as the procedure's.
 
+## Suites
+
+A suite is a registration in `pbench/suites/` (`pbench/core/suites.py`),
+one file per suite or family:
+
+| Suite | Layout | Engines | Durable | Extensions | Default config |
+|---|---|---|---|---|---|
+| S | storage: ratios to the same build's heap (B0) | any | yes | | `standard.toml` |
+| V | version control: against bounds | with history (prolly) | yes | | `standard.toml` |
+| C | correctness: answers against heap | any | no | | `c_standard.toml` |
+| G | storage | any | yes | postgis, postgis_raster, postgis_topology | `standard.toml` |
+| GV | version control | with history | yes | the same | `standard.toml` |
+
+The registration is what the rest of the harness reads: `run`'s and
+`table`'s suite choices, `list`, the default configuration, which `[sizes]`
+keys and per-workload parameters a configuration may use (and which
+workloads take `transactions` and `rate`), whether `fsync` and
+`synchronous_commit` are required, which engines a suite accepts, the
+report layout, the extensions its builds must carry and its databases
+install, and the data manifests whose hashes each run records.  Workload
+IDs are the suite's letters and a number (`G3`, `GV2`).  A new suite is a
+new file; its workloads, size keys and parameters register with it.  (The
+S, V and C workloads' parameter keys are still listed in `config.py`.)
+
+G and GV have no workloads yet: the suites, their builds and their targets
+come first.  A database of either installs PostGIS where its tables are:
+in the versioned schema on prolly, where the extension is shared by every
+branch but not versioned, and in `public` on heap.  `postgis_topology`
+keeps its own `topology` schema.  Workload SQL names PostGIS objects
+unqualified, so the same scripts run on both.
+
+## PostGIS builds
+
+`configs/postgis.toml` pins the PostGIS commit (PostGIS master, the only
+branch that builds against this tree's PostgreSQL development version) and
+the GEOS, PROJ and GDAL versions it is built with.  Those libraries are the
+system's, so the pin is checked, not fetched: a build that finds another
+version is refused unless given `--postgis-allow-library-mismatch`, and
+the versions are recorded either way (`benchmark` quality then refuses the
+run).
+
+```sh
+# a benchmark build: the server, then PostGIS against it, one manifest
+src/tools/prolly_bench/build_postgres.sh --build-dir build-gis --jobs 8 --with-postgis \
+    -- --with-openssl CFLAGS=-O2
+src/tools/prolly_bench/prolly_bench run G --am heap,prolly --pg-bin build-gis/inst/bin
+
+# PostGIS against an existing install (a development build, for
+# src/test/prolly's check-postgis)
+python3 src/tools/prolly_bench/build_postgis.py --pg-config inst/bin/pg_config \
+    --build-dir build-bench/postgis
+```
+
+A build clones the pinned commit (`--postgis-source DIR` takes it from a
+local clone instead of the pin's repository) and checks it is at the pin
+and clean; runs `autogen.sh` and `configure` against the server's
+`pg_config`, with raster and topology, and SFCGAL when `sfcgal-config` is
+found; installs into the server's installation (its man pages under the
+server's prefix, not `/usr/local`); then, in a throwaway cluster, creates
+the extensions a G or GV database does and reads `postgis_full_version()`
+(what each cell's reading is compared with), then `postgis_sfcgal` when
+built, reading it again.  The pin and the library versions are checked
+before anything is built, the server included.  The manifest
+(`pbench-build.json`'s `extensions.postgis`, or `BUILD/pbench-postgis.json`
+from `build_postgis.py`) records:
+
+- the repository, commit and configure command;
+- the pinned and found library versions, and any mismatch;
+- each geospatial shared object any PostGIS module links (GEOS, PROJ,
+  GDAL, SFCGAL, json-c, protobuf-c, libxml2), with its path and hash;
+- each installed module's hash (`postgis-3.so`, `postgis_raster-3.so`,
+  `postgis_topology-3.so`, `postgis_sfcgal-3.so`);
+- the extensions' versions, `postgis_full_version()`, and with SFCGAL
+  `full_version_with_sfcgal`.
+
+The build's `libraries` list then includes PostGIS's modules (a build
+without PostGIS lists only `pg_walinspect.so`, so S-only builds don't need
+PostGIS).  `environment.json` carries the manifest under `extensions`.
+Before every cell, the harness rehashes the build's binaries and every
+listed library; a G or GV cell also records its extensions' versions and
+`postgis_full_version()` in `raw/extensions.json`, and fails if a library
+version differs from the build's record (PROJ's per-user settings aside).
+
+The C suite's runner, `slt-runner`, takes `-search-path-extra` (schemas
+after the test schema) and `-setup-sql FILE` (run in each new database
+before its tests, on that path), for spatial sqllogictest files later.
+
 ## The pull-request gate
 
 ```sh
@@ -711,6 +800,7 @@ file; the driver doesn't change.
 
 | Interface | Implementations | Directory |
 |---|---|---|
+| `Suite` | S, V, C, G, GV ([Suites](#suites)) | `pbench/suites/` |
 | `Workload` | S1-S10 and S13, V1-V4 and V6-V9, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |

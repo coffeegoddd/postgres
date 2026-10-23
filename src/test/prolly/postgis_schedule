@@ -1,0 +1,6 @@
+# PostGIS: must match stock Postgres (expected output comes from heap).
+# Needs PostGIS installed (the Makefile's check-postgis).
+test: gis_values
+test: gis_indexes
+test: gis_catalog
+test: gis_metadata

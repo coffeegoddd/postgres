@@ -344,3 +344,37 @@ func TestPlanConditionalHalt(t *testing.T) {
 		t.Fatalf("conditional halt plan: %s", b)
 	}
 }
+
+// A new database gets its versioned schema, then the setup SQL on the
+// search path (so what it creates lands in the test schema), then the
+// search path again with the extra schemas after the test schema.
+func TestSetupStatements(t *testing.T) {
+	setup := filepath.Join(t.TempDir(), "setup.sql")
+	if err := os.WriteFile(setup, []byte("CREATE EXTENSION postgis"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		cfg  config
+		want []string
+	}{
+		{config{}, nil},
+		{config{schema: "slt"}, []string{"CREATE SCHEMA slt VERSIONED", "SET search_path = slt"}},
+		{config{schema: "slt", searchPathExtra: " ext ,topology,", setupSQL: setup},
+			[]string{"CREATE SCHEMA slt VERSIONED", "SET search_path = slt, ext, topology",
+				"CREATE EXTENSION postgis", "SET search_path = slt, ext, topology"}},
+		{config{searchPathExtra: "ext"}, []string{"SET search_path = public, ext"}},
+	}
+	for _, c := range cases {
+		got, err := c.cfg.setupStatements()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(got, ";") != strings.Join(c.want, ";") {
+			t.Errorf("setupStatements(%+v) = %q, want %q", c.cfg, got, c.want)
+		}
+	}
+	missing := config{setupSQL: filepath.Join(t.TempDir(), "absent.sql")}
+	if _, err := missing.setupStatements(); err == nil {
+		t.Error("a missing setup file must fail the database's setup")
+	}
+}

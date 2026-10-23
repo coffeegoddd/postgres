@@ -1,0 +1,6 @@
+# PostGIS through version control (prolly only; hand-written expected
+# output).  Needs PostGIS installed (the Makefile's check-postgis).
+test: vc_gis_moves
+test: vc_gis_history
+test: vc_gis_types
+test: vc_gis_remotes

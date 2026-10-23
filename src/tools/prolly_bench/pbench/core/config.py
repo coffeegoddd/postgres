@@ -13,6 +13,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from pbench.core import suites
+
 RUN_DEFAULTS: dict[str, Any] = {
     "repetitions": 5,
     "clients": [1, 4, 16, 64, 256],
@@ -52,14 +54,9 @@ RUN_DEFAULTS: dict[str, Any] = {
     "write_amp_materialize": "auto",
 }
 
-# Settings every S and V run requires: results are only comparable when
-# durable.  The C suite measures correctness, not speed, and doesn't crash
-# the server on purpose, so it may run without them.
+# Settings every durable suite's run requires (suites.Suite.durable):
+# results are only comparable when durable.
 REQUIRED_SETTINGS = {"fsync": "on", "synchronous_commit": "on"}
-DURABILITY_EXEMPT_SUITES = {"C"}
-
-# The default configuration per suite, in configs/.
-DEFAULT_CONFIGS = {"S": "standard.toml", "V": "standard.toml", "C": "c_standard.toml"}
 
 # Settings the harness itself needs, under the config's settings.
 HARNESS_SETTINGS = {
@@ -87,6 +84,10 @@ def merge(base: dict, over: dict) -> dict:
 
 
 def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, Any]:
+    try:
+        durable = suites.get(suite).durable
+    except KeyError as e:
+        raise ConfigError(str(e.args[0])) from None
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     unknown = set(raw) - _TOP_LEVEL
@@ -111,7 +112,7 @@ def load(path: Path, overrides: dict[str, Any], suite: str = "S") -> dict[str, A
         if name not in cfg["sizes"]:
             raise ConfigError(f"size {name!r} has no [sizes.{name}] section")
     for k, v in REQUIRED_SETTINGS.items():
-        if suite in DURABILITY_EXEMPT_SUITES:
+        if not durable:
             break
         actual = cfg["postgres"].get(k, v)
         if k == "synchronous_commit" and cfg["run"]["comparison_only"] and actual == "off":
@@ -145,6 +146,7 @@ def guc_bytes(value) -> float:
 
 def validate(cfg: dict, suite: str) -> None:
     run = cfg["run"]
+    correctness = suites.layout(suite) == suites.CORRECTNESS
     def number(value, name, minimum=1, maximum=None):
         if (isinstance(value, bool) or not isinstance(value, (float, int))
                 or not math.isfinite(value) or value < minimum
@@ -155,13 +157,13 @@ def validate(cfg: dict, suite: str) -> None:
         if type(run[name]) is not int:
             raise ConfigError(f"{name} must be an integer")
     for name in ("warmup_seconds", "measure_seconds", "seed"):
-        number(run[name], name, 0 if name != "measure_seconds" or suite == "C" else 1)
+        number(run[name], name, 0 if name != "measure_seconds" or correctness else 1)
         if type(run[name]) is not int:
             raise ConfigError(f"{name} must be an integer")
     number(run["latency_sampling_rate"], "latency_sampling_rate", 1e-12, 1)
     if run["shard"]:
-        if suite != "C":
-            raise ConfigError("only the C suite runs in shards")
+        if not correctness:
+            raise ConfigError("only a correctness suite (C) runs in shards")
         from pbench import cshard
         try:
             cshard.parse(str(run["shard"]))
@@ -221,8 +223,7 @@ def validate(cfg: dict, suite: str) -> None:
         raise ConfigError("required_collectors must be enabled")
     for label, sizes in cfg["sizes"].items():
         for name, value in sizes.items():
-            if name not in {"pgbench_scale", "s4_rows", "s7_rows", "tpcc_warehouses", "tpch_scale",
-                            "v_rows", "sysbench_tables", "sysbench_table_size"}:
+            if name not in suites.size_keys():
                 raise ConfigError(f"unknown size parameter {label}.{name}")
             number(value, f"sizes.{label}.{name}", 1e-12)
             if name != "tpch_scale" and type(value) is not int:
@@ -239,6 +240,8 @@ def validate(cfg: dict, suite: str) -> None:
             "V9": {"background", "rows", "delta", "delta_rows", "deltas"}}
     keys.update({f"C{i}": {"workers", "sample"} for i in range(1, 5)})
     keys.update({f"S{i}": set() for i in (1, 2, 4, 6, 7)})
+    # Workloads of the suites that register their parameters.
+    keys.update(suites.workload_params())
     for wid, params in cfg["workloads"].items():
         if wid not in keys or set(params) - (keys[wid] | common):
             raise ConfigError(f"unknown workload or parameters for {wid}: {sorted(params)}")
@@ -266,11 +269,11 @@ def validate(cfg: dict, suite: str) -> None:
                 number(params[name], f"{wid}.{name}", 0 if name == "warmup_seconds" else 1)
                 if type(params[name]) is not int:
                     raise ConfigError(f"{wid}.{name} must be an integer")
-        if "transactions" in params and wid not in {"S1", "S2", "S3", "S5", "S6", "S7", "S8", "S10"}:
+        if "transactions" in params and wid not in suites.transaction_workloads():
             raise ConfigError("transactions is supported only by pgbench and sysbench workloads")
         for name in ("rate", "latency_limit_ms"):
             if name in params:
-                if wid not in {"S1", "S2", "S3", "S5", "S6", "S7", "S8"}:
+                if wid not in suites.rate_workloads():
                     raise ConfigError(f"{name} is supported only by pgbench workloads")
                 number(params[name], f"{wid}.{name}", 1e-12)
 

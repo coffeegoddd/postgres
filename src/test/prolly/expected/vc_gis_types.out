@@ -1,0 +1,36 @@
+--
+-- PostGIS types without binary send/recv in versioned tables: raster and
+-- spheroid are kept as their text forms and come back byte-identical
+-- through commits, moves and merges, alone and in arrays, domains and
+-- composites; box2d and box3d values whose text doesn't read back the same
+-- are refused where they're written, never at a commit; box2df and gidx,
+-- index keys, can hold no value.  And a NaN point comes back from a
+-- commit as POINT EMPTY, as through pg_dump: its EWKB is an empty
+-- point's.
+--
+\set ECHO none
+on main|t
+without send/recv|box2d,box2df,box3d,gidx,raster,spheroid
+status|public.gis_nosend new table
+commit|t
+reset|t
+reset: same|t
+reset: raster reads|7,3.6666667461395264,1.5
+branch|t
+commit main|t
+checkout|t
+checkout: same|t
+commit side|t
+merge|{0,0,"merge successful"}
+merged|1:5:true:BOX(0 0,1 1),6:3.6666667461395264:false:BOX(2 2,3 3),7:1.5:false:BOX(0 0,1 1)
+checkout main|t
+extent refused|0A000 value of type box2d can't be stored in a versioned table: its text form doesn't read back as the same value
+extent 3D|accepted
+status after|1
+box2df value|0A000 function box2df_in not implemented
+gidx value|0A000 function gidx_in not implemented
+nulls commit|t
+before|1:false:0101000000000000000000f87f000000000000f87f,2:false:0101000000000000000000f8ff000000000000f8ff,3:true:0101000000000000000000f87f000000000000f87f,4:false:0101000000000000000000f03f0000000000000040
+commit nan|t
+reset|t
+after|1:true:0101000000000000000000f87f000000000000f87f,2:true:0101000000000000000000f87f000000000000f87f,3:true:0101000000000000000000f87f000000000000f87f,4:false:0101000000000000000000f03f0000000000000040
