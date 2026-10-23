@@ -5790,8 +5790,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>apply_rows</literal> (rows the row applier inserted,
        updated or deleted, moving a working set to a commit);
        <literal>apply_index_tuples</literal> (index entries those writes
-       made: one per index for each row inserted or updated other than
-       heap-only, and those the builds after a load made);
+       made: for each row inserted or updated, one in each index whose
+       predicate the row meets, in summarizing indexes alone for a
+       heap-only update; and those the builds after a load made);
        <literal>catalog_rows_copied</literal> (catalog rows of versioned
        objects copied to make a branch's copies).  Bytes are counted when
        written, not when synced.  A process counts in the database it is

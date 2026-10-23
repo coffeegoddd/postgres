@@ -56,13 +56,18 @@ SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') =
 	AS none_counted_down;
 
 -- A table whose updates of v aren't heap-only (an index on v): a row
--- written makes an entry in each of its two indexes.  And one whose
--- updates are (nothing indexes w, and its pages have room).
+-- written makes an entry in each of its two indexes.  One whose updates
+-- are (nothing indexes w, and its pages have room).  And one whose index
+-- on v is partial, holding no row: its updates of v aren't heap-only, and
+-- make an entry in the primary key alone.
 CREATE TABLE sm.t (id int PRIMARY KEY, v int NOT NULL, w int NOT NULL);
 CREATE INDEX ON sm.t (v);
 INSERT INTO sm.t SELECT g, 0, 0 FROM generate_series(1, 1000) g;
 CREATE TABLE sm.h (id int PRIMARY KEY, w int NOT NULL) WITH (fillfactor = 50);
 INSERT INTO sm.h SELECT g, 0 FROM generate_series(1, 1000) g;
+CREATE TABLE sm.p (id int PRIMARY KEY, v int NOT NULL);
+CREATE INDEX ON sm.p (v) WHERE id < 0;
+INSERT INTO sm.p SELECT g, 0 FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-Am', 'tables')::text) > 0 AS committed;
 SELECT dolt_branch('other');
 
@@ -130,10 +135,20 @@ SELECT dolt_reset('--hard');
 SELECT pg_stat_force_next_flush();
 SELECT name, value FROM pg_temp.counted('{apply_rows,apply_index_tuples}');
 
+-- Rows a partial index's predicate leaves out make no entry in it.
+UPDATE sm.p SET v = 1 WHERE id IN (1, 2, 3);
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset_shared('prolly');
+SELECT dolt_reset('--hard');
+SELECT pg_stat_force_next_flush();
+SELECT name, value FROM pg_temp.counted('{apply_rows,apply_index_tuples}');
+
 -- A table filled from nothing is loaded, its index built after the rows:
--- an entry for each row all the same.
-CREATE TABLE sm.l (id int PRIMARY KEY);
-INSERT INTO sm.l SELECT generate_series(1, 300);
+-- an entry for each row all the same.  (Its other indexes, made after the
+-- rows by the move, aren't the load's.)
+CREATE TABLE sm.l (id int PRIMARY KEY, v int NOT NULL);
+CREATE INDEX ON sm.l (v);
+INSERT INTO sm.l SELECT g, g FROM generate_series(1, 300) g;
 SELECT length(dolt_commit('-Am', 'a loaded table')::text) > 0 AS committed;
 SELECT dolt_checkout('main');
 SELECT pg_stat_force_next_flush();

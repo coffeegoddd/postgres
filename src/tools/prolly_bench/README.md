@@ -264,7 +264,7 @@ told apart: map work, rows written back, and catalog work.
 | `bmap_refcount_updates` | page-store blocks' reference counts set: shares, drops, copies on write, truncations, sweeps |
 | `bmap_blocks_freed` | page-store blocks given back to the allocator |
 | `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
-| `apply_index_tuples` | index entries those writes made: one per index for each row inserted or updated other than heap-only, and a load's index builds' |
+| `apply_index_tuples` | index entries those writes made: for each row inserted or updated, one in each index whose predicate the row meets (summarizing indexes alone for a heap-only update), and a load's index builds' |
 | `catalog_rows_copied` | catalog rows a branch's copies were made of (first use) |
 
 S7's counters vary a little: GiST breaks ties between pages at random.
