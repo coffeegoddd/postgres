@@ -31,6 +31,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -385,6 +386,19 @@ test_bmap_cleanup_lock(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Drop a block's page from the buffer pool without writing it, as the block
+ * map does with a block given other contents (DropBufferBlock()).
+ */
+PG_FUNCTION_INFO_V1(test_bmap_drop_buffer);
+Datum
+test_bmap_drop_buffer(PG_FUNCTION_ARGS)
+{
+	DropBufferBlock(locator_of(PG_GETARG_OID(0)), MAIN_FORKNUM,
+					PG_GETARG_INT32(1));
+	PG_RETURN_VOID();
+}
+
+/*
  * test_bmap_fold_begin(relnumber): begin a fold; its list's lineage, its
  * epoch and the relation's length then.
  */
@@ -477,4 +491,125 @@ test_bmap_read_old(PG_FUNCTION_ARGS)
 	bmap_read_old(bmap_smgr(PG_GETARG_OID(0)), (BlockNumber) PG_GETARG_INT64(1),
 				  (BlockNumber) PG_GETARG_INT64(2), VARDATA(page));
 	PG_RETURN_BYTEA_P(page);
+}
+
+static void
+tree_row(uint16 level, BlockNumber first, BlockNumber block, uint32 refs,
+		 void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[4];
+	bool		nulls[4] = {0};
+
+	values[0] = Int32GetDatum(level);
+	values[1] = Int64GetDatum(first);
+	values[2] = Int64GetDatum(block);
+	values[3] = Int32GetDatum(refs);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/* test_bmap_tree(relnumber): a tree map's nodes, as reached */
+PG_FUNCTION_INFO_V1(test_bmap_tree);
+
+Datum
+test_bmap_tree(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	bmap_inspect_tree(bmap_smgr(PG_GETARG_OID(0)), tree_row, rsinfo);
+	return (Datum) 0;
+}
+
+/* test_bmap_snapshot_take(relnumber): a snapshot kept; its id */
+PG_FUNCTION_INFO_V1(test_bmap_snapshot_take);
+
+Datum
+test_bmap_snapshot_take(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) bmap_snapshot_take(bmap_smgr(PG_GETARG_OID(0))));
+}
+
+/* test_bmap_snapshot_release(relnumber, id): let go of it */
+PG_FUNCTION_INFO_V1(test_bmap_snapshot_release);
+
+Datum
+test_bmap_snapshot_release(PG_FUNCTION_ARGS)
+{
+	bool		released;
+
+	released = bmap_snapshot_release(bmap_smgr(PG_GETARG_OID(0)),
+									 (uint64) PG_GETARG_INT64(1));
+	XLogFlush(XactLastRecEnd);
+	PG_RETURN_BOOL(released);
+}
+
+/* test_bmap_snapshots(relnumber): the snapshots kept */
+PG_FUNCTION_INFO_V1(test_bmap_snapshots);
+
+Datum
+test_bmap_snapshots(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+	int			n;
+
+	InitMaterializedSRF(fcinfo, 0);
+	n = bmap_snapshot_list(bmap_smgr(PG_GETARG_OID(0)), snaps,
+						   BMAP_SNAPSHOTS_MAX);
+	for (int i = 0; i < Min(n, BMAP_SNAPSHOTS_MAX); i++)
+	{
+		Datum		values[2];
+		bool		nulls[2] = {0};
+
+		values[0] = Int64GetDatum((int64) snaps[i].id);
+		values[1] = Int64GetDatum(snaps[i].nblocks);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/*
+ * test_bmap_share_snapshot(relnumber, id): a new relation file number whose
+ * storage is the snapshot's, which test_bmap_unlink() drops.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_share_snapshot);
+
+Datum
+test_bmap_share_snapshot(PG_FUNCTION_ARGS)
+{
+	SMgrRelation src = bmap_smgr(PG_GETARG_OID(0));
+	RelFileNumber copy = GetNewRelFileNumber(MyDatabaseTableSpace, NULL,
+											 RELPERSISTENCE_PERMANENT);
+	SMgrRelation dst = smgropen(locator_of(copy), INVALID_PROC_NUMBER);
+
+	bmap_share_snapshot(src, (uint64) PG_GETARG_INT64(1), dst);
+	PG_RETURN_OID(copy);
+}
+
+/*
+ * test_bmap_lookups(relnumber, loops): look every logical block up 'loops'
+ * times, as a read's combining does; the microseconds it took.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_lookups);
+
+Datum
+test_bmap_lookups(PG_FUNCTION_ARGS)
+{
+	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
+	int32		loops = PG_GETARG_INT32(1);
+	BlockNumber nblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	instr_time	start;
+	instr_time	elapsed;
+	uint64		sum = 0;
+
+	INSTR_TIME_SET_CURRENT(start);
+	for (int32 i = 0; i < loops; i++)
+		for (BlockNumber blk = 0; blk < nblocks; blk++)
+			sum += smgrmaxcombine(srel, MAIN_FORKNUM, blk);
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, start);
+	if (sum == 0 && nblocks > 0)
+		elog(ERROR, "no block found");
+	PG_RETURN_FLOAT8(INSTR_TIME_GET_MICROSEC(elapsed));
 }

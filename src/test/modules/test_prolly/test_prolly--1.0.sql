@@ -163,6 +163,11 @@ CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Drop a block's page from the buffer pool without writing it.
+CREATE FUNCTION test_bmap_drop_buffer(relnumber oid, blkno int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Folds: begin one (its changes list's lineage, its epoch, the length
 -- then); what changed since one began; let go of what changed before one
 -- began; a page as a fold kept it.
@@ -181,6 +186,38 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_bmap_read_old(relnumber oid, blkno int8, old_block int8)
 RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A map's nodes, each time one is reached from the root page.
+CREATE FUNCTION test_bmap_tree(relnumber oid,
+	OUT level int4, OUT first int8, OUT block int8, OUT refs int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A tree map's snapshots: kept (an id), let go of, listed, and copied into a
+-- new relation file number (its main fork alone), which test_bmap_unlink()
+-- drops.
+CREATE FUNCTION test_bmap_snapshot_take(relnumber oid)
+RETURNS int8
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_snapshot_release(relnumber oid, id int8)
+RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_snapshots(relnumber oid,
+	OUT id int8, OUT nblocks int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_share_snapshot(relnumber oid, id int8)
+RETURNS oid
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Look up every logical block of the storage 'loops' times, as reading its
+-- pages does (from cached map pages): the microseconds it took.
+CREATE FUNCTION test_bmap_lookups(relnumber oid, loops int4)
+RETURNS float8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- The server's chunk store, from SQL: chunks are named by the server's

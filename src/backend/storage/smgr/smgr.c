@@ -681,19 +681,30 @@ smgrshare(SMgrRelation src, SMgrRelation dst)
 		elog(ERROR, "storage of relation %s can't be shared",
 			 relpath(src->smgr_rlocator, MAIN_FORKNUM).str);
 
+	smgrusewhich(dst, which);
+	smgrsw[which].smgr_share(src, dst);
+}
+
+/*
+ * smgrusewhich() -- Have 'reln', a relation not created yet, held by
+ *					 implementation 'which' from now on: one that will make
+ *					 its storage itself (a share, its own way).
+ */
+void
+smgrusewhich(SMgrRelation reln, int which)
+{
 	HOLD_INTERRUPTS();
-	if (dst->smgr_which != which)
+	if (reln->smgr_which != which)
 	{
 		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
 		{
-			smgrsw[dst->smgr_which].smgr_close(dst, fork);
-			dst->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+			smgrsw[reln->smgr_which].smgr_close(reln, fork);
+			reln->smgr_cached_nblocks[fork] = InvalidBlockNumber;
 		}
-		dst->smgr_which = which;
-		smgrsw[which].smgr_open(dst);
+		reln->smgr_which = which;
+		smgrsw[which].smgr_open(reln);
 	}
 	RESUME_INTERRUPTS();
-	smgrsw[which].smgr_share(src, dst);
 }
 
 /*

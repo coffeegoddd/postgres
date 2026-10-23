@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Crash recovery where a full-page image of a map page is older than the
-# map page on disk.  Redo skips a block's records from before the WAL
+# Crash recovery where a full-page image of a map page (a leaf of the
+# map's tree, in the page store) is older than the map page on disk.  Redo skips a block's records from before the WAL
 # position since which its entry has its physical block, as the map page
 # says, and doesn't write pages made by them: the record that gave it that
 # block carries the page's image.  Read from the newer map page on disk, a
@@ -44,15 +44,28 @@ full_page_writes = on
 	return $node;
 }
 
-# Is there an image of map page 1 of relation file 'rel' in the WAL between
-# 'from' and 'to'?
+# Is there an image of the leaf of relation file 'rel''s map in the WAL
+# between 'from' and 'to'?
 sub map_image
 {
 	my ($node, $rel, $from, $to) = @_;
 	return $node->safe_psql('postgres', qq{
 		SELECT count(*) > 0 FROM pg_get_wal_block_info('$from', '$to')
-		WHERE relfilenode = $rel AND relforknumber = 4
-		AND relblocknumber = 1 AND block_fpi_length > 0});
+		WHERE relfilenode = 9421 AND relforknumber = 0
+		AND relblocknumber = (SELECT block FROM test_bmap_tree($rel) WHERE level = 0)
+		AND block_fpi_length > 0});
+}
+
+# Write relation file 'rel''s map out: its header and root page, and
+# (unless 'root_only') the nodes of its tree in the page store.
+sub evict_map
+{
+	my ($node, $rel, $root_only) = @_;
+	my $nodes = $root_only ? 'false' : qq{(relfilenode = 9421 AND relforknumber = 0
+			   AND relblocknumber IN (SELECT block FROM test_bmap_tree($rel)))};
+	$node->safe_psql('postgres', qq{
+		SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
+		WHERE (relfilenode = $rel AND relforknumber = 4) OR $nodes});
 }
 
 # The beginning of both scenarios below.  s has a few pages, all of them on
@@ -87,12 +100,13 @@ sub prepare
 }
 
 # Shared again, s's block 0 is copied to a new block, late in the WAL: the
-# copy keeps the old one.  Its map page as of then reaches disk, and the
-# server crashes (and restarts with 'conf').  Returns the copy, and its
+# copy keeps the old one.  Its map page as of then reaches disk (or, with
+# 'root_only', only its root page, pointing to a leaf the share made), and
+# the server crashes (and restarts with 'conf').  Returns the copy, and its
 # rows' digest before the crash.
 sub remap_and_crash
 {
-	my ($node, $name, $s, $phys, $b, $conf) = @_;
+	my ($node, $name, $s, $phys, $b, $conf, $root_only) = @_;
 	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
 
 	my $copy = $sql->(qq{SELECT test_bmap_share($s)});
@@ -102,8 +116,7 @@ sub remap_and_crash
 		$phys, "$name: block 0 went to a new block");
 	is($sql->(qq{SELECT phys FROM test_bmap_map($copy) WHERE blkno = 0}),
 		$phys, "$name: the copy keeps the old block");
-	$sql->(qq{SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
-		WHERE relfilenode = $s AND relforknumber = 4});
+	evict_map($node, $s, $root_only);
 	$node->stop('immediate');
 	$node->append_conf('postgresql.conf', $conf) if $conf;
 	ok($node->start(fail_ok => 1), "$name: recovery completes");
@@ -119,6 +132,28 @@ sub remap_and_crash
 	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
 	my ($s, $copy, $phys) = prepare($node, $name);
 	my ($copy2, $digest2) = remap_and_crash($node, $name, $s, $phys, 4);
+
+	is($sql->(q{SELECT b FROM cow.s WHERE a = 1}), '4',
+		"$name: block 0 recovered");
+	is($sql->(q{SELECT count(*), sum(b) FROM cow.s}), '40|5',
+		"$name: s recovered");
+	is($sql->(qq{SELECT test_bmap_rows_digest($copy2)}), $digest2,
+		"$name: the second copy recovered");
+	$node->stop;
+}
+
+# Only the root page reaches disk.  Replay finds the records of s's blocks
+# from before the second share under a subtree that wasn't there yet, and
+# skips them (the blocks on disk have them, written out by the share); a
+# page an earlier record's image restored mustn't stay in its buffer, missing
+# them, to be read once the subtree is there.
+{
+	my $name = 'root_only';
+	my $node = new_node($name);
+	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
+	my ($s, $copy, $phys) = prepare($node, $name);
+	my ($copy2, $digest2) =
+	  remap_and_crash($node, $name, $s, $phys, 4, undef, 1);
 
 	is($sql->(q{SELECT b FROM cow.s WHERE a = 1}), '4',
 		"$name: block 0 recovered");
@@ -200,8 +235,7 @@ SKIP:
 	my $copy = $sql->(qq{SELECT test_bmap_share($t)});
 	my $digest = $sql->(qq{SELECT test_bmap_rows_digest($copy)});
 	$sql->(q{UPDATE cow.t SET b = 1});
-	$sql->(qq{SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
-		WHERE relfilenode = $t AND relforknumber = 4});
+	evict_map($node, $t);
 	$node->stop('immediate');
 
 	$node->append_conf('postgresql.conf', 'block_map_replay_entries = 64');

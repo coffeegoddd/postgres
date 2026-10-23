@@ -77,12 +77,17 @@ is(sql(qq{SELECT test_bmap_rows_digest($copy)}), $rows, 'and after a crash');
 is(sql(q{SELECT sum(b) FROM cow.t}), $sum, 'which keeps the source\'s change');
 
 # Dropping the source frees only the blocks it copied to (and its change
-# log's, its own); dropping the copy then frees the rest, on the standby as
-# on the primary.
+# log's, its own), and the map nodes only it holds; dropping the copy then
+# frees the rest, on the standby as on the primary.
 my $src_own = sql(qq{SELECT count(*) FROM test_bmap_map($src)
 	WHERE phys NOT IN (SELECT phys FROM test_bmap_map($copy))});
+$src_own += sql(qq{SELECT count(DISTINCT block) FROM test_bmap_tree($src)
+	WHERE block NOT IN (SELECT block FROM test_bmap_tree($copy))});
 $src_own += sql(q{SELECT (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)) / 8192});
+$src_own += sql(q{SELECT (SELECT count(DISTINCT block) FROM test_bmap_tree(pg_relation_filenode(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid)::regclass))) +
+	(SELECT count(DISTINCT block) FROM test_bmap_tree(pg_relation_filenode(('pg_toast.pg_prolly_log_' || 'cow.t'::regclass::oid || '_index')::regclass)))});
 my $copy_blocks = sql(qq{SELECT count(*) FROM test_bmap_map($copy)});
+$copy_blocks += sql(qq{SELECT count(DISTINCT block) FROM test_bmap_tree($copy)});
 my $free = sql(q{SELECT test_bmap_free_blocks()});
 sql(q{DROP TABLE cow.t});
 is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $src_own,

@@ -65,7 +65,9 @@ SELECT count(*) AS past_end FROM test_bmap_past_end(:log);
 SELECT test_bmap_free_blocks() - :free_before >= :log_blocks AS log_blocks_freed;
 
 -- A shared map: the blocks a copy holds too lose a reference, and stay
--- the copy's; dropping the copy frees them.  (Cut below the table.)
+-- the copy's; dropping the copy frees them, and the leaf that held them,
+-- the copy's alone once the source copied its path to cut it.  (Cut below
+-- the table.)
 CREATE TABLE s (a int, b text);
 INSERT INTO s SELECT g, repeat('x', 500) FROM generate_series(1, 300) g;
 SELECT pg_relation_filenode('s') AS s \gset

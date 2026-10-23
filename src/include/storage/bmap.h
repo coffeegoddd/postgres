@@ -119,11 +119,35 @@ extern void bmap_fold_forget(SMgrRelation reln);
 extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
 						  BlockNumber old_block, char *page);
 
+/*
+ * Snapshots of a tree map: a relation's pages as they were, kept by its root
+ * page, each a reference to the subtrees it had then, taken and let go of in
+ * O(1) of the relation's size; a new relation can be made of one.  The
+ * caller of bmap_snapshot_take() keeps the relation from changing, as for a
+ * share.
+ */
+#define BMAP_SNAPSHOTS_MAX	16
+
+typedef struct BmapSnapshot
+{
+	uint64		id;				/* names it until it is let go of */
+	BlockNumber nblocks;		/* the relation's length then */
+} BmapSnapshot;
+
+extern uint64 bmap_snapshot_take(SMgrRelation reln);
+extern bool bmap_snapshot_release(SMgrRelation reln, uint64 id);
+extern int	bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max);
+extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst);
+
 /* inspection, for tests */
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,
 							   BlockNumber *phys, uint32 *epoch, uint32 *refs);
 extern uint64 bmap_inspect_map_blocks(SMgrRelation reln);
 extern uint32 bmap_inspect_epoch(SMgrRelation reln);
+typedef void (*BmapNodeInspect) (uint16 level, BlockNumber first,
+								 BlockNumber block, uint32 refs, void *arg);
+extern void bmap_inspect_tree(SMgrRelation reln, BmapNodeInspect visit,
+							  void *arg);
 extern void bmap_inspect_allocator(RelFileLocator rel, BlockNumber *hw,
 								   uint32 *nfree);
 

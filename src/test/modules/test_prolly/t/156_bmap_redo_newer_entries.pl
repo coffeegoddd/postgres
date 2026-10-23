@@ -109,14 +109,21 @@ tsql(q{CREATE TABLE t (a int, b text) WITH (fillfactor = 10);
 my $trel = tsql(q{SELECT pg_relation_filenode('t')});
 my $tblocks = tsql(q{SELECT pg_relation_size('t') / 8192});
 cmp_ok($tblocks, '>', 40, 'the table maps blocks past the map page\'s first sector');
-my $mapfile = $torn->data_dir . '/' . tsql(q{SELECT pg_relation_filepath('t')}) . '_bmap';
+# Its blocks shared with a copy, and its map page (the leaf of its map's
+# tree, a block of the page store) copied to be its own again by a change.
+my $tcopy = tsql(qq{SELECT test_bmap_share($trel)});
+tsql(qq{SELECT test_bmap_write($trel, 0, 1)});
+my $mapfile = $torn->data_dir . '/base/'
+  . tsql(q{SELECT oid FROM pg_database WHERE datname = current_database()})
+  . '/9421';
+my $leaf = tsql(qq{SELECT block FROM test_bmap_tree($trel) WHERE level = 0 AND first = 0});
 tsql('CHECKPOINT');
 
 # The map page as the checkpoint wrote it.
 sub map_page
 {
 	open(my $fh, '<:raw', $mapfile) or die "open $mapfile: $!";
-	seek($fh, 8192, 0) or die;
+	seek($fh, $leaf * 8192, 0) or die;
 	read($fh, my $page, 8192) == 8192 or die "short read of $mapfile";
 	close($fh);
 	return $page;
@@ -126,7 +133,6 @@ my $before = map_page();
 # The first change after the checkpoint logs the map page's image; then
 # the table, cut to 5 blocks below the copy and grown back, gives every
 # block from 5 on another block, in its first sector and past it.
-my $tcopy = tsql(qq{SELECT test_bmap_share($trel)});
 tsql(qq{SELECT test_bmap_truncate($trel, 5)});
 tsql(qq{SELECT test_bmap_extend($trel, $tblocks - 5)});
 my $map = qq{SELECT string_agg(blkno || ':' || phys, ',' ORDER BY blkno)
@@ -134,7 +140,8 @@ my $map = qq{SELECT string_agg(blkno || ':' || phys, ',' ORDER BY blkno)
 my $want = tsql($map);
 is( tsql(
 		qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
-		FROM pg_buffercache WHERE relfilenode = $trel AND relforknumber = 4}),
+		FROM pg_buffercache WHERE (relfilenode = $trel AND relforknumber = 4)
+		   OR (relfilenode = 9421 AND relforknumber = 0 AND relblocknumber = $leaf)}),
 	't',
 	'the map is written out');
 $torn->stop('immediate');
@@ -143,7 +150,7 @@ $torn->stop('immediate');
 my $after = map_page();
 isnt(substr($after, 512), substr($before, 512), 'the entries past the first sector changed');
 open(my $fh, '+<:raw', $mapfile) or die "open $mapfile: $!";
-seek($fh, 8192 + 512, 0) or die;
+seek($fh, $leaf * 8192 + 512, 0) or die;
 print $fh substr($before, 512) or die;
 close($fh) or die;
 

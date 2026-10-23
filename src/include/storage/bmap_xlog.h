@@ -28,9 +28,10 @@
  * Record types.
  *
  * XLOG_BMAP_INIT		a database's allocator begins: block 0 is its metapage
- * XLOG_BMAP_CREATE		a relation's map: block 0 is its header
+ * XLOG_BMAP_CREATE		a relation's map: block 0 is its header, block 1 its
+ *						root page
  * XLOG_BMAP_EXTEND		blocks are allocated: block 0 is the map's header,
- *						block 1 the map page, block 2 the allocator's metapage,
+ *						block 1 the leaf, block 2 the allocator's metapage,
  *						then bitmap pages
  * XLOG_BMAP_TRUNCATE	the relation's length: block 0 is the map's header,
  *						then, if the relation was folded, its changes list's
@@ -38,18 +39,15 @@
  *						flushed alone, makes the same change in its replay
  * XLOG_BMAP_FREE		blocks are freed: block 0 is the allocator's metapage,
  *						then bitmap pages
- * XLOG_BMAP_SHARE		part of a map copied into another relation's, sharing
- *						its blocks: block 0 is the copy's map page, then the
- *						reference-count pages of the blocks
  * XLOG_BMAP_PRESERVE	before a private block is shared: block 0 is the
  *						source's page image, main data its physical BlockNumber;
  *						redo restores both the source buffer and that store block
  * XLOG_BMAP_SHARED		a map's sharing ends: block 0 is the source's header
  *						(its epoch raised), block 1 the copy's (its length)
  * XLOG_BMAP_UNREF		references dropped: reference-count pages, after a
- *						map page whose entries change (BMAP_UNREF_MAP)
+ *						leaf whose entries change (BMAP_UNREF_MAP)
  * XLOG_BMAP_REMAP		a shared page is copied before it changes: block 0 is
- *						the map page, then the allocator's metapage and bitmap
+ *						the leaf, then the allocator's metapage and bitmap
  *						pages, the old block's reference-count page if its
  *						count changes, the changes list's header and page if
  *						the old block is listed (BMAP_REMAP_LISTED), and last
@@ -61,13 +59,18 @@
  *						one of its pages, or its header, then the
  *						reference-count pages of the blocks the entries it
  *						takes in hold
+ * XLOG_BMAP_TREE		a map's nodes (xl_bmap_tree says how)
+ *
+ * A leaf registered (EXTEND, REMAP, UNREF) is a page of the page store
+ * (BMAP_STORE_RELNUMBER's main fork).  0x60 was a flat map's SHARE, and the
+ * format of every record here is version 2's: one of an older server's
+ * WAL isn't replayed.
  */
 #define XLOG_BMAP_INIT			0x00
 #define XLOG_BMAP_CREATE		0x10
 #define XLOG_BMAP_EXTEND		0x30
 #define XLOG_BMAP_TRUNCATE		0x40
 #define XLOG_BMAP_FREE			0x50
-#define XLOG_BMAP_SHARE			0x60
 #define XLOG_BMAP_SHARED		0x70
 #define XLOG_BMAP_UNREF			0x80
 #define XLOG_BMAP_REMAP			0x90
@@ -76,6 +79,7 @@
 #define XLOG_BMAP_SHARE_CHANGES	0xC0
 #define XLOG_BMAP_SHRINK		0xD0
 #define XLOG_BMAP_PRESERVE		0xE0
+#define XLOG_BMAP_TREE			0xF0
 
 /* main data of CREATE, TRUNCATE and FREE */
 typedef struct xl_bmap_rel
@@ -163,6 +167,55 @@ typedef struct xl_bmap_extend
 #define SizeOfBmapExtend	(offsetof(xl_bmap_extend, nreused) + sizeof(uint32))
 
 /*
+ * TREE's main data: the relation, what is done to its tree, and the page
+ * store's high-water mark before and after.
+ *
+ * BMAP_TREE_NODE		a node is made: with BMAP_TREE_INSTALL, block 0 is the
+ *						page whose pointer takes it (the root page, or a node);
+ *						then the node, as an image; then the allocator's
+ *						metapage and bitmap pages.  Redo extends the store to
+ *						reach it, writing nothing over a block it had.
+ * BMAP_TREE_HOLD		a node is to be copied: reference-count pages of
+ *						children of it, each holder more (the copy's), set
+ *						before the copy holds them
+ * BMAP_TREE_COPY		a shared node, 'from', is copied to 'node', which the
+ *						relation's page whose pointer named 'from' now names:
+ *						as BMAP_TREE_NODE (block 0 the page, then the copy
+ *						as an image, then the allocator's pages), then
+ *						reference-count pages: of the last of the children
+ *						(a holder more) and of 'from' (one less)
+ * BMAP_TREE_SHARE		a tree shared: 'locator' is the copy, made with the
+ *						source's (relation 'from''s) pointers; block 0 is
+ *						its root page, then the reference-count pages of the
+ *						subtrees, each a holder more; a copy of a snapshot
+ *						(BMAP_TREE_OF_SNAPSHOT) has its header last
+ * BMAP_TREE_SNAPSHOT	a snapshot of the tree kept, or let go of: block 0 is
+ *						the root page, whose slot changes, then (when kept)
+ *						the header (its epoch raised) and the
+ *						reference-count pages of the subtrees, each a holder
+ *						more
+ */
+#define BMAP_TREE_NODE			1
+#define BMAP_TREE_HOLD			3
+#define BMAP_TREE_COPY			4
+#define BMAP_TREE_SHARE			5
+#define BMAP_TREE_SNAPSHOT		6
+
+#define BMAP_TREE_INSTALL		0x01
+#define BMAP_TREE_OF_SNAPSHOT	0x02
+
+typedef struct xl_bmap_tree
+{
+	RelFileLocator locator;
+	uint16		op;
+	uint16		flags;
+	BlockNumber node;			/* the node made (NODE, COPY) */
+	BlockNumber from;			/* the node copied (COPY), relation (SHARE) */
+	BlockNumber old_hw;
+	BlockNumber new_hw;
+} xl_bmap_tree;
+
+/*
  * Every block's data begins with a kind, saying which delta follows, and
  * flags.
  */
@@ -173,6 +226,8 @@ typedef struct xl_bmap_extend
 #define BMAP_DELTA_REFS		5
 #define BMAP_DELTA_CHANGES_HEAD	6
 #define BMAP_DELTA_CHANGES	7
+#define BMAP_DELTA_ROOT		8
+#define BMAP_DELTA_SNAPSHOT	9
 
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
@@ -209,6 +264,49 @@ typedef struct xl_bmap_entry_delta
 	BlockNumber block;
 	uint32		epoch;
 } xl_bmap_entry_delta;
+
+/*
+ * Block data of a tree's root page, always made anew: its pointers to its
+ * subtrees, each a node's block, the epoch it was set in and the node's
+ * birth (InvalidBlockNumber: none).
+ */
+typedef struct xl_bmap_top
+{
+	BlockNumber block;
+	uint32		epoch;
+	XLogRecPtr	since;
+} xl_bmap_top;
+
+#define BMAP_DELTA_ROOT_TOPS	4
+
+typedef struct xl_bmap_root_delta
+{
+	uint16		kind;			/* BMAP_DELTA_ROOT */
+	uint16		flags;			/* BMAP_DELTA_INIT */
+	uint32		ntops;
+	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
+} xl_bmap_root_delta;
+
+/*
+ * A snapshot a tree's root page keeps: its id (0: the slot is free), the
+ * relation's length and last fold's epoch then, and the subtrees it holds.
+ */
+typedef struct xl_bmap_snapshot
+{
+	uint64		id;
+	BlockNumber nblocks;
+	uint32		fold_epoch;
+	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
+} xl_bmap_snapshot;
+
+/* Block data of a tree's root page: a snapshot slot set (or cleared). */
+typedef struct xl_bmap_snapshot_delta
+{
+	uint16		kind;			/* BMAP_DELTA_SNAPSHOT */
+	uint16		flags;
+	uint32		slot;
+	xl_bmap_snapshot snap;
+} xl_bmap_snapshot_delta;
 
 /* Block data of a bitmap page: bits set to 'value'. */
 typedef struct xl_bmap_bits_delta

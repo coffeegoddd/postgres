@@ -17,9 +17,10 @@
  *							which physical blocks of the page store are used
  *	BMAP_STORE_RELNUMBER	the page store.  Its pages carry checksums computed
  *							with their logical block numbers, so tools that
- *							verify checksums from files skip it
+ *							verify checksums from files skip it.  It holds the
+ *							nodes of tree maps too, pages of the store itself
  *	BMAP_REFS_RELNUMBER		reference counts: for each physical block, how many
- *							maps hold it besides the first
+ *							maps (or a tree's pages) hold it besides the first
  *
  * The three relation file numbers are reserved: below FirstGenbkiObjectId and
  * used by no catalog object.
