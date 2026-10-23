@@ -272,15 +272,18 @@ DROP TRIGGER t_deferred ON kp.t;
 SELECT dolt_commit('-am', 'without the trigger') IS NOT NULL AS committed;
 
 -- a commit in a transaction rolled back by a session that then exits: the
--- snapshots it took are let go of as the session exits
-SELECT kept('kp.t') AS kept_before \gset
+-- snapshots it took are let go of as the session exits (of a table no
+-- retired commit keeps, so only the rolled-back commit's could be left)
+CREATE TABLE kp.fresh (id int PRIMARY KEY, v int);
+INSERT INTO kp.fresh SELECT generate_series(1, 10), 0;
+SELECT dolt_commit('-Am', 'fresh') IS NOT NULL AS committed;
+SELECT kept('kp.fresh') AS kept_before;
 \c kept_pages
 SELECT pg_backend_pid() AS gone \gset
-UPDATE kp.t SET v = 15 WHERE id <= 10;
 BEGIN;
+UPDATE kp.fresh SET v = 15;
 SELECT dolt_commit('-am', 'rolled back') IS NOT NULL AS committed;
 ROLLBACK;
-SELECT dolt_reset('--hard') IS NOT NULL AS reset;
 \c kept_pages
 CREATE FUNCTION pg_temp.wait_gone(pid int) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
@@ -289,7 +292,7 @@ BEGIN
 	END LOOP;
 END $$;
 SELECT pg_temp.wait_gone(:gone);
-SELECT kept('kp.t') = :kept_before AS none_left;
+SELECT kept('kp.fresh') AS kept_after;
 
 -- every block the stores hold is held by a map or a snapshot kept
 CHECKPOINT;

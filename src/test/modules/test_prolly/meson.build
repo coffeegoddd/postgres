@@ -319,6 +319,7 @@ tests += {
       't/193_bmap_dropped_buffers.pl',
       't/194_bmap_snapshot_redo.pl',
       't/200_kept_pages_recovery.pl',
+      't/201_kept_pages_old_xids.pl',
     ],
   },
 }
