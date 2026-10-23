@@ -83,5 +83,32 @@ FROM dolt_serve_since(ARRAY[decode(:'old_head', 'hex')],
 :flush
 SELECT counted('commits_read') AS commits_read;
 
+-- a merge base is found by heights: what it reads is the commits above
+-- it, not the 250 beneath (each side's head and the commits down to the
+-- fork, and the fork's parent, beneath it), whichever way round; and,
+-- with a merge, the base the walk of all ancestors chooses (an
+-- assert-enabled build checks every merge base so)
+SELECT dolt_reset('--hard', dolt_hashof('main')) IS NOT NULL AS reset;
+SELECT dolt_branch('mb_side');
+SELECT dolt_checkout('mb_side') IS NOT NULL AS on_side;
+SELECT length(dolt_commit('--allow-empty', '-m', 'mb side 1')::text) AS committed;
+SELECT length(dolt_commit('--allow-empty', '-m', 'mb side 2')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT length(dolt_commit('--allow-empty', '-m', 'mb main')::text) AS committed;
+:reset
+SELECT dolt_merge_base('main', 'mb_side') = dolt_hashof('main~1') AS base_is_the_fork;
+:flush
+SELECT counted('commits_read') AS commits_read;
+:reset
+SELECT dolt_merge_base('mb_side', 'main') = dolt_hashof('main~1') AS either_way;
+:flush
+SELECT counted('commits_read') AS commits_read;
+SELECT (dolt_merge('mb_side', '--no-ff', '-m', 'mb merged'))[3:4];
+SELECT length(dolt_commit('--allow-empty', '-m', 'mb after')::text) AS committed;
+SELECT dolt_checkout('mb_side') IS NOT NULL AS on_side;
+SELECT length(dolt_commit('--allow-empty', '-m', 'mb side 3')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_merge_base('main', 'mb_side') = dolt_hashof('mb_side~1') AS base_past_the_merge;
+
 \c postgres
 DROP DATABASE regress_commit_heights;

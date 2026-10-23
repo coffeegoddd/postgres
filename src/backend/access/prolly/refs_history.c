@@ -18,6 +18,7 @@
 #include "access/prolly_refs.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
+#include "pgstat.h"
 #include "utils/hsearch.h"
 
 static HTAB *
@@ -561,7 +562,11 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 	found = best_common(common, ncommon, lookup, lookup_arg, base);
 #ifdef USE_ASSERT_CHECKING
 	{
-		/* (the walk of all of a's ancestors finds the same) */
+		/*
+		 * (the walk of all of a's ancestors finds the same; the commits it
+		 * reads aren't counted)
+		 */
+		PgStat_Counter read = PendingProllyStats[PGSTAT_PROLLY_COMMITS_READ];
 		ProllyHash *walked;
 		ProllyHash	other;
 		int			nwalked = walked_common(a, b, lookup, lookup_arg, &walked);
@@ -569,6 +574,7 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 		Assert(best_common(walked, nwalked, lookup, lookup_arg, &other) == found);
 		Assert(!found || (other.len == base->len &&
 						  memcmp(other.bytes, base->bytes, base->len) == 0));
+		PendingProllyStats[PGSTAT_PROLLY_COMMITS_READ] = read;
 	}
 #endif
 	return found;
