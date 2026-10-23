@@ -634,7 +634,10 @@ typedef struct ProllyRefsRoutine
 	 * and identity (its "identity" item; NULL or empty: none), dated as
 	 * commit_with() dates one.  Nothing is folded, no catalog read for it,
 	 * and no branch moved: the caller names the commit (branch_move(),
-	 * set_head()).  commit_with() folds, then writes its commit with this.
+	 * set_head()) in the same transaction.  Until a ref names it nothing
+	 * holds it, and a chunk-store collection after the transaction ends may
+	 * drop it as unreachable.  commit_with() folds, then writes its commit
+	 * with this.
 	 */
 	void		(*commit_root) (const ProllyHash *root,
 								const ProllyHash *dependencies,

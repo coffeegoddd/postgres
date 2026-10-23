@@ -153,10 +153,11 @@ SELECT counter, CASE WHEN counter = 'bmap_blocks_freed'
 FROM pg_temp.work() WHERE counter IN ('kept_checkouts_evicted', 'bmap_blocks_freed');
 RESET prolly.kept_checkouts;
 
--- A kept checkout doesn't keep a role its objects name from being
--- dropped (its copies took the grant made since): DROP ROLE lets go of the
--- idle ones first.  Nor does a rolled back checkout of a kept commit leave
--- the session there.
+-- A rolled back checkout of a kept commit doesn't leave the session
+-- there.  DROP ROLE lets go of idle kept checkouts only when something
+-- depends on the role: c1's, kept from before the grant, holds no copy of
+-- it, so it stays (t/216_kept_checkout_budget.pl drops a role a kept
+-- checkout's copies name).
 CREATE ROLE kc_reader;
 GRANT SELECT ON kc.small TO kc_reader;
 SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;

@@ -303,7 +303,9 @@ differences back through the row applier (applier_replication.c), as
 logical replication's apply worker writes rows.  A commit of a canonical
 state a caller already holds is written by the refs' commit_root(), from
 the root, dependencies, parents and metadata given: it folds nothing,
-reads no catalog for the commit and moves no branch.  commit_with() folds
+reads no catalog for the commit and moves no branch.  The caller names the
+commit in the same transaction: a collection after it ends drops a commit
+no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
@@ -421,11 +423,16 @@ Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies
 checked as a first use checks them.  A checkout's sweep lets go of those
 past the budget, the least recently checked out first (recency is kept in
-shared memory; after a restart, older branches go first), passing over one
-a session is on; a detached checkout's sweep doesn't count the one it is
-on.  Letting go of one is deleting its branch, which releases its
-relations' maps.  Writer branches done with are swept as before, apart
-from the budget.
+shared memory; after a restart, older branches go first).  The budget
+counts idle ones: one a session is on is neither counted nor let go of,
+nor is the one a detached checkout's sweep is on.  One another sweep let
+go of meanwhile counts as gone, so two sweeps at once let go of no more
+than one would.  Letting go of one is deleting its branch, which
+releases its relations' maps.  Writer branches done with are swept as
+before, apart from the budget.  When something depends on a role being
+dropped, DROP ROLE lets go of its database's idle kept checkouts and
+checks again; another database's are let go of only from that database
+(the error then has a hint).
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call

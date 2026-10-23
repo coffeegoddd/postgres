@@ -42,6 +42,7 @@
 #include "pgstat.h"
 #include "storage/lwlock.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -231,9 +232,12 @@ by_use(const void *a, const void *b)
 }
 
 /*
- * Let go of the kept branches among names past the budget, the least
- * recently checked out first: as many as drop() deletes, one it can't
- * (a session on it) passed over for the next.
+ * Let go of the idle kept branches among names past the budget, the least
+ * recently checked out first: one a session is on now isn't idle, and is
+ * neither counted nor let go of.  Each drop() leaves one fewer, whether it
+ * deleted the branch or found another sweep had (a concurrent sweep
+ * doesn't take the next one too); one it can't delete (a session came to
+ * it) is passed over for the next.
  */
 static void
 branches_evict(List *names, bool (*drop) (const char *name, void *arg),
@@ -257,7 +261,9 @@ branches_evict(List *names, bool (*drop) (const char *name, void *arg),
 		kept[n].branch = ((Form_pg_branch) GETSTRUCT(tup))->oid;
 		kept[n].used = 0;
 		ReleaseSysCache(tup);
-		n++;
+		/* (one a session is on isn't idle: not counted, nor let go of) */
+		if (!branch_in_use(kept[n].branch))
+			n++;
 	}
 	if (n <= prolly_kept_checkouts)
 		return;
@@ -272,14 +278,12 @@ branches_evict(List *names, bool (*drop) (const char *name, void *arg),
 		LWLockRelease(&k->lock);
 	}
 	qsort(kept, n, sizeof(KeptByUse), by_use);
+	INJECTION_POINT("prolly-kept-evict", NULL);
 	left = n;
 	for (int i = 0; i < n && left > prolly_kept_checkouts; i++)
 	{
 		if (drop(kept[i].name, arg))
-		{
-			pgstat_count_prolly(PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED, 1);
 			left--;
-		}
 	}
 	pfree(kept);
 }

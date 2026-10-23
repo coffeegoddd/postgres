@@ -26,11 +26,12 @@
  *   share()) and skips it if it is gone.
  * - kept() says whether the branch called name is one.
  * - note_use() is called when a session checks out a kept state; evict()
- *   is given the kept states no session may be on (each may still be),
- *   and lets go of those past the budget, least recently used first, by
- *   calling drop() on each until within it: drop() deletes the branch,
- *   false if it couldn't (a session is on it, or it is in use), and then
- *   the next is tried.
+ *   is given the kept states other than the session's, and lets go of the
+ *   idle ones (no session on them) past the budget, least recently used
+ *   first, by calling drop() on each until within it: drop() deletes the
+ *   branch, true if it is gone (deleted now, or by another meanwhile),
+ *   false if it couldn't be (a session came to it), and then the next is
+ *   tried.
  * - Every call is in a transaction; nothing kept is changed but through
  *   the branch operations, so what is kept commits or rolls back with it.
  *
@@ -82,9 +83,14 @@ extern PGDLLIMPORT int prolly_kept_checkouts;
 
 /*
  * Let go of every kept state of the database no session is on (DROP
- * ROLE's, first: a kept state's objects would otherwise keep a role they
- * name from being dropped, as any branch's do).  Nothing if it has none.
+ * ROLE's, when something depends on the role: a kept state's objects would
+ * otherwise keep a role they name from being dropped, as any branch's do):
+ * false if it has none, so nothing changed.  Another database's kept
+ * states are let go of only from that database; prolly_kept_states_named()
+ * says whether a dependency report (checkSharedDependencies()'s) names
+ * objects that may be some.
  */
-extern void prolly_let_go_of_kept_states(void);
+extern bool prolly_let_go_of_kept_states(void);
+extern bool prolly_kept_states_named(const char *detail);
 
 #endif							/* PROLLY_MATCACHE_H */
