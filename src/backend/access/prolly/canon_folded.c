@@ -5404,6 +5404,104 @@ folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 }
 
 /*
+ * The session branch's tables whose next fold from baseline would read
+ * them in full, as table_root() would find (no entry, a definition its
+ * rows can't be mapped from) and then the change finder (full_reason()).
+ * The catalogs are read as a fold reads them, by a snapshot of now.
+ */
+static void
+folded_pending_full(const ProllyNodeRef *baseline,
+					ProllyPendingFullVisit visit, void *arg)
+{
+	Canon		cn;
+	Relation	classes;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relids = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (baseline)
+		load_baseline(&cn, baseline);
+	if (ActiveSnapshotSet())
+		PushCopiedSnapshot(GetActiveSnapshot());
+	else
+		PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		classes = table_open(RelationRelationId, AccessShareLock);
+		scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+			if (form->relkind == RELKIND_RELATION &&
+				form->relam == PROLLY_TABLE_AM_OID &&
+				canon_namespace(form->relnamespace) &&
+				!in_extension(RelationRelationId, form->oid))
+				relids = lappend_oid(relids, form->oid);
+		}
+		systable_endscan(scan);
+		table_close(classes, AccessShareLock);
+
+		foreach_oid(relid, relids)
+		{
+			Relation	rel = try_table_open(relid, AccessShareLock);
+			char	   *name;
+			StringInfoData key;
+			BaseTable  *bt;
+			StringInfoData desc;
+			StringInfoData shape = {0};
+			ProllyHash	dh;
+			ProllyTableFold tf;
+			ProllyFullFoldReason why = PROLLY_FULL_NONE;
+
+			if (rel == NULL)
+				continue;
+			name = qualified(RelationGetNamespace(rel),
+							 RelationGetRelationName(rel));
+			initStringInfo(&key);
+			appendStringInfoString(&key, "t:");
+			append_utf8(&key, name);
+			initStringInfo(&desc);
+			table_description(&cn, rel, &desc, &dh);
+			bt = find_base_table(&cn, &key);
+			memset(&tf, 0, sizeof(tf));
+			if (prolly_full_fold_wanted(&why))
+				;
+			else if (bt == NULL)
+				why = PROLLY_FULL_NO_BASELINE;
+			else if (!(bt->shape_hash.len == dh.len &&
+					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
+					 !shape_holds(rel, base_shape(&cn, bt),
+								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
+					 !shape_mappable(&cn, rel, bt, &shape, &tf.shape))
+				why = PROLLY_FULL_SHAPE_CHANGED;
+			else if (PROLLY_HAS(cn.finder, full_reason))
+			{
+				tf.data = bt->data;
+				tf.state.data = (const uint8 *) bt->state.data;
+				tf.state.len = bt->state.len;
+				tf.reshaped = tf.shape.data != NULL;
+				why = cn.finder->full_reason(rel, &tf);
+			}
+			if (why != PROLLY_FULL_NONE)
+				visit(name, relid, why, arg);
+			pfree(key.data);
+			pfree(desc.data);
+			table_close(rel, AccessShareLock);
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
+}
+
+/*
  * Drop the objects of the session branch's versioned schemas that the
  * canonical form doesn't describe, and what depends on them: work no
  * commit holds, which a move to a commit discards.  (Objects only: no
@@ -12002,6 +12100,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.render = folded_render,
 	.move_schema = folded_move_schema,
 	.make_versioned_schemas = folded_make_versioned_schemas,
+	.pending_full = folded_pending_full,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,
 	.dependencies = folded_dependencies,

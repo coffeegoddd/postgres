@@ -4,6 +4,9 @@
 -- (debug_prolly_force_full_fold makes the fold read every row).
 CREATE DATABASE regress_full_folds;
 \c regress_full_folds
+-- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
+-- counted here is what the next fold reads after one)
+SET prolly.fold_on_rewrite = off;
 CREATE EXTENSION test_prolly;
 CREATE FUNCTION full_folds() RETURNS TABLE (reason text, n bigint) LANGUAGE sql AS $$
 	SELECT substr(name, 11), value FROM pg_stat_prolly

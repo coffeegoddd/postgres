@@ -59,6 +59,14 @@ typedef enum ProllyFullFoldReason
 
 #define PROLLY_FULL_REASONS (PROLLY_FULL_VERIFY + 1)
 
+/*
+ * Visits a table whose next fold will read it in full (dolt_pending_full_folds()):
+ * its qualified name, its OID and why.
+ */
+typedef void (*ProllyPendingFullVisit) (const char *name, Oid relid,
+										ProllyFullFoldReason reason,
+										void *arg);
+
 /* debug_prolly_force_full_fold: every fold reads its table in full. */
 extern PGDLLIMPORT bool debug_prolly_force_full_fold;
 
@@ -120,6 +128,13 @@ typedef void (*ProllyFoldVerifyVisit) (const char *name, bool matches,
  */
 extern int	prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit,
 								void *arg);
+
+/*
+ * prolly.fold_on_rewrite: a rewrite of a versioned table folds its branch
+ * as a checkpoint (prolly_fold_rewritten(), prolly_vcs.c).
+ */
+extern PGDLLIMPORT bool prolly_fold_on_rewrite;
+extern bool prolly_fold_rewritten(Oid relid);
 
 /* prolly.log_full_folds: rows past which a full fold is logged (-1: none). */
 extern PGDLLIMPORT int prolly_log_full_folds;

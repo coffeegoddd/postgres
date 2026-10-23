@@ -13,3 +13,5 @@ test: vc_txn_commit_baselines
 test: vc_stale_folds
 test: vc_stale_spilled_folds
 test: vc_incremental_canon
+test: vc_branch_commits
+test: vc_rewrite_folds

@@ -45,16 +45,21 @@ SELECT count(*) AS changes FROM dolt_status;
 SELECT dolt_checkout('main');
 
 -- feat with a change of its own, left (its checkpoint folded): its head
--- is the nearest, and only its change is written back.
+-- is the nearest, and only its change is written back.  The copies'
+-- working set is folded once, as the first use's baseline, which is then
+-- advanced past the row written back: one candidate.
 SELECT dolt_checkout('feat');
 UPDATE ns.u SET w = 'dirty' WHERE id = 1;
 SELECT dolt_checkout('main');
 SELECT dolt_branch('at_feat', 'feat');
 :flush
+SELECT pg_temp.since('fold_candidates') IS NOT NULL AS counting;
 BEGIN;
 SELECT dolt_checkout('at_feat');
 SELECT * FROM pg_temp.written();
 COMMIT;
+:flush
+SELECT pg_temp.since('fold_candidates') AS first_use_candidates;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
 SELECT w FROM ns.u WHERE id = 1;
 SELECT dolt_checkout('feat');

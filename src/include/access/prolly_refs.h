@@ -509,6 +509,13 @@ typedef struct ProllyRefsRoutine
 	bool		(*fold_mark) (Oid branch, Snapshot snap, ProllyFoldMark *mark);
 	bool		(*written_since) (const ProllyFoldMark *mark, Snapshot snap,
 								  Oid **relids, int *nrelids);
+
+	/*
+	 * Optional: visit each table of the session branch whose next fold
+	 * would read it in full, with why (the canonicalizer's pending_full()
+	 * from the branch's baseline).
+	 */
+	void		(*pending_full_folds) (ProllyPendingFullVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -533,9 +540,9 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
 	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
-	"note_relation", "fold_mark", "written_since"
+	"note_relation", "fold_mark", "written_since", "pending_full_folds"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK written_since
+#define PROLLY_REFS_LAST_CALLBACK pending_full_folds
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

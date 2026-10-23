@@ -5706,7 +5706,14 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        rows (in <varname>maintenance_work_mem</varname>) spilled to disk; a
        fold that reads
        at least <varname>prolly.log_full_folds</varname> rows so is logged,
-       with why;
+       with why, and <function>dolt_pending_full_folds()</function> lists the
+       session branch's tables whose next fold will read them in full, by
+       these reasons (those its baseline and catalogs tell, not those only
+       its change log's entries do), with their estimated rows; a rewrite
+       of a versioned table (<command>ALTER TABLE</command> changing a
+       column's type, <command>REFRESH MATERIALIZED VIEW</command>) folds
+       its branch as it ends (<varname>prolly.fold_on_rewrite</varname>,
+       on by default), so the commit after reads none of its rows again;
        <literal>fold_mapped_tables</literal> (tables whose baseline was
        mapped to a new shape (a column added with a default or dropped, a
        type relabeled, the primary key changed),

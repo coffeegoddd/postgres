@@ -260,6 +260,22 @@ space: it counts against temp_file_limit and is reported by log_temp_files.
 Earlier schema conversion and uncertainty buffers are separate and can still
 grow with table size; this does not bound the entire merge's memory.
 
+A commit, a checkpoint and a fold of a transaction's own rows change
+only their branch's refs (its head, baseline, the names of its head's
+tables, its merge state and violations).  Every change of a branch's refs
+is made holding that branch's lock to transaction end, and they take
+only that, so commits on different branches run together while those on
+one branch take turns.  Anything else that changes the refs (a branch
+made, deleted or renamed, a reset, a merge, a push) holds the session
+branch's lock (and any branch's it changes), then moves the store's root
+with its transaction, as all of them did before: other such movers wait
+for it.  A branch's holder makes its changes in a refs tree of its own,
+rebuilt on the store's root when another's commit moved it, and moves the
+root there as it commits, waiting then for a mover holding it; one that
+comes to change other refs moves the root from then on.  So an operation
+reading another branch's head (a branch made from it, a merge of it)
+reads the head as last committed, not a commit still open there.
+
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the
@@ -288,6 +304,28 @@ transaction commits.  Reading the working set (status, diff, a branch's
 dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
+
+A rewrite of a versioned table (ALTER TABLE changing a column's type,
+REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
+branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
+prolly_fold_rewritten(), called by tablecmds.c and matview.c), so the
+commit after, the fold worker off or in the same transaction, folds only
+what changed since.  The checkpoint never waits for a lock (the rewrite
+holds its table exclusively, and a commit holding the branch may be about
+to read it): a lock not free at once skips it, leaving the table's next
+fold to read it in full.  dolt_pending_full_folds() lists the tables whose next
+fold would read them in full, and why, from the baseline, the catalogs and
+each change finder's full_reason(), reading no rows.
+
+A move of the session's branch (a reset, a fast-forward, a merge's)
+folds its working set, if not known, as a checkpoint: the fold is the
+branch's baseline.  After the rows are written, the baseline is advanced
+to the target without another fold, each table the move wrote holding
+the target's rows and its change log's record of the move's own writes
+consumed (the canonicalizer's advance_baseline()); where it can't be (the
+definitions moved too, a materialized view's rows did, a table's state
+can't be advanced), the rest is folded as before.  So a move from a dirty
+working set folds it once.
 
 What a fold works out for every table, changed or not, is cached in the
 backend (canon_folded.c's own): each table's description and the hash its

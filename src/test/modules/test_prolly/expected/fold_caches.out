@@ -7,6 +7,7 @@
 CREATE DATABASE regress_fold_caches;
 \c regress_fold_caches
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE EXTENSION test_prolly;
 CREATE SCHEMA fc VERSIONED;
 CREATE TABLE fc.t (id int PRIMARY KEY, v text);
 CREATE SEQUENCE fc.s;
@@ -1090,6 +1091,134 @@ SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
  {0}
+(1 row)
+
+-- A move from a dirty working set folds it once: the fold before the move
+-- is the branch's baseline, and after the move the baseline is advanced
+-- to the target, the move's own writes taken as folded, not folded again.
+-- 40 dirty rows reset: 40 candidates, not 80 (the check, which folds again,
+-- off to count it).  The next status folds again (the move wrote the
+-- branch), reading nothing: the move's entries were consumed.  The next
+-- commit holds exactly the rows written after.
+UPDATE fc.t SET v = 'dirty' WHERE id <= 40;
+SET debug_prolly_verify_fold_caches = off;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_candidates') IS NOT NULL AS counting,
+	pg_temp.since('fold_full_tables') IS NOT NULL AS counting_full;
+ counting | counting_full 
+----------+---------------
+ t        | t
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_candidates') AS dirty_reset_candidates,
+	pg_temp.since('fold_full_tables') AS dirty_reset_full;
+ dirty_reset_candidates | dirty_reset_full 
+------------------------+------------------
+                     40 |                0
+(1 row)
+
+SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty_left FROM fc.t;
+ dirty_left 
+------------
+          0
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_candidates') AS status_candidates;
+ status_candidates 
+-------------------
+                 0
+(1 row)
+
+-- A reset to an older commit from a dirty working set: once too.
+UPDATE fc.t SET v = 'dirty' WHERE id <= 40;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_candidates') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_candidates') AS older_reset_candidates;
+ older_reset_candidates 
+------------------------
+                     40
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT test_fold_root(true) = prolly_root_hash('main') AS head_rows;
+ head_rows 
+-----------
+ t
+(1 row)
+
+UPDATE fc.t SET v = 'after' WHERE id = 50;
+SELECT length(dolt_commit('-am', 'after the reset')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT diff_type, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+ diff_type | id |   v   
+-----------+----+-------
+ modified  | 50 | after
+(1 row)
+
+SELECT test_fold_root(true) = prolly_root_hash('main') AS committed_rows;
+ committed_rows 
+----------------
+ t
 (1 row)
 
 \c contrib_regression

@@ -1737,6 +1737,41 @@ log_changes(Relation rel, const ProllyTreeEnv *env,
 	return ok;
 }
 
+/*
+ * Why log_fold() from baseline would read rel in full, from the checks it
+ * makes before reading the log (the log's entries can say so too: a
+ * truncation, a rewrite, more rows than the table holds; those aren't
+ * read here).
+ */
+static ProllyFullFoldReason
+log_full_reason(Relation rel, const ProllyTableFold *baseline)
+{
+	Snapshot	snap = GetActiveSnapshot();
+	ProllyComponents c;
+	ProllyFullFoldReason reason = PROLLY_FULL_NONE;
+	uint64		identity = 0;
+	State		st;
+
+	if (prolly_full_fold_wanted(&reason))
+		return reason;
+	if (baseline == NULL)
+		return PROLLY_FULL_NO_BASELINE;
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log)
+		identity = PROLLY_CALL(c.change_log, identity, rel);
+	if (identity == 0)
+		return PROLLY_FULL_NO_LOG;
+	if (!parse_state(&baseline->state, &st) || st.log != identity)
+		return PROLLY_FULL_LOG_CHANGED;
+	if ((st.flags & STATE_UNSETTLED) && !sees_no_more(snap, &st))
+		return PROLLY_FULL_UNSETTLED;
+	if (!sees_fold(snap, &st) && !PROLLY_HAS(c.change_log, read_unseen))
+		return PROLLY_FULL_STALE_SNAPSHOT;
+	if (storage_unseen(rel, snap))
+		return PROLLY_FULL_STORAGE_UNSEEN;
+	return PROLLY_FULL_NONE;
+}
+
 /* A state holds no nodes: the log's entries are rows, not chunks. */
 static void
 log_walk(const ProllyTreeEnv *env, const ProllyValue *state,
@@ -1885,6 +1920,7 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.state_refs = log_state_refs,
 	.advance = log_advance,
 	.can_advance = log_can_advance,
+	.full_reason = log_full_reason,
 	.fold_on_leave = log_fold_on_leave,
 	.changes = log_changes,
 };

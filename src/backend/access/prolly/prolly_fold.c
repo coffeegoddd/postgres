@@ -31,6 +31,7 @@
 bool		debug_prolly_force_full_fold = false;
 bool		prolly_fold_counted = true;
 int			prolly_log_full_folds = -1;
+bool		prolly_fold_on_rewrite = true;
 ProllyFullFold prolly_last_full_fold;
 
 static const char *const reason_names[PROLLY_FULL_REASONS] = {
