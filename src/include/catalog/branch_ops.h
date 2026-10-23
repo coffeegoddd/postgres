@@ -65,9 +65,12 @@ typedef struct BranchOpsRoutine
 	 * table, passed over) begin empty instead, as TRUNCATE leaves a table:
 	 * the table and its TOAST table given new storage, no page shared, its
 	 * indexes built over no rows, and its change log told it was emptied.
+	 * nowait: if a writer of start_point's is in the middle of changing it,
+	 * nothing is made and InvalidOid returned, rather than waiting for the
+	 * writer (which may be idle in its transaction for as long as it likes).
 	 */
 	Oid			(*make) (const char *name, const char *start_point,
-						 List *emptied);
+						 List *emptied, bool nowait);
 
 	/* Make name the session's branch. */
 	void		(*checkout) (const char *name);

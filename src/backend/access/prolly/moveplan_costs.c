@@ -13,10 +13,12 @@
  * row applier fills before building its indexes) costs much less, its
  * index entries made by a sort.  A table whose definition differs is
  * costed as one whose every row is written again; one made, as its rows
- * loaded; one dropped, as a table's catalog work.  Where the move's
- * working set is new (PROLLY_PLAN_RELOADS), a table whose rows differ is
- * emptied and loaded instead where that costs less than its diff: past
- * about an eighth of its rows changed, with the figures below.
+ * loaded; one dropped, as a table's catalog work.  Materialized views
+ * are costed as tables, as a move writes their rows too.
+ * Where the move's working set is new (PROLLY_PLAN_RELOADS), a table
+ * whose rows differ is emptied and loaded instead where that costs less
+ * than its diff: past about an eighth of its rows changed, with the
+ * figures below.
  *
  * The figures are microseconds per row and per index entry, measured on a
  * development build: moving 100,000 changed rows of a 200,000-row table
@@ -93,6 +95,8 @@ tables_of(const ProllyNodeRef *root)
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, tables, root, NULL, note_table, &tables);
+	/* (a move writes materialized views' rows too: costed as tables') */
+	PROLLY_CALL(dc.canonicalizer, materialized_views, root, note_table, &tables);
 	list_sort(tables, table_cmp);
 	return tables;
 }
