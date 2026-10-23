@@ -44,7 +44,8 @@ def _git(repo: Path) -> dict[str, Any]:
             "diff_sha256": hashlib.sha256(_cmd(["git", "diff", "HEAD", "--binary"], repo).encode()).hexdigest()}
 
 
-def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str]) -> dict[str, Any]:
+def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str],
+           data_manifests: tuple[Path, ...] = ()) -> dict[str, Any]:
     cpus = sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq"))
     governors = sorted({_read(str(c / "scaling_governor")) for c in cpus})
     epp = sorted({_read(str(c / "energy_performance_preference")) for c in cpus})
@@ -99,6 +100,11 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
         if (bin_dir / name).is_file()}
     env["postgres"]["library_hashes"] = library_hashes(bin_dir)
     env["postgres"]["build_provenance"] = build_provenance(bin_dir)
+    # The extensions the build carries (PostGIS's commit, library versions
+    # and postgis_full_version()), as its provenance recorded them.
+    env["extensions"] = (env["postgres"]["build_provenance"] or {}).get("extensions", {})
+    env["data_manifests"] = {str(p.relative_to(repo)) if p.is_relative_to(repo) else str(p): sha256(p)
+                             for p in data_manifests}
     src = repo / "src/tools/prolly_bench"
     env["harness_hash"] = fingerprint({str(p.relative_to(src)): sha256(p)
         for p in sorted(src.rglob("*")) if p.is_file() and p.suffix in (".py", ".go", ".sql", ".sh", ".java")})
@@ -117,17 +123,26 @@ def record(*, repo: Path, bin_dir: Path, data_root: Path, tools: dict[str, str])
     return env
 
 
-# Server libraries the harness loads (write_amp's pg_walinspect).
+# Server libraries the harness loads (write_amp's pg_walinspect).  A build
+# with extensions lists its own (build_postgres.py's manifest "libraries"),
+# so a build without PostGIS needn't have it.
 LIBRARIES = ("pg_walinspect.so",)
 
 
-def library_hashes(bin_dir: Path) -> dict[str, str]:
+def libraries(bin_dir: Path) -> tuple[str, ...]:
+    """The libraries bin_dir's build has: its provenance's list, or
+    LIBRARIES for a build without one."""
+    return tuple((build_provenance(bin_dir) or {}).get("libraries") or LIBRARIES)
+
+
+def library_hashes(bin_dir: Path, names: tuple[str, ...] | list[str] | None = None) -> dict[str, str]:
+    names = libraries(bin_dir) if names is None else names
     try:
         pkglibdir = Path(subprocess.check_output([str(bin_dir / "pg_config"), "--pkglibdir"],
                                                  text=True).strip())
     except (OSError, subprocess.CalledProcessError):
         return {}
-    return {name: sha256(pkglibdir / name) for name in LIBRARIES
+    return {name: sha256(pkglibdir / name) for name in names
             if (pkglibdir / name).is_file()}
 
 
@@ -163,19 +178,33 @@ def _cpu_boost() -> str:
 
 
 def warnings(env: dict[str, Any], suite: str = "S") -> list[str]:
+    from pbench.core import suites
     w = []
     if env.get("slt_build_source_hash") is not None and \
             env["slt_build_source_hash"] != env.get("slt_source_hash"):
         w.append("slt-runner was built from other source than slt/ holds now; "
                  "run build_slt.sh")
-    if suite == "C":
+    definition = suites.get(suite)
+    for name in definition.extensions:
+        # (postgis_raster and postgis_topology are parts of the PostGIS build)
+        build = name.split("_")[0]
+        if build not in env.get("extensions", {}):
+            w.append(f"the {suite} suite needs {name}, which the build's provenance doesn't "
+                     f"record; use build_postgres.sh --with-{build}")
+            break
+        if env["extensions"][build].get("library_mismatches"):
+            w.append(f"{build} was built with libraries other than its pin's: "
+                     + "; ".join(env["extensions"][build]["library_mismatches"]))
+            break
+    if not definition.measures_performance:
         return w  # the rest concern performance
     provenance = env["postgres"].get("build_provenance")
     if not provenance or provenance.get("binary_hashes") != env["postgres"].get("binary_hashes"):
         w.append("server binary has no matching build provenance; use build_postgres.sh")
     elif "library_hashes" in provenance and \
             provenance["library_hashes"] != env["postgres"].get("library_hashes"):
-        w.append("server libraries (pg_walinspect) differ from the build's provenance")
+        w.append("server libraries (" + ", ".join(sorted(provenance["library_hashes"]))
+                 + ") differ from the build's provenance")
     if env["cpu_governors"] != ["performance"]:
         w.append(f"CPU governor is {env['cpu_governors']}, not performance "
                  "(run system/system_prepare.sh)")

@@ -279,7 +279,7 @@ commits, Go GC, OS reclaim, and normal engine activity can still affect results.
 
 ## Memory, CPU, and I/O
 
-There are four passes, each a separate set of measured observations:
+There are five passes, each a separate set of measured observations:
 
 | Pass | Measures | How |
 |---|---|---|
@@ -287,6 +287,7 @@ There are four passes, each a separate set of measured observations:
 | `memory` | RSS, **PSS**, private and swap memory | `/proc/PID/smaps_rollup` sampled every `sample_interval_ms` |
 | `cpu` | CPU time, minor and major faults | one snapshot before the operation, one after |
 | `io` | kernel process read and write bytes | one snapshot before the operation, one after |
+| `counters` | the engine's own work counters (prolly: `pg_stat_prolly`) | read before the operation and after, over the same SQL session |
 
 Primary latency uses Go's monotonic clock around one request on a persistent
 SQL connection, through full result consumption. It excludes client process
@@ -301,7 +302,7 @@ instead, and separate runs of one configuration can be merged into one report:
 ```sh
 python3 "$B" run --passes timing          # results/STAMP-a
 python3 "$B" run --passes memory          # results/STAMP-b
-python3 "$B" run --passes cpu,io          # results/STAMP-c
+python3 "$B" run --passes cpu,io,counters # results/STAMP-c
 python3 "$B" report results/STAMP-a results/STAMP-b results/STAMP-c
 # -> results/merged-STAMP (or --out DIR), with report.md, report.html, CSVs
 ```
@@ -325,6 +326,44 @@ including PostgreSQL backends:
 
 Results recorded before the `cpu` and `io` passes existed took those counters
 from the memory pass; reports of them still show them.
+
+### Engine work counters
+
+The `counters` pass runs only for engines that keep work counters
+(`Engine.counters()`; today the fork's prolly, whose `pg_stat_prolly` counts
+tree nodes read and written, chunks appended, rows and change-log pages a
+fold read, pages copied, rows applied, and more). Around each operation it
+calls `pg_stat_force_next_flush()` and reads `pg_stat_prolly`: once after
+the dirty-row setup and its probes, and once before validation and
+restoration, so each sample counts the timed statement alone. The view is
+per database and the benchmark is the database's only session (autovacuum
+is off), so nothing else counts in it. Each sample keeps the counters the
+operation moved (`counters` in `samples.jsonl`). The report gives each
+counter's median and range per operation in **Engine work counters**, and
+`summary.csv` has `median_`, `min_` and `max_counter_<name>`. Counts repeat
+from run to run, so they explain prolly's latencies (for example, how many
+rows a dirty checkout writes back) where timings alone can't. A counter that
+went backwards during an operation (a statistics reset) fails the sample.
+Dolt and Doltgres keep no counters: the pass isn't run for them, and their
+planned sample count leaves it out.
+
+### Run-order drift
+
+A cell's repetitions are spread across the run, between the other cells
+(each repetition shuffles the operation order). So a series that rises or
+falls with run order means its cost depends on state earlier work left
+behind, such as dead change-log entries piling up or caches filling, and
+not only on the operation measured. The report tests every cell's latency
+repetitions and each engine counter of its `counters` pass repetitions in
+the order they ran: a two-sided Mann-Kendall trend test, exact without ties
+and normal with the tie correction, flagged at p < 0.001 with at least five
+samples. Seven repetitions that rise every time are flagged (p = 0.0004);
+seven with one pair out of order are not (p = 0.003). The bar is high because
+a report tests hundreds of series. Flagged latencies are marked `[drift ↑]`
+or `[drift ↓]` in their cells, and **Run-order drift** lists every flagged
+series with its trend, p and first and last values (also in `drift.csv`
+and `drift.json`). A counter that drifts is that state found directly: the
+same operation should count the same.
 
 Sampling peaks are lower bounds. Operations shorter than the configured interval,
 or without a periodic sample, are flagged. A peak that rises and falls between
@@ -355,6 +394,8 @@ Results are retained in `ROOT/results/TIMESTAMP-ID/`:
   for direct comparisons in a spreadsheet or analysis script.
 - `scaling.csv` / `scaling.json`: log-log power-law slopes with within-level
   bootstrap intervals, fit R², and explicit inconclusive reasons.
+- `drift.csv` / `drift.json`: the series flagged for run-order drift (see
+  "Run-order drift").
 - Fixture manifests, effective PostgreSQL settings, server logs, and total data
   directory apparent/allocated bytes. Directory sizes include history and WAL;
   they are not per-table compressed sizes or per-operation space growth.

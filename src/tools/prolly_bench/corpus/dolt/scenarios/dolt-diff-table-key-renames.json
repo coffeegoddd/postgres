@@ -110,7 +110,7 @@
         "rows": [
           [
             null,
-            null,
+            "1",
             "added"
           ]
         ],
@@ -130,8 +130,8 @@
           [
             null,
             null,
-            null,
-            null,
+            "2",
+            "2",
             "added"
           ]
         ],

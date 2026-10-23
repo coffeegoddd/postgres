@@ -148,6 +148,61 @@ ordering.  Older root formats retain the existing recommit requirement;
 committing a branch writes its current working state in the new format.
 
 
+Identity across renames
+-----------------------
+
+A table or column keeps its identity when it is renamed: the name it was
+made with, and which of the objects made with that name it is (0 unless
+another holding that identity was there, as a renamed column is when a
+new one takes its old name).  A root holds no identities, so the same
+tables, columns and rows give the same root however they were named
+before.  A commit records its root's identities beside it (its "identity"
+item): only those that differ from the object's own name with 0, so a
+commit whose objects were never renamed records nothing.  Commit ids already
+depend on history, through their parents and metadata; two commits with
+the same root can still record different identities.
+
+A branch's working set finds its identities through its own relations
+and attribute numbers, which a rename keeps and a drop and an add don't.
+The refs keep an anchor for each branch ('I'), written by each commit and
+after each move.  The anchor is valid only for the head it was made at.
+Each live table and column is found in the anchor; one the anchor hasn't
+is new since and gets its own name's identity (the first of that name's
+that no live object holds).  Without an anchor of the head (the branch
+moved without one made), each is found by its name in the head's identity
+record.  So a column dropped and another of its name added gets the
+dropped column's identity if that was its own name's, as Dolt's tags do,
+but never the identity of a column renamed into the name.  Identities are
+read from the catalogs, without opening (or locking) any relation, and a
+read of one table identifies that table alone.
+
+Reads match versions by identity.  dolt_at, dolt_history_table,
+dolt_diff_table, row diffs, and a merge's conflict listing read each
+version's columns under the names the working set gives the same columns.
+Diffs read its tables that way too, and a summary (the canonicalizer's
+changes()) pairs a table renamed as one renamed table, its rows and
+definition perhaps changed too.  dolt_at and dolt_history_table read a
+version's table by its name, as Dolt's AS OF and history do.  Tables
+alike but unrelated are never paired.  The canonicalizer's renames()
+works out the renames and rename_description() applies them in memory,
+so nothing is written.  A merge names base, ours and theirs as one, using
+merge_renames().  An
+object renamed on one side takes that side's name.  Renamed differently
+on both sides, or two kept objects given one name, is a schema conflict.
+The branch's own tables and columns are renamed to the merged names first
+(rename_objects(), ALTER TABLE ... RENAME), so their rows stay where they
+are and only the other side's changes are written.  The anchor is then the
+merge's.
+
+Folded format 18 records identities in commits.  Formats are not kept
+compatible while the prototype iterates: this build reads, moves to and
+merges format 18 alone, and a root of format 17 or older has its tables'
+rows unreadable and is refused for moves and merges ("a commit made in an
+older format of prolly's history can't be ..."); commit the branch again to
+write it in format 18.  A server of an earlier format refuses format 18
+likewise, rather than matching renamed objects by name.
+
+
 Internal DDL and event triggers
 ------------------------------
 
@@ -233,7 +288,12 @@ of identical rows.  A commit folds each table's rows into its data tree:
 in full the first time, then from its baseline using the per-table change
 log (the default finder "log", changes_log.c). The older "pages" finder
 (changes_pages.c) remains registered. Incremental folds can fall back to a
-full fold when the log or baseline cannot be used or a budget is exceeded.
+full fold when the log or baseline cannot be used, or when more rows
+changed than reading the table costs.  Changes past maintenance_work_mem
+are not a reason: they are sorted, spilling to disk, and applied a part at
+a time in key order, so the fold's work stays that of the rows changed
+(pg_stat_prolly's fold_changes_spilled).  A transaction commit's own
+changes past it commit the working set instead.
 The refs ("copies", refs_copies.c) keep branch heads, baselines, tags, remotes and
 merge state in the chunk store's root.  Diff and merge ("folded",
 diffmerge_folded.c) compare canonical trees table by table, reading only
@@ -252,8 +312,82 @@ and their resource owner removes them on error, savepoint rollback or
 cancellation.  Ordinary merges do not create these files, but every such
 validation creates both, however small the table, so it uses temporary
 space: it counts against temp_file_limit and is reported by log_temp_files.
-Earlier schema conversion and uncertainty buffers are separate and can still
-grow with table size; this does not bound the entire merge's memory.
+Reading a version as a table is defined now (as_defined_now()) keeps the
+rows in their stored order when the key columns are read as they are
+stored.  Otherwise (a key retyped, an enum relabelled, a keyless table) the
+converted rows go to a tuplesort of their own ordered by the keying, ties
+in the order read, which spills past work_mem; they are read back in order
+and streamed into the tree builder, copies of a row counted and a key found
+twice refused or, shown, warned of, as before.  The base's rows with an
+unsure value are sorted the same way and written to a temporary file in key
+order, which each merge walk reads from its start alongside theirs' changes.
+While a version's rows are read, the converted rows' sort and the unsure
+rows' sort can both be open, each with its own work_mem: the conversion
+uses up to twice work_mem, plus each sort's merge buffers.
+
+A merge that records constraint violations writes each table's rows as an
+attempt.  Where a refused row's put-back is refused too, the table's writes
+are rolled back and made again; the violations an attempt records are
+spooled to a temporary file of its own, dropped when the attempt is rolled
+back.  When it holds, those left are read back in order into the merge's
+kept violations, passing over the handles of those forgotten (a row tried
+again and written after all), which are sorted.  The rows ranked up across
+attempts, and those held to be tried again while a row is pinned, are
+spooled to temporary files in key order.  These files are created under the
+resource owner the writes began with so that an attempt's subtransaction
+can roll back without closing them; their memory is a few file buffers and
+the largest row.  A keyless table's removed values, which the domain checks
+look up, are held in memory up to work_mem, then sorted with a tuplesort
+and written once each, in order, to an image file and a fixed-size entry
+file that lookups search by halving.  All of these files close when the
+table is written and go with their resource owner on error or cancellation.
+
+The violations a merge keeps go to a tuplesort of their own (work_mem,
+spilling past it).  To publish them, the branch's violations are visited
+into the same sort, which orders them by what they are and then the
+branch's first: the first of each is kept only if it is new, and the new
+ones are sorted again into the order found and added to the branch's a
+batch at a time (1000, or work_mem's worth of bytes up to 1MB).  A merge or
+pick counts the branch's violations, to report how many it added, by
+visiting them, not loading them.  The refs keep a branch's violations one entry each, keyed
+by the branch and a place, after an entry holding the next place, so adding
+some reads and writes none of the others (the refs' format version 2).
+Format version 1 kept them all in one value under the branch's key; this
+build doesn't read such a value but refuses it, with a hint to reset the
+branch, which removes it.  The violations' inspection functions and the
+checks before a commit still read a branch's violations whole.
+
+The constraint checks (a merge's foreign keys, the check and not-null rows
+a merge's added constraints take away, dolt_verify_constraints()) run each
+query through SPI_execute_extended() with a DestReceiver that hands each
+row found to its consumer as the executor returns it: the merge's
+violation sort, or a list for verification, which sets the branch's
+violations whole.  No query's result is held as an SPI tuple table.  The
+keys of the rows changed since the head, which verification matches a
+batch at a time, go to two stores shared by every table (keys now, and as
+they were), each held in memory up to half of work_mem and then moved to
+a temporary file; a table's keys of a side are a segment of its store, as
+the diff gives a table's rows together.  What reading a table's rows takes
+is released before the next table's, and each batch's JSON literal and
+query are made only as that batch runs.  A merge still checks every foreign key of the tables it
+wrote whole, by query; the executor's own sorts and hashes spill under
+work_mem as for any query.
+
+A commit, a checkpoint and a fold of a transaction's own rows change
+only their branch's refs (its head, baseline, the names of its head's
+tables, its merge state and violations).  Every change of a branch's refs
+is made holding that branch's lock to transaction end, and they take
+only that, so commits on different branches run together while those on
+one branch take turns.  Anything else that changes the refs (a branch
+made, deleted or renamed, a reset, a merge, a push) holds the session
+branch's lock (and any branch's it changes), then moves the store's root
+with its transaction, as all of them did before: other such movers wait
+for it.  A branch's holder makes its changes in a refs tree of its own,
+rebuilt on the store's root when another's commit moved it, and moves the
+root there as it commits, waiting then for a mover holding it; one that
+comes to change other refs moves the root from then on.  So an operation
+reading another branch's head (a branch made from it, a merge of it)
+reads the head as last committed, not a commit still open there.
 
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
@@ -270,9 +404,9 @@ the TIDs of the tuple versions each write made or replaced
 (branch_tuple_hook), and the change finder applies those the transaction
 made and didn't replace, or replaced and hadn't made, to the head's table
 trees (fold_rows), with no fold and no snapshot checked.  A transaction
-that changed definitions, or more rows than it keeps, or whose rows can't
-be applied so (a table the head describes otherwise), commits its working
-set instead.
+that changed definitions, or more rows than it keeps (or than
+maintenance_work_mem holds), or whose rows can't be applied so (a table
+the head describes otherwise), commits its working set instead.
 
 A fold isn't made again while nothing it reads has changed: the refs
 (refs_generations.c) keep in shared memory each branch's generation,
@@ -283,6 +417,28 @@ transaction commits.  Reading the working set (status, diff, a branch's
 dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
+
+A rewrite of a versioned table (ALTER TABLE changing a column's type,
+REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
+branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
+prolly_fold_rewritten(), called by tablecmds.c and matview.c), so the
+commit after, the fold worker off or in the same transaction, folds only
+what changed since.  The checkpoint never waits for a lock (the rewrite
+holds its table exclusively, and a commit holding the branch may be about
+to read it): a lock not free at once skips it, leaving the table's next
+fold to read it in full.  dolt_pending_full_folds() lists the tables whose next
+fold would read them in full, and why, from the baseline, the catalogs and
+each change finder's full_reason(), reading no rows.
+
+A move of the session's branch (a reset, a fast-forward, a merge's)
+folds its working set, if not known, as a checkpoint: the fold is the
+branch's baseline.  After the rows are written, the baseline is advanced
+to the target without another fold, each table the move wrote holding
+the target's rows and its change log's record of the move's own writes
+consumed (the canonicalizer's advance_baseline()); where it can't be (the
+definitions moved too, a materialized view's rows did, a table's state
+can't be advanced), the rest is folded as before.  So a move from a dirty
+working set folds it once.
 
 What a fold works out for every table, changed or not, is cached in the
 backend (canon_folded.c's own): each table's description and the hash its
@@ -295,6 +451,25 @@ members; and the last canonical tree's items, so the next is applied as
 the items that differ (the baseline's too, from the baseline folded from).
 debug_prolly_verify_fold_caches works each one taken out again too.
 
+A fold after another in the same backend works out again only what may
+have changed (fold_incremental): with no catalog change or collection
+since (the refs' mark, moved by every catalog change sent, and the
+backend's own catalog epoch), the same deparsing settings, and a snapshot
+that sees every writer of the branch that ended, it takes the last
+canonical tree's items and redoes those of the tables whose rows were
+written since, and every sequence's (their values change outside
+transactions), reading no catalog through.  The refs learn which tables:
+every row a writer changes names its relation (note_relation()), and as
+the writer ends the branch keeps them in shared memory, the last few with
+the generation they ended at (refs_generations.c).  A writer of too many
+relations, an eviction, a prepared transaction's end or anything else the
+mark doesn't cover folds everything.  A commit's fold begins the next
+baseline from the one this backend built last, only the written tables'
+entries changed.  debug_prolly_verify_fold_caches then folds everything
+else again (its work not counted) and compares.  dolt_status reads definitions
+without rows and asks each table's change finder, so it still visits
+every table.
+
 
 Remotes
 -------
@@ -302,13 +477,47 @@ Remotes
 Transfer ("chunks", transfer_chunks.c) moves the chunks a commit reaches
 that the other side lacks, re-hashing each chunk it receives.  A remote
 ("file", remote_file.c) is a directory of table files and a manifest.
+What a transfer has seen (prolly_seen.c) is a map held to its share of
+maintenance_work_mem: past it, sorted runs in temporary files, merged
+four of a level into one, each with a Bloom filter folded smaller as the
+map grows, so its memory stays within budget and a lookup checks a number
+of runs logarithmic in its size.
+
+Tags are objects of their own, as commits are: a small tree naming the
+commit, its tagger, date and message, whose hash is the tag's id, so a tag
+is the same in every database.  The refs name each tag's object and keep
+its commit beside it, so resolving a tag reads no object.  A push of a tag
+sends its object and what that reaches, then moves the remote's tag; a
+fetch follows the remote's tags of commits it has (as Dolt's does), and a
+clone takes every tag.  A file remote's manifest lists tags on lines of
+their own.
+
+The refs tree records its format, and a file remote's manifest its
+version; while the prototype iterates, neither is kept readable across a
+change: refs or a manifest of another format are refused, never read.
 
 
 SQL
 ---
 
 prolly_dolt.c is the dolt_* functions and system views, with Doltgres's
-arguments and results, so scripts written for Doltgres run here.
+arguments and results, so scripts written for Doltgres run here.  A tag
+(dolt_tag, the dolt_tags view) is a revision wherever one is read, after a
+branch of its name; checking one out, as checking out a commit's hash, is a
+read-only detached session at its commit.
+
+dolt_rebase replays a branch's commits onto another, as Dolt's: on a
+branch of its own, dolt_rebase_<branch>, made at the commit replayed onto,
+whose rebase state (the plan, the branch rebased and its head then) the
+refs keep with that branch.  Each step is a cherry-pick; a reword, squash
+or fixup then replaces the pick's commit with one of its working set, and
+a commit that became empty is dropped (unless --empty=keep).  The plan is
+edited through the dolt_rebase view, whose INSTEAD OF trigger changes the
+state.  A step that conflicts stops the rebase as a pick in progress
+(outside a transaction block, an error that rolls the whole rebase back),
+and --continue commits its resolution; the last step done, the rebased
+branch is moved to the rebase's head (refused if it moved meanwhile), and
+the rebase's branch deleted.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
 

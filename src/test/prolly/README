@@ -69,6 +69,51 @@ are a separate target, not part of "check":
 (prolly tables exist only in versioned schemas, which the upstream suites
 don't make, so they run on block-mapped heap instead.)
 
+PostGIS
+-------
+
+PostGIS isn't part of this tree, so its groups run only when given a
+build of the pinned PostGIS (src/tools/prolly_bench/configs/postgis.toml)
+made against this tree's installation prefix:
+
+	python3 src/tools/prolly_bench/build_postgis.py \
+	    --pg-config PREFIX/bin/pg_config --build-dir DIR
+	make -C src/test/prolly check-postgis POSTGIS_BUILD=DIR
+
+The build is installed from DIR into the temporary installation.  PostGIS
+goes in public, versioned on prolly, as PostGIS's own tests expect.  Two
+groups:
+
+	check-postgis-semantics  PostGIS on the AM under test answers as on
+	                heap (t/006_postgis.pl, postgis_schedule; also run
+	                by check-heap when POSTGIS_BUILD is set): a corpus of
+	                every geometry type, dimension and kind of empty, NaN
+	                and extreme coordinates, curves, TINs, values from
+	                bytes to a megabyte, geography, rasters and spheroids
+	                (gis_values); every PostGIS operator class, from the
+	                catalog, with index and bitmap scans and KNN agreeing
+	                with sequential scans, exclusion constraints,
+	                statistics, estimated extents and plans (gis_indexes);
+	                every type, operator class, operator and aggregate
+	                PostGIS installs, with what covers it, operators and
+	                aggregates evaluated on the stored corpus
+	                (gis_catalog); metadata views and column management
+	                (gis_metadata)
+	check-vc-postgis  PostGIS through version control, on prolly
+	                (vc_postgis_schedule): byte-identical values and
+	                index agreement through checkout, reset, merge,
+	                cherry-pick and revert, typmods kept and enforced
+	                (vc_gis_moves); one root for one table built seven ways,
+	                no change for storage-only rewrites, exact diffs,
+	                merges of spatial edits and conflicts on other bytes,
+	                geometry keys (vc_gis_history); types without binary
+	                send/recv and NaN points (vc_gis_types); clone, push,
+	                fetch and pull through a file remote (vc_gis_remotes)
+
+gis_catalog's list changes when PostGIS adds a type, operator class,
+operator or aggregate: the group fails until the new member is covered or
+excluded there with a reason.
+
 Validating the tests themselves
 -------------------------------
 

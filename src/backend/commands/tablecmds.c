@@ -37,6 +37,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/partition.h"
+#include "access/prolly_fold.h"
 #include "access/prolly_keying.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_attrdef.h"
@@ -4970,6 +4971,14 @@ ATController(AlterTableStmt *parsetree,
 
 	/* Phase 3: scan/rewrite tables as needed, and run afterStmts */
 	ATRewriteTables(parsetree, &wqueue, lockmode, context);
+
+	/* (a versioned prolly table rewritten: its branch folded now, once) */
+	foreach_ptr(AlteredTableInfo, tab, wqueue)
+	{
+		if (tab->rewrite > 0 && tab->relkind == RELKIND_RELATION &&
+			prolly_fold_rewritten(tab->relid))
+			break;
+	}
 }
 
 /*

@@ -45,6 +45,23 @@
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
  *				   then the bytes)
+ *	'I' name	-> the working set's identity anchor (the canonicalizer's
+ *				   identify()), as of a head: the head's hash in hex (none
+ *				   for a branch without commits), a newline, then the anchor
+ *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
+ *				   of another, are refused
+ *	'T' name	-> a tag: its tag object, then that tag's commit (hash
+ *				   length, hash each; the commit kept here too, so that
+ *				   resolving a tag, or reading an old root's refs, reads
+ *				   no tag object)
+ *	'E' name	-> the branch's rebase in progress: the branch rebased (a
+ *				   varint length, then the bytes), its head then and the
+ *				   commit replayed onto (hash length, hash each), a flags
+ *				   byte (1: keep commits that become empty), the order of
+ *				   the step last begun (a varint length, then the bytes; 0:
+ *				   none), the count of steps (a varint), then each step's
+ *				   order and action (varint length, bytes), commit (hash
+ *				   length, hash) and message (varint length, bytes)
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts, or write to a branch that has
@@ -61,15 +78,29 @@
  *				   big-endian: 1 + the most of its parents', a root's 1;
  *				   a commit without it (one made before heights were
  *				   recorded) has its height found from its parents'
+ *	"identity"	-> the identity of its root's tables and columns, which
+ *				   their renames keep (the canonicalizer's identify()):
+ *				   its identity record; none if every object has its own
+ *				   name's
  *	"message"	-> the message
  *	"parents"	-> the parents' ids, each a length byte and the hash
  *	"root"		-> the commit's root (length byte, hash): the canonical
  *				   form of the branch's versioned schemas, folded
  *	"time"		-> microseconds since the Postgres epoch, 8 bytes big-endian
  *
+ * A tag object is a tree of its own too, and its id that tree's root hash,
+ * so a tag's id is the same in every database it is cloned, pushed or
+ * fetched to; a commit has a "root" item, a tag object none:
+ *
+ *	"commit"	-> the tagged commit (length byte, hash)
+ *	"message"	-> the tag's message
+ *	"tagger"	-> who made it
+ *	"time"		-> when, as a commit's
+ *
  * The chunks a commit's items and the refs' entries name (its dependencies,
- * parents and root; a branch's head, baseline and working set, a merge's
- * commits, a remote branch's head) are declared to the tree as the
+ * parents and root; a tag's commit; a branch's head, baseline and working
+ * set, a merge's commits, a remote branch's head, a tag's object and
+ * commit) are declared to the tree as the
  * references to chunks its leaves hold (commit_chunk_refs(),
  * refs_chunk_refs()), so
  * a collection follows them without reading values.
@@ -83,6 +114,19 @@
  * moves the root again, with the transaction.  So writers of refs take
  * turns, each builds on the last, and an aborted transaction's changes are
  * gone.
+ *
+ * Every change of a branch's own entries (its head, its baseline, the
+ * names its head's tables had, its merge state and violations) is made
+ * holding that branch's lock (lock_branch()) to transaction end, and a
+ * transaction that moves the root holds the session's branch's too,
+ * taken first.  A commit (or a checkpoint) changes only its branch's
+ * entries, and holds only its lock: so commits on different branches run
+ * together, while those on one branch take turns.  Its changes are made
+ * to a tree of its own, built on the root as it last read it and rebuilt
+ * on the root whenever another's commit moved it, and the store's root is
+ * moved there only as the transaction commits, waiting then for a mover
+ * holding it.  Such a transaction that comes to change another entry
+ * moves the root from then on, its changes moved there at once.
  *
  * IDENTIFICATION
  *	  src/backend/access/prolly/refs_copies.c
@@ -119,10 +163,12 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "refs_generations.h"
 #include "storage/bufmgr.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -148,8 +194,50 @@
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
 #define TAG_STASH		'Z'	/* a list of stashes, by name */
+#define TAG_IDENTITY	'I'	/* the working set's identity anchor */
+#define TAG_TAG			'T'	/* a tag, by name */
+#define TAG_REBASE		'E'	/* a branch's rebase in progress */
+#define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
+
+/*
+ * The refs tree's format, kept in it: a tree of another (an older build's)
+ * is refused, never read.  2: tags; 3: rebases.
+ */
+#define REFS_FORMAT		"3"
+
+/*
+ * A branch's own lock (an object lock in the database, of this class, by a
+ * hash of the branch's name: two names sharing one only take turns), held
+ * by whoever changes the branch's entries, to transaction end.
+ */
+#define BRANCH_LOCK_CLASSID	((Oid) 0x50524642)
 
 static bool ready = false;
+
+/*
+ * A transaction holding single branches: whether it has changes to them
+ * not yet on the store's root (scoped), the tree they are in (mine), and
+ * the root that tree was built on (base).  The changes are moved to the
+ * root as the transaction commits (published, from then until it ends:
+ * anything changed later is moved to the root at once).  Each
+ * subtransaction that changes them saves them first (ScopedSave), so its
+ * abort restores them.
+ */
+typedef struct ScopedSave
+{
+	int			level;
+	bool		scoped;
+	bool		whole;
+	ProllyHash	base;
+	ProllyHash	mine;
+} ScopedSave;
+
+static bool scoped = false;
+static bool whole = false;		/* the transaction holds every ref */
+static ProllyHash scoped_base;
+static ProllyHash scoped_mine;
+static bool published = false;
+static List *scoped_saved = NIL;	/* ScopedSave *, innermost last */
 
 /*
  * The branches whose merge states the transaction set (names, in
@@ -159,6 +247,9 @@ static bool ready = false;
 static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
+static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+								  SubTransactionId parentSubid, void *arg);
+static void publish_scoped(void);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_tables_left(const char *branch, ProllyMergeState *state,
 							  char **name);
@@ -172,8 +263,14 @@ static List *violations_of(const char *branch);
 static void violations_key(StringInfo key, const char *branch);
 static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
+static bool tag_entry(const char *name, ProllyHash *tag, ProllyHash *commit);
+static bool copies_tag_get(const ProllyHash *tag, ProllyTagInfo *info);
 static bool upstream_head(const char *branch, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
+static void copies_visit_violations(ProllyViolationVisit visit, void *arg);
+static void copies_add_violations(ProllyViolation *const *violations, int n);
+static void violations_clear(const char *branch);
+static void violations_move(const char *from, const char *to);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
@@ -202,7 +299,73 @@ declare_hashes(const char *p, const char *end, int n, StringInfo refs)
 	return p;
 }
 
-/* A commit's items: its dependencies, parents and root name chunks. */
+static ProllyHash *
+copy_hash_of(const ProllyHash *h)
+{
+	ProllyHash *c = palloc(sizeof(ProllyHash));
+
+	*c = *h;
+	return c;
+}
+
+/* A varint-length string at *p (palloc'd); NULL if it doesn't fit. */
+static char *
+get_short_text(const char **p, const char *end)
+{
+	uint64		len = prolly_get_varint(p, end);
+	char	   *s;
+
+	if (len > (uint64) (end - *p))
+		return NULL;
+	s = pnstrdup(*p, len);
+	*p += len;
+	return s;
+}
+
+/*
+ * A rebase state's entry, read; false if it is malformed (its hashes are
+ * still read as get_hash() reads them, which errors on a bad one).
+ */
+static bool
+rebase_decode(const char *p, const char *end, ProllyRebaseState *state)
+{
+	uint64		n;
+
+	memset(state, 0, sizeof(*state));
+	if ((state->branch = get_short_text(&p, end)) == NULL)
+		return false;
+	p = get_hash(p, end, &state->head);
+	p = get_hash(p, end, &state->onto);
+	if (p >= end)
+		return false;
+	state->keep_empty = (*p++ & 1) != 0;
+	if ((state->last_step = get_short_text(&p, end)) == NULL)
+		return false;
+	if (state->last_step[0] == '\0')
+		state->last_step = NULL;
+	n = prolly_get_varint(&p, end);
+	if (n > (uint64) (end - p))
+		return false;
+	state->steps = palloc0(sizeof(ProllyRebaseStep) * Max(n, 1));
+	for (uint64 i = 0; i < n; i++)
+	{
+		ProllyRebaseStep *s = &state->steps[i];
+
+		if ((s->order = get_short_text(&p, end)) == NULL ||
+			(s->action = get_short_text(&p, end)) == NULL)
+			return false;
+		p = get_hash(p, end, &s->commit);
+		if ((s->message = get_short_text(&p, end)) == NULL)
+			return false;
+		state->nsteps++;
+	}
+	return true;
+}
+
+/*
+ * A commit's items: its dependencies, parents and root name chunks; a tag
+ * object's: its commit.
+ */
 static void
 commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 				  StringInfo refs)
@@ -212,7 +375,8 @@ commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 
 #define KEY_IS(name) \
 	(key->len == strlen(name) && memcmp(key->data, name, key->len) == 0)
-	if (KEY_IS("dependencies") || KEY_IS("parents") || KEY_IS("root"))
+	if (KEY_IS("dependencies") || KEY_IS("parents") || KEY_IS("root") ||
+		KEY_IS("commit"))
 		(void) declare_hashes(p, end, INT_MAX, refs);
 #undef KEY_IS
 }
@@ -220,8 +384,8 @@ commit_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 /*
  * The refs' entries: a branch's head, a remote branch's, a baseline and the
  * working set its fold made, a merge's commits (theirs and the base; a
- * revert's series head and the commits it has left), and each stash's
- * commit.
+ * revert's series head and the commits it has left), each stash's commit,
+ * and each tag's object and commit.
  */
 static void
 refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
@@ -239,6 +403,7 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			(void) declare_hashes(p, end, 1, refs);
 			break;
 		case TAG_BASELINE:
+		case TAG_TAG:
 			(void) declare_hashes(p, end, 2, refs);
 			break;
 		case TAG_MERGE:
@@ -261,6 +426,18 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 					n = get_be32(p);
 					(void) declare_hashes(p + 4, end, (int) Min(n, INT_MAX), refs);
 				}
+			}
+			break;
+		case TAG_REBASE:
+			{
+				ProllyRebaseState rs;
+
+				if (!rebase_decode(p, end, &rs))
+					break;
+				PROLLY_CALL(tree, value_reference, &rs.head, 0, refs);
+				PROLLY_CALL(tree, value_reference, &rs.onto, 0, refs);
+				for (int i = 0; i < rs.nsteps; i++)
+					PROLLY_CALL(tree, value_reference, &rs.steps[i].commit, 0, refs);
 			}
 			break;
 		case TAG_STASH:
@@ -300,6 +477,7 @@ refs_init(void)
 	env.chunk_refs = refs_chunk_refs;
 	commit_env.chunk_refs = commit_chunk_refs;
 	RegisterXactCallback(refs_xact_callback, NULL);
+	RegisterSubXactCallback(refs_subxact_callback, NULL);
 	ready = true;
 }
 
@@ -474,16 +652,24 @@ refs_xact_callback(XactEvent event, void *arg)
 			check_merge_conflicts("commit");
 			if (prolly_refs_end_hook)
 				prolly_refs_end_hook(false);
+			publish_scoped();
+			published = true;
 			break;
 		case XACT_EVENT_PRE_PREPARE:
 			check_merge_conflicts("prepare");
 			if (prolly_refs_end_hook)
 				prolly_refs_end_hook(true);
+			publish_scoped();
+			published = true;
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PREPARE:
 			merge_changed = NIL;
+			scoped = false;
+			whole = false;
+			published = false;
+			scoped_saved = NIL;
 			break;
 		default:
 			break;
@@ -529,6 +715,197 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Refuse a refs tree of another format than REFS_FORMAT (an older one has
+ * no TAG_FORMAT entry): this build reads only its own.  Checked once a
+ * backend (a backend serves one database): every root after the one checked
+ * was made from it, by builds that keep the entry.
+ */
+static void
+check_refs_format(const ProllyNodeRef *root)
+{
+	static bool checked = false;
+	char		k = TAG_FORMAT;
+	ProllyKey	key = {(const uint8 *) &k, 1};
+	StringInfoData v;
+
+	if (checked)
+		return;
+	initStringInfo(&v);
+	if (!PROLLY_CALL(tree, get, &env, root, &key, &v))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's prolly refs are of an older format than %s",
+						REFS_FORMAT),
+				 errdetail("This build reads only refs of format %s.", REFS_FORMAT)));
+	if (strcmp(v.data, REFS_FORMAT) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's prolly refs are of format %s, not %s",
+						v.data, REFS_FORMAT),
+				 errdetail("This build reads only refs of format %s.", REFS_FORMAT)));
+	pfree(v.data);
+	checked = true;
+}
+
+/* Save the scoped changes for the subtransaction, before changing them. */
+static void
+scoped_save(void)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	ScopedSave *save;
+	MemoryContext old;
+
+	if (level <= 1 ||
+		(scoped_saved != NIL && ((ScopedSave *) llast(scoped_saved))->level >= level))
+		return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	save = palloc(sizeof(ScopedSave));
+	save->level = level;
+	save->scoped = scoped;
+	save->whole = whole;
+	save->base = scoped_base;
+	save->mine = scoped_mine;
+	scoped_saved = lappend(scoped_saved, save);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					  SubTransactionId parentSubid, void *arg)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	ScopedSave *last;
+
+	if (scoped_saved == NIL)
+		return;
+	last = llast(scoped_saved);
+	if (last->level < level)
+		return;
+	Assert(last->level == level);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		scoped = last->scoped;
+		whole = last->whole;
+		scoped_base = last->base;
+		scoped_mine = last->mine;
+		scoped_saved = list_delete_last(scoped_saved);
+	}
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		/* the parent's saved state, if it has one, is the older */
+		if (level - 1 <= 1 ||
+			(list_length(scoped_saved) > 1 &&
+			 ((ScopedSave *) list_nth(scoped_saved,
+									  list_length(scoped_saved) - 2))->level == level - 1))
+			scoped_saved = list_delete_last(scoped_saved);
+		else
+			last->level = level - 1;
+	}
+}
+
+typedef struct ScopedEdits
+{
+	ProllyEdit *edits;
+	int			n;
+	int			max;
+} ScopedEdits;
+
+static void
+collect_edit(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	ScopedEdits *se = arg;
+	ProllyEdit *e;
+	uint8	   *k;
+
+	if (se->n == se->max)
+	{
+		se->max = Max(8, se->max * 2);
+		se->edits = se->edits ? repalloc_array(se->edits, ProllyEdit, se->max) :
+			palloc_array(ProllyEdit, se->max);
+	}
+	e = &se->edits[se->n++];
+	k = palloc(Max(key->len, 1));
+	memcpy(k, key->data, key->len);
+	e->key.data = k;
+	e->key.len = key->len;
+	e->is_delete = (after == NULL);
+	e->value.data = NULL;
+	e->value.len = 0;
+	if (after)
+	{
+		uint8	   *v = palloc(Max(after->len, 1));
+
+		memcpy(v, after->data, after->len);
+		e->value.data = v;
+		e->value.len = after->len;
+	}
+}
+
+/*
+ * The scoped changes, rebuilt on cur (the store's root now) if another's
+ * commit moved it since they were built: the entries they changed are the
+ * transaction's branches', which no one else changes meanwhile.
+ */
+static void
+rebase_scoped(const ProllyHash *cur)
+{
+	ScopedEdits se = {NULL, 0, 0};
+	ProllyNodeRef from;
+	ProllyNodeRef to;
+	ProllyNodeRef onto;
+	ProllyNodeRef next;
+
+	if (same_hash(cur, &scoped_base))
+		return;
+	scoped_save();
+	ref_of(&scoped_base, &from);
+	ref_of(&scoped_mine, &to);
+	PROLLY_CALL(tree, diff, &env, &from, &to, collect_edit, &se);
+	if (se.n == 0)
+		scoped_mine = *cur;
+	else
+	{
+		ref_of(cur, &onto);
+		PROLLY_CALL(tree, apply, &env, &onto, se.edits, se.n, &next);
+		scoped_mine = next.hash;
+	}
+	scoped_base = *cur;
+	for (int i = 0; i < se.n; i++)
+	{
+		pfree(unconstify(uint8 *, se.edits[i].key.data));
+		if (se.edits[i].value.data)
+			pfree(unconstify(uint8 *, se.edits[i].value.data));
+	}
+	if (se.edits)
+		pfree(se.edits);
+}
+
+/*
+ * Move the store's root to the scoped changes, with the transaction (as it
+ * commits, or as it comes to hold every ref): waiting only for another
+ * moving it so.
+ */
+static void
+publish_scoped(void)
+{
+	if (!scoped)
+		return;
+	scoped_save();
+	for (;;)
+	{
+		ProllyHash	cur;
+
+		PROLLY_CALL(env.chunk_store, root, env.chunks, &cur);
+		rebase_scoped(&cur);
+		if (PROLLY_CALL(env.chunk_store, move_root, env.chunks, &cur,
+						&scoped_mine))
+			break;
+	}
+	scoped = false;
+}
+
 /* The refs tree's root, as the transaction sees it; false if none yet. */
 static bool
 refs_root(ProllyNodeRef *root)
@@ -537,22 +914,90 @@ refs_root(ProllyNodeRef *root)
 
 	refs_init();
 	PROLLY_CALL(env.chunk_store, root, env.chunks, &h);
+	if (scoped)
+	{
+		rebase_scoped(&h);
+		h = scoped_mine;
+	}
 	if (h.len == 0)
 		return false;
 	ref_of(&h, root);
+	check_refs_format(root);
+	return true;
+}
+
+static void
+branch_lock_tag(LOCKTAG *tag, const char *name, int len)
+{
+	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, BRANCH_LOCK_CLASSID,
+					   hash_bytes((const unsigned char *) name, len), 0);
+}
+
+/* Does the transaction hold the lock of the branch named (len bytes)? */
+static bool
+branch_held(const char *name, int len)
+{
+	LOCKTAG		tag;
+
+	branch_lock_tag(&tag, name, len);
+	return LockHeldByMe(&tag, ExclusiveLock, false);
+}
+
+/*
+ * Hold branch name's refs until the transaction ends, for changing its
+ * entries: other holders of name are waited for, and wait for it, but
+ * holders of other branches don't.
+ */
+static void
+lock_branch(const char *name)
+{
+	LOCKTAG		tag;
+
+	refs_init();
+	PreventCommandIfReadOnly("moving a chunk store's root");
+	branch_lock_tag(&tag, name, strlen(name));
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+}
+
+/*
+ * lock_branch(), if no one holds the branch now (never waiting): false,
+ * nothing held, if someone does.  With hold false, only whether it is
+ * free is told, nothing being kept.
+ */
+static bool
+try_lock_branch(const char *name, bool hold)
+{
+	LOCKTAG		tag;
+
+	refs_init();
+	branch_lock_tag(&tag, name, strlen(name));
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+	if (!hold)
+		LockRelease(&tag, ExclusiveLock, false);
 	return true;
 }
 
 /*
- * Hold the refs until the transaction ends: move the root to itself (or,
- * in a new store, to an empty refs tree).  A mover that comes first is
- * waited for, and then built on.  (Holding them already, this moves the
- * root to itself again, which the transaction's move already is.)
+ * Hold every ref until the transaction ends, the session's branch's own
+ * too: move the root to itself (or, in a new store, to an empty refs
+ * tree).  A mover that comes first is waited for, and then built on;
+ * holders of other branches aren't, but they wait to commit.  Scoped
+ * changes of this transaction's are moved to the root first.  (Holding
+ * them already, this moves the root to itself again, which the
+ * transaction's move already is.)
  */
 static void
 lock_refs(void)
 {
 	refs_init();
+	if (!published && !whole)
+	{
+		lock_branch(branch_ops()->current());
+		scoped_save();
+		whole = true;
+	}
+	publish_scoped();
 	for (;;)
 	{
 		ProllyHash	cur;
@@ -565,13 +1010,78 @@ lock_refs(void)
 			ProllyTreeBuilder *b = PROLLY_CALL(tree, build_begin, &env,
 											   CurrentMemoryContext);
 			ProllyNodeRef empty;
+			char		k = TAG_FORMAT;
+			ProllyKey	key = {(const uint8 *) &k, 1};
+			ProllyValue v = {(const uint8 *) REFS_FORMAT, strlen(REFS_FORMAT)};
 
+			/* (a new store's refs: only their format) */
+			PROLLY_CALL(tree, build_add, b, &key, &v);
 			PROLLY_CALL(tree, build_finish, b, &empty);
 			next = empty.hash;
+		}
+		else
+		{
+			ProllyNodeRef r;
+
+			ref_of(&cur, &r);
+			check_refs_format(&r);
 		}
 		if (PROLLY_CALL(env.chunk_store, move_root, env.chunks, &cur, &next))
 			break;
 	}
+}
+
+/*
+ * lock_refs(), with branch name the session's, if every lock it takes is
+ * free now (never waiting): false if one isn't.  (One taken before
+ * another is found held stays held, to no effect: nothing is changed by
+ * it.)
+ */
+static bool
+try_hold_refs(const char *name)
+{
+	if (!whole && !published &&
+		(!try_lock_branch(name, true) ||
+		 !PROLLY_HAS(env.chunk_store, try_hold_root) ||
+		 !env.chunk_store->try_hold_root(env.chunks)))
+		return false;
+	lock_refs();
+	return true;
+}
+
+/* Is key one of a branch's own entries?  Its name then follows the tag. */
+static bool
+branch_entry(const char *key, int keylen)
+{
+	if (keylen < 2)
+		return false;
+	switch (key[0])
+	{
+		case TAG_BRANCH:
+		case TAG_MOVER:
+		case TAG_BASELINE:
+		case TAG_BASELINE_MOVER:
+		case TAG_NAMES:
+		case TAG_MERGE:
+		case TAG_MERGE_NAMES:
+		case TAG_VIOLATIONS:
+		case TAG_IDENTITY:
+		case TAG_REBASE:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * May the entry key be changed in the scoped changes: one of a branch the
+ * transaction holds, not having held every ref nor begun to commit?
+ */
+static bool
+scoped_key(const char *key, int keylen)
+{
+	return !published && !whole && branch_entry(key, keylen) &&
+		branch_held(key + 1, keylen - 1);
 }
 
 static bool
@@ -593,14 +1103,47 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 	ProllyNodeRef new_root;
 	ProllyEdit	e;
 
-	lock_refs();
-	if (!refs_root(&root))
-		elog(ERROR, "prolly refs have no root");
+	refs_init();
 	e.key.data = (const uint8 *) key;
 	e.key.len = keylen;
 	e.is_delete = (value == NULL);
 	e.value.data = value ? (const uint8 *) value->data : NULL;
 	e.value.len = value ? value->len : 0;
+	if (scoped_key(key, keylen))
+	{
+		ProllyHash	cur;
+
+		PROLLY_CALL(env.chunk_store, root, env.chunks, &cur);
+		if (scoped)
+			rebase_scoped(&cur);
+		/* (a store with no root yet gets one from a holder of every ref) */
+		if (scoped || cur.len > 0)
+		{
+			scoped_save();
+			if (!scoped)
+			{
+				scoped_base = cur;
+				scoped_mine = cur;
+				scoped = true;
+			}
+			ref_of(&scoped_mine, &root);
+			PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
+			scoped_mine = new_root.hash;
+			return;
+		}
+	}
+	lock_refs();
+
+	/* (a branch's entries are changed only by a holder of its lock) */
+	if (branch_entry(key, keylen) && !branch_held(key + 1, keylen - 1))
+	{
+		char	   *name = pnstrdup(key + 1, keylen - 1);
+
+		lock_branch(name);
+		pfree(name);
+	}
+	if (!refs_root(&root))
+		elog(ERROR, "prolly refs have no root");
 	PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
 	if (!PROLLY_CALL(env.chunk_store, move_root, env.chunks, &root.hash,
 					 &new_root.hash))
@@ -909,6 +1452,8 @@ static void verify_known(const char *name, bool complete,
 						 const ProllyNodeRef *root);
 static bool share_clean_tables(const ProllyNodeRef *target,
 							   ProllyNodeRef *working);
+static bool advance_to_target(const ProllyNodeRef *target,
+							  const ProllyNodeRef *working);
 
 /*
  * A first use's source whose working set was known to be the root its
@@ -948,18 +1493,53 @@ copied_working_set(const KnownSource *ks, ProllyNodeRef *working)
  * uncommitted work the move discards, as it does any other.  The working
  * set is folded only if nothing known says what it is (#482): the
  * branch's, or (source, a first use's) the working set of the branch its
- * copies were made from, as they are still (#491).
+ * copies were made from, as they are still (#491).  Otherwise (a move of
+ * the session's branch, or a first use whose source's working set wasn't
+ * known to be the copies' root) the working set, folded, is the branch's
+ * baseline from then on (a checkpoint), so that after the move the
+ * baseline can be advanced to the target without folding again
+ * (advance_to_target()): a move from a dirty working set folds it once.
+ * Either way, the working set's identity anchor is then the commit's: its
+ * objects are named as the commit names them.
  */
+static void anchor_at_commit(const ProllyCommitInfo *commit);
+static void settle_rows(const ProllyNodeRef *target, const KnownSource *source);
+
 static void
-settle(const ProllyNodeRef *target, const KnownSource *source)
+settle(const ProllyCommitInfo *commit, const KnownSource *source)
+{
+	settle_rows(&commit->root, source);
+	anchor_at_commit(commit);
+}
+
+static void
+settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef working;
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
-	if (!copied_working_set(source, &working))
-		working_fold(&working);
+	if (source != NULL)
+	{
+		if (!copied_working_set(source, &working))
+			working_fold(&working);
+	}
+	else
+	{
+		char	   *name = branch_ops()->current();
+		ProllyNodeRef baseline;
+		bool		have = branch_baseline(name, &baseline);
+
+		if (!known_working_set(name, MyBranch, have ? &baseline : NULL, false,
+							   &working))
+		{
+			ProllyNodeRef next;
+
+			fold_from_baseline(&working, &next, false);
+			branch_set_baseline(name, &next, &working);
+		}
+	}
 	if (same_hash(&working.hash, &target->hash))
 		return;
 
@@ -968,7 +1548,8 @@ settle(const ProllyNodeRef *target, const KnownSource *source)
 		same_hash(&working.hash, &target->hash))
 		return;
 	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
-	fold_as_baseline(NULL);
+	if (!advance_to_target(target, &working))
+		fold_as_baseline(NULL);
 }
 
 /*
@@ -1189,6 +1770,98 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	return true;
 }
 
+/*
+ * After a move of rows from working to target: the session branch's
+ * baseline (which holds working's rows, as the fold before the move left
+ * it) advanced to target without a fold, each table whose rows the move
+ * wrote holding target's, its change finder's record of the move's own
+ * writes consumed (the canonicalizer's advance_baseline()), its fold's
+ * working set recorded as target (#482).  (Not published as known: the
+ * move wrote the branch in this transaction, which moves its generation as
+ * it ends; the next read folds, finding nothing left to read.)  False,
+ * the caller folding, where
+ * a table's can't be so: the definitions or a materialized view's rows
+ * moved too, or a finder can't advance a table's state (then those that
+ * were advanced stay so, and the fold reads only the rest).
+ */
+static bool
+advance_to_target(const ProllyNodeRef *target, const ProllyNodeRef *working)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = branch_ops()->current();
+	ProllyNodeRef baseline;
+	ProllyNodeRef next;
+	List	   *ours = NIL;
+	List	   *theirs = NIL;
+	ListCell   *a;
+	ListCell   *b;
+	bool		all = true;
+	bool		any = false;
+
+	prolly_database_components(&dc);
+	if (!fold_caches_usable() ||
+		!PROLLY_HAS(dc.canonicalizer, advance_baseline) ||
+		!branch_baseline(name, &baseline) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, working, target))
+		return false;
+	PROLLY_CALL(dc.canonicalizer, materialized_views, working, note_table,
+				&ours);
+	PROLLY_CALL(dc.canonicalizer, materialized_views, target, note_table,
+				&theirs);
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	forboth(a, ours, b, theirs)
+	{
+		NamedTree  *o = lfirst(a);
+		NamedTree  *t = lfirst(b);
+
+		if (strcmp(o->name, t->name) != 0 ||
+			!same_hash(&o->data.hash, &t->data.hash))
+			return false;
+	}
+	ours = theirs = NIL;
+	PROLLY_CALL(dc.canonicalizer, tables, working, NULL, note_table, &ours);
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	forboth(a, ours, b, theirs)
+	{
+		if (strcmp(((NamedTree *) lfirst(a))->name,
+				   ((NamedTree *) lfirst(b))->name) != 0)
+			return false;
+	}
+	forboth(a, ours, b, theirs)
+	{
+		NamedTree  *o = lfirst(a);
+		NamedTree  *t = lfirst(b);
+		ProllyRowChanges ch = {InvalidOid, NULL, 0};
+
+		if (same_hash(&o->data.hash, &t->data.hash))
+			continue;
+		ch.relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(o->name, NULL)),
+									NoLock, true);
+		if (OidIsValid(ch.relid) && get_rel_relkind(ch.relid) == RELKIND_RELATION &&
+			PROLLY_CALL(dc.canonicalizer, advance_baseline, &baseline, working,
+						target, &ch, 1, &next))
+		{
+			baseline = next;
+			any = true;
+		}
+		else
+			all = false;
+	}
+	if (!all)
+	{
+		if (any)
+			branch_set_baseline(name, &baseline, NULL);
+		return false;
+	}
+	branch_set_baseline(name, &baseline, target);
+	if (debug_prolly_verify_fold_caches)
+		verify_known(name, false, target);
+	return true;
+}
+
 static void
 move_settled(void *arg)
 {
@@ -1354,7 +2027,7 @@ copies_hold_unseen(void)
 /* A first use's move: to target, from copies of source's (NULL: none). */
 typedef struct MoveCopies
 {
-	const ProllyNodeRef *target;
+	const ProllyCommitInfo *commit;
 	const KnownSource *source;
 } MoveCopies;
 
@@ -1394,14 +2067,14 @@ move_copies(void *arg)
 						 errmsg("could not serialize access: the branch's first use copies rows committed after this transaction's snapshot"),
 						 errhint("The transaction might succeed if retried.")));
 			}
-			settle(mc->target, NULL);
+			settle(mc->commit, NULL);
 		}
 		else
-			settle(mc->target, mc->source);
+			settle(mc->commit, mc->source);
 		return;
 	}
 	PushActiveSnapshot(GetLatestSnapshot());
-	settle(mc->target, mc->source);
+	settle(mc->commit, mc->source);
 	PopActiveSnapshot();
 }
 
@@ -1531,7 +2204,7 @@ materialize(const char *name)
 		 * (moved to the head, unless the copies are there already: those of
 		 * a branch whose working set is, if it still is)
 		 */
-		mc.target = &info.root;
+		mc.commit = &info;
 		mc.source = ns.rank == 3 ? &ns.known : NULL;
 		branch_ops()->run_on(name, move_copies, &mc);
 done:
@@ -1674,7 +2347,8 @@ parents_height(const ProllyHash *parents, int nparents)
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message, ProllyHash *id)
+			 const char *author, const char *message,
+			 const StringInfoData *identity, ProllyHash *id)
 {
 	TimestampTz at = GetCurrentTimestamp();
 	int			nparents_dated = nparents;
@@ -1700,8 +2374,8 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/*
-	 * Keys in order: author, dependencies, height, message, parents, root,
-	 * time.
+	 * Keys in order: author, dependencies, height, identity (if any),
+	 * message, parents, root, time.
 	 */
 	initStringInfo(&v);
 	appendStringInfoString(&v, author);
@@ -1713,6 +2387,8 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	put_uint64(&v, (uint64) parents_height(parents, nparents));
 	add_item(b, "height", &v);
 	resetStringInfo(&v);
+	if (identity && identity->len > 0)
+		add_item(b, "identity", identity);
 	appendStringInfoString(&v, message);
 	add_item(b, "message", &v);
 	resetStringInfo(&v);
@@ -1818,6 +2494,12 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 		}
 	}
 	resetStringInfo(&v);
+	if (read_item(&ref, "identity", &v) && v.len > 0)
+	{
+		info->identity = pnstrdup(v.data, v.len);
+		info->identity_len = v.len;
+	}
+	resetStringInfo(&v);
 	if (read_item(&ref, "time", &v))
 		(void) get_time(&v, &info->committed_at);
 	pfree(v.data);
@@ -1876,6 +2558,7 @@ static bool
 resolve_base(const char *refname, ProllyHash *commit_id)
 {
 	ProllyCommitInfo info;
+	bool		branch_only = false;
 
 	/*
 	 * HEAD, in any case: the session branch's head commit, as in Dolt.  (A
@@ -1890,9 +2573,20 @@ resolve_base(const char *refname, ProllyHash *commit_id)
 	 */
 	else if (strncmp(refname, "refs/heads/", 11) == 0 && refname[11] != '\0' &&
 			 !branch_exists(refname))
+	{
 		refname += 11;
+		branch_only = true;
+	}
 	if (branch_head(refname, commit_id) || OidIsValid(branch_oid(refname)))
 		return commit_id->len > 0;
+	if (branch_only)
+		return false;
+	/* a tag, by its name, or its full ref name (only a tag's) */
+	if (strncmp(refname, "refs/tags/", 10) == 0 && refname[10] != '\0' &&
+		!tag_entry(refname, NULL, NULL))
+		return tag_entry(refname + 10, NULL, commit_id);
+	if (tag_entry(refname, NULL, commit_id))
+		return true;
 	if (tracking_head(refname, commit_id))
 		return true;
 	return parse_commit_id(refname, commit_id) &&
@@ -2071,7 +2765,7 @@ hold_for_commit(const char *name, const ProllyHash *parents, int nparents)
 {
 	ProllyHash	head;
 
-	lock_refs();
+	lock_branch(name);
 	if (nparents > 0 && branch_head(name, &head) && !same_hash(&head, &parents[0]))
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -2198,6 +2892,146 @@ carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *nex
 	pfree(v.data);
 }
 
+/*
+ * The working set's identity anchor (the canonicalizer's identify()): what
+ * tells its tables and columns by its own relations and attributes, which
+ * a rename keeps, as of the branch's head (head NULL: none, a branch
+ * without commits).  An anchor of another head is stale (the branch moved
+ * without one made): then the working set's objects are found by name in
+ * the head, which a move left it as.
+ */
+static void
+anchor_key(StringInfo key, const char *name)
+{
+	appendStringInfoChar(key, TAG_IDENTITY);
+	appendStringInfoString(key, name);
+}
+
+static void
+note_anchor(const char *name, const ProllyHash *head, const StringInfoData *anchor)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	anchor_key(&key, name);
+	if (head)
+		appendStringInfoString(&v, prolly_hash_hex(head));
+	appendStringInfoChar(&v, '\n');
+	appendBinaryStringInfo(&v, anchor->data, anchor->len);
+	refs_put(key.data, key.len, &v);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* Branch name's anchor into *anchor, if it is of head (NULL: none). */
+static bool
+anchor_of(const char *name, const ProllyHash *head, StringInfo anchor)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex = head ? prolly_hash_hex(head) : "";
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	anchor_key(&key, name);
+	found = refs_get(key.data, key.len, &v) &&
+		strncmp(v.data, hex, strlen(hex)) == 0 && v.data[strlen(hex)] == '\n';
+	if (found)
+		appendBinaryStringInfo(anchor, v.data + strlen(hex) + 1,
+							   v.len - strlen(hex) - 1);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * The session branch's working identity, into *identity, and (next not
+ * NULL) its next anchor: from its anchor, if it is of its head, and its
+ * head's identity record (none if the branch has no commits).
+ */
+static void
+identify_working(Oid only, StringInfo identity, StringInfo next)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = branch_ops()->current();
+	ProllyHash	head;
+	bool		have_head = branch_head(name, &head);
+	ProllyCommitInfo info;
+	ProllyValue known = {NULL, 0};
+	StringInfoData anchor;
+	ProllyValue av;
+	bool		anchored;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, identify))
+		return;
+	if (have_head && copies_commit_get(&head, &info) && info.identity)
+	{
+		known.data = (const uint8 *) info.identity;
+		known.len = info.identity_len;
+	}
+	initStringInfo(&anchor);
+	anchored = anchor_of(name, have_head ? &head : NULL, &anchor);
+	av.data = (const uint8 *) anchor.data;
+	av.len = anchor.len;
+	PROLLY_CALL(dc.canonicalizer, identify, anchored ? &av : NULL,
+				known.len > 0 ? &known : NULL, only, identity, next);
+	pfree(anchor.data);
+}
+
+/*
+ * Anchor the session branch's working set as what identity record known
+ * (NULL: every object its own name's) describes, as of its head (or head,
+ * if given: the one the branch is about to have): it was just made so.
+ */
+static void
+anchor_working(const ProllyHash *head, const ProllyValue *known)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = branch_ops()->current();
+	ProllyHash	h;
+	StringInfoData identity;
+	StringInfoData next;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, identify))
+		return;
+	if (head == NULL && branch_head(name, &h))
+		head = &h;
+	initStringInfo(&identity);
+	initStringInfo(&next);
+	PROLLY_CALL(dc.canonicalizer, identify, NULL, known, InvalidOid,
+				&identity, &next);
+	note_anchor(name, head, &next);
+	pfree(identity.data);
+	pfree(next.data);
+}
+
+/* anchor_working() as commit's identity describes it. */
+static void
+anchor_at_commit(const ProllyCommitInfo *commit)
+{
+	ProllyValue known = {(const uint8 *) commit->identity, commit->identity_len};
+
+	anchor_working(&commit->id, commit->identity ? &known : NULL);
+}
+
+static void
+copies_working_identity(Oid only, StringInfo identity)
+{
+	identify_working(only, identity, NULL);
+}
+
+static void
+copies_anchor_identity(const ProllyValue *identity)
+{
+	lock_refs();
+	anchor_working(NULL, identity);
+}
+
 /* Are rel's name now and its name at head the same? */
 static bool
 named_as_at_head(const char *lines, Relation rel)
@@ -2229,6 +3063,8 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	ProllyNodeRef parent;
 	ProllyHash	head;
 	bool		pushed;
+	StringInfoData identity;
+	StringInfoData anchor;
 
 	pushed = hold_for_commit(name, parents, nparents);
 	fold_from_baseline(&root, &next, true);
@@ -2244,11 +3080,15 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 		branch_set_baseline(name, &next, &root);
 		return false;
 	}
+	initStringInfo(&identity);
+	initStringInfo(&anchor);
+	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
-				 message, commit_id);
+				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
+	note_anchor(name, commit_id, &anchor);
 	return true;
 }
 
@@ -2381,6 +3221,7 @@ copies_branch_delete(const char *name, bool force)
 	ProllyHash	ours;
 	ProllyHash	base;
 
+	lock_branch(name);
 	lock_refs();
 
 	/*
@@ -2423,14 +3264,16 @@ copies_branch_delete(const char *name, bool force)
 			refs_put(key.data, key.len, NULL);
 			merge_names_put(name, NULL);
 		}
-		if (violations_of(name) != NIL)
-		{
-			resetStringInfo(&key);
-			violations_key(&key, name);
-			refs_put(key.data, key.len, NULL);
-		}
+		violations_clear(name);
 		resetStringInfo(&key);
 		names_key(&key, name);
+		refs_put(key.data, key.len, NULL);
+		resetStringInfo(&key);
+		appendStringInfoChar(&key, TAG_REBASE);
+		appendStringInfoString(&key, name);
+		refs_put(key.data, key.len, NULL);
+		resetStringInfo(&key);
+		anchor_key(&key, name);
 		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
@@ -2446,9 +3289,11 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES};
+	TAG_NAMES, TAG_IDENTITY, TAG_REBASE};
 	ListCell   *lc;
 
+	lock_branch(name);
+	lock_branch(newname);
 	lock_refs();
 	if (!branch_exists(name))
 		ereport(ERROR,
@@ -2479,6 +3324,13 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->check_drop(name);
 		branch_ops()->check_create(newname);
 	}
+	/*
+	 * (violations, kept one entry each, moved apart from the tags'; the
+	 * tags' move an earlier format's value with the branch, to be refused
+	 * there, not left for a branch made again of this name)
+	 */
+	violations_clear(newname);
+	violations_move(name, newname);
 	for (int i = 0; i < lengthof(tags); i++)
 	{
 		StringInfoData key;
@@ -2546,7 +3398,7 @@ copies_checkpoint(ProllyNodeRef *root)
 	ProllyNodeRef next;
 	bool		pushed;
 
-	lock_refs();
+	lock_branch(name);
 	pushed = see_head(name);
 	fold_from_baseline(root, &next, false);
 	if (pushed)
@@ -2555,10 +3407,11 @@ copies_checkpoint(ProllyNodeRef *root)
 }
 
 /*
- * copies_checkpoint(), the fold made before the refs are taken: they are
- * held (to the transaction's end) only to see that neither the head nor
- * the baseline moved since the fold began, and to set the baseline, and
- * taken only if free.  If either moved, or another holds the refs,
+ * copies_checkpoint(), the fold made before the branch's refs are taken:
+ * they are held (to the transaction's end) only to see that neither the
+ * head nor the baseline moved since the fold began, and to set the
+ * baseline, and taken only if free.  If either moved, or another holds
+ * the branch's refs (or every ref),
  * nothing is set, and the caller rolls back what the fold consumed; held
  * by another as it begins, nothing is folded at all.  The fold is by a
  * snapshot taken after the baseline and head are read: one taken before
@@ -2579,9 +3432,9 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	bool		has;
 	bool		has_head;
 
-	refs_init();
-	if (PROLLY_HAS(env.chunk_store, root_free) &&
-		!env.chunk_store->root_free(env.chunks))
+	if (!try_lock_branch(name, false) ||
+		(PROLLY_HAS(env.chunk_store, root_free) &&
+		 !env.chunk_store->root_free(env.chunks)))
 		return false;
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
@@ -2594,10 +3447,8 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	 * consumed, which whoever holds the refs may be waiting to delete too;
 	 * held by another, it rolls back and folds again later)
 	 */
-	if (PROLLY_HAS(env.chunk_store, try_hold_root) &&
-		!env.chunk_store->try_hold_root(env.chunks))
+	if (!try_hold_refs(name))
 		return false;
-	lock_refs();
 	has = branch_baseline(name, &now);
 	has_head = branch_head(name, &head_now);
 	if (has != had || (had && !same_hash(&baseline.hash, &now.hash)) ||
@@ -2705,7 +3556,7 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 	ProllyMergeState ms;
 	bool		merging;
 
-	lock_refs();
+	lock_branch(branch_ops()->current());
 	if (branch_head(branch_ops()->current(), &parents[0]))
 		nparents++;
 	if (!prolly_allow_commit_conflicts() && copies_violations() != NIL)
@@ -2755,7 +3606,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	ProllyDatabaseComponents dc;
 	char	   *names;
 
-	lock_refs();
+	lock_branch(name);
 	if (!branch_head(name, &head) || !copies_commit_get(&head, &info) ||
 		copies_merge_state(&ms))
 		return -1;
@@ -2787,8 +3638,20 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 		return -1;
 	if (same_hash(&root.hash, &info.root.hash))
 		return 0;
-	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
-				 commit_id);
+	{
+		StringInfoData identity;
+		StringInfoData anchor;
+
+		/* (each table named as at the head: its identities are the head's) */
+		initStringInfo(&identity);
+		if (info.identity)
+			appendBinaryStringInfo(&identity, info.identity, info.identity_len);
+		write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
+					 &identity, commit_id);
+		initStringInfo(&anchor);
+		if (anchor_of(name, &head, &anchor))
+			note_anchor(name, commit_id, &anchor);
+	}
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
 	{
@@ -2818,6 +3681,8 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	ProllyNodeRef next;
 	char	   *name;
 	bool		pushed;
+	StringInfoData identity;
+	StringInfoData anchor;
 
 	if (working_set == NULL)
 	{
@@ -2829,18 +3694,39 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	fold_from_baseline(&root, &next, true);
 	if (pushed)
 		PopActiveSnapshot();
+	initStringInfo(&identity);
+	initStringInfo(&anchor);
+	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
-				 message, commit_id);
+				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
+	note_anchor(name, commit_id, &anchor);
 }
 
 static void
 copies_set_head(const ProllyHash *commit_id)
 {
+	char	   *name = branch_ops()->current();
+	ProllyHash	head;
+	bool		have_head;
+	StringInfoData anchor;
+	bool		anchored;
+
 	lock_refs();
-	branch_set_head(branch_ops()->current(), commit_id);
+	have_head = branch_head(name, &head);
+	initStringInfo(&anchor);
+	anchored = anchor_of(name, have_head ? &head : NULL, &anchor);
+	branch_set_head(name, commit_id);
+
+	/*
+	 * (the working set's relations, and what they are, are as they were:
+	 * its anchor is still theirs, now as of the head moved to)
+	 */
+	if (anchored)
+		note_anchor(name, commit_id, &anchor);
+	pfree(anchor.data);
 }
 
 /*
@@ -3094,8 +3980,8 @@ copies_working_changes(Oid relid, ProllyNodeRef *data,
 
 /*
  * The transaction's own row changes folded into the session branch's
- * baseline, under the refs (so baselines move one transaction at a time).
- * Only if they're free: the fold is an optimization a commit mustn't wait
+ * baseline, under the branch's refs (so its baseline moves one transaction
+ * at a time).  Only if they're free: the fold is an optimization a commit mustn't wait
  * for (nor deadlock or time out on); held by another, the changes are left
  * to the next fold, as without it.
  */
@@ -3110,16 +3996,28 @@ copies_fold_own(const ProllyRowChanges *changes, int nchanges)
 	prolly_database_components(&dc);
 	if (!PROLLY_HAS(dc.canonicalizer, advance_own) || nchanges == 0)
 		return false;
-	refs_init();
-	if (!PROLLY_HAS(env.chunk_store, try_hold_root) ||
-		!env.chunk_store->try_hold_root(env.chunks))
+	if (!try_hold_refs(name))
 		return false;
-	lock_refs();
 	if (!branch_baseline(name, &baseline) ||
 		!dc.canonicalizer->advance_own(&baseline, changes, nchanges, &next))
 		return false;
 	branch_set_baseline(name, &next, NULL);
 	return true;
+}
+
+/* The canonicalizer's pending_full() of the session branch, from its baseline. */
+static void
+copies_pending_full_folds(ProllyPendingFullVisit visit, void *arg)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	bool		have;
+
+	refs_init();
+	prolly_database_components(&dc);
+	have = branch_baseline(branch_ops()->current(), &baseline);
+	PROLLY_CALL(dc.canonicalizer, pending_full, have ? &baseline : NULL,
+				visit, arg);
 }
 
 static void
@@ -3166,7 +4064,7 @@ copies_reset(const char *ref)
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
-	move_settled(&info.root);
+	move_settled(&info);
 	if (pushed)
 		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);
@@ -3426,11 +4324,32 @@ copies_set_merge_state(const ProllyMergeState *state)
 	pfree(key.data);
 }
 
+/*
+ * A branch's constraint violations.  They are kept one entry each, keyed
+ * by the tag, the branch's name, a zero byte and the entry's place (eight
+ * bytes, big-endian), after an entry of that prefix alone, which holds the
+ * next place: so violations are added at the end without the others being
+ * read or written again, and read back in the order they were added.
+ * (A branch's name holds no zero byte, so no key is another branch's.)
+ * Format version 1 kept them all in one value, keyed by the tag and the
+ * branch's name alone; such a value isn't read, but refused, and is
+ * removed when the branch's violations are cleared (a reset).
+ */
+
+#define VIOLATIONS_BATCH		1000
+
 static void
 violations_key(StringInfo key, const char *branch)
 {
 	appendStringInfoChar(key, TAG_VIOLATIONS);
 	appendStringInfoString(key, branch);
+}
+
+static void
+violations_prefix(StringInfo key, const char *branch)
+{
+	violations_key(key, branch);
+	appendStringInfoChar(key, '\0');
 }
 
 static void
@@ -3463,6 +4382,117 @@ corrupt:
 	return NULL;				/* keep compiler quiet */
 }
 
+static void
+put_violation(StringInfo out, const ProllyViolation *pv)
+{
+	put_be32(out, pv->relid);
+	put_text(out, pv->type);
+	put_text(out, pv->row);
+	put_text(out, pv->info);
+}
+
+static void
+get_violation(const char **p, const char *end, ProllyViolation *pv)
+{
+	if (end - *p < 4)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a branch's constraint violations are corrupt")));
+	pv->relid = get_be32(*p);
+	*p += 4;
+	pv->type = get_text(p, end);
+	pv->row = get_text(p, end);
+	pv->info = get_text(p, end);
+}
+
+static void
+put_be64(StringInfo out, uint64 v)
+{
+	put_be32(out, (uint32) (v >> 32));
+	put_be32(out, (uint32) v);
+}
+
+static uint64
+get_be64(const char *p)
+{
+	return ((uint64) get_be32(p) << 32) | get_be32(p + 4);
+}
+
+/*
+ * Visit each constraint violation a merge left on branch, in the order
+ * they were added, those of tables since dropped too.  Each is good only
+ * during its visit.
+ */
+static void
+violations_visit(const char *branch, ProllyViolationVisit visit, void *arg)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "branch violations",
+											  ALLOCSET_SMALL_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	StringInfoData key;
+	ProllyNodeRef root;
+
+	refs_init();
+	initStringInfo(&key);
+	violations_key(&key, branch);
+	if (refs_root(&root))
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(tree, cursor_open, &env, &root, cxt);
+		ProllyKey	from = {(const uint8 *) key.data, key.len};
+		ProllyKey	k;
+		ProllyValue val;
+
+		/*
+		 * (the seek starts at the earlier format's key, which comes right
+		 * before the entries', so one written so is seen, and refused)
+		 */
+		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (PROLLY_CALL(tree, cursor_next, c, &k, &val) &&
+			   k.len >= key.len && memcmp(k.data, key.data, key.len) == 0 &&
+			   (k.len == key.len || k.data[key.len] == '\0'))
+		{
+			const char *p = (const char *) val.data;
+			ProllyViolation pv;
+
+			if (k.len == key.len)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("the constraint violations of branch \"%s\" are kept in an earlier format",
+								branch),
+						 errdetail("This build reads only format version 2 of a branch's violations."),
+						 errhint("Reset the branch with dolt_reset('--hard') to drop them.")));
+			/* (the prefix alone holds the next place) */
+			if (k.len == key.len + 1)
+				continue;
+			get_violation(&p, p + val.len, &pv);
+			MemoryContextSwitchTo(old);
+			visit(&pv, arg);
+			MemoryContextSwitchTo(cxt);
+			pfree(pv.type);
+			pfree(pv.row);
+			pfree(pv.info);
+			CHECK_FOR_INTERRUPTS();
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+}
+
+static void
+collect_violation(const ProllyViolation *pv, void *arg)
+{
+	List	  **list = arg;
+	ProllyViolation *copy = palloc(sizeof(ProllyViolation));
+
+	copy->relid = pv->relid;
+	copy->type = pstrdup(pv->type);
+	copy->row = pstrdup(pv->row);
+	copy->info = pstrdup(pv->info);
+	*list = lappend(*list, copy);
+}
+
 /*
  * The constraint violations a merge left on branch, as the refs hold them:
  * violations_left() leaves out those of tables since dropped.
@@ -3470,38 +4500,225 @@ corrupt:
 static List *
 violations_of(const char *branch)
 {
+	List	   *list = NIL;
+
+	violations_visit(branch, collect_violation, &list);
+	return list;
+}
+
+/* Apply edits (n of them, in key order) to the refs, with the transaction. */
+static void
+refs_apply(ProllyEdit *edits, int n)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+
+	if (n == 0)
+		return;
+	lock_refs();
+	if (!refs_root(&root))
+		elog(ERROR, "prolly refs have no root");
+	PROLLY_CALL(tree, apply, &env, &root, edits, n, &new_root);
+	if (!PROLLY_CALL(env.chunk_store, move_root, env.chunks, &root.hash,
+					 &new_root.hash))
+		elog(ERROR, "prolly refs moved while held");
+}
+
+/*
+ * The entries under branch's prefix (their keys copied, at most max of
+ * them, from the first), into *keys; returns how many.
+ */
+static int
+violation_entries(const char *branch, StringInfoData *keys, int max)
+{
+	StringInfoData prefix;
+	ProllyNodeRef root;
+	int			n = 0;
+
+	if (!refs_root(&root))
+		return 0;
+	initStringInfo(&prefix);
+	violations_prefix(&prefix, branch);
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(tree, cursor_open, &env, &root,
+										  CurrentMemoryContext);
+		ProllyKey	from = {(const uint8 *) prefix.data, prefix.len};
+		ProllyKey	k;
+		ProllyValue val;
+
+		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (n < max && PROLLY_CALL(tree, cursor_next, c, &k, &val) &&
+			   k.len >= prefix.len &&
+			   memcmp(k.data, prefix.data, prefix.len) == 0)
+		{
+			initStringInfo(&keys[n]);
+			appendBinaryStringInfo(&keys[n], (const char *) k.data, k.len);
+			n++;
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+	}
+	pfree(prefix.data);
+	return n;
+}
+
+/* Remove branch's constraint violations (an earlier format's value too). */
+static void
+violations_clear(const char *branch)
+{
 	StringInfoData key;
 	StringInfoData v;
-	List	   *list = NIL;
+	StringInfoData *keys = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+	ProllyEdit *edits = palloc0_array(ProllyEdit, VIOLATIONS_BATCH);
+	int			n;
 
 	refs_init();
 	initStringInfo(&key);
 	initStringInfo(&v);
 	violations_key(&key, branch);
 	if (refs_get(key.data, key.len, &v))
+		refs_put(key.data, key.len, NULL);
+	while ((n = violation_entries(branch, keys, VIOLATIONS_BATCH)) > 0)
 	{
-		const char *p = v.data;
-		const char *end = v.data + v.len;
-
-		while (p < end)
+		for (int i = 0; i < n; i++)
 		{
-			ProllyViolation *pv = palloc0(sizeof(ProllyViolation));
-
-			if (end - p < 4)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("a branch's constraint violations are corrupt")));
-			pv->relid = get_be32(p);
-			p += 4;
-			pv->type = get_text(&p, end);
-			pv->row = get_text(&p, end);
-			pv->info = get_text(&p, end);
-			list = lappend(list, pv);
+			edits[i].key.data = (const uint8 *) keys[i].data;
+			edits[i].key.len = keys[i].len;
+			edits[i].is_delete = true;
 		}
+		refs_apply(edits, n);
+		for (int i = 0; i < n; i++)
+			pfree(keys[i].data);
+		CHECK_FOR_INTERRUPTS();
 	}
+	pfree(keys);
+	pfree(edits);
 	pfree(key.data);
 	pfree(v.data);
-	return list;
+}
+
+/* Add violations (n of them) to branch's, after those it has. */
+static void
+violations_append(const char *branch, ProllyViolation *const *violations,
+				  int n)
+{
+	StringInfoData prefix;
+	StringInfoData next;
+	StringInfoData *keys;
+	StringInfoData *values;
+	ProllyEdit *edits;
+	uint64		place = 0;
+
+	if (n == 0)
+		return;
+	refs_init();
+	lock_refs();
+	initStringInfo(&prefix);
+	initStringInfo(&next);
+	violations_prefix(&prefix, branch);
+	if (refs_get(prefix.data, prefix.len, &next))
+	{
+		if (next.len != 8)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a branch's constraint violations are corrupt")));
+		place = get_be64(next.data);
+	}
+	keys = palloc_array(StringInfoData, n);
+	values = palloc_array(StringInfoData, n);
+	edits = palloc0_array(ProllyEdit, n + 1);
+	resetStringInfo(&next);
+	put_be64(&next, place + n);
+	edits[0].key.data = (const uint8 *) prefix.data;
+	edits[0].key.len = prefix.len;
+	edits[0].value.data = (const uint8 *) next.data;
+	edits[0].value.len = next.len;
+	for (int i = 0; i < n; i++)
+	{
+		initStringInfo(&keys[i]);
+		appendBinaryStringInfo(&keys[i], prefix.data, prefix.len);
+		put_be64(&keys[i], place + i);
+		initStringInfo(&values[i]);
+		put_violation(&values[i], violations[i]);
+		edits[i + 1].key.data = (const uint8 *) keys[i].data;
+		edits[i + 1].key.len = keys[i].len;
+		edits[i + 1].value.data = (const uint8 *) values[i].data;
+		edits[i + 1].value.len = values[i].len;
+	}
+	refs_apply(edits, n + 1);
+	for (int i = 0; i < n; i++)
+	{
+		pfree(keys[i].data);
+		pfree(values[i].data);
+	}
+	pfree(keys);
+	pfree(values);
+	pfree(edits);
+	pfree(prefix.data);
+	pfree(next.data);
+	note_merge_changed(branch);
+}
+
+/* Move branch from's constraint violations to branch to (none there). */
+static void
+violations_move(const char *from, const char *to)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "violations moved",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	StringInfoData *keys = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+	StringInfoData *values = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+	ProllyEdit *edits = palloc0_array(ProllyEdit, VIOLATIONS_BATCH);
+	StringInfoData from_prefix;
+	StringInfoData to_prefix;
+	int			n;
+
+	initStringInfo(&from_prefix);
+	initStringInfo(&to_prefix);
+	violations_prefix(&from_prefix, from);
+	violations_prefix(&to_prefix, to);
+	while ((n = violation_entries(from, keys, VIOLATIONS_BATCH)) > 0)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			initStringInfo(&values[i]);
+			if (!refs_get(keys[i].data, keys[i].len, &values[i]))
+				elog(ERROR, "a branch's constraint violation went missing");
+			edits[i].key.data = (const uint8 *) keys[i].data;
+			edits[i].key.len = keys[i].len;
+			edits[i].is_delete = true;
+			edits[i].value.data = NULL;
+			edits[i].value.len = 0;
+		}
+		refs_apply(edits, n);
+		for (int i = 0; i < n; i++)
+		{
+			StringInfoData k;
+
+			/* (the same places, so the same order, under the new name) */
+			initStringInfo(&k);
+			appendBinaryStringInfo(&k, to_prefix.data, to_prefix.len);
+			appendBinaryStringInfo(&k, keys[i].data + from_prefix.len,
+								   keys[i].len - from_prefix.len);
+			pfree(keys[i].data);
+			keys[i] = k;
+			edits[i].key.data = (const uint8 *) keys[i].data;
+			edits[i].key.len = keys[i].len;
+			edits[i].is_delete = false;
+			edits[i].value.data = (const uint8 *) values[i].data;
+			edits[i].value.len = values[i].len;
+		}
+		refs_apply(edits, n);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(cxt);
+		MemoryContextSwitchTo(cxt);
+		keys = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+		values = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+		edits = palloc0_array(ProllyEdit, VIOLATIONS_BATCH);
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
 }
 
 /*
@@ -3538,41 +4755,42 @@ copies_violations(void)
 }
 
 static void
+copies_visit_violations(ProllyViolationVisit visit, void *arg)
+{
+	violations_visit(branch_ops()->current(), visit, arg);
+}
+
+static void
+copies_add_violations(ProllyViolation *const *violations, int n)
+{
+	violations_append(branch_ops()->current(), violations, n);
+}
+
+/*
+ * Set the session branch's violations: those it had removed, these added,
+ * a batch at a time.
+ */
+static void
 copies_set_violations(List *violations)
 {
-	StringInfoData key;
-	StringInfoData v;
-	ListCell   *lc;
+	const char *branch = branch_ops()->current();
+	ProllyViolation **batch = palloc_array(ProllyViolation *, VIOLATIONS_BATCH);
+	int			n = 0;
 
 	refs_init();
-	initStringInfo(&key);
-	violations_key(&key, branch_ops()->current());
-	if (violations == NIL)
+	violations_clear(branch);
+	foreach_ptr(ProllyViolation, pv, violations)
 	{
-		StringInfoData had;
-
-		initStringInfo(&had);
-		if (refs_get(key.data, key.len, &had))
-			refs_put(key.data, key.len, NULL);
-		pfree(had.data);
-	}
-	else
-	{
-		initStringInfo(&v);
-		foreach(lc, violations)
+		batch[n++] = pv;
+		if (n == VIOLATIONS_BATCH)
 		{
-			ProllyViolation *pv = lfirst(lc);
-
-			put_be32(&v, pv->relid);
-			put_text(&v, pv->type);
-			put_text(&v, pv->row);
-			put_text(&v, pv->info);
+			violations_append(branch, batch, n);
+			n = 0;
 		}
-		refs_put(key.data, key.len, &v);
-		pfree(v.data);
 	}
-	note_merge_changed(branch_ops()->current());
-	pfree(key.data);
+	violations_append(branch, batch, n);
+	pfree(batch);
+	note_merge_changed(branch);
 }
 
 /* ------------------------------------------------------------------------
@@ -3617,14 +4835,15 @@ root_ref_cmp(const void *a, const void *b)
 
 /*
  * The refs a root of the store named, whenever it was the store's root:
- * branches' heads and remote-tracking branches' commits, in the order of
- * their full names (as Dolt's: a tracking branch's key, remote then
- * branch, sorts otherwise where one remote's name begins another's).
+ * branches' heads, remote-tracking branches' commits and tags' commits, in
+ * the order of their full names (as Dolt's: a tracking branch's key, remote
+ * then branch, sorts otherwise where one remote's name begins another's).
+ * A tag's commit is the one its entry keeps.
  */
 static bool
 copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 {
-	static const char tags[] = {TAG_BRANCH, TAG_TRACKING};
+	static const char tags[] = {TAG_BRANCH, TAG_TRACKING, TAG_TAG};
 	ProllyNodeRef r;
 	ProllyTreeCursor *c;
 	ProllyKey	k;
@@ -3652,9 +4871,10 @@ copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 			StringInfoData ref;
 
 			initStringInfo(&ref);
-			if (tags[t] == TAG_BRANCH)
+			if (tags[t] == TAG_BRANCH || tags[t] == TAG_TAG)
 			{
-				appendStringInfoString(&ref, "refs/heads/");
+				appendStringInfoString(&ref, tags[t] == TAG_BRANCH ?
+									   "refs/heads/" : "refs/tags/");
 				appendBinaryStringInfo(&ref, name, namelen);
 			}
 			else
@@ -3673,8 +4893,15 @@ copies_root_refs(const ProllyHash *root, ProllyRootRefVisit visit, void *arg)
 				refs = repalloc(refs, sizeof(RootRef) * maxrefs);
 			}
 			refs[nrefs].name = ref.data;
-			(void) get_hash((const char *) v.data, (const char *) v.data + v.len,
-							&refs[nrefs].commit);
+			{
+				const char *p = (const char *) v.data;
+				const char *end = p + v.len;
+
+				p = get_hash(p, end, &refs[nrefs].commit);
+				/* (a tag's object, then its commit) */
+				if (tags[t] == TAG_TAG)
+					(void) get_hash(p, end, &refs[nrefs].commit);
+			}
 			nrefs++;
 		}
 	}
@@ -4002,8 +5229,9 @@ typedef struct WalkState
 /*
  * Walk the commit id and its ancestors, each once: a work list, not
  * recursion (a history may be as long as it likes), and a hash set of the
- * commits seen.  A commit missing from the store is an error; a chunk that
- * isn't a commit is passed over, nothing of it visited.
+ * commits seen.  A commit missing from the store is an error; a tag object
+ * is walked, then its commit; another chunk that isn't a commit is passed
+ * over, nothing of it visited.
  */
 static void
 walk_commit(WalkState *ws, const ProllyHash *id)
@@ -4051,7 +5279,21 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 					 errmsg("commit %s is missing from the chunk store",
 							prolly_hash_hex(next))));
 		if (!copies_commit_get(next, &info))
+		{
+			ProllyTagInfo tag;
+
+			/* (a tag the visitor declines: it has seen its commit) */
+			ref_of(next, &ref);
+			if (copies_tag_get(next, &tag) &&
+				PROLLY_CALL(tree, walk, &env, &ref, ws->visit, ws->arg))
+			{
+				ProllyHash *c = palloc(sizeof(ProllyHash));
+
+				*c = tag.commit;
+				todo = lappend(todo, c);
+			}
 			continue;
+		}
 
 		/* (a commit the visitor declines: it has seen its root and parents) */
 		ref_of(next, &ref);
@@ -4074,7 +5316,8 @@ walk_commit(WalkState *ws, const ProllyHash *id)
 
 /*
  * The refs tree, every commit reachable from a head, a remote-tracking
- * branch or a merge in progress, with its root, and every baseline.
+ * branch, a merge in progress, a stash or a tag (with the tag's object),
+ * with its root, and every baseline.
  */
 static void
 copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
@@ -4098,6 +5341,20 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 		const char *end = p + v.len;
 		ProllyHash *h;
 
+		/* (a rebase: the head it began at, its onto, its steps' commits) */
+		if (k.len >= 1 && k.data[0] == TAG_REBASE)
+		{
+			ProllyRebaseState rs;
+
+			if (rebase_decode(p, end, &rs))
+			{
+				heads = lappend(heads, copy_hash_of(&rs.head));
+				heads = lappend(heads, copy_hash_of(&rs.onto));
+				for (int i = 0; i < rs.nsteps; i++)
+					heads = lappend(heads, copy_hash_of(&rs.steps[i].commit));
+			}
+			continue;
+		}
 		/* (a stash list: each one's commit, kept as a head is) */
 		if (k.len >= 1 && k.data[0] == TAG_STASH)
 		{
@@ -4116,8 +5373,10 @@ copies_walk(const ProllyNodeRef *refs, ProllyTreeVisitNode visit, void *arg)
 			continue;
 		}
 		if (k.len < 1 || (k.data[0] != TAG_BRANCH && k.data[0] != TAG_MERGE &&
-						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING))
+						  k.data[0] != TAG_BASELINE && k.data[0] != TAG_TRACKING &&
+						  k.data[0] != TAG_TAG))
 			continue;
+		/* (a tag: its object, walked as a head is, then its commit) */
 		h = palloc(sizeof(ProllyHash));
 		p = get_hash(p, end, h);
 		if (k.data[0] == TAG_BASELINE)
@@ -4223,12 +5482,7 @@ end_merge(const char *name)
 		refs_put(key.data, key.len, NULL);
 		merge_names_put(name, NULL);
 	}
-	if (violations_of(name) != NIL)
-	{
-		resetStringInfo(&key);
-		violations_key(&key, name);
-		refs_put(key.data, key.len, NULL);
-	}
+	violations_clear(name);
 	pfree(key.data);
 }
 
@@ -4241,6 +5495,7 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	bool		pushed = false;
 	Oid			oid;
 
+	lock_branch(name);
 	lock_refs();
 	AcceptInvalidationMessages();
 	(void) branch_head(name, &at);
@@ -4294,9 +5549,9 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 			if (head == NULL)
 				;
 			else if (strcmp(name, branch_ops()->current()) == 0)
-				move_settled(&info.root);
+				move_settled(&info);
 			else
-				branch_ops()->run_on(name, move_settled, &info.root);
+				branch_ops()->run_on(name, move_settled, &info);
 		}
 		PG_FINALLY();
 		{
@@ -4326,6 +5581,294 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 		PROLLY_CALL(dc.writers, settled, oid);
 	}
 	return true;
+}
+
+/* ------------------------------------------------------------------------
+ * Tags: TAG_TAG and a tag's name -> its tag object, then its commit.
+ * ------------------------------------------------------------------------
+ */
+
+static void
+tag_key(const char *name, StringInfo key)
+{
+	appendStringInfoChar(key, TAG_TAG);
+	appendStringInfoString(key, name);
+}
+
+/*
+ * The tag called name: its object and its commit (each if not NULL); false
+ * if there is none.
+ */
+static bool
+tag_entry(const char *name, ProllyHash *tag, ProllyHash *commit)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tag_key(name, &key);
+	found = refs_get(key.data, key.len, &v);
+	if (found)
+	{
+		const char *p = v.data;
+		const char *end = v.data + v.len;
+		ProllyHash	t;
+		ProllyHash	c;
+
+		p = get_hash(p, end, &t);
+		(void) get_hash(p, end, &c);
+		if (tag)
+			*tag = t;
+		if (commit)
+			*commit = c;
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * Write a tag object of commit; its id is its tree's root hash.  It is
+ * dated now, as a commit is.
+ */
+static void
+copies_tag_write(const ProllyHash *commit, const char *tagger,
+				 const char *message, ProllyHash *tag)
+{
+	ProllyCommitInfo info;
+	ProllyTreeBuilder *b;
+	StringInfoData v;
+	ProllyNodeRef ref;
+
+	refs_init();
+	if (!copies_commit_get(commit, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("commit %s does not exist", prolly_hash_hex(commit))));
+	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
+
+	/* Keys in order: commit, message, tagger, time. */
+	initStringInfo(&v);
+	put_hash(&v, commit);
+	add_item(b, "commit", &v);
+	resetStringInfo(&v);
+	appendStringInfoString(&v, message);
+	add_item(b, "message", &v);
+	resetStringInfo(&v);
+	appendStringInfoString(&v, tagger);
+	add_item(b, "tagger", &v);
+	resetStringInfo(&v);
+	put_uint64(&v, (uint64) GetCurrentTimestamp());
+	add_item(b, "time", &v);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	*tag = ref.hash;
+	pfree(v.data);
+}
+
+/* A tag object, read; false if tag isn't one (a commit, say). */
+static bool
+copies_tag_get(const ProllyHash *tag, ProllyTagInfo *info)
+{
+	ProllyNodeRef ref;
+	StringInfoData v;
+
+	refs_init();
+	if (tag->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, tag))
+		return false;
+	ref_of(tag, &ref);
+	initStringInfo(&v);
+	if (!read_item(&ref, "commit", &v))
+	{
+		pfree(v.data);
+		return false;
+	}
+	memset(info, 0, sizeof(*info));
+	info->id = *tag;
+	(void) get_hash(v.data, v.data + v.len, &info->commit);
+	resetStringInfo(&v);
+	(void) read_item(&ref, "tagger", &v);
+	info->tagger = pstrdup(v.data);
+	resetStringInfo(&v);
+	(void) read_item(&ref, "message", &v);
+	info->message = pstrdup(v.data);
+	resetStringInfo(&v);
+	if (read_item(&ref, "time", &v))
+		(void) get_time(&v, &info->tagged_at);
+	pfree(v.data);
+	return true;
+}
+
+static bool
+copies_tag_lookup(const char *name, ProllyHash *tag)
+{
+	refs_init();
+	return tag_entry(name, tag, NULL);
+}
+
+/*
+ * Call name tag (NULL: delete it), if the tag called name is expected's
+ * (NULL: whatever it is; an empty hash: there is none).  The refs are held
+ * first, so no other session's change comes between the check and the
+ * change.
+ */
+static bool
+copies_tag_set(const char *name, const ProllyHash *expected,
+			   const ProllyHash *tag)
+{
+	ProllyHash	cur;
+	bool		exists;
+	ProllyTagInfo info;
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	lock_refs();
+	exists = tag_entry(name, &cur, NULL);
+	if (expected != NULL &&
+		(expected->len == 0 ? exists : !(exists && same_hash(&cur, expected))))
+		return false;
+	if (tag == NULL && !exists)
+		return false;
+	if (tag != NULL)
+	{
+		ProllyHash	id;
+		ProllyCommitInfo ci;
+
+		/*
+		 * A new tag's name follows a branch's rules, and isn't a commit's
+		 * id, which it would hide where refs are read.
+		 */
+		if (!exists &&
+			(!branch_ops()->name_ok(name) ||
+			 (parse_commit_id(name, &id) && copies_commit_get(&id, &ci))))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_NAME),
+					 errmsg("invalid tag name \"%s\"", name),
+					 errdetail("A tag's name follows a branch's rules, and isn't a commit's id.")));
+		if (!copies_tag_get(tag, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("tag object %s does not exist", prolly_hash_hex(tag))));
+	}
+	initStringInfo(&key);
+	initStringInfo(&v);
+	tag_key(name, &key);
+	if (tag)
+	{
+		put_hash(&v, tag);
+		put_hash(&v, &info.commit);
+	}
+	refs_put(key.data, key.len, tag ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+	return true;
+}
+
+typedef struct TagVisit
+{
+	ProllyTagVisit visit;
+	void	   *arg;
+} TagVisit;
+
+static void
+visit_tag_entry(const ProllyKey *k, const ProllyValue *v, void *arg)
+{
+	TagVisit   *tv = arg;
+	char	   *name = pnstrdup((const char *) k->data + 1, k->len - 1);
+	const char *p = (const char *) v->data;
+	const char *end = p + v->len;
+	ProllyHash	tag;
+	ProllyHash	commit;
+
+	p = get_hash(p, end, &tag);
+	(void) get_hash(p, end, &commit);
+	tv->visit(name, &tag, &commit, tv->arg);
+	pfree(name);
+}
+
+static void
+copies_tags(ProllyTagVisit visit, void *arg)
+{
+	TagVisit	tv = {visit, arg};
+	char		tag = TAG_TAG;
+
+	refs_init();
+	visit_prefix(&tag, 1, visit_tag_entry, &tv);
+}
+
+/* ------------------------------------------------------------------------
+ * Rebases: TAG_REBASE and the branch rebasing on -> its rebase state.
+ * ------------------------------------------------------------------------
+ */
+
+static void
+rebase_key(StringInfo key, const char *branch)
+{
+	appendStringInfoChar(key, TAG_REBASE);
+	appendStringInfoString(key, branch);
+}
+
+static void
+put_short_text(StringInfo out, const char *s)
+{
+	prolly_put_varint(out, strlen(s));
+	appendStringInfoString(out, s);
+}
+
+static bool
+copies_rebase_state(ProllyRebaseState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	rebase_key(&key, branch_ops()->current());
+	found = refs_get(key.data, key.len, &v);
+	if (found && !rebase_decode(v.data, v.data + v.len, state))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupt prolly rebase state")));
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+static void
+copies_set_rebase_state(const ProllyRebaseState *state)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	refs_init();
+	initStringInfo(&key);
+	initStringInfo(&v);
+	rebase_key(&key, branch_ops()->current());
+	if (state)
+	{
+		put_short_text(&v, state->branch);
+		put_hash(&v, &state->head);
+		put_hash(&v, &state->onto);
+		appendStringInfoChar(&v, state->keep_empty ? 1 : 0);
+		put_short_text(&v, state->last_step ? state->last_step : "");
+		prolly_put_varint(&v, state->nsteps);
+		for (int i = 0; i < state->nsteps; i++)
+		{
+			const ProllyRebaseStep *s = &state->steps[i];
+
+			put_short_text(&v, s->order);
+			put_short_text(&v, s->action);
+			put_hash(&v, &s->commit);
+			put_short_text(&v, s->message);
+		}
+	}
+	refs_put(key.data, key.len, state ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
 }
 
 /* ------------------------------------------------------------------------
@@ -4426,8 +5969,14 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 				 errmsg("the current branch has no commit to stash changes against")));
 	lock_refs();
 	entries = stash_get(name);
-	write_commit(&root->hash, &head, 1, prolly_commit_author(),
-				 psprintf("WIP on %s", branch), stash);
+	{
+		StringInfoData identity;
+
+		initStringInfo(&identity);
+		identify_working(InvalidOid, &identity, NULL);
+		write_commit(&root->hash, &head, 1, prolly_commit_author(),
+					 psprintf("WIP on %s", branch), &identity, stash);
+	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
 	stash_set(name, lcons(e, entries));
@@ -4503,7 +6052,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.info = {
 		.iface = PROLLY_IFACE_REFS,
 		.impl_id = 2,
-		.format_version = 1,
+		.format_version = 3,
 		.name = "copies",
 		.description = "head commits of branches made by copying, and the "
 		"commits, in the chunk store",
@@ -4518,6 +6067,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.merge_base = copies_merge_base,
 	.commit_working_set = copies_commit_working_set,
 	.commit_with = copies_commit_with,
+	.working_identity = copies_working_identity,
+	.anchor_identity = copies_anchor_identity,
 	.branches = copies_branches,
 	.working_set = copies_working_set,
 	.read_working_set = copies_read_working_set,
@@ -4525,6 +6076,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_changes = copies_working_changes,
 	.publish_definitions = copies_publish_definitions,
 	.fold_own = copies_fold_own,
+	.pending_full_folds = copies_pending_full_folds,
 	.checkpoint_unless_moved = copies_checkpoint_unless_moved,
 	.moved_databases = branch_generations_moved_databases,
 	.moved_branches = branch_generations_moved,
@@ -4540,6 +6092,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_head = copies_set_head,
 	.violations = copies_violations,
 	.set_violations = copies_set_violations,
+	.visit_violations = copies_visit_violations,
+	.add_violations = copies_add_violations,
 	.walk_commit = copies_walk_commit,
 	.remote_set = copies_remote_set,
 	.remotes = copies_remotes,
@@ -4564,4 +6118,14 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.note_write = branch_generations_note_write,
 	.forget_folds = branch_generations_forget,
 	.prepared_ended = branch_generations_prepared_ended,
+	.note_relation = branch_generations_note_relation,
+	.fold_mark = branch_fold_mark,
+	.written_since = branch_written_since,
+	.tag_write = copies_tag_write,
+	.tag_get = copies_tag_get,
+	.tag_lookup = copies_tag_lookup,
+	.tag_set = copies_tag_set,
+	.tags = copies_tags,
+	.rebase_state = copies_rebase_state,
+	.set_rebase_state = copies_set_rebase_state,
 };

@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-dirty",
+  "description": "Reviewed Dolt port: dolt_rebase errors: working set not clean",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase errors: working set not clean"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', 'main')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', 'main')",
+      "expect": {
+        "sqlstate": "55000"
+      }
+    }
+  ]
+}

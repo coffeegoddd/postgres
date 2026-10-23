@@ -59,7 +59,7 @@ import time
 from typing import Optional
 
 from pbench.collectors._snapshot import wait_for_clients
-from pbench.core import registry
+from pbench.core import registry, suites
 from pbench.core.interfaces import Collector, Context, Outcome, Unavailable
 from pbench.core.stats import counter_delta, per
 from pbench.core.validation import atomic_json
@@ -98,7 +98,7 @@ def materialize_mode(ctx: Context) -> str:
     """What the flush does for prolly: "prolly_checkpoint" or "none"."""
     mode = ctx.params.get("write_amp_materialize", "auto")
     if mode == "auto":
-        mode = "prolly_checkpoint" if ctx.key.suite == "S" else "none"
+        mode = "prolly_checkpoint" if suites.layout(ctx.key.suite) == suites.STORAGE else "none"
     return mode if _is_prolly(ctx) else "none"
 
 

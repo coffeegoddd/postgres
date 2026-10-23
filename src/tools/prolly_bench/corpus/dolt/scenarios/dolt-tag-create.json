@@ -1,0 +1,192 @@
+{
+  "version": 1,
+  "id": "dolt-tag-create",
+  "description": "Reviewed Dolt port: dolt-tag: SQL create tags",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTagTestScripts: dolt-tag: SQL create tags"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.tags"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "author",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SET dolt.author = 'root <root@localhost>'",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0), (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created table test",
+        "-a"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v1', 'HEAD')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v1', 'HEAD')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v1')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT tag_name, CASE WHEN char_length(tag_hash) < 0 THEN NULL ELSE 'not null' END, tagger, email, CASE WHEN date IS NULL THEN NULL ELSE 'not null' END, message FROM dolt_tags",
+      "expect": {
+        "rows": [
+          [
+            "v1",
+            "not null",
+            "root",
+            "root@localhost",
+            "not null",
+            ""
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v2', '-m', 'create tag v2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v2', '-m', 'replace tag v2')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT tag_name, message FROM dolt_tags",
+      "expect": {
+        "rows": [
+          [
+            "v1",
+            ""
+          ],
+          [
+            "v2",
+            "create tag v2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

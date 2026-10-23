@@ -6,8 +6,10 @@ per-operation memory sampling and empirical scaling sweeps, see
 
 Benchmark harness for prolly storage: the S suite (storage, any table AM,
 compared with the fork's heap), the V suite (version control, prolly engines
-only) and the C suite (SQL correctness: sqllogictest, any table AM, compared
-with the fork's heap).
+only), the C suite (SQL correctness: sqllogictest, any table AM, compared
+with the fork's heap), and the G and GV suites (PostGIS: spatial storage
+against heap, and spatial version control; see [Suites](#suites) and
+[PostGIS builds](#postgis-builds)).
 
 Python 3.11+ standard library only.  It drives `psql`, `pgbench`, BenchBase
 (S9 and S13), sysbench (S10), `fio`, `perf`, and for the C suite a Go program,
@@ -264,7 +266,7 @@ told apart: map work, rows written back, and catalog work.
 | `bmap_refcount_updates` | page-store blocks' reference counts set: shares, drops, copies on write, truncations, sweeps |
 | `bmap_blocks_freed` | page-store blocks given back to the allocator |
 | `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
-| `apply_index_tuples` | index entries those writes made: one per index for each row inserted or updated other than heap-only, and a load's index builds' |
+| `apply_index_tuples` | index entries those writes made: for each row inserted or updated, one in each index whose predicate the row meets (summarizing indexes alone for a heap-only update), and a load's index builds' |
 | `catalog_rows_copied` | catalog rows a branch's copies were made of (first use) |
 
 S7's counters vary a little: GiST breaks ties between pages at random.
@@ -298,6 +300,81 @@ that names no counter of the run.  Each cell's series is in its raw directory,
 src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V7 --config src/tools/prolly_bench/configs/v_counters.toml --out G
 src/tools/prolly_bench/prolly_bench vgrowth G/*-V-prolly --accept src/tools/prolly_bench/configs/v_growth_accept.toml
 ```
+
+### Growth shapes (V9)
+
+`configs/v_shape.toml` runs V9: each version-control operation's work, in
+`pg_stat_prolly`'s counters, as the table grows (the `rows` sweep: 4k to
+256k rows, 10 rows changed) and as the change grows (the `delta` sweep:
+700 to 44,800 changed rows of 64k, up to 70% dirty). Each point is a fresh
+database with one narrow table filled to a tenth of each page (so N rows
+are about N/10 blocks, and block-map work shows its shape at sizes CI can
+afford) and an index on the updated column (so rows written back make
+index entries). `maintenance_work_mem` is 1MB, so the largest change
+passes a fold's budget for change candidates and the fold falls back to
+reading every row, as larger tables do at the default. Nothing runs in the
+background: autovacuum and the fold worker are off, since their work
+counts in the same database's `pg_stat_prolly` and changes what an
+operation finds (a working set folded already, which also lets a hard
+reset share another branch's storage), by amounts that depend on the
+machine's speed. Each operation is
+counted alone: the counters are read after the statement before it and
+after it. Counts, not timings: a shape fitted to them is the code's, the
+same on any machine.
+
+`vshape` takes each counter's fastest growth between adjacent sizes, the
+slope of log(count) on log(size), counts below a small floor taken as the
+floor, and names its shape: `zero`, `flat` (≤ 0.1), `log` (≤ 0.35: a tree
+descent, whose depth grows as log N), `linear` (≤ 1.15) or `super`. The
+fastest growth between adjacent sizes, not one fit over all of them: a
+hard reset writes the dirty rows back while few changed and shares another
+branch's storage once many did, and a fit across the switch would average
+the two away. Each check must not grow faster than its target
+(`vshape.TARGETS`):
+
+| Check | Operation | Sweeps | Target |
+|---|---|---|---|
+| `create_branch` | `dolt_branch` from a dirty branch | rows, delta | every work counter flat |
+| `checkout_used` | `dolt_checkout` of a used branch, from a dirty one | rows, delta | every work counter flat |
+| `first_use` | `dolt_checkout` of a new branch | rows | every work counter flat: map work flat, catalog work in the versioned objects only |
+| `soft_reset` | `dolt_reset('--soft', 'HEAD~1')`, dirty | rows, delta | every work counter flat |
+| `hard_reset` | `dolt_reset('--hard')` to the head, dirty | rows, delta | no rows applied or index entries made; map work flat |
+| `branch_delete` | `dolt_branch('-D')` | rows, delta | map work flat in the foreground |
+| `point_read` | `dolt_at('HEAD~1')` with `WHERE id = 1` | rows | `nodes_read` log |
+| `commit` | `dolt_commit` of Δ rows | rows; delta | tree work log in N; at most linear in Δ |
+| `diff` | `dolt_diff` of that commit | rows; delta | `nodes_read` log in N; at most linear in Δ |
+| `merge` | `dolt_merge` of Δ rows, main changed elsewhere | rows; delta | tree work log and rows applied flat in N; both at most linear in Δ |
+
+The work counters are tree work (`nodes_read`, `nodes_written`,
+`chunks_appended`, `fold_rows_read`, `log_pages_read`), map work
+(`bmap_map_pages_copied`, `bmap_refcount_updates`, `bmap_blocks_freed`,
+`page_copies_shared`), rows applied (`apply_rows`, `apply_index_tuples`)
+and `catalog_rows_copied`. Byte and cache counters follow these or the
+caches' state, and aren't gated.
+
+A target not met today is a known exception in
+`configs/v_shape_known.toml`: the check, sweep and counter, the shape it
+has today (`current`), and the issue that owns the work to meet the target.
+It stays checked. `vshape` fails when it grows faster than its recorded
+shape (a regression), when it grows slower but still misses the target
+(record the better shape), and when it meets the target: the change that
+meets it removes the entry, and the check is enforced from then on. An
+entry that names nothing the run checked fails too. CI runs the gate on
+every pull request (`prolly.yml`'s release build). Each cell's series are
+in its raw directory (`v9-series.json`), with each point's script and
+output; `--markdown` writes every finding as a table.
+
+```sh
+src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V9 --config src/tools/prolly_bench/configs/v_shape.toml --out G
+src/tools/prolly_bench/prolly_bench vshape G/*-V-prolly --known src/tools/prolly_bench/configs/v_shape_known.toml --markdown shapes.md
+```
+
+What the checks don't cover yet: conflicts and memory in merges; the rows
+a historical point read decodes (no counter counts them; #697); a
+release's background drain (#768); snapshot roots and kept snapshots
+(#717, #767); reuse of earlier materializations (#725). Large
+confirmation runs, that the counters predict wall time, WAL and storage
+at terabyte scale, need the dedicated host (#247).
 
 ### Storage by component (V8)
 
@@ -423,6 +500,93 @@ src/tools/prolly_bench/prolly_bench table pr/*-S-*
 read-write test at 8 clients, 5 repetitions, 5 s warm-up and 20 s measured.
 Its numbers only compare builds (`comparison_only`), so it may run with
 `synchronous_commit = off`; they are never reported as the procedure's.
+
+## Suites
+
+A suite is a registration in `pbench/suites/` (`pbench/core/suites.py`),
+one file per suite or family:
+
+| Suite | Layout | Engines | Durable | Extensions | Default config |
+|---|---|---|---|---|---|
+| S | storage: ratios to the same build's heap (B0) | any | yes | | `standard.toml` |
+| V | version control: against bounds | with history (prolly) | yes | | `standard.toml` |
+| C | correctness: answers against heap | any | no | | `c_standard.toml` |
+| G | storage | any | yes | postgis, postgis_raster, postgis_topology | `standard.toml` |
+| GV | version control | with history | yes | the same | `standard.toml` |
+
+The registration is what the rest of the harness reads: `run`'s and
+`table`'s suite choices, `list`, the default configuration, which `[sizes]`
+keys and per-workload parameters a configuration may use (and which
+workloads take `transactions` and `rate`), whether `fsync` and
+`synchronous_commit` are required, which engines a suite accepts, the
+report layout, the extensions its builds must carry and its databases
+install, and the data manifests whose hashes each run records.  Workload
+IDs are the suite's letters and a number (`G3`, `GV2`).  A new suite is a
+new file; its workloads, size keys and parameters register with it.  (The
+S, V and C workloads' parameter keys are still listed in `config.py`.)
+
+G and GV have no workloads yet: the suites, their builds and their targets
+come first.  A database of either installs PostGIS where its tables are:
+in the versioned schema on prolly, where the extension is shared by every
+branch but not versioned, and in `public` on heap.  `postgis_topology`
+keeps its own `topology` schema.  Workload SQL names PostGIS objects
+unqualified, so the same scripts run on both.
+
+## PostGIS builds
+
+`configs/postgis.toml` pins the PostGIS commit (PostGIS master, the only
+branch that builds against this tree's PostgreSQL development version) and
+the GEOS, PROJ and GDAL versions it is built with.  Those libraries are the
+system's, so the pin is checked, not fetched: a build that finds another
+version is refused unless given `--postgis-allow-library-mismatch`, and
+the versions are recorded either way (`benchmark` quality then refuses the
+run).
+
+```sh
+# a benchmark build: the server, then PostGIS against it, one manifest
+src/tools/prolly_bench/build_postgres.sh --build-dir build-gis --jobs 8 --with-postgis \
+    -- --with-openssl CFLAGS=-O2
+src/tools/prolly_bench/prolly_bench run G --am heap,prolly --pg-bin build-gis/inst/bin
+
+# PostGIS against an existing install (a development build, for
+# src/test/prolly's check-postgis)
+python3 src/tools/prolly_bench/build_postgis.py --pg-config inst/bin/pg_config \
+    --build-dir build-bench/postgis
+```
+
+A build clones the pinned commit (`--postgis-source DIR` takes it from a
+local clone instead of the pin's repository) and checks it is at the pin
+and clean; runs `autogen.sh` and `configure` against the server's
+`pg_config`, with raster and topology, and SFCGAL when `sfcgal-config` is
+found; installs into the server's installation (its man pages under the
+server's prefix, not `/usr/local`); then, in a throwaway cluster, creates
+the extensions a G or GV database does and reads `postgis_full_version()`
+(what each cell's reading is compared with), then `postgis_sfcgal` when
+built, reading it again.  The pin and the library versions are checked
+before anything is built, the server included.  The manifest
+(`pbench-build.json`'s `extensions.postgis`, or `BUILD/pbench-postgis.json`
+from `build_postgis.py`) records:
+
+- the repository, commit and configure command;
+- the pinned and found library versions, and any mismatch;
+- each geospatial shared object any PostGIS module links (GEOS, PROJ,
+  GDAL, SFCGAL, json-c, protobuf-c, libxml2), with its path and hash;
+- each installed module's hash (`postgis-3.so`, `postgis_raster-3.so`,
+  `postgis_topology-3.so`, `postgis_sfcgal-3.so`);
+- the extensions' versions, `postgis_full_version()`, and with SFCGAL
+  `full_version_with_sfcgal`.
+
+The build's `libraries` list then includes PostGIS's modules (a build
+without PostGIS lists only `pg_walinspect.so`, so S-only builds don't need
+PostGIS).  `environment.json` carries the manifest under `extensions`.
+Before every cell, the harness rehashes the build's binaries and every
+listed library; a G or GV cell also records its extensions' versions and
+`postgis_full_version()` in `raw/extensions.json`, and fails if a library
+version differs from the build's record (PROJ's per-user settings aside).
+
+The C suite's runner, `slt-runner`, takes `-search-path-extra` (schemas
+after the test schema) and `-setup-sql FILE` (run in each new database
+before its tests, on that path), for spatial sqllogictest files later.
 
 ## The pull-request gate
 
@@ -636,7 +800,8 @@ file; the driver doesn't change.
 
 | Interface | Implementations | Directory |
 |---|---|---|
-| `Workload` | S1-S10 and S13, V1-V4 and V6-V8, C1-C4 | `pbench/workloads/` |
+| `Suite` | S, V, C, G, GV ([Suites](#suites)) | `pbench/suites/` |
+| `Workload` | S1-S10 and S13, V1-V4 and V6-V9, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |
@@ -796,7 +961,9 @@ Capabilities are `sql` and the version-control groups in
 reset, log, status, hashof, connecting to a branch), `vc.merge`,
 `vc.conflicts`, `vc.violations`, `vc.cherrypick`, `vc.revert`,
 `vc.diff`, `vc.mergebase`, `vc.gc`, `vc.reflog`, `vc.remotes` (adding,
-listing and removing remotes) and `vc.stash`. A scenario requires exactly what
+listing and removing remotes), `vc.stash`, `vc.tags` (making, listing
+and deleting tags, and reading them as revisions) and `vc.rebase` (dolt_rebase
+and its plan). A scenario requires exactly what
 its steps need, no more.
 
 SQL steps are `exec` (no result columns) or `query` (explicit expected rows).
@@ -870,7 +1037,7 @@ database. It verifies the actual AM (and prolly's table/index/TOAST block-map
 forks); for any version-control capability, it runs the built-in history scenario, including
 branch isolation and restoration, and for any beyond `vc.core` a second
 one (`cases/vc-probe.json`) that finds a merge base, merges, diffs (rows, a summary, statements, a stat, a table's history and rows at a commit), picks, reverts, and reads a
-conflict and a constraint violation, reads the reflog, collects garbage, adds and removes a remote, and pushes and pops a stash, each checked by its effect: a claimed
+conflict and a constraint violation, reads the reflog, collects garbage, adds and removes a remote, pushes and pops a stash, makes, reads and deletes a tag, and rebases a branch, each checked by its effect: a claimed
 capability that doesn't work fails targeting, not the case. Case fixtures therefore start with fresh
 history. The adapter also checks public tables' AMs after steps, deferring
 that check until rollback if a SQL error aborted the transaction. Scenario

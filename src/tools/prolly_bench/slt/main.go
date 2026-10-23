@@ -41,15 +41,20 @@ import (
 )
 
 type config struct {
-	dsn       string // the server, without a database
-	am        string
-	schema    string // a versioned schema to create the tables in, or ""
-	workers   int
-	timeout   int64
-	out       string
-	scratch   string
-	serverLog string
-	dbPrefix  string
+	dsn    string // the server, without a database
+	am     string
+	schema string // a versioned schema to create the tables in, or ""
+	// Schemas searched after the test schema (an extension's, say), and a
+	// file of SQL run in each new database before its tests: spatial
+	// files need PostGIS created first, and its schema on the path.
+	searchPathExtra string
+	setupSQL        string
+	workers         int
+	timeout         int64
+	out             string
+	scratch         string
+	serverLog       string
+	dbPrefix        string
 }
 
 // maintDSN connects to database postgres, to create and drop the others.
@@ -62,6 +67,18 @@ func (c *config) dbDSN(name string) string {
 // sessionParams are the settings every test session starts with.
 func (c *config) sessionParams() map[string]string {
 	return map[string]string{"default_table_access_method": c.am}
+}
+
+// searchPath is every session's search_path: the test schema, then the
+// extra schemas.
+func (c *config) searchPath() string {
+	path := []string{c.testSchema()}
+	for _, s := range strings.Split(c.searchPathExtra, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			path = append(path, s)
+		}
+	}
+	return strings.Join(path, ", ")
 }
 
 // testSchema is where the corpus's tables land.
@@ -80,6 +97,10 @@ func main() {
 	flag.StringVar(&cfg.dsn, "dsn", "", "libpq connection string (keyword form) of the server, without dbname")
 	flag.StringVar(&cfg.am, "am", "heap", "table access method under test")
 	flag.StringVar(&cfg.schema, "schema", "", "create a versioned schema of this name and run the tests in it")
+	flag.StringVar(&cfg.searchPathExtra, "search-path-extra", "",
+		"comma-separated schemas to search after the test schema")
+	flag.StringVar(&cfg.setupSQL, "setup-sql", "",
+		"file of SQL to run in each new database before its tests (on the search path)")
 	flag.IntVar(&cfg.workers, "workers", 1, "worker processes")
 	flag.Int64Var(&cfg.timeout, "timeout", 30, "per-record timeout, seconds; a timeout ends its file")
 	flag.StringVar(&cfg.out, "out", "", "output directory")
@@ -101,6 +122,13 @@ func main() {
 	}
 	if cfg.scratch == "" {
 		cfg.scratch = filepath.Join(cfg.out, "scratch")
+	}
+	if cfg.setupSQL != "" {
+		abs, err := filepath.Abs(cfg.setupSQL)
+		if err != nil {
+			fatal(err)
+		}
+		cfg.setupSQL = abs
 	}
 
 	if *child != "" {
@@ -241,6 +269,7 @@ func spawn(cfg *config, name, dbName string, files []string) error {
 	args := []string{"-child", name, "-db", dbName, "-files", list,
 		"-dsn", cfg.dsn,
 		"-am", cfg.am, "-schema", cfg.schema, "-timeout", fmt.Sprint(cfg.timeout),
+		"-search-path-extra", cfg.searchPathExtra, "-setup-sql", cfg.setupSQL,
 		"-out", cfg.out, "-scratch", cfg.scratch, "-db-prefix", cfg.dbPrefix}
 	cmd := exec.Command(os.Args[0], args...)
 	cmd.Stdout = logf

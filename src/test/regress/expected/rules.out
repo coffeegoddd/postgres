@@ -1328,6 +1328,11 @@ dolt_log| SELECT commit_hash,
     message,
     commit_order
    FROM dolt_log('HEAD'::text) dolt_log(commit_hash, committer, email, date, message, commit_order);
+dolt_rebase| SELECT (rebase_order)::numeric(6,2) AS rebase_order,
+    action,
+    commit_hash,
+    commit_message
+   FROM dolt_rebase_plan() dolt_rebase_plan(rebase_order, action, commit_hash, commit_message);
 dolt_remote_branches| SELECT name,
     hash
    FROM dolt_remote_branches() dolt_remote_branches(name, hash);
@@ -1346,6 +1351,13 @@ dolt_status| SELECT table_name,
     staged,
     status
    FROM dolt_status() dolt_status(table_name, staged, status);
+dolt_tags| SELECT tag_name,
+    tag_hash,
+    tagger,
+    email,
+    date,
+    message
+   FROM dolt_tags() dolt_tags(tag_name, tag_hash, tagger, email, date, message);
 pg_aios| SELECT pid,
     io_id,
     io_generation,

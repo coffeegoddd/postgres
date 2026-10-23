@@ -19,8 +19,15 @@ from engines import ENGINES, literal
 # timing: latency alone. memory: server-tree PSS/RSS/private memory, sampled
 # every sample_interval_ms. cpu: CPU time and page faults; io: kernel read and
 # write bytes -- both from one snapshot before and one after, nothing sampled
-# in between to perturb them.
-PASSES = ("timing", "memory", "cpu", "io")
+# in between to perturb them.  counters: the engine's own work counters
+# (Engine.counters()), read before and after, for engines that keep them.
+PASSES = ("timing", "memory", "cpu", "io", "counters")
+
+
+def engine_passes(c, engine):
+    """The configured passes an engine runs: the counters pass only where
+    the engine keeps work counters."""
+    return [p for p in c["passes"] if p != "counters" or ENGINES[engine].has_counters]
 
 
 def check_passes(passes):
@@ -267,6 +274,9 @@ class SQL:
 
     def ids_in(self, ids):
         return self.adapter.ids_in(ids)
+
+    def counters(self):
+        return self.adapter.counters(self)
 
 
 def disk_size(path):

@@ -1,0 +1,34 @@
+{
+		Name: "dolt-tag: SQL delete tags",
+		SetUpScript: []string{
+			"CREATE TABLE test(pk int primary key);",
+			"CALL DOLT_ADD('.')",
+			"INSERT INTO test VALUES (0),(1),(2);",
+			"CALL DOLT_COMMIT('-am','created table test')",
+			"CALL DOLT_TAG('v1', '-m', 'create tag v1')",
+			"CALL DOLT_TAG('v2', '-m', 'create tag v2')",
+			"CALL DOLT_TAG('v3', '-m', 'create tag v3')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "SELECT tag_name, message from dolt_tags",
+				Expected: []sql.Row{{"v1", "create tag v1"}, {"v2", "create tag v2"}, {"v3", "create tag v3"}},
+			},
+			{
+				Query:    "CALL DOLT_TAG('-d','v1')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT tag_name, message from dolt_tags",
+				Expected: []sql.Row{{"v2", "create tag v2"}, {"v3", "create tag v3"}},
+			},
+			{
+				Query:    "CALL DOLT_TAG('-d','v2','v3')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT tag_name, message from dolt_tags",
+				Expected: []sql.Row{},
+			},
+		},
+	}

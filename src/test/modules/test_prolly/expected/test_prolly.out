@@ -22,7 +22,7 @@ FROM prolly_implementations();
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
- refs          | copies       |       2 |              1
+ refs          | copies       |       2 |              3
  refs          | stub         |       0 |              0
  transfer      | chunks       |       1 |              1
  transfer      | stub         |       0 |              0
@@ -43,7 +43,7 @@ FROM prolly_implementations();
  change_finder | pages        |       1 |              8
  change_finder | log          |       2 |              3
  change_finder | stub         |       0 |              0
- remote        | file         |       1 |              1
+ remote        | file         |       1 |              2
  remote        | postgresql   |       2 |              1
  remote        | postgres     |       3 |              1
  value_memo    | shared       |       1 |              1
@@ -126,7 +126,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs          | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs          | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs          | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs          | stub           | complete                       | not implemented (56 of 56 callbacks missing)
+ refs          | stub           | complete                       | not implemented (71 of 71 callbacks missing)
  transfer      | chunks         | identity                       | pass
  transfer      | chunks         | receive_then_send              | no checks yet
  transfer      | chunks         | complete                       | pass
@@ -196,7 +196,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
- canonicalizer | stub           | complete                       | not implemented (29 of 29 callbacks missing)
+ canonicalizer | stub           | complete                       | not implemented (36 of 36 callbacks missing)
  chunk_store   | journal        | identity                       | pass
  chunk_store   | journal        | complete                       | pass
  chunk_format  | basic          | identity                       | pass
@@ -222,7 +222,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_finder | log            | identity                       | pass
  change_finder | log            | complete                       | pass
  change_finder | stub           | identity                       | pass
- change_finder | stub           | complete                       | not implemented (9 of 9 callbacks missing)
+ change_finder | stub           | complete                       | not implemented (10 of 10 callbacks missing)
  remote        | file           | identity                       | pass
  remote        | file           | heads_and_chunks               | no checks yet
  remote        | file           | complete                       | pass
