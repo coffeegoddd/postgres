@@ -12,7 +12,8 @@
     "sql",
     "vc.core",
     "vc.gc",
-    "vc.reflog"
+    "vc.reflog",
+    "vc.tags"
   ],
   "sessions": [
     "a",
@@ -64,6 +65,23 @@
         "inserting row 1"
       ],
       "save": "c2"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('tag1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
     },
     {
       "id": "setup-5",

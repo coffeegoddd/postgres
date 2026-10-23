@@ -1,0 +1,22 @@
+{
+		// See https://github.com/dolthub/dolt/issues/11270
+		Name: "dolt-tag: a branch and a tag may share a name",
+		SetUpScript: []string{
+			"CALL DOLT_BRANCH('frombr')",
+			"CALL DOLT_TAG('fromtag')",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:    "CALL DOLT_TAG('frombr')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "CALL DOLT_BRANCH('fromtag')",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT (SELECT count(*) FROM dolt_branches WHERE name IN ('frombr', 'fromtag')), (SELECT count(*) FROM dolt_tags WHERE tag_name IN ('frombr', 'fromtag'))",
+				Expected: []sql.Row{{2, 2}},
+			},
+		},
+	}

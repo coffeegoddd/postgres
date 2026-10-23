@@ -1,8 +1,8 @@
 {
   "version": 1,
   "id": "vc-probe",
-  "description": "Native canary for the version-control capabilities beyond vc.core: a merge base, a merge, a diff, a cherry-pick, a revert, a conflict, a constraint violation, the reflog, a garbage collection, a remote and a stash, each checked by its effect",
-  "requires": ["sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase", "vc.gc", "vc.reflog", "vc.remotes", "vc.stash"],
+  "description": "Native canary for the version-control capabilities beyond vc.core: a merge base, a merge, a diff, a cherry-pick, a revert, a conflict, a constraint violation, the reflog, a garbage collection, a remote, a stash and a tag, each checked by its effect",
+  "requires": ["sql", "vc.core", "vc.merge", "vc.conflicts", "vc.violations", "vc.cherrypick", "vc.revert", "vc.diff", "vc.mergebase", "vc.gc", "vc.reflog", "vc.remotes", "vc.stash", "vc.tags"],
   "sessions": ["a", "b"],
   "steps": [
     {"id":"create","session":"a","op":"exec","sql":"CREATE TABLE probe_t (id int PRIMARY KEY, v text)","expect":{"tag":"CREATE TABLE"}},
@@ -60,6 +60,9 @@
     {"id":"stash-push","session":"a","op":"query","requires":["vc.stash"],"sql":"SELECT dolt_stash('push', 'probe')","expect":{"rows":[["{0}"]],"order":"ordered"}},
     {"id":"stashed","session":"a","op":"query","requires":["vc.stash"],"sql":"SELECT (SELECT count(*) FROM probe_t WHERE id = 99), (SELECT count(*) FROM dolt_stashes WHERE name = 'probe')","expect":{"rows":[["0","1"]],"order":"ordered"}},
     {"id":"stash-pop","session":"a","op":"query","requires":["vc.stash"],"sql":"SELECT dolt_stash('pop', 'probe')","expect":{"rows":[["{0}"]],"order":"ordered"}},
-    {"id":"popped","session":"a","op":"query","requires":["vc.stash"],"sql":"SELECT (SELECT v FROM probe_t WHERE id = 99), (SELECT count(*) FROM dolt_stashes)","expect":{"rows":[["stashed","0"]],"order":"ordered"}}
+    {"id":"popped","session":"a","op":"query","requires":["vc.stash"],"sql":"SELECT (SELECT v FROM probe_t WHERE id = 99), (SELECT count(*) FROM dolt_stashes)","expect":{"rows":[["stashed","0"]],"order":"ordered"}},
+    {"id":"tag","session":"a","op":"query","requires":["vc.tags"],"sql":"SELECT dolt_tag('probe_tag', $1, '-m', 'probe')","params":[{"ref":"base"}],"expect":{"rows":[["{0}"]],"order":"ordered"}},
+    {"id":"tagged","session":"a","op":"query","requires":["vc.core","vc.tags"],"sql":"SELECT tag_hash = $1, message, dolt_hashof('probe_tag') = $1 FROM dolt_tags WHERE tag_name = 'probe_tag'","params":[{"ref":"base"}],"expect":{"rows":[["t","probe","t"]],"order":"ordered"}},
+    {"id":"tag-delete","session":"a","op":"query","requires":["vc.tags"],"sql":"SELECT dolt_tag('-d', 'probe_tag'), (SELECT count(*) FROM dolt_tags)","expect":{"rows":[["{0}","0"]],"order":"ordered"}}
   ]
 }

@@ -1346,6 +1346,13 @@ dolt_status| SELECT table_name,
     staged,
     status
    FROM dolt_status() dolt_status(table_name, staged, status);
+dolt_tags| SELECT tag_name,
+    tag_hash,
+    tagger,
+    email,
+    date,
+    message
+   FROM dolt_tags() dolt_tags(tag_name, tag_hash, tagger, email, date, message);
 pg_aios| SELECT pid,
     io_id,
     io_generation,

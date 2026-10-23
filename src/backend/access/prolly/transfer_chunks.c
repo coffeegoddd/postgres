@@ -405,6 +405,32 @@ known_tracking(const char *remote, const char *branch, const ProllyHash *commit,
 	add_known(arg, commit);
 }
 
+/*
+ * The commit a transfer was given: id itself, or, for a tag object, the
+ * tag's commit; false if id is neither.
+ */
+static bool
+given_commit(ProllyDatabaseComponents *dc, const ProllyHash *id,
+			 ProllyHash *commit)
+{
+	ProllyCommitInfo info;
+	ProllyTagInfo tag;
+
+	if (PROLLY_CALL(dc->refs, commit_get, id, &info))
+	{
+		*commit = *id;
+		return true;
+	}
+	if (PROLLY_HAS(dc->refs, tag_get) &&
+		PROLLY_CALL(dc->refs, tag_get, id, &tag) &&
+		PROLLY_CALL(dc->refs, commit_get, &tag.commit, &info))
+	{
+		*commit = tag.commit;
+		return true;
+	}
+	return false;
+}
+
 /* Every commit received from those given: those the store hasn't. */
 static void
 check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
@@ -417,15 +443,15 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 	seen = prolly_seen_create("prolly received commits", 0, TRANSFER_BUDGET(2));
 	for (int i = 0; i < ncommits; i++)
 	{
-		ProllyCommitInfo info;
+		ProllyHash *id = palloc(sizeof(ProllyHash));
 
-		/* (each given commit is one: read through what was received) */
-		if (!PROLLY_CALL(dc.refs, commit_get, &commits[i], &info))
+		/* (each given is a commit, or a tag of one: read through what was received) */
+		if (!given_commit(&dc, &commits[i], id))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the remote's head %s isn't a commit",
 							prolly_hash_hex(&commits[i]))));
-		queue = lappend(queue, (void *) &commits[i]);
+		queue = lappend(queue, id);
 	}
 	while (queue != NIL)
 	{

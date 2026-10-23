@@ -12,7 +12,9 @@
  * (dolt_serve_move_head()): only then is what it sent received, as a fetch
  * receives from a remote (each chunk re-hashed, every reference resolved,
  * the commit of this build's format), and added to the store, and the
- * branch moved as a compare-and-swap.  The caller commits.
+ * branch moved as a compare-and-swap.  The caller commits.  Tags are
+ * served alike: dolt_serve_tags() lists them, and dolt_serve_move_tag()
+ * receives a pushed tag object and its commit, then moves the tag.
  *
  * Fetching takes owning the database or the privileges of
  * pg_prolly_fetch, pushing those of pg_prolly_push: history holds every
@@ -942,4 +944,77 @@ dolt_serve_move_head(PG_FUNCTION_ARGS)
 	if (moved && !has_head && PROLLY_CALL(dc.writers, protected, branch))
 		PROLLY_CALL(dc.writers, set_protected, branch, PROLLY_PROTECT_DEFAULT);
 	PG_RETURN_BOOL(moved);
+}
+
+static void
+tag_row(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+		void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = PointerGetDatum(hash_bytea(tag));
+	values[2] = PointerGetDatum(hash_bytea(commit));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * dolt_serve_tags(OUT name text, OUT tag_id bytea, OUT commit_id bytea)
+ * returns setof record: each tag, its tag object and its commit.
+ */
+Datum
+dolt_serve_tags(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	check_serving(false);
+	prolly_database_components(&dc);
+	InitMaterializedSRF(fcinfo, 0);
+	if (PROLLY_HAS(dc.refs, tags))
+		PROLLY_CALL(dc.refs, tags, tag_row, fcinfo->resultinfo);
+	return (Datum) 0;
+}
+
+/*
+ * dolt_serve_move_tag(name text, expected bytea, tag bytea) returns bool:
+ * what the push sent received, as dolt_serve_move_head() receives it, and
+ * tag name moved from expected (empty: none) to tag (null: deleted),
+ * unless it is no longer at expected (false).
+ */
+Datum
+dolt_serve_move_tag(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name;
+	ProllyHash	expected = {0};
+	ProllyHash	tag;
+	bool		has_tag = !PG_ARGISNULL(2);
+
+	check_serving(true);
+	PreventCommandIfReadOnly("dolt_serve_move_tag()");
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("only dolt_serve_move_tag's tag can be null")));
+	name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	if (VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_PP(1)) > 0)
+		bytea_hash(PG_GETARG_BYTEA_PP(1), &expected);
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, tag_set))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" keeps no tags",
+						dc.refs->info.name)));
+	if (has_tag)
+	{
+		bytea_hash(PG_GETARG_BYTEA_PP(2), &tag);
+		/* (the tag the store lacks: sent, and its bytes its address's) */
+		if (!PROLLY_CALL(prolly_chunk_store(), has, store(), &tag))
+			check_sent(&tag);
+		(void) PROLLY_CALL(dc.transfer, receive, &spool_remote, NULL, &tag, 1);
+	}
+	PG_RETURN_BOOL(PROLLY_CALL(dc.refs, tag_set, name, &expected,
+							   has_tag ? &tag : NULL));
 }

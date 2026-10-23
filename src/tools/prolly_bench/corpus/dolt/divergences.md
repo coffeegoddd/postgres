@@ -1,7 +1,7 @@
 # Dolt compatibility and test adaptations
 
 This catalog records the behavior and test adaptations associated with the
-stable D1–D23 IDs in `ports.json`. IDs are never reused or renumbered; when
+stable D1–D25 IDs in `ports.json`. IDs are never reused or renumbered; when
 a difference is removed, mark its entry as resolved and update the ports.
 These are divergence IDs, unrelated to the removed engine named D1.
 
@@ -580,3 +580,18 @@ OF` are built in D18's shapes.
 - **Port:** compare reconstructed values using the receiver's semantics.
   The generic normalizing-type regression covers hashes, cell merges and
   reset; the PostGIS-specific regression remains tracked in #689/#710.
+
+## D25. Checking out a tag is a read-only detached session
+
+- **Dolt:** `dolt_checkout('v1')` of a tag (or a commit) is refused: Dolt
+  has no detached head in SQL, and suggests `dolt_checkout('v1', '-b',
+  name)`. A tag is read-only as a revision database, `USE mydb/v1`.
+- **Prolly:** a tag (or commit hash) that names no branch checks out as a
+  read-only session on the commit's hidden branch, `detached/<hash>`,
+  as a commit's hash already does; `-b` makes a branch there as in Dolt.
+- **Why:** a connection names a branch (D11), so the session a revision
+  database gives in Dolt is this checkout here; refusing it would leave
+  no way to read a tag's state as a session. Proposed in #704, open for
+  the user's review.
+- **Port:** an assertion of Dolt's refusal is omitted (the case is
+  partial); test_prolly's `tags` test checks the read-only checkout.

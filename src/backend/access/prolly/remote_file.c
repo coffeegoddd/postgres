@@ -7,12 +7,15 @@
  * The directory holds
  *
  *		prolly_remote		the manifest: text lines
- *								prolly remote 1
+ *								prolly remote 2
  *								format <the canonical format, or nothing>
  *								last <the last table file id given>
  *								file <id, 16 hex digits> <size in bytes>
  *								head <commit, hex> <branch name>
- *							(files and heads one a line, heads by name)
+ *								tag <tag object, hex> <its commit, hex> <name>
+ *							(files, heads and tags one a line, heads and
+ *							tags by name; a manifest of another version,
+ *							as an older build's without tags, is refused)
  *		prolly_remote.lock	locked (flock) by whoever changes the manifest
  *		table_<id>			table files, in the table file format, never
  *							changed once named
@@ -61,7 +64,7 @@
 
 #define MANIFEST_NAME	"prolly_remote"
 #define LOCK_NAME		"prolly_remote.lock"
-#define MANIFEST_MAGIC	"prolly remote 1"
+#define MANIFEST_MAGIC	"prolly remote 2"
 
 /* a table file of the remote's */
 typedef struct RemoteTable
@@ -88,12 +91,20 @@ typedef struct RemoteHead
 	ProllyHash	commit;
 } RemoteHead;
 
+typedef struct RemoteTag
+{
+	char	   *name;
+	ProllyHash	tag;
+	ProllyHash	commit;
+} RemoteTag;
+
 typedef struct Manifest
 {
 	char	   *format;
 	uint64		last;
 	List	   *tables;			/* RemoteTable * */
 	List	   *heads;			/* RemoteHead *, by name */
+	List	   *tags;			/* RemoteTag *, by name */
 } Manifest;
 
 struct ProllyRemote
@@ -197,6 +208,13 @@ read_manifest(ProllyRemote *r)
 		line[--buf.len] = '\0';
 		if (n++ == 0)
 		{
+			if (strncmp(line, "prolly remote ", 14) == 0 &&
+				strcmp(line, MANIFEST_MAGIC) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("file remote \"%s\" is of manifest version %s, not %s",
+								r->dir, line + 14, MANIFEST_MAGIC + 14),
+						 errdetail("This build reads only remotes of its own version.")));
 			if (strcmp(line, MANIFEST_MAGIC) != 0)
 				corrupt(r, "it isn't a prolly remote's");
 		}
@@ -226,6 +244,19 @@ read_manifest(ProllyRemote *r)
 			h->branch = pstrdup(sp + 1);
 			r->m.heads = lappend(r->m.heads, h);
 		}
+		else if (strncmp(line, "tag ", 4) == 0)
+		{
+			RemoteTag  *t = palloc0(sizeof(RemoteTag));
+			char	   *sp1 = strchr(line + 4, ' ');
+			char	   *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+
+			if (sp2 == NULL ||
+				!prolly_hash_from_hex(line + 4, sp1 - (line + 4), &t->tag) ||
+				!prolly_hash_from_hex(sp1 + 1, sp2 - (sp1 + 1), &t->commit))
+				corrupt(r, "a tag line is malformed");
+			t->name = pstrdup(sp2 + 1);
+			r->m.tags = lappend(r->m.tags, t);
+		}
 		else
 			corrupt(r, "a line is of no known kind");
 	}
@@ -245,6 +276,13 @@ head_cmp(const ListCell *a, const ListCell *b)
 {
 	return strcmp(((RemoteHead *) lfirst(a))->branch,
 				  ((RemoteHead *) lfirst(b))->branch);
+}
+
+static int
+tag_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((RemoteTag *) lfirst(a))->name,
+				  ((RemoteTag *) lfirst(b))->name);
 }
 
 /* Write buf at the file's end; a short write is the disk being full. */
@@ -289,6 +327,14 @@ write_manifest(ProllyRemote *r, Manifest *m)
 		RemoteHead *h = lfirst(lc);
 
 		appendStringInfo(&buf, "head %s %s\n", prolly_hash_hex(&h->commit), h->branch);
+	}
+	list_sort(m->tags, tag_cmp);
+	foreach(lc, m->tags)
+	{
+		RemoteTag  *t = lfirst(lc);
+
+		appendStringInfo(&buf, "tag %s ", prolly_hash_hex(&t->tag));
+		appendStringInfo(&buf, "%s %s\n", prolly_hash_hex(&t->commit), t->name);
 	}
 	fd = OpenTransientFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0)
@@ -720,6 +766,67 @@ file_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
 	return true;
 }
 
+static void
+file_tags(ProllyRemote *r, ProllyRemoteTagVisit visit, void *arg)
+{
+	ListCell   *lc;
+
+	foreach(lc, r->m.tags)
+	{
+		RemoteTag  *t = lfirst(lc);
+
+		visit(t->name, &t->tag, &t->commit, arg);
+	}
+}
+
+static bool
+file_move_tag(ProllyRemote *r, const char *name, const ProllyHash *expected,
+			  const ProllyHash *tag, const ProllyHash *commit)
+{
+	Manifest	m;
+	RemoteTag  *at = NULL;
+	ListCell   *lc;
+	int			lock;
+
+	check_privilege(r, true);
+	if (strchr(name, '\n') != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a file remote's tag name can't hold a newline")));
+	lock = lock_remote(r);
+	m = r->m;
+	foreach(lc, m.tags)
+	{
+		RemoteTag  *t = lfirst(lc);
+
+		if (strcmp(t->name, name) == 0)
+			at = t;
+	}
+	if (at ? !(expected->len == at->tag.len &&
+			   memcmp(expected->bytes, at->tag.bytes, expected->len) == 0) :
+		expected->len != 0)
+	{
+		unlock_remote(lock);
+		return false;
+	}
+	m.tags = list_copy(m.tags);
+	if (at)
+		m.tags = list_delete_ptr(m.tags, at);
+	if (tag)
+	{
+		RemoteTag  *t = MemoryContextAllocZero(r->cxt, sizeof(RemoteTag));
+
+		t->name = MemoryContextStrdup(r->cxt, name);
+		t->tag = *tag;
+		t->commit = *commit;
+		m.tags = lappend(m.tags, t);
+	}
+	write_manifest(r, &m);
+	r->m = m;
+	unlock_remote(lock);
+	return true;
+}
+
 /* (a file remote's reads are the server's own: one at a time costs nothing) */
 static void
 file_get_many(ProllyRemote *r, const ProllyHash *hashes, int n,
@@ -835,7 +942,7 @@ const ProllyRemoteRoutine prolly_remote_file = {
 	.info = {
 		.iface = PROLLY_IFACE_REMOTE,
 		.impl_id = 1,
-		.format_version = 1,
+		.format_version = 2,
 		.name = "file",
 		.description = "a remote in a directory of the server's files",
 	},
@@ -855,6 +962,8 @@ const ProllyRemoteRoutine prolly_remote_file = {
 	.file_open = file_file_open,
 	.file_next = file_file_next,
 	.file_close = file_file_close,
+	.tags = file_tags,
+	.move_tag = file_move_tag,
 };
 
 const ProllyRemoteRoutine *

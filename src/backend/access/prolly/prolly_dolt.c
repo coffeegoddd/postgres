@@ -2,8 +2,8 @@
  *
  * prolly_dolt.c
  *	  Doltgres's SQL interface to version control: the dolt_* functions
- *	  and the functions behind the dolt_log, dolt_branches, dolt_status
- *	  and dolt_conflicts system views, the dolt.author and
+ *	  and the functions behind the dolt_log, dolt_branches, dolt_tags,
+ *	  dolt_status and dolt_conflicts system views, the dolt.author and
  *	  dolt.allow_commit_conflicts settings, and "dbname/branch"
  *	  connections.
  *
@@ -207,6 +207,7 @@ static const char *author_override = NULL;
 
 static void writers_note_write(Oid branch, void *arg);
 static void writer_branch_hooks(void);
+static bool names_tag(const char *name);
 
 /* a branch to check out once the backend processes normally */
 static char *connect_branch = NULL;
@@ -1493,7 +1494,9 @@ checkout_tables(const char *ref, char **names, int nnames)
 /*
  * dolt_checkout(VARIADIC args text[]) returns text[]: {status, message}
  *
- * branch, or -b branch [start point] to create it first.  Tables, as
+ * branch, or -b branch [start point] to create it first; a commit's hash,
+ * or a tag's name, that names no branch, a detached session there,
+ * read-only.  Tables, as
  * Dolt's: -- tables (or "."), or a name that is no branch but a table
  * (with more after it), put back as the head has them; ref tables (ref
  * no table), or ref -- tables, as ref has them; a name before -- that is
@@ -1638,13 +1641,14 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * A commit's hash that names no branch: a detached session on it,
-	 * read-only, on a hidden branch at the commit that every session
-	 * detached there shares.  Changing anything takes a branch made from
-	 * it.  (Its transactions are read-only from the next one; this one from
+	 * A commit's hash, or a tag, that names no branch: a detached session
+	 * on the commit, read-only, on a hidden branch at the commit that every
+	 * session detached there shares, as a revision database of a tag is
+	 * read-only in Dolt.  Changing anything takes a branch made from it.
+	 * (Its transactions are read-only from the next one; this one from
 	 * now.)
 	 */
-	if (!create && names_commit(branch) &&
+	if (!create && (names_commit(branch) || names_tag(branch)) &&
 		!PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 	{
 		ProllyHash	id;
@@ -3091,6 +3095,169 @@ dolt_stashes(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	if (PROLLY_HAS(refs(), stashes))
 		PROLLY_CALL(refs(), stashes, put_stash, rsinfo);
+	return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * Tags
+ * ----------------------------------------------------------------
+ */
+
+/* The refs, if they keep tags: else an error. */
+static const ProllyRefsRoutine *
+tag_refs(void)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	if (!PROLLY_HAS(r, tags))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" keeps no tags", r->info.name)));
+	return r;
+}
+
+/* Is name a tag's? */
+static bool
+names_tag(const char *name)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	return PROLLY_HAS(r, tag_lookup) &&
+		PROLLY_CALL(r, tag_lookup, name, &(ProllyHash) {0});
+}
+
+/*
+ * dolt_tag(VARIADIC args text[]) returns text[]: {status}
+ *
+ * name [ref] (HEAD if none), with -m/--message message and --author
+ * "Name <email>" (the session's author if none): a tag of ref's commit,
+ * called name, as Dolt's; -d/--delete name...: those tags deleted.  A tag
+ * that exists already isn't replaced.  The dolt_tags view lists them.
+ */
+Datum
+dolt_tag(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		options = true;	/* until "--" */
+	bool		delete = false;
+	bool		list = false;
+	char	   *message = NULL;
+	char	   *author = NULL;
+	char	  **names = palloc_array(char *, Max(nargs, 1));
+	int			nnames = 0;
+	const char *result[1] = {"0"};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
+			names[nnames++] = a;
+		else if (is_option(a, "d") || is_option(a, "delete"))
+			delete = true;
+		else if (is_option(a, "m") || is_option(a, "message"))
+			message = option_value(args, nargs, &i, "dolt_tag");
+		else if (is_option(a, "author"))
+			author = option_value(args, nargs, &i, "dolt_tag");
+		else if (is_option(a, "v") || is_option(a, "verbose"))
+			list = true;
+		else
+			unsupported("dolt_tag", a);
+	}
+	/* (a listing is the view's, as Dolt's is the dolt_tags table's) */
+	if (nnames == 0 || list)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_tag needs a tag's name"),
+				 errhint("The dolt_tags view lists the tags.")));
+	PreventCommandIfReadOnly("dolt_tag()");
+	if (delete)
+	{
+		if (message != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_tag: -d and -m cannot be used together")));
+		for (int i = 0; i < nnames; i++)
+			if (!PROLLY_CALL(tag_refs(), tag_set, names[i], NULL, NULL))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("tag \"%s\" does not exist", names[i])));
+	}
+	else
+	{
+		const ProllyRefsRoutine *r = tag_refs();
+		const char *ref = nnames > 1 ? names[1] : "HEAD";
+		ProllyHash	commit;
+		ProllyHash	tag;
+
+		if (nnames > 2)
+			unexpected("dolt_tag", names[2]);
+		given_author("dolt_tag", author);
+		if (PROLLY_CALL(r, tag_lookup, names[0], &tag))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("tag \"%s\" already exists", names[0])));
+		if (!PROLLY_CALL(r, resolve, ref, &commit))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch, tag or commit \"%s\" does not exist", ref)));
+		PROLLY_CALL(r, tag_write, &commit, author ? author : prolly_commit_author(),
+					message ? message : "", &tag);
+		if (!PROLLY_CALL(r, tag_set, names[0], &(ProllyHash) {0}, &tag))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("tag \"%s\" already exists", names[0])));
+	}
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* dolt_tags()'s rows */
+static void
+put_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+		void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	ProllyTagInfo info;
+	Datum		values[6];
+	bool		nulls[6] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = CStringGetTextDatum(hash_hex(commit));
+	if (PROLLY_CALL(refs(), tag_get, tag, &info))
+	{
+		char	   *tagger;
+		char	   *email;
+
+		split_author(info.tagger, &tagger, &email);
+		values[2] = CStringGetTextDatum(tagger);
+		values[3] = CStringGetTextDatum(email);
+		values[4] = TimestampTzGetDatum(info.tagged_at);
+		values[5] = CStringGetTextDatum(info.message);
+	}
+	else
+		nulls[2] = nulls[3] = nulls[4] = nulls[5] = true;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * dolt_tags(OUT tag_name text, OUT tag_hash text, OUT tagger text,
+ *			 OUT email text, OUT date timestamptz, OUT message text)
+ *			 returns setof record
+ *
+ * Every tag, by name, as Dolt's dolt_tags: the commit it names (tag_hash,
+ * as Dolt's), who made it, when, and its message.
+ */
+Datum
+dolt_tags(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (PROLLY_HAS(refs(), tags))
+		PROLLY_CALL(refs(), tags, put_tag, rsinfo);
 	return (Datum) 0;
 }
 
@@ -6943,13 +7110,89 @@ check_remote_format(const ProllyRemoteRoutine *rr, ProllyRemote *r,
 						name, f.data, mine)));
 }
 
+/* A remote's tags: each one's name, tag object and commit. */
+typedef struct RemoteTags
+{
+	List	   *names;			/* char * */
+	List	   *tags;			/* ProllyHash * */
+	List	   *commits;		/* ProllyHash * */
+	const char *remote;			/* the remote's name, for messages */
+} RemoteTags;
+
+static void
+collect_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+			void *arg)
+{
+	RemoteTags *t = arg;
+
+	if (!pg_verifymbstr(name, strlen(name), true))
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("remote \"%s\"'s tag \"%s\" isn't fetched",
+						t->remote, escaped_branch_name(name)),
+				 errdetail("Its name isn't valid in this database's encoding.")));
+		return;
+	}
+	t->names = lappend(t->names, pstrdup(name));
+	t->tags = lappend(t->tags, copy_hash(tag));
+	t->commits = lappend(t->commits, copy_hash(commit));
+}
+
+/*
+ * Receive the remote's tags of commits this database has, once its
+ * branches are fetched, as Dolt's fetch follows tags (or, with all, as a
+ * clone takes them, every one, with its commit's history): those whose tag
+ * objects differ from the tags here of their names.  *got is what was
+ * received, to name here.
+ */
+static void
+receive_tags(const ProllyRemoteRoutine *rr, ProllyRemote *r, const char *name,
+			 bool all_tags, RemoteTags *got)
+{
+	ProllyDatabaseComponents dc;
+	RemoteTags	all = {NIL, NIL, NIL, name};
+	ListCell   *n;
+	ListCell   *t;
+	ListCell   *c;
+	ProllyHash *tags;
+	int			ntags = 0;
+
+	prolly_database_components(&dc);
+	memset(got, 0, sizeof(*got));
+	if (!PROLLY_HAS(rr, tags) || !PROLLY_HAS(dc.refs, tags))
+		return;
+	PROLLY_CALL(rr, tags, r, collect_tag, &all);
+	forthree(n, all.names, t, all.tags, c, all.commits)
+	{
+		ProllyHash	mine;
+		ProllyCommitInfo info;
+
+		if (PROLLY_CALL(dc.refs, tag_lookup, lfirst(n), &mine) &&
+			same_hash(&mine, lfirst(t)))
+			continue;
+		if (!all_tags && !PROLLY_CALL(dc.refs, commit_get, lfirst(c), &info))
+			continue;			/* (a commit not fetched: its tag isn't) */
+		got->names = lappend(got->names, lfirst(n));
+		got->tags = lappend(got->tags, lfirst(t));
+	}
+	if (got->tags == NIL)
+		return;
+	tags = palloc(sizeof(ProllyHash) * list_length(got->tags));
+	foreach(t, got->tags)
+		tags[ntags++] = *(ProllyHash *) lfirst(t);
+	(void) PROLLY_CALL(dc.transfer, receive, rr, r, tags, ntags);
+}
+
 /*
  * Fetch remote name's branches (NIL: all of them) into its remote-tracking
  * branches, the remote opened and its heads read once; with need, refuse
  * before receiving anything if the remote hasn't that branch.  *got (if
  * not NULL) is what was fetched: the branches and their commits.  A
  * clone's (into a database with nothing to walk against) copies the
- * remote's files whole, where the transfer can.
+ * remote's files whole, where the transfer can.  Then the remote's tags of
+ * commits the database has are fetched too, each set here as the remote
+ * has it.
  */
 static void
 fetch_remote(const char *name, List *only, const char *need, Heads *got,
@@ -6961,6 +7204,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 	ProllyRemote *r;
 	Heads		all = {NIL, NIL, name};
 	Heads		want = {NIL, NIL, name};
+	RemoteTags	tags = {0};
 	ListCell   *b;
 	ListCell   *c;
 
@@ -7026,6 +7270,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 				!PROLLY_CALL(dc.transfer, clone, rr, r, commits, n, &count))
 				(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
 		}
+		receive_tags(rr, r, name, clone, &tags);
 	}
 	PG_FINALLY();
 	{
@@ -7035,6 +7280,9 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 
 	forboth(b, want.branches, c, want.commits)
 		PROLLY_CALL(dc.refs, tracking_set, name, lfirst(b), lfirst(c));
+	/* (a tag here of a name the remote's has is set to the remote's, as Dolt's) */
+	forboth(b, tags.names, c, tags.tags)
+		(void) PROLLY_CALL(dc.refs, tag_set, lfirst(b), NULL, lfirst(c));
 	if (got)
 		*got = want;
 }
@@ -7593,13 +7841,92 @@ need_upstream(const char *fn, char **remote, char **branch)
 						 fn, current, current)));
 }
 
+typedef struct TagFind
+{
+	const char *name;
+	ProllyHash	tag;
+	bool		found;
+} TagFind;
+
+static void
+find_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+		 void *arg)
+{
+	TagFind    *tf = arg;
+
+	if (strcmp(name, tf->name) == 0)
+	{
+		tf->tag = *tag;
+		tf->found = true;
+	}
+}
+
+/*
+ * Push tag name to remote, as Dolt does: its tag object and what that
+ * reaches sent, then the remote's tag of that name made it, whatever tag
+ * it was (a compare-and-swap with the one read, so a change meanwhile is
+ * refused rather than lost).
+ */
+static Datum
+push_tag(const char *remote, const char *name)
+{
+	ProllyDatabaseComponents dc;
+	const char *url = need_remote(remote);
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r;
+	ProllyHash	tag;
+	ProllyTagInfo info;
+	const char *result[2] = {"0", NULL};
+
+	PreventCommandIfReadOnly("dolt_push()");
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, tag_lookup) ||
+		!PROLLY_CALL(dc.refs, tag_lookup, name, &tag) ||
+		!PROLLY_CALL(dc.refs, tag_get, &tag, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("tag \"%s\" not found", name)));
+	if (!PROLLY_HAS(rr, move_tag))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("remote \"%s\" keeps no tags", remote)));
+	r = PROLLY_CALL(rr, open, url, true);
+	PG_TRY();
+	{
+		TagFind		tf = {name, {0}, false};
+
+		check_remote_format(rr, r, remote);
+		PROLLY_CALL(rr, tags, r, find_tag, &tf);
+		if (tf.found && same_hash(&tf.tag, &tag))
+			result[1] = "Everything up-to-date";
+		else
+		{
+			(void) PROLLY_CALL(dc.transfer, send, rr, r, &tag, 1);
+			if (!PROLLY_CALL(rr, move_tag, r, name, &tf.tag, &tag, &info.commit))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the push of tag %s to %s was rejected: the remote's tag moved meanwhile",
+								name, remote),
+						 errhint("Try again.")));
+			result[1] = psprintf("* [new tag] %s -> %s", name, name);
+		}
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(rr, close, r);
+	}
+	PG_END_TRY();
+	return text_array(2, result);
+}
+
 /*
  * dolt_push(VARIADIC args text[]) returns text[]: {status, message}
  *
  * [remote [branch]], -f/--force, -u/--set-upstream: branch (the session's
  * if not named) pushed to the remote's branch of the same name; with no
  * remote, the session branch to its upstream (which names the remote and
- * the remote's branch).  The chunks the branch's head reaches that the
+ * the remote's branch); remote tag (a tag's name that is no branch's, or
+ * refs/tags/tag): the tag, as push_tag() pushes it.  The chunks the branch's head reaches that the
  * remote lacks are sent, then the remote's branch moved to it, only as a
  * fast-forward unless forced.  The remote's branch
  * is moved as it is reached, not with the transaction: the remote-tracking
@@ -7653,6 +7980,28 @@ dolt_push(PG_FUNCTION_ARGS)
 			branch = a;
 		else
 			unexpected("dolt_push", a);
+	}
+	/*
+	 * A tag, named as one ("refs/tags/v1") or by a name that is a tag's
+	 * and no branch's: pushed as Dolt pushes one.
+	 */
+	if (remote != NULL && branch != NULL)
+	{
+		const char *tag = NULL;
+
+		if (strncmp(branch, "refs/tags/", 10) == 0 && branch[10] != '\0')
+			tag = branch + 10;
+		else if (!PROLLY_CALL(remote_refs(), branch_lookup, branch,
+							  &(ProllyBranchId) {0}) && names_tag(branch))
+			tag = branch;
+		if (tag != NULL)
+		{
+			if (set_upstream)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("dolt_push: a tag has no upstream")));
+			PG_RETURN_DATUM(push_tag(remote, tag));
+		}
 	}
 	if (remote == NULL)
 		need_upstream("dolt_push", &remote, &remote_branch);

@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "id": "dolt-tag-delete",
+  "description": "Reviewed Dolt port: dolt-tag: SQL delete tags",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTagTestScripts: dolt-tag: SQL delete tags"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.tags"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('.')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0), (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created table test",
+        "-a"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v1', '-m', 'create tag v1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v2', '-m', 'create tag v2')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v3', '-m', 'create tag v3')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT tag_name, message FROM dolt_tags",
+      "expect": {
+        "rows": [
+          [
+            "v1",
+            "create tag v1"
+          ],
+          [
+            "v2",
+            "create tag v2"
+          ],
+          [
+            "v3",
+            "create tag v3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('-d', 'v1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT tag_name, message FROM dolt_tags",
+      "expect": {
+        "rows": [
+          [
+            "v2",
+            "create tag v2"
+          ],
+          [
+            "v3",
+            "create tag v3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('-d', 'v2', 'v3')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT tag_name, message FROM dolt_tags",
+      "expect": {
+        "rows": [],
+        "order": "ordered"
+      }
+    }
+  ]
+}

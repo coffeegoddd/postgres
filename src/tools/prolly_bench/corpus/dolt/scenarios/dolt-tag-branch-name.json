@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "id": "dolt-tag-branch-name",
+  "description": "Reviewed Dolt port: dolt-tag: a branch and a tag may share a name",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTagTestScripts: dolt-tag: a branch and a tag may share a name"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.tags"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "frombr"
+      ]
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('fromtag')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('frombr')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "fromtag"
+      ]
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core",
+        "vc.tags"
+      ],
+      "sql": "SELECT (SELECT count(*) FROM dolt_branches WHERE name IN ('frombr', 'fromtag')), (SELECT count(*) FROM dolt_tags WHERE tag_name IN ('frombr', 'fromtag'))",
+      "expect": {
+        "rows": [
+          [
+            "2",
+            "2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

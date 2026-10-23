@@ -1603,6 +1603,9 @@ CREATE VIEW dolt_remotes AS
 CREATE VIEW dolt_stashes AS
     SELECT * FROM dolt_stashes();
 
+CREATE VIEW dolt_tags AS
+    SELECT * FROM dolt_tags();
+
 CREATE VIEW dolt_remote_branches AS
     SELECT * FROM dolt_remote_branches();
 

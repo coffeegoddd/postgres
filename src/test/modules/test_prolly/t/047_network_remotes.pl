@@ -72,6 +72,16 @@ is(o('postgres', q{SELECT dolt_hashof('main')}), l('c', q{SELECT dolt_hashof('ma
 is(o('postgres', q{SELECT v FROM n.t WHERE id = 201}), 'pushed',
 	'pushed: the remote\'s rows');
 
+# tags: pushed over the connection, and fetched back with their objects
+l('c', q{SELECT dolt_tag('net_v1', 'HEAD~1', '-m', 'over the wire')});
+l('c', q{SELECT dolt_push('origin', 'net_v1')});
+is(o('postgres', q{SELECT tag_hash || '|' || message FROM dolt_tags WHERE tag_name = 'net_v1'}),
+	l('c', q{SELECT dolt_hashof('HEAD~1')}) . '|over the wire', 'a tag pushed');
+o('postgres', q{SELECT dolt_tag('net_v2', '-m', 'from the origin')});
+l('c', q{SELECT dolt_fetch('origin')});
+is(l('c', q{SELECT tag_hash || '|' || message FROM dolt_tags WHERE tag_name = 'net_v2'}),
+	o('postgres', q{SELECT dolt_hashof('main')}) . '|from the origin', 'a tag fetched');
+
 # uncommitted changes there: refused, unless forced (which drops them,
 # and in the owned writer mode the claim of the writer whose they were)
 o('postgres', q{

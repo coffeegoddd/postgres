@@ -962,6 +962,71 @@ libpq_move_head(ProllyRemote *r, const char *branch, const ProllyHash *expected,
 	return moved;
 }
 
+/* The remote's tags. */
+static void
+libpq_tags(ProllyRemote *r, ProllyRemoteTagVisit visit, void *arg)
+{
+	static const ResultShape shape = {0, -1, 1, 3, {TEXTOID, BYTEAOID, BYTEAOID}};
+	PGresult   *res;
+
+	res = run(r, "SELECT name, tag_id, commit_id FROM pg_catalog.dolt_serve_tags() "
+			  "ORDER BY name COLLATE \"C\"",
+			  0, NULL, NULL, NULL, NULL, &shape, "reading the tags");
+	PG_TRY();
+	{
+		for (int i = 0; i < PQntuples(res); i++)
+		{
+			const char *name = PQgetvalue(res, i, 0);
+			int			len = PQgetlength(res, i, 0);
+			char	   *tag_name;
+			ProllyHash	tag;
+			ProllyHash	commit;
+
+			if (memchr(name, '\0', len) != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("remote %s sent a tag name with a NUL in it",
+								r->where),
+						 errcontext("reading the tags")));
+			tag_name = pnstrdup(name, len);
+			result_hash(r, res, i, 1, &tag);
+			result_hash(r, res, i, 2, &commit);
+			visit(tag_name, &tag, &commit, arg);
+		}
+	}
+	PG_FINALLY();
+	{
+		PQclear(res);
+	}
+	PG_END_TRY();
+}
+
+/* Move the tag there, receiving what was sent first, and commit there. */
+static bool
+libpq_move_tag(ProllyRemote *r, const char *name, const ProllyHash *expected,
+			   const ProllyHash *tag, const ProllyHash *commit)
+{
+	const char *values[3];
+	int			lengths[3] = {0};
+	int			formats[3] = {0, 1, 1};
+	Oid			types[3] = {TEXTOID, BYTEAOID, BYTEAOID};
+	PGresult   *res;
+	bool		moved;
+
+	values[0] = name;
+	values[1] = (const char *) expected->bytes;
+	lengths[1] = expected->len;
+	values[2] = tag ? (const char *) tag->bytes : NULL;
+	lengths[2] = tag ? tag->len : 0;
+	res = run(r, "SELECT pg_catalog.dolt_serve_move_tag($1, $2, $3)",
+			  3, types, values, lengths, formats, &one_bool, "moving a tag");
+	moved = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
+	PQclear(res);
+	run_command(r, moved ? "COMMIT" : "ROLLBACK", "ending the push");
+	r->in_transaction = false;
+	return moved;
+}
+
 static const ProllyRemoteRoutine libpq_routine = {
 	.info = {
 		.iface = PROLLY_IFACE_REMOTE,
@@ -986,4 +1051,6 @@ static const ProllyRemoteRoutine libpq_routine = {
 	.file_open = libpq_file_open,
 	.file_next = libpq_file_next,
 	.file_close = libpq_file_close,
+	.tags = libpq_tags,
+	.move_tag = libpq_move_tag,
 };

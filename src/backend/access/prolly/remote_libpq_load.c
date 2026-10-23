@@ -160,6 +160,20 @@ libpq_file_close(ProllyRemoteFile *file)
 	PROLLY_CALL(libpq(), file_close, file);
 }
 
+static void
+libpq_tags(ProllyRemote *remote, ProllyRemoteTagVisit visit, void *arg)
+{
+	PROLLY_CALL(libpq(), tags, remote, visit, arg);
+}
+
+static bool
+libpq_move_tag(ProllyRemote *remote, const char *name,
+			   const ProllyHash *expected, const ProllyHash *tag,
+			   const ProllyHash *commit)
+{
+	return PROLLY_CALL(libpq(), move_tag, remote, name, expected, tag, commit);
+}
+
 #define LIBPQ_CALLBACKS \
 	.check_url = libpq_check_url, \
 	.open = libpq_open, \
@@ -176,7 +190,9 @@ libpq_file_close(ProllyRemoteFile *file)
 	.files = libpq_files, \
 	.file_open = libpq_file_open, \
 	.file_next = libpq_file_next, \
-	.file_close = libpq_file_close
+	.file_close = libpq_file_close, \
+	.tags = libpq_tags, \
+	.move_tag = libpq_move_tag
 
 const ProllyRemoteRoutine prolly_remote_postgresql = {
 	.info = {
