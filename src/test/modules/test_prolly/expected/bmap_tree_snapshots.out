@@ -149,7 +149,7 @@ SELECT test_bmap_rows_digest(:then) = :'big_rows' AS then_written;
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated 
 -------+-----------+-----------
-     0 |         0 |      1626
+     0 |         0 |      1664
 (1 row)
 
 -- letting the snapshot go: what only it held is freed
@@ -207,7 +207,7 @@ SELECT count(*) FROM test_bmap_snapshots(:big);
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated 
 -------+-----------+-----------
-     0 |         0 |         0
+     0 |         0 |      1939
 (1 row)
 
 -- letting go of a snapshot of an unchanged relation frees nothing
@@ -257,7 +257,7 @@ DROP TABLE small, big;
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated 
 -------+-----------+-----------
-     0 |         0 |     11339
+     0 |         0 |      9396
 (1 row)
 
 -- at most 16

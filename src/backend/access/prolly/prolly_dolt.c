@@ -8628,7 +8628,8 @@ prolly_make_change_logs(PG_FUNCTION_ARGS)
  *
  * The current database's page stores swept (bmap_sweep()), in every
  * tablespace that has one: blocks nothing holds freed, stuck reference
- * counts rewritten exactly, the stores shortened.  Its owner, or a member
+ * counts rewritten exactly, the blocks past what they hold moved down and
+ * the stores shortened.  Its owner, or a member
  * of pg_maintain, as dolt_gc().
  */
 Datum

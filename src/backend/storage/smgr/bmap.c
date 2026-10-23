@@ -98,8 +98,9 @@
  * A sweep counts exactly what every map (and changes list) of a database's
  * page store holds, each relation's read under its header's lock, and
  * frees the blocks allocated as it began that nothing holds, rewrites the
- * stuck counts that now fit, and shortens the store to its last allocated
- * block (SHRINK, which redo truncates by too).  Branch creation (a share,
+ * stuck counts that now fit, moves the blocks past the allocated count down
+ * into free ones (compact_store()), and shortens the store to its last
+ * allocated block (SHRINK, which redo truncates by too).  Branch creation (a share,
  * the one thing that adds holders) waits for it while it counts, and the
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
