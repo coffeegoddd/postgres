@@ -169,7 +169,7 @@ def check(root, c, engines, stage):
                 if 'usage: sql-driver DRIVER DSN' not in output:
                     raise ValueError('unexpected SQL driver; rebuild bin/sql-driver')
             checks.test('SQL driver', driver)
-        if stage in ('prepare', 'run') and set(c['passes']) - {'timing'}:
+        if stage in ('prepare', 'run') and set(c['passes']) - {'timing', 'counters'}:
             from memory import snapshot
             checks.test('Linux /proc memory and I/O access', lambda: snapshot(os.getpid()))
         for engine in engines:
