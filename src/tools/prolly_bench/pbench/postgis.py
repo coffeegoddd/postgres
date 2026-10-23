@@ -147,6 +147,30 @@ def linked_libraries(module: Path, out: Callable[[list[str]], str] = _out) -> di
     return found
 
 
+def linked_by(pkglibdir: Path, names: tuple[str, ...],
+              out: Callable[[list[str]], str] = _out) -> dict[str, dict[str, str]]:
+    """The geospatial shared objects any of the modules links (SFCGAL's
+    only postgis_sfcgal's)."""
+    found: dict[str, dict[str, str]] = {}
+    for name in names:
+        found.update(linked_libraries(pkglibdir / name, out))
+    return dict(sorted(found.items()))
+
+
+def preflight(pin_path: Path = PIN, allow_library_mismatch: bool = False,
+              versions: Callable[[], dict[str, str | None]] | None = None):
+    """The pin, the library versions found and their mismatches, refused
+    before anything is built when they differ and that isn't allowed."""
+    pin = read_pin(pin_path)
+    found = (versions or library_versions)()
+    mismatches = library_mismatches(pin, found)
+    if mismatches and not allow_library_mismatch:
+        raise PinError("PostGIS's libraries don't match configs/postgis.toml: " + "; ".join(mismatches)
+                       + " (install the pinned versions, update the pin, or pass "
+                         "--postgis-allow-library-mismatch, which is recorded)")
+    return pin, found, mismatches
+
+
 def pg_config_value(pg_config: Path, flag: str) -> Path:
     return Path(subprocess.check_output([str(pg_config), flag], text=True).strip())
 
@@ -178,9 +202,25 @@ def _source(build: Path, pin: dict[str, Any], source: Path | None, log) -> Path:
     return src
 
 
-def _smoke(bin_dir: Path, work: Path, names: tuple[str, ...]) -> dict[str, Any]:
-    """Create every extension in a throwaway cluster; postgis_full_version()
-    and each extension's version."""
+def readings(sql: Callable[[str], str], sfcgal: bool) -> dict[str, Any]:
+    """postgis_full_version() with the extensions a G or GV database
+    creates (what each cell's reading is compared with: it names SFCGAL
+    only once postgis_sfcgal exists), then postgis_sfcgal created too when
+    built, and every extension's version."""
+    for name in EXTENSIONS:
+        sql(f"CREATE EXTENSION {name}")
+    out: dict[str, Any] = {"full_version": sql("SELECT postgis_full_version()")}
+    if sfcgal:
+        sql(f"CREATE EXTENSION {SFCGAL_EXTENSION}")
+        out["full_version_with_sfcgal"] = sql("SELECT postgis_full_version()")
+    out["extension_versions"] = json.loads(sql(
+        "SELECT json_object_agg(extname, extversion ORDER BY extname) FROM pg_extension "
+        "WHERE extname <> 'plpgsql'"))
+    return out
+
+
+def _smoke(bin_dir: Path, work: Path, sfcgal: bool) -> dict[str, Any]:
+    """readings() in a throwaway cluster."""
     data = work / "data"
     env = {**os.environ, "PGTZ": "UTC", "LC_ALL": "C"}
     subprocess.run([str(bin_dir / "initdb"), "-D", str(data), "-A", "trust", "-U", "postgres",
@@ -198,12 +238,7 @@ def _smoke(bin_dir: Path, work: Path, names: tuple[str, ...]) -> dict[str, Any]:
                 [str(bin_dir / "psql"), "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-h", "localhost",
                  "-p", str(port), "-U", "postgres", "-d", "postgres", "-c", q],
                 text=True, env=env, stderr=subprocess.STDOUT).strip()
-        for name in names:
-            sql(f"CREATE EXTENSION {name}")
-        return {"full_version": sql("SELECT postgis_full_version()"),
-                "extension_versions": json.loads(sql(
-                    "SELECT json_object_agg(extname, extversion ORDER BY extname) FROM pg_extension "
-                    "WHERE extname <> 'plpgsql'"))}
+        return readings(sql, sfcgal)
     finally:
         subprocess.run([str(bin_dir / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"],
                        capture_output=True, env=env)
@@ -213,15 +248,9 @@ def build(*, pg_config: Path, build_dir: Path, jobs: int = 4, source: Path | Non
           pin_path: Path = PIN, allow_library_mismatch: bool = False) -> dict[str, Any]:
     """Build and install the pinned PostGIS against pg_config's
     installation; the manifest (also written to BUILD/pbench-postgis.json)."""
-    pin = read_pin(pin_path)
+    pin, found, mismatches = preflight(pin_path, allow_library_mismatch)
     pg_config = pg_config.resolve()
     build_dir.mkdir(parents=True, exist_ok=False)
-    found = library_versions()
-    mismatches = library_mismatches(pin, found)
-    if mismatches and not allow_library_mismatch:
-        raise PinError("PostGIS's libraries don't match configs/postgis.toml: " + "; ".join(mismatches)
-                       + " (install the pinned versions, update the pin, or pass "
-                         "--postgis-allow-library-mismatch, which is recorded)")
     sfcgal = found.get("sfcgal") is not None
     bin_dir = pg_config_value(pg_config, "--bindir")
     pkglibdir = pg_config_value(pg_config, "--pkglibdir")
@@ -241,7 +270,7 @@ def build(*, pg_config: Path, build_dir: Path, jobs: int = 4, source: Path | Non
         raise RuntimeError(f"PostGIS install lacks {missing}")
     work = Path(tempfile.mkdtemp(prefix="smoke-", dir=build_dir))
     try:
-        smoke = _smoke(bin_dir, work, extensions(sfcgal))
+        smoke = _smoke(bin_dir, work, sfcgal)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     manifest = {
@@ -251,8 +280,7 @@ def build(*, pg_config: Path, build_dir: Path, jobs: int = 4, source: Path | Non
         "configure_command": configure,
         "pinned_libraries": pin["libraries"], "library_versions": found,
         "library_mismatches": mismatches,
-        "linked_libraries": linked_libraries(pkglibdir / MODULES[0]) |
-                            linked_libraries(pkglibdir / MODULES[1]),
+        "linked_libraries": linked_by(pkglibdir, names),
         "module_hashes": {n: sha256(pkglibdir / n) for n in names},
         "extensions": list(extensions(sfcgal)),
         **smoke,

@@ -44,6 +44,9 @@ def main():
     args = p.parse_args()
     if args.jobs <= 0:
         p.error("jobs must be positive")
+    if args.with_postgis:
+        # (a bad pin or other libraries refused before the server's build)
+        postgis.preflight(allow_library_mismatch=args.postgis_allow_library_mismatch)
     source = args.source.resolve()
     build = args.build_dir.resolve()
     build.mkdir(parents=True, exist_ok=False)

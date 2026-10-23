@@ -255,6 +255,57 @@ class PostgisPinTest(unittest.TestCase):
             with self.assertRaisesRegex(postgis.PinError, "geos 3.14.1, pinned 3.15.0"):
                 postgis.build(pg_config=Path(d) / "pg_config", build_dir=Path(d) / "b")
             source.assert_not_called()
+            # (so the same build directory can be used once they're fixed)
+            self.assertFalse((Path(d) / "b").exists())
+
+    def test_server_build_refused_before_it_starts(self):
+        """build_postgres.py --with-postgis checks the pin and libraries
+        before configuring the server."""
+        import build_postgres
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(postgis, "library_versions",
+                                  lambda: {"geos": "3.14.1", "proj": "9.9.0", "gdal": "3.13.3"}), \
+                mock.patch.object(build_postgres.subprocess, "run") as run, \
+                mock.patch("sys.argv", ["build_postgres.py", "--build-dir", str(Path(d) / "b"),
+                                        "--with-postgis"]):
+            with self.assertRaisesRegex(postgis.PinError, "geos 3.14.1"):
+                build_postgres.main()
+            run.assert_not_called()
+            self.assertFalse((Path(d) / "b").exists())
+
+    def test_build_reading_is_what_cells_read(self):
+        """With SFCGAL built, the recorded postgis_full_version() is read
+        before postgis_sfcgal exists, as in a G or GV database, so cells
+        compare equal; the reading with it is kept beside."""
+        created = []
+        def sql(q):
+            if q.startswith("CREATE EXTENSION "):
+                created.append(q.split()[-1])
+                return ""
+            if "postgis_full_version" in q:
+                return FULL_VERSION + (' SFCGAL="SFCGAL 2.2.0, CGAL 6.0.1, BOOST 1.88.0"'
+                                       if postgis.SFCGAL_EXTENSION in created else "")
+            return json.dumps({n: "3.7.0dev" for n in created})
+        r = postgis.readings(sql, sfcgal=True)
+        self.assertEqual(created, list(postgis.EXTENSIONS) + [postgis.SFCGAL_EXTENSION])
+        self.assertEqual(postgis.full_version_mismatches(r["full_version"], FULL_VERSION), [])
+        self.assertIn("SFCGAL=", r["full_version_with_sfcgal"])
+        self.assertIn(postgis.SFCGAL_EXTENSION, r["extension_versions"])
+
+    def test_linked_libraries_of_every_module(self):
+        """SFCGAL is linked by postgis_sfcgal-3.so alone; it is recorded."""
+        with tempfile.TemporaryDirectory() as d:
+            libs = {}
+            for so in ("libgeos_c.so.1", "libproj.so.25", "libSFCGAL.so.2"):
+                (Path(d) / so).write_bytes(so.encode())
+                libs[so] = Path(d) / so
+            links = {"postgis-3.so": ["libgeos_c.so.1", "libproj.so.25"],
+                     "postgis_raster-3.so": ["libproj.so.25"], "postgis_topology-3.so": ["libgeos_c.so.1"],
+                     "postgis_sfcgal-3.so": ["libSFCGAL.so.2"]}
+            def ldd(args):
+                return "\n".join(f"\t{so} => {libs[so]} (0x0)" for so in links[Path(args[1]).name])
+            found = postgis.linked_by(Path(d), postgis.modules(True), ldd)
+            self.assertEqual(sorted(found), ["libSFCGAL.so.2", "libgeos_c.so.1", "libproj.so.25"])
 
     def test_full_version_compares_versions_not_settings(self):
         fields = postgis.full_version_fields(FULL_VERSION)

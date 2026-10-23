@@ -471,18 +471,22 @@ local clone instead of the pin's repository) and checks it is at the pin
 and clean; runs `autogen.sh` and `configure` against the server's
 `pg_config`, with raster and topology, and SFCGAL when `sfcgal-config` is
 found; installs into the server's installation (its man pages under the
-server's prefix, not `/usr/local`); then creates every extension in a
-throwaway cluster and reads `postgis_full_version()`.  The manifest
+server's prefix, not `/usr/local`); then, in a throwaway cluster, creates
+the extensions a G or GV database does and reads `postgis_full_version()`
+(what each cell's reading is compared with), then `postgis_sfcgal` when
+built, reading it again.  The pin and the library versions are checked
+before anything is built, the server included.  The manifest
 (`pbench-build.json`'s `extensions.postgis`, or `BUILD/pbench-postgis.json`
 from `build_postgis.py`) records:
 
 - the repository, commit and configure command;
 - the pinned and found library versions, and any mismatch;
-- each geospatial shared object PostGIS links (GEOS, PROJ, GDAL, SFCGAL,
-  json-c, protobuf-c, libxml2), with its path and hash;
+- each geospatial shared object any PostGIS module links (GEOS, PROJ,
+  GDAL, SFCGAL, json-c, protobuf-c, libxml2), with its path and hash;
 - each installed module's hash (`postgis-3.so`, `postgis_raster-3.so`,
   `postgis_topology-3.so`, `postgis_sfcgal-3.so`);
-- the extensions' versions and `postgis_full_version()`.
+- the extensions' versions, `postgis_full_version()`, and with SFCGAL
+  `full_version_with_sfcgal`.
 
 The build's `libraries` list then includes PostGIS's modules (a build
 without PostGIS lists only `pg_walinspect.so`, so S-only builds don't need
