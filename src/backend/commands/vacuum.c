@@ -31,6 +31,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
@@ -508,6 +509,10 @@ vacuum(List *relations, const VacuumParams *params, BufferAccessStrategy bstrate
 				use_own_xacts;
 
 	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
+
+	/* (an autovacuum worker's pass is one budget: do_autovacuum()) */
+	if (!AmAutoVacuumWorkerProcess())
+		VacuumReleaseBudgetReset();
 
 	/*
 	 * We cannot run VACUUM inside a user transaction block; if we were inside
@@ -2080,6 +2085,77 @@ vac_truncate_clog(TransactionId frozenXID,
 
 
 /*
+ * Storage whose pages other relations may share may also have pages held
+ * by storage dropped since (a deleted branch's copy of the table), queued
+ * to be let go of in the background.  Until then such a page counts as
+ * shared, so VACUUM would leave it as it is, or copy it to prune or freeze
+ * it, though nothing else will hold it: so that is let go of first, under
+ * the cost-based delay.  The queue is the store's, its entries any
+ * relation's, so what one VACUUM command lets go of, over all the
+ * relations it vacuums, is bounded as one autovacuum pass's release step
+ * is (prolly.release_max_per_pass), and so is what an autovacuum worker's
+ * pass lets go of over its tables (VacuumReleaseBudgetReset()).
+ *
+ * It is a saving, not the VACUUM's work: an anti-wraparound VACUUM, which
+ * must not be put off, doesn't do it, and an error in it (a queue that
+ * can't be read) is reported as a warning and the VACUUM goes on, the
+ * subtransaction it ran in rolled back.
+ */
+static uint64 release_budget_used = 0;
+
+void
+VacuumReleaseBudgetReset(void)
+{
+	release_budget_used = 0;
+}
+
+static void
+vacuum_release_dropped(Relation rel, const VacuumParams *params)
+{
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	uint32		step;
+
+	if (params->is_wraparound || !smgrcanshare(RelationGetSmgr(rel)))
+		return;
+	if (prolly_release_max_per_pass >= 0 &&
+		release_budget_used >= (uint64) prolly_release_max_per_pass)
+		return;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		while ((prolly_release_max_per_pass < 0 ||
+				release_budget_used < (uint64) prolly_release_max_per_pass) &&
+			   (step = smgrreleasestep(RelationGetSmgr(rel))) > 0)
+		{
+			release_budget_used += step;
+			vacuum_delay_point(false);
+		}
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		ereport(WARNING,
+				(errmsg("could not let go of dropped storage before vacuuming \"%s\": %s",
+						RelationGetRelationName(rel), edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
+
+/*
  *	vacuum_rel() -- vacuum one heap relation
  *
  *		relid identifies the relation to vacuum.  If relation is supplied,
@@ -2427,7 +2503,10 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 			rel = NULL;
 		}
 		else
+		{
+			vacuum_release_dropped(rel, &params);
 			table_relation_vacuum(rel, &params, bstrategy);
+		}
 	}
 
 	/* Roll back any GUC changes executed by index functions */
