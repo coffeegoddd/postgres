@@ -1279,9 +1279,6 @@ static bool share_clean_tables(const ProllyNodeRef *target,
 							   ProllyNodeRef *working);
 static bool advance_to_target(const ProllyNodeRef *target,
 							  const ProllyNodeRef *working);
-static void publish_fold(const BranchFoldStamp *stamp, Snapshot snap,
-						 const ProllyNodeRef *baseline,
-						 const ProllyNodeRef *root, bool complete);
 
 /*
  * A first use's source whose working set was known to be the root its
@@ -1321,11 +1318,12 @@ copied_working_set(const KnownSource *ks, ProllyNodeRef *working)
  * uncommitted work the move discards, as it does any other.  The working
  * set is folded only if nothing known says what it is (#482): the
  * branch's, or (source, a first use's) the working set of the branch its
- * copies were made from, as they are still (#491).  The session branch's
- * working set, folded, is its baseline from then on (a checkpoint), so
- * that after the move the baseline can be advanced to the target without
- * folding again (advance_to_target()): a move from a dirty working set
- * folds it once.
+ * copies were made from, as they are still (#491).  Otherwise (a move of
+ * the session's branch, or a first use whose source's working set wasn't
+ * known to be the copies' root) the working set, folded, is the branch's
+ * baseline from then on (a checkpoint), so that after the move the
+ * baseline can be advanced to the target without folding again
+ * (advance_to_target()): a move from a dirty working set folds it once.
  */
 static void
 settle(const ProllyNodeRef *target, const KnownSource *source)
@@ -1590,8 +1588,11 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
  * baseline (which holds working's rows, as the fold before the move left
  * it) advanced to target without a fold, each table whose rows the move
  * wrote holding target's, its change finder's record of the move's own
- * writes consumed (the canonicalizer's advance_baseline()), and target
- * published as the working set (#482).  False, the caller folding, where
+ * writes consumed (the canonicalizer's advance_baseline()), its fold's
+ * working set recorded as target (#482).  (Not published as known: the
+ * move wrote the branch in this transaction, which moves its generation as
+ * it ends; the next read folds, finding nothing left to read.)  False,
+ * the caller folding, where
  * a table's can't be so: the definitions or a materialized view's rows
  * moved too, or a finder can't advance a table's state (then those that
  * were advanced stay so, and the fold reads only the rest).
@@ -1607,8 +1608,6 @@ advance_to_target(const ProllyNodeRef *target, const ProllyNodeRef *working)
 	List	   *theirs = NIL;
 	ListCell   *a;
 	ListCell   *b;
-	BranchFoldStamp stamp;
-	Snapshot	snap;
 	bool		all = true;
 	bool		any = false;
 
@@ -1644,10 +1643,6 @@ advance_to_target(const ProllyNodeRef *target, const ProllyNodeRef *working)
 				   ((NamedTree *) lfirst(b))->name) != 0)
 			return false;
 	}
-
-	/* (the stamp before the baseline moves, as a fold's) */
-	branch_fold_stamp(MyBranch, &stamp);
-	snap = fold_snapshot();
 	forboth(a, ours, b, theirs)
 	{
 		NamedTree  *o = lfirst(a);
@@ -1675,7 +1670,6 @@ advance_to_target(const ProllyNodeRef *target, const ProllyNodeRef *working)
 		return false;
 	}
 	branch_set_baseline(name, &baseline, target);
-	publish_fold(&stamp, snap, &baseline, target, false);
 	if (debug_prolly_verify_fold_caches)
 		verify_known(name, false, target);
 	return true;
