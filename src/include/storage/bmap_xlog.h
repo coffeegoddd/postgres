@@ -34,7 +34,8 @@
  *						then bitmap pages
  * XLOG_BMAP_TRUNCATE	the relation's length: block 0 is the map's header,
  *						then, if the relation was folded, its changes list's
- *						header and page
+ *						header and page; the XLOG_SMGR_TRUNCATE before it,
+ *						flushed alone, makes the same change in its replay
  * XLOG_BMAP_FREE		blocks are freed: block 0 is the allocator's metapage,
  *						then bitmap pages
  * XLOG_BMAP_SHARE		part of a map copied into another relation's, sharing

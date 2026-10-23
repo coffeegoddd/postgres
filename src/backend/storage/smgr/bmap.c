@@ -6009,6 +6009,152 @@ bmapnblocks(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * A truncation writes two records: XLOG_SMGR_TRUNCATE, flushed before any
+ * buffer is dropped, then the header's own (set_length()), which nothing
+ * flushes.  A crash in between leaves only the first durable, whose replay
+ * drops the buffers past the new length: were the header left long, those
+ * pages would be read again from disk, older than the records replayed
+ * onto them (rows deleted before the truncation would come back).  So the
+ * first record's replay cuts the header itself, and lists the truncation
+ * on a folded relation's changes list, as the second record does; that
+ * one's replay, if it comes, applies the same again.  A page newer than
+ * the first record means the second is durable (the header is held from
+ * one record to the other, and the list changes only under it): then the
+ * pages are left to it.
+ *
+ * In redo, before the truncation's critical section: the header, held
+ * exclusively, and a folded relation's changes list's header and the page
+ * its next entry goes on, pinned (the page added to the fork if need be).
+ */
+static void
+pretruncate_in_recovery(SMgrRelation reln)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+
+	reln->bmap_pretrunc = InvalidBuffer;
+	reln->bmap_pretrunc_chg[0] = reln->bmap_pretrunc_chg[1] = InvalidBuffer;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	if (PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch > 0)
+	{
+		Buffer		head = chg_read(rel, 0);
+		Buffer		page;
+		BlockNumber pageno;
+
+		LockBuffer(head, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(head), BMAP_PAGE_CHANGES_HEAD, rel,
+				   BMAP_CHANGES_FORKNUM, 0);
+		pageno = CHANGE_PAGE(PageGetBmapChangesHead(BufferGetPage(head))->nentries);
+		LockBuffer(head, BUFFER_LOCK_UNLOCK);
+		if (pageno < mdnblocks(reln, BMAP_CHANGES_FORKNUM))
+			page = chg_read(rel, pageno);
+		else
+		{
+			page = XLogReadBufferExtended(rel, BMAP_CHANGES_FORKNUM, pageno,
+										  RBM_ZERO_AND_LOCK, InvalidBuffer);
+			LockBuffer(page, BUFFER_LOCK_UNLOCK);
+		}
+		reln->bmap_pretrunc_chg[0] = head;
+		reln->bmap_pretrunc_chg[1] = page;
+	}
+	reln->bmap_pretrunc = headerbuf;
+}
+
+/*
+ * In redo, in XLOG_SMGR_TRUNCATE's critical section: cut the header to
+ * 'nblocks', and list the truncation, unless the header's own record is
+ * durable (see pretruncate_in_recovery()).  The pages take this record's
+ * end as their LSN, so that the header's record still replays onto them.
+ */
+static void
+truncate_in_recovery(SMgrRelation reln, BlockNumber nblocks)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf = reln->bmap_pretrunc;
+	Buffer	   *chg = reln->bmap_pretrunc_chg;
+	XLogRecPtr	end = GetCurrentReplayRecPtr(NULL);
+	Page		hpage;
+	BmapHeader *header;
+	bool		newer;
+
+	if (!BufferIsValid(headerbuf))
+		elog(PANIC, "block-mapped relation %s truncated in recovery without being prepared",
+			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
+	reln->bmap_pretrunc = InvalidBuffer;
+	hpage = BufferGetPage(headerbuf);
+	header = PageGetBmapHeader(hpage);
+	if (BufferIsValid(chg[0]))
+	{
+		LockBuffer(chg[0], BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(chg[1], BUFFER_LOCK_EXCLUSIVE);
+	}
+	newer = PageGetLSN(hpage) >= end ||
+		(BufferIsValid(chg[0]) &&
+		 (PageGetLSN(BufferGetPage(chg[0])) >= end ||
+		  PageGetLSN(BufferGetPage(chg[1])) >= end));
+	if (!newer && nblocks < header->nblocks)
+	{
+		xl_bmap_header_delta delta;
+
+		if (BufferIsValid(chg[0]))
+		{
+			BmapChangesHead *head = PageGetBmapChangesHead(BufferGetPage(chg[0]));
+			xl_bmap_changes_head_delta hdelta;
+			struct
+			{
+				xl_bmap_changes_delta d;
+				BmapChange	c;
+			}			pdelta;
+
+			if (BufferGetBlockNumber(chg[1]) != CHANGE_PAGE(head->nentries))
+				elog(PANIC, "changes list of \"%s\" grew while its truncation was prepared",
+					 relpathperm(rel, MAIN_FORKNUM).str);
+			hdelta.kind = BMAP_DELTA_CHANGES_HEAD;
+			hdelta.flags = 0;
+			hdelta.fold_epoch = head->fold_epoch;
+			hdelta.lineage = head->lineage;
+			hdelta.fold_nblocks = head->fold_nblocks;
+			hdelta.nentries = head->nentries + 1;
+			hdelta.pruned_epoch = head->pruned_epoch;
+			pdelta.d.kind = BMAP_DELTA_CHANGES;
+			pdelta.d.flags = CHANGE_SLOT(head->nentries) == 0 ? BMAP_DELTA_INIT : 0;
+			pdelta.d.first = CHANGE_SLOT(head->nentries);
+			pdelta.d.n = 1;
+			memset(&pdelta.c, 0, sizeof(pdelta.c));
+			pdelta.c.epoch = header->epoch;
+			pdelta.c.blkno = nblocks;
+			pdelta.c.old_block = InvalidBlockNumber;
+			pdelta.c.kind = BMAP_CHANGE_TRUNCATE;
+			apply_changes_head_delta(BufferGetPage(chg[0]), &hdelta);
+			apply_changes_delta(BufferGetPage(chg[1]), &pdelta.d);
+			for (int i = 0; i < 2; i++)
+			{
+				PageSetLSN(BufferGetPage(chg[i]), end);
+				MarkBufferDirty(chg[i]);
+			}
+		}
+		delta.kind = BMAP_DELTA_HEADER;
+		delta.flags = 0;
+		delta.nblocks = nblocks;
+		delta.epoch = header->epoch;
+		delta.fold_epoch = header->fold_epoch;
+		apply_header_delta(hpage, &delta);
+		PageSetLSN(hpage, end);
+		MarkBufferDirty(headerbuf);
+	}
+	UnlockReleaseBuffer(headerbuf);
+	for (int i = 0; i < 2; i++)
+	{
+		if (BufferIsValid(chg[i]))
+			UnlockReleaseBuffer(chg[i]);
+		chg[i] = InvalidBuffer;
+	}
+	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+}
+
+/*
  * Truncation happens inside a critical section, where reading a buffer
  * isn't safe, so the header is read beforehand, and held exclusively until
  * the truncation: no fold begins, and the changes list isn't pruned,
@@ -6022,8 +6168,13 @@ bmappretruncate(SMgrRelation reln, ForkNumber forknum)
 	Buffer		chg[2] = {InvalidBuffer, InvalidBuffer};
 	bool		flushed = false;
 
-	if (forknum != MAIN_FORKNUM || InRecovery)
+	if (forknum != MAIN_FORKNUM)
 		return;
+	if (InRecovery)
+	{
+		pretruncate_in_recovery(reln);
+		return;
+	}
 
 	/* (pins a failed truncation left are gone with its resource owner) */
 	reln->bmap_pretrunc = InvalidBuffer;
@@ -6073,6 +6224,8 @@ bmappretruncate(SMgrRelation reln, ForkNumber forknum)
 	reln->bmap_pretrunc_chg[0] = chg[0];
 	reln->bmap_pretrunc_chg[1] = chg[1];
 	INJECTION_POINT("bmap-pretruncated", NULL);
+	/* (run in the truncation's critical section, which can't load it) */
+	INJECTION_POINT_LOAD("bmap-truncating");
 }
 
 void
@@ -6088,12 +6241,13 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 	}
 
 	/*
-	 * In recovery, the primary's own truncation record follows this one; a
-	 * length kept past the header's is cut here, the header's record maybe
-	 * already replayed.
+	 * In recovery, the header is cut here, its own record maybe lost (see
+	 * pretruncate_in_recovery()); a length kept past the header's is cut
+	 * too, the header's record maybe already replayed.
 	 */
 	if (InRecovery)
 	{
+		truncate_in_recovery(reln, nblocks);
 		cut_recovery_length(reln->smgr_rlocator.locator, nblocks);
 		return;
 	}
@@ -6103,6 +6257,7 @@ bmaptruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber curnblk,
 		elog(ERROR, "block-mapped relation %s truncated without being prepared",
 			 relpath(reln->smgr_rlocator, MAIN_FORKNUM).str);
 	reln->bmap_pretrunc = InvalidBuffer;
+	INJECTION_POINT_CACHED("bmap-truncating", NULL);
 
 	/*
 	 * Blocks past the new length stay mapped until the truncation is done
