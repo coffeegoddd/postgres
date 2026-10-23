@@ -348,6 +348,8 @@ jobs:
       # (the C suite, SQL correctness, runs in correctness.yml)
       - name: Benchmark harness unit tests
         working-directory: src/tools/prolly_bench
+        env:
+          PBENCH_TEST_PG_BIN: ${{ github.workspace }}/tmp_install/usr/local/pgsql/bin
         run: python3 -m unittest discover -s tests
 
       - name: Upload logs and coverage evidence

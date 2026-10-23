@@ -43,6 +43,12 @@ fsync = "on"
 full_page_writes = "on"
 max_connections = 300
 huge_pages = "try"
+# Serializable TPC-C's predicate locks scale with clients, and the default
+# shared pool leaves too few per client at the top of the sweep. Keep the
+# original per-relation promotion threshold while enlarging the pool, so
+# this does not change lock granularity.
+max_pred_locks_per_transaction = 1024
+max_pred_locks_per_relation = 32
 # a replication slot keeps the window's WAL for write_amp to split
 wal_level = "replica"
 max_replication_slots = 2

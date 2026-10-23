@@ -491,6 +491,15 @@ For each cell (workload x size x variant x client count x repetition):
 Before the cells it records the environment and runs an fio baseline on the
 device under `--work-dir`.
 
+Recovery checks hash sorted record text output with fixed date, time,
+interval, bytea, monetary and floating-point output settings. This uses
+each column's type output function, avoiding lossy JSON casts such as
+geometry-to-GeoJSON. COPY escaping preserves row boundaries, NULLs and
+duplicates. Evidence records `row_encoding: record-text-v1`; these hashes
+are not comparable with the older JSON-row hashes. The live digest tests
+run in CI and can be run locally by setting `PBENCH_TEST_PG_BIN` to a
+PostgreSQL build's binary directory when running the Python test suite.
+
 A stub engine's "not implemented" error (SQLSTATE 0A000, read from psql or
 the server log) is reported as status `not_implemented` and fails the execution
 gate for the requested plan. It does not count as tested.

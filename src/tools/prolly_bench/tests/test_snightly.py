@@ -39,6 +39,20 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("instructions", run["collectors"])
         self.assertEqual(len(cfg["workloads"]["S10"]["tests"]), 3)
 
+    def test_serializable_tpcc_predicate_lock_pool(self):
+        # Every config that runs S9 serializable writes the enlarged pool,
+        # with the default promotion threshold, into postgresql.conf.
+        for name in ("s_nightly", "standard", "s_write_amp"):
+            with self.subTest(config=name):
+                cfg = config.load(HERE / "configs" / f"{name}.toml", {})
+                workloads = cfg["run"]["workloads"]
+                self.assertTrue(not workloads or "S9" in workloads)
+                self.assertEqual(cfg["workloads"]["S9"]["isolation"],
+                                 "TRANSACTION_SERIALIZABLE")
+                settings = config.server_settings(cfg)
+                self.assertEqual(settings["max_pred_locks_per_transaction"], "1024")
+                self.assertEqual(settings["max_pred_locks_per_relation"], "32")
+
     def test_summary(self):
         with tempfile.TemporaryDirectory() as d:
             run = night(Path(d), 0.8)
