@@ -54,7 +54,9 @@
 #include "catalog/branch_ops.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_branch.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
@@ -62,6 +64,7 @@
 #include "catalog/storage_xlog.h"
 #include "catalog/versioned.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/latch.h"
@@ -74,6 +77,7 @@
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -335,9 +339,58 @@ unlock_relations(List *relids)
 	list_free(relids);
 }
 
-/* Copy every row of the session branch into branch 'target'. */
+/*
+ * The relations of the session branch's tables named in emptied whose
+ * copies begin with no rows: each plain table's, its TOAST table's and
+ * both's indexes.  (Its change log is shared still: it is told the table
+ * was emptied.)  Returns the tables, adding them all to *relids.
+ */
+static List *
+emptied_relations(List *emptied, List **relids)
+{
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	foreach(lc, emptied)
+	{
+		Oid			relid;
+		Oid			toast;
+		List	   *rels;
+
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(lfirst(lc), NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION ||
+			list_member_oid(tables, relid))
+			continue;
+		tables = lappend_oid(tables, relid);
+		rels = list_make1_oid(relid);
+		{
+			Relation	r = table_open(relid, AccessShareLock);
+
+			toast = r->rd_rel->reltoastrelid;
+			table_close(r, AccessShareLock);
+		}
+		if (OidIsValid(toast))
+			rels = lappend_oid(rels, toast);
+		foreach_oid(rel, rels)
+		{
+			Relation	r = table_open(rel, AccessShareLock);
+
+			*relids = list_concat(*relids, RelationGetIndexList(r));
+			table_close(r, AccessShareLock);
+		}
+		*relids = list_concat(*relids, rels);
+	}
+	return tables;
+}
+
+/*
+ * Copy every row of the session branch into branch 'target'; the
+ * relations in fresh get new, empty storage rather than a share of the
+ * session branch's.
+ */
 static void
-copy_rows(Oid target)
+copy_rows(Oid target, List *fresh)
 {
 	int			ncatalogs;
 	const CatalogBranchInfo *catalogs = catalog_branch_catalogs(&ncatalogs);
@@ -374,7 +427,18 @@ copy_rows(Oid target)
 					if (!RelFileNumberIsValid(c->relfilenode))
 						elog(ERROR, "versioned relation \"%s\" is mapped",
 							 NameStr(c->relname));
-					c->relfilenode = copy_storage(c);
+					if (list_member_oid(fresh, c->oid))
+					{
+						RelFileNumber relnumber;
+
+						relnumber = GetNewRelFileNumber(c->reltablespace, NULL,
+														c->relpersistence);
+						(void) RelationCreateStorage(class_locator(c, relnumber),
+													 c->relpersistence, true);
+						c->relfilenode = relnumber;
+					}
+					else
+						c->relfilenode = copy_storage(c);
 				}
 			}
 
@@ -453,10 +517,19 @@ on_branch(Oid branch, void (*fn) (void *arg), void *arg)
 	PG_END_TRY();
 }
 
+/* A branch's copies to make: the branch's id, and the tables to empty. */
+typedef struct CopyTo
+{
+	Oid			branch;
+	List	   *emptied;		/* names, then the tables' ids */
+} CopyTo;
+
 static void
 copy_from_here(void *arg)
 {
+	CopyTo	   *ct = arg;
 	List	   *locked;
+	List	   *fresh = NIL;
 
 	/*
 	 * (the change logs' entries the transaction holds, of rows on the pages
@@ -465,9 +538,43 @@ copy_from_here(void *arg)
 	prolly_change_logs_flush();
 	locked = lock_versioned_relations();
 
-	copy_rows(*(Oid *) arg);
-	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
+	ct->emptied = emptied_relations(ct->emptied, &fresh);
+	copy_rows(ct->branch, fresh);
+	copyBranchSharedDependencies(MyBranch, ct->branch);
 	unlock_relations(locked);
+}
+
+/*
+ * Each of the new branch's copies of tables (their storage new and empty,
+ * copy_rows()'s fresh) made valid as TRUNCATE leaves a table, under the
+ * ACCESS EXCLUSIVE lock it takes: the table and its TOAST table given new
+ * storage in the transaction (so a load into it builds its indexes once,
+ * after its rows), each index built over no rows, and the change log told
+ * the table was emptied.
+ */
+static void
+empty_here(void *arg)
+{
+	ReindexParams params = {0};
+
+	foreach_oid(relid, (List *) arg)
+	{
+		Relation	rel = table_open(relid, AccessExclusiveLock);
+		Oid			toast = rel->rd_rel->reltoastrelid;
+
+		RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+		if (OidIsValid(toast))
+		{
+			Relation	t = table_open(toast, AccessExclusiveLock);
+
+			RelationSetNewRelfilenumber(t, t->rd_rel->relpersistence);
+			table_close(t, NoLock);
+		}
+		(void) reindex_relation(NULL, relid, REINDEX_REL_PROCESS_TOAST, &params);
+		prolly_note_emptied(rel);
+		table_close(rel, NoLock);
+	}
+	CommandCounterIncrement();
 }
 
 static void
@@ -546,11 +653,12 @@ copies_check_create(const char *name)
 }
 
 static Oid
-copies_make(const char *name, const char *start_point)
+copies_make(const char *name, const char *start_point, List *emptied)
 {
 	Relation	brel;
 	Oid			source;
 	Oid			branch;
+	CopyTo		ct;
 	Datum		values[Natts_pg_branch];
 	bool		nulls[Natts_pg_branch] = {0};
 	NameData	brname;
@@ -574,9 +682,13 @@ copies_make(const char *name, const char *start_point)
 	heap_freetuple(tup);
 	CommandCounterIncrement();
 
-	on_branch(source, copy_from_here, &branch);
+	ct.branch = branch;
+	ct.emptied = emptied;
+	on_branch(source, copy_from_here, &ct);
 	CommandCounterIncrement();
 	note_new_branch(branch);
+	if (ct.emptied != NIL)
+		on_branch(branch, empty_here, ct.emptied);
 
 	table_close(brel, NoLock);
 	return branch;
@@ -586,7 +698,7 @@ static Oid
 copies_create(const char *name, const char *start_point)
 {
 	copies_check_create(name);
-	return copies_make(name, start_point);
+	return copies_make(name, start_point, NIL);
 }
 
 static void

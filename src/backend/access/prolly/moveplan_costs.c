@@ -13,7 +13,10 @@
  * row applier fills before building its indexes) costs much less, its
  * index entries made by a sort.  A table whose definition differs is
  * costed as one whose every row is written again; one made, as its rows
- * loaded; one dropped, as a table's catalog work.
+ * loaded; one dropped, as a table's catalog work.  Where the move's
+ * working set is new (PROLLY_PLAN_RELOADS), a table whose rows differ is
+ * emptied and loaded instead where that costs less than its diff: past
+ * about an eighth of its rows changed, with the figures below.
  *
  * The figures are microseconds per row and per index entry, measured on a
  * development build: moving 100,000 changed rows of a 200,000-row table
@@ -29,15 +32,18 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/prolly_builtins.h"
 #include "access/stratnum.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/regproc.h"
 
 #define ROW_WRITE_USEC		3.5		/* a row a diff writes: its heap work */
@@ -120,6 +126,47 @@ indexes_of(const char *name)
 	return n;
 }
 
+/*
+ * Can table name be loaded, its indexes built after its rows: not with a
+ * deferrable unique, primary key or exclusion constraint, whose rechecks
+ * the row applier queues a row at a time.  Read from pg_constraint,
+ * without opening the table; false if the session branch has no such
+ * table.
+ */
+static bool
+loadable(const char *name)
+{
+	Oid			relid;
+	Relation	rel;
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		ok = true;
+
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		return false;
+	rel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&key, Anum_pg_constraint_conrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	scan = systable_beginscan(rel, ConstraintRelidTypidNameIndexId, true, NULL,
+							  1, &key);
+	while (ok && HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tup);
+
+		if (con->condeferrable &&
+			(con->contype == CONSTRAINT_PRIMARY ||
+			 con->contype == CONSTRAINT_UNIQUE ||
+			 con->contype == CONSTRAINT_EXCLUSION))
+			ok = false;
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return ok;
+}
+
 static bool
 same_hash(const ProllyHash *a, const ProllyHash *b)
 {
@@ -148,8 +195,8 @@ add_move(ProllyMovePlan *plan, const char *name, ProllyTableMoveKind kind,
 }
 
 static void
-costs_plan(const ProllyNodeRef *from, const ProllyNodeRef *to, double bound,
-		   ProllyMovePlan *plan)
+costs_plan(const ProllyNodeRef *from, const ProllyNodeRef *to, int flags,
+		   double bound, ProllyMovePlan *plan)
 {
 	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
 	ProllyTreeEnv env;
@@ -203,9 +250,16 @@ costs_plan(const ProllyNodeRef *from, const ProllyNodeRef *to, double bound,
 					uint64		changes = PROLLY_CALL(tree, diff_estimate, &env,
 													  &f->data, &t->data,
 													  ESTIMATE_NODES);
+					double		reload = TABLE_USEC +
+						rows * (ROW_LOAD_USEC + nidx * INDEX_LOAD_USEC);
 
-					add_move(plan, t->name, PROLLY_TABLE_ROWS, changes, rows,
-							 changes * row);
+					if ((flags & PROLLY_PLAN_RELOADS) && reload < changes * row &&
+						loadable(t->name))
+						add_move(plan, t->name, PROLLY_TABLE_RELOAD, changes,
+								 rows, reload);
+					else
+						add_move(plan, t->name, PROLLY_TABLE_ROWS, changes, rows,
+								 changes * row);
 				}
 			}
 			i++;

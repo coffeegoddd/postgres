@@ -19,13 +19,20 @@
  *   microseconds; plan->cost is their sum.  Tables are named by their
  *   qualified, server-encoded names, as the canonicalizer's tables()
  *   names them.
+ * - With PROLLY_PLAN_RELOADS (the move's working set is new in the
+ *   transaction, which no other sees: a branch's first use), a table whose
+ *   rows differ may be planned PROLLY_TABLE_RELOAD instead, where emptying
+ *   it and loading every row to has (its indexes built once, after) costs
+ *   less than writing the rows that differ; not one with a deferrable
+ *   unique or exclusion constraint (its rows are rechecked a row at a time,
+ *   so it can't be loaded so).
  * - The work is bounded: a table's estimate reads a bounded number of
  *   tree nodes, whatever the size of its diff, and planning stops once
  *   the cost passes bound (plan->over then set, the tables after it not
  *   planned).
  * - It writes nothing, takes no lock, and reads only the session branch's
  *   catalogs (by its tables' names, for what writing their rows costs:
- *   their indexes).  A table the session branch hasn't is costed as one
+ *   their indexes and constraints).  A table the session branch hasn't is costed as one
  *   with a primary key alone.
  *
  * Provisional (v0).
@@ -45,6 +52,7 @@
 typedef enum ProllyTableMoveKind
 {
 	PROLLY_TABLE_ROWS,			/* the rows that differ written */
+	PROLLY_TABLE_RELOAD,		/* emptied, then every row of to's loaded */
 	PROLLY_TABLE_REDEFINED,		/* its definition moved, then its rows */
 	PROLLY_TABLE_ADDED,			/* to's alone: made, and its rows written */
 	PROLLY_TABLE_DROPPED,		/* from's alone: dropped */
@@ -66,12 +74,15 @@ typedef struct ProllyMovePlan
 	bool		over;			/* stopped once past the bound */
 } ProllyMovePlan;
 
+/* plan()'s flags */
+#define PROLLY_PLAN_RELOADS		0x01	/* tables may be emptied and loaded */
+
 typedef struct ProllyMovePlannerRoutine
 {
 	ProllyImplInfo info;
 
 	void		(*plan) (const ProllyNodeRef *from, const ProllyNodeRef *to,
-						 double bound, ProllyMovePlan *plan);
+						 int flags, double bound, ProllyMovePlan *plan);
 } ProllyMovePlannerRoutine;
 
 #define PROLLY_MOVEPLAN_CALLBACK_NAMES \

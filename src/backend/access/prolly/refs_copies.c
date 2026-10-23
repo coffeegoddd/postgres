@@ -2146,7 +2146,10 @@ rank_source(const char *name, Oid branch, void *arg)
  * after it, each stopped once it costs more than the best yet.  NULL if
  * none is cheaper than the session's branch.  (A source a move could start
  * from without a branch's copies, as a kept materialization, would be
- * planned among these, by the root it holds.)
+ * planned among these, by the root it holds.)  The copies are new in the
+ * transaction, which no other sees: the tables of the chosen plan that
+ * cost less emptied and loaded than moved row by row (#713) are added to
+ * *emptied, for their copies to begin empty.
  */
 #define SOURCE_CANDIDATES	16
 
@@ -2187,13 +2190,14 @@ note_candidate(const char *name, Oid branch, void *arg)
 }
 
 static char *
-estimated_source(const ProllyNodeRef *target, Snapshot snap)
+estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied)
 {
 	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
 	SourceCandidates sc = {snap, false, NIL, NIL};
 	ProllyMovePlan plan;
-	double		best;
+	ProllyMovePlan best;
 	char	   *source = NULL;
+	ListCell   *lc;
 
 	/* (the session's branch first, then the others) */
 	branch_ops()->branches(note_candidate, &sc);
@@ -2201,18 +2205,26 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap)
 		return NULL;
 	sc.others = true;
 	branch_ops()->branches(note_candidate, &sc);
-	PROLLY_CALL(planner, plan, linitial(sc.roots), target, INFINITY, &plan);
+	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
+				INFINITY, &best);
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
-	best = plan.cost;
 	for (int i = 1; i < list_length(sc.names); i++)
 	{
-		PROLLY_CALL(planner, plan, list_nth(sc.roots, i), target, best, &plan);
+		PROLLY_CALL(planner, plan, list_nth(sc.roots, i), target,
+					PROLLY_PLAN_RELOADS, best.cost, &plan);
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
-		if (!plan.over && plan.cost < best)
+		if (!plan.over && plan.cost < best.cost)
 		{
-			best = plan.cost;
+			best = plan;
 			source = list_nth(sc.names, i);
 		}
+	}
+	foreach(lc, best.tables)
+	{
+		ProllyTableMove *m = lfirst(lc);
+
+		if (m->kind == PROLLY_TABLE_RELOAD)
+			*emptied = lappend(*emptied, m->name);
 	}
 	return source;
 }
@@ -2234,6 +2246,7 @@ materialize(const char *name)
 	bool		was_read_only = XactReadOnly;
 	int			hush;
 	NearestSource ns = {0};
+	List	   *emptied = NIL;
 	MoveCopies	mc;
 	char	   *source;
 
@@ -2279,9 +2292,9 @@ materialize(const char *name)
 			GetLatestSnapshot();
 		branch_ops()->branches(rank_source, &ns);
 		if (ns.rank == 0)
-			ns.name = estimated_source(&info.root, ns.snap);
+			ns.name = estimated_source(&info.root, ns.snap, &emptied);
 		source = ns.name != NULL ? ns.name : branch_ops()->current();
-		branch_ops()->make(name, ns.name != NULL ? source : NULL);
+		branch_ops()->make(name, ns.name != NULL ? source : NULL, emptied);
 		branch_set_baseline(name,
 							branch_baseline(source, &baseline) ? &baseline : NULL,
 							NULL);

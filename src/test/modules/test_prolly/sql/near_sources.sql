@@ -66,8 +66,8 @@ SELECT bt_index_check('ns.t_pkey', true), bt_index_check('ns.t_v', true);
 SELECT dolt_checkout('main');
 
 -- near dirty, its working set known (folded as its dirtiness is read) to
--- be further from the target than main: main's copies, its 10000 rows
--- written back.
+-- be further from the target than main: main's copies, half of t's rows
+-- differing, so t begins empty and its 20000 rows are loaded.
 SELECT dolt_checkout('near');
 UPDATE ns.t SET v = 'dirty' WHERE id > 200;
 SELECT dolt_checkout('main');

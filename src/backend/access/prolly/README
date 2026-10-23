@@ -400,7 +400,14 @@ known or thought to be: each table's rows that differ, estimated from its
 trees by diff_estimate() in a bounded number of nodes, and the tables
 redefined, made or dropped.  The session's branch and at most 16 others are
 weighed, each stopped once it costs more than the best yet; the cheapest is
-copied, the session's on a tie.
+copied, the session's on a tie.  The copies are new in the transaction, so
+no other sees them: a table of the chosen plan whose rows differ by more
+than reloading it costs (past about an eighth of them) begins empty instead
+(branch operations' make(), its emptied tables: new storage, as TRUNCATE
+gives it, no page shared, its change log told), and the move loads the
+head's rows into it, its indexes built once after them (the row applier's
+load).  Not a table with a deferrable unique, primary key or exclusion
+constraint, whose rows the applier rechecks a row at a time.
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call

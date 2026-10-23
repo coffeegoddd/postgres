@@ -161,8 +161,8 @@ SELECT dolt_checkout('main');
 (1 row)
 
 -- near dirty, its working set known (folded as its dirtiness is read) to
--- be further from the target than main: main's copies, its 10000 rows
--- written back.
+-- be further from the target than main: main's copies, half of t's rows
+-- differing, so t begins empty and its 20000 rows are loaded.
 SELECT dolt_checkout('near');
           dolt_checkout          
 ---------------------------------
@@ -215,7 +215,7 @@ SELECT dolt_checkout('at_target');
 SELECT pg_temp.since('apply_rows') AS rows_written;
  rows_written 
 --------------
-        10000
+        20000
 (1 row)
 
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_target;

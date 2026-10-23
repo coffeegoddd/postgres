@@ -60,9 +60,14 @@ typedef struct BranchOpsRoutine
 	/*
 	 * Make a branch as create does, without its checks of the session: the
 	 * copies of one that exists already in all but them, which its first
-	 * use makes.
+	 * use makes.  The copies of the tables emptied names (qualified names,
+	 * as the source branch has them; a name it hasn't, or of no plain
+	 * table, passed over) begin empty instead, as TRUNCATE leaves a table:
+	 * the table and its TOAST table given new storage, no page shared, its
+	 * indexes built over no rows, and its change log told it was emptied.
 	 */
-	Oid			(*make) (const char *name, const char *start_point);
+	Oid			(*make) (const char *name, const char *start_point,
+						 List *emptied);
 
 	/* Make name the session's branch. */
 	void		(*checkout) (const char *name);
