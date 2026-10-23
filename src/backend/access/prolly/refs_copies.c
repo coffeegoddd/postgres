@@ -49,7 +49,9 @@
  *				   identify()), as of a head: the head's hash in hex (none
  *				   for a branch without commits), a newline, then the anchor
  *	'K' name	-> the commits the branch's pages are kept as of, newest
- *				   first (see "Kept pages"): each its id and the branch's
+ *				   first (see "Kept pages"): each the transaction that
+ *				   retired it (a FullTransactionId, native byte order; 0
+ *				   while it is kept), its id and the branch's
  *				   baseline then (hash length, hash each), the count of
  *				   tables (a varint), and for each its qualified name (a
  *				   varint length, then the bytes), the count of its
@@ -216,9 +218,10 @@
 
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
- * is refused, never read.  2: tags; 3: rebases; 4: kept pages.
+ * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
+ * pages retired.
  */
-#define REFS_FORMAT		"4"
+#define REFS_FORMAT		"5"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -1920,6 +1923,22 @@ move_settled(void *arg)
  * the commit's rows, and the keeping transaction's own, which commit with
  * it.  Not at a transaction's own commit (dolt.transaction_commit): its
  * head moves at every transaction, which would keep pages each time.
+ *
+ * A branch's first use at a commit another branch keeps the pages of is
+ * made of them (make_of_kept(), branch operations' make_kept(), #489):
+ * each table's relations share the snapshots' pages, O(1), and the
+ * source's writers are never locked out for them, the pages being as
+ * they were at the commit whatever is written since.
+ *
+ * So a commit no longer kept (older than the last prolly.kept_commits) may
+ * still be being read by another's first use, which read it from the refs
+ * before.  It is retired, not let go of: its entry stays, marked with the
+ * transaction retiring it, and a later keep lets go of its pages once that
+ * transaction is known to have committed (no first use reads it from the
+ * refs after), holding the relations against first uses still making
+ * copies of it.  A commit kept again (a restore, a commit kept twice) is
+ * retired too, never changed in place, so the pages it keeps stay until
+ * the change is known to commit.
  */
 int			prolly_kept_commits = 2;
 
@@ -1932,6 +1951,8 @@ typedef struct KeptTable
 
 typedef struct KeptCommit
 {
+	FullTransactionId retired;	/* by whom, its pages to be let go of
+								 * (invalid: kept) */
 	ProllyHash	commit;
 	ProllyHash	baseline;		/* the branch's then (len 0: none) */
 	int			ntables;
@@ -1952,6 +1973,7 @@ kept_encode(StringInfo v, List *kept)
 {
 	foreach_ptr(KeptCommit, kc, kept)
 	{
+		appendBinaryStringInfo(v, &kc->retired, sizeof(FullTransactionId));
 		put_hash(v, &kc->commit);
 		put_hash(v, &kc->baseline);
 		prolly_put_varint(v, kc->ntables);
@@ -1996,6 +2018,10 @@ kept_decode(const char *p, const char *end)
 		KeptCommit *kc = palloc0(sizeof(KeptCommit));
 		uint64		n;
 
+		if (end - p < (ptrdiff_t) sizeof(FullTransactionId))
+			kept_corrupt();
+		memcpy(&kc->retired, p, sizeof(FullTransactionId));
+		p += sizeof(FullTransactionId);
 		p = get_hash(p, end, &kc->commit);
 		p = get_hash(p, end, &kc->baseline);
 		n = prolly_get_varint(&p, end);
@@ -2083,7 +2109,8 @@ kept_find(List *kept, const ProllyHash *commit)
 {
 	foreach_ptr(KeptCommit, kc, kept)
 	{
-		if (same_hash(&kc->commit, commit))
+		if (!FullTransactionIdIsValid(kc->retired) &&
+			same_hash(&kc->commit, commit))
 			return kc;
 	}
 	return NULL;
@@ -2111,23 +2138,20 @@ kept_holds(List *kept, const BranchKeptRelation *k)
 	return false;
 }
 
-/* Let go of the snapshots of dropped's commits that none of kept's holds. */
-static void
-kept_let_go(List *dropped, List *kept)
+/*
+ * May a retired commit's pages be let go of?  Once the transaction that
+ * retired it committed, nobody reads it from the refs as kept any more,
+ * but one may still be making a branch of them (make_kept()), which keep()
+ * waits out.
+ */
+static bool
+kept_releasable(const KeptCommit *kc)
 {
-	foreach_ptr(KeptCommit, kc, dropped)
-	{
-		for (int t = 0; t < kc->ntables; t++)
-		{
-			for (int r = 0; r < kc->tables[t].nrels; r++)
-			{
-				const BranchKeptRelation *k = &kc->tables[t].rels[r];
+	TransactionId xid = XidFromFullTransactionId(kc->retired);
 
-				if (!kept_holds(kept, k))
-					branch_ops()->let_go(k);
-			}
-		}
-	}
+	return FullTransactionIdIsValid(kc->retired) &&
+		!TransactionIdIsCurrentTransactionId(xid) &&
+		TransactionIdDidCommit(xid);
 }
 
 /*
@@ -2249,11 +2273,15 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 	List	   *groups = NIL;	/* each table's relids */
 	List	   *names = NIL;
 	List	   *kept;
-	List	   *dropped = NIL;
+	List	   *holding = NIL;
+	List	   *releasing = NIL;
 	List	   *next = NIL;
 	BranchKeptRelation *prior;
+	BranchKeptRelation *release;
 	BranchKeptRelation *out;
 	int			nprior = 0;
+	int			nrelease = 0;
+	int			live = 1;
 	int			at = 0;
 	KeptCommit *kc;
 	ProllyNodeRef baseline;
@@ -2279,22 +2307,48 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 		relids = list_concat(relids, g);
 	}
 
+	/*
+	 * (the pages of retired commits now let go of are kept by no commit
+	 * after: those the others hold stay)
+	 */
 	kept = kept_get(name);
 	foreach_ptr(KeptCommit, o, kept)
+	{
+		if (kept_releasable(o))
+			releasing = lappend(releasing, o);
+		else
+			holding = lappend(holding, o);
+	}
+	foreach_ptr(KeptCommit, o, holding)
 	{
 		for (int t = 0; t < o->ntables; t++)
 			nprior += o->tables[t].nrels;
 	}
 	prior = palloc_array(BranchKeptRelation, Max(nprior, 1));
 	nprior = 0;
-	foreach_ptr(KeptCommit, o, kept)
+	foreach_ptr(KeptCommit, o, holding)
 	{
 		for (int t = 0; t < o->ntables; t++)
 			for (int r = 0; r < o->tables[t].nrels; r++)
 				prior[nprior++] = o->tables[t].rels[r];
 	}
+	foreach_ptr(KeptCommit, o, releasing)
+	{
+		for (int t = 0; t < o->ntables; t++)
+			nrelease += o->tables[t].nrels;
+	}
+	release = palloc_array(BranchKeptRelation, Max(nrelease, 1));
+	nrelease = 0;
+	foreach_ptr(KeptCommit, o, releasing)
+	{
+		for (int t = 0; t < o->ntables; t++)
+			for (int r = 0; r < o->tables[t].nrels; r++)
+				if (!kept_holds(holding, &o->tables[t].rels[r]))
+					release[nrelease++] = o->tables[t].rels[r];
+	}
 	out = palloc0_array(BranchKeptRelation, Max(list_length(relids), 1));
-	if (!branch_ops()->keep(relids, prior, nprior, out, kept_settled, snap))
+	if (!branch_ops()->keep(relids, prior, nprior, out, release, nrelease,
+							kept_settled, snap))
 		return;
 
 	kc = palloc0(sizeof(KeptCommit));
@@ -2313,17 +2367,27 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 		at += kt->nrels;
 	}
 
-	/* (the commit first, then the others kept till there are enough) */
+	/*
+	 * (the commit first, then the others kept till there are enough; the
+	 * rest retired, let go of by a later keep once this transaction
+	 * commits, as a branch may be being made of them meanwhile)
+	 */
 	next = list_make1(kc);
-	foreach_ptr(KeptCommit, o, kept)
+	foreach_ptr(KeptCommit, o, holding)
 	{
-		if (!same_hash(&o->commit, commit_id) &&
-			list_length(next) < prolly_kept_commits)
+		if (FullTransactionIdIsValid(o->retired))
 			next = lappend(next, o);
+		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits)
+		{
+			next = lappend(next, o);
+			live++;
+		}
 		else
-			dropped = lappend(dropped, o);
+		{
+			o->retired = GetTopFullTransactionId();
+			next = lappend(next, o);
+		}
 	}
-	kept_let_go(dropped, next);
 	kept_put(name, next);
 }
 
@@ -2342,6 +2406,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	char	   *name;
 	List	   *kept;
 	KeptCommit *kc;
+	KeptCommit *was;
 	List	   *restored = NIL;
 	List	   *tables = NIL;
 	List	   *readable = NIL;
@@ -2357,10 +2422,26 @@ restore_pages(const ProllyCommitInfo *commit)
 		return;
 	name = branch_ops()->current();
 	kept = kept_get(name);
-	kc = kept_find(kept, &commit->id);
-	if (kc == NULL || kc->baseline.len == 0 ||
+	was = kept_find(kept, &commit->id);
+	if (was == NULL || was->baseline.len == 0 ||
 		!branch_baseline(name, &baseline))
 		return;
+
+	/*
+	 * (the commit kept anew, the restored tables by their new storage's
+	 * snapshots; the entry it was kept by retired, never changed in place,
+	 * so its snapshots stay until the transaction is known to commit)
+	 */
+	kc = palloc(sizeof(KeptCommit));
+	*kc = *was;
+	kc->tables = palloc_array(KeptTable, Max(was->ntables, 1));
+	for (int t = 0; t < was->ntables; t++)
+	{
+		kc->tables[t] = was->tables[t];
+		kc->tables[t].rels = palloc_array(BranchKeptRelation, was->tables[t].nrels);
+		memcpy(kc->tables[t].rels, was->tables[t].rels,
+			   sizeof(BranchKeptRelation) * was->tables[t].nrels);
+	}
 
 	/*
 	 * (only tables whose rows the commit holds as this database can read
@@ -2398,7 +2479,7 @@ restore_pages(const ProllyCommitInfo *commit)
 		return;
 
 	/* (the restored tables' snapshots of their new storage kept at once) */
-	kept = list_delete_ptr(kept, kc);
+	was->retired = GetTopFullTransactionId();
 	kept = lcons(kc, kept);
 	kept_put(name, kept);
 	ref_of(&kc->baseline, &from);
@@ -2673,8 +2754,87 @@ rank_source(const char *name, Oid branch, void *arg)
 	}
 }
 
+/* A branch with copies whose pages are kept as of a commit. */
+typedef struct KeptSource
+{
+	const ProllyHash *commit;
+	char	   *name;
+	KeptCommit *kc;
+} KeptSource;
+
+static void
+find_kept_source(const char *name, Oid branch, void *arg)
+{
+	KeptSource *ks = arg;
+	KeptCommit *kc;
+
+	if (ks->kc != NULL && branch != MyBranch)
+		return;
+	if ((kc = kept_find(kept_get(name), ks->commit)) != NULL)
+	{
+		ks->name = pstrdup(name);
+		ks->kc = kc;
+	}
+}
+
 /*
- * Make the copies of a branch that has only its head: a copy of the
+ * Make the copies of branch name, whose head is commit, of the pages a
+ * branch keeps as of the commit, if one does (#489): the session's, or
+ * another.  Each table whose pages are still kept shares them, O(1), with
+ * no lock on the source that holds up its writers; the rest are copied as
+ * any first use copies them.  The baseline is the source's, with each
+ * table made of kept pages taking its entry from the kept baseline, as
+ * its change log is as it was then.  False, nothing made, if no branch
+ * keeps the commit's pages (or the source has no baseline).
+ */
+static bool
+make_of_kept(const char *name, const ProllyCommitInfo *commit)
+{
+	ProllyDatabaseComponents dc;
+	KeptSource	ks = {&commit->id, NULL, NULL};
+	BranchKeptTable *tables;
+	bool	   *used;
+	List	   *names = NIL;
+	ProllyNodeRef baseline;
+	ProllyNodeRef from;
+	ProllyNodeRef spliced;
+
+	prolly_database_components(&dc);
+	if (prolly_kept_commits <= 0 || branch_ops()->make_kept == NULL ||
+		dc.canonicalizer->splice_baseline == NULL)
+		return false;
+	branch_ops()->branches(find_kept_source, &ks);
+	if (ks.kc == NULL || ks.kc->baseline.len == 0 ||
+		!branch_baseline(ks.name, &baseline))
+		return false;
+	tables = palloc_array(BranchKeptTable, Max(ks.kc->ntables, 1));
+	used = palloc0_array(bool, Max(ks.kc->ntables, 1));
+	for (int t = 0; t < ks.kc->ntables; t++)
+	{
+		tables[t].nrels = ks.kc->tables[t].nrels;
+		tables[t].rels = ks.kc->tables[t].rels;
+	}
+	branch_ops()->make_kept(name, ks.name, tables, ks.kc->ntables, used);
+	for (int t = 0; t < ks.kc->ntables; t++)
+	{
+		if (used[t])
+			names = lappend(names, ks.kc->tables[t].name);
+	}
+	pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT, list_length(names));
+	if (names != NIL)
+	{
+		ref_of(&ks.kc->baseline, &from);
+		PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &from, names,
+					&spliced);
+		baseline = spliced;
+	}
+	branch_set_baseline(name, &baseline, NULL);
+	return true;
+}
+
+/*
+ * Make the copies of a branch that has only its head: of the pages a
+ * branch keeps as of its head (make_of_kept()), or else a copy of the
  * nearest branch's to its head's root (#491), or else the session's (each
  * has the same changes since the same baseline as the copy), moved to the
  * root.
@@ -2732,19 +2892,24 @@ materialize(const char *name)
 		ns.root = &info.root.hash;
 		ns.snap = IsolationUsesXactSnapshot() ? GetActiveSnapshot() :
 			GetLatestSnapshot();
-		branch_ops()->branches(rank_source, &ns);
-		source = ns.rank > 0 ? ns.name : branch_ops()->current();
-		branch_ops()->make(name, ns.rank > 0 ? source : NULL);
-		branch_set_baseline(name,
-							branch_baseline(source, &baseline) ? &baseline : NULL,
-							NULL);
+		mc.commit = &info;
+		if (!make_of_kept(name, &info))
+		{
+			branch_ops()->branches(rank_source, &ns);
+			source = ns.rank > 0 ? ns.name : branch_ops()->current();
+			branch_ops()->make(name, ns.rank > 0 ? source : NULL);
+			branch_set_baseline(name,
+								branch_baseline(source, &baseline) ? &baseline : NULL,
+								NULL);
+			mc.source = ns.rank == 3 ? &ns.known : NULL;
+		}
+		else
+			mc.source = NULL;
 
 		/*
 		 * (moved to the head, unless the copies are there already: those of
 		 * a branch whose working set is, if it still is)
 		 */
-		mc.commit = &info;
-		mc.source = ns.rank == 3 ? &ns.known : NULL;
 		branch_ops()->run_on(name, move_copies, &mc);
 done:
 		;

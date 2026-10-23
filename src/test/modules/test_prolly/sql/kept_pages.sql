@@ -204,15 +204,21 @@ SELECT kept('kp.t') <= 3 AS few_kept;
 SELECT rows_digest() = :'at_load' AS as_loaded, clean();
 
 -- however many commits, each relation keeps no more snapshots than kept
--- commits (and one a reset's new storage took)
-DO $$
-BEGIN
-	FOR i IN 1..6 LOOP
-		UPDATE kp.t SET v = i WHERE id = 2;
-		PERFORM dolt_commit('-am', 'step ' || i);
-	END LOOP;
-END $$;
-SELECT kept('kp.t') AS t, kept('kp.t_v') AS t_v;
+-- commits, and those of the commit last retired (let go of once the
+-- transaction retiring it is known to have committed)
+UPDATE kp.t SET v = 1 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 1') IS NOT NULL AS committed;
+UPDATE kp.t SET v = 2 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 2') IS NOT NULL AS committed;
+UPDATE kp.t SET v = 3 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 3') IS NOT NULL AS committed;
+UPDATE kp.t SET v = 4 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 4') IS NOT NULL AS committed;
+UPDATE kp.t SET v = 5 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 5') IS NOT NULL AS committed;
+UPDATE kp.t SET v = 6 WHERE id = 2;
+SELECT dolt_commit('-am', 'step 6') IS NOT NULL AS committed;
+SELECT kept('kp.t') <= 3 AS t, kept('kp.t_v') <= 3 AS t_v;
 
 -- with none kept, a reset writes the rows back
 SET prolly.kept_commits = 0;

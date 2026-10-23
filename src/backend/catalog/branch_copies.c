@@ -120,6 +120,8 @@ branch_name(Oid branch)
 	return name;
 }
 
+static HeapTuple class_row(Relation pg_class, Oid relid, Oid branch);
+
 /* the storage locator of a pg_class row */
 static RelFileLocator
 class_locator(Form_pg_class c, RelFileNumber relnumber)
@@ -192,12 +194,12 @@ copy_storage(Form_pg_class c)
 #define COPY_LOCK_MAX_DELAY_MS	100
 
 /*
- * Take ShareLock on every one of relids, or on none: a lock that would
- * wait gives back those already taken.  Returns the first relation that
+ * Take 'mode' on every one of relids, or on none: a lock that would wait
+ * gives back those already taken.  Returns the first relation that
  * couldn't be locked, or InvalidOid once all are.
  */
 static Oid
-lock_all_or_none(List *relids)
+lock_all_or_none(List *relids, LOCKMODE mode)
 {
 	int			ntaken = 0;
 	Oid			busy = InvalidOid;
@@ -205,7 +207,7 @@ lock_all_or_none(List *relids)
 
 	foreach(lc, relids)
 	{
-		if (!ConditionalLockRelationOid(lfirst_oid(lc), ShareLock))
+		if (!ConditionalLockRelationOid(lfirst_oid(lc), mode))
 		{
 			busy = lfirst_oid(lc);
 			break;
@@ -217,41 +219,25 @@ lock_all_or_none(List *relids)
 		{
 			if (ntaken-- == 0)
 				break;
-			UnlockRelationOid(lfirst_oid(lc), ShareLock);
+			UnlockRelationOid(lfirst_oid(lc), mode);
 		}
 	return busy;
 }
 
 /*
- * Lock the session branch's versioned relations against changes, so the
- * copy is of a state no writer is in the middle of.  Returns them, for
- * unlock_relations().
- *
- * The locks are tried, not waited for: a ShareLock in the lock queue would
- * hold up every writer that comes after it, for as long as the writers
- * before it take, and then for the copy.  So all are taken at once or none
- * is, and the try is repeated, a little later each time, until they are
- * (writers coming and going meanwhile go ahead), or lock_timeout passes
- * (0, the default, waits for as long as it takes).  Nor does the deadlock
- * detector see this wait: lock_timeout or statement_timeout bounds it.
- *
- * The source's dirty pages are written first, outside the locks, so that
- * what the copy writes under them is only what changed meanwhile.
+ * The session branch's versioned relations, TOAST-kind relations (TOAST
+ * tables, change logs) after every table, in the order a writer takes
+ * them: its table first, then those as it writes a value out of line or an
+ * entry.
  */
 static List *
-lock_versioned_relations(void)
+branch_relations(void)
 {
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
 	SysScanDesc scan;
 	HeapTuple	tup;
 	List	   *relids = NIL;
 	List	   *toasts = NIL;
-	SMgrRelation *srels = NULL;
-	int			nsrels = 0;
-	int			maxsrels = 0;
-	TimestampTz start = 0;
-	long		delay = 1;
-	Oid			busy;
 
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -264,40 +250,66 @@ lock_versioned_relations(void)
 			toasts = lappend_oid(toasts, c->oid);
 		else
 			relids = lappend_oid(relids, c->oid);
-
-		if (RELKIND_HAS_STORAGE(c->relkind) &&
-			c->relpersistence == RELPERSISTENCE_PERMANENT &&
-			RelFileNumberIsValid(c->relfilenode))
-		{
-			if (nsrels == maxsrels)
-			{
-				maxsrels = maxsrels ? maxsrels * 2 : 16;
-				srels = srels ? repalloc_array(srels, SMgrRelation, maxsrels)
-					: palloc_array(SMgrRelation, maxsrels);
-			}
-			srels[nsrels++] = smgropen(class_locator(c, c->relfilenode),
-									   INVALID_PROC_NUMBER);
-		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
-
-	/* in one pass over the buffers, not one per relation under the locks */
-	if (nsrels > 0)
-	{
-		FlushRelationsAllBuffers(srels, nsrels);
-		pfree(srels);
-	}
-
-	/*
-	 * TOAST-kind relations (TOAST tables, change logs) after every table,
-	 * in the order a writer takes them: its table first, then those as it
-	 * writes a value out of line or an entry.
-	 */
 	relids = list_concat(relids, toasts);
 	list_free(toasts);
+	return relids;
+}
 
-	while (OidIsValid(busy = lock_all_or_none(relids)))
+/*
+ * Write out the session branch's dirty pages of relids, in one pass over
+ * the buffers.
+ */
+static void
+flush_relations(List *relids)
+{
+	Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+	SMgrRelation *srels = palloc_array(SMgrRelation, Max(list_length(relids), 1));
+	int			nsrels = 0;
+
+	foreach_oid(relid, relids)
+	{
+		HeapTuple	t = class_row(pg_class, relid, MyBranch);
+		Form_pg_class c;
+
+		if (t == NULL)
+			continue;
+		c = (Form_pg_class) GETSTRUCT(t);
+		if (RELKIND_HAS_STORAGE(c->relkind) &&
+			c->relpersistence == RELPERSISTENCE_PERMANENT &&
+			RelFileNumberIsValid(c->relfilenode))
+			srels[nsrels++] = smgropen(class_locator(c, c->relfilenode),
+									   INVALID_PROC_NUMBER);
+		heap_freetuple(t);
+	}
+	table_close(pg_class, AccessShareLock);
+	if (nsrels > 0)
+		FlushRelationsAllBuffers(srels, nsrels);
+	pfree(srels);
+}
+
+/*
+ * Take 'mode' on each of the session branch's relations relids, all at
+ * once: tried, not waited for.  A lock in the lock queue would hold up
+ * every writer that comes after it (one that conflicts with writers), for
+ * as long as the writers before it take, and then for the copy.  So all
+ * are taken at once or none is, and the try is repeated, a little later
+ * each time, until they are (writers coming and going meanwhile go ahead),
+ * or lock_timeout passes (0, the default, waits for as long as it takes).
+ * Nor does the deadlock detector see this wait: lock_timeout or
+ * statement_timeout bounds it.  The catalogs are read again after, as the
+ * locks left them.
+ */
+static void
+lock_relations(List *relids, LOCKMODE mode)
+{
+	TimestampTz start = 0;
+	long		delay = 1;
+	Oid			busy;
+
+	while (OidIsValid(busy = lock_all_or_none(relids, mode)))
 	{
 		if (start == 0)
 			start = GetCurrentTimestamp();
@@ -321,26 +333,79 @@ lock_versioned_relations(void)
 		CHECK_FOR_INTERRUPTS();
 		delay = Min(delay * 2, COPY_LOCK_MAX_DELAY_MS);
 	}
-
-	/* read the catalogs as the locks left them */
 	InvalidateCatalogSnapshot();
+}
+
+/*
+ * Lock the session branch's versioned relations against changes, so the
+ * copy is of a state no writer is in the middle of (lock_relations()).
+ * Returns them, for unlock_relations().  The source's dirty pages are
+ * written first, outside the locks, so that what the copy writes under
+ * them is only what changed meanwhile.
+ */
+static List *
+lock_versioned_relations(void)
+{
+	List	   *relids = branch_relations();
+
+	flush_relations(relids);
+	lock_relations(relids, ShareLock);
 	return relids;
 }
 
-/* Let go of the locks lock_versioned_relations() took (only those). */
+/* Let go of 'mode' on relids (only those). */
 static void
-unlock_relations(List *relids)
+unlock_relations(List *relids, LOCKMODE mode)
 {
 	ListCell   *lc;
 
 	foreach(lc, relids)
-		UnlockRelationOid(lfirst_oid(lc), ShareLock);
-	list_free(relids);
+		UnlockRelationOid(lfirst_oid(lc), mode);
 }
 
-/* Copy every row of the session branch into branch 'target'. */
+/*
+ * Storage of a relation's copy made of the pages kept by snapshot k of
+ * its storage: O(1).  Its row takes the oldest transaction ids they hold,
+ * and claims no page all-visible (the copy has no visibility map).
+ */
+static RelFileNumber
+copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
+{
+	RelFileNumber relnumber = GetNewRelFileNumber(c->reltablespace, NULL,
+												  c->relpersistence);
+
+	(void) RelationCreateStorageFromSnapshot(class_locator(c, relnumber),
+											 smgropen(class_locator(c, c->relfilenode),
+													  INVALID_PROC_NUMBER),
+											 k->snapshot, true);
+	if (TransactionIdIsNormal(k->frozenxid))
+		c->relfrozenxid = k->frozenxid;
+	if (MultiXactIdIsValid(k->minmxid))
+		c->relminmxid = k->minmxid;
+	c->relallvisible = 0;
+	c->relallfrozen = 0;
+	return relnumber;
+}
+
+/* The one of kept[] (nkept of them) of relation relid, or NULL. */
+static const BranchKeptRelation *
+kept_of(const BranchKeptRelation *const *kept, int nkept, Oid relid)
+{
+	for (int i = 0; i < nkept; i++)
+	{
+		if (kept[i]->relid == relid)
+			return kept[i];
+	}
+	return NULL;
+}
+
+/*
+ * Copy every row of the session branch into branch 'target'; a relation
+ * of kept[] (nkept of them) gets storage made of the pages kept, the
+ * others a copy of their storage as it is.
+ */
 static void
-copy_rows(Oid target)
+copy_rows(Oid target, const BranchKeptRelation *const *kept, int nkept)
 {
 	int			ncatalogs;
 	const CatalogBranchInfo *catalogs = catalog_branch_catalogs(&ncatalogs);
@@ -374,10 +439,12 @@ copy_rows(Oid target)
 
 				if (RELKIND_HAS_STORAGE(c->relkind))
 				{
+					const BranchKeptRelation *k = kept_of(kept, nkept, c->oid);
+
 					if (!RelFileNumberIsValid(c->relfilenode))
 						elog(ERROR, "versioned relation \"%s\" is mapped",
 							 NameStr(c->relname));
-					c->relfilenode = copy_storage(c);
+					c->relfilenode = k ? copy_kept_storage(c, k) : copy_storage(c);
 				}
 			}
 
@@ -468,9 +535,112 @@ copy_from_here(void *arg)
 	prolly_change_logs_flush();
 	locked = lock_versioned_relations();
 
-	copy_rows(*(Oid *) arg);
+	copy_rows(*(Oid *) arg, NULL, 0);
 	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
-	unlock_relations(locked);
+	unlock_relations(locked, ShareLock);
+	list_free(locked);
+}
+
+/* A branch made of the pages kept of the source's tables (make_kept()). */
+typedef struct MakeKept
+{
+	Oid			target;
+	const BranchKeptTable *tables;
+	int			ntables;
+	bool	   *used;
+} MakeKept;
+
+/*
+ * Is kept relation k still the session branch's relation with the storage
+ * that keeps it, its snapshot there?
+ */
+static bool
+still_kept(Relation pg_class, const BranchKeptRelation *k)
+{
+	HeapTuple	t = class_row(pg_class, k->relid, MyBranch);
+	Form_pg_class c;
+	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+	RelFileLocator loc;
+	bool		ok = false;
+	int			n;
+
+	if (t == NULL)
+		return false;
+	c = (Form_pg_class) GETSTRUCT(t);
+	loc = class_locator(c, c->relfilenode);
+	if (c->relfilenode == k->relfilenumber && c->reltablespace == k->tablespace &&
+		c->relpersistence == RELPERSISTENCE_PERMANENT &&
+		bmap_relation_exists(loc))
+	{
+		n = bmap_snapshot_list(smgropen(loc, INVALID_PROC_NUMBER), snaps,
+							   BMAP_SNAPSHOTS_MAX);
+		for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX) && !ok; s++)
+			ok = snaps[s].id == k->snapshot;
+	}
+	heap_freetuple(t);
+	return ok;
+}
+
+/*
+ * The copy of the session branch (the source) made of the pages kept of
+ * its tables, where they are still kept: each such table's relations then
+ * share a snapshot's pages, which no writer changes, so the source's
+ * writers aren't locked out for them.  Every relation of the source is
+ * locked against definition changes, VACUUM and anything letting go of
+ * kept pages (ShareUpdateExclusiveLock, which writers don't take), all at
+ * once and tried, never queued for; only the relations not copied from
+ * kept pages (a table whose storage was replaced since, a sequence) are
+ * locked against writers too, as a copy locks them, and their pages
+ * written out first.
+ */
+static void
+copy_from_kept(void *arg)
+{
+	MakeKept   *mk = arg;
+	List	   *all;
+	List	   *rest = NIL;
+	const BranchKeptRelation **kept;
+	int			nkept = 0;
+	int			max = 0;
+	Relation	pg_class;
+
+	prolly_change_logs_flush();
+	all = branch_relations();
+	lock_relations(all, ShareUpdateExclusiveLock);
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	for (int t = 0; t < mk->ntables; t++)
+		max += mk->tables[t].nrels;
+	kept = palloc_array(const BranchKeptRelation *, Max(max, 1));
+	for (int t = 0; t < mk->ntables; t++)
+	{
+		const BranchKeptTable *kt = &mk->tables[t];
+
+		mk->used[t] = true;
+		for (int r = 0; r < kt->nrels && mk->used[t]; r++)
+			mk->used[t] = list_member_oid(all, kt->rels[r].relid) &&
+				still_kept(pg_class, &kt->rels[r]);
+		if (mk->used[t])
+			for (int r = 0; r < kt->nrels; r++)
+				kept[nkept++] = &kt->rels[r];
+	}
+	table_close(pg_class, AccessShareLock);
+	foreach_oid(relid, all)
+	{
+		if (kept_of(kept, nkept, relid) == NULL)
+			rest = lappend_oid(rest, relid);
+	}
+
+	/* (an error lets go of the locks as the transaction aborts) */
+	flush_relations(rest);
+	lock_relations(rest, ShareLock);
+	copy_rows(mk->target, kept, nkept);
+	copyBranchSharedDependencies(MyBranch, mk->target);
+	unlock_relations(rest, ShareLock);
+	unlock_relations(all, ShareUpdateExclusiveLock);
+	list_free(all);
+	list_free(rest);
+	pfree(kept);
 }
 
 static void
@@ -578,6 +748,53 @@ copies_make(const char *name, const char *start_point)
 	CommandCounterIncrement();
 
 	on_branch(source, copy_from_here, &branch);
+	CommandCounterIncrement();
+	note_new_branch(branch);
+
+	table_close(brel, NoLock);
+	return branch;
+}
+
+/*
+ * Make a branch as make() does, of source's kept pages of tables[] where
+ * they are still kept (used[], for each, says whether it was).
+ */
+static Oid
+copies_make_kept(const char *name, const char *source,
+				 const BranchKeptTable *tables, int ntables, bool *used)
+{
+	Relation	brel;
+	Oid			from;
+	Oid			branch;
+	Datum		values[Natts_pg_branch];
+	bool		nulls[Natts_pg_branch] = {0};
+	NameData	brname;
+	HeapTuple	tup;
+	MakeKept	mk;
+
+	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
+	if (OidIsValid(branch_oid(name, true)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("branch \"%s\" already exists", name)));
+	from = branch_oid(source, false);
+
+	branch = GetNewOidWithIndex(brel, BranchOidIndexId, Anum_pg_branch_oid);
+	namestrcpy(&brname, name);
+	values[Anum_pg_branch_oid - 1] = ObjectIdGetDatum(branch);
+	values[Anum_pg_branch_brname - 1] = NameGetDatum(&brname);
+	values[Anum_pg_branch_brownerrole - 1] = ObjectIdGetDatum(InvalidOid);
+	nulls[Anum_pg_branch_browner - 1] = true;	/* (a new branch is clean) */
+	tup = heap_form_tuple(RelationGetDescr(brel), values, nulls);
+	CatalogTupleInsert(brel, tup);
+	heap_freetuple(tup);
+	CommandCounterIncrement();
+
+	mk.target = branch;
+	mk.tables = tables;
+	mk.ntables = ntables;
+	mk.used = used;
+	on_branch(from, copy_from_kept, &mk);
 	CommandCounterIncrement();
 	note_new_branch(branch);
 
@@ -1007,7 +1224,8 @@ can_keep(Form_pg_class c)
  */
 static bool
 copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
-			BranchKeptRelation *kept, bool (*settled) (void *arg), void *arg)
+			BranchKeptRelation *kept, const BranchKeptRelation *release,
+			int nrelease, bool (*settled) (void *arg), void *arg)
 {
 	Relation	pg_class;
 	List	   *rows = NIL;
@@ -1017,7 +1235,7 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 	let_go_of_abandoned();
 	if (relids == NIL)
 		return true;
-	if (OidIsValid(lock_all_or_none(relids)))
+	if (OidIsValid(lock_all_or_none(relids, ShareLock)))
 		return false;
 	PG_TRY();
 	{
@@ -1067,6 +1285,13 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 			if (!again)
 				keep_now(c, k);
 		}
+
+		/*
+		 * (let go of with the relations held against a copy made of kept
+		 * pages, which holds them against this as it reads what is kept)
+		 */
+		for (int r = 0; ok && r < nrelease; r++)
+			let_go_of(kept_locator(&release[r]), release[r].snapshot);
 	}
 	PG_FINALLY();
 	{
@@ -1228,6 +1453,7 @@ static const BranchOpsRoutine branch_copies = {
 	.run_on = copies_run_on,
 	.share = copies_share,
 	.keep = copies_keep,
+	.make_kept = copies_make_kept,
 	.restore = copies_restore,
 	.let_go = copies_let_go,
 };

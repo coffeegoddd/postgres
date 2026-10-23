@@ -60,8 +60,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  nodes_written             |    17
  value_nodes_written       |     0
  chunks_appended           |    17
- chunk_bytes_appended      | 29728
- bytes_hashed              | 29817
+ chunk_bytes_appended      | 29792
+ bytes_hashed              | 29881
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -133,7 +133,8 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  fold_incremental          |     1
  pages_kept                |     4
  relations_restored        |     0
-(77 rows)
+ first_use_tables_kept     |     0
+(78 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,

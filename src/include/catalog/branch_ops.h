@@ -44,6 +44,13 @@ typedef struct BranchKeptRelation
 	MultiXactId minmxid;
 } BranchKeptRelation;
 
+/* A table's relations as kept, its own first. */
+typedef struct BranchKeptTable
+{
+	int			nrels;
+	const BranchKeptRelation *rels;
+} BranchKeptTable;
+
 typedef struct BranchOpsRoutine
 {
 	const char *name;
@@ -125,10 +132,14 @@ typedef struct BranchOpsRoutine
 	 * the caller found them to.  False, nothing kept, if a lock isn't free,
 	 * settled says no, or one can't be kept (its storage can't, or keeps
 	 * too many snapshots already).  Snapshots taken by a transaction that
-	 * aborts (or a subtransaction) are let go of later.
+	 * aborts (or a subtransaction) are let go of later.  Once they are
+	 * kept, the snapshots release[] (nrelease of them) are let go of, the
+	 * locks still held: a branch being made of kept pages (make_kept())
+	 * holds the relations against that while it reads them.
 	 */
 	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
 						 int nprior, BranchKeptRelation *kept,
+						 const BranchKeptRelation *release, int nrelease,
 						 bool (*settled) (void *arg), void *arg);
 
 	/*
@@ -156,6 +167,19 @@ typedef struct BranchOpsRoutine
 	 * storage still has it (a dropped relation's went with it).
 	 */
 	void		(*let_go) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: make a branch called name as make() does, a copy of branch
+	 * source, but each table of tables[] (ntables of them, each its
+	 * relations as keep() kept them) whose pages are still kept made of
+	 * them, used[] saying which were: O(1) in each relation's size, with
+	 * no lock that holds up the source's writers (only definition changes,
+	 * VACUUM and letting go of kept pages wait).  The source's other
+	 * relations are copied as make() copies them, locked against writers.
+	 */
+	Oid			(*make_kept) (const char *name, const char *source,
+							  const BranchKeptTable *tables, int ntables,
+							  bool *used);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

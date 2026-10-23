@@ -426,6 +426,18 @@ tried, not waited for): its rows are written.  Like TRUNCATE, a restore
 isn't MVCC-safe: a snapshot taken before the move commits reads the
 restored pages after it.
 
+A branch's first use at a commit another branch keeps the pages of is
+made of those pages (branch operations' make_kept()): each such table's
+relations share the snapshots, O(1), and the source's writers are not
+locked out (the source's relations are held with ShareUpdateExclusiveLock,
+tried and never queued for, which only definition changes, VACUUM and
+letting go of kept pages wait for); only relations not kept (a table made
+or whose storage was replaced since, a sequence) are copied as before,
+under locks against writers.  The new branch's baseline takes those
+tables' entries from the kept baseline.  A commit that stops being kept is
+retired rather than let go of, and its pages are let go of by a later keep
+once the retiring transaction has committed.
+
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call
 prolly_refs_end_hook at their pre-commit, before the chunk store's own, and

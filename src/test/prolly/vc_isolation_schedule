@@ -16,3 +16,4 @@ test: vc_incremental_canon
 test: vc_branch_commits
 test: vc_rewrite_folds
 test: vc_reset_kept
+test: vc_first_use_kept
