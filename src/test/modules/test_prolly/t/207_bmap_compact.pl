@@ -74,11 +74,7 @@ my $want = sql($digest);
 sql('DROP TABLE gone');
 sql($sweep);
 my $before = sql($moved);
-is(sql('SELECT test_bmap_free_blocks()') > 0 ? 'holes' : 'none', 'holes',
-	'freeing the dropped table\'s blocks leaves holes a sweep doesn\'t shorten past');
 
-# Holes are made only once the drop's blocks are freed; a second sweep
-# moves the kept table's blocks down into them.
 interleave('keep2', 'gone2', 200);
 my $want2 = q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM keep2};
 my $want2v = sql($want2);

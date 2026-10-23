@@ -174,7 +174,11 @@ typedef struct xl_bmap_extend
  *						page whose pointer takes it (the root page, or a node);
  *						then the node, as an image; then the allocator's
  *						metapage and bitmap pages.  Redo extends the store to
- *						reach it, writing nothing over a block it had.
+ *						reach it, writing nothing over a block it had.  With
+ *						BMAP_TREE_MOVED, the node is one moved to another
+ *						block, its entries the same: redo first writes out
+ *						the relation's pages, as the move leaves them where
+ *						they are.
  * BMAP_TREE_HOLD		a node is to be copied: reference-count pages of
  *						children of it, each holder more (the copy's), set
  *						before the copy holds them
@@ -203,6 +207,7 @@ typedef struct xl_bmap_extend
 
 #define BMAP_TREE_INSTALL		0x01
 #define BMAP_TREE_OF_SNAPSHOT	0x02
+#define BMAP_TREE_MOVED			0x04
 
 typedef struct xl_bmap_tree
 {

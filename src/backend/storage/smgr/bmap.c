@@ -2496,7 +2496,8 @@ tree_make_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
 
 	xlrec.locator = rel;
 	xlrec.op = BMAP_TREE_NODE;
-	xlrec.flags = parent ? BMAP_TREE_INSTALL : 0;
+	xlrec.flags = (parent ? BMAP_TREE_INSTALL : 0) |
+		(entries ? BMAP_TREE_MOVED : 0);
 	xlrec.node = node;
 	xlrec.from = InvalidBlockNumber;
 	xlrec.old_hw = alloc.old_hw;
@@ -6737,6 +6738,25 @@ compact_has_room(RelFileLocator rel, BlockNumber below)
 }
 
 /*
+ * May data page 'blkno' of reln, at physical block 'phys', move?  Its entry
+ * still names the block, which nothing else holds, on a path the relation
+ * owns.  The header is held, at least shared.
+ */
+static bool
+compact_page_movable(SMgrRelation reln, Buffer headerbuf, BlockNumber blkno,
+					 BlockNumber phys, BmapEntry *entry, MapPage *mp)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapHeader *header = PageGetBmapHeader(BufferGetPage(headerbuf));
+
+	return blkno < header->nblocks &&
+		lookup_entry_at(reln, blkno, entry, mp, NULL) &&
+		entry->block == phys &&
+		lookup_ref(rel, phys) == 0 &&
+		tree_path_own(reln, blkno, header->epoch);
+}
+
+/*
  * Move data page 'blkno' of reln from physical block 'phys' to a lower free
  * block.  True if it moved (and 'phys' is to be freed).  Locks as
  * bmapprepareforchange()'s copy: the page's buffer, the header shared, the
@@ -6751,7 +6771,6 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 	Buffer		mapbuf;
 	BmapEntry	entry;
 	MapPage		mp;
-	uint32		epoch;
 	Allocation	alloc;
 	BlockNumber new_block;
 	xl_bmap_remap xlrec;
@@ -6765,24 +6784,36 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 	if (!compact_has_room(rel, phys))
 		return false;
 
+	/*
+	 * Asked first without the page: preparing its buffer for the change
+	 * below would copy a page another relation shares, which isn't to be
+	 * moved at all.
+	 */
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	if (!compact_page_movable(reln, headerbuf, blkno, phys, &entry, &mp))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return false;
+	}
+	LockBuffer(headerbuf, BUFFER_LOCK_UNLOCK);
+
 	/* the page, which nothing else may hold meanwhile */
 	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 									NULL, true);
 	if (!ConditionalLockBufferForCleanupUnprepared(buf))
 	{
 		ReleaseBuffer(buf);
+		ReleaseBuffer(headerbuf);
 		return false;
 	}
+	/* (as a change of no row, which claims an entry nothing else holds) */
+	BufferPrepareForChange(buf);
 
-	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
-	if (blkno >= PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks ||
-		!lookup_entry_at(reln, blkno, &entry, &mp, NULL) ||
-		entry.block != phys ||
-		lookup_ref(rel, phys) != 0 ||
-		!tree_path_own(reln, blkno, epoch))
+	if (!compact_page_movable(reln, headerbuf, blkno, phys, &entry, &mp))
 	{
 		UnlockReleaseBuffer(headerbuf);
 		UnlockReleaseBuffer(buf);
@@ -9193,6 +9224,23 @@ bmap_redo(XLogReaderState *record)
 		case XLOG_BMAP_TREE:
 			{
 				xl_bmap_tree *xlrec = (xl_bmap_tree *) XLogRecGetData(record);
+
+				/*
+				 * A node moved: recovery writes out no page older than the
+				 * pointer to the subtree it is under (see tree_find()), as
+				 * one the subtree's replacement left behind, but a move
+				 * leaves the pages under it as they were, the latest
+				 * perhaps only in their buffers.  They are written out
+				 * first, to the blocks they have.
+				 */
+				if (xlrec->op == BMAP_TREE_NODE &&
+					(xlrec->flags & BMAP_TREE_MOVED) != 0)
+				{
+					SMgrRelation reln = smgropen(xlrec->locator,
+												 INVALID_PROC_NUMBER);
+
+					FlushRelationsAllBuffers(&reln, 1);
+				}
 
 				/* the store reaches a node made, which its image makes */
 				if (xlrec->op == BMAP_TREE_NODE || xlrec->op == BMAP_TREE_COPY)
