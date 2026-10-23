@@ -1680,7 +1680,8 @@ count_change(ProllyDiffKind kind, const ProllyKey *key,
 
 /*
  * Prolly table relid and the relations stored with it: its indexes, its
- * TOAST table and change log, and theirs; their blocks counted.
+ * TOAST table and change log, and theirs; their blocks counted (if
+ * blocks isn't NULL).
  */
 static List *
 stored_with(Oid relid, uint64 *blocks)
@@ -1688,12 +1689,14 @@ stored_with(Oid relid, uint64 *blocks)
 	List	   *relids = list_make1_oid(relid);
 	ProllyComponents c;
 
-	*blocks = 0;
+	if (blocks)
+		*blocks = 0;
 	for (int i = 0; i < list_length(relids); i++)
 	{
 		Relation	rel = relation_open(list_nth_oid(relids, i), AccessShareLock);
 
-		*blocks += RelationGetNumberOfBlocks(rel);
+		if (blocks)
+			*blocks += RelationGetNumberOfBlocks(rel);
 		if (rel->rd_rel->relkind != RELKIND_INDEX)
 			relids = list_concat(relids, RelationGetIndexList(rel));
 		if (OidIsValid(rel->rd_rel->reltoastrelid))
@@ -2166,7 +2169,6 @@ kept_relations(Oid relid)
 {
 	Relation	rel = try_relation_open(relid, AccessShareLock);
 	bool		prolly;
-	uint64		blocks;
 	List	   *relids;
 
 	if (rel == NULL)
@@ -2177,7 +2179,7 @@ kept_relations(Oid relid)
 	relation_close(rel, AccessShareLock);
 	if (!prolly)
 		return NIL;
-	relids = stored_with(relid, &blocks);
+	relids = stored_with(relid, NULL);
 	foreach_oid(r, relids)
 		UnlockRelationOid(r, AccessShareLock);
 	return relids;

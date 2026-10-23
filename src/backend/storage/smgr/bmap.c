@@ -5364,8 +5364,7 @@ bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 {
 	for (int i = 0; i < n; i++)
 		ids[i] = snapshot_take_slot(rels[i]);
-	for (int i = 0; i < n; i++)
-		MarkBufferedRelationShared(rels[i], MAIN_FORKNUM);
+	MarkBufferedRelationsShared(rels, n, MAIN_FORKNUM);
 	if (n > 0)
 		FlushRelationsAllBuffers(rels, n);
 	for (int i = 0; i < n; i++)
