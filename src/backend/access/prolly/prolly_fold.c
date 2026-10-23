@@ -29,6 +29,7 @@
 #include "utils/tuplesort.h"
 
 bool		debug_prolly_force_full_fold = false;
+bool		prolly_fold_counted = true;
 int			prolly_log_full_folds = -1;
 ProllyFullFold prolly_last_full_fold;
 

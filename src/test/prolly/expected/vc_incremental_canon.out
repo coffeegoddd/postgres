@@ -1,0 +1,123 @@
+Parsed test spec with 2 sessions
+
+starting permutation: a_write a_commit a_write b_write a_reset a_commit a_flush a_count a_diff
+step a_write: UPDATE vic.a SET v = v || '.';
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_write: UPDATE vic.a SET v = v || '.';
+step b_write: UPDATE vic.b SET v = v || '!';
+step a_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step a_count: SELECT sum(value) FILTER (WHERE name = 'fold_incremental') > 0 AS incremental FROM pg_stat_prolly;
+incremental
+-----------
+t          
+(1 row)
+
+step a_diff: SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type, schema_change FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 1;
+table_name|diff_type|schema_change
+----------+---------+-------------
+vic.a     |modified |f            
+vic.b     |modified |f            
+(2 rows)
+
+
+starting permutation: a_write a_commit a_write b_begin a_reset a_commit a_flush a_count a_diff b_commit a_write a_commit a_diff
+step a_write: UPDATE vic.a SET v = v || '.';
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_write: UPDATE vic.a SET v = v || '.';
+step b_begin: BEGIN; UPDATE vic.c SET v = 'in flight';
+step a_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step a_count: SELECT sum(value) FILTER (WHERE name = 'fold_incremental') > 0 AS incremental FROM pg_stat_prolly;
+incremental
+-----------
+t          
+(1 row)
+
+step a_diff: SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type, schema_change FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 1;
+table_name|diff_type|schema_change
+----------+---------+-------------
+vic.a     |modified |f            
+(1 row)
+
+step b_commit: COMMIT;
+step a_write: UPDATE vic.a SET v = v || '.';
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_diff: SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type, schema_change FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 1;
+table_name|diff_type|schema_change
+----------+---------+-------------
+vic.a     |modified |f            
+vic.c     |modified |f            
+(2 rows)
+
+
+starting permutation: a_write a_commit b_alter a_write a_commit a_diff
+step a_write: UPDATE vic.a SET v = v || '.';
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step b_alter: ALTER TABLE vic.c ADD COLUMN w int;
+step a_write: UPDATE vic.a SET v = v || '.';
+step a_commit: SELECT (dolt_commit('-am', 'a commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step a_diff: SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type, schema_change FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 1;
+table_name|diff_type|schema_change
+----------+---------+-------------
+vic.a     |modified |f            
+vic.c     |modified |t            
+(2 rows)
+

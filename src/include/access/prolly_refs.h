@@ -30,6 +30,7 @@
 #include "access/prolly_types.h"
 #include "access/transam.h"
 #include "datatype/timestamp.h"
+#include "utils/snapshot.h"
 
 #define PROLLY_MAX_PARENTS 2
 
@@ -127,6 +128,18 @@ typedef void (*ProllyRootRefVisit) (const char *ref, const ProllyHash *commit,
 /* Visits a remote-tracking branch: the remote, its branch, the commit. */
 typedef void (*ProllyTrackingVisit) (const char *remote, const char *branch,
 									 const ProllyHash *commit, void *arg);
+
+/*
+ * What a fold of a branch's working set was made at (written_since()):
+ * opaque to all but the refs.
+ */
+typedef struct ProllyFoldMark
+{
+	Oid			branch;
+	uint64		generation;
+	uint64		overflow;
+	uint64		epoch;
+} ProllyFoldMark;
 
 typedef struct ProllyRefsRoutine
 {
@@ -469,6 +482,31 @@ typedef struct ProllyRefsRoutine
 	int			(*moved_branches) (Oid *branches, uint64 *generations, int max);
 	void		(*saw_branch) (Oid branch, uint64 generation);
 	void		(*saw_database) (Oid database);
+
+	/*
+	 * Optional, together: which tables' rows may have changed since a fold
+	 * of a branch, for a canonicalizer that works out again only what
+	 * changed.  note_relation() is told, as note_write() is (and after
+	 * it), of each relation whose rows a write to branch changes.
+	 * fold_mark() marks a fold by snap of branch, before it reads anything:
+	 * false where nothing could be known of it later (in recovery, while a
+	 * transaction is prepared, after the transaction's catalog changes, or
+	 * by a snapshot that doesn't see every writer of the branch that ended).
+	 * written_since() puts in *relids (*nrelids of them, palloc'd) every
+	 * relation whose rows a transaction that ended since mark, or this
+	 * one, wrote on mark's branch, as snap reads them: false where that
+	 * isn't known (a catalog change or collection since, a writer that
+	 * wrote too many relations or found no room to be told of, a prepared
+	 * transaction ended, the branch forgotten, a snapshot that doesn't see
+	 * every writer that ended), and then everything may have changed.
+	 * Catalog changes and sequences' values aren't relations' rows: a
+	 * catalog change moves what fold_mark() takes, and a sequence is read
+	 * each time.
+	 */
+	void		(*note_relation) (Oid branch, Oid relid);
+	bool		(*fold_mark) (Oid branch, Snapshot snap, ProllyFoldMark *mark);
+	bool		(*written_since) (const ProllyFoldMark *mark, Snapshot snap,
+								  Oid **relids, int *nrelids);
 } ProllyRefsRoutine;
 
 /*
@@ -492,9 +530,10 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
-	"moved_databases", "moved_branches", "saw_branch", "saw_database"
+	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
+	"note_relation", "fold_mark", "written_since"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK saw_database
+#define PROLLY_REFS_LAST_CALLBACK written_since
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

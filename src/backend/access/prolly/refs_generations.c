@@ -40,6 +40,17 @@
  * it is committed or rolled back (one recovered at startup was never told
  * of).  Nothing survives a restart: the first fold after one folds.
  *
+ * Each branch also keeps the relations whose rows its last writers wrote
+ * (note_relation), each with the generation its writer ended at: the last
+ * WRITTEN_RELATIONS of them, and the generation since which every one is
+ * there.  A canonicalizer that marked a fold (branch_fold_mark()) asks
+ * later which relations were written since (branch_written_since()), and
+ * works out again only those.  Anything that changes a fold otherwise
+ * moves what the mark took: a catalog change or collection the epoch, a
+ * writer of every branch or a prepared transaction's end the overflow, a
+ * writer of too many relations or an eviction the generation since which
+ * they are all there.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/refs_generations.c
  *
@@ -65,6 +76,14 @@
 
 #define BRANCH_GENERATIONS	1024
 #define ENDED_WRITERS		8
+#define WRITTEN_RELATIONS	32
+
+/* A relation whose rows a writer that ended at generation wrote. */
+typedef struct WrittenRelation
+{
+	uint64		generation;
+	Oid			relid;
+} WrittenRelation;
 
 /*
  * Writers that ended: the last ENDED_WRITERS by id, and the latest id of
@@ -91,6 +110,11 @@ typedef struct BranchGeneration
 	ProllyHash	baseline;		/* folded from (len 0: none) */
 	ProllyHash	root;
 	uint64		seen;			/* the generation the fold worker last saw */
+	/* the relations written: a ring of the last, all since rels_from */
+	uint64		rels_from;
+	int			nrels;
+	int			relnext;
+	WrittenRelation rels[WRITTEN_RELATIONS];
 } BranchGeneration;
 
 typedef struct BranchGenerations
@@ -134,6 +158,19 @@ static Oid	written[MAX_WRITTEN];
 static int	nwritten = 0;
 static bool written_overflow = false;
 static bool callback_registered = false;
+
+/*
+ * And the relations whose rows it wrote, on which branch: more than fit,
+ * and none of its branches is known to have been written only in these.
+ */
+#define MAX_WRITTEN_RELS 64
+static struct
+{
+	Oid			branch;
+	Oid			relid;
+}			written_rels[MAX_WRITTEN_RELS];
+static int	nwritten_rels = 0;
+static bool written_rels_overflow = false;
 
 static BranchGenerations *
 shared(void)
@@ -286,9 +323,27 @@ make_entry(BranchGenerations *g, Oid branch, uint64 generation)
 		e->branch = branch;
 		e->generation = generation;
 		e->ended.before = g->absent_ended;
+		e->rels_from = generation;
 		return e;
 	}
 	return NULL;
+}
+
+/*
+ * A relation written by e's writer that just ended, at e's generation now
+ * (the lock held exclusively): the oldest dropped if the ring is full,
+ * every relation then known only from after its generation.
+ */
+static void
+note_relation_ended(BranchGeneration *e, Oid relid)
+{
+	if (e->nrels == WRITTEN_RELATIONS)
+		e->rels_from = Max(e->rels_from, e->rels[e->relnext].generation);
+	else
+		e->nrels++;
+	e->rels[e->relnext].generation = e->generation;
+	e->rels[e->relnext].relid = relid;
+	e->relnext = (e->relnext + 1) % WRITTEN_RELATIONS;
 }
 
 /*
@@ -320,6 +375,13 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 		e->generation = ++g->counter;
 		e->known = false;
 		note_ended(&e->ended, xid);
+		if (written_rels_overflow)
+			e->rels_from = e->generation;
+		for (int j = 0; j < nwritten_rels; j++)
+		{
+			if (written_rels[j].branch == written[i])
+				note_relation_ended(e, written_rels[j].relid);
+		}
 	}
 	if (written_overflow)
 	{
@@ -330,6 +392,8 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 	LWLockRelease(&g->lock);
 	nwritten = 0;
 	written_overflow = false;
+	nwritten_rels = 0;
+	written_rels_overflow = false;
 }
 
 void
@@ -370,6 +434,113 @@ branch_generations_note_write(Oid branch)
 		written_overflow = true;
 	}
 	LWLockRelease(&g->lock);
+}
+
+/*
+ * Of a relation whose rows the transaction writes on branch (told of it
+ * already): kept for the branch's entry as the transaction ends.  Called
+ * for every row, so the last one is checked first.
+ */
+void
+branch_generations_note_relation(Oid branch, Oid relid)
+{
+	if (!OidIsValid(branch) || !OidIsValid(relid) || written_rels_overflow ||
+		written_overflow)
+		return;
+	if (nwritten_rels > 0 &&
+		written_rels[nwritten_rels - 1].relid == relid &&
+		written_rels[nwritten_rels - 1].branch == branch)
+		return;
+	for (int i = 0; i < nwritten_rels; i++)
+	{
+		if (written_rels[i].relid == relid && written_rels[i].branch == branch)
+			return;
+	}
+	if (nwritten_rels == MAX_WRITTEN_RELS)
+	{
+		written_rels_overflow = true;
+		return;
+	}
+	written_rels[nwritten_rels].branch = branch;
+	written_rels[nwritten_rels].relid = relid;
+	nwritten_rels++;
+}
+
+/*
+ * Can a fold by snap be marked, or what was written since a mark be known?
+ * As knowable(), but by a transaction that writes the branch too: its own
+ * relations are known here.
+ */
+static bool
+markable(Snapshot snap)
+{
+	return shared() != NULL && snap != NULL &&
+		snap->snapshot_type == SNAPSHOT_MVCC && !RecoveryInProgress() &&
+		!written_overflow && !written_rels_overflow &&
+		!XactHasInvalidations() && !TwoPhaseAnyPrepared();
+}
+
+bool
+branch_fold_mark(Oid branch, Snapshot snap, ProllyFoldMark *mark)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	bool		ok;
+
+	if (!markable(snap))
+		return false;
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, branch);
+	ok = e != NULL && sees_writers(g, e, snap);
+	if (ok)
+	{
+		mark->branch = branch;
+		mark->generation = e->generation;
+		mark->overflow = g->overflow;
+		mark->epoch = pg_atomic_read_u64(&g->epoch);
+	}
+	LWLockRelease(&g->lock);
+	return ok;
+}
+
+bool
+branch_written_since(const ProllyFoldMark *mark, Snapshot snap, Oid **relids,
+					 int *nrelids)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	Oid		   *out;
+	int			n = 0;
+	bool		ok;
+
+	if (!markable(snap))
+		return false;
+	out = palloc_array(Oid, WRITTEN_RELATIONS + MAX_WRITTEN_RELS);
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, mark->branch);
+	ok = e != NULL && e->rels_from <= mark->generation &&
+		g->overflow == mark->overflow &&
+		pg_atomic_read_u64(&g->epoch) == mark->epoch &&
+		sees_writers(g, e, snap);
+	for (int i = 0; ok && i < e->nrels; i++)
+	{
+		if (e->rels[i].generation > mark->generation)
+			out[n++] = e->rels[i].relid;
+	}
+	LWLockRelease(&g->lock);
+	if (!ok)
+	{
+		pfree(out);
+		return false;
+	}
+	for (int i = 0; i < nwritten_rels; i++)
+	{
+		if (written_rels[i].branch == mark->branch)
+			out[n++] = written_rels[i].relid;
+	}
+	*relids = out;
+	*nrelids = n;
+	return true;
 }
 
 /*

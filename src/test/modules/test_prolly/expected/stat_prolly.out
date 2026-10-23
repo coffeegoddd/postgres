@@ -61,7 +61,7 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  value_nodes_written       |     0
  chunks_appended           |    15
  chunk_bytes_appended      | 26284
- bytes_hashed              | 26849
+ bytes_hashed              | 26373
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -111,17 +111,21 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  gc_bytes_freed            |     0
  conjoins                  |     0
  gc_window_usec            |     0
- chunk_file_reads          |    10
+ chunk_file_reads          |     9
  gc_pages_scanned          |     0
  commits_read              |     1
  folds_reused              |     0
  describe_cache_hits       |     1
  apply_rows_batched        |     0
  apply_loads               |     0
- chunk_cache_hits          |    26
+ chunk_cache_hits          |    27
  fold_rows_located         |  1000
  fold_changes_spilled      |     0
-(65 rows)
+ fold_catalog_scans        |     0
+ fold_objects              |     1
+ fold_tables               |     1
+ fold_incremental          |     1
+(69 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,

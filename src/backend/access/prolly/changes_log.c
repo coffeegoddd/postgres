@@ -1539,6 +1539,8 @@ own_copies(Finder *f, ItemPointerData *tids, int ntids)
 static void
 count_work(const Finder *f)
 {
+	if (!prolly_fold_counted)
+		return;
 	counters.pages += f->work.pages;
 	counters.candidates += f->work.candidates;
 	counters.full += f->work.full;

@@ -66,6 +66,13 @@ extern PGDLLIMPORT bool debug_prolly_force_full_fold;
 extern PGDLLIMPORT bool prolly_fold_verifying;
 
 /*
+ * Cleared while a fold is made only to check another against it
+ * (debug_prolly_verify_fold_caches): the change finders count none of its
+ * work, so a fold's counted work is its own whether or not it is checked.
+ */
+extern PGDLLIMPORT bool prolly_fold_counted;
+
+/*
  * debug_prolly_verify_fold_caches: a working set taken from an earlier
  * fold, not folded (#482), is folded too, and checked against it
  * (prolly_check_fold_cache(): left_out, an object the new fold left out

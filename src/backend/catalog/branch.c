@@ -1056,8 +1056,14 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 		prolly_note_change(rel, oldtid, oldtup, newtid);
 	else if (prolly_is_change_log(rel))
 		return;
-	/* (the refs are told of every write to the branch, hushed too (#482)) */
-	prolly_note_branch_write(MyBranch);
+	/*
+	 * (the refs are told of every write to the branch, hushed too (#482),
+	 * and of the relation whose rows it changes: a TOAST relation's are its
+	 * table's)
+	 */
+	prolly_note_relation_write(MyBranch,
+							   rel->rd_rel->relkind == RELKIND_TOASTVALUE ?
+							   InvalidOid : RelationGetRelid(rel));
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
 }
@@ -1074,7 +1080,9 @@ branch_note_made(Relation rel, const ItemPointerData *oldtid,
 		prolly_note_made(rel, oldtid, oldtup, made, nmade);
 	else if (prolly_is_change_log(rel))
 		return;
-	prolly_note_branch_write(MyBranch);
+	prolly_note_relation_write(MyBranch,
+							   rel->rd_rel->relkind == RELKIND_TOASTVALUE ?
+							   InvalidOid : RelationGetRelid(rel));
 	if (branch_tuple_hook && hushes == NIL)
 		for (int i = 0; i < nmade; i++)
 			branch_tuple_hook(rel, i == 0 ? oldtid : NULL, &made[i]->t_self);

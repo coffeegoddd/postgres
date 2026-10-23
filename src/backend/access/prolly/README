@@ -300,6 +300,25 @@ members; and the last canonical tree's items, so the next is applied as
 the items that differ (the baseline's too, from the baseline folded from).
 debug_prolly_verify_fold_caches works each one taken out again too.
 
+A fold after another in the same backend works out again only what may
+have changed (fold_incremental): with no catalog change or collection
+since (the refs' mark, moved by every catalog change sent, and the
+backend's own catalog epoch), the same deparsing settings, and a snapshot
+that sees every writer of the branch that ended, it takes the last
+canonical tree's items and redoes those of the tables whose rows were
+written since, and every sequence's (their values change outside
+transactions), reading no catalog through.  The refs learn which tables:
+every row a writer changes names its relation (note_relation()), and as
+the writer ends the branch keeps them in shared memory, the last few with
+the generation they ended at (refs_generations.c).  A writer of too many
+relations, an eviction, a prepared transaction's end or anything else the
+mark doesn't cover folds everything.  A commit's fold begins the next
+baseline from the one this backend built last, only the written tables'
+entries changed.  debug_prolly_verify_fold_caches then folds everything
+else again (its work not counted) and compares.  dolt_status reads definitions
+without rows and asks each table's change finder, so it still visits
+every table.
+
 
 Remotes
 -------

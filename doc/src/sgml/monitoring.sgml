@@ -5785,7 +5785,15 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>fold_changes_spilled</literal> (folds from a table's
        baseline whose changes passed
        <varname>maintenance_work_mem</varname>: sorted, spilling to disk,
-       and applied a part at a time, not read in full).  Bytes are counted when
+       and applied a part at a time, not read in full);
+       <literal>fold_catalog_scans</literal>,
+       <literal>fold_objects</literal> and <literal>fold_tables</literal>
+       (folds of a working set that read the catalogs through for every
+       versioned object, the objects folds described, and the tables whose
+       rows they folded) and <literal>fold_incremental</literal> (folds that
+       took the last canonical tree the backend built and worked out again
+       only the tables written since and the sequences, as nothing else had
+       changed).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected
