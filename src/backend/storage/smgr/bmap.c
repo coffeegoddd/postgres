@@ -6291,6 +6291,11 @@ tree_release_tops(SMgrRelation reln, const BmapEntry *tops)
  * counts holders, which counts the queue's entries as holders too
  * (sweep_queue()).
  *
+ * Drains run in autovacuum workers (prolly_autovacuum()), in a sweep before
+ * it counts, and before a VACUUM of a relation of the store
+ * (bmapreleasestep()): a page a dropped map still holds counts as shared,
+ * which VACUUM would otherwise leave as it is or copy to change.
+ *
  * Locks: the metapage, exclusively, for a push or a step; a push then
  * locks the pages it writes.  A step reads the pages it pops from under
  * share locks, then locks the reference-count pages, the allocator's, and
@@ -8509,6 +8514,20 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 	INJECTION_POINT("bmap-predrop", NULL);
 	drop_blocks(reln);
 	INJECTION_POINT("bmap-dropped", NULL);
+}
+
+/*
+ * One step of the drain of the release queue of reln's page store, not
+ * waiting for another drain or a sweep: the entries it let go of.
+ */
+uint32
+bmapreleasestep(SMgrRelation reln)
+{
+	BmapRelease done = {0};
+
+	(void) bmap_release_step(reln->smgr_rlocator.locator.spcOid,
+							 reln->smgr_rlocator.locator.dbOid, false, &done);
+	return (uint32) done.entries;
 }
 
 /*

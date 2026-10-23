@@ -163,6 +163,7 @@ tests += {
       'nearest_source',
       'keyless_toast_folds',
       'vacuum_shared',
+      'vacuum_released',
       'eager_freeze',
       'append_check',
       'journal_segments',

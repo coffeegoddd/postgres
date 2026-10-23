@@ -31,6 +31,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/prolly_autovacuum.h"
 #include "access/prolly_config.h"
 #include "access/reloptions.h"
 #include "access/tableam.h"
@@ -2080,6 +2081,31 @@ vac_truncate_clog(TransactionId frozenXID,
 
 
 /*
+ * Storage whose pages other relations may share may also have pages held
+ * by storage dropped since (a deleted branch's copy of the table), queued
+ * to be let go of in the background.  Until then such a page counts as
+ * shared, so VACUUM would leave it as it is, or copy it to prune or freeze
+ * it, though nothing else will hold it: so that is let go of first, as much
+ * as an autovacuum pass would, under the cost-based delay.
+ */
+static void
+vacuum_release_dropped(Relation rel)
+{
+	uint64		released = 0;
+	uint32		step;
+
+	if (!smgrcanshare(RelationGetSmgr(rel)))
+		return;
+	while ((prolly_release_max_per_pass < 0 ||
+			released < (uint64) prolly_release_max_per_pass) &&
+		   (step = smgrreleasestep(RelationGetSmgr(rel))) > 0)
+	{
+		released += step;
+		vacuum_delay_point(false);
+	}
+}
+
+/*
  *	vacuum_rel() -- vacuum one heap relation
  *
  *		relid identifies the relation to vacuum.  If relation is supplied,
@@ -2427,7 +2453,10 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 			rel = NULL;
 		}
 		else
+		{
+			vacuum_release_dropped(rel);
 			table_relation_vacuum(rel, &params, bstrategy);
+		}
 	}
 
 	/* Roll back any GUC changes executed by index functions */
