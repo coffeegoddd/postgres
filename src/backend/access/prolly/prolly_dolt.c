@@ -4212,9 +4212,25 @@ rebase_continue(const char **result)
 	if (rs.last_step != NULL &&
 		(PROLLY_CALL(r, merge_state, &ms) || working_set_dirty()))
 	{
+		bool		found = false;
+
 		for (int i = 0; i < rs.nsteps; i++)
 			if (rebase_order_cmp(rs.steps[i].order, rs.last_step) == 0)
+			{
 				rebase_commit_stopped(&rs, &rs.steps[i]);
+				found = true;
+			}
+
+		/*
+		 * (its step taken out of the plan, or moved: what it left would be
+		 * lost, or a pick in progress carried into the steps after it)
+		 */
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the rebase stopped at step %s, which is no longer in the plan",
+							rs.last_step),
+					 errhint("Put the step back, or abort the rebase.")));
 	}
 	else if (rs.last_step == NULL && working_set_dirty())
 		ereport(ERROR,
@@ -4269,11 +4285,27 @@ rebase_continue(const char **result)
 		}
 	}
 
-	/* every step done: the rebased branch, if it hasn't moved, moved here */
-	if (!PROLLY_CALL(r, resolve, rs.branch, &head) || !same_hash(&head, &rs.head))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("rebase aborted due to changes in branch %s", rs.branch)));
+	/*
+	 * every step done: the rebased branch, if it hasn't changed, moved here.
+	 * Changed is a new head, or uncommitted changes, which another session
+	 * may have written to it meanwhile: its working set, clean as the rebase
+	 * began, is no longer its head's, as Dolt compares its working root.
+	 * The move would drop them.
+	 */
+	{
+		ProllyNodeRef ws;
+		ProllyNodeRef committed;
+		List	   *left_out = NIL;
+
+		if (!PROLLY_CALL(r, resolve, rs.branch, &head) || !same_hash(&head, &rs.head) ||
+			(PROLLY_CALL(r, read_working_set, rs.branch, InvalidOid, &ws, &left_out) &&
+			 (left_out != NIL ||
+			  !PROLLY_CALL(r, commit_working_set, &head, &committed) ||
+			  !same_hash(&ws.hash, &committed.hash))))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("rebase aborted due to changes in branch %s", rs.branch)));
+	}
 	force_branch(rs.branch, working);
 	checkout_branch(rs.branch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
@@ -4458,6 +4490,20 @@ rebase_step_of(HeapTuple tuple, TupleDesc desc, ProllyRebaseStep *s)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid commit hash: %s", TextDatumGetCString(v[2]))));
 	s->message = TextDatumGetCString(v[3]);
+
+	/*
+	 * (a commit the store has: the refs name it as a chunk they reference,
+	 * so one missing couldn't be stored, nor rebased)
+	 */
+	{
+		ProllyCommitInfo info;
+
+		if (!PROLLY_CALL(refs(), commit_get, &s->commit, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("unable to resolve commit hash %s: target commit not found",
+							hash_hex(&s->commit))));
+	}
 }
 
 /*

@@ -699,5 +699,92 @@ SELECT dolt_rebase('--continue');
  {0,"Successfully rebased and updated refs/heads/b7"}
 (1 row)
 
+-- another session's uncommitted changes on the rebased branch: refused at
+-- the end, as Dolt's, not dropped by the branch's move
+SELECT dolt_checkout('-b', 'b8', 'main~1') IS NOT NULL AS on_b8;
+ on_b8 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (80, 'x');
+SELECT dolt_commit('-am', 'row 80') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+\c regress_rebase
+SELECT dolt_checkout('b8') IS NOT NULL AS on_b8;
+ on_b8 
+-------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (81, 'another session');
+\c regress_rebase
+SELECT dolt_checkout('dolt_rebase_b8') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+SELECT dolt_rebase('--continue');
+ERROR:  rebase aborted due to changes in branch b8
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
+SELECT pk, v FROM rb.t WHERE pk >= 80 ORDER BY pk;
+ pk |        v        
+----+-----------------
+ 80 | x
+ 81 | another session
+(2 rows)
+
+-- a plan step naming a commit that doesn't exist: refused as it is given
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS clean;
+ clean 
+-------
+ t
+(1 row)
+
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+ started 
+---------
+ t
+(1 row)
+
+INSERT INTO dolt_rebase VALUES (5, 'pick', repeat('de', 20), 'x');
+ERROR:  unable to resolve commit hash dededededededededededededededededededede: target commit not found
+UPDATE dolt_rebase SET commit_hash = repeat('be', 20) WHERE rebase_order = 1;
+ERROR:  unable to resolve commit hash bebebebebebebebebebebebebebebebebebebebe: target commit not found
+-- the step an edit stopped at taken out of the plan: refused, not lost
+UPDATE dolt_rebase SET action = 'edit' WHERE rebase_order = 1;
+SELECT (dolt_rebase('--continue'))[2] LIKE 'edit action paused at commit %' AS paused;
+ paused 
+--------
+ t
+(1 row)
+
+INSERT INTO rb.t VALUES (82, 'edited');
+DELETE FROM dolt_rebase WHERE rebase_order = 1;
+SELECT dolt_rebase('--continue');
+ERROR:  the rebase stopped at step 1.00, which is no longer in the plan
+HINT:  Put the step back, or abort the rebase.
+SELECT dolt_rebase('--abort');
+           dolt_rebase            
+----------------------------------
+ {0,"Interactive rebase aborted"}
+(1 row)
+
 \c postgres
 DROP DATABASE regress_rebase;

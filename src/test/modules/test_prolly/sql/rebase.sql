@@ -197,5 +197,34 @@ SELECT dolt_checkout('dolt_rebase_b7') IS NOT NULL AS back;
 SELECT action, commit_message FROM dolt_rebase;
 SELECT dolt_rebase('--continue');
 
+-- another session's uncommitted changes on the rebased branch: refused at
+-- the end, as Dolt's, not dropped by the branch's move
+SELECT dolt_checkout('-b', 'b8', 'main~1') IS NOT NULL AS on_b8;
+INSERT INTO rb.t VALUES (80, 'x');
+SELECT dolt_commit('-am', 'row 80') IS NOT NULL AS committed;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+\c regress_rebase
+SELECT dolt_checkout('b8') IS NOT NULL AS on_b8;
+INSERT INTO rb.t VALUES (81, 'another session');
+\c regress_rebase
+SELECT dolt_checkout('dolt_rebase_b8') IS NOT NULL AS back;
+SELECT dolt_rebase('--continue');
+SELECT dolt_rebase('--abort');
+SELECT pk, v FROM rb.t WHERE pk >= 80 ORDER BY pk;
+
+-- a plan step naming a commit that doesn't exist: refused as it is given
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS clean;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+INSERT INTO dolt_rebase VALUES (5, 'pick', repeat('de', 20), 'x');
+UPDATE dolt_rebase SET commit_hash = repeat('be', 20) WHERE rebase_order = 1;
+
+-- the step an edit stopped at taken out of the plan: refused, not lost
+UPDATE dolt_rebase SET action = 'edit' WHERE rebase_order = 1;
+SELECT (dolt_rebase('--continue'))[2] LIKE 'edit action paused at commit %' AS paused;
+INSERT INTO rb.t VALUES (82, 'edited');
+DELETE FROM dolt_rebase WHERE rebase_order = 1;
+SELECT dolt_rebase('--continue');
+SELECT dolt_rebase('--abort');
+
 \c postgres
 DROP DATABASE regress_rebase;
