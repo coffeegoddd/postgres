@@ -12,6 +12,8 @@ import shlex
 from collections import Counter
 from pathlib import Path
 
+from pbench.core import suites
+
 SCHEMA_VERSION = 2
 
 
@@ -100,7 +102,7 @@ def validate_run(path: Path) -> list[str]:
                     continue
             if r["key"].get("workload") == "S13" and r.get("status") == "ok":
                 tpch_answers(path / r["raw_dir"])
-            if run["suite"] == "C" and r.get("status") == "ok":
+            if suites.layout(run["suite"]) == suites.CORRECTNESS and r.get("status") == "ok":
                 from pbench.ccompare import evidence
                 errors, _ = evidence(path / r["raw_dir"] / "slt", run["table_am"])
                 problems.extend(errors)

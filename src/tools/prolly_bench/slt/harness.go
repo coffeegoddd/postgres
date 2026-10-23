@@ -139,7 +139,8 @@ func (h *harness) Init() error {
 }
 
 // setupDatabase recreates the worker's database and opens the session on
-// it, with the target's settings.
+// it, with the target's settings: its versioned schema, the setup SQL,
+// and the search path.
 func (h *harness) setupDatabase() error {
 	ctx := context.Background()
 	if h.conn != nil {
@@ -163,9 +164,12 @@ func (h *harness) setupDatabase() error {
 	if err != nil {
 		return err
 	}
-	if h.cfg.schema != "" {
-		sql := fmt.Sprintf("CREATE SCHEMA %s VERSIONED; SET search_path = %s",
-			h.cfg.schema, h.cfg.schema)
+	sqls, err := h.cfg.setupStatements()
+	if err != nil {
+		conn.Close(ctx)
+		return err
+	}
+	for _, sql := range sqls {
 		if _, err := conn.Exec(ctx, sql).ReadAll(); err != nil {
 			conn.Close(ctx)
 			return err
@@ -173,6 +177,30 @@ func (h *harness) setupDatabase() error {
 	}
 	h.conn = conn
 	return nil
+}
+
+// setupStatements are what a new database runs before its tests: the
+// versioned schema, then the setup SQL (on the search path, so the
+// objects it creates land in the test schema), then the search path
+// again, in case the setup changed it.
+func (c *config) setupStatements() ([]string, error) {
+	var out []string
+	if c.schema != "" {
+		out = append(out, fmt.Sprintf("CREATE SCHEMA %s VERSIONED", c.schema))
+	}
+	path := "SET search_path = " + c.searchPath()
+	if c.schema == "" && c.searchPathExtra == "" && c.setupSQL == "" {
+		return out, nil
+	}
+	out = append(out, path)
+	if c.setupSQL != "" {
+		b, err := os.ReadFile(c.setupSQL)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, string(b), path)
+	}
+	return out, nil
 }
 
 // finishFile checks the AM of every table the file left behind and
