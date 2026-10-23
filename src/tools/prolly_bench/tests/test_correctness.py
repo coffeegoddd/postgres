@@ -79,17 +79,41 @@ class TableDigestTest(unittest.TestCase):
         self.cluster.sql("UPDATE digest_case SET v = NULL WHERE t IS NULL")
         self.assertNotEqual(before["rows_sha256"], self.digest()["rows_sha256"])
 
+    def monetary_locale(self):
+        """Return an installed locale whose money output differs from C."""
+        c_money = self.cluster.scalar("SET lc_monetary = 'C'; SELECT 1234.5::money")
+        for name in ("es_ES.UTF-8", "es_ES.utf8", "de_DE.UTF-8", "de_DE.utf8",
+                     "fr_FR.UTF-8", "fr_FR.utf8", "en_GB.UTF-8", "en_GB.utf8"):
+            r = self.cluster.sql(f"SET lc_monetary = '{name}'; SELECT 1234.5::money",
+                                 check=False)
+            if r.ok and r.stdout.strip() != c_money:
+                return name
+        return None
+
     def test_output_settings_are_fixed(self):
+        # 0.1 + 0.2 needs 17 significant digits, so extra_float_digits=0
+        # rounds it to 0.3.
         self.cluster.sql(r"""
             CREATE TABLE digest_case (f float8, d timestamptz, i interval, b bytea);
-            INSERT INTO digest_case VALUES (1.0000000001, '2026-01-02 03:04:05+00',
-                '1 year 2 months 3 days 04:05:06', '\x00ff'::bytea);
+            INSERT INTO digest_case VALUES (0.1::float8 + 0.2::float8,
+                '2026-01-02 03:04:05+00', '1 year 2 months 3 days 04:05:06',
+                '\x00ff'::bytea);
         """)
         before = self.digest()
         self.ctx.session_options = lambda: {
             "timezone": "America/Los_Angeles", "datestyle": "SQL,DMY",
             "intervalstyle": "sql_standard", "bytea_output": "escape",
             "extra_float_digits": "0"}
+        self.assertEqual(before, self.digest())
+
+    def test_monetary_output_is_fixed(self):
+        locale = self.monetary_locale()
+        if locale is None:
+            self.skipTest("no installed locale formats money differently from C")
+        self.cluster.sql("CREATE TABLE digest_case (m money); "
+                         "INSERT INTO digest_case VALUES (1234.5)")
+        before = self.digest()
+        self.ctx.session_options = lambda: {"lc_monetary": locale}
         self.assertEqual(before, self.digest())
 
 
