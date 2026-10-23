@@ -2,8 +2,8 @@
  *
  * prolly_dolt.c
  *	  Doltgres's SQL interface to version control: the dolt_* functions
- *	  and the functions behind the dolt_log, dolt_branches, dolt_status
- *	  and dolt_conflicts system views, the dolt.author and
+ *	  and the functions behind the dolt_log, dolt_branches, dolt_tags,
+ *	  dolt_status and dolt_conflicts system views, the dolt.author and
  *	  dolt.allow_commit_conflicts settings, and "dbname/branch"
  *	  connections.
  *
@@ -51,6 +51,7 @@
 #include "catalog/versioned.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -207,6 +208,9 @@ static const char *author_override = NULL;
 
 static void writers_note_write(Oid branch, void *arg);
 static void writer_branch_hooks(void);
+static bool names_tag(const char *name);
+static void dolt_tag_change(char **names, int nnames, bool delete,
+							const char *message, const char *author);
 
 /* a branch to check out once the backend processes normally */
 static char *connect_branch = NULL;
@@ -1493,7 +1497,9 @@ checkout_tables(const char *ref, char **names, int nnames)
 /*
  * dolt_checkout(VARIADIC args text[]) returns text[]: {status, message}
  *
- * branch, or -b branch [start point] to create it first.  Tables, as
+ * branch, or -b branch [start point] to create it first; a commit's hash,
+ * or a tag's name, that names no branch, a detached session there,
+ * read-only.  Tables, as
  * Dolt's: -- tables (or "."), or a name that is no branch but a table
  * (with more after it), put back as the head has them; ref tables (ref
  * no table), or ref -- tables, as ref has them; a name before -- that is
@@ -1638,13 +1644,14 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * A commit's hash that names no branch: a detached session on it,
-	 * read-only, on a hidden branch at the commit that every session
-	 * detached there shares.  Changing anything takes a branch made from
-	 * it.  (Its transactions are read-only from the next one; this one from
+	 * A commit's hash, or a tag, that names no branch: a detached session
+	 * on the commit, read-only, on a hidden branch at the commit that every
+	 * session detached there shares, as a revision database of a tag is
+	 * read-only in Dolt.  Changing anything takes a branch made from it.
+	 * (Its transactions are read-only from the next one; this one from
 	 * now.)
 	 */
-	if (!create && names_commit(branch) &&
+	if (!create && (names_commit(branch) || names_tag(branch)) &&
 		!PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 	{
 		ProllyHash	id;
@@ -2004,6 +2011,26 @@ stopped_outside_block(const char *what, const char *What, const char *between,
 			 errhint("%s in a transaction block to see them in dolt_constraint_violations() and fix them before committing, or set dolt.allow_commit_conflicts to keep them.", What)));
 }
 
+static void
+count_violation(const ProllyViolation *pv, void *arg)
+{
+	(*(int *) arg)++;
+}
+
+/*
+ * How many constraint violations the session's branch keeps, counted as
+ * they are visited, not loaded: those of tables since dropped too, so the
+ * difference of two counts is what a merge or pick added.
+ */
+static int
+violations_kept(void)
+{
+	int			n = 0;
+
+	PROLLY_CALL(refs(), visit_violations, count_violation, &n);
+	return n;
+}
+
 /*
  * A pick or revert starts only on a branch without constraint violations,
  * as Dolt's only on a clean working set (which holds them): the ones it
@@ -2126,7 +2153,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
-	known = list_length(PROLLY_CALL(refs(), violations));
+	known = violations_kept();
 	date_given = dated;
 	PG_TRY();
 	{
@@ -2142,7 +2169,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	if (conflicts > 0)
 	{
 		/* (the violations it found, besides those the branch had) */
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations)) - known;
+		int			nviolations = violations_kept() - known;
 
 		conflicts -= nviolations;
 		stopped_outside_block("merge", "Merge", "branches", conflicts, nviolations);
@@ -3094,6 +3121,197 @@ dolt_stashes(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* ----------------------------------------------------------------
+ * Tags
+ * ----------------------------------------------------------------
+ */
+
+/* The refs, if they keep tags: else an error. */
+static const ProllyRefsRoutine *
+tag_refs(void)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	if (!PROLLY_HAS(r, tags))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" keeps no tags", r->info.name)));
+	return r;
+}
+
+/* Is name a tag's, by its name or its full ref name (refs/tags/x)? */
+static bool
+names_tag(const char *name)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	if (strncmp(name, "refs/tags/", 10) == 0 && name[10] != '\0' &&
+		PROLLY_HAS(r, tag_lookup) &&
+		!PROLLY_CALL(r, tag_lookup, name, &(ProllyHash) {0}))
+		name += 10;
+	return PROLLY_HAS(r, tag_lookup) &&
+		PROLLY_CALL(r, tag_lookup, name, &(ProllyHash) {0});
+}
+
+/*
+ * dolt_tag(VARIADIC args text[]) returns text[]: {status}
+ *
+ * name [ref] (HEAD if none), with -m/--message message and --author
+ * "Name <email>" (the session's author if none): a tag of ref's commit,
+ * called name, as Dolt's; -d/--delete name...: those tags deleted.  A tag
+ * that exists already isn't replaced.  The dolt_tags view lists them.
+ */
+Datum
+dolt_tag(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		options = true;	/* until "--" */
+	bool		delete = false;
+	bool		list = false;
+	bool		was_read_only;
+	char	   *message = NULL;
+	char	   *author = NULL;
+	char	  **names = palloc_array(char *, Max(nargs, 1));
+	int			nnames = 0;
+	const char *result[1] = {"0"};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (options && strcmp(a, "--") == 0)
+			options = false;	/* names after it, even ones like flags */
+		else if (!options || a[0] != '-')
+			names[nnames++] = a;
+		else if (is_option(a, "d") || is_option(a, "delete"))
+			delete = true;
+		else if (is_option(a, "m") || is_option(a, "message"))
+			message = option_value(args, nargs, &i, "dolt_tag");
+		else if (is_option(a, "author"))
+			author = option_value(args, nargs, &i, "dolt_tag");
+		else if (is_option(a, "v") || is_option(a, "verbose"))
+			list = true;
+		else
+			unsupported("dolt_tag", a);
+	}
+	/* (a listing is the view's, as Dolt's is the dolt_tags table's) */
+	if (nnames == 0 || list)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dolt_tag needs a tag's name"),
+				 errhint("The dolt_tags view lists the tags.")));
+	/*
+	 * (a tag changes only the refs: made, as a branch is, in a session on a
+	 * commit too, whose transactions are read-only only for that branch)
+	 */
+	was_read_only = XactReadOnly;
+	if (XactReadOnlyFromBranch)
+		XactReadOnly = false;
+	PG_TRY();
+	{
+		dolt_tag_change(names, nnames, delete, message, author);
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* dolt_tag()'s change: names made a tag of (or deleted, if delete). */
+static void
+dolt_tag_change(char **names, int nnames, bool delete, const char *message,
+				const char *author)
+{
+	PreventCommandIfReadOnly("dolt_tag()");
+	if (delete)
+	{
+		if (message != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("dolt_tag: -d and -m cannot be used together")));
+		for (int i = 0; i < nnames; i++)
+			if (!PROLLY_CALL(tag_refs(), tag_set, names[i], NULL, NULL))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("tag \"%s\" does not exist", names[i])));
+	}
+	else
+	{
+		const ProllyRefsRoutine *r = tag_refs();
+		const char *ref = nnames > 1 ? names[1] : "HEAD";
+		ProllyHash	commit;
+		ProllyHash	tag;
+
+		if (nnames > 2)
+			unexpected("dolt_tag", names[2]);
+		given_author("dolt_tag", author);
+		if (PROLLY_CALL(r, tag_lookup, names[0], &tag))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("tag \"%s\" already exists", names[0])));
+		if (!PROLLY_CALL(r, resolve, ref, &commit))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("branch, tag or commit \"%s\" does not exist", ref)));
+		PROLLY_CALL(r, tag_write, &commit, author ? author : prolly_commit_author(),
+					message ? message : "", &tag);
+		if (!PROLLY_CALL(r, tag_set, names[0], &(ProllyHash) {0}, &tag))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("tag \"%s\" already exists", names[0])));
+	}
+}
+
+/* dolt_tags()'s rows */
+static void
+put_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+		void *arg)
+{
+	ReturnSetInfo *rsinfo = arg;
+	ProllyTagInfo info;
+	Datum		values[6];
+	bool		nulls[6] = {0};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = CStringGetTextDatum(hash_hex(commit));
+	if (PROLLY_CALL(refs(), tag_get, tag, &info))
+	{
+		char	   *tagger;
+		char	   *email;
+
+		split_author(info.tagger, &tagger, &email);
+		values[2] = CStringGetTextDatum(tagger);
+		values[3] = CStringGetTextDatum(email);
+		values[4] = TimestampTzGetDatum(info.tagged_at);
+		values[5] = CStringGetTextDatum(info.message);
+	}
+	else
+		nulls[2] = nulls[3] = nulls[4] = nulls[5] = true;
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * dolt_tags(OUT tag_name text, OUT tag_hash text, OUT tagger text,
+ *			 OUT email text, OUT date timestamptz, OUT message text)
+ *			 returns setof record
+ *
+ * Every tag, by name, as Dolt's dolt_tags: the commit it names (tag_hash,
+ * as Dolt's), who made it, when, and its message.
+ */
+Datum
+dolt_tags(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (PROLLY_HAS(refs(), tags))
+		PROLLY_CALL(refs(), tags, put_tag, rsinfo);
+	return (Datum) 0;
+}
+
 /*
  * The tables with conflicts and the tables with constraint violations a
  * pick or revert in progress left, as Dolt counts them (tables, not rows):
@@ -3225,7 +3443,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+		int			nviolations = violations_kept();
 		int			ctables;
 		int			vtables;
 
@@ -3261,7 +3479,7 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 	must_commit(stopped, "a revert");
 	if (stopped > 0)
 	{
-		int			nviolations = list_length(PROLLY_CALL(refs(), violations));
+		int			nviolations = violations_kept();
 		int			ctables;
 		int			vtables;
 
@@ -3621,6 +3839,761 @@ all_log_entries(void)
 
 	PROLLY_CALL(refs(), branches, note_head, &starts);
 	return log_walk(starts);
+}
+
+/* ----------------------------------------------------------------
+ * Rebases
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * The branch a session rebases on, as Dolt's: a branch of its own, made at
+ * the commit replayed onto, which becomes the rebased branch's head once
+ * every step is done.  (Git rebases on a detached HEAD; Dolt has none.)
+ */
+#define REBASE_BRANCH_PREFIX "dolt_rebase_"
+
+/* numeric(6,2)'s typmod: a rebase order's */
+#define REBASE_ORDER_TYPMOD (((6 << 16) | 2) + VARHDRSZ)
+
+static const char *const rebase_actions[] = {
+	"pick", "reword", "squash", "fixup", "drop", "edit"
+};
+
+/* The refs, if they keep rebases: else an error. */
+static const ProllyRefsRoutine *
+rebase_refs(void)
+{
+	const ProllyRefsRoutine *r = refs();
+
+	if (!PROLLY_HAS(r, rebase_state))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("refs implementation \"%s\" can't rebase", r->info.name)));
+	return r;
+}
+
+/* A rebase order, as numeric(6,2) gives it ("1.00"): an error if it isn't one. */
+static char *
+rebase_order_text(Datum order)
+{
+	Datum		fitted = DirectFunctionCall2(numeric, order,
+											 Int32GetDatum(REBASE_ORDER_TYPMOD));
+
+	return DatumGetCString(DirectFunctionCall1(numeric_out, fitted));
+}
+
+static Datum
+rebase_order_datum(const char *order)
+{
+	return DirectFunctionCall3(numeric_in, CStringGetDatum(order),
+							   ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(REBASE_ORDER_TYPMOD));
+}
+
+static int
+rebase_order_cmp(const char *a, const char *b)
+{
+	return DatumGetInt32(DirectFunctionCall2(numeric_cmp, rebase_order_datum(a),
+											 rebase_order_datum(b)));
+}
+
+static int
+rebase_step_cmp(const void *a, const void *b)
+{
+	return rebase_order_cmp(((const ProllyRebaseStep *) a)->order,
+							((const ProllyRebaseStep *) b)->order);
+}
+
+static void
+check_rebase_action(const char *action)
+{
+	for (int i = 0; i < lengthof(rebase_actions); i++)
+		if (strcmp(action, rebase_actions[i]) == 0)
+			return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+			 errmsg("invalid rebase action \"%s\"", action),
+			 errhint("An action is pick, reword, squash, fixup, drop or edit.")));
+}
+
+static void
+no_rebase(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("no rebase in progress")));
+}
+
+/* Does the session branch's working set differ from its head's? */
+static bool
+working_set_dirty(void)
+{
+	ProllyNodeRef working;
+	ProllyNodeRef head_root;
+	ProllyHash	head;
+
+	if (!PROLLY_CALL(refs(), working_set, NULL, &working))
+		return false;
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
+		return true;
+	return !PROLLY_CALL(refs(), commit_working_set, &head, &head_root) ||
+		!same_hash(&working.hash, &head_root.hash);
+}
+
+/*
+ * The plan Dolt's makes: every commit head reaches that onto doesn't, but
+ * merge commits, oldest first, each picked, ordered 1, 2, ...
+ */
+static void
+default_rebase_plan(const ProllyHash *head, const ProllyHash *onto,
+					ProllyRebaseState *rs)
+{
+	List	   *theirs = log_walk(list_make1((void *) onto));
+	List	   *ours = log_walk(list_make1((void *) head));
+	HASHCTL		ctl = {0};
+	HTAB	   *reached;
+	ListCell   *lc;
+	List	   *picked = NIL;
+	int			n = 0;
+
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = CurrentMemoryContext;
+	reached = hash_create("dolt_rebase upstream", 256, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	foreach(lc, theirs)
+		(void) hash_search(reached, &((LogEntry *) lfirst(lc))->key, HASH_ENTER, NULL);
+	foreach(lc, ours)
+	{
+		LogEntry   *e = lfirst(lc);
+
+		if (e->info.nparents == 1 &&
+			hash_search(reached, &e->key, HASH_FIND, NULL) == NULL)
+			picked = lcons(e, picked);	/* (oldest first) */
+	}
+	rs->nsteps = list_length(picked);
+	rs->steps = palloc0(sizeof(ProllyRebaseStep) * Max(rs->nsteps, 1));
+	foreach(lc, picked)
+	{
+		LogEntry   *e = lfirst(lc);
+		ProllyRebaseStep *s = &rs->steps[n++];
+
+		s->order = rebase_order_text(DirectFunctionCall1(int4_numeric,
+														 Int32GetDatum(n)));
+		s->action = "pick";
+		s->commit = e->info.id;
+		s->message = e->info.message;
+	}
+}
+
+/*
+ * Start rebasing the session's branch onto upstream: refused over
+ * uncommitted changes, a merge, pick or revert in progress, or another
+ * rebase, as Dolt's.  The session is left on the rebase's own branch.
+ */
+static void
+rebase_start(const char *upstream, bool keep_empty)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+	char	   *branch = pstrdup(branch_ops()->current());
+	char	   *working = psprintf("%s%s", REBASE_BRANCH_PREFIX, branch);
+	ProllyRebaseState rs = {0};
+	ProllyMergeState ms;
+
+	if (PROLLY_CALL(r, rebase_state, &rs))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to start rebase while another rebase is in progress – abort the current rebase before proceeding")));
+	if (PROLLY_CALL(r, merge_state, &ms))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to start rebase while a merge is in progress – abort the current merge before proceeding")));
+	/* (a branch with no commits has none to rebase: said below) */
+	if (PROLLY_CALL(r, resolve, "HEAD", &rs.head) && working_set_dirty())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot start a rebase with uncommitted changes")));
+	if (!PROLLY_CALL(r, resolve, upstream, &rs.onto))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("branch not found: %s", upstream)));
+	if (!PROLLY_CALL(r, resolve, "HEAD", &rs.head))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("didn't identify any commits!")));
+	default_rebase_plan(&rs.head, &rs.onto, &rs);
+	if (rs.nsteps == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("didn't identify any commits!")));
+	if (PROLLY_CALL(r, branch_lookup, working, &(ProllyBranchId) {0}))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("fatal: A branch named '%s' already exists.", working)));
+	rs.branch = branch;
+	rs.keep_empty = keep_empty;
+	create_branch(working, hash_hex(&rs.onto));
+	checkout_branch(working);
+	PROLLY_CALL(r, set_rebase_state, &rs);
+}
+
+/*
+ * Make the head commit just made (picked onto prev) one with prev's parent
+ * instead, its working set, message and author: a squash or fixup into
+ * prev, as Dolt's amend.  Or, with parent prev itself, a reword.
+ */
+static void
+rebase_amend(const ProllyHash *parent, const char *message, const char *author)
+{
+	ProllyHash	head;
+	ProllyHash	id;
+	ProllyNodeRef ws;
+
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+		!PROLLY_CALL(refs(), commit_working_set, &head, &ws))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the rebased commit's working set is missing")));
+	/* (the head the new commit's parent, as a commit on it is made) */
+	if (parent->len > 0)
+		PROLLY_CALL(refs(), set_head, parent);
+	author_override = author;
+	PG_TRY();
+	{
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), commit_with, message, parent,
+										 parent->len > 0 ? 1 : 0, &ws, &id));
+	}
+	PG_FINALLY();
+	{
+		author_override = NULL;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * The head commit a step's pick just made (on prev, the head before it):
+ * dropped if it changed nothing that its commit did change (unless kept),
+ * else reworded, or squashed or fixed up into prev, as the step's action
+ * says.
+ */
+static void
+rebase_after_pick(const ProllyRebaseState *rs, const ProllyRebaseStep *s,
+				  const ProllyHash *prev)
+{
+	ProllyHash	head;
+	ProllyCommitInfo made;
+	ProllyCommitInfo before;
+	ProllyCommitInfo orig;
+	ProllyCommitInfo orig_parent;
+
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+		!PROLLY_CALL(refs(), commit_get, &head, &made) ||
+		!PROLLY_CALL(refs(), commit_get, prev, &before) ||
+		!PROLLY_CALL(refs(), commit_get, &s->commit, &orig))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a commit of the rebase is missing")));
+
+	/*
+	 * A commit that becomes empty, its changes there already: dropped
+	 * unless --empty=keep.  One empty from the start is kept, as Dolt's.
+	 */
+	if (same_hash(&made.root.hash, &before.root.hash) && !rs->keep_empty &&
+		!(orig.nparents == 1 &&
+		  PROLLY_CALL(refs(), commit_get, &orig.parents[0], &orig_parent) &&
+		  same_hash(&orig.root.hash, &orig_parent.root.hash)))
+	{
+		PROLLY_CALL(refs(), set_head, prev);
+		return;
+	}
+	if (strcmp(s->action, "reword") == 0)
+		rebase_amend(prev, s->message, orig.author);
+	else if (strcmp(s->action, "squash") == 0)
+		rebase_amend(before.nparents > 0 ? &before.parents[0] : &(ProllyHash) {0},
+					 psprintf("%s\n\n%s", before.message, orig.message),
+					 before.author);
+	else if (strcmp(s->action, "fixup") == 0)
+		rebase_amend(before.nparents > 0 ? &before.parents[0] : &(ProllyHash) {0},
+					 before.message, before.author);
+}
+
+/*
+ * Commit the working set of a step stopped at (its conflicts resolved, or
+ * an edit's changes): a commit on the head, with the step's message, then
+ * reworded, squashed or fixed up as a pick would be.
+ */
+static void
+rebase_commit_stopped(const ProllyRebaseState *rs, const ProllyRebaseStep *s)
+{
+	ProllyHash	prev;
+	ProllyHash	id;
+	ProllyMergeState ms;
+	ProllyCommitInfo orig;
+	bool		picking = PROLLY_CALL(refs(), merge_state, &ms);
+
+	if (!PROLLY_CALL(refs(), commit_get, &s->commit, &orig))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("rebased commit %s is missing", hash_hex(&s->commit))));
+	/* (a pick stopped by conflicts: the head before it is the pick's base) */
+	if (!PROLLY_CALL(refs(), resolve, "HEAD", &prev))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the rebase branch has no head")));
+	note_integration();
+	author_override = picking ? orig.author : NULL;
+	PG_TRY();
+	{
+		BRANCH_WRITES_HUSHED((void) PROLLY_CALL(refs(), commit,
+												picking ? orig.message : s->message,
+												true, &id));
+	}
+	PG_FINALLY();
+	{
+		author_override = NULL;
+	}
+	PG_END_TRY();
+	/* (an edit's changes are a commit of their own, with its message) */
+	if (picking)
+		rebase_after_pick(rs, s, &prev);
+	settled();
+}
+
+/*
+ * Go on with the plan from the step after the last begun: each picked
+ * onto the rebase's branch and made what its action says.  A step that
+ * conflicts, or an edit, stops it (result: the status and why); the last
+ * done, the rebased branch is moved to the rebase's head, checked out, and
+ * the rebase's branch deleted.
+ */
+static void
+rebase_continue(const char **result)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+	ProllyRebaseState rs;
+	ProllyMergeState ms;
+	char	   *working;
+	bool		seen_pick = false;
+	ProllyHash	head;
+
+	if (!PROLLY_CALL(r, rebase_state, &rs))
+		no_rebase();
+	working = pstrdup(branch_ops()->current());
+
+	/* (Dolt validates the plan as each --continue loads it) */
+	qsort(rs.steps, rs.nsteps, sizeof(ProllyRebaseStep), rebase_step_cmp);
+	for (int i = 0; i < rs.nsteps; i++)
+	{
+		ProllyRebaseStep *s = &rs.steps[i];
+		ProllyCommitInfo info;
+
+		check_rebase_action(s->action);
+		if (strcmp(s->action, "pick") == 0 || strcmp(s->action, "reword") == 0)
+			seen_pick = true;
+		else if ((strcmp(s->action, "squash") == 0 ||
+				  strcmp(s->action, "fixup") == 0) && !seen_pick)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid rebase plan: squash and fixup actions must appear after a pick or reword action")));
+		if (!PROLLY_CALL(r, commit_get, &s->commit, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("unable to resolve commit hash %s: target commit not found", hash_hex(&s->commit))));
+	}
+
+	if (PROLLY_CALL(r, merge_state, &ms))
+	{
+		int			ctables;
+		int			vtables;
+
+		tables_left(&ctables, &vtables);
+		if (ctables > 0 || vtables > 0)
+		{
+			StringInfoData names;
+
+			initStringInfo(&names);
+			for (int i = 0; i < ms.ntables; i++)
+			{
+				char	   *n = ms.table_names && ms.table_names[i] ?
+					ms.table_names[i] : get_rel_name(ms.tables[i]);
+
+				appendStringInfo(&names, "%s%s", i ? ", " : "", n ? n : "?");
+			}
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("conflicts detected in tables %s; resolve conflicts before continuing the rebase",
+							names.data)));
+		}
+	}
+	PreventCommandIfReadOnly("dolt_rebase()");
+
+	/* a step stopped at: its resolution, or an edit's changes, committed */
+	if (rs.last_step != NULL &&
+		(PROLLY_CALL(r, merge_state, &ms) || working_set_dirty()))
+	{
+		bool		found = false;
+
+		for (int i = 0; i < rs.nsteps; i++)
+			if (rebase_order_cmp(rs.steps[i].order, rs.last_step) == 0)
+			{
+				rebase_commit_stopped(&rs, &rs.steps[i]);
+				found = true;
+			}
+
+		/*
+		 * (its step taken out of the plan, or moved: what it left would be
+		 * lost, or a pick in progress carried into the steps after it)
+		 */
+		if (!found)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the rebase stopped at step %s, which is no longer in the plan",
+							rs.last_step),
+					 errhint("Put the step back, or abort the rebase.")));
+	}
+	else if (rs.last_step == NULL && working_set_dirty())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot start a rebase with uncommitted changes")));
+
+	for (int i = 0; i < rs.nsteps; i++)
+	{
+		ProllyRebaseStep *s = &rs.steps[i];
+		ProllyHash	prev;
+		ProllyHash	id;
+		const char *ref = hash_hex(&s->commit);
+		int			conflicts;
+
+		CHECK_FOR_INTERRUPTS();
+		if (rs.last_step != NULL && rebase_order_cmp(s->order, rs.last_step) <= 0)
+			continue;
+		rs.last_step = s->order;
+		PROLLY_CALL(r, set_rebase_state, &rs);
+		if (strcmp(s->action, "drop") == 0)
+			continue;
+		if (!PROLLY_CALL(r, resolve, "HEAD", &prev))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("the rebase branch has no head")));
+		note_integration();
+		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
+													 &ref, 1, true, &id));
+		if (conflicts > 0)
+		{
+			int			nviolations = list_length(PROLLY_CALL(r, violations));
+
+			stopped_outside_block("rebase", "Rebase", "sides",
+								  conflicts - nviolations, nviolations);
+			result[0] = "1";
+			result[1] = psprintf("data conflict detected while rebasing commit %s (%s). \n\n"
+								 "Resolve the conflicts and remove them from the dolt_conflicts table, "
+								 "then continue the rebase by calling dolt_rebase('--continue')",
+								 ref, s->message);
+			return;
+		}
+		rebase_after_pick(&rs, s, &prev);
+		settled();
+		if (strcmp(s->action, "edit") == 0)
+		{
+			result[0] = "0";
+			result[1] = psprintf("edit action paused at commit %s (%s). \n\n"
+								 "You can now modify the working directory and stage changes. "
+								 "When ready, continue the rebase by calling dolt_rebase('--continue')",
+								 ref, s->message);
+			return;
+		}
+	}
+
+	/*
+	 * every step done: the rebased branch, if it hasn't changed, moved here.
+	 * Changed is a new head, or uncommitted changes, which another session
+	 * may have written to it meanwhile: its working set, clean as the rebase
+	 * began, is no longer its head's, as Dolt compares its working root.
+	 * The move would drop them.
+	 */
+	{
+		ProllyNodeRef ws;
+		ProllyNodeRef committed;
+		List	   *left_out = NIL;
+
+		if (!PROLLY_CALL(r, resolve, rs.branch, &head) || !same_hash(&head, &rs.head) ||
+			(PROLLY_CALL(r, read_working_set, rs.branch, InvalidOid, &ws, &left_out) &&
+			 (left_out != NIL ||
+			  !PROLLY_CALL(r, commit_working_set, &head, &committed) ||
+			  !same_hash(&ws.hash, &committed.hash))))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("rebase aborted due to changes in branch %s", rs.branch)));
+	}
+	force_branch(rs.branch, working);
+	checkout_branch(rs.branch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
+	settled();
+	result[0] = "0";
+	result[1] = psprintf("Successfully rebased and updated refs/heads/%s", rs.branch);
+}
+
+/* Abort the rebase: back on the branch rebased, as it was; its branch gone. */
+static void
+rebase_abort(void)
+{
+	const ProllyRefsRoutine *r = rebase_refs();
+	ProllyRebaseState rs;
+	char	   *working;
+
+	if (!PROLLY_CALL(r, rebase_state, &rs))
+		no_rebase();
+	PreventCommandIfReadOnly("dolt_rebase()");
+	working = pstrdup(branch_ops()->current());
+	checkout_branch(rs.branch);
+	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
+	settled();
+}
+
+/*
+ * dolt_rebase(VARIADIC args text[]) returns text[]: {status, message}
+ *
+ * [-i/--interactive] [--empty=drop|keep] upstream: the session branch's
+ * commits that upstream doesn't reach (but merges), replayed onto it, as
+ * Dolt's; interactively, the plan is left in the dolt_rebase view to edit
+ * (actions pick, reword, squash, fixup, drop, edit, reordered by
+ * rebase_order) until --continue runs it.  A step whose pick conflicts
+ * stops the rebase, as a pick in progress: resolved, --continue commits it
+ * and goes on.  An edit stops after its pick: changes made then are
+ * committed by --continue.  --abort goes back to the branch as it was.
+ * The rebase works on a branch of its own, dolt_rebase_<branch>, which is
+ * deleted when it ends.
+ */
+Datum
+dolt_rebase(PG_FUNCTION_ARGS)
+{
+	char	  **args;
+	int			nargs = text_args(fcinfo, &args);
+	bool		options = true;	/* until "--" */
+	bool		interactive = false;
+	bool		abort_rebase = false;
+	bool		continue_rebase = false;
+	bool		keep_empty = false;
+	char	   *upstream = NULL;
+	int			npositional = 0;
+	const char *result[2] = {"0", ""};
+
+	for (int i = 0; i < nargs; i++)
+	{
+		char	   *a = args[i];
+
+		if (options && strcmp(a, "--") == 0)
+			options = false;
+		else if (!options || a[0] != '-')
+		{
+			if (npositional++ == 0)
+				upstream = a;
+		}
+		else if (is_option(a, "i") || is_option(a, "interactive"))
+			interactive = true;
+		else if (is_option(a, "abort"))
+			abort_rebase = true;
+		else if (is_option(a, "continue"))
+			continue_rebase = true;
+		else if (strncmp(a, "--empty=", 8) == 0 || is_option(a, "empty"))
+		{
+			const char *v = strncmp(a, "--empty=", 8) == 0 ? a + 8 :
+				option_value(args, nargs, &i, "dolt_rebase");
+
+			if (pg_strcasecmp(v, "keep") == 0)
+				keep_empty = true;
+			else if (pg_strcasecmp(v, "drop") == 0)
+				keep_empty = false;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unsupported option for the empty flag (%s); only 'keep' or 'drop' are allowed",
+								v)));
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("error: unknown option `%s'", a + (a[1] == '-' ? 2 : 1))));
+	}
+	if (abort_rebase)
+	{
+		rebase_abort();
+		result[1] = "Interactive rebase aborted";
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	if (continue_rebase)
+	{
+		rebase_continue(result);
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	if (npositional == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("not enough args")));
+	if (npositional > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("rebase takes at most one positional argument.")));
+	PreventCommandIfReadOnly("dolt_rebase()");
+	rebase_start(upstream, keep_empty);
+	if (!interactive)
+	{
+		rebase_continue(result);
+		PG_RETURN_DATUM(text_array(2, result));
+	}
+	result[1] = psprintf("interactive rebase started on branch %s; "
+						 "adjust the rebase plan in the dolt_rebase table, then "
+						 "continue rebasing by calling dolt_rebase('--continue')",
+						 branch_ops()->current());
+	PG_RETURN_DATUM(text_array(2, result));
+}
+
+/*
+ * dolt_rebase_plan(OUT rebase_order numeric, OUT action text,
+ *					OUT commit_hash text, OUT commit_message text)
+ *					returns setof record
+ *
+ * The session branch's rebase plan, in rebase order, behind the dolt_rebase
+ * view; an error when no rebase is in progress, as Dolt's dolt_rebase table
+ * is there only during one.
+ */
+Datum
+dolt_rebase_plan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyRebaseState rs;
+
+	if (!PROLLY_HAS(refs(), rebase_state) || !PROLLY_CALL(refs(), rebase_state, &rs))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("table not found: dolt_rebase"),
+				 errdetail("No rebase is in progress.")));
+	InitMaterializedSRF(fcinfo, 0);
+	qsort(rs.steps, rs.nsteps, sizeof(ProllyRebaseStep), rebase_step_cmp);
+	for (int i = 0; i < rs.nsteps; i++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {0};
+
+		values[0] = rebase_order_datum(rs.steps[i].order);
+		values[1] = CStringGetTextDatum(rs.steps[i].action);
+		values[2] = CStringGetTextDatum(hash_hex(&rs.steps[i].commit));
+		values[3] = CStringGetTextDatum(rs.steps[i].message);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* A row given to the dolt_rebase view, as a step. */
+static void
+rebase_step_of(HeapTuple tuple, TupleDesc desc, ProllyRebaseStep *s)
+{
+	bool		isnull[4];
+	Datum		v[4];
+
+	for (int i = 0; i < 4; i++)
+	{
+		v[i] = heap_getattr(tuple, i + 1, desc, &isnull[i]);
+		if (isnull[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NOT_NULL_VIOLATION),
+					 errmsg("a dolt_rebase step's %s can't be null",
+							NameStr(TupleDescAttr(desc, i)->attname))));
+	}
+	s->order = rebase_order_text(v[0]);
+	s->action = TextDatumGetCString(v[1]);
+	check_rebase_action(s->action);
+	if (!prolly_hash_from_hex(TextDatumGetCString(v[2]),
+							  strlen(TextDatumGetCString(v[2])), &s->commit))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid commit hash: %s", TextDatumGetCString(v[2]))));
+	s->message = TextDatumGetCString(v[3]);
+
+	/*
+	 * (a commit the store has: the refs name it as a chunk they reference,
+	 * so one missing couldn't be stored, nor rebased)
+	 */
+	{
+		ProllyCommitInfo info;
+
+		if (!PROLLY_CALL(refs(), commit_get, &s->commit, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("unable to resolve commit hash %s: target commit not found",
+							hash_hex(&s->commit))));
+	}
+}
+
+/*
+ * dolt_rebase_plan_change() returns trigger
+ *
+ * The dolt_rebase view's INSTEAD OF trigger, row by row: an insert adds a
+ * step, an update changes the step of the old row's rebase order, a delete
+ * removes it, in the session branch's rebase state, with the transaction.
+ * Rebase orders are unique, as the plan's key.
+ */
+Datum
+dolt_rebase_plan_change(PG_FUNCTION_ARGS)
+{
+	TriggerData *td = (TriggerData *) fcinfo->context;
+	TupleDesc	desc;
+	ProllyRebaseState rs;
+	ProllyRebaseStep oldstep;
+	ProllyRebaseStep newstep;
+	bool		has_old;
+	bool		has_new;
+	int			at = -1;
+	HeapTuple	ret;
+
+	if (!CALLED_AS_TRIGGER(fcinfo) || !TRIGGER_FIRED_INSTEAD(td->tg_event) ||
+		!TRIGGER_FIRED_FOR_ROW(td->tg_event))
+		elog(ERROR, "dolt_rebase_plan_change: not called as an INSTEAD OF row trigger");
+	desc = RelationGetDescr(td->tg_relation);
+	if (desc->natts != 4)
+		elog(ERROR, "dolt_rebase_plan_change: the view has %d columns, not 4", desc->natts);
+	if (!PROLLY_HAS(refs(), rebase_state) || !PROLLY_CALL(refs(), rebase_state, &rs))
+		no_rebase();
+	PreventCommandIfReadOnly("dolt_rebase");
+	has_old = !TRIGGER_FIRED_BY_INSERT(td->tg_event);
+	has_new = !TRIGGER_FIRED_BY_DELETE(td->tg_event);
+	if (has_old)
+	{
+		rebase_step_of(td->tg_trigtuple, desc, &oldstep);
+		for (int i = 0; i < rs.nsteps; i++)
+			if (rebase_order_cmp(rs.steps[i].order, oldstep.order) == 0)
+				at = i;
+		if (at < 0)
+			PG_RETURN_POINTER(NULL);	/* (gone already: nothing done) */
+	}
+	if (has_new)
+	{
+		rebase_step_of(TRIGGER_FIRED_BY_UPDATE(td->tg_event) ?
+					   td->tg_newtuple : td->tg_trigtuple, desc, &newstep);
+		for (int i = 0; i < rs.nsteps; i++)
+			if (i != at && rebase_order_cmp(rs.steps[i].order, newstep.order) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("duplicate rebase_order %s in the rebase plan", newstep.order)));
+	}
+	if (has_old && has_new)
+		rs.steps[at] = newstep;
+	else if (has_new)
+	{
+		rs.steps = repalloc(rs.steps, sizeof(ProllyRebaseStep) * (rs.nsteps + 1));
+		rs.steps[rs.nsteps++] = newstep;
+	}
+	else
+	{
+		memmove(&rs.steps[at], &rs.steps[at + 1],
+				sizeof(ProllyRebaseStep) * (rs.nsteps - at - 1));
+		rs.nsteps--;
+	}
+	qsort(rs.steps, rs.nsteps, sizeof(ProllyRebaseStep), rebase_step_cmp);
+	PROLLY_CALL(refs(), set_rebase_state, &rs);
+	ret = TRIGGER_FIRED_BY_UPDATE(td->tg_event) ? td->tg_newtuple : td->tg_trigtuple;
+	PG_RETURN_POINTER(ret);
 }
 
 /*
@@ -5328,8 +6301,16 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 	bool		from_ok = r->from_item == NULL;
 	bool		to_ok = r->to_item == NULL;
 	bool		some = false;
+	bool		reads_all;
 	const char *name;
 
+	/*
+	 * (one who may read every version needs no lineage: walking it reads
+	 * what the working set changed since the head, a fold of its rows,
+	 * whatever the refs diffed)
+	 */
+	reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
 	for (int i = 0; i < 2; i++)
 	{
 		Oid			relid;
@@ -5347,15 +6328,15 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 		check_history_rls(relid, fn);
 		some = true;
+		if (reads_all)
+			continue;
 		l = name_lineage(lineages, names[i]);
 		if (!from_ok)
 			from_ok = lineage_has(l, from_ref, r->from_name);
 		if (!to_ok)
 			to_ok = lineage_has(l, to_ref, r->to_name);
 	}
-	if ((from_ok && to_ok) ||
-		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
-		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+	if ((from_ok && to_ok) || reads_all)
 		return;
 	name = !from_ok ? r->from_name : r->to_name;
 	if (some)
@@ -6943,13 +7924,89 @@ check_remote_format(const ProllyRemoteRoutine *rr, ProllyRemote *r,
 						name, f.data, mine)));
 }
 
+/* A remote's tags: each one's name, tag object and commit. */
+typedef struct RemoteTags
+{
+	List	   *names;			/* char * */
+	List	   *tags;			/* ProllyHash * */
+	List	   *commits;		/* ProllyHash * */
+	const char *remote;			/* the remote's name, for messages */
+} RemoteTags;
+
+static void
+collect_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+			void *arg)
+{
+	RemoteTags *t = arg;
+
+	if (!pg_verifymbstr(name, strlen(name), true))
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("remote \"%s\"'s tag \"%s\" isn't fetched",
+						t->remote, escaped_branch_name(name)),
+				 errdetail("Its name isn't valid in this database's encoding.")));
+		return;
+	}
+	t->names = lappend(t->names, pstrdup(name));
+	t->tags = lappend(t->tags, copy_hash(tag));
+	t->commits = lappend(t->commits, copy_hash(commit));
+}
+
+/*
+ * Receive the remote's tags of commits this database has, once its
+ * branches are fetched, as Dolt's fetch follows tags (or, with all, as a
+ * clone takes them, every one, with its commit's history): those whose tag
+ * objects differ from the tags here of their names.  *got is what was
+ * received, to name here.
+ */
+static void
+receive_tags(const ProllyRemoteRoutine *rr, ProllyRemote *r, const char *name,
+			 bool all_tags, RemoteTags *got)
+{
+	ProllyDatabaseComponents dc;
+	RemoteTags	all = {NIL, NIL, NIL, name};
+	ListCell   *n;
+	ListCell   *t;
+	ListCell   *c;
+	ProllyHash *tags;
+	int			ntags = 0;
+
+	prolly_database_components(&dc);
+	memset(got, 0, sizeof(*got));
+	if (!PROLLY_HAS(rr, tags) || !PROLLY_HAS(dc.refs, tags))
+		return;
+	PROLLY_CALL(rr, tags, r, collect_tag, &all);
+	forthree(n, all.names, t, all.tags, c, all.commits)
+	{
+		ProllyHash	mine;
+		ProllyCommitInfo info;
+
+		if (PROLLY_CALL(dc.refs, tag_lookup, lfirst(n), &mine) &&
+			same_hash(&mine, lfirst(t)))
+			continue;
+		if (!all_tags && !PROLLY_CALL(dc.refs, commit_get, lfirst(c), &info))
+			continue;			/* (a commit not fetched: its tag isn't) */
+		got->names = lappend(got->names, lfirst(n));
+		got->tags = lappend(got->tags, lfirst(t));
+	}
+	if (got->tags == NIL)
+		return;
+	tags = palloc(sizeof(ProllyHash) * list_length(got->tags));
+	foreach(t, got->tags)
+		tags[ntags++] = *(ProllyHash *) lfirst(t);
+	(void) PROLLY_CALL(dc.transfer, receive, rr, r, tags, ntags);
+}
+
 /*
  * Fetch remote name's branches (NIL: all of them) into its remote-tracking
  * branches, the remote opened and its heads read once; with need, refuse
  * before receiving anything if the remote hasn't that branch.  *got (if
  * not NULL) is what was fetched: the branches and their commits.  A
  * clone's (into a database with nothing to walk against) copies the
- * remote's files whole, where the transfer can.
+ * remote's files whole, where the transfer can.  Then the remote's tags of
+ * commits the database has are fetched too, each set here as the remote
+ * has it.
  */
 static void
 fetch_remote(const char *name, List *only, const char *need, Heads *got,
@@ -6961,6 +8018,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 	ProllyRemote *r;
 	Heads		all = {NIL, NIL, name};
 	Heads		want = {NIL, NIL, name};
+	RemoteTags	tags = {0};
 	ListCell   *b;
 	ListCell   *c;
 
@@ -6970,6 +8028,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 	{
 		ProllyHash *commits;
 		int			n = 0;
+		List	   *tag_objects = NIL;
 
 		check_remote_format(rr, r, name);
 		PROLLY_CALL(rr, heads, r, collect_head, &all);
@@ -7016,8 +8075,23 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 						 errmsg("remote \"%s\" has no branch \"%s\"", name,
 								(char *) lfirst(b))));
 		}
-		commits = palloc(sizeof(ProllyHash) * Max(list_length(want.commits), 1));
+		/*
+		 * (a clone's tags, every one: among what it checks, so the commits
+		 * only a tag reaches are checked to be of this build's format, as a
+		 * head's are, though the clone copies them with the files)
+		 */
+		if (clone && PROLLY_HAS(rr, tags) && PROLLY_HAS(dc.refs, tags))
+		{
+			RemoteTags	rt = {NIL, NIL, NIL, name};
+
+			PROLLY_CALL(rr, tags, r, collect_tag, &rt);
+			tag_objects = rt.tags;
+		}
+		commits = palloc(sizeof(ProllyHash) *
+						 Max(list_length(want.commits) + list_length(tag_objects), 1));
 		foreach(c, want.commits)
+			commits[n++] = *(ProllyHash *) lfirst(c);
+		foreach(c, tag_objects)
 			commits[n++] = *(ProllyHash *) lfirst(c);
 		{
 			uint64		count;
@@ -7026,6 +8100,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 				!PROLLY_CALL(dc.transfer, clone, rr, r, commits, n, &count))
 				(void) PROLLY_CALL(dc.transfer, receive, rr, r, commits, n);
 		}
+		receive_tags(rr, r, name, clone, &tags);
 	}
 	PG_FINALLY();
 	{
@@ -7035,6 +8110,9 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 
 	forboth(b, want.branches, c, want.commits)
 		PROLLY_CALL(dc.refs, tracking_set, name, lfirst(b), lfirst(c));
+	/* (a tag here of a name the remote's has is set to the remote's, as Dolt's) */
+	forboth(b, tags.names, c, tags.tags)
+		(void) PROLLY_CALL(dc.refs, tag_set, lfirst(b), NULL, lfirst(c));
 	if (got)
 		*got = want;
 }
@@ -7593,13 +8671,93 @@ need_upstream(const char *fn, char **remote, char **branch)
 						 fn, current, current)));
 }
 
+typedef struct TagFind
+{
+	const char *name;
+	ProllyHash	tag;
+	bool		found;
+} TagFind;
+
+static void
+find_tag(const char *name, const ProllyHash *tag, const ProllyHash *commit,
+		 void *arg)
+{
+	TagFind    *tf = arg;
+
+	if (strcmp(name, tf->name) == 0)
+	{
+		tf->tag = *tag;
+		tf->found = true;
+	}
+}
+
+/*
+ * Push tag name to remote, as Dolt does: its tag object and what that
+ * reaches sent, then the remote's tag of that name made it, whatever tag
+ * it was (a compare-and-swap with the one read, so a change meanwhile is
+ * refused rather than lost).
+ */
+static Datum
+push_tag(const char *remote, const char *name)
+{
+	ProllyDatabaseComponents dc;
+	const char *url = need_remote(remote);
+	const ProllyRemoteRoutine *rr = prolly_remote_for_url(url);
+	ProllyRemote *r;
+	ProllyHash	tag;
+	ProllyTagInfo info;
+	const char *result[2] = {"0", NULL};
+
+	PreventCommandIfReadOnly("dolt_push()");
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, tag_lookup) ||
+		!PROLLY_CALL(dc.refs, tag_lookup, name, &tag) ||
+		!PROLLY_CALL(dc.refs, tag_get, &tag, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("tag \"%s\" not found", name)));
+	if (!PROLLY_HAS(rr, move_tag))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("remote \"%s\" keeps no tags", remote)));
+	r = PROLLY_CALL(rr, open, url, true);
+	PG_TRY();
+	{
+		TagFind		tf = {name, {0}, false};
+
+		check_remote_format(rr, r, remote);
+		PROLLY_CALL(rr, tags, r, find_tag, &tf);
+		if (tf.found && same_hash(&tf.tag, &tag))
+			result[1] = "Everything up-to-date";
+		else
+		{
+			(void) PROLLY_CALL(dc.transfer, send, rr, r, &tag, 1);
+			if (!PROLLY_CALL(rr, move_tag, r, name, &tf.tag, &tag, &info.commit,
+							 build_format()))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the push of tag %s to %s was rejected: the remote's tag moved meanwhile",
+								name, remote),
+						 errhint("Try again.")));
+			result[1] = psprintf("* [new tag] %s -> %s", name, name);
+		}
+	}
+	PG_FINALLY();
+	{
+		PROLLY_CALL(rr, close, r);
+	}
+	PG_END_TRY();
+	return text_array(2, result);
+}
+
 /*
  * dolt_push(VARIADIC args text[]) returns text[]: {status, message}
  *
  * [remote [branch]], -f/--force, -u/--set-upstream: branch (the session's
  * if not named) pushed to the remote's branch of the same name; with no
  * remote, the session branch to its upstream (which names the remote and
- * the remote's branch).  The chunks the branch's head reaches that the
+ * the remote's branch); remote tag (a tag's name that is no branch's, or
+ * refs/tags/tag): the tag, as push_tag() pushes it.  The chunks the branch's head reaches that the
  * remote lacks are sent, then the remote's branch moved to it, only as a
  * fast-forward unless forced.  The remote's branch
  * is moved as it is reached, not with the transaction: the remote-tracking
@@ -7653,6 +8811,28 @@ dolt_push(PG_FUNCTION_ARGS)
 			branch = a;
 		else
 			unexpected("dolt_push", a);
+	}
+	/*
+	 * A tag, named as one ("refs/tags/v1") or by a name that is a tag's
+	 * and no branch's: pushed as Dolt pushes one.
+	 */
+	if (remote != NULL && branch != NULL)
+	{
+		const char *tag = NULL;
+
+		if (strncmp(branch, "refs/tags/", 10) == 0 && branch[10] != '\0')
+			tag = branch + 10;
+		else if (!PROLLY_CALL(remote_refs(), branch_lookup, branch,
+							  &(ProllyBranchId) {0}) && names_tag(branch))
+			tag = branch;
+		if (tag != NULL)
+		{
+			if (set_upstream)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("dolt_push: a tag has no upstream")));
+			PG_RETURN_DATUM(push_tag(remote, tag));
+		}
 	}
 	if (remote == NULL)
 		need_upstream("dolt_push", &remote, &remote_branch);

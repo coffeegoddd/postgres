@@ -17,6 +17,7 @@
   prolly_bench sgate counters|timing RUN ...    S gate: a pull request against its base
   prolly_bench sreport --counters ... --out comment.md   S gate: the pull-request comment
   prolly_bench vgrowth RUN                      V suite: per-commit work growing with prior commits
+  prolly_bench vshape RUN                       V suite: operations' work as N and Δ grow, against targets
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import sys
 from pathlib import Path
 
 from pbench.core import config as config_mod
-from pbench.core import registry
+from pbench.core import registry, suites
 
 REPO = Path(__file__).resolve().parents[4]
 HERE = Path(__file__).resolve().parents[1]
@@ -110,7 +111,8 @@ def _run(args: argparse.Namespace) -> int:
     for s in args.set:
         k, _, v = s.partition("=")
         over["postgres"][k] = v
-    config = args.config or HERE / "configs" / config_mod.DEFAULT_CONFIGS[args.suite]
+    suite = suites.get(args.suite)
+    config = args.config or HERE / "configs" / suite.default_config
     cfg = config_mod.load(config, over, args.suite)
     if not args.am:
         raise SystemExit("at least one --am is required")
@@ -127,8 +129,8 @@ def _run(args: argparse.Namespace) -> int:
     commits = build_commits(args.build_commit, builds)
     if args.label and len(ams) * len(builds) > 1:
         raise SystemExit("--label names one result set; give one --am and one --pg-bin with it")
-    if len(builds) > 1 and args.suite != "S":
-        raise SystemExit("builds are compared in the S suite only")
+    if len(builds) > 1 and suite.layout != suites.STORAGE:
+        raise SystemExit("builds are compared in storage suites only, as the S suite")
     if cfg["run"]["comparison_only"] and len(builds) < 2:
         raise SystemExit("a comparison_only configuration compares builds: give "
                          "--pg-bin base=DIR,candidate=DIR")
@@ -141,8 +143,7 @@ def _run(args: argparse.Namespace) -> int:
             label = args.label
             if not label:
                 label = "B0" if am == "heap" else am
-                if cfg["postgres"].get("full_page_writes") == "off" and \
-                        args.suite not in config_mod.DURABILITY_EXEMPT_SUITES:
+                if cfg["postgres"].get("full_page_writes") == "off" and suite.durable:
                     label += "-fpw-off"
                 if build:
                     label = f"{build}-{label}"
@@ -158,7 +159,7 @@ def _run(args: argparse.Namespace) -> int:
     all_results = run_many(runners, report_format=args.report_format)
     ok = all(bool(results) and not validate_run(runner.out_dir)
              for runner, results in zip(runners, all_results))
-    if args.suite == "S":
+    if suite.layout == suites.STORAGE:
         from pbench.core.validation import compatible
         by = {(r.build, r.table_am): r.out_dir for r in runners}
         pairs = [(by[(b, "heap")], by[(b, am)], "engine")
@@ -172,7 +173,7 @@ def _run(args: argparse.Namespace) -> int:
             for problem in problems:
                 print(problem, file=sys.stderr)
             ok = ok and not problems
-    if args.suite == "C" and len(out_dirs) > 1:
+    if suite.layout == suites.CORRECTNESS and len(out_dirs) > 1:
         from pbench import ccompare, table
         print("\n" + ccompare.to_markdown([table.load_set(d) for d in out_dirs]))
         sets = [table.load_set(d) for d in out_dirs]
@@ -212,10 +213,10 @@ def _cshard(args) -> int:
 
 def _list(_args) -> int:
     registry.load_all()
-    for suite in ("S", "V", "C"):
-        print(f"{suite} suite workloads:")
-        for name, cls in registry.workloads.items():
-            if cls.suite == suite:
+    for suite in suites.all_suites():
+        print(f"{suite.letter} suite ({suite.title}) workloads:")
+        for name, cls in sorted(registry.workloads.items(), key=lambda i: suites.workload_order(i[0])):
+            if cls.suite == suite.letter:
                 print(f"  {name:<4} {cls.title}")
     print("collectors: " + ", ".join(registry.collectors.names()))
     print("sinks:      " + ", ".join(registry.sinks.names()))
@@ -376,7 +377,7 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="run a suite")
-    r.add_argument("suite", choices=["S", "V", "C"])
+    r.add_argument("suite", choices=suites.letters())
     r.add_argument("--am", required=True, type=_csv(str),
                    help="table AM under test (heap, prolly, ...); a list runs each, heap first")
     r.add_argument("--label", help="result set label (default B0 for heap, else the AM)")
@@ -430,7 +431,7 @@ def main(argv=None) -> int:
     t = sub.add_parser("table", help="engines side by side: a table per metric")
     t.add_argument("dirs", type=Path, nargs="*",
                    help="result sets (default: the latest per label)")
-    t.add_argument("--suite", choices=["S", "V", "C"], default="S")
+    t.add_argument("--suite", choices=suites.letters(), default="S")
     t.add_argument("--results", type=Path, default=REPO / "engine-results")
     t.add_argument("-o", "--output", type=Path,
                    help="output path without extension (default RESULTS/summary-SUITE)")
@@ -571,6 +572,15 @@ def main(argv=None) -> int:
     vg.add_argument("--accept", type=Path, help="known growth (configs/v_growth_accept.toml)")
     vg.add_argument("--json", type=Path)
     vg.set_defaults(fn=vgrowth.run)
+
+    from pbench import vshape
+    vs = sub.add_parser("vshape", help="V suite: each version-control operation's work as N and Δ grow, "
+                                       "against its target")
+    vs.add_argument("dir", type=Path, help="a result set of configs/v_shape.toml")
+    vs.add_argument("--known", type=Path, help="known exceptions (configs/v_shape_known.toml)")
+    vs.add_argument("--json", type=Path)
+    vs.add_argument("--markdown", type=Path, help="every finding, as a table")
+    vs.set_defaults(fn=vshape.run)
 
     from pbench import differential
     diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")

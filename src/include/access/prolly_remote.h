@@ -46,6 +46,14 @@
  *   remote must have head's chunks.  A format is recorded with the first
  *   head.  A remote that is a database refuses to move a branch with
  *   uncommitted changes there, unless force.
+ * - tags() visits each tag, in name order: its name, its tag object and
+ *   the commit the remote says that tag is of (the caller reads the tag
+ *   object for itself once received).  move_tag() moves a tag from
+ *   expected (an empty hash: there is none) to tag, a tag object of commit
+ *   (NULL: delete it), as move_head() moves a branch; the remote must have
+ *   tag's chunks.  As move_head() does, it records format if the remote
+ *   has none yet, and refuses a tag of another format than the remote's.
+ *   Optional, together: a remote without them has no tags.
  *
  * Provisional (v0).
  *
@@ -76,6 +84,10 @@ typedef struct ProllyRemoteFile ProllyRemoteFile;
 /* Visits a remote's branch and the commit it is at. */
 typedef void (*ProllyRemoteHeadVisit) (const char *branch,
 									   const ProllyHash *commit, void *arg);
+
+/* Visits a remote's tag: its name, its tag object and that tag's commit. */
+typedef void (*ProllyRemoteTagVisit) (const char *name, const ProllyHash *tag,
+									  const ProllyHash *commit, void *arg);
 
 typedef struct ProllyRemoteRoutine
 {
@@ -115,14 +127,21 @@ typedef struct ProllyRemoteRoutine
 	bool		(*file_next) (ProllyRemoteFile *file, ProllyHash *hash,
 							  StringInfo frame);
 	void		(*file_close) (ProllyRemoteFile *file);
+
+	/* Tags (optional, together). */
+	void		(*tags) (ProllyRemote *remote, ProllyRemoteTagVisit visit,
+						 void *arg);
+	bool		(*move_tag) (ProllyRemote *remote, const char *name,
+							 const ProllyHash *expected, const ProllyHash *tag,
+							 const ProllyHash *commit, const char *format);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \
 	"check_url", "open", "close", "format", "heads", "get", "has", \
 	"add_chunks", "move_head", "get_many", "has_many", "get_since", \
-	"files", "file_open", "file_next", "file_close"
+	"files", "file_open", "file_next", "file_close", "tags", "move_tag"
 #define PROLLY_REMOTE_FIRST_CALLBACK check_url
-#define PROLLY_REMOTE_LAST_CALLBACK file_close
+#define PROLLY_REMOTE_LAST_CALLBACK move_tag
 
 /*
  * The implementation of remotes over a libpq connection, which the loadable

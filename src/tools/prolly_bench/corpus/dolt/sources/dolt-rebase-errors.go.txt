@@ -1,0 +1,28 @@
+{
+		Name:        "dolt_rebase errors: basic errors",
+		SetUpScript: []string{},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_rebase('--abort');",
+				ExpectedErrStr: "no rebase in progress",
+			}, {
+				Query:          "call dolt_rebase('--continue');",
+				ExpectedErrStr: "no rebase in progress",
+			}, {
+				Query:          "call dolt_rebase('main');",
+				ExpectedErrStr: "didn't identify any commits!",
+			}, {
+				Query:          "call dolt_rebase('-i');",
+				ExpectedErrStr: "not enough args",
+			}, {
+				Query:          "call dolt_rebase('-i', 'main1', 'main2');",
+				ExpectedErrStr: "rebase takes at most one positional argument.",
+			}, {
+				Query:          "call dolt_rebase('--abrot');",
+				ExpectedErrStr: "error: unknown option `abrot'",
+			}, {
+				Query:          "call dolt_rebase('-i', 'doesnotexist');",
+				ExpectedErrStr: "branch not found: doesnotexist",
+			},
+		},
+	}

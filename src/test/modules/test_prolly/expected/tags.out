@@ -1,0 +1,654 @@
+-- Tags: names for commits, made and deleted with dolt_tag, listed by
+-- dolt_tags, read wherever a revision is, kept alive by collection, and
+-- carried by push, fetch and clone.
+-- (a database of its own: its history is the test's alone)
+CREATE DATABASE regress_tags;
+\c regress_tags
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SET dolt.author = 'Tagger <tagger@example.com>';
+SELECT current_database() AS db \gset
+\getenv abs_builddir PG_ABS_BUILDDIR
+\set dir :abs_builddir '/tmp_check/tags'
+SELECT 'file://' || :'dir' || '/' || txid_current() AS url \gset
+CREATE SCHEMA tg VERSIONED;
+CREATE TABLE tg.t (id int PRIMARY KEY, v text);
+INSERT INTO tg.t VALUES (0, 'a'), (1, 'a'), (2, 'a');
+SELECT dolt_commit('-Am', 'created table') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c1 \gset
+-- made at HEAD, or at a ref; a name taken is refused, as Dolt refuses it
+SELECT dolt_tag('v1');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_tag('v1', 'HEAD');
+ERROR:  tag "v1" already exists
+SELECT dolt_tag('v1');
+ERROR:  tag "v1" already exists
+SELECT tag_name, tag_hash = :'c1' AS at_c1, tagger, email, date IS NOT NULL AS dated,
+	message FROM dolt_tags;
+ tag_name | at_c1 | tagger |       email        | dated | message 
+----------+-------+--------+--------------------+-------+---------
+ v1       | t     | Tagger | tagger@example.com | t     | 
+(1 row)
+
+DELETE FROM tg.t WHERE id = 0;
+INSERT INTO tg.t VALUES (3, 'b');
+SELECT dolt_commit('-am', 'made changes') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c2 \gset
+SELECT dolt_tag('v2', '-m', 'create tag v2');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_tag('-m', 'at the first', 'v0', 'HEAD~1');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_tag('--author', 'Other <o@example.com>', 'v3', :'c1');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT tag_name, tag_hash = :'c2' AS at_c2, tagger, message FROM dolt_tags ORDER BY 1;
+ tag_name | at_c2 | tagger |    message    
+----------+-------+--------+---------------
+ v0       | f     | Tagger | at the first
+ v1       | f     | Tagger | 
+ v2       | t     | Tagger | create tag v2
+ v3       | f     | Other  | 
+(4 rows)
+
+-- refused: no name, a listing, too many, a bad name, a ref that isn't one
+SELECT dolt_tag('-v');
+ERROR:  dolt_tag needs a tag's name
+HINT:  The dolt_tags view lists the tags.
+SELECT dolt_tag('-m', 'only a message');
+ERROR:  dolt_tag needs a tag's name
+HINT:  The dolt_tags view lists the tags.
+SELECT dolt_tag('v4', 'HEAD', 'extra');
+ERROR:  dolt_tag: unexpected argument "extra"
+SELECT dolt_tag('bad..name');
+ERROR:  invalid tag name "bad..name"
+DETAIL:  A tag's name follows a branch's rules, and isn't a commit's id.
+SELECT dolt_tag('HEAD');
+ERROR:  invalid tag name "HEAD"
+DETAIL:  A tag's name follows a branch's rules, and isn't a commit's id.
+DO $$
+BEGIN
+	PERFORM dolt_tag(dolt_hashof('HEAD'));
+EXCEPTION WHEN invalid_name THEN
+	RAISE NOTICE 'a commit''s id refused: %', (SELECT regexp_replace(SQLERRM, '[0-9a-f]{40}', '<hash>'));
+END $$;
+NOTICE:  a commit's id refused: invalid tag name "<hash>"
+SELECT dolt_tag('v4', 'nowhere');
+ERROR:  branch, tag or commit "nowhere" does not exist
+SELECT dolt_tag('-d', '-m', 'x', 'v3');
+ERROR:  dolt_tag: -d and -m cannot be used together
+-- a tag is a revision: hashof, ancestry, log, diff, as of
+SELECT dolt_hashof('v1') = :'c1' AS v1, dolt_hashof('refs/tags/v2') = :'c2' AS v2,
+	dolt_hashof('v2~1') = :'c1' AS v2_parent, dolt_hashof('v2^') = :'c1' AS v2_caret;
+ v1 | v2 | v2_parent | v2_caret 
+----+----+-----------+----------
+ t  | t  | t         | t
+(1 row)
+
+SELECT message FROM dolt_log('v1');
+    message    
+---------------
+ created table
+(1 row)
+
+SELECT to_table_name, diff_type FROM dolt_diff_summary('v1', 'v2');
+ to_table_name | diff_type 
+---------------+-----------
+ tg.t          | modified
+(1 row)
+
+SELECT * FROM dolt_at('v1', NULL::tg.t) ORDER BY id;
+ id | v 
+----+---
+  0 | a
+  1 | a
+  2 | a
+(3 rows)
+
+SELECT dolt_merge_base('v1', 'v2') = :'c1' AS base;
+ base 
+------
+ t
+(1 row)
+
+-- a branch and a tag may share a name; the branch is read first, as in
+-- Dolt, and refs/tags/ names the tag
+SELECT dolt_branch('both', 'v1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_tag('both', 'v2');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+INSERT INTO tg.t VALUES (9, 'x');
+SELECT dolt_commit('-am', 'moved on') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('both') = :'c1' AS branch_first,
+	dolt_hashof('refs/tags/both') = :'c2' AS tag_by_ref,
+	dolt_hashof('refs/heads/both') = :'c1' AS branch_by_ref;
+ branch_first | tag_by_ref | branch_by_ref 
+--------------+------------+---------------
+ t            | t          | t
+(1 row)
+
+SELECT dolt_hashof('refs/heads/v1');
+ERROR:  prolly ref "refs/heads/v1" does not exist
+SELECT dolt_branch('-D', 'both');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_tag('-d', 'both');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+-- a branch made at a tag; a merge and a reset of one
+SELECT dolt_checkout('-b', 'other', 'v1') IS NOT NULL AS on_other;
+ on_other 
+----------
+ t
+(1 row)
+
+INSERT INTO tg.t VALUES (8, 'o');
+SELECT dolt_commit('-am', 'in other') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_merge('v2') IS NOT NULL AS merged;
+ merged 
+--------
+ t
+(1 row)
+
+SELECT id FROM tg.t ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+  8
+(4 rows)
+
+SELECT dolt_reset('--hard', 'v1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT id FROM tg.t ORDER BY id;
+ id 
+----
+  0
+  1
+  2
+(3 rows)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'other');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- checking out a tag: a detached session at its commit, read-only
+SELECT (dolt_checkout('v1'))[2] = 'HEAD is now at ' || :'c1' || ' (detached, read-only)'
+	AS detached;
+ detached 
+----------
+ t
+(1 row)
+
+SELECT active_branch() = 'detached/' || :'c1' AS on_its_commit;
+ on_its_commit 
+---------------
+ t
+(1 row)
+
+SELECT id FROM tg.t ORDER BY id;
+ id 
+----
+  0
+  1
+  2
+(3 rows)
+
+INSERT INTO tg.t VALUES (99, 'no');
+ERROR:  cannot execute INSERT in a read-only transaction
+-- (a tag changes only the refs: made there, as a branch is, and deleted)
+SELECT dolt_tag('v1.1');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('v1.1') = :'c1' AS tagged_here;
+ tagged_here 
+-------------
+ t
+(1 row)
+
+SELECT dolt_tag('-d', 'v1.1');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+-- (a tag by its full ref name checks out as by its name)
+SELECT (dolt_checkout('refs/tags/v2'))[2] = 'HEAD is now at ' || :'c2' || ' (detached, read-only)'
+	AS detached_by_ref;
+ detached_by_ref 
+-----------------
+ t
+(1 row)
+
+\c :db
+SET dolt.author = 'Tagger <tagger@example.com>';
+-- deleted, one or several; one that isn't is refused, and nothing deleted
+SELECT dolt_tag('-d', 'v3', 'nowhere');
+ERROR:  tag "nowhere" does not exist
+SELECT tag_name FROM dolt_tags ORDER BY 1;
+ tag_name 
+----------
+ v0
+ v1
+ v2
+ v3
+(4 rows)
+
+SELECT dolt_tag('-d', 'v0', 'v3');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT tag_name FROM dolt_tags ORDER BY 1;
+ tag_name 
+----------
+ v1
+ v2
+(2 rows)
+
+-- with the transaction
+BEGIN;
+SELECT dolt_tag('gone');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+ROLLBACK;
+SELECT tag_name FROM dolt_tags ORDER BY 1;
+ tag_name 
+----------
+ v1
+ v2
+(2 rows)
+
+-- the reflog names tags by their full names
+SELECT ref, commit_hash = :'c2' AS at_c2 FROM dolt_reflog('refs/tags/v2');
+     ref      | at_c2 
+--------------+-------
+ refs/tags/v2 | t
+(1 row)
+
+-- a tag keeps its commit alive: a branch's commits only it reaches survive
+-- a collection
+SELECT dolt_checkout('-b', 'doomed') IS NOT NULL AS on_doomed;
+ on_doomed 
+-----------
+ t
+(1 row)
+
+INSERT INTO tg.t VALUES (50, 'kept');
+SELECT dolt_commit('-am', 'only tagged') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c3 \gset
+SELECT dolt_tag('keep');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'doomed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- (and a commit only a deleted branch reached, for contrast: collected)
+SELECT dolt_checkout('-b', 'gone') IS NOT NULL AS on_gone;
+ on_gone 
+---------
+ t
+(1 row)
+
+INSERT INTO tg.t VALUES (51, 'gone');
+SELECT dolt_commit('-am', 'not tagged') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c4 \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'gone');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT kept > 0 AS kept, freed > 0 AS freed FROM test_chunk_gc(true);
+ kept | freed 
+------+-------
+ t    | t
+(1 row)
+
+SELECT test_chunk_has(:'c3') AS tagged_kept, test_chunk_has(:'c4') AS untagged_kept;
+ tagged_kept | untagged_kept 
+-------------+---------------
+ t           | f
+(1 row)
+
+SELECT dolt_hashof('keep') = :'c3' AS kept;
+ kept 
+------
+ t
+(1 row)
+
+SELECT id, v FROM dolt_at('keep', NULL::tg.t) WHERE id = 50;
+ id |  v   
+----+------
+ 50 | kept
+(1 row)
+
+SELECT message FROM dolt_log('keep') LIMIT 1;
+   message   
+-------------
+ only tagged
+(1 row)
+
+-- pushed to a remote, by name or full name; fetched and cloned with it
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT dolt_push('origin', 'v2');
+         dolt_push          
+----------------------------
+ {0,"* [new tag] v2 -> v2"}
+(1 row)
+
+SELECT dolt_push('origin', 'v2');
+          dolt_push          
+-----------------------------
+ {0,"Everything up-to-date"}
+(1 row)
+
+SELECT dolt_push('origin', 'refs/tags/keep');
+           dolt_push            
+--------------------------------
+ {0,"* [new tag] keep -> keep"}
+(1 row)
+
+SELECT dolt_push('-u', 'origin', 'v1');
+ERROR:  dolt_push: a tag has no upstream
+SELECT dolt_push('origin', 'refs/tags/nowhere');
+ERROR:  tag "nowhere" not found
+-- a tag is of the remote's one canonical format, as a head is: pushed
+-- first, it records the format; pushed to a remote of another, refused
+SELECT :'url' || '-tagfirst' AS url_tf \gset
+SELECT dolt_remote('add', 'tagfirst', :'url_tf');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('tagfirst', 'v2') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+SELECT set_config('tags.url_tf', :'url_tf', false) IS NOT NULL AS set;
+ set 
+-----
+ t
+(1 row)
+
+DO $$
+BEGIN
+	PERFORM test_remote_set_head(current_setting('tags.url_tf'), 'main',
+								 dolt_hashof('v2'), '1');
+	RAISE NOTICE 'a head of format 1 taken';
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'a head of format 1 refused';
+END $$;
+NOTICE:  a head of format 1 refused
+SELECT :'url' || '-otherformat' AS url_of \gset
+SELECT test_remote_set_head(:'url_of', 'main', dolt_hashof('v2'), '1');
+ test_remote_set_head 
+----------------------
+ t
+(1 row)
+
+SELECT dolt_remote('add', 'otherformat', :'url_of');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+DO $$
+BEGIN
+	PERFORM dolt_push('otherformat', 'v2');
+	RAISE NOTICE 'a tag pushed to a remote of format 1';
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'a tag refused by a remote of format 1';
+END $$;
+NOTICE:  a tag refused by a remote of format 1
+CREATE DATABASE regress_tags_b;
+\c regress_tags_b
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT dolt_remote('add', 'origin', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_fetch();
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+-- (keep's commit is on no branch fetched: a fetch follows only tags of
+-- commits it has, as Dolt's does)
+SELECT tag_name, tag_hash = :'c2' AS at_c2, tagger, message FROM dolt_tags ORDER BY 1;
+ tag_name | at_c2 | tagger |    message    
+----------+-------+--------+---------------
+ v2       | t     | Tagger | create tag v2
+(1 row)
+
+SELECT dolt_fetch('origin', 'main');
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('v2') = :'c2' AS resolves;
+ resolves 
+----------
+ t
+(1 row)
+
+\c :db
+SELECT dolt_tag('-d', 'v2');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_tag('v2', 'v1', '-m', 'moved');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_push('origin', 'v2') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+\c regress_tags_b
+-- a tag fetched again takes the remote's, as Dolt's fetch sets it
+SELECT dolt_fetch();
+ dolt_fetch 
+------------
+ {0}
+(1 row)
+
+SELECT tag_name, tag_hash = :'c1' AS at_c1, message FROM dolt_tags ORDER BY 1;
+ tag_name | at_c1 | message 
+----------+-------+---------
+ v2       | t     | moved
+(1 row)
+
+\c :db
+DROP DATABASE regress_tags_b;
+CREATE DATABASE regress_tags_c;
+\c regress_tags_c
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT tag_name, tag_hash = :'c1' AS at_c1, message FROM dolt_tags ORDER BY 1;
+ tag_name | at_c1 | message 
+----------+-------+---------
+ keep     | f     | 
+ v2       | t     | moved
+(2 rows)
+
+SELECT dolt_hashof('v2') = :'c1' AS resolves;
+ resolves 
+----------
+ t
+(1 row)
+
+\c :db
+DROP DATABASE regress_tags_c;
+-- refs and remotes of an older format are refused, not read: refs without
+-- their format, as an older build's, and a version 1 manifest
+CREATE DATABASE regress_tags_old;
+\c regress_tags_old
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT test_chunk_move_root(test_chunk_root(), test_chunk_declaring_tree('{}'));
+ test_chunk_move_root 
+----------------------
+ t
+(1 row)
+
+SELECT name FROM dolt_branches;
+ERROR:  the database's prolly refs are of an older format than 3
+DETAIL:  This build reads only refs of format 3.
+SELECT dolt_tag('v1');
+ERROR:  the database's prolly refs are of an older format than 3
+DETAIL:  This build reads only refs of format 3.
+\c :db
+DROP DATABASE regress_tags_old;
+SELECT :'dir' || '/old-' || txid_current() AS olddir \gset
+\set oldmanifest :olddir '/prolly_remote'
+SELECT dolt_remote('add', 'oldremote', 'file://' || :'olddir');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('oldremote', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+COPY (SELECT 'prolly remote 1') TO :'oldmanifest';
+DO $$
+BEGIN
+	PERFORM dolt_fetch('oldremote');
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'refused: %', regexp_replace(SQLERRM, '"/[^"]*"', '"<dir>"');
+END $$;
+NOTICE:  refused: file remote "<dir>" is of manifest version 1, not 2
+\c postgres
+DROP DATABASE regress_tags;

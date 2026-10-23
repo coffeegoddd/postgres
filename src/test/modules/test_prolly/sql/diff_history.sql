@@ -159,8 +159,9 @@ SELECT length(dolt_commit('-am', 'kl keyed')::text) AS committed;
 SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.kl, 'HEAD~1', 'HEAD');
 SELECT * FROM dolt_at('HEAD~1', NULL::dh.kl) ORDER BY i;
 
--- A renamed key is absent when older rows are read by name.  Every old
--- row must survive, even when the projected rows are identical (#653).
+-- A renamed key keeps its identity, so older rows read it under its name
+-- now: every old row is matched by its key, even when the projected rows
+-- are identical (#653).
 CREATE TABLE dh.rpk (pk int PRIMARY KEY, v int);
 INSERT INTO dh.rpk VALUES (1, 7), (2, 7), (3, 7);
 CREATE TABLE dh.rcpk (a numeric, b int, v int, PRIMARY KEY (a, b));
@@ -191,8 +192,8 @@ SELECT * FROM dolt_at('HEAD~', NULL::dh.rpk) ORDER BY v;
 SELECT diff_type, count(*) FROM dolt_diff_table(NULL::dh.rpk, 'HEAD~', 'HEAD')
 GROUP BY diff_type ORDER BY diff_type;
 SELECT count(*) FROM dolt_history_table(NULL::dh.rpk);
--- The historical versions use different key names (pk and pk2), neither
--- current.  Do not infer rename identity: equal projected copies cancel.
+-- The historical versions name the key otherwise (pk and pk2), neither
+-- as now: it is the same column by identity, so its rows match by key.
 ALTER TABLE dh.rpk RENAME COLUMN pk2 TO pk3;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'before_rename', 'HEAD', NULL::dh.rpk)
@@ -202,9 +203,32 @@ SELECT diff_type, from_row, to_row
 FROM dolt_diff('HEAD', :'before_rename', NULL::dh.rpk)
 ORDER BY diff_type, (from_row).v, (to_row).v;
 
--- Both commits predate a single rename and share their old definition.
--- Match stored primary keys: the edit is modified, while the inserted and
--- deleted keys remain added/removed.  Partial composite keys work too.
+-- A key made of a column older versions lack: their rows have no current
+-- key, and each must survive, removed or added, even when the projected
+-- rows are identical (#653).
+CREATE TABLE dh.newkey (pk int PRIMARY KEY, v int);
+INSERT INTO dh.newkey VALUES (1, 7), (2, 7), (3, 7);
+SELECT length(dolt_commit('-Am', 'newkey base')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS newkey_base \gset
+ALTER TABLE dh.newkey ADD COLUMN k int;
+UPDATE dh.newkey SET k = pk * 10;
+ALTER TABLE dh.newkey DROP CONSTRAINT newkey_pkey;
+ALTER TABLE dh.newkey DROP COLUMN pk;
+ALTER TABLE dh.newkey ADD PRIMARY KEY (k);
+UPDATE dh.newkey SET v = 9 WHERE k = 10;
+SELECT length(dolt_commit('-am', 'newkey keyed anew')::text) AS committed;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff(:'newkey_base', 'HEAD', NULL::dh.newkey)
+ORDER BY diff_type, (to_row).k, (from_row).v;
+SELECT diff_type, from_row, to_row
+FROM dolt_diff('HEAD', :'newkey_base', NULL::dh.newkey)
+ORDER BY diff_type, (from_row).k, (to_row).v;
+SELECT * FROM dolt_at(:'newkey_base', NULL::dh.newkey) ORDER BY v;
+
+-- Both commits predate a key made anew (of a column they lack) and share
+-- their old definition.  Match stored primary keys: the edit is modified,
+-- while the inserted and deleted keys remain added/removed.  Partial
+-- composite keys work too.
 CREATE TABLE dh.oldpk (pk int PRIMARY KEY, v int);
 CREATE TABLE dh.oldcpk (a int, b int, v int, PRIMARY KEY (a, b));
 INSERT INTO dh.oldpk VALUES (1, 7), (2, 7), (3, 8), (4, 8);
@@ -217,9 +241,17 @@ INSERT INTO dh.oldpk VALUES (5, 9);
 UPDATE dh.oldcpk SET v = 9 WHERE a = 1 AND b = 1;
 SELECT length(dolt_commit('-am', 'old keys changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS old_keys_changed \gset
-ALTER TABLE dh.oldpk RENAME COLUMN pk TO id;
-ALTER TABLE dh.oldcpk RENAME COLUMN b TO b2;
-SELECT length(dolt_commit('-am', 'old keys renamed')::text) AS committed;
+ALTER TABLE dh.oldpk ADD COLUMN id int;
+UPDATE dh.oldpk SET id = pk;
+ALTER TABLE dh.oldpk DROP CONSTRAINT oldpk_pkey;
+ALTER TABLE dh.oldpk DROP COLUMN pk;
+ALTER TABLE dh.oldpk ADD PRIMARY KEY (id);
+ALTER TABLE dh.oldcpk ADD COLUMN b2 int;
+UPDATE dh.oldcpk SET b2 = b;
+ALTER TABLE dh.oldcpk DROP CONSTRAINT oldcpk_pkey;
+ALTER TABLE dh.oldcpk DROP COLUMN b;
+ALTER TABLE dh.oldcpk ADD PRIMARY KEY (a, b2);
+SELECT length(dolt_commit('-am', 'old keys made anew')::text) AS committed;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'old_keys_base', :'old_keys_changed', NULL::dh.oldpk)
 ORDER BY diff_type, (from_row).v, (to_row).v;
@@ -262,7 +294,11 @@ SELECT dolt_hashof('HEAD') AS spill_base \gset
 UPDATE dh.spillpk SET v = 'changed' WHERE pk = 1;
 SELECT length(dolt_commit('-am', 'spill changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS spill_changed \gset
-ALTER TABLE dh.spillpk RENAME COLUMN pk TO id;
+ALTER TABLE dh.spillpk ADD COLUMN id int;
+UPDATE dh.spillpk SET id = pk;
+ALTER TABLE dh.spillpk DROP CONSTRAINT spillpk_pkey;
+ALTER TABLE dh.spillpk DROP COLUMN pk;
+ALTER TABLE dh.spillpk ADD PRIMARY KEY (id);
 SET work_mem = '64kB';
 SELECT diff_type, count(*) FROM dolt_diff(:'spill_base', :'spill_changed', NULL::dh.spillpk)
 GROUP BY diff_type ORDER BY diff_type;
@@ -282,7 +318,7 @@ ORDER BY diff_type, (to_row).id;
 SELECT * FROM dolt_at('HEAD~', NULL::dh.rkl);
 
 -- A change to a column both historical versions had must remain visible
--- after that column is renamed again (#654).  Projection stays by name.
+-- after that column is renamed again (#654): it is one column by identity.
 CREATE TABLE dh.hc (pk int PRIMARY KEY, c2 int, note text);
 INSERT INTO dh.hc VALUES (1, -1, 'same'), (2, -2, 'same'), (3, NULL, 'same');
 SELECT length(dolt_commit('-Am', 'hc initial')::text) AS committed;
@@ -322,8 +358,9 @@ UPDATE dh.hk SET v = 3 WHERE v = 1;
 UPDATE dh.hl SET v = repeat(md5('changed'), 1000) WHERE b = 1;
 SELECT length(dolt_commit('-am', 'hidden values changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS hidden_after \gset
-ALTER TABLE dh.hk RENAME COLUMN v TO renamed;
-ALTER TABLE dh.hl RENAME COLUMN v TO renamed;
+ALTER TABLE dh.hk ADD COLUMN w int;
+ALTER TABLE dh.hk DROP COLUMN v;
+ALTER TABLE dh.hl DROP COLUMN v;
 -- Fitting visible values and comparing hidden values work together.
 ALTER TABLE dh.hl ALTER COLUMN visible TYPE varchar(3) USING left(visible, 3);
 SELECT diff_type, from_row, to_row
@@ -332,7 +369,11 @@ SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'hidden_before', :'hidden_after', NULL::dh.hl) ORDER BY (to_row).b;
 -- The same stored composite key also matches when a current key component
 -- is absent.  A hidden edit is modified even with identical displayed rows.
-ALTER TABLE dh.hl RENAME COLUMN b TO b_now;
+ALTER TABLE dh.hl ADD COLUMN b_now int;
+UPDATE dh.hl SET b_now = b;
+ALTER TABLE dh.hl DROP CONSTRAINT hl_pkey;
+ALTER TABLE dh.hl DROP COLUMN b;
+ALTER TABLE dh.hl ADD PRIMARY KEY (a, b_now);
 SELECT diff_type, (from_row).a AS from_a, (to_row).a AS to_a,
        (from_row).b_now IS NULL AND (to_row).b_now IS NULL AS missing_key,
        from_row IS NOT DISTINCT FROM to_row AS same_display
@@ -350,8 +391,8 @@ ALTER TABLE dh.ho DROP COLUMN x;
 ALTER TABLE dh.ho ADD COLUMN x varchar(20);
 UPDATE dh.ho SET x = CASE pk WHEN 1 THEN 'changed' ELSE 'two' END;
 SELECT length(dolt_commit('-am', 'hidden column order changed')::text) AS committed;
-ALTER TABLE dh.ho RENAME COLUMN x TO x_now;
-ALTER TABLE dh.ho RENAME COLUMN y TO y_now;
+ALTER TABLE dh.ho ADD COLUMN x_now varchar(20), ADD COLUMN y_now int;
+ALTER TABLE dh.ho DROP COLUMN x, DROP COLUMN y;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'order_before', 'HEAD', NULL::dh.ho) ORDER BY (to_row).pk;
 

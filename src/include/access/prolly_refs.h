@@ -30,6 +30,7 @@
 #include "access/prolly_types.h"
 #include "access/transam.h"
 #include "datatype/timestamp.h"
+#include "utils/snapshot.h"
 
 #define PROLLY_MAX_PARENTS 2
 
@@ -65,6 +66,15 @@ typedef struct ProllyCommitInfo
 	 */
 	bool		has_height;
 	int64		height;
+
+	/*
+	 * The identity of its root's tables and columns, which their renames
+	 * keep (the canonicalizer's identify()): an identity record, palloc'd,
+	 * or NULL where every object has its own name's (nothing in its
+	 * history was renamed).
+	 */
+	char	   *identity;
+	int			identity_len;
 } ProllyCommitInfo;
 
 /*
@@ -108,6 +118,55 @@ typedef struct ProllyViolation
 	char	   *info;
 } ProllyViolation;
 
+/* Visits one violation; it is good only during the visit. */
+typedef void (*ProllyViolationVisit) (const ProllyViolation *violation,
+									  void *arg);
+
+/*
+ * A tag: a name for a commit, with who made it, when and why, as Dolt's
+ * (and git's annotated tags).  A tag is an object of its own, as a commit
+ * is, identified by its content's hash, so the same tag has the same id in
+ * every database (clone/push/fetch).
+ */
+typedef struct ProllyTagInfo
+{
+	ProllyHash	id;				/* the tag object's */
+	ProllyHash	commit;
+	TimestampTz tagged_at;
+	char	   *tagger;			/* palloc'd: "Name <email>" */
+	char	   *message;		/* palloc'd */
+} ProllyTagInfo;
+
+/*
+ * A rebase in progress, as Dolt's: the branch being rebased (its head when
+ * the rebase began), the commit its commits are replayed onto, and the plan,
+ * steps in rebase order, each an action on one of the branch's commits.
+ * The session works on a branch of its own while it rebases; the state is
+ * that branch's.
+ */
+typedef struct ProllyRebaseStep
+{
+	char	   *order;			/* a numeric(6,2), as text (palloc'd) */
+	char	   *action;			/* pick, reword, squash, fixup, drop, edit */
+	ProllyHash	commit;
+	char	   *message;		/* (palloc'd) */
+} ProllyRebaseStep;
+
+typedef struct ProllyRebaseState
+{
+	char	   *branch;			/* the branch rebased (palloc'd) */
+	ProllyHash	head;			/* its head as the rebase began */
+	ProllyHash	onto;
+	bool		keep_empty;		/* keep a commit that becomes empty */
+	char	   *last_step;		/* the order of the step last begun, or NULL */
+	int			nsteps;
+	ProllyRebaseStep *steps;	/* (palloc'd) */
+} ProllyRebaseState;
+
+/* Visits a tag: its name, its tag object and that tag's commit. */
+typedef void (*ProllyTagVisit) (const char *name, const ProllyHash *tag,
+								const ProllyHash *commit, void *arg);
+
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
@@ -127,6 +186,18 @@ typedef void (*ProllyRootRefVisit) (const char *ref, const ProllyHash *commit,
 /* Visits a remote-tracking branch: the remote, its branch, the commit. */
 typedef void (*ProllyTrackingVisit) (const char *remote, const char *branch,
 									 const ProllyHash *commit, void *arg);
+
+/*
+ * What a fold of a branch's working set was made at (written_since()):
+ * opaque to all but the refs.
+ */
+typedef struct ProllyFoldMark
+{
+	Oid			branch;
+	uint64		generation;
+	uint64		overflow;
+	uint64		epoch;
+} ProllyFoldMark;
 
 typedef struct ProllyRefsRoutine
 {
@@ -152,10 +223,12 @@ typedef struct ProllyRefsRoutine
 						   ProllyHash *commit_id);
 
 	/*
-	 * Resolve a branch name, commit id or HEAD (the session branch's head
-	 * commit), each optionally followed by ancestry steps as in Dolt and
-	 * Git (~n: the nth first-parent ancestor; ^n: the nth parent), to a
-	 * commit id.
+	 * Resolve a branch name, tag name, commit id or HEAD (the session
+	 * branch's head commit), each optionally followed by ancestry steps as
+	 * in Dolt and Git (~n: the nth first-parent ancestor; ^n: the nth
+	 * parent), to a commit id.  A name is a branch's before a tag's, and a
+	 * tag's before a remote-tracking branch's, as in Dolt; "refs/heads/x"
+	 * and "refs/tags/x" name only a branch or only a tag.
 	 */
 	bool		(*resolve) (const char *refname, ProllyHash *commit_id);
 
@@ -259,6 +332,15 @@ typedef struct ProllyRefsRoutine
 	void		(*set_violations) (List *violations);
 
 	/*
+	 * The session branch's violations visited in the order they were
+	 * added, those of tables since dropped too, without holding them all;
+	 * and violations (n of them) added after them, with the transaction,
+	 * the others neither read nor written again.
+	 */
+	void		(*visit_violations) (ProllyViolationVisit visit, void *arg);
+	void		(*add_violations) (ProllyViolation *const *violations, int n);
+
+	/*
 	 * working_set() for reading what changed, never to commit or move from:
 	 * objects a commit would refuse are left out, their names appended to
 	 * *left_out (if not NULL), and with only valid, only that table's rows
@@ -356,9 +438,9 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * The refs a root of the chunk store named (one it was at, which may be
-	 * long past): each branch's head and remote-tracking branch's commit, by
-	 * full name ("refs/heads/main", "refs/remotes/origin/main"), in no
-	 * particular order.  False, visiting nothing, if the store no longer
+	 * long past): each branch's head, remote-tracking branch's commit and
+	 * tag's commit, by full name ("refs/heads/main",
+	 * "refs/remotes/origin/main", "refs/tags/v1"), in no particular order.  False, visiting nothing, if the store no longer
 	 * has that root's chunks.
 	 */
 	bool		(*root_refs) (const ProllyHash *root, ProllyRootRefVisit visit,
@@ -469,6 +551,81 @@ typedef struct ProllyRefsRoutine
 	int			(*moved_branches) (Oid *branches, uint64 *generations, int max);
 	void		(*saw_branch) (Oid branch, uint64 generation);
 	void		(*saw_database) (Oid database);
+
+	/*
+	 * Optional, together: which tables' rows may have changed since a fold
+	 * of a branch, for a canonicalizer that works out again only what
+	 * changed.  note_relation() is told, as note_write() is (and after
+	 * it), of each relation whose rows a write to branch changes.
+	 * fold_mark() marks a fold by snap of branch, before it reads anything:
+	 * false where nothing could be known of it later (in recovery, while a
+	 * transaction is prepared, after the transaction's catalog changes, or
+	 * by a snapshot that doesn't see every writer of the branch that ended).
+	 * written_since() puts in *relids (*nrelids of them, palloc'd) every
+	 * relation whose rows a transaction that ended since mark, or this
+	 * one, wrote on mark's branch, as snap reads them: false where that
+	 * isn't known (a catalog change or collection since, a writer that
+	 * wrote too many relations or found no room to be told of, a prepared
+	 * transaction ended, the branch forgotten, a snapshot that doesn't see
+	 * every writer that ended, or another writer of the branch not ended
+	 * yet: others see its commit before its relations are kept), and then
+	 * everything may have changed.
+	 * Catalog changes and sequences' values aren't relations' rows: a
+	 * catalog change moves what fold_mark() takes, and a sequence is read
+	 * each time.
+	 */
+	void		(*note_relation) (Oid branch, Oid relid);
+	bool		(*fold_mark) (Oid branch, Snapshot snap, ProllyFoldMark *mark);
+	bool		(*written_since) (const ProllyFoldMark *mark, Snapshot snap,
+								  Oid **relids, int *nrelids);
+
+	/*
+	 * Optional: visit each table of the session branch whose next fold
+	 * would read it in full, with why (the canonicalizer's pending_full()
+	 * from the branch's baseline).
+	 */
+	void		(*pending_full_folds) (ProllyPendingFullVisit visit, void *arg);
+
+	/*
+	 * Optional, together: the identity record of the session branch's
+	 * working set (with only valid, of that table alone), as the commit it
+	 * would make records it; and the session branch's working set made
+	 * what identity (an identity record) describes, by name (a move to a
+	 * root whose identity it is), for later renames to be told by.
+	 */
+	void		(*working_identity) (Oid only, StringInfo identity);
+	void		(*anchor_identity) (const ProllyValue *identity);
+
+	/*
+	 * Optional, together: tags.  tag_write() writes a tag object of commit,
+	 * by tagger, with message, dated now, and sets *tag to its id; it names
+	 * nothing.  tag_get() reads a tag object (false: tag isn't one).
+	 * tag_lookup() finds the tag called name (false: none).  tag_set()
+	 * calls name tag, a tag object the store has (NULL: deletes the tag), as
+	 * a compare-and-swap: expected NULL takes whatever tag of that name
+	 * there is, an empty hash only none; false, nothing changed, if it isn't
+	 * so.  A new tag's name follows a branch's rules, and isn't a commit's
+	 * id.  tags() visits every tag, by name.  Changes are with the
+	 * transaction, as any change to the refs.  The walk keeps each tag
+	 * object and its commit, and walk_commit() given a tag object walks it
+	 * and then its commit.
+	 */
+	void		(*tag_write) (const ProllyHash *commit, const char *tagger,
+							  const char *message, ProllyHash *tag);
+	bool		(*tag_get) (const ProllyHash *tag, ProllyTagInfo *info);
+	bool		(*tag_lookup) (const char *name, ProllyHash *tag);
+	bool		(*tag_set) (const char *name, const ProllyHash *expected,
+							const ProllyHash *tag);
+	void		(*tags) (ProllyTagVisit visit, void *arg);
+
+	/*
+	 * Optional, together: the session branch's rebase in progress (false:
+	 * none), and setting it (NULL: none), with the transaction.  It goes
+	 * with its branch when the branch is deleted, and is renamed with it.
+	 * The walk keeps the commits it names.
+	 */
+	bool		(*rebase_state) (ProllyRebaseState *state);
+	void		(*set_rebase_state) (const ProllyRebaseState *state);
 } ProllyRefsRoutine;
 
 /*
@@ -485,16 +642,21 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "lock", "walk", "checkpoint", "set_head", "violations", \
-	"set_violations", "read_working_set", "walk_commit", "remote_set", \
+	"set_violations", "visit_violations", "add_violations", \
+	"read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \
 	"stash_clear", "stash_select", "shmem_size", "shmem_init", "note_write", \
 	"forget_folds", "prepared_ended", "read_definitions", "working_changes", \
 	"publish_definitions", "fold_own", "checkpoint_unless_moved", \
-	"moved_databases", "moved_branches", "saw_branch", "saw_database"
+	"moved_databases", "moved_branches", "saw_branch", "saw_database", \
+	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
+	"working_identity", "anchor_identity", "tag_write", "tag_get", \
+	"tag_lookup", "tag_set", "tags", \
+	"rebase_state", "set_rebase_state"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK saw_database
+#define PROLLY_REFS_LAST_CALLBACK set_rebase_state
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

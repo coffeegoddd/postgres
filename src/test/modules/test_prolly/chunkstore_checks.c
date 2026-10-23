@@ -1001,6 +1001,49 @@ test_commit_with(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&id));
 }
 
+/*
+ * test_commit_identity(ref): the identity record ref's commit holds beside
+ * its root, in the server's encoding (NULL: none, every object its own
+ * name's).
+ */
+PG_FUNCTION_INFO_V1(test_commit_identity);
+Datum
+test_commit_identity(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&dc);
+	resolve_ref(&dc, PG_GETARG_TEXT_PP(0), &id);
+	if (!PROLLY_CALL(dc.refs, commit_get, &id, &info) || info.identity == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(pg_any_to_server(info.identity,
+													  info.identity_len,
+													  PG_UTF8)));
+}
+
+/*
+ * test_working_identity(): the session branch's identity record, as its
+ * next commit would record it (NULL: empty).
+ */
+PG_FUNCTION_INFO_V1(test_working_identity);
+Datum
+test_working_identity(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	StringInfoData identity;
+
+	prolly_database_components(&dc);
+	initStringInfo(&identity);
+	PROLLY_CALL(dc.refs, working_identity, InvalidOid, &identity);
+	if (identity.len == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(pg_any_to_server(identity.data,
+													  identity.len,
+													  PG_UTF8)));
+}
+
 /* test_refs_set_head(ref): make ref's commit the session branch's head */
 PG_FUNCTION_INFO_V1(test_refs_set_head);
 Datum
@@ -1198,6 +1241,140 @@ test_seen_check(PG_FUNCTION_ARGS)
 	runs = prolly_seen_runs(seen);
 	prolly_seen_destroy(seen);
 	PG_RETURN_INT32(runs);
+}
+
+typedef struct SeenRef
+{
+	ProllyHash	key;
+	int64		value;
+} SeenRef;
+
+/* The i'th hash of a kind ("seen" entered, "absent" never). */
+static void
+seen_hash(const char *kind, int64 i, ProllyHash *h)
+{
+	char		name[40];
+
+	snprintf(name, sizeof(name), "%s %lld", kind, (long long) i);
+	memset(h, 0, sizeof(*h));
+	content_hash(name, strlen(name), h);
+}
+
+/*
+ * Hash h found in the map exactly as in the reference, with its value, or
+ * not found if the reference hasn't it (an error if not).
+ */
+static void
+seen_ref_check(ProllySeen *seen, HTAB *ref, const ProllyHash *h)
+{
+	ProllyHash	key;
+	SeenRef    *r;
+	int64		got = -1;
+	bool		found;
+
+	memset(&key, 0, sizeof(key));
+	key.len = h->len;
+	memcpy(key.bytes, h->bytes, h->len);
+	r = hash_search(ref, &key, HASH_FIND, NULL);
+	found = prolly_seen_find(seen, h, &got);
+	if (found != (r != NULL))
+		elog(ERROR, "hash %s %s, the reference %s", prolly_hash_hex(h),
+			 found ? "found" : "not found", r ? "holds it" : "doesn't");
+	if (r && got != r->value)
+		elog(ERROR, "hash %s found with %lld, not %lld", prolly_hash_hex(h),
+			 (long long) got, (long long) r->value);
+}
+
+/*
+ * test_seen_measure(n, budget): n hashes entered in a walk's map of budget
+ * bytes, checked against a map in memory as they go: after each, a hash
+ * never entered looked up, and every fourth an earlier one (most of them
+ * spilled) found, entered again and changed; then every hash checked.  The
+ * map's costs (an error if any check fails).  The loop doesn't check for
+ * interrupts itself, so a cancel lands in the map's own work.
+ */
+PG_FUNCTION_INFO_V1(test_seen_measure);
+Datum
+test_seen_measure(PG_FUNCTION_ARGS)
+{
+	int64		n = PG_GETARG_INT32(0);
+	ProllySeen *seen = prolly_seen_create("test seen", sizeof(int64),
+										  (Size) PG_GETARG_INT32(1));
+	HASHCTL		ctl;
+	HTAB	   *ref;
+	ProllySeenStats st;
+	TupleDesc	desc;
+	Datum		values[15];
+	bool		nulls[15] = {0};
+
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(SeenRef);
+	ctl.hcxt = CurrentMemoryContext;
+	ref = hash_create("test seen reference", 1024, &ctl,
+					  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int64 i = 0; i < n; i++)
+	{
+		ProllyHash	h;
+		SeenRef    *r;
+		int64		v = i * 10;
+
+		seen_hash("seen", i, &h);
+		if (!prolly_seen_enter(seen, &h, &v))
+			elog(ERROR, "hash %lld entered twice", (long long) i);
+		r = hash_search(ref, &h, HASH_ENTER, NULL);
+		r->value = v;
+
+		seen_hash("absent", i, &h);
+		seen_ref_check(seen, ref, &h);
+
+		if (i % 4 == 3)
+		{
+			int64		j = (i * 7919) % i;
+
+			seen_hash("seen", j, &h);
+			seen_ref_check(seen, ref, &h);
+			v = -1;
+			if (prolly_seen_enter(seen, &h, &v))
+				elog(ERROR, "hash %lld entered again", (long long) j);
+			r = hash_search(ref, &h, HASH_FIND, NULL);
+			r->value++;
+			prolly_seen_set(seen, &h, &r->value);
+			seen_ref_check(seen, ref, &h);
+		}
+	}
+	for (int64 i = 0; i < n; i++)
+	{
+		ProllyHash	h;
+
+		seen_hash("seen", i, &h);
+		seen_ref_check(seen, ref, &h);
+	}
+	if (prolly_seen_count(seen) != (uint64) n)
+		elog(ERROR, "the map counts %llu, not %lld",
+			 (unsigned long long) prolly_seen_count(seen), (long long) n);
+	prolly_seen_stats(seen, &st);
+	prolly_seen_destroy(seen);
+	hash_destroy(ref);
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum((int64) st.memory_peak);
+	values[1] = Int64GetDatum((int64) st.filter_bytes_peak);
+	values[2] = Int64GetDatum((int64) st.filter_budget);
+	values[3] = Int32GetDatum(st.runs_peak);
+	values[4] = Int64GetDatum((int64) st.runs_written);
+	values[5] = Int32GetDatum(st.max_filter_checks);
+	values[6] = Int64GetDatum((int64) st.lookups);
+	values[7] = Int64GetDatum((int64) st.filter_checks);
+	values[8] = Int64GetDatum((int64) st.run_searches);
+	values[9] = Int64GetDatum((int64) st.false_positives);
+	values[10] = Int64GetDatum((int64) st.record_reads);
+	values[11] = Int64GetDatum((int64) st.merges);
+	values[12] = Int64GetDatum((int64) st.records_merged);
+	values[13] = Int64GetDatum((int64) st.temp_bytes_peak);
+	values[14] = Int64GetDatum((int64) st.block_reads);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
 }
 
 /* test_chunk_stored(hash): a chunk of the store as stored (framed). */

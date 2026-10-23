@@ -1,0 +1,22 @@
+{
+		Name: "dolt_rebase errors: working set not clean",
+		SetUpScript: []string{
+			"create table t (pk int primary key);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"insert into t values (0);",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:       "call dolt_rebase('-i', 'main');",
+				ExpectedErr: dprocedures.ErrRebaseUncommittedChanges,
+			},
+			{
+				Query:    "call dolt_add('t');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:       "call dolt_rebase('-i', 'main');",
+				ExpectedErr: dprocedures.ErrRebaseUncommittedChanges,
+			},
+		},
+	}

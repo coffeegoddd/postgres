@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "id": "dolt-tag-checkout",
+  "description": "Reviewed Dolt port: dolt-tag: checkout errors",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries.go",
+    "case": "DoltTagTestScripts: dolt-tag: checkout errors"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.tags"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE test (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "created table test",
+        "-A"
+      ],
+      "save": "created"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT dolt_tag('v1')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO test VALUES (0), (1), (2)",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserted rows into test",
+        "-a"
+      ],
+      "save": "inserted"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.tags"
+      ],
+      "sql": "SELECT tag_name FROM dolt_tags",
+      "expect": {
+        "rows": [
+          [
+            "v1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM test",
+      "expect": {
+        "rows": [
+          [
+            "0"
+          ],
+          [
+            "1"
+          ],
+          [
+            "2"
+          ]
+        ],
+        "order": "bag"
+      }
+    }
+  ]
+}

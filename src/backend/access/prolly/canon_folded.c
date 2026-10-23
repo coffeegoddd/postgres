@@ -241,12 +241,18 @@ typedef struct CanonItem
 {
 	StringInfoData key;
 	StringInfoData value;
+	Oid			relid;			/* a table's, materialized view's or
+								 * sequence's, whose rows or value it
+								 * holds; else InvalidOid */
 } CanonItem;
 
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "17", extension send values normalized by
+ * The format a folded root is in: "18", whose commits record their
+ * objects' identities beside it (folded_identify()), which a server of an
+ * earlier format would read past, matching renamed objects by name; "17"
+ * had none, and was the first with extension send values normalized by
  * binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
  * table's definition a line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
@@ -278,9 +284,9 @@ typedef struct BaseTable BaseTable;
  * keyless rows keyed by their first bytes and their hash, and a root
  * without the item keyed them by the hash alone.  A root in another has
  * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions or row keying aren't this format's.
+ * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"17"
+#define FOLDED_FORMAT	"18"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -295,6 +301,20 @@ typedef struct BaseTable BaseTable;
 #define FOLDED_KEY_ENCODER		6
 #define FOLDED_VALUE_ENCODER	6
 #define FOLDED_KEYING			1
+
+/*
+ * What a canonical tree or baseline built here was folded at, for a later
+ * fold that works out again only what changed since (fold_changed_only()):
+ * the refs' mark, and this backend's catalog epoch then.  Valid only for a
+ * fold of everything that left nothing out, made since the deparsing
+ * settings were last changed.
+ */
+typedef struct FoldedAt
+{
+	bool		valid;
+	ProllyFoldMark mark;
+	uint64		catalog_epoch;
+} FoldedAt;
 
 typedef struct Canon
 {
@@ -318,6 +338,16 @@ typedef struct Canon
 	Oid			only;			/* valid: only this table's rows folded */
 	bool		no_rows;		/* no table's rows folded (objects only) */
 	bool		cached;			/* descriptions from this backend's cache */
+	const ProllyNodeRef *baseline;	/* the branch's baseline (NULL: none) */
+	bool		partial;		/* only the objects that may have changed:
+								 * the next baseline's entries too */
+	bool		verifying;		/* the full fold a partial one is checked
+								 * against: remembered as nothing */
+	List	   *given;			/* (verifying) CanonItem *: the rows of the
+								 * tables the partial one folded, taken
+								 * from its items, not folded again */
+	bool		marked;			/* a fold of everything, marked: */
+	FoldedAt	at;				/* what it was folded at */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
@@ -510,7 +540,9 @@ add_item(Canon *cn, const char *kind, const char *name)
 	appendStringInfoString(&it->key, kind);
 	append_utf8(&it->key, name);
 	initStringInfo(&it->value);
+	it->relid = InvalidOid;
 	cn->items = lappend(cn->items, it);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_OBJECTS, 1);
 	return it;
 }
 
@@ -1837,7 +1869,21 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 			empty_root(cn, root);
 		return;
 	}
+	/* (checking a partial fold: the rows it folded as it has them) */
+	foreach_ptr(CanonItem, given, cn->given)
+	{
+		if (given->relid == RelationGetRelid(rel))
+		{
+			uint8		len = (uint8) given->value.data[0];
+
+			Assert(!cn->advance);
+			root->hash.len = len;
+			memcpy(root->hash.bytes, given->value.data + 1, len);
+			return;
+		}
+	}
 	initStringInfo(&state);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_TABLES, 1);
 	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, why, root,
 				cn->advance ? &state : NULL);
 	if (cn->advance)
@@ -3059,6 +3105,10 @@ item_cmp(const ListCell *a, const ListCell *b)
  * - The last canonical tree built, with its items in order: the next one
  *   is it with only the items that differ applied.  Its hash is its
  *   content, so it is never stale.
+ * - What that tree (and the last next baseline built) was folded at: the
+ *   refs' mark and the catalog epoch, so the next fold can take its items
+ *   and work out again only the tables written since and the sequences
+ *   (fold_changed_only()).
  * - Which objects are extensions' members, and which namespaces' objects
  *   the canonical form's, against the same epoch: each is asked of every
  *   relation, type and function.
@@ -3099,6 +3149,12 @@ static char *described_settings = NULL;
 static MadeTree dependencies_made;
 static uint64 dependencies_epoch;
 static MadeTree items_made;
+
+static FoldedAt items_at;
+static MadeTree baseline_made;	/* the last next baseline built here */
+static FoldedAt baseline_at;
+static Oid *made_sequences = NULL;	/* the sequences among made_items */
+static int	nmade_sequences = 0;
 static MemoryContext items_cxt = NULL;
 static CanonItem *made_items = NULL;	/* items_made's, in key order */
 static int	nmade_items = 0;
@@ -3185,12 +3241,14 @@ fold_caches_xact(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_COMMIT:
 			made_tree_end(&dependencies_made, true);
 			made_tree_end(&items_made, true);
+			made_tree_end(&baseline_made, true);
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
 			made_tree_end(&dependencies_made, false);
 			made_tree_end(&items_made, false);
+			made_tree_end(&baseline_made, false);
 			break;
 		default:
 			break;
@@ -3215,6 +3273,7 @@ fold_caches_subxact(SubXactEvent event, SubTransactionId mySubid,
 {
 	made_tree_sub(&dependencies_made, event, mySubid, parentSubid);
 	made_tree_sub(&items_made, event, mySubid, parentSubid);
+	made_tree_sub(&baseline_made, event, mySubid, parentSubid);
 }
 
 /*
@@ -3265,6 +3324,8 @@ check_deparse_settings(void)
 	if (described_settings == NULL || strcmp(now.data, described_settings) != 0)
 	{
 		forget_descriptions();
+		items_at.valid = false;
+		baseline_at.valid = false;
 		if (described_settings)
 			pfree(described_settings);
 		described_settings = MemoryContextStrdup(CacheMemoryContext, now.data);
@@ -3586,6 +3647,16 @@ remember_items(Canon *cn, const ProllyNodeRef *root)
 		memcpy(m->value.data, it->value.data, it->value.len + 1);
 		m->value.len = m->value.maxlen = it->value.len;
 		m->value.cursor = 0;
+		m->relid = it->relid;
+	}
+	made_sequences = MemoryContextAlloc(items_cxt,
+										sizeof(Oid) * Max(nmade_items, 1));
+	nmade_sequences = 0;
+	for (int i = 0; i < nmade_items; i++)
+	{
+		if (OidIsValid(made_items[i].relid) &&
+			strncmp(made_items[i].key.data, "s:", 2) == 0)
+			made_sequences[nmade_sequences++] = made_items[i].relid;
 	}
 	made_tree(&items_made, root);
 }
@@ -4153,6 +4224,162 @@ oid_columns(Canon *cn, Relation rel)
 	return any;
 }
 
+/*
+ * A relation's items, if the canonical form holds it (in a versioned
+ * schema, not an extension's member).  The item of a table's, materialized
+ * view's or sequence's rows or value names it (relid): the first it adds,
+ * any ordering item after.
+ */
+static void
+collect_relation(Canon *cn, Form_pg_class form)
+{
+	char	   *name = NameStr(form->relname);
+	int			before = list_length(cn->items);
+
+	if (!canon_namespace(form->relnamespace) ||
+		in_extension(RelationRelationId, form->oid))
+		return;
+	switch (form->relkind)
+	{
+		case RELKIND_RELATION:
+			if (form->relam == PROLLY_TABLE_AM_OID &&
+				!partition_uncovered(cn, form, name))
+			{
+				Relation	rel = table_open(form->oid, AccessShareLock);
+				CanonItem  *it;
+				ProllyNodeRef root;
+				StringInfoData desc;
+				ProllyHash	dh;
+
+				if (oid_columns(cn, rel) && !cn->reading)
+				{
+					table_close(rel, AccessShareLock);
+					break;
+				}
+				it = add_item(cn, "t:", qualified(form->relnamespace, name));
+				initStringInfo(&desc);
+				table_description(cn, rel, &desc, &dh);
+				record_ordering(cn, rel, &desc);
+				table_root(cn, it, rel, &desc, &dh, &root);
+				put_hash(&it->value, &root.hash);
+				appendBinaryStringInfo(&it->value, desc.data, desc.len);
+				pfree(desc.data);
+				table_close(rel, AccessShareLock);
+			}
+			break;
+		case RELKIND_SEQUENCE:
+			describe_sequence(cn, form->oid, form->relnamespace, name);
+			break;
+		case RELKIND_INDEX:
+		case RELKIND_TOASTVALUE:
+		case RELKIND_COMPOSITE_TYPE:
+			break;			/* with their tables, or as types */
+		case RELKIND_VIEW:
+			{
+				CanonItem  *it = add_item(cn, "v:", qualified(form->relnamespace, name));
+
+				append_view_options(&it->value, form->oid);
+				append_utf8(&it->value,
+							TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																	ObjectIdGetDatum(form->oid),
+																	BoolGetDatum(false))));
+			}
+			break;
+		case RELKIND_MATVIEW:
+			{
+				CanonItem  *it;
+				Relation	rel = NULL;
+				StringInfoData query;
+
+				if (form->relam == PROLLY_TABLE_AM_OID)
+				{
+					rel = table_open(form->oid, AccessShareLock);
+					if (oid_columns(cn, rel) && !cn->reading)
+					{
+						table_close(rel, AccessShareLock);
+						break;
+					}
+				}
+				it = add_item(cn, "m:", qualified(form->relnamespace, name));
+				initStringInfo(&query);
+				append_matview_state(&query, form);
+				append_utf8(&query,
+							TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																	ObjectIdGetDatum(form->oid),
+																	BoolGetDatum(false))));
+				if (rel != NULL)
+				{
+					ProllyNodeRef root;
+					ProllyHash	dh;
+
+					table_shape(cn, rel, &query, &dh, NULL);
+					table_root(cn, it, rel, &query, &dh, &root);
+					put_hash(&it->value, &root.hash);
+					table_close(rel, AccessShareLock);
+				}
+				else
+					appendStringInfoChar(&it->value, 0);	/* (no tree) */
+				appendBinaryStringInfo(&it->value, query.data, query.len);
+				pfree(query.data);
+			}
+			break;
+		case RELKIND_FOREIGN_TABLE:
+			{
+				ObjectAddress self;
+				const char *what = NULL;
+
+				/* (what CREATE FOREIGN TABLE alone doesn't make: not yet) */
+				ObjectAddressSet(self, RelationRelationId, form->oid);
+				if (form->relispartition)
+					what = "foreign tables that are partitions";
+				else if (has_superclass(form->oid))
+					what = "foreign tables that inherit";
+				else if (form->relhastriggers && has_triggers(form->oid))
+					what = "triggers on foreign tables";
+				else if (form->relrowsecurity)
+					what = "row security on foreign tables";
+				else
+					what = foreign_table_undescribed(form->oid);
+				if (what)
+					(void) uncovered(cn, what, qualified(form->relnamespace, name),
+									 &self);
+				else
+					describe_foreign_table(form->oid,
+										   &add_item(cn, "r:", qualified(form->relnamespace, name))->value);
+			}
+			break;
+		case RELKIND_PARTITIONED_TABLE:
+			{
+				/* (its rows are its partitions': an empty data tree) */
+				Relation	rel;
+				CanonItem  *it;
+				ProllyNodeRef root;
+				StringInfoData desc;
+
+				if (partition_uncovered(cn, form, name))
+					break;
+				rel = table_open(form->oid, AccessShareLock);
+				it = add_item(cn, "t:", qualified(form->relnamespace, name));
+				empty_root(cn, &root);
+				initStringInfo(&desc);
+				table_description(cn, rel, &desc, NULL);
+				put_hash(&it->value, &root.hash);
+				appendBinaryStringInfo(&it->value, desc.data, desc.len);
+				pfree(desc.data);
+				table_close(rel, AccessShareLock);
+			}
+			break;
+		case RELKIND_PARTITIONED_INDEX:
+			break;			/* with its table */
+	}
+	if (list_length(cn->items) > before &&
+		(form->relkind == RELKIND_SEQUENCE ||
+		 ((form->relkind == RELKIND_RELATION ||
+		   form->relkind == RELKIND_MATVIEW) &&
+		  form->relam == PROLLY_TABLE_AM_OID)))
+		((CanonItem *) list_nth(cn->items, before))->relid = form->oid;
+}
+
 static void
 collect(Canon *cn)
 {
@@ -4160,151 +4387,13 @@ collect(Canon *cn)
 	SysScanDesc scan;
 	HeapTuple	tup;
 
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CATALOG_SCANS, 1);
+
 	/* Relations. */
 	pg_class = table_open(RelationRelationId, AccessShareLock);
 	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
-		char	   *name = NameStr(form->relname);
-
-		if (!canon_namespace(form->relnamespace) ||
-			in_extension(RelationRelationId, form->oid))
-			continue;
-		switch (form->relkind)
-		{
-			case RELKIND_RELATION:
-				if (form->relam == PROLLY_TABLE_AM_OID &&
-					!partition_uncovered(cn, form, name))
-				{
-					Relation	rel = table_open(form->oid, AccessShareLock);
-					CanonItem  *it;
-					ProllyNodeRef root;
-					StringInfoData desc;
-					ProllyHash	dh;
-
-					if (oid_columns(cn, rel) && !cn->reading)
-					{
-						table_close(rel, AccessShareLock);
-						break;
-					}
-					it = add_item(cn, "t:", qualified(form->relnamespace, name));
-					initStringInfo(&desc);
-					table_description(cn, rel, &desc, &dh);
-					record_ordering(cn, rel, &desc);
-					table_root(cn, it, rel, &desc, &dh, &root);
-					put_hash(&it->value, &root.hash);
-					appendBinaryStringInfo(&it->value, desc.data, desc.len);
-					pfree(desc.data);
-					table_close(rel, AccessShareLock);
-				}
-				break;
-			case RELKIND_SEQUENCE:
-				describe_sequence(cn, form->oid, form->relnamespace, name);
-				break;
-			case RELKIND_INDEX:
-			case RELKIND_TOASTVALUE:
-			case RELKIND_COMPOSITE_TYPE:
-				break;			/* with their tables, or as types */
-			case RELKIND_VIEW:
-				{
-					CanonItem  *it = add_item(cn, "v:", qualified(form->relnamespace, name));
-
-					append_view_options(&it->value, form->oid);
-					append_utf8(&it->value,
-								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
-																		ObjectIdGetDatum(form->oid),
-																		BoolGetDatum(false))));
-				}
-				break;
-			case RELKIND_MATVIEW:
-				{
-					CanonItem  *it;
-					Relation	rel = NULL;
-					StringInfoData query;
-
-					if (form->relam == PROLLY_TABLE_AM_OID)
-					{
-						rel = table_open(form->oid, AccessShareLock);
-						if (oid_columns(cn, rel) && !cn->reading)
-						{
-							table_close(rel, AccessShareLock);
-							break;
-						}
-					}
-					it = add_item(cn, "m:", qualified(form->relnamespace, name));
-					initStringInfo(&query);
-					append_matview_state(&query, form);
-					append_utf8(&query,
-								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
-																		ObjectIdGetDatum(form->oid),
-																		BoolGetDatum(false))));
-					if (rel != NULL)
-					{
-						ProllyNodeRef root;
-						ProllyHash	dh;
-
-						table_shape(cn, rel, &query, &dh, NULL);
-						table_root(cn, it, rel, &query, &dh, &root);
-						put_hash(&it->value, &root.hash);
-						table_close(rel, AccessShareLock);
-					}
-					else
-						appendStringInfoChar(&it->value, 0);	/* (no tree) */
-					appendBinaryStringInfo(&it->value, query.data, query.len);
-					pfree(query.data);
-				}
-				break;
-			case RELKIND_FOREIGN_TABLE:
-				{
-					ObjectAddress self;
-					const char *what = NULL;
-
-					/* (what CREATE FOREIGN TABLE alone doesn't make: not yet) */
-					ObjectAddressSet(self, RelationRelationId, form->oid);
-					if (form->relispartition)
-						what = "foreign tables that are partitions";
-					else if (has_superclass(form->oid))
-						what = "foreign tables that inherit";
-					else if (form->relhastriggers && has_triggers(form->oid))
-						what = "triggers on foreign tables";
-					else if (form->relrowsecurity)
-						what = "row security on foreign tables";
-					else
-						what = foreign_table_undescribed(form->oid);
-					if (what)
-						(void) uncovered(cn, what, qualified(form->relnamespace, name),
-										 &self);
-					else
-						describe_foreign_table(form->oid,
-											   &add_item(cn, "r:", qualified(form->relnamespace, name))->value);
-				}
-				break;
-			case RELKIND_PARTITIONED_TABLE:
-				{
-					/* (its rows are its partitions': an empty data tree) */
-					Relation	rel;
-					CanonItem  *it;
-					ProllyNodeRef root;
-					StringInfoData desc;
-
-					if (partition_uncovered(cn, form, name))
-						break;
-					rel = table_open(form->oid, AccessShareLock);
-					it = add_item(cn, "t:", qualified(form->relnamespace, name));
-					empty_root(cn, &root);
-					initStringInfo(&desc);
-					table_description(cn, rel, &desc, NULL);
-					put_hash(&it->value, &root.hash);
-					appendBinaryStringInfo(&it->value, desc.data, desc.len);
-					pfree(desc.data);
-					table_close(rel, AccessShareLock);
-				}
-				break;
-			case RELKIND_PARTITIONED_INDEX:
-				break;			/* with its table */
-		}
-	}
+		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	systable_endscan(scan);
 	table_close(pg_class, AccessShareLock);
 
@@ -4813,22 +4902,20 @@ table_unreadable(const char *name, List *stale)
 	return why;
 }
 
-/* The canonical tree, built in the environment from the items collected. */
+/*
+ * The canonical tree of everything, built from the items collected: the
+ * catalogs read through, every table's rows folded.
+ */
 static void
-build_canonical(Canon *cn, ProllyNodeRef *root)
+build_all(Canon *cn, ProllyNodeRef *root)
 {
 	int			save_nestlevel;
 	ProllyTreeBuilder *b;
 	ListCell   *lc;
 	bool		applied;
 
-	/*
-	 * Deparse with every name qualified, whatever the session's settings;
-	 * tables described as before taken from the cache (#483).
-	 */
-	fold_caches_begin();
-	check_deparse_settings();
-	cn->cached = true;
+	if (cn->baseline)
+		load_baseline(cn, cn->baseline);
 	save_nestlevel = NewGUCNestLevel();
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
@@ -4858,7 +4945,318 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 			check_applied("canonical", root, &built);
 		*root = built;
 	}
-	remember_items(cn, root);
+	if (!cn->verifying)
+		remember_items(cn, root);
+}
+
+static int
+made_item_cmp(const void *a, const void *b)
+{
+	const CanonItem *x = a;
+	const CanonItem *y = b;
+	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
+	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
+
+	return prolly_bytes_compare(&kx, &ky, NULL);
+}
+
+/* The last canonical tree's item of key, or NULL. */
+static CanonItem *
+made_item(const StringInfoData *key)
+{
+	CanonItem	probe;
+
+	probe.key = *key;
+	return bsearch(&probe, made_items, nmade_items, sizeof(CanonItem),
+				   made_item_cmp);
+}
+
+/* The baseline's entries of keys (StringInfo *), in key order. */
+static void
+load_baseline_keys(Canon *cn, const ProllyNodeRef *baseline, List *keys)
+{
+	StringInfoData v;
+
+	initStringInfo(&v);
+	foreach_ptr(StringInfoData, key, keys)
+	{
+		ProllyKey	k = {(const uint8 *) key->data, key->len};
+		ProllyValue pv;
+		BaseTable  *bt;
+
+		resetStringInfo(&v);
+		if (!PROLLY_CALL(cn->tree, get, &cn->env, baseline, &k, &v))
+			continue;
+		if (cn->nbase == cn->maxbase)
+		{
+			cn->maxbase = Max(16, cn->maxbase * 2);
+			cn->base = cn->base ? repalloc_array(cn->base, BaseTable, cn->maxbase) :
+				palloc_array(BaseTable, cn->maxbase);
+		}
+		bt = &cn->base[cn->nbase];
+		initStringInfo(&bt->key);
+		appendBinaryStringInfo(&bt->key, key->data, key->len);
+		pv.data = (const uint8 *) v.data;
+		pv.len = v.len;
+		if (!parse_base_table(&pv, bt))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a branch's baseline holds an invalid table entry")));
+		cn->nbase++;
+	}
+	pfree(v.data);
+	if (cn->nbase > 1)
+		qsort(cn->base, cn->nbase, sizeof(BaseTable), base_table_cmp);
+}
+
+/*
+ * The item key collect_relation() gives a relation's rows or value (a
+ * prolly table's or materialized view's, a sequence's), or NULL if it
+ * gives none.
+ */
+static StringInfo
+relation_item_key(Form_pg_class form)
+{
+	const char *kind;
+	StringInfo	key;
+
+	if (form->relkind == RELKIND_SEQUENCE)
+		kind = "s:";
+	else if (form->relam != PROLLY_TABLE_AM_OID)
+		return NULL;
+	else if (form->relkind == RELKIND_RELATION)
+		kind = "t:";
+	else if (form->relkind == RELKIND_MATVIEW)
+		kind = "m:";
+	else
+		return NULL;
+	key = makeStringInfo();
+	appendStringInfoString(key, kind);
+	append_utf8(key, qualified(form->relnamespace, NameStr(form->relname)));
+	return key;
+}
+
+/*
+ * The canonical tree as the last one built here, only what may have
+ * changed since worked out again (true): the items of the tables and
+ * materialized views whose rows a transaction that ended since, or this
+ * one, wrote (the refs' written_since()), and every sequence's, whose
+ * values change outside transactions.  The rest is as it was, as nothing
+ * else a fold reads changed: no catalog change or collection since (the
+ * refs' mark, which a catalog change sent moves, and this backend's
+ * catalog epoch, which its own move), the same deparsing settings, and a
+ * snapshot that sees every writer that ended (the mark is taken only
+ * then).  A fold that begins the next baseline does so from the one built
+ * here last, whose entries stay but those of the tables written since it.
+ * False where it can't be: then everything is folded.
+ * debug_prolly_verify_fold_caches then folds everything but the tables
+ * this fold folded, and the trees differing is an error.
+ */
+static bool
+fold_changed_only(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyDatabaseComponents dc;
+	ProllyFullFoldReason reason;
+	const FoldedAt *since = &items_at;
+	Oid		   *relids;
+	int			nrelids;
+	List	   *seen = NIL;
+	List	   *rels = NIL;
+	List	   *keys = NIL;
+	ProllyNodeRef expect = {0};
+	ProllyEdit *edits;
+	CanonItem **changed;
+	int			nedits = 0;
+	int			save_nestlevel;
+
+	/* (a fold from no baseline is asked to fold everything from nothing) */
+	if (!cn->marked || !items_at.valid || made_items == NULL ||
+		cn->baseline == NULL || prolly_full_fold_wanted(&reason) ||
+		items_at.catalog_epoch != catalog_epoch ||
+		!made_tree_usable(cn, &items_made))
+		return false;
+	if (cn->advance)
+	{
+		if (cn->baseline == NULL || !baseline_at.valid ||
+			baseline_at.catalog_epoch != catalog_epoch ||
+			baseline_made.root.hash.len != cn->baseline->hash.len ||
+			memcmp(baseline_made.root.hash.bytes, cn->baseline->hash.bytes,
+				   cn->baseline->hash.len) != 0 ||
+			!made_tree_usable(cn, &baseline_made))
+			return false;
+		if (baseline_at.mark.generation < items_at.mark.generation)
+			since = &baseline_at;
+	}
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, written_since) ||
+		!PROLLY_CALL(dc.refs, written_since, &since->mark, GetActiveSnapshot(),
+					 &relids, &nrelids))
+		return false;
+
+	/*
+	 * What to work out again: each relation's item, as the last tree has it
+	 * (one it doesn't have is a catalog change, which the mark would have
+	 * seen; but never folded so)
+	 */
+	for (int i = 0; i < nrelids + nmade_sequences; i++)
+	{
+		Oid			relid = i < nrelids ? relids[i] : made_sequences[i - nrelids];
+		HeapTuple	tup;
+		Form_pg_class form;
+		StringInfo	key;
+
+		if (list_member_oid(seen, relid))
+			continue;
+		seen = lappend_oid(seen, relid);
+		tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(tup))
+			return false;
+		form = (Form_pg_class) GETSTRUCT(tup);
+		if (!canon_namespace(form->relnamespace) ||
+			in_extension(RelationRelationId, form->oid) ||
+			(key = relation_item_key(form)) == NULL)
+			continue;			/* (no item: none of the canonical form's) */
+		if (made_item(key) == NULL)
+			return false;
+		if (form->relkind != RELKIND_SEQUENCE)
+			keys = lappend(keys, key);
+		rels = lappend(rels, tup);
+	}
+
+	cn->partial = true;
+	if (cn->baseline && keys != NIL)
+		load_baseline_keys(cn, cn->baseline, keys);
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	foreach_ptr(HeapTupleData, tup, rels)
+		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
+	AtEOXact_GUC(false, save_nestlevel);
+	if (cn->left_out != NIL || cn->refused != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("prolly fold of the objects changed since the last left out one it had held")));
+
+	/*
+	 * Each item that differs, applied to the last tree; the items kept
+	 * changed only once the tree is made, so they are always a tree's.
+	 */
+	list_sort(cn->items, item_cmp);
+	edits = palloc_array(ProllyEdit, Max(list_length(cn->items), 1));
+	changed = palloc_array(CanonItem *, Max(list_length(cn->items), 1));
+	foreach_ptr(CanonItem, it, cn->items)
+	{
+		CanonItem  *m = made_item(&it->key);
+
+		if (m == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly fold of the objects changed since the last found one it didn't hold")));
+		if (m->value.len == it->value.len &&
+			memcmp(m->value.data, it->value.data, it->value.len) == 0)
+			continue;
+		changed[nedits] = it;
+		edits[nedits].key = (ProllyKey) {(const uint8 *) it->key.data, it->key.len};
+		edits[nedits].value = (ProllyValue) {(const uint8 *) it->value.data, it->value.len};
+		edits[nedits++].is_delete = false;
+	}
+	if (nedits == 0)
+		*root = items_made.root;
+	else
+		PROLLY_CALL(cn->tree, apply, &cn->root_env, &items_made.root, edits,
+					nedits, root);
+	for (int i = 0; i < nedits; i++)
+	{
+		CanonItem  *it = changed[i];
+		CanonItem  *m = made_item(&it->key);
+
+		pfree(m->value.data);
+		m->value.data = MemoryContextAlloc(items_cxt, it->value.len + 1);
+		memcpy(m->value.data, it->value.data, it->value.len + 1);
+		m->value.len = m->value.maxlen = it->value.len;
+	}
+	pfree(edits);
+	pfree(changed);
+	made_tree(&items_made, root);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_INCREMENTAL, 1);
+
+	/*
+	 * (checked against a fold of everything but the tables this one
+	 * folded, their rows taken from its items: every other table's rows,
+	 * folded from the baseline again, must be as the last tree had them.
+	 * Its work isn't counted: the statistics put back as they were, the
+	 * change finders told.  In the same command, so what this fold
+	 * consumed of the change log is still seen.)
+	 */
+	if (debug_prolly_verify_fold_caches)
+	{
+		Canon		full;
+		PgStat_Counter *stats = palloc_array(PgStat_Counter, PGSTAT_PROLLY_NUM_COUNTERS);
+		ProllyNodeCounters tree = *pgstat_prolly_tree_counters();
+
+		memcpy(stats, PendingProllyStats, sizeof(PendingProllyStats));
+		memset(&full, 0, sizeof(full));
+		full.reading = cn->reading;
+		canon_env(&full);
+		full.finder = cn->finder;
+		full.baseline = cn->baseline;
+		full.cached = true;
+		full.verifying = true;
+		foreach_ptr(CanonItem, it, cn->items)
+		{
+			if (OidIsValid(it->relid) && strncmp(it->key.data, "s:", 2) != 0)
+				full.given = lappend(full.given, it);
+		}
+		prolly_fold_counted = false;
+		PG_TRY();
+		{
+			build_all(&full, &expect);
+		}
+		PG_FINALLY();
+		{
+			prolly_fold_counted = true;
+		}
+		PG_END_TRY();
+		memcpy(PendingProllyStats, stats, sizeof(PendingProllyStats));
+		*pgstat_prolly_tree_counters() = tree;
+		pfree(stats);
+		check_applied("canonical folded from the objects changed", root, &expect);
+	}
+	return true;
+}
+
+/*
+ * The canonical tree: the last one built here with only what changed
+ * since worked out again, if it can be (fold_changed_only()), else
+ * everything.  A fold of everything that left nothing out is marked for
+ * the next.
+ */
+static void
+build_canonical(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyDatabaseComponents dc;
+
+	/*
+	 * Deparse with every name qualified, whatever the session's settings;
+	 * tables described as before taken from the cache (#483).
+	 */
+	fold_caches_begin();
+	check_deparse_settings();
+	cn->cached = true;
+
+	/* (marked before anything is read) */
+	prolly_database_components(&dc);
+	cn->at.catalog_epoch = catalog_epoch;
+	cn->marked = !OidIsValid(cn->only) && !cn->no_rows &&
+		PROLLY_HAS(dc.refs, fold_mark) &&
+		PROLLY_CALL(dc.refs, fold_mark, MyBranch, GetActiveSnapshot(),
+					&cn->at.mark);
+	cn->at.valid = cn->marked;
+	if (!fold_changed_only(cn, root))
+		build_all(cn, root);
+	if (cn->left_out != NIL)
+		cn->at.valid = false;
+	items_at = cn->at;
 }
 
 /*
@@ -4927,9 +5325,11 @@ build_baseline(Canon *cn, const ProllyNodeRef *baseline, ProllyNodeRef *next)
 		else
 			PROLLY_CALL(cn->tree, apply, &benv, baseline, edits, nedits, next);
 		pfree(edits);
-		if (!debug_prolly_verify_fold_caches)
+		/* (partial: its entries are only those of the tables written) */
+		if (!debug_prolly_verify_fold_caches || cn->partial)
 			return;
 	}
+	Assert(!cn->partial);
 	b = PROLLY_CALL(cn->tree, build_begin, &benv, CurrentMemoryContext);
 	foreach(lc, cn->next)
 	{
@@ -4965,8 +5365,7 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
 	cn.advance = next_baseline != NULL;
-	if (baseline)
-		load_baseline(&cn, baseline);
+	cn.baseline = baseline;
 
 	/*
 	 * Everything the transaction wrote, this statement's writes too: a
@@ -4991,7 +5390,11 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	}
 	PG_END_TRY();
 	if (next_baseline)
+	{
 		build_baseline(&cn, baseline, next_baseline);
+		made_tree(&baseline_made, next_baseline);
+		baseline_at = cn.at;
+	}
 	return cn.left_out;
 }
 
@@ -5001,6 +5404,104 @@ folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 {
 	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid,
 					  false);
+}
+
+/*
+ * The session branch's tables whose next fold from baseline would read
+ * them in full, as table_root() would find (no entry, a definition its
+ * rows can't be mapped from) and then the change finder (full_reason()).
+ * The catalogs are read as a fold reads them, by a snapshot of now.
+ */
+static void
+folded_pending_full(const ProllyNodeRef *baseline,
+					ProllyPendingFullVisit visit, void *arg)
+{
+	Canon		cn;
+	Relation	classes;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relids = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (baseline)
+		load_baseline(&cn, baseline);
+	if (ActiveSnapshotSet())
+		PushCopiedSnapshot(GetActiveSnapshot());
+	else
+		PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		classes = table_open(RelationRelationId, AccessShareLock);
+		scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+			if (form->relkind == RELKIND_RELATION &&
+				form->relam == PROLLY_TABLE_AM_OID &&
+				canon_namespace(form->relnamespace) &&
+				!in_extension(RelationRelationId, form->oid))
+				relids = lappend_oid(relids, form->oid);
+		}
+		systable_endscan(scan);
+		table_close(classes, AccessShareLock);
+
+		foreach_oid(relid, relids)
+		{
+			Relation	rel = try_table_open(relid, AccessShareLock);
+			char	   *name;
+			StringInfoData key;
+			BaseTable  *bt;
+			StringInfoData desc;
+			StringInfoData shape = {0};
+			ProllyHash	dh;
+			ProllyTableFold tf;
+			ProllyFullFoldReason why = PROLLY_FULL_NONE;
+
+			if (rel == NULL)
+				continue;
+			name = qualified(RelationGetNamespace(rel),
+							 RelationGetRelationName(rel));
+			initStringInfo(&key);
+			appendStringInfoString(&key, "t:");
+			append_utf8(&key, name);
+			initStringInfo(&desc);
+			table_description(&cn, rel, &desc, &dh);
+			bt = find_base_table(&cn, &key);
+			memset(&tf, 0, sizeof(tf));
+			if (prolly_full_fold_wanted(&why))
+				;
+			else if (bt == NULL)
+				why = PROLLY_FULL_NO_BASELINE;
+			else if (!(bt->shape_hash.len == dh.len &&
+					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
+					 !shape_holds(rel, base_shape(&cn, bt),
+								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
+					 !shape_mappable(&cn, rel, bt, &shape, &tf.shape))
+				why = PROLLY_FULL_SHAPE_CHANGED;
+			else if (PROLLY_HAS(cn.finder, full_reason))
+			{
+				tf.data = bt->data;
+				tf.state.data = (const uint8 *) bt->state.data;
+				tf.state.len = bt->state.len;
+				tf.reshaped = tf.shape.data != NULL;
+				why = cn.finder->full_reason(rel, &tf);
+			}
+			if (why != PROLLY_FULL_NONE)
+				visit(name, relid, why, arg);
+			pfree(key.data);
+			pfree(desc.data);
+			table_close(rel, AccessShareLock);
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -6156,16 +6657,129 @@ typedef struct ContentMatch
 
 /*
  * Each object from and to hold differently, by name: what the roots' tree
- * diff gives (equal subtrees skipped), objects of a kind dropped and added
- * with the same item (but for their own names), and the only such pair,
- * made one renamed.
+ * diff gives (equal subtrees skipped); a table renames says was renamed
+ * (by identity, which a rename keeps), dropped by one name and added by
+ * another, made one renamed, its rows and definition perhaps changed too.
+ * Other objects (views, routines), which have no identity, of a kind
+ * dropped and added with the same item (but for their own names), and the
+ * only such pair, are made one renamed; tables never are, so that
+ * unrelated tables that happen to be alike aren't.
  */
 static void folded_render(char object, const char *name, const ProllyValue *item,
 						  StringInfo out);
 
+static Changed *
+dropped_or_added(List *changed, const char *name, bool dropped)
+{
+	ListCell   *lc;
+
+	foreach(lc, changed)
+	{
+		Changed    *c = lfirst(lc);
+
+		if (c->object == PROLLY_OBJECT_TABLE &&
+			(dropped ? c->from_name && !c->to_name &&
+			 strcmp(c->from_name, name) == 0 :
+			 c->to_name && !c->from_name && strcmp(c->to_name, name) == 0))
+			return c;
+	}
+	return NULL;
+}
+
+/*
+ * One side's part of a changed object, the other's NULL: dropped or added,
+ * as note_change() notes one.
+ */
+static void
+one_side(Changed *c, const ProllyValue *v, const char *name)
+{
+	StringInfoData key;
+	ProllyKey	k;
+
+	initStringInfo(&key);
+	appendStringInfoChar(&key, c->object);
+	appendStringInfoChar(&key, ':');
+	append_utf8(&key, name);
+	k.data = (const uint8 *) key.data;
+	k.len = key.len;
+	c->data_change = holds_data(&k, v);
+	c->schema_change = true;
+	c->masked = masked_item(v, name);
+	c->content = hash_bytes_extended(c->masked.data, c->masked.len,
+									 (uint64) c->object);
+}
+
+/*
+ * A table under name in both roots, changed or not, made a drop of from's
+ * and an add of to's: they are other tables, one renamed away from the
+ * name or to it.  False if both haven't one.
+ */
+static bool
+split_changed(Canon *cn, ChangesWalk *w, const ProllyNodeRef *from,
+			  const ProllyNodeRef *to, const char *name)
+{
+	ListCell   *lc;
+	StringInfoData key;
+	StringInfoData fv;
+	StringInfoData tv;
+	ProllyKey	k;
+	Changed    *d;
+	Changed    *a;
+	bool		split;
+
+	foreach(lc, w->changed)
+	{
+		Changed    *c = lfirst(lc);
+
+		if (c->object != PROLLY_OBJECT_TABLE || !c->from_name || !c->to_name ||
+			strcmp(c->from_name, name) != 0 || strcmp(c->to_name, name) != 0)
+			continue;
+		a = palloc0(sizeof(Changed));
+		a->object = c->object;
+		a->to_name = c->to_name;
+		a->to = c->to;
+		one_side(a, &a->to, name);
+		c->to_name = NULL;
+		one_side(c, &c->from, name);
+		w->changed = lappend(w->changed, a);
+		return true;
+	}
+
+	/*
+	 * (the same in both, so not among the changes the diff gave: the two
+	 * are still others, one renamed away and another made with its name)
+	 */
+	initStringInfo(&key);
+	appendStringInfoString(&key, "t:");
+	append_utf8(&key, name);
+	k.data = (const uint8 *) key.data;
+	k.len = key.len;
+	initStringInfo(&fv);
+	initStringInfo(&tv);
+	split = PROLLY_CALL(cn->tree, get, &cn->env, from, &k, &fv) &&
+		PROLLY_CALL(cn->tree, get, &cn->env, to, &k, &tv);
+	if (split)
+	{
+		d = palloc0(sizeof(Changed));
+		d->object = PROLLY_OBJECT_TABLE;
+		d->from_name = pstrdup(name);
+		d->from.data = (const uint8 *) fv.data;
+		d->from.len = fv.len;
+		one_side(d, &d->from, name);
+		a = palloc0(sizeof(Changed));
+		a->object = PROLLY_OBJECT_TABLE;
+		a->to_name = pstrdup(name);
+		a->to.data = (const uint8 *) tv.data;
+		a->to.len = tv.len;
+		one_side(a, &a->to, name);
+		w->changed = lappend(lappend(w->changed, d), a);
+	}
+	return split;
+}
+
 static void
 folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
-			   ProllyCanonChangeVisit visit, void *arg)
+			   List *renames, ProllyCanonChangeVisit visit, void *arg)
 {
 	Canon		cn;
 	ChangesWalk w = {NIL, false};
@@ -6180,7 +6794,45 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
 	PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_change, &w);
 
-	/* renames: a dropped and an added object of one content, alone */
+	/* tables renamed, by identity */
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		Changed    *d;
+		Changed    *a;
+		ProllyNodeRef rd;
+		ProllyNodeRef ra;
+		ProllyValue def;
+		StringInfoData key;
+		ProllyKey	k;
+
+		if (r->column != NULL)
+			continue;
+		/* (a name another table has since, or had before: that one apart) */
+		if (dropped_or_added(w.changed, r->table, true) == NULL)
+			(void) split_changed(&cn, &w, from, to, r->table);
+		if (dropped_or_added(w.changed, r->to, false) == NULL)
+			(void) split_changed(&cn, &w, from, to, r->to);
+		if ((d = dropped_or_added(w.changed, r->table, true)) == NULL ||
+			(a = dropped_or_added(w.changed, r->to, false)) == NULL)
+			continue;
+		initStringInfo(&key);
+		appendStringInfoString(&key, "t:");
+		k.data = (const uint8 *) key.data;
+		k.len = key.len;
+		(void) tree_item(&k, &d->from, &rd, &def);
+		(void) tree_item(&k, &a->to, &ra, &def);
+		d->to_name = a->to_name;
+		d->to = a->to;
+		d->data_change = !(rd.hash.len == ra.hash.len &&
+						   memcmp(rd.hash.bytes, ra.hash.bytes, rd.hash.len) == 0);
+		d->schema_change = true;
+		w.changed = list_delete_ptr(w.changed, a);
+	}
+	/*
+	 * renames: a dropped and an added object of one content, alone (not a
+	 * table, where identities tell renames)
+	 */
 	ctl.keysize = sizeof(uint64);
 	ctl.entrysize = sizeof(ContentMatch);
 	ctl.hcxt = CurrentMemoryContext;
@@ -6191,7 +6843,7 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 		Changed    *c = lfirst(lc);
 		bool		found;
 
-		if (c->from_name && c->to_name)
+		if ((c->from_name && c->to_name) || c->object == PROLLY_OBJECT_TABLE)
 			continue;
 		m = hash_search(matches, &c->content, HASH_ENTER, &found);
 		if (!found)
@@ -11573,6 +12225,1409 @@ folded_make_versioned_schemas(List *names)
 	CommandCounterIncrement();
 }
 
+/* ------------------------------------------------------------------------
+ * Identity
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * A table's or column's identity, which its renames keep: the name it was
+ * made with (a table's qualified), and which of the objects made with that
+ * name it is (0, unless another holding that name's identity was there,
+ * as a column renamed is from one added with its old name).  A root holds
+ * none of it: the same tables, columns and rows are the same root however
+ * they were named before.  A commit records its root's beside it, as an
+ * identity record: in key order, a line for each table and column whose
+ * identity isn't its own name's with 0, fields escaped (append_field()),
+ * names in UTF-8 (a table's qualified and quoted, a column's unquoted):
+ *
+ *	c <table> <column> <origin> <n>
+ *	t <table> <origin> <n>
+ *
+ * So a commit whose objects were never renamed records nothing.  An
+ * anchor, the working set's, has a line for each table and column, by the
+ * branch's own relation and attribute number (0 for the table), which a
+ * rename keeps: relid, attnum, origin, n.
+ */
+typedef struct IdObject
+{
+	char	   *name;			/* a table's qualified and quoted, a
+								 * column's unquoted; server encoding */
+	char	   *origin;			/* likewise */
+	int			n;
+	bool		known;			/* identity settled */
+	Oid			relid;			/* (a working set's) */
+	AttrNumber	attnum;			/* (a working set's column; 0: a table) */
+	List	   *columns;		/* (a table's) IdObject *, in order */
+} IdObject;
+
+/* A line of an identity record or anchor, read back. */
+typedef struct IdEntry
+{
+	char	   *table;			/* (a record's) */
+	char	   *column;			/* (a record's) NULL: the table */
+	Oid			relid;			/* (an anchor's) */
+	AttrNumber	attnum;			/* (an anchor's) */
+	char	   *origin;
+	int			n;
+} IdEntry;
+
+/* A field of an identity record or anchor, unescaped, in the server's encoding. */
+static char *
+identity_field(const char *f)
+{
+	char	   *u = unescape_field(f);
+
+	return pg_any_to_server(u, strlen(u), PG_UTF8);
+}
+
+static int
+identity_number(const char *f)
+{
+	char	   *end;
+	long		n = strtol(f, &end, 10);
+
+	if (*f == '\0' || *end != '\0' || n < 0 || n > PG_INT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a prolly identity record is invalid")));
+	return (int) n;
+}
+
+/*
+ * The lines of an identity record (anchor false) or anchor (true), each an
+ * IdEntry *.
+ */
+static List *
+identity_entries(const ProllyValue *v, bool anchor)
+{
+	List	   *out = NIL;
+	char	   *text;
+	char	   *line;
+	char	   *next;
+
+	if (v == NULL || v->len == 0)
+		return NIL;
+	text = pnstrdup((const char *) v->data, v->len);
+	for (line = text; line && *line; line = next)
+	{
+		char	   *f[5];
+		int			nf = 0;
+		char	   *p = line;
+		IdEntry    *e = palloc0(sizeof(IdEntry));
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		for (;;)
+		{
+			f[nf++] = p;
+			p = strchr(p, '\t');
+			if (p == NULL || nf == lengthof(f))
+				break;
+			*p++ = '\0';
+		}
+		if (p != NULL)
+			nf = 0;				/* (too many fields) */
+		if (anchor && nf == 4)
+		{
+			e->relid = (Oid) strtoul(f[0], NULL, 10);
+			e->attnum = (AttrNumber) identity_number(f[1]);
+			e->origin = identity_field(f[2]);
+			e->n = identity_number(f[3]);
+		}
+		else if (!anchor && nf == 4 && strcmp(f[0], "t") == 0)
+		{
+			e->table = identity_field(f[1]);
+			e->origin = identity_field(f[2]);
+			e->n = identity_number(f[3]);
+		}
+		else if (!anchor && nf == 5 && strcmp(f[0], "c") == 0)
+		{
+			e->table = identity_field(f[1]);
+			e->column = identity_field(f[2]);
+			e->origin = identity_field(f[3]);
+			e->n = identity_number(f[4]);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a prolly identity record is invalid")));
+		out = lappend(out, e);
+	}
+	return out;
+}
+
+/* A record's entry for table (and column, if not NULL), or NULL. */
+static IdEntry *
+record_entry(List *entries, const char *table, const char *column)
+{
+	ListCell   *lc;
+
+	foreach(lc, entries)
+	{
+		IdEntry    *e = lfirst(lc);
+
+		if (strcmp(e->table, table) == 0 &&
+			(column ? e->column && strcmp(e->column, column) == 0 : e->column == NULL))
+			return e;
+	}
+	return NULL;
+}
+
+/* An anchor's entry for relid's attribute attnum (0: the table), or NULL. */
+static IdEntry *
+anchor_entry(List *entries, Oid relid, AttrNumber attnum)
+{
+	ListCell   *lc;
+
+	foreach(lc, entries)
+	{
+		IdEntry    *e = lfirst(lc);
+
+		if (e->relid == relid && e->attnum == attnum)
+			return e;
+	}
+	return NULL;
+}
+
+/* o's identity as a record (entries) gives it by name: its entry's, or its own name's. */
+static void
+identity_by_name(List *entries, const char *table, IdObject *o)
+{
+	IdEntry    *e = record_entry(entries, table ? table : o->name,
+								 table ? o->name : NULL);
+
+	o->origin = pstrdup(e ? e->origin : o->name);
+	o->n = e ? e->n : 0;
+}
+
+static int
+id_object_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((IdObject *) lfirst(a))->name, ((IdObject *) lfirst(b))->name);
+}
+
+static bool
+same_identity(const IdObject *a, const IdObject *b)
+{
+	return a->n == b->n && strcmp(a->origin, b->origin) == 0;
+}
+
+/* The object among objs (IdObject *) with o's identity, but o, or NULL. */
+static IdObject *
+with_identity(List *objs, const IdObject *o)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		IdObject   *x = lfirst(lc);
+
+		if (x != o && x->known && same_identity(x, o))
+			return x;
+	}
+	return NULL;
+}
+
+static IdObject *
+named_object(List *objs, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		IdObject   *x = lfirst(lc);
+
+		if (strcmp(x->name, name) == 0)
+			return x;
+	}
+	return NULL;
+}
+
+/*
+ * Settle o's identity, origin and n, among objs: if another holds it
+ * already, the first of its own name's that none holds.
+ */
+static void
+settle_identity(List *objs, IdObject *o, const char *origin, int n)
+{
+	o->origin = pstrdup(origin);
+	o->n = n;
+	if (with_identity(objs, o))
+	{
+		o->origin = pstrdup(o->name);
+		o->n = 0;
+		while (with_identity(objs, o))
+			o->n++;
+	}
+	o->known = true;
+}
+
+/* Settle objs' identities: those an anchor has first, then the rest by name. */
+static void
+settle_identities(List *objs, List *anchors, List *entries, const char *table)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		IdObject   *o = lfirst(lc);
+		IdEntry    *e = anchor_entry(anchors, o->relid, o->attnum);
+
+		if (e)
+			settle_identity(objs, o, e->origin, e->n);
+	}
+	foreach(lc, objs)
+	{
+		IdObject   *o = lfirst(lc);
+		IdObject	by_name = *o;
+
+		if (o->known)
+			continue;
+		identity_by_name(entries, table, &by_name);
+		settle_identity(objs, o, by_name.origin, by_name.n);
+	}
+}
+
+/* The tables (IdObject *) of a folded root, with identities by its record. */
+static List *
+root_identities(const ProllyNodeRef *root, const ProllyValue *record)
+{
+	Canon		cn;
+	List	   *entries = identity_entries(record, false);
+	List	   *tables = NIL;
+	ProllyTreeCursor *c;
+	ProllyKey	start = {(const uint8 *) "t:", 2};
+	ProllyKey	k;
+	ProllyValue v;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &start, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v) &&
+		   k.len >= 2 && memcmp(k.data, "t:", 2) == 0)
+	{
+		IdObject   *t = palloc0(sizeof(IdObject));
+		ProllyValue def;
+		TableDef	td;
+		ListCell   *lc;
+
+		t->name = from_utf8(k.data + 2, k.len - 2);
+		identity_by_name(entries, NULL, t);
+		t->known = true;
+		definition_of(&k, &v, &def);
+		parse_table_def(from_utf8(def.data, def.len), &td);
+		foreach(lc, td.columns)
+		{
+			IdObject   *col = palloc0(sizeof(IdObject));
+
+			col->name = unquoted(first_field(lfirst(lc)));
+			identity_by_name(entries, t->name, col);
+			col->known = true;
+			t->columns = lappend(t->columns, col);
+		}
+		tables = lappend(tables, t);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	return tables;
+}
+
+/* Append an identity record's or anchor's line: its fields, tab-separated. */
+static void
+identity_line(List **lines, const char *f1, const char *f2, const char *f3,
+			  const char *f4, const char *f5)
+{
+	const char *fields[5] = {f1, f2, f3, f4, f5};
+	StringInfoData line;
+
+	initStringInfo(&line);
+	for (int i = 0; i < lengthof(fields) && fields[i]; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&line, '\t');
+		append_field(&line, fields[i]);
+	}
+	appendStringInfoChar(&line, '\n');
+	*lines = lappend(*lines, line.data);
+}
+
+static void
+append_lines(StringInfo out, List *lines)
+{
+	ListCell   *lc;
+
+	list_sort(lines, cstring_cmp);
+	foreach(lc, lines)
+		appendStringInfoString(out, lfirst(lc));
+}
+
+/* The identity record of tables (IdObject *): what isn't their own names'. */
+static void
+identity_record(List *tables, StringInfo out)
+{
+	List	   *lines = NIL;
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		IdObject   *t = lfirst(lc);
+		ListCell   *cc;
+
+		if (t->n != 0 || strcmp(t->origin, t->name) != 0)
+			identity_line(&lines, "t", t->name, t->origin, psprintf("%d", t->n),
+						  NULL);
+		foreach(cc, t->columns)
+		{
+			IdObject   *col = lfirst(cc);
+
+			if (col->n != 0 || strcmp(col->origin, col->name) != 0)
+				identity_line(&lines, "c", t->name, col->name, col->origin,
+							  psprintf("%d", col->n));
+		}
+	}
+	append_lines(out, lines);
+}
+
+/*
+ * A relation of the session branch's that identities are kept for (a
+ * prolly table or a partitioned table, in a versioned schema, not an
+ * extension's), with its live columns, as an IdObject; NULL if it isn't
+ * one.  Read from the catalogs alone, without opening (or locking) the
+ * relation: identities are worked out for reads of any table, which
+ * mustn't wait for another's locks.
+ */
+static IdObject *
+identified_relation(Form_pg_class form)
+{
+	IdObject   *t;
+
+	if (!((form->relkind == RELKIND_RELATION &&
+		   form->relam == PROLLY_TABLE_AM_OID) ||
+		  form->relkind == RELKIND_PARTITIONED_TABLE) ||
+		!canon_namespace(form->relnamespace) ||
+		in_extension(RelationRelationId, form->oid))
+		return NULL;
+	t = palloc0(sizeof(IdObject));
+	t->name = qualified(form->relnamespace, NameStr(form->relname));
+	t->relid = form->oid;
+	for (AttrNumber a = 1; a <= form->relnatts; a++)
+	{
+		HeapTuple	at = SearchSysCache2(ATTNUM, ObjectIdGetDatum(form->oid),
+										 Int16GetDatum(a));
+		Form_pg_attribute att;
+		IdObject   *col;
+
+		if (!HeapTupleIsValid(at))
+			continue;
+		att = (Form_pg_attribute) GETSTRUCT(at);
+		if (!att->attisdropped)
+		{
+			col = palloc0(sizeof(IdObject));
+			col->name = pstrdup(NameStr(att->attname));
+			col->relid = form->oid;
+			col->attnum = att->attnum;
+			t->columns = lappend(t->columns, col);
+		}
+		ReleaseSysCache(at);
+	}
+	return t;
+}
+
+/*
+ * The session branch's tables and columns (only's alone, if valid), each
+ * found as its anchor entry says (its relation and attribute numbers kept
+ * through renames), its identity that of the object it was before, so a
+ * rename since keeps it.  With an anchor, one it hasn't is new since:
+ * given its own name's identity (or, held, the first of that name's free),
+ * never another's that its name had (an object dropped since and made
+ * again under the name a rename gave the old one is another).  With none
+ * (the working set just made what known describes, or moved since), each
+ * is found by name in known.
+ */
+static void
+folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
+				StringInfo identity, StringInfo next_anchor)
+{
+	List	   *anchors = identity_entries(anchor, true);
+	List	   *entries = anchor ? NIL : identity_entries(known, false);
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	if (OidIsValid(only))
+	{
+		HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(only));
+
+		if (HeapTupleIsValid(tup))
+		{
+			IdObject   *t = identified_relation((Form_pg_class) GETSTRUCT(tup));
+
+			if (t)
+				tables = lappend(tables, t);
+			ReleaseSysCache(tup);
+		}
+	}
+	else
+	{
+		Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+		SysScanDesc scan = systable_beginscan(pg_class, InvalidOid, false,
+											  NULL, 0, NULL);
+		HeapTuple	tup;
+
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			IdObject   *t = identified_relation((Form_pg_class) GETSTRUCT(tup));
+
+			if (t)
+				tables = lappend(tables, t);
+		}
+		systable_endscan(scan);
+		table_close(pg_class, AccessShareLock);
+	}
+
+	/* (in name order, so that a name's identities are given alike everywhere) */
+	list_sort(tables, id_object_cmp);
+	settle_identities(tables, anchors, entries, NULL);
+	foreach(lc, tables)
+	{
+		IdObject   *t = lfirst(lc);
+
+		/* (a table renamed since known: its columns by its name there) */
+		IdObject	was = *t;
+		IdEntry    *e = NULL;
+		ListCell   *ec;
+
+		foreach(ec, entries)
+		{
+			IdEntry    *x = lfirst(ec);
+
+			if (x->column == NULL && x->n == t->n && strcmp(x->origin, t->origin) == 0)
+				e = x;
+		}
+		was.name = e ? e->table : t->n == 0 ? t->origin : t->name;
+		settle_identities(t->columns, anchors, entries, was.name);
+	}
+	identity_record(tables, identity);
+	if (next_anchor == NULL || OidIsValid(only))
+		return;
+	{
+		List	   *lines = NIL;
+
+		foreach(lc, tables)
+		{
+			IdObject   *t = lfirst(lc);
+			ListCell   *cc;
+
+			identity_line(&lines, psprintf("%u", t->relid), "0", t->origin,
+						  psprintf("%d", t->n), NULL);
+			foreach(cc, t->columns)
+			{
+				IdObject   *col = lfirst(cc);
+
+				identity_line(&lines, psprintf("%u", t->relid),
+							  psprintf("%d", col->attnum), col->origin,
+							  psprintf("%d", col->n), NULL);
+			}
+		}
+		append_lines(next_anchor, lines);
+	}
+}
+
+static ProllyRename *
+make_rename(const char *table, const char *column, const char *to)
+{
+	ProllyRename *r = palloc(sizeof(ProllyRename));
+
+	r->table = pstrdup(table);
+	r->column = column ? pstrdup(column) : NULL;
+	r->to = pstrdup(to);
+	return r;
+}
+
+/* What renames make of table (column NULL) or its column, or NULL: none. */
+static const char *
+renamed_to(List *renames, const char *table, const char *column)
+{
+	ListCell   *lc;
+
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+
+		if (strcmp(r->table, table) == 0 &&
+			(column ? r->column && strcmp(r->column, column) == 0 : r->column == NULL))
+			return r->to;
+	}
+	return NULL;
+}
+
+/* Is name among names (IdObject *), or a name renames give (for table, if given)? */
+static bool
+name_used(List *a, List *b, List *renames, const char *table, const char *name)
+{
+	ListCell   *lc;
+
+	if (named_object(a, name) || named_object(b, name))
+		return true;
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+
+		if ((table ? r->column && strcmp(r->table, table) == 0 : r->column == NULL) &&
+			strcmp(r->to, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A name for an object out of the way of another of its name: one neither
+ * a nor b (IdObject *) nor renames use, in table's schema for a table.
+ */
+static char *
+out_of_the_way(List *a, List *b, List *renames, const char *table,
+			   const char *schema_of_table)
+{
+	for (int k = 1;; k++)
+	{
+		char	   *name = psprintf("prolly_renamed_%d", k);
+
+		if (schema_of_table)
+		{
+			List	   *names = stringToQualifiedNameList(schema_of_table, NULL);
+
+			name = list_length(names) > 1 ?
+				quote_qualified_identifier(strVal(linitial(names)), name) :
+				pstrdup(quote_identifier(name));
+		}
+		if (!name_used(a, b, renames, table, name))
+			return name;
+	}
+}
+
+/*
+ * The renames that make the names of from's tables and columns (IdObject
+ * *) those of to's of the same identities, and move each out of the way of
+ * a name to gives an object of another identity.
+ */
+static List *
+identity_renames(List *from, List *to)
+{
+	List	   *renames = NIL;
+	ListCell   *lc;
+
+	foreach(lc, from)
+	{
+		IdObject   *f = lfirst(lc);
+		IdObject   *t = with_identity(to, f);
+		ListCell   *cc;
+
+		if (t == NULL)
+		{
+			if (named_object(to, f->name))
+				renames = lappend(renames,
+								  make_rename(f->name, NULL,
+											  out_of_the_way(from, to, renames, NULL, f->name)));
+			continue;
+		}
+		if (strcmp(f->name, t->name) != 0)
+			renames = lappend(renames, make_rename(f->name, NULL, t->name));
+		foreach(cc, f->columns)
+		{
+			IdObject   *fc = lfirst(cc);
+			IdObject   *tc = with_identity(t->columns, fc);
+
+			if (tc && strcmp(fc->name, tc->name) != 0)
+				renames = lappend(renames, make_rename(f->name, fc->name, tc->name));
+			else if (tc == NULL && named_object(t->columns, fc->name))
+				renames = lappend(renames,
+								  make_rename(f->name, fc->name,
+											  out_of_the_way(f->columns, t->columns,
+															 renames, f->name, NULL)));
+		}
+	}
+	return renames;
+}
+
+static List *
+folded_renames(const ProllyNodeRef *from, const ProllyValue *from_identity,
+			   const ProllyNodeRef *to, const ProllyValue *to_identity)
+{
+	return identity_renames(root_identities(from, from_identity),
+							root_identities(to, to_identity));
+}
+
+/* An object of a merge, as each of its three roots names it (NULL: not there). */
+typedef struct MergedObject
+{
+	IdObject	id;				/* its identity, and its merged name */
+	IdObject   *in[3];
+	List	   *columns;		/* (a table's) MergedObject * */
+} MergedObject;
+
+static MergedObject *
+merged_object(List **objs, const IdObject *o, int side)
+{
+	ListCell   *lc;
+	MergedObject *m;
+
+	foreach(lc, *objs)
+	{
+		m = lfirst(lc);
+		if (same_identity(&m->id, o))
+		{
+			m->in[side] = (IdObject *) o;
+			return m;
+		}
+	}
+	m = palloc0(sizeof(MergedObject));
+	m->id.origin = o->origin;
+	m->id.n = o->n;
+	m->id.known = true;
+	m->in[side] = (IdObject *) o;
+	*objs = lappend(*objs, m);
+	return m;
+}
+
+/*
+ * The name a merge gives an object (a column of table, if table isn't
+ * NULL): as the side that renamed it names it.
+ */
+static char *
+merged_name(MergedObject *m, const char *table)
+{
+	const char *b = m->in[0] ? m->in[0]->name : NULL;
+	const char *o = m->in[1] ? m->in[1]->name : NULL;
+	const char *t = m->in[2] ? m->in[2]->name : NULL;
+	const char *was = b ? b : m->id.origin;
+
+	if (o && t)
+	{
+		if (b && strcmp(o, b) == 0)
+			return pstrdup(t);
+		if (strcmp(o, t) == 0 || (b && strcmp(t, b) == 0))
+			return pstrdup(o);
+		if (table)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: column %s of %s is renamed %s on one side and %s on the other",
+							quote_identifier(was), table, quote_identifier(o),
+							quote_identifier(t))));
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("schema conflict: table %s is renamed %s on one side and %s on the other",
+						was, o, t)));
+	}
+	return pstrdup(o ? o : t ? t : b);
+}
+
+/*
+ * Does a merge keep the object: both sides have it, or one made it?  (One
+ * a side dropped goes, unless the other changed it: then the merge of its
+ * definitions fails.)
+ */
+static bool
+merge_keeps(const MergedObject *m)
+{
+	return (m->in[1] && m->in[2]) || (!m->in[0] && (m->in[1] || m->in[2]));
+}
+
+static bool
+merged_name_used(List *objs, const MergedObject *m, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		MergedObject *x = lfirst(lc);
+
+		if (x != m && x->id.name && strcmp(x->id.name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Refuse two objects a merge keeps (MergedObject *, columns of table if it
+ * isn't NULL) given one name; one it doesn't keep, named as another, is
+ * moved out of the way.
+ */
+static void
+settle_merged_names(List *objs, const char *table)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		MergedObject *m = lfirst(lc);
+
+		if (merge_keeps(m) && merged_name_used(objs, m, m->id.name))
+		{
+			ListCell   *oc;
+
+			foreach(oc, objs)
+			{
+				MergedObject *x = lfirst(oc);
+
+				if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 table ?
+							 errmsg("schema conflict: the merge would give two columns of %s the name %s",
+									table, quote_identifier(m->id.name)) :
+							 errmsg("schema conflict: the merge would give two tables the name %s",
+									m->id.name),
+							 errdetail("One side renamed one to the name, and the other has another of the name.")));
+			}
+		}
+	}
+	foreach(lc, objs)
+	{
+		MergedObject *m = lfirst(lc);
+
+		if (merge_keeps(m) || !merged_name_used(objs, m, m->id.name))
+			continue;
+		for (int k = 1;; k++)
+		{
+			char	   *name = psprintf("prolly_renamed_%d", k);
+
+			if (table == NULL)
+			{
+				List	   *names = stringToQualifiedNameList(m->id.name, NULL);
+
+				name = list_length(names) > 1 ?
+					quote_qualified_identifier(strVal(linitial(names)), name) :
+					pstrdup(quote_identifier(name));
+			}
+			if (!merged_name_used(objs, m, name))
+			{
+				m->id.name = name;
+				break;
+			}
+		}
+	}
+}
+
+static void
+folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
+					 List **renames, StringInfo identity)
+{
+	List	   *merged = NIL;
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	for (int i = 0; i < 3; i++)
+	{
+		foreach(lc, root_identities(&roots[i], &identities[i]))
+		{
+			IdObject   *t = lfirst(lc);
+			MergedObject *m = merged_object(&merged, t, i);
+			ListCell   *cc;
+
+			foreach(cc, t->columns)
+				(void) merged_object(&m->columns, lfirst(cc), i);
+		}
+		renames[i] = NIL;
+	}
+	foreach(lc, merged)
+	{
+		MergedObject *m = lfirst(lc);
+		ListCell   *cc;
+
+		m->id.name = merged_name(m, NULL);
+		foreach(cc, m->columns)
+		{
+			MergedObject *c = lfirst(cc);
+
+			c->id.name = merged_name(c, m->id.name);
+		}
+		settle_merged_names(m->columns, m->id.name);
+	}
+	settle_merged_names(merged, NULL);
+
+	/* each side's renames, and the merge's identities */
+	foreach(lc, merged)
+	{
+		MergedObject *m = lfirst(lc);
+		IdObject   *t = palloc0(sizeof(IdObject));
+		ListCell   *cc;
+
+		*t = m->id;
+		t->columns = NIL;
+		for (int i = 0; i < 3; i++)
+			if (m->in[i] && strcmp(m->in[i]->name, m->id.name) != 0)
+				renames[i] = lappend(renames[i],
+									 make_rename(m->in[i]->name, NULL, m->id.name));
+		foreach(cc, m->columns)
+		{
+			MergedObject *c = lfirst(cc);
+			IdObject   *col = palloc(sizeof(IdObject));
+
+			*col = c->id;
+			if (merge_keeps(c))
+				t->columns = lappend(t->columns, col);
+			for (int i = 0; i < 3; i++)
+				if (m->in[i] && c->in[i] && strcmp(c->in[i]->name, c->id.name) != 0)
+					renames[i] = lappend(renames[i],
+										 make_rename(m->in[i]->name, c->in[i]->name,
+													 c->id.name));
+		}
+		if (merge_keeps(m))
+			tables = lappend(tables, t);
+	}
+	identity_record(tables, identity);
+}
+
+/*
+ * A token of SQL as the deparser prints it, for renaming the tables and
+ * columns it names: an identifier (quoted or not, its name in value), a
+ * literal or anything else, copied as it is.
+ */
+typedef struct SqlToken
+{
+	int			start;
+	int			end;
+	bool		ident;
+	bool		quoted;
+	char	   *value;			/* (an identifier's name) */
+} SqlToken;
+
+/* The tokens of sql, in order. */
+static List *
+sql_tokens(const char *sql)
+{
+	List	   *tokens = NIL;
+	int			n = strlen(sql);
+	int			i = 0;
+
+	while (i < n)
+	{
+		SqlToken   *t = palloc0(sizeof(SqlToken));
+		unsigned char c = (unsigned char) sql[i];
+
+		t->start = i;
+		if (c == '\'' || ((c == 'E' || c == 'e') && sql[i + 1] == '\'' &&
+						  (i == 0 || !(isalnum((unsigned char) sql[i - 1]) ||
+									   sql[i - 1] == '_'))))
+		{
+			bool		escapes = c != '\'';
+
+			i += escapes ? 2 : 1;
+			while (i < n)
+			{
+				if (escapes && sql[i] == '\\' && i + 1 < n)
+					i += 2;
+				else if (sql[i] == '\'' && sql[i + 1] == '\'')
+					i += 2;
+				else if (sql[i] == '\'')
+				{
+					i++;
+					break;
+				}
+				else
+					i++;
+			}
+		}
+		else if (c == '$' && (sql[i + 1] == '$' || isalpha((unsigned char) sql[i + 1]) ||
+							  sql[i + 1] == '_'))
+		{
+			int			j = i + 1;
+			char	   *tag;
+			const char *close;
+
+			while (j < n && (isalnum((unsigned char) sql[j]) || sql[j] == '_'))
+				j++;
+			if (sql[j] != '$')
+				i = j;			/* (not a dollar quote) */
+			else
+			{
+				tag = pnstrdup(sql + i, j + 1 - i);
+				close = strstr(sql + j + 1, tag);
+				i = close ? (close - sql) + strlen(tag) : n;
+			}
+		}
+		else if (c == '"')
+		{
+			StringInfoData v;
+
+			initStringInfo(&v);
+			i++;
+			while (i < n)
+			{
+				if (sql[i] == '"' && sql[i + 1] == '"')
+				{
+					appendStringInfoChar(&v, '"');
+					i += 2;
+				}
+				else if (sql[i] == '"')
+				{
+					i++;
+					break;
+				}
+				else
+					appendStringInfoChar(&v, sql[i++]);
+			}
+			t->ident = true;
+			t->quoted = true;
+			t->value = v.data;
+		}
+		else if (isalpha(c) || c == '_' || c >= 0x80)
+		{
+			while (i < n && (isalnum((unsigned char) sql[i]) || sql[i] == '_' ||
+							 sql[i] == '$' || (unsigned char) sql[i] >= 0x80))
+				i++;
+			t->ident = true;
+			t->value = pnstrdup(sql + t->start, i - t->start);
+		}
+		else if (isdigit(c))
+		{
+			while (i < n && (isalnum((unsigned char) sql[i]) || sql[i] == '.' ||
+							 sql[i] == '_'))
+				i++;
+		}
+		else
+			i++;
+		t->end = i;
+		tokens = lappend(tokens, t);
+	}
+	return tokens;
+}
+
+/* Is token i of tokens (not an identifier) text? */
+static bool
+token_is(List *tokens, int i, const char *sql, const char *text)
+{
+	SqlToken   *t;
+
+	if (i < 0 || i >= list_length(tokens))
+		return false;
+	t = list_nth(tokens, i);
+	return !t->ident && t->end - t->start == (int) strlen(text) &&
+		strncmp(sql + t->start, text, t->end - t->start) == 0;
+}
+
+/* The next token after i that isn't blank, or -1. */
+static int
+next_token(List *tokens, int i, const char *sql)
+{
+	for (i++; i < list_length(tokens); i++)
+	{
+		SqlToken   *t = list_nth(tokens, i);
+
+		if (t->ident || !isspace((unsigned char) sql[t->start]))
+			return i;
+	}
+	return -1;
+}
+
+static int
+prev_token(List *tokens, int i, const char *sql)
+{
+	for (i--; i >= 0; i--)
+	{
+		SqlToken   *t = list_nth(tokens, i);
+
+		if (t->ident || !isspace((unsigned char) sql[t->start]))
+			return i;
+	}
+	return -1;
+}
+
+/* Is identifier token i an unquoted keyword among words? */
+static bool
+keyword_among(List *tokens, int i, const char *const *words)
+{
+	SqlToken   *t;
+
+	if (i < 0)
+		return false;
+	t = list_nth(tokens, i);
+	if (!t->ident || t->quoted)
+		return false;
+	for (; *words; words++)
+		if (pg_strcasecmp(t->value, *words) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * sql, a definition of table's (as a version names it: qualified,
+ * quoted) as the deparser printed it, with the tables and columns it names
+ * renamed as renames say, into out; false (out as sql) if none are.  A
+ * column is an unqualified name (or one qualified by NEW or OLD) that
+ * isn't a function's, a type's or an object's being named, table's, or,
+ * in a REFERENCES list, the referenced table's; a table is a name
+ * qualified by its schema.
+ */
+static bool
+rename_sql(const char *sql, const char *table, List *renames, StringInfo out)
+{
+	static const char *const named[] = {"INDEX", "CONSTRAINT", "TRIGGER", "RULE",
+	"POLICY", "STATISTICS", "COLLATE", "FUNCTION", "PROCEDURE", "TYPE", NULL};
+	static const char *const rows[] = {"NEW", "OLD", NULL};
+	static const char *const referencing[] = {"REFERENCES", NULL};
+	List	   *tokens = sql_tokens(sql);
+	const char *columns_of = table;
+	int			depth = 0;
+	int			referenced_depth = -1;
+	bool		changed = false;
+	int			at = 0;
+
+	for (int i = 0; i < list_length(tokens); i++)
+	{
+		SqlToken   *t = list_nth(tokens, i);
+		int			p;
+		int			nx;
+		const char *to = NULL;
+		int			last = i;
+
+		if (token_is(tokens, i, sql, "("))
+			depth++;
+		else if (token_is(tokens, i, sql, ")"))
+		{
+			if (--depth == referenced_depth)
+			{
+				columns_of = table;
+				referenced_depth = -1;
+			}
+		}
+		if (!t->ident)
+			continue;
+		p = prev_token(tokens, i, sql);
+		/* (a type after ::, an object's own name) */
+		if (token_is(tokens, p, sql, ":") || keyword_among(tokens, p, named))
+		{
+			while (token_is(tokens, last + 1, sql, ".") && last + 2 < list_length(tokens))
+				last += 2;
+			i = last;
+			continue;
+		}
+		if (token_is(tokens, i + 1, sql, ".") && i + 2 < list_length(tokens) &&
+			((SqlToken *) list_nth(tokens, i + 2))->ident)
+		{
+			SqlToken   *second = list_nth(tokens, i + 2);
+			char	   *qualified_name = quote_qualified_identifier(t->value,
+																	second->value);
+			bool		referenced = keyword_among(tokens, p, referencing);
+
+			last = i + 2;
+			if (keyword_among(tokens, i, rows))
+			{
+				to = renamed_to(renames, table, second->value);
+				if (to)
+				{
+					appendBinaryStringInfo(out, sql + at, second->start - at);
+					appendStringInfoString(out, quote_identifier(to));
+					at = second->end;
+					changed = true;
+				}
+				i = last;
+				continue;
+			}
+			to = renamed_to(renames, qualified_name, NULL);
+			if (referenced)
+			{
+				columns_of = pstrdup(qualified_name);
+				referenced_depth = depth;
+			}
+			if (to)
+			{
+				appendBinaryStringInfo(out, sql + at, t->start - at);
+				appendStringInfoString(out, to);
+				at = second->end;
+				changed = true;
+			}
+			/* (schema.table.column) */
+			if (token_is(tokens, i + 3, sql, ".") && i + 4 < list_length(tokens) &&
+				((SqlToken *) list_nth(tokens, i + 4))->ident)
+			{
+				SqlToken   *third = list_nth(tokens, i + 4);
+				const char *col = renamed_to(renames, qualified_name, third->value);
+
+				last = i + 4;
+				if (col)
+				{
+					appendBinaryStringInfo(out, sql + at, third->start - at);
+					appendStringInfoString(out, quote_identifier(col));
+					at = third->end;
+					changed = true;
+				}
+			}
+			i = last;
+			continue;
+		}
+		nx = next_token(tokens, i, sql);
+		/* (a function's name, or a name qualifying another) */
+		if (token_is(tokens, nx, sql, "(") || token_is(tokens, i + 1, sql, "."))
+			continue;
+		to = renamed_to(renames, columns_of, t->value);
+		if (to)
+		{
+			appendBinaryStringInfo(out, sql + at, t->start - at);
+			appendStringInfoString(out, quote_identifier(to));
+			at = t->end;
+			changed = true;
+		}
+	}
+	appendStringInfoString(out, sql + at);
+	return changed;
+}
+
+/*
+ * A field of a description (escaped, UTF-8) with what it names renamed
+ * (rename_sql()), appended to out.
+ */
+static void
+append_renamed_field(StringInfo out, const char *field, const char *table,
+					 List *renames)
+{
+	StringInfoData sql;
+
+	initStringInfo(&sql);
+	if (rename_sql(identity_field(field), table, renames, &sql))
+		append_field(out, sql.data);
+	else
+		appendStringInfoString(out, field);
+	pfree(sql.data);
+}
+
+/*
+ * A table's description (UTF-8, as its item holds it) with the tables and
+ * columns it names renamed as renames say (table its own name, as its
+ * root has it), into out: its columns' names, and what its definitions
+ * name (rename_sql()), as Postgres would print them had the renames been
+ * made, so that one side's renamed definitions merge with the other's.
+ * An object's own name (a constraint's, a statistic's) is left as it is,
+ * as are options.
+ */
+static void
+rename_columns(const char *desc, int len, const char *table, List *renames,
+			   StringInfo out)
+{
+	char	   *copy = pnstrdup(desc, len);
+	char	   *line;
+	char	   *next;
+	const char *section = NULL;
+
+	for (line = copy; line && *line; line = next)
+	{
+		bool		header = false;
+		char	   *field;
+		char	   *tab;
+		int			nfield = 0;
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
+			if (strcmp(line, table_sections[s]) == 0)
+			{
+				section = table_sections[s];
+				header = true;
+			}
+		if (header || section == NULL || strcmp(section, "options") == 0)
+			appendStringInfoString(out, line);
+		else if (strcmp(section, "local") == 0 && strncmp(line, "column ", 7) == 0)
+		{
+			const char *to = renamed_to(renames, table,
+										unquoted(identity_field(line + 7)));
+
+			appendStringInfoString(out, "column ");
+			if (to)
+				append_field(out, quote_identifier(to));
+			else
+				appendStringInfoString(out, line + 7);
+		}
+		else
+			for (field = line; field; field = tab, nfield++)
+			{
+				tab = strchr(field, '\t');
+				if (tab)
+					*tab++ = '\0';
+				if (nfield > 0)
+					appendStringInfoChar(out, '\t');
+				if (nfield == 0 && strcmp(section, "columns") == 0)
+				{
+					const char *to = renamed_to(renames, table,
+												unquoted(identity_field(field)));
+
+					if (to)
+						append_field(out, quote_identifier(to));
+					else
+						appendStringInfoString(out, field);
+				}
+				else if (nfield == 0 && (strcmp(section, "constraints") == 0 ||
+										 strcmp(section, "statistics") == 0))
+					appendStringInfoString(out, field);
+				else
+					append_renamed_field(out, field, table, renames);
+			}
+		if (next)
+			appendStringInfoChar(out, '\n');
+	}
+}
+
+static void
+folded_rename_description(const ProllyValue *description, const char *table,
+						  List *renames, StringInfo out)
+{
+	rename_columns((const char *) description->data, description->len, table,
+				   renames, out);
+}
+
+static void
+folded_rename_root(const ProllyNodeRef *root, List *renames, ProllyNodeRef *out)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *items = NIL;
+	ProllyTreeBuilder *b;
+	ListCell   *lc;
+	int			olen = strlen(ORDERING_PREFIX);
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		CanonItem  *it = palloc(sizeof(CanonItem));
+
+		initStringInfo(&it->key);
+		initStringInfo(&it->value);
+		if (k.len >= 2 && memcmp(k.data, "t:", 2) == 0)
+		{
+			char	   *name = from_utf8(k.data + 2, k.len - 2);
+			const char *to = renamed_to(renames, name, NULL);
+			ProllyNodeRef data;
+			ProllyValue def;
+
+			appendStringInfoString(&it->key, "t:");
+			append_utf8(&it->key, to ? to : name);
+			(void) tree_item(&k, &v, &data, &def);
+			put_hash(&it->value, &data.hash);
+			rename_columns((const char *) def.data, def.len, name, renames,
+						   &it->value);
+		}
+		else if (k.len > olen && memcmp(k.data, ORDERING_PREFIX, olen) == 0)
+		{
+			char	   *name = from_utf8(k.data + olen, k.len - olen);
+			const char *to = renamed_to(renames, name, NULL);
+
+			appendStringInfoString(&it->key, ORDERING_PREFIX);
+			append_utf8(&it->key, to ? to : name);
+			appendBinaryStringInfo(&it->value, (const char *) v.data, v.len);
+		}
+		else
+		{
+			appendBinaryStringInfo(&it->key, (const char *) k.data, k.len);
+			appendBinaryStringInfo(&it->value, (const char *) v.data, v.len);
+		}
+		items = lappend(items, it);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	list_sort(items, item_cmp);
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.root_env, CurrentMemoryContext);
+	foreach(lc, items)
+	{
+		CanonItem  *it = lfirst(lc);
+		ProllyKey	ik = {(const uint8 *) it->key.data, it->key.len};
+		ProllyValue iv = {(const uint8 *) it->value.data, it->value.len};
+
+		PROLLY_CALL(cn.tree, build_add, b, &ik, &iv);
+	}
+	PROLLY_CALL(cn.tree, build_finish, b, out);
+}
+
+/* A table of the session branch's, by its qualified name. */
+static Oid
+renamed_relid(const char *name)
+{
+	return RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							AccessExclusiveLock, false);
+}
+
+/*
+ * Rename the session branch's tables and columns as renames say, each
+ * first to a name of its own, so names swapped or passed along don't
+ * collide on the way: columns, by their tables' names before, then tables.
+ */
+static void
+folded_rename_objects(List *renames)
+{
+	List	   *first = NIL;
+	List	   *then = NIL;
+	ListCell   *lc;
+	int			save_nestlevel;
+	int			k = 0;
+
+	if (renames == NIL)
+		return;
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		Oid			relid = renamed_relid(r->table);
+		char	   *table = qualified(get_rel_namespace(relid), get_rel_name(relid));
+		char	   *step;
+
+		if (r->column == NULL)
+			continue;
+		do
+			step = psprintf("prolly_renaming_%d", ++k);
+		while (get_attnum(relid, step) != InvalidAttrNumber);
+		first = lappend(first, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+										table, quote_identifier(r->column),
+										quote_identifier(step)));
+		then = lappend(then, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+									  table, quote_identifier(step),
+									  quote_identifier(r->to)));
+	}
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		Oid			relid;
+		Oid			nsp;
+		List	   *to;
+		char	   *schema;
+		char	   *step;
+
+		if (r->column != NULL)
+			continue;
+		relid = renamed_relid(r->table);
+		nsp = get_rel_namespace(relid);
+		to = stringToQualifiedNameList(r->to, NULL);
+		schema = list_length(to) > 1 ? strVal(linitial(to)) : get_namespace_name(nsp);
+		do
+			step = psprintf("prolly_renaming_%d", ++k);
+		while (OidIsValid(get_relname_relid(step, nsp)) ||
+			   OidIsValid(get_relname_relid(step, get_namespace_oid(schema, false))));
+		first = lappend(first, psprintf("ALTER TABLE %s RENAME TO %s",
+										qualified(nsp, get_rel_name(relid)),
+										quote_identifier(step)));
+		if (strcmp(schema, get_namespace_name(nsp)) != 0)
+			then = lappend(then, psprintf("ALTER TABLE %s SET SCHEMA %s",
+										  qualified(nsp, step),
+										  quote_identifier(schema)));
+		then = lappend(then, psprintf("ALTER TABLE %s RENAME TO %s",
+									  quote_qualified_identifier(schema, step),
+									  quote_identifier(strVal(llast(to)))));
+	}
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	run_statements(first);
+	run_statements(then);
+	SPI_finish();
+	AtEOXact_GUC(true, save_nestlevel);
+	CommandCounterIncrement();
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -11602,6 +13657,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.render = folded_render,
 	.move_schema = folded_move_schema,
 	.make_versioned_schemas = folded_make_versioned_schemas,
+	.pending_full = folded_pending_full,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,
 	.dependencies = folded_dependencies,
@@ -11611,4 +13667,10 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.type_definitions = folded_type_definitions,
 	.in_format = folded_in_format,
 	.format = folded_format,
+	.identify = folded_identify,
+	.renames = folded_renames,
+	.merge_renames = folded_merge_renames,
+	.rename_description = folded_rename_description,
+	.rename_root = folded_rename_root,
+	.rename_objects = folded_rename_objects,
 };

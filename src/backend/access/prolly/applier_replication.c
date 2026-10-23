@@ -89,8 +89,8 @@ struct ProllyApplier
 	bool		failed;			/* a load's end raised: unusable */
 	int			load_level;		/* the nest level of the transaction
 								 * loading */
-	uint64		load_rows;		/* rows the load wrote, its builds' entries
-								 * counted once they are made */
+	uint64		load_entries;	/* index entries the load's builds make for
+								 * the rows written, counted once made */
 	ResourceOwner owner;		/* begin()'s: the indexes open under it */
 	BulkInsertState bistate;	/* insert_many()'s (no pin held between) */
 	/* without a key or match_index: its rows by the hash of their values */
@@ -601,9 +601,9 @@ find_row(ProllyApplier *a, TupleTableSlot *old)
 
 /*
  * The heap-only updates heap has counted for the table so far, or -1 when
- * it counts none (track_counts off): the index entries an update made are
- * none for a heap-only one, else one per index, which apply_index_tuples
- * counts.  (Without heap's count every update counts its indexes.)
+ * it counts none (track_counts off): a heap-only update makes entries in
+ * summarizing indexes only.  (Without heap's count an update counts as
+ * one that isn't.)
  */
 static PgStat_Counter
 hot_updates(Relation rel)
@@ -613,14 +613,46 @@ hot_updates(Relation rel)
 	return rel->pgstat_info->tab.counts_xact.tuples_hot_updated;
 }
 
-/* Count n rows applied, each with an entry in every index. */
-static void
-count_applied(ProllyApplier *a, uint64 n, bool indexed)
+/*
+ * The index entries a write of row makes, as ExecInsertIndexTuples() and
+ * an index build make them: one in each index ready for inserts whose
+ * predicate the row meets, or, for a heap-only update (only_summarizing),
+ * in each such summarizing index.  apply_index_tuples counts them.
+ */
+static uint64
+index_entries(ProllyApplier *a, TupleTableSlot *row, bool only_summarizing)
 {
-	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS, n);
-	if (indexed)
-		pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES,
-							n * a->rri->ri_NumIndices);
+	ResultRelInfo *rri = a->rri;
+	ExprContext *econtext = GetPerTupleExprContext(a->estate);
+	uint64		n = 0;
+
+	econtext->ecxt_scantuple = row;
+	for (int i = 0; i < rri->ri_NumIndices; i++)
+	{
+		IndexInfo  *ii = rri->ri_IndexRelationInfo[i];
+
+		if (rri->ri_IndexRelationDescs[i] == NULL || !ii->ii_ReadyForInserts ||
+			(only_summarizing && !ii->ii_Summarizing))
+			continue;
+		if (ii->ii_Predicate != NIL)
+		{
+			/* (prepared as the executor prepares it, in the query's memory) */
+			if (ii->ii_PredicateState == NULL)
+				ii->ii_PredicateState = ExecPrepareQual(ii->ii_Predicate, a->estate);
+			if (!ExecQual(ii->ii_PredicateState, econtext))
+				continue;
+		}
+		n++;
+	}
+	return n;
+}
+
+/* Count a row applied, and the index entries its write made. */
+static void
+count_applied(uint64 entries)
+{
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS, 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES, entries);
 }
 
 /*
@@ -774,10 +806,8 @@ load_end(ProllyApplier *a)
 	CurrentResourceOwner = owner;
 	a->failed = false;
 	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_LOADS, 1);
-	/* (the builds made an entry in each index for each row loaded) */
-	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES,
-						a->load_rows * a->rri->ri_NumIndices);
-	a->load_rows = 0;
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES, a->load_entries);
+	a->load_entries = 0;
 }
 
 /*
@@ -809,7 +839,7 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 		prolly_writing_held_rows(held);
 	}
 	PG_END_TRY();
-	count_applied(a, 1, true);
+	count_applied(index_entries(a, row, false));
 	if (a->rows)
 		rows_add(a, row);
 	advance(a);
@@ -876,6 +906,12 @@ replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
 												NIL, NULL);
 			ExecARInsertTriggers(a->estate, a->rri, rows[i], recheck, NULL);
 			list_free(recheck);
+			/* (a load's entries are made by its builds, at its end) */
+			if (a->loading)
+				a->load_entries += index_entries(a, rows[i], false);
+			else
+				pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES,
+									index_entries(a, rows[i], false));
 			if (a->rows)
 				rows_add(a, rows[i]);
 		}
@@ -888,9 +924,7 @@ replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
 	PG_END_TRY();
 	ResetPerTupleExprContext(a->estate);
 	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS_BATCHED, n);
-	count_applied(a, n, !a->loading);
-	if (a->loading)
-		a->load_rows += n;
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS, n);
 	INJECTION_POINT("prolly-insert-many", NULL);
 	advance(a);
 }
@@ -1045,8 +1079,9 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 	}
 	PG_END_TRY();
 	prolly_writing_held_rows(held);
-	/* (a heap-only update made no index entries; a view's insert did) */
-	count_applied(a, 1, a->matview || hot < 0 || hot_updates(a->rel) == hot);
+	/* (a heap-only update made entries in summarizing indexes alone) */
+	count_applied(index_entries(a, row, !a->matview && hot >= 0 &&
+								hot_updates(a->rel) != hot));
 	if (a->rows)
 		rows_add(a, row);
 	advance(a);
@@ -1075,7 +1110,7 @@ replication_remove(ProllyApplier *a, TupleTableSlot *old)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	count_applied(a, 1, false);
+	count_applied(0);
 	advance(a);
 	return true;
 }
