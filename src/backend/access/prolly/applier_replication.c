@@ -89,6 +89,8 @@ struct ProllyApplier
 	bool		failed;			/* a load's end raised: unusable */
 	int			load_level;		/* the nest level of the transaction
 								 * loading */
+	uint64		load_rows;		/* rows the load wrote, its builds' entries
+								 * counted once they are made */
 	ResourceOwner owner;		/* begin()'s: the indexes open under it */
 	BulkInsertState bistate;	/* insert_many()'s (no pin held between) */
 	/* without a key or match_index: its rows by the hash of their values */
@@ -598,6 +600,30 @@ find_row(ProllyApplier *a, TupleTableSlot *old)
 }
 
 /*
+ * The heap-only updates heap has counted for the table so far, or -1 when
+ * it counts none (track_counts off): the index entries an update made are
+ * none for a heap-only one, else one per index, which apply_index_tuples
+ * counts.  (Without heap's count every update counts its indexes.)
+ */
+static PgStat_Counter
+hot_updates(Relation rel)
+{
+	if (!pgstat_should_count_relation(rel))
+		return -1;
+	return rel->pgstat_info->tab.counts_xact.tuples_hot_updated;
+}
+
+/* Count n rows applied, each with an entry in every index. */
+static void
+count_applied(ProllyApplier *a, uint64 n, bool indexed)
+{
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS, n);
+	if (indexed)
+		pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES,
+							n * a->rri->ri_NumIndices);
+}
+
+/*
  * A materialized view's rows, as a refresh writes them: no constraints or
  * triggers to check (it has none), its indexes maintained.  (The
  * executor's simple-relation routines take tables only.)
@@ -748,6 +774,10 @@ load_end(ProllyApplier *a)
 	CurrentResourceOwner = owner;
 	a->failed = false;
 	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_LOADS, 1);
+	/* (the builds made an entry in each index for each row loaded) */
+	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_INDEX_TUPLES,
+						a->load_rows * a->rri->ri_NumIndices);
+	a->load_rows = 0;
 }
 
 /*
@@ -779,6 +809,7 @@ replication_insert(ProllyApplier *a, TupleTableSlot *row)
 		prolly_writing_held_rows(held);
 	}
 	PG_END_TRY();
+	count_applied(a, 1, true);
 	if (a->rows)
 		rows_add(a, row);
 	advance(a);
@@ -857,6 +888,9 @@ replication_insert_many(ProllyApplier *a, TupleTableSlot **rows, int n)
 	PG_END_TRY();
 	ResetPerTupleExprContext(a->estate);
 	pgstat_count_prolly(PGSTAT_PROLLY_APPLY_ROWS_BATCHED, n);
+	count_applied(a, n, !a->loading);
+	if (a->loading)
+		a->load_rows += n;
 	INJECTION_POINT("prolly-insert-many", NULL);
 	advance(a);
 }
@@ -966,6 +1000,7 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 {
 	bool		keeping = false;
 	bool		held;
+	PgStat_Counter hot;
 
 	load_end(a);
 	for (int i = 0; keep && i < RelationGetDescr(a->rel)->natts; i++)
@@ -983,6 +1018,7 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 		return false;
 	}
 	/* (its key the row found's, which a tree held: see replication_insert) */
+	hot = hot_updates(a->rel);
 	held = prolly_writing_held_rows(true);
 	PG_TRY();
 	{
@@ -1009,6 +1045,8 @@ replication_update(ProllyApplier *a, TupleTableSlot *old, TupleTableSlot *row,
 	}
 	PG_END_TRY();
 	prolly_writing_held_rows(held);
+	/* (a heap-only update made no index entries; a view's insert did) */
+	count_applied(a, 1, a->matview || hot < 0 || hot_updates(a->rel) == hot);
 	if (a->rows)
 		rows_add(a, row);
 	advance(a);
@@ -1037,6 +1075,7 @@ replication_remove(ProllyApplier *a, TupleTableSlot *old)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	count_applied(a, 1, false);
 	advance(a);
 	return true;
 }

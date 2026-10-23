@@ -254,6 +254,19 @@ src/tools/prolly_bench/prolly_bench run S --am heap,prolly --config src/tools/pr
 src/tools/prolly_bench/prolly_bench scounters A/*-S-prolly B/*-S-prolly   # which counters differ
 ```
 
+`pg_stat_prolly` (documented with the other statistics views) also counts
+what moving between branches does to storage, so a move's cost can be
+told apart: map work, rows written back, and catalog work.
+
+| Counter | Counts |
+|---|---|
+| `bmap_map_pages_copied` | block-map pages a share copied (a branch's first use shares every relation's blocks) |
+| `bmap_refcount_updates` | page-store blocks' reference counts set: shares, drops, copies on write, truncations, sweeps |
+| `bmap_blocks_freed` | page-store blocks given back to the allocator |
+| `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
+| `apply_index_tuples` | index entries those writes made: one per index for each row inserted or updated other than heap-only, and a load's index builds' |
+| `catalog_rows_copied` | catalog rows a branch's copies were made of (first use) |
+
 S7's counters vary a little: GiST breaks ties between pages at random.
 Without hardware counters, `configs/s_cachegrind.toml` counts instructions
 with the server under Cachegrind (the `cachegrind` cluster and collector),

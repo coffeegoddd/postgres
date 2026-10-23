@@ -2281,6 +2281,7 @@ free_blocks(RelFileLocator rel, BlockNumber *blocks, uint32 n)
 			pfree(bits[k].delta);
 		}
 		UnlockReleaseBuffer(metabuf);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_BLOCKS_FREED, freed);
 	}
 
 	/* (what a scan found in them no longer holds) */
@@ -2369,6 +2370,7 @@ refs_set(RefsPages *rp, BlockNumber phys, uint8 count)
 	ref[delta->nrefs].slot = REF_SLOT(phys);
 	ref[delta->nrefs].count = count;
 	delta->nrefs++;
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_REFCOUNT_UPDATES, 1);
 }
 
 /*
@@ -3973,6 +3975,7 @@ share_map_page(SMgrRelation src, SMgrRelation dst, BlockNumber mapblk,
 	ReleaseBuffer(mapbuf);
 	pfree(items);
 	pfree(phys);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED, 1);
 }
 
 /*
@@ -4356,6 +4359,7 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			ref = (xl_bmap_ref_delta *) (rdelta + 1);
 			ref->slot = REF_SLOT(old_block);
 			ref->count = count - 1;
+			pgstat_count_prolly(PGSTAT_PROLLY_BMAP_REFCOUNT_UPDATES, 1);
 		}
 
 		/* the list's pages are read before the map page is locked */
