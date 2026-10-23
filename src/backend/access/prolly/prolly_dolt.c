@@ -2306,11 +2306,32 @@ raw_query_writes(Node *node, void *context)
 	if (IsA(node, InsertStmt) || IsA(node, UpdateStmt) ||
 		IsA(node, DeleteStmt) || IsA(node, MergeStmt))
 		return true;
-	if (IsA(node, ExplainStmt))
-		return raw_query_writes(((ExplainStmt *) node)->query, context);
-	if (IsA(node, CreateTableAsStmt))
-		return raw_query_writes(((CreateTableAsStmt *) node)->query, context);
 	return raw_expression_tree_walker(node, raw_query_writes, context);
+}
+
+/* Utility wrappers may contain other utility nodes, not raw expressions. */
+static bool
+raw_statement_writes(Node *stmt)
+{
+	if (stmt == NULL)
+		return false;
+	switch (nodeTag(stmt))
+	{
+		case T_InsertStmt:
+		case T_UpdateStmt:
+		case T_DeleteStmt:
+		case T_MergeStmt:
+			return true;
+		case T_SelectStmt:
+			return raw_query_writes(stmt, NULL);
+		case T_ExplainStmt:
+			return raw_statement_writes(((ExplainStmt *) stmt)->query);
+		case T_CreateTableAsStmt:
+			return raw_statement_writes(((CreateTableAsStmt *) stmt)->query);
+		default:
+			/* EXECUTE and other utilities are handled by ProcessUtility. */
+			return false;
+	}
 }
 
 /*
@@ -2332,11 +2353,7 @@ prolly_prepare_writer_statement(Node *stmt)
 	bool		same;
 
 	if (statement_depth != 0 || preparing || stmt == NULL ||
-		!IsTransactionState() ||
-		!(IsA(stmt, SelectStmt) || IsA(stmt, InsertStmt) ||
-		  IsA(stmt, UpdateStmt) || IsA(stmt, DeleteStmt) || IsA(stmt, MergeStmt) ||
-		  IsA(stmt, ExplainStmt) || IsA(stmt, CreateTableAsStmt)) ||
-		!raw_query_writes(stmt, NULL))
+		!IsTransactionState() || !raw_statement_writes(stmt))
 		return;
 
 	preparing = true;
