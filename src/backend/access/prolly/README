@@ -260,6 +260,22 @@ space: it counts against temp_file_limit and is reported by log_temp_files.
 Earlier schema conversion and uncertainty buffers are separate and can still
 grow with table size; this does not bound the entire merge's memory.
 
+A commit, a checkpoint and a fold of a transaction's own rows change
+only their branch's refs (its head, baseline, the names of its head's
+tables, its merge state and violations).  Every change of a branch's refs
+is made holding that branch's lock to transaction end, and they take
+only that, so commits on different branches run together while those on
+one branch take turns.  Anything else that changes the refs (a branch
+made, deleted or renamed, a reset, a merge, a push) holds the session
+branch's lock (and any branch's it changes), then moves the store's root
+with its transaction, as all of them did before: other such movers wait
+for it.  A branch's holder makes its changes in a refs tree of its own,
+rebuilt on the store's root when another's commit moved it, and moves the
+root there as it commits, waiting then for a mover holding it; one that
+comes to change other refs moves the root from then on.  So an operation
+reading another branch's head (a branch made from it, a merge of it)
+reads the head as last committed, not a commit still open there.
+
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the

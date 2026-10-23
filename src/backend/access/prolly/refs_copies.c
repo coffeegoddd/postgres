@@ -84,6 +84,19 @@
  * turns, each builds on the last, and an aborted transaction's changes are
  * gone.
  *
+ * Every change of a branch's own entries (its head, its baseline, the
+ * names its head's tables had, its merge state and violations) is made
+ * holding that branch's lock (lock_branch()) to transaction end, and a
+ * transaction that moves the root holds the session's branch's too,
+ * taken first.  A commit (or a checkpoint) changes only its branch's
+ * entries, and holds only its lock: so commits on different branches run
+ * together, while those on one branch take turns.  Its changes are made
+ * to a tree of its own, built on the root as it last read it and rebuilt
+ * on the root whenever another's commit moved it, and the store's root is
+ * moved there only as the transaction commits, waiting then for a mover
+ * holding it.  Such a transaction that comes to change another entry
+ * moves the root from then on, its changes moved there at once.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/refs_copies.c
  *
@@ -119,10 +132,12 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_branch_d.h"
 #include "catalog/pg_class.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "refs_generations.h"
 #include "storage/bufmgr.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -149,7 +164,39 @@
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
 #define TAG_STASH		'Z'	/* a list of stashes, by name */
 
+/*
+ * A branch's own lock (an object lock in the database, of this class, by a
+ * hash of the branch's name: two names sharing one only take turns), held
+ * by whoever changes the branch's entries, to transaction end.
+ */
+#define BRANCH_LOCK_CLASSID	((Oid) 0x50524642)
+
 static bool ready = false;
+
+/*
+ * A transaction holding single branches: whether it has changes to them
+ * not yet on the store's root (scoped), the tree they are in (mine), and
+ * the root that tree was built on (base).  The changes are moved to the
+ * root as the transaction commits (published, from then until it ends:
+ * anything changed later is moved to the root at once).  Each
+ * subtransaction that changes them saves them first (ScopedSave), so its
+ * abort restores them.
+ */
+typedef struct ScopedSave
+{
+	int			level;
+	bool		scoped;
+	bool		whole;
+	ProllyHash	base;
+	ProllyHash	mine;
+} ScopedSave;
+
+static bool scoped = false;
+static bool whole = false;		/* the transaction holds every ref */
+static ProllyHash scoped_base;
+static ProllyHash scoped_mine;
+static bool published = false;
+static List *scoped_saved = NIL;	/* ScopedSave *, innermost last */
 
 /*
  * The branches whose merge states the transaction set (names, in
@@ -159,6 +206,9 @@ static bool ready = false;
 static List *merge_changed = NIL;
 
 static void refs_xact_callback(XactEvent event, void *arg);
+static void refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+								  SubTransactionId parentSubid, void *arg);
+static void publish_scoped(void);
 static bool merge_state_of(const char *branch, ProllyMergeState *state);
 static void merge_tables_left(const char *branch, ProllyMergeState *state,
 							  char **name);
@@ -300,6 +350,7 @@ refs_init(void)
 	env.chunk_refs = refs_chunk_refs;
 	commit_env.chunk_refs = commit_chunk_refs;
 	RegisterXactCallback(refs_xact_callback, NULL);
+	RegisterSubXactCallback(refs_subxact_callback, NULL);
 	ready = true;
 }
 
@@ -474,16 +525,24 @@ refs_xact_callback(XactEvent event, void *arg)
 			check_merge_conflicts("commit");
 			if (prolly_refs_end_hook)
 				prolly_refs_end_hook(false);
+			publish_scoped();
+			published = true;
 			break;
 		case XACT_EVENT_PRE_PREPARE:
 			check_merge_conflicts("prepare");
 			if (prolly_refs_end_hook)
 				prolly_refs_end_hook(true);
+			publish_scoped();
+			published = true;
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PREPARE:
 			merge_changed = NIL;
+			scoped = false;
+			whole = false;
+			published = false;
+			scoped_saved = NIL;
 			break;
 		default:
 			break;
@@ -529,6 +588,164 @@ same_hash(const ProllyHash *a, const ProllyHash *b)
  * ------------------------------------------------------------------------
  */
 
+/* Save the scoped changes for the subtransaction, before changing them. */
+static void
+scoped_save(void)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	ScopedSave *save;
+	MemoryContext old;
+
+	if (level <= 1 ||
+		(scoped_saved != NIL && ((ScopedSave *) llast(scoped_saved))->level >= level))
+		return;
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	save = palloc(sizeof(ScopedSave));
+	save->level = level;
+	save->scoped = scoped;
+	save->whole = whole;
+	save->base = scoped_base;
+	save->mine = scoped_mine;
+	scoped_saved = lappend(scoped_saved, save);
+	MemoryContextSwitchTo(old);
+}
+
+static void
+refs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					  SubTransactionId parentSubid, void *arg)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	ScopedSave *last;
+
+	if (scoped_saved == NIL)
+		return;
+	last = llast(scoped_saved);
+	if (last->level < level)
+		return;
+	Assert(last->level == level);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		scoped = last->scoped;
+		whole = last->whole;
+		scoped_base = last->base;
+		scoped_mine = last->mine;
+		scoped_saved = list_delete_last(scoped_saved);
+	}
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		/* the parent's saved state, if it has one, is the older */
+		if (level - 1 <= 1 ||
+			(list_length(scoped_saved) > 1 &&
+			 ((ScopedSave *) list_nth(scoped_saved,
+									  list_length(scoped_saved) - 2))->level == level - 1))
+			scoped_saved = list_delete_last(scoped_saved);
+		else
+			last->level = level - 1;
+	}
+}
+
+typedef struct ScopedEdits
+{
+	ProllyEdit *edits;
+	int			n;
+	int			max;
+} ScopedEdits;
+
+static void
+collect_edit(ProllyDiffKind kind, const ProllyKey *key,
+			 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	ScopedEdits *se = arg;
+	ProllyEdit *e;
+	uint8	   *k;
+
+	if (se->n == se->max)
+	{
+		se->max = Max(8, se->max * 2);
+		se->edits = se->edits ? repalloc_array(se->edits, ProllyEdit, se->max) :
+			palloc_array(ProllyEdit, se->max);
+	}
+	e = &se->edits[se->n++];
+	k = palloc(Max(key->len, 1));
+	memcpy(k, key->data, key->len);
+	e->key.data = k;
+	e->key.len = key->len;
+	e->is_delete = (after == NULL);
+	e->value.data = NULL;
+	e->value.len = 0;
+	if (after)
+	{
+		uint8	   *v = palloc(Max(after->len, 1));
+
+		memcpy(v, after->data, after->len);
+		e->value.data = v;
+		e->value.len = after->len;
+	}
+}
+
+/*
+ * The scoped changes, rebuilt on cur (the store's root now) if another's
+ * commit moved it since they were built: the entries they changed are the
+ * transaction's branches', which no one else changes meanwhile.
+ */
+static void
+rebase_scoped(const ProllyHash *cur)
+{
+	ScopedEdits se = {NULL, 0, 0};
+	ProllyNodeRef from;
+	ProllyNodeRef to;
+	ProllyNodeRef onto;
+	ProllyNodeRef next;
+
+	if (same_hash(cur, &scoped_base))
+		return;
+	scoped_save();
+	ref_of(&scoped_base, &from);
+	ref_of(&scoped_mine, &to);
+	PROLLY_CALL(tree, diff, &env, &from, &to, collect_edit, &se);
+	if (se.n == 0)
+		scoped_mine = *cur;
+	else
+	{
+		ref_of(cur, &onto);
+		PROLLY_CALL(tree, apply, &env, &onto, se.edits, se.n, &next);
+		scoped_mine = next.hash;
+	}
+	scoped_base = *cur;
+	for (int i = 0; i < se.n; i++)
+	{
+		pfree(unconstify(uint8 *, se.edits[i].key.data));
+		if (se.edits[i].value.data)
+			pfree(unconstify(uint8 *, se.edits[i].value.data));
+	}
+	if (se.edits)
+		pfree(se.edits);
+}
+
+/*
+ * Move the store's root to the scoped changes, with the transaction (as it
+ * commits, or as it comes to hold every ref): waiting only for another
+ * moving it so.
+ */
+static void
+publish_scoped(void)
+{
+	if (!scoped)
+		return;
+	scoped_save();
+	for (;;)
+	{
+		ProllyHash	cur;
+
+		PROLLY_CALL(env.chunk_store, root, env.chunks, &cur);
+		rebase_scoped(&cur);
+		if (PROLLY_CALL(env.chunk_store, move_root, env.chunks, &cur,
+						&scoped_mine))
+			break;
+	}
+	scoped = false;
+}
+
 /* The refs tree's root, as the transaction sees it; false if none yet. */
 static bool
 refs_root(ProllyNodeRef *root)
@@ -537,22 +754,89 @@ refs_root(ProllyNodeRef *root)
 
 	refs_init();
 	PROLLY_CALL(env.chunk_store, root, env.chunks, &h);
+	if (scoped)
+	{
+		rebase_scoped(&h);
+		h = scoped_mine;
+	}
 	if (h.len == 0)
 		return false;
 	ref_of(&h, root);
 	return true;
 }
 
+static void
+branch_lock_tag(LOCKTAG *tag, const char *name, int len)
+{
+	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, BRANCH_LOCK_CLASSID,
+					   hash_bytes((const unsigned char *) name, len), 0);
+}
+
+/* Does the transaction hold the lock of the branch named (len bytes)? */
+static bool
+branch_held(const char *name, int len)
+{
+	LOCKTAG		tag;
+
+	branch_lock_tag(&tag, name, len);
+	return LockHeldByMe(&tag, ExclusiveLock, false);
+}
+
 /*
- * Hold the refs until the transaction ends: move the root to itself (or,
- * in a new store, to an empty refs tree).  A mover that comes first is
- * waited for, and then built on.  (Holding them already, this moves the
- * root to itself again, which the transaction's move already is.)
+ * Hold branch name's refs until the transaction ends, for changing its
+ * entries: other holders of name are waited for, and wait for it, but
+ * holders of other branches don't.
+ */
+static void
+lock_branch(const char *name)
+{
+	LOCKTAG		tag;
+
+	refs_init();
+	PreventCommandIfReadOnly("moving a chunk store's root");
+	branch_lock_tag(&tag, name, strlen(name));
+	(void) LockAcquire(&tag, ExclusiveLock, false, false);
+}
+
+/*
+ * lock_branch(), if no one holds the branch now (never waiting): false,
+ * nothing held, if someone does.  With hold false, only whether it is
+ * free is told, nothing being kept.
+ */
+static bool
+try_lock_branch(const char *name, bool hold)
+{
+	LOCKTAG		tag;
+
+	refs_init();
+	branch_lock_tag(&tag, name, strlen(name));
+	if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+	if (!hold)
+		LockRelease(&tag, ExclusiveLock, false);
+	return true;
+}
+
+/*
+ * Hold every ref until the transaction ends, the session's branch's own
+ * too: move the root to itself (or, in a new store, to an empty refs
+ * tree).  A mover that comes first is waited for, and then built on;
+ * holders of other branches aren't, but they wait to commit.  Scoped
+ * changes of this transaction's are moved to the root first.  (Holding
+ * them already, this moves the root to itself again, which the
+ * transaction's move already is.)
  */
 static void
 lock_refs(void)
 {
 	refs_init();
+	if (!published && !whole)
+	{
+		lock_branch(branch_ops()->current());
+		scoped_save();
+		whole = true;
+	}
+	publish_scoped();
 	for (;;)
 	{
 		ProllyHash	cur;
@@ -574,6 +858,57 @@ lock_refs(void)
 	}
 }
 
+/*
+ * lock_refs(), with branch name the session's, if every lock it takes is
+ * free now (never waiting): false if one isn't.  (One taken before
+ * another is found held stays held, to no effect: nothing is changed by
+ * it.)
+ */
+static bool
+try_hold_refs(const char *name)
+{
+	if (!whole && !published &&
+		(!try_lock_branch(name, true) ||
+		 !PROLLY_HAS(env.chunk_store, try_hold_root) ||
+		 !env.chunk_store->try_hold_root(env.chunks)))
+		return false;
+	lock_refs();
+	return true;
+}
+
+/* Is key one of a branch's own entries?  Its name then follows the tag. */
+static bool
+branch_entry(const char *key, int keylen)
+{
+	if (keylen < 2)
+		return false;
+	switch (key[0])
+	{
+		case TAG_BRANCH:
+		case TAG_MOVER:
+		case TAG_BASELINE:
+		case TAG_BASELINE_MOVER:
+		case TAG_NAMES:
+		case TAG_MERGE:
+		case TAG_MERGE_NAMES:
+		case TAG_VIOLATIONS:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * May the entry key be changed in the scoped changes: one of a branch the
+ * transaction holds, not having held every ref nor begun to commit?
+ */
+static bool
+scoped_key(const char *key, int keylen)
+{
+	return !published && !whole && branch_entry(key, keylen) &&
+		branch_held(key + 1, keylen - 1);
+}
+
 static bool
 refs_get(const char *key, int keylen, StringInfo value)
 {
@@ -593,14 +928,47 @@ refs_put(const char *key, int keylen, const StringInfoData *value)
 	ProllyNodeRef new_root;
 	ProllyEdit	e;
 
-	lock_refs();
-	if (!refs_root(&root))
-		elog(ERROR, "prolly refs have no root");
+	refs_init();
 	e.key.data = (const uint8 *) key;
 	e.key.len = keylen;
 	e.is_delete = (value == NULL);
 	e.value.data = value ? (const uint8 *) value->data : NULL;
 	e.value.len = value ? value->len : 0;
+	if (scoped_key(key, keylen))
+	{
+		ProllyHash	cur;
+
+		PROLLY_CALL(env.chunk_store, root, env.chunks, &cur);
+		if (scoped)
+			rebase_scoped(&cur);
+		/* (a store with no root yet gets one from a holder of every ref) */
+		if (scoped || cur.len > 0)
+		{
+			scoped_save();
+			if (!scoped)
+			{
+				scoped_base = cur;
+				scoped_mine = cur;
+				scoped = true;
+			}
+			ref_of(&scoped_mine, &root);
+			PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
+			scoped_mine = new_root.hash;
+			return;
+		}
+	}
+	lock_refs();
+
+	/* (a branch's entries are changed only by a holder of its lock) */
+	if (branch_entry(key, keylen) && !branch_held(key + 1, keylen - 1))
+	{
+		char	   *name = pnstrdup(key + 1, keylen - 1);
+
+		lock_branch(name);
+		pfree(name);
+	}
+	if (!refs_root(&root))
+		elog(ERROR, "prolly refs have no root");
 	PROLLY_CALL(tree, apply, &env, &root, &e, 1, &new_root);
 	if (!PROLLY_CALL(env.chunk_store, move_root, env.chunks, &root.hash,
 					 &new_root.hash))
@@ -2071,7 +2439,7 @@ hold_for_commit(const char *name, const ProllyHash *parents, int nparents)
 {
 	ProllyHash	head;
 
-	lock_refs();
+	lock_branch(name);
 	if (nparents > 0 && branch_head(name, &head) && !same_hash(&head, &parents[0]))
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -2381,6 +2749,7 @@ copies_branch_delete(const char *name, bool force)
 	ProllyHash	ours;
 	ProllyHash	base;
 
+	lock_branch(name);
 	lock_refs();
 
 	/*
@@ -2449,6 +2818,8 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 	TAG_NAMES};
 	ListCell   *lc;
 
+	lock_branch(name);
+	lock_branch(newname);
 	lock_refs();
 	if (!branch_exists(name))
 		ereport(ERROR,
@@ -2546,7 +2917,7 @@ copies_checkpoint(ProllyNodeRef *root)
 	ProllyNodeRef next;
 	bool		pushed;
 
-	lock_refs();
+	lock_branch(name);
 	pushed = see_head(name);
 	fold_from_baseline(root, &next, false);
 	if (pushed)
@@ -2555,10 +2926,11 @@ copies_checkpoint(ProllyNodeRef *root)
 }
 
 /*
- * copies_checkpoint(), the fold made before the refs are taken: they are
- * held (to the transaction's end) only to see that neither the head nor
- * the baseline moved since the fold began, and to set the baseline, and
- * taken only if free.  If either moved, or another holds the refs,
+ * copies_checkpoint(), the fold made before the branch's refs are taken:
+ * they are held (to the transaction's end) only to see that neither the
+ * head nor the baseline moved since the fold began, and to set the
+ * baseline, and taken only if free.  If either moved, or another holds
+ * the branch's refs (or every ref),
  * nothing is set, and the caller rolls back what the fold consumed; held
  * by another as it begins, nothing is folded at all.  The fold is by a
  * snapshot taken after the baseline and head are read: one taken before
@@ -2579,9 +2951,9 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	bool		has;
 	bool		has_head;
 
-	refs_init();
-	if (PROLLY_HAS(env.chunk_store, root_free) &&
-		!env.chunk_store->root_free(env.chunks))
+	if (!try_lock_branch(name, false) ||
+		(PROLLY_HAS(env.chunk_store, root_free) &&
+		 !env.chunk_store->root_free(env.chunks)))
 		return false;
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
@@ -2594,10 +2966,8 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	 * consumed, which whoever holds the refs may be waiting to delete too;
 	 * held by another, it rolls back and folds again later)
 	 */
-	if (PROLLY_HAS(env.chunk_store, try_hold_root) &&
-		!env.chunk_store->try_hold_root(env.chunks))
+	if (!try_hold_refs(name))
 		return false;
-	lock_refs();
 	has = branch_baseline(name, &now);
 	has_head = branch_head(name, &head_now);
 	if (has != had || (had && !same_hash(&baseline.hash, &now.hash)) ||
@@ -2705,7 +3075,7 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 	ProllyMergeState ms;
 	bool		merging;
 
-	lock_refs();
+	lock_branch(branch_ops()->current());
 	if (branch_head(branch_ops()->current(), &parents[0]))
 		nparents++;
 	if (!prolly_allow_commit_conflicts() && copies_violations() != NIL)
@@ -2755,7 +3125,7 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 	ProllyDatabaseComponents dc;
 	char	   *names;
 
-	lock_refs();
+	lock_branch(name);
 	if (!branch_head(name, &head) || !copies_commit_get(&head, &info) ||
 		copies_merge_state(&ms))
 		return -1;
@@ -3094,8 +3464,8 @@ copies_working_changes(Oid relid, ProllyNodeRef *data,
 
 /*
  * The transaction's own row changes folded into the session branch's
- * baseline, under the refs (so baselines move one transaction at a time).
- * Only if they're free: the fold is an optimization a commit mustn't wait
+ * baseline, under the branch's refs (so its baseline moves one transaction
+ * at a time).  Only if they're free: the fold is an optimization a commit mustn't wait
  * for (nor deadlock or time out on); held by another, the changes are left
  * to the next fold, as without it.
  */
@@ -3110,11 +3480,8 @@ copies_fold_own(const ProllyRowChanges *changes, int nchanges)
 	prolly_database_components(&dc);
 	if (!PROLLY_HAS(dc.canonicalizer, advance_own) || nchanges == 0)
 		return false;
-	refs_init();
-	if (!PROLLY_HAS(env.chunk_store, try_hold_root) ||
-		!env.chunk_store->try_hold_root(env.chunks))
+	if (!try_hold_refs(name))
 		return false;
-	lock_refs();
 	if (!branch_baseline(name, &baseline) ||
 		!dc.canonicalizer->advance_own(&baseline, changes, nchanges, &next))
 		return false;
@@ -4241,6 +4608,7 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 	bool		pushed = false;
 	Oid			oid;
 
+	lock_branch(name);
 	lock_refs();
 	AcceptInvalidationMessages();
 	(void) branch_head(name, &at);
