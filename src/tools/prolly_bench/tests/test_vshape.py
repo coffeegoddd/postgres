@@ -186,6 +186,18 @@ class KnownFileTest(unittest.TestCase):
 
 
 class V9Test(unittest.TestCase):
+    def test_config_runs_nothing_in_the_background(self):
+        # A fold worker's or autovacuum's work counts in the database's
+        # pg_stat_prolly too, and changes what an operation finds (a working
+        # set folded already): how much of it lands in a sweep depends on
+        # the machine's speed.
+        import tomllib
+        path = Path(__file__).resolve().parents[1] / "configs" / "v_shape.toml"
+        with open(path, "rb") as f:
+            settings = tomllib.load(f)["postgres"]
+        self.assertEqual(settings.get("prolly_fold_worker"), "off")
+        self.assertEqual(settings.get("autovacuum"), "off")
+
     def test_every_counted_step_has_targets(self):
         labels = [label for label, _ in V9().steps(64000, 10) if label]
         self.assertEqual(len(labels), len(set(labels)))

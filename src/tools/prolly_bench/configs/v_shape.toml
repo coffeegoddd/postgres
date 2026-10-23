@@ -23,6 +23,12 @@ autovacuum = "off"
 checkpoint_timeout = "1d"
 max_wal_size = "16GB"
 max_connections = 32
+# (no fold worker: it folds a branch's working set in the background,
+# counting in the same database's pg_stat_prolly, so an operation that
+# ran while it did would count the worker's fold too, and one that ran
+# after would find the working set folded already; which happens depends
+# on the machine's speed)
+prolly_fold_worker = "off"
 # (a small budget for a fold's change candidates, which the delta
 # sweep's largest change passes: a fold then reads every row)
 maintenance_work_mem = "1MB"

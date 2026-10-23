@@ -310,7 +310,12 @@ are about N/10 blocks, and block-map work shows its shape at sizes CI can
 afford) and an index on the updated column (so rows written back make
 index entries). `maintenance_work_mem` is 1MB, so the largest change
 passes a fold's budget for change candidates and the fold falls back to
-reading every row, as larger tables do at the default. Each operation is
+reading every row, as larger tables do at the default. Nothing runs in the
+background: autovacuum and the fold worker are off, since their work
+counts in the same database's `pg_stat_prolly` and changes what an
+operation finds (a working set folded already, which also lets a hard
+reset share another branch's storage), by amounts that depend on the
+machine's speed. Each operation is
 counted alone: the counters are read after the statement before it and
 after it. Counts, not timings: a shape fitted to them is the code's, the
 same on any machine.
