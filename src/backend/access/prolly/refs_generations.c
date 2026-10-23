@@ -362,6 +362,9 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 		IsTransactionState() || (nwritten == 0 && !written_overflow))
 		return;
 	xid = GetTopFullTransactionIdIfAny();
+
+	/* (others see the transaction, but not yet what it wrote) */
+	INJECTION_POINT("prolly-writes-ending", NULL);
 	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
 	for (int i = 0; i < nwritten; i++)
 	{
@@ -511,14 +514,27 @@ branch_written_since(const ProllyFoldMark *mark, Snapshot snap, Oid **relids,
 	BranchGeneration *e;
 	Oid		   *out;
 	int			n = 0;
+	int			own = 0;
 	bool		ok;
 
 	if (!markable(snap))
 		return false;
+	for (int i = 0; i < nwritten; i++)
+	{
+		if (written[i] == mark->branch)
+			own = 1;
+	}
 	out = palloc_array(Oid, WRITTEN_RELATIONS + MAX_WRITTEN_RELS);
 	LWLockAcquire(&g->lock, LW_SHARED);
 	e = find_entry(g, mark->branch);
+
+	/*
+	 * (nobody else writing it, nor any overflow writer: a writer is seen
+	 * committed before it ends here, and only then are its relations
+	 * kept, so one still writing may be one the snapshot sees)
+	 */
 	ok = e != NULL && e->rels_from <= mark->generation &&
+		e->writers == own && g->overflow_writers == 0 &&
 		g->overflow == mark->overflow &&
 		pg_atomic_read_u64(&g->epoch) == mark->epoch &&
 		sees_writers(g, e, snap);

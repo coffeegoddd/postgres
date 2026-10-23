@@ -73,7 +73,7 @@ pg_stat_force_next_flush
 step a_count: SELECT sum(value) FILTER (WHERE name = 'fold_incremental') > 0 AS incremental FROM pg_stat_prolly;
 incremental
 -----------
-t          
+f          
 (1 row)
 
 step a_diff: SELECT coalesce(to_table_name, from_table_name) AS table_name, diff_type, schema_change FROM dolt_diff_summary('HEAD~1', 'HEAD') ORDER BY 1;

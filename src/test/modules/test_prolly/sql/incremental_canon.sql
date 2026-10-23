@@ -186,6 +186,15 @@ SELECT length(dolt_commit('-am', 'back')::text) > 0 AS committed;
 SELECT scans, incremental FROM work();
 SELECT count(*) AS t11_rows FROM many.t11;
 
+-- A fold from no baseline folds everything from nothing, even after one
+-- that folded only what changed.
+UPDATE many.hot SET v = v + 1;
+SELECT test_fold_root() IS NOT NULL AS folded;
+:reset
+SELECT test_fold_root(true) IS NOT NULL AS folded;
+:flush
+SELECT scans, incremental FROM work();
+
 -- A fold forced to read everything does.
 UPDATE many.hot SET v = v + 1;
 SET debug_prolly_force_full_fold = on;

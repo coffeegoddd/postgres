@@ -5066,8 +5066,9 @@ fold_changed_only(Canon *cn, ProllyNodeRef *root)
 	int			nedits = 0;
 	int			save_nestlevel;
 
+	/* (a fold from no baseline is asked to fold everything from nothing) */
 	if (!cn->marked || !items_at.valid || made_items == NULL ||
-		prolly_full_fold_wanted(&reason) ||
+		cn->baseline == NULL || prolly_full_fold_wanted(&reason) ||
 		items_at.catalog_epoch != catalog_epoch ||
 		!made_tree_usable(cn, &items_made))
 		return false;
