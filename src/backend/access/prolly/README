@@ -260,6 +260,54 @@ space: it counts against temp_file_limit and is reported by log_temp_files.
 Earlier schema conversion and uncertainty buffers are separate and can still
 grow with table size; this does not bound the entire merge's memory.
 
+A merge that records constraint violations writes each table's rows as an
+attempt.  Where a refused row's put-back is refused too, the table's writes
+are rolled back and made again; the violations an attempt records are
+spooled to a temporary file of its own, dropped when the attempt is rolled
+back.  When it holds, those left are read back in order into the merge's
+kept violations, passing over the handles of those forgotten (a row tried
+again and written after all), which are sorted.  The rows ranked up across
+attempts, and those held to be tried again while a row is pinned, are
+spooled to temporary files in key order.  These files are created under the
+resource owner the writes began with so that an attempt's subtransaction
+can roll back without closing them; their memory is a few file buffers and
+the largest row.  A keyless table's removed values, which the domain checks
+look up, are held in memory up to work_mem, then sorted with a tuplesort
+and written once each, in order, to an image file and a fixed-size entry
+file that lookups search by halving.  All of these files close when the
+table is written and go with their resource owner on error or cancellation.
+
+The violations a merge keeps go to a tuplesort of their own (work_mem,
+spilling past it).  To publish them, the branch's violations are visited
+into the same sort, which orders them by what they are and then the
+branch's first: the first of each is kept only if it is new, and the new
+ones are sorted again into the order found and added to the branch's a
+batch at a time (1000, or work_mem's worth of bytes up to 1MB).  A merge or
+pick counts the branch's violations, to report how many it added, by
+visiting them, not loading them.  The refs keep a branch's violations one entry each, keyed
+by the branch and a place, after an entry holding the next place, so adding
+some reads and writes none of the others (the refs' format version 2).
+Format version 1 kept them all in one value under the branch's key; this
+build doesn't read such a value but refuses it, with a hint to reset the
+branch, which removes it.  The violations' inspection functions and the
+checks before a commit still read a branch's violations whole.
+
+The constraint checks (a merge's foreign keys, the check and not-null rows
+a merge's added constraints take away, dolt_verify_constraints()) run each
+query through SPI_execute_extended() with a DestReceiver that hands each
+row found to its consumer as the executor returns it: the merge's
+violation sort, or a list for verification, which sets the branch's
+violations whole.  No query's result is held as an SPI tuple table.  The
+keys of the rows changed since the head, which verification matches a
+batch at a time, go to two stores shared by every table (keys now, and as
+they were), each held in memory up to half of work_mem and then moved to
+a temporary file; a table's keys of a side are a segment of its store, as
+the diff gives a table's rows together.  What reading a table's rows takes
+is released before the next table's, and each batch's JSON literal and
+query are made only as that batch runs.  A merge still checks every foreign key of the tables it
+wrote whole, by query; the executor's own sorts and hashes spill under
+work_mem as for any query.
+
 A commit, a checkpoint and a fold of a transaction's own rows change
 only their branch's refs (its head, baseline, the names of its head's
 tables, its merge state and violations).  Every change of a branch's refs
