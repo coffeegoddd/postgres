@@ -77,6 +77,7 @@
 #ifndef PROLLY_CANON_H
 #define PROLLY_CANON_H
 
+#include "access/prolly_fold.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
@@ -388,6 +389,16 @@ typedef struct ProllyCanonRoutine
 	void		(*make_versioned_schemas) (List *names);
 
 	/*
+	 * Optional: visit each table of the session branch's versioned schemas
+	 * whose next fold from baseline (NULL: none) would read it in full, with
+	 * why: no entry for it, its definition changed past what its rows can be
+	 * mapped from, or what its change finder's full_reason() says.  Nothing
+	 * is folded or read but the catalogs and the baseline.
+	 */
+	void		(*pending_full) (const ProllyNodeRef *baseline,
+								 ProllyPendingFullVisit visit, void *arg);
+
+	/*
 	 * Optional: the identity of the session branch's tables and columns,
 	 * into *identity, as a commit records it beside its root; and what to
 	 * find it from next time, into *next_anchor (by the branch's own
@@ -455,7 +466,7 @@ typedef struct ProllyCanonRoutine
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
-	"make_versioned_schemas", "identify", "renames", "merge_renames", \
+	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
 	"rename_description", "rename_root", "rename_objects"
 #define PROLLY_CANON_FIRST_CALLBACK walk
 #define PROLLY_CANON_LAST_CALLBACK rename_objects

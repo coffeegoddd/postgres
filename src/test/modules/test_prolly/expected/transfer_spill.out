@@ -1,6 +1,6 @@
 -- What a transfer has seen is held to maintenance_work_mem: past it, its
--- maps go to a temporary file as sorted runs, each with a filter in
--- memory, read back as needed (and changed in place).
+-- maps go to temporary files as sorted runs, each with a filter in
+-- memory, read back as needed (and changed in place), the runs merged.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -16,6 +16,50 @@ SELECT test_seen_check(20000, 64 * 1024) > 1 AS spilled;
  spilled 
 ---------
  t
+(1 row)
+
+-- Checked against a map in memory as it grows (hashes never entered looked
+-- up, spilled ones entered again and changed), in 64 kB: its memory holds
+-- to the budget, its filters to their half, however many runs it writes;
+-- its runs merge four of a level into one, so a lookup checks at most
+-- three filters a level, a level for each base-4 digit of the runs
+-- written.
+SELECT n, runs_written > n / 400 AS many_runs,
+       memory_peak <= 65536 AS within_budget,
+       filter_bytes_peak <= filter_budget AS filters_within,
+       runs_peak <= 3 * (floor(log(4, runs_written)) + 1) AS runs_logarithmic,
+       max_filter_checks <= runs_peak AS checks_bounded,
+       merges > 0 AS merged
+FROM unnest(ARRAY[5000, 20000, 80000]) n, test_seen_measure(n, 64 * 1024);
+   n   | many_runs | within_budget | filters_within | runs_logarithmic | checks_bounded | merged 
+-------+-----------+---------------+----------------+------------------+----------------+--------
+  5000 | t         | t             | t              | t                | t              | t
+ 20000 | t         | t             | t              | t                | t              | t
+ 80000 | t         | t             | t              | t                | t              | t
+(3 rows)
+
+-- (with room for its filters, they rule out nearly every run not holding
+-- what is looked up)
+SELECT false_positives::float8 /
+       (filter_checks - (run_searches - false_positives)) < 0.02 AS filters_work,
+       memory_peak <= 1024 * 1024 AS within_budget
+FROM test_seen_measure(80000, 1024 * 1024);
+ filters_work | within_budget 
+--------------+---------------
+ t            | t
+(1 row)
+
+-- A cancel lands in the map's work (writing or merging runs), and its
+-- files go as the statement fails.
+SET statement_timeout = '300ms';
+SELECT test_seen_measure(100000000, 64 * 1024);
+ERROR:  canceling statement due to statement timeout
+RESET statement_timeout;
+SELECT count(*) AS files_left FROM pg_ls_tmpdir()
+WHERE name LIKE 'pgsql_tmp' || pg_backend_pid() || '.%';
+ files_left 
+------------
+          0
 (1 row)
 
 \getenv abs_builddir PG_ABS_BUILDDIR
@@ -35,6 +79,7 @@ SELECT length(dolt_commit('-Am', 'many chunks')::text) AS committed;
         42
 (1 row)
 
+SELECT dolt_hashof('main') AS from_main \gset
 -- (the same push to two remotes: with room for its maps in memory, and
 -- with 64 kB, its maps written out as runs too)
 SELECT dolt_remote('add', 'roomy', :'url' || '-roomy');
@@ -117,6 +162,12 @@ SELECT dolt_fetch('origin') AS fetched;
  {0}
 (1 row)
 
+SELECT dolt_hashof('origin/main') = :'from_main' AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
 SELECT dolt_checkout('-b', 'theirs', 'origin/main') IS NOT NULL AS checked_out;
  checked_out 
 -------------
@@ -128,6 +179,43 @@ FROM sp.t;
  count | whole 
 -------+-------
   3000 |  3000
+(1 row)
+
+-- A clone of it in 64 kB, its maps written out as runs: the same commit.
+\c postgres
+CREATE DATABASE spill_clone;
+\c spill_clone
+SET maintenance_work_mem = '64kB';
+SELECT dolt_clone(:'url') IS NOT NULL AS cloned;
+ cloned 
+--------
+ t
+(1 row)
+
+SELECT dolt_hashof('main') = :'from_main' AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT count(*), count(*) FILTER (WHERE length(b) = 3000) AS whole FROM sp.t;
+ count | whole 
+-------+-------
+  3000 |  3000
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+\c spill_clone
+SELECT temp_bytes > 0 AS clone_spilled FROM pg_stat_database
+WHERE datname = 'spill_clone';
+ clone_spilled 
+---------------
+ t
 (1 row)
 
 -- Served as a libpq remote serves it, in 64 kB: what was sent written out
@@ -145,4 +233,5 @@ RESET maintenance_work_mem;
 \c postgres
 DROP DATABASE spill_from;
 DROP DATABASE spill_into;
+DROP DATABASE spill_clone;
 \c :db

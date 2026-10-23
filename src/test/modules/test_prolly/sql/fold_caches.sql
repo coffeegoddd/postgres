@@ -7,6 +7,7 @@
 CREATE DATABASE regress_fold_caches;
 \c regress_fold_caches
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE EXTENSION test_prolly;
 CREATE SCHEMA fc VERSIONED;
 CREATE TABLE fc.t (id int PRIMARY KEY, v text);
 CREATE SEQUENCE fc.s;
@@ -333,6 +334,42 @@ FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
 :flush
 SELECT pg_temp.since('fold_rows_read') AS redefined_history_diff_rows;
 SELECT dolt_reset('--hard');
+
+-- A move from a dirty working set folds it once: the fold before the move
+-- is the branch's baseline, and after the move the baseline is advanced
+-- to the target, the move's own writes taken as folded, not folded again.
+-- 40 dirty rows reset: 40 candidates, not 80 (the check, which folds again,
+-- off to count it).  The next status folds again (the move wrote the
+-- branch), reading nothing: the move's entries were consumed.  The next
+-- commit holds exactly the rows written after.
+UPDATE fc.t SET v = 'dirty' WHERE id <= 40;
+SET debug_prolly_verify_fold_caches = off;
+:flush
+SELECT pg_temp.since('fold_candidates') IS NOT NULL AS counting,
+	pg_temp.since('fold_full_tables') IS NOT NULL AS counting_full;
+SELECT dolt_reset('--hard');
+:flush
+SELECT pg_temp.since('fold_candidates') AS dirty_reset_candidates,
+	pg_temp.since('fold_full_tables') AS dirty_reset_full;
+SELECT count(*) FILTER (WHERE v = 'dirty') AS dirty_left FROM fc.t;
+SELECT * FROM dolt_status;
+:flush
+SELECT pg_temp.since('fold_candidates') AS status_candidates;
+-- A reset to an older commit from a dirty working set: once too.
+UPDATE fc.t SET v = 'dirty' WHERE id <= 40;
+:flush
+SELECT pg_temp.since('fold_candidates') IS NOT NULL AS counting;
+SELECT dolt_reset('--hard', 'HEAD~1');
+:flush
+SELECT pg_temp.since('fold_candidates') AS older_reset_candidates;
+RESET debug_prolly_verify_fold_caches;
+SELECT * FROM dolt_status;
+SELECT test_fold_root(true) = prolly_root_hash('main') AS head_rows;
+UPDATE fc.t SET v = 'after' WHERE id = 50;
+SELECT length(dolt_commit('-am', 'after the reset')::text) > 0 AS committed;
+SELECT diff_type, (to_row).id, (to_row).v
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::fc.t);
+SELECT test_fold_root(true) = prolly_root_hash('main') AS committed_rows;
 
 \c contrib_regression
 DROP DATABASE regress_fold_caches;

@@ -241,6 +241,9 @@ typedef struct CanonItem
 {
 	StringInfoData key;
 	StringInfoData value;
+	Oid			relid;			/* a table's, materialized view's or
+								 * sequence's, whose rows or value it
+								 * holds; else InvalidOid */
 } CanonItem;
 
 typedef struct BaseTable BaseTable;
@@ -299,6 +302,20 @@ typedef struct BaseTable BaseTable;
 #define FOLDED_VALUE_ENCODER	6
 #define FOLDED_KEYING			1
 
+/*
+ * What a canonical tree or baseline built here was folded at, for a later
+ * fold that works out again only what changed since (fold_changed_only()):
+ * the refs' mark, and this backend's catalog epoch then.  Valid only for a
+ * fold of everything that left nothing out, made since the deparsing
+ * settings were last changed.
+ */
+typedef struct FoldedAt
+{
+	bool		valid;
+	ProllyFoldMark mark;
+	uint64		catalog_epoch;
+} FoldedAt;
+
 typedef struct Canon
 {
 	ProllyTreeEnv env;
@@ -321,6 +338,16 @@ typedef struct Canon
 	Oid			only;			/* valid: only this table's rows folded */
 	bool		no_rows;		/* no table's rows folded (objects only) */
 	bool		cached;			/* descriptions from this backend's cache */
+	const ProllyNodeRef *baseline;	/* the branch's baseline (NULL: none) */
+	bool		partial;		/* only the objects that may have changed:
+								 * the next baseline's entries too */
+	bool		verifying;		/* the full fold a partial one is checked
+								 * against: remembered as nothing */
+	List	   *given;			/* (verifying) CanonItem *: the rows of the
+								 * tables the partial one folded, taken
+								 * from its items, not folded again */
+	bool		marked;			/* a fold of everything, marked: */
+	FoldedAt	at;				/* what it was folded at */
 } Canon;
 
 static void build_canonical(Canon *cn, ProllyNodeRef *root);
@@ -513,7 +540,9 @@ add_item(Canon *cn, const char *kind, const char *name)
 	appendStringInfoString(&it->key, kind);
 	append_utf8(&it->key, name);
 	initStringInfo(&it->value);
+	it->relid = InvalidOid;
 	cn->items = lappend(cn->items, it);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_OBJECTS, 1);
 	return it;
 }
 
@@ -1840,7 +1869,21 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 			empty_root(cn, root);
 		return;
 	}
+	/* (checking a partial fold: the rows it folded as it has them) */
+	foreach_ptr(CanonItem, given, cn->given)
+	{
+		if (given->relid == RelationGetRelid(rel))
+		{
+			uint8		len = (uint8) given->value.data[0];
+
+			Assert(!cn->advance);
+			root->hash.len = len;
+			memcpy(root->hash.bytes, given->value.data + 1, len);
+			return;
+		}
+	}
 	initStringInfo(&state);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_TABLES, 1);
 	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, why, root,
 				cn->advance ? &state : NULL);
 	if (cn->advance)
@@ -3062,6 +3105,10 @@ item_cmp(const ListCell *a, const ListCell *b)
  * - The last canonical tree built, with its items in order: the next one
  *   is it with only the items that differ applied.  Its hash is its
  *   content, so it is never stale.
+ * - What that tree (and the last next baseline built) was folded at: the
+ *   refs' mark and the catalog epoch, so the next fold can take its items
+ *   and work out again only the tables written since and the sequences
+ *   (fold_changed_only()).
  * - Which objects are extensions' members, and which namespaces' objects
  *   the canonical form's, against the same epoch: each is asked of every
  *   relation, type and function.
@@ -3102,6 +3149,12 @@ static char *described_settings = NULL;
 static MadeTree dependencies_made;
 static uint64 dependencies_epoch;
 static MadeTree items_made;
+
+static FoldedAt items_at;
+static MadeTree baseline_made;	/* the last next baseline built here */
+static FoldedAt baseline_at;
+static Oid *made_sequences = NULL;	/* the sequences among made_items */
+static int	nmade_sequences = 0;
 static MemoryContext items_cxt = NULL;
 static CanonItem *made_items = NULL;	/* items_made's, in key order */
 static int	nmade_items = 0;
@@ -3188,12 +3241,14 @@ fold_caches_xact(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_COMMIT:
 			made_tree_end(&dependencies_made, true);
 			made_tree_end(&items_made, true);
+			made_tree_end(&baseline_made, true);
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
 			made_tree_end(&dependencies_made, false);
 			made_tree_end(&items_made, false);
+			made_tree_end(&baseline_made, false);
 			break;
 		default:
 			break;
@@ -3218,6 +3273,7 @@ fold_caches_subxact(SubXactEvent event, SubTransactionId mySubid,
 {
 	made_tree_sub(&dependencies_made, event, mySubid, parentSubid);
 	made_tree_sub(&items_made, event, mySubid, parentSubid);
+	made_tree_sub(&baseline_made, event, mySubid, parentSubid);
 }
 
 /*
@@ -3268,6 +3324,8 @@ check_deparse_settings(void)
 	if (described_settings == NULL || strcmp(now.data, described_settings) != 0)
 	{
 		forget_descriptions();
+		items_at.valid = false;
+		baseline_at.valid = false;
 		if (described_settings)
 			pfree(described_settings);
 		described_settings = MemoryContextStrdup(CacheMemoryContext, now.data);
@@ -3589,6 +3647,16 @@ remember_items(Canon *cn, const ProllyNodeRef *root)
 		memcpy(m->value.data, it->value.data, it->value.len + 1);
 		m->value.len = m->value.maxlen = it->value.len;
 		m->value.cursor = 0;
+		m->relid = it->relid;
+	}
+	made_sequences = MemoryContextAlloc(items_cxt,
+										sizeof(Oid) * Max(nmade_items, 1));
+	nmade_sequences = 0;
+	for (int i = 0; i < nmade_items; i++)
+	{
+		if (OidIsValid(made_items[i].relid) &&
+			strncmp(made_items[i].key.data, "s:", 2) == 0)
+			made_sequences[nmade_sequences++] = made_items[i].relid;
 	}
 	made_tree(&items_made, root);
 }
@@ -4156,6 +4224,162 @@ oid_columns(Canon *cn, Relation rel)
 	return any;
 }
 
+/*
+ * A relation's items, if the canonical form holds it (in a versioned
+ * schema, not an extension's member).  The item of a table's, materialized
+ * view's or sequence's rows or value names it (relid): the first it adds,
+ * any ordering item after.
+ */
+static void
+collect_relation(Canon *cn, Form_pg_class form)
+{
+	char	   *name = NameStr(form->relname);
+	int			before = list_length(cn->items);
+
+	if (!canon_namespace(form->relnamespace) ||
+		in_extension(RelationRelationId, form->oid))
+		return;
+	switch (form->relkind)
+	{
+		case RELKIND_RELATION:
+			if (form->relam == PROLLY_TABLE_AM_OID &&
+				!partition_uncovered(cn, form, name))
+			{
+				Relation	rel = table_open(form->oid, AccessShareLock);
+				CanonItem  *it;
+				ProllyNodeRef root;
+				StringInfoData desc;
+				ProllyHash	dh;
+
+				if (oid_columns(cn, rel) && !cn->reading)
+				{
+					table_close(rel, AccessShareLock);
+					break;
+				}
+				it = add_item(cn, "t:", qualified(form->relnamespace, name));
+				initStringInfo(&desc);
+				table_description(cn, rel, &desc, &dh);
+				record_ordering(cn, rel, &desc);
+				table_root(cn, it, rel, &desc, &dh, &root);
+				put_hash(&it->value, &root.hash);
+				appendBinaryStringInfo(&it->value, desc.data, desc.len);
+				pfree(desc.data);
+				table_close(rel, AccessShareLock);
+			}
+			break;
+		case RELKIND_SEQUENCE:
+			describe_sequence(cn, form->oid, form->relnamespace, name);
+			break;
+		case RELKIND_INDEX:
+		case RELKIND_TOASTVALUE:
+		case RELKIND_COMPOSITE_TYPE:
+			break;			/* with their tables, or as types */
+		case RELKIND_VIEW:
+			{
+				CanonItem  *it = add_item(cn, "v:", qualified(form->relnamespace, name));
+
+				append_view_options(&it->value, form->oid);
+				append_utf8(&it->value,
+							TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																	ObjectIdGetDatum(form->oid),
+																	BoolGetDatum(false))));
+			}
+			break;
+		case RELKIND_MATVIEW:
+			{
+				CanonItem  *it;
+				Relation	rel = NULL;
+				StringInfoData query;
+
+				if (form->relam == PROLLY_TABLE_AM_OID)
+				{
+					rel = table_open(form->oid, AccessShareLock);
+					if (oid_columns(cn, rel) && !cn->reading)
+					{
+						table_close(rel, AccessShareLock);
+						break;
+					}
+				}
+				it = add_item(cn, "m:", qualified(form->relnamespace, name));
+				initStringInfo(&query);
+				append_matview_state(&query, form);
+				append_utf8(&query,
+							TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																	ObjectIdGetDatum(form->oid),
+																	BoolGetDatum(false))));
+				if (rel != NULL)
+				{
+					ProllyNodeRef root;
+					ProllyHash	dh;
+
+					table_shape(cn, rel, &query, &dh, NULL);
+					table_root(cn, it, rel, &query, &dh, &root);
+					put_hash(&it->value, &root.hash);
+					table_close(rel, AccessShareLock);
+				}
+				else
+					appendStringInfoChar(&it->value, 0);	/* (no tree) */
+				appendBinaryStringInfo(&it->value, query.data, query.len);
+				pfree(query.data);
+			}
+			break;
+		case RELKIND_FOREIGN_TABLE:
+			{
+				ObjectAddress self;
+				const char *what = NULL;
+
+				/* (what CREATE FOREIGN TABLE alone doesn't make: not yet) */
+				ObjectAddressSet(self, RelationRelationId, form->oid);
+				if (form->relispartition)
+					what = "foreign tables that are partitions";
+				else if (has_superclass(form->oid))
+					what = "foreign tables that inherit";
+				else if (form->relhastriggers && has_triggers(form->oid))
+					what = "triggers on foreign tables";
+				else if (form->relrowsecurity)
+					what = "row security on foreign tables";
+				else
+					what = foreign_table_undescribed(form->oid);
+				if (what)
+					(void) uncovered(cn, what, qualified(form->relnamespace, name),
+									 &self);
+				else
+					describe_foreign_table(form->oid,
+										   &add_item(cn, "r:", qualified(form->relnamespace, name))->value);
+			}
+			break;
+		case RELKIND_PARTITIONED_TABLE:
+			{
+				/* (its rows are its partitions': an empty data tree) */
+				Relation	rel;
+				CanonItem  *it;
+				ProllyNodeRef root;
+				StringInfoData desc;
+
+				if (partition_uncovered(cn, form, name))
+					break;
+				rel = table_open(form->oid, AccessShareLock);
+				it = add_item(cn, "t:", qualified(form->relnamespace, name));
+				empty_root(cn, &root);
+				initStringInfo(&desc);
+				table_description(cn, rel, &desc, NULL);
+				put_hash(&it->value, &root.hash);
+				appendBinaryStringInfo(&it->value, desc.data, desc.len);
+				pfree(desc.data);
+				table_close(rel, AccessShareLock);
+			}
+			break;
+		case RELKIND_PARTITIONED_INDEX:
+			break;			/* with its table */
+	}
+	if (list_length(cn->items) > before &&
+		(form->relkind == RELKIND_SEQUENCE ||
+		 ((form->relkind == RELKIND_RELATION ||
+		   form->relkind == RELKIND_MATVIEW) &&
+		  form->relam == PROLLY_TABLE_AM_OID)))
+		((CanonItem *) list_nth(cn->items, before))->relid = form->oid;
+}
+
 static void
 collect(Canon *cn)
 {
@@ -4163,151 +4387,13 @@ collect(Canon *cn)
 	SysScanDesc scan;
 	HeapTuple	tup;
 
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CATALOG_SCANS, 1);
+
 	/* Relations. */
 	pg_class = table_open(RelationRelationId, AccessShareLock);
 	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
-		char	   *name = NameStr(form->relname);
-
-		if (!canon_namespace(form->relnamespace) ||
-			in_extension(RelationRelationId, form->oid))
-			continue;
-		switch (form->relkind)
-		{
-			case RELKIND_RELATION:
-				if (form->relam == PROLLY_TABLE_AM_OID &&
-					!partition_uncovered(cn, form, name))
-				{
-					Relation	rel = table_open(form->oid, AccessShareLock);
-					CanonItem  *it;
-					ProllyNodeRef root;
-					StringInfoData desc;
-					ProllyHash	dh;
-
-					if (oid_columns(cn, rel) && !cn->reading)
-					{
-						table_close(rel, AccessShareLock);
-						break;
-					}
-					it = add_item(cn, "t:", qualified(form->relnamespace, name));
-					initStringInfo(&desc);
-					table_description(cn, rel, &desc, &dh);
-					record_ordering(cn, rel, &desc);
-					table_root(cn, it, rel, &desc, &dh, &root);
-					put_hash(&it->value, &root.hash);
-					appendBinaryStringInfo(&it->value, desc.data, desc.len);
-					pfree(desc.data);
-					table_close(rel, AccessShareLock);
-				}
-				break;
-			case RELKIND_SEQUENCE:
-				describe_sequence(cn, form->oid, form->relnamespace, name);
-				break;
-			case RELKIND_INDEX:
-			case RELKIND_TOASTVALUE:
-			case RELKIND_COMPOSITE_TYPE:
-				break;			/* with their tables, or as types */
-			case RELKIND_VIEW:
-				{
-					CanonItem  *it = add_item(cn, "v:", qualified(form->relnamespace, name));
-
-					append_view_options(&it->value, form->oid);
-					append_utf8(&it->value,
-								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
-																		ObjectIdGetDatum(form->oid),
-																		BoolGetDatum(false))));
-				}
-				break;
-			case RELKIND_MATVIEW:
-				{
-					CanonItem  *it;
-					Relation	rel = NULL;
-					StringInfoData query;
-
-					if (form->relam == PROLLY_TABLE_AM_OID)
-					{
-						rel = table_open(form->oid, AccessShareLock);
-						if (oid_columns(cn, rel) && !cn->reading)
-						{
-							table_close(rel, AccessShareLock);
-							break;
-						}
-					}
-					it = add_item(cn, "m:", qualified(form->relnamespace, name));
-					initStringInfo(&query);
-					append_matview_state(&query, form);
-					append_utf8(&query,
-								TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
-																		ObjectIdGetDatum(form->oid),
-																		BoolGetDatum(false))));
-					if (rel != NULL)
-					{
-						ProllyNodeRef root;
-						ProllyHash	dh;
-
-						table_shape(cn, rel, &query, &dh, NULL);
-						table_root(cn, it, rel, &query, &dh, &root);
-						put_hash(&it->value, &root.hash);
-						table_close(rel, AccessShareLock);
-					}
-					else
-						appendStringInfoChar(&it->value, 0);	/* (no tree) */
-					appendBinaryStringInfo(&it->value, query.data, query.len);
-					pfree(query.data);
-				}
-				break;
-			case RELKIND_FOREIGN_TABLE:
-				{
-					ObjectAddress self;
-					const char *what = NULL;
-
-					/* (what CREATE FOREIGN TABLE alone doesn't make: not yet) */
-					ObjectAddressSet(self, RelationRelationId, form->oid);
-					if (form->relispartition)
-						what = "foreign tables that are partitions";
-					else if (has_superclass(form->oid))
-						what = "foreign tables that inherit";
-					else if (form->relhastriggers && has_triggers(form->oid))
-						what = "triggers on foreign tables";
-					else if (form->relrowsecurity)
-						what = "row security on foreign tables";
-					else
-						what = foreign_table_undescribed(form->oid);
-					if (what)
-						(void) uncovered(cn, what, qualified(form->relnamespace, name),
-										 &self);
-					else
-						describe_foreign_table(form->oid,
-											   &add_item(cn, "r:", qualified(form->relnamespace, name))->value);
-				}
-				break;
-			case RELKIND_PARTITIONED_TABLE:
-				{
-					/* (its rows are its partitions': an empty data tree) */
-					Relation	rel;
-					CanonItem  *it;
-					ProllyNodeRef root;
-					StringInfoData desc;
-
-					if (partition_uncovered(cn, form, name))
-						break;
-					rel = table_open(form->oid, AccessShareLock);
-					it = add_item(cn, "t:", qualified(form->relnamespace, name));
-					empty_root(cn, &root);
-					initStringInfo(&desc);
-					table_description(cn, rel, &desc, NULL);
-					put_hash(&it->value, &root.hash);
-					appendBinaryStringInfo(&it->value, desc.data, desc.len);
-					pfree(desc.data);
-					table_close(rel, AccessShareLock);
-				}
-				break;
-			case RELKIND_PARTITIONED_INDEX:
-				break;			/* with its table */
-		}
-	}
+		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	systable_endscan(scan);
 	table_close(pg_class, AccessShareLock);
 
@@ -4816,22 +4902,20 @@ table_unreadable(const char *name, List *stale)
 	return why;
 }
 
-/* The canonical tree, built in the environment from the items collected. */
+/*
+ * The canonical tree of everything, built from the items collected: the
+ * catalogs read through, every table's rows folded.
+ */
 static void
-build_canonical(Canon *cn, ProllyNodeRef *root)
+build_all(Canon *cn, ProllyNodeRef *root)
 {
 	int			save_nestlevel;
 	ProllyTreeBuilder *b;
 	ListCell   *lc;
 	bool		applied;
 
-	/*
-	 * Deparse with every name qualified, whatever the session's settings;
-	 * tables described as before taken from the cache (#483).
-	 */
-	fold_caches_begin();
-	check_deparse_settings();
-	cn->cached = true;
+	if (cn->baseline)
+		load_baseline(cn, cn->baseline);
 	save_nestlevel = NewGUCNestLevel();
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
@@ -4861,7 +4945,318 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 			check_applied("canonical", root, &built);
 		*root = built;
 	}
-	remember_items(cn, root);
+	if (!cn->verifying)
+		remember_items(cn, root);
+}
+
+static int
+made_item_cmp(const void *a, const void *b)
+{
+	const CanonItem *x = a;
+	const CanonItem *y = b;
+	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
+	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
+
+	return prolly_bytes_compare(&kx, &ky, NULL);
+}
+
+/* The last canonical tree's item of key, or NULL. */
+static CanonItem *
+made_item(const StringInfoData *key)
+{
+	CanonItem	probe;
+
+	probe.key = *key;
+	return bsearch(&probe, made_items, nmade_items, sizeof(CanonItem),
+				   made_item_cmp);
+}
+
+/* The baseline's entries of keys (StringInfo *), in key order. */
+static void
+load_baseline_keys(Canon *cn, const ProllyNodeRef *baseline, List *keys)
+{
+	StringInfoData v;
+
+	initStringInfo(&v);
+	foreach_ptr(StringInfoData, key, keys)
+	{
+		ProllyKey	k = {(const uint8 *) key->data, key->len};
+		ProllyValue pv;
+		BaseTable  *bt;
+
+		resetStringInfo(&v);
+		if (!PROLLY_CALL(cn->tree, get, &cn->env, baseline, &k, &v))
+			continue;
+		if (cn->nbase == cn->maxbase)
+		{
+			cn->maxbase = Max(16, cn->maxbase * 2);
+			cn->base = cn->base ? repalloc_array(cn->base, BaseTable, cn->maxbase) :
+				palloc_array(BaseTable, cn->maxbase);
+		}
+		bt = &cn->base[cn->nbase];
+		initStringInfo(&bt->key);
+		appendBinaryStringInfo(&bt->key, key->data, key->len);
+		pv.data = (const uint8 *) v.data;
+		pv.len = v.len;
+		if (!parse_base_table(&pv, bt))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a branch's baseline holds an invalid table entry")));
+		cn->nbase++;
+	}
+	pfree(v.data);
+	if (cn->nbase > 1)
+		qsort(cn->base, cn->nbase, sizeof(BaseTable), base_table_cmp);
+}
+
+/*
+ * The item key collect_relation() gives a relation's rows or value (a
+ * prolly table's or materialized view's, a sequence's), or NULL if it
+ * gives none.
+ */
+static StringInfo
+relation_item_key(Form_pg_class form)
+{
+	const char *kind;
+	StringInfo	key;
+
+	if (form->relkind == RELKIND_SEQUENCE)
+		kind = "s:";
+	else if (form->relam != PROLLY_TABLE_AM_OID)
+		return NULL;
+	else if (form->relkind == RELKIND_RELATION)
+		kind = "t:";
+	else if (form->relkind == RELKIND_MATVIEW)
+		kind = "m:";
+	else
+		return NULL;
+	key = makeStringInfo();
+	appendStringInfoString(key, kind);
+	append_utf8(key, qualified(form->relnamespace, NameStr(form->relname)));
+	return key;
+}
+
+/*
+ * The canonical tree as the last one built here, only what may have
+ * changed since worked out again (true): the items of the tables and
+ * materialized views whose rows a transaction that ended since, or this
+ * one, wrote (the refs' written_since()), and every sequence's, whose
+ * values change outside transactions.  The rest is as it was, as nothing
+ * else a fold reads changed: no catalog change or collection since (the
+ * refs' mark, which a catalog change sent moves, and this backend's
+ * catalog epoch, which its own move), the same deparsing settings, and a
+ * snapshot that sees every writer that ended (the mark is taken only
+ * then).  A fold that begins the next baseline does so from the one built
+ * here last, whose entries stay but those of the tables written since it.
+ * False where it can't be: then everything is folded.
+ * debug_prolly_verify_fold_caches then folds everything but the tables
+ * this fold folded, and the trees differing is an error.
+ */
+static bool
+fold_changed_only(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyDatabaseComponents dc;
+	ProllyFullFoldReason reason;
+	const FoldedAt *since = &items_at;
+	Oid		   *relids;
+	int			nrelids;
+	List	   *seen = NIL;
+	List	   *rels = NIL;
+	List	   *keys = NIL;
+	ProllyNodeRef expect = {0};
+	ProllyEdit *edits;
+	CanonItem **changed;
+	int			nedits = 0;
+	int			save_nestlevel;
+
+	/* (a fold from no baseline is asked to fold everything from nothing) */
+	if (!cn->marked || !items_at.valid || made_items == NULL ||
+		cn->baseline == NULL || prolly_full_fold_wanted(&reason) ||
+		items_at.catalog_epoch != catalog_epoch ||
+		!made_tree_usable(cn, &items_made))
+		return false;
+	if (cn->advance)
+	{
+		if (cn->baseline == NULL || !baseline_at.valid ||
+			baseline_at.catalog_epoch != catalog_epoch ||
+			baseline_made.root.hash.len != cn->baseline->hash.len ||
+			memcmp(baseline_made.root.hash.bytes, cn->baseline->hash.bytes,
+				   cn->baseline->hash.len) != 0 ||
+			!made_tree_usable(cn, &baseline_made))
+			return false;
+		if (baseline_at.mark.generation < items_at.mark.generation)
+			since = &baseline_at;
+	}
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.refs, written_since) ||
+		!PROLLY_CALL(dc.refs, written_since, &since->mark, GetActiveSnapshot(),
+					 &relids, &nrelids))
+		return false;
+
+	/*
+	 * What to work out again: each relation's item, as the last tree has it
+	 * (one it doesn't have is a catalog change, which the mark would have
+	 * seen; but never folded so)
+	 */
+	for (int i = 0; i < nrelids + nmade_sequences; i++)
+	{
+		Oid			relid = i < nrelids ? relids[i] : made_sequences[i - nrelids];
+		HeapTuple	tup;
+		Form_pg_class form;
+		StringInfo	key;
+
+		if (list_member_oid(seen, relid))
+			continue;
+		seen = lappend_oid(seen, relid);
+		tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(tup))
+			return false;
+		form = (Form_pg_class) GETSTRUCT(tup);
+		if (!canon_namespace(form->relnamespace) ||
+			in_extension(RelationRelationId, form->oid) ||
+			(key = relation_item_key(form)) == NULL)
+			continue;			/* (no item: none of the canonical form's) */
+		if (made_item(key) == NULL)
+			return false;
+		if (form->relkind != RELKIND_SEQUENCE)
+			keys = lappend(keys, key);
+		rels = lappend(rels, tup);
+	}
+
+	cn->partial = true;
+	if (cn->baseline && keys != NIL)
+		load_baseline_keys(cn, cn->baseline, keys);
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	foreach_ptr(HeapTupleData, tup, rels)
+		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
+	AtEOXact_GUC(false, save_nestlevel);
+	if (cn->left_out != NIL || cn->refused != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("prolly fold of the objects changed since the last left out one it had held")));
+
+	/*
+	 * Each item that differs, applied to the last tree; the items kept
+	 * changed only once the tree is made, so they are always a tree's.
+	 */
+	list_sort(cn->items, item_cmp);
+	edits = palloc_array(ProllyEdit, Max(list_length(cn->items), 1));
+	changed = palloc_array(CanonItem *, Max(list_length(cn->items), 1));
+	foreach_ptr(CanonItem, it, cn->items)
+	{
+		CanonItem  *m = made_item(&it->key);
+
+		if (m == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly fold of the objects changed since the last found one it didn't hold")));
+		if (m->value.len == it->value.len &&
+			memcmp(m->value.data, it->value.data, it->value.len) == 0)
+			continue;
+		changed[nedits] = it;
+		edits[nedits].key = (ProllyKey) {(const uint8 *) it->key.data, it->key.len};
+		edits[nedits].value = (ProllyValue) {(const uint8 *) it->value.data, it->value.len};
+		edits[nedits++].is_delete = false;
+	}
+	if (nedits == 0)
+		*root = items_made.root;
+	else
+		PROLLY_CALL(cn->tree, apply, &cn->root_env, &items_made.root, edits,
+					nedits, root);
+	for (int i = 0; i < nedits; i++)
+	{
+		CanonItem  *it = changed[i];
+		CanonItem  *m = made_item(&it->key);
+
+		pfree(m->value.data);
+		m->value.data = MemoryContextAlloc(items_cxt, it->value.len + 1);
+		memcpy(m->value.data, it->value.data, it->value.len + 1);
+		m->value.len = m->value.maxlen = it->value.len;
+	}
+	pfree(edits);
+	pfree(changed);
+	made_tree(&items_made, root);
+	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_INCREMENTAL, 1);
+
+	/*
+	 * (checked against a fold of everything but the tables this one
+	 * folded, their rows taken from its items: every other table's rows,
+	 * folded from the baseline again, must be as the last tree had them.
+	 * Its work isn't counted: the statistics put back as they were, the
+	 * change finders told.  In the same command, so what this fold
+	 * consumed of the change log is still seen.)
+	 */
+	if (debug_prolly_verify_fold_caches)
+	{
+		Canon		full;
+		PgStat_Counter *stats = palloc_array(PgStat_Counter, PGSTAT_PROLLY_NUM_COUNTERS);
+		ProllyNodeCounters tree = *pgstat_prolly_tree_counters();
+
+		memcpy(stats, PendingProllyStats, sizeof(PendingProllyStats));
+		memset(&full, 0, sizeof(full));
+		full.reading = cn->reading;
+		canon_env(&full);
+		full.finder = cn->finder;
+		full.baseline = cn->baseline;
+		full.cached = true;
+		full.verifying = true;
+		foreach_ptr(CanonItem, it, cn->items)
+		{
+			if (OidIsValid(it->relid) && strncmp(it->key.data, "s:", 2) != 0)
+				full.given = lappend(full.given, it);
+		}
+		prolly_fold_counted = false;
+		PG_TRY();
+		{
+			build_all(&full, &expect);
+		}
+		PG_FINALLY();
+		{
+			prolly_fold_counted = true;
+		}
+		PG_END_TRY();
+		memcpy(PendingProllyStats, stats, sizeof(PendingProllyStats));
+		*pgstat_prolly_tree_counters() = tree;
+		pfree(stats);
+		check_applied("canonical folded from the objects changed", root, &expect);
+	}
+	return true;
+}
+
+/*
+ * The canonical tree: the last one built here with only what changed
+ * since worked out again, if it can be (fold_changed_only()), else
+ * everything.  A fold of everything that left nothing out is marked for
+ * the next.
+ */
+static void
+build_canonical(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyDatabaseComponents dc;
+
+	/*
+	 * Deparse with every name qualified, whatever the session's settings;
+	 * tables described as before taken from the cache (#483).
+	 */
+	fold_caches_begin();
+	check_deparse_settings();
+	cn->cached = true;
+
+	/* (marked before anything is read) */
+	prolly_database_components(&dc);
+	cn->at.catalog_epoch = catalog_epoch;
+	cn->marked = !OidIsValid(cn->only) && !cn->no_rows &&
+		PROLLY_HAS(dc.refs, fold_mark) &&
+		PROLLY_CALL(dc.refs, fold_mark, MyBranch, GetActiveSnapshot(),
+					&cn->at.mark);
+	cn->at.valid = cn->marked;
+	if (!fold_changed_only(cn, root))
+		build_all(cn, root);
+	if (cn->left_out != NIL)
+		cn->at.valid = false;
+	items_at = cn->at;
 }
 
 /*
@@ -4930,9 +5325,11 @@ build_baseline(Canon *cn, const ProllyNodeRef *baseline, ProllyNodeRef *next)
 		else
 			PROLLY_CALL(cn->tree, apply, &benv, baseline, edits, nedits, next);
 		pfree(edits);
-		if (!debug_prolly_verify_fold_caches)
+		/* (partial: its entries are only those of the tables written) */
+		if (!debug_prolly_verify_fold_caches || cn->partial)
 			return;
 	}
+	Assert(!cn->partial);
 	b = PROLLY_CALL(cn->tree, build_begin, &benv, CurrentMemoryContext);
 	foreach(lc, cn->next)
 	{
@@ -4968,8 +5365,7 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
 	cn.advance = next_baseline != NULL;
-	if (baseline)
-		load_baseline(&cn, baseline);
+	cn.baseline = baseline;
 
 	/*
 	 * Everything the transaction wrote, this statement's writes too: a
@@ -4994,7 +5390,11 @@ fold_canon(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 	}
 	PG_END_TRY();
 	if (next_baseline)
+	{
 		build_baseline(&cn, baseline, next_baseline);
+		made_tree(&baseline_made, next_baseline);
+		baseline_at = cn.at;
+	}
 	return cn.left_out;
 }
 
@@ -5004,6 +5404,104 @@ folded_fold(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 {
 	(void) fold_canon(baseline, root, next_baseline, !commit, InvalidOid,
 					  false);
+}
+
+/*
+ * The session branch's tables whose next fold from baseline would read
+ * them in full, as table_root() would find (no entry, a definition its
+ * rows can't be mapped from) and then the change finder (full_reason()).
+ * The catalogs are read as a fold reads them, by a snapshot of now.
+ */
+static void
+folded_pending_full(const ProllyNodeRef *baseline,
+					ProllyPendingFullVisit visit, void *arg)
+{
+	Canon		cn;
+	Relation	classes;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *relids = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	cn.reading = true;
+	canon_env(&cn);
+	cn.finder = prolly_change_finder();
+	if (baseline)
+		load_baseline(&cn, baseline);
+	if (ActiveSnapshotSet())
+		PushCopiedSnapshot(GetActiveSnapshot());
+	else
+		PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		classes = table_open(RelationRelationId, AccessShareLock);
+		scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+		while ((tup = systable_getnext(scan)) != NULL)
+		{
+			Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+			if (form->relkind == RELKIND_RELATION &&
+				form->relam == PROLLY_TABLE_AM_OID &&
+				canon_namespace(form->relnamespace) &&
+				!in_extension(RelationRelationId, form->oid))
+				relids = lappend_oid(relids, form->oid);
+		}
+		systable_endscan(scan);
+		table_close(classes, AccessShareLock);
+
+		foreach_oid(relid, relids)
+		{
+			Relation	rel = try_table_open(relid, AccessShareLock);
+			char	   *name;
+			StringInfoData key;
+			BaseTable  *bt;
+			StringInfoData desc;
+			StringInfoData shape = {0};
+			ProllyHash	dh;
+			ProllyTableFold tf;
+			ProllyFullFoldReason why = PROLLY_FULL_NONE;
+
+			if (rel == NULL)
+				continue;
+			name = qualified(RelationGetNamespace(rel),
+							 RelationGetRelationName(rel));
+			initStringInfo(&key);
+			appendStringInfoString(&key, "t:");
+			append_utf8(&key, name);
+			initStringInfo(&desc);
+			table_description(&cn, rel, &desc, &dh);
+			bt = find_base_table(&cn, &key);
+			memset(&tf, 0, sizeof(tf));
+			if (prolly_full_fold_wanted(&why))
+				;
+			else if (bt == NULL)
+				why = PROLLY_FULL_NO_BASELINE;
+			else if (!(bt->shape_hash.len == dh.len &&
+					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
+					 !shape_holds(rel, base_shape(&cn, bt),
+								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
+					 !shape_mappable(&cn, rel, bt, &shape, &tf.shape))
+				why = PROLLY_FULL_SHAPE_CHANGED;
+			else if (PROLLY_HAS(cn.finder, full_reason))
+			{
+				tf.data = bt->data;
+				tf.state.data = (const uint8 *) bt->state.data;
+				tf.state.len = bt->state.len;
+				tf.reshaped = tf.shape.data != NULL;
+				why = cn.finder->full_reason(rel, &tf);
+			}
+			if (why != PROLLY_FULL_NONE)
+				visit(name, relid, why, arg);
+			pfree(key.data);
+			pfree(desc.data);
+			table_close(rel, AccessShareLock);
+		}
+	}
+	PG_FINALLY();
+	{
+		PopActiveSnapshot();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -13008,6 +13506,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.render = folded_render,
 	.move_schema = folded_move_schema,
 	.make_versioned_schemas = folded_make_versioned_schemas,
+	.pending_full = folded_pending_full,
 	.sequences = folded_sequences,
 	.fold_dependencies = folded_fold_dependencies,
 	.dependencies = folded_dependencies,

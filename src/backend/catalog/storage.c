@@ -1220,6 +1220,8 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			/* anything the storage manager needs, read before the section */
+			smgrpretruncate(reln, forks, nforks);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();

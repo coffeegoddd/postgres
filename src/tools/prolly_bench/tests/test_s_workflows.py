@@ -6,6 +6,7 @@ repositories standing in for the checkout and origin.
 
 Run: cd src/tools/prolly_bench && python3 -m unittest discover -s tests
 """
+import json
 import os
 import subprocess
 import tempfile
@@ -154,6 +155,72 @@ class PullRequestSwitchTest(unittest.TestCase):
         text = (REPO / '.github/workflows/performance.yml').read_text()
         trigger = text.split('\non:\n')[1].split('\n  push:')[0]
         self.assertIn('labeled', trigger.split('types:')[1].split('\n')[0])
+
+
+class NightlyRegressionIssueTest(unittest.TestCase):
+    """A confirmed regression opens (or updates) its issue with the judge's
+    report; a clean night clears it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        # A stand-in gh: each call's arguments to calls, the body file it
+        # was given to body.md's copy, and ISSUE as the open issue found.
+        gh = bin_dir / 'gh'
+        gh.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+with open(os.environ['CALLS'], 'a') as f:
+    f.write(json.dumps(args) + '\\n')
+if '--body-file' in args:
+    shutil.copy(args[args.index('--body-file') + 1], os.environ['BODY'])
+if args[:2] == ['issue', 'list']:
+    print(os.environ.get('ISSUE', ''))
+''')
+        gh.chmod(0o755)
+        self.path = str(bin_dir) + os.pathsep + os.environ['PATH']
+
+    def run_step(self, verdict, issue='', report=True):
+        work = self.root / ('work-' + verdict + issue)
+        (work / 'nightly').mkdir(parents=True)
+        if report:
+            (work / 'nightly/comment.md').write_text('## S suite nightly\nS1 prolly: confirmed\n')
+        calls, body = work / 'calls', work / 'body'
+        env = dict(os.environ, PATH=self.path, CALLS=str(calls), BODY=str(body), ISSUE=issue,
+                   VERDICT=verdict, BASE='b' * 40, CANDIDATE='c' * 40, RUN_URL='https://ci/run',
+                   RUNNER_TEMP=str(self.root / 'runner-temp'), LABEL='nightly-performance-regression',
+                   MARKER='<!-- s-suite-nightly -->')
+        result = subprocess.run(['bash', '-e', '-c', step_script('performance.yml', 'Open, update or clear the regression issue')],
+                                cwd=work, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        got = [json.loads(line) for line in calls.read_text().splitlines()]
+        return got, body.read_text() if body.exists() else None
+
+    def test_regression_opens_the_issue_with_the_report(self):
+        calls, body = self.run_step('regressed')
+        self.assertIn(['issue', 'create'], [c[:2] for c in calls])
+        self.assertTrue(body.startswith('<!-- s-suite-nightly -->\n'))
+        self.assertIn('S1 prolly: confirmed', body)
+
+    def test_regression_without_a_report_still_opens_the_issue(self):
+        calls, body = self.run_step('regressed', report=False)
+        self.assertIn(['issue', 'create'], [c[:2] for c in calls])
+        self.assertIn("didn't write one", body)
+
+    def test_regression_again_updates_the_open_issue(self):
+        calls, body = self.run_step('regressed', issue='17')
+        self.assertIn(['issue', 'edit', '17'], [c[:3] for c in calls])
+        self.assertIn(['issue', 'comment', '17'], [c[:3] for c in calls])
+        self.assertNotIn(['issue', 'create'], [c[:2] for c in calls])
+        self.assertIn('S1 prolly: confirmed', body)
+
+    def test_clean_night_clears_the_open_issue(self):
+        calls, _ = self.run_step('clean', issue='17')
+        self.assertIn(['issue', 'comment', '17'], [c[:3] for c in calls])
+        self.assertIn(['issue', 'close', '17'], [c[:3] for c in calls])
 
 
 class CommentWorkflowTest(unittest.TestCase):

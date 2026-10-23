@@ -1,0 +1,105 @@
+--
+-- PostGIS's metadata views list tables of the AM under test, and its
+-- column management functions work on them.
+--
+SELECT f_table_schema, f_table_name, f_geometry_column, coord_dimension, srid, type
+FROM geometry_columns WHERE f_table_name LIKE 'gis\_%' ORDER BY 2, 3;
+ f_table_schema | f_table_name | f_geometry_column | coord_dimension | srid |   type   
+----------------+--------------+-------------------+-----------------+------+----------
+ public         | gis_big      | g                 |               2 |    0 | GEOMETRY
+ public         | gis_geoms    | g                 |               2 |    0 | GEOMETRY
+ public         | gis_idx      | g                 |               2 |    0 | GEOMETRY
+ public         | gis_parcels  | g                 |               2 |    0 | GEOMETRY
+ public         | gis_pts      | g                 |               2 |    0 | GEOMETRY
+ public         | gis_typed    | p                 |               3 | 4326 | POINT
+(6 rows)
+
+SELECT f_table_schema, f_table_name, f_geography_column, coord_dimension, srid, type
+FROM geography_columns WHERE f_table_name LIKE 'gis\_%' ORDER BY 2, 3;
+ f_table_schema | f_table_name | f_geography_column | coord_dimension | srid |   type   
+----------------+--------------+--------------------+-----------------+------+----------
+ public         | gis_geogs    | g                  |                 |    0 | Geometry
+ public         | gis_typed    | g                  |               2 | 4326 | Polygon
+(2 rows)
+
+CREATE TABLE gis_managed (id int PRIMARY KEY);
+SELECT AddGeometryColumn('gis_managed', 'pt', 4326, 'POINT', 2);
+                 addgeometrycolumn                  
+----------------------------------------------------
+ public.gis_managed.pt SRID:4326 TYPE:POINT DIMS:2 
+(1 row)
+
+SELECT AddGeometryColumn('gis_managed', 'area', 3857, 'MULTIPOLYGONM', 3, false);
+                      addgeometrycolumn                       
+--------------------------------------------------------------
+ public.gis_managed.area SRID:3857 TYPE:MULTIPOLYGONM DIMS:3 
+(1 row)
+
+INSERT INTO gis_managed VALUES (1, 'SRID=4326;POINT(1 1)', NULL);
+INSERT INTO gis_managed VALUES (2, 'SRID=4326;LINESTRING(1 1, 2 2)', NULL);
+ERROR:  Geometry type (LineString) does not match column type (Point)
+SELECT f_geometry_column, coord_dimension, srid, type FROM geometry_columns
+WHERE f_table_name = 'gis_managed' ORDER BY 1;
+ f_geometry_column | coord_dimension | srid |     type      
+-------------------+-----------------+------+---------------
+ area              |               3 | 3857 | MULTIPOLYGONM
+ pt                |               2 | 4326 | POINT
+(2 rows)
+
+SELECT DropGeometryColumn('gis_managed', 'area');
+              dropgeometrycolumn              
+----------------------------------------------
+ public.gis_managed.area effectively removed.
+(1 row)
+
+SELECT attname FROM pg_attribute WHERE attrelid = 'gis_managed'::regclass AND attnum > 0
+  AND NOT attisdropped ORDER BY attnum;
+ attname 
+---------
+ id
+ pt
+(2 rows)
+
+-- an unconstrained column, given a typmod from its values
+CREATE TABLE gis_loose (id int PRIMARY KEY, g geometry);
+INSERT INTO gis_loose VALUES (1, 'SRID=4326;POINT(1 2)'), (2, 'SRID=4326;POINT(3 4)');
+SELECT Populate_Geometry_Columns('gis_loose'::regclass);
+ populate_geometry_columns 
+---------------------------
+                         1
+(1 row)
+
+SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+WHERE attrelid = 'gis_loose'::regclass AND attname = 'g';
+     format_type      
+----------------------
+ geometry(Point,4326)
+(1 row)
+
+-- rasters with their constraints
+CREATE TABLE gis_tiles AS SELECT id, r AS rast FROM gis_rasters WHERE id <= 5;
+SELECT AddRasterConstraints('gis_tiles'::name, 'rast'::name, 'srid', 'num_bands', 'pixel_types');
+NOTICE:  Adding SRID constraint
+NOTICE:  Adding number of bands constraint
+NOTICE:  Adding pixel type constraint
+ addrasterconstraints 
+----------------------
+ t
+(1 row)
+
+SELECT r_table_name, r_raster_column, srid, num_bands, pixel_types FROM raster_columns
+WHERE r_table_name = 'gis_tiles';
+ r_table_name | r_raster_column | srid | num_bands | pixel_types 
+--------------+-----------------+------+-----------+-------------
+ gis_tiles    | rast            | 4326 |         1 | {16BSI}
+(1 row)
+
+INSERT INTO gis_tiles SELECT 99, r FROM gis_rasters WHERE id = 6;
+ERROR:  new row for relation "gis_tiles" violates check constraint "enforce_pixel_types_rast"
+DETAIL:  Failing row contains (99, 0100000100000000000000F03F000000000000F0BF0000000000000000000000...).
+SELECT count(*) FROM gis_tiles;
+ count 
+-------
+     5
+(1 row)
+

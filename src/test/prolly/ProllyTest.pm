@@ -72,8 +72,9 @@ sub run_requirements
 	setup_target($node, 'regression', $am);
 	my $out = "$PostgreSQL::Test::Utils::tmp_check/$kind";
 	make_path($out);
-	my $runner = $kind eq 'semantics' ? $ENV{PG_REGRESS}
-	  : "$ENV{top_builddir}/src/test/isolation/pg_isolation_regress";
+	my $runner = $kind eq 'isolation'
+	  ? "$ENV{top_builddir}/src/test/isolation/pg_isolation_regress"
+	  : $ENV{PG_REGRESS};
 	my $rc = system($runner, '--use-existing', '--bindir=',
 		'--host=' . $node->host, '--port=' . $node->port,
 		'--dbname=regression', '--inputdir=' . abs_path('.'),
@@ -81,11 +82,16 @@ sub run_requirements
 	diag(slurp_file("$out/regression.diffs"))
 	  if $rc && -f "$out/regression.diffs";
 	is($rc, 0, "$kind matches heap on $am");
+	# (an extension's own tables, such as PostGIS's spatial_ref_sys, are
+	# shared heap tables wherever they live)
 	my $wrong = $node->safe_psql('regression', qq{
 		SELECT c.relname, a.amname FROM pg_class c
 		JOIN pg_am a ON a.oid = c.relam
 		WHERE c.relnamespace = 'public'::regnamespace
-		AND c.relkind IN ('r', 'm') AND a.amname <> '$am'});
+		AND c.relkind IN ('r', 'm') AND a.amname <> '$am'
+		AND NOT EXISTS (SELECT FROM pg_depend d
+			WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+			AND d.deptype = 'e')});
 	is($wrong, '', 'remaining tables use the requested engine');
 	$node->stop;
 }
