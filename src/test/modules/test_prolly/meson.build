@@ -102,6 +102,7 @@ tests += {
       'commit_root',
       'kept_checkouts',
       'share_layouts',
+      'checkout_table_work',
       'constraint_violations',
       'keyless_violations',
       'verify_constraints',

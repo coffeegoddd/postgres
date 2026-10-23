@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF1
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF2
 
 typedef struct PgStat_ArchiverStats
 {
@@ -726,9 +726,10 @@ typedef enum PgStat_ProllyCounter
 											 * hidden branch was kept */
 	PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED,	/* kept hidden branches let go
 											 * of past the budget */
+	PGSTAT_PROLLY_MOVE_TABLES_WRITTEN,	/* tables a move wrote rows into */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MOVE_TABLES_WRITTEN + 1)
 
 typedef struct PgStat_ProllyStats
 {

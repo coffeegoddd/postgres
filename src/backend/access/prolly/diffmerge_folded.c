@@ -71,6 +71,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_type.h"
+#include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
@@ -4270,7 +4271,10 @@ rows_from(const ProllyNodeRef *working, const ProllyNodeRef *target)
 					 errmsg("table \"%s\" is missing from the working set",
 							t->name)));
 		if (!same_hash(&f->data.hash, &t->data.hash))
+		{
 			apply_rows(table_named(t->name), f, t);
+			pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_WRITTEN, 1);
+		}
 	}
 
 	/*
