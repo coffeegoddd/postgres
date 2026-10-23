@@ -7,6 +7,9 @@
 -- (debug_prolly_force_full_fold).
 CREATE DATABASE regress_shape_folds;
 \c regress_shape_folds
+-- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
+-- counted here is what the next fold reads after one)
+SET prolly.fold_on_rewrite = off;
 CREATE EXTENSION test_prolly;
 CREATE FUNCTION full_folds() RETURNS text LANGUAGE sql AS $$
 	SELECT coalesce(string_agg(substr(name, 11), ',' ORDER BY name), 'none')

@@ -23,6 +23,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "access/prolly_config.h"
+#include "access/prolly_fold.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_opclass.h"
 #include "commands/matview.h"
@@ -374,6 +375,10 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 	/* Restore userid and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	/* (a versioned prolly materialized view rewritten: its branch folded now) */
+	if (!concurrent && !is_create)
+		prolly_fold_rewritten(matviewOid);
 
 	ObjectAddressSet(address, RelationRelationId, matviewOid);
 

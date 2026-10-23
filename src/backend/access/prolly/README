@@ -305,6 +305,15 @@ dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
 
+A rewrite of a versioned table (ALTER TABLE changing a column's type,
+REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
+branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
+prolly_fold_rewritten(), called by tablecmds.c and matview.c), so the
+commit after, the fold worker off or in the same transaction, folds only
+what changed since.  dolt_pending_full_folds() lists the tables whose next
+fold would read them in full, and why, from the baseline, the catalogs and
+each change finder's full_reason(), reading no rows.
+
 A move of the session's branch (a reset, a fast-forward, a merge's)
 folds its working set, if not known, as a checkpoint: the fold is the
 branch's baseline.  After the rows are written, the baseline is advanced

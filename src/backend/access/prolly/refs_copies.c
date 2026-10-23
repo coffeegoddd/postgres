@@ -3613,6 +3613,21 @@ copies_fold_own(const ProllyRowChanges *changes, int nchanges)
 	return true;
 }
 
+/* The canonicalizer's pending_full() of the session branch, from its baseline. */
+static void
+copies_pending_full_folds(ProllyPendingFullVisit visit, void *arg)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef baseline;
+	bool		have;
+
+	refs_init();
+	prolly_database_components(&dc);
+	have = branch_baseline(branch_ops()->current(), &baseline);
+	PROLLY_CALL(dc.canonicalizer, pending_full, have ? &baseline : NULL,
+				visit, arg);
+}
+
 static void
 copies_publish_definitions(void *read, const ProllyNodeRef *root,
 						   bool complete)
@@ -5017,6 +5032,7 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.working_changes = copies_working_changes,
 	.publish_definitions = copies_publish_definitions,
 	.fold_own = copies_fold_own,
+	.pending_full_folds = copies_pending_full_folds,
 	.checkpoint_unless_moved = copies_checkpoint_unless_moved,
 	.moved_databases = branch_generations_moved_databases,
 	.moved_branches = branch_generations_moved,

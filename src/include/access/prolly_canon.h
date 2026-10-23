@@ -71,6 +71,7 @@
 #ifndef PROLLY_CANON_H
 #define PROLLY_CANON_H
 
+#include "access/prolly_fold.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
@@ -366,6 +367,16 @@ typedef struct ProllyCanonRoutine
 	 * in versioned schemas before the move that makes the rest.
 	 */
 	void		(*make_versioned_schemas) (List *names);
+
+	/*
+	 * Optional: visit each table of the session branch's versioned schemas
+	 * whose next fold from baseline (NULL: none) would read it in full, with
+	 * why: no entry for it, its definition changed past what its rows can be
+	 * mapped from, or what its change finder's full_reason() says.  Nothing
+	 * is folded or read but the catalogs and the baseline.
+	 */
+	void		(*pending_full) (const ProllyNodeRef *baseline,
+								 ProllyPendingFullVisit visit, void *arg);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -375,9 +386,9 @@ typedef struct ProllyCanonRoutine
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
-	"make_versioned_schemas"
+	"make_versioned_schemas", "pending_full"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK make_versioned_schemas
+#define PROLLY_CANON_LAST_CALLBACK pending_full
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,
