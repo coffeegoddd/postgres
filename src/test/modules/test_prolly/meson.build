@@ -320,6 +320,7 @@ tests += {
       't/194_bmap_snapshot_redo.pl',
       't/200_kept_pages_recovery.pl',
       't/201_kept_pages_old_xids.pl',
+      't/202_kept_pages_failed_take.pl',
     ],
   },
 }
