@@ -172,6 +172,13 @@ from the base as the transaction's snapshot saw it and swept once it is
 clean and merged.  The mode, protections and writer branches are
 database settings kept in the refs.
 
+Automatic forks happen before parse analysis (including modifying CTEs)
+and before cached statements reacquire relation locks. Creators therefore
+wait for refs without holding write locks on the protected source that
+another creator needs to copy. Analysis and cached-plan revalidation use
+the writer branch's catalogs. Cleanup rechecks its candidates under refs,
+so concurrent checkouts cannot delete the same completed writer twice.
+
 
 Commits
 -------

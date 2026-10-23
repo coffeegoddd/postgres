@@ -12,6 +12,7 @@
 #define PROLLY_XACT_H
 
 #include "datatype/timestamp.h"
+#include "nodes/nodes.h"
 
 /*
  * Per-session setup once connected to a database: defines the dolt.*
@@ -22,6 +23,9 @@
  */
 extern void prolly_session_init(const char *branch);
 extern void prolly_session_ready(void);
+
+/* Route a top-level write before analysis or cached-plan relation locks. */
+extern void prolly_prepare_writer_statement(Node *stmt);
 
 /*
  * Refuses the branch a connection asked for if no connection may name it:

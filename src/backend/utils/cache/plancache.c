@@ -57,6 +57,8 @@
  */
 #include "postgres.h"
 
+#include "access/prolly_xact.h"
+
 #include <limits.h>
 
 #include "access/transam.h"
@@ -712,6 +714,10 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 		Assert(plansource->is_valid);
 		return NIL;
 	}
+
+	/* A writer branch must exist before we reacquire the source's locks. */
+	if (plansource->raw_parse_tree)
+		prolly_prepare_writer_statement(plansource->raw_parse_tree->stmt);
 
 	/*
 	 * If the query is currently valid, we should have a saved search_path ---

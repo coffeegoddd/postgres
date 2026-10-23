@@ -24,6 +24,8 @@
 
 #include "postgres.h"
 
+#include "access/prolly_xact.h"
+
 #include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_proc.h"
@@ -265,6 +267,8 @@ Query *
 transformTopLevelStmt(ParseState *pstate, RawStmt *parseTree)
 {
 	Query	   *result;
+
+	prolly_prepare_writer_statement(parseTree->stmt);
 
 	/* We're at top level, so allow SELECT INTO */
 	result = transformOptionalSelectInto(pstate, parseTree->stmt);

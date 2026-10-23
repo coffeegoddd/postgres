@@ -106,6 +106,16 @@ SELECT pg_temp.since('chunk_cache_hits') > 0 AS third_hits,
 
 -- What the cache gives is the chunk: the same rows either way.
 SET prolly_chunk_cache_size = 0;
+-- Drain work done by the preceding counter queries while the cache was on.
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+DO $$ BEGIN
+	PERFORM pg_temp.since('chunk_cache_hits');
+END $$;
 CREATE TEMP TABLE uncached AS
 	SELECT (to_row).id, (to_row).v FROM dolt_diff('HEAD~1', 'HEAD', NULL::cc.t);
 SELECT pg_stat_force_next_flush();

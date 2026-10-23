@@ -1285,11 +1285,24 @@ sweep_detached(char *current)
 	ResourceOwner owner = CurrentResourceOwner;
 	ListCell   *lc;
 	bool		was_read_only = XactReadOnly;
+	bool		pushed;
 
 	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
 	PROLLY_CALL(refs(), branches, add_detached, &db);
+	if (db.names == NIL)
+		return;
 	XactReadOnly = false;
+	/*
+	 * Another checkout can delete a candidate while we wait for refs.  Hold
+	 * them before choosing the final set, not just when deleting each name.
+	 * This also rechecks whether a writer branch is still clean and merged.
+	 */
+	pushed = PROLLY_CALL(refs(), hold);
+	AcceptInvalidationMessages();
+	list_free_deep(db.names);
+	db.names = NIL;
+	PROLLY_CALL(refs(), branches, add_detached, &db);
 	foreach(lc, db.names)
 	{
 		BeginInternalSubTransaction(NULL);
@@ -1326,6 +1339,8 @@ sweep_detached(char *current)
 		}
 		PG_END_TRY();
 	}
+	if (pushed)
+		PopActiveSnapshot();
 	XactReadOnly = was_read_only;
 }
 
@@ -2282,6 +2297,68 @@ move_to_writer_branch(bool *same)
 	return true;
 }
 
+/* Find DML, including a modifying CTE in an otherwise read-only SELECT. */
+static bool
+raw_query_writes(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, InsertStmt) || IsA(node, UpdateStmt) ||
+		IsA(node, DeleteStmt) || IsA(node, MergeStmt))
+		return true;
+	if (IsA(node, ExplainStmt))
+		return raw_query_writes(((ExplainStmt *) node)->query, context);
+	if (IsA(node, CreateTableAsStmt))
+		return raw_query_writes(((CreateTableAsStmt *) node)->query, context);
+	return raw_expression_tree_walker(node, raw_query_writes, context);
+}
+
+/*
+ * Analysis takes RowExclusiveLock on a write's target.  Waiting until the
+ * post-analysis hook to fork lets several creators hold those locks on the
+ * protected source while one holds refs and waits for ShareLock to copy it.
+ * Route before analysis instead, and before cached queries reacquire locks.
+ * A branch switch invalidates the plan caches; analysis/revalidation below
+ * therefore uses the destination's definitions and locks throughout.
+ *
+ * Utility commands still use the ProcessUtility hook.  Nested statements
+ * cannot move the session out from under their caller's executor.
+ */
+void
+prolly_prepare_writer_statement(Node *stmt)
+{
+	static bool preparing = false;
+	bool		snapshot_set = false;
+	bool		same;
+
+	if (statement_depth != 0 || preparing || stmt == NULL ||
+		!IsTransactionState() ||
+		!(IsA(stmt, SelectStmt) || IsA(stmt, InsertStmt) ||
+		  IsA(stmt, UpdateStmt) || IsA(stmt, DeleteStmt) || IsA(stmt, MergeStmt) ||
+		  IsA(stmt, ExplainStmt) || IsA(stmt, CreateTableAsStmt)) ||
+		!raw_query_writes(stmt, NULL))
+		return;
+
+	preparing = true;
+	PG_TRY();
+	{
+		/* Extended-protocol revalidation need not have an active snapshot. */
+		if (!ActiveSnapshotSet())
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			snapshot_set = true;
+		}
+		(void) move_to_writer_branch(&same);
+		if (snapshot_set)
+			PopActiveSnapshot();
+	}
+	PG_FINALLY();
+	{
+		preparing = false;
+	}
+	PG_END_TRY();
+}
+
 /* Lock a statement's relations again, on the branch the session is on now. */
 static void
 relock(List *rtable)
@@ -2306,8 +2383,8 @@ query_writes(Query *query)
 }
 
 /*
- * A top-level statement that writes moves as it is analyzed, before it is
- * planned: its plan is then the writer branch's.
+ * Fallback for writes introduced by an analysis hook: ordinary raw DML was
+ * already routed before taking any analysis locks.
  */
 static void
 writer_post_parse_analyze(ParseState *pstate, Query *query, const JumbleState *jstate)
