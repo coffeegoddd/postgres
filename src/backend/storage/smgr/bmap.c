@@ -6190,7 +6190,12 @@ tree_release_tops(SMgrRelation reln, const BmapEntry *tops)
  * but the nodes it points to are freed, and may be made something else: so
  * its root page is first written out with no subtrees, under the header's
  * lock (which a sweep reads it under), and with no record, the relation's
- * drop being logged already (redo removes the map).
+ * drop being logged already (redo removes the map).  Its header is written
+ * out with no blocks too: until the next checkpoint the map is what keeps
+ * the relation file number from being used again, and the relation
+ * reads as empty, as md.c's truncated first segment does (a transaction
+ * syncing the relations it made counts the blocks of one a subtransaction
+ * dropped).
  */
 static void
 tree_drop(SMgrRelation reln)
@@ -6203,6 +6208,7 @@ tree_drop(SMgrRelation reln)
 	void	   *pages[1] = {copy.data};
 
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	buf = map_read(rel, 1);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
@@ -6214,6 +6220,10 @@ tree_drop(SMgrRelation reln)
 	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
 	PageSetChecksum((Page) copy.data, 1);
 	mdwritev(reln, BMAP_FORKNUM, 1, (const void **) pages, 1, false);
+	PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks = 0;
+	memcpy(copy.data, BufferGetPage(headerbuf), BLCKSZ);
+	PageSetChecksum((Page) copy.data, 0);
+	mdwritev(reln, BMAP_FORKNUM, 0, (const void **) pages, 1, false);
 	UnlockReleaseBuffer(buf);
 	UnlockReleaseBuffer(headerbuf);
 
