@@ -1674,6 +1674,24 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 				Datum		canon = send_floats(c, value);
 				bytea	   *b = send_utf8(&c->send, canon);
 
+				/*
+				 * Extension binary input can normalize representations that
+				 * binary output distinguishes (for example PostGIS NaN points).
+				 * Store the representation we will get back, not a pre-receive
+				 * spelling. initdb's fixed I/O and our explicit built-in codecs
+				 * need no extra round trip; ranges over extension base types do.
+				 */
+				if (c->tagged)
+				{
+					Datum		roundtrip = recv_utf8(c, VARDATA(b),
+												 VARSIZE(b) - VARHDRSZ);
+					bytea	   *normalized = send_utf8(&c->send, roundtrip);
+
+					pfree(b);
+					b = normalized;
+					if (!c->typbyval)
+						pfree(DatumGetPointer(roundtrip));
+				}
 				if (c->tagged)
 					appendStringInfoChar(out, TAG_SEND);
 				appendBinaryStringInfo(out, VARDATA(b), VARSIZE(b) - VARHDRSZ);

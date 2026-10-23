@@ -1,0 +1,4 @@
+comment = 'Normalizing binary I/O fixture for prolly tests'
+default_version = '1.0'
+module_pathname = '$libdir/test_prolly'
+relocatable = true
