@@ -246,7 +246,8 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "16", per-table ordering metadata and
+ * The format a folded root is in: "17", extension send values normalized by
+ * binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
  * table's definition a line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
  * TABLE's tail, and was the first with a value of a type whose binary I/O
@@ -279,7 +280,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"16"
+#define FOLDED_FORMAT	"17"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -291,8 +292,8 @@ typedef struct BaseTable BaseTable;
  * FOLDED_FORMAT too, and these with it: a fold refuses to run till they
  * agree (folded_encoders_checked()).
  */
-#define FOLDED_KEY_ENCODER		5
-#define FOLDED_VALUE_ENCODER	5
+#define FOLDED_KEY_ENCODER		6
+#define FOLDED_VALUE_ENCODER	6
 #define FOLDED_KEYING			1
 
 typedef struct Canon

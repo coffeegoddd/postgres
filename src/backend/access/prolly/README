@@ -88,11 +88,37 @@ send formats produced with the client encoding fixed to UTF-8
 and composites.  valenc_canonical.c stores live columns only, without
 trailing NULLs, and decodes rows encoded under an earlier layout.
 
+Folded format 17 (key/value encoder version 6) normalizes binary I/O for
+extension base types and for ranges whose bounds reach one (including
+through a composite or array subtype): send(receive(send(value))).
+Arrays, composites and domains normalize their children recursively.  The
+fixed built-in codecs keep their existing bytes and avoid this extra work.
+This makes a value's stored bytes match its reconstructed representation:
+for example, PostGIS can read either signed-NaN POINT spelling as POINT EMPTY.
+As with binary dump/restore, reconstruction preserves the receiver's value;
+it does not promise to preserve a physical spelling that receive discards.
+Working-side cell merges fold and decode values before comparison, so the
+same normalization applies there.
+
+A normalized primary key must compare equal to its original value under
+the actual key operator class.  Encoding rejects values that cross that
+boundary, including during writes and adding a key to existing rows.  This
+keeps the tree's key compatible with native index lookups into the heap.
+Reconstruction also re-inserts rows through the table's other unique and
+exclusion indexes, so a value such an index constrains is held to the same
+rule: equal under a unique btree key column's operator class, and otherwise
+(an exclusion operator, an index expression or predicate) unchanged by the
+round trip.  Writes and building such an index over existing rows refuse
+values that would not reconstruct.  Other non-key values may normalize
+without that restriction.  Extension I/O must
+still be stable after reconstruction; testing one value is not a certificate
+that an arbitrary extension's send/receive functions satisfy that contract.
+
 
 Extension ordering and history compatibility
 -------------------------------------------
 
-Folded format 16 records the extensions ordering each table's primary key,
+Folded formats since 16 record the extensions ordering each table's primary key,
 including comparators reached through arrays, composites, ranges, multiranges
 and domains.  A dependency's optional flags have one order: "versioned", then
 "ordering".  Clone and move targets require the exact recorded ordering
@@ -115,7 +141,7 @@ Hard reset to a target recording the old version remains refused (including
 HEAD); a forward reset to a compatible new target is allowed.
 
 This is a deliberate history format change.  Earlier servers cannot read
-format-16 commits or the new dependency flags, so these commits must not be
+format-17 commits, so these commits must not be
 sent to an older server or used after downgrading.  Current code still parses
 legacy dependency entries, but it does not retroactively certify legacy key
 ordering.  Older root formats retain the existing recommit requirement;

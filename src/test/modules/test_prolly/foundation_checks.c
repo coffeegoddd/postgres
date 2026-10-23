@@ -37,6 +37,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
+#include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "nodes/value.h"
 #include "port/pg_crc32c.h"
@@ -46,6 +47,24 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/typcache.h"
+
+/* A fixture whose wire input normalizes ASCII case, unlike text input. */
+PG_FUNCTION_INFO_V1(test_normalizing_recv);
+Datum
+test_normalizing_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	int			len;
+	char	   *str = pq_getmsgtext(buf, buf->len - buf->cursor, &len);
+	text	   *result;
+
+	for (int i = 0; i < len; i++)
+		if (str[i] >= 'A' && str[i] <= 'Z')
+			str[i] += 'a' - 'A';
+	result = cstring_to_text_with_len(str, len);
+	pfree(str);
+	PG_RETURN_TEXT_P(result);
+}
 
 /* ------------------------------------------------------------------------
  * Chunker
