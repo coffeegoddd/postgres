@@ -305,6 +305,16 @@ dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
 
+A move of the session's branch (a reset, a fast-forward, a merge's)
+folds its working set, if not known, as a checkpoint: the fold is the
+branch's baseline.  After the rows are written, the baseline is advanced
+to the target without another fold, each table the move wrote holding
+the target's rows and its change log's record of the move's own writes
+consumed (the canonicalizer's advance_baseline()); where it can't be (the
+definitions moved too, a materialized view's rows did, a table's state
+can't be advanced), the rest is folded as before.  So a move from a dirty
+working set folds it once.
+
 What a fold works out for every table, changed or not, is cached in the
 backend (canon_folded.c's own): each table's description and the hash its
 baseline is kept by, dropped by a relcache invalidation of the table or a

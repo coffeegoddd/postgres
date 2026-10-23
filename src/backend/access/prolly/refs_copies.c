@@ -1277,6 +1277,11 @@ static void verify_known(const char *name, bool complete,
 						 const ProllyNodeRef *root);
 static bool share_clean_tables(const ProllyNodeRef *target,
 							   ProllyNodeRef *working);
+static bool advance_to_target(const ProllyNodeRef *target,
+							  const ProllyNodeRef *working);
+static void publish_fold(const BranchFoldStamp *stamp, Snapshot snap,
+						 const ProllyNodeRef *baseline,
+						 const ProllyNodeRef *root, bool complete);
 
 /*
  * A first use's source whose working set was known to be the root its
@@ -1316,7 +1321,11 @@ copied_working_set(const KnownSource *ks, ProllyNodeRef *working)
  * uncommitted work the move discards, as it does any other.  The working
  * set is folded only if nothing known says what it is (#482): the
  * branch's, or (source, a first use's) the working set of the branch its
- * copies were made from, as they are still (#491).
+ * copies were made from, as they are still (#491).  The session branch's
+ * working set, folded, is its baseline from then on (a checkpoint), so
+ * that after the move the baseline can be advanced to the target without
+ * folding again (advance_to_target()): a move from a dirty working set
+ * folds it once.
  */
 static void
 settle(const ProllyNodeRef *target, const KnownSource *source)
@@ -1326,8 +1335,26 @@ settle(const ProllyNodeRef *target, const KnownSource *source)
 
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.canonicalizer, discard_undescribed);
-	if (!copied_working_set(source, &working))
-		working_fold(&working);
+	if (source != NULL)
+	{
+		if (!copied_working_set(source, &working))
+			working_fold(&working);
+	}
+	else
+	{
+		char	   *name = branch_ops()->current();
+		ProllyNodeRef baseline;
+		bool		have = branch_baseline(name, &baseline);
+
+		if (!known_working_set(name, MyBranch, have ? &baseline : NULL, false,
+							   &working))
+		{
+			ProllyNodeRef next;
+
+			fold_from_baseline(&working, &next, false);
+			branch_set_baseline(name, &next, &working);
+		}
+	}
 	if (same_hash(&working.hash, &target->hash))
 		return;
 
@@ -1336,7 +1363,8 @@ settle(const ProllyNodeRef *target, const KnownSource *source)
 		same_hash(&working.hash, &target->hash))
 		return;
 	PROLLY_CALL(dc.diff_merge, move_to, target, &working);
-	fold_as_baseline(NULL);
+	if (!advance_to_target(target, &working))
+		fold_as_baseline(NULL);
 }
 
 /*
@@ -1554,6 +1582,102 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	branch_set_baseline(current, &spliced, NULL);
 	fold_from_baseline(working, &next, false);
 	branch_set_baseline(current, &next, working);
+	return true;
+}
+
+/*
+ * After a move of rows from working to target: the session branch's
+ * baseline (which holds working's rows, as the fold before the move left
+ * it) advanced to target without a fold, each table whose rows the move
+ * wrote holding target's, its change finder's record of the move's own
+ * writes consumed (the canonicalizer's advance_baseline()), and target
+ * published as the working set (#482).  False, the caller folding, where
+ * a table's can't be so: the definitions or a materialized view's rows
+ * moved too, or a finder can't advance a table's state (then those that
+ * were advanced stay so, and the fold reads only the rest).
+ */
+static bool
+advance_to_target(const ProllyNodeRef *target, const ProllyNodeRef *working)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = branch_ops()->current();
+	ProllyNodeRef baseline;
+	ProllyNodeRef next;
+	List	   *ours = NIL;
+	List	   *theirs = NIL;
+	ListCell   *a;
+	ListCell   *b;
+	BranchFoldStamp stamp;
+	Snapshot	snap;
+	bool		all = true;
+	bool		any = false;
+
+	prolly_database_components(&dc);
+	if (!fold_caches_usable() ||
+		!PROLLY_HAS(dc.canonicalizer, advance_baseline) ||
+		!branch_baseline(name, &baseline) ||
+		!PROLLY_CALL(dc.canonicalizer, same_schema, working, target))
+		return false;
+	PROLLY_CALL(dc.canonicalizer, materialized_views, working, note_table,
+				&ours);
+	PROLLY_CALL(dc.canonicalizer, materialized_views, target, note_table,
+				&theirs);
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	forboth(a, ours, b, theirs)
+	{
+		NamedTree  *o = lfirst(a);
+		NamedTree  *t = lfirst(b);
+
+		if (strcmp(o->name, t->name) != 0 ||
+			!same_hash(&o->data.hash, &t->data.hash))
+			return false;
+	}
+	ours = theirs = NIL;
+	PROLLY_CALL(dc.canonicalizer, tables, working, NULL, note_table, &ours);
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	forboth(a, ours, b, theirs)
+	{
+		if (strcmp(((NamedTree *) lfirst(a))->name,
+				   ((NamedTree *) lfirst(b))->name) != 0)
+			return false;
+	}
+
+	/* (the stamp before the baseline moves, as a fold's) */
+	branch_fold_stamp(MyBranch, &stamp);
+	snap = fold_snapshot();
+	forboth(a, ours, b, theirs)
+	{
+		NamedTree  *o = lfirst(a);
+		NamedTree  *t = lfirst(b);
+		ProllyRowChanges ch = {InvalidOid, NULL, 0};
+
+		if (same_hash(&o->data.hash, &t->data.hash))
+			continue;
+		ch.relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(o->name, NULL)),
+									NoLock, true);
+		if (OidIsValid(ch.relid) && get_rel_relkind(ch.relid) == RELKIND_RELATION &&
+			PROLLY_CALL(dc.canonicalizer, advance_baseline, &baseline, working,
+						target, &ch, 1, &next))
+		{
+			baseline = next;
+			any = true;
+		}
+		else
+			all = false;
+	}
+	if (!all)
+	{
+		if (any)
+			branch_set_baseline(name, &baseline, NULL);
+		return false;
+	}
+	branch_set_baseline(name, &baseline, target);
+	publish_fold(&stamp, snap, &baseline, target, false);
+	if (debug_prolly_verify_fold_caches)
+		verify_known(name, false, target);
 	return true;
 }
 
