@@ -107,6 +107,12 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_APPLY_LOADS] = "apply_loads",
 	[PGSTAT_PROLLY_CHUNK_CACHE_HITS] = "chunk_cache_hits",
 	[PGSTAT_PROLLY_FOLD_ROWS_LOCATED] = "fold_rows_located",
+	[PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED] = "bmap_map_pages_copied",
+	[PGSTAT_PROLLY_BMAP_REFCOUNT_UPDATES] = "bmap_refcount_updates",
+	[PGSTAT_PROLLY_BMAP_BLOCKS_FREED] = "bmap_blocks_freed",
+	[PGSTAT_PROLLY_APPLY_ROWS] = "apply_rows",
+	[PGSTAT_PROLLY_APPLY_INDEX_TUPLES] = "apply_index_tuples",
+	[PGSTAT_PROLLY_CATALOG_ROWS_COPIED] = "catalog_rows_copied",
 	[PGSTAT_PROLLY_FOLD_CHANGES_SPILLED] = "fold_changes_spilled",
 };
 
