@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF1
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF2
 
 typedef struct PgStat_ArchiverStats
 {
@@ -722,9 +722,11 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, /* page images a share logged of
 										 * the blocks the relation alone
 										 * held */
+	PGSTAT_PROLLY_BMAP_BLOCKS_MOVED,	/* page-store blocks a sweep moved
+										 * down, to shorten the store */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_PAGES_PRESERVED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BLOCKS_MOVED + 1)
 
 typedef struct PgStat_ProllyStats
 {

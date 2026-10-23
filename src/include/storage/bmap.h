@@ -157,6 +157,7 @@ typedef struct BmapSweep
 	uint64		freed;			/* blocks nothing held */
 	uint64		recounted;		/* stuck counts rewritten */
 	uint64		truncated;		/* blocks the store was shortened by */
+	uint64		moved;			/* blocks moved down for it */
 	uint64		stuck;			/* counts left stuck: past what one holds */
 } BmapSweep;
 
