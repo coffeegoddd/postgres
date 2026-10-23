@@ -109,5 +109,35 @@ SELECT name, value FROM since(:'before') WHERE name = 'first_use_tables_kept';
 SELECT rows_digest() = :'at_load' AS at_load;
 SELECT dolt_checkout('main');
 
+-- a table vacuumed before its commit and unchanged since: the copy of its
+-- kept pages gets its visibility map too, so index-only scans on the
+-- branch don't visit the heap
+CREATE TABLE fk.vis (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+INSERT INTO fk.vis SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+VACUUM fk.vis;
+SELECT dolt_commit('-Am', 'vacuumed') IS NOT NULL AS committed;
+CREATE FUNCTION heap_fetches() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+		SELECT count(id) FROM fk.vis WHERE id > 0
+	LOOP
+		IF line LIKE '%Heap Fetches%' THEN
+			RETURN trim(line);
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT heap_fetches() AS on_main;
+SELECT dolt_branch('b4');
+SELECT dolt_checkout('b4');
+SELECT heap_fetches() AS on_the_branch;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT dolt_checkout('main');
+
 \c :home
 DROP DATABASE first_use_kept;

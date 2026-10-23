@@ -110,13 +110,15 @@ NOTICE:  main's note_ddl: CREATE TABLE
 -- someone else makes a function of its name there (never run as the
 -- trigger's)
 CREATE ROLE regress_evt_alice;
-GRANT CREATE, USAGE ON SCHEMA public TO regress_evt_alice;
 SELECT dolt_checkout('evt_old');
            dolt_checkout            
 ------------------------------------
  {0,"Switched to branch 'evt_old'"}
 (1 row)
 
+-- (granted there: a branch's first use copies the branch nearest its head,
+-- here main, which keeps its pages as of it, not the session's)
+GRANT CREATE, USAGE ON SCHEMA public TO regress_evt_alice;
 CREATE TABLE public.g (id int PRIMARY KEY);
 WARNING:  event trigger function public.note_ddl() isn't on branch "evt_old": the trigger is skipped
 SET ROLE regress_evt_alice;

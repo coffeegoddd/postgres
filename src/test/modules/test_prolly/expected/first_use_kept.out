@@ -280,5 +280,64 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
+-- a table vacuumed before its commit and unchanged since: the copy of its
+-- kept pages gets its visibility map too, so index-only scans on the
+-- branch don't visit the heap
+CREATE TABLE fk.vis (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+INSERT INTO fk.vis SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+VACUUM fk.vis;
+SELECT dolt_commit('-Am', 'vacuumed') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CREATE FUNCTION heap_fetches() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+		SELECT count(id) FROM fk.vis WHERE id > 0
+	LOOP
+		IF line LIKE '%Heap Fetches%' THEN
+			RETURN trim(line);
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT heap_fetches() AS on_main;
+     on_main     
+-----------------
+ Heap Fetches: 0
+(1 row)
+
+SELECT dolt_branch('b4');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('b4');
+         dolt_checkout         
+-------------------------------
+ {0,"Switched to branch 'b4'"}
+(1 row)
+
+SELECT heap_fetches() AS on_the_branch;
+  on_the_branch  
+-----------------
+ Heap Fetches: 0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
 \c :home
 DROP DATABASE first_use_kept;

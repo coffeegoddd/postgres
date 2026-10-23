@@ -365,19 +365,32 @@ unlock_relations(List *relids, LOCKMODE mode)
 
 /*
  * Storage of a relation's copy made of the pages kept by snapshot k of
- * its storage: O(1).  Its row takes the oldest transaction ids they hold,
- * and claims no page all-visible (the copy has no visibility map).
+ * its storage: O(1).  If the relation changed since, its row takes the
+ * oldest transaction ids they hold, and claims no page all-visible (the
+ * copy has no visibility map); if not, the copy gets its maps too, as a
+ * copy of the storage would, and its row says what the source's does.
  */
 static RelFileNumber
 copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 {
 	RelFileNumber relnumber = GetNewRelFileNumber(c->reltablespace, NULL,
 												  c->relpersistence);
+	SMgrRelation src = smgropen(class_locator(c, c->relfilenode),
+								INVALID_PROC_NUMBER);
 
-	(void) RelationCreateStorageFromSnapshot(class_locator(c, relnumber),
-											 smgropen(class_locator(c, c->relfilenode),
-													  INVALID_PROC_NUMBER),
-											 k->snapshot, true);
+	/*
+	 * (the source unchanged since: its maps are true of the pages kept, and
+	 * held against VACUUM no bit is set meanwhile, while a writer only
+	 * clears one, of a page whose kept version had it)
+	 */
+	if (bmap_snapshot_unchanged(src, k->snapshot))
+	{
+		(void) RelationCreateStorageFromSnapshot(class_locator(c, relnumber),
+												 src, k->snapshot, true, true);
+		return relnumber;
+	}
+	(void) RelationCreateStorageFromSnapshot(class_locator(c, relnumber), src,
+											 k->snapshot, false, true);
 	if (TransactionIdIsNormal(k->frozenxid))
 		c->relfrozenxid = k->frozenxid;
 	if (MultiXactIdIsValid(k->minmxid))
@@ -1404,7 +1417,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		nrel = RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
 												 smgropen(kept_locator(k),
 														  INVALID_PROC_NUMBER),
-												 k->snapshot, true);
+												 k->snapshot, false, true);
 		renewed[i].relfilenumber = relnumber;
 		renewed[i].snapshot = bmap_snapshot_take(nrel);
 		note_taken(class_locator(oc, relnumber), renewed[i].snapshot);

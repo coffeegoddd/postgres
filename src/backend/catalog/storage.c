@@ -276,15 +276,19 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  *
  * The new main fork shares the snapshot's pages until it changes one
  * (bmap_share_snapshot()), O(1) in the relation's size.  It gets no free
- * space map or visibility map: src's describe its pages as they are now,
- * not as the snapshot has them, so the new relation claims no page
- * all-visible and knows of no free space until vacuumed.  As
+ * space map or visibility map, unless with_maps: src's describe its pages
+ * as they are now, not as the snapshot has them, so the new relation
+ * claims no page all-visible and knows of no free space until vacuumed.
+ * With with_maps (the caller knows src's pages are the snapshot's still,
+ * and VACUUM kept from setting a bit meanwhile), they are copies of src's,
+ * as RelationCreateStorageShared() makes them.  As
  * RelationCreateStorage(), the storage is deleted if the transaction
  * aborts when register_delete.
  */
 SMgrRelation
 RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
-								  uint64 snapshot, bool register_delete)
+								  uint64 snapshot, bool with_maps,
+								  bool register_delete)
 {
 	SMgrRelation srel;
 
@@ -308,6 +312,18 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
 	bmap_share_snapshot(src, snapshot, srel);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+	if (with_maps)
+	{
+		FlushRelationsAllBuffers(&src, 1);
+		for (ForkNumber fork = FSM_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+		{
+			if (!smgrexists(src, fork))
+				continue;
+			smgrcreate(srel, fork, false);
+			log_smgrcreate(&srel->smgr_rlocator.locator, fork);
+			RelationCopyStorage(src, srel, fork, RELPERSISTENCE_PERMANENT);
+		}
+	}
 
 	/*
 	 * No pending sync: the snapshot's blocks were written out and synced
