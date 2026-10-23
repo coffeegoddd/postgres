@@ -86,6 +86,7 @@
 
 #include "access/prolly_builtins.h"
 #include "access/prolly_datum.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
@@ -2649,6 +2650,279 @@ cow_diff_unordered(const ProllyTreeEnv *env, const ProllyNodeRef *from,
 }
 
 /*
+ * A side of diff_estimate(): the nodes not yet matched or read, each with
+ * its level and item count, and the hashes of its leaf items read (the
+ * key's, then the item's whole).
+ */
+typedef struct EstimateItem
+{
+	uint64		key;
+	uint64		whole;
+} EstimateItem;
+
+typedef struct EstimateSide
+{
+	ProllyNodeRef *nodes;
+	uint16	   *levels;
+	uint64	   *counts;
+	int			n;
+	int			max;
+	EstimateItem *items;
+	int			nitems;
+	int			maxitems;
+} EstimateSide;
+
+static void
+estimate_add_node(EstimateSide *s, const ProllyNodeRef *ref, uint16 level,
+				  uint64 count)
+{
+	if (s->n == s->max)
+	{
+		s->max = Max(16, s->max * 2);
+		s->nodes = s->nodes ? repalloc_array(s->nodes, ProllyNodeRef, s->max) :
+			palloc_array(ProllyNodeRef, s->max);
+		s->levels = s->levels ? repalloc_array(s->levels, uint16, s->max) :
+			palloc_array(uint16, s->max);
+		s->counts = s->counts ? repalloc_array(s->counts, uint64, s->max) :
+			palloc_array(uint64, s->max);
+	}
+	s->nodes[s->n] = *ref;
+	s->levels[s->n] = level;
+	s->counts[s->n++] = count;
+}
+
+static void
+estimate_drop_node(EstimateSide *s, int i)
+{
+	s->nodes[i] = s->nodes[--s->n];
+	s->levels[i] = s->levels[s->n];
+	s->counts[i] = s->counts[s->n];
+}
+
+typedef struct EstimateNode
+{
+	ProllyNodeRef ref;
+	uint16		level;
+	uint64		count;
+} EstimateNode;
+
+static int
+estimate_node_cmp(const void *a, const void *b)
+{
+	return loose_node_cmp(&((const EstimateNode *) a)->ref,
+						  &((const EstimateNode *) b)->ref);
+}
+
+/* s's nodes in order of their hashes, their levels and counts with them. */
+static void
+estimate_sort(EstimateSide *s)
+{
+	EstimateNode *p;
+
+	if (s->n < 2)
+		return;
+	p = palloc_array(EstimateNode, s->n);
+	for (int i = 0; i < s->n; i++)
+	{
+		p[i].ref = s->nodes[i];
+		p[i].level = s->levels[i];
+		p[i].count = s->counts[i];
+	}
+	qsort(p, s->n, sizeof(EstimateNode), estimate_node_cmp);
+	for (int i = 0; i < s->n; i++)
+	{
+		s->nodes[i] = p[i].ref;
+		s->levels[i] = p[i].level;
+		s->counts[i] = p[i].count;
+	}
+	pfree(p);
+}
+
+/* Read node i of s: its children become s's nodes, or its items' hashes its items. */
+static void
+estimate_expand(const ProllyTreeEnv *env, EstimateSide *s, int i)
+{
+	TNode		node;
+	ProllyNodeRef ref = s->nodes[i];
+
+	estimate_drop_node(s, i);
+	node_read(env, &ref, &node);
+	for (int j = 0; j < node.nitems; j++)
+	{
+		if (node.level > 0)
+		{
+			ProllyNodeRef child;
+			uint64		count;
+
+			node_child(env, &node, j, &child, &count);
+			estimate_add_node(s, &child, node.level - 1, count);
+		}
+		else
+		{
+			ProllyKey	k;
+			ProllyValue v;
+			uint8		flags;
+			uint64		key;
+
+			if (s->nitems == s->maxitems)
+			{
+				s->maxitems = Max(64, s->maxitems * 2);
+				s->items = s->items ?
+					repalloc_array(s->items, EstimateItem, s->maxitems) :
+					palloc_array(EstimateItem, s->maxitems);
+			}
+			node_item(env, &node, j, &k, &v, &flags);
+			key = hash_bytes_extended(k.data, k.len, 0);
+			s->items[s->nitems].key = key;
+			s->items[s->nitems++].whole =
+				hash_bytes_extended(v.data, v.len, key ^ flags);
+		}
+	}
+	node_release(&node);
+}
+
+static int
+estimate_item_cmp(const void *a, const void *b)
+{
+	const EstimateItem *x = a;
+	const EstimateItem *y = b;
+
+	if (x->key != y->key)
+		return x->key < y->key ? -1 : 1;
+	return (x->whole > y->whole) - (x->whole < y->whole);
+}
+
+/*
+ * How many keys diff() would report between from and to, estimated
+ * reading at most max_nodes nodes (with diff_unordered()'s walk: by the
+ * nodes' hashes, from the top level down, a node both trees hold dropped
+ * unread).  Where the nodes that differ fit in max_nodes, their leaf items
+ * are matched by their bytes' hashes, which gives diff's count (keys equal
+ * by the tree's order but not as bytes, or a hash collision, aside).  The
+ * nodes left unread once max_nodes are read count every item they hold as
+ * changed, so the estimate is then above the count, never below it: a key
+ * that changed is under a node one side holds and the other lacks.
+ */
+static uint64
+cow_diff_estimate(const ProllyTreeEnv *env, const ProllyNodeRef *from,
+				  const ProllyNodeRef *to, uint64 max_nodes)
+{
+	MemoryContext cxt;
+	MemoryContext old;
+	EstimateSide sides[2] = {0};
+	uint64		read = 0;
+	uint64		changes = 0;
+	bool		over = false;
+
+	if (same_hash(&from->hash, &to->hash))
+		return 0;
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly diff estimate",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(cxt);
+	for (int side = 0; side < 2; side++)
+	{
+		TNode		root;
+
+		uint64		count = 0;
+
+		node_read(env, side == 0 ? from : to, &root);
+		for (int i = 0; i < root.nitems; i++)
+		{
+			ProllyNodeRef child;
+			uint64		n = 1;
+
+			if (root.level > 0)
+				node_child(env, &root, i, &child, &n);
+			count += n;
+		}
+		estimate_add_node(&sides[side], side == 0 ? from : to, root.level,
+						  count);
+		node_release(&root);
+		read++;
+	}
+
+	/* the highest level's nodes, those not both trees', read, till leaves */
+	while (!over)
+	{
+		int			top = -1;
+
+		CHECK_FOR_INTERRUPTS();
+		for (int side = 0; side < 2; side++)
+			for (int i = 0; i < sides[side].n; i++)
+				top = Max(top, sides[side].levels[i]);
+		if (top < 0)
+			break;
+		for (int side = 0; side < 2; side++)
+			estimate_sort(&sides[side]);
+		for (int i = 0, j = 0; i < sides[0].n && j < sides[1].n;)
+		{
+			int			r = loose_node_cmp(&sides[0].nodes[i], &sides[1].nodes[j]);
+
+			if (r == 0 && sides[0].levels[i] == top && sides[1].levels[j] == top)
+			{
+				sides[0].levels[i] = sides[1].levels[j] = LOOSE_GONE;
+				i++;
+				j++;
+			}
+			else if (r <= 0)
+				i++;
+			else
+				j++;
+		}
+		for (int side = 0; side < 2; side++)
+			for (int i = sides[side].n - 1; i >= 0; i--)
+			{
+				if (sides[side].levels[i] == LOOSE_GONE)
+					estimate_drop_node(&sides[side], i);
+				else if (sides[side].levels[i] == top && read >= max_nodes)
+					over = true;
+				else if (sides[side].levels[i] == top)
+				{
+					estimate_expand(env, &sides[side], i);
+					read++;
+				}
+			}
+	}
+
+	/* (the nodes left unread: all they hold) */
+	for (int side = 0; side < 2; side++)
+		for (int i = 0; i < sides[side].n; i++)
+			changes += sides[side].counts[i];
+
+	/* the items read: those on one side, and those whose values differ */
+	for (int side = 0; side < 2; side++)
+		if (sides[side].nitems > 1)
+			qsort(sides[side].items, sides[side].nitems, sizeof(EstimateItem),
+				  estimate_item_cmp);
+	for (int i = 0, j = 0; i < sides[0].nitems || j < sides[1].nitems;)
+	{
+		EstimateItem *a = i < sides[0].nitems ? &sides[0].items[i] : NULL;
+		EstimateItem *b = j < sides[1].nitems ? &sides[1].items[j] : NULL;
+
+		if (b == NULL || (a != NULL && a->key < b->key))
+		{
+			changes++;
+			i++;
+		}
+		else if (a == NULL || b->key < a->key)
+		{
+			changes++;
+			j++;
+		}
+		else
+		{
+			if (a->whole != b->whole)
+				changes++;
+			i++;
+			j++;
+		}
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+	return changes;
+}
+
+/*
  * Visit the nodes of to that from may not have, as the diff finds them:
  * subtrees with equal hashes skipped without being read, a subtree only to
  * has walked whole, value trees of values added or changed walked.  So
@@ -2866,6 +3140,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.diff = cow_diff,
 	.diff_nodes = cow_diff_nodes,
 	.diff_unordered = cow_diff_unordered,
+	.diff_estimate = cow_diff_estimate,
 	.references = cow_references,
 	.value_write = write_value_tree,
 	.value_read = read_value,

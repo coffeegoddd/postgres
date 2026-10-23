@@ -1,0 +1,146 @@
+-- A branch's first use, its copies new in the transaction, no other
+-- seeing them: a table whose rows differ from the head's by more than
+-- reloading it costs (here, past about an eighth of its rows) begins
+-- empty instead, its copy given new storage and no page shared, and is
+-- loaded with the head's rows, its indexes built once after them; a table
+-- a few rows from the head is moved row by row as before, and one with a
+-- deferrable unique constraint (rechecked a row at a time) is never
+-- reloaded.  The rows, indexes, TOAST values and keyless copies are the
+-- head's either way.
+-- written(): the rows the transaction wrote in rm, by table.
+CREATE DATABASE regress_reload_moves;
+\c regress_reload_moves
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+CREATE EXTENSION amcheck;
+RESET client_min_messages;
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE FUNCTION pg_temp.written() RETURNS TABLE (relname name, ins int8, upd int8, del int8)
+  LANGUAGE sql AS $$
+	SELECT relname, n_tup_ins, n_tup_upd, n_tup_del FROM pg_stat_xact_user_tables
+	WHERE schemaname = 'rm' ORDER BY relname
+  $$;
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+-- every btree index of rm's tables checked, every row found in it
+CREATE FUNCTION pg_temp.indexes_valid() RETURNS TABLE (index regclass, valid bool)
+LANGUAGE sql AS
+$$SELECT i.indexrelid::regclass, bt_index_check(i.indexrelid, true) IS NOT NULL
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_am a ON a.oid = c.relam AND a.amname = 'btree'
+  WHERE i.indrelid IN (SELECT oid FROM pg_class WHERE relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'rm')
+					   AND relkind = 'r')
+  ORDER BY i.indexrelid::regclass::text COLLATE "C"$$;
+CREATE SCHEMA rm VERSIONED;
+CREATE TABLE rm.t (id int PRIMARY KEY, v text NOT NULL, u int UNIQUE, big text);
+ALTER TABLE rm.t ALTER COLUMN big SET STORAGE EXTERNAL;
+CREATE INDEX t_v ON rm.t (v);
+CREATE INDEX t_lower ON rm.t (lower(v));
+CREATE TABLE rm.s (id int PRIMARY KEY, v text);
+CREATE TABLE rm.d (id int PRIMARY KEY, v text,
+				   u int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE rm.k (a text, b int);		-- keyless
+INSERT INTO rm.t SELECT g, 'v' || g, g,
+	CASE WHEN g % 500 = 0 THEN (SELECT string_agg(md5(g::text || i), '')
+								FROM generate_series(1, 100) i) END
+FROM generate_series(1, 4000) g;
+INSERT INTO rm.s SELECT g, 's' || g FROM generate_series(1, 4000) g;
+INSERT INTO rm.d SELECT g, 'd' || g, g FROM generate_series(1, 4000) g;
+INSERT INTO rm.k SELECT 'k' || g % 1500, g % 3 FROM generate_series(1, 3000) g;
+SELECT length(dolt_commit('-Am', 'head')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS head \gset
+SELECT md5(string_agg(t::text, ',' ORDER BY id)) AS t_rows FROM rm.t \gset
+SELECT md5(string_agg(k::text, ',' ORDER BY a, b)) AS k_rows FROM rm.k \gset
+
+-- main moved on: every row of t, d and k changed, five of s's.
+UPDATE rm.t SET v = 'w' || id, u = id + 10000,
+	big = CASE WHEN id % 500 = 1 THEN repeat('z', 3000) END;
+UPDATE rm.s SET v = 'changed' WHERE id <= 5;
+UPDATE rm.d SET v = 'changed';
+UPDATE rm.k SET b = b + 10;
+SELECT length(dolt_commit('-am', 'moved on')::text) > 0 AS committed;
+
+-- A first use rolled back leaves the branch as it was, only its head.
+SELECT dolt_branch('back', :'head');
+BEGIN;
+SELECT dolt_checkout('back');
+SELECT count(*) FROM rm.t;
+ROLLBACK;
+SELECT active_branch();
+SELECT count(*) AS copies FROM pg_branch WHERE brname = 'back';
+
+-- Its first use, then: t and k loaded into new storage (inserted, none
+-- updated or deleted: the copy began empty), s's five rows and d's 4000
+-- moved row by row.
+:flush
+SELECT pg_temp.since('apply_loads') >= 0 AS counting;
+BEGIN;
+SELECT dolt_checkout('back');
+SELECT * FROM pg_temp.written();
+COMMIT;
+:flush
+SELECT pg_temp.since('apply_loads') AS loads;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT count(*) AS changes FROM dolt_status;
+SELECT md5(string_agg(t::text, ',' ORDER BY id)) = :'t_rows' AS t_as_head FROM rm.t;
+SELECT md5(string_agg(k::text, ',' ORDER BY a, b)) = :'k_rows' AS k_as_head FROM rm.k;
+SELECT count(*) FILTER (WHERE v = 's' || id) AS s_as_head FROM rm.s;
+SELECT count(*) FILTER (WHERE v = 'd' || id) AS d_as_head FROM rm.d;
+SELECT * FROM pg_temp.indexes_valid();
+SELECT count(*) AS long_values FROM rm.t WHERE length(big) > 3000;
+-- (its constraints hold as before: a unique value taken is refused)
+INSERT INTO rm.t VALUES (5000, 'v', 1);
+
+-- The branch goes on as any other: written, committed, and the source
+-- branch's rows are its own still.
+UPDATE rm.t SET v = 'after' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'after')::text) > 0 AS committed;
+SELECT dolt_checkout('main');
+SELECT count(*) FILTER (WHERE v = 'w' || id) AS main_rows FROM rm.t;
+SELECT * FROM pg_temp.indexes_valid();
+
+\c contrib_regression
+DROP DATABASE regress_reload_moves;
+
+-- Whether a table can be loaded is the source's to say, not the session
+-- branch's: here only the source and the head give d a deferrable unique
+-- constraint, so d, though every row differs, isn't emptied (its load
+-- would be refused, every row then written alone).
+CREATE DATABASE regress_reload_deferred;
+\c regress_reload_deferred
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+RESET client_min_messages;
+SET dolt.author = 'Ada Lovelace <ada@example.com>';
+CREATE FUNCTION pg_temp.written() RETURNS TABLE (relname name, ins int8, upd int8, del int8)
+  LANGUAGE sql AS $$
+	SELECT relname, n_tup_ins, n_tup_upd, n_tup_del FROM pg_stat_xact_user_tables
+	WHERE schemaname = 'rm' ORDER BY relname
+  $$;
+CREATE SCHEMA rm VERSIONED;
+CREATE TABLE rm.d (id int PRIMARY KEY, v text, u int);
+INSERT INTO rm.d SELECT g, 'd' || g, g FROM generate_series(1, 4000) g;
+SELECT length(dolt_commit('-Am', 'plain')::text) > 0 AS committed;
+SELECT dolt_branch('src');
+SELECT dolt_checkout('src');
+ALTER TABLE rm.d ADD CONSTRAINT d_u UNIQUE (u) DEFERRABLE;
+SELECT length(dolt_commit('-am', 'deferrable')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS head \gset
+UPDATE rm.d SET v = 'changed';
+SELECT length(dolt_commit('-am', 'changed')::text) > 0 AS committed;
+SELECT dolt_checkout('main');
+SELECT dolt_branch('tgt', :'head');
+BEGIN;
+SELECT dolt_checkout('tgt');
+SELECT ins = 4000 AND del = 0 AS emptied FROM pg_temp.written();
+COMMIT;
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
+SELECT count(*) FILTER (WHERE v = 'd' || id) AS d_as_head FROM rm.d;
+
+\c contrib_regression
+DROP DATABASE regress_reload_deferred;

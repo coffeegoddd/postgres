@@ -102,6 +102,8 @@ UPDATE folds.d SET b = -b;
 SELECT count(*) AS d_listed FROM test_bmap_fold_changes(:d, :dl, :de) \gset
 SELECT test_bmap_free_blocks() AS free_before_drop \gset
 DROP TABLE folds.d;
+SELECT test_bmap_release_pending() >= :d_listed AS list_queued;
+SELECT entries > 0 AS drained FROM test_bmap_release_drain();
 SELECT test_bmap_free_blocks() - :free_before_drop >= 2 * :d_listed
 	AS freed_map_and_list;
 
