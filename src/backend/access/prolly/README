@@ -303,7 +303,9 @@ differences back through the row applier (applier_replication.c), as
 logical replication's apply worker writes rows.  A commit of a canonical
 state a caller already holds is written by the refs' commit_root(), from
 the root, dependencies, parents and metadata given: it folds nothing,
-reads no catalog for the commit and moves no branch.  commit_with() folds
+reads no catalog for the commit and moves no branch.  The caller names the
+commit in the same transaction: a collection after it ends drops a commit
+no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
