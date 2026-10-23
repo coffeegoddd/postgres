@@ -1,0 +1,32 @@
+--
+-- PostGIS through a file remote: a clone into an empty database installs
+-- PostGIS in the versioned public it had, and every table's values come
+-- back byte-identical, its indexes agreeing with sequential scans; a
+-- change pushed is fetched and pulled the same.  A clone into a database
+-- whose PostGIS is in another schema is refused.
+--
+\set ECHO none
+on main|t
+remote|t
+push|t
+clone|t
+public versioned|t
+postgis installed|postgis in public,postgis_raster in public
+clone: same|t
+clone: tables on prolly|t
+clone: index valid|t
+clone: plan uses it|t
+clone: index|32
+clone: seqscan|32
+commit|t
+push again|t
+fetch|t
+fetched, not merged|POINT(2 3)
+pull|t
+pulled|POINT(2 13)
+pull: same|t
+ERROR:  the clone needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension postgis: in schema public, and the database has it in gis
+HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+nothing cloned|t

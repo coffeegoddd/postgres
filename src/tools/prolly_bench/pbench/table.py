@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from pbench.collectors.write_amp import MIN_LOGICAL_BYTES
-from pbench.core import registry
+from pbench.core import registry, suites
 from pbench.core.stats import summarize, paired_ratio_interval
 from pbench.report import HIGHER_IS_BETTER, WA_COMPONENTS, load_results
 from pbench.core.validation import cell_problems, compatible, validate_run
@@ -213,14 +213,14 @@ def _fmt(x: float) -> str:
 def _row_keys(sets: list[ResultSet]) -> list[tuple]:
     keys = {(r["key"]["workload"], r["key"]["variant"], r["key"]["size"],
              r["key"]["clients"]) for s in sets for r in s.results}
-    return sorted(keys, key=lambda k: (int(k[0][1:]), k[1], k[2], k[3]))
+    return sorted(keys, key=lambda k: (suites.workload_order(k[0]), k[1], k[2], k[3]))
 
 
 def build(sets: list[ResultSet], suite: str):
     """[(metric, heading, unit, columns, rows)]; rows are (key, [Cell])."""
     registry.load_all()
     sets = _order(sets)
-    base = next((s for s in sets if s.is_baseline), None) if suite == "S" else None
+    base = next((s for s in sets if s.is_baseline), None) if _storage(suite) else None
     index = {}
     for s in sets:
         for r in s.results:
@@ -230,7 +230,7 @@ def build(sets: list[ResultSet], suite: str):
     tables = []
     comparability = {s.label: not compatible(base.path, s.path)
                      for s in sets if base and s is not base}
-    for metric, heading, unit in (S_TABLES if suite == "S" else V_TABLES):
+    for metric, heading, unit in (S_TABLES if _storage(suite) else V_TABLES):
         rows = []
         for key in _row_keys(sets):
             b = index.get((base.label, *key)) if base else None
@@ -245,7 +245,12 @@ def build(sets: list[ResultSet], suite: str):
 
 
 def tables_first_metric(suite: str) -> str:
-    return (S_TABLES if suite == "S" else V_TABLES)[0][0]
+    return (S_TABLES if _storage(suite) else V_TABLES)[0][0]
+
+
+def _storage(suite: str) -> bool:
+    """Whether a suite is laid out as S is (ratios to B0) rather than as V."""
+    return suites.layout(suite) == suites.STORAGE
 
 
 def _header(s: ResultSet) -> str:
@@ -279,7 +284,7 @@ def to_markdown(sets: list[ResultSet], suite: str) -> str:
         for s in sets:
             if s is not base:
                 out.extend(f"- {s.label}: comparison withheld: {p}" for p in compatible(base.path, s.path))
-    if suite == "S" and any(s.is_baseline for s in sets):
+    if _storage(suite) and any(s.is_baseline for s in sets):
         out.append("Each number is the median over repetitions; the ratio to B0 "
                    "follows it (for throughput and hit ratio higher is better, "
                    "for everything else lower is better).\n")
@@ -377,7 +382,8 @@ def to_html(sets: list[ResultSet], suite: str) -> str:
         f"<b>{esc(s.label)}</b> = {esc(s.table_am)} ({esc(s.path.name)})" for s in sets)
         + ("<br>Median over repetitions; the ratio to B0 follows each number. "
            "Ratios are descriptive; no statistical significance is implied. Hover a cell for "
-           "its spread or validation errors." if suite == "S" and any(s.is_baseline for s in sets) else "")
+           "its spread or validation errors." if _storage(suite) and any(s.is_baseline for s in sets)
+           else "")
         + "</p>")
     messages = [f"{s.label}: {p}" for s in sets for p in s.problems]
     base = next((s for s in sets if s.is_baseline), None)

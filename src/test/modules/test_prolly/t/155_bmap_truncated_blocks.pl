@@ -86,9 +86,6 @@ $vacuum->query_until(qr/vacuuming/, q{\echo vacuuming
 VACUUM h;
 });
 $node->wait_for_event('client backend', 'bmap-truncated');
-# The wait is before VACUUM commits.  Make its truncation record durable;
-# otherwise a fast crash can legitimately recover the old relation length.
-sql('SELECT pg_switch_wal()');
 $node->stop('immediate');
 $vacuum->{run}->finish;
 $node->start;

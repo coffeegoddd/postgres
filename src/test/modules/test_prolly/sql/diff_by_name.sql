@@ -148,6 +148,20 @@ SET ROLE regress_dn_reader;
 SELECT count(*) FROM dolt_diff('HEAD~2', 'HEAD~', 'k2');
 SELECT count(*) FROM dolt_diff_table('k2');
 RESET ROLE;
+
+-- a diff of two commits by name beside uncommitted changes: the
+-- database's owner reads no working-set row (no lineage to walk); a
+-- reader with a grant gets the same rows
+INSERT INTO dn.k2 VALUES (2, 'two');
+SELECT length(dolt_commit('-am', 'k2 two')::text) AS committed;
+INSERT INTO dn.k2 SELECT g, 'dirty' FROM generate_series(10, 509) g;
+SELECT count(*) AS reset FROM test_fold_counters(true);
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~', 'HEAD', 'k2');
+SELECT pages, candidates, full_tables FROM test_fold_counters(true);
+SET ROLE regress_dn_reader;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~', 'HEAD', 'k2');
+RESET ROLE;
+DELETE FROM dn.k2 WHERE id >= 10;
 DROP OWNED BY regress_dn_reader;
 DROP ROLE regress_dn_reader;
 

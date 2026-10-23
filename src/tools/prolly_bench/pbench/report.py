@@ -89,7 +89,9 @@ def _status(rs: list[dict]) -> str:
 
 
 def summary_tables(results: list[dict], suite: str) -> str:
-    wanted = {"S": S_METRICS, "V": V_METRICS, "C": C_METRICS}[suite]
+    from pbench.core import suites
+    wanted = {suites.STORAGE: S_METRICS, suites.VERSION_CONTROL: V_METRICS,
+              suites.CORRECTNESS: C_METRICS}[suites.layout(suite)]
     by_workload: OrderedDict[str, list] = OrderedDict()
     for key, rs in _group(results).items():
         by_workload.setdefault(key[0], []).append((key, rs))

@@ -31,6 +31,12 @@ def number(value, unit="", scale=1):
     return formatted + (" " + unit if unit else "")
 
 
+def count(value):
+    """A counter's value: whole numbers as they are (a median of two may
+    be a half)."""
+    return f"{int(value):,}" if value == int(value) else number(value)
+
+
 def memory_cell(row, fields, unit, scale):
     value = " / ".join(number(row.get("median_" + f), unit, scale) for f in fields)
     if row["short_memory_observations"]:
@@ -129,7 +135,7 @@ border:0}thead{display:table-header-group}thead th{position:static}tr{break-insi
             '\n'.join(self.html) + '</main></body></html>\n')
 
 
-def render(path, manifest, summaries, fits):
+def render(path, manifest, summaries, fits, drift=()):
     doc = Document()
     doc.heading(1, "Version-control benchmark comparison")
     doc.paragraph(f"Run: {path.name}. Status: {manifest['status']}. "
@@ -200,11 +206,46 @@ def render(path, manifest, summaries, fits):
         if not found:
             doc.paragraph("This pass was not measured.")
 
+    cell_fields = ('engine', 'operation', 'rows', 'changed_rows', 'history_commits',
+                   'working_set', 'dirty_rows', 'distance', 'pass')
+    drifting = {tuple(f.get(k) for k in cell_fields) + (f['metric'],): f for f in drift}
+
+    def drift_mark(row, metric):
+        flag = drifting.get(tuple(row.get(k) for k in cell_fields) + (metric,))
+        return f" [drift {'↑' if flag['direction'] == 'rising' else '↓'}]" if flag else ''
+
     comparisons('Latency',
                 'Each cell: median milliseconds [minimum–maximum]; n = measured repetitions. '
                 'The range describes observed variation, not a confidence interval. Distance 0 is the current root '
-                '(checkout switches branches with the same root).',
-                'timing', lambda r: f"{number(r['median_ms'])} ms [{number(r['min_ms'])}–{number(r['max_ms'])}]; n={r['repetitions']}")
+                '(checkout switches branches with the same root). [drift ↑] or [drift ↓] marks a cell whose '
+                'repetitions rise or fall with run order (see Run-order drift).',
+                'timing', lambda r: f"{number(r['median_ms'])} ms [{number(r['min_ms'])}–{number(r['max_ms'])}]; "
+                                    f"n={r['repetitions']}{drift_mark(r, 'elapsed_ns')}")
+
+    doc.heading(2, 'Run-order drift')
+    doc.paragraph('A series drifts when its samples, taken in run order, rise or fall together more than chance '
+                  'allows (two-sided Mann-Kendall test, p < 0.001, at least five samples): a cell\'s latency '
+                  'repetitions, or one engine counter over its counters-pass repetitions. A cell\'s repetitions '
+                  'are spread across the run, between other cells, so drift means the cost depends on state left '
+                  'by what ran before (dead entries piling up, caches filling), not only on the operation '
+                  'measured. A drifting counter shows that state directly: the same operation should do the '
+                  'same work.')
+    if drift:
+        rows = []
+        for f in drift:
+            cell = (f"N={f['rows']:,}, K={f['changed_rows']:,}, D={f['distance']}, {f['working_set']}"
+                    + (f" ({f['dirty_rows']:,} rows)" if f['dirty_rows'] else ''))
+            if f['metric'] == 'elapsed_ns':
+                series, change = 'latency', f"{number(f['first']/1e6)} → {number(f['last']/1e6)} ms"
+            else:
+                series, change = f['metric'][len('counter_'):], f"{f['first']:,} → {f['last']:,}"
+            rows.append([OPERATIONS.get(f['operation'], f['operation']),
+                         dict(zip(ENGINES, ENGINE_NAMES)).get(f['engine'], f['engine']), cell, series,
+                         f"{f['direction']}; τ {f['kendall_tau']:.2f}, p {f['p_value']:.2g}, n={f['samples']}",
+                         change])
+        doc.table(['Operation', 'Engine', 'Cell', 'Series', 'Trend', 'First → last'], rows)
+    else:
+        doc.paragraph('No series drifts.')
     comparisons('Memory growth',
                 'Each cell: peak growth / immediately retained growth, in KiB of server-tree PSS. '
                 'PSS apportions shared pages. Negative retained growth means resident memory decreased. '
@@ -265,6 +306,39 @@ def render(path, manifest, summaries, fits):
         doc.table(['Operation', 'Distance', 'Metric', *ENGINE_NAMES], rows)
     if not has_resources:
         doc.paragraph('No memory, cpu or io pass was measured.')
+
+    doc.heading(2, 'Engine work counters')
+    doc.paragraph('Each cell: median [minimum–maximum] growth of the engine\'s own work counters across the '
+                  'operation, from the counters pass (PostgreSQL prolly: pg_stat_prolly, read before and after '
+                  'it, outside timing; Dolt and Doltgres keep none). Counts, not timings: what the operation did '
+                  '(tree nodes read, change-log pages read, rows a fold read, chunks appended, pages copied), '
+                  'which explains its latency and repeats from run to run. A counter the operation never moved '
+                  'is left out; one it moved in only some repetitions has 0 as its minimum.')
+
+    def counter_cell(row, name):
+        if 'median_counter_' + name not in row:
+            return '0'
+        lo, hi = row['min_counter_' + name], row['max_counter_' + name]
+        return (count(row['median_counter_' + name]) + (f" [{count(lo)}–{count(hi)}]" if lo != hi else '')
+                + drift_mark(row, 'counter_' + name))
+
+    has_counters = False
+    for fixture, cases in sorted(fixtures.items(), key=fixture_order):
+        rows = []
+        for case in sorted((case for pass_, case in cases if pass_ == 'counters'), key=case_order):
+            engines = cases[('counters', case)]
+            names = sorted({k[len('median_counter_'):] for r in engines.values() for k in r
+                            if k.startswith('median_counter_')})
+            for name in names:
+                rows.append([OPERATIONS.get(case[0], case[0]), case[1], name,
+                             *[counter_cell(engines[e], name) if e in engines else '—' for e in ENGINES]])
+        if not rows:
+            continue
+        has_counters = True
+        doc.heading(3, fixture_title(fixture))
+        doc.table(['Operation', 'Distance', 'Counter', *ENGINE_NAMES], rows)
+    if not has_counters:
+        doc.paragraph('No counters pass was measured, or no operation moved a counter.')
 
     doc.heading(2, 'Empirical scaling')
     doc.paragraph('Each cell: fitted exponent [95% bootstrap interval]; R² in log space. '

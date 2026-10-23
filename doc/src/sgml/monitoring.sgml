@@ -5696,8 +5696,9 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        <literal>too_many</literal> (more rows changed than reading it all
        costs), <literal>keying_changed</literal> (changes written under
        another key), <literal>unsupported_key</literal> (a key rows can't
-       be looked up by), <literal>memory_budget</literal> (the changes it
-       held passed <varname>maintenance_work_mem</varname>) and
+       be looked up by), <literal>memory_budget</literal> (kept for earlier
+       statistics: changes past <varname>maintenance_work_mem</varname> are
+       sorted instead, counted by <literal>fold_changes_spilled</literal>) and
        <literal>forced</literal>
        (<varname>debug_prolly_force_full_fold</varname>) and
        <literal>verify</literal> (the fold verifier's), with
@@ -5705,7 +5706,14 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        rows (in <varname>maintenance_work_mem</varname>) spilled to disk; a
        fold that reads
        at least <varname>prolly.log_full_folds</varname> rows so is logged,
-       with why;
+       with why, and <function>dolt_pending_full_folds()</function> lists the
+       session branch's tables whose next fold will read them in full, by
+       these reasons (those its baseline and catalogs tell, not those only
+       its change log's entries do), with their estimated rows; a rewrite
+       of a versioned table (<command>ALTER TABLE</command> changing a
+       column's type, <command>REFRESH MATERIALIZED VIEW</command>) folds
+       its branch as it ends (<varname>prolly.fold_on_rewrite</varname>,
+       on by default), so the commit after reads none of its rows again;
        <literal>fold_mapped_tables</literal> (tables whose baseline was
        mapped to a new shape (a column added with a default or dropped, a
        type relabeled, the primary key changed),
@@ -5780,7 +5788,33 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        cache of decoded chunks, <varname>prolly_chunk_cache_size</varname>,
        instead of the chunk store's files);
        <literal>fold_rows_located</literal> (rows a fold read where the
-       table's change log said they are, instead of by their key).  Bytes are counted when
+       table's change log said they are, instead of by their key);
+       <literal>bmap_map_pages_copied</literal> (block-map pages a share of
+       a relation's blocks copied, as a branch's first use makes its copies);
+       <literal>bmap_refcount_updates</literal> (page-store blocks'
+       reference counts set: by shares, drops, copies on write, truncations
+       and page sweeps); <literal>bmap_blocks_freed</literal> (page-store
+       blocks given back to the allocator);
+       <literal>apply_rows</literal> (rows the row applier inserted,
+       updated or deleted, moving a working set to a commit);
+       <literal>apply_index_tuples</literal> (index entries those writes
+       made: for each row inserted or updated, one in each index whose
+       predicate the row meets, in summarizing indexes alone for a
+       heap-only update; and those the builds after a load made);
+       <literal>catalog_rows_copied</literal> (catalog rows of versioned
+       objects copied to make a branch's copies);
+       <literal>fold_changes_spilled</literal> (folds from a table's
+       baseline whose changes passed
+       <varname>maintenance_work_mem</varname>: sorted, spilling to disk,
+       and applied a part at a time, not read in full);
+       <literal>fold_catalog_scans</literal>,
+       <literal>fold_objects</literal> and <literal>fold_tables</literal>
+       (folds of a working set that read the catalogs through for every
+       versioned object, the objects folds described, and the tables whose
+       rows they folded) and <literal>fold_incremental</literal> (folds that
+       took the last canonical tree the backend built and worked out again
+       only the tables written since and the sequences, as nothing else had
+       changed).  Bytes are counted when
        written, not when synced.  A process counts in the database it is
        connected to: a <command>CREATE DATABASE</command> copying a chunk
        store counts in the database it runs in, and what processes connected
