@@ -682,7 +682,10 @@ table_renames(const char *from_ref, const ProllyNodeRef *from_root,
 	List	   *tables = NIL;
 	ListCell   *lc;
 
-	if (!identities_known())
+	/* (a root of an older format has no identities this one reads) */
+	if (!identities_known() ||
+		!PROLLY_CALL(components().canonicalizer, in_format, from_root) ||
+		!PROLLY_CALL(components().canonicalizer, in_format, to_root))
 		return NIL;
 	initStringInfo(&fi);
 	initStringInfo(&ti);

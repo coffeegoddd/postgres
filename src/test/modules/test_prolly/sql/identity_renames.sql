@@ -186,6 +186,33 @@ SELECT * FROM dolt_at('HEAD~3', NULL::app.t) ORDER BY id;
 SELECT (from_row).id AS from_id, (to_row).id AS to_id, diff_type
 FROM dolt_diff('HEAD~3', 'HEAD', NULL::app.t);
 
+-- A table dropped after a committed rename and made again under its new
+-- name is another table, not the renamed one.
+CREATE TABLE app.q (id int PRIMARY KEY, v text);
+INSERT INTO app.q VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'q')::text) AS committed;
+ALTER TABLE app.q RENAME TO q2;
+SELECT length(dolt_commit('-Am', 'q renamed')::text) AS committed;
+DROP TABLE app.q2;
+CREATE TABLE app.q2 (k text PRIMARY KEY, n numeric);
+INSERT INTO app.q2 VALUES ('x', 1);
+SELECT from_table_name, to_table_name, diff_type
+FROM dolt_diff_summary('HEAD~1', 'WORKING') ORDER BY 1, 2;
+SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~1', 'WORKING', NULL::app.q2);
+SELECT length(dolt_commit('-Am', 'q2 made again')::text) AS committed;
+SELECT from_table_name, to_table_name, diff_type
+FROM dolt_diff_summary('HEAD~2', 'HEAD') ORDER BY 1, 2;
+
+-- A table renamed and another made with its old name, alike (so its item
+-- is the same in both): still a rename, and the new one added.
+CREATE TABLE app.kk (v int);
+SELECT length(dolt_commit('-Am', 'kk')::text) AS committed;
+ALTER TABLE app.kk RENAME TO kk_old;
+CREATE TABLE app.kk (v int);
+SELECT from_table_name, to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING') ORDER BY 1, 2;
+SELECT dolt_reset('--hard');
+
 -- Tables alike but unrelated: one dropped and another made, not a rename.
 CREATE TABLE app.alike1 (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'alike1')::text) AS committed;

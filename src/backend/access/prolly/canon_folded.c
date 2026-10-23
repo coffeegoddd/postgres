@@ -6212,19 +6212,26 @@ one_side(Changed *c, const ProllyValue *v, const char *name)
 }
 
 /*
- * A table changed under name, in both roots, made a drop of from's and an
- * add of to's: they are other tables, one renamed away from the name or to
- * it.  False if none is.
+ * A table under name in both roots, changed or not, made a drop of from's
+ * and an add of to's: they are other tables, one renamed away from the
+ * name or to it.  False if both haven't one.
  */
 static bool
-split_changed(ChangesWalk *w, const char *name)
+split_changed(Canon *cn, ChangesWalk *w, const ProllyNodeRef *from,
+			  const ProllyNodeRef *to, const char *name)
 {
 	ListCell   *lc;
+	StringInfoData key;
+	StringInfoData fv;
+	StringInfoData tv;
+	ProllyKey	k;
+	Changed    *d;
+	Changed    *a;
+	bool		split;
 
 	foreach(lc, w->changed)
 	{
 		Changed    *c = lfirst(lc);
-		Changed    *a;
 
 		if (c->object != PROLLY_OBJECT_TABLE || !c->from_name || !c->to_name ||
 			strcmp(c->from_name, name) != 0 || strcmp(c->to_name, name) != 0)
@@ -6239,7 +6246,37 @@ split_changed(ChangesWalk *w, const char *name)
 		w->changed = lappend(w->changed, a);
 		return true;
 	}
-	return false;
+
+	/*
+	 * (the same in both, so not among the changes the diff gave: the two
+	 * are still others, one renamed away and another made with its name)
+	 */
+	initStringInfo(&key);
+	appendStringInfoString(&key, "t:");
+	append_utf8(&key, name);
+	k.data = (const uint8 *) key.data;
+	k.len = key.len;
+	initStringInfo(&fv);
+	initStringInfo(&tv);
+	split = PROLLY_CALL(cn->tree, get, &cn->env, from, &k, &fv) &&
+		PROLLY_CALL(cn->tree, get, &cn->env, to, &k, &tv);
+	if (split)
+	{
+		d = palloc0(sizeof(Changed));
+		d->object = PROLLY_OBJECT_TABLE;
+		d->from_name = pstrdup(name);
+		d->from.data = (const uint8 *) fv.data;
+		d->from.len = fv.len;
+		one_side(d, &d->from, name);
+		a = palloc0(sizeof(Changed));
+		a->object = PROLLY_OBJECT_TABLE;
+		a->to_name = pstrdup(name);
+		a->to.data = (const uint8 *) tv.data;
+		a->to.len = tv.len;
+		one_side(a, &a->to, name);
+		w->changed = lappend(lappend(w->changed, d), a);
+	}
+	return split;
 }
 
 static void
@@ -6275,9 +6312,9 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 			continue;
 		/* (a name another table has since, or had before: that one apart) */
 		if (dropped_or_added(w.changed, r->table, true) == NULL)
-			(void) split_changed(&w, r->table);
+			(void) split_changed(&cn, &w, from, to, r->table);
 		if (dropped_or_added(w.changed, r->to, false) == NULL)
-			(void) split_changed(&w, r->to);
+			(void) split_changed(&cn, &w, from, to, r->to);
 		if ((d = dropped_or_added(w.changed, r->table, true)) == NULL ||
 			(a = dropped_or_added(w.changed, r->to, false)) == NULL)
 			continue;
