@@ -1880,11 +1880,14 @@ pages_fold(Relation rel, const ProllyTreeEnv *env,
 								   (int64) f.work.rows_read,
 								   INSTR_TIME_GET_MILLISEC(took));
 		}
-		counters.pages += f.work.pages;
-		counters.candidates += f.work.candidates;
-		counters.full += f.work.full;
-		counters.rows_read += f.work.rows_read;
-		counters.rows_written += f.work.rows_written;
+		if (prolly_fold_counted)
+		{
+			counters.pages += f.work.pages;
+			counters.candidates += f.work.candidates;
+			counters.full += f.work.full;
+			counters.rows_read += f.work.rows_read;
+			counters.rows_written += f.work.rows_written;
+		}
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_PAGES, f.work.pages);
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_CANDIDATES, f.work.candidates);
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_FULL, f.work.full);
@@ -2003,6 +2006,33 @@ pages_can_advance(Relation rel, const ProllyValue *state)
  * Leaving a branch folds its changes: the first change to each page since
  * the fold kept the page's old version, which the fold frees.
  */
+/*
+ * Why pages_fold() from baseline would read rel in full, from the checks it
+ * makes before reading the block map's changes (which can say so too).
+ */
+static ProllyFullFoldReason
+pages_full_reason(Relation rel, const ProllyTableFold *baseline)
+{
+	ProllyFullFoldReason reason = PROLLY_FULL_NONE;
+	State		st;
+
+	if (prolly_full_fold_wanted(&reason))
+		return reason;
+	if (RelationGetSmgr(rel)->smgr_which != SMGR_BMAP || RecoveryInProgress())
+		return RecoveryInProgress() ? PROLLY_FULL_RECOVERY : PROLLY_FULL_NO_LOG;
+	if (baseline == NULL)
+		return PROLLY_FULL_NO_BASELINE;
+	if (!parse_state(&baseline->state, &st))
+		return PROLLY_FULL_LOG_CHANGED;
+	if (st.flags & STATE_UNSETTLED)
+		return PROLLY_FULL_UNSETTLED;
+	if (!sees_fold(GetActiveSnapshot(), &st))
+		return PROLLY_FULL_STALE_SNAPSHOT;
+	if (baseline->reshaped && st.carried.hash.len > 0)
+		return PROLLY_FULL_SHAPE_CHANGED;
+	return PROLLY_FULL_NONE;
+}
+
 static bool
 pages_fold_on_leave(void)
 {
@@ -2037,6 +2067,7 @@ const ProllyChangeFinderRoutine prolly_changes_pages = {
 	.state_refs = pages_state_refs,
 	.advance = pages_advance,
 	.can_advance = pages_can_advance,
+	.full_reason = pages_full_reason,
 	.fold_on_leave = pages_fold_on_leave,
 	.changes = pages_changes,
 };

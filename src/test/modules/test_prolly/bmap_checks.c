@@ -254,6 +254,29 @@ test_bmap_unlink(PG_FUNCTION_ARGS)
 }
 
 /*
+ * An injection point callback, attached with injection_points_attach(name,
+ * 'test_prolly', 'test_bmap_write_one_crash', '\xNN'): of the locked
+ * buffers the point passes, write out the one numbered NN alone, then
+ * crash, as a crash with only that page written leaves the storage.
+ */
+extern PGDLLEXPORT void test_bmap_write_one_crash(const char *name,
+												  const void *private_data,
+												  void *arg);
+
+void
+test_bmap_write_one_crash(const char *name, const void *private_data,
+						  void *arg)
+{
+	uint8		i = *(const uint8 *) private_data;
+	Buffer		buf = ((Buffer *) arg)[i];
+
+	if (BufferIsValid(buf))
+		FlushOneBuffer(buf);
+	elog(PANIC, "crashing at injection point \"%s\" with buffer %u written",
+		 name, (unsigned) i);
+}
+
+/*
  * test_bmap_truncate(relnumber, nblocks, done): shorten the logical length;
  * if done, finish as RelationTruncate() does, letting go of the blocks
  * past it (otherwise as a crash before that leaves them).
