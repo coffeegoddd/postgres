@@ -183,7 +183,7 @@ static bool same_description(const Table *a, const Table *b);
 static bool same_table_enums(const Table *a, const Table *b);
 static Table *find_table(List *tables, const char *name);
 static char *table_name(Oid relid);
-static int	keep_violations(List *found);
+static int	keep_violations(void);
 static List *matviews_in_root(const ProllyNodeRef *root);
 static List *foreign_key_violations(List *relids, List *changed);
 static void violating_rows(List *queries, const char *type, bool removing,
@@ -1611,24 +1611,215 @@ reset_constraints(void)
 }
 
 /*
- * The violations a merge records.  Those kept stay until the merge
- * publishes them.  A table's rows are written as an attempt: the
- * violations it records are its own until it ends, so an attempt rolled
- * back (its writes made again) releases them all at once, and one that
- * holds keeps a copy of those left, a violation tried again and written
- * after all forgotten, its memory with them.  A violation is named by its
- * place among the attempt's (a handle), which stays as others are
- * forgotten.
+ * The violations a merge records, a sink that holds no more than work_mem
+ * of them in memory however many there are.  Those kept go to a sort (a
+ * tuplesort of their own, which spills), in which the merge publishes
+ * them: with the branch's violations already kept, sorted by what they
+ * are, so a violation found twice, or one the branch has, is published
+ * once, and then in the order they were found (keep_violations()).  A
+ * table's rows are written as an attempt: the violations it records are
+ * spooled to a file of its own until it ends, so an attempt rolled back
+ * (its writes made again) drops them all at once, and one that holds
+ * keeps those left: a violation tried again and written after all is
+ * forgotten.  A violation is named by its place among the attempt's (a
+ * handle); the handles forgotten are sorted, and passed over as the
+ * attempt's file is read back in order.  The files, sorts' included, are
+ * the resource owner's the merge began with, so that a subtransaction
+ * rolled back doesn't close them.
  */
 typedef struct Recorded
 {
-	MemoryContext cxt;			/* kept's */
-	List	   *kept;			/* ProllyViolation * */
-	MemoryContext attempt_cxt;	/* attempt's, reset as each ends */
-	List	   *attempt;		/* ProllyViolation *, NULL once forgotten */
-	int			nattempt;		/* those not forgotten */
+	MemoryContext cxt;			/* the sorts' and the attempt's */
+	ResourceOwner owner;		/* their files' */
+	Tuplesortstate *kept;		/* KeptViolation */
+	int64		nkept;			/* (the next one's place) */
+	BufFile    *attempt;		/* the attempt's, in handle order */
+	int			nattempt;		/* recorded */
+	Tuplesortstate *forgotten;	/* handles, as int8 */
+	int			nforgotten;
 	bool		attempting;
+	bool		last_unique;	/* the one recorded last breaks a unique index */
+	StringInfoData buf;			/* (reading the attempt's back) */
 } Recorded;
+
+/* A violation kept, as sorted: its strings follow, each with its NUL. */
+typedef struct KeptViolation
+{
+	Oid			relid;
+	int32		origin;			/* 0: the branch's already; 1: found */
+	int64		place;			/* in the order kept */
+	uint32		typelen;
+	uint32		rowlen;
+	uint32		infolen;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} KeptViolation;
+
+#define KEPT_TYPE(t) ((t)->data)
+#define KEPT_ROW(t) ((t)->data + (t)->typelen + 1)
+#define KEPT_INFO(t) ((t)->data + (t)->typelen + 1 + (t)->rowlen + 1)
+#define KEPT_SIZE(t) \
+	(offsetof(KeptViolation, data) + (t)->typelen + (t)->rowlen + (t)->infolen + 3)
+
+/* Are two violations kept the same violation (whatever their places)? */
+static int
+kept_identity_cmp(const KeptViolation *x, const KeptViolation *y)
+{
+	int			c;
+
+	if (x->relid != y->relid)
+		return x->relid < y->relid ? -1 : 1;
+	if ((c = strcmp(KEPT_TYPE(x), KEPT_TYPE(y))) != 0)
+		return c;
+	if ((c = strcmp(KEPT_ROW(x), KEPT_ROW(y))) != 0)
+		return c;
+	return strcmp(KEPT_INFO(x), KEPT_INFO(y));
+}
+
+/* Each violation, then those the branch had first, each in its order. */
+static int
+comparetup_kept(const SortTuple *a, const SortTuple *b, Tuplesortstate *state)
+{
+	const KeptViolation *x = a->tuple;
+	const KeptViolation *y = b->tuple;
+	int			c = kept_identity_cmp(x, y);
+
+	if (c != 0)
+		return c;
+	if (x->origin != y->origin)
+		return x->origin < y->origin ? -1 : 1;
+	return x->place < y->place ? -1 : x->place > y->place ? 1 : 0;
+}
+
+/* In the order kept. */
+static int
+comparetup_kept_place(const SortTuple *a, const SortTuple *b,
+					  Tuplesortstate *state)
+{
+	const KeptViolation *x = a->tuple;
+	const KeptViolation *y = b->tuple;
+
+	return x->place < y->place ? -1 : x->place > y->place ? 1 : 0;
+}
+
+static void
+writetup_kept(Tuplesortstate *state, LogicalTape *tape, SortTuple *stup)
+{
+	const KeptViolation *t = stup->tuple;
+	unsigned int tuplen = KEPT_SIZE(t);
+	unsigned int written = tuplen + sizeof(unsigned int);
+
+	LogicalTapeWrite(tape, &written, sizeof(written));
+	LogicalTapeWrite(tape, t, tuplen);
+}
+
+static void
+readtup_kept(Tuplesortstate *state, SortTuple *stup, LogicalTape *tape,
+			 unsigned int len)
+{
+	unsigned int tuplen = len - sizeof(unsigned int);
+	KeptViolation *t = tuplesort_readtup_alloc(state, tuplen);
+
+	LogicalTapeReadExact(tape, t, tuplen);
+	stup->tuple = t;
+	stup->datum1 = (Datum) 0;
+	stup->isnull1 = true;
+}
+
+static void
+removeabbrev_kept(Tuplesortstate *state, SortTuple *stups, int count)
+{
+}
+
+/* A sort of KeptViolations, by cmp, in the recorded's context. */
+static Tuplesortstate *
+kept_sort_begin(int (*cmp) (const SortTuple *a, const SortTuple *b,
+							Tuplesortstate *state))
+{
+	MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
+	Tuplesortstate *state = tuplesort_begin_common(work_mem, NULL,
+												   TUPLESORT_NONE);
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+
+	base->nKeys = 1;
+	base->removeabbrev = removeabbrev_kept;
+	base->comparetup = cmp;
+	base->comparetup_tiebreak = cmp;
+	base->writetup = writetup_kept;
+	base->readtup = readtup_kept;
+	base->haveDatum1 = false;
+	base->tuples = true;
+	MemoryContextSwitchTo(old);
+	return state;
+}
+
+/* Put a copy of t into state, its files the recorded's resource owner's. */
+static void
+kept_sort_put(Tuplesortstate *state, const KeptViolation *t)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext old = MemoryContextSwitchTo(base->tuplecontext);
+	ResourceOwner owner = CurrentResourceOwner;
+	Size		size = KEPT_SIZE(t);
+	KeptViolation *copy = palloc(size);
+	SortTuple	stup;
+
+	memcpy(copy, t, size);
+	stup.tuple = copy;
+	stup.datum1 = (Datum) 0;
+	stup.isnull1 = true;
+	CurrentResourceOwner = recorded->owner;
+	/* (the tuple context is a bump allocator, which knows no chunk sizes) */
+	tuplesort_puttuple_common(state, &stup, false,
+							  TupleSortUseBumpTupleCxt(base->sortopt) ?
+							  MAXALIGN(size) : GetMemoryChunkSpace(copy));
+	CurrentResourceOwner = owner;
+	MemoryContextSwitchTo(old);
+}
+
+static const KeptViolation *
+kept_sort_next(Tuplesortstate *state)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext old = MemoryContextSwitchTo(base->sortcontext);
+	SortTuple	stup;
+	bool		got = tuplesort_gettuple_common(state, true, &stup);
+
+	MemoryContextSwitchTo(old);
+	return got ? stup.tuple : NULL;
+}
+
+/* The KeptViolation for a violation (palloc'd), of origin, at place. */
+static KeptViolation *
+kept_of(Oid relid, const char *type, const char *row, const char *info,
+		int origin, int64 place)
+{
+	Size		typelen = strlen(type);
+	Size		rowlen = strlen(row);
+	Size		infolen = strlen(info);
+	KeptViolation *t = palloc(offsetof(KeptViolation, data) + typelen +
+							  rowlen + infolen + 3);
+
+	t->relid = relid;
+	t->origin = origin;
+	t->place = place;
+	t->typelen = typelen;
+	t->rowlen = rowlen;
+	t->infolen = infolen;
+	memcpy(KEPT_TYPE(t), type, typelen + 1);
+	memcpy(KEPT_ROW(t), row, rowlen + 1);
+	memcpy(KEPT_INFO(t), info, infolen + 1);
+	return t;
+}
+
+/* Keep a violation found, after those kept already. */
+static void
+violation_keep(Oid relid, const char *type, const char *row, const char *info)
+{
+	KeptViolation *t = kept_of(relid, type, row, info, 1, recorded->nkept++);
+
+	kept_sort_put(recorded->kept, t);
+	pfree(t);
+}
 
 /* Start recording violations, for a merge in this transaction. */
 static void
@@ -1638,9 +1829,9 @@ recorded_begin(void)
 	recorded->cxt = AllocSetContextCreate(TopTransactionContext,
 										  "merge violations",
 										  ALLOCSET_DEFAULT_SIZES);
-	recorded->attempt_cxt = AllocSetContextCreate(TopTransactionContext,
-												  "merge attempt violations",
-												  ALLOCSET_DEFAULT_SIZES);
+	recorded->owner = CurrentResourceOwner;
+	recorded->kept = kept_sort_begin(comparetup_kept);
+	recorded->buf.data = NULL;
 }
 
 /* Stop recording, releasing what is held (with the merge, or its error). */
@@ -1649,23 +1840,29 @@ recorded_end(void)
 {
 	if (recorded == NULL)
 		return;
+	if (recorded->kept)
+		tuplesort_end(recorded->kept);
+	if (recorded->forgotten)
+		tuplesort_end(recorded->forgotten);
+	if (recorded->attempt)
+		BufFileClose(recorded->attempt);
 	MemoryContextDelete(recorded->cxt);
-	MemoryContextDelete(recorded->attempt_cxt);
 	pfree(recorded);
 	recorded = NULL;
 }
 
-static ProllyViolation *
-violation_copy(const ProllyViolation *pv)
-{
-	ProllyViolation *copy = palloc(sizeof(ProllyViolation));
+/* Violations added to the branch's at a time: so many, or so many bytes. */
+#define VIOLATIONS_BATCH		1000
+#define VIOLATIONS_BATCH_BYTES	(1024 * 1024)
 
-	copy->relid = pv->relid;
-	copy->type = pstrdup(pv->type);
-	copy->row = pstrdup(pv->row);
-	copy->info = pstrdup(pv->info);
-	return copy;
-}
+/* A violation's lengths, then its strings, in an attempt's file. */
+typedef struct AttemptViolation
+{
+	Oid			relid;
+	uint32		typelen;
+	uint32		rowlen;
+	uint32		infolen;
+} AttemptViolation;
 
 /* Begin a table's attempt at writing its rows. */
 static void
@@ -1674,106 +1871,162 @@ attempt_begin(void)
 	if (recorded == NULL)
 		return;
 	Assert(!recorded->attempting);
-	MemoryContextReset(recorded->attempt_cxt);
-	recorded->attempt = NIL;
-	recorded->nattempt = 0;
 	recorded->attempting = true;
+	recorded->nattempt = 0;
+	recorded->nforgotten = 0;
+}
+
+/* Read the attempt's next violation into buf (false: none left). */
+static bool
+attempt_read(AttemptViolation *h)
+{
+	Size		len;
+
+	if (BufFileReadMaybeEOF(recorded->attempt, h, sizeof(*h), true) == 0)
+		return false;
+	len = (Size) h->typelen + h->rowlen + h->infolen + 3;
+	if (recorded->buf.data == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
+
+		initStringInfo(&recorded->buf);
+		MemoryContextSwitchTo(old);
+	}
+	resetStringInfo(&recorded->buf);
+	enlargeStringInfo(&recorded->buf, len);
+	BufFileReadExact(recorded->attempt, recorded->buf.data, len);
+	recorded->buf.len = len;
+	return true;
 }
 
 /*
- * End the attempt: its violations left kept if it holds, all released if
- * it is rolled back.
+ * End the attempt: the violations it recorded and didn't forget kept, in
+ * order, if it holds; all dropped if it is rolled back.
  */
 static void
 attempt_end(bool holds)
 {
 	if (recorded == NULL || !recorded->attempting)
 		return;
-	if (holds)
-	{
-		MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
-
-		foreach_ptr(ProllyViolation, pv, recorded->attempt)
-			if (pv != NULL)
-				recorded->kept = lappend(recorded->kept, violation_copy(pv));
-		MemoryContextSwitchTo(old);
-	}
-	MemoryContextReset(recorded->attempt_cxt);
-	recorded->attempt = NIL;
-	recorded->nattempt = 0;
 	recorded->attempting = false;
+	if (holds && recorded->nattempt > recorded->nforgotten)
+	{
+		Datum		gone = (Datum) 0;
+		bool		have_gone = false;
+		bool		isnull;
+
+		if (recorded->forgotten)
+		{
+			tuplesort_performsort(recorded->forgotten);
+			have_gone = tuplesort_getdatum(recorded->forgotten, true, false,
+										   &gone, &isnull, NULL);
+		}
+		if (BufFileSeek(recorded->attempt, 0, 0, SEEK_SET) != 0)
+			elog(ERROR, "could not rewind a merge's violations");
+		for (int64 h = 0; h < recorded->nattempt; h++)
+		{
+			AttemptViolation av;
+			const char *s;
+
+			if (!attempt_read(&av))
+				elog(ERROR, "a merge's violations went missing");
+			if (have_gone && DatumGetInt64(gone) == h)
+			{
+				have_gone = tuplesort_getdatum(recorded->forgotten, true,
+											   false, &gone, &isnull, NULL);
+				continue;
+			}
+			s = recorded->buf.data;
+			violation_keep(av.relid, s, s + av.typelen + 1,
+						   s + av.typelen + 1 + av.rowlen + 1);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
+	if (recorded->forgotten)
+		tuplesort_end(recorded->forgotten);
+	recorded->forgotten = NULL;
+	if (recorded->attempt)
+		BufFileClose(recorded->attempt);
+	recorded->attempt = NULL;
+	recorded->nattempt = 0;
+	recorded->nforgotten = 0;
 }
 
 /*
- * Record a violation of relid's (copied): the attempt's, if one is under
- * way.  Returns its handle there (-1: kept at once).
+ * Record a violation of relid's: the attempt's, if one is under way.
+ * Returns its handle there (-1: kept at once).
  */
 static int
 violation_record(Oid relid, const char *type, const char *row,
 				 const char *info)
 {
-	MemoryContext old;
-	ProllyViolation *pv;
-	int			handle = -1;
+	AttemptViolation av;
 
-	old = MemoryContextSwitchTo(recorded->attempting ?
-								recorded->attempt_cxt : recorded->cxt);
-	pv = palloc(sizeof(ProllyViolation));
-	pv->relid = relid;
-	pv->type = pstrdup(type);
-	pv->row = pstrdup(row);
-	pv->info = pstrdup(info);
-	if (recorded->attempting)
+	recorded->last_unique = strcmp(type, "unique index") == 0;
+	if (!recorded->attempting)
 	{
-		handle = list_length(recorded->attempt);
-		recorded->attempt = lappend(recorded->attempt, pv);
-		recorded->nattempt++;
+		violation_keep(relid, type, row, info);
+		return -1;
 	}
-	else
-		recorded->kept = lappend(recorded->kept, pv);
-	MemoryContextSwitchTo(old);
-	return handle;
+	if (recorded->attempt == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
+		ResourceOwner owner = CurrentResourceOwner;
+
+		CurrentResourceOwner = recorded->owner;
+		recorded->attempt = BufFileCreateTemp(false);
+		CurrentResourceOwner = owner;
+		MemoryContextSwitchTo(old);
+	}
+	memset(&av, 0, sizeof(av));
+	av.relid = relid;
+	av.typelen = strlen(type);
+	av.rowlen = strlen(row);
+	av.infolen = strlen(info);
+	BufFileWrite(recorded->attempt, &av, sizeof(av));
+	BufFileWrite(recorded->attempt, type, av.typelen + 1);
+	BufFileWrite(recorded->attempt, row, av.rowlen + 1);
+	BufFileWrite(recorded->attempt, info, av.infolen + 1);
+	return recorded->nattempt++;
 }
 
-/* Keep violations found (copies), outside any attempt. */
+/* Keep violations found, outside any attempt. */
 static void
 violations_keep(List *found)
 {
-	MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
-
 	foreach_ptr(ProllyViolation, pv, found)
-		recorded->kept = lappend(recorded->kept, violation_copy(pv));
-	MemoryContextSwitchTo(old);
-}
-
-/* The attempt's violation of handle h. */
-static const ProllyViolation *
-violation_at(int h)
-{
-	Assert(recorded->attempting && h >= 0 && h < list_length(recorded->attempt));
-	return list_nth(recorded->attempt, h);
+		violation_keep(pv->relid, pv->type, pv->row, pv->info);
 }
 
 /* Forget the attempt's violation of handle h: the row it refused fits. */
 static void
 violation_forget(int h)
 {
-	ProllyViolation *pv = (ProllyViolation *) violation_at(h);
+	ResourceOwner owner = CurrentResourceOwner;
 
-	Assert(pv != NULL);
-	pfree(pv->type);
-	pfree(pv->row);
-	pfree(pv->info);
-	pfree(pv);
-	list_nth_cell(recorded->attempt, h)->ptr_value = NULL;
-	recorded->nattempt--;
+	Assert(recorded->attempting && h >= 0 && h < recorded->nattempt);
+	if (recorded->forgotten == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
+
+		recorded->forgotten = tuplesort_begin_datum(INT8OID, Int8LessOperator,
+													InvalidOid, false,
+													work_mem, NULL,
+													TUPLESORT_NONE);
+		MemoryContextSwitchTo(old);
+	}
+	CurrentResourceOwner = recorded->owner;
+	tuplesort_putdatum(recorded->forgotten, Int64GetDatum((int64) h), false);
+	CurrentResourceOwner = owner;
+	recorded->nforgotten++;
 }
 
 /* How many violations the attempt has recorded and not forgotten. */
 static int
 attempt_violations(void)
 {
-	return recorded && recorded->attempting ? recorded->nattempt : 0;
+	return recorded && recorded->attempting ?
+		recorded->nattempt - recorded->nforgotten : 0;
 }
 
 static void
@@ -1808,9 +2061,9 @@ merge_recording(const ProllyNodeRef *roots, const MergeCommits *commits,
 		conflicts = merge_roots(roots, commits, fail_on_conflict, what, name,
 								conflicted);
 		recording = false;
-		found = list_concat(list_copy(recorded->kept),
-							foreign_key_violations(written, NIL));
-		*nviolations = keep_violations(found);
+		found = foreign_key_violations(written, NIL);
+		violations_keep(found);
+		*nviolations = keep_violations();
 	}
 	PG_FINALLY();
 	{
@@ -3687,6 +3940,7 @@ typedef struct KeyWrite
 	/* (in a pass:) */
 	bool		refused;		/* row refused, old in its place */
 	int			violation;		/* its handle, as recorded (-1: none) */
+	bool		unique;			/* it breaks a unique index */
 } KeyWrite;
 
 /*
@@ -3987,6 +4241,7 @@ typedef struct SpooledWrite
 	int64		nrow;
 	bool		in_place;
 	bool		refused;
+	bool		unique;
 	uint8		rank;
 } SpooledWrite;
 
@@ -4052,6 +4307,7 @@ spool_put(KeyWriter *kw, WriteSpool *sp, const KeyWrite *w)
 	h.nrow = w->nrow;
 	h.in_place = w->in_place;
 	h.refused = w->refused;
+	h.unique = w->unique;
 	h.rank = (uint8) w->rank;
 	BufFileWrite(sp->file, &h, sizeof(h));
 	BufFileWrite(sp->file, w->key.data, w->key.len);
@@ -4104,6 +4360,7 @@ spool_next(WriteSpool *sp)
 	sp->cur.nrow = h.nrow;
 	sp->cur.in_place = h.in_place;
 	sp->cur.refused = h.refused;
+	sp->cur.unique = h.unique;
 	sp->cur.rank = (KeyRank) h.rank;
 }
 
@@ -4237,6 +4494,7 @@ write_row(KeyWriter *kw, KeyWrite *w, bool held)
 		{
 			w->refused = true;
 			w->violation = last_violation;
+			w->unique = recorded->last_unique;
 		}
 	}
 
@@ -4357,6 +4615,7 @@ write_keys_once(KeyWriter *kw)
 		{
 			w->refused = true;
 			w->violation = last_violation;
+			w->unique = recorded->last_unique;
 			note_refused(kw, w);
 		}
 	}
@@ -4385,8 +4644,7 @@ write_keys_once(KeyWriter *kw)
 		{
 			KeyWrite   *w = &kw->retry.cur;
 
-			if (!w->refused ||
-				strcmp(violation_at(w->violation)->type, "unique index") != 0)
+			if (!w->refused || !w->unique)
 				continue;
 			if (retry_key(kw, w))
 			{
@@ -9348,43 +9606,98 @@ verify_constraints(List *relids, bool all)
 	return found;
 }
 
+/* The branch's violations already kept, put in the sort (keep_violations()). */
+static void
+sort_known_violation(const ProllyViolation *pv, void *arg)
+{
+	int64	   *place = arg;
+	KeptViolation *t = kept_of(pv->relid, pv->type, pv->row, pv->info, 0,
+							   (*place)++);
+
+	kept_sort_put(recorded->kept, t);
+	pfree(t);
+}
+
 /*
- * Keep the violations a merge (or pick) found with those the session's
- * branch has already (a violation found again, once).  Returns how many
+ * Publish the violations a merge (or pick) kept with those the session's
+ * branch has already (a violation found again, once), added after them in
+ * the order found.  The branch's are visited, not loaded, into the sort of
+ * those kept; read back sorted, the first of each violation is one the
+ * branch has, or the first found; those found go to a second sort, read
+ * back in the order found, and are added a batch at a time.  So it holds
+ * no more than the sorts' memory however many there are.  Returns how many
  * are new.
  */
 static int
-keep_violations(List *found)
+keep_violations(void)
 {
-	List	   *all = PROLLY_CALL(components().refs, violations);
+	const ProllyRefsRoutine *refs = components().refs;
+	MemoryContext batch_cxt = AllocSetContextCreate(recorded->cxt,
+													"merge violations published",
+													ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
+	Tuplesortstate *found;
+	const KeptViolation *t;
+	KeptViolation *prev = NULL;
+	ProllyViolation **batch;
+	Size		batch_bytes = 0;
+	int64		place = 0;
+	int			nbatch = 0;
 	int			n = 0;
-	ListCell   *lc;
 
-	foreach(lc, found)
+	PROLLY_CALL(refs, visit_violations, sort_known_violation, &place);
+	tuplesort_performsort(recorded->kept);
+	INJECTION_POINT("prolly-merge-publishing-violations", NULL);
+	found = kept_sort_begin(comparetup_kept_place);
+	while ((t = kept_sort_next(recorded->kept)) != NULL)
 	{
-		ProllyViolation *pv = lfirst(lc);
-		bool		known = false;
-		ListCell   *la;
+		bool		again = prev && kept_identity_cmp(prev, t) == 0;
 
-		foreach(la, all)
+		if (prev)
+			pfree(prev);
+		prev = MemoryContextAlloc(recorded->cxt, KEPT_SIZE(t));
+		memcpy(prev, t, KEPT_SIZE(t));
+		if (!again && t->origin == 1)
 		{
-			ProllyViolation *a = lfirst(la);
-
-			if (a->relid == pv->relid && strcmp(a->type, pv->type) == 0 &&
-				strcmp(a->row, pv->row) == 0 && strcmp(a->info, pv->info) == 0)
-			{
-				known = true;
-				break;
-			}
-		}
-		if (!known)
-		{
-			all = lappend(all, pv);
+			kept_sort_put(found, t);
 			n++;
 		}
+		CHECK_FOR_INTERRUPTS();
 	}
-	if (n > 0)
-		PROLLY_CALL(components().refs, set_violations, all);
+	if (prev)
+		pfree(prev);
+	tuplesort_end(recorded->kept);
+	recorded->kept = NULL;
+
+	tuplesort_performsort(found);
+	batch = MemoryContextAlloc(recorded->cxt,
+							   sizeof(ProllyViolation *) * VIOLATIONS_BATCH);
+	old = MemoryContextSwitchTo(batch_cxt);
+	while ((t = kept_sort_next(found)) != NULL)
+	{
+		ProllyViolation *pv = palloc(sizeof(ProllyViolation));
+
+		pv->relid = t->relid;
+		pv->type = pstrdup(KEPT_TYPE(t));
+		pv->row = pstrdup(KEPT_ROW(t));
+		pv->info = pstrdup(KEPT_INFO(t));
+		batch[nbatch++] = pv;
+		batch_bytes += KEPT_SIZE(t);
+		if (nbatch == VIOLATIONS_BATCH || batch_bytes >= VIOLATIONS_BATCH_BYTES)
+		{
+			PROLLY_CALL(refs, add_violations, batch, nbatch);
+			MemoryContextReset(batch_cxt);
+			nbatch = 0;
+			batch_bytes = 0;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (nbatch > 0)
+		PROLLY_CALL(refs, add_violations, batch, nbatch);
+	MemoryContextSwitchTo(old);
+	tuplesort_end(found);
+	pfree(batch);
+	MemoryContextDelete(batch_cxt);
 	return n;
 }
 

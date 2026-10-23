@@ -257,20 +257,33 @@ grow with table size; this does not bound the entire merge's memory.
 
 A merge that records constraint violations writes each table's rows as an
 attempt.  Where a refused row's put-back is refused too, the table's writes
-are rolled back and made again; the violations an attempt records live in
-their own memory context, reset when the attempt is rolled back, and only
-those left when it holds are copied to the merge's kept violations (a row
-tried again and written after all is forgotten at once).  The rows ranked
-up across attempts, and those held to be tried again while a row is pinned,
-are spooled to temporary files in key order, created under the resource
-owner the writes began with so that an attempt's subtransaction can roll
-back without closing them; their memory is a few file buffers and the
-largest row.  A keyless table's removed values, which the domain checks
+are rolled back and made again; the violations an attempt records are
+spooled to a temporary file of its own, dropped when the attempt is rolled
+back.  When it holds, those left are read back in order into the merge's
+kept violations, passing over the handles of those forgotten (a row tried
+again and written after all), which are sorted.  The rows ranked up across
+attempts, and those held to be tried again while a row is pinned, are
+spooled to temporary files in key order.  These files are created under the
+resource owner the writes began with so that an attempt's subtransaction
+can roll back without closing them; their memory is a few file buffers and
+the largest row.  A keyless table's removed values, which the domain checks
 look up, are held in memory up to work_mem, then sorted with a tuplesort
 and written once each, in order, to an image file and a fixed-size entry
 file that lookups search by halving.  All of these files close when the
 table is written and go with their resource owner on error or cancellation.
-The violations a merge keeps are still held in memory until published.
+
+The violations a merge keeps go to a tuplesort of their own (work_mem,
+spilling past it).  To publish them, the branch's violations are visited
+into the same sort, which orders them by what they are and then the
+branch's first: the first of each is kept only if it is new, and the new
+ones are sorted again into the order found and added to the branch's a
+batch at a time.  The refs keep a branch's violations one entry each, keyed
+by the branch and a place, after an entry holding the next place, so adding
+some reads and writes none of the others.  Earlier versions kept them all in
+one value under the branch's key; such a value is still read, before the
+entries, and goes when the branch's violations are set again (verify,
+resolution).  The violations' inspection functions and the checks before a
+commit still read a branch's violations whole.
 
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their

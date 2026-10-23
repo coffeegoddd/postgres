@@ -174,6 +174,10 @@ static List *copies_violations(void);
 static bool tracking_head(const char *refname, ProllyHash *commit_id);
 static bool upstream_head(const char *branch, ProllyHash *commit_id);
 static void copies_set_violations(List *violations);
+static void copies_visit_violations(ProllyViolationVisit visit, void *arg);
+static void copies_add_violations(ProllyViolation *const *violations, int n);
+static void violations_clear(const char *branch);
+static void violations_move(const char *from, const char *to);
 static bool copies_merge_state(ProllyMergeState *state);
 static void copies_set_merge_state(const ProllyMergeState *state);
 static bool copies_commit_working_set(const ProllyHash *commit_id,
@@ -2423,12 +2427,7 @@ copies_branch_delete(const char *name, bool force)
 			refs_put(key.data, key.len, NULL);
 			merge_names_put(name, NULL);
 		}
-		if (violations_of(name) != NIL)
-		{
-			resetStringInfo(&key);
-			violations_key(&key, name);
-			refs_put(key.data, key.len, NULL);
-		}
+		violations_clear(name);
 		resetStringInfo(&key);
 		names_key(&key, name);
 		refs_put(key.data, key.len, NULL);
@@ -2479,6 +2478,9 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->check_drop(name);
 		branch_ops()->check_create(newname);
 	}
+	/* (violations kept one entry each, then those of any single value) */
+	violations_clear(newname);
+	violations_move(name, newname);
 	for (int i = 0; i < lengthof(tags); i++)
 	{
 		StringInfoData key;
@@ -3426,11 +3428,33 @@ copies_set_merge_state(const ProllyMergeState *state)
 	pfree(key.data);
 }
 
+/*
+ * A branch's constraint violations.  They are kept one entry each, keyed
+ * by the tag, the branch's name, a zero byte and the entry's place (eight
+ * bytes, big-endian), after an entry of that prefix alone, which holds the
+ * next place: so violations are added at the end without the others being
+ * read or written again, and read back in the order they were added.
+ * Earlier versions kept them all in one value, keyed by the tag and the
+ * branch's name; one written so is still read, before the entries, and is
+ * replaced when the branch's violations are set again.  (A branch's name
+ * holds no zero byte, so neither key is another branch's.)
+ */
+bool		debug_prolly_violations_one_value = false;
+
+#define VIOLATIONS_BATCH		1000
+
 static void
 violations_key(StringInfo key, const char *branch)
 {
 	appendStringInfoChar(key, TAG_VIOLATIONS);
 	appendStringInfoString(key, branch);
+}
+
+static void
+violations_prefix(StringInfo key, const char *branch)
+{
+	violations_key(key, branch);
+	appendStringInfoChar(key, '\0');
 }
 
 static void
@@ -3463,6 +3487,116 @@ corrupt:
 	return NULL;				/* keep compiler quiet */
 }
 
+static void
+put_violation(StringInfo out, const ProllyViolation *pv)
+{
+	put_be32(out, pv->relid);
+	put_text(out, pv->type);
+	put_text(out, pv->row);
+	put_text(out, pv->info);
+}
+
+static void
+get_violation(const char **p, const char *end, ProllyViolation *pv)
+{
+	if (end - *p < 4)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a branch's constraint violations are corrupt")));
+	pv->relid = get_be32(*p);
+	*p += 4;
+	pv->type = get_text(p, end);
+	pv->row = get_text(p, end);
+	pv->info = get_text(p, end);
+}
+
+static void
+put_be64(StringInfo out, uint64 v)
+{
+	put_be32(out, (uint32) (v >> 32));
+	put_be32(out, (uint32) v);
+}
+
+static uint64
+get_be64(const char *p)
+{
+	return ((uint64) get_be32(p) << 32) | get_be32(p + 4);
+}
+
+/*
+ * Visit each constraint violation a merge left on branch, in the order
+ * they were added, those of tables since dropped too.  Each is good only
+ * during its visit.
+ */
+static void
+violations_visit(const char *branch, ProllyViolationVisit visit, void *arg)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "branch violations",
+											  ALLOCSET_SMALL_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	StringInfoData key;
+	ProllyNodeRef root;
+
+	refs_init();
+	initStringInfo(&key);
+	violations_key(&key, branch);
+	if (refs_root(&root))
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(tree, cursor_open, &env, &root, cxt);
+		ProllyKey	from = {(const uint8 *) key.data, key.len};
+		ProllyKey	k;
+		ProllyValue val;
+
+		/*
+		 * (one seek reads both: the one value's key comes right before the
+		 * entries', which extend it by a zero byte)
+		 */
+		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (PROLLY_CALL(tree, cursor_next, c, &k, &val) &&
+			   k.len >= key.len && memcmp(k.data, key.data, key.len) == 0 &&
+			   (k.len == key.len || k.data[key.len] == '\0'))
+		{
+			const char *p = (const char *) val.data;
+			const char *end = p + val.len;
+
+			/* (the prefix alone holds the next place) */
+			if (k.len == key.len + 1)
+				continue;
+			/* (the one value holds many, each entry one) */
+			while (p < end)
+			{
+				ProllyViolation pv;
+
+				get_violation(&p, end, &pv);
+				MemoryContextSwitchTo(old);
+				visit(&pv, arg);
+				MemoryContextSwitchTo(cxt);
+				pfree(pv.type);
+				pfree(pv.row);
+				pfree(pv.info);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
+}
+
+static void
+collect_violation(const ProllyViolation *pv, void *arg)
+{
+	List	  **list = arg;
+	ProllyViolation *copy = palloc(sizeof(ProllyViolation));
+
+	copy->relid = pv->relid;
+	copy->type = pstrdup(pv->type);
+	copy->row = pstrdup(pv->row);
+	copy->info = pstrdup(pv->info);
+	*list = lappend(*list, copy);
+}
+
 /*
  * The constraint violations a merge left on branch, as the refs hold them:
  * violations_left() leaves out those of tables since dropped.
@@ -3470,38 +3604,225 @@ corrupt:
 static List *
 violations_of(const char *branch)
 {
+	List	   *list = NIL;
+
+	violations_visit(branch, collect_violation, &list);
+	return list;
+}
+
+/* Apply edits (n of them, in key order) to the refs, with the transaction. */
+static void
+refs_apply(ProllyEdit *edits, int n)
+{
+	ProllyNodeRef root;
+	ProllyNodeRef new_root;
+
+	if (n == 0)
+		return;
+	lock_refs();
+	if (!refs_root(&root))
+		elog(ERROR, "prolly refs have no root");
+	PROLLY_CALL(tree, apply, &env, &root, edits, n, &new_root);
+	if (!PROLLY_CALL(env.chunk_store, move_root, env.chunks, &root.hash,
+					 &new_root.hash))
+		elog(ERROR, "prolly refs moved while held");
+}
+
+/*
+ * The entries under branch's prefix (their keys copied, at most max of
+ * them, from the first), into *keys; returns how many.
+ */
+static int
+violation_entries(const char *branch, StringInfoData *keys, int max)
+{
+	StringInfoData prefix;
+	ProllyNodeRef root;
+	int			n = 0;
+
+	if (!refs_root(&root))
+		return 0;
+	initStringInfo(&prefix);
+	violations_prefix(&prefix, branch);
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(tree, cursor_open, &env, &root,
+										  CurrentMemoryContext);
+		ProllyKey	from = {(const uint8 *) prefix.data, prefix.len};
+		ProllyKey	k;
+		ProllyValue val;
+
+		PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+		while (n < max && PROLLY_CALL(tree, cursor_next, c, &k, &val) &&
+			   k.len >= prefix.len &&
+			   memcmp(k.data, prefix.data, prefix.len) == 0)
+		{
+			initStringInfo(&keys[n]);
+			appendBinaryStringInfo(&keys[n], (const char *) k.data, k.len);
+			n++;
+		}
+		PROLLY_CALL(tree, cursor_close, c);
+	}
+	pfree(prefix.data);
+	return n;
+}
+
+/* Remove branch's constraint violations, in either form. */
+static void
+violations_clear(const char *branch)
+{
 	StringInfoData key;
 	StringInfoData v;
-	List	   *list = NIL;
+	StringInfoData *keys = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+	ProllyEdit *edits = palloc0_array(ProllyEdit, VIOLATIONS_BATCH);
+	int			n;
 
 	refs_init();
 	initStringInfo(&key);
 	initStringInfo(&v);
 	violations_key(&key, branch);
 	if (refs_get(key.data, key.len, &v))
+		refs_put(key.data, key.len, NULL);
+	while ((n = violation_entries(branch, keys, VIOLATIONS_BATCH)) > 0)
 	{
-		const char *p = v.data;
-		const char *end = v.data + v.len;
-
-		while (p < end)
+		for (int i = 0; i < n; i++)
 		{
-			ProllyViolation *pv = palloc0(sizeof(ProllyViolation));
-
-			if (end - p < 4)
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("a branch's constraint violations are corrupt")));
-			pv->relid = get_be32(p);
-			p += 4;
-			pv->type = get_text(&p, end);
-			pv->row = get_text(&p, end);
-			pv->info = get_text(&p, end);
-			list = lappend(list, pv);
+			edits[i].key.data = (const uint8 *) keys[i].data;
+			edits[i].key.len = keys[i].len;
+			edits[i].is_delete = true;
 		}
+		refs_apply(edits, n);
+		for (int i = 0; i < n; i++)
+			pfree(keys[i].data);
+		CHECK_FOR_INTERRUPTS();
 	}
+	pfree(keys);
+	pfree(edits);
 	pfree(key.data);
 	pfree(v.data);
-	return list;
+}
+
+/* Add violations (n of them) to branch's, after those it has. */
+static void
+violations_append(const char *branch, ProllyViolation *const *violations,
+				  int n)
+{
+	StringInfoData prefix;
+	StringInfoData next;
+	StringInfoData *keys;
+	StringInfoData *values;
+	ProllyEdit *edits;
+	uint64		place = 0;
+
+	if (n == 0)
+		return;
+	refs_init();
+	lock_refs();
+	initStringInfo(&prefix);
+	initStringInfo(&next);
+	violations_prefix(&prefix, branch);
+	if (refs_get(prefix.data, prefix.len, &next))
+	{
+		if (next.len != 8)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a branch's constraint violations are corrupt")));
+		place = get_be64(next.data);
+	}
+	keys = palloc_array(StringInfoData, n);
+	values = palloc_array(StringInfoData, n);
+	edits = palloc0_array(ProllyEdit, n + 1);
+	resetStringInfo(&next);
+	put_be64(&next, place + n);
+	edits[0].key.data = (const uint8 *) prefix.data;
+	edits[0].key.len = prefix.len;
+	edits[0].value.data = (const uint8 *) next.data;
+	edits[0].value.len = next.len;
+	for (int i = 0; i < n; i++)
+	{
+		initStringInfo(&keys[i]);
+		appendBinaryStringInfo(&keys[i], prefix.data, prefix.len);
+		put_be64(&keys[i], place + i);
+		initStringInfo(&values[i]);
+		put_violation(&values[i], violations[i]);
+		edits[i + 1].key.data = (const uint8 *) keys[i].data;
+		edits[i + 1].key.len = keys[i].len;
+		edits[i + 1].value.data = (const uint8 *) values[i].data;
+		edits[i + 1].value.len = values[i].len;
+	}
+	refs_apply(edits, n + 1);
+	for (int i = 0; i < n; i++)
+	{
+		pfree(keys[i].data);
+		pfree(values[i].data);
+	}
+	pfree(keys);
+	pfree(values);
+	pfree(edits);
+	pfree(prefix.data);
+	pfree(next.data);
+	note_merge_changed(branch);
+}
+
+/* Move branch from's constraint violations to branch to (none there). */
+static void
+violations_move(const char *from, const char *to)
+{
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "violations moved",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	StringInfoData *keys = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+	StringInfoData *values = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+	ProllyEdit *edits = palloc0_array(ProllyEdit, VIOLATIONS_BATCH);
+	StringInfoData from_prefix;
+	StringInfoData to_prefix;
+	int			n;
+
+	initStringInfo(&from_prefix);
+	initStringInfo(&to_prefix);
+	violations_prefix(&from_prefix, from);
+	violations_prefix(&to_prefix, to);
+	while ((n = violation_entries(from, keys, VIOLATIONS_BATCH)) > 0)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			initStringInfo(&values[i]);
+			if (!refs_get(keys[i].data, keys[i].len, &values[i]))
+				elog(ERROR, "a branch's constraint violation went missing");
+			edits[i].key.data = (const uint8 *) keys[i].data;
+			edits[i].key.len = keys[i].len;
+			edits[i].is_delete = true;
+			edits[i].value.data = NULL;
+			edits[i].value.len = 0;
+		}
+		refs_apply(edits, n);
+		for (int i = 0; i < n; i++)
+		{
+			StringInfoData k;
+
+			/* (the same places, so the same order, under the new name) */
+			initStringInfo(&k);
+			appendBinaryStringInfo(&k, to_prefix.data, to_prefix.len);
+			appendBinaryStringInfo(&k, keys[i].data + from_prefix.len,
+								   keys[i].len - from_prefix.len);
+			pfree(keys[i].data);
+			keys[i] = k;
+			edits[i].key.data = (const uint8 *) keys[i].data;
+			edits[i].key.len = keys[i].len;
+			edits[i].is_delete = false;
+			edits[i].value.data = (const uint8 *) values[i].data;
+			edits[i].value.len = values[i].len;
+		}
+		refs_apply(edits, n);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(cxt);
+		MemoryContextSwitchTo(cxt);
+		keys = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+		values = palloc_array(StringInfoData, VIOLATIONS_BATCH);
+		edits = palloc0_array(ProllyEdit, VIOLATIONS_BATCH);
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextDelete(cxt);
 }
 
 /*
@@ -3538,41 +3859,61 @@ copies_violations(void)
 }
 
 static void
+copies_visit_violations(ProllyViolationVisit visit, void *arg)
+{
+	violations_visit(branch_ops()->current(), visit, arg);
+}
+
+static void
+copies_add_violations(ProllyViolation *const *violations, int n)
+{
+	violations_append(branch_ops()->current(), violations, n);
+}
+
+/*
+ * Set the session branch's violations: those it had removed, these added,
+ * a batch at a time (or, for testing, as one value, as earlier versions
+ * kept them).
+ */
+static void
 copies_set_violations(List *violations)
 {
-	StringInfoData key;
-	StringInfoData v;
-	ListCell   *lc;
+	const char *branch = branch_ops()->current();
 
 	refs_init();
-	initStringInfo(&key);
-	violations_key(&key, branch_ops()->current());
-	if (violations == NIL)
+	violations_clear(branch);
+	if (violations != NIL && debug_prolly_violations_one_value)
 	{
-		StringInfoData had;
+		StringInfoData key;
+		StringInfoData v;
 
-		initStringInfo(&had);
-		if (refs_get(key.data, key.len, &had))
-			refs_put(key.data, key.len, NULL);
-		pfree(had.data);
+		initStringInfo(&key);
+		initStringInfo(&v);
+		violations_key(&key, branch);
+		foreach_ptr(ProllyViolation, pv, violations)
+			put_violation(&v, pv);
+		refs_put(key.data, key.len, &v);
+		pfree(key.data);
+		pfree(v.data);
 	}
 	else
 	{
-		initStringInfo(&v);
-		foreach(lc, violations)
-		{
-			ProllyViolation *pv = lfirst(lc);
+		ProllyViolation **batch = palloc_array(ProllyViolation *, VIOLATIONS_BATCH);
+		int			n = 0;
 
-			put_be32(&v, pv->relid);
-			put_text(&v, pv->type);
-			put_text(&v, pv->row);
-			put_text(&v, pv->info);
+		foreach_ptr(ProllyViolation, pv, violations)
+		{
+			batch[n++] = pv;
+			if (n == VIOLATIONS_BATCH)
+			{
+				violations_append(branch, batch, n);
+				n = 0;
+			}
 		}
-		refs_put(key.data, key.len, &v);
-		pfree(v.data);
+		violations_append(branch, batch, n);
+		pfree(batch);
 	}
-	note_merge_changed(branch_ops()->current());
-	pfree(key.data);
+	note_merge_changed(branch);
 }
 
 /* ------------------------------------------------------------------------
@@ -4223,12 +4564,7 @@ end_merge(const char *name)
 		refs_put(key.data, key.len, NULL);
 		merge_names_put(name, NULL);
 	}
-	if (violations_of(name) != NIL)
-	{
-		resetStringInfo(&key);
-		violations_key(&key, name);
-		refs_put(key.data, key.len, NULL);
-	}
+	violations_clear(name);
 	pfree(key.data);
 }
 
@@ -4540,6 +4876,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_head = copies_set_head,
 	.violations = copies_violations,
 	.set_violations = copies_set_violations,
+	.visit_violations = copies_visit_violations,
+	.add_violations = copies_add_violations,
 	.walk_commit = copies_walk_commit,
 	.remote_set = copies_remote_set,
 	.remotes = copies_remotes,

@@ -23,8 +23,8 @@ work_mem = 64kB
 });
 $node->start;
 
-# Bytes a context (summed over those of that name) or the backend holds,
-# from the log pg_log_backend_memory_contexts() writes.
+# Bytes a context and those under it hold (summed over those of that name),
+# or the backend does, from the log pg_log_backend_memory_contexts() writes.
 sub memory_of
 {
 	my ($db, $pid, $what) = @_;
@@ -34,7 +34,16 @@ sub memory_of
 	my $log = substr(slurp_file($node->logfile), $offset);
 	my %bytes;
 	($bytes{grand}) = $log =~ /Grand total: (\d+) bytes/;
-	$bytes{$1} += $2 while $log =~ /level: \d+; ([^:]+): (\d+) total/g;
+	# (each context's bytes with those of the contexts under it)
+	my @open;
+	while ($log =~ /level: (\d+); ([^:]+): (\d+) total/g)
+	{
+		my ($level, $name, $total) = ($1, $2, $3);
+		@open = grep { $_->[0] < $level } @open;
+		$bytes{ $_->[1] } += $total for @open;
+		$bytes{$name} += $total;
+		push @open, [ $level, $name ];
+	}
 	return \%bytes;
 }
 
@@ -254,7 +263,7 @@ for my $n (20, 3000)
 	});
 	$node->wait_for_event('client backend', 'prolly-merge-removed-values-held');
 	my $m = memory_of($db, $pid);
-	my $values = $m->{'merge removed values'} + ($m->{'merge removed values held'} // 0);
+	my $values = $m->{'merge removed values'};
 	push @removed, $values;
 	push @in_memory, exists $m->{'merge removed values held'} ? 1 : 0;
 	my ($files, $bytes) = split /\|/, temp_files($db, $pid);

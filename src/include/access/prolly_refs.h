@@ -108,6 +108,16 @@ typedef struct ProllyViolation
 	char	   *info;
 } ProllyViolation;
 
+/* Visits one violation; it is good only during the visit. */
+typedef void (*ProllyViolationVisit) (const ProllyViolation *violation,
+									  void *arg);
+
+/*
+ * Keep a branch's violations in one value, as earlier versions did, when
+ * they are set (for testing that such a value is still read).
+ */
+extern PGDLLIMPORT bool debug_prolly_violations_one_value;
+
 /* Visits one branch: its name and head commit (len 0: none yet). */
 typedef void (*ProllyBranchVisit) (const char *name, const ProllyHash *head,
 								   void *arg);
@@ -257,6 +267,15 @@ typedef struct ProllyRefsRoutine
 	 */
 	List	   *(*violations) (void);
 	void		(*set_violations) (List *violations);
+
+	/*
+	 * The session branch's violations visited in the order they were
+	 * added, those of tables since dropped too, without holding them all;
+	 * and violations (n of them) added after them, with the transaction,
+	 * the others neither read nor written again.
+	 */
+	void		(*visit_violations) (ProllyViolationVisit visit, void *arg);
+	void		(*add_violations) (ProllyViolation *const *violations, int n);
 
 	/*
 	 * working_set() for reading what changed, never to commit or move from:
@@ -485,7 +504,8 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
 	"commit_with", "branches", "working_set", "reset", "merge_state", \
 	"set_merge_state", "hold", "lock", "walk", "checkpoint", "set_head", "violations", \
-	"set_violations", "read_working_set", "walk_commit", "remote_set", \
+	"set_violations", "visit_violations", "add_violations", \
+	"read_working_set", "walk_commit", "remote_set", \
 	"remotes", "tracking_set", "trackings", "upstream_set", "upstream", \
 	"branch_move", "config_get", "config_set", "open", "commit_rows", \
 	"branch_rename", "root_refs", "stash_push", "stashes", "stash_drop", \

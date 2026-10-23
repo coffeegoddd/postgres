@@ -1,0 +1,328 @@
+-- A branch's constraint violations are kept one entry each, added after
+-- those it has; violations kept in one value, as earlier versions kept
+-- them, are still read, first, and a merge finds them again only once.
+-- A branch renamed takes both with it; a branch deleted, or reset, drops
+-- them.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA vs VERSIONED;
+CREATE TABLE vs.parent (id int PRIMARY KEY);
+CREATE TABLE vs.child (id int PRIMARY KEY, p int REFERENCES vs.parent);
+CREATE TABLE vs.u (pk int PRIMARY KEY, b int);
+INSERT INTO vs.parent VALUES (1), (2);
+SELECT length(dolt_commit('-Am', 'vs base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('vs_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('vs_more');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO vs.child VALUES (1, 1), (2, 2);
+CREATE UNIQUE INDEX u_b ON vs.u (b);
+INSERT INTO vs.u VALUES (10, 1);
+SELECT length(dolt_commit('-Am', 'vs ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('vs_theirs');
+            dolt_checkout             
+--------------------------------------
+ {0,"Switched to branch 'vs_theirs'"}
+(1 row)
+
+DELETE FROM vs.parent;
+SELECT length(dolt_commit('-am', 'vs theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('vs_more');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'vs_more'"}
+(1 row)
+
+INSERT INTO vs.parent VALUES (5);
+INSERT INTO vs.u VALUES (11, 1);
+SELECT length(dolt_commit('-am', 'vs more')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('vs_work');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('vs_work');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'vs_work'"}
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('vs_theirs'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violation_type, violating_row FROM dolt_constraint_violations('vs.child')
+ORDER BY 2::text;
+ violation_type |   violating_row   
+----------------+-------------------
+ foreign key    | {"p": 1, "id": 1}
+ foreign key    | {"p": 2, "id": 2}
+(2 rows)
+
+-- Set again as one value, they read the same.
+SET debug_prolly_violations_one_value = on;
+SELECT dolt_verify_constraints('vs.child');
+ dolt_verify_constraints 
+-------------------------
+ {1}
+(1 row)
+
+RESET debug_prolly_violations_one_value;
+SELECT violation_type, violating_row FROM dolt_constraint_violations('vs.child')
+ORDER BY 2::text;
+ violation_type |   violating_row   
+----------------+-------------------
+ foreign key    | {"p": 1, "id": 1}
+ foreign key    | {"p": 2, "id": 2}
+(2 rows)
+
+SELECT length(dolt_commit('-afm', 'vs merged')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- Merged again: the child rows' violations, found again, are kept once;
+-- the new one (u's 11) follows them.
+SELECT (dolt_merge('vs_more'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row
+FROM unnest(ARRAY['vs.child', 'vs.u']) t,
+	LATERAL dolt_constraint_violations(t);
+   t   | violation_type |   violating_row    
+-------+----------------+--------------------
+ child | foreign key    | {"p": 1, "id": 1}
+ child | foreign key    | {"p": 2, "id": 2}
+ u     | unique index   | {"b": 1, "pk": 11}
+(3 rows)
+
+SELECT * FROM dolt_constraint_violations() ORDER BY table_name;
+ table_name | num_violations 
+------------+----------------
+ vs.child   |              2
+ vs.u       |              1
+(2 rows)
+
+SELECT length(dolt_commit('-afm', 'vs merged more')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- Renamed, the branch takes them all, in order; a branch of its old name
+-- has none.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-m', 'vs_work', 'vs_renamed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('vs_work');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('vs_work');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'vs_work'"}
+(1 row)
+
+SELECT count(*) AS none FROM dolt_constraint_violations();
+ none 
+------
+    0
+(1 row)
+
+SELECT dolt_checkout('vs_renamed');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'vs_renamed'"}
+(1 row)
+
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row
+FROM unnest(ARRAY['vs.child', 'vs.u']) t,
+	LATERAL dolt_constraint_violations(t);
+   t   | violation_type |   violating_row    
+-------+----------------+--------------------
+ child | foreign key    | {"p": 1, "id": 1}
+ child | foreign key    | {"p": 2, "id": 2}
+ u     | unique index   | {"b": 1, "pk": 11}
+(3 rows)
+
+-- Set again (the rows fixed and checked), the one value goes too.
+DELETE FROM vs.child;
+SELECT dolt_verify_constraints('vs.child');
+ dolt_verify_constraints 
+-------------------------
+ {0}
+(1 row)
+
+SELECT split_part(t, '.', 2) AS t, violation_type, violating_row
+FROM unnest(ARRAY['vs.child', 'vs.u']) t,
+	LATERAL dolt_constraint_violations(t);
+ t | violation_type |   violating_row    
+---+----------------+--------------------
+ u | unique index   | {"b": 1, "pk": 11}
+(1 row)
+
+SELECT length(dolt_commit('-afm', 'vs checked')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- A branch deleted drops them: one made again of its name has none.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'vs_renamed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('vs_renamed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('vs_renamed');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'vs_renamed'"}
+(1 row)
+
+SELECT count(*) AS none FROM dolt_constraint_violations();
+ none 
+------
+    0
+(1 row)
+
+-- A reset drops them.
+SELECT dolt_checkout('vs_work');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'vs_work'"}
+(1 row)
+
+SELECT (dolt_merge('vs_theirs'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT count(*) AS two FROM dolt_constraint_violations('vs.child');
+ two 
+-----
+   2
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT count(*) AS none FROM dolt_constraint_violations();
+ none 
+------
+    0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'vs_renamed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'vs_work');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_branch('-D', 'vs_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'vs_more');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA vs CASCADE;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to table vs.parent
+drop cascades to table vs.child
+drop cascades to table vs.u
+SELECT length(dolt_commit('-Am', 'no vs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
