@@ -186,6 +186,36 @@ sql(q{SELECT * FROM test_bmap_release_drain()});
 is(sql($free) - $free4, $blocks4 + $nodes4, 'and the drain frees, once');
 is(sql(q{SELECT freed FROM prolly_page_sweep()}), '0', 'none leaked');
 
+# A drop whose queuing fails part way (after the changes list's blocks,
+# before the subtrees) leaves nothing queued that its map still reaches.
+# While the drop waits to unlink the map, a drain frees none of the map's
+# nodes, so a sweep reading the map reads it whole, even with freed blocks
+# taken again; once the map is gone, a sweep frees what it held.
+my ($rel5, $blocks5, $nodes5) = make_table('t5', 12000);
+sql('CHECKPOINT');
+my $d5 = $node->background_psql('postgres');
+$d5->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-drop-changes-queued', 'error');
+	SELECT injection_points_attach('bmap-dropped', 'wait')});
+$d5->query_until(qr/dropping/, q{\echo dropping
+DROP TABLE t5;
+\echo dropped
+});
+$node->wait_for_event('client backend', 'bmap-dropped');
+sql(q{SELECT * FROM test_bmap_release_drain()});
+make_table('t6', 12000);
+my ($r5, $o5, $e5) = $node->psql('postgres',
+	q{SELECT freed FROM prolly_page_sweep()});
+is($r5, 0, 'a sweep reads the dropped map whole') or diag($e5);
+is($o5, '0', 'and frees none of what it holds');
+sql(q{SELECT injection_points_wakeup('bmap-dropped')});
+$d5->query_until(qr/dropped/, '');
+$d5->quit;
+cmp_ok(sql(q{SELECT freed FROM prolly_page_sweep()}), '>=', $blocks5,
+	'once the map is gone, a sweep frees its blocks');
+sql('DROP TABLE t6');
+sql(q{SELECT * FROM test_bmap_release_drain()});
+
 # A database dropped with its queue not drained.
 sql('CREATE DATABASE gone');
 $node->safe_psql('gone', q{CREATE EXTENSION test_prolly;

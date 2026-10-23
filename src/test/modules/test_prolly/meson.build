@@ -318,6 +318,7 @@ tests += {
       't/193_bmap_dropped_buffers.pl',
       't/194_bmap_snapshot_redo.pl',
       't/210_bmap_release_queue.pl',
+      't/211_bmap_release_autovacuum.pl',
     ],
   },
 }

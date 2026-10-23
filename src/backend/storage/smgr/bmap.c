@@ -6638,13 +6638,17 @@ tree_drop(SMgrRelation reln)
 	root = *PageGetBmapRoot(BufferGetPage(buf));
 	UnlockReleaseBuffer(buf);
 
+	/*
+	 * The changes list's blocks first, in as many records as they take, and
+	 * the subtrees last, in one record of their own: a failure before it
+	 * leaves nothing queued that the root page still reaches (the blocks
+	 * queued are listed by the changes list too, so counted twice, which
+	 * keeps them).  The root page is written out with no subtrees only
+	 * once they are queued.
+	 */
 	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
-	items = palloc_array(BmapQueued, BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS) +
-						 (changes ? nchanges : 0));
-	n += queued_tops(root.top, items + n);
-	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
-		if (root.snap[s].id != 0)
-			n += queued_tops(snapshot_tops(&root.snap[s]), items + n);
+	items = palloc_array(BmapQueued, Max(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS),
+										 changes ? nchanges : 0));
 	if (changes != NULL)
 	{
 		BlockNumber *held = palloc_array(BlockNumber, Max(nchanges, 1));
@@ -6655,6 +6659,7 @@ tree_drop(SMgrRelation reln)
 		pfree(held);
 		pfree(changes);
 	}
+
 	/*
 	 * The drop's commit is flushed, these records maybe not: the WAL writer
 	 * is asked to flush them soon, not waited for.  A crash first leaves
@@ -6662,10 +6667,22 @@ tree_drop(SMgrRelation reln)
 	 * sweep a restart makes due (bmap_sweep_due()).
 	 */
 	{
-		XLogRecPtr	end = queue_push(rel, items, n);
+		XLogRecPtr	end;
 
+		(void) queue_push(rel, items, n);
+		INJECTION_POINT("bmap-drop-changes-queued", NULL);
+		n = queued_tops(root.top, items);
+		for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
+			if (root.snap[s].id != 0)
+				n += queued_tops(snapshot_tops(&root.snap[s]), items + n);
+		StaticAssertStmt(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS) <=
+						 (BMAP_QUEUE_PAGES_PER_RECORD - 1) * BMAP_QUEUE_PER_PAGE,
+						 "a map's subtrees are queued in one record");
+		end = queue_push(rel, items, n);
 		if (!XLogRecPtrIsInvalid(end))
 			XLogSetAsyncXactLSN(end);
+		else if (!XLogRecPtrIsInvalid(XactLastRecEnd))
+			XLogSetAsyncXactLSN(XactLastRecEnd);
 	}
 	pfree(items);
 
@@ -6753,6 +6770,13 @@ page_fits(BlockNumber page, BlockNumber *pages, int *n, int max)
 	return true;
 }
 
+static int
+cmp_queued_block(const void *a, const void *b)
+{
+	return pg_cmp_u32(((const BmapQueued *) a)->block,
+					  ((const BmapQueued *) b)->block);
+}
+
 /*
  * A node popped: its children, as entries, into children[]; their count,
  * which the caller pushes if the node is freed.  Shared, the node changes
@@ -6795,6 +6819,21 @@ queued_children(RelFileLocator rel, const BmapQueued *node,
 								   entries[i].since);
 	}
 	UnlockReleaseBuffer(buf);
+
+	/*
+	 * A leaf holds each block it maps once, however many of its entries map
+	 * it (as tree_copy_node() counts it): each is queued once.
+	 */
+	if (node->level == 0 && n > 1)
+	{
+		int			u = 0;
+
+		qsort(children, n, sizeof(BmapQueued), cmp_queued_block);
+		for (int i = 0; i < n; i++)
+			if (u == 0 || children[u - 1].block != children[i].block)
+				children[u++] = children[i];
+		n = u;
+	}
 	return n;
 }
 
