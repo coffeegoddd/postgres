@@ -73,7 +73,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 -- feat with a change of its own, left (its checkpoint folded): its head
--- is the nearest, and only its change is written back.
+-- is the nearest, and only its change is written back.  The copies'
+-- working set is folded once, as the first use's baseline, which is then
+-- advanced past the row written back: one candidate.
 SELECT dolt_checkout('feat');
           dolt_checkout          
 ---------------------------------
@@ -99,6 +101,12 @@ SELECT dolt_branch('at_feat', 'feat');
  
 (1 row)
 
+SELECT pg_temp.since('fold_candidates') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
 BEGIN;
 SELECT dolt_checkout('at_feat');
            dolt_checkout            
@@ -114,6 +122,18 @@ SELECT * FROM pg_temp.written();
 (2 rows)
 
 COMMIT;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('fold_candidates') AS first_use_candidates;
+ first_use_candidates 
+----------------------
+                    1
+(1 row)
+
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_head;
  at_head 
 ---------

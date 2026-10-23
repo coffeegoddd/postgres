@@ -233,7 +233,7 @@ class RegistryTest(unittest.TestCase):
                                 key=lambda n: int(n[1:])),
                          [f"S{i}" for i in range(1, 11)] + ["S13"])
         self.assertEqual([n for n in names if n.startswith("V")],
-                         ["V1", "V2", "V3", "V4", "V6", "V7", "V8"])
+                         ["V1", "V2", "V3", "V4", "V6", "V7", "V8", "V9"])
         for _, cls in registry.workloads.items():
             self.assertTrue(issubclass(cls, Workload))
         for name, cls in registry.collectors.items():

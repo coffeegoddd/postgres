@@ -11,6 +11,7 @@
 #ifndef REFS_GENERATIONS_H
 #define REFS_GENERATIONS_H
 
+#include "access/prolly_refs.h"
 #include "access/prolly_types.h"
 #include "access/transam.h"
 #include "utils/snapshot.h"
@@ -27,6 +28,12 @@ typedef struct BranchFoldStamp
 extern Size branch_generations_shmem_size(void);
 extern void branch_generations_shmem_init(void *area);
 extern void branch_generations_note_write(Oid branch);
+extern void branch_generations_note_relation(Oid branch, Oid relid);
+
+/* The refs' fold_mark() and written_since() (prolly_refs.h). */
+extern bool branch_fold_mark(Oid branch, Snapshot snap, ProllyFoldMark *mark);
+extern bool branch_written_since(const ProllyFoldMark *mark, Snapshot snap,
+								 Oid **relids, int *nrelids);
 extern void branch_generations_forget(void);
 extern void branch_generations_prepared_ended(FullTransactionId xid);
 

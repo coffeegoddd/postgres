@@ -156,12 +156,22 @@ typedef struct ProllyChangeFinderRoutine
 	 * snapshot, advance()'s.
 	 */
 	bool		(*can_advance) (Relation rel, const ProllyValue *state);
+
+	/*
+	 * Optional: why fold() from baseline (NULL: none) would read rel in
+	 * full, as far as the baseline's state and the table tell it without
+	 * reading the finder's record of the changes (PROLLY_FULL_NONE: it
+	 * wouldn't, so far as that tells).  Needs an active snapshot, fold()'s.
+	 */
+	ProllyFullFoldReason (*full_reason) (Relation rel,
+										 const ProllyTableFold *baseline);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
-	"state_refs", "advance", "fold_on_leave", "changes", "can_advance"
+	"state_refs", "advance", "fold_on_leave", "changes", "can_advance", \
+	"full_reason"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK can_advance
+#define PROLLY_CHANGES_LAST_CALLBACK full_reason
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from itertools import product
 from typing import Any
 
-from pbench import vgrowth
+from pbench import vgrowth, vshape
 from pbench.core import registry, targets
 from pbench.core.sqlerr import raise_for_sql_error
 from pbench.core.interfaces import Context, NotImplementedByEngine, Outcome, Window, Workload
@@ -519,6 +519,160 @@ class V7(VWorkload):
         ungated = vgrowth.AUTOVACUUM_COUNTED if spec.get("autovacuum") else set()
         return Outcome(metrics=vgrowth.growth_metrics(series, ungated),
                        transactions=k, unit="transaction")
+
+
+@registry.workloads.register("V9")
+class V9(VWorkload):
+    """Growth shapes: each version-control operation's work, counted in
+    pg_stat_prolly, at four or more table sizes N (the "rows" sweep, Δ
+    fixed) and four or more change sizes Δ (the "delta" sweep, N fixed),
+    each point on a fresh database.  vshape fits each counter's growth and
+    gates it against the operation's target (vshape.TARGETS).
+
+    The table is narrow and filled to a tenth of each page (fillfactor
+    10), so N rows are about N / 10 blocks: block-map work shows its shape
+    at sizes CI can afford.  An index on the column the changes update
+    keeps them from being heap-only, so rows written back make index
+    entries.  The Δ changed rows are spread evenly over the keys.
+
+    Each point runs, counting each operation alone (the counters read
+    after the statement before it and after it): a branch made from
+    the load commit and first used (first_use); Δ rows changed on it;
+    another branch made from it, dirty (create_branch); a checkout of
+    main, used and clean, from the dirty branch (checkout_used); back;
+    the Δ rows committed (commit); the commit's diff (diff); a point read
+    of the load commit (point_read); Δ rows changed again, the head reset
+    softly to the load commit (soft_reset) and hard, discarding the
+    working set (hard_reset); Δ rows committed again, main changed in
+    another row, and the branch merged into main (merge); the branch
+    deleted (branch_delete)."""
+
+    id, title = "V9", "Growth shapes"
+
+    def variants(self, params):
+        # (counters alone: never with a background workload)
+        return [("bgnone", {"background": "none"})]
+
+    def prepare(self, ctx):
+        """Nothing: each point makes its own database."""
+
+    def tables(self, ctx):
+        return []
+
+    def sweeps(self, ctx) -> dict[str, list[tuple[int, int]]]:
+        """Each sweep's points, (rows, delta)."""
+        p = ctx.params
+        rows = [int(n) for n in p.get("rows", [4000, 16000, 64000, 256000])]
+        deltas = [int(d) for d in p.get("deltas", [700, 2800, 11200, 44800])]
+        delta, fixed = int(p.get("delta", 10)), int(p.get("delta_rows", 64000))
+        for n in rows:
+            if delta >= n:
+                raise ValueError(f"V9's delta {delta} must be fewer than its rows {n}")
+        for d in deltas:
+            if d >= fixed:
+                raise ValueError(f"V9's delta {d} must be fewer than delta_rows {fixed}")
+        for levels in (rows, deltas):
+            if len(levels) < 4 or max(levels) / min(levels) < 8:
+                raise ValueError("each V9 sweep needs four levels or more spanning 8x")
+        return {"rows": [(n, delta) for n in rows], "delta": [(fixed, d) for d in deltas]}
+
+    READ = ("SELECT pg_stat_force_next_flush();\n"
+            "SELECT 'v9|{label}|' || json_object_agg(name, value) FROM pg_stat_prolly;\n")
+
+    @staticmethod
+    def change(n: int, d: int, value: int) -> str:
+        step = n // d
+        return (f"UPDATE v9 SET v = {value} WHERE id IN "
+                f"(SELECT 1 + i * {step} FROM generate_series(0, {d - 1}) i)")
+
+    def steps(self, n: int, d: int) -> list[tuple[str, str]]:
+        """The point's statements, each (label, sql): those labelled are
+        counted."""
+        return [
+            ("", "SELECT dolt_branch('v9_b')"),
+            ("first_use", "SELECT dolt_checkout('v9_b')"),
+            ("", self.change(n, d, 1)),
+            ("create_branch", "SELECT dolt_branch('v9_c')"),
+            ("checkout_used", "SELECT dolt_checkout('main')"),
+            ("", "SELECT dolt_checkout('v9_b')"),
+            ("commit", "SELECT dolt_commit('-am', 'v9 changes')"),
+            ("diff", "SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::v9)"),
+            ("point_read", "SELECT v FROM dolt_at('HEAD~1', NULL::v9) WHERE id = 1"),
+            ("", self.change(n, d, 2)),
+            ("soft_reset", "SELECT dolt_reset('--soft', 'HEAD~1')"),
+            ("hard_reset", "SELECT dolt_reset('--hard')"),
+            ("", self.change(n, d, 3)),
+            ("", "SELECT dolt_commit('-am', 'v9 changes again')"),
+            ("", "SELECT dolt_checkout('main')"),
+            # (a row no change touches: the last, past every changed one)
+            ("", f"UPDATE v9 SET v = 9 WHERE id = {n}"),
+            ("", "SELECT dolt_commit('-am', 'v9 on main')"),
+            ("merge", "SELECT dolt_merge('v9_b')"),
+            ("branch_delete", "SELECT dolt_branch('-D', 'v9_b')"),
+        ]
+
+    def point(self, ctx, sweep: str, n: int, d: int) -> dict[str, dict[str, int]]:
+        """One point's counted operations: {label: {counter: growth}}."""
+        db = f"v9_{sweep}_{n}_{d}"
+        target = targets.for_am(ctx.table_am)
+        ctx.cluster.sql(f"CREATE DATABASE {db}")
+        try:
+            setup = target.setup_sql(db)
+            if setup:
+                ctx.cluster.sql(setup, dbname=db)
+            ctx.cluster.sql(f"""
+                CREATE TABLE v9 (id bigint PRIMARY KEY, v int NOT NULL, payload text NOT NULL)
+                    WITH (fillfactor = 10, autovacuum_enabled = off);
+                INSERT INTO v9 SELECT g, 0, md5(g::text) FROM generate_series(1, {n}) g;
+                CREATE INDEX ON v9 (v);
+                {VC_SQL.commit('v9 load')};
+            """, dbname=db, options=ctx.session_options())
+            script = ""
+            for label, sql in self.steps(n, d):
+                if label:
+                    script += self.READ.format(label="before")
+                script += sql + ";\n"
+                if label:
+                    script += self.READ.format(label=label)
+            (ctx.raw_dir / f"v9-{sweep}-{n}-{d}.sql").write_text(script)
+            res = ctx.cluster.sql(script, dbname=db, options=ctx.session_options(), check=False)
+            (ctx.raw_dir / f"v9-{sweep}-{n}-{d}.out").write_text(res.stdout + res.stderr)
+            raise_for_sql_error(res, script)
+        finally:
+            ctx.cluster.sql(f"DROP DATABASE {db} WITH (FORCE)")
+        readings = [line.split("|", 2)[1:] for line in res.stdout.splitlines()
+                    if line.startswith("v9|")]
+        out: dict[str, dict[str, int]] = {}
+        for (before, a), (label, b) in zip(readings[::2], readings[1::2]):
+            if before != "before":
+                raise RuntimeError(f"V9's readings are out of order at {label}")
+            a, b = json.loads(a), json.loads(b)
+            out[label] = {name: int(b[name]) - int(a[name]) for name in b}
+        expected = [label for label, _ in self.steps(n, d) if label]
+        if list(out) != expected:
+            raise RuntimeError(f"V9 expected readings of {expected}, got {list(out)}")
+        return out
+
+    def operations(self, ctx):
+        series: dict = {}
+        metrics: dict = {}
+        points = 0
+        for sweep, pts in self.sweeps(ctx).items():
+            levels = [n if sweep == "rows" else d for n, d in pts]
+            counted = [self.point(ctx, sweep, n, d) for n, d in pts]
+            points += len(pts)
+            checks: dict = {}
+            for label in counted[0]:
+                # (a counter the server doesn't report is missing, not 0)
+                names = set.intersection(*(set(c[label]) for c in counted))
+                checks[label] = {name: [c[label][name] for c in counted] for name in sorted(names)}
+                for name in vshape.WORK:
+                    if name in checks[label]:
+                        b = vshape.growth(levels, checks[label][name], vshape.FLOORS[name])
+                        metrics[f"{label}_{sweep}_{name}_growth"] = b
+            series[sweep] = {"levels": levels, "points": [list(p) for p in pts], "checks": checks}
+        (ctx.raw_dir / "v9-series.json").write_text(json.dumps(series, indent=1) + "\n")
+        return Outcome(metrics=metrics, transactions=points, unit="point")
 
 
 @registry.workloads.register("V8")

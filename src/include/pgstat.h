@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCED
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF0
 
 typedef struct PgStat_ArchiverStats
 {
@@ -695,9 +695,33 @@ typedef enum PgStat_ProllyCounter
 									 * instead of the store's files */
 	PGSTAT_PROLLY_FOLD_ROWS_LOCATED,	/* rows a fold read where the change
 										 * log said, not by their key */
+	PGSTAT_PROLLY_BMAP_MAP_PAGES_COPIED,	/* map pages a share of a
+											 * relation's blocks copied */
+	PGSTAT_PROLLY_BMAP_REFCOUNT_UPDATES,	/* block reference counts set:
+											 * shares, drops, copies on write,
+											 * truncations, sweeps */
+	PGSTAT_PROLLY_BMAP_BLOCKS_FREED,	/* page-store blocks given back to
+										 * the allocator */
+	PGSTAT_PROLLY_APPLY_ROWS,	/* rows the row applier inserted, updated
+								 * or deleted */
+	PGSTAT_PROLLY_APPLY_INDEX_TUPLES,	/* index entries its writes made,
+										 * its loads' builds included */
+	PGSTAT_PROLLY_CATALOG_ROWS_COPIED,	/* catalog rows a branch's copies
+										 * were made of */
+	PGSTAT_PROLLY_FOLD_CHANGES_SPILLED, /* folds from a baseline whose
+										 * changes passed
+										 * maintenance_work_mem: sorted,
+										 * spilling, not read in full */
+	PGSTAT_PROLLY_FOLD_CATALOG_SCANS,	/* folds that read the catalogs
+										 * through for every versioned
+										 * object */
+	PGSTAT_PROLLY_FOLD_OBJECTS, /* versioned objects folds described */
+	PGSTAT_PROLLY_FOLD_TABLES,	/* tables whose rows folds folded */
+	PGSTAT_PROLLY_FOLD_INCREMENTAL, /* folds that worked out again only
+									 * what changed since the last */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_ROWS_LOCATED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_INCREMENTAL + 1)
 
 typedef struct PgStat_ProllyStats
 {
