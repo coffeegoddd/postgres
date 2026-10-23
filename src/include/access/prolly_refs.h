@@ -498,7 +498,9 @@ typedef struct ProllyRefsRoutine
 	 * isn't known (a catalog change or collection since, a writer that
 	 * wrote too many relations or found no room to be told of, a prepared
 	 * transaction ended, the branch forgotten, a snapshot that doesn't see
-	 * every writer that ended), and then everything may have changed.
+	 * every writer that ended, or another writer of the branch not ended
+	 * yet: others see its commit before its relations are kept), and then
+	 * everything may have changed.
 	 * Catalog changes and sequences' values aren't relations' rows: a
 	 * catalog change moves what fold_mark() takes, and a sequence is read
 	 * each time.
