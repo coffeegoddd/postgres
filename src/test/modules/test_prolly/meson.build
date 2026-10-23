@@ -315,6 +315,7 @@ tests += {
       't/191_bmap_tree_share.pl',
       't/192_bmap_tree_snapshots.pl',
       't/193_bmap_dropped_buffers.pl',
+      't/194_bmap_snapshot_redo.pl',
     ],
   },
 }

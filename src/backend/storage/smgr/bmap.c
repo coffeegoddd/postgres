@@ -8455,7 +8455,15 @@ newer_tree_node(XLogReaderState *record, RelFileLocator rlocator,
 	return tree_node_any(dst) && PageGetLSN(dst) > record->ReadRecPtr;
 }
 
-/* keep the entries of 'newer' changed after those of the restored page */
+/*
+ * Keep the entries of 'newer' changed after those of the restored page.
+ * The page then takes the newer page's LSN, so the records between the two
+ * aren't replayed on it: whatever else of the page they change must be the
+ * newer page's too.  On a root page that is its snapshot slots, which no
+ * birth orders: the newer page's are taken whole, as of its LSN, so that a
+ * snapshot taken in between is kept and one released in between stays
+ * released.
+ */
 static void
 keep_newer_entries(Buffer buf, char *newer)
 {
@@ -8463,11 +8471,15 @@ keep_newer_entries(Buffer buf, char *newer)
 	BmapEntry  *entries = PageGetBmapEntries(page);
 	const BmapEntry *kept = PageGetBmapEntries(newer);
 	bool		any = false;
+	bool		root = false;
 	uint32		nslots = BMAP_TREE_FANOUT;
 
 	/* (a root page has its pointers, a node its entries) */
 	if (map_page_is((const PGIOAlignedBlock *) newer, BMAP_PAGE_ROOT))
+	{
 		nslots = BMAP_TREE_TOPS;
+		root = true;
+	}
 	for (uint32 i = 0; i < nslots; i++)
 	{
 		if (kept[i].since > entries[i].since)
@@ -8478,6 +8490,9 @@ keep_newer_entries(Buffer buf, char *newer)
 	}
 	if (any)
 	{
+		if (root && PageGetLSN(newer) > PageGetLSN(page))
+			memcpy(PageGetBmapRoot(page)->snap, PageGetBmapRoot(newer)->snap,
+				   sizeof(PageGetBmapRoot(page)->snap));
 		PageSetLSN(page, Max(PageGetLSN(page), PageGetLSN(newer)));
 		MarkBufferDirty(buf);
 	}
