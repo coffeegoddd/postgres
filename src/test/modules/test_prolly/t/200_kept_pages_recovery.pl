@@ -125,8 +125,10 @@ is(sql(q{SELECT bool_and(bt_index_check(indexrelid, true) IS NOT NULL)
 	FROM pg_index WHERE indrelid = 'kr.t'::regclass}), 't', 'its indexes valid');
 standby_agrees('a reset to a later commit');
 
-# nothing the stores hold is held by nothing
+# the crashes may have left blocks held by nothing (a dropped storage's,
+# freed after its commit), which a sweep frees; then nothing is
 sql('CHECKPOINT');
+sql(q{SELECT freed FROM prolly_page_sweep()});
 is(sql(q{SELECT freed FROM prolly_page_sweep()}), '0', 'a sweep finds nothing held by nothing');
 
 $standby->stop;

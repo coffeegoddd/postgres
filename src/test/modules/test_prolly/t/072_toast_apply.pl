@@ -21,7 +21,8 @@ if ($ENV{enable_injection_points} ne 'yes')
 
 my $node = PostgreSQL::Test::Cluster->new('apply');
 $node->init;
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+# (the rows a reset writes, not pages kept as of its commit given back)
+$node->append_conf('postgresql.conf', "autovacuum = off\nprolly.kept_commits = 0");
 $node->start;
 $node->safe_psql('postgres', q{CREATE DATABASE latin1 ENCODING 'LATIN1'
 	LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0});
