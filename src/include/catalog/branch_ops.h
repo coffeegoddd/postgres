@@ -144,7 +144,9 @@ typedef struct BranchOpsRoutine
 	 * if one isn't on the branch with the storage that kept it, its
 	 * snapshot is gone, its rows' transaction ids are older than the
 	 * database still knows, or one that changed is in use (each is locked
-	 * as TRUNCATE locks it, without waiting; the locks taken are kept).
+	 * as TRUNCATE locks it, without waiting, and refused, as TRUNCATE
+	 * refuses, while the session itself has it open or an AFTER trigger's
+	 * event queued on it; the locks taken are kept).
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the restored storage once it commits.
 	 */
