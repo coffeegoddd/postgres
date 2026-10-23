@@ -104,9 +104,10 @@
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
  * read before.  A dropped
- * relation's map stays until the next checkpoint, and counts until then
+ * relation's map counts until it is removed, after its blocks are freed
  * (a tree's root page is written out with no subtrees first, as the nodes
- * it named are freed).  A tree's node counts once for each page pointing to
+ * it named are freed); an empty main fork file then keeps its relation
+ * file number until the next checkpoint, as md.c's does.  A tree's node counts once for each page pointing to
  * it, its children once however many reach it.  A path copy (not held off)
  * adds holders only to blocks held already; one adding a holder to a stuck
  * count makes a sweep under way leave the stuck counts as they are.
@@ -6190,12 +6191,7 @@ tree_release_tops(SMgrRelation reln, const BmapEntry *tops)
  * but the nodes it points to are freed, and may be made something else: so
  * its root page is first written out with no subtrees, under the header's
  * lock (which a sweep reads it under), and with no record, the relation's
- * drop being logged already (redo removes the map).  Its header is written
- * out with no blocks too: until the next checkpoint the map is what keeps
- * the relation file number from being used again, and the relation
- * reads as empty, as md.c's truncated first segment does (a transaction
- * syncing the relations it made counts the blocks of one a subtransaction
- * dropped).
+ * drop being logged already (redo removes the map).
  */
 static void
 tree_drop(SMgrRelation reln)
@@ -6208,7 +6204,6 @@ tree_drop(SMgrRelation reln)
 	void	   *pages[1] = {copy.data};
 
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
-	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	buf = map_read(rel, 1);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
@@ -6220,10 +6215,6 @@ tree_drop(SMgrRelation reln)
 	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
 	PageSetChecksum((Page) copy.data, 1);
 	mdwritev(reln, BMAP_FORKNUM, 1, (const void **) pages, 1, false);
-	PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks = 0;
-	memcpy(copy.data, BufferGetPage(headerbuf), BLCKSZ);
-	PageSetChecksum((Page) copy.data, 0);
-	mdwritev(reln, BMAP_FORKNUM, 0, (const void **) pages, 1, false);
 	UnlockReleaseBuffer(buf);
 	UnlockReleaseBuffer(headerbuf);
 
@@ -7506,14 +7497,6 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		bmapunlink(rlocator, MAIN_FORKNUM, isRedo);
 		return;
 	}
-
-	/*
-	 * The map is the relation's main fork's to remove (below): callers that
-	 * go through every fork reach it too, and removing it here would free
-	 * the relation file number before the checkpoint.
-	 */
-	if (forknum == BMAP_FORKNUM)
-		return;
 	if (forknum != MAIN_FORKNUM)
 	{
 		mdunlink(rlocator, forknum, isRedo);
@@ -7534,6 +7517,8 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		DropRelationBuffers(smgropen(rlocator.locator, INVALID_PROC_NUMBER),
 							forks, 2, firsts);
 		mdunlink(rlocator, BMAP_FORKNUM, true);
+		/* (and the empty main fork file the drop kept, if redo made the map again) */
+		mdunlink(rlocator, MAIN_FORKNUM, true);
 		forget_recovery_length(rlocator.locator);
 		return;
 	}
@@ -7542,28 +7527,31 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	if (!mdexists(reln, BMAP_FORKNUM))
 		return;
 
-	/* (a binary upgrade gives relation file numbers itself, as md.c says) */
-	if (IsBinaryUpgrade)
-	{
-		mdunlink(rlocator, BMAP_FORKNUM, false);
-		return;
-	}
-
 	/*
-	 * Keep the map until after the next checkpoint, as md.c keeps a main
-	 * fork's first segment: until then, its relation file number must not
-	 * be used again, since crash recovery may still replay records for it.
+	 * The map goes at once, but the relation file number must not be used
+	 * again until after the next checkpoint, since crash recovery may still
+	 * replay records for it.  An empty main fork file keeps it, as md.c's
+	 * truncated first segment keeps a dropped relation's, and md.c removes
+	 * it after the checkpoint.  Redo, finding no map, replays the
+	 * relation's records onto that file as md.c's, until the drop's record
+	 * removes it.  (A binary upgrade gives out relation file numbers
+	 * itself, and md.c keeps nothing then.)
 	 */
+	if (!IsBinaryUpgrade)
 	{
-		FileTag		tag;
+		RelPathStr	path = relpath(rlocator, MAIN_FORKNUM);
+		int			fd = OpenTransientFile(path.str, O_RDWR | O_CREAT | PG_BINARY);
 
-		memset(&tag, 0, sizeof(tag));
-		tag.handler = SYNC_HANDLER_BMAP;
-		tag.forknum = BMAP_FORKNUM;
-		tag.rlocator = rlocator.locator;
-		tag.segno = 0;
-		RegisterSyncRequest(&tag, SYNC_UNLINK_REQUEST, true);
+		if (fd < 0)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not create file \"%s\": %m", path.str)));
+		else
+			CloseTransientFile(fd);
 	}
+	mdunlink(rlocator, BMAP_FORKNUM, false);
+	if (!IsBinaryUpgrade)
+		mdunlink(rlocator, MAIN_FORKNUM, false);
 }
 
 /*
@@ -8343,62 +8331,6 @@ bmapfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	phys = lookup(reln, blocknum, 1, NULL);
 	return mdfd(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM, phys,
 				off);
-}
-
-/* ----------------------------------------------------------------
- * Sync handler: maps removed after a checkpoint
- * ----------------------------------------------------------------
- */
-
-int
-bmapsyncfiletag(const FileTag *ftag, char *path)
-{
-	/* only unlink requests are queued with this handler */
-	strlcpy(path, relpathperm(ftag->rlocator, BMAP_FORKNUM).str, MAXPGPATH);
-	return 0;
-}
-
-int
-bmapunlinkfiletag(const FileTag *ftag, char *path)
-{
-	RelPathStr	base = relpathperm(ftag->rlocator, BMAP_FORKNUM);
-	int			ret;
-
-	/* the first segment's result is the request's; later ones follow it */
-	strlcpy(path, base.str, MAXPGPATH);
-	ret = unlink(path);
-	for (int segno = 1; ret == 0; segno++)
-	{
-		char		segpath[MAXPGPATH];
-
-		snprintf(segpath, sizeof(segpath), "%s.%d", base.str, segno);
-		if (unlink(segpath) < 0)
-			break;
-	}
-
-	/*
-	 * A sweep reads the maps it finds, a dropped one's too until now, and
-	 * leaves their pages (and its changes list's) in shared buffers, where a
-	 * relation given the file number next would find them.  They go once
-	 * the file has: a sweep that reads one later finds it gone, and drops
-	 * what it read itself (sweep_relation()).
-	 */
-	if (ret == 0)
-	{
-		ForkNumber	forks[2] = {BMAP_FORKNUM, BMAP_CHANGES_FORKNUM};
-		BlockNumber firsts[2] = {0, 0};
-
-		DropRelationBuffers(smgropen(ftag->rlocator, INVALID_PROC_NUMBER),
-							forks, 2, firsts);
-	}
-	return ret;
-}
-
-bool
-bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate)
-{
-	/* used to forget a dropped database's requests */
-	return ftag->rlocator.dbOid == candidate->rlocator.dbOid;
 }
 
 /* ----------------------------------------------------------------
