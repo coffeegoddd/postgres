@@ -37,7 +37,7 @@ checkout keys|t
 keys side|t
 merge keys|{0,0,"merge successful"}
 heap copy|t
-key order as on heap|t|180
+merged keys in heap order|t|180
 composite keys merged|28|29
 merged keys|t
 side violations|t

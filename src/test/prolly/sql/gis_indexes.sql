@@ -3,12 +3,14 @@
 -- does heap: for each of its operators, index and bitmap scans find what a
 -- sequential scan finds, and KNN gives the same distances in order.
 --
--- (SP-GiST's 2D class misses rows on the boundary for &>, which a
+-- (SP-GiST's 2D class misses rows on the boundary for &> and |&>, which a
 -- sequential scan finds: PostGIS's, on heap as well.)
 --
-SELECT * FROM gis_check.index_agreement('gis_idx');
-SELECT * FROM gis_check.index_agreement('gis_geogs');
-SELECT * FROM gis_check.index_agreement('gis_rasters');
+CREATE TABLE gis_check.index_results AS
+SELECT 'gis_idx' AS tbl, * FROM gis_check.index_agreement('gis_idx')
+UNION ALL SELECT 'gis_geogs', * FROM gis_check.index_agreement('gis_geogs')
+UNION ALL SELECT 'gis_rasters', * FROM gis_check.index_agreement('gis_rasters');
+SELECT * FROM gis_check.index_results ORDER BY tbl, opclass;
 
 -- an exclusion constraint on a GiST index
 CREATE TABLE gis_parcels (id int PRIMARY KEY, g geometry,

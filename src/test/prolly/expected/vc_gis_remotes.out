@@ -14,6 +14,8 @@ public versioned|t
 postgis installed|postgis in public,postgis_raster in public
 clone: same|t
 clone: tables on prolly|t
+clone: index valid|t
+clone: plan uses it|t
 clone: index|32
 clone: seqscan|32
 commit|t

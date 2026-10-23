@@ -124,6 +124,7 @@ INSERT INTO gis_pk SELECT g, id FROM gis_idx WHERE id % 5 = 0 AND ST_NDims(g) = 
 INSERT INTO gis_rk SELECT id % 3, g, id FROM gis_idx WHERE id % 7 = 0 AND g IS NOT NULL
 ON CONFLICT DO NOTHING;
 SELECT 'keys', (dolt_commit('-Am', 'keys'))[1] ~ '^[0-9a-f]{40}$';
+SELECT dolt_hashof('HEAD') AS keys_c \gset
 SELECT 'branch', (dolt_branch('gis_keys'))[1] = '0';
 INSERT INTO gis_pk SELECT g, id FROM gis_idx WHERE id % 5 = 1 AND ST_NDims(g) = 2 ON CONFLICT DO NOTHING;
 UPDATE gis_rk SET v = -v WHERE region = 0;
@@ -136,8 +137,13 @@ SELECT 'merge keys', (dolt_merge('main'))[2:4];
 CREATE TABLE gis_check.pk_heap AS SELECT * FROM gis_pk;
 SELECT 'heap copy', relam = (SELECT oid FROM pg_am WHERE amname = 'heap') FROM pg_class
 WHERE oid = 'gis_check.pk_heap'::regclass;
-SELECT 'key order as on heap',
-  (SELECT array_agg(v ORDER BY g) FROM gis_pk) = (SELECT array_agg(v ORDER BY g) FROM gis_check.pk_heap),
+-- (a diff walks the commits' trees in key order: the rows both sides
+-- added come out in the order the merge keyed them, which must be heap's
+-- btree order)
+SELECT 'merged keys in heap order',
+  (SELECT array_agg((to_row).v) FROM dolt_diff(:'keys_c', 'HEAD', NULL::gis_pk) WHERE diff_type = 'added')
+  = (SELECT array_agg(v ORDER BY g) FROM gis_check.pk_heap h
+     WHERE NOT EXISTS (SELECT FROM dolt_at(:'keys_c', NULL::gis_pk) k WHERE k.g = h.g)),
   (SELECT count(*) FROM gis_pk);
 SELECT 'composite keys merged', count(*) FILTER (WHERE v < 0), count(*) FILTER (WHERE v > 1000)
 FROM gis_rk;

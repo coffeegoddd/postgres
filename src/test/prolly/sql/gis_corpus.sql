@@ -153,7 +153,10 @@ BEGIN
                   ' FROM %s WHERE %I IS NOT NULL ORDER BY %I %s $1::%s LIMIT 20) s',
                   col, op.oprname, typ, tbl, col, col, op.oprname, typ);
     END IF;
-    FOR p IN EXECUTE format('SELECT %I::text AS v FROM %s WHERE id %% 50 = 3 AND %I IS NOT NULL ORDER BY id',
+    -- (probes of every kind the table holds: a stride prime to its
+    -- generator's four kinds, and its polygon and 3D line)
+    FOR p IN EXECUTE format('SELECT %I::text AS v FROM %s WHERE (id %% 47 = 3 OR id IN (6, 7, 8, 603, 604))'
+                            ' AND %I IS NOT NULL ORDER BY id',
                             col, tbl, col)
     LOOP
       results := '{}';

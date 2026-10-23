@@ -3,38 +3,32 @@
 -- does heap: for each of its operators, index and bitmap scans find what a
 -- sequential scan finds, and KNN gives the same distances in order.
 --
--- (SP-GiST's 2D class misses rows on the boundary for &>, which a
+-- (SP-GiST's 2D class misses rows on the boundary for &> and |&>, which a
 -- sequential scan finds: PostGIS's, on heap as well.)
 --
-SELECT * FROM gis_check.index_agreement('gis_idx');
-               opclass               |          result          
--------------------------------------+--------------------------
- brin/brin_geometry_inclusion_ops_2d | agree (3 operators)
- brin/brin_geometry_inclusion_ops_3d | agree (1 operators)
- brin/brin_geometry_inclusion_ops_4d | agree (1 operators)
- btree/btree_geometry_ops            | agree (5 operators)
- gist/gist_geometry_ops_2d           | agree (14 operators)
- gist/gist_geometry_ops_nd           | agree (6 operators)
- hash/hash_geometry_ops              | agree (1 operators)
- spgist/spgist_geometry_ops_2d       | DIFFER &> (12 operators)
- spgist/spgist_geometry_ops_3d       | agree (4 operators)
- spgist/spgist_geometry_ops_nd       | agree (4 operators)
-(10 rows)
-
-SELECT * FROM gis_check.index_agreement('gis_geogs');
-              opclass              |       result        
------------------------------------+---------------------
- brin/brin_geography_inclusion_ops | agree (1 operators)
- btree/btree_geography_ops         | agree (5 operators)
- gist/gist_geography_ops           | agree (2 operators)
- spgist/spgist_geography_ops_nd    | agree (1 operators)
-(4 rows)
-
-SELECT * FROM gis_check.index_agreement('gis_rasters');
-       opclass        |            result            
-----------------------+------------------------------
- hash/hash_raster_ops | agree (1 operators) unused =
-(1 row)
+CREATE TABLE gis_check.index_results AS
+SELECT 'gis_idx' AS tbl, * FROM gis_check.index_agreement('gis_idx')
+UNION ALL SELECT 'gis_geogs', * FROM gis_check.index_agreement('gis_geogs')
+UNION ALL SELECT 'gis_rasters', * FROM gis_check.index_agreement('gis_rasters');
+SELECT * FROM gis_check.index_results ORDER BY tbl, opclass;
+     tbl     |               opclass               |            result            
+-------------+-------------------------------------+------------------------------
+ gis_geogs   | brin/brin_geography_inclusion_ops   | agree (1 operators)
+ gis_geogs   | btree/btree_geography_ops           | agree (5 operators)
+ gis_geogs   | gist/gist_geography_ops             | agree (2 operators)
+ gis_geogs   | spgist/spgist_geography_ops_nd      | agree (1 operators)
+ gis_idx     | brin/brin_geometry_inclusion_ops_2d | agree (3 operators)
+ gis_idx     | brin/brin_geometry_inclusion_ops_3d | agree (1 operators)
+ gis_idx     | brin/brin_geometry_inclusion_ops_4d | agree (1 operators)
+ gis_idx     | btree/btree_geometry_ops            | agree (5 operators)
+ gis_idx     | gist/gist_geometry_ops_2d           | agree (14 operators)
+ gis_idx     | gist/gist_geometry_ops_nd           | agree (6 operators)
+ gis_idx     | hash/hash_geometry_ops              | agree (1 operators)
+ gis_idx     | spgist/spgist_geometry_ops_2d       | DIFFER &> |&> (12 operators)
+ gis_idx     | spgist/spgist_geometry_ops_3d       | agree (4 operators)
+ gis_idx     | spgist/spgist_geometry_ops_nd       | agree (4 operators)
+ gis_rasters | hash/hash_raster_ops                | agree (1 operators) unused =
+(15 rows)
 
 -- an exclusion constraint on a GiST index
 CREATE TABLE gis_parcels (id int PRIMARY KEY, g geometry,

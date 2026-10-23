@@ -31,9 +31,23 @@ FROM pg_extension WHERE extname LIKE 'postgis%';
 SELECT 'clone: same', :'clone_string_agg' = :'src_string_agg';
 SELECT 'clone: tables on prolly', bool_and(amname = 'prolly') FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE relname LIKE 'gis\_%' AND relkind = 'r' AND relnamespace = 'public'::regnamespace;
+-- the GiST index came with it, valid, and a plan uses it
+SELECT 'clone: index valid', indisvalid AND indisready FROM pg_index
+WHERE indrelid = 'gis_m_gist'::regclass AND NOT indisprimary;
+CREATE FUNCTION pg_temp.plan(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE line text; out text := '';
+BEGIN
+  FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP out := out || line || ' '; END LOOP;
+  RETURN out;
+END $$;
 SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT 'clone: plan uses it',
+  pg_temp.plan($$SELECT count(*) FROM gis_m_gist WHERE g && ST_MakeEnvelope(0, 0, 5, 5)$$)
+  LIKE '%Index Scan using gis_m_gist_g_idx on gis_m_gist%';
 SELECT 'clone: index', count(*) FROM gis_m_gist WHERE g && ST_MakeEnvelope(0, 0, 5, 5);
 RESET enable_seqscan;
+RESET enable_bitmapscan;
 SELECT 'clone: seqscan', count(*) FROM gis_m_gist WHERE g && ST_MakeEnvelope(0, 0, 5, 5);
 \c :db
 UPDATE gis_geoms SET g = ST_Translate(g, 0, 10) WHERE id IN (1, 39);
