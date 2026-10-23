@@ -5814,7 +5814,10 @@ description | Waiting for a newly initialized WAL file to reach durable storage
        rows they folded) and <literal>fold_incremental</literal> (folds that
        took the last canonical tree the backend built and worked out again
        only the tables written since and the sequences, as nothing else had
-       changed); <literal>move_plans</literal> (moves the move planner
+       changed); <literal>bmap_pages_preserved</literal> (page images
+       logged of the blocks a relation alone held as a share of its blocks,
+       or a snapshot of them, begins to share them, so that recovery and
+       backups' redo can restore them); <literal>move_plans</literal> (moves the move planner
        costed: each branch a branch's first use weighed copying, when no
        branch is at its head) and <literal>first_use_sources_busy</literal>
        (first uses that copied the session's branch instead of the one

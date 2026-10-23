@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF0
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF2
 
 typedef struct PgStat_ArchiverStats
 {
@@ -719,6 +719,9 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_TABLES,	/* tables whose rows folds folded */
 	PGSTAT_PROLLY_FOLD_INCREMENTAL, /* folds that worked out again only
 									 * what changed since the last */
+	PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, /* page images of the blocks a
+										 * relation alone held, logged as a
+										 * share or snapshot shares them */
 	PGSTAT_PROLLY_MOVE_PLANS,	/* moves the move planner costed: the
 								 * sources a branch's first use weighed */
 	PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY,	/* first uses that copied the
