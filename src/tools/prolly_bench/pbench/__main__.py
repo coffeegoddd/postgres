@@ -17,6 +17,7 @@
   prolly_bench sgate counters|timing RUN ...    S gate: a pull request against its base
   prolly_bench sreport --counters ... --out comment.md   S gate: the pull-request comment
   prolly_bench vgrowth RUN                      V suite: per-commit work growing with prior commits
+  prolly_bench vshape RUN                       V suite: operations' work as N and Δ grow, against targets
 """
 
 from __future__ import annotations
@@ -571,6 +572,15 @@ def main(argv=None) -> int:
     vg.add_argument("--accept", type=Path, help="known growth (configs/v_growth_accept.toml)")
     vg.add_argument("--json", type=Path)
     vg.set_defaults(fn=vgrowth.run)
+
+    from pbench import vshape
+    vs = sub.add_parser("vshape", help="V suite: each version-control operation's work as N and Δ grow, "
+                                       "against its target")
+    vs.add_argument("dir", type=Path, help="a result set of configs/v_shape.toml")
+    vs.add_argument("--known", type=Path, help="known exceptions (configs/v_shape_known.toml)")
+    vs.add_argument("--json", type=Path)
+    vs.add_argument("--markdown", type=Path, help="every finding, as a table")
+    vs.set_defaults(fn=vshape.run)
 
     from pbench import differential
     diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")

@@ -1,0 +1,55 @@
+Parsed test spec with 3 sessions
+
+starting permutation: a_begin b_write c_fold c_reset a_status a_diff a_verify a_commit a_flush c_full
+step a_begin: BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) AS k_rows FROM vss.k;
+k_rows
+------
+  5000
+(1 row)
+
+step b_write: UPDATE vss.k SET v = repeat('b', 200) WHERE id % 2 = 0; DELETE FROM vss.k WHERE id % 7 = 1; INSERT INTO vss.n SELECT g % 3000, repeat('w', 200) FROM generate_series(1, 3000) g; DELETE FROM vss.n WHERE v = 3;
+step c_fold: SELECT (dolt_commit('-am', 'c commits'))[1] IS NOT NULL AS committed;
+committed
+---------
+t        
+(1 row)
+
+step c_reset: SELECT pg_stat_reset_shared('prolly');
+pg_stat_reset_shared
+--------------------
+                    
+(1 row)
+
+step a_status: SELECT table_name, staged, status FROM dolt_status ORDER BY 1, 2;
+table_name|staged|status  
+----------+------+--------
+vss.k     |t     |modified
+vss.n     |t     |modified
+(2 rows)
+
+step a_diff: SELECT (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vss.k)) AS k_diff, (SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::vss.n)) AS n_diff;
+k_diff|n_diff
+------+------
+  2858|  3099
+(1 row)
+
+step a_verify: SELECT table_name, matches FROM dolt_verify_folds() ORDER BY 1;
+table_name|matches
+----------+-------
+vss.k     |t      
+vss.n     |t      
+(2 rows)
+
+step a_commit: COMMIT;
+step a_flush: SELECT pg_stat_force_next_flush();
+pg_stat_force_next_flush
+------------------------
+                        
+(1 row)
+
+step c_full: SELECT sum(value) FILTER (WHERE name = 'fold_full_tables') - sum(value) FILTER (WHERE name = 'fold_full_verify') AS full_folds, sum(value) FILTER (WHERE name = 'fold_changes_spilled') > 0 AS spilled FROM pg_stat_prolly;
+full_folds|spilled
+----------+-------
+         0|t      
+(1 row)
+
