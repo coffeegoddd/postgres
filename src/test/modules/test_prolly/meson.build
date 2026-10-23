@@ -312,6 +312,7 @@ tests += {
       't/184_merge_conversion_spill.pl',
       't/190_bmap_tree.pl',
       't/191_bmap_tree_share.pl',
+      't/193_bmap_dropped_buffers.pl',
     ],
   },
 }

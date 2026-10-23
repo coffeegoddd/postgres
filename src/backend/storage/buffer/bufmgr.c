@@ -64,6 +64,7 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -4975,17 +4976,93 @@ drop_in_pass(const DropPasses *passes, ForkNumber forknum, int pass)
  *		DropBufferBlock
  *
  *		Remove one block's page from the buffer pool, if it is there, without
- *		writing it, waiting for whoever has it pinned.  For storage that is
- *		to hold something else at that block, which a stale page written out
- *		later would overwrite.  The caller makes sure nothing reads or dirties
- *		the page again meanwhile.
+ *		writing it.  For storage that is to hold something else at that block,
+ *		which a stale page written out later would overwrite.  The caller makes
+ *		sure nothing dirties the page again meanwhile, and holds no pin on it.
+ *
+ *		Another backend's pin is waited out as a cleanup lock waits for one,
+ *		not by spinning: a reader may hold its pin for long (a cursor stopped
+ *		on the page).  In the startup process of a hot standby, that is the
+ *		recovery conflict on a buffer pin, which cancels the queries holding
+ *		it once max_standby_streaming_delay passes.
  * --------------------------------------------------------------------
  */
 void
 DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
 				BlockNumber blkno)
 {
-	FindAndDropRelationBuffers(rlocator, forkNum, blkno + 1, blkno);
+	BufferTag	tag;
+	uint32		hash;
+	LWLock	   *partitionLock;
+
+	InitBufferTag(&tag, &rlocator, forkNum, blkno);
+	hash = BufTableHashCode(&tag);
+	partitionLock = BufMappingPartitionLock(hash);
+
+	for (;;)
+	{
+		int			buf_id;
+		BufferDesc *bufHdr;
+		Buffer		buffer;
+		uint64		buf_state;
+
+		LWLockAcquire(partitionLock, LW_SHARED);
+		buf_id = BufTableLookup(&tag, hash);
+		LWLockRelease(partitionLock);
+		if (buf_id < 0)
+			return;
+		bufHdr = GetBufferDescriptor(buf_id);
+		buffer = BufferDescriptorGetBuffer(bufHdr);
+		if (GetPrivateRefCount(buffer) > 0)
+			elog(ERROR, "buffer is pinned in DropBufferBlock");
+
+		INJECTION_POINT("drop-buffer-block-found", NULL);
+
+		/*
+		 * The buffer may have been given another page since the lookup, even
+		 * another block of the same fork: only this block's page is dropped,
+		 * so the whole tag is checked again, under the mapping lock that any
+		 * change of it takes.
+		 */
+		LWLockAcquire(partitionLock, LW_EXCLUSIVE);
+		buf_state = LockBufHdr(bufHdr);
+		if (!BufferTagsEqual(&bufHdr->tag, &tag))
+		{
+			UnlockBufHdr(bufHdr);
+			LWLockRelease(partitionLock);
+			continue;
+		}
+		if (BUF_STATE_GET_REFCOUNT(buf_state) == 0)
+		{
+			uint64		oldFlags = buf_state & BUF_FLAG_MASK;
+
+			Assert(!(buf_state & BM_LOCK_WAKE_IN_PROGRESS));
+			ClearBufferTag(&bufHdr->tag);
+			UnlockBufHdrExt(bufHdr, buf_state,
+							0,
+							BUF_FLAG_MASK | BUF_USAGECOUNT_MASK,
+							0);
+			if (oldFlags & BM_TAG_VALID)
+				BufTableDelete(&tag, hash);
+			LWLockRelease(partitionLock);
+			return;
+		}
+		UnlockBufHdr(bufHdr);
+		LWLockRelease(partitionLock);
+
+		/*
+		 * Pinned: wait until only a pin of ours is left, then look again.
+		 * A buffer still being read in can't be pinned this way; its read
+		 * is waited for instead.
+		 */
+		if (ReadRecentBuffer(rlocator, forkNum, blkno, buffer))
+		{
+			LockBufferForCleanupUnprepared(buffer);
+			UnlockReleaseBuffer(buffer);
+		}
+		else
+			WaitIO(bufHdr);
+	}
 }
 
 /* ---------------------------------------------------------------------

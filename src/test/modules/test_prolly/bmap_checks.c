@@ -386,6 +386,19 @@ test_bmap_cleanup_lock(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Drop a block's page from the buffer pool without writing it, as the block
+ * map does with a block given other contents (DropBufferBlock()).
+ */
+PG_FUNCTION_INFO_V1(test_bmap_drop_buffer);
+Datum
+test_bmap_drop_buffer(PG_FUNCTION_ARGS)
+{
+	DropBufferBlock(locator_of(PG_GETARG_OID(0)), MAIN_FORKNUM,
+					PG_GETARG_INT32(1));
+	PG_RETURN_VOID();
+}
+
+/*
  * test_bmap_fold_begin(relnumber): begin a fold; its list's lineage, its
  * epoch and the relation's length then.
  */

@@ -163,6 +163,11 @@ CREATE FUNCTION test_bmap_cleanup_lock(relnumber oid, blkno int)
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- Drop a block's page from the buffer pool without writing it.
+CREATE FUNCTION test_bmap_drop_buffer(relnumber oid, blkno int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Folds: begin one (its changes list's lineage, its epoch, the length
 -- then); what changed since one began; let go of what changed before one
 -- began; a page as a fold kept it.

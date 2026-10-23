@@ -2069,6 +2069,23 @@ lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
  */
 
 /*
+ * Before a block the allocator handed out again is given its new contents:
+ * it may have been a tree's node, whose page may still be in a buffer under
+ * the page store's own tag, dirty.  A node is freed with no change to its
+ * buffer, and the block's new page may be written through another buffer
+ * (a relation's own, for a data page), so a stale node page written out
+ * later would overwrite it.  The buffer is dropped.  The node's incarnation
+ * was let go of, so nothing reads it as a node again (tree_find() checks
+ * the birth of what it reads).
+ */
+static void
+drop_node_buffer(RelFileLocator rel, BlockNumber blk)
+{
+	DropBufferBlock(with_relnumber(rel, BMAP_STORE_RELNUMBER),
+					MAIN_FORKNUM, blk);
+}
+
+/*
  * Make the page store hold the blocks below 'new_hw', zeroing the blocks
  * from 'old_hw', and zero the reused blocks.  Done before the record that
  * maps them, and again by its redo unless 'skip_existing': then blocks the
@@ -2078,8 +2095,7 @@ lookup_cached(SMgrRelation reln, BlockNumber blkno, BlockNumber maxrun,
  * else counts) by what the blocks are for.
  *
  * A reused block may have been a tree's node, whose page may still be in a
- * buffer, dirty: it is dropped first, so that it is never written over what
- * the block holds now.  Its incarnation was let go of, so nothing reads it.
+ * buffer, dirty: it is dropped first (drop_node_buffer()).
  */
 static void
 prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
@@ -2094,8 +2110,7 @@ prepare_store(RelFileLocator rel, BlockNumber old_hw, BlockNumber new_hw,
 	{
 		const void *page = zero_block.data;
 
-		DropBufferBlock(with_relnumber(rel, BMAP_STORE_RELNUMBER),
-						MAIN_FORKNUM, reused[i]);
+		drop_node_buffer(rel, reused[i]);
 		if (skip_existing && reused[i] < store_cur)
 			continue;
 		mdwritev(ssrel, MAIN_FORKNUM, reused[i], &page, 1, false);
@@ -5443,8 +5458,12 @@ bmapprepareforchange(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		/*
 		 * The page store reaches the block.  The page's contents come with
 		 * the record, as an image; a page of zeroes (one being initialized)
-		 * is zeroed in the new block instead, here and in redo.
+		 * is zeroed in the new block instead, here and in redo.  An image's
+		 * block is written only from the page's buffer, later, so a node's
+		 * stale buffer for it is dropped now, here and in redo.
 		 */
+		if (reused && !zeroed)
+			drop_node_buffer(rel, new_block);
 		prepare_store(rel, alloc.old_hw, alloc.new_hw,
 					  &new_block, zeroed && reused ? 1 : 0, false,
 					  PGSTAT_PROLLY_BMAP_STORE_BYTES_WRITTEN);
@@ -8336,6 +8355,8 @@ bmap_redo(XLogReaderState *record)
 				 * or zeroes, which redo writes there.  The old block keeps
 				 * what it had: shared blocks were synced when shared.
 				 */
+				if (!zeroed && xlrec->new_block < xlrec->old_hw)
+					drop_node_buffer(xlrec->locator, xlrec->new_block);
 				prepare_store(xlrec->locator, xlrec->old_hw, xlrec->new_hw,
 							  &xlrec->new_block,
 							  zeroed && xlrec->new_block < xlrec->old_hw ? 1 : 0,
