@@ -904,6 +904,7 @@ branch_entry(const char *key, int keylen)
 		case TAG_MERGE:
 		case TAG_MERGE_NAMES:
 		case TAG_VIOLATIONS:
+		case TAG_IDENTITY:
 			return true;
 		default:
 			return false;
