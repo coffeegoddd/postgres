@@ -1584,7 +1584,7 @@ count_of(Changes *c, const StringInfoData *value)
  * each is checked (DomainPlan).
  */
 static bool recording = false;
-static List *recorded = NIL;	/* ProllyViolation * */
+static struct Recorded *recorded = NULL;	/* recorded_begin() */
 static List *written = NIL;		/* OIDs */
 static Oid	breakable_relid = InvalidOid;
 static bool breakable;
@@ -1610,6 +1610,172 @@ reset_constraints(void)
 	removed = NULL;
 }
 
+/*
+ * The violations a merge records.  Those kept stay until the merge
+ * publishes them.  A table's rows are written as an attempt: the
+ * violations it records are its own until it ends, so an attempt rolled
+ * back (its writes made again) releases them all at once, and one that
+ * holds keeps a copy of those left, a violation tried again and written
+ * after all forgotten, its memory with them.  A violation is named by its
+ * place among the attempt's (a handle), which stays as others are
+ * forgotten.
+ */
+typedef struct Recorded
+{
+	MemoryContext cxt;			/* kept's */
+	List	   *kept;			/* ProllyViolation * */
+	MemoryContext attempt_cxt;	/* attempt's, reset as each ends */
+	List	   *attempt;		/* ProllyViolation *, NULL once forgotten */
+	int			nattempt;		/* those not forgotten */
+	bool		attempting;
+} Recorded;
+
+/* Start recording violations, for a merge in this transaction. */
+static void
+recorded_begin(void)
+{
+	recorded = MemoryContextAllocZero(TopTransactionContext, sizeof(Recorded));
+	recorded->cxt = AllocSetContextCreate(TopTransactionContext,
+										  "merge violations",
+										  ALLOCSET_DEFAULT_SIZES);
+	recorded->attempt_cxt = AllocSetContextCreate(TopTransactionContext,
+												  "merge attempt violations",
+												  ALLOCSET_DEFAULT_SIZES);
+}
+
+/* Stop recording, releasing what is held (with the merge, or its error). */
+static void
+recorded_end(void)
+{
+	if (recorded == NULL)
+		return;
+	MemoryContextDelete(recorded->cxt);
+	MemoryContextDelete(recorded->attempt_cxt);
+	pfree(recorded);
+	recorded = NULL;
+}
+
+static ProllyViolation *
+violation_copy(const ProllyViolation *pv)
+{
+	ProllyViolation *copy = palloc(sizeof(ProllyViolation));
+
+	copy->relid = pv->relid;
+	copy->type = pstrdup(pv->type);
+	copy->row = pstrdup(pv->row);
+	copy->info = pstrdup(pv->info);
+	return copy;
+}
+
+/* Begin a table's attempt at writing its rows. */
+static void
+attempt_begin(void)
+{
+	if (recorded == NULL)
+		return;
+	Assert(!recorded->attempting);
+	MemoryContextReset(recorded->attempt_cxt);
+	recorded->attempt = NIL;
+	recorded->nattempt = 0;
+	recorded->attempting = true;
+}
+
+/*
+ * End the attempt: its violations left kept if it holds, all released if
+ * it is rolled back.
+ */
+static void
+attempt_end(bool holds)
+{
+	if (recorded == NULL || !recorded->attempting)
+		return;
+	if (holds)
+	{
+		MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
+
+		foreach_ptr(ProllyViolation, pv, recorded->attempt)
+			if (pv != NULL)
+				recorded->kept = lappend(recorded->kept, violation_copy(pv));
+		MemoryContextSwitchTo(old);
+	}
+	MemoryContextReset(recorded->attempt_cxt);
+	recorded->attempt = NIL;
+	recorded->nattempt = 0;
+	recorded->attempting = false;
+}
+
+/*
+ * Record a violation of relid's (copied): the attempt's, if one is under
+ * way.  Returns its handle there (-1: kept at once).
+ */
+static int
+violation_record(Oid relid, const char *type, const char *row,
+				 const char *info)
+{
+	MemoryContext old;
+	ProllyViolation *pv;
+	int			handle = -1;
+
+	old = MemoryContextSwitchTo(recorded->attempting ?
+								recorded->attempt_cxt : recorded->cxt);
+	pv = palloc(sizeof(ProllyViolation));
+	pv->relid = relid;
+	pv->type = pstrdup(type);
+	pv->row = pstrdup(row);
+	pv->info = pstrdup(info);
+	if (recorded->attempting)
+	{
+		handle = list_length(recorded->attempt);
+		recorded->attempt = lappend(recorded->attempt, pv);
+		recorded->nattempt++;
+	}
+	else
+		recorded->kept = lappend(recorded->kept, pv);
+	MemoryContextSwitchTo(old);
+	return handle;
+}
+
+/* Keep violations found (copies), outside any attempt. */
+static void
+violations_keep(List *found)
+{
+	MemoryContext old = MemoryContextSwitchTo(recorded->cxt);
+
+	foreach_ptr(ProllyViolation, pv, found)
+		recorded->kept = lappend(recorded->kept, violation_copy(pv));
+	MemoryContextSwitchTo(old);
+}
+
+/* The attempt's violation of handle h. */
+static const ProllyViolation *
+violation_at(int h)
+{
+	Assert(recorded->attempting && h >= 0 && h < list_length(recorded->attempt));
+	return list_nth(recorded->attempt, h);
+}
+
+/* Forget the attempt's violation of handle h: the row it refused fits. */
+static void
+violation_forget(int h)
+{
+	ProllyViolation *pv = (ProllyViolation *) violation_at(h);
+
+	Assert(pv != NULL);
+	pfree(pv->type);
+	pfree(pv->row);
+	pfree(pv->info);
+	pfree(pv);
+	list_nth_cell(recorded->attempt, h)->ptr_value = NULL;
+	recorded->nattempt--;
+}
+
+/* How many violations the attempt has recorded and not forgotten. */
+static int
+attempt_violations(void)
+{
+	return recorded && recorded->attempting ? recorded->nattempt : 0;
+}
+
 static void
 note_written(Oid relid)
 {
@@ -1633,24 +1799,26 @@ merge_recording(const ProllyNodeRef *roots, const MergeCommits *commits,
 	List	   *found = NIL;
 
 	recording = true;
-	recorded = NIL;
+	recorded = NULL;
 	written = NIL;
 	reset_constraints();
 	PG_TRY();
 	{
+		recorded_begin();
 		conflicts = merge_roots(roots, commits, fail_on_conflict, what, name,
 								conflicted);
 		recording = false;
-		found = list_concat(recorded, foreign_key_violations(written, NIL));
+		found = list_concat(list_copy(recorded->kept),
+							foreign_key_violations(written, NIL));
+		*nviolations = keep_violations(found);
 	}
 	PG_FINALLY();
 	{
 		recording = false;
-		recorded = NIL;
+		recorded_end();
 		written = NIL;
 	}
 	PG_END_TRY();
-	*nviolations = keep_violations(found);
 	return conflicts;
 }
 
@@ -1989,12 +2157,30 @@ domain_refusal(DomainPlan *p, Datum value, bool isnull)
  * row that changed is removed and another inserted, with no tie between
  * them, so a value inserted that a row removed held counts as unchanged
  * (row_domain_refusal()), whichever row held it.
+ *
+ * The set is held in memory while it fits in work_mem.  Past that, its
+ * images are sorted (a tuplesort of their own, which spills) by column,
+ * hash and image, and when the first value is looked up, written once
+ * each to a temporary file of images, with a file of fixed-size entries
+ * in the same order, searched by halving.  A lookup then reads only the
+ * entries and images of its column and hash.  The rows of a keyless table
+ * a merge writes are all removed before any is inserted, so the set is
+ * complete by the first lookup.
  */
 typedef struct Removed
 {
 	MemoryContext cxt;
+	Size		budget;			/* for values' memory, in bytes */
+	MemoryContext values_cxt;	/* values', while in memory */
 	HTAB	   *values;			/* RemovedValue, by RemovedKey */
 	Bitmapset  *nulls;			/* attnums of a null removed */
+	bool		looked_up;		/* a value was looked up */
+	/* spilled: images sorted, then written in order */
+	Tuplesortstate *sort;
+	BufFile    *images;
+	BufFile    *entries;		/* RemovedEntry, in order */
+	int64		nentries;
+	StringInfoData image;		/* (a lookup's) */
 } Removed;
 
 typedef struct RemovedKey
@@ -2009,15 +2195,268 @@ typedef struct RemovedValue
 	List	   *images;			/* Datum *, those with that hash */
 } RemovedValue;
 
+/* A spilled image, as sorted: its column, hash and bytes. */
+typedef struct RemovedImage
+{
+	int32		attnum;
+	uint32		hash;
+	uint32		len;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} RemovedImage;
+
+/* Where a spilled image is (Removed's entries). */
+typedef struct RemovedEntry
+{
+	int32		attnum;
+	uint32		hash;
+	uint32		len;
+	int32		fileno;			/* (BufFileTell()'s) */
+	pgoff_t		offset;
+} RemovedEntry;
+
+/* The image of value, of column att: its bytes, *len of them. */
+static const char *
+image_of(Form_pg_attribute att, const Datum *value, Size *len)
+{
+	if (att->attbyval)
+	{
+		*len = sizeof(Datum);
+		return (const char *) value;
+	}
+	*len = datumGetSize(*value, false, att->attlen);
+	return DatumGetPointer(*value);
+}
+
 /* The hash of value's image, of column att. */
 static uint32
 image_hash(Form_pg_attribute att, Datum value)
 {
-	if (att->attbyval)
-		return DatumGetUInt32(hash_any((const unsigned char *) &value,
-									   sizeof(Datum)));
-	return DatumGetUInt32(hash_any((const unsigned char *) DatumGetPointer(value),
-								   datumGetSize(value, false, att->attlen)));
+	Size		len;
+	const char *bytes = image_of(att, &value, &len);
+
+	return DatumGetUInt32(hash_any((const unsigned char *) bytes, len));
+}
+
+static int
+removed_image_cmp(const RemovedImage *x, const RemovedImage *y)
+{
+	if (x->attnum != y->attnum)
+		return x->attnum < y->attnum ? -1 : 1;
+	if (x->hash != y->hash)
+		return x->hash < y->hash ? -1 : 1;
+	if (x->len != y->len)
+		return x->len < y->len ? -1 : 1;
+	return memcmp(x->data, y->data, x->len);
+}
+
+static int
+comparetup_removed(const SortTuple *a, const SortTuple *b, Tuplesortstate *state)
+{
+	return removed_image_cmp(a->tuple, b->tuple);
+}
+
+static void
+writetup_removed(Tuplesortstate *state, LogicalTape *tape, SortTuple *stup)
+{
+	const RemovedImage *t = stup->tuple;
+	unsigned int tuplen = offsetof(RemovedImage, data) + t->len;
+	unsigned int written = tuplen + sizeof(unsigned int);
+
+	LogicalTapeWrite(tape, &written, sizeof(written));
+	LogicalTapeWrite(tape, t, tuplen);
+}
+
+static void
+readtup_removed(Tuplesortstate *state, SortTuple *stup, LogicalTape *tape,
+				unsigned int len)
+{
+	unsigned int tuplen = len - sizeof(unsigned int);
+	RemovedImage *t = tuplesort_readtup_alloc(state, tuplen);
+
+	LogicalTapeReadExact(tape, t, tuplen);
+	stup->tuple = t;
+	stup->datum1 = (Datum) 0;
+	stup->isnull1 = true;
+}
+
+static void
+removeabbrev_removed(Tuplesortstate *state, SortTuple *stups, int count)
+{
+}
+
+/* Sort image (len bytes) of column attnum, hash its hash, with the rest. */
+static void
+removed_sort_put(int attnum, uint32 hash, const char *image, Size len)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(removed->sort);
+	MemoryContext old = MemoryContextSwitchTo(base->tuplecontext);
+	Size		size = offsetof(RemovedImage, data) + len;
+	RemovedImage *t = palloc(size);
+	SortTuple	stup;
+
+	t->attnum = attnum;
+	t->hash = hash;
+	t->len = len;
+	memcpy(t->data, image, len);
+	stup.tuple = t;
+	stup.datum1 = (Datum) 0;
+	stup.isnull1 = true;
+	/* (the tuple context is a bump allocator, which knows no chunk sizes) */
+	tuplesort_puttuple_common(removed->sort, &stup, false,
+							  TupleSortUseBumpTupleCxt(base->sortopt) ?
+							  MAXALIGN(size) : GetMemoryChunkSpace(t));
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * The removed values grew past their budget: sort them from now on, those
+ * held in memory first, and release the memory.
+ */
+static void
+removed_spill(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	MemoryContext old = MemoryContextSwitchTo(removed->cxt);
+	TuplesortPublic *base;
+	HASH_SEQ_STATUS seq;
+	RemovedValue *rv;
+
+	removed->sort = tuplesort_begin_common(Max(removed->budget / 1024, 64),
+										   NULL, TUPLESORT_NONE);
+	base = TuplesortstateGetPublic(removed->sort);
+	base->nKeys = 1;
+	base->removeabbrev = removeabbrev_removed;
+	base->comparetup = comparetup_removed;
+	base->comparetup_tiebreak = comparetup_removed;
+	base->writetup = writetup_removed;
+	base->readtup = readtup_removed;
+	base->haveDatum1 = false;
+	base->tuples = true;
+	MemoryContextSwitchTo(old);
+
+	hash_seq_init(&seq, removed->values);
+	while ((rv = hash_seq_search(&seq)) != NULL)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, rv->key.attnum - 1);
+
+		foreach_ptr(Datum, d, rv->images)
+		{
+			Size		len;
+			const char *bytes = image_of(att, d, &len);
+
+			removed_sort_put(rv->key.attnum, rv->key.hash, bytes, len);
+		}
+	}
+	MemoryContextDelete(removed->values_cxt);
+	removed->values_cxt = NULL;
+	removed->values = NULL;
+}
+
+/* Position file at byte pos, counted from its start. */
+static void
+buffile_seek_to(BufFile *file, int64 pos)
+{
+	if (BufFileSeekBlock(file, pos / BLCKSZ) != 0 ||
+		BufFileSeek(file, 0, pos % BLCKSZ, SEEK_CUR) != 0)
+		elog(ERROR, "could not seek in merge removed values");
+}
+
+/*
+ * The sorted removed values, written once each to the images' and the
+ * entries' files, for looking up.
+ */
+static void
+removed_write_sorted(void)
+{
+	MemoryContext old = MemoryContextSwitchTo(removed->cxt);
+	TuplesortPublic *base = TuplesortstateGetPublic(removed->sort);
+	RemovedImage *prev = NULL;
+
+	removed->images = BufFileCreateTemp(false);
+	removed->entries = BufFileCreateTemp(false);
+	initStringInfo(&removed->image);
+	MemoryContextSwitchTo(old);
+	tuplesort_performsort(removed->sort);
+	for (;;)
+	{
+		SortTuple	stup;
+		RemovedImage *t;
+		RemovedEntry e;
+		bool		got;
+
+		old = MemoryContextSwitchTo(base->sortcontext);
+		got = tuplesort_gettuple_common(removed->sort, true, &stup);
+		MemoryContextSwitchTo(old);
+		if (!got)
+			break;
+		t = stup.tuple;
+		if (prev && removed_image_cmp(prev, t) == 0)
+			continue;
+		memset(&e, 0, sizeof(e));
+		e.attnum = t->attnum;
+		e.hash = t->hash;
+		e.len = t->len;
+		BufFileTell(removed->images, &e.fileno, &e.offset);
+		BufFileWrite(removed->images, t->data, t->len);
+		BufFileWrite(removed->entries, &e, sizeof(e));
+		removed->nentries++;
+
+		/* (the last read tuple's memory lasts until the next is read) */
+		if (prev)
+			pfree(prev);
+		prev = MemoryContextAlloc(removed->cxt,
+								  offsetof(RemovedImage, data) + t->len);
+		memcpy(prev, t, offsetof(RemovedImage, data) + t->len);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (prev)
+		pfree(prev);
+	tuplesort_end(removed->sort);
+	removed->sort = NULL;
+}
+
+static void
+removed_entry(int64 i, RemovedEntry *e)
+{
+	buffile_seek_to(removed->entries, i * (int64) sizeof(RemovedEntry));
+	BufFileReadExact(removed->entries, e, sizeof(*e));
+}
+
+/* Is image (len bytes) of column attnum, hash its hash, among those spilled? */
+static bool
+removed_spilled_held(int attnum, uint32 hash, const char *image, Size len)
+{
+	int64		lo = 0;
+	int64		hi = removed->nentries;
+	RemovedEntry e;
+
+	/* the first entry of attnum and hash, or past them */
+	while (lo < hi)
+	{
+		int64		mid = lo + (hi - lo) / 2;
+
+		removed_entry(mid, &e);
+		if (e.attnum < attnum || (e.attnum == attnum && e.hash < hash))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	for (int64 i = lo; i < removed->nentries; i++)
+	{
+		removed_entry(i, &e);
+		if (e.attnum != attnum || e.hash != hash)
+			break;
+		if (e.len != len)
+			continue;
+		resetStringInfo(&removed->image);
+		enlargeStringInfo(&removed->image, len);
+		if (BufFileSeek(removed->images, e.fileno, e.offset, SEEK_SET) != 0)
+			elog(ERROR, "could not seek in merge removed values");
+		BufFileReadExact(removed->images, removed->image.data, len);
+		if (memcmp(removed->image.data, image, len) == 0)
+			return true;
+	}
+	return false;
 }
 
 /* Start noting the rows a merge removes from rel, if keyless and checked. */
@@ -2033,9 +2472,13 @@ removed_begin(Relation rel, bool keyless)
 	removed->cxt = AllocSetContextCreate(CurrentMemoryContext,
 										 "merge removed values",
 										 ALLOCSET_DEFAULT_SIZES);
+	removed->values_cxt = AllocSetContextCreate(removed->cxt,
+												"merge removed values held",
+												ALLOCSET_DEFAULT_SIZES);
+	removed->budget = (Size) work_mem * 1024;
 	ctl.keysize = sizeof(RemovedKey);
 	ctl.entrysize = sizeof(RemovedValue);
-	ctl.hcxt = removed->cxt;
+	ctl.hcxt = removed->values_cxt;
 	removed->values = hash_create("merge removed values", 64, &ctl,
 								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
@@ -2045,13 +2488,14 @@ static void
 removed_note(Relation rel, TupleTableSlot *row)
 {
 	TupleDesc	desc = RelationGetDescr(rel);
-	MemoryContext old;
 	int			attnum = -1;
 
 	if (removed == NULL)
 		return;
+	if (removed->looked_up)
+		elog(ERROR, "a row of \"%s\" removed after its rows were written",
+			 RelationGetRelationName(rel));
 	slot_getallattrs(row);
-	old = MemoryContextSwitchTo(removed->cxt);
 	while ((attnum = bms_next_member(breakable_domains, attnum)) >= 0)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
@@ -2060,15 +2504,26 @@ removed_note(Relation rel, TupleTableSlot *row)
 		RemovedValue *rv;
 		bool		found;
 		Datum	   *image;
+		MemoryContext old;
 
 		if (row->tts_isnull[attnum - 1])
 		{
+			old = MemoryContextSwitchTo(removed->cxt);
 			removed->nulls = bms_add_member(removed->nulls, attnum);
+			MemoryContextSwitchTo(old);
 			continue;
 		}
 		memset(&key, 0, sizeof(key));
 		key.attnum = attnum;
 		key.hash = image_hash(att, value);
+		if (removed->sort)
+		{
+			Size		len;
+			const char *bytes = image_of(att, &value, &len);
+
+			removed_sort_put(attnum, key.hash, bytes, len);
+			continue;
+		}
 		rv = hash_search(removed->values, &key, HASH_ENTER, &found);
 		if (!found)
 			rv->images = NIL;
@@ -2082,11 +2537,14 @@ removed_note(Relation rel, TupleTableSlot *row)
 			if (dup)
 				continue;
 		}
+		old = MemoryContextSwitchTo(removed->values_cxt);
 		image = palloc(sizeof(Datum));
 		*image = datumCopy(value, att->attbyval, att->attlen);
 		rv->images = lappend(rv->images, image);
+		MemoryContextSwitchTo(old);
+		if (MemoryContextMemAllocated(removed->values_cxt, true) > removed->budget)
+			removed_spill(rel);
 	}
-	MemoryContextSwitchTo(old);
 }
 
 /* Did a row removed (removed_note()) hold value in column att? */
@@ -2096,11 +2554,25 @@ removed_held(Form_pg_attribute att, Datum value, bool isnull)
 	RemovedKey	key;
 	RemovedValue *rv;
 
+	if (!removed->looked_up)
+	{
+		removed->looked_up = true;
+		if (removed->sort)
+			removed_write_sorted();
+		INJECTION_POINT("prolly-merge-removed-values-held", NULL);
+	}
 	if (isnull)
 		return bms_is_member(att->attnum, removed->nulls);
 	memset(&key, 0, sizeof(key));
 	key.attnum = att->attnum;
 	key.hash = image_hash(att, value);
+	if (removed->images)
+	{
+		Size		len;
+		const char *bytes = image_of(att, &value, &len);
+
+		return removed_spilled_held(key.attnum, key.hash, bytes, len);
+	}
 	rv = hash_search(removed->values, &key, HASH_FIND, NULL);
 	if (rv == NULL)
 		return false;
@@ -2110,12 +2582,18 @@ removed_held(Form_pg_attribute att, Datum value, bool isnull)
 	return false;
 }
 
-/* Stop noting the rows removed (removed_begin()). */
+/* Stop noting the rows removed (removed_begin()), their files closed. */
 static void
 removed_end(void)
 {
 	if (removed == NULL)
 		return;
+	if (removed->sort)
+		tuplesort_end(removed->sort);
+	if (removed->images)
+		BufFileClose(removed->images);
+	if (removed->entries)
+		BufFileClose(removed->entries);
 	MemoryContextDelete(removed->cxt);
 	pfree(removed);
 	removed = NULL;
@@ -2388,6 +2866,9 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
 	return refused;
 }
 
+/* The handle of the violation merge_write() recorded last. */
+static int	last_violation = -1;
+
 /*
  * Write a row as a merge does: insert it, or update old to it.  While a
  * merge records violations, a row that breaks a unique, check or not-null
@@ -2407,7 +2888,7 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 	ErrorData  *ed;
 	const char *type;
 	char	   *info;
-	MemoryContext rec;
+	char	   *json;
 	bool		ok;
 
 	if (refused)
@@ -2424,11 +2905,10 @@ merge_write(const ProllyApplierRoutine *ar, ProllyApplier *a, Relation rel,
 		return ok;
 	type = refusal_type(ed->sqlerrcode);
 	info = constraint_info(rel, type, ed);
-	rec = MemoryContextSwitchTo(TopTransactionContext);
-	recorded = lappend(recorded,
-					   violation(RelationGetRelid(rel), type, row_json(row),
-								 pstrdup(info)));
-	MemoryContextSwitchTo(rec);
+	json = row_json(row);
+	last_violation = violation_record(RelationGetRelid(rel), type, json, info);
+	pfree(json);
+	pfree(info);
 	FreeErrorData(ed);
 	if (refused)
 		*refused = true;
@@ -2540,9 +3020,9 @@ puts_back(Relation rel, bool keyless)
  * removals, the rows refused are recorded alone, as for a keyed table.
  */
 static void
-refuse_keyless_violations(Relation rel, int nrecorded, bool removed_rows)
+refuse_keyless_violations(Relation rel, bool removed_rows)
 {
-	if (!removed_rows || list_length(recorded) == nrecorded)
+	if (!removed_rows || attempt_violations() == 0)
 		return;
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2751,7 +3231,6 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	ProllyTreeEnv env;
 	ProllyKeyingRefs krefs;
 	Applying	ap;
-	int			nrecorded = list_length(recorded);
 
 	require_readable(from);
 	require_readable(to);
@@ -2785,6 +3264,7 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		ap.batch = palloc0_array(TupleTableSlot *, BATCH_ROWS);
 	ap.a = PROLLY_CALL(ap.ar, begin, ap.rel);
 	removed_begin(ap.rel, ap.keyless);
+	attempt_begin();
 	if (ap.put_back)
 	{
 		BeginInternalSubTransaction(NULL);
@@ -2797,20 +3277,18 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	}
 	batch_flush(&ap);
 	if (recording && ap.keyless)
-		refuse_keyless_violations(ap.rel, nrecorded, ap.removed_rows);
+		refuse_keyless_violations(ap.rel, ap.removed_rows);
 	if (ap.put_back)
 	{
 		/* (stuck: none of it written, nor its violations recorded) */
 		if (ap.stuck)
-		{
 			RollbackAndReleaseCurrentSubTransaction();
-			recorded = list_truncate(recorded, nrecorded);
-		}
 		else
 			ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
 	}
+	attempt_end(!ap.stuck);
 	removed_end();
 	PROLLY_CALL(ap.ar, end, ap.a);
 	ExecDropSingleTupleTableSlot(ap.slot);
@@ -3194,7 +3672,8 @@ typedef enum KeyRank
 
 /*
  * What a merge writes for one key: copies of a row removed, then added.
- * Walked, it is the walk's while it's visited; ranked up, a copy is held.
+ * Walked, it is the walk's while it's visited; ranked up, a copy is held
+ * (in a spool: WriteSpool).
  */
 typedef struct KeyWrite
 {
@@ -3207,8 +3686,26 @@ typedef struct KeyWrite
 	KeyRank		rank;			/* (a copy held's) */
 	/* (in a pass:) */
 	bool		refused;		/* row refused, old in its place */
-	ProllyViolation *violation; /* as recorded */
+	int			violation;		/* its handle, as recorded (-1: none) */
 } KeyWrite;
+
+/*
+ * KeyWrites held past the walk that visited them, in a temporary file
+ * written in key order and read back one at a time (spool_put(),
+ * spool_rewind() and spool_next()).
+ */
+typedef struct WriteSpool
+{
+	BufFile    *file;			/* NULL until the first is written */
+	int64		count;
+	int64		npinned;		/* of them, KEY_PINNED */
+	KeyWrite	cur;			/* the one read last, if has_cur */
+	bool		has_cur;
+	bool		consumed;		/* cur returned (ranked_write()) */
+	StringInfoData key;			/* (cur's) */
+	StringInfoData old;
+	StringInfoData row;
+} WriteSpool;
 
 /*
  * Each column's length coercion (as INSERT applies its typmod), for
@@ -3291,7 +3788,9 @@ typedef void (*KeyWriteVisit) (KeyWriter *kw, KeyWrite *w);
  * walks them, in key order, to visit, a pass each time.  Only those
  * ranked up (a put-back refused) are held, copies in ranked, in key
  * order; and while one is pinned, those refused in a pass, for trying
- * again.
+ * again.  Those held are spooled to temporary files, owned by the
+ * resource owner write_keys() began with, so that a pass's subtransaction
+ * rolled back leaves them open.
  */
 struct KeyWriter
 {
@@ -3312,14 +3811,17 @@ struct KeyWriter
 	RowsFrom	from;			/* row_missing()'s */
 	FitCheck   *fits;			/* (taking theirs) */
 	/* (write_keys()'s:) */
-	MemoryContext cxt;			/* ranked's */
-	MemoryContext pass_cxt;		/* refused's, a pass's */
-	List	   *ranked;			/* KeyWrite *, held */
-	ListCell   *next_ranked;	/* (ranked_write()'s, in a pass) */
-	List	   *newly_ranked;	/* KeyWrite *, ranked up in a pass */
+	MemoryContext spool_cxt;	/* the spools' buffers */
+	ResourceOwner owner;		/* the spools' files' */
+	WriteSpool	ranked;			/* held, ranked up */
+	WriteSpool	newly_ranked;	/* ranked up in a pass */
+	WriteSpool	next;			/* (a spool being rewritten) */
 	bool		pinning;		/* a row is pinned in this pass */
 	bool		written;		/* no put-back refused in this pass */
-	List	   *refused;		/* KeyWrite *, while pinning */
+	/* while pinning, refused: those ranked first, walked, then pinned */
+	WriteSpool	refused[3];
+	int			refusing;		/* (the run being written) */
+	WriteSpool	retry;			/* refused, in key order, to try again */
 };
 
 /* Three versions of a row decoded, for merging it column by column. */
@@ -3474,90 +3976,210 @@ retry_key(KeyWriter *kw, KeyWrite *w)
 	return true;
 }
 
-/*
- * A copy of w, its key and rows too, in cxt (ranked up, or refused while
- * a row is pinned: held past the walk that visited it).
- */
-static KeyWrite *
-copy_write(const KeyWrite *w, MemoryContext cxt)
+/* A spooled KeyWrite's fixed part, then its key, old row and row. */
+typedef struct SpooledWrite
 {
-	MemoryContext old = MemoryContextSwitchTo(cxt);
-	KeyWrite   *copy = palloc(sizeof(KeyWrite));
-	uint8	   *key = palloc(Max(w->key.len, 1));
+	uint32		keylen;
+	int32		oldlen;			/* -1: none */
+	int32		rowlen;			/* -1: none */
+	int32		violation;
+	int64		nold;
+	int64		nrow;
+	bool		in_place;
+	bool		refused;
+	uint8		rank;
+} SpooledWrite;
 
-	*copy = *w;
-	memcpy(key, w->key.data, w->key.len);
-	copy->key.data = key;
-	if (w->old)
-	{
-		StringInfo	s = palloc(sizeof(StringInfoData));
-
-		copy_bytes(s, (const uint8 *) w->old->data, w->old->len);
-		copy->old = s;
-	}
-	if (w->row)
-	{
-		StringInfo	s = palloc(sizeof(StringInfoData));
-
-		copy_bytes(s, (const uint8 *) w->row->data, w->row->len);
-		copy->row = s;
-	}
-	MemoryContextSwitchTo(old);
-	return copy;
-}
-
-static int
-write_key_cmp(const void *a, const void *b, void *arg)
-{
-	const KeyWrite *x = lfirst((const ListCell *) a);
-	const KeyWrite *y = lfirst((const ListCell *) b);
-
-	return changes_compare(&x->key, &y->key, arg);
-}
-
-/* Sort writes (KeyWrite *) into key order. */
+/* Make sp, empty, its buffers in kw's spool context. */
 static void
-sort_writes(List *writes, Changes *c)
+spool_init(KeyWriter *kw, WriteSpool *sp)
 {
-	if (list_length(writes) > 1)
-		qsort_arg(writes->elements, list_length(writes), sizeof(ListCell),
-				  write_key_cmp, c);
+	MemoryContext old = MemoryContextSwitchTo(kw->spool_cxt);
+
+	memset(sp, 0, sizeof(*sp));
+	initStringInfo(&sp->key);
+	initStringInfo(&sp->old);
+	initStringInfo(&sp->row);
+	MemoryContextSwitchTo(old);
+}
+
+/* Empty sp, its file closed. */
+static void
+spool_clear(WriteSpool *sp)
+{
+	if (sp->file)
+		BufFileClose(sp->file);
+	sp->file = NULL;
+	sp->count = 0;
+	sp->npinned = 0;
+	sp->has_cur = false;
+	sp->consumed = false;
+}
+
+/* Exchange two spools (one rewritten, put in the other's place). */
+static void
+spool_swap(WriteSpool *a, WriteSpool *b)
+{
+	WriteSpool	t = *a;
+
+	*a = *b;
+	*b = t;
+}
+
+/* Append a copy of w to sp, which is written in key order. */
+static void
+spool_put(KeyWriter *kw, WriteSpool *sp, const KeyWrite *w)
+{
+	SpooledWrite h;
+
+	if (sp->file == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(kw->spool_cxt);
+		ResourceOwner owner = CurrentResourceOwner;
+
+		/* (a pass's subtransaction, rolled back, mustn't close it) */
+		CurrentResourceOwner = kw->owner;
+		sp->file = BufFileCreateTemp(false);
+		CurrentResourceOwner = owner;
+		MemoryContextSwitchTo(old);
+	}
+	memset(&h, 0, sizeof(h));
+	h.keylen = w->key.len;
+	h.oldlen = w->old ? w->old->len : -1;
+	h.rowlen = w->row ? w->row->len : -1;
+	h.violation = w->violation;
+	h.nold = w->nold;
+	h.nrow = w->nrow;
+	h.in_place = w->in_place;
+	h.refused = w->refused;
+	h.rank = (uint8) w->rank;
+	BufFileWrite(sp->file, &h, sizeof(h));
+	BufFileWrite(sp->file, w->key.data, w->key.len);
+	if (w->old)
+		BufFileWrite(sp->file, w->old->data, w->old->len);
+	if (w->row)
+		BufFileWrite(sp->file, w->row->data, w->row->len);
+	sp->count++;
+	if (w->rank == KEY_PINNED)
+		sp->npinned++;
+}
+
+static void
+spool_read_bytes(BufFile *file, StringInfo s, int32 len)
+{
+	resetStringInfo(s);
+	enlargeStringInfo(s, len);
+	BufFileReadExact(file, s->data, len);
+	s->len = len;
+	s->data[len] = '\0';
+}
+
+/* Read sp's next KeyWrite into sp->cur (sp->has_cur: there was one). */
+static void
+spool_next(WriteSpool *sp)
+{
+	SpooledWrite h;
+
+	sp->consumed = false;
+	sp->has_cur = sp->file != NULL &&
+		BufFileReadMaybeEOF(sp->file, &h, sizeof(h), true) != 0;
+	if (!sp->has_cur)
+		return;
+	spool_read_bytes(sp->file, &sp->key, h.keylen);
+	memset(&sp->cur, 0, sizeof(sp->cur));
+	sp->cur.key.data = (const uint8 *) sp->key.data;
+	sp->cur.key.len = h.keylen;
+	if (h.oldlen >= 0)
+	{
+		spool_read_bytes(sp->file, &sp->old, h.oldlen);
+		sp->cur.old = &sp->old;
+	}
+	if (h.rowlen >= 0)
+	{
+		spool_read_bytes(sp->file, &sp->row, h.rowlen);
+		sp->cur.row = &sp->row;
+	}
+	sp->cur.violation = h.violation;
+	sp->cur.nold = h.nold;
+	sp->cur.nrow = h.nrow;
+	sp->cur.in_place = h.in_place;
+	sp->cur.refused = h.refused;
+	sp->cur.rank = (KeyRank) h.rank;
+}
+
+/* Read sp from its start: its first KeyWrite into sp->cur. */
+static void
+spool_rewind(WriteSpool *sp)
+{
+	if (sp->file && BufFileSeek(sp->file, 0, 0, SEEK_SET) != 0)
+		elog(ERROR, "could not rewind merge rows held");
+	spool_next(sp);
 }
 
 /*
- * The copy held of w's key ranked up (kw->ranked), if any.  A pass asks
- * in key order, from the start of ranked.
+ * Write the KeyWrites of spools in (n of them, each in key order, no key
+ * in two) to out, in key order.
+ */
+static void
+spool_merge(KeyWriter *kw, WriteSpool **in, int n, WriteSpool *out)
+{
+	for (int i = 0; i < n; i++)
+		spool_rewind(in[i]);
+	for (;;)
+	{
+		WriteSpool *least = NULL;
+
+		for (int i = 0; i < n; i++)
+			if (in[i]->has_cur &&
+				(least == NULL ||
+				 changes_compare(&in[i]->cur.key, &least->cur.key, kw->c) < 0))
+				least = in[i];
+		if (least == NULL)
+			break;
+		spool_put(kw, out, &least->cur);
+		spool_next(least);
+	}
+}
+
+/*
+ * The KeyWrite held for w's key ranked up (kw->ranked), if any.  A pass
+ * asks in key order, from the start of ranked (spool_rewind()); what is
+ * returned is good until the next call.
  */
 static KeyWrite *
 ranked_write(KeyWriter *kw, const KeyWrite *w)
 {
-	while (kw->next_ranked)
+	WriteSpool *sp = &kw->ranked;
+
+	if (sp->consumed)
+		spool_next(sp);
+	while (sp->has_cur)
 	{
-		KeyWrite   *r = lfirst(kw->next_ranked);
-		int			c = changes_compare(&r->key, &w->key, kw->c);
+		int			c = changes_compare(&sp->cur.key, &w->key, kw->c);
 
 		if (c > 0)
 			return NULL;
-		kw->next_ranked = lnext(kw->ranked, kw->next_ranked);
 		if (c == 0)
-			return r;
+		{
+			sp->consumed = true;
+			return &sp->cur;
+		}
+		spool_next(sp);
 	}
 	return NULL;
 }
 
-/* w refused (and not put back), held for trying again while pinning. */
+/*
+ * w refused (and not put back), held for trying again while pinning: in
+ * the pass's run of refused rows under way (kw->refusing), each run in key
+ * order.
+ */
 static void
-note_refused(KeyWriter *kw, KeyWrite *w, bool held)
+note_refused(KeyWriter *kw, KeyWrite *w)
 {
-	MemoryContext old;
-
 	if (!kw->pinning)
 		return;
-	if (!held)
-		w = copy_write(w, kw->pass_cxt);
-	old = MemoryContextSwitchTo(kw->pass_cxt);
-	kw->refused = lappend(kw->refused, w);
-	MemoryContextSwitchTo(old);
+	spool_put(kw, &kw->refused[kw->refusing], w);
 }
 
 /* A pass's removals: the rows going, but those pinned. */
@@ -3580,8 +4202,9 @@ remove_rows(KeyWriter *kw, KeyWrite *w)
 }
 
 /*
- * Write w's row (none pinned), as write_keys_once() says.  held: w is a
- * copy held, ranked up (KEY_FIRST).
+ * Write w's row (none pinned), as write_keys_once() says.  held: w is
+ * held, ranked up (KEY_FIRST), and is pinned if its put-back is refused
+ * again.
  */
 static void
 write_row(KeyWriter *kw, KeyWrite *w, bool held)
@@ -3589,7 +4212,7 @@ write_row(KeyWriter *kw, KeyWrite *w, bool held)
 	TupleTableSlot *was;
 
 	w->refused = false;
-	w->violation = NULL;
+	w->violation = -1;
 	if (w->in_place)
 	{
 		/* (a violation recorded instead leaves the row as it was) */
@@ -3613,7 +4236,7 @@ write_row(KeyWriter *kw, KeyWrite *w, bool held)
 		if (r)
 		{
 			w->refused = true;
-			w->violation = llast(recorded);
+			w->violation = last_violation;
 		}
 	}
 
@@ -3636,19 +4259,16 @@ write_row(KeyWriter *kw, KeyWrite *w, bool held)
 				w->rank = KEY_PINNED;
 			else
 			{
-				MemoryContext old;
+				KeyWrite	r = *w;
 
-				w = copy_write(w, kw->cxt);
-				w->rank = KEY_FIRST;
-				old = MemoryContextSwitchTo(kw->cxt);
-				kw->newly_ranked = lappend(kw->newly_ranked, w);
-				MemoryContextSwitchTo(old);
+				r.rank = KEY_FIRST;
+				spool_put(kw, &kw->newly_ranked, &r);
 			}
 			return;
 		}
 	}
 	if (w->refused)
-		note_refused(kw, w, held);
+		note_refused(kw, w);
 }
 
 /* A pass's rows written in key order: those not ranked up. */
@@ -3674,82 +4294,126 @@ write_rows(KeyWriter *kw, KeyWrite *w)
  * updated, the rows refused are tried again (retry_key()), in key order,
  * while one is written, and a violation is left recorded for those still
  * refused only.  The writes are walked twice (kw->each()), for the rows
- * going and those coming; those ranked up are held.
+ * going and those coming.  Those ranked up, and those refused while a
+ * row is pinned, are held in spools: temporary files written and read
+ * back in key order, so holding them takes memory for a row at a time.
  */
 static bool
 write_keys_once(KeyWriter *kw)
 {
+	WriteSpool *runs[3];
 	bool		progress;
-	ListCell   *lc;
 
-	MemoryContextReset(kw->pass_cxt);
-	kw->refused = NIL;
-	kw->newly_ranked = NIL;
+	spool_clear(&kw->newly_ranked);
+	for (int i = 0; i < 3; i++)
+		spool_clear(&kw->refused[i]);
 	kw->written = true;
-	kw->pinning = false;
-	foreach(lc, kw->ranked)
-		kw->pinning |= ((KeyWrite *) lfirst(lc))->rank == KEY_PINNED;
+	kw->pinning = kw->ranked.npinned > 0;
 
-	kw->next_ranked = list_head(kw->ranked);
+	spool_rewind(&kw->ranked);
 	kw->each(kw, remove_rows);
-	foreach(lc, kw->ranked)
-	{
-		KeyWrite   *w = lfirst(lc);
 
-		if (w->nrow > 0 && w->rank == KEY_FIRST)
-			write_row(kw, w, true);
+	/* those ranked up first, the ranked rewritten with their new ranks */
+	if (kw->ranked.count > 0)
+	{
+		kw->refusing = 0;
+		spool_rewind(&kw->ranked);
+		for (; kw->ranked.has_cur; spool_next(&kw->ranked))
+		{
+			KeyWrite   *w = &kw->ranked.cur;
+
+			if (w->nrow > 0 && w->rank == KEY_FIRST)
+				write_row(kw, w, true);
+			spool_put(kw, &kw->next, w);
+		}
+		spool_clear(&kw->ranked);
+		spool_swap(&kw->ranked, &kw->next);
 	}
-	kw->next_ranked = list_head(kw->ranked);
+	kw->refusing = 1;
+	spool_rewind(&kw->ranked);
 	kw->each(kw, write_rows);
-	if (kw->newly_ranked != NIL)
+	if (kw->newly_ranked.count > 0)
 	{
-		MemoryContext old = MemoryContextSwitchTo(kw->cxt);
+		WriteSpool *both[2] = {&kw->ranked, &kw->newly_ranked};
 
-		kw->ranked = list_concat(kw->ranked, kw->newly_ranked);
-		sort_writes(kw->ranked, kw->c);
-		MemoryContextSwitchTo(old);
+		spool_merge(kw, both, 2, &kw->next);
+		spool_clear(&kw->ranked);
+		spool_clear(&kw->newly_ranked);
+		spool_swap(&kw->ranked, &kw->next);
 	}
 	if (!kw->written)
 		return false;
-	foreach(lc, kw->ranked)
+	kw->refusing = 2;
+	spool_rewind(&kw->ranked);
+	for (; kw->ranked.has_cur; spool_next(&kw->ranked))
 	{
-		KeyWrite   *w = lfirst(lc);
+		KeyWrite   *w = &kw->ranked.cur;
 
 		if (w->rank != KEY_PINNED)
 			continue;
 		w->refused = false;
-		w->violation = NULL;
+		w->violation = -1;
 		if (!update_key(kw, w, true))
 		{
 			w->refused = true;
-			w->violation = llast(recorded);
-			note_refused(kw, w, true);
+			w->violation = last_violation;
+			note_refused(kw, w);
 		}
 	}
+	if (!kw->pinning)
+		return true;
 
 	/*
 	 * (only a row refused for a unique value another row holds may fit
 	 * now; a check or not-null constraint refuses it still.  Rows refused
 	 * one for the other's value, as two swapping one, aren't tried
-	 * together: both stay refused, though they would fit.)
+	 * together: both stay refused, though they would fit.)  Each round
+	 * tries those still refused in key order, keeping those refused again
+	 * for the next.
 	 */
-	sort_writes(kw->refused, kw->c);
+	for (int i = 0; i < 3; i++)
+		runs[i] = &kw->refused[i];
+	spool_merge(kw, runs, 3, &kw->retry);
+	for (int i = 0; i < 3; i++)
+		spool_clear(&kw->refused[i]);
+	INJECTION_POINT("prolly-merge-retrying-refused", NULL);
 	do
 	{
 		progress = false;
-		foreach(lc, kw->refused)
+		spool_rewind(&kw->retry);
+		for (; kw->retry.has_cur; spool_next(&kw->retry))
 		{
-			KeyWrite   *w = lfirst(lc);
+			KeyWrite   *w = &kw->retry.cur;
 
-			if (!w->refused || strcmp(w->violation->type, "unique index") != 0 ||
-				!retry_key(kw, w))
+			if (!w->refused ||
+				strcmp(violation_at(w->violation)->type, "unique index") != 0)
 				continue;
-			recorded = list_delete_ptr(recorded, w->violation);
-			w->refused = false;
-			progress = true;
+			if (retry_key(kw, w))
+			{
+				violation_forget(w->violation);
+				progress = true;
+			}
+			else
+				spool_put(kw, &kw->next, w);
 		}
+		spool_clear(&kw->retry);
+		spool_swap(&kw->retry, &kw->next);
 	} while (progress);
+	spool_clear(&kw->retry);
 	return true;
+}
+
+/* kw's spools closed, and their memory released. */
+static void
+spools_close(KeyWriter *kw)
+{
+	spool_clear(&kw->ranked);
+	spool_clear(&kw->newly_ranked);
+	spool_clear(&kw->next);
+	spool_clear(&kw->retry);
+	for (int i = 0; i < 3; i++)
+		spool_clear(&kw->refused[i]);
+	MemoryContextDelete(kw->spool_cxt);
 }
 
 /*
@@ -3760,34 +4424,43 @@ write_keys_once(KeyWriter *kw)
  * (Without a row pinned, a row refused in the last pass is refused in
  * the table written: no value is given up once rows are written anew.
  * With one, a row refused is tried again each time another is written,
- * so it ends too.)
+ * so it ends too.)  Each pass is an attempt (attempt_begin()): one rolled
+ * back releases the violations it recorded before the next begins.
  */
 static void
 write_keys(KeyWriter *kw)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
-	int			nrecorded = list_length(recorded);
 
-	kw->cxt = cxt;
-	kw->pass_cxt = AllocSetContextCreate(cxt, "merge rows refused",
-										 ALLOCSET_SMALL_SIZES);
-	kw->ranked = NIL;
+	kw->owner = owner;
+	kw->spool_cxt = AllocSetContextCreate(cxt, "merge rows held",
+										  ALLOCSET_SMALL_SIZES);
+	spool_init(kw, &kw->ranked);
+	spool_init(kw, &kw->newly_ranked);
+	spool_init(kw, &kw->next);
+	spool_init(kw, &kw->retry);
+	for (int i = 0; i < 3; i++)
+		spool_init(kw, &kw->refused[i]);
 	if (!kw->put_back)
 	{
 		bool		written PG_USED_FOR_ASSERTS_ONLY;
 
+		attempt_begin();
 		written = write_keys_once(kw);
 		Assert(written);
 		if (recording && kw->keyless)
-			refuse_keyless_violations(kw->rel, nrecorded, kw->removed_rows);
-		MemoryContextDelete(kw->pass_cxt);
+			refuse_keyless_violations(kw->rel, kw->removed_rows);
+		attempt_end(true);
+		spools_close(kw);
 		return;
 	}
 	for (;;)
 	{
 		bool		written;
 
+		attempt_begin();
+		INJECTION_POINT("prolly-merge-write-attempt", NULL);
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
 		written = write_keys_once(kw);
@@ -3797,11 +4470,11 @@ write_keys(KeyWriter *kw)
 			RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
+		attempt_end(written);
 		if (written)
 			break;
-		recorded = list_truncate(recorded, nrecorded);
 	}
-	MemoryContextDelete(kw->pass_cxt);
+	spools_close(kw);
 }
 
 /* A diff's changes walked as KeyWrites (apply_rows_held()'s). */
@@ -8073,7 +8746,6 @@ take_breaking_rows(List *added, void *arg)
 	List	   *found = NIL;
 	ListCell   *lc;
 	int			save_nestlevel;
-	MemoryContext old;
 
 	Assert(recording);
 	pg_constraint = table_open(ConstraintRelationId, RowExclusiveLock);
@@ -8108,11 +8780,10 @@ take_breaking_rows(List *added, void *arg)
 	save_nestlevel = NewGUCNestLevel();
 	(void) set_config_option("session_replication_role", "replica", PGC_SUSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
-	old = MemoryContextSwitchTo(TopTransactionContext);
 	violating_rows(checks, "check constraint", true, &found);
 	violating_rows(notnulls, "not null", true, &found);
-	recorded = list_concat(recorded, found);
-	MemoryContextSwitchTo(old);
+	violations_keep(found);
+	list_free_deep(found);
 	AtEOXact_GUC(true, save_nestlevel);
 }
 

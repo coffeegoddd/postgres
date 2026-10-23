@@ -255,6 +255,23 @@ space: it counts against temp_file_limit and is reported by log_temp_files.
 Earlier schema conversion and uncertainty buffers are separate and can still
 grow with table size; this does not bound the entire merge's memory.
 
+A merge that records constraint violations writes each table's rows as an
+attempt.  Where a refused row's put-back is refused too, the table's writes
+are rolled back and made again; the violations an attempt records live in
+their own memory context, reset when the attempt is rolled back, and only
+those left when it holds are copied to the merge's kept violations (a row
+tried again and written after all is forgotten at once).  The rows ranked
+up across attempts, and those held to be tried again while a row is pinned,
+are spooled to temporary files in key order, created under the resource
+owner the writes began with so that an attempt's subtransaction can roll
+back without closing them; their memory is a few file buffers and the
+largest row.  A keyless table's removed values, which the domain checks
+look up, are held in memory up to work_mem, then sorted with a tuplesort
+and written once each, in order, to an image file and a fixed-size entry
+file that lookups search by halving.  All of these files close when the
+table is written and go with their resource owner on error or cancellation.
+The violations a merge keeps are still held in memory until published.
+
 A move to a root another branch's working set is known to be gives the
 tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the
