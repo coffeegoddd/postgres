@@ -60,6 +60,11 @@ class FakeVersionedSQL:
     def ids_in(self, ids):
         return 'id IN (' + ','.join(map(str, ids)) + ')'
 
+    def counters(self):
+        # (work counted: every statement so far, and the UPDATEs apart)
+        return {'statements': len(self.statements),
+                'updates': sum(q.startswith('UPDATE') for q in self.statements)}
+
     def scalar(self, q):
         return self.query(q)['rows'][0][0]
 
@@ -336,16 +341,129 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(core.ENGINES['doltgres'].ids_in(ids),
                          'id IN (SELECT id FROM (VALUES (1),(962),(1923)) v(id))')
 
-    def _run_cell(self, sql, n, k, commits):
+    def _run_cell(self, sql, n, k, commits, engine='doltgres', passes=('timing',)):
         import random
         from experiment import run_cell
-        c = {'passes': ['timing'], 'warmups': 1, 'repetitions': 1, 'history_depths': [1, 3],
+        c = {'passes': list(passes), 'warmups': 1, 'repetitions': 1, 'history_depths': [1, 3],
              'sample_interval_ms': 10, 'payload_bytes': 16,
              'dirty_sizes': {'small': {'rows': 3}, 'half': {'fraction': 0.5}}}
         out = io.StringIO()
-        run_cell(None, c, 'doltgres', n, k, sql, None, {'commits': commits, 'branch': 'fixture'},
+        run_cell(None, c, engine, n, k, sql, None, {'commits': commits, 'branch': 'fixture'},
                  out, random.Random(7))
         return [json.loads(line) for line in out.getvalue().splitlines()]
+
+    def test_counters_pass_counts_the_operation_alone(self):
+        # The model counts every statement: the operation's deltas are the
+        # operation's one statement, not the dirty rows' setup before it or
+        # the validation and restoration after.
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        records = self._run_cell(sql, n, k, commits, engine='prolly', passes=('timing', 'counters'))
+        counted = [r for r in records if r['pass'] == 'counters']
+        self.assertEqual(len(counted), len([r for r in records if r['pass'] == 'timing']))
+        for r in counted:
+            self.assertEqual(r['counters'], {'statements': 1}, r['operation'])
+        self.assertTrue(any(r['dirty_rows'] for r in counted))
+        self.assertTrue(all('counters' not in r for r in records if r['pass'] == 'timing'))
+
+    def test_counters_pass_only_for_engines_with_counters(self):
+        c = {'passes': ['timing', 'counters'], 'row_counts': [10, 20], 'changes': [1],
+             'history_depths': [1], 'repetitions': 3, 'dirty_sizes': {}}
+        self.assertEqual(core.engine_passes(c, 'prolly'), ['timing', 'counters'])
+        self.assertEqual(core.engine_passes(c, 'dolt'), ['timing'])
+        from experiment import planned_samples
+        per_pass = 2 * 1 * len(cases(c)) * 3
+        self.assertEqual(planned_samples(c, ['dolt', 'doltgres', 'prolly']), 4 * per_pass)
+        # a Go engine run through the model never asks for counters
+        n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
+        sql = FakeVersionedSQL(n, k, commits, 'fixture')
+        sql.counters = None
+        records = self._run_cell(sql, n, k, commits, engine='dolt', passes=('timing', 'counters'))
+        self.assertEqual({r['pass'] for r in records}, {'timing'})
+
+    def test_counter_deltas_refuse_resets(self):
+        from experiment import counter_deltas
+        self.assertEqual(counter_deltas({'a': 1, 'b': 5}, {'a': 1, 'b': 7}), {'b': 2})
+        with self.assertRaisesRegex(RuntimeError, 'backwards'):
+            counter_deltas({'a': 5}, {'a': 0})
+        with self.assertRaisesRegex(RuntimeError, 'names'):
+            counter_deltas({'a': 5}, {'b': 5})
+
+    def test_trend_test(self):
+        from report import trend
+        import math
+        s, tau, p = trend([1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual((s, tau), (21, 1))
+        self.assertAlmostEqual(p, 2 / math.factorial(7))
+        s, tau, p = trend([7, 6, 5, 4, 3, 2, 1])
+        self.assertEqual((s, tau), (-21, -1))
+        # one pair out of order: twice the 7 orders that close or closer
+        self.assertAlmostEqual(trend([2, 1, 3, 4, 5, 6, 7])[2], 2 * 7 / math.factorial(7))
+        self.assertIsNone(trend([4, 4, 4, 4, 4]))
+        self.assertEqual(trend([3, 1, 4, 2, 5, 0, 6])[0], 5)
+        # ties: the normal approximation, which still sees a steady rise
+        s, tau, p = trend([1, 1, 2, 2, 3, 3, 4, 4, 5, 5])
+        self.assertEqual(s, 40)
+        self.assertLess(p, 1e-3)
+
+    def _drift_rows(self, values, counters=None):
+        rows = []
+        for i, v in enumerate(values):
+            r = dict(engine='prolly', operation='checkout', rows=1000, changed_rows=10,
+                     history_commits=4, distance=1, working_set='clean', dirty_rows=0,
+                     repetition=i, elapsed_ns=v, status='ok', warmup=False, **{'pass': 'timing'})
+            rows.append(r)
+            if counters is not None:
+                rows.append(dict(r, **{'pass': 'counters'}, counters=counters[i]))
+        return rows
+
+    def test_drift_flags_series_that_follow_run_order(self):
+        from report import drift
+        fields = ["engine", "operation", "rows", "changed_rows", "history_commits",
+                  "working_set", "dirty_rows", "distance", "pass"]
+        rising = [10, 11, 13, 14, 18, 19, 25]
+        log = [{'log_pages_read': 2 * i + 1, 'nodes_read': 4} for i in range(7)]
+        flags = drift(self._drift_rows(rising, log), fields)
+        self.assertEqual(sorted((f['pass'], f['metric']) for f in flags),
+                         [('counters', 'counter_log_pages_read'), ('timing', 'elapsed_ns')])
+        timing = next(f for f in flags if f['pass'] == 'timing')
+        self.assertEqual((timing['direction'], timing['first'], timing['last']), ('rising', 10, 25))
+        # the same samples out of order, and flat counters, drift not at all
+        self.assertEqual(drift(self._drift_rows([14, 10, 25, 11, 19, 13, 18],
+                                                [{'nodes_read': 4}] * 7), fields), [])
+        # too few samples to tell
+        self.assertEqual(drift(self._drift_rows(rising[:4]), fields), [])
+
+    def test_report_shows_counters_and_drift(self):
+        records = []
+        for i, v in enumerate([1, 2, 3, 4, 5, 6, 7]):
+            r = dict(engine='prolly', operation='diff_history', rows=1000, changed_rows=10, history_commits=4,
+                     distance=1, working_set='clean', dirty_rows=0, repetition=i, elapsed_ns=v * 1_000_000,
+                     status='ok', warmup=False, **{'pass': 'timing'})
+            records += [r, dict(r, **{'pass': 'counters'},
+                                counters={'nodes_read': 40, 'log_pages_read': 3 + i})]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            core.write_json(path/'manifest.json', {'status': 'complete', 'planned_samples': len(records),
+                                                   'config': {'passes': ['timing', 'counters']}})
+            (path/'samples.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+            with contextlib.redirect_stdout(io.StringIO()):
+                report(path)
+            rows = list(__import__('csv').DictReader(open(path/'summary.csv')))
+            counted = next(r for r in rows if r['pass'] == 'counters')
+            self.assertEqual(float(counted['median_counter_nodes_read']), 40)
+            self.assertEqual(float(counted['median_counter_log_pages_read']), 6)
+            flagged = json.loads((path/'drift.json').read_text())
+            self.assertEqual({f['metric'] for f in flagged}, {'elapsed_ns', 'counter_log_pages_read'})
+            for name in ('report.md', 'report.html'):
+                text = (path/name).read_text()
+                self.assertIn('Engine work counters', text)
+                self.assertIn('Run-order drift', text)
+                self.assertIn('4.00 ms [1.00–7.00]; n=7 [drift ↑]', text)
+                self.assertIn('log_pages_read', text)
+                self.assertIn('6 [3–9] [drift ↑]', text)
+            self.assertIn('| Diff old → HEAD | 1 | nodes_read | — | — | 40 |', (path/'report.md').read_text())
+            self.assertIn('2 series flagged', (path/'report.txt').read_text())
 
     def test_every_case_validates_and_restores_against_a_model_engine(self):
         n, k, commits = 64, 8, ['c%d' % i for i in range(5)]
@@ -394,7 +512,9 @@ class BenchTests(unittest.TestCase):
                 r = dict(engine='dolt', operation='branch', rows=1000, changed_rows=10, history_commits=4,
                          distance=0, working_set='clean', dirty_rows=0, repetition=rep, elapsed_ns=1_000_000,
                          status='ok', warmup=False, **{'pass': pass_})
-                if pass_ != 'timing':
+                if pass_ == 'counters':
+                    r['counters'] = {'nodes_read': 12}
+                elif pass_ != 'timing':
                     r['memory'] = dict(cells, short_operation=pass_ != 'memory')
                 records.append(r)
         core.write_json(path/'manifest.json', {
@@ -411,7 +531,8 @@ class BenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             runs = [self._run(root, 'a', ['timing'], cells), self._run(root, 'b', ['memory'], cells),
-                    self._run(root, 'c', ['cpu'], cells), self._run(root, 'd', ['io'], cells)]
+                    self._run(root, 'c', ['cpu'], cells), self._run(root, 'd', ['io'], cells),
+                    self._run(root, 'e', ['counters'], cells)]
             from report import merge
             out = merge(runs, root/'results')
             with contextlib.redirect_stdout(io.StringIO()):
@@ -426,6 +547,8 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(by_pass['cpu']['median_read_bytes_delta'], '')
             self.assertEqual(float(by_pass['io']['median_write_bytes_delta']), 8192)
             self.assertEqual(by_pass['memory']['median_cpu_seconds_delta'], '')
+            self.assertEqual(float(by_pass['counters']['median_counter_nodes_read']), 12)
+            self.assertEqual(by_pass['timing']['median_counter_nodes_read'], '')
             text = (out/'report.md').read_text()
             self.assertIn('CPU time | 250.00 ms', text)
             self.assertIn('Write bytes | 8.00 KiB', text)
