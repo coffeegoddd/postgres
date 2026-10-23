@@ -169,9 +169,10 @@ libpq_tags(ProllyRemote *remote, ProllyRemoteTagVisit visit, void *arg)
 static bool
 libpq_move_tag(ProllyRemote *remote, const char *name,
 			   const ProllyHash *expected, const ProllyHash *tag,
-			   const ProllyHash *commit)
+			   const ProllyHash *commit, const char *format)
 {
-	return PROLLY_CALL(libpq(), move_tag, remote, name, expected, tag, commit);
+	return PROLLY_CALL(libpq(), move_tag, remote, name, expected, tag, commit,
+					   format);
 }
 
 #define LIBPQ_CALLBACKS \

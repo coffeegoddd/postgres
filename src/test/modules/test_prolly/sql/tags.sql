@@ -89,6 +89,13 @@ SELECT (dolt_checkout('v1'))[2] = 'HEAD is now at ' || :'c1' || ' (detached, rea
 SELECT active_branch() = 'detached/' || :'c1' AS on_its_commit;
 SELECT id FROM tg.t ORDER BY id;
 INSERT INTO tg.t VALUES (99, 'no');
+-- (a tag changes only the refs: made there, as a branch is, and deleted)
+SELECT dolt_tag('v1.1');
+SELECT dolt_hashof('v1.1') = :'c1' AS tagged_here;
+SELECT dolt_tag('-d', 'v1.1');
+-- (a tag by its full ref name checks out as by its name)
+SELECT (dolt_checkout('refs/tags/v2'))[2] = 'HEAD is now at ' || :'c2' || ' (detached, read-only)'
+	AS detached_by_ref;
 \c :db
 SET dolt.author = 'Tagger <tagger@example.com>';
 
@@ -136,6 +143,30 @@ SELECT dolt_push('origin', 'v2');
 SELECT dolt_push('origin', 'refs/tags/keep');
 SELECT dolt_push('-u', 'origin', 'v1');
 SELECT dolt_push('origin', 'refs/tags/nowhere');
+-- a tag is of the remote's one canonical format, as a head is: pushed
+-- first, it records the format; pushed to a remote of another, refused
+SELECT :'url' || '-tagfirst' AS url_tf \gset
+SELECT dolt_remote('add', 'tagfirst', :'url_tf');
+SELECT dolt_push('tagfirst', 'v2') IS NOT NULL AS pushed;
+SELECT set_config('tags.url_tf', :'url_tf', false) IS NOT NULL AS set;
+DO $$
+BEGIN
+	PERFORM test_remote_set_head(current_setting('tags.url_tf'), 'main',
+								 dolt_hashof('v2'), '1');
+	RAISE NOTICE 'a head of format 1 taken';
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'a head of format 1 refused';
+END $$;
+SELECT :'url' || '-otherformat' AS url_of \gset
+SELECT test_remote_set_head(:'url_of', 'main', dolt_hashof('v2'), '1');
+SELECT dolt_remote('add', 'otherformat', :'url_of');
+DO $$
+BEGIN
+	PERFORM dolt_push('otherformat', 'v2');
+	RAISE NOTICE 'a tag pushed to a remote of format 1';
+EXCEPTION WHEN feature_not_supported THEN
+	RAISE NOTICE 'a tag refused by a remote of format 1';
+END $$;
 
 CREATE DATABASE regress_tags_b;
 \c regress_tags_b

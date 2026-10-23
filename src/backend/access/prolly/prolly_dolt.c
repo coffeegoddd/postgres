@@ -208,6 +208,8 @@ static const char *author_override = NULL;
 static void writers_note_write(Oid branch, void *arg);
 static void writer_branch_hooks(void);
 static bool names_tag(const char *name);
+static void dolt_tag_change(char **names, int nnames, bool delete,
+							const char *message, const char *author);
 
 /* a branch to check out once the backend processes normally */
 static char *connect_branch = NULL;
@@ -3116,12 +3118,16 @@ tag_refs(void)
 	return r;
 }
 
-/* Is name a tag's? */
+/* Is name a tag's, by its name or its full ref name (refs/tags/x)? */
 static bool
 names_tag(const char *name)
 {
 	const ProllyRefsRoutine *r = refs();
 
+	if (strncmp(name, "refs/tags/", 10) == 0 && name[10] != '\0' &&
+		PROLLY_HAS(r, tag_lookup) &&
+		!PROLLY_CALL(r, tag_lookup, name, &(ProllyHash) {0}))
+		name += 10;
 	return PROLLY_HAS(r, tag_lookup) &&
 		PROLLY_CALL(r, tag_lookup, name, &(ProllyHash) {0});
 }
@@ -3142,6 +3148,7 @@ dolt_tag(PG_FUNCTION_ARGS)
 	bool		options = true;	/* until "--" */
 	bool		delete = false;
 	bool		list = false;
+	bool		was_read_only;
 	char	   *message = NULL;
 	char	   *author = NULL;
 	char	  **names = palloc_array(char *, Max(nargs, 1));
@@ -3173,6 +3180,30 @@ dolt_tag(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_tag needs a tag's name"),
 				 errhint("The dolt_tags view lists the tags.")));
+	/*
+	 * (a tag changes only the refs: made, as a branch is, in a session on a
+	 * commit too, whose transactions are read-only only for that branch)
+	 */
+	was_read_only = XactReadOnly;
+	if (XactReadOnlyFromBranch)
+		XactReadOnly = false;
+	PG_TRY();
+	{
+		dolt_tag_change(names, nnames, delete, message, author);
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+	PG_RETURN_DATUM(text_array(1, result));
+}
+
+/* dolt_tag()'s change: names made a tag of (or deleted, if delete). */
+static void
+dolt_tag_change(char **names, int nnames, bool delete, const char *message,
+				const char *author)
+{
 	PreventCommandIfReadOnly("dolt_tag()");
 	if (delete)
 	{
@@ -3211,7 +3242,6 @@ dolt_tag(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("tag \"%s\" already exists", names[0])));
 	}
-	PG_RETURN_DATUM(text_array(1, result));
 }
 
 /* dolt_tags()'s rows */
@@ -7214,6 +7244,7 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 	{
 		ProllyHash *commits;
 		int			n = 0;
+		List	   *tag_objects = NIL;
 
 		check_remote_format(rr, r, name);
 		PROLLY_CALL(rr, heads, r, collect_head, &all);
@@ -7260,8 +7291,23 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 						 errmsg("remote \"%s\" has no branch \"%s\"", name,
 								(char *) lfirst(b))));
 		}
-		commits = palloc(sizeof(ProllyHash) * Max(list_length(want.commits), 1));
+		/*
+		 * (a clone's tags, every one: among what it checks, so the commits
+		 * only a tag reaches are checked to be of this build's format, as a
+		 * head's are, though the clone copies them with the files)
+		 */
+		if (clone && PROLLY_HAS(rr, tags) && PROLLY_HAS(dc.refs, tags))
+		{
+			RemoteTags	rt = {NIL, NIL, NIL, name};
+
+			PROLLY_CALL(rr, tags, r, collect_tag, &rt);
+			tag_objects = rt.tags;
+		}
+		commits = palloc(sizeof(ProllyHash) *
+						 Max(list_length(want.commits) + list_length(tag_objects), 1));
 		foreach(c, want.commits)
+			commits[n++] = *(ProllyHash *) lfirst(c);
+		foreach(c, tag_objects)
 			commits[n++] = *(ProllyHash *) lfirst(c);
 		{
 			uint64		count;
@@ -7902,7 +7948,8 @@ push_tag(const char *remote, const char *name)
 		else
 		{
 			(void) PROLLY_CALL(dc.transfer, send, rr, r, &tag, 1);
-			if (!PROLLY_CALL(rr, move_tag, r, name, &tf.tag, &tag, &info.commit))
+			if (!PROLLY_CALL(rr, move_tag, r, name, &tf.tag, &tag, &info.commit,
+							 build_format()))
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("the push of tag %s to %s was rejected: the remote's tag moved meanwhile",

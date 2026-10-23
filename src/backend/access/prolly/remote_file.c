@@ -781,7 +781,7 @@ file_tags(ProllyRemote *r, ProllyRemoteTagVisit visit, void *arg)
 
 static bool
 file_move_tag(ProllyRemote *r, const char *name, const ProllyHash *expected,
-			  const ProllyHash *tag, const ProllyHash *commit)
+			  const ProllyHash *tag, const ProllyHash *commit, const char *format)
 {
 	Manifest	m;
 	RemoteTag  *at = NULL;
@@ -809,6 +809,14 @@ file_move_tag(ProllyRemote *r, const char *name, const ProllyHash *expected,
 		unlock_remote(lock);
 		return false;
 	}
+	/* (a tag's commits are the remote's as a head's are: of its one format) */
+	if (tag && m.format[0] != '\0' && strcmp(m.format, format) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("file remote \"%s\" holds commits of canonical format %s, not %s",
+						r->dir, m.format, format)));
+	if (tag && m.format[0] == '\0')
+		m.format = MemoryContextStrdup(r->cxt, format);
 	m.tags = list_copy(m.tags);
 	if (at)
 		m.tags = list_delete_ptr(m.tags, at);

@@ -1004,12 +1004,12 @@ libpq_tags(ProllyRemote *r, ProllyRemoteTagVisit visit, void *arg)
 /* Move the tag there, receiving what was sent first, and commit there. */
 static bool
 libpq_move_tag(ProllyRemote *r, const char *name, const ProllyHash *expected,
-			   const ProllyHash *tag, const ProllyHash *commit)
+			   const ProllyHash *tag, const ProllyHash *commit, const char *format)
 {
-	const char *values[3];
-	int			lengths[3] = {0};
-	int			formats[3] = {0, 1, 1};
-	Oid			types[3] = {TEXTOID, BYTEAOID, BYTEAOID};
+	const char *values[4];
+	int			lengths[4] = {0};
+	int			formats[4] = {0, 1, 1, 0};
+	Oid			types[4] = {TEXTOID, BYTEAOID, BYTEAOID, TEXTOID};
 	PGresult   *res;
 	bool		moved;
 
@@ -1018,8 +1018,9 @@ libpq_move_tag(ProllyRemote *r, const char *name, const ProllyHash *expected,
 	lengths[1] = expected->len;
 	values[2] = tag ? (const char *) tag->bytes : NULL;
 	lengths[2] = tag ? tag->len : 0;
-	res = run(r, "SELECT pg_catalog.dolt_serve_move_tag($1, $2, $3)",
-			  3, types, values, lengths, formats, &one_bool, "moving a tag");
+	values[3] = format;
+	res = run(r, "SELECT pg_catalog.dolt_serve_move_tag($1, $2, $3, $4)",
+			  4, types, values, lengths, formats, &one_bool, "moving a tag");
 	moved = strcmp(PQgetvalue(res, 0, 0), "t") == 0;
 	PQclear(res);
 	run_command(r, moved ? "COMMIT" : "ROLLBACK", "ending the push");

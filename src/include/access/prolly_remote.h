@@ -51,7 +51,8 @@
  *   object for itself once received).  move_tag() moves a tag from
  *   expected (an empty hash: there is none) to tag, a tag object of commit
  *   (NULL: delete it), as move_head() moves a branch; the remote must have
- *   tag's chunks.
+ *   tag's chunks.  As move_head() does, it records format if the remote
+ *   has none yet, and refuses a tag of another format than the remote's.
  *   Optional, together: a remote without them has no tags.
  *
  * Provisional (v0).
@@ -132,7 +133,7 @@ typedef struct ProllyRemoteRoutine
 						 void *arg);
 	bool		(*move_tag) (ProllyRemote *remote, const char *name,
 							 const ProllyHash *expected, const ProllyHash *tag,
-							 const ProllyHash *commit);
+							 const ProllyHash *commit, const char *format);
 } ProllyRemoteRoutine;
 
 #define PROLLY_REMOTE_CALLBACK_NAMES \

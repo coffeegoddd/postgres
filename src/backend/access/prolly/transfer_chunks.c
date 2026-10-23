@@ -695,7 +695,14 @@ check_cloned_commits(const ProllyHash *commits, int ncommits)
 	prolly_database_components(&dc);
 	seen = prolly_seen_create("prolly cloned commits", 0, 0);
 	for (int i = 0; i < ncommits; i++)
-		queue = lappend(queue, (void *) &commits[i]);
+	{
+		ProllyHash *id = palloc(sizeof(ProllyHash));
+
+		/* (a tag: its commit is checked, as the heads are) */
+		if (!given_commit(&dc, &commits[i], id))
+			*id = commits[i];	/* (reported missing below) */
+		queue = lappend(queue, id);
+	}
 	while (queue != NIL)
 	{
 		ProllyHash *id = linitial(queue);
