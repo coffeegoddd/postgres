@@ -42,15 +42,20 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/heapam.h"
+#include "access/nbtree.h"
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_datum.h"
 #include "access/tableam.h"
+#include "catalog/pg_am_d.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "optimizer/optimizer.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -68,6 +73,24 @@ prolly_tableam_handler(PG_FUNCTION_ARGS)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * A column a unique or exclusion index constrains, whose binary receive may
+ * normalize its values.  Reconstruction re-inserts the normalized value
+ * through that index, so the value must still be the one the index saw:
+ * equal under a unique btree key column's operator class, or else (an
+ * exclusion operator, an expression, a predicate) received back unchanged.
+ */
+typedef struct UniqueColumn
+{
+	AttrNumber	attnum;
+	Oid			index;
+	ProllyDatumCodec *codec;
+	bool		by_cmp;			/* compared by cmp, else by send's bytes */
+	FmgrInfo	cmp;
+	Oid			collation;
+	FmgrInfo	send;
+} UniqueColumn;
+
 /* A table's keying, its rows' keys encoded by: kept until invalidated. */
 typedef struct KeyBound
 {
@@ -83,6 +106,7 @@ typedef struct KeyBound
 	int			ntext;			/* columns holding a type kept as text */
 	AttrNumber *text_atts;
 	ProllyDatumCodec **text_codecs;
+	List	   *unique_columns; /* of UniqueColumn * */
 } KeyBound;
 
 static HTAB *key_bounds = NULL;
@@ -125,6 +149,122 @@ key_bounds_inval(Datum arg, Oid relid)
 			key_bounds_invalid++;
 		kb->valid = false;
 	}
+}
+
+static void
+add_unique_column(List **cols, Relation index, TupleDesc desc,
+				  AttrNumber attnum, int keycol, MemoryContext cxt)
+{
+	Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+	ProllyDatumCodec *codec = prolly_datum_codec(att->atttypid,
+												 att->atttypmod, cxt);
+	UniqueColumn *col;
+
+	if (!prolly_datum_codec_normalizes(codec))
+		return;
+	col = MemoryContextAllocZero(cxt, sizeof(UniqueColumn));
+	col->attnum = attnum;
+	col->index = RelationGetRelid(index);
+	col->codec = codec;
+	col->by_cmp = keycol >= 0 && index->rd_index->indisunique &&
+		index->rd_rel->relam == BTREE_AM_OID;
+	if (col->by_cmp)
+	{
+		fmgr_info_cxt(index_getprocid(index, keycol + 1, BTORDER_PROC),
+					  &col->cmp, cxt);
+		col->collation = index->rd_indcollation[keycol];
+	}
+	else
+	{
+		Oid			send;
+		bool		varlena;
+
+		getTypeBinaryOutputInfo(att->atttypid, &send, &varlena);
+		fmgr_info_cxt(send, &col->send, cxt);
+	}
+	*cols = lappend(*cols, col);
+}
+
+/*
+ * rel's columns that a unique or exclusion index other than its primary key
+ * constrains, and whose values binary receive may normalize.  The primary
+ * key is the tree's key, which its key encoding checks.
+ */
+static List *
+unique_columns(Relation rel, TupleDesc desc, MemoryContext cxt)
+{
+	List	   *cols = NIL;
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+
+	foreach(lc, indexes)
+	{
+		Relation	index = index_open(lfirst_oid(lc), AccessShareLock);
+		Form_pg_index form = index->rd_index;
+
+		if ((form->indisunique || form->indisexclusion) && !form->indisprimary)
+		{
+			Bitmapset  *refs = NULL;
+			List	   *exprs = RelationGetIndexExpressions(index);
+			List	   *pred = RelationGetIndexPredicate(index);
+			int			attnum = -1;
+
+			for (int i = 0; i < form->indnkeyatts; i++)
+			{
+				if (form->indkey.values[i] != 0)
+					add_unique_column(&cols, index, desc,
+									  form->indkey.values[i], i, cxt);
+			}
+			pull_varattnos((Node *) exprs, 1, &refs);
+			pull_varattnos((Node *) pred, 1, &refs);
+			while ((attnum = bms_next_member(refs, attnum)) >= 0)
+			{
+				AttrNumber	a = attnum + FirstLowInvalidHeapAttributeNumber;
+
+				if (a > 0)
+					add_unique_column(&cols, index, desc, a, -1, cxt);
+			}
+		}
+		index_close(index, AccessShareLock);
+	}
+	list_free(indexes);
+	return cols;
+}
+
+/*
+ * A value of a column a unique or exclusion index constrains, refused if a
+ * reconstruction would re-insert a value that index tells apart from it.
+ */
+static void
+check_unique_value(Relation rel, UniqueColumn *col, Datum value)
+{
+	StringInfoData buf;
+	Datum		decoded;
+	bool		same;
+
+	initStringInfo(&buf);
+	prolly_datum_encode(col->codec, value, &buf);
+	decoded = prolly_datum_decode(col->codec, buf.data, buf.len);
+	if (col->by_cmp)
+		same = DatumGetInt32(FunctionCall2Coll(&col->cmp, col->collation,
+											   value, decoded)) == 0;
+	else
+	{
+		bytea	   *a = SendFunctionCall(&col->send, value);
+		bytea	   *b = SendFunctionCall(&col->send, decoded);
+
+		same = VARSIZE(a) == VARSIZE(b) &&
+			memcmp(VARDATA(a), VARDATA(b), VARSIZE(a) - VARHDRSZ) == 0;
+	}
+	if (!same)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("binary normalization changes a value constrained by index \"%s\"",
+						get_rel_name(col->index)),
+				 errdetail("Column \"%s\" of prolly table \"%s\" would be reconstructed as a value the index treats as different.",
+						   NameStr(TupleDescAttr(RelationGetDescr(rel), col->attnum - 1)->attname),
+						   RelationGetRelationName(rel)),
+				 errhint("Store a value that binary receive leaves unchanged, or drop the index.")));
 }
 
 /*
@@ -219,6 +359,7 @@ key_bound(Relation rel)
 		made.text_atts[made.ntext] = att->attnum;
 		made.text_codecs[made.ntext++] = codec;
 	}
+	made.unique_columns = unique_columns(rel, desc, made.cxt);
 	MemoryContextSwitchTo(old);
 
 	MemoryContextSetParent(made.cxt, CacheMemoryContext);
@@ -275,6 +416,37 @@ same_key(Relation rel, KeyBound *kb, const ItemPointerData *otid,
 		memcmp(oldkey.data, key->data, key->len) == 0;
 }
 
+/* tuple's values under rel's unique and exclusion indexes, checked */
+static void
+check_unique_values(Relation rel, KeyBound *kb, HeapTuple tuple)
+{
+	MemoryContext old;
+	TupleDesc	desc = RelationGetDescr(rel);
+	ListCell   *lc;
+
+	if (kb->unique_columns == NIL)
+		return;
+	old = MemoryContextSwitchTo(kb->scratch);
+	foreach(lc, kb->unique_columns)
+	{
+		UniqueColumn *col = lfirst(lc);
+		bool		isnull;
+		Datum		value = heap_getattr(tuple, col->attnum, desc, &isnull);
+
+		if (!isnull)
+			check_unique_value(rel, col, value);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(kb->scratch);
+}
+
+void
+prolly_check_row_unique(Relation rel, HeapTuple tuple)
+{
+	if (!writing_held_rows)
+		check_unique_values(rel, key_bound(rel), tuple);
+}
+
 void
 prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 					 HeapTuple tuple)
@@ -310,6 +482,7 @@ prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(kb->scratch);
 	}
+	check_unique_values(rel, kb, tuple);
 	if (kb->keyless)
 		return;
 	MemoryContextReset(kb->scratch);

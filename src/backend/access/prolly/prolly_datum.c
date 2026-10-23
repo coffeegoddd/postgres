@@ -112,6 +112,7 @@ struct ProllyDatumCodec
 	int16		typlen;
 	bool		typbyval;
 	bool		tagged;			/* values start with TAG_SEND or TAG_OUTPUT */
+	bool		normalizes;		/* CODEC_SEND: store send(receive(send())) */
 	bool		has_recv;		/* CODEC_OUTPUT: a TAG_SEND value is readable */
 
 	/* CODEC_ARRAY */
@@ -711,6 +712,42 @@ io_may_change(Oid base)
 	return base >= FirstNormalObjectId && get_typtype(base) == TYPTYPE_BASE;
 }
 
+/*
+ * May binary receive of base type (domains looked through) normalize a
+ * value: an extension base type's receive, reached directly or through a
+ * range's subtype, an array's elements or a composite's attributes.  A range
+ * over a composite holding an extension type is untagged, but range_recv
+ * still calls that type's receive for its bounds.
+ */
+static bool
+io_may_normalize(Oid base)
+{
+	Oid			sub = range_subtype(base);
+	Oid			elem;
+
+	if (OidIsValid(sub))
+		return io_may_normalize(sub);
+	elem = get_element_type(base);
+	if (OidIsValid(elem))
+		return io_may_normalize(getBaseType(elem));
+	if (get_typtype(base) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(base, -1);
+		bool		normalizes = false;
+
+		for (int i = 0; i < desc->natts && !normalizes; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+
+			if (!att->attisdropped)
+				normalizes = io_may_normalize(getBaseType(att->atttypid));
+		}
+		ReleaseTupleDesc(desc);
+		return normalizes;
+	}
+	return io_may_change(base);
+}
+
 static void
 elem_info_init(ElemInfo *ei, Oid elemtype, int32 typmod, MemoryContext mcxt)
 {
@@ -853,6 +890,7 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 		getTypeBinaryInputInfo(base, &recv, &c->ioparam);
 		fmgr_info_cxt(send, &c->send, mcxt);
 		fmgr_info_cxt(recv, &c->recv, mcxt);
+		c->normalizes = io_may_normalize(base);
 	}
 
 	/*
@@ -1604,7 +1642,7 @@ prolly_datum_codec_normalizes(const ProllyDatumCodec *c)
 	switch (c->kind)
 	{
 		case CODEC_SEND:
-			return c->tagged;
+			return c->normalizes;
 		case CODEC_ARRAY:
 			return prolly_datum_codec_normalizes(c->elem.codec);
 		case CODEC_COMPOSITE:
@@ -1700,9 +1738,10 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 				 * binary output distinguishes (for example PostGIS NaN points).
 				 * Store the representation we will get back, not a pre-receive
 				 * spelling. initdb's fixed I/O and our explicit built-in codecs
-				 * need no extra round trip; ranges over extension base types do.
+				 * need no extra round trip; ranges whose bounds hold extension
+				 * types do.
 				 */
-				if (c->tagged)
+				if (c->normalizes)
 				{
 					Datum		roundtrip = recv_utf8(c, VARDATA(b),
 													  VARSIZE(b) - VARHDRSZ);

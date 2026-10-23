@@ -9,6 +9,7 @@ SET search_path = sn, public;
 CREATE DOMAIN sn.normal_domain AS sn.test_normalizing;
 CREATE TYPE sn.normal_pair AS (v sn.test_normalizing, n int);
 CREATE TYPE sn.normal_range AS RANGE (subtype = sn.test_normalizing);
+CREATE TYPE sn.pair_range AS RANGE (subtype = sn.normal_pair);
 SELECT test_normalizing_send('ABC') <> test_normalizing_send('abc') AS distinct_send,
     prolly_canonical_value('ABC'::test_normalizing) =
     prolly_canonical_value('abc'::test_normalizing) AS same_canonical,
@@ -31,6 +32,16 @@ SELECT prolly_canonical_value(ARRAY['ABC', NULL]::test_normalizing[]) =
  same_array | same_domain | same_composite | same_range | same_multirange 
 ------------+-------------+----------------+------------+-----------------
  t          | t           | t              | t          | t
+(1 row)
+
+-- A range over a composite reaches the member's receive through record_recv.
+SELECT prolly_canonical_value('["(ABC,1)","(ABC,2)")'::pair_range) =
+    prolly_canonical_value('["(abc,1)","(abc,2)")'::pair_range) AS same_composite_range,
+    prolly_canonical_value('{["(ABC,1)","(ABC,2)")}'::pair_multirange) =
+    prolly_canonical_value('{["(abc,1)","(abc,2)")}'::pair_multirange) AS same_composite_multirange;
+ same_composite_range | same_composite_multirange 
+----------------------+---------------------------
+ t                    | t
 (1 row)
 
 CREATE TABLE sn.t (id int PRIMARY KEY, v test_normalizing, n int);
@@ -215,7 +226,102 @@ ALTER TABLE sn.later_key ADD PRIMARY KEY (k);
 ERROR:  binary normalization changes a prolly primary key's comparison value
 DETAIL:  Primary key column 1 does not compare equal to its stored representation.
 HINT:  Use a primary key whose values compare equal after binary receive.
-DROP TABLE sn.unsafe, sn.later_key;
+-- The check reaches unsafe values nested in arrays, composites and ranges.
+CREATE TYPE sn.raw_pair AS (v test_raw, n int);
+CREATE TYPE sn.raw_pair_range AS RANGE (subtype = sn.raw_pair);
+CREATE TABLE sn.unsafe_array (k test_raw[] PRIMARY KEY);
+INSERT INTO sn.unsafe_array VALUES (ARRAY['ABC']::test_raw[]);
+ERROR:  binary normalization changes a prolly primary key's comparison value
+DETAIL:  Primary key column 1 does not compare equal to its stored representation.
+HINT:  Use a primary key whose values compare equal after binary receive.
+INSERT INTO sn.unsafe_array VALUES (ARRAY['abc']::test_raw[]);
+CREATE TABLE sn.unsafe_composite (k sn.raw_pair PRIMARY KEY);
+INSERT INTO sn.unsafe_composite VALUES (ROW('ABC', 1));
+ERROR:  binary normalization changes a prolly primary key's comparison value
+DETAIL:  Primary key column 1 does not compare equal to its stored representation.
+HINT:  Use a primary key whose values compare equal after binary receive.
+INSERT INTO sn.unsafe_composite VALUES (ROW('abc', 1));
+CREATE TABLE sn.unsafe_range (k sn.raw_pair_range PRIMARY KEY);
+INSERT INTO sn.unsafe_range VALUES ('["(ABC,1)","(ABC,2)")');
+ERROR:  binary normalization changes a prolly primary key's comparison value
+DETAIL:  Primary key column 1 does not compare equal to its stored representation.
+HINT:  Use a primary key whose values compare equal after binary receive.
+INSERT INTO sn.unsafe_range VALUES ('["(abc,1)","(abc,2)")');
+-- Ranges and multiranges over a safe ordering may be keys.
+CREATE TABLE sn.range_key (k normal_range PRIMARY KEY);
+CREATE TABLE sn.multirange_key (k normal_multirange PRIMARY KEY);
+INSERT INTO sn.range_key VALUES ('[A,C)');
+INSERT INTO sn.multirange_key VALUES ('{[A,C)}');
+SELECT k FROM sn.range_key;
+   k   
+-------
+ [A,C)
+(1 row)
+
+SELECT k FROM sn.multirange_key;
+    k    
+---------
+ {[A,C)}
+(1 row)
+
+DROP TABLE sn.unsafe, sn.later_key, sn.unsafe_array, sn.unsafe_composite,
+    sn.unsafe_range, sn.range_key, sn.multirange_key;
+-- A unique or exclusion index other than the key re-inserts normalized
+-- values when a commit is reconstructed, so values it tells apart from
+-- their normalized form are refused, as written and as such an index is built.
+CREATE TABLE sn.uniq (id int PRIMARY KEY, v test_raw UNIQUE,
+    w test_normalizing UNIQUE);
+INSERT INTO sn.uniq VALUES (1, 'ABC', 'x');
+ERROR:  binary normalization changes a value constrained by index "uniq_v_key"
+DETAIL:  Column "v" of prolly table "uniq" would be reconstructed as a value the index treats as different.
+HINT:  Store a value that binary receive leaves unchanged, or drop the index.
+INSERT INTO sn.uniq VALUES (2, 'abc', 'XYZ');
+UPDATE sn.uniq SET v = 'DEF';
+ERROR:  binary normalization changes a value constrained by index "uniq_v_key"
+DETAIL:  Column "v" of prolly table "uniq" would be reconstructed as a value the index treats as different.
+HINT:  Store a value that binary receive leaves unchanged, or drop the index.
+-- Expressions and predicates see what receive returns, whatever the opclass.
+CREATE UNIQUE INDEX uniq_w_text ON sn.uniq ((w::text));
+ERROR:  binary normalization changes a value constrained by index "uniq_w_text"
+DETAIL:  Column "w" of prolly table "uniq" would be reconstructed as a value the index treats as different.
+HINT:  Store a value that binary receive leaves unchanged, or drop the index.
+CREATE UNIQUE INDEX uniq_w_partial ON sn.uniq (id) WHERE w::text <> '';
+ERROR:  binary normalization changes a value constrained by index "uniq_w_partial"
+DETAIL:  Column "w" of prolly table "uniq" would be reconstructed as a value the index treats as different.
+HINT:  Store a value that binary receive leaves unchanged, or drop the index.
+CREATE TABLE sn.excl (id int PRIMARY KEY, v test_raw,
+    EXCLUDE USING btree (v WITH =));
+INSERT INTO sn.excl VALUES (1, 'ABC');
+ERROR:  binary normalization changes a value constrained by index "excl_v_excl"
+DETAIL:  Column "v" of prolly table "excl" would be reconstructed as a value the index treats as different.
+HINT:  Store a value that binary receive leaves unchanged, or drop the index.
+INSERT INTO sn.excl VALUES (2, 'abc');
+SELECT length(dolt_commit('-Am', 'unique values')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+DROP TABLE sn.uniq, sn.excl;
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM sn.uniq;
+ id |  v  |  w  
+----+-----+-----
+  2 | abc | xyz
+(1 row)
+
+SELECT * FROM sn.excl;
+ id |  v  
+----+-----
+  2 | abc
+(1 row)
+
+DROP TABLE sn.uniq, sn.excl;
 -- Format 16's pre-normalized data must never be reused as a new baseline.
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '16'),
     'old binary bytes') AS old_format \gset

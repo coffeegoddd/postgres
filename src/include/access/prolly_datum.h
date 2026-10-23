@@ -42,7 +42,9 @@
  *					Receive may normalize different physical spellings to
  *					one value; keys and values store that normalized form.
  *					Keys additionally require it to compare equal to the
- *					original under the primary key's operator class.
+ *					original under the primary key's operator class, and
+ *					values under other unique or exclusion indexes must
+ *					reconstruct as values those indexes treat as the same.
  *	a type without binary send and receive (or a range over one)
  *					tag 1, then its text form (its output function's) in
  *					UTF-8, written with the settings it may depend on fixed

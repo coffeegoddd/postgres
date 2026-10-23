@@ -9,6 +9,7 @@ SET search_path = sn, public;
 CREATE DOMAIN sn.normal_domain AS sn.test_normalizing;
 CREATE TYPE sn.normal_pair AS (v sn.test_normalizing, n int);
 CREATE TYPE sn.normal_range AS RANGE (subtype = sn.test_normalizing);
+CREATE TYPE sn.pair_range AS RANGE (subtype = sn.normal_pair);
 
 SELECT test_normalizing_send('ABC') <> test_normalizing_send('abc') AS distinct_send,
     prolly_canonical_value('ABC'::test_normalizing) =
@@ -24,6 +25,11 @@ SELECT prolly_canonical_value(ARRAY['ABC', NULL]::test_normalizing[]) =
     prolly_canonical_value('[a,c)'::normal_range) AS same_range,
     prolly_canonical_value('{[A,C)}'::normal_multirange) =
     prolly_canonical_value('{[a,c)}'::normal_multirange) AS same_multirange;
+-- A range over a composite reaches the member's receive through record_recv.
+SELECT prolly_canonical_value('["(ABC,1)","(ABC,2)")'::pair_range) =
+    prolly_canonical_value('["(abc,1)","(abc,2)")'::pair_range) AS same_composite_range,
+    prolly_canonical_value('{["(ABC,1)","(ABC,2)")}'::pair_multirange) =
+    prolly_canonical_value('{["(abc,1)","(abc,2)")}'::pair_multirange) AS same_composite_multirange;
 CREATE TABLE sn.t (id int PRIMARY KEY, v test_normalizing, n int);
 CREATE TABLE sn.keyed (k test_normalizing PRIMARY KEY, n int);
 CREATE TABLE sn.keyless (v test_normalizing);
@@ -83,7 +89,48 @@ SELECT k FROM sn.unsafe;
 CREATE TABLE sn.later_key (k test_raw);
 INSERT INTO sn.later_key VALUES ('ABC');
 ALTER TABLE sn.later_key ADD PRIMARY KEY (k);
-DROP TABLE sn.unsafe, sn.later_key;
+-- The check reaches unsafe values nested in arrays, composites and ranges.
+CREATE TYPE sn.raw_pair AS (v test_raw, n int);
+CREATE TYPE sn.raw_pair_range AS RANGE (subtype = sn.raw_pair);
+CREATE TABLE sn.unsafe_array (k test_raw[] PRIMARY KEY);
+INSERT INTO sn.unsafe_array VALUES (ARRAY['ABC']::test_raw[]);
+INSERT INTO sn.unsafe_array VALUES (ARRAY['abc']::test_raw[]);
+CREATE TABLE sn.unsafe_composite (k sn.raw_pair PRIMARY KEY);
+INSERT INTO sn.unsafe_composite VALUES (ROW('ABC', 1));
+INSERT INTO sn.unsafe_composite VALUES (ROW('abc', 1));
+CREATE TABLE sn.unsafe_range (k sn.raw_pair_range PRIMARY KEY);
+INSERT INTO sn.unsafe_range VALUES ('["(ABC,1)","(ABC,2)")');
+INSERT INTO sn.unsafe_range VALUES ('["(abc,1)","(abc,2)")');
+-- Ranges and multiranges over a safe ordering may be keys.
+CREATE TABLE sn.range_key (k normal_range PRIMARY KEY);
+CREATE TABLE sn.multirange_key (k normal_multirange PRIMARY KEY);
+INSERT INTO sn.range_key VALUES ('[A,C)');
+INSERT INTO sn.multirange_key VALUES ('{[A,C)}');
+SELECT k FROM sn.range_key;
+SELECT k FROM sn.multirange_key;
+DROP TABLE sn.unsafe, sn.later_key, sn.unsafe_array, sn.unsafe_composite,
+    sn.unsafe_range, sn.range_key, sn.multirange_key;
+-- A unique or exclusion index other than the key re-inserts normalized
+-- values when a commit is reconstructed, so values it tells apart from
+-- their normalized form are refused, as written and as such an index is built.
+CREATE TABLE sn.uniq (id int PRIMARY KEY, v test_raw UNIQUE,
+    w test_normalizing UNIQUE);
+INSERT INTO sn.uniq VALUES (1, 'ABC', 'x');
+INSERT INTO sn.uniq VALUES (2, 'abc', 'XYZ');
+UPDATE sn.uniq SET v = 'DEF';
+-- Expressions and predicates see what receive returns, whatever the opclass.
+CREATE UNIQUE INDEX uniq_w_text ON sn.uniq ((w::text));
+CREATE UNIQUE INDEX uniq_w_partial ON sn.uniq (id) WHERE w::text <> '';
+CREATE TABLE sn.excl (id int PRIMARY KEY, v test_raw,
+    EXCLUDE USING btree (v WITH =));
+INSERT INTO sn.excl VALUES (1, 'ABC');
+INSERT INTO sn.excl VALUES (2, 'abc');
+SELECT length(dolt_commit('-Am', 'unique values')::text) AS committed;
+DROP TABLE sn.uniq, sn.excl;
+SELECT dolt_reset('--hard');
+SELECT * FROM sn.uniq;
+SELECT * FROM sn.excl;
+DROP TABLE sn.uniq, sn.excl;
 -- Format 16's pre-normalized data must never be reused as a new baseline.
 SELECT test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '16'),
     'old binary bytes') AS old_format \gset

@@ -217,6 +217,14 @@ extern void prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 								 HeapTuple tuple);
 
 /*
+ * Refuse a row of prolly table rel holding a value, under a unique or
+ * exclusion index other than its primary key, that binary receive would
+ * normalize into one the index tells apart: as a new such index is built
+ * over it.  prolly_check_row_key() checks this too, as heap writes a row.
+ */
+extern void prolly_check_row_unique(Relation rel, HeapTuple tuple);
+
+/*
  * error if a column's missing value (added with a default no row is
  * written with) is one no commit could hold
  */

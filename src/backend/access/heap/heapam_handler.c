@@ -1195,6 +1195,7 @@ heapam_index_build_range_scan(Relation heapRelation,
 	BlockNumber root_blkno = InvalidBlockNumber;
 	OffsetNumber root_offsets[MaxHeapTuplesPerPage];
 	bool		checking_keys;
+	bool		checking_unique;
 
 	/*
 	 * sanity checks
@@ -1214,6 +1215,17 @@ heapam_index_build_range_scan(Relation heapRelation,
 	checking_keys = (heapRelation->rd_rel->relam == PROLLY_TABLE_AM_OID &&
 					 indexRelation->rd_index->indisprimary &&
 					 !ReindexIsProcessingIndex(RelationGetRelid(indexRelation)));
+
+	/*
+	 * A new unique or exclusion index constrains values that reconstruction
+	 * re-inserts through it, as each commit's rows are checked for when
+	 * written; rows written before it are checked as it is built.
+	 */
+	checking_unique = (heapRelation->rd_rel->relam == PROLLY_TABLE_AM_OID &&
+					   !indexRelation->rd_index->indisprimary &&
+					   (indexRelation->rd_index->indisunique ||
+						indexRelation->rd_index->indisexclusion) &&
+					   !ReindexIsProcessingIndex(RelationGetRelid(indexRelation)));
 
 	/* Remember if it's a system catalog */
 	is_system_catalog = IsSystemRelation(heapRelation);
@@ -1666,6 +1678,8 @@ heapam_index_build_range_scan(Relation heapRelation,
 
 		if (checking_keys && tupleIsAlive)
 			prolly_check_row_key(heapRelation, NULL, heapTuple);
+		else if (checking_unique && tupleIsAlive)
+			prolly_check_row_unique(heapRelation, heapTuple);
 
 		/*
 		 * You'd think we should go ahead and build the index tuple here, but

@@ -41,8 +41,7 @@ CREATE OPERATOR CLASS test_normalizing_ops DEFAULT FOR TYPE test_normalizing USI
     OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
     FUNCTION 1 test_normalizing_cmp(test_normalizing, test_normalizing);
 
--- An unsafe ordering: receive changes its comparison value.
--- A base type whose binary receive normalizes ASCII case.
+-- An unsafe ordering: the same receive, but compared case-sensitively.
 CREATE TYPE test_raw;
 CREATE FUNCTION test_raw_in(cstring) RETURNS test_raw
 AS 'textin' LANGUAGE internal IMMUTABLE STRICT;
@@ -70,7 +69,7 @@ CREATE OPERATOR <= (LEFTARG = test_raw, RIGHTARG = test_raw,
 CREATE FUNCTION test_raw_eq(test_raw, test_raw) RETURNS bool
 AS 'texteq' LANGUAGE internal IMMUTABLE STRICT;
 CREATE OPERATOR = (LEFTARG = test_raw, RIGHTARG = test_raw,
-    PROCEDURE = test_raw_eq);
+    PROCEDURE = test_raw_eq, COMMUTATOR = =);
 CREATE FUNCTION test_raw_ge(test_raw, test_raw) RETURNS bool
 AS 'text_ge' LANGUAGE internal IMMUTABLE STRICT;
 CREATE OPERATOR >= (LEFTARG = test_raw, RIGHTARG = test_raw,

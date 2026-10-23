@@ -363,6 +363,14 @@ ordered_encode(ProllyKeyEncoder *enc, const Datum *values, const bool *isnull,
 					 * A stored key must still find its heap row through the
 					 * native index.  A receive function may normalize values,
 					 * but not across this primary key's comparison classes.
+					 * The check decodes the stored bytes rather than reusing
+					 * the encoder's intermediate value: that is the value a
+					 * reconstruction produces, including rebuilt array and
+					 * composite children, and it also catches a receive that
+					 * is not idempotent.  Only keys reaching an extension's
+					 * receive pay for it.  Freeing the top-level value leaves
+					 * any nested allocations in the caller's context, as the
+					 * encoding itself does.
 					 */
 					if (col->normalizes)
 					{
