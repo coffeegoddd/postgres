@@ -4975,11 +4975,9 @@ ATController(AlterTableStmt *parsetree,
 	/* (a versioned prolly table rewritten: its branch folded now, once) */
 	foreach_ptr(AlteredTableInfo, tab, wqueue)
 	{
-		if (tab->rewrite > 0 && tab->relkind == RELKIND_RELATION)
-		{
-			prolly_fold_rewritten(tab->relid);
+		if (tab->rewrite > 0 && tab->relkind == RELKIND_RELATION &&
+			prolly_fold_rewritten(tab->relid))
 			break;
-		}
 	}
 }
 

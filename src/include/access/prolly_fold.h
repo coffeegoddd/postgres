@@ -134,7 +134,7 @@ extern int	prolly_verify_folds(double rate, ProllyFoldVerifyVisit visit,
  * as a checkpoint (prolly_fold_rewritten(), prolly_vcs.c).
  */
 extern PGDLLIMPORT bool prolly_fold_on_rewrite;
-extern void prolly_fold_rewritten(Oid relid);
+extern bool prolly_fold_rewritten(Oid relid);
 
 /* prolly.log_full_folds: rows past which a full fold is logged (-1: none). */
 extern PGDLLIMPORT int prolly_log_full_folds;

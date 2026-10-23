@@ -310,7 +310,10 @@ REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
 branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
 prolly_fold_rewritten(), called by tablecmds.c and matview.c), so the
 commit after, the fold worker off or in the same transaction, folds only
-what changed since.  dolt_pending_full_folds() lists the tables whose next
+what changed since.  The checkpoint never waits for a lock (the rewrite
+holds its table exclusively, and a commit holding the branch may be about
+to read it): a lock not free at once skips it, leaving the table's next
+fold to read it in full.  dolt_pending_full_folds() lists the tables whose next
 fold would read them in full, and why, from the baseline, the catalogs and
 each change finder's full_reason(), reading no rows.
 

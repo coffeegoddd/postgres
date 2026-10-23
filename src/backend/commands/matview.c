@@ -378,7 +378,7 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 
 	/* (a versioned prolly materialized view rewritten: its branch folded now) */
 	if (!concurrent && !is_create)
-		prolly_fold_rewritten(matviewOid);
+		(void) prolly_fold_rewritten(matviewOid);
 
 	ObjectAddressSet(address, RelationRelationId, matviewOid);
 

@@ -89,6 +89,19 @@ RESET debug_prolly_force_full_fold;
 SELECT length(dolt_commit('-Am', 'u')::text) > 0 AS committed;
 SELECT * FROM dolt_pending_full_folds();
 
+-- A rewrite of a table that isn't versioned, with a versioned prolly
+-- child rewritten with it: the child's branch is folded.
+CREATE TABLE public.rf_parent (k int);
+CREATE TABLE rf.child () INHERITS (public.rf_parent);
+INSERT INTO rf.child SELECT g FROM generate_series(1, 10) g;
+SELECT length(dolt_commit('-Am', 'child')::text) > 0 AS committed;
+ALTER TABLE public.rf_parent ALTER COLUMN k TYPE bigint;
+SELECT * FROM dolt_pending_full_folds();
+SELECT length(dolt_commit('-am', 'child retyped')::text) > 0 AS committed;
+DROP TABLE rf.child;
+DROP TABLE public.rf_parent;
+SELECT length(dolt_commit('-Am', 'child gone')::text) > 0 AS committed;
+
 -- A rewrite made by history work (a reset moving a retyped column back)
 -- isn't the session's: no checkpoint of its own, and the move's result
 -- is what the head holds.

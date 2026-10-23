@@ -223,6 +223,37 @@ SELECT * FROM dolt_pending_full_folds();
 ------------+--------+----------------
 (0 rows)
 
+-- A rewrite of a table that isn't versioned, with a versioned prolly
+-- child rewritten with it: the child's branch is folded.
+CREATE TABLE public.rf_parent (k int);
+CREATE TABLE rf.child () INHERITS (public.rf_parent);
+INSERT INTO rf.child SELECT g FROM generate_series(1, 10) g;
+SELECT length(dolt_commit('-Am', 'child')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+ALTER TABLE public.rf_parent ALTER COLUMN k TYPE bigint;
+SELECT * FROM dolt_pending_full_folds();
+ table_name | reason | estimated_rows 
+------------+--------+----------------
+(0 rows)
+
+SELECT length(dolt_commit('-am', 'child retyped')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+DROP TABLE rf.child;
+DROP TABLE public.rf_parent;
+SELECT length(dolt_commit('-Am', 'child gone')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
 -- A rewrite made by history work (a reset moving a retyped column back)
 -- isn't the session's: no checkpoint of its own, and the move's result
 -- is what the head holds.

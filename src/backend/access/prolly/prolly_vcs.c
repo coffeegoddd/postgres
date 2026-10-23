@@ -26,7 +26,9 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
@@ -143,22 +145,63 @@ dolt_pending_full_folds(PG_FUNCTION_ARGS)
  * changed since rather than reading every row again.  The rewrite pays for
  * the fold.  Not during recovery, in a transaction that can't write, nor
  * for history work's own DDL (a move rewriting a table folds after it).
+ *
+ * The checkpoint never waits for a lock: the rewrite holds its table
+ * exclusively, and a commit open on the branch, holding the branch, may
+ * be about to read that table, so waiting for the branch (or for another
+ * table a rewrite elsewhere holds) could deadlock, and would hold the
+ * table from readers meanwhile.  It is made in a subtransaction with
+ * lock_timeout at its least; a lock not free at once rolls it back, and
+ * the table's next fold reads it in full, as without the checkpoint.
+ * True if relid was such a table (folded or not): the branch's fold is
+ * then tried, and needn't be for another table of the same rewrite.
  */
-void
+bool
 prolly_fold_rewritten(Oid relid)
 {
 	ProllyDatabaseComponents components;
 	ProllyNodeRef root;
 	char		relkind = get_rel_relkind(relid);
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	int			save_nestlevel;
 
 	if (!prolly_fold_on_rewrite || RecoveryInProgress() || XactReadOnly ||
 		branch_ddl_internal() ||
 		(relkind != RELKIND_RELATION && relkind != RELKIND_MATVIEW) ||
 		get_rel_relam(relid) != PROLLY_TABLE_AM_OID ||
 		!namespace_is_versioned(get_rel_namespace(relid)))
-		return;
+		return false;
 	prolly_database_components(&components);
 	if (components.refs->checkpoint == NULL)
-		return;
-	BRANCH_WRITES_HUSHED(PROLLY_CALL(components.refs, checkpoint, &root));
+		return true;
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("lock_timeout", "1", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(components.refs, checkpoint, &root));
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+			ReThrowError(ed);
+		FlushErrorState();
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	AtEOXact_GUC(true, save_nestlevel);
+	return true;
 }
