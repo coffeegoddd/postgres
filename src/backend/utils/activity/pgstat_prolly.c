@@ -118,6 +118,7 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_FOLD_OBJECTS] = "fold_objects",
 	[PGSTAT_PROLLY_FOLD_TABLES] = "fold_tables",
 	[PGSTAT_PROLLY_FOLD_INCREMENTAL] = "fold_incremental",
+	[PGSTAT_PROLLY_BMAP_PAGES_PRESERVED] = "bmap_pages_preserved",
 };
 
 /*

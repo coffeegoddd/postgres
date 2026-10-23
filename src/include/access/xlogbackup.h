@@ -30,6 +30,7 @@ typedef struct BackupState
 	bool		started_in_recovery;	/* backup started in recovery? */
 	XLogRecPtr	istartpoint;	/* incremental based on backup at this LSN */
 	TimeLineID	istarttli;		/* incremental based on backup on this TLI */
+	uint64		bmap_shares;	/* bmap_shares_replayed() as it started */
 
 	/* Fields saved at the end of backup */
 	XLogRecPtr	stoppoint;		/* backup stop WAL location */

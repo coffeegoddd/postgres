@@ -3,6 +3,7 @@
 # A base backup can copy a page-store block before it is shared, and its
 # source's map after a later remap.  Recovery skips the source's older WAL
 # through that newer map, but must still reconstruct the shared copy (#665).
+# A share logs the images that needs while a backup runs, as one does here.
 
 use strict;
 use warnings FATAL => 'all';
@@ -34,6 +35,10 @@ my $phys = sql(qq{SELECT phys FROM test_bmap_map($rel) WHERE blkno = 10});
 my $store = $node->data_dir . '/base/'
   . sql(q{SELECT oid FROM pg_database WHERE datname = current_database()})
   . '/9421';
+
+# (a backup runs from here to the crash: the shares log their images)
+my $backup = $node->background_psql('postgres');
+$backup->query_safe(q{SELECT pg_backup_start('fuzzy', true)});
 
 sql('CHECKPOINT');
 open(my $fh, '<:raw', $store) or die "open $store: $!";
@@ -95,6 +100,7 @@ is(sql(qq{SELECT bool_and((pg_buffercache_evict(bufferid)).buffer_evicted)
 	FROM pg_buffercache WHERE relfilenode = $rel AND relforknumber = 4}),
 	't', 'the newer source map reaches disk');
 $node->stop('immediate');
+$backup->quit;
 
 # Reproduce the two reads of a fuzzy backup deterministically: the older
 # store page and newer map.  Keep the page's valid checksum, of logical

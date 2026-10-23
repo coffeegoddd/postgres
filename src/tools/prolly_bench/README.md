@@ -265,6 +265,7 @@ told apart: map work, rows written back, and catalog work.
 | `bmap_map_pages_copied` | block-map pages a share copied (a branch's first use shares every relation's blocks) |
 | `bmap_refcount_updates` | page-store blocks' reference counts set: shares, drops, copies on write, truncations, sweeps |
 | `bmap_blocks_freed` | page-store blocks given back to the allocator |
+| `bmap_pages_preserved` | page images a share logged of the blocks it shares (only while an online backup runs) |
 | `apply_rows` | rows the row applier inserted, updated or deleted, moving a working set to a commit |
 | `apply_index_tuples` | index entries those writes made: for each row inserted or updated, one in each index whose predicate the row meets (summarizing indexes alone for a heap-only update), and a load's index builds' |
 | `catalog_rows_copied` | catalog rows a branch's copies were made of (first use) |
@@ -348,7 +349,7 @@ the two away. Each check must not grow faster than its target
 The work counters are tree work (`nodes_read`, `nodes_written`,
 `chunks_appended`, `fold_rows_read`, `log_pages_read`), map work
 (`bmap_map_pages_copied`, `bmap_refcount_updates`, `bmap_blocks_freed`,
-`page_copies_shared`), rows applied (`apply_rows`, `apply_index_tuples`)
+`page_copies_shared`, `bmap_pages_preserved`), rows applied (`apply_rows`, `apply_index_tuples`)
 and `catalog_rows_copied`. Byte and cache counters follow these or the
 caches' state, and aren't gated.
 
