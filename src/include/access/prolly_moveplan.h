@@ -16,9 +16,9 @@
  *   writes (those alike in both are left out), each with what the move
  *   does with it, the rows that differ (an estimate never below the
  *   diff's count), the rows to has, and the estimated cost, in
- *   microseconds; plan->cost is their sum.  Tables are named by their
- *   qualified, server-encoded names, as the canonicalizer's tables()
- *   names them.
+ *   microseconds; plan->cost is their sum.  Tables (materialized views
+ *   among them) are named by their qualified, server-encoded names, as
+ *   the canonicalizer's tables() and materialized_views() name them.
  * - With PROLLY_PLAN_RELOADS (the move's working set is new in the
  *   transaction, which no other sees: a branch's first use), a table whose
  *   rows differ may be planned PROLLY_TABLE_RELOAD instead, where emptying
@@ -32,8 +32,9 @@
  *   planned).
  * - It writes nothing, takes no lock, and reads only the session branch's
  *   catalogs (by its tables' names, for what writing their rows costs:
- *   their indexes and constraints).  A table the session branch hasn't is costed as one
- *   with a primary key alone.
+ *   their indexes and constraints), so a caller costing a move of another
+ *   branch's copies plans on that branch.  A table the session branch
+ *   hasn't is costed as one with a primary key alone.
  *
  * Provisional (v0).
  *

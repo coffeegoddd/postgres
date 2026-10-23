@@ -721,9 +721,13 @@ typedef enum PgStat_ProllyCounter
 									 * what changed since the last */
 	PGSTAT_PROLLY_MOVE_PLANS,	/* moves the move planner costed: the
 								 * sources a branch's first use weighed */
+	PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY,	/* first uses that copied the
+											 * session's branch, the one
+											 * chosen having a writer in
+											 * flight */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_MOVE_PLANS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY + 1)
 
 typedef struct PgStat_ProllyStats
 {

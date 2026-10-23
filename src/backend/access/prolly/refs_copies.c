@@ -2143,13 +2143,16 @@ rank_source(const char *name, Oid branch, void *arg)
  * baseline's fold, else its head; one changed since is only a hint, the
  * move folding the copies as they are).  The session's branch is planned
  * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
- * after it, each stopped once it costs more than the best yet.  NULL if
+ * after it, each stopped once it costs more than the best yet, each planned
+ * on its own branch (its tables' indexes are its own).  NULL if
  * none is cheaper than the session's branch.  (A source a move could start
  * from without a branch's copies, as a kept materialization, would be
  * planned among these, by the root it holds.)  The copies are new in the
  * transaction, which no other sees: the tables of the chosen plan that
  * cost less emptied and loaded than moved row by row (#713) are added to
- * *emptied, for their copies to begin empty.
+ * *emptied, for their copies to begin empty; those of the session's
+ * branch's plan to *own_emptied, for the copies made of it instead if the
+ * chosen branch is busy.
  */
 #define SOURCE_CANDIDATES	16
 
@@ -2189,15 +2192,49 @@ note_candidate(const char *name, Oid branch, void *arg)
 	sc->roots = lappend(sc->roots, root);
 }
 
+/* The tables of a plan whose copies begin empty, added to *emptied. */
+static void
+reloaded_tables(const ProllyMovePlan *plan, List **emptied)
+{
+	ListCell   *lc;
+
+	foreach(lc, plan->tables)
+	{
+		ProllyTableMove *m = lfirst(lc);
+
+		if (m->kind == PROLLY_TABLE_RELOAD)
+			*emptied = lappend(*emptied, m->name);
+	}
+}
+
+/* A plan made on a candidate's branch (run_on()). */
+typedef struct PlanOn
+{
+	const ProllyMovePlannerRoutine *planner;
+	const ProllyNodeRef *from;
+	const ProllyNodeRef *to;
+	double		bound;
+	ProllyMovePlan *plan;
+} PlanOn;
+
+static void
+plan_here(void *arg)
+{
+	PlanOn	   *po = arg;
+
+	PROLLY_CALL(po->planner, plan, po->from, po->to, PROLLY_PLAN_RELOADS,
+				po->bound, po->plan);
+}
+
 static char *
-estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied)
+estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
+				 List **own_emptied)
 {
 	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
 	SourceCandidates sc = {snap, false, NIL, NIL};
 	ProllyMovePlan plan;
 	ProllyMovePlan best;
 	char	   *source = NULL;
-	ListCell   *lc;
 
 	/* (the session's branch first, then the others) */
 	branch_ops()->branches(note_candidate, &sc);
@@ -2208,10 +2245,12 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied)
 	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
 				INFINITY, &best);
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+	reloaded_tables(&best, own_emptied);
 	for (int i = 1; i < list_length(sc.names); i++)
 	{
-		PROLLY_CALL(planner, plan, list_nth(sc.roots, i), target,
-					PROLLY_PLAN_RELOADS, best.cost, &plan);
+		PlanOn		po = {planner, list_nth(sc.roots, i), target, best.cost, &plan};
+
+		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
 		if (!plan.over && plan.cost < best.cost)
 		{
@@ -2219,13 +2258,10 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied)
 			source = list_nth(sc.names, i);
 		}
 	}
-	foreach(lc, best.tables)
-	{
-		ProllyTableMove *m = lfirst(lc);
-
-		if (m->kind == PROLLY_TABLE_RELOAD)
-			*emptied = lappend(*emptied, m->name);
-	}
+	if (source != NULL)
+		reloaded_tables(&best, emptied);
+	else
+		*emptied = list_copy(*own_emptied);
 	return source;
 }
 
@@ -2247,6 +2283,7 @@ materialize(const char *name)
 	int			hush;
 	NearestSource ns = {0};
 	List	   *emptied = NIL;
+	List	   *own_emptied = NIL;
 	MoveCopies	mc;
 	char	   *source;
 
@@ -2292,9 +2329,28 @@ materialize(const char *name)
 			GetLatestSnapshot();
 		branch_ops()->branches(rank_source, &ns);
 		if (ns.rank == 0)
-			ns.name = estimated_source(&info.root, ns.snap, &emptied);
+			ns.name = estimated_source(&info.root, ns.snap, &emptied,
+									   &own_emptied);
 		source = ns.name != NULL ? ns.name : branch_ops()->current();
-		branch_ops()->make(name, ns.name != NULL ? source : NULL, emptied);
+
+		/*
+		 * (another branch's copies only if none of its writers is in the
+		 * middle of changing it: waiting for one, with the refs held, would
+		 * hold up every commit of the session's branch for as long as that
+		 * writer's transaction lasts; else the session's own, whose writers
+		 * a first use waits for, as ever, with the tables its own plan
+		 * empties)
+		 */
+		if (ns.name == NULL ||
+			!OidIsValid(branch_ops()->make(name, source, emptied, true)))
+		{
+			if (ns.name != NULL)
+				pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
+			ns.name = NULL;
+			ns.rank = 0;
+			source = branch_ops()->current();
+			branch_ops()->make(name, NULL, own_emptied, false);
+		}
 		branch_set_baseline(name,
 							branch_baseline(source, &baseline) ? &baseline : NULL,
 							NULL);
