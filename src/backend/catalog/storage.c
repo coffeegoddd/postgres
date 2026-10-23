@@ -28,6 +28,7 @@
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bmap.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
 #include "storage/proc.h"
@@ -264,6 +265,53 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
 	 * No pending sync, even when WAL is skipped for new relations: the share
 	 * is logged and synced, and syncing the new relation at commit could
 	 * log and write every page it shares.
+	 */
+	return srel;
+}
+
+/*
+ * RelationCreateStorageFromSnapshot
+ *		Create a permanent relation's storage as a copy of a snapshot that
+ *		another's block-mapped storage keeps (bmap_snapshot_take()).
+ *
+ * The new main fork shares the snapshot's pages until it changes one
+ * (bmap_share_snapshot()), O(1) in the relation's size.  It gets no free
+ * space map or visibility map: src's describe its pages as they are now,
+ * not as the snapshot has them, so the new relation claims no page
+ * all-visible and knows of no free space until vacuumed.  As
+ * RelationCreateStorage(), the storage is deleted if the transaction
+ * aborts when register_delete.
+ */
+SMgrRelation
+RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
+								  uint64 snapshot, bool register_delete)
+{
+	SMgrRelation srel;
+
+	Assert(!IsInParallelMode());
+
+	/* (registered first, as for a share) */
+	if (register_delete)
+	{
+		PendingRelDelete *pending;
+
+		pending = (PendingRelDelete *)
+			MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDelete));
+		pending->rlocator = rlocator;
+		pending->procNumber = INVALID_PROC_NUMBER;
+		pending->atCommit = false;	/* delete if abort */
+		pending->nestLevel = GetCurrentTransactionNestLevel();
+		pending->next = pendingDeletes;
+		pendingDeletes = pending;
+	}
+
+	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
+	bmap_share_snapshot(src, snapshot, srel);
+	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	/*
+	 * No pending sync: the snapshot's blocks were written out and synced
+	 * when it was taken, and the share is logged.
 	 */
 	return srel;
 }

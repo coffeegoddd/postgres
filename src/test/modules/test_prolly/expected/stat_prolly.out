@@ -56,12 +56,12 @@ FROM pg_stat_prolly
 WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
            name            | value 
 ---------------------------+-------
- nodes_read                |    70
- nodes_written             |    16
+ nodes_read                |    80
+ nodes_written             |    17
  value_nodes_written       |     0
- chunks_appended           |    16
- chunk_bytes_appended      | 27168
- bytes_hashed              | 27257
+ chunks_appended           |    17
+ chunk_bytes_appended      | 29728
+ bytes_hashed              | 29817
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -95,12 +95,12 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  memo_hits                 |     0
  memo_misses               |     0
  page_copies_fold          |     0
- page_copies_shared        |     0
+ page_copies_shared        |     2
  table_file_bytes_written  |     0
  manifest_bytes_written    |     0
  gc_bytes_copied           |     0
  conjoin_bytes_copied      |     0
- bmap_store_bytes_written  |     0
+ bmap_store_bytes_written  |     2
  bmap_extend_bytes_written |    14
  bmap_bulk_bytes_written   |     0
  journal_scans             |     1
@@ -131,7 +131,9 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  fold_objects              |     1
  fold_tables               |     1
  fold_incremental          |     1
-(75 rows)
+ pages_kept                |     4
+ relations_restored        |     0
+(77 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
@@ -187,7 +189,7 @@ WHERE name IN ('fold_rows_read', 'fold_candidates', 'fold_rows_written',
  commits            |     1
  head_moves         |     1
  page_copies_fold   |     0
- page_copies_shared |     0
+ page_copies_shared |     5
 (8 rows)
 
 -- The same commit again, in a database just like it: the same counts.

@@ -637,6 +637,13 @@ typedef struct ProllyRefsRoutine
 typedef void (*ProllyRefsEndHook) (bool prepare);
 extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
 
+/*
+ * prolly.kept_commits: how many commits each branch's pages are kept as of,
+ * the last it was at (0: none), for a move back to one to give the pages
+ * back rather than write rows.
+ */
+extern PGDLLIMPORT int prolly_kept_commits;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \

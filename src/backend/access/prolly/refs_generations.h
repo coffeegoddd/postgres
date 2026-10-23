@@ -65,6 +65,12 @@ extern bool branch_fold_known_at(Oid branch, Snapshot snap,
 extern bool branch_fold_unchanged(const BranchFoldStamp *at);
 
 /*
+ * Do branch's pages hold only what snap sees and the transaction's own
+ * changes?  (Its writers kept out by the caller.)
+ */
+extern bool branch_writers_settled(Oid branch, Snapshot snap);
+
+/*
  * The fold worker's view: the databases, and the current database's
  * branches (with their generation), whose generation moved since it last
  * saw them; and what it saw.

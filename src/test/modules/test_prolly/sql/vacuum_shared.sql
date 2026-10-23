@@ -8,6 +8,8 @@ CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
 SELECT current_database() AS home \gset
 CREATE DATABASE vacuum_shared;
+-- (pages shared with a branch alone: pages kept as of each commit are shared too, which VACUUM leaves as they are)
+ALTER DATABASE vacuum_shared SET prolly.kept_commits = 0;
 \c vacuum_shared
 CREATE SCHEMA vs VERSIONED;
 CREATE TABLE vs.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);

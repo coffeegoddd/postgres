@@ -375,7 +375,8 @@ work_mem as for any query.
 
 A commit, a checkpoint and a fold of a transaction's own rows change
 only their branch's refs (its head, baseline, the names of its head's
-tables, its merge state and violations).  Every change of a branch's refs
+tables, its merge state and violations, the commits its pages are kept
+as of).  Every change of a branch's refs
 is made holding that branch's lock to transaction end, and they take
 only that, so commits on different branches run together while those on
 one branch take turns.  Anything else that changes the refs (a branch
@@ -394,6 +395,36 @@ tables whose rows differ that branch's storage instead, where sharing their
 blocks costs less than writing the rows (branch operations' share(), the
 canonicalizer's splice_baseline()); a branch's first use copies the branch
 nearest its head.
+
+A branch's pages are kept as of the last commits it was at
+(prolly.kept_commits, 2 by default): when a commit's fold, or a move
+settled, leaves the working set known to be a commit's root, each
+block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
+change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
+through branch operations' keep()), O(1) in its size, a relation unchanged
+since a commit kept already reusing that one's.  Only while nothing else
+can be on the pages: the relations are locked against writers without
+waiting, and the snapshot the commit or move went by saw every writer of
+the branch that ended and nobody else is writing it; otherwise nothing is
+kept.  Not at a transaction's own commit (dolt.transaction_commit), whose
+head moves every transaction.  The refs record each kept commit with the
+branch's baseline then and each table's relations and snapshots ('K').  A
+move back to one of them (dolt_reset('--hard') to the head or the commit
+before, a merge's abort, a stash) first gives each table that changed
+since its pages back (restore()): new storage made of each relation's
+snapshot, O(1), its pg_class row repointed with its oldest transaction ids
+then, as TRUNCATE gives a relation new storage, and the old storage dropped
+at commit; the baseline takes the table's entry from the kept baseline,
+whose change log is restored with it, so the fold that follows reads none
+of its rows.  Whatever still differs (definitions, sequences, a table not
+restored) the move writes as before.  A table isn't restored if its
+storage was replaced since (a rewrite, a truncation), an index was made or
+dropped, it was renamed, its rows' transaction ids are older than the
+database still knows, its rows in the commit can't be read here, the user
+couldn't write its rows, or one of its relations is in use (its locks are
+tried, not waited for): its rows are written.  Like TRUNCATE, a restore
+isn't MVCC-safe: a snapshot taken before the move commits reads the
+restored pages after it.
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call

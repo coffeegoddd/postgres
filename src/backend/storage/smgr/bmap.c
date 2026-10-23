@@ -5551,6 +5551,46 @@ bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max)
 }
 
 /*
+ * Are reln's pages still those of its snapshot 'id': its root page pointing
+ * to the subtrees the snapshot holds, and its length the snapshot's?  O(1):
+ * a page changed since the snapshot was taken was copied first, its path
+ * with it, so the root page points to a copy of a subtree the snapshot
+ * holds where anything under it changed.  False if reln keeps no snapshot
+ * 'id'.  The caller keeps reln from changing, or takes the answer as of
+ * when it was asked.
+ */
+bool
+bmap_snapshot_unchanged(SMgrRelation reln, uint64 id)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	BmapRoot	root;
+	BlockNumber nblocks;
+	int			slot;
+	bool		same;
+
+	if (id == 0)
+		return false;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
+	slot = snapshot_slot(reln, id, &root);
+	UnlockReleaseBuffer(headerbuf);
+	if (slot < 0)
+		return false;
+	same = root.snap[slot].nblocks == nblocks;
+	for (int k = 0; same && k < BMAP_TREE_TOPS; k++)
+	{
+		const BmapEntry *top = &snapshot_tops(&root.snap[slot])[k];
+
+		same = root.top[k].block == top->block &&
+			(!BlockNumberIsValid(top->block) || root.top[k].since == top->since);
+	}
+	return same;
+}
+
+/*
  * Make 'dst', a new relation file number in src's tablespace and database,
  * a copy of src's snapshot 'id': its root page gets the snapshot's
  * subtrees, each gaining a holder, and its header the snapshot's length, in

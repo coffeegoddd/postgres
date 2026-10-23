@@ -47,6 +47,7 @@
 
 #include "access/genam.h"
 #include "access/heaptoast.h"
+#include "access/multixact.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -63,6 +64,7 @@
 #include "catalog/versioned.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/bmap.h"
 #include "storage/bufmgr.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
@@ -74,6 +76,7 @@
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -844,6 +847,372 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	return true;
 }
 
+/*
+ * Keeping a branch's pages (keep(), restore()).  A snapshot of a relation's
+ * block-mapped storage (bmap_snapshot_take()) is in the storage, not the
+ * transaction: one taken by a transaction (or subtransaction) that aborts
+ * would be kept by nobody, so each taken is remembered until its
+ * transaction commits, and one whose transaction aborted is let go of the
+ * next time this backend keeps or restores (letting go writes, which an
+ * abort can't).
+ */
+typedef struct TakenSnapshot
+{
+	RelFileLocator locator;
+	uint64		id;
+	int			level;			/* the (sub)transaction's nesting level */
+} TakenSnapshot;
+
+static List *taken = NIL;		/* TakenSnapshot *, in TopMemoryContext */
+static List *abandoned = NIL;	/* and those to let go of */
+static bool taken_callbacks = false;
+
+static void
+taken_xact(XactEvent event, void *arg)
+{
+	MemoryContext old;
+
+	if (taken == NIL)
+		return;
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_PREPARE)
+	{
+		list_free_deep(taken);
+		taken = NIL;
+	}
+	else if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		old = MemoryContextSwitchTo(TopMemoryContext);
+		abandoned = list_concat(abandoned, taken);
+		MemoryContextSwitchTo(old);
+		list_free(taken);
+		taken = NIL;
+	}
+}
+
+static void
+taken_subxact(SubXactEvent event, SubTransactionId mySubid,
+			  SubTransactionId parentSubid, void *arg)
+{
+	int			level = GetCurrentTransactionNestLevel();
+	MemoryContext old;
+
+	foreach_ptr(TakenSnapshot, t, taken)
+	{
+		if (t->level < level)
+			continue;
+		if (event == SUBXACT_EVENT_ABORT_SUB)
+		{
+			old = MemoryContextSwitchTo(TopMemoryContext);
+			abandoned = lappend(abandoned, t);
+			MemoryContextSwitchTo(old);
+			taken = foreach_delete_current(taken, t);
+		}
+		else if (event == SUBXACT_EVENT_COMMIT_SUB)
+			t->level = level - 1;
+	}
+}
+
+static void
+note_taken(RelFileLocator locator, uint64 id)
+{
+	MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+	TakenSnapshot *t = palloc(sizeof(TakenSnapshot));
+
+	if (!taken_callbacks)
+	{
+		RegisterXactCallback(taken_xact, NULL);
+		RegisterSubXactCallback(taken_subxact, NULL);
+		taken_callbacks = true;
+	}
+	t->locator = locator;
+	t->id = id;
+	t->level = GetCurrentTransactionNestLevel();
+	taken = lappend(taken, t);
+	MemoryContextSwitchTo(old);
+}
+
+/* Let go of a snapshot of storage locator, if it still has it. */
+static void
+let_go_of(RelFileLocator locator, uint64 id)
+{
+	if (id != 0 && bmap_relation_exists(locator))
+		(void) bmap_snapshot_release(smgropen(locator, INVALID_PROC_NUMBER), id);
+}
+
+/* The snapshots of aborted (sub)transactions, let go of. */
+static void
+let_go_of_abandoned(void)
+{
+	while (abandoned != NIL)
+	{
+		TakenSnapshot *t = linitial(abandoned);
+
+		abandoned = list_delete_first(abandoned);
+		let_go_of(t->locator, t->id);
+		pfree(t);
+	}
+}
+
+static RelFileLocator
+kept_locator(const BranchKeptRelation *k)
+{
+	RelFileLocator loc;
+
+	loc.spcOid = OidIsValid(k->tablespace) ? k->tablespace : MyDatabaseTableSpace;
+	loc.dbOid = MyDatabaseId;
+	loc.relNumber = k->relfilenumber;
+	return loc;
+}
+
+/* (a relation keeping more than this many snapshots is kept by none more) */
+#define KEEP_SNAPSHOTS_MAX	(BMAP_SNAPSHOTS_MAX - 4)
+
+/* Keep a relation's pages as they are, by a new snapshot. */
+static void
+keep_now(Form_pg_class c, BranchKeptRelation *k)
+{
+	RelFileLocator loc = class_locator(c, c->relfilenode);
+	SMgrRelation srel = smgropen(loc, INVALID_PROC_NUMBER);
+
+	k->tablespace = c->reltablespace;
+	k->relfilenumber = c->relfilenode;
+	k->frozenxid = c->relfrozenxid;
+	k->minmxid = c->relminmxid;
+	k->snapshot = bmap_snapshot_take(srel);
+	note_taken(loc, k->snapshot);
+	pgstat_count_prolly(PGSTAT_PROLLY_PAGES_KEPT, 1);
+}
+
+/* Can relation c's storage keep its pages, by one snapshot more? */
+static bool
+can_keep(Form_pg_class c)
+{
+	RelFileLocator loc;
+	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+
+	if (!RELKIND_HAS_STORAGE(c->relkind) ||
+		c->relpersistence != RELPERSISTENCE_PERMANENT ||
+		!RelFileNumberIsValid(c->relfilenode))
+		return false;
+	loc = class_locator(c, c->relfilenode);
+	return !RelFileLocatorSkippingWAL(loc) && bmap_relation_exists(loc) &&
+		bmap_snapshot_list(smgropen(loc, INVALID_PROC_NUMBER), snaps,
+						   BMAP_SNAPSHOTS_MAX) <= KEEP_SNAPSHOTS_MAX;
+}
+
+/*
+ * Keep the pages of the session branch's relations relids (see
+ * branch_ops.h).
+ */
+static bool
+copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
+			BranchKeptRelation *kept, bool (*settled) (void *arg), void *arg)
+{
+	Relation	pg_class;
+	List	   *rows = NIL;
+	bool		ok = true;
+	int			i = 0;
+
+	let_go_of_abandoned();
+	if (relids == NIL)
+		return true;
+	if (OidIsValid(lock_all_or_none(relids)))
+		return false;
+	PG_TRY();
+	{
+		AcceptInvalidationMessages();
+		if (settled && !settled(arg))
+			ok = false;
+
+		/* (each checked before any is kept) */
+		pg_class = table_open(RelationRelationId, AccessShareLock);
+		foreach_oid(relid, relids)
+		{
+			HeapTuple	t;
+
+			if (!ok)
+				break;
+			t = class_row(pg_class, relid, MyBranch);
+			if (t == NULL || !can_keep((Form_pg_class) GETSTRUCT(t)))
+				ok = false;
+			if (t != NULL)
+				rows = lappend(rows, t);
+		}
+		table_close(pg_class, AccessShareLock);
+
+		foreach_ptr(HeapTupleData, t, rows)
+		{
+			Form_pg_class c = (Form_pg_class) GETSTRUCT(t);
+			BranchKeptRelation *k = &kept[i++];
+			bool		again = false;
+
+			if (!ok)
+				break;
+			memset(k, 0, sizeof(*k));
+			k->relid = c->oid;
+			for (int p = 0; p < nprior && !again; p++)
+			{
+				if (prior[p].relid == c->oid &&
+					prior[p].relfilenumber == c->relfilenode &&
+					prior[p].tablespace == c->reltablespace &&
+					bmap_snapshot_unchanged(smgropen(class_locator(c, c->relfilenode),
+													 INVALID_PROC_NUMBER),
+											prior[p].snapshot))
+				{
+					*k = prior[p];
+					again = true;
+				}
+			}
+			if (!again)
+				keep_now(c, k);
+		}
+	}
+	PG_FINALLY();
+	{
+		foreach_oid(relid, relids)
+			UnlockRelationOid(relid, ShareLock);
+	}
+	PG_END_TRY();
+	list_free_deep(rows);
+	return ok;
+}
+
+/*
+ * Is relation c (its row k) still on the branch with the storage that kept
+ * it, its snapshot there, and its rows' transaction ids ones the database
+ * still knows?
+ */
+static bool
+can_restore(Form_pg_class c, const BranchKeptRelation *k,
+			TransactionId datfrozenxid, MultiXactId datminmxid)
+{
+	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+	int			n;
+
+	if (c->relfilenode != k->relfilenumber ||
+		c->reltablespace != k->tablespace ||
+		c->relpersistence != RELPERSISTENCE_PERMANENT ||
+		!bmap_relation_exists(kept_locator(k)) ||
+		(TransactionIdIsNormal(k->frozenxid) &&
+		 TransactionIdPrecedes(k->frozenxid, datfrozenxid)) ||
+		(MultiXactIdIsValid(k->minmxid) &&
+		 MultiXactIdPrecedes(k->minmxid, datminmxid)))
+		return false;
+	n = bmap_snapshot_list(smgropen(kept_locator(k), INVALID_PROC_NUMBER),
+						   snaps, BMAP_SNAPSHOTS_MAX);
+	for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX); s++)
+	{
+		if (snaps[s].id == k->snapshot)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Give the session branch's relations kept[] back the pages keep() kept
+ * (see branch_ops.h).
+ */
+static bool
+copies_restore(const BranchKeptRelation *kept, int nkept,
+			   BranchKeptRelation *renewed)
+{
+	Relation	pg_class;
+	HeapTuple	dbtup;
+	TransactionId datfrozenxid;
+	MultiXactId datminmxid;
+	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
+	bool	   *changed = palloc0_array(bool, Max(nkept, 1));
+	bool		any = false;
+	bool		ok = true;
+
+	let_go_of_abandoned();
+	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(dbtup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
+	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
+	ReleaseSysCache(dbtup);
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	/* (each checked before any is restored) */
+	for (int i = 0; i < nkept && ok; i++)
+	{
+		rows[i] = class_row(pg_class, kept[i].relid, MyBranch);
+		if (rows[i] == NULL ||
+			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i],
+						 datfrozenxid, datminmxid))
+			ok = false;
+		else if (!bmap_snapshot_unchanged(smgropen(kept_locator(&kept[i]),
+												   INVALID_PROC_NUMBER),
+										  kept[i].snapshot))
+			any = true;
+	}
+
+	/*
+	 * If any changed, every one is given new storage, locked first as
+	 * TRUNCATE locks it: one whose pages didn't change may still hold, in
+	 * its buffers, hints true of it as it is alone (an index entry dead
+	 * because its row is), which the storage keeping the pages never got.
+	 */
+	for (int i = 0; i < nkept && ok && any; i++)
+	{
+		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
+			ok = false;
+		changed[i] = true;
+	}
+
+	for (int i = 0; i < nkept && ok; i++)
+	{
+		const BranchKeptRelation *k = &kept[i];
+		HeapTuple	o = rows[i];
+		Form_pg_class oc = (Form_pg_class) GETSTRUCT(o);
+		RelFileNumber relnumber;
+		SMgrRelation nrel;
+
+		renewed[i] = *k;
+		if (!changed[i])
+			continue;
+		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
+										oc->relpersistence);
+		nrel = RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
+												 smgropen(kept_locator(k),
+														  INVALID_PROC_NUMBER),
+												 k->snapshot, true);
+		renewed[i].relfilenumber = relnumber;
+		renewed[i].snapshot = bmap_snapshot_take(nrel);
+		note_taken(class_locator(oc, relnumber), renewed[i].snapshot);
+		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
+		oc->relfilenode = relnumber;
+		if (TransactionIdIsNormal(k->frozenxid))
+			oc->relfrozenxid = k->frozenxid;
+		if (MultiXactIdIsValid(k->minmxid))
+			oc->relminmxid = k->minmxid;
+		oc->relallvisible = 0;
+		oc->relallfrozen = 0;
+		CatalogTupleUpdate(pg_class, &o->t_self, o);
+		pgstat_count_prolly(PGSTAT_PROLLY_RELATIONS_RESTORED, 1);
+	}
+	if (ok && any)
+		CommandCounterIncrement();
+	table_close(pg_class, RowExclusiveLock);
+	for (int i = 0; i < nkept; i++)
+	{
+		if (rows[i])
+			heap_freetuple(rows[i]);
+	}
+	pfree(rows);
+	pfree(changed);
+	return ok;
+}
+
+static void
+copies_let_go(const BranchKeptRelation *kept)
+{
+	let_go_of(kept_locator(kept), kept->snapshot);
+}
+
 static const BranchOpsRoutine branch_copies = {
 	.name = "copies",
 	.create = copies_create,
@@ -858,6 +1227,9 @@ static const BranchOpsRoutine branch_copies = {
 	.branches = copies_branches,
 	.run_on = copies_run_on,
 	.share = copies_share,
+	.keep = copies_keep,
+	.restore = copies_restore,
+	.let_go = copies_let_go,
 };
 
 const BranchOpsRoutine *

@@ -199,6 +199,7 @@ tests += {
       'rebase',
       'bmap_tree_share',
       'bmap_tree_snapshots',
+      'kept_pages',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -316,6 +317,7 @@ tests += {
       't/192_bmap_tree_snapshots.pl',
       't/193_bmap_dropped_buffers.pl',
       't/194_bmap_snapshot_redo.pl',
+      't/200_kept_pages_recovery.pl',
     ],
   },
 }

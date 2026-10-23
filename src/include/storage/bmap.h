@@ -137,6 +137,7 @@ typedef struct BmapSnapshot
 extern uint64 bmap_snapshot_take(SMgrRelation reln);
 extern bool bmap_snapshot_release(SMgrRelation reln, uint64 id);
 extern int	bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max);
+extern bool bmap_snapshot_unchanged(SMgrRelation reln, uint64 id);
 extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst);
 
 /* inspection, for tests */

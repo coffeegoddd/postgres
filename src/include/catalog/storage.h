@@ -35,6 +35,10 @@ extern SMgrRelation RelationCreateStorageWith(RelFileLocator rlocator,
 extern SMgrRelation RelationCreateStorageShared(RelFileLocator rlocator,
 												SMgrRelation src,
 												bool register_delete);
+extern SMgrRelation RelationCreateStorageFromSnapshot(RelFileLocator rlocator,
+													  SMgrRelation src,
+													  uint64 snapshot,
+													  bool register_delete);
 extern void RelationDropStorage(Relation rel);
 extern void RelationDropStorageByLocator(RelFileLocator rlocator);
 extern void RelationPreserveStorage(RelFileLocator rlocator, bool atCommit);
