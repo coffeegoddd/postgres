@@ -4397,6 +4397,7 @@ check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 	old = MemoryContextSwitchTo(plans);
 	merge_plan_begin(&text_plan);
 	merge_plan_begin(&cast_plan);
+	initStringInfo(&unchanged);
 	MemoryContextSwitchTo(old);
 	(void) merge_table(relid, text_base, ours, theirs, WALK_PLAN, NULL, NULL,
 					   text_unsure, &text_plan);
@@ -4408,7 +4409,6 @@ check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 	env.compare = keying_compare;
 	env.compare_arg = &rd;
 	prolly_keying_use_env(&krefs, rd.kr, rd.k, tree, &env);
-	initStringInfo(&unchanged);
 	merge_plan_rewind(&text_plan);
 	merge_plan_rewind(&cast_plan);
 	while (text_plan.has_current || cast_plan.has_current)
@@ -4446,7 +4446,6 @@ check_merge_readings(Oid relid, const Table *text_base, const Table *cast_base,
 	BufFileClose(text_plan.file);
 	BufFileClose(cast_plan.file);
 	MemoryContextDelete(plans);
-	pfree(unchanged.data);
 	PROLLY_CALL(rd.kr, close, rd.k);
 	table_close(rel, AccessShareLock);
 }
