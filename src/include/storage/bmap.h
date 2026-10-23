@@ -89,11 +89,6 @@ extern void bmapregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	bmapfd(SMgrRelation reln, ForkNumber forknum,
 				   BlockNumber blocknum, uint32 *off);
 
-/* sync handler callbacks (maps unlinked after a checkpoint) */
-extern int	bmapsyncfiletag(const FileTag *ftag, char *path);
-extern int	bmapunlinkfiletag(const FileTag *ftag, char *path);
-extern bool bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate);
-
 /* remove a database's unused block map from a tablespace's directory */
 extern void bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path);
 

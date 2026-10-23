@@ -131,11 +131,14 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  fold_objects                  |     1
  fold_tables                   |     1
  fold_incremental              |     1
+ bmap_pages_preserved          |     0
+ move_plans                    |     0
+ first_use_sources_busy        |     0
  bmap_release_queued           |     0
  bmap_release_drained          |     0
  bmap_release_blocks_freed     |     0
  bmap_release_refcount_updates |     0
-(79 rows)
+(82 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
