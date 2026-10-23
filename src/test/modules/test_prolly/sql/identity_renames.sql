@@ -158,12 +158,49 @@ SELECT length(dolt_commit('-Am', 't base')::text) AS committed;
 SELECT dolt_branch('t_theirs');
 ALTER TABLE app.t RENAME TO renamed_t;
 UPDATE app.renamed_t SET v = 'uno' WHERE id = 1;
+-- (uncommitted: one table renamed, its rows changed too; a version read
+-- alone, by dolt_at or history, finds its tables by name, as Dolt's AS OF)
+SELECT * FROM dolt_at('HEAD', NULL::app.renamed_t) ORDER BY id;
+SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
+FROM dolt_diff_summary('HEAD', 'WORKING');
 SELECT length(dolt_commit('-Am', 't renamed and changed')::text) AS committed;
+SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
+FROM dolt_diff_summary('HEAD~1', 'HEAD');
+SELECT table_name, rows_unmodified, rows_added, rows_deleted, rows_modified
+FROM dolt_diff_stat('HEAD~1', 'HEAD');
+SELECT (from_row).v AS from_v, (to_row).v AS to_v, diff_type
+FROM dolt_diff('HEAD~1', 'HEAD', NULL::app.renamed_t);
 ALTER TABLE app.renamed_t SET SCHEMA other;
 SELECT length(dolt_commit('-Am', 't moved')::text) AS committed;
+SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
+FROM dolt_diff_summary('HEAD~2', 'HEAD');
+SELECT * FROM dolt_at('HEAD~2', NULL::other.renamed_t) ORDER BY id;
+SELECT count(*) FROM dolt_history_table(NULL::other.renamed_t);
+-- the old name reused: an unrelated table, not the renamed one, in diffs
 CREATE TABLE app.t (id int PRIMARY KEY, v text);
 INSERT INTO app.t VALUES (9, 'nine');
 SELECT length(dolt_commit('-Am', 'new t')::text) AS committed;
+SELECT from_table_name, to_table_name, diff_type
+FROM dolt_diff_summary('HEAD~3', 'HEAD') ORDER BY 1, 2;
+SELECT * FROM dolt_at('HEAD~3', NULL::app.t) ORDER BY id;
+SELECT (from_row).id AS from_id, (to_row).id AS to_id, diff_type
+FROM dolt_diff('HEAD~3', 'HEAD', NULL::app.t);
+
+-- Tables alike but unrelated: one dropped and another made, not a rename.
+CREATE TABLE app.alike1 (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'alike1')::text) AS committed;
+DROP TABLE app.alike1;
+CREATE TABLE app.alike2 (id int PRIMARY KEY);
+SELECT from_table_name, to_table_name, diff_type
+FROM dolt_diff_summary('HEAD', 'WORKING') ORDER BY 1, 2;
+SELECT dolt_reset('--hard');
+-- A pure rename is one renamed table; renamed again, still the one.
+ALTER TABLE app.alike1 RENAME TO alike3;
+SELECT length(dolt_commit('-Am', 'alike3')::text) AS committed;
+ALTER TABLE app.alike3 RENAME TO alike4;
+SELECT length(dolt_commit('-Am', 'alike4')::text) AS committed;
+SELECT from_table_name, to_table_name, diff_type, data_change
+FROM dolt_diff_summary('HEAD~2', 'HEAD');
 SELECT dolt_checkout('t_theirs');
 UPDATE app.t SET v = 'dos' WHERE id = 2;
 SELECT length(dolt_commit('-Am', 't theirs')::text) AS committed;
@@ -172,6 +209,26 @@ SELECT (dolt_merge('t_theirs'))[3] AS conflicts;
 SELECT * FROM other.renamed_t ORDER BY id;
 SELECT * FROM app.t ORDER BY id;
 SELECT * FROM dolt_status;
+-- Both sides rename a table: alike merges, otherwise a schema conflict.
+CREATE TABLE app.both (id int PRIMARY KEY, v text);
+INSERT INTO app.both VALUES (1, 'one'), (2, 'two');
+SELECT length(dolt_commit('-Am', 'both base')::text) AS committed;
+SELECT dolt_branch('both_alike');
+SELECT dolt_branch('both_otherwise');
+ALTER TABLE app.both RENAME TO both_renamed;
+UPDATE app.both_renamed SET v = 'uno' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'both ours')::text) AS committed;
+SELECT dolt_checkout('both_alike');
+ALTER TABLE app.both RENAME TO both_renamed;
+UPDATE app.both_renamed SET v = 'dos' WHERE id = 2;
+SELECT length(dolt_commit('-Am', 'both alike')::text) AS committed;
+SELECT dolt_checkout('both_otherwise');
+ALTER TABLE app.both RENAME TO both_elsewhere;
+SELECT length(dolt_commit('-Am', 'both otherwise')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('both_alike'))[3] AS conflicts;
+SELECT * FROM app.both_renamed ORDER BY id;
+SELECT dolt_merge('both_otherwise');
 
 -- A pick of a change to a column renamed since; then a reset to before the
 -- rename, after which a rename is still told from a drop and an add.

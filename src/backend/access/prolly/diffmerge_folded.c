@@ -589,9 +589,9 @@ identities_known(void)
 }
 
 /*
- * renames but those of tables renamed (or moved out of the way): a version's
- * tables are read by their names, as summaries pair them, and only their
- * columns by identity (a table renamed, its columns too, is left as it is).
+ * renames but those of tables renamed (or moved out of the way), and their
+ * columns': a version read alone, its tables by their names, as Dolt's
+ * AS OF and history read them.
  */
 static List *
 columns_only(List *renames)
@@ -649,8 +649,60 @@ renames_to_working(const ProllyNodeRef *root, const StringInfoData *identity,
 	}
 	to.data = (const uint8 *) w->identity.data;
 	to.len = w->identity.len;
-	return columns_only(PROLLY_CALL(components().canonicalizer, renames, root,
-									&from, &w->root, &to));
+	return PROLLY_CALL(components().canonicalizer, renames, root, &from,
+					   &w->root, &to);
+}
+
+/* A ref's identity record into *out: a commit's, or WORKING's. */
+static void
+ref_identity(const char *ref, StringInfo out)
+{
+	ProllyHash	id;
+
+	if (ref == NULL)
+		return;
+	if (is_working(ref))
+		PROLLY_CALL(components().refs, working_identity, InvalidOid, out);
+	else if (PROLLY_CALL(components().refs, resolve, ref, &id))
+		commit_identity(&id, out);
+}
+
+/*
+ * The tables renamed (by identity) from one ref's root to another's, for
+ * a summary to pair: renames() of tables alone (NIL if none).
+ */
+static List *
+table_renames(const char *from_ref, const ProllyNodeRef *from_root,
+			  const char *to_ref, const ProllyNodeRef *to_root)
+{
+	StringInfoData fi;
+	StringInfoData ti;
+	ProllyValue fv;
+	ProllyValue tv;
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	if (!identities_known())
+		return NIL;
+	initStringInfo(&fi);
+	initStringInfo(&ti);
+	ref_identity(from_ref, &fi);
+	ref_identity(to_ref, &ti);
+	if (fi.len == 0 && ti.len == 0)
+		return NIL;
+	fv.data = (const uint8 *) fi.data;
+	fv.len = fi.len;
+	tv.data = (const uint8 *) ti.data;
+	tv.len = ti.len;
+	foreach(lc, PROLLY_CALL(components().canonicalizer, renames, from_root,
+							&fv, to_root, &tv))
+	{
+		ProllyRename *r = lfirst(lc);
+
+		if (r->column == NULL)
+			tables = lappend(tables, r);
+	}
+	return tables;
 }
 
 static int
@@ -711,11 +763,13 @@ renamed_tables(List *tables, List *renames)
 
 /*
  * A version's tables, as tables_of() reads them, named as the working set
- * names them (relid valid: the table of the working set's relid alone,
- * found by identity).
+ * names them (relid valid: the table of the working set's relid alone):
+ * its columns by identity, and its tables too with follow_tables (a diff,
+ * which pairs a table renamed as one, as Dolt's does), else by name (a
+ * version read alone).
  */
 static List *
-version_tables(const char *ref, Oid relid)
+version_tables(const char *ref, Oid relid, bool follow_tables)
 {
 	ProllyNodeRef root;
 	ProllyHash	id;
@@ -730,6 +784,8 @@ version_tables(const char *ref, Oid relid)
 	initStringInfo(&identity);
 	commit_identity(&id, &identity);
 	renames = renames_to_working(&root, &identity, relid);
+	if (!follow_tables)
+		renames = columns_only(renames);
 	if (renames == NIL)
 		return root_tables(&root, ref, relid);
 	tables = renamed_tables(root_tables(&root, ref, InvalidOid), renames);
@@ -1128,7 +1184,7 @@ diff_working_from_changes(const char *from_ref, Oid relid,
 	ok = refs->working_changes(relid, &base, buffer_change, &bc);
 	if (ok)
 	{
-		from = version_tables(from_ref, relid);
+		from = version_tables(from_ref, relid, true);
 		now = tables_defined_now(relid);
 		f = from ? linitial(from) : NULL;
 		n = now ? linitial(now) : NULL;
@@ -1311,11 +1367,11 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 	if (OidIsValid(relid) && is_working(to_ref) && !is_working(from_ref) &&
 		diff_working_from_changes(from_ref, relid, sink))
 		return;
-	from = version_tables(from_ref, relid);
+	from = version_tables(from_ref, relid, from_ref != NULL);
 
 	/* (WORKING folded once) */
 	to = is_working(to_ref) && is_working(from_ref) ? from :
-		version_tables(to_ref, relid);
+		version_tables(to_ref, relid, from_ref != NULL);
 
 	/*
 	 * Rows are read as the tables are defined now: the working set's
@@ -1732,6 +1788,7 @@ folded_summary(const char *from_ref, const char *to_ref, bool definitions,
 	sc.left_out = left_out;
 	if (!same_hash(&from_root.hash, &to_root.hash))
 		PROLLY_CALL(components().canonicalizer, changes, &from_root, &to_root,
+					table_renames(from_ref, &from_root, to_ref, &to_root),
 					summary_change, &sc);
 
 	list_sort(left_out, string_cmp);

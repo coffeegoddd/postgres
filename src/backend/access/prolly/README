@@ -178,8 +178,13 @@ read of one table identifies that table alone.
 
 Reads match versions by identity.  dolt_at, dolt_history_table,
 dolt_diff_table, row diffs, and a merge's conflict listing read each
-version's columns under the names the working set gives the same columns
-(its tables by name, as a summary pairs them).  The canonicalizer's
+version's columns under the names the working set gives the same columns.
+Diffs read its tables that way too, and a summary (the canonicalizer's
+changes()) pairs a table renamed as one renamed table, its rows and
+definition perhaps changed too.  dolt_at and dolt_history_table read a
+version's table by its name, as Dolt's AS OF and history do.  Between
+roots of format 17, which tell no renames, a dropped and an added table
+alike but for their names are still one renamed.  The canonicalizer's
 renames() works out the renames and rename_description() applies them in
 memory, so nothing is written.  A
 merge names base, ours and theirs as one, using merge_renames().  An

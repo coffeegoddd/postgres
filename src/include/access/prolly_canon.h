@@ -306,12 +306,18 @@ typedef struct ProllyCanonRoutine
 
 	/*
 	 * Optional: each object from and to hold differently, tables and the
-	 * rest, by name; a dropped and an added object of a kind whose items
-	 * are the same (definition and rows), and the only such pair, as one
-	 * renamed.  Read from the roots' tree diff: equal subtrees skipped.
+	 * rest, by name; a table renames (ProllyRename *, of tables, from's
+	 * names to to's: renames()'s) says was renamed, dropped by its name in
+	 * from and added by its name in to, as one renamed (its rows and
+	 * definition perhaps changed too).  Where either root is of the format
+	 * before identities were recorded, a dropped and an added object of a
+	 * kind whose items are the same (definition and rows), and the only
+	 * such pair, is one renamed too.  Read from the roots' tree diff: equal
+	 * subtrees skipped.
 	 */
 	void		(*changes) (const ProllyNodeRef *from, const ProllyNodeRef *to,
-							ProllyCanonChangeVisit visit, void *arg);
+							List *renames, ProllyCanonChangeVisit visit,
+							void *arg);
 
 	/*
 	 * Optional: the statements that make the object of kind object named

@@ -82,11 +82,6 @@
       "expect": {
         "rows": [
           [
-            "1",
-            "2",
-            "added"
-          ],
-          [
             "3",
             "4",
             "added"
@@ -105,11 +100,6 @@
       "sql": "SELECT (to_row).a, (to_row).b, diff_type FROM dolt_diff('HEAD~', 'HEAD', NULL::t2)",
       "expect": {
         "rows": [
-          [
-            "1",
-            "2",
-            "added"
-          ],
           [
             "3",
             "4",

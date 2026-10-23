@@ -6159,17 +6159,110 @@ typedef struct ContentMatch
 
 /*
  * Each object from and to hold differently, by name: what the roots' tree
- * diff gives (equal subtrees skipped), objects of a kind dropped and added
- * with the same item (but for their own names), and the only such pair,
- * made one renamed.
+ * diff gives (equal subtrees skipped); a table renames says was renamed
+ * (by identity, which a rename keeps), dropped by one name and added by
+ * another, made one renamed, its rows and definition perhaps changed too.
+ * Objects of a kind dropped and added with the same item (but for their
+ * own names), and the only such pair, are made one renamed: tables only
+ * where either root is of the format before identities were recorded,
+ * which tells no renames, so that unrelated tables that happen to be
+ * alike aren't, where identities are known.
  */
 static void folded_render(char object, const char *name, const ProllyValue *item,
 						  StringInfo out);
 
+static Changed *
+dropped_or_added(List *changed, const char *name, bool dropped)
+{
+	ListCell   *lc;
+
+	foreach(lc, changed)
+	{
+		Changed    *c = lfirst(lc);
+
+		if (c->object == PROLLY_OBJECT_TABLE &&
+			(dropped ? c->from_name && !c->to_name &&
+			 strcmp(c->from_name, name) == 0 :
+			 c->to_name && !c->from_name && strcmp(c->to_name, name) == 0))
+			return c;
+	}
+	return NULL;
+}
+
+/*
+ * One side's part of a changed object, the other's NULL: dropped or added,
+ * as note_change() notes one.
+ */
+static void
+one_side(Changed *c, const ProllyValue *v, const char *name)
+{
+	StringInfoData key;
+	ProllyKey	k;
+
+	initStringInfo(&key);
+	appendStringInfoChar(&key, c->object);
+	appendStringInfoChar(&key, ':');
+	append_utf8(&key, name);
+	k.data = (const uint8 *) key.data;
+	k.len = key.len;
+	c->data_change = holds_data(&k, v);
+	c->schema_change = true;
+	c->masked = masked_item(v, name);
+	c->content = hash_bytes_extended(c->masked.data, c->masked.len,
+									 (uint64) c->object);
+}
+
+/*
+ * A table changed under name, in both roots, made a drop of from's and an
+ * add of to's: they are other tables, one renamed away from the name or to
+ * it.  False if none is.
+ */
+static bool
+split_changed(ChangesWalk *w, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, w->changed)
+	{
+		Changed    *c = lfirst(lc);
+		Changed    *a;
+
+		if (c->object != PROLLY_OBJECT_TABLE || !c->from_name || !c->to_name ||
+			strcmp(c->from_name, name) != 0 || strcmp(c->to_name, name) != 0)
+			continue;
+		a = palloc0(sizeof(Changed));
+		a->object = c->object;
+		a->to_name = c->to_name;
+		a->to = c->to;
+		one_side(a, &a->to, name);
+		c->to_name = NULL;
+		one_side(c, &c->from, name);
+		w->changed = lappend(w->changed, a);
+		return true;
+	}
+	return false;
+}
+
+/* Is a folded root of the format before identities were recorded? */
+static bool
+root_before_identities(Canon *cn, const ProllyNodeRef *root)
+{
+	StringInfoData v;
+	ProllyKey	want = {(const uint8 *) "!:format", 8};
+	bool		before;
+
+	initStringInfo(&v);
+	before = PROLLY_CALL(cn->tree, get, &cn->env, root, &want, &v) &&
+		strcmp(v.data, FOLDED_FORMAT_READ) == 0;
+	pfree(v.data);
+	return before;
+}
+
 static void
 folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
-			   ProllyCanonChangeVisit visit, void *arg)
+			   List *renames, ProllyCanonChangeVisit visit, void *arg)
 {
+	bool		tables_known;
 	Canon		cn;
 	ChangesWalk w = {NIL, false};
 	HTAB	   *matches;
@@ -6183,7 +6276,48 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	w.same_format = root_in_format(&cn, from) == root_in_format(&cn, to);
 	PROLLY_CALL(cn.tree, diff, &cn.env, from, to, note_change, &w);
 
-	/* renames: a dropped and an added object of one content, alone */
+	/* tables renamed, by identity */
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		Changed    *d;
+		Changed    *a;
+		ProllyNodeRef rd;
+		ProllyNodeRef ra;
+		ProllyValue def;
+		StringInfoData key;
+		ProllyKey	k;
+
+		if (r->column != NULL)
+			continue;
+		/* (a name another table has since, or had before: that one apart) */
+		if (dropped_or_added(w.changed, r->table, true) == NULL)
+			(void) split_changed(&w, r->table);
+		if (dropped_or_added(w.changed, r->to, false) == NULL)
+			(void) split_changed(&w, r->to);
+		if ((d = dropped_or_added(w.changed, r->table, true)) == NULL ||
+			(a = dropped_or_added(w.changed, r->to, false)) == NULL)
+			continue;
+		initStringInfo(&key);
+		appendStringInfoString(&key, "t:");
+		k.data = (const uint8 *) key.data;
+		k.len = key.len;
+		(void) tree_item(&k, &d->from, &rd, &def);
+		(void) tree_item(&k, &a->to, &ra, &def);
+		d->to_name = a->to_name;
+		d->to = a->to;
+		d->data_change = !(rd.hash.len == ra.hash.len &&
+						   memcmp(rd.hash.bytes, ra.hash.bytes, rd.hash.len) == 0);
+		d->schema_change = true;
+		w.changed = list_delete_ptr(w.changed, a);
+	}
+	tables_known = !root_before_identities(&cn, from) &&
+		!root_before_identities(&cn, to);
+
+	/*
+	 * renames: a dropped and an added object of one content, alone (not a
+	 * table, where identities tell renames)
+	 */
 	ctl.keysize = sizeof(uint64);
 	ctl.entrysize = sizeof(ContentMatch);
 	ctl.hcxt = CurrentMemoryContext;
@@ -6194,7 +6328,8 @@ folded_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 		Changed    *c = lfirst(lc);
 		bool		found;
 
-		if (c->from_name && c->to_name)
+		if ((c->from_name && c->to_name) ||
+			(tables_known && c->object == PROLLY_OBJECT_TABLE))
 			continue;
 		m = hash_search(matches, &c->content, HASH_ENTER, &found);
 		if (!found)
