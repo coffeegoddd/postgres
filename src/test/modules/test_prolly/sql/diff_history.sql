@@ -159,8 +159,10 @@ SELECT length(dolt_commit('-am', 'kl keyed')::text) AS committed;
 SELECT diff_type, from_row, to_row FROM dolt_diff_table(NULL::dh.kl, 'HEAD~1', 'HEAD');
 SELECT * FROM dolt_at('HEAD~1', NULL::dh.kl) ORDER BY i;
 
--- A renamed key is absent when older rows are read by name.  Every old
--- row must survive, even when the projected rows are identical (#653).
+-- A renamed key is absent when older rows are read by name, as history
+-- made before identities were recorded reads (each rename below is
+-- recorded so: test_anchor_by_name()).  Every old row must survive, even
+-- when the projected rows are identical (#653).
 CREATE TABLE dh.rpk (pk int PRIMARY KEY, v int);
 INSERT INTO dh.rpk VALUES (1, 7), (2, 7), (3, 7);
 CREATE TABLE dh.rcpk (a numeric, b int, v int, PRIMARY KEY (a, b));
@@ -169,6 +171,7 @@ SELECT length(dolt_commit('-Am', 'before key rename')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS before_rename \gset
 ALTER TABLE dh.rpk RENAME COLUMN pk TO pk2;
 ALTER TABLE dh.rcpk RENAME COLUMN b TO b2;
+SELECT test_anchor_by_name();
 -- A rename alone still changes no stored row.
 SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::dh.rpk);
 UPDATE dh.rpk SET v = 9 WHERE pk2 = 1;
@@ -194,6 +197,7 @@ SELECT count(*) FROM dolt_history_table(NULL::dh.rpk);
 -- The historical versions use different key names (pk and pk2), neither
 -- current.  Do not infer rename identity: equal projected copies cancel.
 ALTER TABLE dh.rpk RENAME COLUMN pk2 TO pk3;
+SELECT test_anchor_by_name();
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'before_rename', 'HEAD', NULL::dh.rpk)
 ORDER BY diff_type, (from_row).v, (to_row).v;
@@ -219,6 +223,7 @@ SELECT length(dolt_commit('-am', 'old keys changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS old_keys_changed \gset
 ALTER TABLE dh.oldpk RENAME COLUMN pk TO id;
 ALTER TABLE dh.oldcpk RENAME COLUMN b TO b2;
+SELECT test_anchor_by_name();
 SELECT length(dolt_commit('-am', 'old keys renamed')::text) AS committed;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'old_keys_base', :'old_keys_changed', NULL::dh.oldpk)
@@ -263,6 +268,7 @@ UPDATE dh.spillpk SET v = 'changed' WHERE pk = 1;
 SELECT length(dolt_commit('-am', 'spill changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS spill_changed \gset
 ALTER TABLE dh.spillpk RENAME COLUMN pk TO id;
+SELECT test_anchor_by_name();
 SET work_mem = '64kB';
 SELECT diff_type, count(*) FROM dolt_diff(:'spill_base', :'spill_changed', NULL::dh.spillpk)
 GROUP BY diff_type ORDER BY diff_type;
@@ -287,6 +293,7 @@ CREATE TABLE dh.hc (pk int PRIMARY KEY, c2 int, note text);
 INSERT INTO dh.hc VALUES (1, -1, 'same'), (2, -2, 'same'), (3, NULL, 'same');
 SELECT length(dolt_commit('-Am', 'hc initial')::text) AS committed;
 ALTER TABLE dh.hc RENAME COLUMN c2 TO c3;
+SELECT test_anchor_by_name();
 SELECT length(dolt_commit('-am', 'hc renamed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS hc_before \gset
 UPDATE dh.hc SET c3 = 1 WHERE pk = 1;
@@ -294,6 +301,7 @@ UPDATE dh.hc SET c3 = 0 WHERE pk = 3;
 SELECT length(dolt_commit('-am', 'hc changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS hc_after \gset
 ALTER TABLE dh.hc RENAME COLUMN c3 TO c2;
+SELECT test_anchor_by_name();
 SELECT length(dolt_commit('-am', 'hc renamed back')::text) AS committed;
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'hc_before', :'hc_after', NULL::dh.hc) ORDER BY (to_row).pk;
@@ -324,6 +332,7 @@ SELECT length(dolt_commit('-am', 'hidden values changed')::text) AS committed;
 SELECT dolt_hashof('HEAD') AS hidden_after \gset
 ALTER TABLE dh.hk RENAME COLUMN v TO renamed;
 ALTER TABLE dh.hl RENAME COLUMN v TO renamed;
+SELECT test_anchor_by_name();
 -- Fitting visible values and comparing hidden values work together.
 ALTER TABLE dh.hl ALTER COLUMN visible TYPE varchar(3) USING left(visible, 3);
 SELECT diff_type, from_row, to_row
@@ -333,6 +342,7 @@ FROM dolt_diff(:'hidden_before', :'hidden_after', NULL::dh.hl) ORDER BY (to_row)
 -- The same stored composite key also matches when a current key component
 -- is absent.  A hidden edit is modified even with identical displayed rows.
 ALTER TABLE dh.hl RENAME COLUMN b TO b_now;
+SELECT test_anchor_by_name();
 SELECT diff_type, (from_row).a AS from_a, (to_row).a AS to_a,
        (from_row).b_now IS NULL AND (to_row).b_now IS NULL AS missing_key,
        from_row IS NOT DISTINCT FROM to_row AS same_display
@@ -352,6 +362,7 @@ UPDATE dh.ho SET x = CASE pk WHEN 1 THEN 'changed' ELSE 'two' END;
 SELECT length(dolt_commit('-am', 'hidden column order changed')::text) AS committed;
 ALTER TABLE dh.ho RENAME COLUMN x TO x_now;
 ALTER TABLE dh.ho RENAME COLUMN y TO y_now;
+SELECT test_anchor_by_name();
 SELECT diff_type, from_row, to_row
 FROM dolt_diff(:'order_before', 'HEAD', NULL::dh.ho) ORDER BY (to_row).pk;
 

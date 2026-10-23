@@ -18,9 +18,9 @@ permanent. GitHub issues track plans and changes:
   schema-conflict errors.
 - [#702](https://github.com/coffeegoddd/postgres/issues/702) revisits D12/D13's
   constraint-violation rows and artifacts.
-- [#700](https://github.com/coffeegoddd/postgres/issues/700) and
-  [#699](https://github.com/coffeegoddd/postgres/issues/699) revisit D17/D18's
-  table and column identity.
+- [#699](https://github.com/coffeegoddd/postgres/issues/699) changed D18's
+  column matching to follow identity; [#700](https://github.com/coffeegoddd/postgres/issues/700)
+  revisits D17's table renames.
 - [#710](https://github.com/coffeegoddd/postgres/issues/710) tracks documenting
   PostGIS NaN points' send/receive round trip; it is not assigned an ID here.
 
@@ -456,14 +456,18 @@ OF` are built in D18's shapes.
   support estimates its rows from the commit's tree, [historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md)). The `dolt_diff`
   view, over `dolt_diff()`, is the system table, every kind of object
   listed (D15). Rows of other versions are decoded as the table is
-  defined now, by column name ([historical design 21](https://github.com/coffeegoddd/postgres/blob/28cca9345d/specs/21-schema-diffs.md), decision 3), where Dolt follows
-  column tags: a column dropped changes no row (the rows read the
-  same); a column renamed reads as NULL in versions before the rename,
-  so a row diff across it shows the row modified (or a stat counts the
-  cell); a column of another type in an older version is converted to
+  defined now, their columns matched by identity, which renames keep,
+  as Dolt's column tags are (#699): a column renamed reads its values in
+  versions before the rename. A column
+  dropped changes no row (the rows read the same); one dropped and
+  another of its name added has the dropped one's identity, as Dolt's
+  tags do. A column of another type in an older version is converted to
   today's type (text `'3'` reads as integer 3, where Dolt gives NULL).
-  A table's history is followed by its name: one dropped and made again
-  has both tables' rows. Each also takes the table's name as text, for a
+  History made before identities were recorded (format 17) has every
+  object under its own name's identity, so a rename there reads as a
+  drop and an add: the renamed column as NULL before it. A table's
+  history is followed by its name: one dropped and made again has both
+  tables' rows. Each also takes the table's name as text, for a
   table the session hasn't (#612): `dolt_diff_table('t' [, from_ref,
   to_ref])` and `dolt_history_table('t')`, the same columns with the
   rows as `jsonb`, each version's decoded as that version defines the
@@ -473,7 +477,7 @@ OF` are built in D18's shapes.
 - **Port:** `SELECT * FROM dolt_diff_t` becomes `dolt_diff_table(NULL::t)`
   with `(to_row).col` for `to_col`; `AS OF 'r'` becomes `dolt_at('r',
   NULL::t)`; `dolt_history_t` becomes `dolt_history_table(NULL::t)` with
-  `(row).col`. Expected rows follow the reading by name. A case reading
+  `(row).col`. Expected rows follow the reading by identity, as defined now. A case reading
   a table that doesn't exist now names it as text and reads
   `to_row->>'col'`.
 

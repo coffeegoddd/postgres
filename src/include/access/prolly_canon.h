@@ -61,6 +61,12 @@
  *   without breaking().  rewritten says rows() writes every table's rows
  *   as to has them, so those the branch has needn't be kept: a table whose
  *   columns change type loses its rows first rather than converting them.
+ * - Identity: a table or column keeps its identity through renames, but a
+ *   root, by name, holds none of it.  identify() gives the working set's
+ *   (as an identity record a commit keeps beside its root, and an anchor
+ *   for the next time); renames(), merge_renames(), rename_description()
+ *   and rename_root() read one version's objects under another's names,
+ *   and rename_objects() renames the branch's own.
  *
  * Provisional (v0).
  *
@@ -161,6 +167,20 @@ typedef struct ProllyRowChanges
 	ItemPointerData *tids;
 	int			ntids;
 } ProllyRowChanges;
+
+/*
+ * A rename that makes a version's names another's: table (qualified,
+ * quoted, in the server's encoding) as the version names it; column (its
+ * name, unquoted) or NULL for the table itself; to, the name it takes (a
+ * table's qualified and quoted).  A list of renames is applied all at
+ * once: a swap of two names is two renames.
+ */
+typedef struct ProllyRename
+{
+	char	   *table;
+	char	   *column;
+	char	   *to;
+} ProllyRename;
 
 /* A constraint a move adds: its table (qualified, quoted) and name. */
 typedef struct ProllyAddedConstraint
@@ -366,6 +386,65 @@ typedef struct ProllyCanonRoutine
 	 * in versioned schemas before the move that makes the rest.
 	 */
 	void		(*make_versioned_schemas) (List *names);
+
+	/*
+	 * Optional: the identity of the session branch's tables and columns,
+	 * into *identity, as a commit records it beside its root; and what to
+	 * find it from next time, into *next_anchor (by the branch's own
+	 * relations and attributes, which a rename keeps).  Each table and
+	 * column is found in anchor (a next_anchor given before; NULL: none),
+	 * else by its name in known (an identity record, NULL: none), else
+	 * given its own name's identity: anchor NULL and known a root's record
+	 * for a working set just made that root's.  With only valid, only that
+	 * table is identified (and next_anchor is NULL).
+	 */
+	void		(*identify) (const ProllyValue *anchor, const ProllyValue *known,
+							 Oid only, StringInfo identity,
+							 StringInfo next_anchor);
+
+	/*
+	 * Optional: the renames (ProllyRename *) that make from's tables and
+	 * columns (by identity record from_identity) have the names to's (by
+	 * to_identity) of the same identity have; and that move each other
+	 * out of the way of a name to gives an object of another identity, so
+	 * that it reads as gone.  An identity record NULL or empty gives every
+	 * object its own name's identity.
+	 */
+	List	   *(*renames) (const ProllyNodeRef *from,
+							const ProllyValue *from_identity,
+							const ProllyNodeRef *to,
+							const ProllyValue *to_identity);
+
+	/*
+	 * Optional: the names a merge of three roots (base, ours, theirs; by
+	 * their identity records) gives their tables and columns, as renames
+	 * of each (renames[i], ProllyRename *), and the merged identity record,
+	 * into *identity.  An object renamed on one side takes that side's
+	 * name; renamed otherwise on both, or two objects of one name, is a
+	 * schema conflict, an error.
+	 */
+	void		(*merge_renames) (const ProllyNodeRef *roots,
+								  const ProllyValue *identities,
+								  List **renames, StringInfo identity);
+
+	/*
+	 * Optional: a table's description (as tables() gives it) with its
+	 * columns renamed as renames say for table (as the description's root
+	 * names it), into *out.
+	 */
+	void		(*rename_description) (const ProllyValue *description,
+									   const char *table, List *renames,
+									   StringInfo out);
+
+	/* Optional: root with renames applied to its tables and columns, into *out. */
+	void		(*rename_root) (const ProllyNodeRef *root, List *renames,
+								ProllyNodeRef *out);
+
+	/*
+	 * Optional: rename the session branch's tables and columns as renames
+	 * say (as a move does, without user event triggers).
+	 */
+	void		(*rename_objects) (List *renames);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -375,9 +454,10 @@ typedef struct ProllyCanonRoutine
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
-	"make_versioned_schemas"
+	"make_versioned_schemas", "identify", "renames", "merge_renames", \
+	"rename_description", "rename_root", "rename_objects"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK make_versioned_schemas
+#define PROLLY_CANON_LAST_CALLBACK rename_objects
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

@@ -45,6 +45,9 @@
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
  *				   then the bytes)
+ *	'I' name	-> the working set's identity anchor (the canonicalizer's
+ *				   identify()), as of a head: the head's hash in hex (none
+ *				   for a branch without commits), a newline, then the anchor
  *
  * A branch without an entry has no commits yet.  A transaction can't
  * commit a merge with unresolved conflicts, or write to a branch that has
@@ -61,6 +64,10 @@
  *				   big-endian: 1 + the most of its parents', a root's 1;
  *				   a commit without it (one made before heights were
  *				   recorded) has its height found from its parents'
+ *	"identity"	-> the identity of its root's tables and columns, which
+ *				   their renames keep (the canonicalizer's identify()):
+ *				   its identity record; none if every object has its own
+ *				   name's
  *	"message"	-> the message
  *	"parents"	-> the parents' ids, each a length byte and the hash
  *	"root"		-> the commit's root (length byte, hash): the canonical
@@ -148,6 +155,7 @@
 #define TAG_NAMES		'N'	/* the head's tables, as named by a full commit */
 #define TAG_MERGE_NAMES	'Q'	/* a merge's conflicted tables' names then */
 #define TAG_STASH		'Z'	/* a list of stashes, by name */
+#define TAG_IDENTITY	'I'	/* the working set's identity anchor */
 
 static bool ready = false;
 
@@ -948,10 +956,21 @@ copied_working_set(const KnownSource *ks, ProllyNodeRef *working)
  * uncommitted work the move discards, as it does any other.  The working
  * set is folded only if nothing known says what it is (#482): the
  * branch's, or (source, a first use's) the working set of the branch its
- * copies were made from, as they are still (#491).
+ * copies were made from, as they are still (#491).  Its identity anchor
+ * is then the commit's: its objects are named as the commit names them.
  */
+static void anchor_at_commit(const ProllyCommitInfo *commit);
+static void settle_rows(const ProllyNodeRef *target, const KnownSource *source);
+
 static void
-settle(const ProllyNodeRef *target, const KnownSource *source)
+settle(const ProllyCommitInfo *commit, const KnownSource *source)
+{
+	settle_rows(&commit->root, source);
+	anchor_at_commit(commit);
+}
+
+static void
+settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 {
 	ProllyDatabaseComponents dc;
 	ProllyNodeRef working;
@@ -1354,7 +1373,7 @@ copies_hold_unseen(void)
 /* A first use's move: to target, from copies of source's (NULL: none). */
 typedef struct MoveCopies
 {
-	const ProllyNodeRef *target;
+	const ProllyCommitInfo *commit;
 	const KnownSource *source;
 } MoveCopies;
 
@@ -1394,14 +1413,14 @@ move_copies(void *arg)
 						 errmsg("could not serialize access: the branch's first use copies rows committed after this transaction's snapshot"),
 						 errhint("The transaction might succeed if retried.")));
 			}
-			settle(mc->target, NULL);
+			settle(mc->commit, NULL);
 		}
 		else
-			settle(mc->target, mc->source);
+			settle(mc->commit, mc->source);
 		return;
 	}
 	PushActiveSnapshot(GetLatestSnapshot());
-	settle(mc->target, mc->source);
+	settle(mc->commit, mc->source);
 	PopActiveSnapshot();
 }
 
@@ -1531,7 +1550,7 @@ materialize(const char *name)
 		 * (moved to the head, unless the copies are there already: those of
 		 * a branch whose working set is, if it still is)
 		 */
-		mc.target = &info.root;
+		mc.commit = &info;
 		mc.source = ns.rank == 3 ? &ns.known : NULL;
 		branch_ops()->run_on(name, move_copies, &mc);
 done:
@@ -1674,7 +1693,8 @@ parents_height(const ProllyHash *parents, int nparents)
  */
 static void
 write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message, ProllyHash *id)
+			 const char *author, const char *message,
+			 const StringInfoData *identity, ProllyHash *id)
 {
 	TimestampTz at = GetCurrentTimestamp();
 	int			nparents_dated = nparents;
@@ -1700,8 +1720,8 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/*
-	 * Keys in order: author, dependencies, height, message, parents, root,
-	 * time.
+	 * Keys in order: author, dependencies, height, identity (if any),
+	 * message, parents, root, time.
 	 */
 	initStringInfo(&v);
 	appendStringInfoString(&v, author);
@@ -1713,6 +1733,8 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	put_uint64(&v, (uint64) parents_height(parents, nparents));
 	add_item(b, "height", &v);
 	resetStringInfo(&v);
+	if (identity && identity->len > 0)
+		add_item(b, "identity", identity);
 	appendStringInfoString(&v, message);
 	add_item(b, "message", &v);
 	resetStringInfo(&v);
@@ -1816,6 +1838,12 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 			info->height = (int64) height;
 			info->has_height = true;
 		}
+	}
+	resetStringInfo(&v);
+	if (read_item(&ref, "identity", &v) && v.len > 0)
+	{
+		info->identity = pnstrdup(v.data, v.len);
+		info->identity_len = v.len;
 	}
 	resetStringInfo(&v);
 	if (read_item(&ref, "time", &v))
@@ -2198,6 +2226,146 @@ carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *nex
 	pfree(v.data);
 }
 
+/*
+ * The working set's identity anchor (the canonicalizer's identify()): what
+ * tells its tables and columns by its own relations and attributes, which
+ * a rename keeps, as of the branch's head (head NULL: none, a branch
+ * without commits).  An anchor of another head is stale (the branch moved
+ * without one made): then the working set's objects are found by name in
+ * the head, which a move left it as.
+ */
+static void
+anchor_key(StringInfo key, const char *name)
+{
+	appendStringInfoChar(key, TAG_IDENTITY);
+	appendStringInfoString(key, name);
+}
+
+static void
+note_anchor(const char *name, const ProllyHash *head, const StringInfoData *anchor)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	anchor_key(&key, name);
+	if (head)
+		appendStringInfoString(&v, prolly_hash_hex(head));
+	appendStringInfoChar(&v, '\n');
+	appendBinaryStringInfo(&v, anchor->data, anchor->len);
+	refs_put(key.data, key.len, &v);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* Branch name's anchor into *anchor, if it is of head (NULL: none). */
+static bool
+anchor_of(const char *name, const ProllyHash *head, StringInfo anchor)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex = head ? prolly_hash_hex(head) : "";
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	anchor_key(&key, name);
+	found = refs_get(key.data, key.len, &v) &&
+		strncmp(v.data, hex, strlen(hex)) == 0 && v.data[strlen(hex)] == '\n';
+	if (found)
+		appendBinaryStringInfo(anchor, v.data + strlen(hex) + 1,
+							   v.len - strlen(hex) - 1);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * The session branch's working identity, into *identity, and (next not
+ * NULL) its next anchor: from its anchor, if it is of its head, and its
+ * head's identity record (none if the branch has no commits).
+ */
+static void
+identify_working(Oid only, StringInfo identity, StringInfo next)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = branch_ops()->current();
+	ProllyHash	head;
+	bool		have_head = branch_head(name, &head);
+	ProllyCommitInfo info;
+	ProllyValue known = {NULL, 0};
+	StringInfoData anchor;
+	ProllyValue av;
+	bool		anchored;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, identify))
+		return;
+	if (have_head && copies_commit_get(&head, &info) && info.identity)
+	{
+		known.data = (const uint8 *) info.identity;
+		known.len = info.identity_len;
+	}
+	initStringInfo(&anchor);
+	anchored = anchor_of(name, have_head ? &head : NULL, &anchor);
+	av.data = (const uint8 *) anchor.data;
+	av.len = anchor.len;
+	PROLLY_CALL(dc.canonicalizer, identify, anchored ? &av : NULL,
+				known.len > 0 ? &known : NULL, only, identity, next);
+	pfree(anchor.data);
+}
+
+/*
+ * Anchor the session branch's working set as what identity record known
+ * (NULL: every object its own name's) describes, as of its head (or head,
+ * if given: the one the branch is about to have): it was just made so.
+ */
+static void
+anchor_working(const ProllyHash *head, const ProllyValue *known)
+{
+	ProllyDatabaseComponents dc;
+	char	   *name = branch_ops()->current();
+	ProllyHash	h;
+	StringInfoData identity;
+	StringInfoData next;
+
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.canonicalizer, identify))
+		return;
+	if (head == NULL && branch_head(name, &h))
+		head = &h;
+	initStringInfo(&identity);
+	initStringInfo(&next);
+	PROLLY_CALL(dc.canonicalizer, identify, NULL, known, InvalidOid,
+				&identity, &next);
+	note_anchor(name, head, &next);
+	pfree(identity.data);
+	pfree(next.data);
+}
+
+/* anchor_working() as commit's identity describes it. */
+static void
+anchor_at_commit(const ProllyCommitInfo *commit)
+{
+	ProllyValue known = {(const uint8 *) commit->identity, commit->identity_len};
+
+	anchor_working(&commit->id, commit->identity ? &known : NULL);
+}
+
+static void
+copies_working_identity(Oid only, StringInfo identity)
+{
+	identify_working(only, identity, NULL);
+}
+
+static void
+copies_anchor_identity(const ProllyValue *identity)
+{
+	lock_refs();
+	anchor_working(NULL, identity);
+}
+
 /* Are rel's name now and its name at head the same? */
 static bool
 named_as_at_head(const char *lines, Relation rel)
@@ -2229,6 +2397,8 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	ProllyNodeRef parent;
 	ProllyHash	head;
 	bool		pushed;
+	StringInfoData identity;
+	StringInfoData anchor;
 
 	pushed = hold_for_commit(name, parents, nparents);
 	fold_from_baseline(&root, &next, true);
@@ -2244,11 +2414,15 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 		branch_set_baseline(name, &next, &root);
 		return false;
 	}
+	initStringInfo(&identity);
+	initStringInfo(&anchor);
+	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&root.hash, parents, nparents, prolly_commit_author(),
-				 message, commit_id);
+				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
+	note_anchor(name, commit_id, &anchor);
 	return true;
 }
 
@@ -2432,6 +2606,9 @@ copies_branch_delete(const char *name, bool force)
 		resetStringInfo(&key);
 		names_key(&key, name);
 		refs_put(key.data, key.len, NULL);
+		resetStringInfo(&key);
+		anchor_key(&key, name);
+		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
 }
@@ -2446,7 +2623,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES};
+	TAG_NAMES, TAG_IDENTITY};
 	ListCell   *lc;
 
 	lock_refs();
@@ -2787,8 +2964,20 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 		return -1;
 	if (same_hash(&root.hash, &info.root.hash))
 		return 0;
-	write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
-				 commit_id);
+	{
+		StringInfoData identity;
+		StringInfoData anchor;
+
+		/* (each table named as at the head: its identities are the head's) */
+		initStringInfo(&identity);
+		if (info.identity)
+			appendBinaryStringInfo(&identity, info.identity, info.identity_len);
+		write_commit(&root.hash, &head, 1, prolly_commit_author(), message,
+					 &identity, commit_id);
+		initStringInfo(&anchor);
+		if (anchor_of(name, &head, &anchor))
+			note_anchor(name, commit_id, &anchor);
+	}
 	branch_set_head(name, commit_id);
 	carry_head_names(name, &head, commit_id);
 	{
@@ -2818,6 +3007,8 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	ProllyNodeRef next;
 	char	   *name;
 	bool		pushed;
+	StringInfoData identity;
+	StringInfoData anchor;
 
 	if (working_set == NULL)
 	{
@@ -2829,11 +3020,15 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	fold_from_baseline(&root, &next, true);
 	if (pushed)
 		PopActiveSnapshot();
+	initStringInfo(&identity);
+	initStringInfo(&anchor);
+	identify_working(InvalidOid, &identity, &anchor);
 	write_commit(&working_set->hash, parents, nparents, prolly_commit_author(),
-				 message, commit_id);
+				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
+	note_anchor(name, commit_id, &anchor);
 }
 
 static void
@@ -3166,7 +3361,7 @@ copies_reset(const char *ref)
 				 errmsg("prolly ref \"%s\" does not exist", ref)));
 	/* (the rows moved as a snapshot that sees the head has them) */
 	pushed = see_head(branch_ops()->current());
-	move_settled(&info.root);
+	move_settled(&info);
 	if (pushed)
 		PopActiveSnapshot();
 	branch_set_head(branch_ops()->current(), &target);
@@ -4294,9 +4489,9 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 			if (head == NULL)
 				;
 			else if (strcmp(name, branch_ops()->current()) == 0)
-				move_settled(&info.root);
+				move_settled(&info);
 			else
-				branch_ops()->run_on(name, move_settled, &info.root);
+				branch_ops()->run_on(name, move_settled, &info);
 		}
 		PG_FINALLY();
 		{
@@ -4426,8 +4621,14 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 				 errmsg("the current branch has no commit to stash changes against")));
 	lock_refs();
 	entries = stash_get(name);
-	write_commit(&root->hash, &head, 1, prolly_commit_author(),
-				 psprintf("WIP on %s", branch), stash);
+	{
+		StringInfoData identity;
+
+		initStringInfo(&identity);
+		identify_working(InvalidOid, &identity, NULL);
+		write_commit(&root->hash, &head, 1, prolly_commit_author(),
+					 psprintf("WIP on %s", branch), &identity, stash);
+	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
 	stash_set(name, lcons(e, entries));
@@ -4518,6 +4719,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.merge_base = copies_merge_base,
 	.commit_working_set = copies_commit_working_set,
 	.commit_with = copies_commit_with,
+	.working_identity = copies_working_identity,
+	.anchor_identity = copies_anchor_identity,
 	.branches = copies_branches,
 	.working_set = copies_working_set,
 	.read_working_set = copies_read_working_set,

@@ -359,8 +359,9 @@ SELECT id, v FROM rm.k ORDER BY id;
   2 | two
 (2 rows)
 
--- A column renamed on one side while the other changed it isn't matched by
--- name: refused, not lost.
+-- A column renamed on one side while the other changed it is matched by
+-- its identity, which the rename keeps: both changes merge.  Dropped
+-- instead, the change would be lost: refused.
 SELECT dolt_checkout('feature');
            dolt_checkout            
 ------------------------------------
@@ -394,6 +395,54 @@ SELECT length(dolt_commit('-am', 'main: n of 1')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('feature', '-m', 'merged a rename'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT id, n2 FROM rm.t ORDER BY id;
+ id | n2  
+----+-----
+  1 | 100
+  2 |   2
+  3 |   3
+  4 | 400
+  5 |   5
+  6 |   6
+(6 rows)
+
+SELECT dolt_reset('--hard', 'HEAD~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('feature');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'feature'"}
+(1 row)
+
+SELECT dolt_reset('--hard', 'main~1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+ALTER TABLE rm.t DROP COLUMN n;
+SELECT length(dolt_commit('-am', 'feature: n dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('feature', '-m', 'merged a drop'))[3:4];
 ERROR:  rows of table "t" can't be merged across column "n" being dropped or renamed
 DETAIL:  One side changed values of "n", which the other dropped or renamed: the changes would be lost.
 SELECT dolt_reset('--hard');
@@ -505,5 +554,5 @@ SELECT dolt_branch('-D', 'feature');
 
 DROP SCHEMA rm CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table rm.t
-drop cascades to table rm.k
+DETAIL:  drop cascades to table rm.k
+drop cascades to table rm.t

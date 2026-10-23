@@ -246,8 +246,12 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "17", extension send values normalized by
- * binary receive/send; "16", per-table ordering metadata and
+ * The format a folded root is in: "18", whose commits record their
+ * objects' identities beside it (folded_identify()), which an older server
+ * would read past, matching renamed objects by name: its bytes are
+ * otherwise "17"'s, so a "17" root is read, moved to and merged as one of
+ * this format, its objects each of its own name's identity; "17",
+ * extension send values normalized by binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
  * table's definition a line each (describe_foreign_table()); "14" had it as CREATE FOREIGN
  * TABLE's tail, and was the first with a value of a type whose binary I/O
@@ -276,11 +280,12 @@ typedef struct BaseTable BaseTable;
  * long rows out of line; "3" keyed value trees' chunks by offset, and was
  * the first with its definitions' fields escaped (append_field()); "2" was
  * keyless rows keyed by their first bytes and their hash, and a root
- * without the item keyed them by the hash alone.  A root in another has
- * its tables' rows unreadable here, and is neither moved to nor merged:
- * its definitions or row keying aren't this format's.
+ * without the item keyed them by the hash alone.  A root in another (but
+ * FOLDED_FORMAT_READ) has its tables' rows unreadable here, and is neither
+ * moved to nor merged: its definitions or row keying aren't this format's.
  */
-#define FOLDED_FORMAT	"17"
+#define FOLDED_FORMAT	"18"
+#define FOLDED_FORMAT_READ "17"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -326,6 +331,7 @@ static char *printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
 						  Form_pg_type domain, ParseExprKind kind);
 static char *constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain);
 static bool list_has_string(List *list, const char *s);
+static bool readable_format(const ProllyValue *v);
 
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
@@ -5378,7 +5384,20 @@ folded_walk_changes(const ProllyNodeRef *from, const ProllyNodeRef *to,
 	}
 }
 
-/* Is a folded root in the current format (its "!:format" item)? */
+/*
+ * Is a "!:format" item's value the current format, or the one before,
+ * whose roots are the same but for the item?
+ */
+static bool
+readable_format(const ProllyValue *v)
+{
+	return (v->len == strlen(FOLDED_FORMAT) &&
+			memcmp(v->data, FOLDED_FORMAT, v->len) == 0) ||
+		(v->len == strlen(FOLDED_FORMAT_READ) &&
+		 memcmp(v->data, FOLDED_FORMAT_READ, v->len) == 0);
+}
+
+/* Is a folded root in the current format (its "!:format" item readable)? */
 static bool
 root_in_format(Canon *cn, const ProllyNodeRef *root)
 {
@@ -5392,8 +5411,7 @@ root_in_format(Canon *cn, const ProllyNodeRef *root)
 	PROLLY_CALL(cn->tree, cursor_seek, c, &want, ForwardScanDirection);
 	current = PROLLY_CALL(cn->tree, cursor_next, c, &k, &v) &&
 		k.len == want.len && memcmp(k.data, want.data, want.len) == 0 &&
-		v.len == strlen(FOLDED_FORMAT) &&
-		memcmp(v.data, FOLDED_FORMAT, v.len) == 0;
+		readable_format(&v);
 	PROLLY_CALL(cn->tree, cursor_close, c);
 	return current;
 }
@@ -5859,6 +5877,8 @@ same_definition_pair(const ProllyKey *ka, const ProllyValue *va,
 
 	if (ka == NULL || kb == NULL)
 		*same = false;
+	else if (ka->len == 8 && memcmp(ka->data, "!:format", 8) == 0)
+		*same = readable_format(va) && readable_format(vb);
 	else
 	{
 		definition_of(ka, va, &da);
@@ -11573,6 +11593,1030 @@ folded_make_versioned_schemas(List *names)
 	CommandCounterIncrement();
 }
 
+/* ------------------------------------------------------------------------
+ * Identity
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * A table's or column's identity, which its renames keep: the name it was
+ * made with (a table's qualified), and which of the objects made with that
+ * name it is (0, unless another holding that name's identity was there,
+ * as a column renamed is from one added with its old name).  A root holds
+ * none of it: the same tables, columns and rows are the same root however
+ * they were named before.  A commit records its root's beside it, as an
+ * identity record: in key order, a line for each table and column whose
+ * identity isn't its own name's with 0, fields escaped (append_field()),
+ * names in UTF-8 (a table's qualified and quoted, a column's unquoted):
+ *
+ *	c <table> <column> <origin> <n>
+ *	t <table> <origin> <n>
+ *
+ * So a commit whose objects were never renamed records nothing, and one
+ * made before identities were recorded reads as such.  An anchor, the
+ * working set's, has a line for each table and column, by the branch's own
+ * relation and attribute number (0 for the table), which a rename keeps:
+ * relid, attnum, origin, n.
+ */
+typedef struct IdObject
+{
+	char	   *name;			/* a table's qualified and quoted, a
+								 * column's unquoted; server encoding */
+	char	   *origin;			/* likewise */
+	int			n;
+	bool		known;			/* identity settled */
+	Oid			relid;			/* (a working set's) */
+	AttrNumber	attnum;			/* (a working set's column; 0: a table) */
+	List	   *columns;		/* (a table's) IdObject *, in order */
+} IdObject;
+
+/* A line of an identity record or anchor, read back. */
+typedef struct IdEntry
+{
+	char	   *table;			/* (a record's) */
+	char	   *column;			/* (a record's) NULL: the table */
+	Oid			relid;			/* (an anchor's) */
+	AttrNumber	attnum;			/* (an anchor's) */
+	char	   *origin;
+	int			n;
+} IdEntry;
+
+/* A field of an identity record or anchor, unescaped, in the server's encoding. */
+static char *
+identity_field(const char *f)
+{
+	char	   *u = unescape_field(f);
+
+	return pg_any_to_server(u, strlen(u), PG_UTF8);
+}
+
+static int
+identity_number(const char *f)
+{
+	char	   *end;
+	long		n = strtol(f, &end, 10);
+
+	if (*f == '\0' || *end != '\0' || n < 0 || n > PG_INT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("a prolly identity record is invalid")));
+	return (int) n;
+}
+
+/*
+ * The lines of an identity record (anchor false) or anchor (true), each an
+ * IdEntry *.
+ */
+static List *
+identity_entries(const ProllyValue *v, bool anchor)
+{
+	List	   *out = NIL;
+	char	   *text;
+	char	   *line;
+	char	   *next;
+
+	if (v == NULL || v->len == 0)
+		return NIL;
+	text = pnstrdup((const char *) v->data, v->len);
+	for (line = text; line && *line; line = next)
+	{
+		char	   *f[5];
+		int			nf = 0;
+		char	   *p = line;
+		IdEntry    *e = palloc0(sizeof(IdEntry));
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		for (;;)
+		{
+			f[nf++] = p;
+			p = strchr(p, '\t');
+			if (p == NULL || nf == lengthof(f))
+				break;
+			*p++ = '\0';
+		}
+		if (p != NULL)
+			nf = 0;				/* (too many fields) */
+		if (anchor && nf == 4)
+		{
+			e->relid = (Oid) strtoul(f[0], NULL, 10);
+			e->attnum = (AttrNumber) identity_number(f[1]);
+			e->origin = identity_field(f[2]);
+			e->n = identity_number(f[3]);
+		}
+		else if (!anchor && nf == 4 && strcmp(f[0], "t") == 0)
+		{
+			e->table = identity_field(f[1]);
+			e->origin = identity_field(f[2]);
+			e->n = identity_number(f[3]);
+		}
+		else if (!anchor && nf == 5 && strcmp(f[0], "c") == 0)
+		{
+			e->table = identity_field(f[1]);
+			e->column = identity_field(f[2]);
+			e->origin = identity_field(f[3]);
+			e->n = identity_number(f[4]);
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a prolly identity record is invalid")));
+		out = lappend(out, e);
+	}
+	return out;
+}
+
+/* A record's entry for table (and column, if not NULL), or NULL. */
+static IdEntry *
+record_entry(List *entries, const char *table, const char *column)
+{
+	ListCell   *lc;
+
+	foreach(lc, entries)
+	{
+		IdEntry    *e = lfirst(lc);
+
+		if (strcmp(e->table, table) == 0 &&
+			(column ? e->column && strcmp(e->column, column) == 0 : e->column == NULL))
+			return e;
+	}
+	return NULL;
+}
+
+/* An anchor's entry for relid's attribute attnum (0: the table), or NULL. */
+static IdEntry *
+anchor_entry(List *entries, Oid relid, AttrNumber attnum)
+{
+	ListCell   *lc;
+
+	foreach(lc, entries)
+	{
+		IdEntry    *e = lfirst(lc);
+
+		if (e->relid == relid && e->attnum == attnum)
+			return e;
+	}
+	return NULL;
+}
+
+/* o's identity as a record (entries) gives it by name: its entry's, or its own name's. */
+static void
+identity_by_name(List *entries, const char *table, IdObject *o)
+{
+	IdEntry    *e = record_entry(entries, table ? table : o->name,
+								 table ? o->name : NULL);
+
+	o->origin = pstrdup(e ? e->origin : o->name);
+	o->n = e ? e->n : 0;
+}
+
+static int
+id_object_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((IdObject *) lfirst(a))->name, ((IdObject *) lfirst(b))->name);
+}
+
+static bool
+same_identity(const IdObject *a, const IdObject *b)
+{
+	return a->n == b->n && strcmp(a->origin, b->origin) == 0;
+}
+
+/* The object among objs (IdObject *) with o's identity, but o, or NULL. */
+static IdObject *
+with_identity(List *objs, const IdObject *o)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		IdObject   *x = lfirst(lc);
+
+		if (x != o && x->known && same_identity(x, o))
+			return x;
+	}
+	return NULL;
+}
+
+static IdObject *
+named_object(List *objs, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		IdObject   *x = lfirst(lc);
+
+		if (strcmp(x->name, name) == 0)
+			return x;
+	}
+	return NULL;
+}
+
+/*
+ * Settle o's identity, origin and n, among objs: if another holds it
+ * already, the first of its own name's that none holds.
+ */
+static void
+settle_identity(List *objs, IdObject *o, const char *origin, int n)
+{
+	o->origin = pstrdup(origin);
+	o->n = n;
+	if (with_identity(objs, o))
+	{
+		o->origin = pstrdup(o->name);
+		o->n = 0;
+		while (with_identity(objs, o))
+			o->n++;
+	}
+	o->known = true;
+}
+
+/* Settle objs' identities: those an anchor has first, then the rest by name. */
+static void
+settle_identities(List *objs, List *anchors, List *entries, const char *table)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		IdObject   *o = lfirst(lc);
+		IdEntry    *e = anchor_entry(anchors, o->relid, o->attnum);
+
+		if (e)
+			settle_identity(objs, o, e->origin, e->n);
+	}
+	foreach(lc, objs)
+	{
+		IdObject   *o = lfirst(lc);
+		IdObject	by_name = *o;
+
+		if (o->known)
+			continue;
+		identity_by_name(entries, table, &by_name);
+		settle_identity(objs, o, by_name.origin, by_name.n);
+	}
+}
+
+/* The tables (IdObject *) of a folded root, with identities by its record. */
+static List *
+root_identities(const ProllyNodeRef *root, const ProllyValue *record)
+{
+	Canon		cn;
+	List	   *entries = identity_entries(record, false);
+	List	   *tables = NIL;
+	ProllyTreeCursor *c;
+	ProllyKey	start = {(const uint8 *) "t:", 2};
+	ProllyKey	k;
+	ProllyValue v;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &start, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v) &&
+		   k.len >= 2 && memcmp(k.data, "t:", 2) == 0)
+	{
+		IdObject   *t = palloc0(sizeof(IdObject));
+		ProllyValue def;
+		TableDef	td;
+		ListCell   *lc;
+
+		t->name = from_utf8(k.data + 2, k.len - 2);
+		identity_by_name(entries, NULL, t);
+		t->known = true;
+		definition_of(&k, &v, &def);
+		parse_table_def(from_utf8(def.data, def.len), &td);
+		foreach(lc, td.columns)
+		{
+			IdObject   *col = palloc0(sizeof(IdObject));
+
+			col->name = unquoted(first_field(lfirst(lc)));
+			identity_by_name(entries, t->name, col);
+			col->known = true;
+			t->columns = lappend(t->columns, col);
+		}
+		tables = lappend(tables, t);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	return tables;
+}
+
+/* Append an identity record's or anchor's line: its fields, tab-separated. */
+static void
+identity_line(List **lines, const char *f1, const char *f2, const char *f3,
+			  const char *f4, const char *f5)
+{
+	const char *fields[5] = {f1, f2, f3, f4, f5};
+	StringInfoData line;
+
+	initStringInfo(&line);
+	for (int i = 0; i < lengthof(fields) && fields[i]; i++)
+	{
+		if (i > 0)
+			appendStringInfoChar(&line, '\t');
+		append_field(&line, fields[i]);
+	}
+	appendStringInfoChar(&line, '\n');
+	*lines = lappend(*lines, line.data);
+}
+
+static void
+append_lines(StringInfo out, List *lines)
+{
+	ListCell   *lc;
+
+	list_sort(lines, cstring_cmp);
+	foreach(lc, lines)
+		appendStringInfoString(out, lfirst(lc));
+}
+
+/* The identity record of tables (IdObject *): what isn't their own names'. */
+static void
+identity_record(List *tables, StringInfo out)
+{
+	List	   *lines = NIL;
+	ListCell   *lc;
+
+	foreach(lc, tables)
+	{
+		IdObject   *t = lfirst(lc);
+		ListCell   *cc;
+
+		if (t->n != 0 || strcmp(t->origin, t->name) != 0)
+			identity_line(&lines, "t", t->name, t->origin, psprintf("%d", t->n),
+						  NULL);
+		foreach(cc, t->columns)
+		{
+			IdObject   *col = lfirst(cc);
+
+			if (col->n != 0 || strcmp(col->origin, col->name) != 0)
+				identity_line(&lines, "c", t->name, col->name, col->origin,
+							  psprintf("%d", col->n));
+		}
+	}
+	append_lines(out, lines);
+}
+
+/*
+ * The session branch's tables and columns, each found as its anchor
+ * entry says (its relation and attribute numbers kept through renames),
+ * else by name in known, else by its own name: its identity is that of
+ * the object it was before, so a rename since the commit known is of keeps
+ * it, and a column added (of a name another had, or not) has a new one.
+ */
+static void
+folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
+				StringInfo identity, StringInfo next_anchor)
+{
+	List	   *anchors = identity_entries(anchor, true);
+	List	   *entries = identity_entries(known, false);
+	List	   *tables = NIL;
+	Relation	pg_class;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	ListCell   *lc;
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+		IdObject   *t;
+		Relation	rel;
+		TupleDesc	desc;
+
+		if (OidIsValid(only) && form->oid != only)
+			continue;
+		if (!((form->relkind == RELKIND_RELATION &&
+			   form->relam == PROLLY_TABLE_AM_OID) ||
+			  form->relkind == RELKIND_PARTITIONED_TABLE) ||
+			!canon_namespace(form->relnamespace) ||
+			in_extension(RelationRelationId, form->oid))
+			continue;
+		t = palloc0(sizeof(IdObject));
+		t->name = qualified(form->relnamespace, NameStr(form->relname));
+		t->relid = form->oid;
+		rel = relation_open(form->oid, AccessShareLock);
+		desc = RelationGetDescr(rel);
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+			IdObject   *col;
+
+			if (att->attisdropped)
+				continue;
+			col = palloc0(sizeof(IdObject));
+			col->name = pstrdup(NameStr(att->attname));
+			col->relid = form->oid;
+			col->attnum = att->attnum;
+			t->columns = lappend(t->columns, col);
+		}
+		relation_close(rel, AccessShareLock);
+		tables = lappend(tables, t);
+	}
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+
+	/* (in name order, so that a name's identities are given alike everywhere) */
+	list_sort(tables, id_object_cmp);
+	settle_identities(tables, anchors, entries, NULL);
+	foreach(lc, tables)
+	{
+		IdObject   *t = lfirst(lc);
+
+		/* (a table renamed since known: its columns by its name there) */
+		IdObject	was = *t;
+		IdEntry    *e = NULL;
+		ListCell   *ec;
+
+		foreach(ec, entries)
+		{
+			IdEntry    *x = lfirst(ec);
+
+			if (x->column == NULL && x->n == t->n && strcmp(x->origin, t->origin) == 0)
+				e = x;
+		}
+		was.name = e ? e->table : t->n == 0 ? t->origin : t->name;
+		settle_identities(t->columns, anchors, entries, was.name);
+	}
+	identity_record(tables, identity);
+	if (next_anchor == NULL || OidIsValid(only))
+		return;
+	{
+		List	   *lines = NIL;
+
+		foreach(lc, tables)
+		{
+			IdObject   *t = lfirst(lc);
+			ListCell   *cc;
+
+			identity_line(&lines, psprintf("%u", t->relid), "0", t->origin,
+						  psprintf("%d", t->n), NULL);
+			foreach(cc, t->columns)
+			{
+				IdObject   *col = lfirst(cc);
+
+				identity_line(&lines, psprintf("%u", t->relid),
+							  psprintf("%d", col->attnum), col->origin,
+							  psprintf("%d", col->n), NULL);
+			}
+		}
+		append_lines(next_anchor, lines);
+	}
+}
+
+static ProllyRename *
+make_rename(const char *table, const char *column, const char *to)
+{
+	ProllyRename *r = palloc(sizeof(ProllyRename));
+
+	r->table = pstrdup(table);
+	r->column = column ? pstrdup(column) : NULL;
+	r->to = pstrdup(to);
+	return r;
+}
+
+/* What renames make of table (column NULL) or its column, or NULL: none. */
+static const char *
+renamed_to(List *renames, const char *table, const char *column)
+{
+	ListCell   *lc;
+
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+
+		if (strcmp(r->table, table) == 0 &&
+			(column ? r->column && strcmp(r->column, column) == 0 : r->column == NULL))
+			return r->to;
+	}
+	return NULL;
+}
+
+/* Is name among names (IdObject *), or a name renames give (for table, if given)? */
+static bool
+name_used(List *a, List *b, List *renames, const char *table, const char *name)
+{
+	ListCell   *lc;
+
+	if (named_object(a, name) || named_object(b, name))
+		return true;
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+
+		if ((table ? r->column && strcmp(r->table, table) == 0 : r->column == NULL) &&
+			strcmp(r->to, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * A name for an object out of the way of another of its name: one neither
+ * a nor b (IdObject *) nor renames use, in table's schema for a table.
+ */
+static char *
+out_of_the_way(List *a, List *b, List *renames, const char *table,
+			   const char *schema_of_table)
+{
+	for (int k = 1;; k++)
+	{
+		char	   *name = psprintf("prolly_renamed_%d", k);
+
+		if (schema_of_table)
+		{
+			List	   *names = stringToQualifiedNameList(schema_of_table, NULL);
+
+			name = list_length(names) > 1 ?
+				quote_qualified_identifier(strVal(linitial(names)), name) :
+				pstrdup(quote_identifier(name));
+		}
+		if (!name_used(a, b, renames, table, name))
+			return name;
+	}
+}
+
+/*
+ * The renames that make the names of from's tables and columns (IdObject
+ * *) those of to's of the same identities, and move each out of the way of
+ * a name to gives an object of another identity.
+ */
+static List *
+identity_renames(List *from, List *to)
+{
+	List	   *renames = NIL;
+	ListCell   *lc;
+
+	foreach(lc, from)
+	{
+		IdObject   *f = lfirst(lc);
+		IdObject   *t = with_identity(to, f);
+		ListCell   *cc;
+
+		if (t == NULL)
+		{
+			if (named_object(to, f->name))
+				renames = lappend(renames,
+								  make_rename(f->name, NULL,
+											  out_of_the_way(from, to, renames, NULL, f->name)));
+			continue;
+		}
+		if (strcmp(f->name, t->name) != 0)
+			renames = lappend(renames, make_rename(f->name, NULL, t->name));
+		foreach(cc, f->columns)
+		{
+			IdObject   *fc = lfirst(cc);
+			IdObject   *tc = with_identity(t->columns, fc);
+
+			if (tc && strcmp(fc->name, tc->name) != 0)
+				renames = lappend(renames, make_rename(f->name, fc->name, tc->name));
+			else if (tc == NULL && named_object(t->columns, fc->name))
+				renames = lappend(renames,
+								  make_rename(f->name, fc->name,
+											  out_of_the_way(f->columns, t->columns,
+															 renames, f->name, NULL)));
+		}
+	}
+	return renames;
+}
+
+static List *
+folded_renames(const ProllyNodeRef *from, const ProllyValue *from_identity,
+			   const ProllyNodeRef *to, const ProllyValue *to_identity)
+{
+	return identity_renames(root_identities(from, from_identity),
+							root_identities(to, to_identity));
+}
+
+/* An object of a merge, as each of its three roots names it (NULL: not there). */
+typedef struct MergedObject
+{
+	IdObject	id;				/* its identity, and its merged name */
+	IdObject   *in[3];
+	List	   *columns;		/* (a table's) MergedObject * */
+} MergedObject;
+
+static MergedObject *
+merged_object(List **objs, const IdObject *o, int side)
+{
+	ListCell   *lc;
+	MergedObject *m;
+
+	foreach(lc, *objs)
+	{
+		m = lfirst(lc);
+		if (same_identity(&m->id, o))
+		{
+			m->in[side] = (IdObject *) o;
+			return m;
+		}
+	}
+	m = palloc0(sizeof(MergedObject));
+	m->id.origin = o->origin;
+	m->id.n = o->n;
+	m->id.known = true;
+	m->in[side] = (IdObject *) o;
+	*objs = lappend(*objs, m);
+	return m;
+}
+
+/*
+ * The name a merge gives an object (a column of table, if table isn't
+ * NULL): as the side that renamed it names it.
+ */
+static char *
+merged_name(MergedObject *m, const char *table)
+{
+	const char *b = m->in[0] ? m->in[0]->name : NULL;
+	const char *o = m->in[1] ? m->in[1]->name : NULL;
+	const char *t = m->in[2] ? m->in[2]->name : NULL;
+	const char *was = b ? b : m->id.origin;
+
+	if (o && t)
+	{
+		if (b && strcmp(o, b) == 0)
+			return pstrdup(t);
+		if (strcmp(o, t) == 0 || (b && strcmp(t, b) == 0))
+			return pstrdup(o);
+		if (table)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: column %s of %s is renamed %s on one side and %s on the other",
+							quote_identifier(was), table, quote_identifier(o),
+							quote_identifier(t))));
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("schema conflict: table %s is renamed %s on one side and %s on the other",
+						was, o, t)));
+	}
+	return pstrdup(o ? o : t ? t : b);
+}
+
+/*
+ * Does a merge keep the object: both sides have it, or one made it?  (One
+ * a side dropped goes, unless the other changed it: then the merge of its
+ * definitions fails.)
+ */
+static bool
+merge_keeps(const MergedObject *m)
+{
+	return (m->in[1] && m->in[2]) || (!m->in[0] && (m->in[1] || m->in[2]));
+}
+
+static bool
+merged_name_used(List *objs, const MergedObject *m, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		MergedObject *x = lfirst(lc);
+
+		if (x != m && x->id.name && strcmp(x->id.name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Refuse two objects a merge keeps (MergedObject *, columns of table if it
+ * isn't NULL) given one name; one it doesn't keep, named as another, is
+ * moved out of the way.
+ */
+static void
+settle_merged_names(List *objs, const char *table)
+{
+	ListCell   *lc;
+
+	foreach(lc, objs)
+	{
+		MergedObject *m = lfirst(lc);
+
+		if (merge_keeps(m) && merged_name_used(objs, m, m->id.name))
+		{
+			ListCell   *oc;
+
+			foreach(oc, objs)
+			{
+				MergedObject *x = lfirst(oc);
+
+				if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 table ?
+							 errmsg("schema conflict: the merge would give two columns of %s the name %s",
+									table, quote_identifier(m->id.name)) :
+							 errmsg("schema conflict: the merge would give two tables the name %s",
+									m->id.name),
+							 errdetail("One side renamed one to the name, and the other has another of the name.")));
+			}
+		}
+	}
+	foreach(lc, objs)
+	{
+		MergedObject *m = lfirst(lc);
+
+		if (merge_keeps(m) || !merged_name_used(objs, m, m->id.name))
+			continue;
+		for (int k = 1;; k++)
+		{
+			char	   *name = psprintf("prolly_renamed_%d", k);
+
+			if (table == NULL)
+			{
+				List	   *names = stringToQualifiedNameList(m->id.name, NULL);
+
+				name = list_length(names) > 1 ?
+					quote_qualified_identifier(strVal(linitial(names)), name) :
+					pstrdup(quote_identifier(name));
+			}
+			if (!merged_name_used(objs, m, name))
+			{
+				m->id.name = name;
+				break;
+			}
+		}
+	}
+}
+
+static void
+folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
+					 List **renames, StringInfo identity)
+{
+	List	   *merged = NIL;
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	for (int i = 0; i < 3; i++)
+	{
+		foreach(lc, root_identities(&roots[i], &identities[i]))
+		{
+			IdObject   *t = lfirst(lc);
+			MergedObject *m = merged_object(&merged, t, i);
+			ListCell   *cc;
+
+			foreach(cc, t->columns)
+				(void) merged_object(&m->columns, lfirst(cc), i);
+		}
+		renames[i] = NIL;
+	}
+	foreach(lc, merged)
+	{
+		MergedObject *m = lfirst(lc);
+		ListCell   *cc;
+
+		m->id.name = merged_name(m, NULL);
+		foreach(cc, m->columns)
+		{
+			MergedObject *c = lfirst(cc);
+
+			c->id.name = merged_name(c, m->id.name);
+		}
+		settle_merged_names(m->columns, m->id.name);
+	}
+	settle_merged_names(merged, NULL);
+
+	/* each side's renames, and the merge's identities */
+	foreach(lc, merged)
+	{
+		MergedObject *m = lfirst(lc);
+		IdObject   *t = palloc0(sizeof(IdObject));
+		ListCell   *cc;
+
+		*t = m->id;
+		t->columns = NIL;
+		for (int i = 0; i < 3; i++)
+			if (m->in[i] && strcmp(m->in[i]->name, m->id.name) != 0)
+				renames[i] = lappend(renames[i],
+									 make_rename(m->in[i]->name, NULL, m->id.name));
+		foreach(cc, m->columns)
+		{
+			MergedObject *c = lfirst(cc);
+			IdObject   *col = palloc(sizeof(IdObject));
+
+			*col = c->id;
+			if (merge_keeps(c))
+				t->columns = lappend(t->columns, col);
+			for (int i = 0; i < 3; i++)
+				if (m->in[i] && c->in[i] && strcmp(c->in[i]->name, c->id.name) != 0)
+					renames[i] = lappend(renames[i],
+										 make_rename(m->in[i]->name, c->in[i]->name,
+													 c->id.name));
+		}
+		if (merge_keeps(m))
+			tables = lappend(tables, t);
+	}
+	identity_record(tables, identity);
+}
+
+/*
+ * A table's description (UTF-8, as its item holds it) with its columns
+ * renamed as renames say for table, into out.
+ */
+static void
+rename_columns(const char *desc, int len, const char *table, List *renames,
+			   StringInfo out)
+{
+	char	   *copy = pnstrdup(desc, len);
+	char	   *line;
+	char	   *next;
+	bool		columns = false;
+
+	for (line = copy; line && *line; line = next)
+	{
+		char	   *tab = strchr(line, '\t');
+		const char *to = NULL;
+
+		next = strchr(line, '\n');
+		if (next)
+			*next++ = '\0';
+		for (int s = 0; s < NUM_TABLE_SECTIONS; s++)
+			if (strcmp(line, table_sections[s]) == 0)
+			{
+				columns = s == 0;
+				tab = NULL;
+			}
+		if (columns && tab)
+		{
+			char	   *field = pnstrdup(line, tab - line);
+
+			to = renamed_to(renames, table, unquoted(identity_field(field)));
+		}
+		if (to)
+		{
+			append_field(out, quote_identifier(to));
+			appendStringInfoString(out, tab);
+		}
+		else
+			appendStringInfoString(out, line);
+		if (next)
+			appendStringInfoChar(out, '\n');
+	}
+}
+
+static void
+folded_rename_description(const ProllyValue *description, const char *table,
+						  List *renames, StringInfo out)
+{
+	rename_columns((const char *) description->data, description->len, table,
+				   renames, out);
+}
+
+static void
+folded_rename_root(const ProllyNodeRef *root, List *renames, ProllyNodeRef *out)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	List	   *items = NIL;
+	ProllyTreeBuilder *b;
+	ListCell   *lc;
+	int			olen = strlen(ORDERING_PREFIX);
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		CanonItem  *it = palloc(sizeof(CanonItem));
+
+		initStringInfo(&it->key);
+		initStringInfo(&it->value);
+		if (k.len >= 2 && memcmp(k.data, "t:", 2) == 0)
+		{
+			char	   *name = from_utf8(k.data + 2, k.len - 2);
+			const char *to = renamed_to(renames, name, NULL);
+			ProllyNodeRef data;
+			ProllyValue def;
+
+			appendStringInfoString(&it->key, "t:");
+			append_utf8(&it->key, to ? to : name);
+			(void) tree_item(&k, &v, &data, &def);
+			put_hash(&it->value, &data.hash);
+			rename_columns((const char *) def.data, def.len, name, renames,
+						   &it->value);
+		}
+		else if (k.len > olen && memcmp(k.data, ORDERING_PREFIX, olen) == 0)
+		{
+			char	   *name = from_utf8(k.data + olen, k.len - olen);
+			const char *to = renamed_to(renames, name, NULL);
+
+			appendStringInfoString(&it->key, ORDERING_PREFIX);
+			append_utf8(&it->key, to ? to : name);
+			appendBinaryStringInfo(&it->value, (const char *) v.data, v.len);
+		}
+		else
+		{
+			appendBinaryStringInfo(&it->key, (const char *) k.data, k.len);
+			appendBinaryStringInfo(&it->value, (const char *) v.data, v.len);
+		}
+		items = lappend(items, it);
+		CHECK_FOR_INTERRUPTS();
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	list_sort(items, item_cmp);
+	b = PROLLY_CALL(cn.tree, build_begin, &cn.root_env, CurrentMemoryContext);
+	foreach(lc, items)
+	{
+		CanonItem  *it = lfirst(lc);
+		ProllyKey	ik = {(const uint8 *) it->key.data, it->key.len};
+		ProllyValue iv = {(const uint8 *) it->value.data, it->value.len};
+
+		PROLLY_CALL(cn.tree, build_add, b, &ik, &iv);
+	}
+	PROLLY_CALL(cn.tree, build_finish, b, out);
+}
+
+/* A table of the session branch's, by its qualified name. */
+static Oid
+renamed_relid(const char *name)
+{
+	return RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							AccessExclusiveLock, false);
+}
+
+/*
+ * Rename the session branch's tables and columns as renames say, each
+ * first to a name of its own, so names swapped or passed along don't
+ * collide on the way: columns, by their tables' names before, then tables.
+ */
+static void
+folded_rename_objects(List *renames)
+{
+	List	   *first = NIL;
+	List	   *then = NIL;
+	ListCell   *lc;
+	int			save_nestlevel;
+	int			k = 0;
+
+	if (renames == NIL)
+		return;
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		Oid			relid = renamed_relid(r->table);
+		char	   *table = qualified(get_rel_namespace(relid), get_rel_name(relid));
+		char	   *step;
+
+		if (r->column == NULL)
+			continue;
+		do
+			step = psprintf("prolly_renaming_%d", ++k);
+		while (get_attnum(relid, step) != InvalidAttrNumber);
+		first = lappend(first, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+										table, quote_identifier(r->column),
+										quote_identifier(step)));
+		then = lappend(then, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+									  table, quote_identifier(step),
+									  quote_identifier(r->to)));
+	}
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		Oid			relid;
+		Oid			nsp;
+		List	   *to;
+		char	   *schema;
+		char	   *step;
+
+		if (r->column != NULL)
+			continue;
+		relid = renamed_relid(r->table);
+		nsp = get_rel_namespace(relid);
+		to = stringToQualifiedNameList(r->to, NULL);
+		schema = list_length(to) > 1 ? strVal(linitial(to)) : get_namespace_name(nsp);
+		do
+			step = psprintf("prolly_renaming_%d", ++k);
+		while (OidIsValid(get_relname_relid(step, nsp)) ||
+			   OidIsValid(get_relname_relid(step, get_namespace_oid(schema, false))));
+		first = lappend(first, psprintf("ALTER TABLE %s RENAME TO %s",
+										qualified(nsp, get_rel_name(relid)),
+										quote_identifier(step)));
+		if (strcmp(schema, get_namespace_name(nsp)) != 0)
+			then = lappend(then, psprintf("ALTER TABLE %s SET SCHEMA %s",
+										  qualified(nsp, step),
+										  quote_identifier(schema)));
+		then = lappend(then, psprintf("ALTER TABLE %s RENAME TO %s",
+									  quote_qualified_identifier(schema, step),
+									  quote_identifier(strVal(llast(to)))));
+	}
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	run_statements(first);
+	run_statements(then);
+	SPI_finish();
+	AtEOXact_GUC(true, save_nestlevel);
+	CommandCounterIncrement();
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -11611,4 +12655,10 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.type_definitions = folded_type_definitions,
 	.in_format = folded_in_format,
 	.format = folded_format,
+	.identify = folded_identify,
+	.renames = folded_renames,
+	.merge_renames = folded_merge_renames,
+	.rename_description = folded_rename_description,
+	.rename_root = folded_rename_root,
+	.rename_objects = folded_rename_objects,
 };

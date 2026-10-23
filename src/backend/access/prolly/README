@@ -148,6 +148,50 @@ ordering.  Older root formats retain the existing recommit requirement;
 committing a branch writes its current working state in the new format.
 
 
+Identity across renames
+-----------------------
+
+A table or column keeps its identity when it is renamed: the name it was
+made with, and which of the objects made with that name it is (0 unless
+another holding that identity was there, as a renamed column is when a
+new one takes its old name).  A root holds no identities, so the same
+tables, columns and rows give the same root however they were named
+before.  A commit records its root's identities beside it (its "identity"
+item): only those that differ from the object's own name with 0, so a
+commit whose objects were never renamed records nothing, and commits made
+before identities were recorded read the same way.  Commit ids already
+depend on history, through their parents and metadata; two commits with
+the same root can still record different identities.
+
+A branch's working set finds its identities through its own relations
+and attribute numbers, which a rename keeps and a drop and an add don't.
+The refs keep an anchor for each branch ('I'), written by each commit and
+after each move.  The anchor is valid only for the head it was made at.
+Each live table and column is found in the anchor, then by its name in
+the head's identity record, then given its own name's identity.  A column
+dropped and another of its name added gets the dropped column's identity,
+as Dolt's tags do.
+
+Reads match versions by identity.  dolt_at, dolt_history_table,
+dolt_diff_table, row diffs, and a merge's conflict listing read each
+version's columns under the names the working set gives the same columns
+(its tables by name, as a summary pairs them).  The canonicalizer's
+renames() works out the renames and rename_description() applies them in
+memory, so nothing is written.  A
+merge names base, ours and theirs as one, using merge_renames().  An
+object renamed on one side takes that side's name.  Renamed differently
+on both sides, or two kept objects given one name, is a schema conflict.
+The branch's own tables and columns are renamed to the merged names first
+(rename_objects(), ALTER TABLE ... RENAME), so their rows stay where they
+are and only the other side's changes are written.  The anchor is then the
+merge's.
+
+Folded format 18 is format 17 with identities recorded in commits.  Its
+roots differ from format 17's only in the "!:format" item, so this build
+reads, moves to and merges both.  An older server refuses format 18
+instead of matching renamed objects by name.
+
+
 Internal DDL and event triggers
 ------------------------------
 

@@ -1001,6 +1001,66 @@ test_commit_with(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&id));
 }
 
+/*
+ * test_commit_identity(ref): the identity record ref's commit holds beside
+ * its root, in the server's encoding (NULL: none, every object its own
+ * name's).
+ */
+PG_FUNCTION_INFO_V1(test_commit_identity);
+Datum
+test_commit_identity(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyHash	id;
+	ProllyCommitInfo info;
+
+	prolly_database_components(&dc);
+	resolve_ref(&dc, PG_GETARG_TEXT_PP(0), &id);
+	if (!PROLLY_CALL(dc.refs, commit_get, &id, &info) || info.identity == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(pg_any_to_server(info.identity,
+													  info.identity_len,
+													  PG_UTF8)));
+}
+
+/*
+ * test_working_identity(): the session branch's identity record, as its
+ * next commit would record it (NULL: empty).
+ */
+PG_FUNCTION_INFO_V1(test_working_identity);
+Datum
+test_working_identity(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	StringInfoData identity;
+
+	prolly_database_components(&dc);
+	initStringInfo(&identity);
+	PROLLY_CALL(dc.refs, working_identity, InvalidOid, &identity);
+	if (identity.len == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(pg_any_to_server(identity.data,
+													  identity.len,
+													  PG_UTF8)));
+}
+
+/*
+ * test_anchor_by_name(): anchor the session branch's working set as if
+ * every table and column had its own name's identity, as history made
+ * before identities were recorded has them: a rename since reads as a drop
+ * and an add, by name.
+ */
+PG_FUNCTION_INFO_V1(test_anchor_by_name);
+Datum
+test_anchor_by_name(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.refs, anchor_identity, NULL);
+	PG_RETURN_VOID();
+}
+
 /* test_refs_set_head(ref): make ref's commit the session branch's head */
 PG_FUNCTION_INFO_V1(test_refs_set_head);
 Datum

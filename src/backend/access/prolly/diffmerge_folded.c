@@ -43,6 +43,13 @@
  * three-way, and one defined otherwise takes the rows of the side that
  * redefined, made or kept it, if the other side didn't change them.
  *
+ * Tables and columns are matched across versions by their identity, which
+ * a rename keeps (the canonicalizer's identify()): a version's are read
+ * under the names the working set gives the same objects, and a merge's
+ * three roots under the names the merge gives them, the branch's own
+ * renamed to those first, so that a rename on one side and a change of
+ * the renamed object's rows on the other both merge.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/diffmerge_folded.c
  *
@@ -65,6 +72,7 @@
 #include "parser/parse_collate.h"
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/typcache.h"
@@ -84,6 +92,7 @@
 #include "catalog/pg_index.h"
 #include "catalog/pg_operator_d.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
@@ -199,6 +208,9 @@ static List *distinct_violations(List *found);
 static void take_breaking_rows(List *added, void *arg);
 static void diff_rows_now(Oid relid, const Table *from, const Table *to,
 						  const Table *now, ProllyDiffSink *sink);
+static void commit_root(const ProllyHash *id, ProllyNodeRef *root);
+static List *tables_in_root(const ProllyNodeRef *root, const ProllyHash *commit,
+							bool exact);
 
 static ProllyDatabaseComponents
 components(void)
@@ -491,6 +503,252 @@ find_table(List *tables, const char *name)
 			return t;
 	}
 	return NULL;
+}
+
+/* ------------------------------------------------------------------------
+ * Identity
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * A version's tables and columns are matched to another's by identity,
+ * which their renames keep (the canonicalizer's identify()): a commit's
+ * identity record, or the working set's.  Rows are read by name, so a
+ * version is read as the working set names its tables and columns: renamed
+ * as they are since (renames()), its descriptions and names those the
+ * working set has for the same objects.
+ */
+
+/* A commit's identity record into *out (empty: none recorded). */
+static void
+commit_identity(const ProllyHash *id, StringInfo out)
+{
+	ProllyCommitInfo info;
+
+	if (PROLLY_CALL(components().refs, commit_get, id, &info) && info.identity)
+		appendBinaryStringInfo(out, info.identity, info.identity_len);
+}
+
+/*
+ * The working set's identity record and definitions, for the command
+ * (kept while the transaction, command and branch are the same).
+ */
+typedef struct WorkingNames
+{
+	LocalTransactionId lxid;
+	CommandId	cid;
+	Oid			branch;
+	StringInfoData identity;
+	bool		have_root;		/* (read as it's first needed) */
+	ProllyNodeRef root;
+} WorkingNames;
+
+static WorkingNames working_names;
+
+static WorkingNames *
+working_names_now(void)
+{
+	WorkingNames *w = &working_names;
+	const ProllyRefsRoutine *refs = components().refs;
+	CommandId	cid = GetCurrentCommandId(false);
+
+	if (w->identity.data != NULL && w->lxid == MyProc->vxid.lxid &&
+		w->cid == cid && w->branch == MyBranch)
+		return w;
+	w->identity.data = NULL;
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		initStringInfo(&w->identity);
+		MemoryContextSwitchTo(old);
+	}
+	{
+		StringInfoData identity;
+
+		initStringInfo(&identity);
+		refs->working_identity(InvalidOid, &identity);
+		appendBinaryStringInfo(&w->identity, identity.data, identity.len);
+	}
+	w->have_root = false;
+	w->lxid = MyProc->vxid.lxid;
+	w->cid = cid;
+	w->branch = MyBranch;
+	return w;
+}
+
+static bool
+identities_known(void)
+{
+	ProllyDatabaseComponents dc = components();
+
+	return PROLLY_HAS(dc.refs, working_identity) &&
+		PROLLY_HAS(dc.canonicalizer, renames) &&
+		PROLLY_HAS(dc.canonicalizer, rename_description);
+}
+
+/*
+ * renames but those of tables renamed (or moved out of the way): a version's
+ * tables are read by their names, as summaries pair them, and only their
+ * columns by identity (a table renamed, its columns too, is left as it is).
+ */
+static List *
+columns_only(List *renames)
+{
+	List	   *kept = NIL;
+	ListCell   *lc;
+
+	foreach(lc, renames)
+	{
+		ProllyRename *r = lfirst(lc);
+		ListCell   *tc;
+		bool		renamed = false;
+
+		foreach(tc, renames)
+		{
+			ProllyRename *t = lfirst(tc);
+
+			if (t->column == NULL && strcmp(t->table, r->table) == 0)
+				renamed = true;
+		}
+		if (!renamed)
+			kept = lappend(kept, r);
+	}
+	return kept;
+}
+
+/*
+ * The renames that read root (of identity record identity) as the working
+ * set names its tables and columns; NIL if none.  (Both recording none,
+ * every object has its own name's identity: none.)
+ */
+static List *
+renames_to_working(const ProllyNodeRef *root, const StringInfoData *identity)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	WorkingNames *w;
+	ProllyValue from = {(const uint8 *) identity->data, identity->len};
+	ProllyValue to;
+
+	if (!identities_known())
+		return NIL;
+	w = working_names_now();
+	if (identity->len == 0 && w->identity.len == 0)
+		return NIL;
+	if (!w->have_root)
+	{
+		if (PROLLY_HAS(refs, read_definitions))
+			refs->read_definitions(&w->root, NULL, NULL, NULL);
+		else
+			(void) PROLLY_CALL(refs, working_set, NULL, &w->root);
+		w->have_root = true;
+	}
+	to.data = (const uint8 *) w->identity.data;
+	to.len = w->identity.len;
+	return columns_only(PROLLY_CALL(components().canonicalizer, renames, root,
+									&from, &w->root, &to));
+}
+
+static int
+table_utf8_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(((Table *) lfirst(a))->utf8, ((Table *) lfirst(b))->utf8);
+}
+
+/*
+ * tables (Table *, of one version) renamed as renames say: their names,
+ * and their descriptions' columns.  Kept in the canonical tree's order.
+ */
+static List *
+renamed_tables(List *tables, List *renames)
+{
+	const ProllyCanonRoutine *canon = components().canonicalizer;
+	ListCell   *lc;
+
+	if (renames == NIL)
+		return tables;
+	foreach(lc, tables)
+	{
+		Table	   *t = lfirst(lc);
+		ListCell   *rc;
+		bool		columns = false;
+		const char *to = NULL;
+
+		foreach(rc, renames)
+		{
+			ProllyRename *r = lfirst(rc);
+
+			if (strcmp(r->table, t->name) != 0)
+				continue;
+			if (r->column)
+				columns = true;
+			else
+				to = r->to;
+		}
+		if (columns)
+		{
+			ProllyValue d = {(const uint8 *) t->text, t->textlen};
+			StringInfoData out;
+
+			initStringInfo(&out);
+			PROLLY_CALL(canon, rename_description, &d, t->name, renames, &out);
+			t->text = out.data;
+			t->textlen = out.len;
+		}
+		if (to)
+		{
+			t->name = pstrdup(to);
+			t->utf8 = pg_server_to_any(to, strlen(to), PG_UTF8);
+		}
+	}
+	list_sort(tables, table_utf8_cmp);
+	return tables;
+}
+
+/*
+ * A version's tables, as tables_of() reads them, named as the working set
+ * names them (relid valid: the table of the working set's relid alone,
+ * found by identity).
+ */
+static List *
+version_tables(const char *ref, Oid relid)
+{
+	ProllyNodeRef root;
+	ProllyHash	id;
+	StringInfoData identity;
+	List	   *renames;
+	List	   *tables;
+
+	if (ref == NULL || is_working(ref) || !identities_known() ||
+		!PROLLY_CALL(components().refs, resolve, ref, &id))
+		return tables_of(ref, relid);
+	root_of(ref, &root);
+	initStringInfo(&identity);
+	commit_identity(&id, &identity);
+	renames = renames_to_working(&root, &identity);
+	if (renames == NIL)
+		return root_tables(&root, ref, relid);
+	tables = renamed_tables(root_tables(&root, ref, InvalidOid), renames);
+	if (OidIsValid(relid))
+	{
+		Table	   *t = find_table(tables, table_name(relid));
+
+		return t ? list_make1(t) : NIL;
+	}
+	return tables;
+}
+
+/* tables_at(), named as the working set names them. */
+static List *
+tables_at_now(const ProllyHash *id)
+{
+	ProllyNodeRef root;
+	StringInfoData identity;
+
+	commit_root(id, &root);
+	initStringInfo(&identity);
+	commit_identity(id, &identity);
+	return renamed_tables(tables_in_root(&root, id, true),
+						  renames_to_working(&root, &identity));
 }
 
 /* ------------------------------------------------------------------------
@@ -865,7 +1123,7 @@ diff_working_from_changes(const char *from_ref, Oid relid,
 	ok = refs->working_changes(relid, &base, buffer_change, &bc);
 	if (ok)
 	{
-		from = tables_of(from_ref, relid);
+		from = version_tables(from_ref, relid);
 		now = tables_defined_now(relid);
 		f = from ? linitial(from) : NULL;
 		n = now ? linitial(now) : NULL;
@@ -1048,11 +1306,11 @@ folded_diff(const char *from_ref, const char *to_ref, Oid relid,
 	if (OidIsValid(relid) && is_working(to_ref) && !is_working(from_ref) &&
 		diff_working_from_changes(from_ref, relid, sink))
 		return;
-	from = tables_of(from_ref, relid);
+	from = version_tables(from_ref, relid);
 
 	/* (WORKING folded once) */
 	to = is_working(to_ref) && is_working(from_ref) ? from :
-		tables_of(to_ref, relid);
+		version_tables(to_ref, relid);
 
 	/*
 	 * Rows are read as the tables are defined now: the working set's
@@ -7525,15 +7783,6 @@ tables_in_root(const ProllyNodeRef *root, const ProllyHash *commit, bool exact)
 	return ts.tables;
 }
 
-static List *
-tables_at(const ProllyHash *id)
-{
-	ProllyNodeRef root;
-
-	commit_root(id, &root);
-	return tables_in_root(&root, id, true);
-}
-
 /*
  * The working set holds something of its own: an object other than a
  * versioned schema (a branch with no commit has nothing else to lose).
@@ -7629,16 +7878,99 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 }
 
 /*
+ * The roots of a merge (base, ours, theirs) named alike, into aligned:
+ * each object as the side that renamed it names it (merge_renames()), the
+ * branch's own tables and columns renamed so (its rows kept, as only the
+ * other side's changes are written to it), ours then the branch as it is.
+ * The merged identity record goes into *identity.  False if no object
+ * is named otherwise on any side: aligned is roots.
+ */
+static bool
+align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
+			ProllyNodeRef *aligned, StringInfo identity)
+{
+	ProllyDatabaseComponents dc = components();
+	StringInfoData ids[3];
+	ProllyValue values[3];
+	List	   *renames[3];
+	bool		any = false;
+
+	for (int i = 0; i < 3; i++)
+		aligned[i] = roots[i];
+	if (!PROLLY_HAS(dc.canonicalizer, merge_renames) ||
+		!PROLLY_HAS(dc.canonicalizer, rename_root) ||
+		!PROLLY_HAS(dc.canonicalizer, rename_objects) ||
+		!PROLLY_HAS(dc.refs, working_identity))
+		return false;
+	for (int i = 0; i < 3; i++)
+	{
+		initStringInfo(&ids[i]);
+		if (i == 1 && !commits->ours_exact)
+			PROLLY_CALL(dc.refs, working_identity, InvalidOid, &ids[i]);
+		else
+			commit_identity(&commits->ids[i], &ids[i]);
+		values[i].data = (const uint8 *) ids[i].data;
+		values[i].len = ids[i].len;
+		any |= ids[i].len > 0;
+	}
+	/* (none recording any, every object has its own name's identity) */
+	if (!any)
+		return false;
+	PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, renames, identity);
+	if (renames[0] == NIL && renames[1] == NIL && renames[2] == NIL)
+		return false;
+	for (int i = 0; i < 3; i += 2)
+		if (renames[i] != NIL)
+			PROLLY_CALL(dc.canonicalizer, rename_root, &roots[i], renames[i],
+						&aligned[i]);
+	if (renames[1] != NIL)
+	{
+		PROLLY_CALL(dc.canonicalizer, rename_objects, renames[1]);
+		(void) PROLLY_CALL(dc.refs, working_set, NULL, &aligned[1]);
+	}
+	return true;
+}
+
+static int	merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
+						  bool fail_on_conflict, const char *what,
+						  const char *name, List **conflicted);
+
+/*
  * Write to the session's branch (its rows as roots[1] has them) what
  * changed from roots[0] to roots[2], three-way: what (a merge of branch
  * name, a cherry-pick) fails if a row conflicts and fail_on_conflict, else
  * conflicted gets the tables with conflicts.  Returns how many keys
- * conflict.  commits are the roots'.
+ * conflict.  commits are the roots'.  The roots' objects are matched by
+ * identity (align_merge()), and the branch's identity anchor is then the
+ * merge's.
  */
 static int
 merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
 			bool fail_on_conflict, const char *what, const char *name,
 			List **conflicted)
+{
+	ProllyNodeRef aligned[3];
+	StringInfoData identity;
+	bool		renamed;
+	int			conflicts;
+
+	initStringInfo(&identity);
+	renamed = align_merge(roots, commits, aligned, &identity);
+	conflicts = merge_aligned(aligned, commits, fail_on_conflict, what, name,
+							  conflicted);
+	if (renamed || identity.len > 0)
+	{
+		ProllyValue v = {(const uint8 *) identity.data, identity.len};
+
+		PROLLY_CALL(components().refs, anchor_identity, &v);
+	}
+	return conflicts;
+}
+
+static int
+merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
+			  bool fail_on_conflict, const char *what, const char *name,
+			  List **conflicted)
 {
 	ProllyDatabaseComponents dc = components();
 	List	   *base_tables;
@@ -9990,9 +10322,9 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 				 errmsg("%s", why),
 				 errhint("Give it its name back to list or resolve its conflicts.")));
 	}
-	bt = find_table(tables_at(&ms->base), name);
-	ot = find_table(tables_at(&ours), name);
-	tt = find_table(tables_at(&ms->theirs), name);
+	bt = find_table(tables_at_now(&ms->base), name);
+	ot = find_table(tables_at_now(&ours), name);
+	tt = find_table(tables_at_now(&ms->theirs), name);
 
 	/*
 	 * (a version keyed otherwise than the table is now, as a partition the

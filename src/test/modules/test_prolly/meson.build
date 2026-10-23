@@ -76,6 +76,7 @@ tests += {
       'diff_history',
       'diff_by_name',
       'as_of',
+      'identity_renames',
       'collations',
       'applier',
       'move_heads',

@@ -56,12 +56,12 @@ FROM pg_stat_prolly
 WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
            name            | value 
 ---------------------------+-------
- nodes_read                |    55
- nodes_written             |    15
+ nodes_read                |    70
+ nodes_written             |    16
  value_nodes_written       |     0
- chunks_appended           |    15
- chunk_bytes_appended      | 26284
- bytes_hashed              | 26849
+ chunks_appended           |    16
+ chunk_bytes_appended      | 27114
+ bytes_hashed              | 27679
  fold_rows_read            |  1000
  fold_rows_written         |  1000
  fold_pages                |     0
@@ -113,12 +113,12 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  gc_window_usec            |     0
  chunk_file_reads          |    10
  gc_pages_scanned          |     0
- commits_read              |     1
+ commits_read              |     2
  folds_reused              |     0
  describe_cache_hits       |     1
  apply_rows_batched        |     0
  apply_loads               |     0
- chunk_cache_hits          |    26
+ chunk_cache_hits          |    37
  fold_rows_located         |  1000
 (64 rows)
 

@@ -1,0 +1,770 @@
+-- Tables and columns keep their identity through renames: a commit records
+-- it beside its root (never in it), and historical reads, diffs and merges
+-- match objects by it, so a rename is not a drop and an add.
+CREATE DATABASE regress_identity_renames;
+\c regress_identity_renames
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA app VERSIONED;
+CREATE SCHEMA other VERSIONED;
+-- A rename on one branch, an update of the renamed column on another.
+CREATE TABLE app.users (id int PRIMARY KEY, email text);
+INSERT INTO app.users VALUES (42, 'person42');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT test_commit_identity('HEAD') IS NULL AS nothing_recorded;
+ nothing_recorded 
+------------------
+ t
+(1 row)
+
+ALTER TABLE app.users RENAME COLUMN email TO address;
+-- (uncommitted: the head's rows read as the table is named now)
+SELECT * FROM dolt_at('HEAD', NULL::app.users);
+ id | address  
+----+----------
+ 42 | person42
+(1 row)
+
+SELECT replace(test_working_identity(), E'\t', ' ') AS identity;
+          identity           
+-----------------------------
+ c app.users address email 0+
+ 
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'rename email to address')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT replace(test_commit_identity('HEAD'), E'\t', ' ') AS identity;
+          identity           
+-----------------------------
+ c app.users address email 0+
+ 
+(1 row)
+
+SELECT * FROM dolt_at('HEAD~1', NULL::app.users);
+ id | address  
+----+----------
+ 42 | person42
+(1 row)
+
+SELECT dolt_checkout('-b', 'edit', 'HEAD~1');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'edit'"}
+(1 row)
+
+UPDATE app.users SET email = 'changed' WHERE id = 42;
+SELECT length(dolt_commit('-Am', 'change email')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('edit'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.users;
+ id | address 
+----+---------
+ 42 | changed
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+SELECT replace(test_commit_identity('HEAD'), E'\t', ' ') AS identity;
+          identity           
+-----------------------------
+ c app.users address email 0+
+ 
+(1 row)
+
+-- The other direction: theirs renames (and edits another row), ours edits.
+CREATE TABLE app.dir (id int PRIMARY KEY, email text, n int);
+INSERT INTO app.dir VALUES (1, 'a', 10), (2, 'b', 20);
+SELECT length(dolt_commit('-Am', 'dir base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('renamer');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+UPDATE app.dir SET email = 'a2' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'ours edit')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('renamer');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'renamer'"}
+(1 row)
+
+ALTER TABLE app.dir RENAME COLUMN email TO address;
+UPDATE app.dir SET address = 'b2' WHERE id = 2;
+SELECT length(dolt_commit('-Am', 'theirs rename')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('renamer'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.dir ORDER BY id;
+ id | address | n  
+----+---------+----
+  1 | a2      | 10
+  2 | b2      | 20
+(2 rows)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- Historical reads across the rename: each version's stored values.
+SELECT * FROM dolt_at('HEAD~1', NULL::app.dir) ORDER BY id;
+ id | address | n  
+----+---------+----
+  1 | a2      | 10
+  2 | b       | 20
+(2 rows)
+
+SELECT (to_row).id, (to_row).address AS to_address, (from_row).address AS from_address,
+	   diff_type
+FROM dolt_diff_table(NULL::app.dir, 'HEAD~2', 'HEAD') ORDER BY 1, to_commit;
+ id | to_address | from_address | diff_type 
+----+------------+--------------+-----------
+  1 | a2         | a            | modified
+  2 | b2         | b            | modified
+(2 rows)
+
+SELECT (row).id, (row).address FROM dolt_history_table(NULL::app.dir)
+WHERE commit_hash = dolt_hashof('HEAD~1') ORDER BY 1;
+ id | address 
+----+---------
+  1 | a2
+  2 | b
+(2 rows)
+
+-- The old name reused: a new column, not the renamed one.
+ALTER TABLE app.dir ADD COLUMN email text DEFAULT 'new';
+UPDATE app.dir SET email = 'fresh' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'email again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT replace(test_commit_identity('HEAD'), E'\t', ' ') AS identity;
+          identity           
+-----------------------------
+ c app.dir address email 0  +
+ c app.dir email email 1    +
+ c app.users address email 0+
+ 
+(1 row)
+
+SELECT * FROM dolt_at('HEAD~2', NULL::app.dir) ORDER BY id;
+ id | address | n  | email 
+----+---------+----+-------
+  1 | a2      | 10 | new
+  2 | b       | 20 | new
+(2 rows)
+
+-- Names swapped: each column's values go with it.
+ALTER TABLE app.dir RENAME COLUMN email TO tmp;
+ALTER TABLE app.dir RENAME COLUMN address TO email;
+ALTER TABLE app.dir RENAME COLUMN tmp TO address;
+SELECT * FROM dolt_at('HEAD', NULL::app.dir) ORDER BY id;
+ id | email | n  | address 
+----+-------+----+---------
+  1 | a2    | 10 | fresh
+  2 | b2    | 20 | new
+(2 rows)
+
+SELECT length(dolt_commit('-Am', 'swap')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT * FROM dolt_at('HEAD~1', NULL::app.dir) ORDER BY id;
+ id | email | n  | address 
+----+-------+----+---------
+  1 | a2    | 10 | fresh
+  2 | b2    | 20 | new
+(2 rows)
+
+SELECT * FROM dolt_at('HEAD~3', NULL::app.dir) ORDER BY id;
+ id | email | n  | address 
+----+-------+----+---------
+  1 | a2    | 10 | new
+  2 | b     | 20 | new
+(2 rows)
+
+-- A key column renamed (composite key), and the same row's cells changed on
+-- both sides, one of them renaming another column twice.
+CREATE TABLE app.k (a int, b int, v text, w int, PRIMARY KEY (a, b));
+INSERT INTO app.k VALUES (1, 1, 'x', 1), (1, 2, 'y', 2);
+SELECT length(dolt_commit('-Am', 'k base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('k_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('k_conflict');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('k_same');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.k RENAME COLUMN b TO bb;
+UPDATE app.k SET w = 100 WHERE a = 1 AND bb = 1;
+SELECT length(dolt_commit('-Am', 'k ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('k_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'k_theirs'"}
+(1 row)
+
+ALTER TABLE app.k RENAME COLUMN v TO v1;
+SELECT length(dolt_commit('-Am', 'k theirs 1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE app.k RENAME COLUMN v1 TO v2;
+UPDATE app.k SET v2 = 'xx' WHERE a = 1 AND b = 1;
+SELECT length(dolt_commit('-Am', 'k theirs 2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('k_theirs'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.k ORDER BY a, bb;
+ a | bb | v2 |  w  
+---+----+----+-----
+ 1 |  1 | xx | 100
+ 1 |  2 | y  |   2
+(2 rows)
+
+SELECT * FROM dolt_at('k_theirs~1', NULL::app.k) ORDER BY a, bb;
+ a | bb | v2 | w 
+---+----+----+---
+ 1 |  1 | x  | 1
+ 1 |  2 | y  | 2
+(2 rows)
+
+SELECT * FROM dolt_at('HEAD~1', NULL::app.k) ORDER BY a, bb;
+ a | bb | v2 |  w  
+---+----+----+-----
+ 1 |  1 | x  | 100
+ 1 |  2 | y  |   2
+(2 rows)
+
+-- renamed otherwise on each side: a schema conflict
+SELECT dolt_checkout('k_conflict');
+             dolt_checkout             
+---------------------------------------
+ {0,"Switched to branch 'k_conflict'"}
+(1 row)
+
+ALTER TABLE app.k RENAME COLUMN v TO vthird;
+SELECT length(dolt_commit('-Am', 'k conflict')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_merge('k_conflict');
+ERROR:  schema conflict: column v of app.k is renamed v2 on one side and vthird on the other
+-- renamed alike on both sides: no conflict
+SELECT dolt_checkout('k_same');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'k_same'"}
+(1 row)
+
+ALTER TABLE app.k RENAME COLUMN b TO bb;
+UPDATE app.k SET v = 'yy' WHERE bb = 2;
+SELECT length(dolt_commit('-Am', 'k same')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('k_same'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.k ORDER BY a, bb;
+ a | bb | v2 |  w  
+---+----+----+-----
+ 1 |  1 | xx | 100
+ 1 |  2 | yy |   2
+(2 rows)
+
+-- A conflict on a renamed column's cell, listed and resolved as named now.
+CREATE TABLE app.c (id int PRIMARY KEY, v text);
+INSERT INTO app.c VALUES (1, 'base');
+SELECT length(dolt_commit('-Am', 'c base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('c_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.c RENAME COLUMN v TO val;
+UPDATE app.c SET val = 'ours';
+SELECT length(dolt_commit('-Am', 'c ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('c_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'c_theirs'"}
+(1 row)
+
+UPDATE app.c SET v = 'theirs';
+SELECT length(dolt_commit('-Am', 'c theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('c_theirs'))[3] AS conflicts;
+ conflicts 
+-----------
+ 1
+(1 row)
+
+SELECT (base_row).val AS base, (our_row).val AS ours, (their_row).val AS theirs
+FROM dolt_conflicts(NULL::app.c);
+ base | ours | theirs 
+------+------+--------
+ base | ours | theirs
+(1 row)
+
+SELECT dolt_conflicts_resolve('--theirs', 'app.c');
+ dolt_conflicts_resolve 
+------------------------
+ {0}
+(1 row)
+
+SELECT * FROM app.c;
+ id |  val   
+----+--------
+  1 | theirs
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'c merged')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+-- One side drops a column and renames another to its name.
+CREATE TABLE app.d (id int PRIMARY KEY, a text, c text);
+INSERT INTO app.d VALUES (1, 'a1', 'c1');
+SELECT length(dolt_commit('-Am', 'd base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('d_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.d DROP COLUMN c;
+ALTER TABLE app.d RENAME COLUMN a TO c;
+SELECT length(dolt_commit('-Am', 'd ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('d_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'd_theirs'"}
+(1 row)
+
+INSERT INTO app.d VALUES (2, 'a2', 'c2');
+SELECT length(dolt_commit('-Am', 'd theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('d_theirs'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM app.d ORDER BY id;
+ id | c  
+----+----
+  1 | a1
+  2 | a2
+(2 rows)
+
+-- A column dropped and one of its name added has the dropped one's
+-- identity (as Dolt's tags have it); a rename keeps the column's own.
+CREATE TABLE app.r (id int PRIMARY KEY, w int);
+INSERT INTO app.r VALUES (1, 7);
+SELECT length(dolt_commit('-Am', 'r base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE app.r DROP COLUMN w;
+ALTER TABLE app.r ADD COLUMN w int;
+SELECT * FROM dolt_at('HEAD', NULL::app.r);
+ id | w 
+----+---
+  1 | 7
+(1 row)
+
+SELECT position(E'app.r\t' IN test_working_identity()) = 0 AS own_names;
+ own_names 
+-----------
+ t
+(1 row)
+
+-- Tables: renamed with their rows changed, moved to another schema, the old
+-- name reused by an unrelated table; and merged with rows changed elsewhere.
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (1, 'one'), (2, 'two');
+SELECT length(dolt_commit('-Am', 't base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('t_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.t RENAME TO renamed_t;
+UPDATE app.renamed_t SET v = 'uno' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 't renamed and changed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE app.renamed_t SET SCHEMA other;
+SELECT length(dolt_commit('-Am', 't moved')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE TABLE app.t (id int PRIMARY KEY, v text);
+INSERT INTO app.t VALUES (9, 'nine');
+SELECT length(dolt_commit('-Am', 'new t')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('t_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 't_theirs'"}
+(1 row)
+
+UPDATE app.t SET v = 'dos' WHERE id = 2;
+SELECT length(dolt_commit('-Am', 't theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_merge('t_theirs'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT * FROM other.renamed_t ORDER BY id;
+ id |  v  
+----+-----
+  1 | uno
+  2 | dos
+(2 rows)
+
+SELECT * FROM app.t ORDER BY id;
+ id |  v   
+----+------
+  9 | nine
+(1 row)
+
+SELECT * FROM dolt_status;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
+-- A pick of a change to a column renamed since; then a reset to before the
+-- rename, after which a rename is still told from a drop and an add.
+CREATE TABLE app.p (id int PRIMARY KEY, v text);
+INSERT INTO app.p VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'p base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('p_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE app.p RENAME COLUMN v TO val;
+SELECT length(dolt_commit('-Am', 'p renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('p_theirs');
+            dolt_checkout            
+-------------------------------------
+ {0,"Switched to branch 'p_theirs'"}
+(1 row)
+
+UPDATE app.p SET v = 'uno';
+SELECT length(dolt_commit('-Am', 'p theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT (dolt_cherry_pick('p_theirs'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {0,0,0}
+(1 row)
+
+SELECT * FROM app.p;
+ id | val 
+----+-----
+  1 | uno
+(1 row)
+
+SELECT dolt_reset('--hard', 'HEAD~2');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM app.p;
+ id |  v  
+----+-----
+  1 | one
+(1 row)
+
+ALTER TABLE app.p RENAME COLUMN v TO renamed_again;
+SELECT * FROM dolt_at('HEAD', NULL::app.p);
+ id | renamed_again 
+----+---------------
+  1 | one
+(1 row)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+-- The same tables and rows reached by other renames are the same root;
+-- only the identities their commits record differ.
+SELECT dolt_checkout('-b', 'plain', 'HEAD');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'plain'"}
+(1 row)
+
+CREATE TABLE app.same (id int PRIMARY KEY, name text);
+INSERT INTO app.same VALUES (1, 'x');
+SELECT length(dolt_commit('-Am', 'made as named')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('-b', 'renamed', 'HEAD~1');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'renamed'"}
+(1 row)
+
+CREATE TABLE app.made (id int PRIMARY KEY, label text);
+INSERT INTO app.made VALUES (1, 'x');
+SELECT length(dolt_commit('-Am', 'made otherwise')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+ALTER TABLE app.made RENAME COLUMN label TO name;
+ALTER TABLE app.made RENAME TO same;
+-- (its constraints named as made as named: names are what a root holds)
+ALTER INDEX app.made_pkey RENAME TO same_pkey;
+ALTER TABLE app.same RENAME CONSTRAINT made_id_not_null TO same_id_not_null;
+SELECT length(dolt_commit('-Am', 'renamed to it')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT prolly_root_hash('plain') = prolly_root_hash('renamed') AS same_root;
+ same_root 
+-----------
+ t
+(1 row)
+
+SELECT test_commit_identity('plain') IS DISTINCT FROM test_commit_identity('renamed')
+	AS identities_differ;
+ identities_differ 
+-------------------
+ t
+(1 row)
+
+SELECT test_commit_identity('renamed') LIKE '%app.made%' AS renamed_recorded;
+ renamed_recorded 
+------------------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_identity_renames;
