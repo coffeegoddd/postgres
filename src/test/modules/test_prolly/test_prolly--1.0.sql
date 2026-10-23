@@ -326,6 +326,16 @@ CREATE FUNCTION test_commit_with(parent text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- The identity record a commit holds beside its root (NULL: none), and the
+-- one the session branch's next commit would record.
+CREATE FUNCTION test_commit_identity(ref text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_working_identity()
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 CREATE FUNCTION test_refs_set_head(ref text)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -375,6 +385,18 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- A walk's map checked: n hashes in budget bytes; the runs it wrote.
 CREATE FUNCTION test_seen_check(n int, budget int)
 RETURNS int
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A walk's map checked against one in memory, n hashes in budget bytes:
+-- what it cost.
+CREATE FUNCTION test_seen_measure(n int, budget int,
+	OUT memory_peak bigint, OUT filter_bytes_peak bigint,
+	OUT filter_budget bigint, OUT runs_peak int, OUT runs_written bigint,
+	OUT max_filter_checks int, OUT lookups bigint, OUT filter_checks bigint,
+	OUT run_searches bigint, OUT false_positives bigint,
+	OUT record_reads bigint, OUT merges bigint, OUT records_merged bigint,
+	OUT temp_bytes_peak bigint, OUT block_reads bigint)
+RETURNS record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- Every chunk a commit's walk reaches, once.

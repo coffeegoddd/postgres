@@ -106,8 +106,9 @@ SELECT length(dolt_commit('--allow-empty', '-m', 'main: nothing')::text) AS comm
 SELECT (dolt_merge('feature', '-m', 'merged a key'))[3:4];
 SELECT id, v FROM rm.k ORDER BY id;
 
--- A column renamed on one side while the other changed it isn't matched by
--- name: refused, not lost.
+-- A column renamed on one side while the other changed it is matched by
+-- its identity, which the rename keeps: both changes merge.  Dropped
+-- instead, the change would be lost: refused.
 SELECT dolt_checkout('feature');
 SELECT dolt_reset('--hard', 'main');
 ALTER TABLE rm.t RENAME COLUMN n TO n2;
@@ -116,6 +117,14 @@ SELECT dolt_checkout('main');
 UPDATE rm.t SET n = 100 WHERE id = 1;
 SELECT length(dolt_commit('-am', 'main: n of 1')::text) AS committed;
 SELECT (dolt_merge('feature', '-m', 'merged a rename'))[3:4];
+SELECT id, n2 FROM rm.t ORDER BY id;
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT dolt_checkout('feature');
+SELECT dolt_reset('--hard', 'main~1');
+ALTER TABLE rm.t DROP COLUMN n;
+SELECT length(dolt_commit('-am', 'feature: n dropped')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('feature', '-m', 'merged a drop'))[3:4];
 SELECT dolt_reset('--hard');
 
 -- A serial column one side added: its rows' values can't be told from the

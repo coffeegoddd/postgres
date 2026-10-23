@@ -1,8 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Commits of branches made by copying: committers on different branches
-# take turns on the refs and each keeps the other's commit; commits survive
-# a crash and reach a standby.
+# commit together and each keeps the other's commit; commits survive a
+# crash and reach a standby.
 
 use strict;
 use warnings FATAL => 'all';
@@ -29,24 +29,17 @@ sql(q{
 	SELECT dolt_branch('f');
 });
 
-# A committer on f waits for one on main, then builds on its refs.
+# A committer on f doesn't wait for one on main, and neither loses the
+# other's commit.
 my $a = $node->background_psql('postgres');
 my $b = $node->background_psql('postgres');
 $b->query_safe(q{SELECT dolt_checkout('f')});
 $a->query_safe(q{BEGIN; INSERT INTO app.t VALUES (2, 'main');
 	SELECT dolt_commit('-m', 'on main')});
-$b->query_until(qr/started/, q{
-	\echo started
-	INSERT INTO app.t VALUES (2, 'f');
-	SELECT dolt_commit('-m', 'on f');
-	\echo committed
-});
-ok($node->poll_query_until('postgres', q{
-	SELECT count(*) > 0 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-	WHERE NOT l.granted AND a.query LIKE '%on f%'}),
-	'a committer on another branch waits for the refs');
+$b->query_safe(q{SET lock_timeout = '5s'});
+$b->query_safe(q{INSERT INTO app.t VALUES (2, 'f');
+	SELECT dolt_commit('-m', 'on f')});
 $a->query_safe('COMMIT');
-$b->query_until(qr/committed/, '');
 is(sql(q{SELECT string_agg(message, ',') FROM dolt_log('main')}), 'on main,first',
 	'main has its commit');
 is(sql(q{SELECT string_agg(message, ',') FROM dolt_log('f')}), 'on f,first',

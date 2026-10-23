@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 
 from pbench.core import config as config_mod
 from pbench.core import env as env_mod
-from pbench.core import registry, targets
+from pbench.core import registry, suites, targets
 from pbench.core import correctness
 from pbench.core.validation import sha256
 from pbench.core.interfaces import (CellKey, CellResult, Cluster, Collector, Context,
@@ -102,6 +102,9 @@ def guard(name: str, fn: Callable[[], Any], status: dict[str, tuple[str, str]]) 
 
 
 class Runner:
+    # Extensions every cell's database installs (the suite's).
+    extensions: tuple[str, ...] = ()
+
     def __init__(self, *, suite: str, cfg: dict[str, Any], table_am: str, label: str,
                  repo: Path, bin_dir: Path, work_dir: Path, out_root: Path,
                  command: str, keep_failed: bool = False, build: str = "",
@@ -113,8 +116,10 @@ class Runner:
         # The build this runner's server is ("" unless builds are compared),
         # and every build compared, the base first.
         self.build, self.builds = build, tuple(builds)
-        if suite == "V" and table_am not in targets.VERSIONED_HISTORY:
-            raise SystemExit("The V suite measures version control, which only "
+        self.suite_def = suites.get(suite)
+        self.extensions = self.suite_def.extensions
+        if self.suite_def.history_only and table_am not in targets.VERSIONED_HISTORY:
+            raise SystemExit(f"The {suite} suite measures version control, which only "
                              f"{', '.join(sorted(targets.VERSIONED_HISTORY))} has.")
         date = dt.date.today().isoformat()
         out = out_root / f"{date}-{suite}-{label}"
@@ -138,7 +143,26 @@ class Runner:
         unknown = set(wanted) - {w.id for w in found}
         if unknown:
             raise SystemExit(f"unknown {self.suite} workloads: {sorted(unknown)}")
-        return sorted(found, key=lambda w: int(w.id[1:]))
+        return sorted(found, key=lambda w: suites.workload_order(w.id))
+
+    def _check_extensions(self, cluster: Cluster, ctx: Context) -> None:
+        """Record the cell's extension versions (and postgis_full_version(),
+        which names the GEOS, PROJ and GDAL PostGIS loaded), and refuse a
+        cell whose libraries aren't the ones the build recorded."""
+        found = {"extension_versions": json.loads(cluster.scalar(
+            "SELECT json_object_agg(extname, extversion ORDER BY extname) FROM pg_extension "
+            "WHERE extname <> 'plpgsql'", dbname=ctx.dbname))}
+        if "postgis" in self.extensions:
+            found["full_version"] = cluster.scalar("SELECT postgis_full_version()", dbname=ctx.dbname)
+        (ctx.raw_dir / "extensions.json").write_text(json.dumps(found, indent=1) + "\n")
+        built = self.info.environment.get("extensions", {}).get("postgis")
+        if built and "full_version" in found:
+            from pbench import postgis
+            changed = postgis.full_version_mismatches(built.get("full_version", ""),
+                                                      found["full_version"])
+            if changed:
+                raise RuntimeError("PostGIS is not running the libraries it was built with: "
+                                   + "; ".join(changed))
 
     def _make_cluster(self, instance: str) -> Cluster:
         cls = registry.clusters.get(self.cfg["run"]["cluster"])
@@ -170,13 +194,17 @@ class Runner:
         raw_root = self.out_dir / "raw"
         raw_root.mkdir()
 
+        configs = self.repo / "src" / "tools" / "prolly_bench" / "configs"
         environment = env_mod.record(repo=self.repo, bin_dir=self.bin_dir,
-                                     data_root=self.work_dir, tools=self.cfg["tools"])
+                                     data_root=self.work_dir, tools=self.cfg["tools"],
+                                     data_manifests=tuple(configs / m for m in
+                                                          self.suite_def.data_manifests))
         if self.cfg["run"]["fio_baseline"]:
             environment["fio"] = env_mod.fio_baseline(
                 self.work_dir, int(self.cfg["run"]["fio_seconds"]), raw_root)
         warnings = env_mod.warnings(environment, self.suite)
-        if (self.cfg["run"]["quality"] == "benchmark" or self.suite == "C") and warnings:
+        if (self.cfg["run"]["quality"] == "benchmark" or not self.suite_def.measures_performance) \
+                and warnings:
             raise RuntimeError("benchmark conditions failed: " + "; ".join(warnings))
         cells = list(self._cells())
         if not cells:
@@ -240,14 +268,19 @@ class Runner:
             if env_mod.build_provenance(self.bin_dir) != \
                     self.info.environment["postgres"].get("build_provenance"):
                 raise RuntimeError("the build's provenance changed after the run was planned")
+            if env_mod.library_hashes(self.bin_dir) != \
+                    self.info.environment["postgres"].get("library_hashes", {}):
+                raise RuntimeError("a server library changed after the run was planned")
             cluster.create(config_mod.server_settings(self.cfg))
             cluster.start()
             cluster.sql(f"CREATE DATABASE {ctx.dbname}")
-            target = targets.for_am(self.table_am)
+            target = targets.for_am(self.table_am, self.extensions)
             if target.setup_sql(ctx.dbname):
                 cluster.sql(target.setup_sql(ctx.dbname), dbname=ctx.dbname)
             log_pos = cluster.log_position()
             target.verify(cluster, ctx.dbname)
+            if self.extensions:
+                self._check_extensions(cluster, ctx)
 
             workload.check(ctx)
             collectors: list[Collector] = []

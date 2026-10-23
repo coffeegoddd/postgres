@@ -1,0 +1,49 @@
+--
+-- PostGIS values and indexes through every move: each table's EWKB
+-- (raster WKB) is byte-identical after checkout, reset back and forward,
+-- a merge into a branch that never had the tables, cherry-pick, revert
+-- and revert of the revert; the spatial indexes the moves maintain agree
+-- with sequential scans; typmods are kept and enforced.
+--
+\set ECHO none
+anchor|t
+branch bare|t
+tables on prolly|t
+indexes before|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+branch|t
+checkout|t
+checkout: same|t
+checkout: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+checkout: typmods|geometry(PointZ,4326),geography(Polygon,4326)
+checkout: no Z refused|22023 Column has Z dimension but geometry does not
+checkout: a point refused|22023 Geometry type (Point) does not match column type (Polygon)
+checkout main|t
+edits change the state|t
+reset back|t
+reset back: same|t
+reset back: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+reset forward|t
+reset forward: same|t
+reset forward: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+checkout bare|t
+bare has none|t
+commit bare|t
+merge|{0,0,"merge successful"}
+merge: a merge commit|t
+merge: same|t
+merge: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+merge: typmods|geometry(PointZ,4326),geography(Polygon,4326)
+branch at c1|t
+checkout pick|t
+cherry-pick|{0,0,0}
+cherry-pick: same|t
+cherry-pick: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+revert|{0,0,0}
+revert: same as c1|t
+revert: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+revert again|{0,0,0}
+revert again: same as c2|t
+revert again: indexes|brin agree (3 operators), geog agree (2 operators), gist agree (14 operators), nd agree (6 operators), spgist agree (4 operators)
+typmods|geometry(PointZ,4326),geography(Polygon,4326)
+another SRID refused|22023 Geometry SRID (3857) does not match column SRID (4326)
+checkout main|t

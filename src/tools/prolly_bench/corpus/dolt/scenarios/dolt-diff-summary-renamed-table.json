@@ -82,9 +82,9 @@
       "expect": {
         "rows": [
           [
-            "",
+            "public.t1",
             "public.t2",
-            "added",
+            "renamed",
             "t",
             "t"
           ]
@@ -103,9 +103,9 @@
       "expect": {
         "rows": [
           [
-            "",
+            "public.t1",
             "public.t2",
-            "added",
+            "renamed",
             "t",
             "t"
           ]
@@ -125,15 +125,8 @@
         "rows": [
           [
             "public.t1",
-            "",
-            "dropped",
-            "t",
-            "t"
-          ],
-          [
-            "",
             "public.t2",
-            "added",
+            "renamed",
             "t",
             "t"
           ]
@@ -153,15 +146,8 @@
         "rows": [
           [
             "public.t1",
-            "",
-            "dropped",
-            "t",
-            "t"
-          ],
-          [
-            "",
             "public.t2",
-            "added",
+            "renamed",
             "t",
             "t"
           ]
@@ -181,8 +167,8 @@
         "rows": [
           [
             "public.t1",
-            "",
-            "dropped",
+            "public.t2",
+            "renamed",
             "t",
             "t"
           ]
@@ -202,8 +188,8 @@
         "rows": [
           [
             "public.t1",
-            "",
-            "dropped",
+            "public.t2",
+            "renamed",
             "t",
             "t"
           ]
