@@ -48,6 +48,7 @@
 #include "access/genam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/relation.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -61,11 +62,13 @@
 #include "catalog/pg_database.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "commands/trigger.h"
 #include "catalog/versioned.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
+#include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -854,7 +857,8 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
  * would be kept by nobody, so each taken is remembered until its
  * transaction commits, and one whose transaction aborted is let go of the
  * next time this backend keeps or restores (letting go writes, which an
- * abort can't).
+ * abort can't), or, if it never does, as it exits.  (A crash in between
+ * leaves the snapshot to its storage, until the relation is dropped.)
  */
 typedef struct TakenSnapshot
 {
@@ -913,6 +917,8 @@ taken_subxact(SubXactEvent event, SubTransactionId mySubid,
 	}
 }
 
+static void let_go_at_exit(int code, Datum arg);
+
 static void
 note_taken(RelFileLocator locator, uint64 id)
 {
@@ -923,6 +929,7 @@ note_taken(RelFileLocator locator, uint64 id)
 	{
 		RegisterXactCallback(taken_xact, NULL);
 		RegisterSubXactCallback(taken_subxact, NULL);
+		before_shmem_exit(let_go_at_exit, (Datum) 0);
 		taken_callbacks = true;
 	}
 	t->locator = locator;
@@ -938,6 +945,37 @@ let_go_of(RelFileLocator locator, uint64 id)
 {
 	if (id != 0 && bmap_relation_exists(locator))
 		(void) bmap_snapshot_release(smgropen(locator, INVALID_PROC_NUMBER), id);
+}
+
+static void let_go_of_abandoned(void);
+
+/*
+ * As the backend exits: the snapshots of its aborted transactions (and of
+ * the one it is in, aborted now), let go of in a transaction of their own.
+ * Before the backend leaves its database; a failure is reported, not
+ * raised, the snapshots left to their storage.
+ */
+static void
+let_go_at_exit(int code, Datum arg)
+{
+	if (taken == NIL && abandoned == NIL)
+		return;
+	AbortOutOfAnyTransaction();
+	if (abandoned == NIL)
+		return;
+	PG_TRY();
+	{
+		StartTransactionCommand();
+		let_go_of_abandoned();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		FlushErrorState();
+		AbortOutOfAnyTransaction();
+	}
+	PG_END_TRY();
 }
 
 /* The snapshots of aborted (sub)transactions, let go of. */
@@ -1161,6 +1199,21 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
 			ok = false;
 		changed[i] = true;
+	}
+
+	/*
+	 * (nor while this session still uses one's storage, as TRUNCATE
+	 * refuses to: a scan of it open, or an AFTER trigger's event queued
+	 * holding a location in it, which would then name a row of the restored
+	 * pages)
+	 */
+	for (int i = 0; i < nkept && ok && any; i++)
+	{
+		Relation	rel = relation_open(kept[i].relid, NoLock);
+
+		if (rel->rd_refcnt != 1 || AfterTriggerPendingOnRel(kept[i].relid))
+			ok = false;
+		relation_close(rel, NoLock);
 	}
 
 	for (int i = 0; i < nkept && ok; i++)
