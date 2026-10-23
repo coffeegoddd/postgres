@@ -99,6 +99,7 @@ tests += {
       'checkpoints',
       'format_freeze',
       'dirty_merges',
+      'commit_root',
       'constraint_violations',
       'keyless_violations',
       'verify_constraints',

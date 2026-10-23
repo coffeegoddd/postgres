@@ -2334,29 +2334,30 @@ parents_height(const ProllyHash *parents, int nparents)
 }
 
 /*
- * Write a commit's tree; its id is the root's hash.  What its versioned
- * objects need from outside is folded now, from the catalogs as the
- * transaction sees them.  It is dated now, as Dolt's are, not at the
- * transaction's start, so a parent another session committed since then is
- * older than it; and never at or before a parent's date (the clock may have
- * stepped back, or a parent come from a remote whose clock runs ahead), so
- * along history the dates only rise.  (A parent dated outside timestamp's
- * range, or at its last microsecond, which only a foreign or corrupt commit
- * could be, leaves the date as it is.)  A date the commit was given
- * (dolt_commit --date) is its date, as Dolt's is.
+ * Write a commit's tree of root and dependencies (what its versioned
+ * objects need from outside); its id is the root's hash.  It is dated now,
+ * as Dolt's are, not at the transaction's start, so a parent another
+ * session committed since then is older than it; and never at or before a
+ * parent's date (the clock may have stepped back, or a parent come from a
+ * remote whose clock runs ahead), so along history the dates only rise.
+ * (A parent dated outside timestamp's range, or at its last microsecond,
+ * which only a foreign or corrupt commit could be, leaves the date as it
+ * is.)  A date the commit was given (dolt_commit --date) is its date, as
+ * Dolt's is.  Nothing is folded and no branch is moved.
  */
 static void
-write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message,
-			 const StringInfoData *identity, ProllyHash *id)
+copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
+				   const ProllyHash *parents, int nparents,
+				   const char *author, const char *message,
+				   const StringInfoData *identity, ProllyHash *id)
 {
 	TimestampTz at = GetCurrentTimestamp();
 	int			nparents_dated = nparents;
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
-	ProllyNodeRef deps;
-	ProllyDatabaseComponents dc;
+
+	refs_init();
 
 	/* (a date given, as dolt_commit --date: as given, whatever the parents') */
 	if (prolly_commit_date(&at))
@@ -2369,8 +2370,6 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 			IS_VALID_TIMESTAMP(parent_at) && IS_VALID_TIMESTAMP(parent_at + 1))
 			at = parent_at + 1;
 	}
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/*
@@ -2381,7 +2380,7 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	appendStringInfoString(&v, author);
 	add_item(b, "author", &v);
 	resetStringInfo(&v);
-	put_hash(&v, &deps.hash);
+	put_hash(&v, dependencies);
 	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
 	put_uint64(&v, (uint64) parents_height(parents, nparents));
@@ -2405,6 +2404,24 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	*id = ref.hash;
 	pfree(v.data);
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS, 1);
+}
+
+/*
+ * A commit of root whose dependencies are folded now, from the catalogs as
+ * the transaction sees them (copies_commit_root()).
+ */
+static void
+write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
+			 const char *author, const char *message,
+			 const StringInfoData *identity, ProllyHash *id)
+{
+	ProllyNodeRef deps;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
+	copies_commit_root(root, &deps.hash, parents, nparents, author, message,
+					   identity, id);
 }
 
 static bool
@@ -6128,4 +6145,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tags = copies_tags,
 	.rebase_state = copies_rebase_state,
 	.set_rebase_state = copies_set_rebase_state,
+	.commit_root = copies_commit_root,
 };

@@ -363,6 +363,17 @@ CREATE FUNCTION test_commit_with(parent text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- A commit written of the root and dependencies source's commit holds,
+-- with parent as its one parent (the refs' commit_root): nothing folded,
+-- no branch moved.
+CREATE FUNCTION test_commit_root(source text, parent text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A commit's canonical root and dependencies' root, as hex.
+CREATE FUNCTION test_commit_roots(ref text, OUT root text, OUT dependencies text)
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- The identity record a commit holds beside its root (NULL: none), and the
 -- one the session branch's next commit would record.
 CREATE FUNCTION test_commit_identity(ref text)

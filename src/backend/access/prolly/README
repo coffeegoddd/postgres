@@ -299,7 +299,12 @@ merge state in the chunk store's root.  Diff and merge ("folded",
 diffmerge_folded.c) compare canonical trees table by table, reading only
 subtrees that differ; moving a branch to another commit writes the
 differences back through the row applier (applier_replication.c), as
-logical replication's apply worker writes rows.
+logical replication's apply worker writes rows.  A commit of a canonical
+state a caller already holds is written by the refs' commit_root(), from
+the root, dependencies, parents and metadata given: it folds nothing,
+reads no catalog for the commit and moves no branch.  commit_with() folds
+the working set (and the dependencies, from the catalogs) and writes its
+commit through it.
 
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk
