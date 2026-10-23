@@ -566,33 +566,22 @@ typedef struct MakeKept
 	bool	   *used;
 } MakeKept;
 
+static bool can_restore(Form_pg_class c, const BranchKeptRelation *k);
+
 /*
  * Is kept relation k still the session branch's relation with the storage
- * that keeps it, its snapshot there?
+ * that keeps it, its snapshot there, and its pages' transaction ids ones
+ * the database still knows (can_restore())?
  */
 static bool
 still_kept(Relation pg_class, const BranchKeptRelation *k)
 {
 	HeapTuple	t = class_row(pg_class, k->relid, MyBranch);
-	Form_pg_class c;
-	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
-	RelFileLocator loc;
-	bool		ok = false;
-	int			n;
+	bool		ok;
 
 	if (t == NULL)
 		return false;
-	c = (Form_pg_class) GETSTRUCT(t);
-	loc = class_locator(c, c->relfilenode);
-	if (c->relfilenode == k->relfilenumber && c->reltablespace == k->tablespace &&
-		c->relpersistence == RELPERSISTENCE_PERMANENT &&
-		bmap_relation_exists(loc))
-	{
-		n = bmap_snapshot_list(smgropen(loc, INVALID_PROC_NUMBER), snaps,
-							   BMAP_SNAPSHOTS_MAX);
-		for (int s = 0; s < Min(n, BMAP_SNAPSHOTS_MAX) && !ok; s++)
-			ok = snaps[s].id == k->snapshot;
-	}
+	ok = can_restore((Form_pg_class) GETSTRUCT(t), k);
 	heap_freetuple(t);
 	return ok;
 }
@@ -1357,14 +1346,25 @@ copies_keep(List *relids, const BranchKeptRelation *prior, int nprior,
 /*
  * Is relation c (its row k) still on the branch with the storage that kept
  * it, its snapshot there, and its rows' transaction ids ones the database
- * still knows?
+ * still knows (none older than its datfrozenxid and datminmxid, whose
+ * status may be gone)?  Asked before the pages kept are given back, and
+ * before a branch is made of them.
  */
 static bool
-can_restore(Form_pg_class c, const BranchKeptRelation *k,
-			TransactionId datfrozenxid, MultiXactId datminmxid)
+can_restore(Form_pg_class c, const BranchKeptRelation *k)
 {
 	BmapSnapshot snaps[BMAP_SNAPSHOTS_MAX];
+	HeapTuple	dbtup;
+	TransactionId datfrozenxid;
+	MultiXactId datminmxid;
 	int			n;
+
+	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	if (!HeapTupleIsValid(dbtup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
+	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
+	ReleaseSysCache(dbtup);
 
 	if (c->relfilenode != k->relfilenumber ||
 		c->reltablespace != k->tablespace ||
@@ -1394,22 +1394,12 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 			   BranchKeptRelation *renewed)
 {
 	Relation	pg_class;
-	HeapTuple	dbtup;
-	TransactionId datfrozenxid;
-	MultiXactId datminmxid;
 	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
 	bool	   *changed = palloc0_array(bool, Max(nkept, 1));
 	bool		any = false;
 	bool		ok = true;
 
 	let_go_of_abandoned();
-	dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
-	if (!HeapTupleIsValid(dbtup))
-		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
-	datfrozenxid = ((Form_pg_database) GETSTRUCT(dbtup))->datfrozenxid;
-	datminmxid = ((Form_pg_database) GETSTRUCT(dbtup))->datminmxid;
-	ReleaseSysCache(dbtup);
-
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 
 	/* (each checked before any is restored) */
@@ -1417,8 +1407,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	{
 		rows[i] = class_row(pg_class, kept[i].relid, MyBranch);
 		if (rows[i] == NULL ||
-			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i],
-						 datfrozenxid, datminmxid))
+			!can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]))
 			ok = false;
 		else if (!bmap_snapshot_unchanged(smgropen(kept_locator(&kept[i]),
 												   INVALID_PROC_NUMBER),
