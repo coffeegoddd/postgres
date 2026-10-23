@@ -1256,6 +1256,8 @@ typedef struct DetachedBranches
 {
 	List	   *names;
 	char	   *current;
+	const char *only;			/* (non-NULL: is just this one still one?) */
+	bool		found;
 } DetachedBranches;
 
 static void
@@ -1263,9 +1265,14 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
 {
 	DetachedBranches *db = arg;
 
-	if (strcmp(name, db->current) == 0)
+	if (strcmp(name, db->current) == 0 ||
+		(db->only != NULL && strcmp(name, db->only) != 0))
 		return;
-	if (detached_branch(name) || done_writer_branch(name, head))
+	if (!(detached_branch(name) || done_writer_branch(name, head)))
+		return;
+	if (db->only != NULL)
+		db->found = true;
+	else
 		db->names = lappend(db->names, pstrdup(name));
 }
 
@@ -1276,11 +1283,17 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
  * checkout's.  Only in a transaction that can
  * write, or that is read-only only for the branch it started on (one
  * leaving a commit).
+ *
+ * Another checkout can delete a candidate, or a session write on a writer
+ * branch and leave it, while this one waits for the refs.  Each is asked
+ * again with the refs held, in its subtransaction: one no longer to be
+ * deleted, or one that is left, lets the refs go with the subtransaction,
+ * so a checkout that deletes nothing holds up no other mover.
  */
 static void
 sweep_detached(char *current)
 {
-	DetachedBranches db = {NIL, current};
+	DetachedBranches db = {NIL, current, NULL, false};
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
 	ListCell   *lc;
@@ -1289,19 +1302,32 @@ sweep_detached(char *current)
 	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
 	PROLLY_CALL(refs(), branches, add_detached, &db);
+	if (db.names == NIL)
+		return;
 	XactReadOnly = false;
 	foreach(lc, db.names)
 	{
+		char	   *name = (char *) lfirst(lc);
+		DetachedBranches still = {NIL, current, name, false};
+
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
 		PG_TRY();
 		{
-			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
-											 (char *) lfirst(lc), true));
-			if (writer_branch_name((char *) lfirst(lc)))
-				PROLLY_CALL(writers(), set_writer_branch, (char *) lfirst(lc),
-							NULL, NULL);
-			ReleaseCurrentSubTransaction();
+			PROLLY_CALL(refs(), lock);
+			AcceptInvalidationMessages();
+			PROLLY_CALL(refs(), branches, add_detached, &still);
+			if (still.found)
+			{
+				BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
+												 name, true));
+				if (writer_branch_name(name))
+					PROLLY_CALL(writers(), set_writer_branch, name,
+								NULL, NULL);
+				ReleaseCurrentSubTransaction();
+			}
+			else
+				RollbackAndReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(cxt);
 			CurrentResourceOwner = owner;
 		}
@@ -2282,6 +2308,96 @@ move_to_writer_branch(bool *same)
 	return true;
 }
 
+/* Find DML, including a modifying CTE in an otherwise read-only SELECT. */
+static bool
+raw_query_writes(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, InsertStmt) || IsA(node, UpdateStmt) ||
+		IsA(node, DeleteStmt) || IsA(node, MergeStmt))
+		return true;
+	return raw_expression_tree_walker(node, raw_query_writes, context);
+}
+
+/* Utility wrappers may contain other utility nodes, not raw expressions. */
+static bool
+raw_statement_writes(Node *stmt)
+{
+	if (stmt == NULL)
+		return false;
+	switch (nodeTag(stmt))
+	{
+		case T_InsertStmt:
+		case T_UpdateStmt:
+		case T_DeleteStmt:
+		case T_MergeStmt:
+			return true;
+		case T_SelectStmt:
+			return raw_query_writes(stmt, NULL);
+		case T_ExplainStmt:
+			{
+				/* Only EXPLAIN ANALYZE runs the statement it explains. */
+				ExplainStmt *es = (ExplainStmt *) stmt;
+				bool		analyze = false;
+
+				foreach_node(DefElem, opt, es->options)
+				{
+					if (strcmp(opt->defname, "analyze") == 0)
+						analyze = defGetBoolean(opt);
+				}
+				return analyze && raw_statement_writes(es->query);
+			}
+		case T_CreateTableAsStmt:
+			return raw_statement_writes(((CreateTableAsStmt *) stmt)->query);
+		default:
+			/* EXECUTE and other utilities are handled by ProcessUtility. */
+			return false;
+	}
+}
+
+/*
+ * Analysis takes RowExclusiveLock on a write's target.  Waiting until the
+ * post-analysis hook to fork lets several creators hold those locks on the
+ * protected source while one holds refs and waits for ShareLock to copy it.
+ * Route before analysis instead, and before cached queries reacquire locks.
+ * A branch switch invalidates the plan caches; analysis/revalidation below
+ * therefore uses the destination's definitions and locks throughout.
+ *
+ * Utility commands still use the ProcessUtility hook.  Nested statements
+ * cannot move the session out from under their caller's executor.
+ */
+void
+prolly_prepare_writer_statement(Node *stmt)
+{
+	static bool preparing = false;
+	bool		snapshot_set = false;
+	bool		same;
+
+	if (statement_depth != 0 || preparing || stmt == NULL ||
+		!IsTransactionState() || !raw_statement_writes(stmt))
+		return;
+
+	preparing = true;
+	PG_TRY();
+	{
+		/* Extended-protocol revalidation need not have an active snapshot. */
+		if (!ActiveSnapshotSet())
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			snapshot_set = true;
+		}
+		(void) move_to_writer_branch(&same);
+		if (snapshot_set)
+			PopActiveSnapshot();
+	}
+	PG_FINALLY();
+	{
+		preparing = false;
+	}
+	PG_END_TRY();
+}
+
 /* Lock a statement's relations again, on the branch the session is on now. */
 static void
 relock(List *rtable)
@@ -2306,8 +2422,8 @@ query_writes(Query *query)
 }
 
 /*
- * A top-level statement that writes moves as it is analyzed, before it is
- * planned: its plan is then the writer branch's.
+ * Fallback for writes introduced by an analysis hook: ordinary raw DML was
+ * already routed before taking any analysis locks.
  */
 static void
 writer_post_parse_analyze(ParseState *pstate, Query *query, const JumbleState *jstate)
