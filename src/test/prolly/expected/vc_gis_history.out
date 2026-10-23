@@ -1,0 +1,53 @@
+--
+-- PostGIS values and history: the same table built different ways has one
+-- root hash; rewrites that change only how a value is stored show no
+-- change; merges combine disjoint spatial edits and conflict on different
+-- bytes (spatially equal or not); geometry keys order, merge and refuse
+-- as they should.
+--
+\set ECHO none
+on main|t
+one root for one table|t|7
+checkout|t
+rewritten: no change|t
+stored uncompressed: no change|t
+same root after|t
+root unchanged|t
+three moved|t
+diff: exactly the moved rows|modified:1,modified:39,modified:101
+checkout main|t
+mg base|t
+branch|t
+mg main|t
+checkout side|t
+mg side|t
+spatially equal|t
+merge|{0,1,"conflicts found"}
+conflicts|8:POINT(-2 -2)|POINT(-1 -1), 9:POLYGON((1 0,1 1,0 0,1 0))|POLYGON((0 0,1 0,1 1,0 0))
+resolve theirs|t
+merged|t
+disjoint edits both kept|1:POINT(1 101),5:POINT(5 105),6:POINT(6 6),11:POINT(111 11),15:POINT(115 15),16:POINT(16 16)
+same polygon kept|16001|t
+conflicts resolved|8:POINT(-1 -1),9:POLYGON((0 0,1 0,1 1,0 0))
+checkout main|t
+keys|t
+branch|t
+keys main|t
+checkout keys|t
+keys side|t
+merge keys|{0,0,"merge successful"}
+heap copy|t
+key order as on heap|t|180
+composite keys merged|28|29
+merged keys|t
+side violations|t
+checkout main|t
+main violations|t
+checkout keys|t
+merge violating|{0,1,"conflicts found"}
+violations|public.gis_ex 1, public.gis_uq 1
+unique violation|unique index
+exclusion violation|unique index
+nothing merged|2|2
+long key|54000 primary key of 128035 bytes exceeds the maximum 32724 for prolly table "gis_pk"
+checkout main|t

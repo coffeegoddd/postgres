@@ -132,11 +132,42 @@ check-upstream-bmap: temp-install bmap.conf
 	$(MAKE) -C $(top_builddir)/src/test/isolation check TEMP_CONFIG=$(CURDIR)/bmap.conf
 	$(MAKE) -C $(top_builddir)/src/test/recovery check TEMP_CONFIG=$(CURDIR)/bmap.conf
 
+# PostGIS on versioned tables: what PostGIS does on heap, it does on prolly
+# (check-postgis-semantics, also run against heap), and its values and
+# indexes survive commits, moves and remotes (check-vc-postgis, always on
+# prolly).  PostGIS isn't part of this tree: POSTGIS_BUILD names a build of
+# the pinned PostGIS against this tree's installation prefix, made by
+#
+#	python3 src/tools/prolly_bench/build_postgis.py \
+#	    --pg-config PREFIX/bin/pg_config --build-dir DIR
+#
+# and is installed from there into the temporary installation.
+POSTGIS_BUILD ?=
+
+check-postgis: check-postgis-semantics check-vc-postgis
+
+postgis-install: temp-install
+	@test -n '$(POSTGIS_BUILD)' || { echo 'Set POSTGIS_BUILD to a build of PostGIS (see src/test/prolly/README)'; exit 1; }
+	@test -f '$(POSTGIS_BUILD)/src/GNUmakefile' || { echo '$(POSTGIS_BUILD) is not a PostGIS build directory'; exit 1; }
+	$(MAKE) -C '$(POSTGIS_BUILD)/src' DESTDIR='$(abs_top_builddir)/tmp_install' install \
+		>'$(abs_top_builddir)/tmp_install/log/postgis-install.log' 2>&1
+	@test -f '$(abs_top_builddir)/tmp_install$(pkglibdir)/postgis-3.so' || \
+		{ echo '$(POSTGIS_BUILD) is a build for another installation prefix than $(prefix)'; exit 1; }
+
+check-postgis-semantics: PROVE_TESTS = t/006_postgis.pl
+check-postgis-semantics: require-tap postgis-install
+	$(prove_check)
+
+check-vc-postgis: postgis-install check-vc-target-prolly vc.conf
+	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
+		--schedule=$(srcdir)/vc_postgis_schedule
+
 # What stock Postgres must pass: proves the tests are right.  The temporary
 # installation (with EXTRA_INSTALL) is made here: temp-install does nothing
-# in the recursive make below.
+# in the recursive make below.  With POSTGIS_BUILD, PostGIS's group too.
 check-heap: temp-install
-	$(MAKE) check-semantics check-isolation check-tap-durability PROLLY_AM=heap
+	$(MAKE) check-semantics check-isolation check-tap-durability \
+		$(if $(POSTGIS_BUILD),check-postgis-semantics) PROLLY_AM=heap
 
 require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
@@ -146,4 +177,5 @@ clean distclean:
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
+	check-postgis postgis-install check-postgis-semantics check-vc-postgis \
 	check-upstream-bmap require-tap FORCE

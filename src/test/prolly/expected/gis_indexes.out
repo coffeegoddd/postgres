@@ -1,0 +1,133 @@
+--
+-- Every PostGIS operator class indexes a table of the AM under test as it
+-- does heap: for each of its operators, index and bitmap scans find what a
+-- sequential scan finds, and KNN gives the same distances in order.
+--
+-- (SP-GiST's 2D class misses rows on the boundary for &>, which a
+-- sequential scan finds: PostGIS's, on heap as well.)
+--
+SELECT * FROM gis_check.index_agreement('gis_idx');
+               opclass               |          result          
+-------------------------------------+--------------------------
+ brin/brin_geometry_inclusion_ops_2d | agree (3 operators)
+ brin/brin_geometry_inclusion_ops_3d | agree (1 operators)
+ brin/brin_geometry_inclusion_ops_4d | agree (1 operators)
+ btree/btree_geometry_ops            | agree (5 operators)
+ gist/gist_geometry_ops_2d           | agree (14 operators)
+ gist/gist_geometry_ops_nd           | agree (6 operators)
+ hash/hash_geometry_ops              | agree (1 operators)
+ spgist/spgist_geometry_ops_2d       | DIFFER &> (12 operators)
+ spgist/spgist_geometry_ops_3d       | agree (4 operators)
+ spgist/spgist_geometry_ops_nd       | agree (4 operators)
+(10 rows)
+
+SELECT * FROM gis_check.index_agreement('gis_geogs');
+              opclass              |       result        
+-----------------------------------+---------------------
+ brin/brin_geography_inclusion_ops | agree (1 operators)
+ btree/btree_geography_ops         | agree (5 operators)
+ gist/gist_geography_ops           | agree (2 operators)
+ spgist/spgist_geography_ops_nd    | agree (1 operators)
+(4 rows)
+
+SELECT * FROM gis_check.index_agreement('gis_rasters');
+       opclass        |            result            
+----------------------+------------------------------
+ hash/hash_raster_ops | agree (1 operators) unused =
+(1 row)
+
+-- an exclusion constraint on a GiST index
+CREATE TABLE gis_parcels (id int PRIMARY KEY, g geometry,
+  EXCLUDE USING gist (g WITH &&));
+INSERT INTO gis_parcels VALUES (1, 'POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'),
+  (2, 'POLYGON((2 2, 3 2, 3 3, 2 3, 2 2))');
+INSERT INTO gis_parcels VALUES (3, 'POLYGON((0.5 0.5, 1.5 0.5, 1.5 1.5, 0.5 0.5))');
+ERROR:  conflicting key value violates exclusion constraint "gis_parcels_g_excl"
+DETAIL:  Key (g)=(01030000000100000004000000000000000000E03F000000000000E03F000000000000F83F000000000000E03F000000000000F83F000000000000F83F000000000000E03F000000000000E03F) conflicts with existing key (g)=(0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000).
+SELECT count(*) FROM gis_parcels;
+ count 
+-------
+     2
+(1 row)
+
+-- statistics: PostGIS's own, and the estimates and plans made from them
+ANALYZE gis_idx, gis_geogs, gis_geoms;
+SELECT stakind1, stakind2, stakind3, stakind4, stakind5 FROM pg_statistic s JOIN pg_attribute a
+  ON a.attrelid = s.starelid AND a.attnum = s.staattnum
+WHERE starelid = 'gis_idx'::regclass AND attname = 'g' AND NOT stainherit;
+ stakind1 | stakind2 | stakind3 | stakind4 | stakind5 
+----------+----------+----------+----------+----------
+        2 |        3 |        0 |      102 |      103
+(1 row)
+
+SELECT ST_AsText(ST_EstimatedExtent('gis_idx', 'g'));
+                                                                                                st_astext                                                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ POLYGON((-2.712500095367432 -2.662499904632568,-2.712500095367432 30.162500381469727,40.212501525878906 30.162500381469727,40.212501525878906 -2.662499904632568,-2.712500095367432 -2.662499904632568))
+(1 row)
+
+SELECT ST_AsText(ST_EstimatedExtent('public', 'gis_geogs', 'g'));
+                      st_astext                      
+-----------------------------------------------------
+ POLYGON((-180 -90,-180 90,180 90,180 -90,-180 -90))
+(1 row)
+
+CREATE INDEX gis_idx_g ON gis_idx USING gist (g);
+CREATE INDEX gis_geogs_g ON gis_geogs USING gist (g);
+ANALYZE gis_idx, gis_geogs;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM gis_idx WHERE g && ST_MakeEnvelope(0, 0, 2, 2);
+                                                                                                               QUERY PLAN                                                                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on gis_idx
+         Recheck Cond: (g && '010300000001000000050000000000000000000000000000000000000000000000000000000000000000000040000000000000004000000000000000400000000000000040000000000000000000000000000000000000000000000000'::geometry)
+         ->  Bitmap Index Scan on gis_idx_g
+               Index Cond: (g && '010300000001000000050000000000000000000000000000000000000000000000000000000000000000000040000000000000004000000000000000400000000000000040000000000000000000000000000000000000000000000000'::geometry)
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM gis_idx WHERE ST_Intersects(g, ST_MakeEnvelope(0, 0, 2, 2));
+                                                                                                                QUERY PLAN                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on gis_idx
+         Filter: st_intersects(g, '010300000001000000050000000000000000000000000000000000000000000000000000000000000000000040000000000000004000000000000000400000000000000040000000000000000000000000000000000000000000000000'::geometry)
+         ->  Bitmap Index Scan on gis_idx_g
+               Index Cond: (g && '010300000001000000050000000000000000000000000000000000000000000000000000000000000000000040000000000000004000000000000000400000000000000040000000000000000000000000000000000000000000000000'::geometry)
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT id FROM gis_idx ORDER BY g <-> 'POINT(3 3)'::geometry LIMIT 5;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using gis_idx_g on gis_idx
+         Order By: (g <-> '010100000000000000000008400000000000000840'::geometry)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM gis_geogs WHERE ST_DWithin(g, 'POINT(0 0)'::geography, 100000);
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Index Scan using gis_geogs_g on gis_geogs
+         Index Cond: (g && _st_expand('0101000020E610000000000000000000000000000000000000'::geography, '100000'::double precision))
+         Filter: st_dwithin(g, '0101000020E610000000000000000000000000000000000000'::geography, '100000'::double precision, true)
+(4 rows)
+
+SELECT count(*) FROM gis_idx WHERE ST_Intersects(g, ST_MakeEnvelope(0, 0, 2, 2));
+ count 
+-------
+    12
+(1 row)
+
+SELECT array_agg(round(d::numeric, 6) ORDER BY d) FROM (SELECT g <-> 'POINT(3 3)'::geometry AS d
+  FROM gis_idx ORDER BY d LIMIT 5) s;
+                   array_agg                    
+------------------------------------------------
+ {0.000000,0.000000,0.000000,0.000000,0.500000}
+(1 row)
+
+SELECT count(*) FROM gis_geogs WHERE ST_DWithin(g, 'POINT(0 0)'::geography, 2000000);
+ count 
+-------
+     5
+(1 row)
+
