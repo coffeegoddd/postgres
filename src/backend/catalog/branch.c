@@ -1128,6 +1128,12 @@ branch_writes_hush(void)
 	return depth;
 }
 
+bool
+branch_writes_hushed(void)
+{
+	return hushes != NIL;
+}
+
 /* (back to depth: a hush inside, left by an error, goes too) */
 void
 branch_writes_unhush(int depth)

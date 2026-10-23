@@ -148,6 +148,19 @@ ordering.  Older root formats retain the existing recommit requirement;
 committing a branch writes its current working state in the new format.
 
 
+Internal DDL and event triggers
+------------------------------
+
+Checkout, reset, merge, cherry-pick, clone and other internal history work
+reproduce database state without firing user event triggers.  Both SPI DDL
+and direct catalog deletions use branch_writes_hush()'s existing nested,
+subtransaction-aware scope.  Event-trigger dispatch and command/drop
+collection ignore that scope, including when a move runs inside an outer
+user DDL event.  The outer event retains its own commands and dropped
+objects.  No session GUC is changed; normal user DDL still fires triggers
+once the internal scope ends, including after errors.
+
+
 Trees and chunks
 ----------------
 

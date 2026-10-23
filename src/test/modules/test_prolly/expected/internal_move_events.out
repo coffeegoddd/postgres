@@ -1,0 +1,262 @@
+-- History operations reproduce state and must not fire users' DDL events.
+CREATE DATABASE regress_move_events;
+\c regress_move_events
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA mv VERSIONED;
+CREATE TABLE mv.base (id int PRIMARY KEY);
+INSERT INTO mv.base VALUES (1);
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS base \gset
+SELECT dolt_branch('old'), dolt_branch('merge_target'), dolt_branch('pick_target');
+ dolt_branch | dolt_branch | dolt_branch 
+-------------+-------------+-------------
+ {0}         | {0}         | {0}
+(1 row)
+
+CREATE TABLE mv.added (id int PRIMARY KEY);
+INSERT INTO mv.added VALUES (2);
+SELECT length(dolt_commit('-Am', 'added')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS added \gset
+CREATE TABLE public.events (event text, tag text);
+CREATE FUNCTION public.audit_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('test.guard_ddl', true) = 'on' THEN
+    RAISE EXCEPTION 'user DDL guard: % %', tg_event, tg_tag;
+  END IF;
+  INSERT INTO public.events VALUES (tg_event, tg_tag);
+END $$;
+CREATE EVENT TRIGGER mv_start ON ddl_command_start EXECUTE FUNCTION public.audit_ddl();
+CREATE EVENT TRIGGER mv_end ON ddl_command_end EXECUTE FUNCTION public.audit_ddl();
+CREATE EVENT TRIGGER mv_drop ON sql_drop EXECUTE FUNCTION public.audit_ddl();
+CREATE EVENT TRIGGER mv_rewrite ON table_rewrite EXECUTE FUNCTION public.audit_ddl();
+SET test.guard_ddl = on;
+-- First use creates branch copies and removes objects absent from its head.
+SELECT dolt_checkout('old');
+         dolt_checkout          
+--------------------------------
+ {0,"Switched to branch 'old'"}
+(1 row)
+
+SELECT to_regclass('mv.added') IS NULL AS absent;
+ absent 
+--------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_reset('--hard', :'base');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT to_regclass('mv.added') IS NULL AS absent;
+ absent 
+--------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'added');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM mv.added;
+ id 
+----
+  2
+(1 row)
+
+SELECT dolt_checkout('merge_target');
+              dolt_checkout              
+-----------------------------------------
+ {0,"Switched to branch 'merge_target'"}
+(1 row)
+
+INSERT INTO mv.base VALUES (3);
+SELECT length(dolt_commit('-Am', 'diverge')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT (dolt_merge('main'))[2:4];
+        dolt_merge        
+--------------------------
+ {0,0,"merge successful"}
+(1 row)
+
+SELECT * FROM mv.added;
+ id 
+----
+  2
+(1 row)
+
+SELECT dolt_checkout('pick_target');
+             dolt_checkout              
+----------------------------------------
+ {0,"Switched to branch 'pick_target'"}
+(1 row)
+
+SELECT (dolt_cherry_pick(:'added'))[2:4];
+ dolt_cherry_pick 
+------------------
+ {0,0,0}
+(1 row)
+
+SELECT * FROM mv.added;
+ id 
+----
+  2
+(1 row)
+
+SELECT count(*) AS internal_events FROM public.events;
+ internal_events 
+-----------------
+               0
+(1 row)
+
+-- A successful move must not leave user event triggers disabled.
+CREATE TABLE mv.guarded (id int);
+ERROR:  user DDL guard: ddl_command_start CREATE TABLE
+CONTEXT:  PL/pgSQL function audit_ddl() line 4 at RAISE
+SET test.guard_ddl = off;
+CREATE TABLE mv.ordinary (id int);
+ALTER TABLE mv.ordinary ALTER COLUMN id TYPE text;
+DROP TABLE mv.ordinary;
+SELECT event, tag FROM public.events ORDER BY event, tag;
+       event       |     tag      
+-------------------+--------------
+ ddl_command_end   | ALTER TABLE
+ ddl_command_end   | CREATE TABLE
+ ddl_command_end   | DROP TABLE
+ ddl_command_start | ALTER TABLE
+ ddl_command_start | CREATE TABLE
+ ddl_command_start | DROP TABLE
+ sql_drop          | DROP TABLE
+ table_rewrite     | ALTER TABLE
+(8 rows)
+
+TRUNCATE public.events;
+-- An error inside a move, caught by a subtransaction, also restores triggers.
+SELECT set_config('test.base', :'base', false) IS NOT NULL AS saved;
+ saved 
+-------
+ t
+(1 row)
+
+SELECT set_config('test.bad',
+  test_commit_of(test_root_with_format(prolly_root_hash('HEAD'), '0'), 'obsolete'),
+  false) IS NOT NULL AS saved;
+ saved 
+-------
+ t
+(1 row)
+
+SET test.guard_ddl = on;
+DO $$ BEGIN
+  PERFORM dolt_reset('--hard', current_setting('test.bad'));
+EXCEPTION WHEN feature_not_supported THEN
+  RAISE NOTICE 'caught obsolete-format reset';
+END $$;
+NOTICE:  caught obsolete-format reset
+CREATE TABLE mv.still_guarded (id int);
+ERROR:  user DDL guard: ddl_command_start CREATE TABLE
+CONTEXT:  PL/pgSQL function audit_ddl() line 4 at RAISE
+SET test.guard_ddl = off;
+TRUNCATE public.events;
+-- A move invoked inside an event trigger must not append internal commands
+-- to the surrounding event's command list, or lose that outer list.
+CREATE FUNCTION public.move_inside_event() RETURNS event_trigger LANGUAGE plpgsql AS $$
+DECLARE before_count int; after_count int;
+BEGIN
+  SELECT count(*) INTO before_count FROM pg_event_trigger_ddl_commands();
+  PERFORM dolt_reset('--hard', current_setting('test.base'));
+  SELECT count(*) INTO after_count FROM pg_event_trigger_ddl_commands();
+  RAISE NOTICE 'outer commands before %, after %', before_count, after_count;
+END $$;
+CREATE EVENT TRIGGER mv_nested ON ddl_command_end WHEN TAG IN ('CREATE SCHEMA')
+  EXECUTE FUNCTION public.move_inside_event();
+TRUNCATE public.events;
+CREATE SCHEMA outer_ddl;
+NOTICE:  outer commands before 1, after 1
+SELECT event, tag FROM public.events ORDER BY event, tag;
+       event       |      tag      
+-------------------+---------------
+ ddl_command_end   | CREATE SCHEMA
+ ddl_command_start | CREATE SCHEMA
+(2 rows)
+
+SELECT to_regclass('mv.added') IS NULL AS nested_reset;
+ nested_reset 
+--------------
+ t
+(1 row)
+
+DROP EVENT TRIGGER mv_nested;
+DROP SCHEMA outer_ddl;
+-- Clone with a guarding event trigger already installed in the destination.
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/move-events-' || txid_current() AS url \gset
+SELECT dolt_remote('add', 'events', :'url');
+ dolt_remote 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_push('events', 'main');
+         dolt_push         
+---------------------------
+ {0,"main -> events/main"}
+(1 row)
+
+CREATE DATABASE regress_move_events_clone;
+\c regress_move_events_clone
+CREATE FUNCTION public.guard_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'clone fired % %', tg_event, tg_tag; END $$;
+CREATE EVENT TRIGGER clone_start ON ddl_command_start EXECUTE FUNCTION public.guard_ddl();
+CREATE EVENT TRIGGER clone_end ON ddl_command_end EXECUTE FUNCTION public.guard_ddl();
+CREATE EVENT TRIGGER clone_drop ON sql_drop EXECUTE FUNCTION public.guard_ddl();
+SELECT dolt_clone(:'url');
+ dolt_clone 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM mv.added;
+ id 
+----
+  2
+(1 row)
+
+CREATE TABLE mv.clone_guarded (id int);
+ERROR:  clone fired ddl_command_start CREATE TABLE
+CONTEXT:  PL/pgSQL function guard_ddl() line 2 at RAISE
+DROP EVENT TRIGGER clone_start, clone_end, clone_drop;
+\c regress_move_events
+DROP EVENT TRIGGER mv_start, mv_end, mv_drop, mv_rewrite;
+\c contrib_regression
+DROP DATABASE regress_move_events_clone;
+DROP DATABASE regress_move_events;

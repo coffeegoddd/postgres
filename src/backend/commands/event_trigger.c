@@ -18,6 +18,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/branch.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -684,6 +685,10 @@ EventTriggerCommonSetup(Node *parsetree,
 	List	   *runlist = NIL;
 	List	   *planned = NIL;
 
+	/* A history move reproduces state; its DDL is not a user's command. */
+	if (branch_writes_hushed())
+		return NIL;
+
 	/*
 	 * We want the list of command tags for which this procedure is actually
 	 * invoked to match up exactly with the list that CREATE EVENT TRIGGER
@@ -1311,6 +1316,10 @@ EventTriggerEndCompleteQuery(void)
 bool
 trackDroppedObjectsNeeded(void)
 {
+	/* Direct dependency deletions, as well as SPI DDL, are internal. */
+	if (branch_writes_hushed())
+		return false;
+
 	/*
 	 * true if any sql_drop, table_rewrite, ddl_command_end event trigger
 	 * exists
@@ -1346,7 +1355,7 @@ EventTriggerSQLDropAddObject(const ObjectAddress *object, bool original, bool no
 	SQLDropObject *obj;
 	MemoryContext oldcxt;
 
-	if (!currentEventTriggerState)
+	if (!currentEventTriggerState || branch_writes_hushed())
 		return;
 
 	Assert(EventTriggerSupportsObject(object));
@@ -1747,7 +1756,7 @@ pg_event_trigger_table_rewrite_reason(PG_FUNCTION_ARGS)
 void
 EventTriggerInhibitCommandCollection(void)
 {
-	if (!currentEventTriggerState)
+	if (!currentEventTriggerState || branch_writes_hushed())
 		return;
 
 	currentEventTriggerState->commandCollectionInhibited = true;
@@ -1759,7 +1768,7 @@ EventTriggerInhibitCommandCollection(void)
 void
 EventTriggerUndoInhibitCommandCollection(void)
 {
-	if (!currentEventTriggerState)
+	if (!currentEventTriggerState || branch_writes_hushed())
 		return;
 
 	currentEventTriggerState->commandCollectionInhibited = false;
@@ -1786,8 +1795,8 @@ EventTriggerCollectSimpleCommand(ObjectAddress address,
 	MemoryContext oldcxt;
 	CollectedCommand *command;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1822,8 +1831,8 @@ EventTriggerAlterTableStart(const Node *parsetree)
 	MemoryContext oldcxt;
 	CollectedCommand *command;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1853,7 +1862,7 @@ EventTriggerAlterTableStart(const Node *parsetree)
 void
 EventTriggerAlterTableRelid(Oid objectId)
 {
-	if (!currentEventTriggerState ||
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1874,8 +1883,8 @@ EventTriggerCollectAlterTableSubcmd(const Node *subcmd, ObjectAddress address)
 	MemoryContext oldcxt;
 	CollectedATSubcmd *newsub;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1908,8 +1917,8 @@ EventTriggerAlterTableEnd(void)
 {
 	CollectedCommand *parent;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1949,8 +1958,8 @@ EventTriggerCollectGrant(InternalGrant *istmt)
 	InternalGrant *icopy;
 	ListCell   *cell;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -1992,8 +2001,8 @@ EventTriggerCollectAlterOpFam(const AlterOpFamilyStmt *stmt, Oid opfamoid,
 	MemoryContext oldcxt;
 	CollectedCommand *command;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2025,8 +2034,8 @@ EventTriggerCollectCreateOpClass(const CreateOpClassStmt *stmt, Oid opcoid,
 	MemoryContext oldcxt;
 	CollectedCommand *command;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2059,8 +2068,8 @@ EventTriggerCollectAlterTSConfig(const AlterTSConfigurationStmt *stmt, Oid cfgId
 	MemoryContext oldcxt;
 	CollectedCommand *command;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
@@ -2096,8 +2105,8 @@ EventTriggerCollectAlterDefPrivs(const AlterDefaultPrivilegesStmt *stmt)
 	MemoryContext oldcxt;
 	CollectedCommand *command;
 
-	/* ignore if event trigger context not set, or collection disabled */
-	if (!currentEventTriggerState ||
+	/* Ignore internal DDL even when an outer user command has a state. */
+	if (!currentEventTriggerState || branch_writes_hushed() ||
 		currentEventTriggerState->commandCollectionInhibited)
 		return;
 
