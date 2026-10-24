@@ -112,7 +112,8 @@ DETAIL:  An extension in a versioned schema is shared by every branch, and every
 HINT:  Drop the extension first.
 DROP EXTENSION citext CASCADE;
 NOTICE:  drop cascades to column name of table ve.t
-ERROR:  cannot drop type ve.citext because objects on branch "em_old" depend on it
+ERROR:  cannot drop extension citext because objects on branch "em_old" depend on it
+DETAIL:  They depend on type ve.citext, which it would drop.
 HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
 SELECT dolt_checkout('em_old');
            dolt_checkout           
