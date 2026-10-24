@@ -215,6 +215,39 @@ jobs:
       - name: PostGIS regression suite on versioned tables
         run: make -C src/test/prolly check-postgis-regress POSTGIS_BUILD="${{ steps.postgis.outputs.build-dir }}"
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/tools/prolly_bench/slt/go.mod
+          cache-dependency-path: src/tools/prolly_bench/slt/go.sum
+
+      # (seeded histories with a geometry table: heap against prolly, and
+      # version-control histories against the model; PostGIS is installed
+      # in inst)
+      - name: Seeded spatial histories
+        env:
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+        run: |
+          bash src/tools/prolly_bench/build_diff.sh
+          seeds=3
+          vcseeds=4
+          seed=1
+          if [ "$NIGHTLY" = true ]; then
+            seeds=20
+            vcseeds=40
+            seed="$GITHUB_RUN_NUMBER"
+          fi
+          failed=0
+          for am in heap prolly; do
+            src/tools/prolly_bench/prolly_bench differential --postgis \
+              --pg-bin "$PWD/inst/bin" --am "$am" \
+              --seed "$seed" --seeds "$seeds" --steps 48 --self-test \
+              --reduce 24 --out "$PWD/engine-results/differential-postgis-$am" || failed=1
+          done
+          src/tools/prolly_bench/prolly_bench vcfuzz --postgis \
+            --pg-bin "$PWD/inst/bin" --seed "$seed" --seeds "$vcseeds" --steps 80 \
+            --self-test --reduce 24 --out "$PWD/engine-results/vcfuzz-postgis" || failed=1
+          exit "$failed"
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v5
@@ -227,6 +260,7 @@ jobs:
             tmp_install/log/postgis-install.log
             build-bench/postgis/build.log
             build-bench/postgis/pbench-postgis.json
+            engine-results/**
           if-no-files-found: ignore
 
   build-and-test:
