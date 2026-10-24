@@ -376,11 +376,12 @@ SELECT dolt_branch('-m', 'mine2', 'mine3');
 (1 row)
 
 RESET ROLE;
-SELECT name, creator FROM dolt_branches WHERE name IN ('main', 'mine', 'mine3')
+SELECT name, CASE WHEN creator = current_user THEN '(database owner)' ELSE creator END AS creator
+FROM dolt_branches WHERE name IN ('main', 'mine', 'mine3')
 ORDER BY name;
  name  |     creator      
 -------+------------------
- main  | postgres
+ main  | (database owner)
  mine  | regress_hm_owner
  mine3 | regress_hm_owner
 (3 rows)

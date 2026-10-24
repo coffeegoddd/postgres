@@ -146,7 +146,8 @@ RESET ROLE;
 SET ROLE regress_hm_writer;
 SELECT dolt_branch('-m', 'mine2', 'mine3');
 RESET ROLE;
-SELECT name, creator FROM dolt_branches WHERE name IN ('main', 'mine', 'mine3')
+SELECT name, CASE WHEN creator = current_user THEN '(database owner)' ELSE creator END AS creator
+FROM dolt_branches WHERE name IN ('main', 'mine', 'mine3')
 ORDER BY name;
 SET ROLE regress_hm_owner;
 SELECT try($$SELECT dolt_branch('-D', 'mine3')$$) AS delete_renamed;
