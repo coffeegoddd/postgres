@@ -1737,6 +1737,19 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 	tree_path(blkno, &path);
 	n = Min(n, BMAP_TREE_FANOUT - path.slot[0]);
 	Assert(n > 0);
+
+	/*
+	 * In recovery, a map with no root page on disk is one dropped after the
+	 * record being replayed, whose header an earlier record's image made
+	 * again (redo makes a missing file to restore an image in): the
+	 * relation's pages go nowhere, as a relation's whose files are gone,
+	 * and the map goes again as its drop is replayed.
+	 */
+	if (InRecovery && !cached_only &&
+		(!mdexists(reln, BMAP_FORKNUM) ||
+		 mdnblocks(reln, BMAP_FORKNUM) < BMAP_TREE_MAP_PAGES))
+		return TREE_UNAVAILABLE;
+
 	for (;;)
 	{
 		PGIOAlignedBlock page;
