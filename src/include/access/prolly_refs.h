@@ -29,6 +29,7 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "access/transam.h"
+#include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
 #include "utils/snapshot.h"
 
@@ -226,6 +227,30 @@ typedef struct ProllyMovedBranch
 	TimestampTz last_ended;
 	int			writers;
 } ProllyMovedBranch;
+
+/*
+ * A commit a branch's pages are kept as of: each table's relations as
+ * branch operations' keep() kept them (the table's own first), the
+ * branch's baseline then (len 0: none), and the transaction that kept
+ * them, which saw every writer of the pages end.
+ */
+typedef struct ProllyKeptTable
+{
+	const char *name;			/* qualified, as tables() names it */
+	int			nrels;
+	const BranchKeptRelation *rels;
+} ProllyKeptTable;
+
+typedef struct ProllyKeptCommit
+{
+	ProllyHash	commit;
+	ProllyHash	baseline;
+	FullTransactionId kept_by;
+	int			ntables;
+	const ProllyKeptTable *tables;
+} ProllyKeptCommit;
+
+typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
 
 typedef struct ProllyRefsRoutine
 {
@@ -677,6 +702,14 @@ typedef struct ProllyRefsRoutine
 								ProllyHash *commit_id);
 
 	/*
+	 * Optional: visit the commits branch name's pages are kept as of (see
+	 * prolly.kept_commits), newest first; not those retired.  What is
+	 * visited is the refs' as this transaction reads them.
+	 */
+	void		(*kept_commits) (const char *name, ProllyKeptCommitVisit visit,
+								 void *arg);
+
+	/*
 	 * Optional, together: pins.  A pin keeps a commit, and everything it
 	 * reaches, from collection under a name, for a reader outside the refs
 	 * that names the commit (a snapshot mount), with the nkeep trees keep
@@ -711,6 +744,13 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  */
 extern PGDLLIMPORT int prolly_kept_commits;
 
+/*
+ * prolly.restore_min_changes: how many of a table's rows must differ from
+ * a kept commit's, since a baseline holding them, before a move back to it
+ * gives the table its pages back rather than write those rows (0: always).
+ */
+extern PGDLLIMPORT int prolly_restore_min_changes;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
@@ -728,8 +768,8 @@ extern PGDLLIMPORT int prolly_kept_commits;
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root", "pin_set", \
-	"pin_get", "pins"
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
+	"pin_set", "pin_get", "pins"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK pins
 

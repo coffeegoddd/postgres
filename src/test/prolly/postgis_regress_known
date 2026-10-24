@@ -1,0 +1,17 @@
+# PostGIS's regression tests whose outcome on versioned tables differs
+# from heap's (t/299_postgis_regress.pl): one per line,
+#
+#	TEST MODE ISSUE KIND DIFF REASON...
+#
+# TEST as run_test.pl names it (regress/core/affine), MODE one of prolly,
+# prolly_txn or prolly_dump, ISSUE the issue that decided or will fix the
+# difference, KIND intended (postgres_semantics: decided, documented) or
+# bug (known_bug: reported, not yet fixed), DIFF the md5 of the test's diff
+# on that mode as the summary prints it.  Only that diff is listed: a test
+# whose diff changes is a regression again, and so is a listed test that
+# agrees with heap, so a fixed bug's line must go with its fix.
+
+# Geometries PostGIS's text input accepts and its binary receive refuses
+# (a one-point LINESTRING; unclosed rings) can't be committed.
+regress/core/tickets prolly_txn #868 bug f9907ce93f5016ed1463575196e0d49d a one-point LINESTRING (#2985)
+regress/core/clean prolly_txn #868 bug ee35342c6340bd6cc15f69e0118ed15e invalid polygons and lines
