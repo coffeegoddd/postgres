@@ -136,6 +136,7 @@ SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a merge of a branch that still has the old table
 SELECT (dolt_merge('--no-ff', '-m', 'merged keeps_old', 'keeps_old'))[3] AS conflicts;
  conflicts 
@@ -143,6 +144,7 @@ SELECT (dolt_merge('--no-ff', '-m', 'merged keeps_old', 'keeps_old'))[3] AS conf
  0
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.t) ORDER BY id;
  id |       note       
@@ -174,6 +176,7 @@ SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a merge of a branch made from the new table: its versions read
 SELECT dolt_branch('keeps_new');
  dolt_branch 
@@ -380,8 +383,8 @@ SELECT dolt_checkout('main');
 
 -- a branch made at the old table's branch's head (from its hash: it has
 -- copies of main's relation, moved to the old rows), merging main in, and
--- merged back: its commits are of this relation (and its rows, merged, are
--- the table's: #936), the old table's commits aren't
+-- merged back: its first use made its copy again, a relation of its own,
+-- so neither its commits nor the old table's are this table's
 SELECT dolt_hashof('main') AS before_k \gset
 SELECT dolt_branch('k3', dolt_hashof('keeps_old')) IS NOT NULL AS made;
  made 
@@ -413,6 +416,7 @@ SELECT (dolt_merge('--no-ff', '-m', 'k3 in', 'k3'))[3] AS conflicts;
  0
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
@@ -432,14 +436,12 @@ SELECT count(*) AS rows_now FROM ln.t;
         4
 (1 row)
 
+-- (the merge made the table again, a relation of its own, as k3's copy
+-- was: main's history before it is another relation's now, and is refused)
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
- id |     note     
-----+--------------
- 10 | public
- 11 | public, side
- 12 | public, main
-(3 rows)
-
+ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT * FROM dolt_at('k3', NULL::ln.t) ORDER BY id;
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
 DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
@@ -455,6 +457,7 @@ SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a branch made at the old table's commit after the re-make, first used
 -- there, with a commit of its own, merged in
 SELECT dolt_branch('late2', :'old_commit') IS NOT NULL AS made;
@@ -488,6 +491,7 @@ SELECT (dolt_merge('--no-ff', '-m', 'late2 in', 'late2'))[3] AS conflicts;
  0
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
@@ -514,6 +518,7 @@ SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a branch made at the new table's commit by hash, its head moved to the
 -- old table's commit by a write role and committed
 SELECT dolt_branch('k4', :'new_commit') IS NOT NULL AS made;
@@ -596,6 +601,7 @@ SELECT (dolt_merge('--no-ff', '-m', 'forger in', 'forger'))[3] AS conflicts;
  0
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t);
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
@@ -628,6 +634,7 @@ SELECT dolt_reset('--hard', :'before_f') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a table made on a branch and merged in is a relation made here, of the
 -- class of the branch's relation it was made from: its branch's history
 -- is its grantee's
@@ -770,6 +777,7 @@ SELECT (dolt_merge('keeps_old'))[2] AS fast_forward;
  1
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
@@ -803,6 +811,7 @@ SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 CREATE TABLE ln.sm (id int PRIMARY KEY, note text);
 CREATE TABLE ln.sp (id int PRIMARY KEY, note text);
 CREATE TABLE ln.sr (id int PRIMARY KEY, note text);
@@ -903,6 +912,7 @@ SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a cherry-pick)
 SELECT pg_temp.remake('sp');
  remake 
@@ -928,6 +938,7 @@ SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a revert)
 SELECT pg_temp.remake('sr');
  remake 
@@ -953,6 +964,7 @@ SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- the same, a definition changed by the move too (an unrelated table
 -- altered): the uncommitted changes set aside, the branch moved to its
 -- head, so the remade table holds the head's rows; still not recorded made
@@ -1045,6 +1057,7 @@ SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a cherry-pick)
 SELECT pg_temp.remake('sp');
  remake 
@@ -1070,6 +1083,7 @@ SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a revert)
 SELECT pg_temp.remake('sr');
  remake 
@@ -1095,6 +1109,7 @@ SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a branch first used after the table changed on main: its copies, moved
 -- back to the table's definition at its start, are a relation made again
 -- (a column renamed back), the same table's: its commits read
@@ -1144,6 +1159,7 @@ SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a class is no branch's entry: a branch named as a relation's class is
 -- keyed, its merge's conflicted names written and dropped, leaves it
 CREATE TABLE ln.c (id int PRIMARY KEY, a int, note text);
@@ -1273,6 +1289,7 @@ SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
  t
 (1 row)
 
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- a commit of dolt.transaction_commit's records its relations too: the
 -- table's history reads through it
 SET dolt.transaction_commit = on;

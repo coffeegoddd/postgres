@@ -94,6 +94,58 @@ SELECT * FROM rv.t;
 RESET ROLE;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 
+-- a branch made at the old table's commit after the re-make, first used
+-- there, with a commit of its own, merged in: its commits are of the
+-- relation made again, so neither they nor the old rows read as this
+-- table's history
+SELECT dolt_branch('late2', :'old_commit') IS NOT NULL AS made;
+SELECT dolt_checkout('late2') IS NOT NULL AS on_late2;
+SELECT 'rv.t'::regclass::oid <> :new_oid AS another_relation, * FROM pg_temp.made_again('rv.t');
+INSERT INTO rv.t VALUES (3, 'late2 row');
+SELECT length(dolt_commit('-am', 'late2 row')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', '-m', 'late2 in', 'late2'))[3] AS conflicts;
+-- (the merge brought the other relation's rows in: made again here too)
+SELECT * FROM pg_temp.made_again('rv.t');
+GRANT SELECT ON rv.t TO regress_rv_reader;
+SET ROLE regress_rv_reader;
+SELECT * FROM dolt_at('HEAD^2', NULL::rv.t);
+SELECT * FROM dolt_at('late2', NULL::rv.t);
+SELECT * FROM dolt_at(:'old_commit', NULL::rv.t);
+RESET ROLE;
+SELECT * FROM dolt_at('late2', NULL::rv.t) ORDER BY id;
+SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
+GRANT SELECT ON rv.t TO regress_rv_reader;
+
+-- the same where the copy's definition differs from the old table's, so
+-- that the first use makes it again anyway (a column the old table had
+-- before a kept one): made again, it is still no copy of this table
+CREATE TABLE rv.d (id int PRIMARY KEY, a int, note text);
+INSERT INTO rv.d VALUES (1, 1, 'old secret d');
+SELECT length(dolt_commit('-Am', 'old d')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS old_d \gset
+DROP TABLE rv.d;
+SELECT length(dolt_commit('-Am', 'dropped d')::text) AS committed;
+CREATE TABLE rv.d (id int PRIMARY KEY, note text);
+INSERT INTO rv.d VALUES (10, 'public d');
+GRANT SELECT ON rv.d TO regress_rv_reader;
+SELECT length(dolt_commit('-Am', 'new d')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS new_d \gset
+SELECT dolt_branch('late_d', :'old_d') IS NOT NULL AS made;
+SELECT dolt_checkout('late_d') IS NOT NULL AS on_late_d;
+SELECT * FROM pg_temp.made_again('rv.d');
+INSERT INTO rv.d VALUES (3, 3, 'late d row');
+SELECT length(dolt_commit('-am', 'late d row')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', '-m', 'late_d in', 'late_d'))[3] AS conflicts;
+GRANT SELECT ON rv.d TO regress_rv_reader;
+SET ROLE regress_rv_reader;
+SELECT * FROM dolt_at('HEAD^2', NULL::rv.d);
+SELECT * FROM dolt_at('late_d', NULL::rv.d);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
+GRANT SELECT ON rv.t TO regress_rv_reader;
+
 -- a move within the table's own history keeps its relation and grants:
 -- the relation made again has its history from then on
 INSERT INTO rv.t VALUES (11, 'public, later');

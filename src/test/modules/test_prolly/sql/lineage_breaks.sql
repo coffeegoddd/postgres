@@ -56,9 +56,11 @@ RESET ROLE;
 -- (the database's owner reads it)
 SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
 SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a merge of a branch that still has the old table
 SELECT (dolt_merge('--no-ff', '-m', 'merged keeps_old', 'keeps_old'))[3] AS conflicts;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t);
@@ -67,6 +69,7 @@ SELECT row FROM dolt_history_table(NULL::ln.t);
 SELECT diff_type, to_row FROM dolt_diff('HEAD^2', 'HEAD', NULL::ln.t);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'new_commit') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a merge of a branch made from the new table: its versions read
 SELECT dolt_branch('keeps_new');
@@ -134,24 +137,28 @@ SELECT dolt_checkout('main');
 
 -- a branch made at the old table's branch's head (from its hash: it has
 -- copies of main's relation, moved to the old rows), merging main in, and
--- merged back: its commits are of this relation (and its rows, merged, are
--- the table's: #936), the old table's commits aren't
+-- merged back: its first use made its copy again, a relation of its own,
+-- so neither its commits nor the old table's are this table's
 SELECT dolt_hashof('main') AS before_k \gset
 SELECT dolt_branch('k3', dolt_hashof('keeps_old')) IS NOT NULL AS made;
 SELECT dolt_checkout('k3') IS NOT NULL AS on_k3;
 SELECT (dolt_merge('-m', 'main into k3', 'main'))[3] AS conflicts;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('--no-ff', '-m', 'k3 in', 'k3'))[3] AS conflicts;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 SELECT * FROM dolt_at('keeps_old', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^2^1', NULL::ln.t);
 SELECT count(*) AS rows_now FROM ln.t;
+-- (the merge made the table again, a relation of its own, as k3's copy
+-- was: main's history before it is another relation's now, and is refused)
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('k3', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
 RESET ROLE;
 SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a branch made at the old table's commit after the re-make, first used
 -- there, with a commit of its own, merged in
@@ -161,6 +168,7 @@ INSERT INTO ln.t VALUES (3, 'late2 row');
 SELECT length(dolt_commit('-am', 'late2 row')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('--no-ff', '-m', 'late2 in', 'late2'))[3] AS conflicts;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
 SELECT * FROM dolt_at('late2', NULL::ln.t) ORDER BY id;
@@ -168,6 +176,7 @@ SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 RESET ROLE;
 SELECT count(*) AS owner_reads FROM dolt_at('late2', NULL::ln.t);
 SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a branch made at the new table's commit by hash, its head moved to the
 -- old table's commit by a write role and committed
@@ -196,6 +205,7 @@ SELECT format('CREATE TABLE ln.%I (id int PRIMARY KEY)',
 SELECT length(dolt_commit('-Am', 'forged')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('--no-ff', '-m', 'forger in', 'forger'))[3] AS conflicts;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD^2', NULL::ln.t);
 SELECT * FROM dolt_at('forger', NULL::ln.t);
@@ -212,6 +222,7 @@ SELECT format('SELECT count(*) AS forged_rows FROM dolt_at(%L, NULL::ln.%I)',
 :read_forge;
 RESET ROLE;
 SELECT dolt_reset('--hard', :'before_f') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a table made on a branch and merged in is a relation made here, of the
 -- class of the branch's relation it was made from: its branch's history
@@ -264,6 +275,7 @@ SELECT dolt_checkout('keeps_old') IS NOT NULL AS on_old;
 SELECT (dolt_merge('-m', 'main into old', 'main'))[3] AS conflicts;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('keeps_old'))[2] AS fast_forward;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t);
@@ -278,6 +290,7 @@ RESET ROLE;
 -- working set, uncommitted: the commit holds the old table (the working
 -- set's own change left out), so it isn't recorded made from the new one
 SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 CREATE TABLE ln.sm (id int PRIMARY KEY, note text);
 CREATE TABLE ln.sp (id int PRIMARY KEY, note text);
 CREATE TABLE ln.sr (id int PRIMARY KEY, note text);
@@ -317,6 +330,7 @@ SELECT * FROM lb_snap.sm;
 RESET ROLE;
 SELECT prolly_unmount('lb_snap');
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a cherry-pick)
 SELECT pg_temp.remake('sp');
 SELECT (dolt_cherry_pick(:'to_pick'))[1] IS NOT NULL AS picked;
@@ -324,6 +338,7 @@ SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sp);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a revert)
 SELECT pg_temp.remake('sr');
 SELECT (dolt_revert(:'to_revert'))[1] IS NOT NULL AS reverted;
@@ -331,6 +346,7 @@ SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- the same, a definition changed by the move too (an unrelated table
 -- altered): the uncommitted changes set aside, the branch moved to its
@@ -363,6 +379,7 @@ SELECT * FROM lb_snap2.sm;
 RESET ROLE;
 SELECT prolly_unmount('lb_snap2');
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a cherry-pick)
 SELECT pg_temp.remake('sp');
 SELECT (dolt_cherry_pick(:'alter_pick'))[1] IS NOT NULL AS picked;
@@ -370,6 +387,7 @@ SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sp);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 -- (a revert)
 SELECT pg_temp.remake('sr');
 SELECT (dolt_revert(:'alter_revert'))[1] IS NOT NULL AS reverted;
@@ -377,6 +395,7 @@ SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a branch first used after the table changed on main: its copies, moved
 -- back to the table's definition at its start, are a relation made again
@@ -392,6 +411,7 @@ SET ROLE regress_lb_reader;
 SELECT id FROM dolt_at('late_side', NULL::ln.t) WHERE id = 60;
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a class is no branch's entry: a branch named as a relation's class is
 -- keyed, its merge's conflicted names written and dropped, leaves it
@@ -427,6 +447,7 @@ SET ROLE regress_lb_reader;
 SELECT id, note FROM dolt_at('c_late', NULL::ln.c);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+GRANT SELECT ON ln.t TO regress_lb_reader, regress_lb_writer;
 
 -- a commit of dolt.transaction_commit's records its relations too: the
 -- table's history reads through it
