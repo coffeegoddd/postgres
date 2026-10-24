@@ -431,7 +431,8 @@ prolly_folded_tree_env(ProllyTreeEnv *env)
 	env->chunk_format = prolly_chunkformat_lookup("basic");
 	env->chunker = prolly_chunker_lookup("bytes");
 	env->hash = prolly_content_hash();
-	env->chunk_store = prolly_chunk_store();
+	/* (reading the chunks a step keeps in the backend, if it keeps any) */
+	env->chunk_store = prolly_local_chunks_reading();
 	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
 							  MyDatabaseTableSpace);
 	env->compare = prolly_bytes_compare;
@@ -540,6 +541,13 @@ canon_env(Canon *cn)
 	cn->tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&cn->env);
 	prolly_folded_canon_env(&cn->root_env);
+
+	/* (a step that only compares keeps what it builds in the backend) */
+	if (prolly_local_chunks_active())
+	{
+		cn->env.chunk_store = prolly_local_chunks_keeping();
+		cn->root_env.chunk_store = prolly_local_chunks_keeping();
+	}
 }
 
 /* Append s in UTF-8. */

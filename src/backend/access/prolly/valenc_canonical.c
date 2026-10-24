@@ -67,6 +67,7 @@
 
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_chunkstore.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
 #include "common/hashfn.h"
@@ -386,7 +387,12 @@ encode_into(ProllyValueEncoder *enc, TupleTableSlot *slot,
 						(const uint8 *) val.data, val.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 			appendBinaryStringInfo(out, ref.data, ref.len);
-			if (toasted)
+			/*
+			 * (not a tree only this backend keeps: the memo's references
+			 * are everyone's once the transaction commits)
+			 */
+			if (toasted &&
+				!prolly_local_chunks_kept(enc->values->env->chunk_store))
 			{
 				ProllyValue r = {(const uint8 *) ref.data, ref.len};
 
