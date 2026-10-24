@@ -222,8 +222,9 @@ typedef struct BranchOpsRoutine
 	 * privileges its namesake on branch source has (the relation called as
 	 * it is, in the schema called as it is), the relation's and each
 	 * column's (by name), as the relation's owner here, keeping those it
-	 * has: for a relation a merge of source made here, whose commits hold
-	 * no privileges.  None
+	 * has: for a relation a merge of source, or a pick or revert of a
+	 * commit source's history has, made here, whose commits hold no
+	 * privileges.  Called for several sources, it adds each one's.  None
 	 * for one source hasn't, nor where source is no branch with copies
 	 * (a remote's ref, a tag, a commit, a branch never used).
 	 */

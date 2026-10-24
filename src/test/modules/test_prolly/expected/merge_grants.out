@@ -3,6 +3,7 @@
 -- making gives it (the branch's default privileges): commits hold
 -- no privileges, but a branch of this database does.  One a remote's ref
 -- brings (a fetch, a pull) arrives with only the ones its making gives it.
+-- A cherry-pick's or a revert's, of a commit a local branch has, the same.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 DROP ROLE IF EXISTS regress_mg_r;
@@ -276,7 +277,7 @@ SELECT pg_temp.grants('mg.i');
  regress_mg_r SELECT
 (1 row)
 
--- Cherry-picked: a commit, not a branch, gives none.
+-- Cherry-picked: the commit comes from a local branch, the same.
 SELECT dolt_checkout('-b', 'mg_cp') IS NOT NULL AS on_cp;
  on_cp 
 -------
@@ -304,9 +305,110 @@ SELECT length(dolt_cherry_pick('mg_cp')::text) > 0 AS picked;
 (1 row)
 
 SELECT pg_temp.grants('mg.cp');
- grants 
+       grants        
+---------------------
+ regress_mg_r SELECT
+(1 row)
+
+-- (by its hash, too: the branch whose history has it)
+SELECT dolt_checkout('-b', 'mg_cp2') IS NOT NULL AS on_cp2;
+ on_cp2 
 --------
- none
+ t
+(1 row)
+
+CREATE TABLE mg.cp2 (id int PRIMARY KEY);
+GRANT SELECT ON mg.cp2 TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'cp2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS cp2_commit \gset
+SELECT length(dolt_commit('--allow-empty', '-m', 'past cp2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT length(dolt_cherry_pick(:'cp2_commit')::text) > 0 AS picked;
+ picked 
+--------
+ t
+(1 row)
+
+SELECT pg_temp.grants('mg.cp2');
+       grants        
+---------------------
+ regress_mg_w SELECT
+(1 row)
+
+-- Reverted: a revert of a drop makes the table again, with the grants of a
+-- local branch whose history has the dropping commit and the table.
+SELECT dolt_checkout('-b', 'mg_rv') IS NOT NULL AS on_rv;
+ on_rv 
+-------
+ t
+(1 row)
+
+CREATE TABLE mg.rv (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'rv')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+DROP TABLE mg.rv;
+SELECT length(dolt_commit('-Am', 'rv gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS rv_drop \gset
+SELECT dolt_checkout('-b', 'mg_rv2') IS NOT NULL AS on_rv2;
+ on_rv2 
+--------
+ t
+(1 row)
+
+CREATE TABLE mg.rv (id int PRIMARY KEY);
+GRANT SELECT ON mg.rv TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'rv again')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('mg_rv'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {1}
+(1 row)
+
+SELECT length(dolt_revert(:'rv_drop')::text) > 0 AS reverted;
+ reverted 
+----------
+ t
+(1 row)
+
+SELECT pg_temp.grants('mg.rv');
+       grants        
+---------------------
+ regress_mg_r SELECT
 (1 row)
 
 -- Fetched: pushed to a remote and fetched back, the branch deleted here,
@@ -340,6 +442,26 @@ SELECT dolt_push('mg_origin', 'mg_far') AS pushed;
  {0,"mg_far -> mg_origin/mg_far"}
 (1 row)
 
+SELECT dolt_checkout('-b', 'mg_far2') IS NOT NULL AS on_far2;
+ on_far2 
+---------
+ t
+(1 row)
+
+CREATE TABLE mg.far2 (id int PRIMARY KEY);
+GRANT SELECT ON mg.far2 TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'far2')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_push('mg_origin', 'mg_far2') AS pushed;
+               pushed               
+------------------------------------
+ {0,"mg_far2 -> mg_origin/mg_far2"}
+(1 row)
+
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  on_main 
 ---------
@@ -347,6 +469,12 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 (1 row)
 
 SELECT dolt_branch('-D', 'mg_far');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mg_far2');
  dolt_branch 
 -------------
  {0}
@@ -365,6 +493,19 @@ SELECT (dolt_merge('mg_origin/mg_far'))[2:2] AS fast_forward;
 (1 row)
 
 SELECT pg_temp.grants('mg.far');
+ grants 
+--------
+ none
+(1 row)
+
+-- (and a fetched commit, cherry-picked, the same)
+SELECT length(dolt_cherry_pick('mg_origin/mg_far2')::text) > 0 AS picked;
+ picked 
+--------
+ t
+(1 row)
+
+SELECT pg_temp.grants('mg.far2');
  grants 
 --------
  none
@@ -412,8 +553,26 @@ SELECT dolt_branch('-D', 'mg_cp');
  {0}
 (1 row)
 
+SELECT dolt_branch('-D', 'mg_cp2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mg_rv');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mg_rv2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA mg CASCADE;
-NOTICE:  drop cascades to 9 other objects
+NOTICE:  drop cascades to 12 other objects
 DETAIL:  drop cascades to table mg.t
 drop cascades to table mg.n
 drop cascades to table mg.o
@@ -422,7 +581,10 @@ drop cascades to table mg.q
 drop cascades to table mg.back
 drop cascades to table mg.i
 drop cascades to table mg.cp
+drop cascades to table mg.cp2
+drop cascades to table mg.rv
 drop cascades to table mg.far
+drop cascades to table mg.far2
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
  committed 
 -----------

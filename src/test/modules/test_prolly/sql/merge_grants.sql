@@ -3,6 +3,7 @@
 -- making gives it (the branch's default privileges): commits hold
 -- no privileges, but a branch of this database does.  One a remote's ref
 -- brings (a fetch, a pull) arrives with only the ones its making gives it.
+-- A cherry-pick's or a revert's, of a commit a local branch has, the same.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -109,7 +110,7 @@ SELECT (dolt_integrate('main', '-m', 'i in'))[2] AS fast_forward;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT pg_temp.grants('mg.i');
 
--- Cherry-picked: a commit, not a branch, gives none.
+-- Cherry-picked: the commit comes from a local branch, the same.
 SELECT dolt_checkout('-b', 'mg_cp') IS NOT NULL AS on_cp;
 CREATE TABLE mg.cp (id int PRIMARY KEY);
 GRANT SELECT ON mg.cp TO regress_mg_r;
@@ -117,6 +118,33 @@ SELECT length(dolt_commit('-Am', 'cp')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT length(dolt_cherry_pick('mg_cp')::text) > 0 AS picked;
 SELECT pg_temp.grants('mg.cp');
+-- (by its hash, too: the branch whose history has it)
+SELECT dolt_checkout('-b', 'mg_cp2') IS NOT NULL AS on_cp2;
+CREATE TABLE mg.cp2 (id int PRIMARY KEY);
+GRANT SELECT ON mg.cp2 TO regress_mg_w;
+SELECT length(dolt_commit('-Am', 'cp2')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS cp2_commit \gset
+SELECT length(dolt_commit('--allow-empty', '-m', 'past cp2')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT length(dolt_cherry_pick(:'cp2_commit')::text) > 0 AS picked;
+SELECT pg_temp.grants('mg.cp2');
+
+-- Reverted: a revert of a drop makes the table again, with the grants of a
+-- local branch whose history has the dropping commit and the table.
+SELECT dolt_checkout('-b', 'mg_rv') IS NOT NULL AS on_rv;
+CREATE TABLE mg.rv (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'rv')::text) AS committed;
+DROP TABLE mg.rv;
+SELECT length(dolt_commit('-Am', 'rv gone')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS rv_drop \gset
+SELECT dolt_checkout('-b', 'mg_rv2') IS NOT NULL AS on_rv2;
+CREATE TABLE mg.rv (id int PRIMARY KEY);
+GRANT SELECT ON mg.rv TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'rv again')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('mg_rv'))[2:2] AS fast_forward;
+SELECT length(dolt_revert(:'rv_drop')::text) > 0 AS reverted;
+SELECT pg_temp.grants('mg.rv');
 
 -- Fetched: pushed to a remote and fetched back, the branch deleted here,
 -- its table arrives with none.
@@ -129,11 +157,20 @@ GRANT SELECT ON mg.far TO regress_mg_r;
 SELECT length(dolt_commit('-Am', 'far')::text) AS committed;
 SELECT dolt_remote('add', 'mg_origin', :'mg_url');
 SELECT dolt_push('mg_origin', 'mg_far') AS pushed;
+SELECT dolt_checkout('-b', 'mg_far2') IS NOT NULL AS on_far2;
+CREATE TABLE mg.far2 (id int PRIMARY KEY);
+GRANT SELECT ON mg.far2 TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'far2')::text) AS committed;
+SELECT dolt_push('mg_origin', 'mg_far2') AS pushed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', 'mg_far');
+SELECT dolt_branch('-D', 'mg_far2');
 SELECT dolt_fetch('mg_origin') AS fetched;
 SELECT (dolt_merge('mg_origin/mg_far'))[2:2] AS fast_forward;
 SELECT pg_temp.grants('mg.far');
+-- (and a fetched commit, cherry-picked, the same)
+SELECT length(dolt_cherry_pick('mg_origin/mg_far2')::text) > 0 AS picked;
+SELECT pg_temp.grants('mg.far2');
 SELECT dolt_remote('remove', 'mg_origin');
 
 SELECT dolt_branch('-D', 'mg_ff');
@@ -142,6 +179,9 @@ SELECT dolt_branch('-D', 'mg_noff');
 SELECT dolt_branch('-D', 'mg_rev');
 SELECT dolt_branch('-D', 'mg_int');
 SELECT dolt_branch('-D', 'mg_cp');
+SELECT dolt_branch('-D', 'mg_cp2');
+SELECT dolt_branch('-D', 'mg_rv');
+SELECT dolt_branch('-D', 'mg_rv2');
 DROP SCHEMA mg CASCADE;
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
 DROP ROLE regress_mg_r;

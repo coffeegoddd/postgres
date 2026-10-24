@@ -453,10 +453,12 @@ relation of its schema's and its own name has: the relation's, and each
 column's by name, as the new relation's owner gives them, with their
 shared dependencies (branch_ops' carry_privileges), added to those its
 making gave it (the target's default privileges).  The merging role
-approves them as it approves the table.  dolt_integrate() merges so too.
-A relation merged from a remote's ref (a fetch, a pull), a tag or a
-commit arrives with only those its making gives it, as does one a reset,
-cherry-pick or revert makes.  Row security and policies are held in
+approves them as it approves the table.  dolt_integrate() merges so too,
+and a cherry-pick or a revert takes them from each other branch of this
+database whose history has a commit it picks or reverts.  A relation
+merged from a remote's ref (a fetch, a pull), a tag or a commit, or
+picked from a commit no other branch here has, arrives with only those
+its making gives it, as does one a reset makes.  Row security and policies are held in
 commits, so they arrive with the relation whatever its source.
 
 Other shared state in the refs is guarded the same way.  Making a tag, and

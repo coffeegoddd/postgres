@@ -12751,33 +12751,126 @@ relations_made(HTAB *names, HTAB *relids)
 	return made;
 }
 
+/*
+ * The relations a move is about to make, found before it: those of the
+ * session branch's versioned schemas, by name and by id, and the local
+ * branches whose relations' privileges the ones it makes take.
+ */
+typedef struct CarriedPrivileges
+{
+	List	   *sources;		/* branches' names */
+	HTAB	   *names;
+	HTAB	   *relids;
+} CarriedPrivileges;
+
+/*
+ * Before a move whose relations come from branches sources (NIL: none of
+ * this database), the relations the session's branch has.
+ */
+static void
+carry_begin(CarriedPrivileges *carried, List *sources)
+{
+	carried->sources = branch_ops()->carry_privileges != NULL ? sources : NIL;
+	carried->names = NULL;
+	carried->relids = NULL;
+	if (carried->sources != NIL)
+		carried->names = relations_before(&carried->relids);
+}
+
+/*
+ * After it, each relation it made, new to the branch, has too the
+ * privileges of each source branch's relation of its name (several
+ * sources' together): its commits hold none, and a branch of this database
+ * has them.
+ */
+static void
+carry_end(CarriedPrivileges *carried)
+{
+	List	   *made;
+
+	if (carried->names == NULL)
+		return;
+	made = relations_made(carried->names, carried->relids);
+	foreach_ptr(char, source, carried->sources)
+		branch_ops()->carry_privileges(source, made);
+}
+
+/* The local branches a pick's commits come from, as they are found. */
+typedef struct PickSources
+{
+	const ProllyHash *commits;
+	int			ncommits;
+	const char *current;		/* the session's branch: not one */
+	List	   *names;
+} PickSources;
+
+/* Is branch name, at head, one a pick's commits come from (arg's)? */
+static void
+pick_source(const char *name, const ProllyHash *head, void *arg)
+{
+	PickSources *ps = arg;
+	ProllyDatabaseComponents dc = components();
+
+	if (head->len == 0 || strcmp(name, ps->current) == 0)
+		return;
+	for (int i = 0; i < ps->ncommits; i++)
+	{
+		ProllyHash	base;
+
+		if (PROLLY_CALL(dc.refs, merge_base, &ps->commits[i], head, &base) &&
+			same_hash(&base, &ps->commits[i]))
+		{
+			ps->names = lappend(ps->names, pstrdup(name));
+			return;
+		}
+	}
+}
+
+/*
+ * The branches of this database, other than the session's, that refs'
+ * commits (a cherry-pick's or a revert's) come from: those whose history
+ * has one of them.  A commit only a remote's ref, a tag or no ref at all
+ * has comes from none.
+ */
+static List *
+picked_sources(const char *const *refs, int nrefs)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyHash *commits;
+	PickSources ps = {0};
+
+	if (branch_ops()->carry_privileges == NULL || nrefs == 0)
+		return NIL;
+	commits = palloc_array(ProllyHash, nrefs);
+	for (int i = 0; i < nrefs; i++)
+		if (PROLLY_CALL(dc.refs, resolve, refs[i], &commits[ps.ncommits]))
+			ps.ncommits++;
+	if (ps.ncommits == 0)
+		return NIL;
+	ps.commits = commits;
+	ps.current = branch_ops()->current();
+	PROLLY_CALL(dc.refs, branches, pick_source, &ps);
+	return ps.names;
+}
+
 static int
 folded_merge(const char *branch, const char *message, int flags,
 			 ProllyHash *commit_id)
 {
 	/* the heads read under the refs held, as they are */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	const BranchOpsRoutine *ops = branch_ops();
 	const char *source = branch;
-	HTAB	   *before_names = NULL;
-	HTAB	   *before_relids = NULL;
+	CarriedPrivileges carried;
 	int			result;
 
-	/*
-	 * A relation the merge makes here, new to the branch, has too the
-	 * privileges of the source branch's of its name: its commits hold none,
-	 * and a branch of this database has them (one merged as a remote's
-	 * ref, a tag or a commit has none to give).
-	 */
+	/* (one merged as a remote's ref, a tag or a commit has none to give) */
 	if (strncmp(source, "refs/heads/", 11) == 0)
 		source += 11;
-	if (ops->carry_privileges != NULL &&
-		SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(source)))
-		before_names = relations_before(&before_relids);
+	carry_begin(&carried,
+				SearchSysCacheExists1(BRANCHNAME, CStringGetDatum(source)) ?
+				list_make1((char *) source) : NIL);
 	result = merge_held(branch, message, flags, commit_id);
-	if (before_names != NULL)
-		ops->carry_privileges(source,
-							  relations_made(before_names, before_relids));
+	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
@@ -13296,8 +13389,12 @@ folded_cherry_pick(const char *const *refs, int nrefs, bool allow_empty,
 {
 	/* the head read under the refs held, as it is */
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
+	CarriedPrivileges carried;
+	int			result;
 
+	carry_begin(&carried, picked_sources(refs, nrefs));
+	result = pick_held(refs, nrefs, allow_empty, commit_id, NULL);
+	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
@@ -13325,8 +13422,12 @@ folded_revert(const char *const *refs, int nrefs, const ProllyHash *series_head,
 			  ProllyHash *commit_id)
 {
 	bool		pushed = PROLLY_CALL(components().refs, hold);
-	int			result = revert_held(refs, nrefs, series_head, commit_id);
+	CarriedPrivileges carried;
+	int			result;
 
+	carry_begin(&carried, picked_sources(refs, nrefs));
+	result = revert_held(refs, nrefs, series_head, commit_id);
+	carry_end(&carried);
 	if (pushed)
 		PopActiveSnapshot();
 	return result;
