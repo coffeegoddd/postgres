@@ -62,7 +62,6 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/resowner.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -295,53 +294,31 @@ collection_due(void)
 }
 
 /*
- * A collection is refused while another of the store runs (a lock not
- * available, never waited for): several workers find the same store due
- * at once.  The one that runs collects what was due, so the others skip
- * it quietly, counted (auto_collections_skipped), rather than each
- * reporting the refusal as an error; dolt_gc() still reports it.
+ * A collection is refused while another of the store runs (its lock tried,
+ * never waited for): several workers find the same store due at once.
+ * The one that runs collects what was due, so the others skip it quietly,
+ * counted (auto_collections_skipped), rather than each reporting the
+ * refusal as an error; dolt_gc() still reports it.
  */
 static void
 collect(void)
 {
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
-	MemoryContext cxt = CurrentMemoryContext;
-	ResourceOwner owner = CurrentResourceOwner;
 
 	if (!collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 	prolly_database_components(&dc);
-	BeginInternalSubTransaction(NULL);
-	PG_TRY();
+	if (!PROLLY_CALL(dc.reclamation, collect, false, true, &r))
 	{
-		PROLLY_CALL(dc.reclamation, collect, false, &r);
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(cxt);
-		CurrentResourceOwner = owner;
-	}
-	PG_CATCH();
-	{
-		ErrorData  *ed;
-
-		MemoryContextSwitchTo(cxt);
-		ed = CopyErrorData();
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(cxt);
-		CurrentResourceOwner = owner;
-		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
-			ReThrowError(ed);
-		FlushErrorState();
 		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
 		ereport(DEBUG1,
-				(errmsg_internal("automatic collection of database \"%s\" skipped: %s",
-								 get_database_name(MyDatabaseId), ed->message)));
-		FreeErrorData(ed);
+				(errmsg_internal("automatic collection of database \"%s\" skipped: another collection of its chunk store is running",
+								 get_database_name(MyDatabaseId))));
 		return;
 	}
-	PG_END_TRY();
 	ereport(DEBUG1,
 			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 get_database_name(MyDatabaseId),

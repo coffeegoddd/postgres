@@ -3,7 +3,8 @@
 # Autovacuum's automatic collection, refused because another collection of
 # the store is running, skips quietly: a DEBUG1 message and
 # pg_stat_prolly's auto_collections_skipped, not an ERROR in the log.  An
-# explicit dolt_gc() refused so still reports the error.
+# explicit dolt_gc() refused so still reports the error, and any other
+# error an automatic collection meets is still reported.
 
 use strict;
 use warnings FATAL => 'all';
@@ -66,6 +67,20 @@ my $log = slurp_file($node->logfile, $log_offset);
 my @refusals = grep { /ERROR:  another collection/ } split /\n/, $log;
 is(scalar(@refusals), 1, "the log's only refusal is the explicit collection's")
 	or diag(join("\n", @refusals));
+
+# Any other error an automatic collection meets is still reported, and
+# not counted as a skip.
+my $count = sql($skipped);
+$log_offset = -s $node->logfile;
+sql(q{SELECT injection_points_attach('prolly-gc-roots-scanned', 'error')});
+sql(q{SELECT count(test_chunk_put(test_noise(g::text, 100002)))
+	FROM generate_series(1, 20) g});
+ok( $node->wait_for_log(
+		qr/autovacuum worker.*ERROR:  error triggered for injection point prolly-gc-roots-scanned/,
+		$log_offset),
+	'another error of an automatic collection is reported');
+sql(q{SELECT injection_points_detach('prolly-gc-roots-scanned')});
+is(sql($skipped), $count, 'and not counted as skipped');
 
 # With the store free again, the next automatic collection runs.
 my $dead = sql(q{SELECT test_chunk_put('dead after the skip')});
