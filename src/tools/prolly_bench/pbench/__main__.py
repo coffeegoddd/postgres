@@ -18,6 +18,7 @@
   prolly_bench sreport --counters ... --out comment.md   S gate: the pull-request comment
   prolly_bench vgrowth RUN                      V suite: per-commit work growing with prior commits
   prolly_bench vshape RUN                       V suite: operations' work as N and Δ grow, against targets
+  prolly_bench vclean RUN                       V suite: the same queries' rows and latency across cleanup
 """
 
 from __future__ import annotations
@@ -582,6 +583,20 @@ def main(argv=None) -> int:
     vs.add_argument("--markdown", type=Path, help="every finding, as a table")
     vs.set_defaults(fn=vshape.run)
 
+    from pbench import vclean
+    vcl = sub.add_parser("vclean", help="V suite: the same queries before and after storage "
+                                        "cleanup, their latencies compared")
+    vcl.add_argument("dir", type=Path, help="a result set of configs/v_cleanup.toml")
+    vcl.add_argument("--tolerance", type=float, default=vclean.TOLERANCE,
+                     help="a query's paired phase 2 over phase 1 ratio above this is slower")
+    vcl.add_argument("--floor-ms", type=float, default=vclean.FLOOR_MS,
+                     help="and only by more than this many milliseconds")
+    vcl.add_argument("--gate-latency", action="store_true",
+                     help="fail on a slower query (digests always gate: the run fails)")
+    vcl.add_argument("--json", type=Path)
+    vcl.add_argument("--markdown", type=Path, help="every query, as a table")
+    vcl.set_defaults(fn=vclean.run)
+
     from pbench import differential
     diff = sub.add_parser("differential", help="seeded transaction histories compared with heap")
     diff.add_argument("--am", default="prolly",
@@ -595,6 +610,8 @@ def main(argv=None) -> int:
     diff.add_argument("--reduce", type=int, default=0, help="bounded reduction attempts on failure")
     diff.add_argument("--replay", type=Path, help="saved program.json or reduced.json")
     diff.add_argument("--self-test", action="store_true", help="also prove the comparator rejects a known mismatch")
+    diff.add_argument("--postgis", action="store_true",
+                      help="add a geometry table and spatial families (PostGIS installed in --pg-bin's server)")
     diff.set_defaults(fn=differential.run)
 
     vcfuzz = sub.add_parser("vcfuzz", help="seeded version-control histories checked against a model")
@@ -608,6 +625,8 @@ def main(argv=None) -> int:
     vcfuzz.add_argument("--reduce", type=int, default=0, help="bounded reduction attempts on failure")
     vcfuzz.add_argument("--replay", help="saved history.json or reduced.json files (a glob)")
     vcfuzz.add_argument("--self-test", action="store_true", help="also prove the checks reject known wrong engines")
+    vcfuzz.add_argument("--postgis", action="store_true",
+                        help="give table t a geometry column written with b, and check window queries")
     vcfuzz.set_defaults(fn=differential.run_vc)
 
     from pbench import vc

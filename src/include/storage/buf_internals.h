@@ -114,7 +114,7 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_L
 #define BM_IO_IN_PROGRESS			BUF_DEFINE_FLAG( 4)
 /* previous I/O failed */
 #define BM_IO_ERROR					BUF_DEFINE_FLAG( 5)
-/* the storage manager must prepare the page before it next changes */
+/* with BM_SMGR_PREPARES: the page is to be prepared before it next changes */
 #define BM_SMGR_PREPARE				BUF_DEFINE_FLAG( 6)
 /* have waiter for sole pin */
 #define BM_PIN_COUNT_WAITER			BUF_DEFINE_FLAG( 7)
@@ -128,8 +128,8 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS + BUF_L
 #define BM_LOCK_WAKE_IN_PROGRESS	BUF_DEFINE_FLAG(11)
 /* with BM_SMGR_PREPARE: the page is shared, so preparing it copies it */
 #define BM_SMGR_SHARED				BUF_DEFINE_FLAG(12)
-/* BM_SMGR_PREPARE was set again since a check of the page began */
-#define BM_SMGR_REMARKED			BUF_DEFINE_FLAG(13)
+/* the page's storage manager prepares its pages before they change */
+#define BM_SMGR_PREPARES			BUF_DEFINE_FLAG(13)
 /* with BM_SMGR_PREPARE: the page isn't shared, but preparing it copies it */
 #define BM_SMGR_OWN					BUF_DEFINE_FLAG(14)
 
@@ -363,6 +363,15 @@ typedef struct BufferDesc
 	 * buffer header spinlock.
 	 */
 	proclist_head lock_waiters;
+
+	/*
+	 * With BM_SMGR_PREPARES: the generation of the storage managers' sharing
+	 * (BufferSmgrGeneration) at which the page's BM_SMGR_PREPARE,
+	 * BM_SMGR_SHARED and BM_SMGR_OWN were settled.  They hold only while it
+	 * is the current one: a page settled at an older generation is to be
+	 * prepared before it next changes.  Set under the buffer header spinlock.
+	 */
+	pg_atomic_uint64 smgr_gen;
 } BufferDesc;
 
 /*
@@ -393,6 +402,9 @@ typedef union BufferDescPadded
 	char		pad[BUFFERDESC_PAD_TO_SIZE];
 } BufferDescPadded;
 
+StaticAssertDecl(SIZEOF_VOID_P != 8 || sizeof(BufferDesc) <= BUFFERDESC_PAD_TO_SIZE,
+				 "a buffer descriptor must fit its cache line");
+
 /*
  * The PendingWriteback & WritebackContext structure are used to keep
  * information about pending flush requests to be issued to the OS.
@@ -418,6 +430,7 @@ typedef struct WritebackContext
 
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
+extern PGDLLIMPORT pg_atomic_uint64 *BufferSmgrGeneration;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 
 /* in localbuf.c */

@@ -111,6 +111,8 @@ jobs:
           make -s -j4 -C contrib COPT=-Werror
           make -s -j4 -C src/test/modules COPT=-Werror
           make -s install
+          make -s -C contrib/amcheck install
+          make -s -C contrib/pg_buffercache install
 
       - uses: actions/setup-java@v4
         with:
@@ -155,6 +157,23 @@ jobs:
             --known src/tools/prolly_bench/configs/v_shape_known.toml \
             --json "$PWD/engine-results/v-shape/vshape.json" \
             --markdown "$PWD/engine-results/v-shape/vshape.md"
+
+      # The same queries' rows before and after every storage cleanup: a
+      # difference fails the run; the latencies are reported, not gated.
+      # Nightly, at a larger size too.
+      - name: V suite cleanup invariance
+        env:
+          V10_SIZES: ${{ (github.event_name == 'schedule' || inputs.nightly) && 'pr,nightly' || 'pr' }}
+        run: |
+          src/tools/prolly_bench/prolly_bench run V --am prolly \
+            --workloads V10 --config src/tools/prolly_bench/configs/v_cleanup.toml \
+            --sizes "$V10_SIZES" \
+            --work-dir "$RUNNER_TEMP/v-cleanup" --out "$PWD/engine-results/v-cleanup"
+          src/tools/prolly_bench/prolly_bench vclean "$PWD"/engine-results/v-cleanup/*-V-prolly \
+            --json "$PWD/engine-results/v-cleanup/vclean.json" \
+            --markdown "$PWD/engine-results/v-cleanup/vclean.md"
+          { echo '### V10 cleanup invariance: paired latency, phase 2 over phase 1'; echo;
+            cat "$PWD/engine-results/v-cleanup/vclean.md"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark evidence
         if: always()
@@ -215,6 +234,40 @@ jobs:
       - name: PostGIS regression suite on versioned tables
         run: make -C src/test/prolly check-postgis-regress POSTGIS_BUILD="${{ steps.postgis.outputs.build-dir }}"
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/tools/prolly_bench/slt/go.mod
+          cache-dependency-path: src/tools/prolly_bench/slt/go.sum
+
+      # (seeded histories with a geometry table: heap against prolly, and
+      # version-control histories against the model; PostGIS is installed
+      # in inst)
+      - name: Seeded spatial histories
+        env:
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+        run: |
+          bash src/tools/prolly_bench/build_diff.sh
+          seeds=3
+          vcseeds=4
+          seed=1
+          if [ "$NIGHTLY" = true ]; then
+            seeds=20
+            vcseeds=40
+            # (each night's seeds apart from the last night's)
+            seed=$((GITHUB_RUN_NUMBER * 40))
+          fi
+          failed=0
+          for am in heap prolly; do
+            src/tools/prolly_bench/prolly_bench differential --postgis \
+              --pg-bin "$PWD/inst/bin" --am "$am" \
+              --seed "$seed" --seeds "$seeds" --steps 48 --self-test \
+              --reduce 24 --out "$PWD/engine-results/differential-postgis-$am" || failed=1
+          done
+          src/tools/prolly_bench/prolly_bench vcfuzz --postgis \
+            --pg-bin "$PWD/inst/bin" --seed "$seed" --seeds "$vcseeds" --steps 80 \
+            --self-test --reduce 24 --out "$PWD/engine-results/vcfuzz-postgis" || failed=1
+          exit "$failed"
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v5
@@ -227,6 +280,7 @@ jobs:
             tmp_install/log/postgis-install.log
             build-bench/postgis/build.log
             build-bench/postgis/pbench-postgis.json
+            engine-results/**
           if-no-files-found: ignore
 
   build-and-test:
