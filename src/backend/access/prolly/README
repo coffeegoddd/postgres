@@ -48,6 +48,7 @@ Changes to this design are tracked in GitHub issues:
 	remote            prolly_remote.h         file
 	value_memo        prolly_memo.h           shared, stub
 	writers           prolly_writers.h        modes, stub
+	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
@@ -420,9 +421,37 @@ and the tables and materialized views whose rows it wrote
 (move_tables_written): a checkout's work,
 table by table.
 
+With no branch at its head, the move planner (moveplan_costs.c)
+costs moving each branch's copies there, from the root its working set is
+known or thought to be: each table's rows that differ, estimated from its
+trees by diff_estimate() in a bounded number of nodes, and the tables
+redefined, made or dropped (materialized views' rows as tables'), each
+planned on its own branch.  The session's branch and at most 16 others are
+weighed, each stopped once it costs more than the best yet; the cheapest is
+copied, the session's on a tie.  Another branch is copied only if none of
+its writers is in the middle of a change (make()'s nowait): waiting for one,
+with the refs held, would hold up the session's branch's commits for as long
+as that writer's transaction lasts.  Else the session's branch is copied,
+waiting for its writers, as ever (pg_stat_prolly's first_use_sources_busy).
+The copies are new in the transaction, so no other sees them: a table of the chosen plan whose rows differ by more
+than reloading it costs (past about an eighth of them) begins empty instead
+(branch operations' make(), its emptied tables: new storage, as TRUNCATE
+gives it, no page shared, its change log told), and the move loads the
+head's rows into it, its indexes built once after them (the row applier's
+load).  Not a table with a deferrable unique, primary key or exclusion
+constraint, whose rows the applier rechecks a row at a time.  A table the
+head hasn't begins empty too, so the move drops it without its pages
+having been shared (and, for pages no other map held, logged) first.  A
+table whose definition differs keeps its pages: the move may keep its rows.
+
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies
-checked as a first use checks them.  A checkout's sweep lets go of those
+checked as a first use checks them.  At a first use, the move planner
+takes a kept one as any other branch, by its root, and costs every
+candidate's copies with the tables a kept one holds as the target does
+shared rather than written (a copy the planner empties to reload is
+shared into too), so the copies chosen are those cheapest to finish.  A
+checkout's sweep lets go of those
 past the budget, the least recently checked out first (recency is kept in
 shared memory; after a restart, older branches go first).  The budget
 counts idle ones: one a session is on is neither counted nor let go of,

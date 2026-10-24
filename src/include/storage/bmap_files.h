@@ -21,8 +21,11 @@
  *							nodes of tree maps too, pages of the store itself
  *	BMAP_REFS_RELNUMBER		reference counts: for each physical block, how many
  *							maps (or a tree's pages) hold it besides the first
+ *	BMAP_QUEUE_RELNUMBER	the release queue: subtrees and blocks of dropped
+ *							maps, each holding what it names until a
+ *							background pass lets go of it
  *
- * The three relation file numbers are reserved: below FirstGenbkiObjectId and
+ * The four relation file numbers are reserved: below FirstGenbkiObjectId and
  * used by no catalog object.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
@@ -38,5 +41,6 @@
 #define BMAP_ALLOC_RELNUMBER	9420
 #define BMAP_STORE_RELNUMBER	9421
 #define BMAP_REFS_RELNUMBER		9419
+#define BMAP_QUEUE_RELNUMBER	9441
 
 #endif							/* BMAP_FILES_H */

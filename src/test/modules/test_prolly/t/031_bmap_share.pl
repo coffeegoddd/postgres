@@ -90,6 +90,8 @@ my $copy_blocks = sql(qq{SELECT count(*) FROM test_bmap_map($copy)});
 $copy_blocks += sql(qq{SELECT count(DISTINCT block) FROM test_bmap_tree($copy)});
 my $free = sql(q{SELECT test_bmap_free_blocks()});
 sql(q{DROP TABLE cow.t});
+# (the drop queues what it held; the drain lets go of it)
+sql(q{SELECT * FROM test_bmap_release_drain()});
 is(sql(q{SELECT test_bmap_free_blocks()}) - $free, $src_own,
 	'the copy keeps the blocks it shared');
 sql(qq{SELECT test_bmap_unlink($copy)});

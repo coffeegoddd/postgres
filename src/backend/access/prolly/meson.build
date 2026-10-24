@@ -28,6 +28,8 @@ backend_sources += files(
   'memo_shared.c',
   'memo_stub.c',
   'merge_stub.c',
+  'moveplan_costs.c',
+  'moveplan_stub.c',
   'prolly_chunkstore.c',
   'prolly_config.c',
   'prolly_hashtext.c',

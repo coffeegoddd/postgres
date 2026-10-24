@@ -110,6 +110,7 @@ sql(q{
 ok(replayed(), 'the standby replays another relation');
 ssql(q{SELECT pg_buffercache_evict_relation('cow.junk')});
 sql(q{DROP TABLE cow.junk});
+sql(q{SELECT * FROM test_bmap_release_drain()});
 my $free = sql(q{SELECT test_bmap_free_blocks()});
 cmp_ok($free, '>', 0, 'which frees its blocks');
 sql(q{SELECT pg_buffercache_evict_relation('cow.z')});

@@ -52,9 +52,11 @@ FROM prolly_implementations();
  writers       | stub         |       0 |              0
  change_log    | relation     |       1 |              2
  change_log    | stub         |       0 |              0
+ move_planner  | costs        |       1 |              1
+ move_planner  | stub         |       0 |              0
  matcache      | branches     |       1 |              1
  matcache      | stub         |       0 |              0
-(45 rows)
+(47 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -157,6 +159,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | cow            | diff_reads_changed_paths       | pass
  tree          | cow            | diff_across_heights            | pass
  tree          | cow            | diff_unordered_matches         | pass
+ tree          | cow            | diff_estimate_bounds           | pass
  tree          | cow            | seeks_in_order                 | pass
  tree          | cow            | nodes_are_valid                | pass
  tree          | cow            | large_values                   | pass
@@ -176,11 +179,12 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | diff_reads_changed_paths       | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
  tree          | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
  tree          | stub           | diff_unordered_matches         | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff_unordered)
+ tree          | stub           | diff_estimate_bounds           | not implemented (missing build_begin, build_add, build_finish, apply, diff_estimate)
  tree          | stub           | seeks_in_order                 | not implemented (missing build_begin, build_add, build_finish, walk, cursor_open, cursor_seek, cursor_next, cursor_close)
  tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
  tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
  tree          | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
- tree          | stub           | complete                       | not implemented (21 of 21 callbacks missing)
+ tree          | stub           | complete                       | not implemented (22 of 22 callbacks missing)
  table_keying  | pk_or_prefix   | identity                       | pass
  table_keying  | pk_or_prefix   | round_trip                     | pass
  table_keying  | pk_or_prefix   | keys_and_content               | pass
@@ -246,11 +250,15 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  change_log    | relation       | complete                       | pass
  change_log    | stub           | identity                       | pass
  change_log    | stub           | complete                       | not implemented (15 of 15 callbacks missing)
+ move_planner  | costs          | identity                       | pass
+ move_planner  | costs          | complete                       | pass
+ move_planner  | stub           | identity                       | pass
+ move_planner  | stub           | complete                       | not implemented (1 of 1 callbacks missing)
  matcache      | branches       | identity                       | pass
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(188 rows)
+(194 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -271,12 +279,13 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | diff_reads_changed_paths  | pass
  tree      | cow            | diff_across_heights       | pass
  tree      | cow            | diff_unordered_matches    | pass
+ tree      | cow            | diff_estimate_bounds      | pass
  tree      | cow            | seeks_in_order            | pass
  tree      | cow            | nodes_are_valid           | pass
  tree      | cow            | large_values              | pass
  tree      | cow            | held_references           | pass
  tree      | cow            | complete                  | pass
-(19 rows)
+(20 rows)
 
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        

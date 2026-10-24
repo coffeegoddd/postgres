@@ -36,7 +36,7 @@ SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
         42
 (1 row)
 
--- base, first visited: both differ, both written.
+-- base, first visited: both differ, both written (reloaded).
 :flush
  pg_stat_force_next_flush 
 --------------------------
@@ -66,11 +66,13 @@ SELECT * FROM pg_temp.work();
 ---------------------+------
  move_tables_written |    2
  move_tables_shared  |    0
- apply_rows          | 2000
+ apply_rows          | 6000
 (3 rows)
 
--- A commit with base's a and a b of its own, base kept: a is shared, b
--- written, same neither.
+-- A commit with base's a and a b of its own, base kept: the planner takes
+-- base's kept copies, a as they have it, and only b is written (its ten
+-- rows); a and same cost neither.  (kept_planned.sql shares a kept table
+-- into other copies.)
 SELECT (dolt_checkout('main'))[2];
        dolt_checkout       
 ---------------------------
@@ -138,8 +140,8 @@ SELECT * FROM pg_temp.work();
        counter       | grew 
 ---------------------+------
  move_tables_written |    1
- move_tables_shared  |    1
- apply_rows          | 1000
+ move_tables_shared  |    0
+ apply_rows          |   10
 (3 rows)
 
 SELECT count(*) FILTER (WHERE v < 0) AS a_changed FROM cw.a;

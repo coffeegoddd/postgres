@@ -135,6 +135,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include <ctype.h>
 
 #include "access/prolly_builtins.h"
@@ -2240,10 +2242,209 @@ rank_source(const char *name, Oid branch, void *arg)
 }
 
 /*
+ * With no branch at the root: the branch whose copies would cost least to
+ * move there, as the move planner estimates the move from what its working
+ * set is known or thought to be (its working set known, else its
+ * baseline's fold, else its head; one changed since is only a hint, the
+ * move folding the copies as they are).  The session's branch is planned
+ * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
+ * after it, each stopped once it costs more than the best yet, each planned
+ * on its own branch (its tables' indexes are its own).  NULL if
+ * none is cheaper than the session's branch.  A kept materialization is a
+ * branch, so a candidate by the root it holds; and each plan is costed with
+ * the tables any kept one holds as the target does shared, not written
+ * (cost_with_shares()), as the move then shares them (share_clean_tables():
+ * an emptied copy too), so the copies chosen are those cheapest to finish
+ * with the shares, not without them; and then, with tables to share, a
+ * candidate isn't stopped at the best's cost.  The copies are new in the
+ * transaction, which no other sees: the tables of the chosen plan that
+ * cost less emptied and loaded than moved row by row (#713), and those the
+ * head hasn't, which the move drops (#714), are added to *emptied, for
+ * their copies to begin empty: no page of theirs is shared only to be
+ * written over or dropped.  Those of the session's branch's plan go to
+ * *own_emptied, for the copies made of it instead if the chosen branch is
+ * busy.
+ */
+#define SOURCE_CANDIDATES	16
+
+typedef struct SourceCandidates
+{
+	Snapshot	snap;
+	bool		others;			/* the others noted now, not the session's */
+	List	   *names;			/* char *, the session's branch first */
+	List	   *roots;			/* ProllyNodeRef *, what each is thought to be */
+} SourceCandidates;
+
+static void
+note_candidate(const char *name, Oid branch, void *arg)
+{
+	SourceCandidates *sc = arg;
+	ProllyNodeRef *root = palloc(sizeof(ProllyNodeRef));
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	ProllyCommitInfo info;
+	BranchFoldStamp at;
+
+	if ((branch != MyBranch) != sc->others ||
+		list_length(sc->names) > SOURCE_CANDIDATES)
+		return;
+	if (fold_caches_usable() &&
+		branch_fold_known_at(branch, sc->snap,
+							 branch_baseline(name, &baseline) ? &baseline.hash : NULL,
+							 false, &h, &at))
+		ref_of(&h, root);
+	else if (branch_baseline_root(name, root))
+		;
+	else if (branch_head(name, &h) && copies_commit_get(&h, &info))
+		*root = info.root;
+	else
+		return;
+	sc->names = lappend(sc->names, pstrdup(name));
+	sc->roots = lappend(sc->roots, root);
+}
+
+/* The tables of a plan whose copies begin empty, added to *emptied. */
+static void
+reloaded_tables(const ProllyMovePlan *plan, List **emptied)
+{
+	ListCell   *lc;
+
+	foreach(lc, plan->tables)
+	{
+		ProllyTableMove *m = lfirst(lc);
+
+		if (m->kind == PROLLY_TABLE_RELOAD || m->kind == PROLLY_TABLE_DROPPED)
+			*emptied = lappend(*emptied, m->name);
+	}
+}
+
+/* A plan made on a candidate's branch (run_on()). */
+typedef struct PlanOn
+{
+	const ProllyMovePlannerRoutine *planner;
+	const ProllyNodeRef *from;
+	const ProllyNodeRef *to;
+	double		bound;
+	ProllyMovePlan *plan;
+} PlanOn;
+
+static void
+plan_here(void *arg)
+{
+	PlanOn	   *po = arg;
+
+	PROLLY_CALL(po->planner, plan, po->from, po->to, PROLLY_PLAN_RELOADS,
+				po->bound, po->plan);
+}
+
+/*
+ * The target's tables a kept materialization holds as the target has them
+ * (the materialization cache's, made before snap): a first use's move
+ * shares each of these instead of writing its rows (share_clean_tables()),
+ * where its definitions are the target's.  Their names, as Strings.
+ */
+static List *
+kept_shareable(const ProllyNodeRef *target, Snapshot snap)
+{
+	ProllyDatabaseComponents dc;
+	ShareSources ss = {snap, NIL};
+	List	   *theirs = NIL;
+	List	   *names = NIL;
+
+	prolly_database_components(&dc);
+	if (dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
+		return NIL;
+	PROLLY_CALL(dc.matcache, visit, snap, find_kept_source, &ss);
+	if (ss.sources == NIL)
+		return NIL;
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
+	foreach_ptr(NamedTree, t, theirs)
+		if (source_of(ss.sources, t) != NULL)
+			names = lappend(names, makeString(t->name));
+	return names;
+}
+
+/*
+ * A plan's cost with the tables a kept materialization holds as shared
+ * instead of written: each costs no more than sharing a table and the
+ * relations stored with it.  Only a plan of rows alone (the definitions
+ * alike), as a share is made only then.
+ */
+#define SHARE_TABLE_USEC	(4 * SHARE_RELATION_USEC)
+
+static double
+cost_with_shares(const ProllyMovePlan *plan, List *shareable)
+{
+	double		cost = plan->cost;
+
+	if (shareable == NIL)
+		return cost;
+	foreach_ptr(ProllyTableMove, m, plan->tables)
+		if (m->kind != PROLLY_TABLE_ROWS && m->kind != PROLLY_TABLE_RELOAD)
+			return cost;
+	foreach_ptr(ProllyTableMove, m, plan->tables)
+		if (m->cost > SHARE_TABLE_USEC && list_member(shareable, makeString(m->name)))
+			cost -= m->cost - SHARE_TABLE_USEC;
+	return cost;
+}
+
+static char *
+estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
+				 List **own_emptied)
+{
+	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
+	SourceCandidates sc = {snap, false, NIL, NIL};
+	ProllyMovePlan plan;
+	ProllyMovePlan best;
+	double		best_cost;
+	char	   *source = NULL;
+	List	   *shareable;
+
+	/* (the session's branch first, then the others) */
+	branch_ops()->branches(note_candidate, &sc);
+	if (sc.names == NIL)
+		return NULL;
+	sc.others = true;
+	branch_ops()->branches(note_candidate, &sc);
+	shareable = kept_shareable(target, snap);
+	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
+				INFINITY, &best);
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+	reloaded_tables(&best, own_emptied);
+	best_cost = cost_with_shares(&best, shareable);
+	for (int i = 1; i < list_length(sc.names); i++)
+	{
+		/*
+		 * (with tables to share, not bounded by the best's cost: one past it
+		 * may cost less once they are shared)
+		 */
+		PlanOn		po = {planner, list_nth(sc.roots, i), target,
+		shareable ? INFINITY : best_cost, &plan};
+		double		cost;
+
+		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+		cost = cost_with_shares(&plan, shareable);
+		if (!plan.over && cost < best_cost)
+		{
+			best = plan;
+			best_cost = cost;
+			source = list_nth(sc.names, i);
+		}
+	}
+	if (source != NULL)
+		reloaded_tables(&best, emptied);
+	else
+		*emptied = list_copy(*own_emptied);
+	return source;
+}
+
+/*
  * Make the copies of a branch that has only its head: a copy of the
- * nearest branch's to its head's root (#491), or else the session's (each
- * has the same changes since the same baseline as the copy), moved to the
- * root.
+ * nearest branch's to its head's root (#491), else of the branch the
+ * move planner estimates is cheapest to move there, or else the
+ * session's (each has the same changes since the same baseline as the
+ * copy), moved to the root.
  */
 static void
 materialize(const char *name)
@@ -2255,6 +2456,8 @@ materialize(const char *name)
 	bool		was_read_only = XactReadOnly;
 	int			hush;
 	NearestSource ns = {0};
+	List	   *emptied = NIL;
+	List	   *own_emptied = NIL;
 	MoveCopies	mc;
 	char	   *source;
 
@@ -2299,8 +2502,29 @@ materialize(const char *name)
 		ns.snap = IsolationUsesXactSnapshot() ? GetActiveSnapshot() :
 			GetLatestSnapshot();
 		branch_ops()->branches(rank_source, &ns);
-		source = ns.rank > 0 ? ns.name : branch_ops()->current();
-		branch_ops()->make(name, ns.rank > 0 ? source : NULL);
+		if (ns.rank == 0)
+			ns.name = estimated_source(&info.root, ns.snap, &emptied,
+									   &own_emptied);
+		source = ns.name != NULL ? ns.name : branch_ops()->current();
+
+		/*
+		 * (another branch's copies only if none of its writers is in the
+		 * middle of changing it: waiting for one, with the refs held, would
+		 * hold up every commit of the session's branch for as long as that
+		 * writer's transaction lasts; else the session's own, whose writers
+		 * a first use waits for, as ever, with the tables its own plan
+		 * empties)
+		 */
+		if (ns.name == NULL ||
+			!OidIsValid(branch_ops()->make(name, source, emptied, true)))
+		{
+			if (ns.name != NULL)
+				pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
+			ns.name = NULL;
+			ns.rank = 0;
+			source = branch_ops()->current();
+			branch_ops()->make(name, NULL, own_emptied, false);
+		}
 		branch_set_baseline(name,
 							branch_baseline(source, &baseline) ? &baseline : NULL,
 							NULL);

@@ -45,6 +45,9 @@ full_page_writes = off
 		INSERT INTO cow.fill VALUES (1);
 		CREATE TABLE cow.q (a int8);
 		SELECT test_drop_change_log('cow.q');
+		-- (the change logs' storage, queued by their drops, let go of: their
+		-- blocks free for the tables, as each scenario arranges)
+		SELECT * FROM test_bmap_release_drain();
 	});
 	$sql->(q{INSERT INTO cow.q VALUES (1)}) if $s_page > 0;
 	$sql->(q{
@@ -53,6 +56,7 @@ full_page_writes = off
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
 		CREATE TABLE cow.s (a int8, b char(1900));
 		SELECT test_drop_change_log('cow.s');
+		SELECT * FROM test_bmap_release_drain();
 		CREATE TABLE churn (a int8, b text);
 	});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
@@ -99,6 +103,7 @@ full_page_writes = off
 	# its log's, take theirs first, and r's copy is dropped only then.
 	my $scopy = $sql->(qq{SELECT test_bmap_share($s)});
 	$sql->(q{DROP TABLE cow.q});
+	$sql->(q{SELECT * FROM test_bmap_release_drain()});
 	$sql->(q{DELETE FROM cow.s});
 	$sql->(q{VACUUM cow.s});
 	my $first = 4 * $s_page;
@@ -152,9 +157,11 @@ full_page_writes = off
 		CREATE SCHEMA cow VERSIONED;
 		CREATE TABLE cow.r (a int8, b int8);
 		SELECT test_drop_change_log('cow.r');
+		SELECT * FROM test_bmap_release_drain();
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
 		CREATE TABLE cow.s (a int8, b int8);
 		SELECT test_drop_change_log('cow.s');
+		SELECT * FROM test_bmap_release_drain();
 		INSERT INTO cow.s SELECT g, g FROM generate_series(1, 5) g;
 	});
 	my $r = $sql->(q{SELECT pg_relation_filenode('cow.r')});
@@ -167,6 +174,7 @@ full_page_writes = off
 
 	# r is dropped, freeing its block; s, shared, copies its page to it.
 	$sql->(q{DROP TABLE cow.r});
+	$sql->(q{SELECT * FROM test_bmap_release_drain()});
 	my $copy = $sql->(qq{SELECT test_bmap_share($s)});
 	my $copy_digest = $sql->(qq{SELECT test_bmap_rows_digest($copy)});
 	$sql->(q{UPDATE cow.s SET b = 0 WHERE a = 1});
@@ -210,12 +218,15 @@ full_page_writes = off
 		CREATE SCHEMA cow VERSIONED;
 		CREATE TABLE cow.fill (a int8);
 		SELECT test_drop_change_log('cow.fill');
+		SELECT * FROM test_bmap_release_drain();
 		INSERT INTO cow.fill VALUES (1);
 		CREATE TABLE cow.r (a int8, b int8);
 		SELECT test_drop_change_log('cow.r');
+		SELECT * FROM test_bmap_release_drain();
 		INSERT INTO cow.r SELECT g, g FROM generate_series(1, 150) g;
 		CREATE TABLE cow.s (a int8, b char(1900));
 		SELECT test_drop_change_log('cow.s');
+		SELECT * FROM test_bmap_release_drain();
 		INSERT INTO cow.s SELECT g, 'x' FROM generate_series(1, 4) g;
 	});
 	my $fill = $sql->(q{SELECT pg_relation_filenode('cow.fill')});

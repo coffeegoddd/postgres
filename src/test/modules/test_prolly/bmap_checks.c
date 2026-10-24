@@ -238,7 +238,8 @@ test_bmap_sweep_due(PG_FUNCTION_ARGS)
 }
 
 /*
- * test_bmap_unlink(relnumber): drop storage, freeing what no copy holds.
+ * test_bmap_unlink(relnumber, drain): drop storage, its blocks queued for
+ * release; with drain, the queue drained after, freeing what no copy holds.
  * The records are flushed before returning: this transaction has no
  * commit record that would flush them.
  */
@@ -250,8 +251,51 @@ test_bmap_unlink(PG_FUNCTION_ARGS)
 	SMgrRelation srel = bmap_smgr(PG_GETARG_OID(0));
 
 	smgrdounlinkall(&srel, 1, false);
+	if (PG_GETARG_BOOL(1))
+	{
+		BmapRelease done = {0};
+
+		bmap_release_drain(MyDatabaseTableSpace, MyDatabaseId, 0, &done);
+	}
 	XLogFlush(XactLastRecEnd);
 	PG_RETURN_VOID();
+}
+
+/*
+ * test_bmap_release_drain(max_entries): the release queue of the database's
+ * page store drained, of at most max_entries (0: all of it); the entries
+ * popped, the blocks freed and the counts set.  Flushed, as above.
+ */
+PG_FUNCTION_INFO_V1(test_bmap_release_drain);
+
+Datum
+test_bmap_release_drain(PG_FUNCTION_ARGS)
+{
+	BmapRelease done = {0};
+	TupleDesc	desc;
+	Datum		values[3];
+	bool		nulls[3] = {0};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	bmap_release_drain(MyDatabaseTableSpace, MyDatabaseId,
+					   (uint64) Max(PG_GETARG_INT64(0), 0), &done);
+	XLogFlush(XactLastRecEnd);
+	values[0] = Int64GetDatum((int64) done.entries);
+	values[1] = Int64GetDatum((int64) done.freed);
+	values[2] = Int64GetDatum((int64) done.unrefs);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
+/* test_bmap_release_pending(): the entries the release queue holds */
+PG_FUNCTION_INFO_V1(test_bmap_release_pending);
+
+Datum
+test_bmap_release_pending(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) bmap_release_pending(MyDatabaseTableSpace,
+												 MyDatabaseId));
 }
 
 /*

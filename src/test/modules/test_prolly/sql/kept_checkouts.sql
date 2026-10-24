@@ -25,7 +25,7 @@ LANGUAGE sql AS $$
 		ELSE n::text END
 	FROM unnest(ARRAY['apply_rows', 'catalog_rows_copied', 'move_tables_shared',
 					  'kept_checkouts_reused', 'kept_checkouts_evicted',
-					  'bmap_blocks_freed']) c,
+					  'bmap_release_queued']) c,
 		LATERAL pg_temp.since(c) n
 $$;
 CREATE FUNCTION pg_temp.hidden() RETURNS int8 LANGUAGE sql AS
@@ -57,10 +57,11 @@ SHOW prolly.kept_checkouts;
 :flush
 SELECT count(*) >= 0 AS counting FROM pg_temp.work();
 
--- A first checkout of c1 makes its copies and writes c1's rows.
+-- A first checkout of c1 makes its copies and writes c1's rows (the
+-- planner reloads big, its 4000 rows and small's one).
 SELECT (dolt_checkout(:'c1'))[2] = 'HEAD is now at ' || :'c1' || ' (detached, read-only)' AS detached;
 :flush
-SELECT * FROM pg_temp.work() WHERE counter <> 'bmap_blocks_freed';
+SELECT * FROM pg_temp.work() WHERE counter <> 'bmap_release_queued';
 SELECT count(*) FILTER (WHERE v <> id) AS changed, max(v) FROM kc.big;
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_c1;
 
@@ -71,21 +72,22 @@ SELECT pg_temp.hidden() AS kept;
 SELECT count(*) >= 0 AS counting FROM pg_temp.work();
 SELECT dolt_checkout(:'c1') IS NOT NULL AS detached;
 :flush
-SELECT * FROM pg_temp.work() WHERE counter <> 'bmap_blocks_freed';
+SELECT * FROM pg_temp.work() WHERE counter <> 'bmap_release_queued';
 SELECT count(*) FILTER (WHERE v <> id) AS changed, max(v) FROM kc.big;
 SELECT v FROM kc.small WHERE id = 1;
 -- (still read-only)
 UPDATE kc.small SET v = 'no' WHERE id = 1;
 
 -- c2, from main: big's rows differ from main's, and c1's kept branch has
--- c2's big, so big is given its storage, writing no row; small, the same
--- on main as at c2, is main's.
+-- c2's big, so the move planner takes c1's copies, its big shared whole,
+-- and only small's one row is written.  (kept_planned.sql shares a kept
+-- table into another branch's copies.)
 SELECT (dolt_checkout('main'))[2];
 :flush
 SELECT count(*) >= 0 AS counting FROM pg_temp.work();
 SELECT dolt_checkout(:'c2') IS NOT NULL AS detached;
 :flush
-SELECT * FROM pg_temp.work() WHERE counter <> 'bmap_blocks_freed';
+SELECT * FROM pg_temp.work() WHERE counter <> 'bmap_release_queued';
 SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_c2;
 SELECT count(*) FILTER (WHERE v <> id) AS changed, max(v) FROM kc.big;
 SELECT v FROM kc.small WHERE id = 1;
@@ -140,17 +142,17 @@ SELECT pg_temp.hidden() AS kept;
 SELECT dolt_checkout(:'c2') IS NOT NULL AS detached;
 SELECT substr(brname, 10) IN (substr(:'c0', 1, 40), substr(:'c2', 1, 40)) AS c0_or_c2
 FROM pg_branch WHERE brname LIKE 'detached/%' ORDER BY 1;
--- (and none at all kept with 0, as before, the blocks only they held
--- freed)
+-- (and none at all kept with 0, as before, their storage released:
+-- queued, for autovacuum to free)
 SET prolly.kept_checkouts = 0;
 :flush
 SELECT count(*) >= 0 AS counting FROM pg_temp.work();
 SELECT (dolt_checkout('main'))[2];
 SELECT pg_temp.hidden() AS kept;
 :flush
-SELECT counter, CASE WHEN counter = 'bmap_blocks_freed'
+SELECT counter, CASE WHEN counter = 'bmap_release_queued'
 	THEN (grew::int8 > 0)::text ELSE grew END AS grew
-FROM pg_temp.work() WHERE counter IN ('kept_checkouts_evicted', 'bmap_blocks_freed');
+FROM pg_temp.work() WHERE counter IN ('kept_checkouts_evicted', 'bmap_release_queued');
 RESET prolly.kept_checkouts;
 
 -- A rolled back checkout of a kept commit doesn't leave the session

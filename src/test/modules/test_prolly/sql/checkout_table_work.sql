@@ -35,15 +35,17 @@ UPDATE cw.a SET v = -v WHERE id <= 1000;
 UPDATE cw.b SET v = -v WHERE id <= 1000;
 SELECT length(dolt_commit('-am', 'changed')::text) AS committed;
 
--- base, first visited: both differ, both written.
+-- base, first visited: both differ, both written (reloaded).
 :flush
 SELECT count(*) >= 0 AS counting FROM pg_temp.work();
 SELECT dolt_checkout(:'base') IS NOT NULL AS detached;
 :flush
 SELECT * FROM pg_temp.work();
 
--- A commit with base's a and a b of its own, base kept: a is shared, b
--- written, same neither.
+-- A commit with base's a and a b of its own, base kept: the planner takes
+-- base's kept copies, a as they have it, and only b is written (its ten
+-- rows); a and same cost neither.  (kept_planned.sql shares a kept table
+-- into other copies.)
 SELECT (dolt_checkout('main'))[2];
 SELECT dolt_branch('other', :'base');
 SELECT dolt_checkout('other');
