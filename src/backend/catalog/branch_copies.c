@@ -200,6 +200,28 @@ copy_storage(Form_pg_class c)
 	return relnumber;
 }
 
+/*
+ * Try 'mode' on relation relid, as ConditionalLockRelationOid() does, but
+ * waiting out a page sweep's compaction that holds it: asked, it lets go
+ * after the move under way (bmap_compaction_let_go()), as it does for a
+ * waiter in the lock's queue, so a hold of a moment doesn't turn the try
+ * away.  Any other holder does.
+ */
+static bool
+try_lock_relation(Oid relid, LOCKMODE mode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid,
+								relation_lock_branch(relid));
+	while (!ConditionalLockRelationOid(relid, mode))
+	{
+		if (!bmap_compaction_let_go(&tag))
+			return ConditionalLockRelationOid(relid, mode);
+	}
+	return true;
+}
+
 /* the longest wait between tries at the copy's locks, in milliseconds */
 #define COPY_LOCK_MAX_DELAY_MS	100
 
@@ -1307,7 +1329,7 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	{
 		LOCKTAG		tag;
 
-		if (!ConditionalLockRelationOid(relid, AccessExclusiveLock))
+		if (!try_lock_relation(relid, AccessExclusiveLock))
 			return false;
 		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, relid, source);
 		if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
@@ -1791,7 +1813,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	 */
 	for (int i = 0; i < nkept && ok && any; i++)
 	{
-		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
+		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock))
 			ok = false;
 		changed[i] = true;
 	}
@@ -1879,7 +1901,7 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
 	{
 		LOCKTAG		tag;
 
-		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
+		if (!try_lock_relation(kept[i].relid, AccessExclusiveLock))
 			return false;
 		if (!other)
 			continue;

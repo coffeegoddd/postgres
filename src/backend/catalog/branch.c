@@ -76,6 +76,7 @@
 #include "commands/extension.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/bmap.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/fmgroids.h"
@@ -765,6 +766,27 @@ branch_locktag(LOCKTAG *tag, Oid branch)
 }
 
 /*
+ * Try AccessExclusiveLock on a branch (its lock 'tag'), not waiting for
+ * it, but waiting out a page sweep's compaction that holds the branch
+ * while it moves one of its relations' blocks: asked, it lets go after the
+ * move under way (bmap_compaction_let_go()).  A session on the branch
+ * turns the try away.
+ */
+static LockAcquireResult
+try_branch_lock(const LOCKTAG *tag)
+{
+	LockAcquireResult res;
+
+	while ((res = LockAcquire(tag, AccessExclusiveLock, false, true)) ==
+		   LOCKACQUIRE_NOT_AVAIL)
+	{
+		if (!bmap_compaction_let_go(tag))
+			return LockAcquire(tag, AccessExclusiveLock, false, true);
+	}
+	return res;
+}
+
+/*
  * Lock a branch to delete it, until the transaction ends; false if a
  * session is on it (or another transaction is deleting it).
  */
@@ -774,8 +796,7 @@ lock_branch_for_delete(Oid branch)
 	LOCKTAG		tag;
 
 	branch_locktag(&tag, branch);
-	return LockAcquire(&tag, AccessExclusiveLock, false, true) !=
-		LOCKACQUIRE_NOT_AVAIL;
+	return try_branch_lock(&tag) != LOCKACQUIRE_NOT_AVAIL;
 }
 
 /*
@@ -790,7 +811,7 @@ branch_in_use(Oid branch)
 	LockAcquireResult res;
 
 	branch_locktag(&tag, branch);
-	res = LockAcquire(&tag, AccessExclusiveLock, false, true);
+	res = try_branch_lock(&tag);
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return true;
 	if (res == LOCKACQUIRE_OK)
