@@ -19,6 +19,16 @@ content-addressed prolly trees, kept in the database's chunk store, and
 names the canonical root (canon_folded.c).  Diffs and merges compare
 those trees; remotes exchange their chunks.
 
+Each versioned object has catalog rows on every branch that has used it,
+each carrying its branch (catalog/branch.c).  Every branch-aware catalog
+has an index on its branch column alone (pg_shdepend one on its database
+and branch), and what reads a branch's objects reads them by it
+(catalog_branch_beginscan()): a branch's first use copies the rows on its
+source, a branch's delete removes the rows on it, and a commit's
+canonical form, and the checks of a working set against a commit, read
+the rows on the session's branch.  That work is in the objects on the
+branch, however many rows other branches and shared objects have.
+
 
 Interfaces and implementations
 ------------------------------
