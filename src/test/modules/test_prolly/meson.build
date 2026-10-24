@@ -322,6 +322,7 @@ tests += {
       't/193_bmap_dropped_buffers.pl',
       't/194_bmap_snapshot_redo.pl',
       't/200_kept_pages_recovery.pl',
+      't/204_kept_pages_crash.pl',
       't/205_bmap_deferred_unlink.pl',
       't/210_bmap_release_queue.pl',
       't/211_bmap_release_autovacuum.pl',
