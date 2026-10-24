@@ -18,6 +18,7 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('kept_pages_unwritten');
 $node->init;
 $node->append_conf('postgresql.conf', qq{
+shared_buffers = 64MB
 autovacuum = off
 prolly_fold_worker = off
 checkpoint_timeout = 1h
