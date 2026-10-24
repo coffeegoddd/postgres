@@ -5408,7 +5408,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * by another as it begins, nothing is folded at all.  The fold is by a
  * snapshot taken after the baseline and head are read: one taken before
  * would see none of a fold that moved the baseline in between (the check
- * then passing), and read every table in full.
+ * then passing), and read every table in full.  The fold waits for no
+ * relation's lock: one not free at once fails it, with
+ * ERRCODE_LOCK_NOT_AVAILABLE.
  */
 static bool
 copies_checkpoint_unless_moved(ProllyNodeRef *root)
@@ -5431,7 +5433,26 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
 	PushActiveSnapshot(GetLatestSnapshot());
-	fold_from_baseline(root, &next, false);
+
+	/*
+	 * (never waiting for a relation's lock either: the fold keeps its locks
+	 * on the change logs it consumed past its lock on their table, so a
+	 * DROP of several tables, holding them and waiting for one's log, would
+	 * deadlock with the fold waiting for the next table; a lock not free at
+	 * once fails the fold with ERRCODE_LOCK_NOT_AVAILABLE, for the caller
+	 * to roll back and fold again later)
+	 */
+	RelationLocksNoWait = true;
+	RelationLockRefused = false;
+	PG_TRY();
+	{
+		fold_from_baseline(root, &next, false);
+	}
+	PG_FINALLY();
+	{
+		RelationLocksNoWait = false;
+	}
+	PG_END_TRY();
 	PopActiveSnapshot();
 
 	/*
