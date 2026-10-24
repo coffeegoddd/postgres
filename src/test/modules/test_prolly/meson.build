@@ -346,6 +346,7 @@ tests += {
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
       't/265_fold_worker_batching.pl',
+      't/267_status_definitions.pl',
       't/311_rebase_crash.pl',
       't/312_amend_race.pl',
       't/280_merge_kept_references.pl',

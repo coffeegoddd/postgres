@@ -694,8 +694,15 @@ mark doesn't cover folds everything.  A commit's fold begins the next
 baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
-without rows and asks each table's change finder, so it still visits
-every table.
+without rows and asks each table's change finder (from that table's
+baseline entry alone), so it still visits every table; but the
+definitions are those the last read here made while nothing they're of
+changed (no catalog change in this backend's epoch, the same deparsing
+settings and baseline, the tree still stored), only every sequence's item
+worked out again (pg_stat_prolly's definitions_reused).  They're kept
+apart from the folds' items, so a status between two commits leaves the
+second's fold to work out only what was written.
+debug_prolly_verify_fold_caches reads them all again and compares.
 
 
 Remotes

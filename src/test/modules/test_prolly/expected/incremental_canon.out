@@ -788,6 +788,158 @@ SELECT scans, incremental FROM work();
 (1 row)
 
 RESET debug_prolly_force_full_fold;
+-- A status reads definitions without rows: the last read's are taken
+-- while nothing they're of changed (definitions_reused), no catalog read
+-- through, only sequences read again; rows written since don't change
+-- them.  It leaves the folds' own items be: the commit after it still
+-- works out only what was written.  (verify on: each taken is read again
+-- and compared.)
+CREATE FUNCTION reused() RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE name = 'definitions_reused'
+$$;
+UPDATE many.hot SET v = v + 1;
+SELECT length(dolt_commit('-am', 'before statuses')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+UPDATE many.hot SET v = v + 1;
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       1
+(1 row)
+
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+INSERT INTO many.t12 VALUES (12, 'twelve');
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ many.hot   | t      | modified
+ many.t12   | t      | modified
+(2 rows)
+
+SELECT nextval('many.seq') > 0 AS moved;
+ moved 
+-------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SET debug_prolly_verify_fold_caches = off;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ many.hot   | t      | modified
+ many.seq   | t      | modified
+ many.t12   | t      | modified
+(3 rows)
+
+RESET debug_prolly_verify_fold_caches;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT 'statuses' AS read, scans, reused() FROM work();
+   read   | scans | reused 
+----------+-------+--------
+ statuses |     0 |      2
+(1 row)
+
+-- (each table's changes asked of its baseline entry alone, not the whole
+-- baseline read again for each table: ~890 nodes here, ~1200 that way)
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
+	<= 1000 AS status_nodes_bounded;
+ status_nodes_bounded 
+----------------------
+ t
+(1 row)
+
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT length(dolt_commit('-am', 'after statuses')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT 'commit after statuses' AS fold, * FROM work();
+         fold          | scans | objects | tables | incremental 
+-----------------------+-------+---------+--------+-------------
+ commit after statuses |     0 |       3 |      2 |           1
+(1 row)
+
+-- (a definition changed: read again)
+ALTER TABLE many.t13 ADD COLUMN w int;
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ many.t13   | t      | modified
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT 'status after DDL' AS read, scans > 0 AS scanned, reused() FROM work();
+       read       | scanned | reused 
+------------------+---------+--------
+ status after DDL | t       |      0
+(1 row)
+
+SELECT length(dolt_commit('-Am', 'ddl')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
 SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;
  verify_mismatches 
 -------------------
