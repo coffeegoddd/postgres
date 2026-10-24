@@ -112,6 +112,22 @@ ok( $node->poll_query_until(
 		   WHERE name = 'fold_worker_retries'}),
 	'the fold gave way, a retry');
 
+# It gives way to an index build waiting out its snapshot, too: its
+# virtual transaction's lock, which is in no local lock table.
+ok($node->poll_query_until('postgres', $folded), 'folded after the lock');
+$retries = counter('fold_worker_retries');
+sql(q{UPDATE s.t SET v = 'indexed' WHERE id <= 500});
+ok($node->poll_query_until('postgres', $napping), 'a paced fold naps again');
+$t0 = time;
+sql(q{CREATE INDEX CONCURRENTLY t_v ON s.t (v)});
+cmp_ok(time - $t0, '<', 8, 'the index is built promptly');
+ok( $node->poll_query_until(
+		'postgres',
+		qq{SELECT value > $retries FROM pg_stat_prolly
+		   WHERE name = 'fold_worker_retries'}),
+	'the fold gave way to it, a retry');
+sql(q{DROP INDEX s.t_v});
+
 # A paced fold naps 10 s in all at most, then goes on unpaced: the writes
 # are folded long before 100 ms naps would let them be.
 ok($node->poll_query_until('postgres', $folded), 'folded after giving way');

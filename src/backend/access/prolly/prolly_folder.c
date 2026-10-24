@@ -303,10 +303,12 @@ fold_branch(void *arg)
  * point reached: a fold costs what it did.
  *
  * A paced fold holds its locks (the table's, its index's, its change
- * log's) and its snapshot through its naps, so it gives way as autovacuum
- * is made to: before each nap, if another backend waits for a lock that
- * conflicts with one it holds, the fold gives up (an error the pass takes
- * as a retry, the branch backed off), and is made again later.  And it
+ * log's) and its snapshot through its naps, so it gives way to whoever
+ * waits for them: before each nap, if another backend waits for a lock
+ * that conflicts with one it holds, or for its virtual transaction (a
+ * concurrent index build waiting out older snapshots), the fold gives up
+ * (an error the pass takes as a retry, the branch backed off), and is
+ * made again later.  And it
  * naps for FOLDER_MAX_PACED_NAPS_MS in all at most, then goes on unpaced,
  * so its snapshot holds the xmin horizon back no longer than that.  A
  * configuration reload is taken at the delay points, so a change of the

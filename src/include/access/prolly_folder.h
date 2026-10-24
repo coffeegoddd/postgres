@@ -27,7 +27,8 @@ extern PGDLLIMPORT int prolly_fold_worker_max_delay;
  * and dirties are charged as vacuum's are, and prolly_fold_delay_point(),
  * called in the folds' loops, charges the tree nodes read and written
  * since its last call, then naps once the fold has spent its limit; or,
- * if another backend waits for a lock the fold's holds, gives up the fold
+ * if another backend waits for a lock the fold's holds (its virtual
+ * transaction's among them), gives up the fold
  * (an error the worker takes as a retry).  It does nothing in any other
  * fold.
  */

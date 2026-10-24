@@ -379,6 +379,7 @@ tests += {
       't/313_reflog_gc_slot.pl',
       't/335_fold_worker_pacing.pl',
       't/336_compared_fold_restart.pl',
+      't/337_lock_has_waiters.pl',
     ],
   },
 }

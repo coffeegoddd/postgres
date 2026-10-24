@@ -788,9 +788,11 @@ those written as dirtied ones (each is appended, WAL-logged and synced),
 then naps once the limit is spent; pg_stat_prolly's
 fold_worker_cost_delays counts the naps.  So background folds take a
 share of the I/O and CPU, not all they can.  A paced fold holds its locks and its
-snapshot through its naps, so it gives way as autovacuum is made to:
+snapshot through its naps, so it gives way to whoever waits for them:
 before each nap, if another backend waits for a lock that conflicts with
-one it holds (AnyLockHasWaiters()), it gives up, a retry
+one it holds, fast-path ones included, or for its virtual transaction (as
+CREATE INDEX CONCURRENTLY waits for older snapshots) (AnyLockHasWaiters()),
+it gives up, a retry
 (fold_worker_retries), the branch backed off; and it naps 10 s in all at
 most, then goes on unpaced, so its snapshot holds the xmin horizon back
 no longer.  A reload of the settings reaches a fold under way.  The trade: a paced fold
