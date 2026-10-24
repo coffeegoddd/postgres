@@ -10,9 +10,11 @@
 # found, and how they differ from the pin's, are in the build's manifest
 # (BUILD_DIR/pbench-postgis.json) and the job summary.
 #
-# GEOS is cached by its version and the runner image; PostGIS by the
-# server's commit, the PostGIS commit, the GEOS version and the runner
-# image, since a PostGIS build is made against one server's headers.
+# GEOS is cached by its version and the runner image; PostGIS by what it
+# is compiled against: the server's headers and makefiles, the PostGIS
+# commit, the GEOS version, the build scripts and the runner image.  (A
+# wrong hit is caught: check-postgis's install checks the prefix, and an
+# ABI change fails the tests.)
 
 name: PostGIS
 description: Build the pinned PostGIS against the job's server installation
@@ -106,7 +108,9 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ inputs.build-dir }}
-        key: postgis-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ github.sha }}-${{ steps.pin.outputs.commit }}-geos${{ steps.pin.outputs.geos }}
+        # (what PostGIS compiles against, not the commit: a nightly or a
+        # pull request is a new commit every time)
+        key: postgis-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ steps.pin.outputs.commit }}-geos${{ steps.pin.outputs.geos }}-${{ hashFiles('src/include/**', 'src/makefiles/**', 'configure', 'src/tools/prolly_bench/build_postgis.py', 'src/tools/prolly_bench/pbench/postgis.py') }}
 
     - name: Build the pinned PostGIS
       if: steps.cache.outputs.cache-hit != 'true'
@@ -114,8 +118,8 @@ runs:
       run: |
         python3 "$GITHUB_WORKSPACE/src/tools/prolly_bench/build_postgis.py" \
           --pg-config "${{ inputs.pg-config }}" --build-dir "${{ inputs.build-dir }}" \
-          --jobs "${{ inputs.jobs }}" --allow-library-mismatch \
-          || { tail -n 100 "${{ inputs.build-dir }}/build.log"; exit 1; }
+          --jobs "${{ inputs.jobs }}" --allow-library-mismatch ||
+          { tail -n 100 "${{ inputs.build-dir }}/build.log"; exit 1; }
 
     - name: Record the build
       shell: bash
