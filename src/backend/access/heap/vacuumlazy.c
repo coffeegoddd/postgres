@@ -160,6 +160,13 @@
 
 
 /*
+ * Does VACUUM freeze, and set all-visible, a block-mapped page shared only
+ * with its relation's own snapshots (the pages a commit keeps), copying it?
+ * (prolly.vacuum_copy_kept_pages)
+ */
+bool		vacuum_copy_kept_pages = false;
+
+/*
  * Space/time tradeoff parameters: do these need to be user-tunable?
  *
  * To consider truncating the relation, we want there to be at least
@@ -1484,13 +1491,15 @@ lazy_scan_heap(LVRelState *vacrel)
 		 * dead line pointers is pruned as any (copied: the space it frees is
 		 * real, and left, its dead would be counted at every VACUUM and
 		 * never removed), and an aggressive VACUUM that must freeze a tuple
-		 * of it still does (lazy_scan_noprune() says so).  A page shared only
-		 * with the relation's own snapshots (the pages a commit keeps) is
-		 * vacuumed as any: the copy is the relation's for good, and the
-		 * snapshot's version goes once the commit stops being kept.
+		 * of it still does (lazy_scan_noprune() says so).  So is a page
+		 * shared only with the relation's own snapshots (the pages a commit
+		 * keeps), unless vacuum_copy_kept_pages: then it is vacuumed as any,
+		 * the copy the relation's for good and the snapshot's version gone
+		 * once the commit stops being kept, which doubles, for a while, the
+		 * storage of every page so set all-visible or frozen.
 		 */
 		if (got_cleanup_lock && BufferPageIsShared(buf) &&
-			BufferPageIsSharedElsewhere(buf) &&
+			(!vacuum_copy_kept_pages || BufferPageIsSharedElsewhere(buf)) &&
 			!lazy_scan_reclaimable(vacrel, buf, blkno, page))
 		{
 			got_cleanup_lock = false;

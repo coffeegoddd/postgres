@@ -22,6 +22,7 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
+prolly.vacuum_copy_kept_pages = on
 });
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
@@ -58,6 +59,21 @@ my $pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
 cmp_ok($pages, '>', 20, 'the table has some pages');
 is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('kv.t'))}),
 	'1', 'c1 keeps it by a snapshot');
+
+# By default (prolly.vacuum_copy_kept_pages off), VACUUM leaves the pages
+# a commit keeps as they are, copying none.
+is(sql(q{SELECT boot_val FROM pg_settings WHERE name = 'prolly.vacuum_copy_kept_pages'}),
+	'off', 'prolly.vacuum_copy_kept_pages is off by default');
+sql(q{CREATE TABLE kv.z (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	INSERT INTO kv.z SELECT g, repeat('z', 100) FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-Am', 'z')});
+my $zpages = sql(q{SELECT pg_relation_size('kv.z') / 8192});
+my $zmap = q{SELECT string_agg(phys::text, ',' ORDER BY blkno)
+	FROM test_bmap_map(pg_relation_filenode('kv.z'))};
+my $zbefore = sql($zmap);
+sql(q{SET prolly.vacuum_copy_kept_pages = off; VACUUM kv.z});
+is(visible('kv.z'), "0/$zpages", 'by default, VACUUM leaves the kept pages as they are');
+is(sql($zmap), $zbefore, 'copying none of them');
 
 # Its pages are shared only with c1's snapshot: VACUUM sets them all-visible.
 sql('VACUUM kv.t');
