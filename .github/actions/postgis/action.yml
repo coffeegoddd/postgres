@@ -1,0 +1,138 @@
+# The pinned PostGIS (src/tools/prolly_bench/configs/postgis.toml), built
+# against the job's server installation, for src/test/prolly's
+# check-postgis groups (POSTGIS_BUILD) and the G and GV suites.
+#
+# GEOS is built at the pin's version, from its release tarball (checked by
+# sha256 below), because PostGIS's answers depend on it: overlay results
+# and buffer vertex counts differ between Ubuntu 24.04's GEOS 3.12 and the
+# pin.  PROJ, GDAL and the rest come from the runner's Ubuntu packages, so
+# the PostGIS build is made with --allow-library-mismatch: the versions
+# found, and how they differ from the pin's, are in the build's manifest
+# (BUILD_DIR/pbench-postgis.json) and the job summary.
+#
+# GEOS is cached by its version and the runner image; PostGIS by what it
+# is compiled against: the server's headers and makefiles, the PostGIS
+# commit, the GEOS version, the build scripts and the runner image.  (A
+# wrong hit is caught: check-postgis's install checks the prefix, and an
+# ABI change fails the tests.)
+
+name: PostGIS
+description: Build the pinned PostGIS against the job's server installation
+
+inputs:
+  pg-config:
+    description: The installation's pg_config (an absolute path)
+    required: true
+  build-dir:
+    description: Where the build goes (absolute; made, or restored from the cache)
+    required: true
+  jobs:
+    description: make -j
+    default: '4'
+
+outputs:
+  build-dir:
+    description: The PostGIS build directory (POSTGIS_BUILD for check-postgis)
+    value: ${{ inputs.build-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install PostGIS's build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          autoconf automake libtool pkg-config xsltproc cmake \
+          libgeos-dev libproj-dev libgdal-dev libjson-c-dev libprotobuf-c-dev \
+          protobuf-c-compiler libxml2-dev libsfcgal-dev
+
+    - name: Read the pin
+      id: pin
+      shell: bash
+      run: |
+        python3 - "$GITHUB_WORKSPACE/src/tools/prolly_bench/configs/postgis.toml" >> "$GITHUB_OUTPUT" <<'PY'
+        import sys, tomllib
+        pin = tomllib.load(open(sys.argv[1], "rb"))
+        print(f"commit={pin['commit']}")
+        print(f"geos={pin['libraries']['geos']}")
+        PY
+        # (the runner image: ImageOS and ImageVersion are set on hosted runners)
+        echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore a cached GEOS
+      id: geos-cache
+      uses: actions/cache@v4
+      with:
+        path: /opt/geos-${{ steps.pin.outputs.geos }}
+        key: geos-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ steps.pin.outputs.geos }}
+
+    - name: Build the pinned GEOS
+      if: steps.geos-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GEOS: ${{ steps.pin.outputs.geos }}
+      run: |
+        # (a new pin needs its tarball's hash here)
+        case "$GEOS" in
+          3.15.0) sha=d5e5192a686d065eaed082de14dd26244c5c8e02bff16b2c6cce3265f648e00e ;;
+          *) echo "no sha256 for GEOS $GEOS in .github/actions/postgis"; exit 1 ;;
+        esac
+        work="$RUNNER_TEMP/geos"
+        mkdir -p "$work"
+        curl -sSfL -o "$work/geos.tar.bz2" "https://download.osgeo.org/geos/geos-$GEOS.tar.bz2"
+        echo "$sha  $work/geos.tar.bz2" | sha256sum -c -
+        tar -xjf "$work/geos.tar.bz2" -C "$work"
+        sudo mkdir -p "/opt/geos-$GEOS"
+        sudo chown "$(id -u)" "/opt/geos-$GEOS"
+        cmake -S "$work/geos-$GEOS" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="/opt/geos-$GEOS" > "$work/cmake.log"
+        cmake --build "$work/build" -j "${{ inputs.jobs }}" > "$work/build.log"
+        cmake --install "$work/build" > /dev/null
+
+    # (ahead of Ubuntu's GEOS, which GDAL's packages bring: geos-config on
+    # the path, and the library ahead of the system's for the loader)
+    - name: Use the pinned GEOS
+      shell: bash
+      env:
+        GEOS: ${{ steps.pin.outputs.geos }}
+      run: |
+        echo "/opt/geos-$GEOS/bin" >> "$GITHUB_PATH"
+        libdir=$(dirname "$(find "/opt/geos-$GEOS" -name 'libgeos_c.so*' | head -n 1)")
+        echo "$libdir" | sudo tee /etc/ld.so.conf.d/00-geos.conf > /dev/null
+        sudo ldconfig
+        "/opt/geos-$GEOS/bin/geos-config" --version
+
+    - name: Restore a cached build
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.build-dir }}
+        # (what PostGIS compiles against, not the commit: a nightly or a
+        # pull request is a new commit every time)
+        key: postgis-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ steps.pin.outputs.commit }}-geos${{ steps.pin.outputs.geos }}-${{ hashFiles('src/include/**', 'src/makefiles/**', 'configure', 'src/tools/prolly_bench/build_postgis.py', 'src/tools/prolly_bench/pbench/postgis.py') }}
+
+    - name: Build the pinned PostGIS
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        python3 "$GITHUB_WORKSPACE/src/tools/prolly_bench/build_postgis.py" \
+          --pg-config "${{ inputs.pg-config }}" --build-dir "${{ inputs.build-dir }}" \
+          --jobs "${{ inputs.jobs }}" --allow-library-mismatch ||
+          { tail -n 100 "${{ inputs.build-dir }}/build.log"; exit 1; }
+
+    - name: Record the build
+      shell: bash
+      run: |
+        python3 - "${{ inputs.build-dir }}/pbench-postgis.json" "${{ steps.cache.outputs.cache-hit }}" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+        import json, sys
+        m = json.load(open(sys.argv[1]))
+        print("### PostGIS build")
+        print()
+        print(f"- commit `{m['commit']}`" + (" (cached)" if sys.argv[2] == "true" else ""))
+        print(f"- `{m['full_version']}`")
+        for name, version in sorted(m["library_versions"].items()):
+            pinned = m["pinned_libraries"].get(name)
+            note = f" (pinned {pinned})" if pinned and pinned != version else ""
+            print(f"- {name} {version}{note}")
+        PY
