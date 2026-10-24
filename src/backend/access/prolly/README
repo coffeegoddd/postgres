@@ -297,8 +297,9 @@ version is the table's only through the branch's record of its tables,
 made by its last commit, having the table's relation: at that commit, or
 at a head moved since without a commit to one of its descendants or
 ancestors, the name never without a table between.  A head moved to a
-commit holding a dropped table and then committed (#895), or a merge of a
-branch still holding it, isn't told from the table's own history either.
+commit holding a dropped table and then committed, or a merge of a
+branch still holding it, isn't told from the table's own history either;
+moving a head takes a write role (see Writers), not SELECT alone.
 A plan's row estimate of a version, and dolt_diff_stat's counts, are
 read on the same rule.  A table dropped and made again within one commit
 isn't told from one kept (#891).
@@ -385,6 +386,25 @@ moves the session to its writer branch (writer/<writer>/<base>), forked
 from the base as the transaction's snapshot saw it and swept once it is
 clean and merged.  The mode, protections and writer branches are
 database settings kept in the refs.
+
+Moving a branch's head is a write to the branch, whatever its tables'
+grants: a commit (dolt_commit, or dolt.transaction_commit's at a
+transaction's end), a reset of any kind (a hard reset to the head too, as
+it drops the branch's changes), a merge or pull into it, a cherry-pick,
+revert or rebase onto it, an integration (of the branch, and into its
+target), and the branch's deletion, rename or forced move
+(dolt_branch('-f', ...)).  Each takes prolly_check_head_move(): the role
+owns the branch, owns the database, has the database's CREATE privilege
+(which makes branches), or has the privileges of pg_prolly_write.  A
+branch's owner is the role that made it, recorded in the refs ('A', refs
+format 13) as it is made, its first head set by a fetch, clone or push
+included, and kept by a rename; main has none, being the database
+owner's.  A role dropped leaves its OID recorded, which no role has the
+privileges of until another is given it.  A rebase's own branch and a
+writer branch are made on the session's behalf, without the privilege to
+make branches, and are its role's.  dolt_serve_move_head(), a push from
+another database, takes pg_prolly_push's privileges instead; deleting a
+branch through it is a deletion, and takes these.
 
 Automatic forks happen before parse analysis (including modifying CTEs)
 and before cached statements reacquire relation locks. Creators therefore

@@ -657,7 +657,8 @@ OF` are built in D18's shapes.
   without a table between. Known gaps, as commits name tables by name and
   identity alone: a table dropped and made again within one commit or in
   the working set (#891); a head moved to the dropped table's commit and
-  then committed (#895: such moves need no privilege), an owner's squash,
+  then committed (a head move takes D27's privileges, not SELECT), an
+  owner's squash,
   or a merge of a branch that still has the old table, which record the
   re-made table above a commit holding the dropped one. Planner
   estimates of a version's rows and `dolt_diff_stat`'s counts are history
@@ -670,3 +671,32 @@ OF` are built in D18's shapes.
   dropped and made again within one commit (or in the working set) isn't
   told from one kept: #891.
 - **Port:** ports run as a superuser; none is affected.
+
+## D27. Moving a branch's head takes a write role, or the branch
+
+- **Dolt:** branch permissions are rows of `dolt_branch_control`: a user
+  and host pattern given `write` or `admin` on database and branch name
+  patterns. Modifying a branch (a commit, merge, reset, deletion or
+  rename) takes `write` on it, and a branch's creator is given `admin` on
+  it. By default one row gives every user `write` on every branch, so
+  branches are guarded by SQL privileges alone until the table is edited.
+- **Prolly:** a branch's head moves (`dolt_commit`, the commit of
+  `dolt.transaction_commit`, `dolt_reset` of any kind, `dolt_merge`,
+  `dolt_pull`, `dolt_cherry_pick`, `dolt_revert`, `dolt_rebase`,
+  `dolt_integrate`, and `dolt_branch`'s delete, rename and forced move)
+  take one of: owning the branch (having made it; main is the database
+  owner's), owning the database, the database's `CREATE` privilege, or
+  the privileges of the predefined role `pg_prolly_write`. Privileges on
+  the branch's tables alone don't give them: a role with `SELECT` can't
+  move a branch every other session on it reads, nor undo the move to
+  hide it. Deleting and renaming branches, the database owner's alone
+  before, take the same. There is no per-branch table of grants:
+  protected branches (the writer modes) stay the database owner's to
+  move outside integrations.
+- **Why:** Postgres has no default write grant on a database to mirror
+  Dolt's default row; its roles and `CREATE` (which already makes
+  branches) are the native way to say who may change shared state, and
+  the branch's maker owns it as a relation's creator owns it.
+- **Port:** ports run as a superuser; none is affected. A script that
+  commits as a role with table privileges alone grants it
+  `pg_prolly_write` (or `CREATE` on the database).

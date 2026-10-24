@@ -103,6 +103,14 @@ extern const ProllyChangeFinderRoutine *prolly_change_finder(void);
  * table is made (or, for one that has none, as it is altered), and told
  * each tuple version a write to one made or replaced.
  */
+/*
+ * Refuse the session's role a move of branch name's head (a commit, reset,
+ * merge, cherry-pick, revert or rebase, its deletion or rename) unless it
+ * owns the branch or the database, or has the database's CREATE privilege
+ * or pg_prolly_write's privileges.
+ */
+extern void prolly_check_head_move(const char *name);
+
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_change_logs_flush(void);
 extern void prolly_note_change(Relation rel, const ItemPointerData *oldtid,

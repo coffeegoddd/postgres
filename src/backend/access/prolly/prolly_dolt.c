@@ -794,6 +794,8 @@ transaction_commit_at_end(bool prepare)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("dolt.transaction_commit can't commit changes to a branch the session has left"),
 				 errhint("Check the changed branch out again before committing.")));
+	/* (a Dolt commit moves the branch's head, as dolt_commit's does) */
+	prolly_check_head_move(branch_ops()->current());
 	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.ntables > 0)
 	{
 		ereport(WARNING,
@@ -923,6 +925,36 @@ qualified_name(Oid relid)
  * ------------------------------------------------------------------------
  */
 
+
+/*
+ * Refuse the session's role a move of branch name's head (a commit, reset,
+ * merge, cherry-pick, revert or rebase onto it, its deletion or rename)
+ * unless it owns the branch (made it; main is the database owner's), owns
+ * the database, has the database's CREATE privilege (which makes branches),
+ * or has the privileges of pg_prolly_write.  A branch's head is what every
+ * session on it reads and commits on, so moving it is a write to the
+ * branch: privileges on its tables alone don't give it.
+ */
+void
+prolly_check_head_move(const char *name)
+{
+	Oid			user = GetUserId();
+	Oid			creator;
+
+	if (object_ownercheck(DatabaseRelationId, MyDatabaseId, user) ||
+		has_privs_of_role(user, ROLE_PG_PROLLY_WRITE) ||
+		object_aclcheck(DatabaseRelationId, MyDatabaseId, user,
+						ACL_CREATE) == ACLCHECK_OK)
+		return;
+	if (strcmp(name, "main") != 0 && PROLLY_HAS(refs(), branch_creator) &&
+		PROLLY_CALL(refs(), branch_creator, name, &creator) &&
+		has_privs_of_role(user, creator))
+		return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("permission denied to move the head of branch \"%s\"", name),
+			 errdetail("Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role may.")));
+}
 
 /*
  * Hold the refs (to the transaction's end) before what reads the head and
@@ -1065,6 +1097,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_commit can't --allow-empty and --skip-empty at once")));
 	PreventCommandIfReadOnly("dolt_commit()");
+	prolly_check_head_move(branch_ops()->current());
 	author_override = author;
 	commit_forced = force;
 	date_given = dated;
@@ -1223,7 +1256,9 @@ force_branch(const char *name, const char *from)
 		XactReadOnly = false;
 	PG_TRY();
 	{
-		branch_ops()->check_create(name);
+		/* (the branch, which exists, moved: a head move's privileges) */
+		PreventCommandIfReadOnly("dolt_branch()");
+		prolly_check_head_move(name);
 		written = branches_written();
 
 		/*
@@ -2316,6 +2351,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("there is no merge to abort")));
 		PreventCommandIfReadOnly("dolt_merge()");
+		prolly_check_head_move(branch_ops()->current());
 		abort_in_progress("merge");
 		result[0] = "";
 		result[1] = "0";
@@ -2337,6 +2373,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	exclusive_flags(flags, PROLLY_MERGE_FF_ONLY, "--ff-only", PROLLY_MERGE_SQUASH, "--squash");
 
 	PreventCommandIfReadOnly("dolt_merge()");
+	prolly_check_head_move(branch_ops()->current());
 	/* (the branch held first: its head is read as the merge finds it) */
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
@@ -2935,6 +2972,9 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				 errhint("Check out a branch with dolt_checkout('-b', ...) first.")));
 
 	PreventCommandIfReadOnly("dolt_integrate()");
+	/* (it commits on the branch, and merges into target) */
+	prolly_check_head_move(mine);
+	prolly_check_head_move(target);
 	/* (failing, the session stays on its branch, as everything else does) */
 	returning = branch_return_on_abort();
 
@@ -3021,6 +3061,8 @@ dolt_reset(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_reset can't be --hard and --soft at once")));
 	PreventCommandIfReadOnly("dolt_reset()");
+	/* (a hard reset to the head drops the branch's changes: checked too) */
+	prolly_check_head_move(branch_ops()->current());
 	if (!hard)
 	{
 		ProllyMergeState ms;
@@ -3595,6 +3637,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 					 errmsg("there is no cherry-pick to %s",
 							abort_pick ? "abort" : "continue")));
 		PreventCommandIfReadOnly("dolt_cherry_pick()");
+		prolly_check_head_move(branch_ops()->current());
 		if (abort_pick)
 		{
 			abort_in_progress("cherry-pick");
@@ -3638,6 +3681,7 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("dolt_cherry_pick needs a commit")));
 	PreventCommandIfReadOnly("dolt_cherry_pick()");
+	prolly_check_head_move(branch_ops()->current());
 	refuse_violations("cherry-pick");
 	note_integration();
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
@@ -3756,6 +3800,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("there is no revert in progress")));
 			PreventCommandIfReadOnly("dolt_revert()");
+			prolly_check_head_move(branch_ops()->current());
 			note_integration();
 			if (abort_revert)
 			{
@@ -3791,6 +3836,7 @@ dolt_revert(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("dolt_revert needs a commit")));
 			PreventCommandIfReadOnly("dolt_revert()");
+			prolly_check_head_move(branch_ops()->current());
 			revert_series(refs_given, nrefs, NULL, result);
 		}
 	}
@@ -4235,7 +4281,20 @@ rebase_start(const char *upstream, bool keep_empty)
 				 errmsg("fatal: A branch named '%s' already exists.", working)));
 	rs.branch = branch;
 	rs.keep_empty = keep_empty;
-	create_branch(working, hash_hex(&rs.onto));
+	/*
+	 * (the rebase's own branch, its machinery: made on the session's behalf,
+	 * its head move on the branch rebased checked already, and the role's)
+	 */
+	BranchCreateOnBehalf = true;
+	PG_TRY();
+	{
+		create_branch(working, hash_hex(&rs.onto));
+	}
+	PG_FINALLY();
+	{
+		BranchCreateOnBehalf = false;
+	}
+	PG_END_TRY();
 	checkout_branch(working);
 	PROLLY_CALL(r, set_rebase_state, &rs);
 }
@@ -4429,6 +4488,8 @@ rebase_continue(const char **result)
 		}
 	}
 	PreventCommandIfReadOnly("dolt_rebase()");
+	/* (it moves the branch rebased once done) */
+	prolly_check_head_move(rs.branch);
 
 	/* a step stopped at: its resolution, or an edit's changes, committed */
 	if (rs.last_step != NULL &&
@@ -4547,6 +4608,7 @@ rebase_abort(void)
 	if (!PROLLY_CALL(r, rebase_state, &rs))
 		no_rebase();
 	PreventCommandIfReadOnly("dolt_rebase()");
+	prolly_check_head_move(rs.branch);
 	working = pstrdup(branch_ops()->current());
 	checkout_branch(rs.branch);
 	BRANCH_WRITES_HUSHED(PROLLY_CALL(r, branch_delete, working, true));
@@ -4642,6 +4704,7 @@ dolt_rebase(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("rebase takes at most one positional argument.")));
 	PreventCommandIfReadOnly("dolt_rebase()");
+	prolly_check_head_move(branch_ops()->current());
 	rebase_start(upstream, keep_empty);
 	if (!interactive)
 	{
@@ -4766,6 +4829,7 @@ dolt_rebase_plan_change(PG_FUNCTION_ARGS)
 	if (!PROLLY_HAS(refs(), rebase_state) || !PROLLY_CALL(refs(), rebase_state, &rs))
 		no_rebase();
 	PreventCommandIfReadOnly("dolt_rebase");
+	prolly_check_head_move(rs.branch);
 	has_old = !TRIGGER_FIRED_BY_INSERT(td->tg_event);
 	has_new = !TRIGGER_FIRED_BY_DELETE(td->tg_event);
 	if (has_old)
@@ -9890,6 +9954,7 @@ dolt_pull(PG_FUNCTION_ARGS)
 	if (branch == NULL)
 		branch = pstrdup(branch_ops()->current());
 	PreventCommandIfReadOnly("dolt_pull()");
+	prolly_check_head_move(branch_ops()->current());
 	fetch_remote(remote, list_make1(branch), NULL, NULL, false);
 
 	/* (after "--": a remote's name may begin with "-") */

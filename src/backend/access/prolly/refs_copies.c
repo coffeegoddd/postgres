@@ -63,6 +63,9 @@
  *				   tablespace, file number, snapshot (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
+ *	'A' name	-> the role that made the branch, which owns it (its OID,
+ *				   native byte order); main has none, being the database
+ *				   owner's
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
@@ -227,6 +230,7 @@
 #define TAG_REBASE		'E'	/* a branch's rebase in progress */
 #define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
+#define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
@@ -236,7 +240,7 @@
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
  * trees a pin keeps; 12: a schema-conflicted table's names on each side.
  */
-#define REFS_FORMAT		"12"
+#define REFS_FORMAT		"13"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -1125,6 +1129,7 @@ branch_entry(const char *key, int keylen)
 		case TAG_IDENTITY:
 		case TAG_REBASE:
 		case TAG_KEPT:
+		case TAG_CREATOR:
 			return true;
 		default:
 			return false;
@@ -1241,9 +1246,48 @@ branch_head(const char *name, ProllyHash *head)
 	return found && head->len > 0;
 }
 
+/* Record role (InvalidOid: none) as the role that made branch name. */
+static void
+creator_put(const char *name, Oid role)
+{
+	StringInfoData key;
+	StringInfoData v;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_CREATOR);
+	appendStringInfoString(&key, name);
+	appendBinaryStringInfo(&v, &role, sizeof(role));
+	refs_put(key.data, key.len, OidIsValid(role) ? &v : NULL);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/* The role that made branch name; false if none is recorded. */
+static bool
+creator_get(const char *name, Oid *role)
+{
+	StringInfoData key;
+	StringInfoData v;
+	bool		found;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_CREATOR);
+	appendStringInfoString(&key, name);
+	found = refs_get(key.data, key.len, &v) && v.len == sizeof(Oid);
+	if (found)
+		memcpy(role, v.data, sizeof(Oid));
+	pfree(key.data);
+	pfree(v.data);
+	return found;
+}
+
 /*
  * Make head (NULL: none) branch name's head commit, noting the transaction
- * that moved it (head_moved_unseen()).
+ * that moved it (head_moved_unseen()).  A branch that gets its first head
+ * here (a fetch's, a clone's or a push's new branch) is the session role's,
+ * unless it was made with a role recorded already; main is never anyone's.
  */
 static void
 branch_set_head(const char *name, const ProllyHash *head)
@@ -1252,10 +1296,15 @@ branch_set_head(const char *name, const ProllyHash *head)
 	StringInfoData v;
 	FullTransactionId xid = head ? GetTopFullTransactionId() :
 		InvalidFullTransactionId;
+	Oid			role;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
 	branch_key(name, &key);
+	if (head && strcmp(name, "main") != 0 && !refs_get(key.data, key.len, &v) &&
+		!creator_get(name, &role))
+		creator_put(name, GetUserId());
+	resetStringInfo(&v);
 	if (head)
 		put_hash(&v, head);
 	refs_put(key.data, key.len, head ? &v : NULL);
@@ -4228,6 +4277,14 @@ head_names(const char *name, const ProllyHash *head)
 	return lines;
 }
 
+/* The role that made branch name, if one is recorded (never main's). */
+static bool
+copies_branch_creator(const char *name, Oid *role)
+{
+	refs_init();
+	return creator_get(name, role);
+}
+
 /*
  * The commit the session branch's record of its tables is of, if it lists
  * relation relid among them (the head may have moved since, uncommitted).
@@ -4588,6 +4645,7 @@ copies_branch_create(const char *name, const char *start_point)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", name)));
+	creator_put(name, GetUserId());
 
 	/*
 	 * A branch starts at its start point's head commit, as in Dolt: a
@@ -4685,6 +4743,7 @@ copies_branch_delete(const char *name, bool force)
 		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
+	creator_put(name, InvalidOid);
 	/* (and the commits its pages were kept as of: they went with them) */
 	kept_put(name, NIL);
 }
@@ -4699,7 +4758,7 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 {
 	static const char tags[] = {TAG_BRANCH, TAG_BASELINE, TAG_MERGE,
 	TAG_MERGE_NAMES, TAG_VIOLATIONS, TAG_UPSTREAM, TAG_MOVER, TAG_BASELINE_MOVER,
-	TAG_NAMES, TAG_IDENTITY, TAG_REBASE, TAG_KEPT};
+	TAG_NAMES, TAG_IDENTITY, TAG_REBASE, TAG_KEPT, TAG_CREATOR};
 	ListCell   *lc;
 
 	lock_branch(name);
@@ -4730,9 +4789,14 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->rename(name, newname, force);
 	else
 	{
-		/* (one with only a head: no session is on it) */
+		/*
+		 * (one with only a head: no session is on it; checked as a rename
+		 * with copies is, the new name by its rules alone, which
+		 * check_create says how it breaks)
+		 */
 		branch_ops()->check_drop(name);
-		branch_ops()->check_create(newname);
+		if (!branch_ops()->name_ok(newname))
+			branch_ops()->check_create(newname);
 	}
 	/*
 	 * (violations, kept one entry each, moved apart from the tags'; the
@@ -7744,4 +7808,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
 	.recorded_relation = copies_recorded_relation,
+	.branch_creator = copies_branch_creator,
 };
