@@ -104,6 +104,16 @@ typedef struct ProllyKeyingRoutine
 									TupleTableSlot *slot, bool *kept);
 
 	/*
+	 * Append the canonical encoding of slot's row to row, as encode_row()
+	 * does (no key, no content hash), except the columns marked in kept are
+	 * the references row before holds there (the value encoder's
+	 * encode_kept()): columns decode_row_kept() left unread.
+	 */
+	void		(*encode_row_kept) (ProllyKeying *k, TupleTableSlot *slot,
+									const ProllyValue *before,
+									const bool *kept, StringInfo row);
+
+	/*
 	 * Append slot's row's key to key, as encode_row() does, without the
 	 * rest of the row; false, appending nothing, for a keying that keys
 	 * rows by content (whose keys are a fixed few bytes and a hash).
@@ -173,8 +183,8 @@ typedef struct ProllyKeyingRoutine
 #define PROLLY_KEYING_CALLBACK_NAMES \
 	"open", "keyless", "encode_row", "make_value", "parse_value", \
 	"decode_row", "compare", "close", "set_values", "row_refs", \
-	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
-	"row_shape", "shape_extends", "open_shape"
+	"decode_row_kept", "encode_row_kept", "encode_key", "parse_value_as", \
+	"open_described", "row_shape", "shape_extends", "open_shape"
 #define PROLLY_KEYING_FIRST_CALLBACK open
 #define PROLLY_KEYING_LAST_CALLBACK open_shape
 

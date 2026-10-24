@@ -84,13 +84,24 @@ typedef struct ProllyValueEncoderRoutine
 	void		(*decode_kept) (ProllyValueEncoder *enc, const ProllyValue *row,
 								const ProllyValue *before,
 								TupleTableSlot *slot, bool *kept);
+
+	/*
+	 * encode(), except each column marked in kept (by attribute index) is
+	 * written as the reference to a value tree that row before (of this
+	 * encoder's layout) holds there, its value in slot not read: a column
+	 * decode_kept() left unread.  The reference names the value's canonical
+	 * bytes, so the row is the one encode() would give with the value.
+	 */
+	void		(*encode_kept) (ProllyValueEncoder *enc, TupleTableSlot *slot,
+								const ProllyValue *before, const bool *kept,
+								StringInfo out);
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
-	"set_values", "refs", "decode_kept"
+	"set_values", "refs", "decode_kept", "encode_kept"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
-#define PROLLY_VALENC_LAST_CALLBACK decode_kept
+#define PROLLY_VALENC_LAST_CALLBACK encode_kept
 
 /* Historical enum decoding for the canonical encoder and nested values. */
 extern bool prolly_canonical_map_enums(ProllyValueEncoder *enc, List *mappings);
