@@ -218,6 +218,15 @@ ERROR:  dolt_diff can't read "feel" as a version describes it
 DETAIL:  One of its columns' types isn't one this database has now.
 -- the table of a version's name the session has: SELECT on it; a dropped
 -- one, no grant to check: the database's owner, or pg_read_all_data
+-- (a plan's row estimate for a query)
+CREATE FUNCTION pg_temp.estimated(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXECUTE 'EXPLAIN ' || q LOOP
+		RETURN substring(line from 'rows=[0-9]+');
+	END LOOP;
+END $$;
 CREATE ROLE regress_dn_reader;
 GRANT USAGE ON SCHEMA dn TO regress_dn_reader;
 SET ROLE regress_dn_reader;
@@ -278,19 +287,19 @@ SELECT length(dolt_commit('-Am', 'public secret')::text) AS committed;
 SET ROLE regress_dn_reader;
 SELECT * FROM dolt_diff('HEAD~2', 'HEAD~', 'dn.secret');
 ERROR:  dolt_diff can't read "dn.secret": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, so the table here is another.
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT * FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');
 ERROR:  dolt_diff can't read "dn.secret": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, so the table here is another.
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT diff_type, from_row FROM dolt_diff_table('dn.secret');
 ERROR:  dolt_diff_table can't read "dn.secret": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, so the table here is another.
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT row FROM dolt_history_table('dn.secret');
 ERROR:  dolt_history_table can't read "dn.secret": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, so the table here is another.
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', 'dn.secret');
  diff_type |           to_row            
@@ -304,6 +313,116 @@ SELECT diff_type, to_row FROM dolt_diff_table('dn.secret', 'HEAD~');
  added     | {"id": 2, "note": "public"}
 (1 row)
 
+-- the same versions read by the table's row type: the same rule, so the
+-- dropped table's rows aren't read on the grants of the one made again
+SELECT * FROM dolt_at('HEAD~2', NULL::dn.secret);
+ERROR:  dolt_at can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_history_table(NULL::dn.secret);
+ERROR:  dolt_history_table can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_diff('HEAD~2', 'HEAD', NULL::dn.secret);
+ERROR:  dolt_diff can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT diff_type FROM dolt_diff_table(NULL::dn.secret);
+ERROR:  dolt_diff_table can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+ id |  note  
+----+--------
+  2 | public
+(1 row)
+
+SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', NULL::dn.secret);
+ diff_type |   to_row   
+-----------+------------
+ added     | (2,public)
+(1 row)
+
+SELECT diff_type, to_row FROM dolt_diff_table(NULL::dn.secret, 'HEAD~');
+ diff_type |   to_row   
+-----------+------------
+ added     | (2,public)
+(1 row)
+
+-- a planner's estimate of the version's rows is history too: refused, the
+-- default estimate taken
+SELECT pg_temp.estimated('SELECT * FROM dolt_at(''HEAD~2'', NULL::dn.secret)');
+ estimated 
+-----------
+ rows=1000
+(1 row)
+
+SELECT pg_temp.estimated('SELECT * FROM dolt_at(''HEAD'', NULL::dn.secret)');
+ estimated 
+-----------
+ rows=1
+(1 row)
+
+-- and a statistic of its rows: left out, and refused by name
+SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~');
+ table_name | rows_deleted 
+------------+--------------
+(0 rows)
+
+SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~', 'dn.secret');
+ERROR:  dolt_diff_stat can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT table_name, rows_added FROM dolt_diff_stat('HEAD~', 'HEAD');
+ table_name | rows_added 
+------------+------------
+ dn.secret  |          1
+(1 row)
+
+RESET ROLE;
+-- the head moved back to the dropped table's commit, by the reader: the
+-- head's version is no longer this table's by the branch's record of its
+-- head, so the step from the working set to the head vouches for nothing
+SELECT dolt_hashof('HEAD') AS secret_head \gset
+SET ROLE regress_dn_reader;
+SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
+ moved 
+-------
+ t
+(1 row)
+
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+ERROR:  dolt_at can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT row FROM dolt_history_table(NULL::dn.secret);
+ERROR:  dolt_history_table can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT row FROM dolt_history_table('dn.secret');
+ERROR:  dolt_history_table can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_at('WORKING', NULL::dn.secret);
+ id |  note  
+----+--------
+  2 | public
+(1 row)
+
+RESET ROLE;
+SELECT dolt_reset('--soft', :'secret_head') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+ id |  note  
+----+--------
+  2 | public
+(1 row)
+
 RESET ROLE;
 -- (the database's owner reads both)
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');
@@ -312,6 +431,159 @@ SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret')
  removed   | {"s": "top secret", "id": 1} | 
  added     |                              | {"id": 2, "note": "public"}
 (2 rows)
+
+SELECT * FROM dolt_at('HEAD~2', NULL::dn.secret);
+ id | note 
+----+------
+  1 | 
+(1 row)
+
+-- another branch's commits: its version of this table (made from this
+-- table's history) is readable on its grants, as Dolt reads any commit;
+-- another table of its name, made on that branch, isn't
+SELECT dolt_branch('dn_side') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_branch('dn_other') IS NOT NULL AS made;
+ made 
+------
+ t
+(1 row)
+
+SELECT dolt_checkout('dn_side') IS NOT NULL AS on_side;
+ on_side 
+---------
+ t
+(1 row)
+
+INSERT INTO dn.secret VALUES (3, 'side');
+SELECT length(dolt_commit('-am', 'side row')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('dn_other') IS NOT NULL AS on_other;
+ on_other 
+----------
+ t
+(1 row)
+
+DROP TABLE dn.secret;
+SELECT length(dolt_commit('-am', 'no secret')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE TABLE dn.secret (id int PRIMARY KEY, note text);
+INSERT INTO dn.secret VALUES (4, 'other secret');
+SELECT length(dolt_commit('-Am', 'another secret')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('dn_side', NULL::dn.secret) ORDER BY id;
+ id |  note  
+----+--------
+  2 | public
+  3 | side
+(2 rows)
+
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'dn_side', NULL::dn.secret);
+ diff_type |  to_row  
+-----------+----------
+ added     | (3,side)
+(1 row)
+
+SELECT * FROM dolt_at('dn_other', NULL::dn.secret);
+ERROR:  dolt_at can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_diff('HEAD', 'dn_other', 'dn.secret');
+ERROR:  dolt_diff can't read "dn.secret": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+RESET ROLE;
+-- the head moved without a commit of the branch's (its record of its
+-- tables is of the commit before): a fast-forward to a later version of
+-- the table, and a soft reset to an earlier one, keep the reader reading
+-- the table's own history
+SELECT (dolt_merge('dn_side'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
+ id |  note  
+----+--------
+  2 | public
+  3 | side
+(2 rows)
+
+SELECT * FROM dolt_at('HEAD~', NULL::dn.secret) ORDER BY id;
+ id |  note  
+----+--------
+  2 | public
+(1 row)
+
+RESET ROLE;
+INSERT INTO dn.secret VALUES (5, 'five');
+SELECT length(dolt_commit('-am', 'row 5')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS five_head \gset
+SELECT dolt_reset('--soft', 'HEAD~') IS NOT NULL AS moved;
+ moved 
+-------
+ t
+(1 row)
+
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
+ id |  note  
+----+--------
+  2 | public
+  3 | side
+(2 rows)
+
+RESET ROLE;
+SELECT dolt_reset('--soft', :'five_head') IS NOT NULL AS back;
+ back 
+------
+ t
+(1 row)
+
+-- (a head moved to the dropped table's commit and then committed records
+-- the re-made table at a commit whose parent holds the dropped one, which
+-- the names and identities alone can't tell from one table: #891, #895)
+SELECT dolt_branch('-D', 'dn_side') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', 'dn_other') IS NOT NULL AS deleted;
+ deleted 
+---------
+ t
+(1 row)
 
 -- nor one made with a renamed one's old name: the renamed one's rows by
 -- that name, without SELECT on it
@@ -341,11 +613,11 @@ SELECT length(dolt_commit('-Am', 'k1 again')::text) AS committed;
 SET ROLE regress_dn_reader;
 SELECT * FROM dolt_diff('HEAD~3', 'HEAD~2', 'k1');
 ERROR:  dolt_diff can't read "dn.k1": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, so the table here is another.
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 SELECT count(*) FROM dolt_history_table('k1');
 ERROR:  dolt_history_table can't read "dn.k1": the table of that name here isn't the one a version holds
-DETAIL:  The name was without a table since that version, so the table here is another.
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 RESET ROLE;
 GRANT SELECT ON dn.k2 TO regress_dn_reader;

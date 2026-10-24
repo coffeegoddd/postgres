@@ -635,3 +635,38 @@ OF` are built in D18's shapes.
   the user's review.
 - **Port:** an assertion of Dolt's refusal is omitted (the case is
   partial); test_prolly's `tags` test checks the read-only checkout.
+
+## D26. Reading a table's history takes its grants, over its lineage
+
+- **Dolt:** a user who may read a database reads any table at any commit
+  by hash, `AS OF` or a history table; privileges are on databases and
+  tables by name, not on versions.
+- **Prolly:** every history read of a table's rows (`dolt_at`,
+  `dolt_history_table`, `dolt_diff`, `dolt_diff_table`, by row type or
+  by name) takes `SELECT` on the table here of the version's name, and
+  that grant covers only versions that are that table: back through the
+  working set and the head's history, and forward from it along other
+  branches' commits, with the name never without a table between. A
+  version of another table of its name (one dropped, and a table made
+  again with its name in a later commit) is read only by the database's
+  owner or a member of `pg_read_all_data`. The step from the working set
+  to the head vouches for the head's version only through the branch's
+  record of its tables, made by its last commit, that has the table's
+  relation: at that commit, or at a head moved since (a fast-forward, a
+  reset) to a descendant or an ancestor of it with the name never
+  without a table between. Known gaps, as commits name tables by name and
+  identity alone: a table dropped and made again within one commit or in
+  the working set (#891); a head moved to the dropped table's commit and
+  then committed (#895: such moves need no privilege), an owner's squash,
+  or a merge of a branch that still has the old table, which record the
+  re-made table above a commit holding the dropped one. Planner
+  estimates of a version's rows and `dolt_diff_stat`'s counts are history
+  too: a version the user may not read gives the default estimate, and
+  its table is left out of `dolt_diff_stat` (refused when named). Any
+  commit is otherwise read by hash, as in Dolt.
+- **Why:** Postgres grants are on relations; a table made again with an
+  old name is another relation, and its grants don't cover the dropped
+  one's rows. Commits name tables by name and identity alone, so a table
+  dropped and made again within one commit (or in the working set) isn't
+  told from one kept: #891.
+- **Port:** ports run as a superuser; none is affected.

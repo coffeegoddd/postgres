@@ -4228,6 +4228,49 @@ head_names(const char *name, const ProllyHash *head)
 	return lines;
 }
 
+/*
+ * The commit the session branch's record of its tables is of, if it lists
+ * relation relid among them (the head may have moved since, uncommitted).
+ */
+static bool
+copies_recorded_relation(Oid relid, ProllyHash *at)
+{
+	char	   *name = branch_ops()->current();
+	StringInfoData key;
+	StringInfoData v;
+	char	   *nl;
+	char	   *lines;
+	char		want[16];
+	bool		found = false;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	if (!refs_get(key.data, key.len, &v) || (nl = strchr(v.data, '\n')) == NULL ||
+		!prolly_hash_from_hex(v.data, nl - v.data, at))
+	{
+		pfree(key.data);
+		pfree(v.data);
+		return false;
+	}
+	lines = pstrdup(nl);
+	pfree(key.data);
+	pfree(v.data);
+	snprintf(want, sizeof(want), "%010u ", relid);
+	for (char *p = lines; p && *p; p = strchr(p, '\n'))
+	{
+		if (*p == '\n')
+			p++;
+		if (strncmp(p, want, strlen(want)) == 0)
+		{
+			found = true;
+			break;
+		}
+	}
+	pfree(lines);
+	return found;
+}
+
 /* The record of head, now of next (a commit that renamed nothing). */
 static void
 carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *next)
@@ -7700,4 +7743,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
+	.recorded_relation = copies_recorded_relation,
 };
