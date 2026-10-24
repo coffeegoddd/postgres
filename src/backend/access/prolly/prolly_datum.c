@@ -24,6 +24,7 @@
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pgtime.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -36,6 +37,7 @@
 #include "utils/memutils.h"
 #include "utils/multirangetypes.h"
 #include "utils/numeric.h"
+#include "utils/pg_locale.h"
 #include "utils/resowner.h"
 #include "utils/rangetypes.h"
 #include "utils/syscache.h"
@@ -531,8 +533,11 @@ send_floats(ProllyDatumCodec *c, Datum value)
 /*
  * Settings a type's text form may depend on, fixed while one is written or
  * read: the shortest exact float output (extra_float_digits 1), ISO dates
- * in MDY order, the postgres interval style.  A nest level to end, or -1 if
- * they were so already.
+ * in MDY order, the postgres interval style, times in UTC and money in the
+ * C locale.  A type that prints a time with its zone's offset, or an amount
+ * with a locale's symbol and separators, would otherwise give the same
+ * value a different canonical form in each committer's session.  A nest
+ * level to end, or -1 if they were so already.
  */
 static int
 fixed_text_settings(void)
@@ -540,7 +545,9 @@ fixed_text_settings(void)
 	int			nest;
 
 	if (extra_float_digits == 1 && DateStyle == USE_ISO_DATES &&
-		DateOrder == DATEORDER_MDY && IntervalStyle == INTSTYLE_POSTGRES)
+		DateOrder == DATEORDER_MDY && IntervalStyle == INTSTYLE_POSTGRES &&
+		strcmp(pg_get_timezone_name(session_timezone), "UTC") == 0 &&
+		strcmp(locale_monetary, "C") == 0)
 		return -1;
 	nest = NewGUCNestLevel();
 	(void) set_config_option("extra_float_digits", "1", PGC_USERSET, PGC_S_SESSION,
@@ -548,6 +555,10 @@ fixed_text_settings(void)
 	(void) set_config_option("datestyle", "ISO, MDY", PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
 	(void) set_config_option("intervalstyle", "postgres", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("timezone", "UTC", PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("lc_monetary", "C", PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
 	return nest;
 }

@@ -252,9 +252,12 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "19", whose dependencies record each
- * extension's configuration rows (those pg_dump dumps with it:
- * prolly_extconfig.h); "18" didn't, and was the first whose commits record
+ * The format a folded root is in: "20", whose text forms of values (a type
+ * without binary I/O's, or one its receive refuses) are written with times
+ * in UTC and money in the C locale (prolly_datum.c); "19" had them in the
+ * committer's TimeZone and lc_monetary, and was the first whose
+ * dependencies record each extension's configuration rows (those pg_dump
+ * dumps with it: prolly_extconfig.h); "18" didn't, and was the first whose commits record
  * their objects' identities beside it (folded_identify()), which a server
  * of an earlier format would read past, matching renamed objects by name; "17"
  * had none, and was the first with extension send values normalized by
@@ -291,7 +294,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"19"
+#define FOLDED_FORMAT	"20"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -303,8 +306,8 @@ typedef struct BaseTable BaseTable;
  * FOLDED_FORMAT too, and these with it: a fold refuses to run till they
  * agree (folded_encoders_checked()).
  */
-#define FOLDED_KEY_ENCODER		6
-#define FOLDED_VALUE_ENCODER	6
+#define FOLDED_KEY_ENCODER		7
+#define FOLDED_VALUE_ENCODER	7
 #define FOLDED_KEYING			1
 
 /*

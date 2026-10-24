@@ -613,7 +613,7 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 		.iface = PROLLY_IFACE_KEY_ENCODER,
 		.impl_id = 1,
 		/* (pinned by canon_folded.c: change FOLDED_FORMAT with it) */
-		.format_version = 6,		/* 5: tagged values; 6: extension send round trips */
+		.format_version = 7,		/* 6: extension send round trips; 7: text forms in UTC, C money */
 		.name = "ordered",
 		.description = "memcmp-ordered integers, bools and C-collation text; "
 		"other types by canonical bytes and their comparison function",

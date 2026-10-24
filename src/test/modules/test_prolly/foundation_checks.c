@@ -1734,6 +1734,33 @@ test_receiver_recv(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(s));
 }
 
+/*
+ * A text-only fixture whose output shows the settings it was printed
+ * under: "value|TimeZone|lc_monetary".  Its input takes the value before
+ * the first '|', so the text reads back as the value whatever it shows.
+ */
+PG_FUNCTION_INFO_V1(test_settings_in);
+PG_FUNCTION_INFO_V1(test_settings_out);
+
+Datum
+test_settings_in(PG_FUNCTION_ARGS)
+{
+	char	   *s = PG_GETARG_CSTRING(0);
+	char	   *bar = strchr(s, '|');
+
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(s, bar ? bar - s : strlen(s)));
+}
+
+Datum
+test_settings_out(PG_FUNCTION_ARGS)
+{
+	char	   *value = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	PG_RETURN_CSTRING(psprintf("%s|%s|%s", value,
+							   GetConfigOption("TimeZone", false, false),
+							   GetConfigOption("lc_monetary", false, false)));
+}
+
 Datum
 test_toast_pointer_value(PG_FUNCTION_ARGS)
 {

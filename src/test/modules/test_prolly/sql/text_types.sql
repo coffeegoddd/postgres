@@ -72,6 +72,49 @@ SELECT table_name, status FROM dolt_status() ORDER BY 1;
 RESET extra_float_digits;
 SELECT table_name, status FROM dolt_status() ORDER BY 1;
 
+-- TimeZone and lc_monetary are fixed too (UTC and C): a type printing a
+-- time with its zone's offset, or the settings it prints under, has one
+-- canonical form whatever the committer's session.  (The types outside the
+-- versioned schemas, as an extension's would be.)
+CREATE SCHEMA ttx;
+SET client_min_messages = warning;
+CREATE FUNCTION ttx.canon(anyelement) RETURNS bytea
+AS '$libdir/test_prolly', 'prolly_canonical_value' LANGUAGE C STRICT;
+CREATE TYPE ttx.stamp;
+CREATE FUNCTION ttx.stamp_in(cstring, oid, int4) RETURNS ttx.stamp
+AS 'timestamptz_in' LANGUAGE internal STABLE STRICT;
+CREATE FUNCTION ttx.stamp_out(ttx.stamp) RETURNS cstring
+AS 'timestamptz_out' LANGUAGE internal STABLE STRICT;
+CREATE TYPE ttx.stamp (INPUT = ttx.stamp_in, OUTPUT = ttx.stamp_out,
+    INTERNALLENGTH = 8, PASSEDBYVALUE, ALIGNMENT = double);
+CREATE TYPE ttx.shown;
+CREATE FUNCTION ttx.shown_in(cstring) RETURNS ttx.shown
+AS '$libdir/test_prolly', 'test_settings_in' LANGUAGE C IMMUTABLE STRICT;
+CREATE FUNCTION ttx.shown_out(ttx.shown) RETURNS cstring
+AS '$libdir/test_prolly', 'test_settings_out' LANGUAGE C STABLE STRICT;
+CREATE TYPE ttx.shown (INPUT = ttx.shown_in, OUTPUT = ttx.shown_out,
+    INTERNALLENGTH = variable, STORAGE = extended);
+RESET client_min_messages;
+SET TimeZone = 'America/New_York';
+SET lc_monetary = 'POSIX';
+CREATE TABLE tt.z (id int PRIMARY KEY, w ttx.stamp, s ttx.shown);
+INSERT INTO tt.z VALUES (1, '2026-01-02 03:04:05.678+00', 'v');
+SELECT id, convert_from(substr(ttx.canon(w), 2), 'UTF8') AS w_form,
+       convert_from(substr(ttx.canon(s), 2), 'UTF8') AS s_form FROM tt.z;
+SELECT md5(ttx.canon(w)) AS w_hash, md5(ttx.canon(s)) AS s_hash FROM tt.z \gset
+SELECT length(dolt_commit('-Am', 'settings-dependent text forms')::text) AS committed;
+SET TimeZone = 'Asia/Tokyo';
+SET lc_monetary = 'C';
+SELECT md5(ttx.canon(w)) = :'w_hash' AS same_w, md5(ttx.canon(s)) = :'s_hash' AS same_s
+  FROM tt.z;
+UPDATE tt.z SET id = id;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
+DROP TABLE tt.z;
+SELECT dolt_reset('--hard');
+SELECT id, w::text, s::text FROM tt.z;
+RESET TimeZone;
+RESET lc_monetary;
+
 -- a column added with a default no row is written with: checked too
 ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.23456789';
 ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.5';

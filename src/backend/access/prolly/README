@@ -162,9 +162,10 @@ parallel index build), where no subtransaction can be begun; while the
 caller holds off interrupts (a buffer's content lock, a critical
 section), so encoders read a page's copy, not the page; and for a range
 over a row type holding such a type, whose values are untagged;
-there a refusal is raised as before.  Text forms are written with
-extra_float_digits, DateStyle and IntervalStyle fixed, but not TimeZone or
-lc_monetary.
+there a refusal is raised as before.  Text forms are written and read
+with extra_float_digits, DateStyle, IntervalStyle, TimeZone (UTC) and
+lc_monetary (C) fixed, so a value's canonical form doesn't depend on the
+committer's session (since folded format 20).
 
 
 Extension ordering and history compatibility
