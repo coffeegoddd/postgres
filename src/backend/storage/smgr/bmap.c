@@ -36,7 +36,10 @@
  * Sharing with other maps (a share, a copy of a snapshot) raises the
  * header's shared_below to the map's epoch: an entry born since can be
  * shared only with the map's own snapshots (bmappagesharedelsewhere()),
- * which VACUUM changes as if unshared.
+ * which VACUUM changes as if unshared.  A sweep, having counted every
+ * holder, lowers it to just past the newest entry another map still
+ * holds (sweep_shared_below()), so pages the other map let go of are
+ * vacuumed as unshared again.
  *
  * Sharing.  A node is held by every page that points to it, and a data
  * block by every leaf (and changes list) holding it, the reference counts
@@ -6048,10 +6051,11 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
  * snapshots) may be; one born since only by its snapshots, which keep the
  * relation's pages as they were for its own branch.  A hint for callers
  * weighing a copy's cost: preparing the page for a change copies it either
- * way.  shared_below only rises (a restore's new storage takes its old
- * storage's, which goes): once the other map is gone (a branch deleted),
- * the entries born before it still count as shared elsewhere until they
- * change, which costs VACUUM's work on them, never their contents.
+ * way.  shared_below rises with a share (a restore's new storage takes its
+ * old storage's, which goes); once the other map is gone (a branch
+ * deleted), the entries born before it count as shared elsewhere until
+ * they change or a page sweep lowers it (sweep_shared_below()), which
+ * costs VACUUM's work on them meanwhile, never their contents.
  */
 bool
 bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
@@ -8073,6 +8077,192 @@ sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
 }
 
 /*
+ * A relation's own holders of each block, as the sweep counts every
+ * relation's (sweep_node(), sweep_entry()): its tree's and its snapshots'
+ * nodes once for each of its pages pointing to them, a node's children
+ * once.  Then, walking its tree alone, which of its entries another map
+ * may hold: one whose block, or a node on whose path, more hold than the
+ * relation does.
+ */
+typedef struct OwnHolder
+{
+	BlockNumber block;
+	uint32		count;
+	bool		reached;
+} OwnHolder;
+
+typedef struct OwnHolders
+{
+	HTAB	   *own;
+	const uint16 *holders;		/* every relation's */
+	BlockNumber hw;
+	bool		elsewhere[BMAP_TREE_TOPS + 1];	/* each level's node on the
+												 * path so far */
+	uint32		below;			/* how far shared_below goes down */
+	uint32		shared_below;	/* as it was */
+} OwnHolders;
+
+static OwnHolder *
+own_holder(OwnHolders *oh, BlockNumber b)
+{
+	bool		found;
+	OwnHolder  *h = hash_search(oh->own, &b, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		h->count = 0;
+		h->reached = false;
+	}
+	return h;
+}
+
+static bool
+own_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	OwnHolders *oh = arg;
+	OwnHolder  *h;
+
+	if (node >= oh->hw)
+		return true;
+	h = own_holder(oh, node);
+	h->count++;
+	if (h->reached)
+		return false;
+	h->reached = true;
+	return true;
+}
+
+static void
+own_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	OwnHolders *oh = arg;
+
+	if (entry->block < oh->hw)
+		own_holder(oh, entry->block)->count++;
+}
+
+/* Does another map hold block b, as counted (or may it: one newer)? */
+static bool
+held_elsewhere(OwnHolders *oh, BlockNumber b)
+{
+	OwnHolder  *h;
+
+	if (b >= oh->hw)
+		return true;
+	h = hash_search(oh->own, &b, HASH_FIND, NULL);
+	return h == NULL || oh->holders[b] > h->count;
+}
+
+/*
+ * (the tree's tops come first, a level each from the leaves up, so a top's
+ * parent's flag, a level above any reached yet, is still false)
+ */
+static bool
+shared_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
+{
+	OwnHolders *oh = arg;
+	OwnHolder  *h;
+
+	oh->elsewhere[level] = oh->elsewhere[level + 1] || held_elsewhere(oh, node);
+	if (node >= oh->hw)
+		return true;
+	/* (each node once: the snapshots' subtrees the tree has are walked) */
+	h = own_holder(oh, node);
+	if (!h->reached)
+		return false;
+	h->reached = false;
+	return true;
+}
+
+static void
+shared_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
+{
+	OwnHolders *oh = arg;
+
+	/* (the tree's own entries, not a snapshot's) */
+	if (!BlockNumberIsValid(blkno) || entry->epoch >= oh->shared_below)
+		return;
+	if (oh->elsewhere[0] || held_elsewhere(oh, entry->block))
+		oh->below = Max(oh->below, entry->epoch + 1);
+}
+
+/*
+ * Lower a relation's shared_below to just past the newest of its entries
+ * another map still holds (0 if none), now that every holder is counted,
+ * holders[] (each block's, of every map, its changes list and the release
+ * queue).  Never raised, and never below an entry another map holds: no
+ * share adds a holder while the sweep's lock is held, and a copy of a node
+ * or a page meanwhile only adds holders, of blocks the counts already
+ * hold or of blocks newer than any counted, which count as held
+ * elsewhere.  Under the header's lock, WAL-logged as a header delta, the
+ * relation's length as it is (a truncation's record, which carries one).
+ */
+static void
+sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	BmapHeader *header;
+	HASHCTL		ctl;
+	OwnHolders	oh;
+
+	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0 ||
+		!bmap_relation_exists(rel))
+		return;
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	if (PageIsNew(BufferGetPage(headerbuf)))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	header = PageGetBmapHeader(BufferGetPage(headerbuf));
+	if (header->shared_below == 0)
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+
+	ctl.keysize = sizeof(BlockNumber);
+	ctl.entrysize = sizeof(OwnHolder);
+	ctl.hcxt = CurrentMemoryContext;
+	memset(&oh, 0, sizeof(oh));
+	oh.own = hash_create("bmap own holders", 1024, &ctl,
+						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	oh.holders = holders;
+	oh.hw = hw;
+	oh.shared_below = header->shared_below;
+	tree_walk(reln, own_node, own_entry, &oh);
+	tree_walk(reln, shared_node, shared_entry, &oh);
+	hash_destroy(oh.own);
+
+	if (oh.below < header->shared_below)
+	{
+		xl_bmap_header_delta delta;
+		XLogRecPtr	lsn;
+
+		delta.kind = BMAP_DELTA_HEADER;
+		delta.flags = BMAP_DELTA_SHARED_BELOW;
+		delta.nblocks = header->nblocks;
+		delta.epoch = header->epoch;
+		delta.fold_epoch = header->fold_epoch;
+		delta.shared_below = oh.below;
+		START_CRIT_SECTION();
+		apply_header_delta(BufferGetPage(headerbuf), &delta);
+		MarkBufferDirty(headerbuf);
+		XLogBeginInsert();
+		XLogRegisterData(&rel, sizeof(xl_bmap_rel));
+		XLogRegisterBuffer(0, headerbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(0, &delta, sizeof(delta));
+		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TRUNCATE);
+		PageSetLSN(BufferGetPage(headerbuf), lsn);
+		END_CRIT_SECTION();
+	}
+	UnlockReleaseBuffer(headerbuf);
+}
+
+/*
  * Rewrite the counts of the blocks stuck[0 .. n), sorted: a stuck count
  * whose holders fit a count now, and the count of a block nothing holds
  * (zero, before it is freed).  A stuck count is changed only by a sweep,
@@ -9304,6 +9494,24 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 		stuck.n = kept;
 	}
 	result->recounted = sweep_recount(rel, stuck.blocks, stuck.n, holders);
+
+	/*
+	 * Each relation's shared_below lowered to what other maps still hold,
+	 * while no share can add a holder.
+	 */
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		RelFileNumber relnumber;
+		char	   *end;
+
+		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
+		if (end == de->d_name || strcmp(end, "_bmap") != 0)
+			continue;
+		sweep_shared_below(smgropen(with_relnumber(rel, relnumber),
+									INVALID_PROC_NUMBER), holders, hw);
+	}
+	FreeDir(dir);
 	LockRelease(&tag, ExclusiveLock, false);
 
 	/* (a block nothing holds gets no new holder: freed after the lock) */
