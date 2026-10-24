@@ -1040,8 +1040,20 @@ prolly_check_branch_rename(const char *newname)
 }
 
 /*
- * After a move from before (the branch folded then, had: one there was)
- * bringing versions from the commits from (n of them), and having made
+ * Before a move bringing versions from the commits from (n of them): the
+ * branch folded (into before), if a table here may take another table's
+ * version from them (prolly_versions_may_be_foreign()); false, with
+ * nothing folded, if none may.
+ */
+static bool
+fold_before_move(const ProllyHash *from, int n, ProllyNodeRef *before)
+{
+	return n > 0 && prolly_versions_may_be_foreign(from, n) &&
+		PROLLY_CALL(refs(), working_set, NULL, before);
+}
+
+/*
+ * After that move (had: fold_before_move() folded before), having made
  * commit made (NULL: none): the tables whose versions came from another
  * table's commits made again, relations of their own
  * (prolly_remake_foreign_versions()).
@@ -1050,7 +1062,7 @@ static void
 remake_moved(bool had, const ProllyNodeRef *before, const ProllyHash *from,
 			 int n, const ProllyHash *made)
 {
-	if (had && n > 0)
+	if (had)
 		BRANCH_WRITES_HUSHED(prolly_remake_foreign_versions(before, from, n,
 															made));
 }
@@ -2532,7 +2544,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	date_given = dated;
 	PG_TRY();
 	{
-		had_folded = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		had_folded = fold_before_move(&theirs, theirs.len > 0 ? 1 : 0, &folded);
 		WITH_PROVENANCE(&theirs, theirs.len > 0 ? 1 : 0,
 						BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge,
 																	 branch, message,
@@ -3335,9 +3347,10 @@ dolt_reset(PG_FUNCTION_ARGS)
 	{
 		ProllyHash	target = {0};
 		ProllyNodeRef folded;
-		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		bool		had;
 
 		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
+		had = fold_before_move(&target, target.len > 0 ? 1 : 0, &folded);
 		WITH_PROVENANCE(&target, target.len > 0 ? 1 : 0,
 						BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset,
 														 ref ? ref : "HEAD")));
@@ -3947,9 +3960,10 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	{
 		ProllyHash	picked = {0};
 		ProllyNodeRef folded;
-		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		bool		had;
 
 		(void) PROLLY_CALL(refs(), resolve, ref, &picked);
+		had = fold_before_move(&picked, picked.len > 0 ? 1 : 0, &folded);
 		WITH_PROVENANCE(&picked, picked.len > 0 ? 1 : 0,
 						BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
 																	 &ref, 1, allow_empty,
@@ -3995,7 +4009,7 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 		ProllyHash *from = palloc0(sizeof(ProllyHash) * Max(n, 1));
 		int			nfrom = 0;
 		ProllyNodeRef folded;
-		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		bool		had;
 
 		/* (a revert brings back what each commit's parent had) */
 		for (int i = 0; i < n; i++)
@@ -4007,6 +4021,7 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 				PROLLY_CALL(refs(), commit_get, &c, &info) && info.nparents > 0)
 				from[nfrom++] = info.parents[0];
 		}
+		had = fold_before_move(from, nfrom, &folded);
 		WITH_PROVENANCE(from, nfrom,
 						BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert,
 																   ids, n, series_head,

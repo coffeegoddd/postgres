@@ -4706,6 +4706,60 @@ folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 }
 
 /*
+ * Whether a move bringing versions from the commits provenance (n of them)
+ * may bring a table here another table's version
+ * (prolly_remake_foreign_versions()), asked before the move, of their
+ * records and the catalog alone, so that a move that can't folds nothing
+ * more: a commit made here lists, by name, a relation of another class
+ * than the table of that name here, or, with none of that name here, one
+ * that isn't here under another (renamed since).
+ * A commit made elsewhere (unrecorded) can't be told so.
+ */
+bool
+prolly_versions_may_be_foreign(const ProllyHash *provenance, int n)
+{
+	ProllyDatabaseComponents dc = components();
+
+	if (!PROLLY_HAS(dc.refs, commit_relations) ||
+		!PROLLY_HAS(dc.refs, relation_class))
+		return false;
+	for (int i = 0; i < n; i++)
+	{
+		char	   *lines;
+
+		if (!PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &lines))
+			continue;
+		for (char *p = lines; *p;)
+		{
+			char	   *end = strchrnul(p, '\n');
+
+			if (end - p > 11)
+			{
+				Oid			r = (Oid) strtoul(p, NULL, 10);
+				char	   *name = pnstrdup(p + 11, end - (p + 11));
+				Oid			here;
+
+				here = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+										NoLock, true);
+				if (OidIsValid(here) ?
+					(here != r &&
+					 PROLLY_CALL(dc.refs, relation_class, here) !=
+					 PROLLY_CALL(dc.refs, relation_class, r)) :
+					get_rel_relkind(r) != RELKIND_RELATION)
+				{
+					pfree(name);
+					return true;
+				}
+				pfree(name);
+			}
+			p = *end ? end + 1 : end;
+		}
+		pfree(lines);
+	}
+	return false;
+}
+
+/*
  * After a move from before (the branch folded then) that brought versions
  * from the commits provenance (the commit moved to, a merge's other side,
  * the commit a pick takes or a revert goes back to): each table whose

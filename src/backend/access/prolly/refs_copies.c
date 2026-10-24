@@ -2365,6 +2365,43 @@ move_settled(void *arg)
 	settle(arg, NULL);
 }
 
+/* A branch's copies moved to a commit (copies_branch_move()). */
+typedef struct MoveSettled
+{
+	ProllyCommitInfo *info;
+	ProllyHash	head;			/* the commit moved to */
+} MoveSettled;
+
+/*
+ * The branch's copies moved to the commit (move_settled()), the tables it
+ * makes in the classes of the relations the commit was made from, and then
+ * its tables whose versions are of another table than the commit was made
+ * from made again, relations of their own, the mover's
+ * (prolly_remake_foreign_versions()), as a hard reset's are.
+ */
+static void
+move_settled_remade(void *arg)
+{
+	MoveSettled *ms = arg;
+	ProllyNodeRef before;
+	bool		had;
+
+	had = prolly_versions_may_be_foreign(&ms->head, 1) &&
+		copies_working_set(NULL, &before);
+	prolly_move_provenance = list_make1(&ms->head);
+	PG_TRY();
+	{
+		move_settled(ms->info);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_provenance = NIL;
+	}
+	PG_END_TRY();
+	if (had)
+		prolly_remake_foreign_versions(&before, &ms->head, 1, NULL);
+}
+
 /*
  * Kept pages (#767).  When a branch's working set is known to be a commit's
  * root (a commit's fold made it; a move settled there), the pages of its
@@ -3802,7 +3839,8 @@ move_copies_remade(void *arg)
 	Oid			save_user;
 	int			save_sec;
 
-	had = copies_working_set(NULL, &before);
+	had = prolly_versions_may_be_foreign(&mc->head, 1) &&
+		copies_working_set(NULL, &before);
 	move_copies(arg);
 	if (!had)
 		return;
@@ -7622,10 +7660,15 @@ copies_branch_move(const char *name, const ProllyHash *expected,
 			}
 			if (head == NULL)
 				;
-			else if (strcmp(name, branch_ops()->current()) == 0)
-				move_settled(&info);
 			else
-				branch_ops()->run_on(name, move_settled, &info);
+			{
+				MoveSettled ms = {&info, *head};
+
+				if (strcmp(name, branch_ops()->current()) == 0)
+					move_settled_remade(&ms);
+				else
+					branch_ops()->run_on(name, move_settled_remade, &ms);
+			}
 		}
 		PG_FINALLY();
 		{

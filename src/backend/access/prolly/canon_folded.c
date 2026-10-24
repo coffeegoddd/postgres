@@ -10398,6 +10398,12 @@ inheritance_kept(List *from, List *to, const char *name, const TableDef *td,
 	List	   *cons = NIL;
 	ListCell   *lc;
 
+	/* (a table, or a table it inherits from, made again as one of its own) */
+	if (list_has_string(prolly_move_remade, name))
+		return false;
+	foreach(lc, td->inherits)
+		if (list_has_string(prolly_move_remade, lfirst(lc)))
+			return false;
 	foreach(lc, td->inherits)
 	{
 		MoveItem   *pf = find_item(from, 't', lfirst(lc));
@@ -11339,7 +11345,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	 * if any changes, or a view or a type they may use does: all of them,
 	 * each after those it uses (one going takes no other with it).
 	 */
-	matviews_change = tm.any || view_drops != NIL || foreign_remade;
+	matviews_change = tm.any || view_drops != NIL || foreign_remade ||
+		prolly_move_remade != NIL;
 	foreach(lc, from)
 	{
 		MoveItem   *f = lfirst(lc);

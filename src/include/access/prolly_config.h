@@ -120,6 +120,14 @@ extern void prolly_check_head_move(const char *name);
 extern void prolly_check_branch_rename(const char *newname);
 
 /*
+ * Whether a move bringing versions from the commits provenance
+ * (nprovenance of them) may bring a table here another table's version:
+ * false, and prolly_remake_foreign_versions() would make nothing again.
+ */
+extern bool prolly_versions_may_be_foreign(const ProllyHash *provenance,
+										   int nprovenance);
+
+/*
  * After a move from before (the branch folded then) bringing versions from
  * the commits provenance (nprovenance of them): the tables whose versions it changed that provenance
  * wasn't made from the table's relation made again, relations of their own
