@@ -8,43 +8,6 @@
 # then the change that met it removes the entry, and the check is enforced
 # from then on.  An entry naming nothing the run checked fails too.
 
-# A hard reset to the head writes the dirty rows back through the row
-# applier, with their index entries.  (Where another branch's working set
-# is known to be the head, it may share that branch's storage instead; in
-# V9's sequence none is, but for a background fold of main, and V9 runs no
-# fold worker.)
-[[known]]
-check = "hard_reset"
-sweep = "rows"
-counter = "apply_rows"
-current = "flat"
-issue = "#767"
-reason = "the dirty rows are written back (restoring the head's pages writes none)"
-
-[[known]]
-check = "hard_reset"
-sweep = "rows"
-counter = "apply_index_tuples"
-current = "flat"
-issue = "#767"
-reason = "the rows written back make their index entries again"
-
-[[known]]
-check = "hard_reset"
-sweep = "delta"
-counter = "apply_rows"
-current = "linear"
-issue = "#767"
-reason = "a row written back per dirty row"
-
-[[known]]
-check = "hard_reset"
-sweep = "delta"
-counter = "apply_index_tuples"
-current = "linear"
-issue = "#767"
-reason = "an entry in each index per row written back"
-
 # A historical point read decodes the commit's whole table (dolt_at is a
 # full scan).
 [[known]]
@@ -54,15 +17,3 @@ counter = "nodes_read"
 current = "linear"
 issue = "#697"
 reason = "dolt_at reads every row of the table at the commit; no key access path"
-
-# A branch's first use shares each relation's blocks, and before a block
-# the relation alone held is shared, its page image is logged (PRESERVE):
-# redo may skip the source's older records for it once the source's map
-# moves on, and zero it again where it was reused after the redo point.
-[[known]]
-check = "first_use"
-sweep = "rows"
-counter = "bmap_pages_preserved"
-current = "linear"
-issue = "#810"
-reason = "an image of each block the relation alone holds, logged before it is shared"

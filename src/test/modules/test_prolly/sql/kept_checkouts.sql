@@ -7,6 +7,10 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
+-- (the move planner's sources and the kept materializations' shares, not
+-- pages kept as of the head, which come before them and move nothing:
+-- first_use_kept tests those)
+SET prolly.kept_commits = 0;
 
 -- since(counter): pg_stat_prolly's counter's growth since it was last
 -- asked, the session's counts flushed first (:flush, a statement of its

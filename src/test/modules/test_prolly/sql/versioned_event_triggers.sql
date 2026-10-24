@@ -68,8 +68,10 @@ CREATE TABLE public.f (id int PRIMARY KEY);
 -- someone else makes a function of its name there (never run as the
 -- trigger's)
 CREATE ROLE regress_evt_alice;
-GRANT CREATE, USAGE ON SCHEMA public TO regress_evt_alice;
 SELECT dolt_checkout('evt_old');
+-- (granted there: a branch's first use copies the branch nearest its head,
+-- here main, which keeps its pages as of it, not the session's)
+GRANT CREATE, USAGE ON SCHEMA public TO regress_evt_alice;
 CREATE TABLE public.g (id int PRIMARY KEY);
 SET ROLE regress_evt_alice;
 CREATE FUNCTION public.note_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$

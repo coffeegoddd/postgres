@@ -384,7 +384,8 @@ work_mem as for any query.
 
 A commit, a checkpoint and a fold of a transaction's own rows change
 only their branch's refs (its head, baseline, the names of its head's
-tables, its merge state and violations).  Every change of a branch's refs
+tables, its merge state and violations, the commits its pages are kept
+as of).  Every change of a branch's refs
 is made holding that branch's lock to transaction end, and they take
 only that, so commits on different branches run together while those on
 one branch take turns.  Anything else that changes the refs (a branch
@@ -443,6 +444,48 @@ constraint, whose rows the applier rechecks a row at a time.  A table the
 head hasn't begins empty too, so the move drops it without its pages
 having been shared (and, for pages no other map held, logged) first.  A
 table whose definition differs keeps its pages: the move may keep its rows.
+
+A branch's pages are kept as of the last commits it was at
+(prolly.kept_commits, 2 by default): when a commit's fold, or a move
+settled, leaves the working set known to be a commit's root, each
+block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
+change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
+through branch operations' keep()), O(1) in its size, a relation unchanged
+since a commit kept already reusing that one's.  Only while nothing else
+can be on the pages: the relations are locked against writers without
+waiting, and the snapshot the commit or move went by saw every writer of
+the branch that ended and nobody else is writing it; otherwise nothing is
+kept.  Not at a transaction's own commit (dolt.transaction_commit), whose
+head moves every transaction.  The refs record each kept commit with the
+branch's baseline then and each table's relations and snapshots ('K').  A
+move back to one of them (dolt_reset('--hard') to the head or the commit
+before, a merge's abort, a stash) first gives each table that changed
+since its pages back (restore()): new storage made of each relation's
+snapshot, O(1), its pg_class row repointed with its oldest transaction ids
+then, as TRUNCATE gives a relation new storage, and the old storage dropped
+at commit; the baseline takes the table's entry from the kept baseline,
+whose change log is restored with it, so the fold that follows reads none
+of its rows.  Whatever still differs (definitions, sequences, a table not
+restored) the move writes as before.  A table isn't restored if its
+storage was replaced since (a rewrite, a truncation), an index was made or
+dropped, it was renamed, its rows' transaction ids are older than the
+database still knows, its rows in the commit can't be read here, the user
+couldn't write its rows, or one of its relations is in use (its locks are
+tried, not waited for): its rows are written.  Like TRUNCATE, a restore
+isn't MVCC-safe: a snapshot taken before the move commits reads the
+restored pages after it.
+
+A branch's first use at a commit another branch keeps the pages of is
+made of those pages (branch operations' make_kept()): each such table's
+relations share the snapshots, O(1), and the source's writers are not
+locked out (the source's relations are held with ShareUpdateExclusiveLock,
+tried and never queued for, which only definition changes, VACUUM and
+letting go of kept pages wait for); only relations not kept (a table made
+or whose storage was replaced since, a sequence) are copied as before,
+under locks against writers.  The new branch's baseline takes those
+tables' entries from the kept baseline.  A commit that stops being kept is
+retired rather than let go of, and its pages are let go of by a later keep
+once the retiring transaction has committed.
 
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies

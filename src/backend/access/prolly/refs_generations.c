@@ -924,3 +924,36 @@ branch_generations_saw(Oid branch, uint64 generation)
 		e->seen = generation;
 	LWLockRelease(&g->lock);
 }
+
+/*
+ * Do branch's pages hold only what snap sees, and the transaction's own
+ * changes: nobody else writing it, nor any writer of every branch, and
+ * every writer of it that committed seen by snap?  The caller keeps new
+ * writers out (its relations locked against them), so it holds after.
+ * Unlike a fold known, the catalogs needn't be as they were: the pages are
+ * asked of alone.  False where nothing can be told (in recovery, while a
+ * transaction is prepared, by a snapshot that isn't MVCC).
+ */
+bool
+branch_writers_settled(Oid branch, Snapshot snap)
+{
+	BranchGenerations *g = shared();
+	BranchGeneration *e;
+	int			own = 0;
+	bool		settled;
+
+	if (g == NULL || snap == NULL || snap->snapshot_type != SNAPSHOT_MVCC ||
+		RecoveryInProgress() || written_overflow || TwoPhaseAnyPrepared())
+		return false;
+	for (int i = 0; i < nwritten; i++)
+	{
+		if (written[i] == branch)
+			own = 1;
+	}
+	LWLockAcquire(&g->lock, LW_SHARED);
+	e = find_entry(g, branch);
+	settled = (e == NULL ? own == 0 : e->writers == own) &&
+		g->overflow_writers == 0 && sees_writers(g, e, snap);
+	LWLockRelease(&g->lock);
+	return settled;
+}

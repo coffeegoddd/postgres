@@ -1,0 +1,343 @@
+-- A branch's first use makes its tables of the pages the branch it was
+-- made from keeps as of its head (#489): each shares a snapshot's pages,
+-- O(1), with no row written back and no lock on the source's writers.
+-- What it holds is the head's rows, whatever the source's working set has
+-- since; a table whose pages aren't kept (made since the commit, its
+-- storage replaced since) is copied as before and moved to the head.
+SELECT current_database() AS home \gset
+CREATE DATABASE first_use_kept;
+\c first_use_kept
+SET client_min_messages = warning;
+CREATE EXTENSION amcheck;
+RESET client_min_messages;
+CREATE FUNCTION counted() RETURNS jsonb LANGUAGE sql AS $$
+	SELECT jsonb_object_agg(name, value) FROM pg_stat_prolly
+	WHERE name IN ('apply_rows', 'first_use_tables_kept', 'bmap_map_pages_copied')
+$$;
+CREATE FUNCTION since(before jsonb) RETURNS TABLE (name text, value bigint)
+LANGUAGE sql AS $$
+	SELECT key, value::bigint - (before ->> key)::bigint
+	FROM jsonb_each_text(counted()) ORDER BY 1
+$$;
+CREATE SCHEMA fk VERSIONED;
+CREATE TABLE fk.t (id bigint PRIMARY KEY, v int NOT NULL, w text NOT NULL);
+CREATE INDEX t_v ON fk.t (v);
+CREATE TABLE fk.k (k int, note text);
+CREATE TABLE fk.s (id serial PRIMARY KEY, x text);
+INSERT INTO fk.t SELECT g, g % 7, repeat(md5(g::text), 1 + g % 50)
+FROM generate_series(1, 5000) g;
+INSERT INTO fk.k SELECT g % 50, 'n' FROM generate_series(1, 1000) g;
+INSERT INTO fk.s (x) SELECT 'a' FROM generate_series(1, 10);
+SELECT dolt_commit('-Am', 'load') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CREATE FUNCTION rows_digest() RETURNS text LANGUAGE sql AS $$
+	SELECT md5((SELECT string_agg(t::text, ',' ORDER BY id) FROM fk.t) || '|' ||
+			   (SELECT string_agg(k::text || ':' || n, ',' ORDER BY k)
+				FROM (SELECT k, count(*) n FROM fk.k GROUP BY k) g) || '|' ||
+			   (SELECT string_agg(s::text, ',' ORDER BY id) FROM fk.s))
+$$;
+SELECT rows_digest() AS at_load \gset
+-- main's working set changes after its commit; a branch made at the head
+UPDATE fk.t SET v = -1 WHERE id <= 300;
+DELETE FROM fk.k WHERE k = 1;
+INSERT INTO fk.s (x) VALUES ('main');
+SELECT rows_digest() AS main_dirty \gset
+SELECT dolt_branch('b1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted() AS before \gset
+SELECT dolt_checkout('b1');
+         dolt_checkout         
+-------------------------------
+ {0,"Switched to branch 'b1'"}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+-- (each table made of kept pages, no row written, no map page copied
+-- but the copies' own)
+SELECT * FROM since(:'before');
+         name          | value 
+-----------------------+-------
+ apply_rows            |     0
+ bmap_map_pages_copied |    18
+ first_use_tables_kept |     3
+(3 rows)
+
+SELECT rows_digest() = :'at_load' AS at_head, NOT EXISTS (SELECT FROM dolt_status) AS clean;
+ at_head | clean 
+---------+-------
+ t       | t
+(1 row)
+
+SET enable_seqscan = off;
+SELECT count(*) FROM fk.t WHERE v = -1;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM fk.t WHERE id = 7;
+ count 
+-------
+     1
+(1 row)
+
+RESET enable_seqscan;
+SELECT nextval('fk.s_id_seq') AS next_on_branch;
+ next_on_branch 
+----------------
+             11
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT rows_digest() = :'main_dirty' AS main_as_it_was;
+ main_as_it_was 
+----------------
+ t
+(1 row)
+
+SELECT bool_and(bt_index_check(indexrelid, true) IS NOT NULL) AS indexes_valid
+FROM pg_index WHERE indrelid IN ('fk.t'::regclass, 'fk.s'::regclass);
+ indexes_valid 
+---------------
+ t
+(1 row)
+
+-- a table made since the commit, and one whose storage was replaced
+-- since: copied as before, then moved to the head
+CREATE TABLE fk.n (id int PRIMARY KEY);
+TRUNCATE fk.k;
+SELECT dolt_branch('b2');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted() AS before \gset
+SELECT dolt_checkout('b2');
+         dolt_checkout         
+-------------------------------
+ {0,"Switched to branch 'b2'"}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, value > 0 AS some FROM since(:'before');
+         name          | some 
+-----------------------+------
+ apply_rows            | t
+ bmap_map_pages_copied | t
+ first_use_tables_kept | t
+(3 rows)
+
+SELECT rows_digest() = :'at_load' AS at_head, NOT EXISTS (SELECT FROM dolt_status) AS clean,
+	to_regclass('fk.n') IS NULL AS no_new_table;
+ at_head | clean | no_new_table 
+---------+-------+--------------
+ t       | t     | t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- the branch keeps its own pages as of its head: a reset there gives
+-- them back
+SELECT dolt_checkout('b1');
+         dolt_checkout         
+-------------------------------
+ {0,"Switched to branch 'b1'"}
+(1 row)
+
+UPDATE fk.t SET v = 5 WHERE id <= 10;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT (counted() ->> 'apply_rows')::bigint AS applied \gset
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT (counted() ->> 'apply_rows')::bigint - :applied AS reset_applied;
+ reset_applied 
+---------------
+             0
+(1 row)
+
+SELECT rows_digest() = :'at_load' AS at_head;
+ at_head 
+---------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- main's later commits retire and let go of the pages it kept as of the
+-- first; a branch made at that commit is made of another's kept as of it (b1's)
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+DO $$
+BEGIN
+	FOR i IN 1..4 LOOP
+		UPDATE fk.t SET v = 100 + i WHERE id = 2;
+		PERFORM dolt_commit('-am', 'step ' || i);
+	END LOOP;
+END $$;
+SELECT dolt_branch('b3', (SELECT commit_hash FROM dolt_log WHERE message = 'load'));
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted() AS before \gset
+SELECT dolt_checkout('b3');
+         dolt_checkout         
+-------------------------------
+ {0,"Switched to branch 'b3'"}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, value FROM since(:'before') WHERE name = 'first_use_tables_kept';
+         name          | value 
+-----------------------+-------
+ first_use_tables_kept |     3
+(1 row)
+
+SELECT rows_digest() = :'at_load' AS at_load;
+ at_load 
+---------
+ t
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- a table vacuumed before its commit and unchanged since: the copy of its
+-- kept pages gets its visibility map too, so index-only scans on the
+-- branch don't visit the heap
+CREATE TABLE fk.vis (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+INSERT INTO fk.vis SELECT g, 'v' || g FROM generate_series(1, 20000) g;
+VACUUM fk.vis;
+SELECT dolt_commit('-Am', 'vacuumed') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CREATE FUNCTION heap_fetches() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+		SELECT count(id) FROM fk.vis WHERE id > 0
+	LOOP
+		IF line LIKE '%Heap Fetches%' THEN
+			RETURN trim(line);
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT heap_fetches() AS on_main;
+     on_main     
+-----------------
+ Heap Fetches: 0
+(1 row)
+
+SELECT dolt_branch('b4');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('b4');
+         dolt_checkout         
+-------------------------------
+ {0,"Switched to branch 'b4'"}
+(1 row)
+
+SELECT heap_fetches() AS on_the_branch;
+  on_the_branch  
+-----------------
+ Heap Fetches: 0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+\c :home
+DROP DATABASE first_use_kept;

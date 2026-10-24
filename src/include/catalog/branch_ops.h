@@ -23,8 +23,33 @@
 #ifndef BRANCH_OPS_H
 #define BRANCH_OPS_H
 
+#include "common/relpath.h"
+
 /* Visits one branch, by name. */
 typedef void (*BranchVisit) (const char *name, Oid branch, void *arg);
+
+/*
+ * A relation's pages as keep() kept them, for restore() to give back: the
+ * storage that keeps them (its tablespace, 0 for the database's, and file
+ * number), the snapshot's id there, and the relation's oldest unfrozen
+ * transaction and multixact ids then (its pages hold none older).
+ */
+typedef struct BranchKeptRelation
+{
+	Oid			relid;
+	Oid			tablespace;
+	RelFileNumber relfilenumber;
+	uint64		snapshot;
+	TransactionId frozenxid;
+	MultiXactId minmxid;
+} BranchKeptRelation;
+
+/* A table's relations as kept, its own first. */
+typedef struct BranchKeptTable
+{
+	int			nrels;
+	const BranchKeptRelation *rels;
+} BranchKeptTable;
 
 typedef struct BranchOpsRoutine
 {
@@ -106,6 +131,71 @@ typedef struct BranchOpsRoutine
 	 */
 	bool		(*share) (Oid source, List *relids,
 						  bool (*unchanged) (void *arg), void *arg);
+
+	/*
+	 * Optional: keep the pages of the session branch's relations relids as
+	 * they are, each in a snapshot of its storage that later changes don't
+	 * touch, into kept[] (one for each, in order): O(1) in each relation's
+	 * size.  A relation whose pages are still those of a snapshot in
+	 * prior[] (nprior of them, of its storage) is kept by that one again;
+	 * only the others take a snapshot.  Every one of relids is locked
+	 * against writers first, without waiting (and let go after); then
+	 * settled(arg), if given, says whether their pages hold exactly what
+	 * the caller found them to.  False, nothing kept, if a lock isn't free,
+	 * settled says no, or one can't be kept (its storage can't, or keeps
+	 * too many snapshots already).  Snapshots taken by a transaction that
+	 * aborts (or a subtransaction) are let go of later.  Once they are
+	 * kept, the snapshots release[] (nrelease of them) are let go of, the
+	 * locks still held: a branch being made of kept pages (make_kept())
+	 * holds the relations against that while it reads them.
+	 */
+	bool		(*keep) (List *relids, const BranchKeptRelation *prior,
+						 int nprior, BranchKeptRelation *kept,
+						 const BranchKeptRelation *release, int nrelease,
+						 bool (*settled) (void *arg), void *arg);
+
+	/*
+	 * Optional: give the session branch's relations kept[] (nkept of them,
+	 * a table's together) back the pages keep() kept, the storage they had
+	 * going when the transaction commits, into renewed[] (each one kept as
+	 * it is now, by a snapshot of its new storage or, all unchanged since,
+	 * the same one).  O(1) in each relation's size, and nothing if none
+	 * changed since: if one did, each gets new storage made of its
+	 * snapshot (with no free space or visibility map), its row the oldest
+	 * transaction ids it had then (one unchanged may hold hints, in its
+	 * buffers, true of it alone).  All or none: false, nothing changed,
+	 * if one isn't on the branch with the storage that kept it, its
+	 * snapshot is gone, its rows' transaction ids are older than the
+	 * database still knows, or one that changed is in use (each is locked
+	 * as TRUNCATE locks it, without waiting, and refused, as TRUNCATE
+	 * refuses, while the session itself has it open or an AFTER trigger's
+	 * event queued on it; the locks taken are kept).
+	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
+	 * the restored storage once it commits.
+	 */
+	bool		(*restore) (const BranchKeptRelation *kept, int nkept,
+							BranchKeptRelation *renewed);
+
+	/*
+	 * Optional: let go of a snapshot keep() or restore() took, if its
+	 * storage still has it (a dropped relation's went with it).
+	 */
+	void		(*let_go) (const BranchKeptRelation *kept);
+
+	/*
+	 * Optional: make a branch called name as make() does, a copy of branch
+	 * source, but each table of tables[] (ntables of them, each its
+	 * relations as keep() kept them) whose pages are still kept made of
+	 * them, used[] saying which were: O(1) in each relation's size, with
+	 * no lock that holds up the source's writers (only definition changes,
+	 * VACUUM and letting go of kept pages wait).  The source's other
+	 * relations are copied as make() copies them, locked against writers,
+	 * the tables of emptied among them begun empty; nowait as for make()
+	 * (InvalidOid, nothing made, if a lock is held).
+	 */
+	Oid			(*make_kept) (const char *name, const char *source,
+							  const BranchKeptTable *tables, int ntables,
+							  bool *used, List *emptied, bool nowait);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

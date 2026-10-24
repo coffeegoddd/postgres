@@ -11,6 +11,8 @@
 -- since(counter): pg_stat_prolly's counter's growth since it was last
 -- asked (flushed first too).
 CREATE DATABASE regress_nearest_source;
+-- (another branch's storage shared, not pages given back: kept_pages tests those)
+ALTER DATABASE regress_nearest_source SET prolly.kept_commits = 0;
 \c regress_nearest_source
 SET client_min_messages = warning;
 CREATE EXTENSION test_prolly;
