@@ -15,6 +15,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_datum.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
@@ -32,6 +33,7 @@
 #include "utils/memutils.h"
 #include "utils/multirangetypes.h"
 #include "utils/numeric.h"
+#include "utils/resowner.h"
 #include "utils/rangetypes.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -104,7 +106,8 @@ struct ProllyDatumCodec
 
 	/*
 	 * CODEC_OUTPUT (ioparam above too); and a tagged CODEC_SEND's, to read
-	 * a value written in its text form
+	 * a value written in its text form, and (output too) to write one its
+	 * receive function refuses
 	 */
 	FmgrInfo	output;
 	FmgrInfo	input;
@@ -566,7 +569,8 @@ encode_output(ProllyDatumCodec *c, Datum value, StringInfo out)
 {
 	int			nest = fixed_text_settings();
 	char	   *text = OutputFunctionCall(&c->output, value);
-	Datum		back = InputFunctionCall(&c->input, text, c->ioparam, c->typmod);
+	Datum		back = InputFunctionCall(&c->input, text, c->input_ioparam,
+										 c->typmod);
 	char	   *utf8;
 
 	end_text_settings(nest);
@@ -640,6 +644,73 @@ recv_utf8(ProllyDatumCodec *c, const char *data, int len)
 	PG_END_TRY();
 	if (buf.cursor != buf.len)
 		bad_value("receive function did not consume the value");
+	return result;
+}
+
+/*
+ * A normalizing CODEC_SEND value's binary form as its receive function gives
+ * it back: send(receive(b)), or NULL when receive refuses b and the value is
+ * tagged, so it can be kept as text instead.  An extension's receive may be
+ * stricter than its input (PostGIS's refuses a one-point LINESTRING, which
+ * its text input takes), and a value a table already holds must still be
+ * committed.  The refusal is caught in a subtransaction, as receive is the
+ * extension's code.  Cancels, resource and system errors, and corruption
+ * are raised as they are; anything else (PostGIS refuses with an internal
+ * error) is a refusal.
+ */
+static bytea *
+received_form(ProllyDatumCodec *c, bytea *b)
+{
+	MemoryContext mcxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	bytea	   *result = NULL;
+
+	if (!c->tagged || IsInParallelMode() || !IsTransactionState())
+	{
+		Datum		roundtrip = recv_utf8(c, VARDATA(b), VARSIZE(b) - VARHDRSZ);
+
+		result = send_utf8(&c->send, roundtrip);
+		if (!c->typbyval)
+			pfree(DatumGetPointer(roundtrip));
+		return result;
+	}
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(mcxt);
+	PG_TRY();
+	{
+		Datum		roundtrip = recv_utf8(c, VARDATA(b), VARSIZE(b) - VARHDRSZ);
+
+		result = send_utf8(&c->send, roundtrip);
+		if (!c->typbyval)
+			pfree(DatumGetPointer(roundtrip));
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(mcxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		int			class;
+
+		MemoryContextSwitchTo(mcxt);
+		edata = CopyErrorData();
+		class = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			class == ERRCODE_INSUFFICIENT_RESOURCES ||
+			class == ERRCODE_OPERATOR_INTERVENTION ||
+			class == ERRCODE_SYSTEM_ERROR ||
+			edata->sqlerrcode == ERRCODE_DATA_CORRUPTED ||
+			edata->sqlerrcode == ERRCODE_INDEX_CORRUPTED)
+			PG_RE_THROW();
+		FlushErrorState();
+		FreeErrorData(edata);
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(mcxt);
+		CurrentResourceOwner = owner;
+		result = NULL;
+	}
+	PG_END_TRY();
 	return result;
 }
 
@@ -891,6 +962,13 @@ prolly_datum_codec(Oid typid, int32 typmod, MemoryContext mcxt)
 		fmgr_info_cxt(send, &c->send, mcxt);
 		fmgr_info_cxt(recv, &c->recv, mcxt);
 		c->normalizes = io_may_normalize(base);
+		if (c->normalizes && c->tagged)
+		{
+			Oid			output;
+
+			getTypeOutputInfo(base, &output, &varlena);
+			fmgr_info_cxt(output, &c->output, mcxt);
+		}
 	}
 
 	/*
@@ -1739,18 +1817,22 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 				 * Store the representation we will get back, not a pre-receive
 				 * spelling. initdb's fixed I/O and our explicit built-in codecs
 				 * need no extra round trip; ranges whose bounds hold extension
-				 * types do.
+				 * types do.  A value receive refuses is kept as its text form,
+				 * which must read back as it.
 				 */
 				if (c->normalizes)
 				{
-					Datum		roundtrip = recv_utf8(c, VARDATA(b),
-													  VARSIZE(b) - VARHDRSZ);
-					bytea	   *normalized = send_utf8(&c->send, roundtrip);
+					bytea	   *normalized = received_form(c, b);
 
 					pfree(b);
+					if (normalized == NULL)
+					{
+						if (canon != value)
+							pfree(DatumGetPointer(canon));
+						encode_output(c, value, out);
+						break;
+					}
 					b = normalized;
-					if (!c->typbyval)
-						pfree(DatumGetPointer(roundtrip));
 				}
 				if (c->tagged)
 					appendStringInfoChar(out, TAG_SEND);
