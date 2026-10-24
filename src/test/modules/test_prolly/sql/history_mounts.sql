@@ -144,6 +144,104 @@ SELECT length(dolt_commit('-Am', 'keyed by b')::text) > 0 AS committed;
 SELECT mount FROM prolly_mount('HEAD', 'hs', 'hk', ARRAY['rekeyed'], false, true);
 SELECT a, count(*) FROM hk.rekeyed WHERE b = 20 GROUP BY a;
 
+-- Columns by identity: one renamed since is read by its name then, one
+-- retyped since converted (a value that doesn't convert NULL, with a
+-- warning), as dolt_history_table() reads them.
+CREATE TABLE hs.ident (id int PRIMARY KEY, old_name text, n text);
+INSERT INTO hs.ident VALUES (1, 'one', '10'), (2, 'two', 'x');
+SELECT length(dolt_commit('-Am', 'ident')::text) > 0 AS committed;
+ALTER TABLE hs.ident RENAME COLUMN old_name TO new_name;
+UPDATE hs.ident SET n = '20' WHERE id = 2;
+ALTER TABLE hs.ident ALTER COLUMN n TYPE int USING n::int;
+SELECT length(dolt_commit('-Am', 'renamed and retyped')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'hi', ARRAY['ident'], false, true);
+\set VERBOSITY terse
+SELECT id, new_name, n FROM hi.ident ORDER BY commit_date, id;
+SELECT (SELECT count(*) FROM (
+		SELECT id, new_name, n, commit_hash FROM hi.ident
+		EXCEPT ALL
+		SELECT (row).id, (row).new_name, (row).n, commit_hash
+		FROM dolt_history_table(NULL::hs.ident)) d) AS only_mount,
+	(SELECT count(*) FROM (
+		SELECT (row).id, (row).new_name, (row).n, commit_hash
+		FROM dolt_history_table(NULL::hs.ident)
+		EXCEPT ALL
+		SELECT id, new_name, n, commit_hash FROM hi.ident) d) AS only_function;
+\set VERBOSITY default
+SELECT prolly_unmount('hi');
+
+-- Who may read each version: a table dropped and made again by its name
+-- is another table, so a role granted the new one is refused the old
+-- one's commits, as dolt_history_table() by name refuses them.
+CREATE TABLE hs.again (id int PRIMARY KEY, v text);
+INSERT INTO hs.again VALUES (1, 'old1'), (2, 'old2');
+SELECT length(dolt_commit('-Am', 'first again')::text) > 0 AS committed;
+DROP TABLE hs.again;
+SELECT length(dolt_commit('-Am', 'dropped again')::text) > 0 AS committed;
+CREATE TABLE hs.again (id int PRIMARY KEY, v text);
+INSERT INTO hs.again VALUES (3, 'new');
+SELECT length(dolt_commit('-Am', 'made again')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'ha', ARRAY['again'], false, true);
+SELECT v FROM ha.again ORDER BY v;
+CREATE ROLE regress_history_reader;
+GRANT USAGE ON SCHEMA hs, ha TO regress_history_reader;
+GRANT SELECT ON hs.again, ha.again TO regress_history_reader;
+SET ROLE regress_history_reader;
+\set VERBOSITY terse
+SELECT v FROM ha.again ORDER BY v;
+SELECT count(*) FROM dolt_history_table('hs.again');
+\set VERBOSITY default
+RESET ROLE;
+REVOKE ALL ON hs.again, ha.again FROM regress_history_reader;
+REVOKE ALL ON SCHEMA hs, ha FROM regress_history_reader;
+DROP ROLE regress_history_reader;
+SELECT prolly_unmount('ha');
+
+-- A commit whose table can't be read here: an error, as a mount's.
+CREATE EXTENSION test_prolly_ordering VERSION '1.0';
+CREATE TABLE hs.ordered (k test_ordering PRIMARY KEY, v int);
+INSERT INTO hs.ordered VALUES (ROW(1), 1);
+SELECT length(dolt_commit('-Am', 'ordered by an extension')::text) > 0 AS committed;
+ALTER TABLE hs.ordered DROP CONSTRAINT ordered_pkey, ADD COLUMN id int;
+UPDATE hs.ordered SET id = 1;
+ALTER TABLE hs.ordered ADD PRIMARY KEY (id);
+SELECT length(dolt_commit('-Am', 'keyed by id')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'ho', ARRAY['ordered'], false, true);
+SELECT dolt_hashof('HEAD') AS ordered_head \gset
+SELECT count(*) FROM ho.ordered WHERE commit_hash = :'ordered_head';
+\set VERBOSITY terse
+SELECT count(*) FROM ho.ordered;
+\set VERBOSITY default
+SELECT prolly_unmount('ho');
+DROP TABLE hs.ordered;
+DROP EXTENSION test_prolly_ordering;
+SELECT length(dolt_commit('-Am', 'no ordered')::text) > 0 AS committed;
+
+-- Work: planning reads no history; LIMIT reads few commits; a join to
+-- every commit reads each once (reachability found once per scan).
+SELECT count(*) FILTER (WHERE length(dolt_commit('--allow-empty', '-m', 'empty ' || g)::text) > 0) AS empties
+FROM generate_series(1, 30) g \gset
+SELECT prolly_refresh_mount('h') IS NOT NULL AS refreshed;
+SELECT count(*) AS commits FROM dolt_log \gset
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') >= 0 AS counting;
+EXPLAIN (COSTS OFF) SELECT email FROM h.users WHERE tenant_id = 4 AND id = 42;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') <= 2 AS planning_reads_no_history;
+SELECT count(*) FROM (SELECT email FROM h.users LIMIT 3) x;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') < :commits / 4 AS limit_reads_few;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT count(*) FROM dolt_log c
+JOIN LATERAL (SELECT email FROM h.users u WHERE u.commit_hash = c.commit_hash
+			  AND u.tenant_id = 4 AND u.id = 42 OFFSET 0) x ON true;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') < :commits * 5 AS join_reads_each_commit_once;
+SELECT mount, history FROM prolly_mounts() ORDER BY mount;
+
 -- Refused: a history mount with index trees, or of a table with a column
 -- named as the commit's.
 SELECT * FROM prolly_mount('HEAD', 'hs', 'hx', NULL, true, true);

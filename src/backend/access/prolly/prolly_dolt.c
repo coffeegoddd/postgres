@@ -6704,6 +6704,68 @@ prolly_check_history_by_name(const char *name, const char *commit,
 	}
 }
 
+/*
+ * A reader of a table's history, version by version: who may read it
+ * (checked once) and the table's lineage (walked once, as far as the
+ * versions asked of need).
+ */
+struct ProllyHistoryReader
+{
+	char	   *name;			/* the table's name here */
+	bool		reads_all;		/* the database's owner, or pg_read_all_data */
+	List	   *lineages;
+	const char *fn;
+};
+
+ProllyHistoryReader *
+prolly_history_reader_begin(const char *name, const char *fn)
+{
+	ProllyHistoryReader *r = palloc0(sizeof(ProllyHistoryReader));
+	Oid			relid;
+	AclResult	aclresult;
+
+	r->name = pstrdup(name);
+	r->fn = fn;
+	r->reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+	if (r->reads_all)
+		return r;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
+						fn, name),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+	check_history_rls(relid, fn);
+	return r;
+}
+
+/*
+ * Refuse reading the version commit (hex) has of the reader's table, by
+ * the name it has there, unless it is the table here (its lineage reaches
+ * back to it), as dolt_history_table() by name refuses it.
+ */
+void
+prolly_history_reader_check(ProllyHistoryReader *r, const char *commit,
+							const char *version_name)
+{
+	if (r->reads_all)
+		return;
+	if (!lineage_has(name_lineage(&r->lineages, r->name), commit, version_name))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
+						r->fn, version_name),
+				 errdetail("The name was without a table since commit %s, so the table here is another.",
+						   commit),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+}
+
 /* rows_begin_described() of a table's version, or refused. */
 static void
 rows_begin_named(Rows *r, const char *item, int len, const char *name,
