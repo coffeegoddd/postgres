@@ -1,0 +1,84 @@
+# The pinned PostGIS (src/tools/prolly_bench/configs/postgis.toml), built
+# against the job's server installation, for src/test/prolly's
+# check-postgis groups (POSTGIS_BUILD) and the G and GV suites.
+#
+# GEOS, PROJ, GDAL and the rest come from the runner's Ubuntu packages, not
+# from the pin, so the build is made with --allow-library-mismatch: the
+# versions found, and how they differ from the pin's, are in the build's
+# manifest (BUILD_DIR/pbench-postgis.json) and the job summary.
+#
+# The build is cached by the server's commit, the PostGIS commit and the
+# runner image: a PostGIS build is made against one server's headers.
+
+name: PostGIS
+description: Build the pinned PostGIS against the job's server installation
+
+inputs:
+  pg-config:
+    description: The installation's pg_config (an absolute path)
+    required: true
+  build-dir:
+    description: Where the build goes (absolute; made, or restored from the cache)
+    required: true
+  jobs:
+    description: make -j
+    default: '4'
+
+outputs:
+  build-dir:
+    description: The PostGIS build directory (POSTGIS_BUILD for check-postgis)
+    value: ${{ inputs.build-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install PostGIS's build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          autoconf automake libtool pkg-config xsltproc \
+          libgeos-dev libproj-dev libgdal-dev libjson-c-dev libprotobuf-c-dev \
+          protobuf-c-compiler libxml2-dev libsfcgal-dev
+
+    - name: Read the pin
+      id: pin
+      shell: bash
+      run: |
+        commit=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["commit"])' \
+          "$GITHUB_WORKSPACE/src/tools/prolly_bench/configs/postgis.toml")
+        echo "commit=$commit" >> "$GITHUB_OUTPUT"
+        # (the runner image: ImageOS and ImageVersion are set on hosted runners)
+        echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore a cached build
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.build-dir }}
+        key: postgis-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ github.sha }}-${{ steps.pin.outputs.commit }}
+
+    - name: Build the pinned PostGIS
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        python3 "$GITHUB_WORKSPACE/src/tools/prolly_bench/build_postgis.py" \
+          --pg-config "${{ inputs.pg-config }}" --build-dir "${{ inputs.build-dir }}" \
+          --jobs "${{ inputs.jobs }}" --allow-library-mismatch \
+          || { tail -n 100 "${{ inputs.build-dir }}/build.log"; exit 1; }
+
+    - name: Record the build
+      shell: bash
+      run: |
+        python3 - "${{ inputs.build-dir }}/pbench-postgis.json" "${{ steps.cache.outputs.cache-hit }}" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+        import json, sys
+        m = json.load(open(sys.argv[1]))
+        print("### PostGIS build")
+        print()
+        print(f"- commit `{m['commit']}`" + (" (cached)" if sys.argv[2] == "true" else ""))
+        print(f"- `{m['full_version']}`")
+        for name, version in sorted(m["library_versions"].items()):
+            pinned = m["pinned_libraries"].get(name)
+            note = f" (pinned {pinned})" if pinned and pinned != version else ""
+            print(f"- {name} {version}{note}")
+        PY

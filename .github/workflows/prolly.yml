@@ -163,6 +163,66 @@ jobs:
           name: release-benchmark-evidence
           path: engine-results/**
 
+  # PostGIS on versioned tables (src/test/prolly's check-postgis): nightly,
+  # on a manual dispatch, on upstream sync pull requests (a Postgres merge
+  # can break PostGIS's build; that is reported there, not gated, and
+  # fixed by re-pinning PostGIS) and on pull requests labelled area:postgis.
+  postgis:
+    name: PostGIS requirement groups
+    if: >-
+      github.event_name == 'schedule' || inputs.nightly ||
+      (github.event_name == 'pull_request' &&
+       (startsWith(github.head_ref, 'upstream-sync-') ||
+        contains(github.event.pull_request.labels.*.name, 'area:postgis')))
+    continue-on-error: ${{ startsWith(github.head_ref || '', 'upstream-sync-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex libicu-dev libipc-run-perl liblz4-dev libreadline-dev libssl-dev zlib1g-dev
+
+      # (installed: PostGIS builds against an installation's pg_config)
+      - name: Build and install
+        run: |
+          ./configure --enable-cassert --enable-debug --enable-tap-tests --enable-injection-points \
+            --with-openssl --with-lz4 --prefix="$PWD/inst"
+          make -s -j4
+          make -s install
+
+      - name: Pinned PostGIS
+        id: postgis
+        uses: ./.github/actions/postgis
+        with:
+          pg-config: ${{ github.workspace }}/inst/bin/pg_config
+          build-dir: ${{ github.workspace }}/build-bench/postgis
+
+      - name: PostGIS requirements on versioned prolly storage
+        run: make -C src/test/prolly check-postgis POSTGIS_BUILD="${{ steps.postgis.outputs.build-dir }}"
+
+      - name: PostGIS requirements, validated against heap
+        run: |
+          make -C src/test/prolly check-postgis-semantics check-postgis-isolation \
+            check-postgis-durability PROLLY_AM=heap POSTGIS_BUILD="${{ steps.postgis.outputs.build-dir }}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: postgis-logs
+          path: |
+            **/regression.diffs
+            **/tmp_check/log/*
+            **/tmp_check/postgis*/**
+            tmp_install/log/postgis-install.log
+            build-bench/postgis/build.log
+            build-bench/postgis/pbench-postgis.json
+          if-no-files-found: ignore
+
   build-and-test:
     name: build and test
     runs-on: ubuntu-24.04
