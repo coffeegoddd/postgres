@@ -5453,13 +5453,15 @@ snapshot_abandoned(const xl_bmap_snapshot *snap)
 /*
  * Let go of the snapshots of reln that nobody keeps (snapshot_abandoned()),
  * as bmap_snapshot_release() does: how many.  Not under any of its pages'
- * locks.
+ * locks.  A map not made yet (its header page, or its root page, all
+ * zeroes, as a crash part way through making one leaves it) keeps none.
  */
 static int
 snapshot_reclaim(SMgrRelation reln)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	Buffer		headerbuf;
+	Buffer		rootbuf;
 	BmapRoot	root;
 	int			n = 0;
 
@@ -5467,6 +5469,21 @@ snapshot_reclaim(SMgrRelation reln)
 		return 0;
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(headerbuf)))
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return 0;
+	}
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	rootbuf = map_read(rel, 1);
+	LockBuffer(rootbuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(rootbuf)))
+	{
+		UnlockReleaseBuffer(rootbuf);
+		UnlockReleaseBuffer(headerbuf);
+		return 0;
+	}
+	UnlockReleaseBuffer(rootbuf);
 	(void) snapshot_slot(reln, 0, &root);
 	UnlockReleaseBuffer(headerbuf);
 	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
@@ -5686,6 +5703,7 @@ bmap_snapshot_release(SMgrRelation reln, uint64 id)
 		return false;
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	slot = snapshot_slot(reln, id, &root);
 	if (slot < 0)
 	{
@@ -8157,8 +8175,11 @@ compact_store(RelFileLocator rel, const char *path)
 
 /*
  * The snapshots nobody keeps (snapshot_abandoned()) of every map of rel's
- * page store, let go of: how many.  A relation dropped meanwhile is passed
- * over, its snapshots queued by its drop.
+ * page store, let go of: how many.  As sweep_relation() reads them: a map
+ * dropped since the directory was read is passed over (its snapshots queued
+ * by its drop), as is one with no pages, or whose header or root page is
+ * all zeroes (a crash part way through making it), and a map dropped while
+ * it was read leaves none of its pages in shared buffers.
  */
 static uint64
 reclaim_store_snapshots(RelFileLocator rel, const char *path)
@@ -8173,14 +8194,24 @@ reclaim_store_snapshots(RelFileLocator rel, const char *path)
 		RelFileNumber relnumber;
 		char	   *end;
 		RelFileLocator loc;
+		SMgrRelation reln;
 
 		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
 		if (end == de->d_name || strcmp(end, "_bmap") != 0)
 			continue;
 		loc = with_relnumber(rel, relnumber);
-		if (!bmap_relation_exists(loc))
+		reln = smgropen(loc, INVALID_PROC_NUMBER);
+		if (!mdexists(reln, BMAP_FORKNUM) ||
+			mdnblocks(reln, BMAP_FORKNUM) < BMAP_TREE_MAP_PAGES)
 			continue;
-		n += snapshot_reclaim(smgropen(loc, INVALID_PROC_NUMBER));
+		n += snapshot_reclaim(reln);
+		if (!bmap_relation_exists(loc))
+		{
+			ForkNumber	forks[2] = {BMAP_FORKNUM, BMAP_CHANGES_FORKNUM};
+			BlockNumber firsts[2] = {0, 0};
+
+			DropRelationBuffers(reln, forks, 2, firsts);
+		}
 		CHECK_FOR_INTERRUPTS();
 	}
 	FreeDir(dir);

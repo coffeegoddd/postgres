@@ -27,6 +27,7 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
+max_prepared_transactions = 2
 });
 $node->start;
 $node->safe_psql('postgres',
@@ -43,6 +44,7 @@ sql(q{
 	CREATE TABLE ko.t (id int PRIMARY KEY, v int);
 	INSERT INTO ko.t SELECT g, 0 FROM generate_series(1, 200) g;
 	SELECT dolt_commit('-Am', 'c1');
+	CREATE TABLE sub (i int);
 	CREATE FUNCTION slots_free(rel oid) RETURNS int LANGUAGE plpgsql AS $$
 	DECLARE ids int8[] := '{}';
 	BEGIN
@@ -128,6 +130,53 @@ sql(qq{BEGIN; SELECT test_bmap_snapshot_take($rel); ROLLBACK;
 	ROLLBACK TO s; COMMIT;});
 is(kept(), '3', 'snapshots of transactions rolled back are listed by nobody');
 is(free_slots(), '13', 'and the next snapshot taken let go of them');
+
+# A prepared transaction's snapshot is kept while it is prepared, a sweep
+# included: kept once it commits, let go of if it is rolled back.
+sql(qq{BEGIN; SELECT test_bmap_snapshot_take($rel); PREPARE TRANSACTION 'p1'});
+is(kept(), '4', 'a prepared transaction\'s snapshot is kept');
+sql(q{SELECT freed FROM prolly_page_sweep()});
+is(kept(), '4', 'and a sweep leaves it');
+sql(q{COMMIT PREPARED 'p1'});
+is(free_slots(), '12', 'committed, it is kept');
+my $prepared = sql(qq{SELECT id FROM test_bmap_snapshots($rel) ORDER BY id DESC LIMIT 1});
+sql(qq{SELECT test_bmap_snapshot_release($rel, $prepared)});
+sql(qq{BEGIN; SELECT test_bmap_snapshot_take($rel); PREPARE TRANSACTION 'p2'});
+sql(q{ROLLBACK PREPARED 'p2'});
+is(kept(), '3', 'rolled back, it is listed by nobody');
+is(free_slots(), '13', 'and let go of');
+
+# A snapshot taken in a subtransaction past the ones a backend keeps track
+# of (its subtransactions overflowed): kept while the transaction runs, a
+# sweep included, and let go of once that subtransaction rolls back.
+my $s = $node->background_psql('postgres');
+$s->query_safe('BEGIN');
+$s->query_safe(join('', map { "SAVEPOINT s$_; INSERT INTO sub VALUES ($_);" } 1 .. 80));
+$s->query_safe(qq{SELECT test_bmap_snapshot_take($rel)});
+is(kept(), '4', 'a snapshot of an overflowed subtransaction is kept');
+sql(q{SELECT freed FROM prolly_page_sweep()});
+is(kept(), '4', 'and a sweep leaves it');
+$s->query_safe('ROLLBACK TO s40');
+is(kept(), '3', 'rolled back, it is listed by nobody');
+$s->query_safe('COMMIT');
+$s->quit;
+is(free_slots(), '13', 'and let go of');
+
+# A sweep passes over maps a crash left unfinished: one with no pages, and
+# one whose pages are all zeroes.
+my $dir = $node->data_dir . '/'
+  . sql(q{SELECT 'base/' || oid FROM pg_database WHERE datname = 'postgres'});
+for my $f (["999990_bmap", 0, 'no pages'], ["999991_bmap", 16384, 'zeroed pages'])
+{
+	open(my $fh, '>:raw', "$dir/$f->[0]") or die "open: $!";
+	print $fh ("\0" x $f->[1]);
+	close($fh) or die "close: $!";
+	my ($ret, $out, $err) = $node->psql('postgres',
+		q{SELECT freed >= 0 FROM prolly_page_sweep()});
+	is($out, 't', "a sweep passes over a map of $f->[2]");
+	is($err, '', 'with no error');
+	unlink("$dir/$f->[0]");
+}
 
 # the standby lists every slot it has (it judges no transaction): as many
 # as the primary keeps, once it has replayed what was let go of
