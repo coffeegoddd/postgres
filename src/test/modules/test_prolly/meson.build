@@ -196,6 +196,7 @@ tests += {
       'float_canonical',
       'send_canonical',
       'hash_pointers',
+      'toast_identity',
       'toast_by_content',
       'toast_folds',
       'redefined_rows',

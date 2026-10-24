@@ -67,6 +67,13 @@ CREATE FUNCTION test_toast_pointer_value(bytea)
 RETURNS bytea
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+-- An out-of-line value's pointer identity (toast_pointer_identity()), as
+-- an extension's cache of detoasted values would key it; NULL for any
+-- other value.
+CREATE FUNCTION test_toast_identity(anyelement)
+RETURNS bytea
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 -- Check that catalog rows formed with a null branch column don't leak the
 -- rows written in their place.  Inserts into pg_description; roll back.
 CREATE FUNCTION test_catalog_null_branch_no_leak(n int)
