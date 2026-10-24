@@ -6960,14 +6960,24 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 	return st != NULL && strcmp(st->name, name) == 0;
 }
 
+/* a commit a walk back from another ref reached, and how */
+typedef struct ReachStep
+{
+	char		key[PROLLY_HASH_MAX_LEN * 2 + 1];	/* the commit's hex */
+	char		child[PROLLY_HASH_MAX_LEN * 2 + 1]; /* the one it was reached
+													 * from ("": the ref) */
+	char	   *name;			/* the table's name there */
+} ReachStep;
+
 /*
  * Is the version ref has of the table named name l's table, in ref's
  * history if not the session's?  One of the lineage's versions
  * (lineage_has()), or a commit made from the table's relation whose walk
  * back, by such commits, meets one of them: another branch's commit, made
- * from the history this table shares.  A walk that meets none marks every
- * commit it saw apart, which no later walk takes again: each commit's
- * record is read once a lineage.
+ * from the history this table shares.  A walk that meets the lineage adds
+ * the path it took to it, and one that meets none marks every commit it
+ * saw apart, so no later walk takes either again: each commit's record is
+ * read about once a lineage.
  */
 static bool
 lineage_reaches(NameLineage *l, const char *ref, const char *name)
@@ -6976,10 +6986,10 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 	List	   *queue = NIL;
 	HTAB	   *seen;
 	HASHCTL		ctl = {0};
-	bool		found = false;
+	ReachStep  *found = NULL;
+	ReachStep  *rs;
 	char	   *at_name;
 	HASH_SEQ_STATUS hs;
-	char	   *k;
 
 	if (lineage_has(l, ref, name))
 		return true;
@@ -6995,41 +7005,68 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 	if (l->apart == NULL)
 		l->apart = hash_create("prolly lineage apart", 64, &ctl,
 							   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	ctl.entrysize = sizeof(ReachStep);
 	seen = hash_create("prolly lineage reached", 64, &ctl,
 					   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
-	queue = lappend(lappend(queue, copy_hash(&h)), at_name);
-	while (queue != NIL && !found)
+	rs = hash_search(seen, hash_hex(&h), HASH_ENTER, NULL);
+	rs->child[0] = '\0';
+	rs->name = at_name;
+	queue = lappend(queue, copy_hash(&h));
+	while (queue != NIL && found == NULL)
 	{
 		ProllyHash *at = linitial(queue);
-		char	   *a_name = lsecond(queue);
 		char	   *hex = hash_hex(at);
-		bool		dup;
+		ProllyCommitInfo info;
 
 		CHECK_FOR_INTERRUPTS();
-		queue = list_delete_first(list_delete_first(queue));
-		if (hash_search(l->apart, hex, HASH_FIND, NULL) != NULL)
-			continue;
-		(void) hash_search(seen, hex, HASH_ENTER, &dup);
-		if (dup)
-			continue;
-		if (lineage_has(l, hex, a_name))
+		queue = list_delete_first(queue);
+		rs = hash_search(seen, hex, HASH_FIND, NULL);
+		if (lineage_has(l, hex, rs->name))
 		{
-			found = true;
+			found = rs;
 			break;
 		}
 		/* (a version of the lineage of another name: another table's) */
 		if (hash_search(l->steps, hex, HASH_FIND, NULL) != NULL)
 			continue;
-		queue = parents_made_from(l, at, queue, seen);
+		if (!PROLLY_CALL(refs(), commit_get, at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", hex)));
+		for (int i = 0; i < info.nparents; i++)
+		{
+			char	   *phex = hash_hex(&info.parents[i]);
+			char	   *pname;
+			bool		dup;
+			ReachStep  *ps;
+
+			if (hash_search(l->apart, phex, HASH_FIND, NULL) != NULL ||
+				hash_search(seen, phex, HASH_FIND, NULL) != NULL ||
+				(pname = made_from(&info.parents[i], l->relid)) == NULL)
+				continue;
+			ps = hash_search(seen, phex, HASH_ENTER, &dup);
+			strlcpy(ps->child, hex, sizeof(ps->child));
+			ps->name = pname;
+			queue = lappend(queue, copy_hash(&info.parents[i]));
+		}
 	}
-	if (!found)
+	if (found != NULL)
+	{
+		/* (the path from the ref to the lineage joins it) */
+		for (rs = found; rs->child[0] != '\0';)
+		{
+			rs = hash_search(seen, rs->child, HASH_FIND, NULL);
+			lineage_enter(l, rs->key, rs->name);
+		}
+	}
+	else
 	{
 		hash_seq_init(&hs, seen);
-		while ((k = hash_seq_search(&hs)) != NULL)
-			(void) hash_search(l->apart, k, HASH_ENTER, NULL);
+		while ((rs = hash_seq_search(&hs)) != NULL)
+			(void) hash_search(l->apart, rs->key, HASH_ENTER, NULL);
 	}
 	hash_destroy(seen);
-	return found;
+	return found != NULL;
 }
 
 /* The lineage of the table here named now: from lineages, or begun. */

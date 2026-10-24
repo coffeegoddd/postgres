@@ -667,11 +667,13 @@ OF` are built in D18's shapes.
   then committed (a head move also takes D27's privileges), a squash of
   the drop into the re-make, a merge of a branch that still has the old
   table, or a branch made at the old table's commit, doesn't vouch for the
-  old table's versions. Known limits, as commits name tables by name and
-  identity alone and a table made again keeps its name's identity (#891,
-  decided: commit identities don't change): a table dropped and made
-  again within one commit, or both in the working set, is one relation; a
-  branch's first use may take its copies from another branch's relation,
+  old table's versions, nor does a table dropped and made again within
+  one commit (its record names the new relation, its parent's the old).
+  A merge, pick or revert committed over uncommitted changes is recorded
+  made only from what its first parent's record and the working set both
+  have. Known limits, as commits name tables by name and identity alone
+  and a table made again keeps its name's identity (#891, decided: commit
+  identities don't change): a branch's first use may take its copies from another branch's relation,
   whose commits it then makes; a move that brings the old table's rows (a
   merge, a hard reset, a revert of the drop, a cherry-pick) writes them
   into the new table, where they are its rows
@@ -685,9 +687,9 @@ OF` are built in D18's shapes.
   (refused when named). Any commit is otherwise read by hash, as in Dolt.
 - **Why:** Postgres grants are on relations; a table made again with an
   old name is another relation, and its grants don't cover the dropped
-  one's rows. Commits name tables by name and identity alone, so a table
-  dropped and made again within one commit (or in the working set) isn't
-  told from one kept: #891.
+  one's rows. Commits name tables by name and identity alone, so the
+  names can't tell a table made again from the one dropped (#891); each
+  commit's record of the relations it was made from can.
 - **Port:** ports run as a superuser; none is affected.
 
 ## D27. Moving a branch's head takes a write role, or the branch

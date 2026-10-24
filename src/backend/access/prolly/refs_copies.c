@@ -4496,8 +4496,56 @@ copies_commit_relations(const ProllyHash *commit, char **lines)
 	return found;
 }
 
+/*
+ * Of the first parent's relation record (parent), the lines of relations
+ * the session still has: a commit that isn't its working set (a merge's,
+ * a pick's or a revert's, made over uncommitted changes) holds a table as
+ * the parent's relation made it, or one made by the move, never the
+ * working set's own, so it is recorded made only from what both hold.
+ */
+static char *
+relations_kept(const ProllyHash *parent, const char *now)
+{
+	StringInfoData key;
+	StringInfoData v;
+	StringInfoData out;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	initStringInfo(&out);
+	relations_key(&key, parent);
+	if (refs_get(key.data, key.len, &v))
+	{
+		for (char *p = v.data; *p;)
+		{
+			char	   *end = strchrnul(p, '\n');
+			char		want[16];
+
+			/* (the relation still the session's, by its OID) */
+			snprintf(want, sizeof(want), "\n%.10s ", p);
+			if (end - p > 11 &&
+				(strncmp(now, want + 1, 11) == 0 || strstr(now, want) != NULL))
+			{
+				appendBinaryStringInfo(&out, p, end - p);
+				appendStringInfoChar(&out, '\n');
+			}
+			p = *end ? end + 1 : end;
+		}
+	}
+	pfree(key.data);
+	pfree(v.data);
+	return out.data;
+}
+
+/*
+ * The branch's record of its head's tables, and the head's relation
+ * record: of the working set, or (partial: the head isn't the working set
+ * folded) only of what its first parent's record and the working set both
+ * hold (relations_kept()).
+ */
 static void
-note_head_names(const char *name, const ProllyHash *head)
+note_head_names(const char *name, const ProllyHash *head,
+				const ProllyHash *partial)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -4509,7 +4557,10 @@ note_head_names(const char *name, const ProllyHash *head)
 	appendStringInfo(&v, "%s\n", hex);
 	table_names(&v);
 	refs_put(key.data, key.len, &v);
-	note_relations(head, v.data + strlen(hex) + 1);
+	if (partial != NULL)
+		note_relations(head, relations_kept(partial, v.data + strlen(hex) + 1));
+	else
+		note_relations(head, v.data + strlen(hex) + 1);
 	pfree(hex);
 	pfree(key.data);
 	pfree(v.data);
@@ -4795,7 +4846,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
-	note_head_names(name, commit_id);
+	note_head_names(name, commit_id, NULL);
 	note_anchor(name, commit_id, &anchor);
 	keep_pages(commit_id, nparents > 0 ? &parents[0] : NULL, &root, snap);
 	UnregisterSnapshot(snap);
@@ -5459,7 +5510,10 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
-	note_head_names(name, commit_id);
+	/* (the working set committed, or a move's result over changes of its own) */
+	note_head_names(name, commit_id,
+					same_hash(&root.hash, &working_set->hash) ? NULL :
+					nparents > 0 ? &parents[0] : &(ProllyHash) {0});
 	note_anchor(name, commit_id, &anchor);
 	/* (kept only if the working set is what was committed) */
 	if (same_hash(&root.hash, &working_set->hash))

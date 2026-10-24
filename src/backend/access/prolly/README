@@ -309,10 +309,14 @@ a record: one made in another database (fetched, pulled, cloned or pushed
 here).  Commits name tables by name and identity alone, and a re-made
 table keeps its name's identity (#891), so the names can't tell a head
 moved to a commit holding a dropped table and then committed, a merge of
-a branch still holding it, a squash of the drop into the re-make, or a
-branch made at the old table's commit from the new one; the records can.
-What the records can't: a table dropped and made again within one commit,
-or both in the working set, is one relation; a branch's first use may
+a branch still holding it, a squash of the drop into the re-make, a
+table dropped and made again within one commit, or a branch made at the
+old table's commit from the new one; the records can.  A commit that
+isn't its working set folded (a merge's, a pick's or a revert's, over
+uncommitted changes) is recorded made only from the relations its first
+parent's record and the working set both have, as it holds a table
+dropped and made again in the working set as the parent had it.  What
+the records can't: a branch's first use may
 make its copies from another branch's relation (the table here's, moved
 to the old rows), and its commits are then that relation's; a move that
 brings the old table's rows (a merge, a hard reset, a revert of the drop,

@@ -225,6 +225,96 @@ SELECT diff_type, from_row FROM dolt_diff(:'old_commit', 'HEAD', NULL::ln.t);
 SELECT * FROM dolt_at(:'new_commit', NULL::ln.t);
 RESET ROLE;
 
+-- a merge, pick or revert made over a table dropped and made again in the
+-- working set, uncommitted: the commit holds the old table (the working
+-- set's own change left out), so it isn't recorded made from the new one
+SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
+CREATE TABLE ln.sm (id int PRIMARY KEY, note text);
+CREATE TABLE ln.sp (id int PRIMARY KEY, note text);
+CREATE TABLE ln.sr (id int PRIMARY KEY, note text);
+INSERT INTO ln.sm VALUES (1, 'old secret m');
+INSERT INTO ln.sp VALUES (1, 'old secret p');
+INSERT INTO ln.sr VALUES (1, 'old secret r');
+SELECT length(dolt_commit('-Am', 'secrets')::text) AS committed;
+SELECT dolt_branch('picks') IS NOT NULL AS made;
+SELECT dolt_checkout('picks') IS NOT NULL AS on_picks;
+INSERT INTO ln.t VALUES (40, 'picked');
+SELECT length(dolt_commit('-am', 'to pick')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS to_pick \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO ln.t VALUES (41, 'to revert');
+SELECT length(dolt_commit('-am', 'to revert')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS to_revert \gset
+SELECT dolt_hashof('HEAD') AS secrets_head \gset
+CREATE FUNCTION pg_temp.remake(t text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE format('DROP TABLE ln.%I', t);
+	EXECUTE format('CREATE TABLE ln.%I (id int PRIMARY KEY, note text)', t);
+	EXECUTE format('GRANT SELECT ON ln.%I TO regress_lb_reader', t);
+END $$;
+-- (a merge)
+SELECT pg_temp.remake('sm');
+SELECT (dolt_merge('--no-ff', '-m', 'picks in', 'picks'))[3] AS conflicts;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.sm);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+-- (a cherry-pick)
+SELECT pg_temp.remake('sp');
+SELECT (dolt_cherry_pick(:'to_pick'))[1] IS NOT NULL AS picked;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.sp);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+-- (a revert)
+SELECT pg_temp.remake('sr');
+SELECT (dolt_revert(:'to_revert'))[1] IS NOT NULL AS reverted;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+
+-- a commit of dolt.transaction_commit's records its relations too: the
+-- table's history reads through it
+SET dolt.transaction_commit = on;
+INSERT INTO ln.t VALUES (50, 'by transaction');
+INSERT INTO ln.t VALUES (51, 'by transaction');
+RESET dolt.transaction_commit;
+SET ROLE regress_lb_reader;
+SELECT count(*) AS rows_at_head FROM dolt_at('HEAD', NULL::ln.t) WHERE id >= 50;
+SELECT count(*) AS rows_before FROM dolt_at('HEAD~', NULL::ln.t) WHERE id >= 50;
+RESET ROLE;
+
+-- an allowed read of another branch's history reads each commit's record
+-- about once: a side branch's commits, each read
+CREATE TABLE ln.h (id int PRIMARY KEY, note text);
+GRANT SELECT ON ln.h TO regress_lb_reader;
+SELECT length(dolt_commit('-Am', 'h')::text) AS committed;
+SELECT dolt_branch('long_side') IS NOT NULL AS made;
+SELECT dolt_checkout('long_side') IS NOT NULL AS on_side;
+DO $$
+BEGIN
+	FOR i IN 1..30 LOOP
+		INSERT INTO ln.h VALUES (200 + i, 'side');
+		PERFORM dolt_commit('-am', 'side ' || i);
+	END LOOP;
+END $$;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT count(*) AS side_commits FROM dolt_log('long_side') \gset
+CREATE SCHEMA lb_mnt;
+SELECT mount FROM prolly_mount('long_side', 'ln', 'lb_mnt', ARRAY['h'], false, true);
+GRANT USAGE ON SCHEMA lb_mnt TO regress_lb_reader;
+GRANT SELECT ON lb_mnt.h TO regress_lb_reader;
+SELECT pg_stat_force_next_flush();
+SELECT value AS read_before FROM pg_stat_prolly WHERE name = 'commits_read' \gset
+SET ROLE regress_lb_reader;
+SELECT count(DISTINCT commit_hash) >= 30 AS side_versions_read FROM lb_mnt.h;
+RESET ROLE;
+SELECT pg_stat_force_next_flush();
+SELECT value - :read_before AS side_read FROM pg_stat_prolly WHERE name = 'commits_read' \gset
+SELECT :side_read <= 8 * :side_commits AS linear;
+SELECT prolly_unmount('lb_mnt');
+
 \c contrib_regression
 DROP DATABASE regress_lineage_breaks;
 DROP ROLE regress_lb_reader, regress_lb_writer;
