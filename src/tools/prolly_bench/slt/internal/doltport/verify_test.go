@@ -44,8 +44,8 @@ func manifestAt(t *testing.T, root string) Manifest {
 const (
 	reviewedPorts      = 303 // ported whole
 	reviewedPartial    = 76  // ported in part
-	reviewedAssertions = 1660
-	reviewedOmitted    = 125 // assertions left out, each with its note
+	reviewedAssertions = 1667
+	reviewedOmitted    = 118 // assertions left out, each with its note
 	reviewedDeferred   = 81
 )
 
