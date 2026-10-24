@@ -621,11 +621,11 @@ SELECT test_chunk_move_root(test_chunk_root(), test_chunk_declaring_tree('{}'));
 (1 row)
 
 SELECT name FROM dolt_branches;
-ERROR:  the database's prolly refs are of an older format than 6
-DETAIL:  This build reads only refs of format 6.
+ERROR:  the database's prolly refs are of an older format than 7
+DETAIL:  This build reads only refs of format 7.
 SELECT dolt_tag('v1');
-ERROR:  the database's prolly refs are of an older format than 6
-DETAIL:  This build reads only refs of format 6.
+ERROR:  the database's prolly refs are of an older format than 7
+DETAIL:  This build reads only refs of format 7.
 \c :db
 DROP DATABASE regress_tags_old;
 SELECT :'dir' || '/old-' || txid_current() AS olddir \gset

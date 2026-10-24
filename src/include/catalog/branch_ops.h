@@ -209,8 +209,10 @@ typedef struct BranchOpsRoutine
 	 * pages (ShareUpdateExclusiveLock), the session's locked as TRUNCATE
 	 * locks them (and refused while the session has one open, as restore()
 	 * refuses), each tried without waiting.  All or none: false, nothing
-	 * changed, otherwise (the locks taken are kept).  Not MVCC-safe, as
-	 * TRUNCATE isn't.
+	 * changed, otherwise (the locks taken are kept).  Not MVCC-safe: a
+	 * snapshot taken before the keeping transaction ended could read
+	 * versions source made and deleted, rows never the session branch's,
+	 * so the caller gives only pages kept before every snapshot there is.
 	 */
 	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
 							   int nkept);

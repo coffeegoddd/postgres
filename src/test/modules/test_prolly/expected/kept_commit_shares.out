@@ -176,20 +176,41 @@ SELECT dolt_checkout('main');
  {0,"Switched to branch 'main'"}
 (1 row)
 
--- with no pages kept (prolly.kept_commits = 0 when main commits), the reset
--- writes the rows
+-- a commit main keeps no pages of (prolly.kept_commits = 0 as it commits):
+-- the reset to it, with the setting back, writes the rows; main's kept c1
+-- is visited, but doesn't hold the commit's table
 SELECT dolt_reset('--hard');
  dolt_reset 
 ------------
  {0}
 (1 row)
 
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'pages_kept') AS kept_before \gset
 SET prolly.kept_commits = 0;
 UPDATE ks.t SET v = v + 1 WHERE id <= 5000;
 SELECT dolt_commit('-am', 'c2') IS NOT NULL AS committed;
  committed 
 -----------
  t
+(1 row)
+
+RESET prolly.kept_commits;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'pages_kept') - :kept_before AS c2_pages_kept;
+ c2_pages_kept 
+---------------
+             0
 (1 row)
 
 SELECT commit_hash AS c2 FROM dolt_log WHERE message = 'c2' \gset
@@ -228,7 +249,62 @@ SELECT name, value > 0 AS some FROM since(:'before');
  relations_restored    | f
 (4 rows)
 
-RESET prolly.kept_commits;
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+-- the same with the commit kept: shared
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE ks.t SET v = v + 1 WHERE id <= 5000;
+SELECT dolt_commit('-am', 'c3') IS NOT NULL AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT commit_hash AS c3 FROM dolt_log WHERE message = 'c3' \gset
+UPDATE ks.t SET v = 7 WHERE id <= 5000;
+SELECT dolt_checkout('b');
+        dolt_checkout         
+------------------------------
+ {0,"Switched to branch 'b'"}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', :'c3');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT name, value > 0 AS some FROM since(:'before');
+         name          | some 
+-----------------------+------
+ apply_rows            | f
+ first_use_tables_kept | f
+ move_tables_shared    | t
+ relations_restored    | t
+(4 rows)
+
 SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------

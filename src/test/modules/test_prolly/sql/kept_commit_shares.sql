@@ -75,12 +75,18 @@ SELECT name, value FROM since(:'before') WHERE name IN ('apply_rows', 'first_use
 SELECT digest() = :'at_c1' AS at_c1;
 SELECT dolt_checkout('main');
 
--- with no pages kept (prolly.kept_commits = 0 when main commits), the reset
--- writes the rows
+-- a commit main keeps no pages of (prolly.kept_commits = 0 as it commits):
+-- the reset to it, with the setting back, writes the rows; main's kept c1
+-- is visited, but doesn't hold the commit's table
 SELECT dolt_reset('--hard');
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'pages_kept') AS kept_before \gset
 SET prolly.kept_commits = 0;
 UPDATE ks.t SET v = v + 1 WHERE id <= 5000;
 SELECT dolt_commit('-am', 'c2') IS NOT NULL AS committed;
+RESET prolly.kept_commits;
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'pages_kept') - :kept_before AS c2_pages_kept;
 SELECT commit_hash AS c2 FROM dolt_log WHERE message = 'c2' \gset
 UPDATE ks.t SET v = 7 WHERE id <= 5000;
 SELECT dolt_checkout('b');
@@ -89,7 +95,20 @@ SELECT counted() AS before \gset
 SELECT dolt_reset('--hard', :'c2');
 SELECT pg_stat_force_next_flush();
 SELECT name, value > 0 AS some FROM since(:'before');
-RESET prolly.kept_commits;
+SELECT dolt_checkout('main');
+
+-- the same with the commit kept: shared
+SELECT dolt_reset('--hard');
+UPDATE ks.t SET v = v + 1 WHERE id <= 5000;
+SELECT dolt_commit('-am', 'c3') IS NOT NULL AS committed;
+SELECT commit_hash AS c3 FROM dolt_log WHERE message = 'c3' \gset
+UPDATE ks.t SET v = 7 WHERE id <= 5000;
+SELECT dolt_checkout('b');
+SELECT pg_stat_force_next_flush();
+SELECT counted() AS before \gset
+SELECT dolt_reset('--hard', :'c3');
+SELECT pg_stat_force_next_flush();
+SELECT name, value > 0 AS some FROM since(:'before');
 SELECT dolt_checkout('main');
 
 \c :home

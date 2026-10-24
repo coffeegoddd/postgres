@@ -185,6 +185,7 @@
 #include "refs_generations.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "storage/lock.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -222,9 +223,10 @@
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
- * pages retired.
+ * pages retired; 6: snapshot mounts; 7: kept pages' keeping
+ * transaction.
  */
-#define REFS_FORMAT		"6"
+#define REFS_FORMAT		"7"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -1807,6 +1809,50 @@ same_relation_set(List *relids, const BranchKeptRelation *rels, int nrels)
 }
 
 static bool may_restore(Oid relid);
+static List *kept_relations(Oid relid);
+static Oid	table_named(const char *name);
+
+/*
+ * Does every snapshot that could read the session's branch see the
+ * transaction that kept a commit's pages committed?  Each of the pages'
+ * tuples was written, and deleted if it is, by a transaction that ended
+ * before that one's snapshot, so such a snapshot sees exactly the commit's
+ * rows in them.  One taken before (on any branch: a session may check out
+ * this one while it holds it) could see versions another branch made and
+ * deleted, rows that were never this branch's nor any commit's.  Asked of
+ * every backend's oldest snapshot in the cluster (the shared catalogs'
+ * horizon), the mover's own among them.
+ */
+static bool
+kept_before_every_snapshot(const ProllyKeptCommit *kc)
+{
+	TransactionId xid = XidFromFullTransactionId(kc->kept_by);
+
+	return TransactionIdIsNormal(xid) &&
+		TransactionIdPrecedes(xid, GetOldestNonRemovableTransactionId(NULL));
+}
+
+/*
+ * Can a kept commit give table name (the target's, as the commit has it)
+ * its pages: its kept relations are the table's now (the table's own
+ * first), the user could write its rows (as restore_pages() asks), and
+ * every snapshot sees its pages as the commit's rows?
+ */
+static bool
+kept_commit_serves(const ProllyKeptCommit *kc, const char *name)
+{
+	const ProllyKeptTable *kt = kept_table(kc, name);
+	Oid			relid;
+	List	   *relids;
+
+	if (branch_ops()->share_kept == NULL || kt == NULL ||
+		!kept_before_every_snapshot(kc) ||
+		!OidIsValid(relid = table_named(name)) || kt->rels[0].relid != relid)
+		return false;
+	relids = kept_relations(relid);
+	return relids != NIL && same_relation_set(relids, kt->rels, kt->nrels) &&
+		may_restore(relid);
+}
 
 /*
  * Is source still at its root: a known one as it was known (asked of what
@@ -1822,7 +1868,12 @@ still_at_root(void *arg)
 	return s->kept || branch_fold_unchanged(&s->at);
 }
 
-/* The source with table t as the target has it, or NULL. */
+/*
+ * The first source with table t as the target has it that can give it its
+ * pages, or NULL: a kept commit only where it serves (kept_commit_serves()),
+ * so that a share a source would refuse leaves the later ones to try, and
+ * the planner costs only shares the move can make.
+ */
 static ShareSource *
 source_of(List *sources, const NamedTree *t)
 {
@@ -1838,8 +1889,14 @@ source_of(List *sources, const NamedTree *t)
 			s->read = true;
 		}
 		foreach_ptr(NamedTree, theirs, s->tables)
-			if (same_table(theirs, t))
+		{
+			if (!same_table(theirs, t))
+				continue;
+			if (s->kept_commit == NULL ||
+				kept_commit_serves(s->kept_commit, t->name))
 				return s;
+			break;
+		}
 	}
 	return NULL;
 }
@@ -1907,21 +1964,6 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
-
-		/*
-		 * (a kept commit's only where its pages are the table's relations,
-		 * and the user could write its rows, as restore_pages() asks)
-		 */
-		if (s->kept_commit != NULL)
-		{
-			const ProllyKeptTable *kt = kept_table(s->kept_commit, t->name);
-
-			if (branch_ops()->share_kept == NULL || kt == NULL ||
-				kt->rels[0].relid != relid ||
-				!same_relation_set(relids, kt->rels, kt->nrels) ||
-				!may_restore(relid))
-				continue;
-		}
 		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
 					&changes);
 		if ((double) changes * MOVE_ROW_USEC <=
