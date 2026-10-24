@@ -346,6 +346,7 @@ tests += {
       't/212_vacuum_release_bounds.pl',
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
+      't/283_renamed_schema_conflict_restart.pl',
       't/225_kept_commit_snapshots.pl',
       't/266_autofold_defers.pl',
       't/268_kept_pages_buffers.pl',

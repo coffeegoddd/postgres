@@ -7754,13 +7754,15 @@ typedef struct ConflictSide
 } ConflictSide;
 
 /*
- * Table name in from and to (refs), if it changed between them, as
- * dolt_schema_diff() lists it: each side's item and statements (a side
- * without it: "<deleted>").  Sides already found are left as they are.
+ * A table in from and to (refs), named from_name in from and to_name in
+ * to, if it changed between them, as dolt_schema_diff() lists it: each
+ * side's item and statements (a side without it: "<deleted>").  Sides
+ * already found are left as they are.
  */
 static void
-conflict_sides(const char *from, const char *to, const char *name,
-			   ConflictSide *from_side, ConflictSide *to_side)
+conflict_sides(const char *from, const char *to, const char *from_name,
+			   const char *to_name, ConflictSide *from_side,
+			   ConflictSide *to_side)
 {
 	ListCell   *lc;
 
@@ -7769,8 +7771,8 @@ conflict_sides(const char *from, const char *to, const char *name,
 		SummaryRow *r = lfirst(lc);
 
 		if (r->object != PROLLY_OBJECT_TABLE ||
-			!((r->from_name && strcmp(r->from_name, name) == 0) ||
-			  (r->to_name && strcmp(r->to_name, name) == 0)))
+			!((r->from_name && strcmp(r->from_name, from_name) == 0) ||
+			  (r->to_name && strcmp(r->to_name, to_name) == 0)))
 			continue;
 		if (!from_side->found)
 		{
@@ -7901,14 +7903,18 @@ dolt_schema_conflicts(PG_FUNCTION_ARGS)
 	for (int i = 0; i < ms.nschema; i++)
 	{
 		const char *name = ms.schema_tables[i];
+
+		/* (each side by its own name: one may have renamed it) */
+		const char *base_name = ms.schema_base_tables ? ms.schema_base_tables[i] : name;
+		const char *their_name = ms.schema_their_tables ? ms.schema_their_tables[i] : name;
 		ConflictSide b = {0};
 		ConflictSide o = {0};
 		ConflictSide t = {0};
 		Datum		values[5];
 		bool		nulls[5] = {0};
 
-		conflict_sides(base, ours, name, &b, &o);
-		conflict_sides(base, theirs, name, &b, &t);
+		conflict_sides(base, ours, base_name, name, &b, &o);
+		conflict_sides(base, theirs, base_name, their_name, &b, &t);
 		/* (a side that changed only the table's rows: as listed from base) */
 		if (!b.found)
 		{

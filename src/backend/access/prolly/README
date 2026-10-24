@@ -354,14 +354,17 @@ A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed
 it, its definition or only its rows) is a schema conflict.  dolt_merge()
 keeps it as the branch has it, definition and rows, records it in the
-merge in progress (the refs' merge names entry, by name, OID 0: refs
-format 8) and merges the other tables, as Dolt does;
+merge in progress (the refs' merge names entry, OID 0 and its names on
+each side: refs format 12) and merges the other tables, as Dolt does;
 dolt_schema_conflicts shows its statements in the base, the head and
-theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
-committed until it is aborted.  A cherry-pick or revert, schema conflicts
-of other objects, a conflicted table renamed on either side, and one the
-other side's objects use in its version (a view over a column it added)
-fail as before, the last two saying so.
+theirs, each under its own name.  A table a side renamed (matched by
+identity) is kept under ours' names, its own and its columns': the
+merge's names are made again so (merge_renames()'s keep_ours), found by
+merging the definitions once before the merge does.
+dolt_conflicts_resolve() refuses it, and the merge can't be committed
+until it is aborted.  A cherry-pick or revert, schema conflicts of other
+objects, and a table the other side's objects use in its version (a view
+over a column it added) fail as before, the last saying so.
 
 A keyed row both sides of a merge changed is merged column by column, on
 its encoded fields (the keying's row_fields()): all three versions are
