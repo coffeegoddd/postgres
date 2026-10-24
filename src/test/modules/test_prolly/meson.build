@@ -169,6 +169,7 @@ tests += {
       'truncate_folds',
       'fold_verify',
       'fold_caches',
+      'compared_folds',
       'fold_on_commit',
       'row_locations',
       'describe_caches',
@@ -375,6 +376,7 @@ tests += {
       't/298_rewrite_checkpoint_errors.pl',
       't/310_reflog_after_gc.pl',
       't/313_reflog_gc_slot.pl',
+      't/336_compared_fold_restart.pl',
     ],
   },
 }

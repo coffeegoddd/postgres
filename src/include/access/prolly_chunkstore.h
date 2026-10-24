@@ -522,4 +522,41 @@ extern bool prolly_store_format_equal(const ProllyStoreFormat *a,
 									  const ProllyStoreFormat *b);
 extern char *prolly_store_format_text(const ProllyStoreFormat *format);
 
+/*
+ * Chunks kept in the backend's memory (chunkstore_local.c): the trees a
+ * step builds only to compare with, never to keep, put nowhere durable.
+ * Between prolly_local_chunks_begin() and prolly_local_chunks_end(), a
+ * tree environment whose store is prolly_local_chunks_keeping()'s puts its
+ * chunks in the backend's memory (has() finding them there too), and one
+ * whose store is prolly_local_chunks_reading()'s gets them from there, its
+ * puts and has() the server's store's: so a durable tree is never taken
+ * to have a chunk it names that only the backend has.  Both are the
+ * server's store otherwise.  prolly_local_chunks_persist() puts in the
+ * server's store the chunks of those kept that a chunk reaches (it
+ * included), each after those it names, descending only into chunks kept
+ * and not already stored (a stored chunk names only stored ones):
+ * whatever is kept past the step.  prolly_local_chunks_end() forgets the
+ * rest, as does the end of the (sub)transaction that began them.  Past
+ * maintenance_work_mem of chunks kept, those kept are persisted and the
+ * keeping routine puts in the server's store from then on: a step that
+ * builds much keeps nothing in memory, and saves nothing.  Never
+ * nested; prolly_local_chunks_active() says whether they are begun, and
+ * prolly_local_chunks_kept() whether an environment's store keeps its
+ * chunks so (whose chunks nothing outside the step may remember).
+ */
+extern void prolly_local_chunks_begin(void);
+extern void prolly_local_chunks_end(void);
+extern bool prolly_local_chunks_active(void);
+extern void prolly_local_chunks_persist(const ProllyHash *hash);
+extern const ProllyChunkStoreRoutine *prolly_local_chunks_keeping(void);
+extern const ProllyChunkStoreRoutine *prolly_local_chunks_reading(void);
+extern bool prolly_local_chunks_kept(const ProllyChunkStoreRoutine *store);
+
+/*
+ * The store a routine is: the server's for either routine above (struct
+ * copies of its routine, told apart by pointer), any other as it is.  An
+ * environment compared with another's by its store asks this of both.
+ */
+extern const ProllyChunkStoreRoutine *prolly_local_chunks_store(const ProllyChunkStoreRoutine *store);
+
 #endif							/* PROLLY_CHUNKSTORE_H */
