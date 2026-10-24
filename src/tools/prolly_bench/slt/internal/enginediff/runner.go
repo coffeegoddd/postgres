@@ -179,7 +179,7 @@ var snapshots = []string{
 
 // geoSnapshot is the spatial table's state, by EWKB (whose md5 keeps a
 // large polygon's row small).
-const geoSnapshot = "SELECT id, kind, md5(ST_AsEWKB(g)) FROM geo ORDER BY id"
+const geoSnapshot = "SELECT id, kind, md5(ST_AsEWKB(g)), md5(ST_AsEWKB(s)), md5(ST_AsEWKB(gg::geometry)), md5(ST_AsEWKB(r)) FROM geo ORDER BY id"
 
 // indexProbe is a query compared, within each target, between a scan
 // that doesn't use the index and one that does (node).
@@ -325,6 +325,18 @@ func Compare(dsn, am string, p Program, timeout time.Duration) (*Failure, error)
 			}
 			if f, err := compare(g.Name+"/probe", probe.query); f != nil || err != nil {
 				return f, err
+			}
+		}
+		// On prolly, a Dolt commit after each group folds what it changed
+		// into canonical form, so a value the fold can't encode (a refused
+		// geometry, say) fails the run rather than a background fold.
+		if am == "prolly" {
+			o, err := b.exec("SELECT dolt_commit('-Am', 'engine-diff after " + g.Name + "', '--allow-empty') IS NOT NULL")
+			if err != nil {
+				return nil, fmt.Errorf("%s/%s fold: %w", am, g.Name, err)
+			}
+			if o.SQLState != "" {
+				return &Failure{Kind: "fold", Group: g.Name, SQL: "dolt_commit", Candidate: o, Target: am}, nil
 			}
 		}
 	}

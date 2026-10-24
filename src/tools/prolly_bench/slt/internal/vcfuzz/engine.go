@@ -45,13 +45,15 @@ type Identities interface {
 }
 
 // Spatial is implemented by engines that, for a history with PostGIS,
-// give table t a geometry column g written with b: Geom(id, b).
+// give table t a geometry column g and a geography column gg written with
+// b: Geom(id, b) and Geog(id, b).
 type Spatial interface {
 	// Windows is, for each of Windows, the ids of the rows of t session s
-	// sees whose g overlaps it (&&), read through t's GiST index, in order.
-	Windows(s int) ([][]int, error)
+	// sees whose g overlaps it (&&), in order; and whether they were read
+	// through t's GiST index on g.
+	Windows(s int) ([][]int, bool, error)
 	// Misplaced is the ids of the rows of t session s sees whose g isn't
-	// Geom(id, b), in order.
+	// Geom(id, b) or whose gg isn't Geog(id, b), in order.
 	Misplaced(s int) ([]int, error)
 }
 

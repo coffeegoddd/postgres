@@ -86,7 +86,9 @@ func TestPostGISOptionAddsSpatialFamilies(t *testing.T) {
 		t.Fatal("seeds did not change the spatial workload")
 	}
 	setup := strings.Join(p.Setup, "\n")
-	for _, want := range []string{"CREATE EXTENSION postgis", "CREATE TABLE geo", "USING gist (g)", "generate_series(100000"} {
+	for _, want := range []string{"CREATE EXTENSION postgis", "CREATE TABLE geo", "USING gist (g)", "generate_series(100000",
+		"gg geography", "USING gist (gg)", "USING gist (r)", "'SRID=4326;", "ST_SetSRID(", " ZM (", "CIRCULARSTRING(",
+		"postgis_addbbox(", "'0102", "'0103"} {
 		if !strings.Contains(setup, want) {
 			t.Fatalf("setup lacks %q", want)
 		}
@@ -116,7 +118,8 @@ func TestPostGISOptionAddsSpatialFamilies(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"&&", "ST_Intersects", "ST_Contains", "ST_DWithin", "<->", "enable_seqscan = off"} {
+	for _, want := range []string{"&&", "ST_Intersects", "ST_Contains", "ST_DWithin", "<->", "enable_seqscan = off",
+		"ST_SetSRID(ST_MakeEnvelope", "ST_DWithin(gg", "ST_Area(gg)", "r && "} {
 		if !strings.Contains(reads, want) {
 			t.Fatalf("reads lack %s", want)
 		}

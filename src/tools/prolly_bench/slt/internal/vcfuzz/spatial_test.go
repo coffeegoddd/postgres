@@ -9,11 +9,11 @@ import (
 
 func TestWindowIDsFollowTheModel(t *testing.T) {
 	s := emptyState()
-	s["t"][1] = Row{0, 1} // a line over x 10..16, y 7.25..11.25
+	s["t"][1] = Row{0, 1} // a half circle over x 10..14, y 10..12
 	s["t"][2] = Row{0, 3} // empty
-	s["t"][4] = Row{0, 1} // a line over x 40..46
+	s["t"][4] = Row{0, 1} // a half circle over x 40..44
 	s["t"][6] = Row{0, 3} // empty
-	s["t"][5] = Row{0, 2} // a rhombus over x 50..54, y 20..24
+	s["t"][5] = Row{0, 2} // an open ring over x 50..54, y 20..24 (refused)
 	s["t"][8] = Row{0, 3} // the large polygon, over x 80..88
 	s["u"][1] = Row{0, 1} // (u has no geometries)
 	got := WindowIDs(s)
@@ -45,11 +45,12 @@ func TestWindowIDsFollowTheModel(t *testing.T) {
 // A write of b writes g with it, for t in a history with PostGIS only.
 func TestRowSQLWritesGeometryWithB(t *testing.T) {
 	ins := Op{Kind: OpInsert, Table: "t", ID: 3, Val: 1, Val2: 2}
-	if sql := rowSQL(ins, true); !strings.Contains(sql, Geom(3, 2).SQL) || !strings.Contains(sql, "g = excluded.g") {
+	if sql := rowSQL(ins, true); !strings.Contains(sql, Geom(3, 2).SQL) || !strings.Contains(sql, "g = excluded.g") ||
+		!strings.Contains(sql, Geog(3, 2)) || !strings.Contains(sql, "gg = excluded.gg") {
 		t.Fatalf("insert: %s", sql)
 	}
 	upd := Op{Kind: OpUpdate, Table: "t", ID: 3, Col: 1, Val: 0}
-	if sql := rowSQL(upd, true); !strings.Contains(sql, "b = 0, g = "+Geom(3, 0).SQL) {
+	if sql := rowSQL(upd, true); !strings.Contains(sql, "b = 0, g = "+Geom(3, 0).SQL+", gg = "+Geog(3, 0)) {
 		t.Fatalf("update of b: %s", sql)
 	}
 	for _, op := range []Op{{Kind: OpUpdate, Table: "t", ID: 3, Col: 0, Val: 2}, {Kind: OpUpdate, Table: "t", ID: 3, Col: 2, Val: 2}} {

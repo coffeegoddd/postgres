@@ -234,7 +234,8 @@ jobs:
           if [ "$NIGHTLY" = true ]; then
             seeds=20
             vcseeds=40
-            seed="$GITHUB_RUN_NUMBER"
+            # (each night's seeds apart from the last night's)
+            seed=$((GITHUB_RUN_NUMBER * 40))
           fi
           failed=0
           for am in heap prolly; do

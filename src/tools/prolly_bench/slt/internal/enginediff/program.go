@@ -135,11 +135,19 @@ const geoRows = 200
 // twice that).
 const largeN = 100000
 
+// geoValues are rows of geo: id, kind, g (Random's, SRID 0), s (one of
+// Random's in one of several SRIDs), gg (a geography) and r (a value
+// PostGIS's receive refuses, one row in three).
 func geoValues(r *rand.Rand, first, n, largeEvery int) string {
 	rows := make([]string, n)
 	for i := range rows {
 		g := geomgen.Random(r, largeEvery, largeN)
-		rows[i] = fmt.Sprintf("(%d, '%s', %s)", first+i, g.Kind, g.SQL)
+		srid, _ := geomgen.WithSRID(r, geomgen.Random(r, 0, 0))
+		refused := "NULL"
+		if r.Intn(3) == 0 {
+			refused = geomgen.Refused(r).SQL
+		}
+		rows[i] = fmt.Sprintf("(%d, '%s', %s, %s, %s, %s)", first+i, g.Kind, g.SQL, srid.SQL, geomgen.Geography(r), refused)
 	}
 	return strings.Join(rows, ", ")
 }
@@ -147,11 +155,14 @@ func geoValues(r *rand.Rand, first, n, largeEvery int) string {
 func geoSetup(r *rand.Rand) []string {
 	return []string{
 		"CREATE EXTENSION postgis",
-		"CREATE TABLE geo (id int PRIMARY KEY, kind text, g geometry)",
+		"CREATE TABLE geo (id int PRIMARY KEY, kind text, g geometry, s geometry, gg geography, r geometry)",
 		"INSERT INTO geo VALUES " + geoValues(r, 1, geoRows, 0),
 		// one large polygon from the start, so every run reads one
-		fmt.Sprintf("INSERT INTO geo VALUES (0, 'large', %s)", geomgen.Large(quarterOf(r), quarterOf(r), largeN).SQL),
+		fmt.Sprintf("INSERT INTO geo (id, kind, g) VALUES (0, 'large', %s)", geomgen.Large(quarterOf(r), quarterOf(r), largeN).SQL),
 		"CREATE INDEX geo_g ON geo USING gist (g)",
+		"CREATE INDEX geo_s ON geo USING gist (s)",
+		"CREATE INDEX geo_gg ON geo USING gist (gg)",
+		"CREATE INDEX geo_r ON geo USING gist (r)",
 		"ANALYZE geo",
 	}
 }
@@ -161,14 +172,19 @@ func quarterOf(r *rand.Rand) float64 { return float64(r.Intn(geomgen.Extent*4)) 
 // geoFamilies are the spatial families: writes (with a large polygon one
 // insert in eight), reads with the index and without, nearest neighbours,
 // a transaction with savepoints, and a large polygon's corner moved.
+// GEOS and distance functions read g, s in its own SRID, and gg; r's
+// refused values are read only by && and functions of their points, which
+// take them (GEOS and distances raise errors on them).
 func geoFamilies(r *rand.Rand) []Group {
 	id := 1 + r.Intn(geoRows)
 	w := geomgen.Window(r)
 	pt := geomgen.Point(quarterOf(r), quarterOf(r)).SQL
 	window := w.SQL()
 	changed := func(sql string) string {
-		return "WITH changed AS (" + sql + " RETURNING id, kind, md5(ST_AsEWKB(g)) AS g) SELECT * FROM changed ORDER BY id"
+		return "WITH changed AS (" + sql + " RETURNING id, kind, md5(ST_AsEWKB(g)) AS g, md5(ST_AsEWKB(s)) AS s, " +
+			"md5(ST_AsEWKB(gg::geometry)) AS gg, md5(ST_AsEWKB(r)) AS r) SELECT * FROM changed ORDER BY id"
 	}
+	gpt := fmt.Sprintf("'SRID=4326;POINT(%s %s)'::geography", num(float64(r.Intn(1400))/4-175), num(float64(r.Intn(600))/4-75))
 	reads := []string{
 		"SELECT id, kind FROM geo WHERE g && " + window + " ORDER BY id",
 		"SELECT id, kind FROM geo WHERE ST_Intersects(g, " + window + ") ORDER BY id",
@@ -177,18 +193,27 @@ func geoFamilies(r *rand.Rand) []Group {
 		// (numeric sums: the same whatever order the rows are scanned in)
 		"SELECT kind, count(*), sum(round(ST_Area(g)::numeric, 6)), sum(round(ST_Length(g)::numeric, 6)), sum(ST_NPoints(g)) FROM geo GROUP BY kind ORDER BY kind",
 		"SELECT ST_AsText(ST_Extent(g)) FROM geo",
+		"SELECT id, ST_SRID(s) FROM geo WHERE s && " + window + " ORDER BY id",
+		"SELECT id FROM geo WHERE ST_Intersects(s, ST_SetSRID(" + window + ", ST_SRID(s))) ORDER BY id",
+		"SELECT ST_SRID(s), count(*), sum(ST_NPoints(s)) FROM geo GROUP BY 1 ORDER BY 1",
+		fmt.Sprintf("SELECT id, round(ST_Distance(gg, %s)::numeric, 3) FROM geo WHERE ST_DWithin(gg, %s, %d) ORDER BY id", gpt, gpt, 100000+r.Intn(900000)),
+		"SELECT count(*), sum(round(ST_Area(gg)::numeric, 1)), sum(round(ST_Length(gg)::numeric, 3)) FROM geo",
+		"SELECT id, ST_NPoints(r), ST_AsText(r) FROM geo WHERE r && " + window + " ORDER BY id",
+		"SELECT count(r), sum(ST_NPoints(r)), ST_AsText(ST_Extent(r)) FROM geo",
 	}
 	knn := fmt.Sprintf("SELECT id, round((g <-> %s)::numeric, 6) AS d FROM geo WHERE NOT ST_IsEmpty(g) ORDER BY g <-> %s, id LIMIT %d",
 		pt, pt, []int{1, 10, 100}[r.Intn(3)])
 	return []Group{
 		{"geo_writes", []string{
-			changed(fmt.Sprintf("INSERT INTO geo VALUES %s ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, g = excluded.g",
-				geoValues(r, geoRows+1+r.Intn(geoRows), 1+r.Intn(4), 8))),
-			changed(fmt.Sprintf("UPDATE geo SET g = ST_Translate(g, %d, %d) WHERE id BETWEEN %d AND %d", r.Intn(21)-10, r.Intn(21)-10, id, id+5)),
+			changed(fmt.Sprintf("INSERT INTO geo VALUES %s ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, g = excluded.g, "+
+				"s = excluded.s, gg = excluded.gg, r = excluded.r", geoValues(r, geoRows+1+r.Intn(geoRows), 1+r.Intn(4), 8))),
+			changed(fmt.Sprintf("UPDATE geo SET g = ST_Translate(g, %[1]d, %[2]d), s = ST_Translate(s, %[1]d, %[2]d), "+
+				"r = ST_Translate(r, %[1]d, %[2]d) WHERE id BETWEEN %[3]d AND %[4]d", r.Intn(21)-10, r.Intn(21)-10, id, id+5)),
+			changed(fmt.Sprintf("UPDATE geo SET r = %s, gg = %s WHERE id = %d", geomgen.Refused(r).SQL, geomgen.Geography(r), id+6)),
 			changed("DELETE FROM geo WHERE g && " + geomgen.Window(r).SQL() + " AND kind <> 'large'"),
 		}},
 		{"geo_reads", reads},
-		{"geo_index_reads", append(append([]string{"SET enable_seqscan = off"}, reads[:4]...), knn, "RESET enable_seqscan")},
+		{"geo_index_reads", append(append(append([]string{"SET enable_seqscan = off"}, reads[:4]...), reads[6], reads[7], reads[9], reads[11]), knn, "RESET enable_seqscan")},
 		{"geo_knn", []string{knn}},
 		{"geo_savepoints", []string{"BEGIN",
 			changed(fmt.Sprintf("UPDATE geo SET g = ST_Scale(g, 2, 2) WHERE id BETWEEN %d AND %d", id, id+3)),

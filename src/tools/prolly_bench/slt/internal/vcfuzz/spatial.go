@@ -13,12 +13,15 @@ const largeN = 100000
 // Geom is the geometry table t's row id holds in column g for its b.
 func Geom(id, b int) geomgen.Geom { return geomgen.Coded(id, b, 4, largeN) }
 
+// Geog is the geography table t's row id holds in column gg for its b.
+func Geog(id, b int) string { return geomgen.CodedGeography(id, b) }
+
 // Windows are the windows a spatial check reads t's geometries through.
 // Rows sit at x = 10 id (10 to 80, each up to 8 wide) and y = 10 b (0 to
 // 30, each from 3 below to 5 above); the windows cut across both, and the
 // last holds row 8 whatever its b (its large polygon too).
 var Windows = []geomgen.Box{
-	{MinX: 14.125, MinY: -5.125, MaxX: 41.875, MaxY: 12.125},
+	{MinX: 9.125, MinY: -5.125, MaxX: 41.875, MaxY: 12.125},
 	{MinX: 38.125, MinY: 8.125, MaxX: 66.875, MaxY: 24.875},
 	{MinX: 0.125, MinY: 18.125, MaxX: 90.875, MaxY: 35.875},
 	{MinX: 78.125, MinY: -5.125, MaxX: 90.875, MaxY: 40.875},

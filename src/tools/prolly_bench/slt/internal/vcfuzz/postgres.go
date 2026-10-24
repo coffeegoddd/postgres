@@ -82,11 +82,12 @@ func OpenPostgres(dsn string, timeout time.Duration) Opener {
 			}
 			geo := p.geo(t)
 			if geo {
-				c += ", g geometry"
+				c += ", g geometry, gg geography"
 			}
 			setup = append(setup, "CREATE TABLE "+t+" (id int PRIMARY KEY, a int, b int"+c+")")
 			if geo {
-				setup = append(setup, "CREATE INDEX "+t+"_g ON "+t+" USING gist (g)")
+				setup = append(setup, "CREATE INDEX "+t+"_g ON "+t+" USING gist (g)",
+					"CREATE INDEX "+t+"_gg ON "+t+" USING gist (gg)")
 			}
 			ids := make([]int, 0, len(h.Setup[t]))
 			for id := range h.Setup[t] {
@@ -100,7 +101,7 @@ func OpenPostgres(dsn string, timeout time.Duration) Opener {
 					cols, vals = cols+", c", vals+fmt.Sprintf(", NULLIF(%d, 0)", r[2])
 				}
 				if geo {
-					cols, vals = cols+", g", vals+", "+Geom(id, r[1]).SQL
+					cols, vals = cols+", g, gg", vals+", "+Geom(id, r[1]).SQL+", "+Geog(id, r[1])
 				}
 				setup = append(setup, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", t, cols, vals))
 			}
@@ -209,7 +210,7 @@ func classify(pgerr *pgconn.PgError) Outcome {
 }
 
 // rowSQL is a row write's statement.  A keyless write picks one copy of
-// its content.  With geo, a write of b writes g too.
+// its content.  With geo, a write of b writes g and gg too.
 func rowSQL(op Op, geo bool) string {
 	if op.Table == Keyless {
 		a, b := content(op.ID)
@@ -230,7 +231,8 @@ func rowSQL(op Op, geo bool) string {
 			cols, vals, set = cols+", c", vals+fmt.Sprintf(", NULLIF(%d, 0)", op.Val3), set+", c = excluded.c"
 		}
 		if geo {
-			cols, vals, set = cols+", g", vals+", "+Geom(op.ID, op.Val2).SQL, set+", g = excluded.g"
+			cols, vals, set = cols+", g, gg", vals+", "+Geom(op.ID, op.Val2).SQL+", "+Geog(op.ID, op.Val2),
+				set+", g = excluded.g, gg = excluded.gg"
 		}
 		return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (id) DO UPDATE SET %s", op.Table, cols, vals, set)
 	case OpUpdate:
@@ -239,7 +241,7 @@ func rowSQL(op Op, geo bool) string {
 			value = fmt.Sprintf("NULLIF(%d, 0)", op.Val)
 		}
 		if geo && op.Col == 1 {
-			value += ", g = " + Geom(op.ID, op.Val).SQL
+			value += ", g = " + Geom(op.ID, op.Val).SQL + ", gg = " + Geog(op.ID, op.Val)
 		}
 		return fmt.Sprintf("UPDATE %s SET %s = %s WHERE id = %d", op.Table, []string{"a", "b", "c"}[op.Col], value, op.ID)
 	}
@@ -535,19 +537,31 @@ func (p *Postgres) Visible(s int) (State, error) {
 }
 
 // Windows reads each window through t's GiST index (sequential scans
-// off, for the one statement).
-func (p *Postgres) Windows(s int) ([][]int, error) {
+// off, for the one statement), and checks from its plan that the index is
+// what it is read through.
+func (p *Postgres) Windows(s int) ([][]int, bool, error) {
 	c := p.sessions[s]
 	out := make([][]int, len(Windows))
+	indexed := true
 	for i, w := range Windows {
-		rows, err := p.must(c, "SET enable_seqscan = off; SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM t WHERE g && "+
-			w.SQL()+"; RESET enable_seqscan")
+		query := "SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM t WHERE g && " + w.SQL()
+		plan, err := p.must(c, "SET enable_seqscan = off; EXPLAIN (COSTS OFF) "+query+"; RESET enable_seqscan")
 		if err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		through := false
+		for _, line := range plan {
+			through = through || strings.Contains(line[0], "Index Scan using t_g ") ||
+				strings.Contains(line[0], "Bitmap Index Scan on t_g")
+		}
+		indexed = indexed && through
+		rows, err := p.must(c, "SET enable_seqscan = off; "+query+"; RESET enable_seqscan")
+		if err != nil {
+			return nil, false, err
 		}
 		out[i] = []int{}
 		if len(rows) != 1 {
-			return nil, fmt.Errorf("window %d: %v", i, rows)
+			return nil, false, fmt.Errorf("window %d: %v", i, rows)
 		}
 		if rows[0][0] == "" {
 			continue
@@ -557,35 +571,51 @@ func (p *Postgres) Windows(s int) ([][]int, error) {
 			out[i] = append(out[i], id)
 		}
 	}
-	return out, nil
+	return out, indexed, nil
 }
 
-// Misplaced compares each row's g, by the md5 of its EWKB, with its b's
-// geometry as the server makes it (once each, on the observer).
+// Misplaced compares each row's g and gg, by the md5 of their EWKB, with
+// its b's as the server makes them (once each, on the observer).
 func (p *Postgres) Misplaced(s int) ([]int, error) {
-	rows, err := p.must(p.sessions[s], "SELECT id, b, coalesce(md5(ST_AsEWKB(g)), 'null') FROM t ORDER BY id")
+	rows, err := p.must(p.sessions[s], "SELECT id, b, coalesce(md5(ST_AsEWKB(g)), 'null'), "+
+		"coalesce(md5(ST_AsEWKB(gg::geometry)), 'null') FROM t ORDER BY id")
 	if err != nil {
 		return nil, err
+	}
+	expected := func(sql string) (string, error) {
+		if want, ok := p.geomMD5[sql]; ok {
+			return want, nil
+		}
+		got, err := p.must(p.observer, "SELECT md5(ST_AsEWKB(("+sql+")::geometry))")
+		if err != nil {
+			return "", err
+		}
+		p.geomMD5[sql] = got[0][0]
+		return got[0][0], nil
 	}
 	var wrong []int
 	for _, r := range rows {
 		id, _ := strconv.Atoi(r[0])
 		b, _ := strconv.Atoi(r[1])
-		sql := Geom(id, b).SQL
-		want, ok := p.geomMD5[sql]
-		if !ok {
-			got, err := p.must(p.observer, "SELECT md5(ST_AsEWKB("+sql+"))")
-			if err != nil {
-				return nil, err
-			}
-			want = got[0][0]
-			p.geomMD5[sql] = want
+		g, err := expected(Geom(id, b).SQL)
+		if err != nil {
+			return nil, err
 		}
-		if r[2] != want {
+		gg, err := expected(Geog(id, b))
+		if err != nil {
+			return nil, err
+		}
+		if r[2] != g || r[3] != gg {
 			wrong = append(wrong, id)
 		}
 	}
 	return wrong, nil
+}
+
+// Exec runs sql in session s, for a self-test's engine wrong on purpose.
+func (p *Postgres) Exec(s int, sql string) error {
+	_, err := p.must(p.sessions[s], sql)
+	return err
 }
 
 func (p *Postgres) Branch(s int) (string, error) {

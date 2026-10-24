@@ -50,8 +50,9 @@ type Report struct {
 // commit the model has there, and that commits with the same rows have
 // the same root hash and commits with different rows different ones.  For
 // a history with PostGIS, on an engine with geometries (Spatial), it
-// checks each row of t holds its b's geometry and each window query
-// returns the rows the model's geometries overlap.
+// checks each row of t holds its b's geometry and geography, and that each
+// window query is read through the GiST index and returns the rows the
+// model's geometries overlap.
 // Ops the model holds illegal are skipped.  An error is the harness's.
 func Run(h History, open Opener) (Report, error) {
 	r := Report{Outcomes: map[string]int{}}
@@ -103,9 +104,12 @@ func Run(h History, open Opener) (Report, error) {
 				if len(wrong) > 0 {
 					return fail("geometries not their rows'", []int{}, wrong), nil
 				}
-				got, err := spatial.Windows(s)
+				got, indexed, err := spatial.Windows(s)
 				if err != nil {
 					return nil, err
+				}
+				if !indexed {
+					return fail("window reads not through the GiST index", true, false), nil
 				}
 				for i, ids := range WindowIDs(want) {
 					if i >= len(got) || !slices.Equal(ids, got[i]) {
