@@ -1737,6 +1737,25 @@ typedef struct TreeLeaf
  * needs the old.)  So the block's records from before then are skipped,
  * and its pages go nowhere: TREE_UNAVAILABLE.
  */
+/*
+ * In recovery: has reln's map no root page, neither on disk nor in a buffer
+ * (one made in this replay has it in a buffer until it is written out)?
+ * Then it is a map dropped later in the WAL, whose header an earlier
+ * record's image made again (redo makes a missing file to restore an image
+ * in), or one that lost its pages.
+ */
+static bool
+map_root_lost(SMgrRelation reln)
+{
+	PrefetchBufferResult r;
+
+	if (!mdexists(reln, BMAP_FORKNUM) ||
+		mdnblocks(reln, BMAP_FORKNUM) >= BMAP_TREE_MAP_PAGES)
+		return false;
+	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, 1);
+	return !BufferIsValid(r.recent_buffer);
+}
+
 static TreeFound
 tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 		  bool cached_only, uint32 n, BmapEntry *entries, TreeLeaf *leaf)
@@ -1749,16 +1768,8 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 	n = Min(n, BMAP_TREE_FANOUT - path.slot[0]);
 	Assert(n > 0);
 
-	/*
-	 * In recovery, a map with no root page on disk is one dropped after the
-	 * record being replayed, whose header an earlier record's image made
-	 * again (redo makes a missing file to restore an image in): the
-	 * relation's pages go nowhere, as a relation's whose files are gone,
-	 * and the map goes again as its drop is replayed.
-	 */
-	if (InRecovery && !cached_only &&
-		(!mdexists(reln, BMAP_FORKNUM) ||
-		 mdnblocks(reln, BMAP_FORKNUM) < BMAP_TREE_MAP_PAGES))
+	/* (a map with no root in recovery: the relation's pages go nowhere) */
+	if (RecoveryInProgress() && !cached_only && map_root_lost(reln))
 		return TREE_UNAVAILABLE;
 
 	for (;;)
@@ -4119,6 +4130,20 @@ bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BmapEntry	entry;
 	MapPage		mp;
 	bool		unavailable;
+
+	/*
+	 * A map with no root page (map_root_lost()): the record is skipped, and
+	 * its page noted invalid as md.c notes a page of a missing file.  The
+	 * drop's replay forgets it; an archive recovery that reaches
+	 * consistency without one fails.  (An image of the page is restored to
+	 * its buffer, which goes nowhere when written out: tree_find().)
+	 */
+	if (map_root_lost(reln))
+	{
+		XLogNoteInvalidPage(rel, forknum, blocknum, false);
+		DropBufferBlock(rel, forknum, blocknum);
+		return true;
+	}
 
 	if (lookup_entry_at(reln, blocknum, &entry, &mp, &unavailable))
 	{
@@ -11155,6 +11180,39 @@ keep_newer_entries(Buffer buf, char *newer)
 	}
 }
 
+/*
+ * In redo: does page-store block 'blk' hold a page that is no tree's node
+ * (nor all zeroes)?  As replay has it in a buffer, if it does; else on
+ * disk, read as it is (through a buffer, a relation's page would fail its
+ * checksum, which is of its logical block).
+ */
+static bool
+redo_block_not_node(RelFileLocator rel, BlockNumber blk)
+{
+	SMgrRelation ssrel = store_smgr(rel);
+	RelFileLocator sloc = with_relnumber(rel, BMAP_STORE_RELNUMBER);
+	PrefetchBufferResult r;
+	PGIOAlignedBlock page;
+	void	   *pages[1] = {page.data};
+
+	if (blk >= mdnblocks(ssrel, MAIN_FORKNUM))
+		return false;
+	r = PrefetchSharedBuffer(ssrel, MAIN_FORKNUM, blk);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(sloc, MAIN_FORKNUM, blk, r.recent_buffer))
+	{
+		bool		other;
+
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
+		other = !PageIsNew(BufferGetPage(r.recent_buffer)) &&
+			!tree_node_any(BufferGetPage(r.recent_buffer));
+		UnlockReleaseBuffer(r.recent_buffer);
+		return other;
+	}
+	mdreadv(ssrel, MAIN_FORKNUM, blk, pages, 1);
+	return !PageIsNew(page.data) && !tree_node_any(page.data);
+}
+
 static void
 redo_block(XLogReaderState *record, uint8 block_id)
 {
@@ -11219,6 +11277,20 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	memcpy(copy, data, len);
 	memcpy(&kind, copy, sizeof(uint16));
 	memcpy(&flags, copy + sizeof(uint16), sizeof(uint16));
+
+	/*
+	 * A node's entries changed, on a block holding something else on disk
+	 * now (freed since and made a relation's page, written out before a
+	 * crash): the node was let go of after the record, and nothing reads it
+	 * any more.  The block is left as it is; read through a buffer, a
+	 * relation's page would fail its checksum, which is of its logical
+	 * block.
+	 */
+	if (node && !(flags & BMAP_DELTA_INIT) && redo_block_not_node(rlocator, blkno))
+	{
+		pfree(copy);
+		return;
+	}
 
 	if (flags & BMAP_DELTA_INIT)
 	{

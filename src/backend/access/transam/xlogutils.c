@@ -160,6 +160,19 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	}
 }
 
+/*
+ * Note a reference to an invalid page found by a storage manager of its own
+ * in redo (a page of a relation whose storage is gone), as
+ * XLogReadBufferExtended() notes one of a missing file: forgotten as the
+ * relation is dropped or truncated, a failure at consistency otherwise.
+ */
+void
+XLogNoteInvalidPage(RelFileLocator locator, ForkNumber forkno,
+					BlockNumber blkno, bool present)
+{
+	log_invalid_page(locator, forkno, blkno, present);
+}
+
 /* Forget any invalid pages >= minblkno, because they've been dropped */
 static void
 forget_invalid_pages(RelFileLocator locator, ForkNumber forkno,
