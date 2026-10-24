@@ -152,8 +152,9 @@ dolt_pending_full_folds(PG_FUNCTION_ARGS)
  * table a rewrite elsewhere holds) could deadlock, and would hold the
  * table from readers meanwhile.  It is made in a subtransaction with
  * lock_timeout at its least; a lock not free at once rolls it back, and
- * the table's next fold reads it in full, as without the checkpoint.
- * True if relid was such a table (folded or not): the branch's fold is
+ * the table's next fold reads it in full, as without the checkpoint.  Any
+ * other error but a cancel does the same, logged: the checkpoint is an
+ * optimization, never a reason for the rewrite to fail.  True if relid was such a table (folded or not): the branch's fold is
  * then tried, and needn't be for another table of the same rewrite.
  */
 bool
@@ -196,8 +197,19 @@ prolly_fold_rewritten(Oid relid)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
-		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+		/*
+		 * Nor does any other error the fold meets fail the rewrite: the
+		 * checkpoint folds every table of the branch, and one the next
+		 * commit refuses (a value its type's text form no longer reads
+		 * back as, say) is that commit's to report, not this table's
+		 * ALTER's.  A cancel still cancels.
+		 */
+		if (ed->sqlerrcode == ERRCODE_QUERY_CANCELED)
 			ReThrowError(ed);
+		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+			ereport(LOG,
+					(errmsg("branch not checkpointed after rewriting \"%s\": %s",
+							get_rel_name(relid), ed->message)));
 		FlushErrorState();
 		FreeErrorData(ed);
 	}
