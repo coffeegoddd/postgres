@@ -1380,6 +1380,37 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 						 stored[s] < 0 ? "NULL" : psprintf("%d", stored[s]),
 						 alike ? "alike" : "different");
 			}
+
+			/*
+			 * project() of the stored value alone, and of the column before
+			 * it alone: a stored NULL stays NULL, not the missing value; a
+			 * column not asked for is NULL too; and the missing value of a
+			 * row that predates the column is kept where asked for.
+			 */
+			for (int w = 0; w < 3; w++)
+			{
+				StringInfoData proj;
+				ProllyValue pv;
+				ProllyValue from = w == 2 ? (ProllyValue) {(const uint8 *) buf2.data, buf2.len} : b;
+
+				memset(wanted, 0, sizeof(bool) * natts);
+				wanted[w == 1 ? 5 : 6] = true;
+				initStringInfo(&proj);
+				PROLLY_CALL(ve, project, enc, &from, wanted, &proj);
+				pv.data = (const uint8 *) proj.data;
+				pv.len = proj.len;
+				PROLLY_CALL(ve, decode, enc, &pv, some);
+				slot_getallattrs(some);
+				if (w == 0 && (stored[s] < 0) != some->tts_isnull[6])
+					elog(ERROR, "project() of a stored %s gave %s",
+						 stored[s] < 0 ? "NULL" : "value",
+						 some->tts_isnull[6] ? "NULL" : "a value");
+				if (w == 1 && !some->tts_isnull[6])
+					elog(ERROR, "project() gave a value to a column not asked for");
+				if (w == 2 && (some->tts_isnull[6] || DatumGetInt32(some->tts_values[6]) != 5))
+					elog(ERROR, "project() lost a predating row's missing value");
+				pfree(proj.data);
+			}
 		}
 	}
 

@@ -683,7 +683,7 @@ one ordered by what isn't built in): an entry per row, keyed by the
 index's columns under the version's operator families, collations and
 options, then the row's data-tree key, holding the row with only the
 index's, INCLUDE and primary key columns (the value encoder's project(),
-made of the row's bytes).  The pin keeps those trees too (refs format 7:
+made of the row's bytes).  The pin keeps those trees too (refs format 9:
 a pin's kept trees).  An index scan seeks and orders as the primary key's
 does, and reads a row from the data tree only where its entry lacks a
 column the query uses.  A refresh brings each tree to the new commit by

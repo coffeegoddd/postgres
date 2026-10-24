@@ -518,7 +518,66 @@ SELECT (SELECT array_agg(i ORDER BY i) FROM prolly_mounts(), unnest(indexes) i
 		WHERE mount = 'ixm') IS NOT NULL AS listed;
 SELECT bool_and(a.indexes = b.indexes) AS same_indexes
 FROM prolly_mounts() a, prolly_mounts() b WHERE a.mount = 'ixm' AND b.mount = 'whole';
+-- (and reads alike by every index)
+SELECT (SELECT array_agg(id ORDER BY tenant_id, email, id) FROM ixm.users
+		WHERE tenant_id = 4 AND email >= 'person030') =
+	(SELECT array_agg(id ORDER BY tenant_id, email, id) FROM whole.users
+		WHERE tenant_id = 4 AND email >= 'person030') AS same_by_tenant_email,
+	(SELECT array_agg(email || id ORDER BY email DESC, id) FROM ixm.users WHERE email > 'person090') =
+	(SELECT array_agg(email || id ORDER BY email DESC, id) FROM whole.users WHERE email > 'person090')
+	AS same_by_email,
+	(SELECT array_agg(id ORDER BY id) FROM ixm.users WHERE payload >= 'p990') =
+	(SELECT array_agg(id ORDER BY id) FROM whole.users WHERE payload >= 'p990') AS same_by_payload;
 SELECT prolly_unmount('whole'), prolly_unmount('ixm');
+
+-- A refresh reuses an index's tree only where its order and content are
+-- the same: not after its column's collation changed (the definition's
+-- text the same), nor after the rows' columns did.
+CREATE TABLE ix.coll (id int PRIMARY KEY, b text COLLATE "C");
+CREATE INDEX coll_b ON ix.coll (b);
+INSERT INTO ix.coll VALUES (1, 'a'), (2, 'B'), (3, 'c'), (4, 'D'), (5, 'e'), (6, 'F');
+CREATE TABLE ix.lay (id int PRIMARY KEY, a int, b int, c int);
+CREATE INDEX lay_c ON ix.lay (c);
+INSERT INTO ix.lay SELECT g, g, g * 10, g * 100 FROM generate_series(1, 100) g;
+SELECT length(dolt_commit('-Am', 'collated and laid out')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'ix', 'reuse', ARRAY['coll', 'lay'], true);
+ALTER TABLE ix.coll ALTER COLUMN b TYPE text COLLATE "und-x-icu";
+ALTER TABLE ix.lay DROP COLUMN b;
+ALTER TABLE ix.lay ADD COLUMN d int;
+UPDATE ix.lay SET c = c + 1;
+SELECT length(dolt_commit('-Am', 'recollated and laid out again')::text) > 0 AS committed;
+SELECT prolly_refresh_mount('reuse') = dolt_hashof('HEAD') AS refreshed;
+SELECT string_agg(b, ',') AS by_index FROM (SELECT b FROM reuse.coll ORDER BY b) x;
+SELECT string_agg(b, ',' ORDER BY b COLLATE "und-x-icu") AS truth FROM dolt_at('HEAD', NULL::ix.coll);
+SELECT string_agg(id::text, ',' ORDER BY id) AS above_b FROM reuse.coll WHERE b > 'b';
+SELECT id, c FROM reuse.lay WHERE c >= 500 AND c <= 502 ORDER BY id;
+SELECT count(*) FROM reuse.lay WHERE c > 0;
+SELECT prolly_unmount('reuse');
+
+-- The build's memory: its entries, counted as allocated, held to
+-- maintenance_work_mem.
+CREATE TABLE ix.many (id int PRIMARY KEY, a int);
+CREATE INDEX many_a ON ix.many (a);
+INSERT INTO ix.many SELECT g, g % 1000 FROM generate_series(1, 40000) g;
+SELECT length(dolt_commit('-Am', 'many')::text) > 0 AS committed;
+SET maintenance_work_mem = '1MB';
+SELECT * FROM prolly_mount('HEAD', 'ix', 'many', ARRAY['many'], true);
+SET maintenance_work_mem = '8MB';
+SELECT mount FROM prolly_mount('HEAD', 'ix', 'many', ARRAY['many'], true);
+RESET maintenance_work_mem;
+SELECT count(*) FROM many.many WHERE a = 7;
+SELECT prolly_unmount('many');
+
+-- A table and index whose names hold a tab: their tree is the mount's too.
+CREATE TABLE ix."tab	bed" (id int PRIMARY KEY, v int);
+CREATE INDEX "v	idx" ON ix."tab	bed" (v);
+INSERT INTO ix."tab	bed" SELECT g, g FROM generate_series(1, 10) g;
+SELECT length(dolt_commit('-Am', 'tabbed')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'ix', 'tabs', ARRAY['tab	bed'], true);
+SELECT cardinality(indexes) FROM prolly_mounts() WHERE mount = 'tabs';
+EXPLAIN (COSTS OFF) SELECT id FROM tabs."tab	bed" WHERE v = 3;
+SELECT id FROM tabs."tab	bed" WHERE v = 3;
+SELECT prolly_unmount('tabs');
 
 SELECT prolly_unmount('old');
 SELECT prolly_unmount('head');
