@@ -2055,6 +2055,7 @@ move_settled(void *arg)
  * the change is known to commit.
  */
 int			prolly_kept_commits = 2;
+int			prolly_restore_min_changes = 64;
 
 typedef struct KeptTable
 {
@@ -2510,25 +2511,25 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 /*
  * Giving a table its kept pages back costs about as much as writing a
  * hundred rows (new storage for each of its relations, its catalog row
- * and caches, measured ~18 ms against ~3 ms for a row and ~20 ms for a
- * hundred at 1M rows): fewer changed since a baseline holding the
- * commit's rows are written instead.
+ * and caches: measured ~18 ms, against ~3 ms for a row and ~20 ms for a
+ * hundred, at 1M rows), so fewer than prolly.restore_min_changes changed
+ * since a baseline holding the commit's rows are written instead.
  */
-#define RESTORE_MIN_CHANGES		64
 
-/* (a table's changes since its baseline, counted to RESTORE_MIN_CHANGES) */
+/* (a table's changes since its baseline, counted to the setting) */
 static bool
 count_restore_change(ProllyDiffKind kind, const ProllyKey *key,
-			 const ProllyValue *before, const ProllyValue *after, void *arg)
+					 const ProllyValue *before, const ProllyValue *after,
+					 void *arg)
 {
-	return ++*(int *) arg < RESTORE_MIN_CHANGES;
+	return ++*(int *) arg < prolly_restore_min_changes;
 }
 
 /*
  * Would writing table relid's rows back to the commit's (data) cost less
  * than restoring its pages: its baseline holds the commit's rows, and
- * fewer than RESTORE_MIN_CHANGES of them changed since, as its change
- * finder reads them?
+ * fewer than prolly.restore_min_changes of them changed since, as its
+ * change finder reads them?
  */
 static bool
 few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
@@ -2537,11 +2538,12 @@ few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 	ProllyNodeRef base;
 	int			n = 0;
 
-	if (!PROLLY_HAS(dc->canonicalizer, table_changes) ||
+	if (prolly_restore_min_changes <= 0 ||
+		!PROLLY_HAS(dc->canonicalizer, table_changes) ||
 		!dc->canonicalizer->table_changes(baseline, relid, &base,
 										  count_restore_change, &n))
 		return false;
-	return same_hash(&base.hash, &data->hash) && n < RESTORE_MIN_CHANGES;
+	return same_hash(&base.hash, &data->hash) && n < prolly_restore_min_changes;
 }
 
 /*
