@@ -706,15 +706,16 @@ typedef struct ProllyRefsRoutine
 								 void *arg);
 
 	/*
-	 * Optional: was relation relid one of the session branch's tables as its
-	 * head commit was made, by the branch's own record of them?  False if
-	 * the record isn't of the head (the head moved since without a commit
-	 * of the branch's, as a reset does) or doesn't have it (a table made,
-	 * or dropped and made again, since).  A history read takes the head's
-	 * version of a table for the table here only on this, as a commit
-	 * holds tables by name and identity alone.
+	 * Optional: the commit (*at) whose tables the session branch's own
+	 * record of them lists relation relid among, the record made by the
+	 * branch's last commit; false if it doesn't (a table made, or dropped
+	 * and made again, since that commit), or there is no record.  The
+	 * branch's head may have moved since without a commit (a reset, a
+	 * fast-forward): the record is still of the commit that made it.  A
+	 * history read takes a version of a table for the table here only
+	 * through this, as a commit holds tables by name and identity alone.
 	 */
-	bool		(*head_has_relation) (Oid relid);
+	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
 } ProllyRefsRoutine;
 
 /*
@@ -758,9 +759,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"head_has_relation"
+	"recorded_relation"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK head_has_relation
+#define PROLLY_REFS_LAST_CALLBACK recorded_relation
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

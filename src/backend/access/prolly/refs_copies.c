@@ -4212,20 +4212,33 @@ head_names(const char *name, const ProllyHash *head)
 }
 
 /*
- * Did the session branch's head commit have relation relid among its tables,
- * by the record its commit made (the record of another head: unknown)?
+ * The commit the session branch's record of its tables is of, if it lists
+ * relation relid among them (the head may have moved since, uncommitted).
  */
 static bool
-copies_head_has_relation(Oid relid)
+copies_recorded_relation(Oid relid, ProllyHash *at)
 {
 	char	   *name = branch_ops()->current();
-	ProllyHash	head;
+	StringInfoData key;
+	StringInfoData v;
+	char	   *nl;
 	char	   *lines;
 	char		want[16];
 	bool		found = false;
 
-	if (!branch_head(name, &head) || (lines = head_names(name, &head)) == NULL)
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	if (!refs_get(key.data, key.len, &v) || (nl = strchr(v.data, '\n')) == NULL ||
+		!prolly_hash_from_hex(v.data, nl - v.data, at))
+	{
+		pfree(key.data);
+		pfree(v.data);
 		return false;
+	}
+	lines = pstrdup(nl);
+	pfree(key.data);
+	pfree(v.data);
 	snprintf(want, sizeof(want), "%010u ", relid);
 	for (char *p = lines; p && *p; p = strchr(p, '\n'))
 	{
@@ -7545,5 +7558,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
-	.head_has_relation = copies_head_has_relation,
+	.recorded_relation = copies_recorded_relation,
 };

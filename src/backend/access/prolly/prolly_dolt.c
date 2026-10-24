@@ -6472,6 +6472,61 @@ lineage_enter(NameLineage *l, const char *key, const char *name)
 }
 
 /*
+ * Is commit to, its table named to_name, reached back from commit from,
+ * its table named from_name, by parents, the name never without a table
+ * between (a rename followed)?
+ */
+static bool
+name_walk_reaches(const ProllyHash *from, const char *from_name,
+				  const ProllyHash *to, const char *to_name)
+{
+	List	   *queue = list_make2(copy_hash(from), pstrdup(from_name));
+	HTAB	   *seen;
+	HASHCTL		ctl = {0};
+	bool		found = false;
+
+	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
+	ctl.entrysize = PROLLY_HASH_MAX_LEN * 2 + 1;
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly name walk", 64, &ctl,
+					   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	while (queue != NIL && !found)
+	{
+		ProllyHash *at = linitial(queue);
+		char	   *at_name = lsecond(queue);
+		char	   *hex = hash_hex(at);
+		ProllyCommitInfo info;
+		bool		dup;
+
+		CHECK_FOR_INTERRUPTS();
+		queue = list_delete_first(list_delete_first(queue));
+		(void) hash_search(seen, hex, HASH_ENTER, &dup);
+		if (dup)
+			continue;
+		if (same_hash(at, to))
+		{
+			found = strcmp(at_name, to_name) == 0;
+			break;
+		}
+		if (!PROLLY_CALL(refs(), commit_get, at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", hex)));
+		for (int i = 0; i < info.nparents; i++)
+		{
+			char	   *before = lineage_name_before(hash_hex(&info.parents[i]),
+													 hex, at_name);
+
+			if (before)
+				queue = lappend(lappend(queue, copy_hash(&info.parents[i])),
+								before);
+		}
+	}
+	hash_destroy(seen);
+	return found;
+}
+
+/*
  * Is the version ref has (a commit, or the working set) of the table named
  * name l's table?
  */
@@ -6494,22 +6549,35 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 	if (!l->started)
 	{
 		char	   *before;
+		ProllyHash	at;
 
 		l->started = true;
 		lineage_enter(l, "WORKING", l->now);
 
 		/*
-		 * (the head's version is this table only if the branch's own record
-		 * of its head's tables, made by its commit, has this relation: a
+		 * (the head's version is this table only by the branch's own record
+		 * of its tables, made by its last commit, that has this relation: a
 		 * table made again with the name, or a head moved to a commit
 		 * holding another table of it, has the same name and identity, so
-		 * the step's changes can't tell)
+		 * the step's changes can't tell.  The head moved since without a
+		 * commit, its version is this table's if one of the head and the
+		 * record's commit is the other's ancestor with the table's name
+		 * never without a table between: a fast-forward, a reset to an
+		 * earlier version of it)
 		 */
-		if (OidIsValid(l->relid) && PROLLY_HAS(refs(), head_has_relation) &&
-			PROLLY_CALL(refs(), head_has_relation, l->relid) &&
+		if (OidIsValid(l->relid) && PROLLY_HAS(refs(), recorded_relation) &&
+			PROLLY_CALL(refs(), recorded_relation, l->relid, &at) &&
 			PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
 			(before = lineage_name_before(hash_hex(&h), "WORKING", l->now)) != NULL)
-			l->queue = lappend(lappend(l->queue, copy_hash(&h)), before);
+		{
+			char	   *at_name;
+
+			if (same_hash(&h, &at) ||
+				((at_name = lineage_name_before(hash_hex(&at), "WORKING", l->now)) != NULL &&
+				 (name_walk_reaches(&h, before, &at, at_name) ||
+				  name_walk_reaches(&at, at_name, &h, before))))
+				l->queue = lappend(lappend(l->queue, copy_hash(&h)), before);
+		}
 	}
 	while ((st = hash_search(l->steps, key, HASH_FIND, NULL)) == NULL &&
 		   l->queue != NIL)

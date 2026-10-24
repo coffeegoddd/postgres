@@ -191,6 +191,26 @@ SELECT diff_type, to_row FROM dolt_diff('HEAD', 'dn_side', NULL::dn.secret);
 SELECT * FROM dolt_at('dn_other', NULL::dn.secret);
 SELECT * FROM dolt_diff('HEAD', 'dn_other', 'dn.secret');
 RESET ROLE;
+-- the head moved without a commit of the branch's (its record of its
+-- tables is of the commit before): a fast-forward to a later version of
+-- the table, and a soft reset to an earlier one, keep the reader reading
+-- the table's own history
+SELECT (dolt_merge('dn_side'))[2] AS fast_forward;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
+SELECT * FROM dolt_at('HEAD~', NULL::dn.secret) ORDER BY id;
+RESET ROLE;
+INSERT INTO dn.secret VALUES (5, 'five');
+SELECT length(dolt_commit('-am', 'row 5')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS five_head \gset
+SELECT dolt_reset('--soft', 'HEAD~') IS NOT NULL AS moved;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
+RESET ROLE;
+SELECT dolt_reset('--soft', :'five_head') IS NOT NULL AS back;
+-- (a head moved to the dropped table's commit and then committed records
+-- the re-made table at a commit whose parent holds the dropped one, which
+-- the names and identities alone can't tell from one table: #891, #895)
 SELECT dolt_branch('-D', 'dn_side') IS NOT NULL AS deleted;
 SELECT dolt_branch('-D', 'dn_other') IS NOT NULL AS deleted;
 

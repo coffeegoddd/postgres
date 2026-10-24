@@ -645,10 +645,16 @@ OF` are built in D18's shapes.
   version of another table of its name (one dropped, and a table made
   again with its name in a later commit) is read only by the database's
   owner or a member of `pg_read_all_data`. The step from the working set
-  to the head vouches for the head's version only if the branch's record
-  of its head's tables, made by the head's commit, has the table's
-  relation: after the head is moved without a commit (a soft reset, say),
-  only the working set is the table's until the next commit. Planner
+  to the head vouches for the head's version only through the branch's
+  record of its tables, made by its last commit, that has the table's
+  relation: at that commit, or at a head moved since (a fast-forward, a
+  reset) to a descendant or an ancestor of it with the name never
+  without a table between. Known gaps, as commits name tables by name and
+  identity alone: a table dropped and made again within one commit or in
+  the working set (#891); a head moved to the dropped table's commit and
+  then committed (#895: such moves need no privilege), an owner's squash,
+  or a merge of a branch that still has the old table, which record the
+  re-made table above a commit holding the dropped one. Planner
   estimates of a version's rows and `dolt_diff_stat`'s counts are history
   too: a version the user may not read gives the default estimate, and
   its table is left out of `dolt_diff_stat` (refused when named). Any
