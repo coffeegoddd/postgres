@@ -7087,9 +7087,29 @@ journal_roots(ProllyChunkStore *s, ProllyHash *before,
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
-	scan_journal(s);
-	*before = s->base;
-	jindex_lock(s->ix, false);
+	/*
+	 * The base as of the manifest the shared index's segments are: a
+	 * collection between this backend's read of its manifest and the lock
+	 * would pair the segments it left with the base before it.  (Each swap
+	 * names a new segment, so the same segments are the same base.)
+	 */
+	for (int tries = 0;; tries++)
+	{
+		bool		same;
+
+		scan_journal(s);
+		jindex_lock(s->ix, false);
+		same = jindex_scan(s->ix)->nsegments == list_length(s->segments);
+		for (int i = 0; same && i < list_length(s->segments); i++)
+			same = jindex_segment(s->ix, i)->id ==
+				((Segment *) list_nth(s->segments, i))->id;
+		if (same || tries == 3)
+		{
+			*before = same ? s->base : (ProllyHash) {0};
+			break;
+		}
+		jindex_unlock(s->ix);
+	}
 	for (int si = 0; si < jindex_scan(s->ix)->nsegments; si++)
 	{
 		JournalSegScan *sg = jindex_segment(s->ix, si);
@@ -7189,6 +7209,7 @@ struct ProllyChunkGc
 	bool		settle;			/* the files written are settled */
 	Manifest	m;				/* as the seal left it */
 	uint64		segment;		/* where appends go from the seal */
+	ProllyHash	sealed_root;	/* the root the sealed segments end at */
 	int			nfiles;
 	GcFile	   *files;
 	uint64		nslots;
@@ -7722,6 +7743,60 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 	return gc;
 }
 
+/*
+ * The root the sealed segments' moves end at: the last ROOT record they
+ * hold, the newest segment's first, or else the root the seal saw (the
+ * manifest's).  Asked once every move in flight at the seal has ended, its
+ * ROOT (or its PAD, aborted) written in a sealed segment: one in flight is
+ * newer than the root the seal saw.
+ */
+static void
+sealed_root(ProllyChunkGc *gc, ProllyHash *root)
+{
+	char	   *rec = NULL;
+	Size		reclen = 0;
+
+	*root = gc->m.root;
+	for (int i = gc->m.nsegments - 2; i >= 0; i--)
+	{
+		Segment		g = {0};
+		uint64		offset = JOURNAL_HEADER_SIZE;
+		uint64		size;
+		uint32		len;
+		bool		found = false;
+
+		g.id = gc->m.segments[i];
+		g.path = segment_path(gc->s->dboid, gc->s->spcoid, g.id);
+		g.file = -1;
+		if (!open_segment(&g))
+		{
+			pfree(g.path);
+			continue;
+		}
+		size = FileSize(g.file);
+		while ((len = gc_record(&g, offset, size, &rec, &reclen)) > 0)
+		{
+			ProllyHash	h;
+			Size		after;
+
+			CHECK_FOR_INTERRUPTS();
+			if ((uint8) rec[sizeof(uint32)] == KIND_ROOT &&
+				record_hash(rec, len, &h, &after))
+			{
+				*root = h;
+				found = true;
+			}
+			offset += len;
+		}
+		FileClose(g.file);
+		pfree(g.path);
+		if (found)
+			break;
+	}
+	if (rec)
+		pfree(rec);
+}
+
 static void
 journal_gc_files(ProllyChunkGc *gc, ProllyChunkGcFileVisit visit, void *arg)
 {
@@ -7967,6 +8042,14 @@ journal_gc_new(ProllyChunkGc *gc, bool window, ProllyChunkGcVisit visit,
 		if (prepared != NIL)
 			gc_prepared(gc, prepared, visit, arg);
 		list_free(prepared);
+
+		/*
+		 * The root a reflog's moves begin at after the swap, kept whole: a
+		 * root as of the seal, or one a move in flight then moved to.
+		 */
+		sealed_root(gc, &gc->sealed_root);
+		if (gc->sealed_root.len > 0)
+			visit(&gc->sealed_root, NULL, 0, arg);
 	}
 	if (window && !gc->window)
 	{
@@ -8431,13 +8514,11 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 
 	/*
 	 * What a reflog reads from: the moves the segments kept record, after
-	 * the root as of the seal, which the collection kept whole.  (A move
-	 * in flight at the seal, its ROOT in a sealed segment, comes after it
-	 * and is forgotten: its changes are listed with the next move.)  Not
-	 * known with sealed segments kept: their moves are older than it.
+	 * the root the sealed ones end at, which the collection kept whole.
+	 * Not known with sealed segments kept: their moves are older than it.
 	 */
 	if (gc->nretained == 0)
-		nm.base = gc->m.root;
+		nm.base = gc->sealed_root;
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
 	jindex_append_unlock(s->ix);
 	gc->window = false;
