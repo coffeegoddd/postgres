@@ -73,6 +73,7 @@ typedef FormData_pg_partitioned_table *Form_pg_partitioned_table;
 DECLARE_TOAST(pg_partitioned_table, 4165, 4166);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index, 3351, PartitionedRelidIndexId, pg_partitioned_table, btree(partrelid oid_ops, partbranch oid_ops));
+DECLARE_INDEX(pg_partitioned_table_branch_index, 9179, PartitionedBranchIndexId, pg_partitioned_table, btree(partbranch oid_ops));
 
 MAKE_SYSCACHE(PARTRELID, pg_partitioned_table_partrelid_index, 32);
 

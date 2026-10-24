@@ -1,0 +1,65 @@
+{
+		Name: "dolt_rebase: negative rebase order",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(100));",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('branch1');",
+
+			"insert into t values (0, 'zero');",
+			"call dolt_commit('-am', 'inserting row 0 on main');",
+
+			"call dolt_checkout('branch1');",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-am', 'inserting row 1 on branch1');",
+			"update t set c1='uno' where pk=1;",
+			"call dolt_commit('-am', 'updating row 1 on branch1');",
+			"update t set c1='ein' where pk=1;",
+			"call dolt_commit('-am', 'updating row 1, again, on branch1');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "call dolt_rebase('-i', 'main');",
+				Expected: []sql.Row{{0, "interactive rebase started on branch dolt_rebase_branch1; " +
+					"adjust the rebase plan in the dolt_rebase table, then " +
+					"continue rebasing by calling dolt_rebase('--continue')"}},
+			},
+			{
+				Query: "update dolt_rebase set rebase_order=rebase_order-12.34;",
+				Expected: []sql.Row{{gmstypes.OkResult{RowsAffected: uint64(3), Info: plan.UpdateInfo{
+					Matched: 3,
+					Updated: 3,
+				}}}},
+			},
+			{
+				Query: "select * from dolt_rebase order by rebase_order ASC;",
+				Expected: []sql.Row{
+					{"-11.34", "pick", doltCommit, "inserting row 1 on branch1"},
+					{"-10.34", "pick", doltCommit, "updating row 1 on branch1"},
+					{"-9.34", "pick", doltCommit, "updating row 1, again, on branch1"},
+				},
+			},
+			{
+				Query:    "call dolt_rebase('--continue');",
+				Expected: []sql.Row{{0, "Successfully rebased and updated refs/heads/branch1"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{0, "zero"}, {1, "ein"}},
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"branch1"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"updating row 1, again, on branch1"},
+					{"updating row 1 on branch1"},
+					{"inserting row 1 on branch1"},
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+		},
+	}

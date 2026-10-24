@@ -47,6 +47,7 @@ var callCapability = map[string]string{
 	"dolt_merge":                  "vc.merge",
 	"dolt_conflicts":              "vc.conflicts",
 	"dolt_conflicts_resolve":      "vc.conflicts",
+	"dolt_schema_conflicts":       "vc.conflicts",
 	"dolt.allow_commit_conflicts": "vc.conflicts",
 	"dolt_constraint_violations":  "vc.violations",
 	"dolt_verify_constraints":     "vc.violations",

@@ -48,7 +48,11 @@
  *   with its value: its last value, and whether it was given out.
  * - merge_schema() merges three folded roots' definitions: each object as
  *   the side that changed it has it; one both changed differently is a
- *   schema conflict, an error.
+ *   schema conflict, an error.  With kept, a table in such a conflict (both
+ *   changed it differently, or one dropped it and the other changed it) is
+ *   kept as ours has it instead (gone, if ours dropped it), and its name
+ *   (qualified, as the merge's other names are) appended to *kept (char *):
+ *   its rows are ours' too, for the caller to leave as they are.
  * - move_schema() makes the session branch's objects defined as a folded
  *   root defines them, from as another (the branch folded now) does: it
  *   changes the definitions, then calls rows(), which writes the tables'
@@ -265,7 +269,7 @@ typedef struct ProllyCanonRoutine
 	void		(*merge_schema) (const ProllyNodeRef *base,
 								 const ProllyNodeRef *ours,
 								 const ProllyNodeRef *theirs,
-								 ProllyNodeRef *merged);
+								 ProllyNodeRef *merged, List **kept);
 	void		(*walk_baseline) (const ProllyNodeRef *baseline,
 								  ProllyTreeVisitNode visit, void *arg);
 

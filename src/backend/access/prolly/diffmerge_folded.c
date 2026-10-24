@@ -2185,7 +2185,8 @@ typedef struct Recorded
 	Tuplesortstate *forgotten;	/* handles, as int8 */
 	int			nforgotten;
 	bool		attempting;
-	bool		last_unique;	/* the one recorded last breaks a unique index */
+	bool		last_unique;	/* the one recorded last breaks a unique index
+								 * or exclusion constraint */
 	StringInfoData buf;			/* (reading the attempt's back) */
 } Recorded;
 
@@ -2512,7 +2513,8 @@ violation_record(Oid relid, const char *type, const char *row,
 {
 	AttemptViolation av;
 
-	recorded->last_unique = strcmp(type, "unique index") == 0;
+	recorded->last_unique = strcmp(type, "unique index") == 0 ||
+		strcmp(type, "exclusion constraint") == 0;
 	if (!recorded->attempting)
 	{
 		violation_keep(relid, type, row, info);
@@ -3500,7 +3502,8 @@ check_expr(Oid con)
 
 /*
  * What a row a merge couldn't write breaks (ed, the error writing it
- * raised), as Dolt describes it: a unique index by its name and columns, a
+ * raised), as Dolt describes it: a unique index (or an exclusion
+ * constraint, which Dolt hasn't) by its name and columns, a
  * check constraint by its name and expression (a domain's, of the domain
  * ed names), a not-null constraint by its column (a domain's, by the
  * column of the domain's value).
@@ -3575,8 +3578,9 @@ refusal_type(int sqlerrcode)
 	switch (sqlerrcode)
 	{
 		case ERRCODE_UNIQUE_VIOLATION:
-		case ERRCODE_EXCLUSION_VIOLATION:
 			return "unique index";
+		case ERRCODE_EXCLUSION_VIOLATION:
+			return "exclusion constraint";
 		case ERRCODE_CHECK_VIOLATION:
 			return "check constraint";
 		case ERRCODE_NOT_NULL_VIOLATION:
@@ -4489,7 +4493,8 @@ typedef struct KeyWrite
 	/* (in a pass:) */
 	bool		refused;		/* row refused, old in its place */
 	int			violation;		/* its handle, as recorded (-1: none) */
-	bool		unique;			/* it breaks a unique index */
+	bool		unique;			/* it breaks a unique index or exclusion
+								 * constraint */
 } KeyWrite;
 
 /*
@@ -8608,7 +8613,34 @@ typedef struct MergeRows
 	const ProllyNodeRef *roots; /* base, ours, theirs */
 	const ProllyNodeRef *now_root;	/* the branch, if known (as now) */
 	const MergeCommits *commits;	/* the roots' commits */
+	List	   *schema_conflicts;	/* tables kept as ours has them (names) */
 } MergeRows;
+
+/*
+ * Whether a merge keeps a table in a schema conflict as the branch has it,
+ * recording the conflict, rather than failing (dolt_merge(), not a pick or
+ * revert, as in Dolt); and the tables it kept so (names, qualified).
+ */
+static bool keep_schema_conflicts = false;
+static List *schema_conflicted = NIL;
+
+/*
+ * The tables a merge's alignment renamed on some side (each rename's table
+ * and, for a table's, what it is renamed to): a schema conflict in one
+ * isn't kept, as the branch's table would no longer be as it has it.
+ */
+static List *merge_renamed_tables = NIL;
+
+static bool
+schema_conflicted_table(const MergeRows *mr, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, mr->schema_conflicts)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
 
 
 /* What failed, for an error: a merge of branch name, or what (a pick). */
@@ -8909,6 +8941,9 @@ merge_rows(void *arg)
 		const Table *want;
 		Oid			relid;
 
+		/* (a schema conflict: the branch's rows, as its definition, stay) */
+		if (schema_conflicted_table(mr, name))
+			continue;
 		if (w == NULL)
 		{
 			/* the merged definitions drop it: unless its rows changed */
@@ -9162,6 +9197,19 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 				PG_RE_THROW();
 		}
 		FlushErrorState();
+
+		/*
+		 * (with a table kept as the branch has it, the other side's objects
+		 * may use its version: say so, the conflict not being kept)
+		 */
+		if (mr->schema_conflicts != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: %s was changed differently on both sides, and the other side's objects use its version of it",
+							(char *) linitial(mr->schema_conflicts)),
+					 errdetail("Kept as the branch has it, the table doesn't fit the other side's objects: %s",
+							   ed->message),
+					 errhint("Make the definitions agree on one side, and merge again.")));
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("schema conflict: the merged definitions don't fit together"),
@@ -9213,6 +9261,19 @@ align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
 	PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, renames, identity);
 	if (renames[0] == NIL && renames[1] == NIL && renames[2] == NIL)
 		return false;
+	for (int i = 0; i < 3; i++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, renames[i])
+		{
+			ProllyRename *r = lfirst(lc);
+
+			merge_renamed_tables = lappend(merge_renamed_tables, r->table);
+			if (r->column == NULL)
+				merge_renamed_tables = lappend(merge_renamed_tables, r->to);
+		}
+	}
 	for (int i = 0; i < 3; i += 2)
 		if (renames[i] != NIL)
 			PROLLY_CALL(dc.canonicalizer, rename_root, &roots[i], renames[i],
@@ -9249,6 +9310,7 @@ merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
 	int			conflicts;
 
 	initStringInfo(&identity);
+	merge_renamed_tables = NIL;
 	renamed = align_merge(roots, commits, aligned, &identity);
 	conflicts = merge_aligned(aligned, commits, fail_on_conflict, what, name,
 							  conflicted);
@@ -9271,6 +9333,7 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 	List	   *ours_tables;
 	List	   *theirs_tables;
 
+	schema_conflicted = NIL;
 	base_tables = tables_in_root(&roots[0], &commits->ids[0], true);
 	ours_tables = tables_in_root(&roots[1], &commits->ids[1], commits->ours_exact);
 	theirs_tables = tables_in_root(&roots[2], &commits->ids[2], true);
@@ -9281,11 +9344,30 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 	{
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
 		fail_on_conflict, what, name, conflicted, 0, NIL, roots, NULL,
-		commits};
+		commits, NIL};
 		ProllyNodeRef merged;
 
 		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
-					&roots[2], &merged);
+					&roots[2], &merged,
+					keep_schema_conflicts && !fail_on_conflict ?
+					&mr.schema_conflicts : NULL);
+		schema_conflicted = mr.schema_conflicts;
+
+		/*
+		 * (a table renamed on a side: kept, it would take the merged name,
+		 * and its versions be found under other names; refused instead)
+		 */
+		foreach_ptr(char, kept, mr.schema_conflicts)
+		{
+			foreach_ptr(char, renamed, merge_renamed_tables)
+				if (strcmp(kept, renamed) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+									kept),
+							 errdetail("A schema conflict is kept only for a table neither side renamed."),
+							 errhint("Make the definitions agree on one side, or rename the table on the other side too, and merge again.")));
+		}
 		move_schema_merging(&roots[1], &merged, &mr);
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		return mr.conflicts;
@@ -9295,7 +9377,7 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 		/* (the branch has ours' rows, every table defined alike) */
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
 		fail_on_conflict, what, name, conflicted, 0, ours_tables, roots,
-		&roots[1], commits};
+		&roots[1], commits, NIL};
 
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		merge_rows(&mr);
@@ -11398,6 +11480,11 @@ fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
 	int			i = 0;
 
 	memset(ms, 0, sizeof(*ms));
+	ms->nschema = list_length(schema_conflicted);
+	ms->schema_tables = palloc(sizeof(char *) * Max(ms->nschema, 1));
+	foreach(lc, schema_conflicted)
+		ms->schema_tables[i++] = lfirst(lc);
+	i = 0;
 	ms->theirs = *theirs;
 	ms->base = *base;
 	ms->ntables = list_length(conflicted);
@@ -11516,9 +11603,21 @@ merge_held(const char *branch, const char *message, int flags,
 	commits.ids[1] = ours;
 	commits.ids[2] = theirs;
 	commits.ours_exact = true;
-	conflicts = merge_recording(roots, &commits,
-								(flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
-								"merge", branch, &conflicted, &nviolations);
+	schema_conflicted = NIL;
+	keep_schema_conflicts = true;
+	PG_TRY();
+	{
+		conflicts = merge_recording(roots, &commits,
+									(flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
+									"merge", branch, &conflicted, &nviolations);
+	}
+	PG_FINALLY();
+	{
+		keep_schema_conflicts = false;
+	}
+	PG_END_TRY();
+	/* (each table in a schema conflict counts as a conflict) */
+	conflicts += list_length(schema_conflicted);
 
 	/*
 	 * Conflicts or constraint violations: a merge in progress, to resolve

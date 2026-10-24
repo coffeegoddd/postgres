@@ -10,6 +10,9 @@ CREATE DATABASE regress_shape_folds;
 -- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
 -- counted here is what the next fold reads after one)
 SET prolly.fold_on_rewrite = off;
+-- (every mappable baseline mapped, whatever reading the table would cost:
+-- the cost's choice is tested at the end)
+SET prolly.map_reshaped_dead_ratio = 0;
 CREATE EXTENSION test_prolly;
 CREATE FUNCTION full_folds() RETURNS text LANGUAGE sql AS $$
 	SELECT coalesce(string_agg(substr(name, 11), ',' ORDER BY name), 'none')
@@ -2000,6 +2003,144 @@ SELECT * FROM sf.rk2 ORDER BY a;
  1 | x
  2 | z
 (2 rows)
+
+-- mapped only where reading the table costs more: a heap of live rows is
+-- read in full, one holding more dead versions than
+-- prolly.map_reshaped_dead_ratio a live row is mapped
+RESET prolly.map_reshaped_dead_ratio;
+CREATE TABLE sf.cost (id int PRIMARY KEY, v int);
+INSERT INTO sf.cost SELECT g, 0 FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'cost')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ALTER TABLE sf.cost ADD COLUMN w int DEFAULT 7;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+ table_name |    reason     
+------------+---------------
+ sf.cost    | shape_changed
+(1 row)
+
+-- (mapped whatever it costs: pending none)
+SET prolly.map_reshaped_dead_ratio = 0;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+ table_name | reason 
+------------+--------
+(0 rows)
+
+RESET prolly.map_reshaped_dead_ratio;
+:check
+ same 
+------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+ committed 
+-----------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ read_in_full  | mapped 
+---------------+--------
+ shape_changed |      0
+(1 row)
+
+ verify_mismatches 
+-------------------
+                 0
+(1 row)
+
+UPDATE sf.cost SET v = v + 1;
+UPDATE sf.cost SET v = v + 1;
+SELECT length(dolt_commit('-am', 'dead versions')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT n_dead_tup >= 1.5 * n_live_tup AS mostly_dead
+  FROM pg_stat_user_tables WHERE relid = 'sf.cost'::regclass;
+ mostly_dead 
+-------------
+ t
+(1 row)
+
+ALTER TABLE sf.cost ADD COLUMN x int DEFAULT 8;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+ table_name | reason 
+------------+--------
+(0 rows)
+
+:check
+ same 
+------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+ committed 
+-----------
+ t
+(1 row)
+
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ read_in_full | mapped 
+--------------+--------
+ none         |      1
+(1 row)
+
+ verify_mismatches 
+-------------------
+                 0
+(1 row)
+
+SELECT count(*), sum(w), sum(x) FROM sf.cost;
+ count | sum  | sum  
+-------+------+------
+  1000 | 7000 | 8000
+(1 row)
 
 \c contrib_regression
 DROP DATABASE regress_shape_folds;

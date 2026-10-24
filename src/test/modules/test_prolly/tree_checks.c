@@ -23,7 +23,11 @@
 #include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "common/pg_prng.h"
+#include "funcapi.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
+#include "utils/builtins.h"
+#include "utils/tuplestore.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "test_prolly.h"
@@ -2245,6 +2249,288 @@ tree_held_references(const ProllyImplInfo *impl)
 				elog(ERROR, "diff_nodes() didn't reach value tree %d, which a changed value references",
 					 (k * 2 + i + 1) % 8);
 	pfree(vbuf.data);
+}
+
+/*
+ * value_splice(): a value tree edited in place gives the reference
+ * value_write() gives the edited bytes, whatever the edit (at the start,
+ * the end, on a chunk boundary, across many chunks, deleting past the end,
+ * emptying the value, growing a one-leaf value past one leaf, and edits
+ * one after another), and writes only the nodes around the edit: an edit
+ * of a few bytes in a value of megabytes writes O(depth) nodes, and reads
+ * its leaves and the nodes above the leaves, not the value.
+ */
+static void
+splice_matches(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
+			   StringInfo val, StringInfo ref, uint64 offset, uint64 del,
+			   const char *ins, Size ilen, ProllyNodeCounters *counters)
+{
+	StringInfoData edited;
+	StringInfoData want;
+	StringInfoData got;
+	ProllyValue r = {(const uint8 *) ref->data, ref->len};
+	uint64		cut = Min(del, val->len - Min(offset, (uint64) val->len));
+
+	initStringInfo(&edited);
+	appendBinaryStringInfo(&edited, val->data, offset);
+	appendBinaryStringInfo(&edited, ins, ilen);
+	appendBinaryStringInfo(&edited, val->data + offset + cut,
+						   val->len - offset - cut);
+	initStringInfo(&want);
+	PROLLY_CALL(tr, value_write, env, (const uint8 *) edited.data, edited.len,
+				&want);
+	initStringInfo(&got);
+	if (counters)
+	{
+		memset(counters, 0, sizeof(*counters));
+		env->counters = counters;
+	}
+	PROLLY_CALL(tr, value_splice, env, &r, offset, del, (const uint8 *) ins,
+				ilen, &got);
+	env->counters = NULL;
+	if (got.len != want.len || memcmp(got.data, want.data, want.len) != 0)
+		elog(ERROR, "splicing %zu bytes for %llu at %llu of a %d-byte value gave another tree than writing the result",
+			 ilen, (unsigned long long) del, (unsigned long long) offset, val->len);
+	/* the edit is the value from here on */
+	resetStringInfo(val);
+	appendBinaryStringInfo(val, edited.data, edited.len);
+	resetStringInfo(ref);
+	appendBinaryStringInfo(ref, got.data, got.len);
+	pfree(edited.data);
+	pfree(want.data);
+	pfree(got.data);
+}
+
+void
+tree_value_splices(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	ProllyNodeCounters counters = {0};
+	StringInfoData val;
+	StringInfoData ref;
+	StringInfoData ins;
+	uint64		x = 7;
+	uint64		total;
+	ProllyHash	root;
+
+	make_env(&env);
+	initStringInfo(&val);
+	initStringInfo(&ins);
+	for (int shape = 0; shape < 2; shape++)
+	{
+		/* random bytes, and text: a few words over and over */
+		resetStringInfo(&val);
+		while (val.len < 3000000)
+		{
+			x = x * 6364136223846793005u + 1442695040888963407u;
+			if (shape == 0)
+				appendStringInfoChar(&val, (char) (x >> 56));
+			else
+				appendStringInfoString(&val, (x >> 60) < 8 ? "lorem " : "ipsum dolor ");
+		}
+		initStringInfo(&ref);
+		PROLLY_CALL(tr, value_write, &env, (const uint8 *) val.data, val.len, &ref);
+
+		/* a byte in the middle, in and out, then edits of every kind */
+		splice_matches(tr, &env, &val, &ref, val.len / 2, 0, "x", 1, &counters);
+		if (counters.nodes_written > 8 || counters.nodes_read > 12)
+			elog(ERROR, "inserting a byte in a %d-byte value wrote %llu nodes and read %llu",
+				 val.len, (unsigned long long) counters.nodes_written,
+				 (unsigned long long) counters.nodes_read);
+		splice_matches(tr, &env, &val, &ref, val.len / 2, 1, NULL, 0, &counters);
+		if (counters.nodes_written > 8)
+			elog(ERROR, "deleting a byte of a %d-byte value wrote %llu nodes",
+				 val.len, (unsigned long long) counters.nodes_written);
+		for (int i = 0; i < 40; i++)
+		{
+			uint64		offset;
+			uint64		del;
+			Size		ilen;
+
+			x = x * 6364136223846793005u + 1442695040888963407u;
+			switch (i % 8)
+			{
+				case 0:
+					offset = 0;
+					break;
+				case 1:
+					offset = val.len;
+					break;
+				case 2:
+					offset = val.len - 1;
+					break;
+				default:
+					offset = (x >> 16) % (val.len + 1);
+			}
+			del = (i % 5 == 0) ? (x >> 8) % 200000 : (x >> 40) % 9000;
+			ilen = (i % 3 == 0) ? 0 : (x >> 24) % 9000;
+			resetStringInfo(&ins);
+			for (Size j = 0; j < ilen; j++)
+				appendStringInfoChar(&ins, (char) (x >> (j % 56)) ^ (char) j);
+			splice_matches(tr, &env, &val, &ref, offset, del, ins.data, ilen, NULL);
+		}
+		/* past the end: deletes to it */
+		splice_matches(tr, &env, &val, &ref, val.len - 10, 1000, "end", 3, NULL);
+		pfree(ref.data);
+	}
+
+	/*
+	 * Heights changed by splices: a value of one level above its leaves
+	 * grown to two and more, shrunk back to one, then to a single leaf.
+	 */
+	resetStringInfo(&val);
+	while (val.len < 20000)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(&val, (char) (x >> 56));
+	}
+	initStringInfo(&ref);
+	PROLLY_CALL(tr, value_write, &env, (const uint8 *) val.data, val.len, &ref);
+	resetStringInfo(&ins);
+	while (ins.len < 4000000)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(&ins, (char) (x >> 56));
+	}
+	splice_matches(tr, &env, &val, &ref, 10000, 0, ins.data, ins.len, NULL);
+	splice_matches(tr, &env, &val, &ref, 5000, val.len - 20000, NULL, 0, NULL);
+	splice_matches(tr, &env, &val, &ref, 100, val.len - 1000, NULL, 0, NULL);
+	pfree(ref.data);
+
+	/* a small value grown past one leaf, emptied, grown again */
+	resetStringInfo(&val);
+	appendStringInfoString(&val, "small");
+	initStringInfo(&ref);
+	PROLLY_CALL(tr, value_write, &env, (const uint8 *) val.data, val.len, &ref);
+	resetStringInfo(&ins);
+	for (int j = 0; j < 20000; j++)
+		appendStringInfoChar(&ins, (char) (j * 31));
+	splice_matches(tr, &env, &val, &ref, 2, 0, ins.data, ins.len, NULL);
+	splice_matches(tr, &env, &val, &ref, 0, val.len, NULL, 0, NULL);
+	splice_matches(tr, &env, &val, &ref, 0, 0, ins.data, ins.len, NULL);
+	{
+		ProllyValue r = {(const uint8 *) ref.data, ref.len};
+
+		PROLLY_CALL(tr, value_root, &r, &root, &total);
+		if (total != (uint64) val.len)
+			elog(ERROR, "a spliced value's reference says %llu bytes, not %d",
+				 (unsigned long long) total, val.len);
+	}
+	pfree(val.data);
+	pfree(ref.data);
+	pfree(ins.data);
+}
+
+/*
+ * test_value_edit_cost(size, offset, del, ilen): what reading and editing
+ * a value tree of size pseudo-random bytes costs, each way: a slice of
+ * ilen bytes at offset read (value_read()), the value read whole, the
+ * edit (del bytes at offset replaced by ilen others) made by
+ * value_splice(), and made by rewriting (the value read whole, edited and
+ * written again by value_write()).  For each: the nodes read and written
+ * and the time taken.  The splice must give the rewrite's reference.
+ */
+PG_FUNCTION_INFO_V1(test_value_edit_cost);
+Datum
+test_value_edit_cost(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int64		size = PG_GETARG_INT64(0);
+	int64		offset = PG_GETARG_INT64(1);
+	int64		del = PG_GETARG_INT64(2);
+	int64		ilen = PG_GETARG_INT64(3);
+	const ProllyTreeRoutine *tr = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+	ProllyNodeCounters counters;
+	StringInfoData val;
+	StringInfoData ins;
+	StringInfoData ref;
+	StringInfoData out;
+	StringInfoData spliced;
+	StringInfoData rewritten;
+	ProllyValue r;
+	uint64		x = 11;
+	static const char *const methods[] = {"read slice", "read whole", "splice", "rewrite"};
+
+	if (size <= 0 || offset < 0 || offset > size || del < 0 || ilen < 0 ||
+		size > 512 * 1024 * 1024 || ilen > 64 * 1024 * 1024)
+		elog(ERROR, "test_value_edit_cost: bad arguments");
+	InitMaterializedSRF(fcinfo, 0);
+	make_env(&env);
+	initStringInfo(&val);
+	enlargeStringInfo(&val, (int) size);
+	while (val.len < size)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		val.data[val.len++] = (char) (x >> 56);
+	}
+	val.data[val.len] = '\0';
+	initStringInfo(&ins);
+	for (int64 i = 0; i < ilen; i++)
+		appendStringInfoChar(&ins, (char) (i * 131 + 7));
+	initStringInfo(&ref);
+	PROLLY_CALL(tr, value_write, &env, (const uint8 *) val.data, val.len, &ref);
+	pfree(val.data);
+	r.data = (const uint8 *) ref.data;
+	r.len = ref.len;
+	initStringInfo(&out);
+	initStringInfo(&spliced);
+	initStringInfo(&rewritten);
+
+	for (int m = 0; m < lengthof(methods); m++)
+	{
+		instr_time	start;
+		instr_time	took;
+		Datum		values[4];
+		bool		nulls[4] = {0};
+
+		memset(&counters, 0, sizeof(counters));
+		resetStringInfo(&out);
+		env.counters = &counters;
+		INSTR_TIME_SET_CURRENT(start);
+		switch (m)
+		{
+			case 0:
+				PROLLY_CALL(tr, value_read, &env, &r, offset, Max(ilen, 1), &out);
+				break;
+			case 1:
+				PROLLY_CALL(tr, value_read, &env, &r, 0, PG_UINT64_MAX, &out);
+				break;
+			case 2:
+				PROLLY_CALL(tr, value_splice, &env, &r, offset, del,
+							(const uint8 *) ins.data, ins.len, &spliced);
+				break;
+			case 3:
+				{
+					StringInfoData edited;
+					uint64		cut = Min((uint64) del, (uint64) (size - offset));
+
+					PROLLY_CALL(tr, value_read, &env, &r, 0, PG_UINT64_MAX, &out);
+					initStringInfo(&edited);
+					appendBinaryStringInfo(&edited, out.data, offset);
+					appendBinaryStringInfo(&edited, ins.data, ins.len);
+					appendBinaryStringInfo(&edited, out.data + offset + cut,
+										   out.len - offset - cut);
+					PROLLY_CALL(tr, value_write, &env, (const uint8 *) edited.data,
+								edited.len, &rewritten);
+					pfree(edited.data);
+				}
+				break;
+		}
+		INSTR_TIME_SET_CURRENT(took);
+		INSTR_TIME_SUBTRACT(took, start);
+		env.counters = NULL;
+		values[0] = CStringGetTextDatum(methods[m]);
+		values[1] = Int64GetDatum((int64) counters.nodes_read);
+		values[2] = Int64GetDatum((int64) counters.nodes_written);
+		values[3] = Float8GetDatum(INSTR_TIME_GET_MICROSEC(took));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	if (spliced.len != rewritten.len ||
+		memcmp(spliced.data, rewritten.data, spliced.len) != 0)
+		elog(ERROR, "test_value_edit_cost: the splice gave another tree than the rewrite");
+	return (Datum) 0;
 }
 
 /*

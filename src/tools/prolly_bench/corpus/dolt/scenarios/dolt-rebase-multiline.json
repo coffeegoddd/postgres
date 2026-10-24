@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-multiline",
+  "description": "Reviewed Dolt port: dolt_rebase: handles multi-line commit messages",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase: handles multi-line commit messages"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "empty commit 1",
+        "--allow-empty"
+      ],
+      "save": "e1"
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "empty \ncommit \n2",
+        "--allow-empty"
+      ],
+      "save": "e2"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "empty \ncommit \n2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', '--empty=keep', 'HEAD~1')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"interactive rebase started on branch dolt_rebase_main; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT * FROM dolt_rebase",
+      "expect": {
+        "rows": [
+          [
+            "1.00",
+            "pick",
+            {
+              "ref": "e2"
+            },
+            "empty \ncommit \n2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Successfully rebased and updated refs/heads/main\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "empty \ncommit \n2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

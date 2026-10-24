@@ -1,0 +1,628 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-conflict-reword",
+  "description": "Reviewed Dolt port: dolt_rebase: data conflicts with reword",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase: data conflicts with reword"
+  },
+  "requires": [
+    "sql",
+    "vc.conflicts",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, c1 varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (-1, 'negative')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (0, 'zero')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 0 on main",
+        "-a"
+      ],
+      "save": "m0"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET c1 = '-1' WHERE pk = -1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "updating row -1 on branch1",
+        "-a"
+      ],
+      "save": "b1"
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "DELETE FROM t WHERE c1 = '-1'",
+      "expect": {
+        "tag": "DELETE 1"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "deleting -1 on branch1",
+        "-a"
+      ],
+      "save": "b2"
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (999, 'nines')",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 999 on branch1",
+        "-a"
+      ],
+      "save": "b3"
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "sql": "BEGIN",
+      "expect": {
+        "tag": "BEGIN"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', 'main')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"interactive rebase started on branch dolt_rebase_branch1; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT * FROM dolt_rebase ORDER BY rebase_order ASC",
+      "expect": {
+        "rows": [
+          [
+            "1.00",
+            "pick",
+            {
+              "ref": "b1"
+            },
+            "updating row -1 on branch1"
+          ],
+          [
+            "2.00",
+            "pick",
+            {
+              "ref": "b2"
+            },
+            "deleting -1 on branch1"
+          ],
+          [
+            "3.00",
+            "pick",
+            {
+              "ref": "b3"
+            },
+            "inserting row 999 on branch1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "UPDATE dolt_rebase SET rebase_order = 3.5, action = 'reword', commit_message = 'reworded message!' WHERE rebase_order = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT * FROM dolt_rebase ORDER BY rebase_order ASC",
+      "expect": {
+        "rows": [
+          [
+            "2.00",
+            "pick",
+            {
+              "ref": "b2"
+            },
+            "deleting -1 on branch1"
+          ],
+          [
+            "3.00",
+            "pick",
+            {
+              "ref": "b3"
+            },
+            "inserting row 999 on branch1"
+          ],
+          [
+            "3.50",
+            "reword",
+            {
+              "ref": "b1"
+            },
+            "reworded message!"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT r[1], r[2] LIKE 'data conflict detected while rebasing commit % (deleting -1 on branch1). %' FROM dolt_rebase('--continue') r",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "dolt_rebase_branch1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT * FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (base_row).pk, (base_row).c1, (our_row).pk, (our_row).c1, our_diff_type, (their_row).pk, (their_row).c1, their_diff_type FROM dolt_conflicts(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "-1",
+            "-1",
+            "-1",
+            "negative",
+            "modified",
+            null,
+            null,
+            "removed"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "inserting row 0 on main"
+          ],
+          [
+            "creating table t"
+          ],
+          [
+            "Initialize data repository"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-9",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT dolt_conflicts_resolve('--theirs', 't')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-10",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "0",
+            "zero"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT r[1], r[2] LIKE 'data conflict detected while rebasing commit % (reworded message!). %' FROM dolt_rebase('--continue') r",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "0",
+            "zero"
+          ],
+          [
+            "999",
+            "nines"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-14",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "inserting row 999 on branch1"
+          ],
+          [
+            "deleting -1 on branch1"
+          ],
+          [
+            "inserting row 0 on main"
+          ],
+          [
+            "creating table t"
+          ],
+          [
+            "Initialize data repository"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-15",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT (base_row).pk, (base_row).c1, (our_row).pk, (our_row).c1, our_diff_type, (their_row).pk, (their_row).c1, their_diff_type FROM dolt_conflicts(NULL::t)",
+      "expect": {
+        "rows": [
+          [
+            "-1",
+            "negative",
+            null,
+            null,
+            "removed",
+            "-1",
+            "-1",
+            "modified"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-16",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT dolt_conflicts_resolve('--theirs', 't')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-17",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-18",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Successfully rebased and updated refs/heads/branch1\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-19",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t",
+      "expect": {
+        "rows": [
+          [
+            "-1",
+            "-1"
+          ],
+          [
+            "0",
+            "zero"
+          ],
+          [
+            "999",
+            "nines"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-20",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT active_branch()",
+      "expect": {
+        "rows": [
+          [
+            "branch1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-21",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log",
+      "expect": {
+        "rows": [
+          [
+            "reworded message!"
+          ],
+          [
+            "inserting row 999 on branch1"
+          ],
+          [
+            "deleting -1 on branch1"
+          ],
+          [
+            "inserting row 0 on main"
+          ],
+          [
+            "creating table t"
+          ],
+          [
+            "Initialize data repository"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

@@ -11,7 +11,8 @@
   "requires": [
     "sql",
     "vc.core",
-    "vc.merge"
+    "vc.merge",
+    "vc.conflicts"
   ],
   "sessions": [
     "a"
@@ -240,14 +241,41 @@
     {
       "id": "assert-1",
       "session": "a",
-      "op": "exec",
-      "sql": "SELECT dolt_merge('right')",
-      "expect": {
-        "sqlstate": "40001"
-      },
+      "op": "query",
       "requires": [
         "vc.merge"
-      ]
+      ],
+      "sql": "SELECT m[1], m[2], m[3], m[4] FROM (SELECT dolt_merge('right')) AS r(m)",
+      "expect": {
+        "rows": [
+          [
+            "",
+            "0",
+            "1",
+            "conflicts found"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT table_name, base_schema IN (our_schema, their_schema), (our_schema || their_schema) LIKE '%col1 character varying(100)%' FROM dolt_schema_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "t",
+            "t"
+          ]
+        ],
+        "order": "bag"
+      }
     }
   ]
 }
