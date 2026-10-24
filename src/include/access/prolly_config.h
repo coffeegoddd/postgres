@@ -119,6 +119,18 @@ extern bool prolly_may_move_head(const char *name);
 extern void prolly_check_head_move(const char *name);
 extern void prolly_check_branch_rename(const char *newname);
 
+/*
+ * After a move from before (the branch folded then) bringing versions from
+ * the commits provenance (nprovenance of them): the tables whose versions it changed that provenance
+ * wasn't made from the table's relation made again, relations of their own
+ * (and made, a commit the move made of them, if not NULL, recorded made
+ * from the new relations).
+ */
+extern void prolly_remake_foreign_versions(const ProllyNodeRef *before,
+										   const ProllyHash *provenance,
+										   int nprovenance,
+										   const ProllyHash *made);
+
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_change_logs_flush(void);
 extern void prolly_note_change(Relation rel, const ItemPointerData *oldtid,

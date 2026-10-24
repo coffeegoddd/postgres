@@ -1040,6 +1040,22 @@ prolly_check_branch_rename(const char *newname)
 }
 
 /*
+ * After a move from before (the branch folded then, had: one there was)
+ * bringing versions from the commits from (n of them), and having made
+ * commit made (NULL: none): the tables whose versions came from another
+ * relation's commits made again, relations of their own
+ * (prolly_remake_foreign_versions()).
+ */
+static void
+remake_moved(bool had, const ProllyNodeRef *before, const ProllyHash *from,
+			 int n, const ProllyHash *made)
+{
+	if (had && n > 0)
+		BRANCH_WRITES_HUSHED(prolly_remake_foreign_versions(before, from, n,
+															made));
+}
+
+/*
  * Hold the refs (to the transaction's end) before what reads the head and
  * then replaces commits from it, as an amend or a rebase does: a commit
  * another session made in between would be dropped from the branch, the
@@ -2404,6 +2420,8 @@ dolt_merge(PG_FUNCTION_ARGS)
 	int			flags = 0;
 	ProllyHash	before = {0};
 	ProllyHash	theirs = {0};
+	ProllyNodeRef folded;
+	bool		had_folded;
 	ProllyHash	id = {0};
 	bool		had_head;
 	bool		abort_merge = false;
@@ -2490,6 +2508,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
 	known = violations_kept();
 	date_given = dated;
+	had_folded = PROLLY_CALL(refs(), working_set, NULL, &folded);
 	PG_TRY();
 	{
 		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
@@ -2500,6 +2519,14 @@ dolt_merge(PG_FUNCTION_ARGS)
 		date_given = false;
 	}
 	PG_END_TRY();
+	{
+		ProllyHash	now;
+		bool		made = PROLLY_CALL(refs(), resolve, "HEAD", &now) &&
+			!(had_head && same_hash(&now, &before)) && !same_hash(&now, &theirs);
+
+		remake_moved(had_folded, &folded, &theirs, theirs.len > 0 ? 1 : 0,
+					 made ? &now : NULL);
+	}
 	must_commit(conflicts, "a merge");
 	if (conflicts > 0)
 	{
@@ -3281,7 +3308,15 @@ dolt_reset(PG_FUNCTION_ARGS)
 		object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
 		PROLLY_CALL(writers(), take, MyBranch);
 	note_integration();
-	BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
+	{
+		ProllyNodeRef folded;
+		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		ProllyHash	target;
+
+		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
+		if (PROLLY_CALL(refs(), resolve, "HEAD", &target))
+			remake_moved(had, &folded, &target, 1, NULL);
+	}
 	settled();
 	PG_RETURN_DATUM(text_array(1, result));
 }
@@ -3883,8 +3918,17 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	prolly_check_head_move(branch_ops()->current());
 	refuse_violations("cherry-pick");
 	note_integration();
-	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
-												 &ref, 1, allow_empty, &id));
+	{
+		ProllyNodeRef folded;
+		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		ProllyHash	picked;
+
+		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
+													 &ref, 1, allow_empty, &id));
+		if (PROLLY_CALL(refs(), resolve, ref, &picked))
+			remake_moved(had, &folded, &picked, 1,
+						 conflicts == 0 && id.len > 0 ? &id : NULL);
+	}
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
 	{
@@ -3919,8 +3963,27 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 
 	refuse_violations("revert");
 	note_integration();
-	BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
-											   series_head, &id));
+	{
+		ProllyNodeRef folded;
+		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		ProllyHash *from = palloc0(sizeof(ProllyHash) * Max(n, 1));
+		int			nfrom = 0;
+
+		/* (a revert brings back what each commit's parent had) */
+		for (int i = 0; i < n; i++)
+		{
+			ProllyHash	c;
+			ProllyCommitInfo info;
+
+			if (PROLLY_CALL(refs(), resolve, ids[i], &c) &&
+				PROLLY_CALL(refs(), commit_get, &c, &info) && info.nparents > 0)
+				from[nfrom++] = info.parents[0];
+		}
+		BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
+												   series_head, &id));
+		remake_moved(had, &folded, from, nfrom,
+					 stopped == 0 && id.len > 0 ? &id : NULL);
+	}
 	must_commit(stopped, "a revert");
 	if (stopped > 0)
 	{

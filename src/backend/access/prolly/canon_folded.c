@@ -7952,6 +7952,8 @@ partition_defaults(SchemaMove *sm, const char *name, const TableDef *from,
 	}
 }
 
+List	   *prolly_move_remade = NIL;
+
 /*
  * Whether move_table() makes a table again, its definition from as to has
  * it (both): a column added before a kept one, kept ones in another order,
@@ -8132,7 +8134,8 @@ move_table(SchemaMove *sm, const char *name, const TableDef *from,
 			from_names = lappend(from_names, first_field(lfirst(lc)));
 		foreach(lc, to->columns)
 			to_names = lappend(to_names, first_field(lfirst(lc)));
-		remake = table_remade(from, to);
+		remake = table_remade(from, to) ||
+			list_has_string(prolly_move_remade, name);
 	}
 	if (from != NULL && (from->partition_of == NULL) != (to->partition_of == NULL))
 		ereport(ERROR,
@@ -10599,7 +10602,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		if (f->kind != 't' ||
 			(t && strcmp(t->def, f->def) == 0 &&
 			 !list_has_string(tm.tables, f->name) &&
-			 !list_has_string(tm.detached, f->name)))
+			 !list_has_string(tm.detached, f->name) &&
+			 !list_has_string(prolly_move_remade, f->name)))
 			continue;
 		parse_table_def(f->def, &fd);
 		/* type_moves() detaches it first; move_table() restores to's link. */

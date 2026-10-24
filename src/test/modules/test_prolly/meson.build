@@ -226,6 +226,7 @@ tests += {
       'history_mounts',
       'head_move_privileges',
       'lineage_breaks',
+      'remade_versions',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],

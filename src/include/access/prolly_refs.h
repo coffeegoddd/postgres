@@ -764,6 +764,14 @@ typedef struct ProllyRefsRoutine
 	 * commits made from the table's relation.
 	 */
 	bool		(*commit_relations) (const ProllyHash *commit, char **lines);
+
+	/*
+	 * Optional: record commit as made from the relations lines lists (as
+	 * commit_relations() gives them): a move that made a commit and then
+	 * made one of its tables again, a relation of its own, says so.
+	 */
+	void		(*set_commit_relations) (const ProllyHash *commit,
+										 const char *lines);
 } ProllyRefsRoutine;
 
 /*
@@ -809,9 +817,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
 	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
-	"commit_relations"
+	"commit_relations", "set_commit_relations"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK commit_relations
+#define PROLLY_REFS_LAST_CALLBACK set_commit_relations
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

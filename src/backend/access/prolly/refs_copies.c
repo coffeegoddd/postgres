@@ -3204,10 +3204,14 @@ copies_hold_unseen(void)
 }
 
 /* A first use's move: to target, from copies of source's (NULL: none). */
+static void move_copies_remade(void *arg);
+
 typedef struct MoveCopies
 {
 	const ProllyCommitInfo *commit;
 	const KnownSource *source;
+	ProllyHash	head;			/* the commit moved to */
+	Oid			owner;			/* the branch's owner */
 } MoveCopies;
 
 /*
@@ -3753,7 +3757,9 @@ materialize(const char *name)
 		 * (moved to the head, unless the copies are there already: those of
 		 * a branch whose working set is, if it still is)
 		 */
-		branch_ops()->run_on(name, move_copies, &mc);
+		mc.head = head;
+		mc.owner = prolly_branch_owner(name);
+		branch_ops()->run_on(name, move_copies_remade, &mc);
 done:
 		;
 	}
@@ -3761,6 +3767,39 @@ done:
 	{
 		branch_writes_unhush(hush);
 		XactReadOnly = was_read_only;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * A first use's move (move_copies()), then its tables whose copies are of
+ * another relation than its head was made from made again, relations of
+ * their own (prolly_remake_foreign_versions()): the copies are of the
+ * nearest source's relations, whatever commit they are moved to.  Made as
+ * the branch's owner, whose branch it is, not as whoever first used it.
+ */
+static void
+move_copies_remade(void *arg)
+{
+	MoveCopies *mc = arg;
+	ProllyNodeRef before;
+	bool		had;
+	Oid			save_user;
+	int			save_sec;
+
+	had = copies_working_set(NULL, &before);
+	move_copies(arg);
+	if (!had)
+		return;
+	GetUserIdAndSecContext(&save_user, &save_sec);
+	SetUserIdAndSecContext(mc->owner, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+	PG_TRY();
+	{
+		prolly_remake_foreign_versions(&before, &mc->head, 1, NULL);
+	}
+	PG_FINALLY();
+	{
+		SetUserIdAndSecContext(save_user, save_sec);
 	}
 	PG_END_TRY();
 }
@@ -4474,6 +4513,13 @@ note_relations(const ProllyHash *commit, const char *lines)
 	refs_put(key.data, key.len, &v);
 	pfree(key.data);
 	pfree(v.data);
+}
+
+static void
+copies_set_commit_relations(const ProllyHash *commit, const char *lines)
+{
+	refs_init();
+	note_relations(commit, lines);
 }
 
 /* The relations commit was made from (palloc'd lines); false if unrecorded. */
@@ -8190,4 +8236,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_set_creator = copies_tag_set_creator,
 	.stash_maker = copies_stash_maker,
 	.commit_relations = copies_commit_relations,
+	.set_commit_relations = copies_set_commit_relations,
 };

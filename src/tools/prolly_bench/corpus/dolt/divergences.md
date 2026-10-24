@@ -671,14 +671,15 @@ OF` are built in D18's shapes.
   one commit (its record names the new relation, its parent's the old).
   A merge, pick or revert committed over uncommitted changes is recorded
   made only from what its first parent's record and the working set both
-  have. Known limits, as commits name tables by name and identity alone
+  have. A move (a hard reset, a merge or pull, a cherry-pick, a
+  revert) or a branch's first use that changes a table's version to one
+  whose commits weren't made from the table's relation (or have no record)
+  makes the table again, a relation of its own: the mover's (a first use's,
+  the branch owner's), with no grants, which must be given again
+  ([#936](https://github.com/coffeegoddd/postgres/issues/936)). In Dolt,
+  grants are on table names and survive any move. Known limits, as commits name tables by name and identity alone
   and a table made again keeps its name's identity (#891, decided: commit
-  identities don't change): a branch's first use may take its copies from another branch's relation,
-  whose commits it then makes; a move that brings the old table's rows (a
-  merge, a hard reset, a revert of the drop, a cherry-pick) writes them
-  into the new table, where they are its rows
-  ([#936](https://github.com/coffeegoddd/postgres/issues/936)); a table a
-  merge makes is a relation of its own, so its source branch's history
+  identities don't change): a table a merge makes is a relation of its own, so its source branch's history
   isn't its grantee's (this and the unrecorded commits fail closed); and
   a role given a dropped relation's OID again would read that relation's
   versions. Planner estimates of a version's rows and `dolt_diff_stat`'s

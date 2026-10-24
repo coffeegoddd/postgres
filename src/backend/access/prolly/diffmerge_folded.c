@@ -4660,6 +4660,133 @@ folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 }
 
 /*
+ * After a move from before (the branch folded then) that brought versions
+ * from commit provenance (the commit moved to, a merge's other side, the
+ * commit a pick takes or a revert goes back to): each table whose version
+ * the move changed and that provenance wasn't made from the table's
+ * relation (its record doesn't list it; or it has none, a commit made
+ * elsewhere) is made again, a relation of its own (a new OID, the session
+ * role's, no grants), its rows as the move left them.  The relation's
+ * grants, which covered the rows its own history holds, don't cover those
+ * another relation's version brought.
+ */
+void
+prolly_remake_foreign_versions(const ProllyNodeRef *before,
+							   const ProllyHash *provenance, int nprovenance,
+							   const ProllyHash *made)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef after;
+	Tables		b = {NIL};
+	Tables		a = {NIL};
+	char	   *lines = NULL;
+	List	   *remade = NIL;
+	List	   *old_relids = NIL;
+	ListCell   *lc;
+
+	if (!PROLLY_CALL(dc.refs, working_set, NULL, &after) ||
+		same_hash(&before->hash, &after.hash))
+		return;
+	read_tables(before, &b);
+	read_tables(&after, &a);
+	foreach(lc, a.tables)
+	{
+		Table	   *t = lfirst(lc);
+		Table	   *f = NULL;
+		Oid			relid;
+		ListCell   *bc;
+
+		foreach(bc, b.tables)
+			if (strcmp(((Table *) lfirst(bc))->name, t->name) == 0)
+				f = lfirst(bc);
+		/* (a table the move made is a relation of its own already) */
+		if (f == NULL ||
+			(same_hash(&f->data.hash, &t->data.hash) && f->textlen == t->textlen &&
+			 memcmp(f->text, t->text, t->textlen) == 0))
+			continue;
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(t->name, NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+			continue;
+		{
+			char	   *line = psprintf("%010u %s\n", relid, t->name);
+			char	   *nl_line = psprintf("\n%s", line);
+			bool		every = true;
+
+			/* (each commit the versions came from made from this relation) */
+			for (int i = 0; i < nprovenance && every; i++)
+				every = PROLLY_HAS(dc.refs, commit_relations) &&
+					PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &lines) &&
+					(strncmp(lines, line, strlen(line)) == 0 ||
+					 strstr(lines, nl_line) != NULL);
+			if (every)
+				continue;
+		}
+		remade = lappend(remade, pstrdup(t->name));
+		old_relids = lappend_oid(old_relids, relid);
+	}
+	if (remade == NIL)
+		return;
+	prolly_move_remade = remade;
+	PG_TRY();
+	{
+		PROLLY_CALL(dc.canonicalizer, move_schema, &after, &after, move_rows,
+					NULL, (void *) &after, true);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_remade = NIL;
+	}
+	PG_END_TRY();
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_WRITTEN, list_length(remade));
+
+	/*
+	 * (a commit the move made of them is made from the new relations: its
+	 * record says so, each remade table's line of its old relation now of
+	 * its new)
+	 */
+	if (made != NULL && PROLLY_HAS(dc.refs, commit_relations) &&
+		PROLLY_HAS(dc.refs, set_commit_relations) &&
+		PROLLY_CALL(dc.refs, commit_relations, made, &lines))
+	{
+		StringInfoData out;
+		ListCell   *nc;
+		ListCell   *oc;
+
+		initStringInfo(&out);
+		for (char *p = lines; *p;)
+		{
+			char	   *end = strchrnul(p, '\n');
+			bool		replaced = false;
+
+			forboth(nc, remade, oc, old_relids)
+			{
+				char		want[16];
+
+				snprintf(want, sizeof(want), "%010u ", lfirst_oid(oc));
+				if (strncmp(p, want, 11) == 0)
+				{
+					Oid			now = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(lfirst(nc), NULL)),
+													   NoLock, true);
+
+					if (OidIsValid(now))
+						appendStringInfo(&out, "%010u %s\n", now, (char *) lfirst(nc));
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced && end > p)
+			{
+				appendBinaryStringInfo(&out, p, end - p);
+				appendStringInfoChar(&out, '\n');
+			}
+			p = *end ? end + 1 : end;
+		}
+		PROLLY_CALL(dc.refs, set_commit_relations, made, out.data);
+	}
+}
+
+/*
  * Each sequence theirs changed since base gets the larger of its value and
  * ours.
  */

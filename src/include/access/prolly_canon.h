@@ -555,6 +555,14 @@ typedef struct ProllyCanonRoutine
 #define PROLLY_CANON_LAST_CALLBACK table_names
 
 /*
+ * While set, the tables (qualified names) move_schema() makes again, as
+ * new relations, though the move changes neither their definitions nor
+ * their rows: a version of another relation's, which a move brought into
+ * the table's (see prolly_remake_tables()).
+ */
+extern PGDLLIMPORT List *prolly_move_remade;
+
+/*
  * The tree environment of folded canonical trees: the chunk store's,
  * ordered by bytes.
  */
