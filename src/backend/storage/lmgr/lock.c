@@ -717,8 +717,40 @@ GetLockMethodLocalHash(void)
 #endif
 
 /*
+ * Does another backend wait for a lock conflicting with the one this
+ * backend holds as 'locallock'?  A fast-path lock this backend holds has
+ * no shared lock object of its own: a strong locker transfers it to the
+ * shared table before it waits, so there can be waiters only if the lock
+ * object is found there, their modes in its waitMask.
+ */
+static bool
+locallock_has_waiters(LOCALLOCK *locallock)
+{
+	LockMethod	lockMethodTable = LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)];
+	LWLock	   *partitionLock = LockHashPartitionLock(locallock->hashcode);
+	LOCK	   *lock;
+	bool		hasWaiters = false;
+
+	LWLockAcquire(partitionLock, LW_SHARED);
+	lock = locallock->lock;
+	if (lock == NULL)
+		lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+													&locallock->tag.lock,
+													locallock->hashcode,
+													HASH_FIND, NULL);
+	if (lock != NULL &&
+		(lockMethodTable->conflictTab[locallock->tag.mode] &
+		 lock->waitMask) != 0)
+		hasWaiters = true;
+	LWLockRelease(partitionLock);
+	return hasWaiters;
+}
+
+/*
  * LockHasWaiters -- look up 'locktag' and check if releasing this
  *		lock would wake up other processes waiting for it.
+ *
+ * The lock may have been taken by the fast path (locallock_has_waiters()).
  */
 bool
 LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
@@ -766,31 +798,16 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		return false;
 	}
 
+	/* (taken by the fast path: no proclock of ours to check against) */
+	if (locallock->lock == NULL)
+		return locallock_has_waiters(locallock);
+
 	/*
 	 * Check the shared lock table.
 	 */
 	partitionLock = LockHashPartitionLock(locallock->hashcode);
 
 	LWLockAcquire(partitionLock, LW_SHARED);
-
-	/*
-	 * A lock taken by the fast path has no shared lock object of ours.  A
-	 * request that conflicts with it moves it into the shared table before
-	 * waiting, so there can be waiters only if the lock object exists, and
-	 * their modes are its waitMask.
-	 */
-	if (locallock->lock == NULL)
-	{
-		lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
-													locktag,
-													locallock->hashcode,
-													HASH_FIND, NULL);
-		if (lock != NULL &&
-			(lockMethodTable->conflictTab[lockmode] & lock->waitMask) != 0)
-			hasWaiters = true;
-		LWLockRelease(partitionLock);
-		return hasWaiters;
-	}
 
 	/*
 	 * We don't need to re-find the lock or proclock, since we kept their
@@ -852,26 +869,8 @@ AnyLockHasWaiters(void)
 	while (!hasWaiters &&
 		   (locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
 	{
-		LockMethod	lockMethodTable;
-		LWLock	   *partitionLock;
-		LOCK	   *lock;
-
-		if (locallock->nLocks <= 0)
-			continue;
-		lockMethodTable = LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)];
-		partitionLock = LockHashPartitionLock(locallock->hashcode);
-		LWLockAcquire(partitionLock, LW_SHARED);
-		lock = locallock->lock;
-		if (lock == NULL)
-			lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
-														&locallock->tag.lock,
-														locallock->hashcode,
-														HASH_FIND, NULL);
-		if (lock != NULL &&
-			(lockMethodTable->conflictTab[locallock->tag.mode] &
-			 lock->waitMask) != 0)
-			hasWaiters = true;
-		LWLockRelease(partitionLock);
+		if (locallock->nLocks > 0)
+			hasWaiters = locallock_has_waiters(locallock);
 	}
 	if (hasWaiters)
 		hash_seq_term(&status);

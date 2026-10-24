@@ -9099,8 +9099,10 @@ cmp_move_desc(const void *a, const void *b)
 /*
  * Move one relation's blocks from 'target' on, the highest first; the old
  * blocks go back to the allocator.  With 'held' (the relation held against
- * its drop), the moves stop once another waits for that hold: a DDL, or a
- * move of the branch trying its locks, waits for no more than a move.
+ * its drop), the moves stop once another waits for that hold, so a DDL
+ * waits for no more than a move.  Those that only try their locks (a move
+ * of the branch restoring its tables, a branch's deletion) aren't waiting,
+ * and still find the relation held until its moves end.
  */
 static uint64
 compact_relation(SMgrRelation reln, BlockNumber target,
