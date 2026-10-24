@@ -40,6 +40,12 @@
  * it is committed or rolled back (one recovered at startup was never told
  * of).  Nothing survives a restart: the first fold after one folds.
  *
+ * For the fold worker, each branch keeps the generation it last saw, and
+ * what the writers that ended since did: how many rows they wrote (every
+ * row a write changes is told of, a multi-row insertion's each) and when
+ * the first and the last of them ended, so that the worker can wait for a
+ * batch of them before it folds (prolly_folder.c).
+ *
  * Each branch also keeps the relations whose rows its last writers wrote
  * (note_relation), each with the generation its writer ended at: the last
  * WRITTEN_RELATIONS of them, and the generation since which every one is
@@ -73,6 +79,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 
 #define BRANCH_GENERATIONS	1024
 #define ENDED_WRITERS		8
@@ -110,6 +117,14 @@ typedef struct BranchGeneration
 	ProllyHash	baseline;		/* folded from (len 0: none) */
 	ProllyHash	root;
 	uint64		seen;			/* the generation the fold worker last saw */
+	/* what the writers that ended since then did: rows, when, how late */
+	uint64		rows;
+	TimestampTz since;			/* 0: none ended since */
+	TimestampTz last_ended;
+	/* what the fold worker was last given: of these, what it saw */
+	uint64		offered;
+	uint64		offered_rows;
+	TimestampTz offered_at;
 	/* the relations written: a ring of the last, all since rels_from */
 	uint64		rels_from;
 	int			nrels;
@@ -171,6 +186,9 @@ static struct
 }			written_rels[MAX_WRITTEN_RELS];
 static int	nwritten_rels = 0;
 static bool written_rels_overflow = false;
+
+/* The rows it wrote on each of the branches written[] names. */
+static uint64 written_rows[MAX_WRITTEN];
 
 static BranchGenerations *
 shared(void)
@@ -357,11 +375,15 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 {
 	BranchGenerations *g = shared();
 	FullTransactionId xid;
+	TimestampTz now;
 
 	if (phase != RESOURCE_RELEASE_AFTER_LOCKS || !isTopLevel ||
-		IsTransactionState() || (nwritten == 0 && !written_overflow))
+		IsTransactionState())
+		return;
+	if (nwritten == 0 && !written_overflow)
 		return;
 	xid = GetTopFullTransactionIdIfAny();
+	now = GetCurrentTimestamp();
 
 	/* (others see the transaction, but not yet what it wrote) */
 	INJECTION_POINT("prolly-writes-ending", NULL);
@@ -378,6 +400,10 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 		e->generation = ++g->counter;
 		e->known = false;
 		note_ended(&e->ended, xid);
+		e->rows += written_rows[i];
+		if (e->since == 0)
+			e->since = now;
+		e->last_ended = now;
 		if (written_rels_overflow)
 			e->rels_from = e->generation;
 		for (int j = 0; j < nwritten_rels; j++)
@@ -429,6 +455,7 @@ branch_generations_note_write(Oid branch)
 	if (e != NULL && nwritten < MAX_WRITTEN)
 	{
 		e->writers++;
+		written_rows[nwritten] = 0;
 		written[nwritten++] = branch;
 	}
 	else
@@ -445,10 +472,20 @@ branch_generations_note_write(Oid branch)
  * for every row, so the last one is checked first.
  */
 void
-branch_generations_note_relation(Oid branch, Oid relid)
+branch_generations_note_relation(Oid branch, Oid relid, int nrows)
 {
-	if (!OidIsValid(branch) || !OidIsValid(relid) || written_rels_overflow ||
-		written_overflow)
+	if (!OidIsValid(branch) || !OidIsValid(relid))
+		return;
+	/* (counted to its branch, the last noted first; none past MAX_WRITTEN) */
+	for (int i = nwritten - 1; i >= 0; i--)
+	{
+		if (written[i] == branch)
+		{
+			written_rows[i] += Max(nrows, 0);
+			break;
+		}
+	}
+	if (written_rels_overflow || written_overflow)
 		return;
 	if (nwritten_rels > 0 &&
 		written_rels[nwritten_rels - 1].relid == relid &&
@@ -860,18 +897,20 @@ branch_generations_moved_databases(Oid *databases, int max)
 
 /*
  * The current database's branches whose generation moved since the fold
- * worker last saw it, each with its generation now, into branches and
- * generations (at most max); their count.
+ * worker last saw it, each with its generation now and what its writers
+ * did since, into branches (at most max); their count.  What each is given
+ * as is remembered, so that saw() knows what the worker's fold saw of it.
  */
 int
-branch_generations_moved(Oid *branches, uint64 *generations, int max)
+branch_generations_moved(ProllyMovedBranch *branches, int max)
 {
 	BranchGenerations *g = shared();
+	TimestampTz now = GetCurrentTimestamp();
 	int			n = 0;
 
 	if (g == NULL)
 		return 0;
-	LWLockAcquire(&g->lock, LW_SHARED);
+	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
 	for (int i = 0; i < BRANCH_GENERATIONS && n < max; i++)
 	{
 		BranchGeneration *e = &g->entries[i];
@@ -879,8 +918,15 @@ branch_generations_moved(Oid *branches, uint64 *generations, int max)
 		if (!OidIsValid(e->branch) || e->database != MyDatabaseId ||
 			e->generation == e->seen)
 			continue;
-		branches[n] = e->branch;
-		generations[n] = e->generation;
+		branches[n].branch = e->branch;
+		branches[n].generation = e->generation;
+		branches[n].rows = e->rows;
+		branches[n].since = e->since;
+		branches[n].last_ended = e->last_ended;
+		branches[n].writers = e->writers;
+		e->offered = e->generation;
+		e->offered_rows = e->rows;
+		e->offered_at = now;
 		n++;
 	}
 	LWLockRelease(&g->lock);
@@ -904,12 +950,20 @@ branch_generations_saw_database(Oid database)
 		BranchGeneration *e = &g->entries[i];
 
 		if (OidIsValid(e->branch) && e->database == database)
+		{
 			e->seen = e->generation;
+			e->rows = 0;
+			e->since = 0;
+		}
 	}
 	LWLockRelease(&g->lock);
 }
 
-/* The fold worker saw branch at generation (no later one: kept as moved). */
+/*
+ * The fold worker saw branch at generation (no later one: kept as moved).
+ * What was written since it was given that generation is what's left: the
+ * rows written since, from then on (the writers since all ended after it).
+ */
 void
 branch_generations_saw(Oid branch, uint64 generation)
 {
@@ -921,7 +975,19 @@ branch_generations_saw(Oid branch, uint64 generation)
 	LWLockAcquire(&g->lock, LW_EXCLUSIVE);
 	e = find_entry(g, branch);
 	if (e != NULL && e->seen < generation && generation <= e->generation)
+	{
 		e->seen = generation;
+		if (generation == e->generation)
+		{
+			e->rows = 0;
+			e->since = 0;
+		}
+		else if (generation == e->offered)
+		{
+			e->rows -= Min(e->rows, e->offered_rows);
+			e->since = e->offered_at;
+		}
+	}
 	LWLockRelease(&g->lock);
 }
 

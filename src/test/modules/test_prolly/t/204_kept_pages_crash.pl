@@ -15,7 +15,7 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('kept_pages_crash');
 $node->init;
 $node->append_conf('postgresql.conf',
-	"wal_level = minimal\nmax_wal_senders = 0\nautovacuum = off\nprolly_fold_worker = off\ncheckpoint_timeout = 1h");
+	"wal_level = minimal\nmax_wal_senders = 0\nautovacuum = off\nprolly_fold_worker = off\ncheckpoint_timeout = 1h\nprolly.restore_min_changes = 0");
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 my $rows = q{SELECT count(*) FILTER (WHERE v = 'v' || id) || '/' || count(*) FROM app.t};

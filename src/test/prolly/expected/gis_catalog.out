@@ -130,7 +130,7 @@ DECLARE
 BEGIN
   FOR m IN SELECT c.name, c.kind, c.covered_by, x.oid FROM gis_check.coverage() c
            JOIN gis_check.members() x ON x.kind = c.kind AND x.name = c.name
-           WHERE c.covered_by IN ('evaluated', 'called') ORDER BY c.kind, c.name LOOP
+           WHERE c.covered_by IN ('evaluated', 'called') ORDER BY c.kind COLLATE "C", c.name COLLATE "C" LOOP
     name := m.kind || ' ' || m.name;
     IF m.covered_by = 'called' THEN
       BEGIN
@@ -184,7 +184,7 @@ BEGIN
     RETURN NEXT;
   END LOOP;
 END $$;
-SELECT kind, name, covered_by FROM gis_check.coverage() ORDER BY kind, name;
+SELECT kind, name, covered_by FROM gis_check.coverage() ORDER BY kind COLLATE "C", name COLLATE "C";
    kind    |                                        name                                         |                                       covered_by                                       
 -----------+-------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------
  aggregate | st_3dextent(geometry)                                                               | evaluated
@@ -236,124 +236,124 @@ SELECT kind, name, covered_by FROM gis_check.coverage() ORDER BY kind, name;
  opclass   | spgist/spgist_geometry_ops_2d                                                       | index agreement
  opclass   | spgist/spgist_geometry_ops_3d                                                       | index agreement
  opclass   | spgist/spgist_geometry_ops_nd                                                       | index agreement
+ operator  | &&&(geometry,geometry)                                                              | evaluated
+ operator  | &&&(geometry,gidx)                                                                  | excluded: an index key argument
+ operator  | &&&(gidx,geometry)                                                                  | excluded: an index key argument
+ operator  | &&&(gidx,gidx)                                                                      | excluded: an index key argument
  operator  | &&(box2df,box2df)                                                                   | excluded: an index key argument
- operator  | @(box2df,box2df)                                                                    | excluded: an index key argument
- operator  | ~(box2df,box2df)                                                                    | excluded: an index key argument
  operator  | &&(box2df,geometry)                                                                 | excluded: an index key argument
- operator  | @(box2df,geometry)                                                                  | excluded: an index key argument
- operator  | ~(box2df,geometry)                                                                  | excluded: an index key argument
  operator  | &&(geography,geography)                                                             | evaluated
- operator  | <(geography,geography)                                                              | evaluated
- operator  | <->(geography,geography)                                                            | evaluated
- operator  | <=(geography,geography)                                                             | evaluated
- operator  | =(geography,geography)                                                              | evaluated
- operator  | >(geography,geography)                                                              | evaluated
- operator  | >=(geography,geography)                                                             | evaluated
  operator  | &&(geography,gidx)                                                                  | excluded: an index key argument
  operator  | &&(geometry,box2df)                                                                 | excluded: an index key argument
- operator  | @(geometry,box2df)                                                                  | excluded: an index key argument
- operator  | ~(geometry,box2df)                                                                  | excluded: an index key argument
- operator  | &&&(geometry,geometry)                                                              | evaluated
  operator  | &&(geometry,geometry)                                                               | evaluated
+ operator  | &&(geometry,raster)                                                                 | evaluated
+ operator  | &&(gidx,geography)                                                                  | excluded: an index key argument
+ operator  | &&(gidx,gidx)                                                                       | excluded: an index key argument
+ operator  | &&(raster,geometry)                                                                 | evaluated
+ operator  | &&(raster,raster)                                                                   | evaluated
  operator  | &/&(geometry,geometry)                                                              | evaluated
  operator  | &<(geometry,geometry)                                                               | evaluated
+ operator  | &<(raster,raster)                                                                   | evaluated
  operator  | &<|(geometry,geometry)                                                              | evaluated
+ operator  | &<|(raster,raster)                                                                  | evaluated
  operator  | &>(geometry,geometry)                                                               | evaluated
+ operator  | &>(raster,raster)                                                                   | evaluated
  operator  | <#>(geometry,geometry)                                                              | evaluated
+ operator  | <(geography,geography)                                                              | evaluated
  operator  | <(geometry,geometry)                                                                | evaluated
+ operator  | <->(geography,geography)                                                            | evaluated
  operator  | <->(geometry,geometry)                                                              | evaluated
  operator  | <<(geometry,geometry)                                                               | evaluated
+ operator  | <<(raster,raster)                                                                   | evaluated
  operator  | <<->>(geometry,geometry)                                                            | evaluated
  operator  | <<@(geometry,geometry)                                                              | evaluated
  operator  | <<|(geometry,geometry)                                                              | evaluated
+ operator  | <<|(raster,raster)                                                                  | evaluated
+ operator  | <=(geography,geography)                                                             | evaluated
  operator  | <=(geometry,geometry)                                                               | evaluated
  operator  | <>(geometry,geometry)                                                               | evaluated
+ operator  | =(geography,geography)                                                              | evaluated
  operator  | =(geometry,geometry)                                                                | evaluated
+ operator  | =(raster,raster)                                                                    | evaluated
+ operator  | >(geography,geography)                                                              | evaluated
  operator  | >(geometry,geometry)                                                                | evaluated
+ operator  | >=(geography,geography)                                                             | evaluated
  operator  | >=(geometry,geometry)                                                               | evaluated
  operator  | >>(geometry,geometry)                                                               | evaluated
+ operator  | >>(raster,raster)                                                                   | evaluated
+ operator  | @(box2df,box2df)                                                                    | excluded: an index key argument
+ operator  | @(box2df,geometry)                                                                  | excluded: an index key argument
+ operator  | @(geometry,box2df)                                                                  | excluded: an index key argument
  operator  | @(geometry,geometry)                                                                | evaluated
+ operator  | @(geometry,raster)                                                                  | evaluated
+ operator  | @(raster,geometry)                                                                  | evaluated
+ operator  | @(raster,raster)                                                                    | evaluated
  operator  | @>>(geometry,geometry)                                                              | evaluated
  operator  | @@(geometry,geometry)                                                               | evaluated
  operator  | |&>(geometry,geometry)                                                              | evaluated
+ operator  | |&>(raster,raster)                                                                  | evaluated
  operator  | |=|(geometry,geometry)                                                              | evaluated
  operator  | |>>(geometry,geometry)                                                              | evaluated
+ operator  | |>>(raster,raster)                                                                  | evaluated
+ operator  | ~(box2df,box2df)                                                                    | excluded: an index key argument
+ operator  | ~(box2df,geometry)                                                                  | excluded: an index key argument
+ operator  | ~(geometry,box2df)                                                                  | excluded: an index key argument
  operator  | ~(geometry,geometry)                                                                | evaluated
+ operator  | ~(geometry,raster)                                                                  | evaluated
+ operator  | ~(raster,geometry)                                                                  | evaluated
+ operator  | ~(raster,raster)                                                                    | evaluated
  operator  | ~=(geometry,geometry)                                                               | evaluated
+ operator  | ~=(raster,raster)                                                                   | evaluated
  operator  | ~==(geometry,geometry)                                                              | evaluated
  operator  | ~~(geometry,geometry)                                                               | evaluated
  operator  | ~~=(geometry,geometry)                                                              | evaluated
- operator  | &&&(geometry,gidx)                                                                  | excluded: an index key argument
- operator  | &&(geometry,raster)                                                                 | evaluated
- operator  | @(geometry,raster)                                                                  | evaluated
- operator  | ~(geometry,raster)                                                                  | evaluated
- operator  | &&(gidx,geography)                                                                  | excluded: an index key argument
- operator  | &&&(gidx,geometry)                                                                  | excluded: an index key argument
- operator  | &&&(gidx,gidx)                                                                      | excluded: an index key argument
- operator  | &&(gidx,gidx)                                                                       | excluded: an index key argument
- operator  | &&(raster,geometry)                                                                 | evaluated
- operator  | @(raster,geometry)                                                                  | evaluated
- operator  | ~(raster,geometry)                                                                  | evaluated
- operator  | &&(raster,raster)                                                                   | evaluated
- operator  | &<(raster,raster)                                                                   | evaluated
- operator  | &<|(raster,raster)                                                                  | evaluated
- operator  | &>(raster,raster)                                                                   | evaluated
- operator  | <<(raster,raster)                                                                   | evaluated
- operator  | <<|(raster,raster)                                                                  | evaluated
- operator  | =(raster,raster)                                                                    | evaluated
- operator  | >>(raster,raster)                                                                   | evaluated
- operator  | @(raster,raster)                                                                    | evaluated
- operator  | |&>(raster,raster)                                                                  | evaluated
- operator  | |>>(raster,raster)                                                                  | evaluated
- operator  | ~(raster,raster)                                                                    | evaluated
- operator  | ~=(raster,raster)                                                                   | evaluated
  type      | _addbandarg (b)                                                                     | values (send/recv)
- type      | addbandarg (c)                                                                      | excluded: function results, composites of covered types
  type      | _agg_count (b)                                                                      | values (send/recv)
- type      | agg_count (c)                                                                       | excluded: function results, composites of covered types
  type      | _agg_samealignment (b)                                                              | values (send/recv)
- type      | agg_samealignment (c)                                                               | excluded: function results, composites of covered types
  type      | _box2d (b)                                                                          | values (send/recv)
- type      | box2d (b)                                                                           | values (text form)
  type      | _box2df (b)                                                                         | values (send/recv)
- type      | box2df (b)                                                                          | excluded: index keys; their input is not implemented, so no value can be stored
  type      | _box3d (b)                                                                          | values (send/recv)
- type      | box3d (b)                                                                           | values (text form)
  type      | _geography (b)                                                                      | values (send/recv)
- type      | geography (b)                                                                       | values (send/recv)
  type      | _geography_columns (b)                                                              | values (send/recv)
- type      | geography_columns (c)                                                               | excluded: function results, composites of covered types
  type      | _geometry (b)                                                                       | values (send/recv)
- type      | geometry (b)                                                                        | values (send/recv)
  type      | _geometry_columns (b)                                                               | values (send/recv)
- type      | geometry_columns (c)                                                                | excluded: function results, composites of covered types
  type      | _geometry_dump (b)                                                                  | values (send/recv)
- type      | geometry_dump (c)                                                                   | excluded: function results, composites of covered types
  type      | _geomval (b)                                                                        | values (send/recv)
- type      | geomval (c)                                                                         | excluded: function results, composites of covered types
  type      | _gidx (b)                                                                           | values (send/recv)
- type      | gidx (b)                                                                            | excluded: index keys; their input is not implemented, so no value can be stored
  type      | _rastbandarg (b)                                                                    | values (send/recv)
- type      | rastbandarg (c)                                                                     | excluded: function results, composites of covered types
  type      | _raster (b)                                                                         | values (send/recv)
- type      | raster (b)                                                                          | values (text form)
  type      | _raster_columns (b)                                                                 | values (send/recv)
- type      | raster_columns (c)                                                                  | excluded: function results, composites of covered types
  type      | _raster_overviews (b)                                                               | values (send/recv)
- type      | raster_overviews (c)                                                                | excluded: function results, composites of covered types
  type      | _reclassarg (b)                                                                     | values (send/recv)
- type      | reclassarg (c)                                                                      | excluded: function results, composites of covered types
  type      | _simple_detail (b)                                                                  | values (send/recv)
- type      | simple_detail (c)                                                                   | excluded: function results, composites of covered types
  type      | _spatial_ref_sys (b)                                                                | values (send/recv)
- type      | spatial_ref_sys (c)                                                                 | excluded: function results, composites of covered types
  type      | _spheroid (b)                                                                       | values (send/recv)
- type      | spheroid (b)                                                                        | values (text form)
  type      | _summarystats (b)                                                                   | values (send/recv)
- type      | summarystats (c)                                                                    | excluded: function results, composites of covered types
  type      | _unionarg (b)                                                                       | values (send/recv)
- type      | unionarg (c)                                                                        | excluded: function results, composites of covered types
  type      | _valid_detail (b)                                                                   | values (send/recv)
+ type      | addbandarg (c)                                                                      | excluded: function results, composites of covered types
+ type      | agg_count (c)                                                                       | excluded: function results, composites of covered types
+ type      | agg_samealignment (c)                                                               | excluded: function results, composites of covered types
+ type      | box2d (b)                                                                           | values (text form)
+ type      | box2df (b)                                                                          | excluded: index keys; their input is not implemented, so no value can be stored
+ type      | box3d (b)                                                                           | values (text form)
+ type      | geography (b)                                                                       | values (send/recv)
+ type      | geography_columns (c)                                                               | excluded: function results, composites of covered types
+ type      | geometry (b)                                                                        | values (send/recv)
+ type      | geometry_columns (c)                                                                | excluded: function results, composites of covered types
+ type      | geometry_dump (c)                                                                   | excluded: function results, composites of covered types
+ type      | geomval (c)                                                                         | excluded: function results, composites of covered types
+ type      | gidx (b)                                                                            | excluded: index keys; their input is not implemented, so no value can be stored
+ type      | rastbandarg (c)                                                                     | excluded: function results, composites of covered types
+ type      | raster (b)                                                                          | values (text form)
+ type      | raster_columns (c)                                                                  | excluded: function results, composites of covered types
+ type      | raster_overviews (c)                                                                | excluded: function results, composites of covered types
+ type      | reclassarg (c)                                                                      | excluded: function results, composites of covered types
+ type      | simple_detail (c)                                                                   | excluded: function results, composites of covered types
+ type      | spatial_ref_sys (c)                                                                 | excluded: function results, composites of covered types
+ type      | spheroid (b)                                                                        | values (text form)
+ type      | summarystats (c)                                                                    | excluded: function results, composites of covered types
+ type      | unionarg (c)                                                                        | excluded: function results, composites of covered types
  type      | valid_detail (c)                                                                    | excluded: function results, composites of covered types
 (168 rows)
 
@@ -369,7 +369,7 @@ NOTICE:  No points or linestrings in input array
 NOTICE:  No points or linestrings in input array
 NOTICE:  No points or linestrings in input array
 NOTICE:  No points or linestrings in input array
-SELECT * FROM gis_check.answers ORDER BY name;
+SELECT * FROM gis_check.answers ORDER BY name COLLATE "C";
                                              name                                              |               answer                
 -----------------------------------------------------------------------------------------------+-------------------------------------
  aggregate st_3dextent(geometry)                                                               | e7bff8bbc3c7 (6 groups, 0 errors)
@@ -384,88 +384,88 @@ SELECT * FROM gis_check.answers ORDER BY name;
  aggregate st_asmvt(anyelement,text,integer,text)                                              | a7185155f39f
  aggregate st_asmvt(anyelement,text,integer,text,text)                                         | abd8c1711b91
  aggregate st_asrasteragg(geometry,double precision,raster,text,double precision,text,boolean) | 1702f60e6df1
- aggregate st_clusterintersecting(geometry)                                                    | 0b1dc0f7633e (20 groups, 0 errors)
+ aggregate st_clusterintersecting(geometry)                                                    | 11babf3c85be (20 groups, 0 errors)
  aggregate st_clusterwithin(geometry,double precision)                                         | f1b1c7176290
- aggregate st_collect(geometry)                                                                | 4675fd2408a5 (20 groups, 0 errors)
+ aggregate st_collect(geometry)                                                                | 985e246070d0 (20 groups, 0 errors)
  aggregate st_countagg(raster,boolean)                                                         | b08c36e9aea4
  aggregate st_countagg(raster,integer,boolean)                                                 | b08c36e9aea4
  aggregate st_countagg(raster,integer,boolean,double precision)                                | b08c36e9aea4
  aggregate st_coverageunion(geometry)                                                          | 95fd4e36384d (20 groups, 3 errors)
  aggregate st_extent(geometry)                                                                 | 9e13e3dbad04 (20 groups, 0 errors)
  aggregate st_makeline(geometry)                                                               | b331aca3e8bc (20 groups, 0 errors)
- aggregate st_memunion(geometry)                                                               | 3149303d64ae (20 groups, 0 errors)
- aggregate st_polygonize(geometry)                                                             | a8ea3ebfe117 (20 groups, 0 errors)
+ aggregate st_memunion(geometry)                                                               | cdaf5cb07a45 (20 groups, 0 errors)
+ aggregate st_polygonize(geometry)                                                             | 27ac22eacef1 (20 groups, 0 errors)
  aggregate st_samealignment(raster)                                                            | 98be9ba7838c (7 groups, 0 errors)
  aggregate st_summarystatsagg(raster,boolean,double precision)                                 | ad1f6273aada
  aggregate st_summarystatsagg(raster,integer,boolean)                                          | ad1f6273aada
  aggregate st_summarystatsagg(raster,integer,boolean,double precision)                         | ad1f6273aada
- aggregate st_union(geometry)                                                                  | 9a16247cb39d (20 groups, 0 errors)
+ aggregate st_union(geometry)                                                                  | 0fcb583f61b0 (20 groups, 0 errors)
  aggregate st_union(geometry,double precision)                                                 | eadcf3ca5f08
  aggregate st_union(raster)                                                                    | e86311b0d4d0 (7 groups, 0 errors)
  aggregate st_union(raster,integer)                                                            | 542edc3389a8
  aggregate st_union(raster,integer,text)                                                       | 2f125f2bf52e
  aggregate st_union(raster,text)                                                               | 542edc3389a8
  aggregate st_union(raster,unionarg[])                                                         | 542edc3389a8
- operator &&(geography,geography)                                                              | 8fbfab4edb60
- operator <(geography,geography)                                                               | a1c5c3540e2b
- operator <->(geography,geography)                                                             | f9ce50360c1a
- operator <=(geography,geography)                                                              | 67f4d455795c
- operator =(geography,geography)                                                               | adb647b39064
- operator >(geography,geography)                                                               | 4f8072adc459
- operator >=(geography,geography)                                                              | c2a87f943133
  operator &&&(geometry,geometry)                                                               | 961b08b6c772
+ operator &&(geography,geography)                                                              | 8fbfab4edb60
  operator &&(geometry,geometry)                                                                | ead46dfc5aa4
+ operator &&(geometry,raster)                                                                  | 1412fc77250f
+ operator &&(raster,geometry)                                                                  | 57189f2d3a6b
+ operator &&(raster,raster)                                                                    | 07d89c61c93f
  operator &/&(geometry,geometry)                                                               | pairwise c5420ece5a5f (891 errors)
  operator &<(geometry,geometry)                                                                | cb946ba67b1b
+ operator &<(raster,raster)                                                                    | f48a4eb6f9e1
  operator &<|(geometry,geometry)                                                               | 53ba3a3c4dc5
+ operator &<|(raster,raster)                                                                   | f98ed82ca296
  operator &>(geometry,geometry)                                                                | 37f64cb3ff40
+ operator &>(raster,raster)                                                                    | f98ed82ca296
  operator <#>(geometry,geometry)                                                               | ccba74c6cf4f
+ operator <(geography,geography)                                                               | a1c5c3540e2b
  operator <(geometry,geometry)                                                                 | df3ce0be0ab0
+ operator <->(geography,geography)                                                             | f9ce50360c1a
  operator <->(geometry,geometry)                                                               | ed2af35fbf73
  operator <<(geometry,geometry)                                                                | 21f1d74e580f
+ operator <<(raster,raster)                                                                    | f57d3679e4cb
  operator <<->>(geometry,geometry)                                                             | c1ad8c1ea486
  operator <<@(geometry,geometry)                                                               | pairwise 138e82660855 (891 errors)
  operator <<|(geometry,geometry)                                                               | 63c46555572a
+ operator <<|(raster,raster)                                                                   | f57d3679e4cb
+ operator <=(geography,geography)                                                              | 67f4d455795c
  operator <=(geometry,geometry)                                                                | ee2d2c0a817e
  operator <>(geometry,geometry)                                                                | ca7729c700d6
+ operator =(geography,geography)                                                               | adb647b39064
  operator =(geometry,geometry)                                                                 | 3570091cbdfd
+ operator =(raster,raster)                                                                     | b30e1a66261a
+ operator >(geography,geography)                                                               | 4f8072adc459
  operator >(geometry,geometry)                                                                 | 2359f3c313d8
+ operator >=(geography,geography)                                                              | c2a87f943133
  operator >=(geometry,geometry)                                                                | 57ca929b676e
  operator >>(geometry,geometry)                                                                | abd993685082
+ operator >>(raster,raster)                                                                    | f57d3679e4cb
  operator @(geometry,geometry)                                                                 | 060a9f4750b5
+ operator @(geometry,raster)                                                                   | d9587c0f8200
+ operator @(raster,geometry)                                                                   | d5c56a7c5af5
+ operator @(raster,raster)                                                                     | 9e7f051aa91b
  operator @>>(geometry,geometry)                                                               | pairwise 86bd77aabcb3 (891 errors)
  operator @@(geometry,geometry)                                                                | dc4595c5a0b7
  operator |&>(geometry,geometry)                                                               | 3af0ae853ff5
+ operator |&>(raster,raster)                                                                   | 4562a0dff407
  operator |=|(geometry,geometry)                                                               | pairwise 299094583df9 (2915 errors)
  operator |>>(geometry,geometry)                                                               | 6828b99bf83d
+ operator |>>(raster,raster)                                                                   | f57d3679e4cb
  operator ~(geometry,geometry)                                                                 | ae95526842df
+ operator ~(geometry,raster)                                                                   | 63de0e5595d6
+ operator ~(raster,geometry)                                                                   | 6ca51677c976
+ operator ~(raster,raster)                                                                     | a964df281d2f
  operator ~=(geometry,geometry)                                                                | 7846e7a72c06
+ operator ~=(raster,raster)                                                                    | b30e1a66261a
  operator ~==(geometry,geometry)                                                               | pairwise ce0dcb89ab2c (891 errors)
  operator ~~(geometry,geometry)                                                                | cddd08f86069
  operator ~~=(geometry,geometry)                                                               | 479f9e4fdd62
- operator &&(geometry,raster)                                                                  | 1412fc77250f
- operator @(geometry,raster)                                                                   | d9587c0f8200
- operator ~(geometry,raster)                                                                   | 63de0e5595d6
- operator &&(raster,geometry)                                                                  | 57189f2d3a6b
- operator @(raster,geometry)                                                                   | d5c56a7c5af5
- operator ~(raster,geometry)                                                                   | 6ca51677c976
- operator &&(raster,raster)                                                                    | 07d89c61c93f
- operator &<(raster,raster)                                                                    | f48a4eb6f9e1
- operator &<|(raster,raster)                                                                   | f98ed82ca296
- operator &>(raster,raster)                                                                    | f98ed82ca296
- operator <<(raster,raster)                                                                    | f57d3679e4cb
- operator <<|(raster,raster)                                                                   | f57d3679e4cb
- operator =(raster,raster)                                                                     | b30e1a66261a
- operator >>(raster,raster)                                                                    | f57d3679e4cb
- operator @(raster,raster)                                                                     | 9e7f051aa91b
- operator |&>(raster,raster)                                                                   | 4562a0dff407
- operator |>>(raster,raster)                                                                   | f57d3679e4cb
- operator ~(raster,raster)                                                                     | a964df281d2f
- operator ~=(raster,raster)                                                                    | b30e1a66261a
 (90 rows)
 
 -- (no call may be of nothing: an aggregate of no rows is null)
-SELECT name FROM gis_check.answers WHERE answer = left(md5('null'), 12) ORDER BY name;
+SELECT name FROM gis_check.answers WHERE answer = left(md5('null'), 12) ORDER BY name COLLATE "C";
  name 
 ------
 (0 rows)

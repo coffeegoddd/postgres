@@ -165,13 +165,23 @@ typedef struct ProllyChangeFinderRoutine
 	 */
 	ProllyFullFoldReason (*full_reason) (Relation rel,
 										 const ProllyTableFold *baseline);
+
+	/*
+	 * Optional: true if fewer than limit of rel's rows differ from
+	 * baseline's, as changes() would find them, read from at most limit
+	 * of the finder's records (each of which changes a row at most), none
+	 * of it counted as a fold's work; false if as many may, or it can't
+	 * tell where changes() couldn't.  Needs an active snapshot.
+	 */
+	bool		(*fewer_changes) (Relation rel, const ProllyTableFold *baseline,
+								  int limit);
 } ProllyChangeFinderRoutine;
 
 #define PROLLY_CHANGES_CALLBACK_NAMES "fold", "walk", "counters", "fold_rows", \
 	"state_refs", "advance", "fold_on_leave", "changes", "can_advance", \
-	"full_reason"
+	"full_reason", "fewer_changes"
 #define PROLLY_CHANGES_FIRST_CALLBACK fold
-#define PROLLY_CHANGES_LAST_CALLBACK full_reason
+#define PROLLY_CHANGES_LAST_CALLBACK fewer_changes
 
 static inline const ProllyChangeFinderRoutine *
 prolly_changes_lookup(const char *name)

@@ -311,6 +311,32 @@ typedef struct ProllyTreeRoutine
 								  const ProllyNodeRef *from,
 								  const ProllyNodeRef *to,
 								  uint64 max_nodes);
+
+	/*
+	 * Optional: the value a reference (value_write()'s) names, with bytes
+	 * [offset, offset + del) replaced by the ilen bytes at insert, its
+	 * reference appended to out: the reference value_write() gives the
+	 * edited bytes, made without reading or chunking the value whole.  The
+	 * leaves around the edit are read and cut again until a cut meets an
+	 * old one past it, and each level above is made again, from the start
+	 * of the node holding its first changed child, until its boundaries
+	 * meet the old ones; every other node is the old tree's.  So an edit
+	 * reads and writes the nodes along its path and around it: O(depth +
+	 * its length), as a slice reads, whatever the value's size.  offset
+	 * past the value's end is an error; del past it, its end.
+	 */
+	void		(*value_splice) (const ProllyTreeEnv *env, const ProllyValue *ref,
+								 uint64 offset, uint64 del,
+								 const uint8 *insert, Size ilen,
+								 StringInfo out);
+
+	/*
+	 * Optional: how many of root's keys are less than key, exactly, from
+	 * the subtree counts internal items record: the nodes on key's path
+	 * alone are read.  Two ranks count the keys in a range.
+	 */
+	uint64		(*rank) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+						 const ProllyKey *key);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
@@ -318,9 +344,9 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
 	"value_present", "value_reference", "value_root", "key_max", \
-	"diff_unordered", "diff_estimate"
+	"diff_unordered", "diff_estimate", "value_splice", "rank"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK diff_estimate
+#define PROLLY_TREE_LAST_CALLBACK rank
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

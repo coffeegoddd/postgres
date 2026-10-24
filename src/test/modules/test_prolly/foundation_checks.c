@@ -1156,6 +1156,121 @@ check_same_column(Oid type, bool anull, Datum a, bool bnull, Datum b,
 }
 
 /*
+ * Rows assembled from encoded fields: encode_fields() of a row's fields()
+ * is the row encode() gives for its values (encode() of decode()), and so
+ * is a row taking each column from one of two rows: long values by their
+ * references, NULLs and trailing NULLs, a dropped column, and a row from
+ * before columns were added (a missing value, and NULLs).
+ */
+void
+valenc_assembled_rows(const ProllyImplInfo *impl)
+{
+	const ProllyValueEncoderRoutine *ve = (const ProllyValueEncoderRoutine *) impl;
+	static const ColSpec cols[] = {
+		{COL_I4}, {COL_TEXT}, {COL_I8}, {COL_TEXT, true}, {COL_TEXT},
+		{COL_I4_ARRAY}, {COL_I4, false, true},
+	};
+	static const ColSpec before[] = {{COL_I4}, {COL_TEXT}, {COL_I8}, {COL_TEXT, true}};
+	int			natts = lengthof(cols);
+	TupleDesc	desc = make_desc(cols, natts);
+	TupleDesc	bdesc = make_desc(before, lengthof(before));
+	ProllyValueEncoder *enc = PROLLY_CALL(ve, begin, desc, CurrentMemoryContext);
+	ProllyValueEncoder *benc = PROLLY_CALL(ve, begin, bdesc, CurrentMemoryContext);
+	TupleTableSlot *src = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *bsrc = MakeSingleTupleTableSlot(bdesc, &TTSOpsVirtual);
+	TupleTableSlot *mixed = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *a = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	TupleTableSlot *b = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	ProllyEncodedField *fa = palloc_array(ProllyEncodedField, natts);
+	ProllyEncodedField *fb = palloc_array(ProllyEncodedField, natts);
+	ProllyEncodedField *fm = palloc_array(ProllyEncodedField, natts);
+	ProllyTreeEnv env;
+	ProllyValueStore values = {0};
+	StringInfoData rows[2];
+	StringInfoData want;
+	StringInfoData got;
+	char	   *longtext;
+
+	prolly_folded_tree_env(&env);
+	values.tree = prolly_tree_lookup("cow");
+	values.env = &env;
+	PROLLY_CALL(ve, set_values, enc, &values);
+	PROLLY_CALL(ve, set_values, benc, &values);
+	initStringInfo(&rows[0]);
+	initStringInfo(&rows[1]);
+	initStringInfo(&want);
+	initStringInfo(&got);
+	longtext = palloc(100001);
+	for (int i = 0; i < 100000; i++)
+		longtext[i] = 'a' + (i * 7 + i / 26) % 26;
+	longtext[100000] = '\0';
+
+	for (int r = 0; r < 48; r++)
+	{
+		ProllyValue row[2];
+
+		for (int k = 0; k < 2; k++)
+		{
+			int			n = r * 2 + k;
+
+			resetStringInfo(&rows[k]);
+			if (n % 12 == 11)
+			{
+				/* a row from before the last three columns were added */
+				store_row(bsrc, before, n, 0, "old");
+				PROLLY_CALL(ve, encode, benc, bsrc, &rows[k]);
+			}
+			else
+			{
+				store_row(src, cols, n, n < 8 ? 0 : (uint32) (n * 37) & 0x37,
+						  n % 4 == 1 ? longtext : "abc");
+				encode_row(ve, enc, src, &rows[k]);
+			}
+			row[k].data = (const uint8 *) rows[k].data;
+			row[k].len = rows[k].len;
+		}
+		PROLLY_CALL(ve, fields, enc, &row[0], fa);
+		PROLLY_CALL(ve, fields, enc, &row[1], fb);
+
+		/* one row's fields, as encode() of its values */
+		PROLLY_CALL(ve, decode, enc, &row[0], a);
+		encode_row(ve, enc, a, &want);
+		resetStringInfo(&got);
+		PROLLY_CALL(ve, encode_fields, enc, fa, &got);
+		if (got.len != want.len || memcmp(got.data, want.data, got.len) != 0)
+			elog(ERROR, "row %d: encode_fields() of its fields isn't encode() of its values", r);
+
+		/* each column from one row or the other, by the row's number */
+		PROLLY_CALL(ve, decode, enc, &row[1], b);
+		slot_getallattrs(a);
+		slot_getallattrs(b);
+		ExecClearTuple(mixed);
+		for (int c = 0; c < natts; c++)
+		{
+			bool		from_b = ((r >> (c % 5)) & 1) != 0;
+
+			fm[c] = from_b ? fb[c] : fa[c];
+			mixed->tts_values[c] = from_b ? b->tts_values[c] : a->tts_values[c];
+			mixed->tts_isnull[c] = from_b ? b->tts_isnull[c] : a->tts_isnull[c];
+		}
+		ExecStoreVirtualTuple(mixed);
+		encode_row(ve, enc, mixed, &want);
+		resetStringInfo(&got);
+		PROLLY_CALL(ve, encode_fields, enc, fm, &got);
+		if (got.len != want.len || memcmp(got.data, want.data, got.len) != 0)
+			elog(ERROR, "row %d: encode_fields() of two rows' fields isn't encode() of their values", r);
+	}
+	pfree(longtext);
+	ExecDropSingleTupleTableSlot(src);
+	ExecDropSingleTupleTableSlot(bsrc);
+	ExecDropSingleTupleTableSlot(mixed);
+	ExecDropSingleTupleTableSlot(a);
+	ExecDropSingleTupleTableSlot(b);
+	PROLLY_CALL(ve, end, enc);
+	PROLLY_CALL(ve, end, benc);
+}
+
+/*
  * fields(), decode_field() and decode_columns() against decode(): every
  * column fields() gives decodes as decode() decodes it, NULLs, dropped
  * columns and columns a row predates (their missing values) included;
@@ -1167,6 +1282,7 @@ check_same_column(Oid type, bool anull, Datum a, bool bnull, Datum b,
  * fields_alike() takes a column a row predates as its missing value, and
  * field_compatible() holds only between columns that encode alike.
  */
+
 void
 valenc_selected_columns(const ProllyImplInfo *impl)
 {
@@ -1288,6 +1404,54 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 			if (wanted[1] && fields[1].out_of_line &&
 				counters.nodes_read == read_before)
 				elog(ERROR, "row %d: a long value asked for was not read", r);
+
+			/*
+			 * project(): the row with only the wanted columns, made of its
+			 * bytes alone (no value read), decoding as decode() does for
+			 * them, NULL for the others; its references some of the row's.
+			 */
+			{
+				StringInfoData proj;
+				StringInfoData prefs;
+				StringInfoData rrefs;
+				ProllyValue pv;
+
+				initStringInfo(&proj);
+				read_before = counters.nodes_read;
+				PROLLY_CALL(ve, project, enc, &row, wanted, &proj);
+				if (counters.nodes_read != read_before)
+					elog(ERROR, "row %d: project() read a value", r);
+				pv.data = (const uint8 *) proj.data;
+				pv.len = proj.len;
+				PROLLY_CALL(ve, decode, enc, &pv, some);
+				slot_getallattrs(some);
+				for (int c = 0; c < natts; c++)
+				{
+					if (TupleDescAttr(desc, c)->attisdropped ||
+						(r % 12 == 11 && c >= 4))
+						continue;
+					if (!wanted[c])
+					{
+						/* (a column with a missing value isn't NULL absent) */
+						if (!some->tts_isnull[c] &&
+							!TupleDescAttr(desc, c)->atthasmissing)
+							elog(ERROR, "row %d column %d: project() kept a column not asked for",
+								 r, c + 1);
+						continue;
+					}
+					check_same_column(TupleDescAttr(desc, c)->atttypid,
+									  all->tts_isnull[c], all->tts_values[c],
+									  some->tts_isnull[c], some->tts_values[c],
+									  r, c, "project()");
+				}
+				initStringInfo(&prefs);
+				initStringInfo(&rrefs);
+				PROLLY_CALL(ve, refs, enc, &pv, &prefs);
+				PROLLY_CALL(ve, refs, enc, &row, &rrefs);
+				if (prefs.len > rrefs.len)
+					elog(ERROR, "row %d: project() holds references the row doesn't", r);
+				pfree(proj.data);
+			}
 		}
 	}
 
@@ -1331,6 +1495,37 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 					elog(ERROR, "a missing 5 and a stored %s compare %s",
 						 stored[s] < 0 ? "NULL" : psprintf("%d", stored[s]),
 						 alike ? "alike" : "different");
+			}
+
+			/*
+			 * project() of the stored value alone, and of the column before
+			 * it alone: a stored NULL stays NULL, not the missing value; a
+			 * column not asked for is NULL too; and the missing value of a
+			 * row that predates the column is kept where asked for.
+			 */
+			for (int w = 0; w < 3; w++)
+			{
+				StringInfoData proj;
+				ProllyValue pv;
+				ProllyValue from = w == 2 ? (ProllyValue) {(const uint8 *) buf2.data, buf2.len} : b;
+
+				memset(wanted, 0, sizeof(bool) * natts);
+				wanted[w == 1 ? 5 : 6] = true;
+				initStringInfo(&proj);
+				PROLLY_CALL(ve, project, enc, &from, wanted, &proj);
+				pv.data = (const uint8 *) proj.data;
+				pv.len = proj.len;
+				PROLLY_CALL(ve, decode, enc, &pv, some);
+				slot_getallattrs(some);
+				if (w == 0 && (stored[s] < 0) != some->tts_isnull[6])
+					elog(ERROR, "project() of a stored %s gave %s",
+						 stored[s] < 0 ? "NULL" : "value",
+						 some->tts_isnull[6] ? "NULL" : "a value");
+				if (w == 1 && !some->tts_isnull[6])
+					elog(ERROR, "project() gave a value to a column not asked for");
+				if (w == 2 && (some->tts_isnull[6] || DatumGetInt32(some->tts_values[6]) != 5))
+					elog(ERROR, "project() lost a predating row's missing value");
+				pfree(proj.data);
 			}
 		}
 	}

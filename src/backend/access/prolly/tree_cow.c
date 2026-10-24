@@ -547,6 +547,24 @@ value_leaf(ValueBuilder *vb, const uint8 *data, uint32 len)
 		value_add(vb, 1, &ref.hash, len);
 }
 
+/*
+ * Does a value's chunk end at its nth byte, chunk[n - 1]?  h is the
+ * rolling hash of the chunk so far, 0 as it begins, and moves on by that
+ * byte: a boundary where its low bits are all set, past CHUNK_MIN bytes,
+ * or at CHUNK_MAX.  (The value's end ends its last chunk too: the caller's
+ * to see.)  A chunk's end so depends on its own bytes alone, which a
+ * splice relies on to cut only around its edit.
+ */
+static inline bool
+value_cut(uint32 *h, const uint8 *chunk, Size n)
+{
+	*h = rotl32(*h, 1) ^ buz_table[chunk[n - 1]];
+	if (n > BUZ_WINDOW)
+		*h ^= rotl32(buz_table[chunk[n - 1 - BUZ_WINDOW]], BUZ_WINDOW);
+	return (n >= CHUNK_MIN && (*h & CHUNK_MASK) == CHUNK_MASK) ||
+		n >= CHUNK_MAX;
+}
+
 /* Store len bytes as a value tree; append its reference to out. */
 static void
 write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
@@ -568,11 +586,7 @@ write_value_tree(const ProllyTreeEnv *env, const uint8 *data, Size len,
 	{
 		Size		n = i - start + 1;	/* bytes in the chunk so far */
 
-		h = rotl32(h, 1) ^ buz_table[data[i]];
-		if (n > BUZ_WINDOW)
-			h ^= rotl32(buz_table[data[i - BUZ_WINDOW]], BUZ_WINDOW);
-		if ((n >= CHUNK_MIN && (h & CHUNK_MASK) == CHUNK_MASK) ||
-			n >= CHUNK_MAX || i + 1 == len)
+		if (value_cut(&h, data + start, n) || i + 1 == len)
 		{
 			value_leaf(vb, data + start, (uint32) n);
 			start = i + 1;
@@ -817,6 +831,476 @@ static void
 resolve_value(const ProllyTreeEnv *env, const ProllyValue *ref, StringInfo out)
 {
 	read_value(env, ref, 0, PG_UINT64_MAX, out);
+}
+
+/*
+ * Splicing a value tree.  A level's nodes as a cursor sees them: one node
+ * at a time, from the node an edit's path holds, reading each parent as it
+ * is reached, so only the nodes around the edit are read.
+ */
+typedef struct SpliceNode
+{
+	ProllyHash	hash;
+	uint64		count;
+	int			nkids;			/* above the leaves, a node made: its children */
+	ProllyHash	only;			/* and with one child, it */
+} SpliceNode;
+
+typedef struct SpliceLevel
+{
+	SpliceNode *nodes;
+	int			n;
+	int			max;
+} SpliceLevel;
+
+/* A cursor over one level's old nodes. */
+typedef struct SpliceCursor
+{
+	bool		top;			/* the root's level: the root alone */
+	bool		at_end;
+	TNode		parent;			/* not top: the node above holding the node */
+	int			index;			/* the node's place among its children */
+	ProllyNodeRef ref;			/* the node */
+	uint64		count;			/* its bytes */
+	uint64		start;			/* where they begin in the value */
+} SpliceCursor;
+
+static void
+splice_push(SpliceLevel *sl, const ProllyHash *hash, uint64 count, int nkids,
+			const ProllyHash *only)
+{
+	if (sl->n == sl->max)
+	{
+		sl->max = sl->max ? sl->max * 2 : 16;
+		sl->nodes = sl->nodes ? repalloc(sl->nodes, sizeof(SpliceNode) * sl->max) :
+			palloc(sizeof(SpliceNode) * sl->max);
+	}
+	memset(&sl->nodes[sl->n], 0, sizeof(SpliceNode));
+	sl->nodes[sl->n].hash = *hash;
+	sl->nodes[sl->n].count = count;
+	sl->nodes[sl->n].nkids = nkids;
+	if (only)
+		sl->nodes[sl->n].only = *only;
+	sl->n++;
+}
+
+/* Cursor k on child i of its parent (already read). */
+static void
+splice_cursor_at(const ProllyTreeEnv *env, SpliceCursor *c, int i)
+{
+	c->index = i;
+	node_child(env, &c->parent, i, &c->ref, &c->count);
+}
+
+/*
+ * Move cursor k (of levels 0 .. height) to the next node of its level:
+ * the next child of its parent, or the first of the parent's next sibling,
+ * which the cursor above moves to.
+ */
+static void
+splice_next(const ProllyTreeEnv *env, SpliceCursor *cs, int k)
+{
+	SpliceCursor *c = &cs[k];
+
+	if (c->at_end)
+		return;
+	c->start += c->count;
+	if (c->top)
+	{
+		c->at_end = true;
+		return;
+	}
+	if (c->index + 1 < c->parent.nitems)
+	{
+		splice_cursor_at(env, c, c->index + 1);
+		return;
+	}
+	splice_next(env, cs, k + 1);
+	node_release(&c->parent);
+	if (cs[k + 1].at_end)
+	{
+		c->at_end = true;
+		return;
+	}
+	node_read(env, &cs[k + 1].ref, &c->parent);
+	splice_cursor_at(env, c, 0);
+}
+
+/* A level above the leaves being made again: its chunker, its node. */
+typedef struct SpliceFill
+{
+	const ProllyTreeEnv *env;
+	uint16		level;
+	ProllyChunker *chunker;
+	SpliceNode *kids;			/* the node being filled */
+	int			n;
+	int			max;
+	SpliceLevel out;			/* the nodes made */
+	StringInfoData child;
+} SpliceFill;
+
+static void
+splice_flush(SpliceFill *sf)
+{
+	Item	   *items;
+	StringInfoData *children;
+	ProllyNodeRef ref;
+	uint64		count;
+	uint64		bytes = 0;
+
+	if (sf->n == 0)
+		return;
+	items = palloc0(sizeof(Item) * sf->n);
+	children = palloc(sizeof(StringInfoData) * sf->n);
+	for (int i = 0; i < sf->n; i++)
+	{
+		initStringInfo(&children[i]);
+		encode_child(&children[i], &sf->kids[i].hash, sf->kids[i].count);
+		items[i].value.data = (const uint8 *) children[i].data;
+		items[i].value.len = children[i].len;
+		items[i].count = sf->kids[i].count;
+		bytes += sf->kids[i].count;
+	}
+	write_node(sf->env, sf->level, items, sf->n, &ref, &count);
+	for (int i = 0; i < sf->n; i++)
+		pfree(children[i].data);
+	pfree(children);
+	pfree(items);
+	splice_push(&sf->out, &ref.hash, bytes, sf->n,
+				sf->n == 1 ? &sf->kids[0].hash : NULL);
+	sf->n = 0;
+}
+
+/* Feed a child to the level being made; true if it ended a node. */
+static bool
+splice_fill(SpliceFill *sf, const ProllyHash *hash, uint64 count)
+{
+	ProllyKey	key = {hash->bytes, hash->len};
+	ProllyKey	nokey = {NULL, 0};
+	ProllyValue value;
+	ProllyChunkDecision d;
+
+	resetStringInfo(&sf->child);
+	encode_child(&sf->child, hash, count);
+	value.data = (const uint8 *) sf->child.data;
+	value.len = sf->child.len;
+	d = PROLLY_CALL(sf->env->chunker, add, sf->chunker, &key, &value,
+					PROLLY_CALL(sf->env->chunk_format, item_space, sf->level,
+								&nokey, &value));
+	if (d == PROLLY_CHUNK_SPLIT_BEFORE)
+		splice_flush(sf);
+	if (sf->n == sf->max)
+	{
+		sf->max = sf->max ? sf->max * 2 : 64;
+		sf->kids = sf->kids ? repalloc(sf->kids, sizeof(SpliceNode) * sf->max) :
+			palloc(sizeof(SpliceNode) * sf->max);
+	}
+	memset(&sf->kids[sf->n], 0, sizeof(SpliceNode));
+	sf->kids[sf->n].hash = *hash;
+	sf->kids[sf->n].count = count;
+	sf->n++;
+	if (d == PROLLY_CHUNK_SPLIT_AFTER)
+	{
+		splice_flush(sf);
+		return true;
+	}
+	return false;
+}
+
+static void
+splice_fill_begin(SpliceFill *sf, const ProllyTreeEnv *env, uint16 level)
+{
+	memset(sf, 0, sizeof(*sf));
+	sf->env = env;
+	sf->level = level;
+	sf->chunker = PROLLY_CALL(env->chunker, begin, level,
+							  level_capacity(env, level), CurrentMemoryContext);
+	initStringInfo(&sf->child);
+}
+
+static void
+splice_fill_end(SpliceFill *sf)
+{
+	PROLLY_CALL(sf->env->chunker, end, sf->chunker);
+	if (sf->kids)
+		pfree(sf->kids);
+	pfree(sf->child.data);
+}
+
+/* A leaf a splice cut: written, and added to the new leaves. */
+static void
+splice_leaf(const ProllyTreeEnv *env, const char *data, uint32 len,
+			SpliceLevel *leaves)
+{
+	Item		item = {0};
+	ProllyNodeRef ref;
+	uint64		count;
+
+	item.value.data = (const uint8 *) data;
+	item.value.len = len;
+	item.count = 1;
+	write_node(env, 0, &item, 1, &ref, &count);
+	splice_push(leaves, &ref.hash, len, 0, NULL);
+}
+
+/* The bytes of the leaf at ref, which its parent says holds count. */
+static void
+splice_leaf_bytes(const ProllyTreeEnv *env, const ProllyNodeRef *ref,
+				  uint64 count, uint64 from, StringInfo out)
+{
+	read_value_range(env, ref, count, from, count - from, out);
+}
+
+/*
+ * The value ref names, bytes [offset, offset + del) replaced by insert's
+ * ilen bytes, as a value tree; its reference appended to out.
+ *
+ * The tree is walked down to the leaf holding the edit, a cursor at each
+ * level on the edit's path.  The new bytes are cut from that leaf's start
+ * as write_value_tree() cuts them (each leaf's cut depends on its bytes
+ * alone), the old bytes after the edit read a leaf at a time as needed,
+ * until a cut past the edit falls where an old leaf begins.  Then each
+ * level above is made again from the start of the node on the path, with
+ * a chunker begun there (the build's decides from the items since its node
+ * began): that node's children before the path, the nodes made below, and
+ * the old ones after them, until a node ends where an old node begins.  So
+ * an edit reads the nodes on its path, the leaves it touches and the few
+ * nodes around them, and writes O(depth + its length) nodes.
+ */
+static void
+splice_value(const ProllyTreeEnv *env, const ProllyValue *ref, uint64 offset,
+			 uint64 del, const uint8 *insert, Size ilen, StringInfo out)
+{
+	ProllyTreeEnv venv;
+	ProllyNodeRef root;
+	uint64		total;
+	uint64		newtotal;
+	TNode		rnode;
+	uint16		height;
+	SpliceCursor cs[MAX_LEVELS];
+	TNode		path[MAX_LEVELS];	/* the node on the edit's path, by level */
+	int			pidx[MAX_LEVELS];	/* the path's child's place in it */
+	SpliceLevel made = {0};		/* the nodes made at the level below */
+	uint64		written = env->counters ? env->counters->nodes_written : 0;
+	ProllyHash	top;
+
+	value_env(env, &venv);
+	decode_value_ref(ref, &root, &total);
+	if (offset > total)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("splice at byte %llu of a value of %llu bytes",
+						(unsigned long long) offset, (unsigned long long) total)));
+	del = Min(del, total - offset);
+	newtotal = total - del + ilen;
+
+	node_read(&venv, &root, &rnode);
+	height = rnode.level;
+
+	/* A value of one leaf, or none left: written whole, being small. */
+	if (height == 0 || newtotal == 0)
+	{
+		StringInfoData whole;
+
+		node_release(&rnode);
+		initStringInfo(&whole);
+		read_value(env, ref, 0, offset, &whole);
+		appendBinaryStringInfo(&whole, (const char *) insert, ilen);
+		read_value(env, ref, offset + del, PG_UINT64_MAX, &whole);
+		write_value_tree(env, (const uint8 *) whole.data, whole.len, out);
+		pfree(whole.data);
+		return;
+	}
+	if (!buz_ready)
+		buz_init();
+
+	/* down to the leaf holding the first byte edited (appending: the last) */
+	memset(cs, 0, sizeof(cs));
+	cs[height].top = true;
+	cs[height].ref = root;
+	cs[height].count = total;
+	path[height] = rnode;
+	for (int k = height - 1; k >= 0; k--)
+	{
+		SpliceCursor *c = &cs[k];
+		int			i = 0;
+
+		node_read(&venv, &cs[k + 1].ref, &c->parent);
+		if (k + 1 < height)
+			path[k + 1] = c->parent;
+		c->start = cs[k + 1].start;
+		splice_cursor_at(&venv, c, 0);
+		while (i + 1 < c->parent.nitems && c->start + c->count <= offset)
+		{
+			c->start += c->count;
+			splice_cursor_at(&venv, c, ++i);
+		}
+		pidx[k + 1] = i;
+	}
+	/* (each path node a copy of its own: the cursors' parents move on) */
+	for (int k = 1; k < height; k++)
+	{
+		TNode		copy = path[k];
+		char	   *data = palloc(copy.chunk.len);
+
+		memcpy(data, copy.chunk.data, copy.chunk.len);
+		copy.chunk.data = (const uint8 *) data;
+		path[k] = copy;
+	}
+
+	/* the leaves: from the path's leaf, until a cut meets an old leaf */
+	{
+		StringInfoData chunk;
+		StringInfoData tail;
+		uint64		pos = cs[0].start;	/* the next new byte's position */
+		uint64		op = offset + del;	/* the next old byte after the edit */
+		uint64		edit_end = offset + ilen;	/* in the new bytes */
+		int64		shift = (int64) ilen - (int64) del;
+		uint32		h = 0;
+
+		initStringInfo(&chunk);
+		initStringInfo(&tail);
+		if (offset > cs[0].start)
+			read_value_range(&venv, &cs[0].ref, cs[0].count, 0,
+							 offset - cs[0].start, &tail);
+		appendBinaryStringInfo(&tail, (const char *) insert, ilen);
+		for (;;)
+		{
+			bool		cut = false;
+
+			for (int t = 0; t < tail.len; t++)
+			{
+				appendStringInfoChar(&chunk, tail.data[t]);
+				pos++;
+				cut = value_cut(&h, (const uint8 *) chunk.data, chunk.len) ||
+					pos == newtotal;
+				if (cut)
+				{
+					splice_leaf(&venv, chunk.data, chunk.len, &made);
+					resetStringInfo(&chunk);
+					h = 0;
+				}
+			}
+			if (pos == newtotal)
+				break;
+			/* (past leaves the edit deleted, unread) */
+			while (!cs[0].at_end && cs[0].start + cs[0].count <= op)
+				splice_next(&venv, cs, 0);
+			/* a cut past the edit where an old leaf begins: the rest are old */
+			if (cut && pos >= edit_end && (int64) pos - shift == (int64) op &&
+				!cs[0].at_end && cs[0].start == op)
+				break;
+			Assert(!cs[0].at_end);
+			resetStringInfo(&tail);
+			splice_leaf_bytes(&venv, &cs[0].ref, cs[0].count, op - cs[0].start, &tail);
+			op = cs[0].start + cs[0].count;
+			splice_next(&venv, cs, 0);
+		}
+		/* (the old leaves the edit replaced passed: the cursor on the first kept) */
+		while (!cs[0].at_end && cs[0].start + cs[0].count <= op)
+			splice_next(&venv, cs, 0);
+		Assert(chunk.len == 0);
+		pfree(chunk.data);
+		pfree(tail.data);
+	}
+
+	/*
+	 * Each level above, from its path node's start: its children before the
+	 * path, the nodes made below, then the old ones the cursor below is on,
+	 * until a node ends where an old node begins.
+	 */
+	for (uint16 level = 1; level <= height; level++)
+	{
+		SpliceFill	sf;
+		TNode	   *pn = &path[level];
+		bool		resynced = false;
+		bool		cut = false;
+
+		splice_fill_begin(&sf, &venv, level);
+		for (int i = 0; i < pidx[level]; i++)
+		{
+			ProllyNodeRef child;
+			uint64		count;
+
+			node_child(&venv, pn, i, &child, &count);
+			(void) splice_fill(&sf, &child.hash, count);
+		}
+		for (int i = 0; i < made.n; i++)
+			cut = splice_fill(&sf, &made.nodes[i].hash, made.nodes[i].count);
+		for (;;)
+		{
+			SpliceCursor *below = &cs[level - 1];
+
+			if (below->at_end)
+				break;
+			if (cut && !below->top && below->index == 0)
+			{
+				resynced = true;
+				break;
+			}
+			cut = splice_fill(&sf, &below->ref.hash, below->count);
+			splice_next(&venv, cs, level - 1);
+		}
+		if (!resynced)
+			splice_flush(&sf);
+		pfree(made.nodes);
+		made = sf.out;
+		splice_fill_end(&sf);
+	}
+
+	/*
+	 * The root level made: one node, or more, a level grown above them.  A
+	 * root of one child is no root: the first level counting up that has a
+	 * single node is.
+	 */
+	for (uint16 level = height + 1; made.n > 1; level++)
+	{
+		SpliceFill	sf;
+
+		if (level >= MAX_LEVELS)
+			elog(ERROR, "prolly value tree is more than %d levels high", MAX_LEVELS);
+		splice_fill_begin(&sf, &venv, level);
+		for (int i = 0; i < made.n; i++)
+			(void) splice_fill(&sf, &made.nodes[i].hash, made.nodes[i].count);
+		splice_flush(&sf);
+		pfree(made.nodes);
+		made = sf.out;
+		splice_fill_end(&sf);
+	}
+	top = made.nodes[0].hash;
+	if (made.nodes[0].nkids == 1)
+	{
+		/* (one child: it, and so on down while each has one) */
+		ProllyNodeRef r = {0};
+
+		r.hash = made.nodes[0].only;
+		for (;;)
+		{
+			TNode		n;
+			ProllyNodeRef child;
+			uint64		count;
+
+			top = r.hash;
+			node_read(&venv, &r, &n);
+			if (n.level == 0 || n.nitems != 1)
+			{
+				node_release(&n);
+				break;
+			}
+			node_child(&venv, &n, 0, &child, &count);
+			node_release(&n);
+			r = child;
+		}
+	}
+	encode_value_ref(out, &top, newtotal);
+	pfree(made.nodes);
+	for (int k = 0; k < height; k++)
+		node_release(&cs[k].parent);
+	for (int k = 1; k <= height; k++)
+		node_release(&path[k]);
+	if (env->counters)
+		env->counters->value_nodes_written +=
+			env->counters->nodes_written - written;
 }
 
 static void
@@ -1500,6 +1984,49 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	}
 	node_release(&node);
 	return total;
+}
+
+/*
+ * The keys below key: a descent of key's path, adding the counts of the
+ * children before the one that may hold it (an internal item's key is its
+ * child's greatest), then the leaf's keys before it.
+ */
+static uint64
+cow_rank(const ProllyTreeEnv *env, const ProllyNodeRef *root,
+		 const ProllyKey *key)
+{
+	ProllyNodeRef ref = *root;
+	uint64		below = 0;
+
+	for (;;)
+	{
+		TNode		node;
+		int			idx;
+		uint64		count;
+
+		node_read(env, &ref, &node);
+		idx = lower_bound(env, &node, key);
+		if (node.level == 0)
+		{
+			below += idx;
+			node_release(&node);
+			return below;
+		}
+		for (int i = 0; i < idx && i < node.nitems; i++)
+		{
+			ProllyNodeRef child;
+
+			node_child(env, &node, i, &child, &count);
+			below += count;
+		}
+		if (idx >= node.nitems)
+		{
+			node_release(&node);
+			return below;
+		}
+		node_child(env, &node, idx, &ref, &count);
+		node_release(&node);
+	}
 }
 
 /* Append h to *hashes, which holds *n of room for *max. */
@@ -3141,9 +3668,11 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.diff_nodes = cow_diff_nodes,
 	.diff_unordered = cow_diff_unordered,
 	.diff_estimate = cow_diff_estimate,
+	.rank = cow_rank,
 	.references = cow_references,
 	.value_write = write_value_tree,
 	.value_read = read_value,
+	.value_splice = splice_value,
 	.value_reference = cow_value_reference,
 	.value_root = cow_value_root,
 	.value_present = cow_value_present,

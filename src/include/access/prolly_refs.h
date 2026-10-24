@@ -29,6 +29,7 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "access/transam.h"
+#include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
 #include "utils/snapshot.h"
 
@@ -90,6 +91,9 @@ typedef struct ProllyMergeState
 	char	  **table_names;	/* each one's name (qualified) when the merge
 								 * recorded it, as tables[] (NULL, or an
 								 * entry NULL: not known) */
+	int			nschema;
+	char	  **schema_tables;	/* in schema conflicts, kept as the branch
+								 * has them (names, qualified; palloc'd) */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -165,6 +169,10 @@ typedef struct ProllyRebaseState
 	ProllyRebaseStep *steps;	/* (palloc'd) */
 } ProllyRebaseState;
 
+/* Visits a pin: its name, its commit and the record kept beside it. */
+typedef void (*ProllyPinVisit) (const char *name, const ProllyHash *commit,
+								const ProllyValue *info, void *arg);
+
 /* Visits a tag: its name, its tag object and that tag's commit. */
 typedef void (*ProllyTagVisit) (const char *name, const ProllyHash *tag,
 								const ProllyHash *commit, void *arg);
@@ -200,6 +208,50 @@ typedef struct ProllyFoldMark
 	uint64		overflow;
 	uint64		epoch;
 } ProllyFoldMark;
+
+/*
+ * A branch written since the background folder last saw it
+ * (moved_branches()): the generation it's at, and what its writers since
+ * did, for the folder to judge whether a fold is due yet.  rows counts the
+ * rows the writers that ended since wrote on it (a multi-row insertion's
+ * every row; a writer of more branches than the refs note for one has
+ * those past them uncounted); since is when the first of them ended (0:
+ * none has), last_ended when the last did; writers, how many are writing
+ * it now.
+ */
+typedef struct ProllyMovedBranch
+{
+	Oid			branch;
+	uint64		generation;
+	uint64		rows;
+	TimestampTz since;
+	TimestampTz last_ended;
+	int			writers;
+} ProllyMovedBranch;
+
+/*
+ * A commit a branch's pages are kept as of: each table's relations as
+ * branch operations' keep() kept them (the table's own first), the
+ * branch's baseline then (len 0: none), and the transaction that kept
+ * them, which saw every writer of the pages end.
+ */
+typedef struct ProllyKeptTable
+{
+	const char *name;			/* qualified, as tables() names it */
+	int			nrels;
+	const BranchKeptRelation *rels;
+} ProllyKeptTable;
+
+typedef struct ProllyKeptCommit
+{
+	ProllyHash	commit;
+	ProllyHash	baseline;
+	FullTransactionId kept_by;
+	int			ntables;
+	const ProllyKeptTable *tables;
+} ProllyKeptCommit;
+
+typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
 
 typedef struct ProllyRefsRoutine
 {
@@ -543,14 +595,15 @@ typedef struct ProllyRefsRoutine
 	 * Optional, together, for a background folder (prolly_folder.c), from
 	 * shared memory, needing no database: the databases with a branch
 	 * written since the folder last saw it (at most max, their count); the
-	 * current database's such branches, each with the generation it's at;
+	 * current database's such branches, each with the generation it's at
+	 * and what was written since (ProllyMovedBranch);
 	 * that the folder saw branch at generation (written again since: still
 	 * moved); and that it can't fold any branch of database (gone, or
 	 * accepting no connections), so that none of its branches counts as
 	 * moved until written again.
 	 */
 	int			(*moved_databases) (Oid *databases, int max);
-	int			(*moved_branches) (Oid *branches, uint64 *generations, int max);
+	int			(*moved_branches) (ProllyMovedBranch *branches, int max);
 	void		(*saw_branch) (Oid branch, uint64 generation);
 	void		(*saw_database) (Oid database);
 
@@ -558,7 +611,8 @@ typedef struct ProllyRefsRoutine
 	 * Optional, together: which tables' rows may have changed since a fold
 	 * of a branch, for a canonicalizer that works out again only what
 	 * changed.  note_relation() is told, as note_write() is (and after
-	 * it), of each relation whose rows a write to branch changes.
+	 * it), of each relation whose rows a write to branch changes, and of
+	 * how many rows the write changed (moved_branches() counts them).
 	 * fold_mark() marks a fold by snap of branch, before it reads anything:
 	 * false where nothing could be known of it later (in recovery, while a
 	 * transaction is prepared, after the transaction's catalog changes, or
@@ -576,7 +630,7 @@ typedef struct ProllyRefsRoutine
 	 * catalog change moves what fold_mark() takes, and a sequence is read
 	 * each time.
 	 */
-	void		(*note_relation) (Oid branch, Oid relid);
+	void		(*note_relation) (Oid branch, Oid relid, int nrows);
 	bool		(*fold_mark) (Oid branch, Snapshot snap, ProllyFoldMark *mark);
 	bool		(*written_since) (const ProllyFoldMark *mark, Snapshot snap,
 								  Oid **relids, int *nrelids);
@@ -647,6 +701,32 @@ typedef struct ProllyRefsRoutine
 								const char *author, const char *message,
 								const StringInfoData *identity,
 								ProllyHash *commit_id);
+
+	/*
+	 * Optional: visit the commits branch name's pages are kept as of (see
+	 * prolly.kept_commits), newest first; not those retired.  What is
+	 * visited is the refs' as this transaction reads them.
+	 */
+	void		(*kept_commits) (const char *name, ProllyKeptCommitVisit visit,
+								 void *arg);
+
+	/*
+	 * Optional, together: pins.  A pin keeps a commit, and everything it
+	 * reaches, from collection under a name, for a reader outside the refs
+	 * that names the commit (a snapshot mount), with the nkeep trees keep
+	 * names (the reader's own, as a mount's index trees), which must be in
+	 * the store; info is the reader's, kept beside it.  pin_set() sets
+	 * name's pin (commit NULL: removes it), holding the refs; pin_get()
+	 * reads one (false: none), appending its info; pins() visits each, by
+	 * name.  Changes are with the transaction, as any change to the refs.
+	 * Pins are the database's own: transfers never send them.
+	 */
+	void		(*pin_set) (const char *name, const ProllyHash *commit,
+							const ProllyHash *keep, int nkeep,
+							const ProllyValue *info);
+	bool		(*pin_get) (const char *name, ProllyHash *commit,
+							StringInfo info);
+	void		(*pins) (ProllyPinVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -665,6 +745,13 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  */
 extern PGDLLIMPORT int prolly_kept_commits;
 
+/*
+ * prolly.restore_min_changes: how many of a table's rows must differ from
+ * a kept commit's, since a baseline holding them, before a move back to it
+ * gives the table its pages back rather than write those rows (0: always).
+ */
+extern PGDLLIMPORT int prolly_restore_min_changes;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
@@ -682,9 +769,10 @@ extern PGDLLIMPORT int prolly_kept_commits;
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root"
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
+	"pin_set", "pin_get", "pins"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK commit_root
+#define PROLLY_REFS_LAST_CALLBACK pins
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

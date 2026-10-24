@@ -4708,7 +4708,65 @@ typedef struct CellMerge
 	bool	   *theirs_kept;
 	bool	   *merged_kept;
 	StringInfoData row;
+	/* (merge_fields()'s, by attribute index; fields NULL: not merged so) */
+	ProllyEncodedField *fields[4];	/* base, ours, theirs, merged */
 } CellMerge;
+
+typedef enum FieldsMerge
+{
+	FIELDS_MERGED,
+	FIELDS_CONFLICT,
+	FIELDS_DECODE,				/* a column needs its values decoded */
+} FieldsMerge;
+
+/*
+ * merge_cells()'s merge of a row by its encoded columns (the keying's
+ * row_fields()), none decoded.  All three versions are rows of the
+ * merge's keying, the table's as defined now (a version of another shape
+ * is converted to it before it is merged, as_defined_now()), so each
+ * live column's bytes name its value (field_compatible() of the keying
+ * with itself): a column one side's bytes leave as base's takes the
+ * other's, one both changed alike keeps it, and one they changed
+ * differently is a conflict; a stored generated column takes ours'.  The
+ * merged row is assembled from the fields taken (encode_row_fields()),
+ * its long values' references copied.  FIELDS_DECODE when base's value in
+ * a column is unsure (see ReadFor): merge_cells() decodes then.
+ */
+static FieldsMerge
+merge_fields(Changes *c, CellMerge *cm, const ProllyValue *rows,
+			 const Bitmapset *unsure, StringInfo out)
+{
+	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
+	ProllyEncodedField *b = cm->fields[0];
+	ProllyEncodedField *o = cm->fields[1];
+	ProllyEncodedField *t = cm->fields[2];
+	ProllyEncodedField *m = cm->fields[3];
+
+	if (b == NULL || !bms_is_empty(unsure))
+		return FIELDS_DECODE;
+	for (int i = 0; i < 3; i++)
+		PROLLY_CALL(c->rd.kr, row_fields, c->rd.k, &rows[i], cm->fields[i]);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool		ours_changed;
+		bool		theirs_changed;
+
+		m[i] = o[i];
+		if (att->attisdropped || att->attgenerated)
+			continue;
+		Assert(PROLLY_CALL(c->rd.kr, field_compatible, c->rd.k, i, c->rd.k, i));
+		ours_changed = !PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &b[i], &o[i]);
+		theirs_changed = !PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &b[i], &t[i]);
+		if (ours_changed && theirs_changed &&
+			!PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &o[i], &t[i]))
+			return FIELDS_CONFLICT;
+		if (theirs_changed)
+			m[i] = t[i];
+	}
+	PROLLY_CALL(c->rd.kr, encode_row_fields, c->rd.k, m, out);
+	return FIELDS_MERGED;
+}
 
 /*
  * A tree value's row into slot, each column whose value is out of line
@@ -4750,14 +4808,82 @@ decode_kept(Changes *c, const StringInfoData *value,
  * columns are compared decoded, as are all of a row with unsure columns
  * (base's bytes there aren't its value).
  */
+static bool merge_decoded(Changes *c, CellMerge *cm, const StringInfoData *base,
+						  const StringInfoData *ours, const StringInfoData *theirs,
+						  const Bitmapset *unsure);
+
 static bool
 merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 			const StringInfoData *ours, const StringInfoData *theirs,
 			const Bitmapset *unsure, const StringInfoData **merged)
 {
-	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
+	const StringInfoData *versions[3] = {base, ours, theirs};
+	ProllyValue rows[3];
 	StringInfo	value;
 	ProllyValue row;
+	uint64		count;
+	FieldsMerge how;
+
+	for (int i = 0; i < 3; i++)
+	{
+		ProllyValue v = {(const uint8 *) versions[i]->data, versions[i]->len};
+
+		PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &v, &rows[i], &count);
+	}
+	resetStringInfo(&cm->row);
+	how = merge_fields(c, cm, rows, unsure, &cm->row);
+#ifdef USE_ASSERT_CHECKING
+	if (how != FIELDS_DECODE)
+	{
+		/*
+		 * (decoded, the row merges alike: the same conflict, or the same
+		 * bytes; the columns it decodes aren't counted)
+		 */
+		PgStat_Counter decoded = PendingProllyStats[PGSTAT_PROLLY_COLUMNS_DECODED];
+		PgStat_Counter read = PendingProllyStats[PGSTAT_PROLLY_VALUES_READ];
+		PgStat_Counter bytes = PendingProllyStats[PGSTAT_PROLLY_VALUE_BYTES_READ];
+		StringInfoData fields_row = cm->row;
+		bool		merges;
+
+		initStringInfo(&cm->row);
+		merges = merge_decoded(c, cm, base, ours, theirs, unsure);
+		Assert(merges == (how == FIELDS_MERGED));
+		Assert(!merges || (cm->row.len == fields_row.len &&
+						   memcmp(cm->row.data, fields_row.data, fields_row.len) == 0));
+		pfree(cm->row.data);
+		cm->row = fields_row;
+		PendingProllyStats[PGSTAT_PROLLY_COLUMNS_DECODED] = decoded;
+		PendingProllyStats[PGSTAT_PROLLY_VALUES_READ] = read;
+		PendingProllyStats[PGSTAT_PROLLY_VALUE_BYTES_READ] = bytes;
+	}
+#endif
+	if (how == FIELDS_CONFLICT)
+		return false;
+	if (how == FIELDS_DECODE)
+	{
+		resetStringInfo(&cm->row);
+		if (!merge_decoded(c, cm, base, ours, theirs, unsure))
+			return false;
+	}
+	row.data = (const uint8 *) cm->row.data;
+	row.len = cm->row.len;
+	value = palloc(sizeof(StringInfoData));
+	initStringInfo(value);
+	PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &row, 1, value);
+	*merged = value;
+	return true;
+}
+
+/*
+ * merge_cells()'s merge of a row decoded: false on a conflict, else the
+ * merged row's encoding appended to cm->row.
+ */
+static bool
+merge_decoded(Changes *c, CellMerge *cm, const StringInfoData *base,
+			  const StringInfoData *ours, const StringInfoData *theirs,
+			  const Bitmapset *unsure)
+{
+	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
 	ProllyValue base_value = {(const uint8 *) base->data, base->len};
 	ProllyValue base_row;
 	uint64		count;
@@ -4832,16 +4958,9 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 		cm->merged_kept[i] = theirs_changed ? theirs_kept : ours_kept;
 	}
 	ExecStoreVirtualTuple(cm->merged);
-	resetStringInfo(&cm->row);
 	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &base_value, &base_row, &count);
 	PROLLY_CALL(c->rd.kr, encode_row_kept, c->rd.k, cm->merged, &base_row,
 				cm->merged_kept, &cm->row);
-	row.data = (const uint8 *) cm->row.data;
-	row.len = cm->row.len;
-	value = palloc(sizeof(StringInfoData));
-	initStringInfo(value);
-	PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &row, 1, value);
-	*merged = value;
 	return true;
 }
 
@@ -5924,6 +6043,16 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		mw.cm.ours_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 		mw.cm.theirs_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 		mw.cm.merged_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+		if (PROLLY_HAS(tc.rd.kr, row_fields) &&
+			PROLLY_HAS(tc.rd.kr, fields_alike) &&
+			PROLLY_HAS(tc.rd.kr, field_compatible) &&
+			PROLLY_HAS(tc.rd.kr, encode_row_fields))
+		{
+			int			natts = RelationGetDescr(rel)->natts;
+
+			for (int i = 0; i < 4; i++)
+				mw.cm.fields[i] = palloc0_array(ProllyEncodedField, natts);
+		}
 		initStringInfo(&mw.cm.row);
 	}
 
@@ -5983,6 +6112,11 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		pfree(mw.cm.ours_kept);
 		pfree(mw.cm.theirs_kept);
 		pfree(mw.cm.merged_kept);
+		if (mw.cm.fields[0])
+		{
+			for (int i = 0; i < 4; i++)
+				pfree(mw.cm.fields[i]);
+		}
 	}
 	if (fits.estate)
 		FreeExecutorState(fits.estate);
@@ -8676,7 +8810,34 @@ typedef struct MergeRows
 	const ProllyNodeRef *roots; /* base, ours, theirs */
 	const ProllyNodeRef *now_root;	/* the branch, if known (as now) */
 	const MergeCommits *commits;	/* the roots' commits */
+	List	   *schema_conflicts;	/* tables kept as ours has them (names) */
 } MergeRows;
+
+/*
+ * Whether a merge keeps a table in a schema conflict as the branch has it,
+ * recording the conflict, rather than failing (dolt_merge(), not a pick or
+ * revert, as in Dolt); and the tables it kept so (names, qualified).
+ */
+static bool keep_schema_conflicts = false;
+static List *schema_conflicted = NIL;
+
+/*
+ * The tables a merge's alignment renamed on some side (each rename's table
+ * and, for a table's, what it is renamed to): a schema conflict in one
+ * isn't kept, as the branch's table would no longer be as it has it.
+ */
+static List *merge_renamed_tables = NIL;
+
+static bool
+schema_conflicted_table(const MergeRows *mr, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, mr->schema_conflicts)
+		if (strcmp(lfirst(lc), name) == 0)
+			return true;
+	return false;
+}
 
 
 /* What failed, for an error: a merge of branch name, or what (a pick). */
@@ -8977,6 +9138,9 @@ merge_rows(void *arg)
 		const Table *want;
 		Oid			relid;
 
+		/* (a schema conflict: the branch's rows, as its definition, stay) */
+		if (schema_conflicted_table(mr, name))
+			continue;
 		if (w == NULL)
 		{
 			/* the merged definitions drop it: unless its rows changed */
@@ -9230,6 +9394,19 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 				PG_RE_THROW();
 		}
 		FlushErrorState();
+
+		/*
+		 * (with a table kept as the branch has it, the other side's objects
+		 * may use its version: say so, the conflict not being kept)
+		 */
+		if (mr->schema_conflicts != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: %s was changed differently on both sides, and the other side's objects use its version of it",
+							(char *) linitial(mr->schema_conflicts)),
+					 errdetail("Kept as the branch has it, the table doesn't fit the other side's objects: %s",
+							   ed->message),
+					 errhint("Make the definitions agree on one side, and merge again.")));
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("schema conflict: the merged definitions don't fit together"),
@@ -9281,6 +9458,19 @@ align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
 	PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, renames, identity);
 	if (renames[0] == NIL && renames[1] == NIL && renames[2] == NIL)
 		return false;
+	for (int i = 0; i < 3; i++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, renames[i])
+		{
+			ProllyRename *r = lfirst(lc);
+
+			merge_renamed_tables = lappend(merge_renamed_tables, r->table);
+			if (r->column == NULL)
+				merge_renamed_tables = lappend(merge_renamed_tables, r->to);
+		}
+	}
 	for (int i = 0; i < 3; i += 2)
 		if (renames[i] != NIL)
 			PROLLY_CALL(dc.canonicalizer, rename_root, &roots[i], renames[i],
@@ -9317,6 +9507,7 @@ merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
 	int			conflicts;
 
 	initStringInfo(&identity);
+	merge_renamed_tables = NIL;
 	renamed = align_merge(roots, commits, aligned, &identity);
 	conflicts = merge_aligned(aligned, commits, fail_on_conflict, what, name,
 							  conflicted);
@@ -9339,6 +9530,7 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 	List	   *ours_tables;
 	List	   *theirs_tables;
 
+	schema_conflicted = NIL;
 	base_tables = tables_in_root(&roots[0], &commits->ids[0], true);
 	ours_tables = tables_in_root(&roots[1], &commits->ids[1], commits->ours_exact);
 	theirs_tables = tables_in_root(&roots[2], &commits->ids[2], true);
@@ -9349,11 +9541,30 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 	{
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
 		fail_on_conflict, what, name, conflicted, 0, NIL, roots, NULL,
-		commits};
+		commits, NIL};
 		ProllyNodeRef merged;
 
 		PROLLY_CALL(dc.canonicalizer, merge_schema, &roots[0], &roots[1],
-					&roots[2], &merged);
+					&roots[2], &merged,
+					keep_schema_conflicts && !fail_on_conflict ?
+					&mr.schema_conflicts : NULL);
+		schema_conflicted = mr.schema_conflicts;
+
+		/*
+		 * (a table renamed on a side: kept, it would take the merged name,
+		 * and its versions be found under other names; refused instead)
+		 */
+		foreach_ptr(char, kept, mr.schema_conflicts)
+		{
+			foreach_ptr(char, renamed, merge_renamed_tables)
+				if (strcmp(kept, renamed) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+									kept),
+							 errdetail("A schema conflict is kept only for a table neither side renamed."),
+							 errhint("Make the definitions agree on one side, or rename the table on the other side too, and merge again.")));
+		}
 		move_schema_merging(&roots[1], &merged, &mr);
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		return mr.conflicts;
@@ -9363,7 +9574,7 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 		/* (the branch has ours' rows, every table defined alike) */
 		MergeRows	mr = {base_tables, ours_tables, theirs_tables,
 		fail_on_conflict, what, name, conflicted, 0, ours_tables, roots,
-		&roots[1], commits};
+		&roots[1], commits, NIL};
 
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		merge_rows(&mr);
@@ -11824,6 +12035,11 @@ fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
 	int			i = 0;
 
 	memset(ms, 0, sizeof(*ms));
+	ms->nschema = list_length(schema_conflicted);
+	ms->schema_tables = palloc(sizeof(char *) * Max(ms->nschema, 1));
+	foreach(lc, schema_conflicted)
+		ms->schema_tables[i++] = lfirst(lc);
+	i = 0;
 	ms->theirs = *theirs;
 	ms->base = *base;
 	ms->ntables = list_length(conflicted);
@@ -11942,9 +12158,21 @@ merge_held(const char *branch, const char *message, int flags,
 	commits.ids[1] = ours;
 	commits.ids[2] = theirs;
 	commits.ours_exact = true;
-	conflicts = merge_recording(roots, &commits,
-								(flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
-								"merge", branch, &conflicted, &nviolations);
+	schema_conflicted = NIL;
+	keep_schema_conflicts = true;
+	PG_TRY();
+	{
+		conflicts = merge_recording(roots, &commits,
+									(flags & PROLLY_MERGE_FAIL_ON_CONFLICT) != 0,
+									"merge", branch, &conflicted, &nviolations);
+	}
+	PG_FINALLY();
+	{
+		keep_schema_conflicts = false;
+	}
+	PG_END_TRY();
+	/* (each table in a schema conflict counts as a conflict) */
+	conflicts += list_length(schema_conflicted);
 
 	/*
 	 * Conflicts or constraint violations: a merge in progress, to resolve

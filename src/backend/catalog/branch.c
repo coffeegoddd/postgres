@@ -1118,7 +1118,7 @@ branch_note_tuple(Relation rel, const ItemPointerData *oldtid,
 	 */
 	prolly_note_relation_write(MyBranch,
 							   rel->rd_rel->relkind == RELKIND_TOASTVALUE ?
-							   InvalidOid : RelationGetRelid(rel));
+							   InvalidOid : RelationGetRelid(rel), 1);
 	if (branch_tuple_hook && hushes == NIL)
 		branch_tuple_hook(rel, oldtid, newtid);
 }
@@ -1137,7 +1137,7 @@ branch_note_made(Relation rel, const ItemPointerData *oldtid,
 		return;
 	prolly_note_relation_write(MyBranch,
 							   rel->rd_rel->relkind == RELKIND_TOASTVALUE ?
-							   InvalidOid : RelationGetRelid(rel));
+							   InvalidOid : RelationGetRelid(rel), nmade);
 	if (branch_tuple_hook && hushes == NIL)
 		for (int i = 0; i < nmade; i++)
 			branch_tuple_hook(rel, i == 0 ? oldtid : NULL, &made[i]->t_self);

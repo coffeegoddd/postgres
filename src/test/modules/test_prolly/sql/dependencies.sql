@@ -175,6 +175,20 @@ SELECT extnamespace::regnamespace FROM pg_extension WHERE extname = 'citext';
 SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext')], ARRAY['{1.8,public}']) AS c2 \gset
 SELECT test_check_dependencies(ARRAY[:'c2'], false);
 SELECT test_check_dependencies(ARRAY[:'c', :'c2'], false);
+-- the remedy for an extension in another schema: moved where it can be
+-- (citext, above), made again where it can't (test_prolly_ext_table);
+-- several at once; and joined with another kind of problem's, "then try
+-- again" once
+CREATE EXTENSION test_prolly_ext_table SCHEMA dep_ext;
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('test_prolly_ext_table')], ARRAY['{1.0,public}']) AS c3 \gset
+SELECT test_check_dependencies(ARRAY[:'c3'], false);
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext'), pg_temp.ext('hstore')],
+						   ARRAY['{"",public}', '{"",dep_ext}']) AS c4 \gset
+SELECT test_check_dependencies(ARRAY[:'c4'], false);
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext'), pg_temp.ext('cube')],
+						   ARRAY['{"",public}', '{"",public}']) AS c5 \gset
+SELECT test_check_dependencies(ARRAY[:'c5'], false);
+DROP EXTENSION test_prolly_ext_table;
 
 -- an error other than "not found" while looking for an object is raised
 -- as it is, not taken for a missing object

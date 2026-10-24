@@ -48,7 +48,11 @@
  *   with its value: its last value, and whether it was given out.
  * - merge_schema() merges three folded roots' definitions: each object as
  *   the side that changed it has it; one both changed differently is a
- *   schema conflict, an error.
+ *   schema conflict, an error.  With kept, a table in such a conflict (both
+ *   changed it differently, or one dropped it and the other changed it) is
+ *   kept as ours has it instead (gone, if ours dropped it), and its name
+ *   (qualified, as the merge's other names are) appended to *kept (char *):
+ *   its rows are ours' too, for the caller to leave as they are.
  * - move_schema() makes the session branch's objects defined as a folded
  *   root defines them, from as another (the branch folded now) does: it
  *   changes the definitions, then calls rows(), which writes the tables'
@@ -81,6 +85,7 @@
 #include "access/prolly_registry.h"
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
+#include "access/tupdesc.h"
 #include "storage/itemptr.h"
 
 /* Visits one dependency a commit records: its name and its value. */
@@ -152,6 +157,43 @@ typedef struct ProllyTableColumn
 	char	   *type;			/* as format_type() writes it */
 	char	   *generated;		/* a generated column's expression, or NULL */
 } ProllyTableColumn;
+
+/*
+ * A version of a table as its commit's root describes it, read from the
+ * root's items alone (table_metadata()): its data tree, its columns (names,
+ * types and collations resolved in this database, in the order its rows
+ * encode them), and the primary key keying its rows, with each key column's
+ * btree operator family, collation and INDOPTION_* options; and its other
+ * indexes, alike, each with why it can't be followed here (not a btree, a
+ * partial or expression index, an ordering not built in), if it can't.
+ */
+typedef struct ProllyHistoricalIndex
+{
+	char	   *name;
+	char	   *definition;		/* its statement, as the version has it */
+	bool		unique;
+	int			nkeys;
+	AttrNumber	attnos[INDEX_MAX_KEYS]; /* 1-based, in the table's desc */
+	Oid			opfamilies[INDEX_MAX_KEYS];
+	Oid			collations[INDEX_MAX_KEYS];
+	int16		options[INDEX_MAX_KEYS];
+	int			ninclude;
+	AttrNumber	include[INDEX_MAX_KEYS];	/* INCLUDE columns */
+	const char *unusable;		/* why it can't be followed here, or NULL */
+} ProllyHistoricalIndex;
+
+typedef struct ProllyHistoricalTable
+{
+	ProllyNodeRef data;
+	TupleDesc	desc;
+	bool		keyed;			/* false: keyed by content */
+	int			nkeys;
+	AttrNumber	key_attnos[INDEX_MAX_KEYS]; /* 1-based, in desc */
+	Oid			opfamilies[INDEX_MAX_KEYS];
+	Oid			collations[INDEX_MAX_KEYS];
+	int16		options[INDEX_MAX_KEYS];
+	List	   *indexes;		/* its other indexes (ProllyHistoricalIndex) */
+} ProllyHistoricalTable;
 
 /* A saved named type; enum labels are String nodes in sort order. */
 typedef struct ProllyTypeDefinition
@@ -227,7 +269,7 @@ typedef struct ProllyCanonRoutine
 	void		(*merge_schema) (const ProllyNodeRef *base,
 								 const ProllyNodeRef *ours,
 								 const ProllyNodeRef *theirs,
-								 ProllyNodeRef *merged);
+								 ProllyNodeRef *merged, List **kept);
 	void		(*walk_baseline) (const ProllyNodeRef *baseline,
 								  ProllyTreeVisitNode visit, void *arg);
 
@@ -371,6 +413,17 @@ typedef struct ProllyCanonRoutine
 								  ProllyRowChangeVisit visit, void *arg);
 
 	/*
+	 * Optional: whether fewer than limit of table relid's rows differ from
+	 * baseline's (true), as table_changes() would find them but from the
+	 * change finder's fewer_changes(): no more of its record read than
+	 * limit entries, and no fold's work counted.  The baseline's data tree
+	 * for the table is put in *data.  False where that isn't known.
+	 */
+	bool		(*table_fewer_changes) (const ProllyNodeRef *baseline,
+										Oid relid, int limit,
+										ProllyNodeRef *data);
+
+	/*
 	 * Optional: baseline with the current transaction's own row changes to
 	 * these tables applied to its rows, and each table's change finder
 	 * state advanced past them, into *next: a fold of the transaction's
@@ -462,6 +515,26 @@ typedef struct ProllyCanonRoutine
 	 * say (as a move does, without user event triggers).
 	 */
 	void		(*rename_objects) (List *renames);
+
+	/*
+	 * Optional: the table name (qualified and quoted, as root names tables)
+	 * as root describes it, into *t, from root's items alone: no row is read
+	 * or re-sorted, nothing is written, and the session's tables aren't
+	 * consulted.  Returns NULL, or why its rows can't be read here as root
+	 * stores them, *t then unset: root is in another format; a column's
+	 * type or collation isn't one this database has; the key is ordered by
+	 * an extension, a collation whose version changed, or an operator class
+	 * or type that isn't built in; or the key encoder can't order it.
+	 * *found is whether root has the table (NULL is returned if not).
+	 */
+	const char *(*table_metadata) (const ProllyNodeRef *root, const char *name,
+								   ProllyHistoricalTable *t, bool *found);
+
+	/*
+	 * Optional: the names of root's tables in schema (qualified and quoted,
+	 * in the server's encoding), in root's order, from its items alone.
+	 */
+	List	   *(*table_names) (const ProllyNodeRef *root, const char *schema);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -470,11 +543,12 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "table_fewer_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
-	"rename_description", "rename_root", "rename_objects"
+	"rename_description", "rename_root", "rename_objects", "table_metadata", \
+	"table_names"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK rename_objects
+#define PROLLY_CANON_LAST_CALLBACK table_names
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

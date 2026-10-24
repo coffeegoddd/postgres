@@ -345,8 +345,11 @@ SELECT dolt_branch('dropped', :'dropped');
 
 BEGIN;
 SELECT (dolt_merge('dropped'))[2:] AS merged;
-ERROR:  merge of branch "dropped" can't combine the rows of table ord.composite yet
-DETAIL:  One side changed its definition, or dropped it, and the other its rows.
+         merged          
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
 ROLLBACK;
 SELECT dolt_branch('-D', 'dropped');
  dolt_branch 

@@ -269,8 +269,14 @@ of its own (valenc_canonical.c, through the tree's value_write()), so
 rows holding the same value share it, and a row that is still long goes
 out of line whole.  Value trees are cut by a rolling hash and addressed
 by byte counts, so an insertion rewrites the chunks around it and a
-slice reads only its own.  A leaf records the references its value
-holds, so walks reach those trees without knowing the rows' layout.  The
+slice reads only its own.  An edit can be spliced into a value tree
+(the tree's value_splice()), giving the tree a write of the edited bytes
+would: the leaves around the edit are cut again, and each level above
+made again from the node on the edit's path until its nodes end where
+the old ones did, so it reads and writes the nodes along that path and
+the bytes around the edit, as a slice reads, whatever the value's size.
+A leaf records the references its value holds, so walks reach those
+trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
@@ -344,15 +350,32 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
-A keyed row both sides of a merge changed is merged column by column.  A
-long value is held out of line by a reference naming its canonical bytes,
-so where a side's reference is base's, decoded by the same keying, that
-side didn't change the column: neither value is read (decode_row_kept()),
-and a merged row taking it is written with the reference
-(encode_row_kept()).  A large value neither side changed is not fetched to
-find that out, nor when the merged row is applied.  A column whose base
-value is unsure (below) is compared by value, as are values either side
-changed.
+A table both sides of a merge changed in ways that don't merge (its
+definitions changed differently, or one dropped it and the other changed
+it, its definition or only its rows) is a schema conflict.  dolt_merge()
+keeps it as the branch has it, definition and rows, records it in the
+merge in progress (the refs' merge names entry, by name, OID 0: refs
+format 8) and merges the other tables, as Dolt does;
+dolt_schema_conflicts shows its statements in the base, the head and
+theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
+committed until it is aborted.  A cherry-pick or revert, schema conflicts
+of other objects, a conflicted table renamed on either side, and one the
+other side's objects use in its version (a view over a column it added)
+fail as before, the last two saying so.
+
+A keyed row both sides of a merge changed is merged column by column, on
+its encoded fields (the keying's row_fields()): all three versions are
+rows of the table as defined now (a version of another shape is converted
+first), so a column's bytes name its value.  A column whose bytes one side
+left as base's takes the other's, one both changed alike keeps it, and the
+merged row is assembled from the fields taken (encode_row_fields()), long
+values by their references, no column decoded.  A large value neither side
+changed is not fetched to find that out, nor when the merged row is
+applied.  A row with a column whose base value is unsure (below) is
+decoded and compared by value instead, except that where a side's long
+value has base's reference neither is read (decode_row_kept()) and the
+merged row keeps the reference (encode_row_kept()).  An assert-enabled
+build merges each row both ways and checks they agree.
 
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk
@@ -524,7 +547,11 @@ branch's baseline then and each table's relations and snapshots ('K').
 A snapshot's slot names the transaction that took it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
 included) is kept by nobody: the relation's next snapshot, or a page
-sweep, lets go of it.  A
+sweep, lets go of it.  VACUUM freezes and sets all-visible the pages a
+relation shares only with its own snapshots, copying them (the kept
+version goes once its commit stops being kept), but leaves as they are
+the pages another branch shares, which the block map tells apart by when
+each page's entry was born (its header's shared_below).  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's
@@ -538,9 +565,16 @@ storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
 couldn't write its rows, or one of its relations is in use (its locks are
-tried, not waited for): its rows are written.  Like TRUNCATE, a restore
-isn't MVCC-safe: a snapshot taken before the move commits reads the
-restored pages after it.
+tried, not waited for): its rows are written.  Nor is one whose baseline
+holds the commit's rows with fewer than prolly.restore_min_changes (2) of
+them changed since, as its change finder tells from no more than that many
+of its records (the log's entries, none read as a fold reads them):
+restoring a table costs about as much as writing a few rows back and
+syncing their pages as the commit's are kept again, so a reset of a row
+writes it.  Like TRUNCATE, a restore isn't MVCC-safe: a
+snapshot taken before the move commits reads the restored pages after
+it.  So a small reset, its rows written, is MVCC-safe, and a large one,
+restored, isn't, for a snapshot older than the move.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's
@@ -553,6 +587,27 @@ under locks against writers.  The new branch's baseline takes those
 tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
+
+Kept commits are kept states of the materialization cache
+(prolly_matcache.h), beside kept checkouts: the cache's visit() gives
+each branch's kept commits (the refs' kept_commits(), each recording the
+transaction that kept it, which a snapshot must see committed: refs
+format 9) with their commits' roots, and every user of kept states takes both kinds.  A
+first use at a kept commit is made of its pages, found through the cache.
+A move of any branch (a reset, a checkout's move, a first use's) gives a
+table whose rows differ from the target's, where a kept commit of any
+branch holds the target's table and sharing costs less than writing the
+rows, and the transaction that kept it precedes every snapshot in the
+cluster, storage made of that commit's snapshots (branch operations'
+share_kept(): O(1) each, the source branch held against deletion and its
+relations against letting go of the pages, each relation stored alike on
+both and the source's still on the storage that kept it), its baseline
+entry taken from the kept baseline; and the move planner costs a first
+use's candidates with those tables shared, as it does a kept checkout's.
+So the old heads a branch has moved on from serve other branches until
+they retire.  (The pages are the source branch's: a snapshot older than
+their keeping could see versions it made and deleted before the commit,
+rows in no commit; while one is open the rows are written instead.)
 
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies
@@ -597,6 +652,30 @@ dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
 
+The fold worker (prolly_folder.c, prolly_fold_worker) takes a working-set
+checkpoint of each branch written, in the background, so a status or a
+commit folds only what came since, by default at every pass.  With
+prolly_fold_worker_batch_rows set, a branch whose writes go on is folded
+once its writers since its last fold wrote prolly_fold_worker_batch_rows
+rows (the refs count them, each row a write changes) or the first of them
+waited prolly_fold_worker_max_delay; one whose writes stopped (nobody
+writing it, and no writer ended for a naptime) at the next pass, as is one
+no writer of which ended since (nothing to batch). A fold writes the nodes
+on the paths to the rows it changes, so folds of a few rows each write the
+upper nodes again: batching writes keeps a busy branch's chunk writes, WAL
+and journal near its rows' own, while a commit or status during the writes
+folds the batch not yet folded itself (so batching is off by default).
+pg_stat_prolly counts the worker's folds (fold_worker_folds), the
+branches it left for a later pass (fold_worker_deferred), and its
+attempts rolled back, the refs held or the branch moved meanwhile, to be
+made again (fold_worker_retries), each branch's tries backed off (after
+1, 3, 7... passes, 63 at most).  The launcher takes the databases written
+in turn, and a worker exits after 64 passes, so a database written
+without pause doesn't keep a slot from the others.  Autovacuum's
+automatic fold (prolly.autofold_threshold), the backstop for the
+database's default branch, folds the same way, before taking the refs,
+and gives up while another holds them: a commit never waits for it.
+
 A rewrite of a versioned table (ALTER TABLE changing a column's type,
 REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
 branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
@@ -605,7 +684,11 @@ commit after, the fold worker off or in the same transaction, folds only
 what changed since.  The checkpoint never waits for a lock (the rewrite
 holds its table exclusively, and a commit holding the branch may be about
 to read it): a lock not free at once skips it, leaving the table's next
-fold to read it in full.  dolt_pending_full_folds() lists the tables whose next
+fold to read it in full.  So does any other error the fold meets (it
+folds every table of the branch, and one may hold what a commit refuses),
+logged with the error's fields; a cancel, or an internal error (class
+XX), fails the rewrite instead.  pg_stat_prolly's
+rewrite_checkpoints_skipped counts the checkpoints skipped.  dolt_pending_full_folds() lists the tables whose next
 fold would read them in full, and why, from the baseline, the catalogs and
 each change finder's full_reason(), reading no rows.
 
@@ -646,8 +729,15 @@ mark doesn't cover folds everything.  A commit's fold begins the next
 baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
-without rows and asks each table's change finder, so it still visits
-every table.
+without rows and asks each table's change finder (from that table's
+baseline entry alone), so it still visits every table; but the
+definitions are those the last read here made while nothing they're of
+changed (no catalog change in this backend's epoch, the same deparsing
+settings and baseline, the tree still stored), only every sequence's item
+worked out again (pg_stat_prolly's definitions_reused).  They're kept
+apart from the folds' items, so a status between two commits leaves the
+second's fold to work out only what was written.
+debug_prolly_verify_fold_caches reads them all again and compares.
 
 
 Remotes
@@ -693,11 +783,59 @@ or fixup then replaces the pick's commit with one of its working set, and
 a commit that became empty is dropped (unless --empty=keep).  The plan is
 edited through the dolt_rebase view, whose INSTEAD OF trigger changes the
 state.  A step that conflicts stops the rebase as a pick in progress
-(outside a transaction block, an error that rolls the whole rebase back),
-and --continue commits its resolution; the last step done, the rebased
-branch is moved to the rebase's head (refused if it moved meanwhile), and
-the rebase's branch deleted.
+(outside a transaction block, an error, which rolls back the statement:
+a rebase it began is gone, one begun before is left as it was, to
+continue or abort), and --continue commits its resolution; a pick whose
+definitions conflict (a schema conflict) is such an error too.  The last
+step done, the rebased branch is moved to the rebase's head (refused if
+it moved meanwhile), and the rebase's branch deleted.  An edit's stop
+may amend the commit it stopped at: dolt_commit('--amend') replaces the
+head commit with one of the working set and the head's parents, its
+message kept unless -m gives one, as Dolt's, refused with constraint
+violations unless forced as a commit is.  An amend and a rebase's steps
+replace commits from the head they read, so they hold the branch first,
+and fail (40001, to retry) if another's commit moved it meanwhile; the
+commit amended away has its kept pages let go of, the commit before it
+staying kept.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
+
+Snapshot mounts (prolly_snapshot.c) are history read through the
+planner: prolly_mount(ref, schema, target) resolves the ref to one commit
+and makes, in the ordinary schema target, a foreign table (foreign data
+wrapper prolly_snapshot, server prolly_local, made at the first mount)
+for each table of schema the commit has, defined as the commit describes
+it: columns, types and collations, no constraints.  Mounting reads the
+commit's root items alone (the canonicalizer's table_metadata()): no row
+is read, re-sorted or written.  It refuses what can't be read as stored:
+a key ordered by a type, operator class or collation that isn't built in,
+a collation whose version changed, an extension ordering it that changed.
+The refs pin the commit under the mount's name ('P', the refs' format
+10), so a collection keeps what it reaches; prolly_unmount() and
+prolly_refresh_mount() drop the mount's tables first, so they wait for
+its scans.  A scan reads only the commit its mount pins, rechecks that
+the reader may read the table's history (SELECT on the table of its name,
+row security not applying), and streams the data tree in key order:
+equalities on the primary key's leading columns and a range on the next
+seek and stop the scan (the keying's encode_key_bound()), the key's order
+is offered to the planner both ways, and an equality joined to another
+relation gives a parameterized path that re-seeks on each rescan.  Only
+the columns the query uses are decoded.  The quals are all kept as the
+plan's filter too.
+
+Commits don't hold secondary indexes.  A mount made with indexes
+(prolly_mount(..., indexes => true)) builds a tree of its own for each
+btree index the version describes (not a partial or expression index, nor
+one ordered by what isn't built in): an entry per row, keyed by the
+index's columns under the version's operator families, collations and
+options, then the row's data-tree key, holding the row with only the
+index's, INCLUDE and primary key columns (the value encoder's project(),
+made of the row's bytes).  The pin keeps those trees too (refs format 11:
+a pin's kept trees).  An index scan seeks and orders as the primary key's
+does, and reads a row from the data tree only where its entry lacks a
+column the query uses.  A refresh brings each tree to the new commit by
+the data trees' differences when the rows are keyed and laid out alike,
+else builds it again; the first build sorts every row's entry in memory
+(maintenance_work_mem).  A plain mount builds none and reads no row.
 
 
 Core hooks

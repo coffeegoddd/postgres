@@ -573,6 +573,34 @@ ordered_compare(ProllyKeyEncoder *enc, const ProllyKey *a, const ProllyKey *b)
 	return 0;
 }
 
+/*
+ * The first n columns encoded as encode() encodes them, then a marker for
+ * each other column at or below (above) every marker a value or NULL has:
+ * NULLS FIRST's, the least, or NULLS LAST's, the greatest.  A key that
+ * begins so and has NULLs there compares equal to the bound.
+ */
+static void
+ordered_encode_bound(ProllyKeyEncoder *enc, const Datum *values,
+					 const bool *isnull, int n, bool high, StringInfo out)
+{
+	int			ncols = enc->ncols;
+
+	if (n < 0 || n > ncols)
+		elog(ERROR, "a prolly key bound of %d of %d columns", n, ncols);
+	enc->ncols = n;
+	PG_TRY();
+	{
+		ordered_encode(enc, values, isnull, out);
+	}
+	PG_FINALLY();
+	{
+		enc->ncols = ncols;
+	}
+	PG_END_TRY();
+	for (int i = n; i < ncols; i++)
+		appendStringInfoChar(out, high ? MARKER_NULL_LAST : MARKER_NULL_FIRST);
+}
+
 static void
 ordered_end(ProllyKeyEncoder *enc)
 {
@@ -595,4 +623,5 @@ const ProllyKeyEncoderRoutine prolly_keyenc_ordered = {
 	.encode = ordered_encode,
 	.compare = ordered_compare,
 	.end = ordered_end,
+	.encode_bound = ordered_encode_bound,
 };
