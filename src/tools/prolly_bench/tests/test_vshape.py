@@ -177,9 +177,8 @@ class KnownFileTest(unittest.TestCase):
 
     def test_checked_in_entries_load_and_name_targets(self):
         path = Path(__file__).resolve().parents[1] / "configs" / "v_shape_known.toml"
-        entries = vshape.load_known(path)
-        self.assertTrue(entries)
-        for e in entries:
+        # (none, once every target is met)
+        for e in vshape.load_known(path):
             target = vshape.TARGETS[(e.check, e.sweep)][e.counter]
             # (an exception is only for a shape that misses its target)
             self.assertGreater(vshape.rank(e.current), vshape.rank(target), e)

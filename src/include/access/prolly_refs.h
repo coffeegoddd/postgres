@@ -170,6 +170,10 @@ typedef struct ProllyRebaseState
 	ProllyRebaseStep *steps;	/* (palloc'd) */
 } ProllyRebaseState;
 
+/* Visits a pin: its name, its commit and the record kept beside it. */
+typedef void (*ProllyPinVisit) (const char *name, const ProllyHash *commit,
+								const ProllyValue *info, void *arg);
+
 /* Visits a tag: its name, its tag object and that tag's commit. */
 typedef void (*ProllyTagVisit) (const char *name, const ProllyHash *tag,
 								const ProllyHash *commit, void *arg);
@@ -706,6 +710,24 @@ typedef struct ProllyRefsRoutine
 	 */
 	void		(*kept_commits) (const char *name, ProllyKeptCommitVisit visit,
 								 void *arg);
+
+	/*
+	 * Optional, together: pins.  A pin keeps a commit, and everything it
+	 * reaches, from collection under a name, for a reader outside the refs
+	 * that names the commit (a snapshot mount), with the nkeep trees keep
+	 * names (the reader's own, as a mount's index trees), which must be in
+	 * the store; info is the reader's, kept beside it.  pin_set() sets
+	 * name's pin (commit NULL: removes it), holding the refs; pin_get()
+	 * reads one (false: none), appending its info; pins() visits each, by
+	 * name.  Changes are with the transaction, as any change to the refs.
+	 * Pins are the database's own: transfers never send them.
+	 */
+	void		(*pin_set) (const char *name, const ProllyHash *commit,
+							const ProllyHash *keep, int nkeep,
+							const ProllyValue *info);
+	bool		(*pin_get) (const char *name, ProllyHash *commit,
+							StringInfo info);
+	void		(*pins) (ProllyPinVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -748,9 +770,10 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root", "kept_commits"
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
+	"pin_set", "pin_get", "pins"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK kept_commits
+#define PROLLY_REFS_LAST_CALLBACK pins
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

@@ -33,6 +33,7 @@
 #include "access/htup_details.h"
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_snapshot.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -6620,6 +6621,87 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
 					fn, name),
 			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+}
+
+/*
+ * The versions and tables lineage_has() found alike, this backend's, as
+ * of a head: a lineage is walked back from the working set, so moving the
+ * head (a reset to before the table was made) asks again.  Emptied when
+ * full.
+ */
+#define LINEAGES_KNOWN_MAX	1024
+static HTAB *lineages_known = NULL;
+
+/*
+ * check_named_rows() of one version, commit, of the table named name.
+ */
+void
+prolly_check_history_by_name(const char *name, const char *commit,
+							 bool lineage, const char *fn)
+{
+	Oid			relid;
+	AclResult	aclresult;
+	List	   *lineages = NIL;
+
+	if (object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA))
+		return;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
+						fn, name),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+	check_history_rls(relid, fn);
+	if (!lineage)
+		return;
+
+	/*
+	 * (a version and the table here it was found to be, remembered: the
+	 * table dropped and made again, or another renamed to the name, is
+	 * another relation, so asks again)
+	 */
+	{
+		ProllyHash	head;
+		char		key[NAMEDATALEN * 4 + 4 * PROLLY_HASH_MAX_LEN];
+		bool		found;
+
+		if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
+			head.len = 0;
+		snprintf(key, sizeof(key), "%u %s %s %s", relid, commit,
+				 head.len ? hash_hex(&head) : "", name);
+		if (lineages_known == NULL)
+		{
+			HASHCTL		ctl = {0};
+
+			ctl.keysize = sizeof(key);
+			ctl.entrysize = sizeof(key);
+			lineages_known = hash_create("prolly known lineages",
+										 LINEAGES_KNOWN_MAX, &ctl,
+										 HASH_ELEM | HASH_STRINGS);
+		}
+		if (hash_search(lineages_known, key, HASH_FIND, NULL))
+			return;
+		if (!lineage_has(name_lineage(&lineages, name), commit, name))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
+							fn, name),
+					 errdetail("The name was without a table since that version, so the table here is another."),
+					 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+		if (hash_get_num_entries(lineages_known) >= LINEAGES_KNOWN_MAX)
+		{
+			hash_destroy(lineages_known);
+			lineages_known = NULL;
+			return;
+		}
+		(void) hash_search(lineages_known, key, HASH_ENTER, &found);
+	}
 }
 
 /* rows_begin_described() of a table's version, or refused. */

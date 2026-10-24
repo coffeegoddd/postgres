@@ -4645,7 +4645,65 @@ typedef struct CellMerge
 	bool	   *theirs_kept;
 	bool	   *merged_kept;
 	StringInfoData row;
+	/* (merge_fields()'s, by attribute index; fields NULL: not merged so) */
+	ProllyEncodedField *fields[4];	/* base, ours, theirs, merged */
 } CellMerge;
+
+typedef enum FieldsMerge
+{
+	FIELDS_MERGED,
+	FIELDS_CONFLICT,
+	FIELDS_DECODE,				/* a column needs its values decoded */
+} FieldsMerge;
+
+/*
+ * merge_cells()'s merge of a row by its encoded columns (the keying's
+ * row_fields()), none decoded.  All three versions are rows of the
+ * merge's keying, the table's as defined now (a version of another shape
+ * is converted to it before it is merged, as_defined_now()), so each
+ * live column's bytes name its value (field_compatible() of the keying
+ * with itself): a column one side's bytes leave as base's takes the
+ * other's, one both changed alike keeps it, and one they changed
+ * differently is a conflict; a stored generated column takes ours'.  The
+ * merged row is assembled from the fields taken (encode_row_fields()),
+ * its long values' references copied.  FIELDS_DECODE when base's value in
+ * a column is unsure (see ReadFor): merge_cells() decodes then.
+ */
+static FieldsMerge
+merge_fields(Changes *c, CellMerge *cm, const ProllyValue *rows,
+			 const Bitmapset *unsure, StringInfo out)
+{
+	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
+	ProllyEncodedField *b = cm->fields[0];
+	ProllyEncodedField *o = cm->fields[1];
+	ProllyEncodedField *t = cm->fields[2];
+	ProllyEncodedField *m = cm->fields[3];
+
+	if (b == NULL || !bms_is_empty(unsure))
+		return FIELDS_DECODE;
+	for (int i = 0; i < 3; i++)
+		PROLLY_CALL(c->rd.kr, row_fields, c->rd.k, &rows[i], cm->fields[i]);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool		ours_changed;
+		bool		theirs_changed;
+
+		m[i] = o[i];
+		if (att->attisdropped || att->attgenerated)
+			continue;
+		Assert(PROLLY_CALL(c->rd.kr, field_compatible, c->rd.k, i, c->rd.k, i));
+		ours_changed = !PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &b[i], &o[i]);
+		theirs_changed = !PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &b[i], &t[i]);
+		if (ours_changed && theirs_changed &&
+			!PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &o[i], &t[i]))
+			return FIELDS_CONFLICT;
+		if (theirs_changed)
+			m[i] = t[i];
+	}
+	PROLLY_CALL(c->rd.kr, encode_row_fields, c->rd.k, m, out);
+	return FIELDS_MERGED;
+}
 
 /*
  * A tree value's row into slot, each column whose value is out of line
@@ -4687,14 +4745,82 @@ decode_kept(Changes *c, const StringInfoData *value,
  * columns are compared decoded, as are all of a row with unsure columns
  * (base's bytes there aren't its value).
  */
+static bool merge_decoded(Changes *c, CellMerge *cm, const StringInfoData *base,
+						  const StringInfoData *ours, const StringInfoData *theirs,
+						  const Bitmapset *unsure);
+
 static bool
 merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 			const StringInfoData *ours, const StringInfoData *theirs,
 			const Bitmapset *unsure, const StringInfoData **merged)
 {
-	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
+	const StringInfoData *versions[3] = {base, ours, theirs};
+	ProllyValue rows[3];
 	StringInfo	value;
 	ProllyValue row;
+	uint64		count;
+	FieldsMerge how;
+
+	for (int i = 0; i < 3; i++)
+	{
+		ProllyValue v = {(const uint8 *) versions[i]->data, versions[i]->len};
+
+		PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &v, &rows[i], &count);
+	}
+	resetStringInfo(&cm->row);
+	how = merge_fields(c, cm, rows, unsure, &cm->row);
+#ifdef USE_ASSERT_CHECKING
+	if (how != FIELDS_DECODE)
+	{
+		/*
+		 * (decoded, the row merges alike: the same conflict, or the same
+		 * bytes; the columns it decodes aren't counted)
+		 */
+		PgStat_Counter decoded = PendingProllyStats[PGSTAT_PROLLY_COLUMNS_DECODED];
+		PgStat_Counter read = PendingProllyStats[PGSTAT_PROLLY_VALUES_READ];
+		PgStat_Counter bytes = PendingProllyStats[PGSTAT_PROLLY_VALUE_BYTES_READ];
+		StringInfoData fields_row = cm->row;
+		bool		merges;
+
+		initStringInfo(&cm->row);
+		merges = merge_decoded(c, cm, base, ours, theirs, unsure);
+		Assert(merges == (how == FIELDS_MERGED));
+		Assert(!merges || (cm->row.len == fields_row.len &&
+						   memcmp(cm->row.data, fields_row.data, fields_row.len) == 0));
+		pfree(cm->row.data);
+		cm->row = fields_row;
+		PendingProllyStats[PGSTAT_PROLLY_COLUMNS_DECODED] = decoded;
+		PendingProllyStats[PGSTAT_PROLLY_VALUES_READ] = read;
+		PendingProllyStats[PGSTAT_PROLLY_VALUE_BYTES_READ] = bytes;
+	}
+#endif
+	if (how == FIELDS_CONFLICT)
+		return false;
+	if (how == FIELDS_DECODE)
+	{
+		resetStringInfo(&cm->row);
+		if (!merge_decoded(c, cm, base, ours, theirs, unsure))
+			return false;
+	}
+	row.data = (const uint8 *) cm->row.data;
+	row.len = cm->row.len;
+	value = palloc(sizeof(StringInfoData));
+	initStringInfo(value);
+	PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &row, 1, value);
+	*merged = value;
+	return true;
+}
+
+/*
+ * merge_cells()'s merge of a row decoded: false on a conflict, else the
+ * merged row's encoding appended to cm->row.
+ */
+static bool
+merge_decoded(Changes *c, CellMerge *cm, const StringInfoData *base,
+			  const StringInfoData *ours, const StringInfoData *theirs,
+			  const Bitmapset *unsure)
+{
+	TupleDesc	desc = cm->merged->tts_tupleDescriptor;
 	ProllyValue base_value = {(const uint8 *) base->data, base->len};
 	ProllyValue base_row;
 	uint64		count;
@@ -4769,16 +4895,9 @@ merge_cells(Changes *c, CellMerge *cm, const StringInfoData *base,
 		cm->merged_kept[i] = theirs_changed ? theirs_kept : ours_kept;
 	}
 	ExecStoreVirtualTuple(cm->merged);
-	resetStringInfo(&cm->row);
 	PROLLY_CALL(c->rd.kr, parse_value, c->rd.k, &base_value, &base_row, &count);
 	PROLLY_CALL(c->rd.kr, encode_row_kept, c->rd.k, cm->merged, &base_row,
 				cm->merged_kept, &cm->row);
-	row.data = (const uint8 *) cm->row.data;
-	row.len = cm->row.len;
-	value = palloc(sizeof(StringInfoData));
-	initStringInfo(value);
-	PROLLY_CALL(c->rd.kr, make_value, c->rd.k, &row, 1, value);
-	*merged = value;
 	return true;
 }
 
@@ -5861,6 +5980,16 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		mw.cm.ours_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 		mw.cm.theirs_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
 		mw.cm.merged_kept = palloc0_array(bool, RelationGetDescr(rel)->natts);
+		if (PROLLY_HAS(tc.rd.kr, row_fields) &&
+			PROLLY_HAS(tc.rd.kr, fields_alike) &&
+			PROLLY_HAS(tc.rd.kr, field_compatible) &&
+			PROLLY_HAS(tc.rd.kr, encode_row_fields))
+		{
+			int			natts = RelationGetDescr(rel)->natts;
+
+			for (int i = 0; i < 4; i++)
+				mw.cm.fields[i] = palloc0_array(ProllyEncodedField, natts);
+		}
 		initStringInfo(&mw.cm.row);
 	}
 
@@ -5920,6 +6049,11 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		pfree(mw.cm.ours_kept);
 		pfree(mw.cm.theirs_kept);
 		pfree(mw.cm.merged_kept);
+		if (mw.cm.fields[0])
+		{
+			for (int i = 0; i < 4; i++)
+				pfree(mw.cm.fields[i]);
+		}
 	}
 	if (fits.estate)
 		FreeExecutorState(fits.estate);
