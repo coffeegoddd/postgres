@@ -10014,10 +10014,10 @@ unique_queries(Relation rel, const char *batch, List **queries)
 				break;
 			}
 			if (ix->indnullsnotdistinct)
-				appendStringInfo(&cond, " AND ((t.%s IS NULL AND r.%s IS NULL) OR t.%s%s %s r.%s%s)",
+				appendStringInfo(&cond, " AND ((t.%s IS NULL AND (\"prolly refused\".rec).%s IS NULL) OR t.%s%s %s (\"prolly refused\".rec).%s%s)",
 								 att, att, att, coll, operator_sql(eq), att, coll);
 			else
-				appendStringInfo(&cond, " AND t.%s%s %s r.%s%s",
+				appendStringInfo(&cond, " AND t.%s%s %s (\"prolly refused\".rec).%s%s",
 								 att, coll, operator_sql(eq), att, coll);
 		}
 		if (!plain)
@@ -10034,7 +10034,7 @@ unique_queries(Relation rel, const char *batch, List **queries)
 															   col + FirstLowInvalidHeapAttributeNumber,
 															   false));
 
-				appendStringInfo(&cond, "%st.%s IS DISTINCT FROM r.%s",
+				appendStringInfo(&cond, "%st.%s IS DISTINCT FROM (\"prolly refused\".rec).%s",
 								 first ? "" : " OR ", att, att);
 				first = false;
 			}
@@ -10043,19 +10043,35 @@ unique_queries(Relation rel, const char *batch, List **queries)
 
 		/*
 		 * The rows collided with, and the refused rows colliding (as they
-		 * were recorded), each a row of text.
+		 * were recorded), each a row of text.  A refused row is a whole
+		 * row (rec) of "prolly refused", so no column of the table's is
+		 * named alike with the query's own (j), and the table's columns,
+		 * read in the subquery where a name finds them first, don't shadow
+		 * it (a column would have to be named "prolly refused").  The
+		 * table is read for each refused row in a
+		 * subquery of its own (OFFSET 0, LIMIT 1: not flattened into a
+		 * join), so each lookup goes through the index; the predicate,
+		 * read there, names the table's columns first.
 		 */
 		initStringInfo(&q);
 		appendStringInfo(&q,
 						 "WITH e(j) AS (SELECT json_array_elements_text(%s::json)), "
-						 "r AS (SELECT e.j, x.* FROM e, json_populate_record(NULL::%s, e.j::json) x%s%s), "
-						 "t AS (SELECT * FROM %s%s%s%s) "
-						 "SELECT DISTINCT row_to_json(t.*)::text FROM t, r WHERE true%s "
-						 "UNION ALL SELECT r.j FROM r WHERE EXISTS (SELECT FROM t WHERE true%s)",
-						 batch, name, pred ? " WHERE " : "", pred ? pred : "",
+						 "\"prolly refused\" AS (SELECT e.j AS j, ROW(x.*)::%s AS rec FROM e, "
+						 "json_populate_record(NULL::%s, e.j::json) x%s%s%s) "
+						 "SELECT DISTINCT row_to_json(t.*)::text FROM \"prolly refused\", LATERAL "
+						 "(SELECT * FROM %s%s t WHERE true%s%s%s%s OFFSET 0) t "
+						 "UNION ALL SELECT \"prolly refused\".j FROM \"prolly refused\", LATERAL "
+						 "(SELECT FROM %s%s t WHERE true%s%s%s%s LIMIT 1) z",
+						 batch, name, name,
+						 pred ? " WHERE EXISTS (SELECT FROM (SELECT x.*) s WHERE " : "",
+						 pred ? pred : "", pred ? ")" : "",
 						 only_unless_partitioned(RelationGetRelid(rel)), name,
-						 pred ? " WHERE " : "", pred ? pred : "",
-						 cond.data, cond.data);
+						 pred ? " AND (" : "", pred ? pred : "", pred ? ")" : "",
+						 cond.data,
+						 only_unless_partitioned(RelationGetRelid(rel)), name,
+						 pred ? " AND (" : "", pred ? pred : "", pred ? ")" : "",
+						 cond.data);
+		elog(DEBUG1, "prolly merge unique completion query: %s", q.data);
 		*queries = lappend(*queries, check_query(q.data, index_info(rel, ix),
 												 RelationGetRelid(rel)));
 		ReleaseSysCache(tup);
@@ -10143,7 +10159,8 @@ complete_unique_violations(void)
 	initStringInfo(&ub->literal);
 	while ((t = kept_sort_next(unique)) != NULL)
 	{
-		if (ub->n > 0 && (t->relid != ub->relid || ub->n == UNIQUE_BATCH_ROWS))
+		if (ub->n > 0 && (t->relid != ub->relid || ub->n == UNIQUE_BATCH_ROWS ||
+						  ub->literal.len + t->rowlen > CHANGED_BATCH_BYTES))
 		{
 			MemoryContextSwitchTo(batch_cxt);
 			complete_batch(ub);

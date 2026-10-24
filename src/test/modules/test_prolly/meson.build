@@ -344,6 +344,7 @@ tests += {
       't/236_bmap_release_window.pl',
       't/280_merge_kept_references.pl',
       't/281_unique_collation_collisions.pl',
+      't/282_unique_collision_queries.pl',
       't/310_reflog_after_gc.pl',
     ],
   },

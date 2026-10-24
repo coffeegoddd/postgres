@@ -1608,12 +1608,85 @@ SELECT dolt_branch('-D', 'uy_s');
  {0}
 (1 row)
 
+-- columns named as the query's own names are (e, j, r, rec, s, t, x, z),
+-- in a key, outside one, and in a partial index's predicate
+CREATE TABLE uy.w (pk int PRIMARY KEY, e int UNIQUE, j int UNIQUE, r int,
+	rec int, s int, t int, x int, z int);
+CREATE UNIQUE INDEX w_r ON uy.w (r) WHERE j > 0 AND s IS NOT NULL;
+INSERT INTO uy.w VALUES (1, 1, 1, 1, 1, 1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'uy w base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('uy_w');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO uy.w VALUES (2, 2, 20, 30, 0, 0, 0, 0, 0);
+SELECT length(dolt_commit('-am', 'uy w ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('uy_w');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'uy_w'"}
+(1 row)
+
+-- (3: j with 2; 4: e with 2; 5: r with 2, the predicate held by both)
+INSERT INTO uy.w VALUES (3, 3, 20, 3, 0, 0, 0, 0, 0), (4, 2, 4, 4, 0, 0, 0, 0, 0),
+	(5, 5, 5, 30, 0, 0, 0, 0, 0);
+SELECT length(dolt_commit('-am', 'uy w theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('uy_w'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('uy.w') ORDER BY 1, 2;
+ pk |  index  
+----+---------
+ 2  | w_e_key
+ 2  | w_j_key
+ 2  | w_r
+ 3  | w_j_key
+ 4  | w_e_key
+ 5  | w_r
+(6 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'uy_w');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA uy CASCADE;
-NOTICE:  drop cascades to 4 other objects
+NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table uy.t
 drop cascades to type uy.n
 drop cascades to table uy.x
 drop cascades to table uy.s
+drop cascades to table uy.w
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------

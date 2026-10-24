@@ -543,6 +543,29 @@ SELECT (dolt_merge('uy_s'))[3:4];
 SELECT violating_row::text FROM dolt_constraint_violations('uy.s') ORDER BY 1;
 ROLLBACK;
 SELECT dolt_branch('-D', 'uy_s');
+
+-- columns named as the query's own names are (e, j, r, rec, s, t, x, z),
+-- in a key, outside one, and in a partial index's predicate
+CREATE TABLE uy.w (pk int PRIMARY KEY, e int UNIQUE, j int UNIQUE, r int,
+	rec int, s int, t int, x int, z int);
+CREATE UNIQUE INDEX w_r ON uy.w (r) WHERE j > 0 AND s IS NOT NULL;
+INSERT INTO uy.w VALUES (1, 1, 1, 1, 1, 1, 1, 1, 1);
+SELECT length(dolt_commit('-Am', 'uy w base')::text) AS committed;
+SELECT dolt_branch('uy_w');
+INSERT INTO uy.w VALUES (2, 2, 20, 30, 0, 0, 0, 0, 0);
+SELECT length(dolt_commit('-am', 'uy w ours')::text) AS committed;
+SELECT dolt_checkout('uy_w');
+-- (3: j with 2; 4: e with 2; 5: r with 2, the predicate held by both)
+INSERT INTO uy.w VALUES (3, 3, 20, 3, 0, 0, 0, 0, 0), (4, 2, 4, 4, 0, 0, 0, 0, 0),
+	(5, 5, 5, 30, 0, 0, 0, 0, 0);
+SELECT length(dolt_commit('-am', 'uy w theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('uy_w'))[3:4];
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('uy.w') ORDER BY 1, 2;
+ROLLBACK;
+SELECT dolt_branch('-D', 'uy_w');
 DROP SCHEMA uy CASCADE;
 
 SELECT dolt_branch('-D', 'feature');
