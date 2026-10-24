@@ -124,6 +124,19 @@ ok($node->poll_query_until('postgres', $b_empty), 'b is folded once free');
 ok(!$node->log_contains('could not obtain lock', $log_offset), 'with no error');
 
 
+# the worker terminated mid-fold (as DROP DATABASE terminates it): it
+# exits cleanly, and the server stays up
+sql(q{SELECT injection_points_attach('prolly-log-trimmed', 'wait')});
+sql(q{UPDATE s.b SET v = 4});
+ok($node->poll_query_until('postgres', $stopped), 'the worker stopped mid-fold');
+sql(q{SELECT injection_points_detach('prolly-log-trimmed')});
+sql(q{SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+	WHERE backend_type = 'prolly fold worker'});
+ok($node->poll_query_until('postgres', q{SELECT count(*) = 0 FROM pg_stat_activity
+	WHERE backend_type = 'prolly fold worker' AND wait_event = 'prolly-log-trimmed'}),
+	'it exits');
+ok($node->poll_query_until('postgres', $b_empty), 'and a later fold folds b');
+
 # (and no process failed on the way)
 ok(!$node->log_contains(qr/TRAP|terminated by signal/), 'no process failed');
 $node->stop;

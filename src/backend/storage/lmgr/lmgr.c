@@ -157,7 +157,8 @@ SetLocktagHeldRelationOid(LOCKTAG *tag, Oid relid, LOCKMODE lockmode)
  * that keeps locks a foreground transaction may wait for, and so must
  * never wait for that transaction's in turn.  Other locks (a relation's
  * extension, a transaction's) are waited for as ever.  Whoever sets it
- * resets it, on error too.  RelationLockRefused is set once such a lock
+ * resets it, on error too; a transaction's abort resets it as well, for a
+ * FATAL exits without unwinding to them.  RelationLockRefused is set once such a lock
  * was refused, for the caller to tell that error from another lock's
  * timeout.
  */

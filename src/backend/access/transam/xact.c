@@ -2926,8 +2926,12 @@ AbortTransaction(void)
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 
-	/* (whoever set it, to take relation locks only if free, reset it) */
-	Assert(!RelationLocksNoWait);
+	/*
+	 * (set to take relation locks only if free, it is reset by whoever set
+	 * it, but not on a FATAL, which exits without unwinding to them)
+	 */
+	RelationLocksNoWait = false;
+	RelationLockRefused = false;
 
 	/* Disable transaction timeout */
 	if (TransactionTimeout > 0)
