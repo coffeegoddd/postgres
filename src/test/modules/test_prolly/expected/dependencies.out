@@ -405,12 +405,40 @@ SELECT test_check_dependencies(ARRAY[:'c2'], false);
 ERROR:  the check needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
 extension citext: in schema public, and the database has it in dep_ext
-HINT:  Extension citext is in schema dep_ext, and the commits need it in public: drop it and create it there (CREATE EXTENSION citext SCHEMA public), then try again.
+HINT:  Move extension citext from schema dep_ext to public, where the commits need it (ALTER EXTENSION citext SET SCHEMA public), then try again.
 SELECT test_check_dependencies(ARRAY[:'c', :'c2'], false);
 ERROR:  the check needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
 extension citext: in schemas dep_ext, public, which differ
 HINT:  Make what is missing, then try again.
+-- the remedy for an extension in another schema: moved where it can be
+-- (citext, above), made again where it can't (test_prolly_ext_table);
+-- several at once; and joined with another kind of problem's, "then try
+-- again" once
+CREATE EXTENSION test_prolly_ext_table SCHEMA dep_ext;
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('test_prolly_ext_table')], ARRAY['{1.0,public}']) AS c3 \gset
+SELECT test_check_dependencies(ARRAY[:'c3'], false);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ext_table: in schema public, and the database has it in dep_ext
+HINT:  Extension test_prolly_ext_table is in schema dep_ext and can't be moved: drop it (which drops what depends on it too) and create it in public, where the commits need it (CREATE EXTENSION test_prolly_ext_table SCHEMA public), then try again.
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext'), pg_temp.ext('hstore')],
+						   ARRAY['{"",public}', '{"",dep_ext}']) AS c4 \gset
+SELECT test_check_dependencies(ARRAY[:'c4'], false);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension citext: in schema public, and the database has it in dep_ext
+extension hstore: in schema dep_ext, and the database has it in public
+HINT:  Move the extensions to the schemas the commits need (ALTER EXTENSION ... SET SCHEMA; one that can't be moved, drop, which drops what depends on it too, and create there with CREATE EXTENSION ... SCHEMA), then try again.
+SELECT test_commit_needing(:'root', ARRAY[pg_temp.ext('citext'), pg_temp.ext('cube')],
+						   ARRAY['{"",public}', '{"",public}']) AS c5 \gset
+SELECT test_check_dependencies(ARRAY[:'c5'], false);
+ERROR:  the check needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension citext: in schema public, and the database has it in dep_ext
+extension cube: version 1.5, not installed
+HINT:  Move extension citext from schema dep_ext to public, where the commits need it (ALTER EXTENSION citext SET SCHEMA public); and install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.
+DROP EXTENSION test_prolly_ext_table;
 -- an error other than "not found" while looking for an object is raised
 -- as it is, not taken for a missing object
 SELECT test_commit_needing(:'root', ARRAY['nonsense x'], ARRAY['{nonsense,"{x}","{}"}']) AS c \gset

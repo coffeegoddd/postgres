@@ -75,7 +75,8 @@ typedef struct Problems
 	int			schemas;		/* extensions in another schema than needed */
 	char	   *schema_name;	/* the first of those, */
 	char	   *schema_needed;	/* the schema its commits need, */
-	char	   *schema_have;	/* and the one it is in */
+	char	   *schema_have;	/* the one it is in, */
+	bool		schema_relocatable; /* and whether it can be moved */
 } Problems;
 
 /* An extension to create. */
@@ -372,6 +373,14 @@ installed(const char *name, char **version, char **schema)
 	return true;
 }
 
+/* Whether an extension the database has can be moved to another schema. */
+static bool
+relocatable(const char *name)
+{
+	query("SELECT extrelocatable FROM pg_catalog.pg_extension WHERE extname = $1", 1, &name);
+	return SPI_processed > 0 && strcmp(column(0, 1), "t") == 0;
+}
+
 /*
  * The newest of the versions, by the update paths: the one every other can
  * be updated to.  NULL if none is.
@@ -463,6 +472,7 @@ check_extension(NeededExtension *e, StringInfo missing, Problems *problems,
 				problems->schema_name = e->name;
 				problems->schema_needed = schema;
 				problems->schema_have = have_schema;
+				problems->schema_relocatable = relocatable(e->name);
 			}
 		}
 		if (e->ordering_versions &&
@@ -683,33 +693,62 @@ collect_trees(List *trees, Needs *needs)
 /*
  * The hint for a refusal: the remedy of each kind of problem found, in a
  * fixed order (an extension in another schema, ordering versions,
- * extensions to install or update), or the general one.
+ * extensions to install or update), or the general one.  One kind gives
+ * its own sentence; several, their remedies joined, then "try again" once.
  */
 static char *
 problems_hint(const Problems *problems)
 {
+	List	   *remedies = NIL;
 	StringInfoData hint;
+	ListCell   *lc;
 
-	initStringInfo(&hint);
-	if (problems->schemas == 1)
-		appendStringInfo(&hint, "Extension %s is in schema %s, and the commits need it in %s: "
-						 "drop it and create it there (CREATE EXTENSION %s SCHEMA %s), then try again.",
-						 problems->schema_name, problems->schema_have, problems->schema_needed,
-						 quote_identifier(problems->schema_name),
-						 quote_identifier(problems->schema_needed));
+	if (problems->schemas == 1 && problems->schema_relocatable)
+		remedies = lappend(remedies, psprintf(
+			"move extension %s from schema %s to %s, where the commits need it "
+			"(ALTER EXTENSION %s SET SCHEMA %s)",
+			problems->schema_name, problems->schema_have, problems->schema_needed,
+			quote_identifier(problems->schema_name), quote_identifier(problems->schema_needed)));
+	else if (problems->schemas == 1)
+		remedies = lappend(remedies, psprintf(
+			"extension %s is in schema %s and can't be moved: drop it (which drops what depends "
+			"on it too) and create it in %s, where the commits need it (CREATE EXTENSION %s SCHEMA %s)",
+			problems->schema_name, problems->schema_have, problems->schema_needed,
+			quote_identifier(problems->schema_name), quote_identifier(problems->schema_needed)));
 	else if (problems->schemas > 1)
-		appendStringInfoString(&hint, "Create the extensions in the schemas the commits need "
-							   "(CREATE EXTENSION ... SCHEMA ...), then try again.");
+		remedies = lappend(remedies,
+						   "move the extensions to the schemas the commits need "
+						   "(ALTER EXTENSION ... SET SCHEMA; one that can't be moved, drop, which "
+						   "drops what depends on it too, and create there with CREATE EXTENSION ... SCHEMA)");
 	if (problems->ordering)
-		appendStringInfo(&hint, "%sUse a database with the recorded ordering-extension versions. "
-						 "After upgrading a branch, commit it before retrying a move or clone.",
-						 hint.len > 0 ? " " : "");
+		remedies = lappend(remedies,
+						   "use a database with the recorded ordering-extension versions (after "
+						   "upgrading a branch, commit it before retrying a move or clone)");
 	if (problems->extension)
-		appendStringInfo(&hint, "%sInstall or update the extensions (CREATE EXTENSION, "
-						 "ALTER EXTENSION ... UPDATE), then try again.",
-						 hint.len > 0 ? " " : "");
-	if (hint.len == 0)
-		appendStringInfoString(&hint, "Make what is missing, then try again.");
+		remedies = lappend(remedies,
+						   "install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE)");
+
+	/* (one kind alone keeps the sentence it has always had) */
+	if (remedies == NIL)
+		return "Make what is missing, then try again.";
+	if (list_length(remedies) == 1 && problems->ordering)
+		return "Use a database with the recorded ordering-extension versions. After upgrading a "
+			"branch, commit it before retrying a move or clone.";
+	if (list_length(remedies) == 1 && problems->extension)
+		return "Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), "
+			"then try again.";
+	initStringInfo(&hint);
+	foreach(lc, remedies)
+	{
+		const char *r = lfirst(lc);
+
+		if (hint.len == 0)
+			appendStringInfo(&hint, "%c%s", pg_toupper((unsigned char) r[0]), r + 1);
+		else
+			appendStringInfo(&hint, "; %s%s",
+							 foreach_current_index(lc) == list_length(remedies) - 1 ? "and " : "", r);
+	}
+	appendStringInfoString(&hint, ", then try again.");
 	return hint.data;
 }
 
