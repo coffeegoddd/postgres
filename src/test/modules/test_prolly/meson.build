@@ -347,6 +347,7 @@ tests += {
       't/311_rebase_crash.pl',
       't/312_amend_race.pl',
       't/280_merge_kept_references.pl',
+      't/298_rewrite_checkpoint_errors.pl',
       't/310_reflog_after_gc.pl',
     ],
   },
