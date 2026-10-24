@@ -72,7 +72,8 @@ SELECT table_name, status FROM dolt_status() ORDER BY 1;
 RESET extra_float_digits;
 SELECT table_name, status FROM dolt_status() ORDER BY 1;
 
--- TimeZone and lc_monetary are fixed too (UTC and C): a type printing a
+-- TimeZone, the zone abbreviations, the locale's money, numbers and dates
+-- and bytea_output are fixed too (UTC, Default, C, hex): a type printing a
 -- time with its zone's offset, or the settings it prints under, has one
 -- canonical form whatever the committer's session.  (The types outside the
 -- versioned schemas, as an extension's would be.)
@@ -96,7 +97,11 @@ CREATE TYPE ttx.shown (INPUT = ttx.shown_in, OUTPUT = ttx.shown_out,
     INTERNALLENGTH = variable, STORAGE = extended);
 RESET client_min_messages;
 SET TimeZone = 'America/New_York';
+SET timezone_abbreviations = 'India';
 SET lc_monetary = 'POSIX';
+SET lc_numeric = 'POSIX';
+SET lc_time = 'POSIX';
+SET bytea_output = 'escape';
 CREATE TABLE tt.z (id int PRIMARY KEY, w ttx.stamp, s ttx.shown);
 INSERT INTO tt.z VALUES (1, '2026-01-02 03:04:05.678+00', 'v');
 SELECT id, convert_from(substr(ttx.canon(w), 2), 'UTF8') AS w_form,
@@ -104,7 +109,11 @@ SELECT id, convert_from(substr(ttx.canon(w), 2), 'UTF8') AS w_form,
 SELECT md5(ttx.canon(w)) AS w_hash, md5(ttx.canon(s)) AS s_hash FROM tt.z \gset
 SELECT length(dolt_commit('-Am', 'settings-dependent text forms')::text) AS committed;
 SET TimeZone = 'Asia/Tokyo';
+RESET timezone_abbreviations;
 SET lc_monetary = 'C';
+SET lc_numeric = 'C';
+SET lc_time = 'C';
+RESET bytea_output;
 SELECT md5(ttx.canon(w)) = :'w_hash' AS same_w, md5(ttx.canon(s)) = :'s_hash' AS same_s
   FROM tt.z;
 UPDATE tt.z SET id = id;
@@ -112,8 +121,26 @@ SELECT table_name, status FROM dolt_status() ORDER BY 1;
 DROP TABLE tt.z;
 SELECT dolt_reset('--hard');
 SELECT id, w::text, s::text FROM tt.z;
+
+-- many values are written with the settings fixed once (a fold's batch):
+-- an error there leaves the session's settings as they were, and a value
+-- encoded after it fixes them again
+SET TimeZone = 'America/New_York';
+UPDATE tt.z SET s = 'w';
+SET ttx.fail_output = on;
+DO $$ BEGIN PERFORM dolt_commit('-Am', 'fails');
+EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'caught: %', SQLERRM; END $$;
+SHOW TimeZone;
+RESET ttx.fail_output;
+SELECT convert_from(substr(ttx.canon(s), 2), 'UTF8') AS s_form FROM tt.z;
+SELECT length(dolt_commit('-Am', 'w')::text) AS committed;
+SET TimeZone = 'Asia/Tokyo';
+UPDATE tt.z SET id = id;
+SELECT table_name, status FROM dolt_status() ORDER BY 1;
 RESET TimeZone;
 RESET lc_monetary;
+RESET lc_numeric;
+RESET lc_time;
 
 -- a column added with a default no row is written with: checked too
 ALTER TABLE tt.f ADD COLUMN s tt.seg DEFAULT '1.23456789';

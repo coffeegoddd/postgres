@@ -254,8 +254,9 @@ typedef struct BaseTable BaseTable;
 /*
  * The format a folded root is in: "20", whose text forms of values (a type
  * without binary I/O's, or one its receive refuses) are written with times
- * in UTC and money in the C locale (prolly_datum.c); "19" had them in the
- * committer's TimeZone and lc_monetary, and was the first whose
+ * in UTC, hex bytea and the C locale's money, numbers and dates
+ * (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
+ * bytea_output, and was the first whose
  * dependencies record each extension's configuration rows (those pg_dump
  * dumps with it: prolly_extconfig.h); "18" didn't, and was the first whose commits record
  * their objects' identities beside it (folded_identify()), which a server
@@ -5940,6 +5941,27 @@ typedef struct TableChangesAsk
 	int			limit;
 } TableChangesAsk;
 
+/* A change finder's walk of one table's changes. */
+typedef struct ChangesRun
+{
+	Canon	   *cn;
+	Relation	rel;
+	ProllyTableFold tf;
+	const TableChangesAsk *ask;
+	bool		ok;
+} ChangesRun;
+
+static void
+changes_run(void *arg)
+{
+	ChangesRun *run = arg;
+
+	run->ok = run->ask->limit > 0 ?
+		run->cn->finder->fewer_changes(run->rel, &run->tf, run->ask->limit) :
+		run->cn->finder->changes(run->rel, &run->cn->env, &run->tf,
+								 run->ask->visit, run->ask->arg);
+}
+
 /*
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
@@ -6023,16 +6045,19 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			AtEOXact_GUC(false, save_nestlevel);
 			if (bt)
 			{
-				ProllyTableFold tf;
+				ChangesRun	run;
 
-				memset(&tf, 0, sizeof(tf));
-				tf.data = bt->data;
-				tf.state.data = (const uint8 *) bt->state.data;
-				tf.state.len = bt->state.len;
+				memset(&run, 0, sizeof(run));
+				run.tf.data = bt->data;
+				run.tf.state.data = (const uint8 *) bt->state.data;
+				run.tf.state.len = bt->state.len;
+				run.cn = &cn;
+				run.rel = rel;
+				run.ask = ask;
 				*data = bt->data;
-				ok = ask->limit > 0 ?
-					cn.finder->fewer_changes(rel, &tf, ask->limit) :
-					cn.finder->changes(rel, &cn.env, &tf, ask->visit, ask->arg);
+				/* (the rows' values encoded with the text settings fixed once) */
+				prolly_datum_fixed_text(changes_run, &run);
+				ok = run.ok;
 			}
 		}
 	}
