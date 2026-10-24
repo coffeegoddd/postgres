@@ -647,6 +647,12 @@ SELECT diff_type, from_row FROM dolt_diff(:'old_commit', 'HEAD', NULL::ln.t);
 ERROR:  dolt_diff can't read "ln.t": the table of that name here isn't the one a version holds
 DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
 HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+-- (and the head, of the old table's relation, cuts the table's own
+-- history off from the working set: it fails closed)
+SELECT * FROM dolt_at(:'new_commit', NULL::ln.t);
+ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
 RESET ROLE;
 \c contrib_regression
 DROP DATABASE regress_lineage_breaks;

@@ -56,12 +56,12 @@ FROM pg_stat_prolly
 WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
              name              | value 
 -------------------------------+-------
- nodes_read                    |    39
- nodes_written                 |    17
+ nodes_read                    |    40
+ nodes_written                 |    18
  value_nodes_written           |     0
- chunks_appended               |    17
- chunk_bytes_appended          | 29863
- bytes_hashed                  | 29952
+ chunks_appended               |    18
+ chunk_bytes_appended          | 31233
+ bytes_hashed                  | 31322
  fold_rows_read                |  1000
  fold_rows_written             |  1000
  fold_pages                    |     0

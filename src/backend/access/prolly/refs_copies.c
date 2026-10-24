@@ -4408,9 +4408,9 @@ table_names(StringInfo out)
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
 		if (c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION)
-			lines = lappend(lines, psprintf("%010u %s.%s", c->oid,
-											get_namespace_name(c->relnamespace),
-											NameStr(c->relname)));
+			lines = lappend(lines, psprintf("%010u %s", c->oid,
+											quote_qualified_identifier(get_namespace_name(c->relnamespace),
+																	   NameStr(c->relname))));
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
@@ -4455,56 +4455,16 @@ relations_key(StringInfo key, const ProllyHash *commit)
 	pfree(hex);
 }
 
-/* The session's prolly tables, as relations_key()'s value has them. */
+/* Record commit as made from the tables lines lists (table_names()'s). */
 static void
-table_relations(StringInfo out)
-{
-	Relation	rel = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
-	HeapTuple	tup;
-	List	   *lines = NIL;
-	ListCell   *lc;
-
-	while ((tup = systable_getnext(scan)) != NULL)
-	{
-		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
-
-		if (c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION)
-			lines = lappend(lines, psprintf("%010u %s", c->oid,
-											quote_qualified_identifier(get_namespace_name(c->relnamespace),
-																	   NameStr(c->relname))));
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-	list_sort(lines, line_cmp);
-	foreach(lc, lines)
-	{
-		appendStringInfoString(out, lfirst(lc));
-		appendStringInfoChar(out, '\n');
-	}
-}
-
-/* Record commit as made from the session's tables (from, if not NULL: those) */
-static void
-note_relations(const ProllyHash *commit, const ProllyHash *from)
+note_relations(const ProllyHash *commit, const char *lines)
 {
 	StringInfoData key;
 	StringInfoData v;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	if (from != NULL)
-	{
-		relations_key(&key, from);
-		if (!refs_get(key.data, key.len, &v))
-		{
-			resetStringInfo(&v);
-			table_relations(&v);
-		}
-		resetStringInfo(&key);
-	}
-	else
-		table_relations(&v);
+	appendStringInfoString(&v, lines);
 	relations_key(&key, commit);
 	refs_put(key.data, key.len, &v);
 	pfree(key.data);
@@ -4544,7 +4504,7 @@ note_head_names(const char *name, const ProllyHash *head)
 	appendStringInfo(&v, "%s\n", hex);
 	table_names(&v);
 	refs_put(key.data, key.len, &v);
-	note_relations(head, NULL);
+	note_relations(head, v.data + strlen(hex) + 1);
 	pfree(hex);
 	pfree(key.data);
 	pfree(v.data);
@@ -4624,7 +4584,7 @@ carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *nex
 	appendStringInfo(&v, "%s%s", hex, lines);
 	refs_put(key.data, key.len, &v);
 	/* (made of the head's relations, as their names say) */
-	note_relations(next, head);
+	note_relations(next, lines[0] == '\n' ? lines + 1 : lines);
 	pfree(hex);
 	pfree(lines);
 	pfree(key.data);
@@ -4775,9 +4735,9 @@ copies_anchor_identity(const ProllyValue *identity)
 static bool
 named_as_at_head(const char *lines, Relation rel)
 {
-	char	   *line = psprintf("\n%010u %s.%s\n", RelationGetRelid(rel),
-								get_namespace_name(RelationGetNamespace(rel)),
-								RelationGetRelationName(rel));
+	char	   *line = psprintf("\n%010u %s\n", RelationGetRelid(rel),
+								quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+														   RelationGetRelationName(rel)));
 	bool		same = strstr(lines, line) != NULL;
 
 	pfree(line);

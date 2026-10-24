@@ -220,6 +220,9 @@ SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t);
 SELECT * FROM dolt_at('keeps_old~', NULL::ln.t);
 SELECT diff_type, from_row FROM dolt_diff(:'old_commit', 'HEAD', NULL::ln.t);
+-- (and the head, of the old table's relation, cuts the table's own
+-- history off from the working set: it fails closed)
+SELECT * FROM dolt_at(:'new_commit', NULL::ln.t);
 RESET ROLE;
 
 \c contrib_regression
