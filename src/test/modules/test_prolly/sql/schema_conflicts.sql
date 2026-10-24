@@ -257,9 +257,84 @@ SELECT table_name, staged, status FROM dolt_status ORDER BY table_name;
 SELECT (dolt_merge('--abort'))[4];
 ROLLBACK;
 
+-- More renames beside a schema conflict:
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE sc.m (pk int PRIMARY KEY, v int);
+CREATE TABLE sc.n (pk int PRIMARY KEY, v int);
+CREATE TABLE sc.o (pk int PRIMARY KEY, v int);
+SELECT length(dolt_commit('-Am', 'm n o')::text) AS committed;
+SELECT dolt_branch('mx_ours');
+SELECT dolt_branch('mx_theirs');
+-- ours retypes m and renames o; theirs renames m and a column of n, and
+-- retypes n: m and n conflict, m kept as sc.m, n as ours has it, with
+-- theirs' column name only in its statement; o renamed, as ours did
+SELECT dolt_checkout('mx_ours') IS NOT NULL AS on_ours;
+ALTER TABLE sc.m ALTER COLUMN v TYPE bigint;
+ALTER TABLE sc.n ALTER COLUMN v TYPE bigint;
+ALTER TABLE sc.o RENAME TO o2;
+SELECT length(dolt_commit('-am', 'mx ours')::text) AS committed;
+SELECT dolt_checkout('mx_theirs') IS NOT NULL AS on_theirs;
+ALTER TABLE sc.m RENAME TO m2;
+ALTER TABLE sc.m2 ALTER COLUMN v TYPE text;
+ALTER TABLE sc.n RENAME COLUMN v TO w;
+ALTER TABLE sc.n ALTER COLUMN w TYPE text;
+SELECT length(dolt_commit('-am', 'mx theirs')::text) AS committed;
+SELECT dolt_checkout('mx_ours') IS NOT NULL AS on_ours;
+BEGIN;
+SELECT (dolt_merge('mx_theirs'))[2:4];
+SELECT table_name, our_schema, their_schema FROM dolt_schema_conflicts
+ORDER BY table_name;
+SELECT table_name, status FROM dolt_status ORDER BY table_name;
+SELECT (dolt_merge('--abort'))[4];
+ROLLBACK;
+
+-- theirs renames the conflicted table, and ours dropped it: kept as gone
+SELECT dolt_checkout('mx_theirs') IS NOT NULL AS on_theirs;
+SELECT dolt_branch('dr_ours', 'main');
+SELECT dolt_checkout('dr_ours') IS NOT NULL AS on_dr;
+DROP TABLE sc.m;
+SELECT length(dolt_commit('-Am', 'dr ours')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('mx_theirs'))[2:4];
+SELECT table_name, our_schema, description FROM dolt_schema_conflicts
+WHERE table_name LIKE '%m%';
+SELECT to_regclass('sc.m2') IS NULL AS no_m2;
+SELECT (dolt_merge('--abort'))[4];
+ROLLBACK;
+
+-- theirs swaps two tables' names, one in a conflict; or renames it and
+-- makes another under its name: kept as ours names it, it would share a
+-- name with the other, so the merge is refused, saying so
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('sw_ours');
+SELECT dolt_branch('sw_theirs');
+SELECT dolt_branch('mk_theirs');
+SELECT dolt_checkout('sw_ours') IS NOT NULL AS on_ours;
+ALTER TABLE sc.m ALTER COLUMN v TYPE bigint;
+SELECT length(dolt_commit('-am', 'sw ours')::text) AS committed;
+SELECT dolt_checkout('sw_theirs') IS NOT NULL AS on_theirs;
+ALTER TABLE sc.m RENAME TO tmp;
+ALTER TABLE sc.n RENAME TO m;
+ALTER TABLE sc.tmp RENAME TO n;
+ALTER TABLE sc.n ALTER COLUMN v TYPE text;
+SELECT length(dolt_commit('-am', 'sw theirs')::text) AS committed;
+SELECT dolt_checkout('mk_theirs') IS NOT NULL AS on_mk;
+ALTER TABLE sc.m RENAME TO m3;
+ALTER TABLE sc.m3 ALTER COLUMN v TYPE text;
+CREATE TABLE sc.m (pk int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'mk theirs')::text) AS committed;
+SELECT dolt_checkout('sw_ours') IS NOT NULL AS on_ours;
+BEGIN;
+SELECT (dolt_merge('sw_theirs'))[2:4];
+ROLLBACK;
+BEGIN;
+SELECT (dolt_merge('mk_theirs'))[2:4];
+ROLLBACK;
+
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
 	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left',
-	'd_rows', 'd_drop', 'ty_text', 'ty_big', 'rn_retype', 'rn_rename']) b;
+	'd_rows', 'd_drop', 'ty_text', 'ty_big', 'rn_retype', 'rn_rename',
+	'mx_ours', 'mx_theirs', 'dr_ours', 'sw_ours', 'sw_theirs', 'mk_theirs']) b;
 DROP SCHEMA sc CASCADE;
 SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;

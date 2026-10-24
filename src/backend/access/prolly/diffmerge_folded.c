@@ -9230,18 +9230,12 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 }
 
 /*
- * The roots of a merge (base, ours, theirs) named alike, into aligned:
- * each object as the side that renamed it names it (merge_renames()), the
- * branch's own tables and columns renamed so (its rows kept, as only the
- * other side's changes are written to it), ours then the branch as it is.
- * The merged identity record goes into *identity.  False if no object
- * is named otherwise on any side: aligned is roots.
- */
-/*
  * The tables of a merge (roots, renamed as renames say) that will be in a
  * schema conflict a merge keeps, and that a side renamed (or renamed a
  * column of): their merged names.  Found by merging the definitions as
- * the merge will, renamed so, nothing written but the tree that makes.
+ * the merge will, renamed so: a second merge of the definitions, made
+ * only when a side renamed something, its tree written to the chunk
+ * store and left for its collection.
  */
 static List *
 renamed_schema_conflicts(const ProllyNodeRef *roots, List **renames)
@@ -9287,6 +9281,17 @@ renamed_schema_conflicts(const ProllyNodeRef *roots, List **renames)
 	return keep;
 }
 
+/*
+ * The roots of a merge (base, ours, theirs) named alike, into aligned:
+ * each object as the side that renamed it names it (merge_renames()), the
+ * branch's own tables and columns renamed so (its rows kept, as only the
+ * other side's changes are written to it), ours then the branch as it is.
+ * A merge that keeps schema conflicts (keep_schema_conflicts, unless
+ * fail_on_conflict) names a conflicted table a side renamed as ours does
+ * (renamed_schema_conflicts()).  The merged identity record goes into
+ * *identity.  False if no object is named otherwise on any side: aligned
+ * is roots.
+ */
 static bool
 align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
 			bool fail_on_conflict, ProllyNodeRef *aligned, StringInfo identity)
@@ -9420,6 +9425,23 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 					keep_schema_conflicts && !fail_on_conflict ?
 					&mr.schema_conflicts : NULL);
 		schema_conflicted = mr.schema_conflicts;
+
+		/*
+		 * (a table kept is named as ours names it: were ours' table renamed
+		 * for it after all, as the merge found a conflict the definitions'
+		 * first merge didn't, refused, not kept under another name)
+		 */
+		foreach_ptr(char, kept, mr.schema_conflicts)
+		{
+			foreach_ptr(ProllyRename, r, merge_renames_made[1])
+				if (r->column == NULL ? strcmp(r->to, kept) == 0 :
+					strcmp(r->table, kept) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+									kept),
+							 errdetail("The table can't be kept as the branch names it.")));
+		}
 		move_schema_merging(&roots[1], &merged, &mr);
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		return mr.conflicts;

@@ -878,6 +878,247 @@ SELECT (dolt_merge('--abort'))[4];
 (1 row)
 
 ROLLBACK;
+-- More renames beside a schema conflict:
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE sc.m (pk int PRIMARY KEY, v int);
+CREATE TABLE sc.n (pk int PRIMARY KEY, v int);
+CREATE TABLE sc.o (pk int PRIMARY KEY, v int);
+SELECT length(dolt_commit('-Am', 'm n o')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('mx_ours');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('mx_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- ours retypes m and renames o; theirs renames m and a column of n, and
+-- retypes n: m and n conflict, m kept as sc.m, n as ours has it, with
+-- theirs' column name only in its statement; o renamed, as ours did
+SELECT dolt_checkout('mx_ours') IS NOT NULL AS on_ours;
+ on_ours 
+---------
+ t
+(1 row)
+
+ALTER TABLE sc.m ALTER COLUMN v TYPE bigint;
+ALTER TABLE sc.n ALTER COLUMN v TYPE bigint;
+ALTER TABLE sc.o RENAME TO o2;
+SELECT length(dolt_commit('-am', 'mx ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('mx_theirs') IS NOT NULL AS on_theirs;
+ on_theirs 
+-----------
+ t
+(1 row)
+
+ALTER TABLE sc.m RENAME TO m2;
+ALTER TABLE sc.m2 ALTER COLUMN v TYPE text;
+ALTER TABLE sc.n RENAME COLUMN v TO w;
+ALTER TABLE sc.n ALTER COLUMN w TYPE text;
+SELECT length(dolt_commit('-am', 'mx theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('mx_ours') IS NOT NULL AS on_ours;
+ on_ours 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('mx_theirs'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, our_schema, their_schema FROM dolt_schema_conflicts
+ORDER BY table_name;
+ table_name |                         our_schema                         |                        their_schema                         
+------------+------------------------------------------------------------+-------------------------------------------------------------
+ sc.m       | CREATE TABLE sc.m (pk integer, v bigint);                 +| CREATE TABLE sc.m2 (pk integer, v pg_catalog.text);        +
+            | ALTER TABLE sc.m ADD CONSTRAINT m_pk_not_null NOT NULL pk;+| ALTER TABLE sc.m2 ADD CONSTRAINT m_pk_not_null NOT NULL pk;+
+            | ALTER TABLE sc.m ADD CONSTRAINT m_pkey PRIMARY KEY (pk);   | ALTER TABLE sc.m2 ADD CONSTRAINT m_pkey PRIMARY KEY (pk);
+ sc.n       | CREATE TABLE sc.n (pk integer, v bigint);                 +| CREATE TABLE sc.n (pk integer, w pg_catalog.text);         +
+            | ALTER TABLE sc.n ADD CONSTRAINT n_pk_not_null NOT NULL pk;+| ALTER TABLE sc.n ADD CONSTRAINT n_pk_not_null NOT NULL pk; +
+            | ALTER TABLE sc.n ADD CONSTRAINT n_pkey PRIMARY KEY (pk);   | ALTER TABLE sc.n ADD CONSTRAINT n_pkey PRIMARY KEY (pk);
+(2 rows)
+
+SELECT table_name, status FROM dolt_status ORDER BY table_name;
+ table_name |     status      
+------------+-----------------
+ sc.m       | schema conflict
+ sc.n       | schema conflict
+(2 rows)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+ROLLBACK;
+-- theirs renames the conflicted table, and ours dropped it: kept as gone
+SELECT dolt_checkout('mx_theirs') IS NOT NULL AS on_theirs;
+ on_theirs 
+-----------
+ t
+(1 row)
+
+SELECT dolt_branch('dr_ours', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('dr_ours') IS NOT NULL AS on_dr;
+ on_dr 
+-------
+ t
+(1 row)
+
+DROP TABLE sc.m;
+SELECT length(dolt_commit('-Am', 'dr ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('mx_theirs'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, our_schema, description FROM dolt_schema_conflicts
+WHERE table_name LIKE '%m%';
+ table_name | our_schema |                      description                       
+------------+------------+--------------------------------------------------------
+ sc.m2      | <deleted>  | cannot merge a table deletion with schema modification
+(1 row)
+
+SELECT to_regclass('sc.m2') IS NULL AS no_m2;
+ no_m2 
+-------
+ t
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+ROLLBACK;
+-- theirs swaps two tables' names, one in a conflict; or renames it and
+-- makes another under its name: kept as ours names it, it would share a
+-- name with the other, so the merge is refused, saying so
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('sw_ours');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('sw_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('mk_theirs');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('sw_ours') IS NOT NULL AS on_ours;
+ on_ours 
+---------
+ t
+(1 row)
+
+ALTER TABLE sc.m ALTER COLUMN v TYPE bigint;
+SELECT length(dolt_commit('-am', 'sw ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('sw_theirs') IS NOT NULL AS on_theirs;
+ on_theirs 
+-----------
+ t
+(1 row)
+
+ALTER TABLE sc.m RENAME TO tmp;
+ALTER TABLE sc.n RENAME TO m;
+ALTER TABLE sc.tmp RENAME TO n;
+ALTER TABLE sc.n ALTER COLUMN v TYPE text;
+SELECT length(dolt_commit('-am', 'sw theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('mk_theirs') IS NOT NULL AS on_mk;
+ on_mk 
+-------
+ t
+(1 row)
+
+ALTER TABLE sc.m RENAME TO m3;
+ALTER TABLE sc.m3 ALTER COLUMN v TYPE text;
+CREATE TABLE sc.m (pk int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'mk theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('sw_ours') IS NOT NULL AS on_ours;
+ on_ours 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('sw_theirs'))[2:4];
+ERROR:  schema conflict: sc.n was changed differently on both sides, and renamed on one
+DETAIL:  Kept as the branch names it, sc.m, it would share that name with another table the merge keeps.
+ROLLBACK;
+BEGIN;
+SELECT (dolt_merge('mk_theirs'))[2:4];
+ERROR:  schema conflict: sc.m3 was changed differently on both sides, and renamed on one
+DETAIL:  Kept as the branch names it, sc.m, it would share that name with another table the merge keeps.
+ROLLBACK;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  on_main 
 ---------
@@ -886,7 +1127,8 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 
 SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
 	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left',
-	'd_rows', 'd_drop', 'ty_text', 'ty_big', 'rn_retype', 'rn_rename']) b;
+	'd_rows', 'd_drop', 'ty_text', 'ty_big', 'rn_retype', 'rn_rename',
+	'mx_ours', 'mx_theirs', 'dr_ours', 'sw_ours', 'sw_theirs', 'mk_theirs']) b;
  dolt_branch 
 -------------
  {0}
@@ -902,13 +1144,22 @@ SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
  {0}
  {0}
  {0}
-(13 rows)
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+(19 rows)
 
 DROP SCHEMA sc CASCADE;
-NOTICE:  drop cascades to 3 other objects
+NOTICE:  drop cascades to 6 other objects
 DETAIL:  drop cascades to table sc.t
 drop cascades to table sc.other
 drop cascades to table sc.d
+drop cascades to table sc.m
+drop cascades to table sc.n
+drop cascades to table sc.o
 SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
  committed 
 -----------

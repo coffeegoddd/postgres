@@ -13330,7 +13330,11 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 {
 	List	   *merged = NIL;
 	List	   *tables = NIL;
+	List	   *kept_as_ours = NIL;
+	List	   *kept_merged_names = NIL;
 	ListCell   *lc;
+	ListCell   *kc;
+	ListCell   *nc;
 
 	for (int i = 0; i < 3; i++)
 	{
@@ -13358,7 +13362,11 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 		foreach_ptr(char, keep, keep_ours)
 			ours |= strcmp(keep, m->id.name) == 0;
 		if (ours && m->in[1])
+		{
+			kept_as_ours = lappend(kept_as_ours, m);
+			kept_merged_names = lappend(kept_merged_names, m->id.name);
 			m->id.name = pstrdup(m->in[1]->name);
+		}
 		foreach(cc, m->columns)
 		{
 			MergedObject *c = lfirst(cc);
@@ -13367,6 +13375,25 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 				merged_name(c, m->id.name);
 		}
 		settle_merged_names(m->columns, m->id.name);
+	}
+
+	/*
+	 * (another table the merge keeps under the name a table kept as ours
+	 * has it takes, theirs having swapped their names or made another of
+	 * it: refused, not kept)
+	 */
+	forboth(kc, kept_as_ours, nc, kept_merged_names)
+	{
+		MergedObject *m = lfirst(kc);
+
+		foreach_ptr(MergedObject, x, merged)
+			if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+								(char *) lfirst(nc)),
+						 errdetail("Kept as the branch names it, %s, it would share that name with another table the merge keeps.",
+								   m->id.name)));
 	}
 	settle_merged_names(merged, NULL);
 
