@@ -20,6 +20,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 sub map_path
 {
@@ -125,11 +126,23 @@ full_page_writes = off
 	$standby->stop('immediate');
 	truncate($tpath, 8192) or die "truncate $tpath: $!";
 	my $log_from = -s $standby->logfile;
-	$standby->start(fail_ok => 1);
+	# (started by pg_ctl, not waited for: recovery may PANIC, and the
+	# postmaster exit, before a start would read its pid file)
+	PostgreSQL::Test::Utils::system_log('pg_ctl', '--no-wait',
+		'--pgdata' => $standby->data_dir,
+		'--log' => $standby->logfile, 'start');
 	ok($standby->wait_for_log(qr/PANIC:  WAL contains references to invalid pages/,
 			$log_from),
 		'a standby whose map lost its root page fails recovery, its page invalid');
-	$standby->stop('immediate', fail_ok => 1);
+	# (the postmaster exits once its startup process PANICs)
+	my $pidfile = $standby->data_dir . '/postmaster.pid';
+	for (my $i = 0; -e $pidfile && $i < 10 * $PostgreSQL::Test::Utils::timeout_default; $i++)
+	{
+		usleep(100_000);
+	}
+	ok(!-e $pidfile, 'and its postmaster exits');
+	PostgreSQL::Test::Utils::system_log('pg_ctl', '--pgdata' => $standby->data_dir,
+		'--mode' => 'immediate', 'stop') if -e $pidfile;
 	$node->stop;
 }
 
