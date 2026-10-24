@@ -137,6 +137,7 @@ tests += {
       'versioned_extensions',
       'extension_moves',
       'extension_clone',
+      'extension_config_rows',
       'text_types',
       'versioned_event_triggers',
       'internal_move_events',

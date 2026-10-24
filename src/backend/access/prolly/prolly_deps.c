@@ -47,7 +47,15 @@ typedef struct NeededExtension
 	List	   *schemas;		/* String, distinct */
 	List	   *ordering_versions; /* String, exact versions ordering keys */
 	bool		versioned;		/* its schema is a versioned one */
+	List	   *configs;		/* NeededConfig *, a table each */
 } NeededExtension;
+
+/* An extension's configuration table's rows the commits record. */
+typedef struct NeededConfig
+{
+	char	   *table;			/* qualified, quoted */
+	List	   *rows;			/* String: each row's text form */
+} NeededConfig;
 
 /* An object the commits need. */
 typedef struct NeededObject
@@ -133,23 +141,44 @@ text_array_elements(const char *literal, int n, const char *what)
 	return text_array_elements_upto(literal, n, 0, NULL, what);
 }
 
-/* Canonical order: versioned, then ordering; either may be absent. */
+/*
+ * Canonical order: versioned, then ordering, either of which may be
+ * absent, then the configuration tables' rows, if any
+ * ("config<tab><table><tab><row>", into *configs, NeededConfig *, when
+ * given).
+ */
 static Datum *
-extension_parts(const char *value, bool *versioned, bool *ordering)
+extension_parts_configs(const char *value, bool *versioned, bool *ordering,
+						List **configs)
 {
 	int			nparts;
-	Datum	   *parts = text_array_elements_upto(value, 2, 2, &nparts,
+	Datum	   *parts = text_array_elements_upto(value, 2, 1024, &nparts,
 												 "extension");
+	bool		config = false;
 
 	*versioned = *ordering = false;
 	for (int i = 2; i < nparts; i++)
 	{
 		char	   *flag = TextDatumGetCString(parts[i]);
+		char	   *tab;
 
-		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering)
+		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering && !config)
 			*versioned = true;
-		else if (strcmp(flag, "ordering") == 0 && !*ordering)
+		else if (strcmp(flag, "ordering") == 0 && !*ordering && !config)
 			*ordering = true;
+		else if (strncmp(flag, "config\t", 7) == 0 && (tab = strchr(flag + 7, '\t')) != NULL &&
+				 tab > flag + 7)
+		{
+			config = true;
+			if (configs)
+			{
+				NeededConfig *c = palloc0(sizeof(NeededConfig));
+
+				c->table = pnstrdup(flag + 7, tab - (flag + 7));
+				c->rows = list_make1(makeString(pstrdup(tab + 1)));
+				*configs = lappend(*configs, c);
+			}
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -160,6 +189,36 @@ extension_parts(const char *value, bool *versioned, bool *ordering)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("an ordering extension dependency must record a version")));
 	return parts;
+}
+
+static Datum *
+extension_parts(const char *value, bool *versioned, bool *ordering)
+{
+	return extension_parts_configs(value, versioned, ordering, NULL);
+}
+
+/* Merge one commit's configuration rows into an extension's needs. */
+static void
+note_configs(NeededExtension *e, List *configs)
+{
+	ListCell   *lc;
+
+	foreach(lc, configs)
+	{
+		NeededConfig *c = lfirst(lc);
+		NeededConfig *have = NULL;
+		ListCell   *hc;
+
+		foreach(hc, e->configs)
+			if (strcmp(((NeededConfig *) lfirst(hc))->table, c->table) == 0)
+				have = lfirst(hc);
+		if (have == NULL)
+			e->configs = lappend(e->configs, c);
+		else
+			foreach(hc, c->rows)
+				if (!list_member(have->rows, lfirst(hc)))
+					have->rows = lappend(have->rows, lfirst(hc));
+	}
 }
 
 static NeededExtension *
@@ -230,7 +289,8 @@ note_need(const char *name, const char *value, void *arg)
 		char	   *quoted = pstrdup(name + strlen(EXTENSION_PREFIX));
 		bool		versioned;
 		bool		ordering;
-		Datum	   *parts = extension_parts(value, &versioned, &ordering);
+		List	   *configs = NIL;
+		Datum	   *parts = extension_parts_configs(value, &versioned, &ordering, &configs);
 		char	   *version = TextDatumGetCString(parts[0]);
 		char	   *schema = TextDatumGetCString(parts[1]);
 		List	   *names;
@@ -255,6 +315,7 @@ note_need(const char *name, const char *value, void *arg)
 		if (!list_member(e->schemas, makeString(schema)))
 			e->schemas = lappend(e->schemas, makeString(schema));
 		e->versioned = e->versioned || versioned;
+		note_configs(e, configs);
 		return;
 	}
 	foreach(lc, needs->objects)
@@ -752,6 +813,73 @@ problems_hint(const Problems *problems)
 	return hint.data;
 }
 
+/*
+ * Every configuration row the commits record must be in the database's
+ * configuration table: the commits' data may refer to them.  An extension
+ * just made (by a clone) gets them, as a restore of a dump gives an
+ * extension its configuration rows; for one the database had, a lacking
+ * row refuses the move.  Rows the database has besides are its own, and
+ * fine.
+ */
+static void
+check_configs(Needs *needs, List *installs, const char *what)
+{
+	StringInfoData missing;
+	ListCell   *lc;
+
+	initStringInfo(&missing);
+	foreach(lc, needs->extensions)
+	{
+		NeededExtension *e = lfirst(lc);
+		bool		made = find_install(installs, e->name) != NULL;
+		ListCell   *cc;
+
+		foreach(cc, e->configs)
+		{
+			NeededConfig *c = lfirst(cc);
+			List	   *have = NIL;
+			int			lacking = 0;
+			ListCell   *rc;
+
+			if (SPI_execute(psprintf("SELECT t::text FROM %s t", c->table), true, 0) != SPI_OK_SELECT)
+				elog(ERROR, "could not read configuration table %s", c->table);
+			for (uint64 i = 0; i < SPI_processed; i++)
+				have = lappend(have, makeString(column(i, 1)));
+			foreach(rc, c->rows)
+			{
+				const char *row = strVal(lfirst(rc));
+
+				if (list_member(have, lfirst(rc)))
+					continue;
+				if (!made)
+				{
+					lacking++;
+					continue;
+				}
+				{
+					Oid			types[1] = {TEXTOID};
+					Datum		values[1] = {CStringGetTextDatum(row)};
+
+					if (SPI_execute_with_args(psprintf("INSERT INTO %s SELECT (($1::text)::%s).*",
+													   c->table, c->table),
+											  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
+						elog(ERROR, "could not restore a row of configuration table %s", c->table);
+				}
+			}
+			if (lacking > 0)
+				appendStringInfo(&missing, "\nextension %s: configuration table %s lacks %d of the %d rows the commits record",
+								 e->name, c->table, lacking, list_length(c->rows));
+		}
+	}
+	if (missing.len > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the %s needs what this database lacks", what),
+				 errdetail_internal("Needed from outside the versioned schemas:%s", missing.data),
+				 errhint("Add the rows the commits record to the extension's configuration tables "
+						 "(those pg_dump dumps with the extension), then try again.")));
+}
+
 /* Check the needs, as prolly_check_dependencies() says. */
 static void
 check_needs(Needs *needs, bool install, const char *what)
@@ -843,6 +971,7 @@ check_needs(Needs *needs, bool install, const char *what)
 	}
 	foreach(lc, installs)
 		create_extension(installs, lfirst(lc));
+	check_configs(needs, installs, what);
 	SPI_finish();
 }
 

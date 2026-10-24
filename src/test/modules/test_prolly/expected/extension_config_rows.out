@@ -1,0 +1,111 @@
+--
+-- An extension's configuration rows (the rows of its configuration tables
+-- pg_dump dumps with it: a user's, by its extcondition) are recorded in
+-- the commits' dependency on it.  A clone writes them into the extension
+-- it makes, as a restore of a dump would; a move to a commit recording
+-- rows the database lacks is refused, naming the table; rows the database
+-- has besides are its own.  An extension without such rows is recorded as
+-- before.  (test_prolly_ext_table's configuration table dumps v > 1.)
+--
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT current_database() AS db \gset
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/extconfig-' || txid_current() AS url \gset
+CREATE DATABASE regress_extconfig_src;
+\c regress_extconfig_src
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA ec VERSIONED;
+CREATE EXTENSION test_prolly_ext_table SCHEMA ec;
+CREATE TABLE ec.t (id int PRIMARY KEY, n bigint DEFAULT ec.test_prolly_ext_count());
+INSERT INTO ec.t (id) VALUES (1);
+SELECT (dolt_commit('-Am', 'no configuration rows'))[1] AS c0 \gset
+-- the script's own row (v = 1) isn't dumped, so isn't recorded
+SELECT test_commit_dependencies(dolt_hashof('HEAD')) AS without_rows;
+                       without_rows                        
+-----------------------------------------------------------
+ {"extension test_prolly_ext_table => {1.0,ec,versioned}"}
+(1 row)
+
+INSERT INTO ec.test_prolly_ext_rows VALUES (7), (9);
+UPDATE ec.t SET n = ec.test_prolly_ext_count();
+SELECT (dolt_commit('-am', 'with configuration rows'))[1] AS c1 \gset
+SELECT unnest(test_commit_dependencies(dolt_hashof('HEAD'))) AS with_rows;
+                                                               with_rows                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ extension test_prolly_ext_table => {1.0,ec,versioned,"config    ec.test_prolly_ext_rows (7)","config    ec.test_prolly_ext_rows (9)"}
+(1 row)
+
+-- (not the cached dependencies of the commit before: the rows aren't
+-- catalogs)
+SELECT dolt_remote('add', 'origin', :'url') IS NOT NULL AS remote;
+ remote 
+--------
+ t
+(1 row)
+
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+ pushed 
+--------
+ t
+(1 row)
+
+-- a move to a commit recording a row the database lacks: refused
+DELETE FROM ec.test_prolly_ext_rows WHERE v = 9;
+SELECT (dolt_reset('--hard', :'c0'))[1] AS back_to_c0;
+ back_to_c0 
+------------
+ 0
+(1 row)
+
+SELECT dolt_reset('--hard', :'c1');
+ERROR:  the reset needs what this database lacks
+DETAIL:  Needed from outside the versioned schemas:
+extension test_prolly_ext_table: configuration table ec.test_prolly_ext_rows lacks 1 of the 2 rows the commits record
+HINT:  Add the rows the commits record to the extension's configuration tables (those pg_dump dumps with the extension), then try again.
+SELECT dolt_hashof('HEAD') = :'c0' AS still_at_c0;
+ still_at_c0 
+-------------
+ t
+(1 row)
+
+-- with the row back, and one of the database's own besides
+INSERT INTO ec.test_prolly_ext_rows VALUES (9), (11);
+SELECT (dolt_reset('--hard', :'c1'))[1] AS to_c1;
+ to_c1 
+-------
+ 0
+(1 row)
+
+SELECT n FROM ec.t;
+ n 
+---
+ 3
+(1 row)
+
+-- a clone makes the extension and writes the recorded rows into it
+\c :db
+CREATE DATABASE regress_extconfig_clone;
+\c regress_extconfig_clone
+SELECT dolt_clone(:'url') IS NOT NULL AS cloned;
+ cloned 
+--------
+ t
+(1 row)
+
+SELECT v FROM ec.test_prolly_ext_rows ORDER BY v;
+ v 
+---
+ 1
+ 7
+ 9
+(3 rows)
+
+SELECT n, ec.test_prolly_ext_count() AS counted FROM ec.t;
+ n | counted 
+---+---------
+ 3 |       3
+(1 row)
+
+\c :db
+DROP DATABASE regress_extconfig_clone;
+DROP DATABASE regress_extconfig_src;

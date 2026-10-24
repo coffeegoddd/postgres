@@ -249,9 +249,11 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "18", whose commits record their
- * objects' identities beside it (folded_identify()), which a server of an
- * earlier format would read past, matching renamed objects by name; "17"
+ * The format a folded root is in: "19", whose dependencies record each
+ * extension's configuration rows (those pg_dump dumps with it:
+ * extension_config()); "18" didn't, and was the first whose commits record
+ * their objects' identities beside it (folded_identify()), which a server
+ * of an earlier format would read past, matching renamed objects by name; "17"
  * had none, and was the first with extension send values normalized by
  * binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
@@ -286,7 +288,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"18"
+#define FOLDED_FORMAT	"19"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -3162,6 +3164,8 @@ static HTAB *described = NULL;
 static char *described_settings = NULL;
 static MadeTree dependencies_made;
 static uint64 dependencies_epoch;
+/* (it holds an extension's configuration rows, which aren't catalogs) */
+static bool dependencies_config;
 static MadeTree items_made;
 
 static FoldedAt items_at;
@@ -3704,6 +3708,99 @@ extension_version(Oid extoid)
 	return version;
 }
 
+/* Configuration tables by name. */
+static int
+config_entry_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(linitial(lfirst(a)), linitial(lfirst(b)));
+}
+
+/*
+ * An extension's configuration rows, for its dependency: the rows of its
+ * configuration tables (pg_extension.extconfig) that pg_dump dumps with it
+ * (those its extcondition selects: a user's, not its script's), each as
+ * "config<tab><table><tab><row>", the row in its text form, in order of
+ * table and row.  A clone writes them into the tables of the extension it
+ * makes, as a restore of a dump would, and a move checks the database has
+ * them (prolly_deps.c): the commits' data may refer to them, as columns
+ * refer to a custom SRID in PostGIS's spatial_ref_sys.  Nothing for a
+ * table without such rows, so an extension a user hasn't configured is
+ * recorded as before.  *has_config is set if the extension has
+ * configuration tables at all (their rows aren't catalogs, so a tree made
+ * from them can't be taken from the cache).
+ */
+static List *
+extension_config(Oid extoid, bool *has_config)
+{
+	List	   *out = NIL;
+	HeapTuple	tup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(extoid));
+	Datum		config;
+	Datum		condition;
+	bool		isnull;
+	bool		cond_null;
+	Datum	   *tables;
+	Datum	   *conditions = NULL;
+	int			ntables;
+	int			nconditions = 0;
+	List	   *entries = NIL;
+	ListCell   *lc;
+	MemoryContext caller;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for extension %u", extoid);
+	config = SysCacheGetAttr(EXTENSIONOID, tup, Anum_pg_extension_extconfig, &isnull);
+	condition = SysCacheGetAttr(EXTENSIONOID, tup, Anum_pg_extension_extcondition, &cond_null);
+	if (isnull)
+	{
+		ReleaseSysCache(tup);
+		return NIL;
+	}
+	deconstruct_array_builtin(DatumGetArrayTypeP(config), OIDOID, &tables, NULL, &ntables);
+	*has_config = *has_config || ntables > 0;
+	if (!cond_null)
+		deconstruct_array_builtin(DatumGetArrayTypeP(condition), TEXTOID, &conditions, NULL,
+								  &nconditions);
+	for (int i = 0; i < ntables; i++)
+	{
+		Oid			relid = DatumGetObjectId(tables[i]);
+		char	   *name;
+
+		/* (a sequence's state isn't a row a commit's data refers to) */
+		if (get_rel_relkind(relid) != RELKIND_RELATION)
+			continue;
+		name = quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+										  get_rel_name(relid));
+		entries = lappend(entries, list_make2(name,
+											  i < nconditions ? TextDatumGetCString(conditions[i]) : ""));
+	}
+	ReleaseSysCache(tup);
+	if (entries == NIL)
+		return NIL;
+	list_sort(entries, config_entry_cmp);
+
+	/* (the rows go in the caller's memory: SPI_finish() frees SPI's) */
+	caller = CurrentMemoryContext;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	foreach(lc, entries)
+	{
+		char	   *name = linitial(lfirst(lc));
+		char	   *cond = lsecond(lfirst(lc));
+		MemoryContext spi;
+
+		if (SPI_execute(psprintf("SELECT r FROM (SELECT t::text AS r FROM %s t %s) s ORDER BY r COLLATE \"C\"", name, cond),
+						true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not read configuration table %s", name);
+		spi = MemoryContextSwitchTo(caller);
+		for (uint64 i = 0; i < SPI_processed; i++)
+			out = lappend(out, psprintf("config\t%s\t%s", name,
+										SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+		MemoryContextSwitchTo(spi);
+	}
+	SPI_finish();
+	return out;
+}
+
 /* A list of strings as a text[] literal. */
 static char *
 text_array_literal(List *strings)
@@ -3745,7 +3842,7 @@ dependency_cmp(const ListCell *a, const ListCell *b)
  * object's address.
  */
 static Dependency *
-describe_dependency(const ObjectAddress *addr, List *ordering)
+describe_dependency(const ObjectAddress *addr, List *ordering, bool *has_config)
 {
 	Dependency *dep = palloc(sizeof(Dependency));
 	char	   *type = getObjectTypeDescription(addr, false);
@@ -3765,6 +3862,7 @@ describe_dependency(const ObjectAddress *addr, List *ordering)
 			value = lappend(value, "versioned");
 		if (list_member_oid(ordering, addr->objectId))
 			value = lappend(value, "ordering");
+		value = list_concat(value, extension_config(addr->objectId, has_config));
 		append_utf8(&dep->value, text_array_literal(value));
 	}
 	else
@@ -3835,6 +3933,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	ProllyTreeBuilder *b;
 	uint64		epoch;
 	bool		taken = false;
+	bool		has_config = false;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
@@ -3842,7 +3941,8 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	/* (the tree made last, if nothing it was read from changed since: #483) */
 	fold_caches_begin();
 	epoch = catalog_epoch;
-	if (dependencies_epoch == epoch && made_tree_usable(&cn, &dependencies_made))
+	if (dependencies_epoch == epoch && !dependencies_config &&
+		made_tree_usable(&cn, &dependencies_made))
 	{
 		*out = dependencies_made.root;
 		if (!debug_prolly_verify_fold_caches)
@@ -3921,7 +4021,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			deps = lappend(deps, entry);
 	}
 	foreach(lc, deps)
-		lfirst(lc) = describe_dependency(lfirst(lc), ordering);
+		lfirst(lc) = describe_dependency(lfirst(lc), ordering, &has_config);
 
 	list_sort(deps, dependency_cmp);
 	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
@@ -3958,6 +4058,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 		{
 			made_tree(&dependencies_made, out);
 			dependencies_epoch = epoch;
+			dependencies_config = has_config;
 		}
 	}
 	hash_destroy(seen);
