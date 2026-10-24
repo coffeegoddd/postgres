@@ -861,13 +861,23 @@ baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
 without rows and asks each table's change finder (from that table's
-baseline entry alone), so it still visits every table; but the
+baseline entry alone), so a status in full visits every table; but the
 definitions are those the last read here made while nothing they're of
 changed (no catalog change in this backend's epoch, the same deparsing
 settings and baseline, the tree still stored), only every sequence's item
 worked out again (pg_stat_prolly's definitions_reused).  They're kept
 apart from the folds' items, so a status between two commits leaves the
 second's fold to work out only what was written.
+A later status takes the last one's answer too, when it compared the same
+two roots (the version's and the definitions', which holds every table's
+description and baseline rows) and the refs know which tables were written
+since a mark it took before asking any change finder (written_since()):
+only those tables are compared again (pg_stat_prolly's status_reused), so
+a status after a row write costs about the tables written, not every
+table.  The answer is this backend's own, and is kept only from a
+comparison of every table's changes read so: a table whose change finder
+can't tell its changes that way (a keyless or partitioned one) makes every
+status a fold, and status_reused never moves.
 debug_prolly_verify_fold_caches reads them all again and compares.
 
 
