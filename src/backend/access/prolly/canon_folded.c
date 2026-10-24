@@ -5823,7 +5823,6 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	cn.finder = prolly_change_finder();
 	if (!PROLLY_HAS(cn.finder, changes))
 		return false;
-	load_baseline(&cn, baseline);
 
 	/* (the fold's snapshot: the transaction's writes, this statement's too) */
 	if (!IsInParallelMode())
@@ -5854,6 +5853,8 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 			appendStringInfoString(&key, "t:");
 			append_utf8(&key, qualified(form->relnamespace,
 										NameStr(form->relname)));
+			/* (the table's entry alone: a status asks each table so) */
+			load_baseline_keys(&cn, baseline, list_make1(&key));
 			/* (described as collect() describes it: see build_canonical()) */
 			fold_caches_begin();
 			check_deparse_settings();

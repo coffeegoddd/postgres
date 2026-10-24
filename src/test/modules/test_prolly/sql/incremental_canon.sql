@@ -221,9 +221,17 @@ SELECT count(*) AS changes FROM dolt_status;
 INSERT INTO many.t12 VALUES (12, 'twelve');
 SELECT * FROM dolt_status ORDER BY 1;
 SELECT nextval('many.seq') > 0 AS moved;
+:flush
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SET debug_prolly_verify_fold_caches = off;
 SELECT * FROM dolt_status ORDER BY 1;
+RESET debug_prolly_verify_fold_caches;
 :flush
 SELECT 'statuses' AS read, scans, reused() FROM work();
+-- (each table's changes asked of its baseline entry alone, not the whole
+-- baseline read again for each table: ~890 nodes here, ~1200 that way)
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
+	<= 1000 AS status_nodes_bounded;
 :reset
 SELECT length(dolt_commit('-am', 'after statuses')::text) > 0 AS committed;
 :flush
