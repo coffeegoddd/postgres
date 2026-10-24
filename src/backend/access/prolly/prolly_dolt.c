@@ -3702,6 +3702,9 @@ dolt_tag_change(char **names, int nnames, bool delete, const char *message,
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("tag \"%s\" already exists", names[0])));
+		/* (a tag made here is its role's; one fetched or pushed, no one's) */
+		if (PROLLY_HAS(r, tag_set_creator))
+			PROLLY_CALL(r, tag_set_creator, names[0], GetUserId());
 	}
 }
 
@@ -6297,6 +6300,7 @@ typedef struct IntegratedRows
 {
 	Oid			relid;
 	AclMode		need;
+	bool		any;			/* (one of need's privileges is enough) */
 } IntegratedRows;
 
 /*
@@ -6307,8 +6311,10 @@ typedef struct IntegratedRows
  * write as the change needs: INSERT for rows added, DELETE for rows
  * removed, UPDATE for rows changed (of a table without a key, whose changed
  * rows are counts of copies, INSERT and DELETE).  A change to any
- * definition, or to another object, takes the head move's privileges.
- * *needs: the tables and privileges, checked on target's catalogs
+ * definition, or to another object, takes the head move's privileges; but
+ * a sequence's value, which a write to a serial or identity column moves,
+ * takes USAGE or UPDATE on it, as nextval() does.
+ * *needs: the tables (and sequences) and privileges, checked on target's catalogs
  * (check_integrated_rows()), whose grants are the ones its rows take.
  */
 static bool
@@ -6349,6 +6355,23 @@ writer_may_integrate(const char *mine, const char *target, const ProllyHash *hea
 		Oid			relid;
 		AclMode		need = 0;
 
+		if (r->object == 's' && !r->schema_change && !r->not_covered &&
+			r->from_name != NULL && r->to_name != NULL &&
+			strcmp(r->from_name, r->to_name) == 0)
+		{
+			IntegratedRows *ir;
+
+			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(r->to_name, NULL)),
+									 NoLock, true);
+			if (!OidIsValid(relid))
+				return false;
+			ir = palloc(sizeof(IntegratedRows));
+			ir->relid = relid;
+			ir->need = ACL_USAGE | ACL_UPDATE;
+			ir->any = true;
+			*needs = lappend(*needs, ir);
+			continue;
+		}
 		if (r->object != PROLLY_OBJECT_TABLE || r->not_covered ||
 			r->schema_change || r->from_name == NULL || r->to_name == NULL ||
 			strcmp(r->from_name, r->to_name) != 0 ||
@@ -6379,6 +6402,7 @@ writer_may_integrate(const char *mine, const char *target, const ProllyHash *hea
 
 			ir->relid = relid;
 			ir->need = need;
+			ir->any = false;
 			*needs = lappend(*needs, ir);
 		}
 	}
@@ -6396,7 +6420,9 @@ check_integrated_rows(const char *target, List *needs)
 		IntegratedRows *ir = lfirst(lc);
 
 		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(ir->relid)) ||
-			pg_class_aclmask(ir->relid, GetUserId(), ir->need, ACLMASK_ALL) != ir->need)
+			(ir->any ?
+			 pg_class_aclmask(ir->relid, GetUserId(), ir->need, ACLMASK_ANY) == 0 :
+			 pg_class_aclmask(ir->relid, GetUserId(), ir->need, ACLMASK_ALL) != ir->need))
 			prolly_check_head_move(target);
 	}
 }
@@ -9420,9 +9446,19 @@ fetch_remote(const char *name, List *only, const char *need, Heads *got,
 
 	forboth(b, want.branches, c, want.commits)
 		PROLLY_CALL(dc.refs, tracking_set, name, lfirst(b), lfirst(c));
-	/* (a tag here of a name the remote's has is set to the remote's, as Dolt's) */
-	forboth(b, tags.names, c, tags.tags)
-		(void) PROLLY_CALL(dc.refs, tag_set, lfirst(b), NULL, lfirst(c));
+	/*
+	 * (a tag here of a name the remote's has is set to the remote's, as
+	 * Dolt's: tags are shared refs, so only by a role that writes them; for
+	 * another, a fetch leaves them as they are.  A fetched tag has no maker
+	 * here: its deletion takes a role that writes the refs.)
+	 */
+	if (tags.names != NIL && !prolly_writes_refs())
+		ereport(NOTICE,
+				(errmsg("the remote's tags were not fetched"),
+				 errdetail("Setting tags takes the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role.")));
+	else
+		forboth(b, tags.names, c, tags.tags)
+			(void) PROLLY_CALL(dc.refs, tag_set, lfirst(b), NULL, lfirst(c));
 	if (got)
 		*got = want;
 }

@@ -706,7 +706,12 @@ OF` are built in D18's shapes.
   protected branches stay the database owner's to move outside
   integrations. A branch's owner is recorded by role OID, not as a
   dependency: `DROP ROLE` doesn't refuse it, `REASSIGN OWNED` and
-  `DROP OWNED` don't move or drop it.
+  `DROP OWNED` don't move or drop it, and a role later given a dropped
+  role's OID (after OID wraparound, or as a dump and restore assigns role
+  OIDs anew) would own its branches, tags and stashes
+  ([#931](https://github.com/coffeegoddd/postgres/issues/931)). A fetch
+  sets the remote's tags here only for a role with those privileges, and
+  a fetched or pushed tag has no maker here.
 - **Why:** Postgres has no default write grant on a database to mirror
   Dolt's default row; its roles and `CREATE` (which already makes
   branches) are the native way to say who may change shared state, and

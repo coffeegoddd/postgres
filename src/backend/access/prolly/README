@@ -421,7 +421,10 @@ integration of any other branch, take the head move's privileges.
 
 Other shared state in the refs is guarded the same way.  Making a tag, and
 adding or removing a remote, takes prolly_writes_refs(); deleting a tag
-takes that or having made it ('G', its maker).  A stash records the role
+takes that or having made it ('G', its maker, recorded by dolt_tag()
+alone: a tag fetched or pushed is no one's).  A fetch sets the remote's
+tags here only for a role that writes the refs; another's fetch leaves
+them, with a notice.  A stash records the role
 that pushed it; dropping or popping it takes that role's privileges or
 prolly_writes_refs(), and a clear by a role without the latter clears only
 its own.  dolt_serve_move_head(), a push from another database, takes
