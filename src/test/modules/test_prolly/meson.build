@@ -348,6 +348,7 @@ tests += {
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
       't/237_vacuum_kept_pages.pl',
+      't/239_bmap_hint_shared.pl',
       't/265_fold_worker_batching.pl',
       't/267_status_definitions.pl',
       't/311_rebase_crash.pl',
