@@ -240,6 +240,8 @@ extern void copyBranchSharedDependencies(Oid source, Oid target);
 
 extern void dropBranchSharedDependencies(Oid branch);
 
+extern Oid	newMadeObjectId(Oid classId);
+
 extern void shdepDropOwned(List *roleids, DropBehavior behavior);
 
 extern void shdepReassignOwned(List *roleids, Oid newrole);

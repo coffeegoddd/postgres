@@ -65,4 +65,19 @@ DECLARE_UNIQUE_INDEX(pg_branch_name_index, 9426, BranchNameIndexId, pg_branch, b
 MAKE_SYSCACHE(BRANCHOID, pg_branch_oid_index, 4);
 MAKE_SYSCACHE(BRANCHNAME, pg_branch_name_index, 4);
 
+/*
+ * The kinds of the version control's objects that a role makes but no
+ * catalog lists: a branch, a tag, a stash, kept in a database's refs.  Each
+ * is recorded with an id of its own as a shared dependency of its maker
+ * (pg_shdepend's classid and objid), so that the role commands see it as
+ * any object the role owns.
+ */
+DECLARE_OID_DEFINING_MACRO(RefsBranchClassId, 9907);
+DECLARE_OID_DEFINING_MACRO(RefsTagClassId, 9908);
+DECLARE_OID_DEFINING_MACRO(RefsStashClassId, 9909);
+
+#define IsRefsMadeClassId(classId) \
+	((classId) == RefsBranchClassId || (classId) == RefsTagClassId || \
+	 (classId) == RefsStashClassId)
+
 #endif							/* PG_BRANCH_H */

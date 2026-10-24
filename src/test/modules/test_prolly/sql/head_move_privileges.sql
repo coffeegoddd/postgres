@@ -160,7 +160,7 @@ SET ROLE regress_hm_owner;
 SELECT try($$SELECT dolt_branch('-D', 'mine3')$$) AS delete_others;
 RESET ROLE;
 
--- a branch whose maker was dropped is the database owner's
+-- a branch whose maker's objects were dropped is the database owner's
 CREATE ROLE regress_hm_gone;
 GRANT CREATE ON DATABASE regress_head_moves TO regress_hm_gone;
 SET ROLE regress_hm_gone;
@@ -169,6 +169,7 @@ RESET ROLE;
 SELECT name, creator = 'regress_hm_gone' AS by_gone FROM dolt_branches
 WHERE name = 'orphan';
 REVOKE CREATE ON DATABASE regress_head_moves FROM regress_hm_gone;
+DROP OWNED BY regress_hm_gone;
 DROP ROLE regress_hm_gone;
 SELECT name, creator = current_user AS database_owners FROM dolt_branches
 WHERE name = 'orphan';

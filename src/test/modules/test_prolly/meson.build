@@ -226,6 +226,7 @@ tests += {
       'snapshot_mounts',
       'history_mounts',
       'head_move_privileges',
+      'role_makers',
       'writer_definitions',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
@@ -395,6 +396,7 @@ tests += {
       't/336_compared_fold_restart.pl',
       't/337_lock_has_waiters.pl',
       't/360_cleanup_invariance.pl',
+      't/375_role_maker_oid_reuse.pl',
     ],
   },
 }

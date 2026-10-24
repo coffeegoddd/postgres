@@ -1,0 +1,350 @@
+-- The branches, tags and stashes a role makes are shared dependencies of
+-- the role, as the objects it owns are: DROP ROLE refuses a role that still
+-- makes any and names them, REASSIGN OWNED gives them to another role, and
+-- DROP OWNED deletes its tags and stashes and gives its branches to the
+-- database's owner (#931).
+CREATE DATABASE regress_role_makers;
+\c regress_role_makers
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA rm VERSIONED;
+CREATE TABLE rm.t (a int PRIMARY KEY);
+GRANT USAGE ON SCHEMA rm TO PUBLIC;
+GRANT ALL ON rm.t TO PUBLIC;
+INSERT INTO rm.t VALUES (1);
+SELECT length(dolt_commit('-Am', 'one')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+CREATE ROLE regress_rm_maker;
+CREATE ROLE regress_rm_heir;
+CREATE ROLE regress_rm_other;
+-- the role's objects, and what each records
+CREATE VIEW made AS
+SELECT pg_describe_object(classid, objid, objsubid) AS object,
+	refobjid::regrole AS role, deptype
+FROM pg_shdepend
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+	-- (the kinds' class ids: a branch, a tag, a stash)
+	AND classid IN (9907, 9908, 9909);
+GRANT CREATE ON DATABASE regress_role_makers TO regress_rm_maker;
+SET ROLE regress_rm_maker;
+SELECT dolt_branch('made');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('renamed_from');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('deleted');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_tag('made_tag');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_tag('deleted_tag');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+INSERT INTO rm.t VALUES (2);
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO rm.t VALUES (3);
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+RESET ROLE;
+REVOKE CREATE ON DATABASE regress_role_makers FROM regress_rm_maker;
+SELECT * FROM made ORDER BY object;
+           object           |       role       | deptype 
+----------------------------+------------------+---------
+ branch "deleted"           | regress_rm_maker | o
+ branch "made"              | regress_rm_maker | o
+ branch "renamed_from"      | regress_rm_maker | o
+ stash stash@{0} of "shelf" | regress_rm_maker | o
+ stash stash@{1} of "shelf" | regress_rm_maker | o
+ tag "deleted_tag"          | regress_rm_maker | o
+ tag "made_tag"             | regress_rm_maker | o
+(7 rows)
+
+-- a rename keeps the dependency, and a deletion drops it, as does a stash
+-- dropped or popped
+SELECT dolt_branch('-m', 'renamed_from', 'renamed');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'deleted');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_tag('-d', 'deleted_tag');
+ dolt_tag 
+----------
+ {0}
+(1 row)
+
+SELECT dolt_stash('drop', 'shelf', 'stash@{0}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM made ORDER BY object;
+           object           |       role       | deptype 
+----------------------------+------------------+---------
+ branch "made"              | regress_rm_maker | o
+ branch "renamed"           | regress_rm_maker | o
+ stash stash@{0} of "shelf" | regress_rm_maker | o
+ tag "made_tag"             | regress_rm_maker | o
+(4 rows)
+
+SELECT name, creator FROM dolt_branches WHERE name <> 'main' ORDER BY name;
+  name   |     creator      
+---------+------------------
+ made    | regress_rm_maker
+ renamed | regress_rm_maker
+(2 rows)
+
+-- DROP ROLE refuses the role, naming what it makes
+DROP ROLE regress_rm_maker;
+ERROR:  role "regress_rm_maker" cannot be dropped because some objects depend on it
+DETAIL:  owner of branch "made"
+owner of branch "renamed"
+owner of tag "made_tag"
+owner of stash stash@{0} of "shelf"
+-- REASSIGN OWNED gives them to the new role, which then owns them
+REASSIGN OWNED BY regress_rm_maker TO regress_rm_heir;
+SELECT * FROM made ORDER BY object;
+           object           |      role       | deptype 
+----------------------------+-----------------+---------
+ branch "made"              | regress_rm_heir | o
+ branch "renamed"           | regress_rm_heir | o
+ stash stash@{0} of "shelf" | regress_rm_heir | o
+ tag "made_tag"             | regress_rm_heir | o
+(4 rows)
+
+SELECT name, creator FROM dolt_branches WHERE name <> 'main' ORDER BY name;
+  name   |     creator     
+---------+-----------------
+ made    | regress_rm_heir
+ renamed | regress_rm_heir
+(2 rows)
+
+DROP ROLE regress_rm_maker;
+SET ROLE regress_rm_other;
+SELECT dolt_branch('-f', 'renamed', 'main');
+ERROR:  permission denied to move the head of branch "renamed"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
+RESET ROLE;
+SET ROLE regress_rm_heir;
+SELECT dolt_branch('-f', 'renamed', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+-- a forced move of a branch without commits keeps its maker
+SELECT dolt_branch('-f', 'made', 'main');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT * FROM made WHERE object LIKE 'branch "made"';
+    object     |      role       | deptype 
+---------------+-----------------+---------
+ branch "made" | regress_rm_heir | o
+(1 row)
+
+-- DROP OWNED deletes the role's tags and stashes and gives its branches to
+-- the database's owner: deleting a branch would lose its commits
+DROP OWNED BY regress_rm_heir;
+SELECT * FROM made ORDER BY object;
+ object | role | deptype 
+--------+------+---------
+(0 rows)
+
+SELECT name, creator = current_user AS database_owners FROM dolt_branches
+WHERE name <> 'main' ORDER BY name;
+  name   | database_owners 
+---------+-----------------
+ made    | t
+ renamed | t
+(2 rows)
+
+SELECT count(*) AS tags FROM dolt_tags;
+ tags 
+------
+    0
+(1 row)
+
+SELECT count(*) AS stashes FROM dolt_stashes;
+ stashes 
+---------
+       0
+(1 row)
+
+DROP ROLE regress_rm_heir;
+-- a stash the role pushed alone, dropped with the stash's list's others
+SET ROLE regress_rm_other;
+INSERT INTO rm.t VALUES (4);
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+RESET ROLE;
+INSERT INTO rm.t VALUES (5);
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM made ORDER BY object;
+           object           |       role       | deptype 
+----------------------------+------------------+---------
+ stash stash@{1} of "shelf" | regress_rm_other | o
+(1 row)
+
+DROP OWNED BY regress_rm_other;
+SELECT * FROM made ORDER BY object;
+ object | role | deptype 
+--------+------+---------
+(0 rows)
+
+SELECT name, stash_id FROM dolt_stashes;
+ name  | stash_id  
+-------+-----------
+ shelf | stash@{0}
+(1 row)
+
+-- a clear drops each stash's dependency, so the role may then be dropped
+SET ROLE regress_rm_other;
+INSERT INTO rm.t VALUES (4);
+SELECT dolt_stash('push', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT * FROM made ORDER BY object;
+           object           |       role       | deptype 
+----------------------------+------------------+---------
+ stash stash@{0} of "shelf" | regress_rm_other | o
+(1 row)
+
+SELECT dolt_stash('clear', 'shelf');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT * FROM made ORDER BY object;
+ object | role | deptype 
+--------+------+---------
+(0 rows)
+
+DROP ROLE regress_rm_other;
+-- a list of several stashes keeps each one's commit through a collection
+INSERT INTO rm.t VALUES (6);
+SELECT dolt_stash('push', 'many');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO rm.t VALUES (7);
+SELECT dolt_stash('push', 'many');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+INSERT INTO rm.t VALUES (8);
+SELECT dolt_stash('push', 'many');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_gc('--full') IS NOT NULL AS collected;
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT dolt_stash('pop', 'many', 'stash@{2}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT a FROM rm.t ORDER BY a;
+ a 
+---
+ 1
+ 6
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('pop', 'many', 'stash@{1}');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+SELECT a FROM rm.t ORDER BY a;
+ a 
+---
+ 1
+ 7
+(2 rows)
+
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_stash('clear', 'many');
+ dolt_stash 
+------------
+ {0}
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_role_makers;
