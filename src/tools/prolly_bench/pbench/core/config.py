@@ -251,8 +251,9 @@ def validate(cfg: dict, suite: str) -> None:
             if name in params and params[name] not in choices:
                 raise ConfigError(f"invalid {wid}.{name}")
         for name, choices in {"modes": {"serial", "throughput"},
-                              # (G5, the moving objects, behind the GV workloads)
-                              "background": {"none", "S1", "G5"},
+                              # (S1 behind V's workloads, G5's moving
+                              # objects behind GV's)
+                              "background": {"none", "G5"} if wid.startswith("GV") else {"none", "S1"},
                               "locality": {"clustered", "scattered"},
                               "overlap": {"disjoint", "overlapping"},
                               "predicates": {"bbox", "intersects"}}.items():

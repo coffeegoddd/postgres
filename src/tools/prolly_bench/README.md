@@ -538,8 +538,8 @@ G's and GV's workloads are in `pbench/workloads/g_suite.py`:
 | G1 | COPY of points and buildings, then GiST, SP-GiST and BRIN builds | load and build seconds, index bytes per AM |
 | G2 | random windows over buildings: `&&` (`bbox`) or `ST_Intersects` (`intersects`), pgbench | tps, latency |
 | G3 | KNN, `ORDER BY g <-> point LIMIT k`, k swept, pgbench | tps, latency |
-| G4 | points in zones, and points in large polygons by a nested loop (PostGIS's toast cache), `parallel` workers swept | query ms |
-| G5 | moving objects: moves, inserts and deletes (8:1:1), pgbench | tps, latency, writes |
+| G4 | points in zones, and up to `large_points` points in large polygons by a nested loop (PostGIS's toast cache), `parallel` workers swept | query ms |
+| G5 | moving objects: moves, inserts of new vehicles and deletes of existing ones (8:1:1, counts checked), pgbench | tps, latency, writes, each script's count |
 | G6 | large polygons: full read, `ST_Simplify`, a one-vertex rewrite | ms per statement |
 | G7 | `ST_AsMVT` over a fixed tile list, zooms 4 to 7 | ms per tile |
 | G8 | geography `ST_DWithin`, pgbench | tps, latency |
@@ -551,7 +551,7 @@ G's and GV's workloads are in `pbench/workloads/g_suite.py`:
 | GV5 | a new branch's checkout and first window and KNN queries, against second ones | ms |
 
 GV workloads run with nothing in the background or with G5 (`background`
-`none`, `G5`).  The data is a seeded synthetic generator in SQL (clustered
+`none`, `G5`).  The data is a deterministic synthetic generator in SQL (clustered
 points, rotated buildings, zones of about 2000 vertices, large polygons of
 `g_large_vertices` vertices, a fleet, geography points), sized by the
 `g_*` `[sizes]` keys.  Every G cell records its answers (an md5 of each of

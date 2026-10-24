@@ -6,8 +6,8 @@ geometries, vector tiles, geography, and ANALYZE.  GV (prolly only, as V)
 measures spatial version control: commits, diffs and merges, pushes,
 clones and fetches, growth over many commits, and checkouts.
 
-Every table is made by a seeded synthetic generator in SQL (no data is
-downloaded): clustered points, small rotated buildings, zones with many
+Every table is made by a deterministic synthetic generator in SQL (no
+data is downloaded, and every run makes the same rows): clustered points, small rotated buildings, zones with many
 vertices (stored out of line), large polygons with tens of thousands of
 vertices, a fleet of points, and geography points.  The [sizes] keys in
 SIZE_DEFAULTS scale it, so both size classes come from one generator.
@@ -21,6 +21,8 @@ run whose answers differ from the heap run's isn't comparable with it
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import statistics
 import time
 from contextlib import nullcontext
@@ -50,7 +52,8 @@ SIZE_KEYS = frozenset(SIZE_DEFAULTS)
 
 # Per-workload parameter keys (suites/g.py registers them).
 PARAMS = {
-    "G1": set(), "G2": {"predicates", "window"}, "G3": {"k"}, "G4": {"parallel", "iterations"},
+    "G1": set(), "G2": {"predicates", "window"}, "G3": {"k"},
+    "G4": {"parallel", "iterations", "large_points"},
     "G5": set(), "G6": {"iterations"}, "G7": set(), "G8": {"radius"}, "G9": set(),
     "GV1": {"background", "changes", "iterations"}, "GV2": {"background", "changes", "overlap"},
     "GV3": {"background", "changes"}, "GV4": {"background", "commits"},
@@ -150,6 +153,9 @@ def load(ctx: Context, tables: list[str], indexes: bool = True) -> None:
     for t in tables:
         columns, rows = TABLES[t]
         _sql(ctx, f"CREATE TABLE {t} ({columns});\nINSERT INTO {t} {rows(ctx)};")
+        if t == "gfleet":
+            # (the ids G5's inserts give new vehicles)
+            _sql(ctx, f"CREATE SEQUENCE gfleet_new START {size(ctx, 'g_fleet') + 1}")
         if indexes:
             _sql(ctx, f"CREATE INDEX {t}_g ON {t} USING gist (g)")
     _sql(ctx, "ANALYZE " + ", ".join(tables))
@@ -332,42 +338,50 @@ class G3(GPgbench):
 @registry.workloads.register("G4")
 class G4(SingleStream):
     """Spatial joins, one stream: points in zones (counts per zone), and
-    points in the large polygons by a nested loop that probes each polygon
-    once per point (PostGIS's toast cache, hypothesis H3), with and without
-    parallel workers."""
+    points in the large polygons, which the planner does as a nested loop
+    probing each polygon once per point (PostGIS's toast cache, hypothesis
+    H3), with and without parallel workers.  The large join reads at most
+    large_points points (20000): on prolly every probe detoasts the
+    polygon again, so at the standard sizes all of them would take hours
+    a query."""
 
     id, title = "G4", "Spatial joins"
     data = ["gpts", "gzones", "glarge"]
 
-    QUERIES = {
-        "zones": "SELECT z.id, count(*) FROM gzones z JOIN gpts p ON ST_Contains(z.g, p.g) GROUP BY z.id",
-        "large": "SELECT l.id, count(*) FROM glarge l JOIN gpts p ON ST_Intersects(l.g, p.g) GROUP BY l.id",
-    }
+    ZONES = "SELECT z.id, count(*) FROM gzones z JOIN gpts p ON ST_Contains(z.g, p.g) GROUP BY z.id"
+    LARGE = ("SELECT l.id, count(*) FROM glarge l JOIN gpts p ON ST_Intersects(l.g, p.g) "
+             "WHERE p.id <= {n} GROUP BY l.id")
+
+    def queries(self, ctx) -> dict[str, str]:
+        return {"zones": self.ZONES,
+                "large": self.LARGE.format(n=int(ctx.params.get("large_points", 20000)))}
 
     def variants(self, params):
         return [(f"par{w}", {"workers": int(w)}) for w in params.get("parallel", [0, 4])]
 
-    def settings(self, ctx, name):
-        s = [f"SET max_parallel_workers_per_gather = {ctx.params['workers']}"]
-        if name == "large":
-            # (each point probed against the polygon on the outer side)
-            s += ["SET enable_hashjoin = off", "SET enable_mergejoin = off"]
-        return s
+    def setting(self, ctx):
+        return f"SET max_parallel_workers_per_gather = {ctx.params['workers']}"
 
     def measure(self, ctx, window):
         n = int(ctx.params.get("iterations", 5))
         metrics = {}
         with window:
-            for name, q in self.QUERIES.items():
-                stmts = self.settings(ctx, name) + [q] * n
-                t = timed_session(ctx, stmts, f"g4-{name}")[len(stmts) - n:]
+            for name, q in self.queries(ctx).items():
+                stmts = [self.setting(ctx)] + [q] * n
+                t = timed_session(ctx, stmts, f"g4-{name}")[1:]
                 metrics[f"{name}_ms"] = _median(t)
                 metrics[f"{name}_p95_ms"] = _p95(t)
-        return Outcome(metrics=metrics, transactions=n * len(self.QUERIES), unit="query",
+        return Outcome(metrics=metrics, transactions=n * len(self.queries(ctx)), unit="query",
                        read_only=True)
 
     def verify(self, ctx):
-        answers(ctx, self.QUERIES)
+        # (the plans too: a join the planner did another way isn't the same
+        # measurement)
+        plans = {f"plan_{name}": ctx.cluster.sql(f"{self.setting(ctx)};\nEXPLAIN (COSTS OFF) {q}",
+                                                 dbname=ctx.dbname,
+                                                 options=ctx.session_options()).stdout.strip()
+                 for name, q in self.queries(ctx).items()}
+        answers(ctx, self.queries(ctx), plans)
 
 
 @registry.workloads.register("G5")
@@ -386,13 +400,48 @@ class G5(GPgbench):
     def defines(self, ctx):
         return {**super().defines(ctx), "n": size(ctx, "g_fleet")}
 
+    @staticmethod
+    def script_transactions(output: str) -> list[int]:
+        """Each script's transactions, in SCRIPTS' order, from pgbench's
+        report."""
+        counts = [int(x) for x in re.findall(r"^ - (\d+) transactions \(", output, re.M)]
+        if len(counts) != len(G5.SCRIPTS):
+            raise RuntimeError("pgbench's report doesn't give each G5 script's transactions")
+        return counts
+
+    def measure(self, ctx, window):
+        before = int(_scalar(ctx, "SELECT count(*) FROM gfleet"))
+        out = super().measure(ctx, window)
+        moves, inserts, deletes = self.script_transactions(
+            (ctx.raw_dir / "pgbench-measure.out").read_text())
+        out.metrics.update({"moves": moves, "inserts": inserts, "deletes": deletes})
+        # each insert adds a vehicle and each delete takes one away (the
+        # first at or past a random id of the initial fleet's), so the
+        # fleet is what the counts say, but for the transactions in flight
+        # as the window closed (done, not reported): one a client at most
+        after = int(_scalar(ctx, "SELECT count(*) FROM gfleet"))
+        if abs(after - (before + inserts - deletes)) > ctx.key.clients:
+            raise RuntimeError(f"G5's fleet has {after} vehicles, not {before} + {inserts} inserted "
+                               f"- {deletes} deleted")
+        return out
+
     def verify(self, ctx):
-        # (what the run did is random; the fleet's points still all lie in
-        # the extent, and the index agrees with a sequential scan)
-        env = f"ST_MakeEnvelope(0, 0, {EXTENT}, {EXTENT}, {SRID})"
-        answers(ctx, {}, {"fleet_in_extent": _scalar(ctx, f"SELECT bool_and(g && {env}) FROM gfleet"),
-                          "index_agrees": _scalar(ctx, (
-                              f"SELECT (SELECT count(*) FROM gfleet WHERE g && {env}) = (SELECT count(*) FROM gfleet)"))})
+        # (what the run did is random: the fleet's points still lie in the
+        # extent, and a selective window by the GiST index finds what a
+        # sequential scan finds)
+        extent = f"ST_MakeEnvelope(0, 0, {EXTENT}, {EXTENT}, {SRID})"
+        window = f"ST_MakeEnvelope(400000, 400000, 450000, 450000, {SRID})"
+        q = f"SELECT md5(string_agg(id::text, ',' ORDER BY id)) FROM gfleet WHERE g && {window}"
+        plan = ctx.cluster.sql(f"SET enable_seqscan = off; SET enable_bitmapscan = off;\nEXPLAIN (COSTS OFF) {q}",
+                               dbname=ctx.dbname, options=ctx.session_options()).stdout
+        if "gfleet_g" not in plan:
+            raise RuntimeError(f"G5's index check didn't use the GiST index: {plan}")
+        indexed = ctx.cluster.sql(f"SET enable_seqscan = off; SET enable_bitmapscan = off;\n{q}",
+                                  dbname=ctx.dbname, options=ctx.session_options()).stdout.strip()
+        scanned = ctx.cluster.sql(f"SET enable_indexscan = off; SET enable_bitmapscan = off;\n{q}",
+                                  dbname=ctx.dbname, options=ctx.session_options()).stdout.strip()
+        answers(ctx, {}, {"fleet_in_extent": _scalar(ctx, f"SELECT bool_and(g && {extent}) FROM gfleet"),
+                          "index_agrees": str(indexed == scanned and bool(indexed))})
 
 
 @registry.workloads.register("G6")
@@ -489,7 +538,7 @@ class G9(SingleStream):
         "window": f"SELECT count(*) FROM gbld WHERE g && ST_MakeEnvelope(1000, 1000, 5000, 5000, {SRID})",
         "intersects": f"SELECT count(*) FROM gbld WHERE ST_Intersects(g, ST_MakeEnvelope(1000, 1000, 5000, 5000, {SRID}))",
         "knn": f"SELECT id FROM gpts ORDER BY g <-> ST_SetSRID(ST_MakePoint(500000, 500000), {SRID}) LIMIT 10",
-        "zones": G4.QUERIES["zones"],
+        "zones": G4.ZONES,
         "dwithin": "SELECT count(*) FROM ggeog WHERE ST_DWithin(g, ST_MakePoint(0, 0)::geography, 50000)",
     }
 
@@ -670,9 +719,10 @@ class GV3(GVWorkload):
                                          _commit("gv3 change"), "SELECT dolt_push('gv3', 'main')"],
                                    "gv3-change")[2]
             fetch = _timed(ctx, "SELECT dolt_fetch()", clone_db)
+            remote_bytes = sum(p.stat().st_size for p in remote.rglob("*") if p.is_file())
         finally:
             ctx.cluster.sql(f"DROP DATABASE IF EXISTS {clone_db} WITH (FORCE)")
-        remote_bytes = sum(p.stat().st_size for p in remote.rglob("*") if p.is_file())
+            shutil.rmtree(remote, ignore_errors=True)
         return Outcome(metrics={"push_ms": push, "clone_ms": clone, "change_push_ms": change,
                                 "fetch_ms": fetch, "remote_bytes": float(remote_bytes)},
                        transactions=4, unit="operation")
