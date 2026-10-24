@@ -120,7 +120,10 @@ extern void bmap_read_old(SMgrRelation reln, BlockNumber blkno,
  * page, each a reference to the subtrees it had then, taken and let go of in
  * O(1) of the relation's size; a new relation can be made of one.  The
  * caller of bmap_snapshot_take() keeps the relation from changing, as for a
- * share.
+ * share.  A snapshot is kept only once the (sub)transaction taking it
+ * commits: one whose taker aborted, or was ended by a crash, is listed by
+ * nobody and let go of by the relation's next snapshot or its page store's
+ * next sweep.
  */
 #define BMAP_SNAPSHOTS_MAX	16
 

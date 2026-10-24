@@ -478,7 +478,11 @@ waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is
 kept.  Not at a transaction's own commit (dolt.transaction_commit), whose
 head moves every transaction.  The refs record each kept commit with the
-branch's baseline then and each table's relations and snapshots ('K').  A
+branch's baseline then and each table's relations and snapshots ('K').
+A snapshot's slot names the transaction that took it, so one whose
+transaction doesn't commit (a crash between the keep and the commit
+included) is kept by nobody: the relation's next snapshot, or a page
+sweep, lets go of it.  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's

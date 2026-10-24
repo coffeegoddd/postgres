@@ -1375,7 +1375,9 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
  * transaction commits, and one whose transaction aborted is let go of the
  * next time this backend keeps or restores (letting go writes, which an
  * abort can't), or, if it never does, as it exits.  (A crash in between
- * leaves the snapshot to its storage, until the relation is dropped.)
+ * leaves the snapshot to its storage, whose slot names the transaction
+ * that took it: the relation's next snapshot, or its page store's next
+ * sweep, lets go of it then.)
  */
 typedef struct TakenSnapshot
 {
