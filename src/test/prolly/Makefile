@@ -63,7 +63,10 @@ bmap.conf: FORCE
 	@{ echo "debug_block_mapped_heap = on"; \
 	   echo "max_prepared_transactions = 10"; } > $@
 
-EXTRA_INSTALL = contrib/btree_gist
+EXTRA_INSTALL = contrib/btree_gist src/test/modules/injection_points
+
+# (TAP tests that stop a fold in its middle need injection points)
+export enable_injection_points
 
 REGRESS_OPTS = --temp-config=$(CURDIR)/prolly_am.conf
 
@@ -119,7 +122,8 @@ check-tap-durability: PROVE_TESTS = t/1*.pl
 check-tap-durability: require-tap temp-install
 	$(prove_check)
 
-check-tap-vc: PROVE_TESTS = t/2*.pl
+# (PostGIS's TAP tests aside: they run in check-postgis)
+check-tap-vc: PROVE_TESTS = $(filter-out $(POSTGIS_TAP),$(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/t/2*.pl)))
 check-tap-vc: check-vc-target require-tap temp-install
 	$(prove_check)
 
@@ -144,7 +148,13 @@ check-upstream-bmap: temp-install bmap.conf
 # and is installed from there into the temporary installation.
 POSTGIS_BUILD ?=
 
-check-postgis: check-postgis-semantics check-vc-postgis
+# PostGIS's TAP tests: concurrency and durability on the AM under test,
+# network remotes on prolly
+POSTGIS_TAP = t/295_postgis_isolation.pl t/296_postgis_crash.pl \
+	t/297_postgis_network.pl
+
+check-postgis: check-postgis-semantics check-postgis-isolation \
+	check-postgis-durability check-vc-postgis check-tap-vc-postgis
 
 postgis-install: temp-install
 	@test -n '$(POSTGIS_BUILD)' || { echo 'Set POSTGIS_BUILD to a build of PostGIS (see src/test/prolly/README)'; exit 1; }
@@ -158,6 +168,19 @@ check-postgis-semantics: PROVE_TESTS = t/006_postgis.pl
 check-postgis-semantics: require-tap postgis-install
 	$(prove_check)
 
+check-postgis-isolation: PROVE_TESTS = t/295_postgis_isolation.pl
+check-postgis-isolation: require-tap postgis-install
+	$(MAKE) -C $(top_builddir)/src/test/isolation all
+	$(prove_check)
+
+check-postgis-durability: PROVE_TESTS = t/296_postgis_crash.pl
+check-postgis-durability: require-tap postgis-install
+	$(prove_check)
+
+check-tap-vc-postgis: PROVE_TESTS = t/297_postgis_network.pl
+check-tap-vc-postgis: check-vc-target-prolly require-tap postgis-install
+	$(prove_check)
+
 check-vc-postgis: postgis-install check-vc-target-prolly vc.conf
 	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_postgis_schedule
@@ -167,7 +190,8 @@ check-vc-postgis: postgis-install check-vc-target-prolly vc.conf
 # in the recursive make below.  With POSTGIS_BUILD, PostGIS's group too.
 check-heap: temp-install
 	$(MAKE) check-semantics check-isolation check-tap-durability \
-		$(if $(POSTGIS_BUILD),check-postgis-semantics) PROLLY_AM=heap
+		$(if $(POSTGIS_BUILD),check-postgis-semantics check-postgis-isolation \
+			check-postgis-durability) PROLLY_AM=heap
 
 require-tap:
 	@test '$(enable_tap_tests)' = yes || { echo 'Configure with --enable-tap-tests to run requirements'; exit 1; }
@@ -177,5 +201,6 @@ clean distclean:
 
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
-	check-postgis postgis-install check-postgis-semantics check-vc-postgis \
+	check-postgis postgis-install check-postgis-semantics check-postgis-isolation \
+	check-postgis-durability check-vc-postgis check-tap-vc-postgis \
 	check-upstream-bmap require-tap FORCE

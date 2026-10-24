@@ -341,6 +341,7 @@ tests += {
       't/221_reload_first_use.pl',
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
+      't/280_merge_kept_references.pl',
     ],
   },
 }
