@@ -294,6 +294,23 @@ END $$;
 SELECT pg_temp.wait_gone(:gone);
 SELECT kept('kp.fresh') AS kept_after;
 
+-- a commit amended away is no longer the branch's: its pages are let go
+-- of, so the commit before it stays kept, and a reset to it writes no row
+SELECT dolt_reset('--hard') IS NOT NULL AS clean;
+SELECT rows_digest() AS before_amend \gset
+UPDATE kp.t SET v = 3 WHERE id <= 50;
+SELECT dolt_commit('-am', 'to amend') IS NOT NULL AS committed;
+UPDATE kp.t SET v = 4 WHERE id <= 50;
+SELECT dolt_commit('--amend') IS NOT NULL AS amended;
+UPDATE kp.t SET v = 5 WHERE id <= 50;
+SELECT pg_stat_force_next_flush();
+SELECT now_counted() AS before \gset
+SELECT dolt_reset('--hard', 'HEAD~1');
+SELECT pg_stat_force_next_flush();
+SELECT since(:'before') ->> 'apply_rows' AS applied,
+	   (since(:'before') ->> 'relations_restored')::int > 0 AS restored;
+SELECT rows_digest() = :'before_amend' AS as_before, clean(), indexes_valid();
+
 -- every block the stores hold is held by a map or a snapshot kept
 CHECKPOINT;
 SELECT freed FROM prolly_page_sweep();
