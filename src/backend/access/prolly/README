@@ -542,9 +542,16 @@ storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
 couldn't write its rows, or one of its relations is in use (its locks are
-tried, not waited for): its rows are written.  Like TRUNCATE, a restore
-isn't MVCC-safe: a snapshot taken before the move commits reads the
-restored pages after it.
+tried, not waited for): its rows are written.  Nor is one whose baseline
+holds the commit's rows with fewer than prolly.restore_min_changes (2) of
+them changed since, as its change finder tells from no more than that many
+of its records (the log's entries, none read as a fold reads them):
+restoring a table costs about as much as writing a few rows back and
+syncing their pages as the commit's are kept again, so a reset of a row
+writes it.  Like TRUNCATE, a restore isn't MVCC-safe: a
+snapshot taken before the move commits reads the restored pages after
+it.  So a small reset, its rows written, is MVCC-safe, and a large one,
+restored, isn't, for a snapshot older than the move.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's
@@ -557,6 +564,27 @@ under locks against writers.  The new branch's baseline takes those
 tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
+
+Kept commits are kept states of the materialization cache
+(prolly_matcache.h), beside kept checkouts: the cache's visit() gives
+each branch's kept commits (the refs' kept_commits(), each recording the
+transaction that kept it, which a snapshot must see committed: refs
+format 9) with their commits' roots, and every user of kept states takes both kinds.  A
+first use at a kept commit is made of its pages, found through the cache.
+A move of any branch (a reset, a checkout's move, a first use's) gives a
+table whose rows differ from the target's, where a kept commit of any
+branch holds the target's table and sharing costs less than writing the
+rows, and the transaction that kept it precedes every snapshot in the
+cluster, storage made of that commit's snapshots (branch operations'
+share_kept(): O(1) each, the source branch held against deletion and its
+relations against letting go of the pages, each relation stored alike on
+both and the source's still on the storage that kept it), its baseline
+entry taken from the kept baseline; and the move planner costs a first
+use's candidates with those tables shared, as it does a kept checkout's.
+So the old heads a branch has moved on from serve other branches until
+they retire.  (The pages are the source branch's: a snapshot older than
+their keeping could see versions it made and deleted before the commit,
+rows in no commit; while one is open the rows are written instead.)
 
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies

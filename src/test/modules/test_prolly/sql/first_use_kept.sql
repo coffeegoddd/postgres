@@ -7,6 +7,9 @@
 
 SELECT current_database() AS home \gset
 CREATE DATABASE first_use_kept;
+-- (a reset there restores however few rows changed: kept_pages tests the
+-- threshold)
+ALTER DATABASE first_use_kept SET prolly.restore_min_changes = 0;
 \c first_use_kept
 SET client_min_messages = warning;
 CREATE EXTENSION amcheck;
