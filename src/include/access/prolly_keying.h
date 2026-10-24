@@ -190,6 +190,29 @@ typedef struct ProllyKeyingRoutine
 	Datum		(*decode_field) (ProllyKeying *k, int attno,
 								 const ProllyEncodedField *field,
 								 bool *isnull);
+
+	/*
+	 * Optional: open_described(), keyed instead by a primary key of nkeys
+	 * of desc's columns (attnos, 1-based), with their btree operator
+	 * families, collations and INDOPTION_* options, as a version of a table
+	 * only its commits describe keyed its rows: compare() orders its keys
+	 * as that version's tree.  NULL if the key encoder can't order such a
+	 * key.
+	 */
+	ProllyKeying *(*open_keyed) (TupleDesc desc, int nkeys,
+								 const AttrNumber *attnos,
+								 const Oid *opfamilies,
+								 const Oid *collations,
+								 const int16 *options, MemoryContext mcxt);
+
+	/*
+	 * Optional: a bound for seeking keys whose first n key columns have
+	 * values (the key encoder's encode_bound()), appended to out; false,
+	 * appending nothing, for a keying that keys rows by content.
+	 */
+	bool		(*encode_key_bound) (ProllyKeying *k, const Datum *values,
+									 const bool *isnull, int n, bool high,
+									 StringInfo out);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
@@ -197,9 +220,9 @@ typedef struct ProllyKeyingRoutine
 	"decode_row", "compare", "close", "set_values", "row_refs", \
 	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
 	"row_shape", "shape_extends", "open_shape", "decode_row_columns", \
-	"row_fields", "decode_field"
+	"row_fields", "decode_field", "open_keyed", "encode_key_bound"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK decode_field
+#define PROLLY_KEYING_LAST_CALLBACK encode_key_bound
 
 /*
  * Set up a data tree's environment and k's value store for each other:

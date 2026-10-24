@@ -94,7 +94,7 @@ hash_row(ProllyKeying *k, const uint8 *data, Size len, ProllyHash *out)
 
 /* Set up encoding of a primary key on the given columns. */
 static void
-setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
+setup_key(ProllyKeying *k, int natts, int nkeys, const KeyColumn *cols,
 		  const ProllyKeyEncoderRoutine *keyenc)
 {
 	ProllyKeyDesc desc;
@@ -110,9 +110,8 @@ setup_key(ProllyKeying *k, Relation rel, int nkeys, const KeyColumn *cols,
 	for (int i = 0; i < nkeys; i++)
 	{
 		/* Primary keys are plain columns, never expressions. */
-		if (cols[i].attno <= 0 || cols[i].attno > RelationGetNumberOfAttributes(rel))
-			elog(ERROR, "primary key of \"%s\" has an invalid key column",
-				 RelationGetRelationName(rel));
+		if (cols[i].attno <= 0 || cols[i].attno > natts)
+			elog(ERROR, "a prolly primary key has an invalid key column");
 		k->key_attnos[i] = cols[i].attno;
 		k->opfamilies[i] = cols[i].opfamily;
 		k->collations[i] = cols[i].collation;
@@ -188,7 +187,8 @@ pkprefix_open(Relation rel, MemoryContext mcxt)
 						 cols[i].type, cols[i].collation))
 			k->keyless = true;
 	if (!k->keyless)
-		setup_key(k, rel, nkeys, cols, c.key_encoder);
+		setup_key(k, RelationGetNumberOfAttributes(rel), nkeys, cols,
+				  c.key_encoder);
 	initStringInfo(&k->layout);
 	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
 	MemoryContextSwitchTo(old);
@@ -218,6 +218,57 @@ pkprefix_open_described(TupleDesc desc, MemoryContext mcxt)
 	PROLLY_CALL(c.value_encoder, layout, k->valenc, &k->layout);
 	MemoryContextSwitchTo(old);
 	return k;
+}
+
+/*
+ * Rows of desc's columns keyed by the given primary key, opened without a
+ * relation: pkprefix_open_described(), keyed as pkprefix_open() keys a
+ * table with that primary key.  NULL if the key encoder can't order it.
+ */
+static ProllyKeying *
+pkprefix_open_keyed(TupleDesc desc, int nkeys, const AttrNumber *attnos,
+					const Oid *opfamilies, const Oid *collations,
+					const int16 *options, MemoryContext mcxt)
+{
+	ProllyComponents c;
+	KeyColumn	cols[INDEX_MAX_KEYS];
+	ProllyKeying *k;
+	MemoryContext old;
+
+	if (nkeys <= 0 || nkeys > INDEX_MAX_KEYS)
+		return NULL;
+	prolly_history_components(&c);
+	for (int i = 0; i < nkeys; i++)
+	{
+		if (attnos[i] <= 0 || attnos[i] > desc->natts ||
+			TupleDescAttr(desc, attnos[i] - 1)->attisdropped)
+			return NULL;
+		cols[i].attno = attnos[i];
+		cols[i].opfamily = opfamilies[i];
+		cols[i].collation = collations[i];
+		cols[i].option = options[i];
+		cols[i].type = TupleDescAttr(desc, attnos[i] - 1)->atttypid;
+		if (!PROLLY_CALL(c.key_encoder, supports, cols[i].opfamily,
+						 cols[i].type, cols[i].collation))
+			return NULL;
+	}
+	k = pkprefix_open_described(desc, mcxt);
+	old = MemoryContextSwitchTo(mcxt);
+	k->keyless = false;
+	setup_key(k, desc->natts, nkeys, cols, c.key_encoder);
+	MemoryContextSwitchTo(old);
+	return k;
+}
+
+static bool
+pkprefix_encode_key_bound(ProllyKeying *k, const Datum *values,
+						  const bool *isnull, int n, bool high, StringInfo out)
+{
+	if (k->keyless)
+		return false;
+	PROLLY_CALL(k->keyenc_routine, encode_bound, k->keyenc, values, isnull, n,
+				high, out);
+	return true;
 }
 
 /*
@@ -826,6 +877,8 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.decode_row_columns = pkprefix_decode_row_columns,
 	.row_fields = pkprefix_row_fields,
 	.decode_field = pkprefix_decode_field,
+	.open_keyed = pkprefix_open_keyed,
+	.encode_key_bound = pkprefix_encode_key_bound,
 	.encode_key = pkprefix_encode_key,
 	.row_shape = pkprefix_row_shape,
 	.shape_extends = pkprefix_shape_extends,
