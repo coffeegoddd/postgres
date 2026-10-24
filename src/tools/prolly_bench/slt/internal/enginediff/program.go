@@ -4,6 +4,9 @@ package enginediff
 import (
 	"fmt"
 	"math/rand"
+	"strings"
+
+	"prolly_bench/slt/internal/geomgen"
 )
 
 type Group struct {
@@ -17,9 +20,24 @@ type Program struct {
 	Setup   []string          `json:"setup"`
 	Groups  []Group           `json:"groups"`
 	Errors  map[string]string `json:"expected_errors,omitempty"`
+	// PostGIS is whether the program has the spatial table geo (it creates
+	// the postgis extension in its setup).
+	PostGIS bool `json:"postgis,omitempty"`
 }
 
-func Generate(seed int64, steps int) Program {
+// Options are what a generated program covers beyond the core families.
+type Options struct {
+	// PostGIS adds a geometry table with a GiST index, spatial writes and
+	// spatial reads (window, intersection, distance and nearest-neighbour
+	// queries), and now and then a multi-megabyte polygon.
+	PostGIS bool
+}
+
+func Generate(seed int64, steps int) Program { return GenerateWith(seed, steps, Options{}) }
+
+// GenerateWith is Generate with options.  Without any it makes the same
+// program as Generate for the same seed.
+func GenerateWith(seed int64, steps int, o Options) Program {
 	r := rand.New(rand.NewSource(seed))
 	p := Program{Version: 1, Seed: seed, Errors: map[string]string{
 		"INSERT INTO t VALUES (-1, -100, NULL, NULL, NULL)": "23514",
@@ -35,6 +53,13 @@ ELSE md5(g::text) END, decode(lpad(to_hex(g), 8, '0'), 'hex') FROM generate_seri
 		"INSERT INTO child SELECT g, g FROM generate_series(1, 10) g",
 		"CREATE TABLE audit (id int, v int)",
 	}}
+	// (its own source, so the core families' seeds stay as they were)
+	var geo *rand.Rand
+	if o.PostGIS {
+		geo = rand.New(rand.NewSource(seed ^ 0x67656f))
+		p.PostGIS = true
+		p.Setup = append(p.Setup, geoSetup(geo)...)
+	}
 	for i := 0; i < steps; i++ {
 		id, v := 1+r.Intn(450), r.Intn(50)
 		update := fmt.Sprintf("UPDATE t SET v = %d, txt = coalesce(txt, '') || 'x' WHERE id BETWEEN %d AND %d", v, id, id+7)
@@ -93,12 +118,118 @@ BEGIN INSERT INTO audit VALUES (NEW.id, NEW.v); RETURN NEW; END $$`,
 				"TRUNCATE sibling1", "SELECT count(*) FROM sibling0", "SELECT count(*) FROM sibling2",
 				"DROP TABLE sibling0, sibling1, sibling2"}},
 		}
+		if o.PostGIS {
+			families = append(families, geoFamilies(geo)...)
+		}
 		// Rotate the first full cycle so short runs vary without losing families.
 		family := (i + int(uint64(seed)%uint64(len(families)))) % len(families)
 		p.Groups = append(p.Groups, families[family])
 	}
 	return p
 }
+
+// geoRows is the spatial table's initial rows; ids above it are inserted.
+const geoRows = 200
+
+// largeN is the fewest vertices of a large polygon (about 1.6 MB; up to
+// twice that).
+const largeN = 100000
+
+// geoValues are rows of geo: id, kind, g (Random's, SRID 0), s (one of
+// Random's in one of several SRIDs), gg (a geography) and r (a value
+// PostGIS's receive refuses, one row in three).
+func geoValues(r *rand.Rand, first, n, largeEvery int) string {
+	rows := make([]string, n)
+	for i := range rows {
+		g := geomgen.Random(r, largeEvery, largeN)
+		srid, _ := geomgen.WithSRID(r, geomgen.Random(r, 0, 0))
+		refused := "NULL"
+		if r.Intn(3) == 0 {
+			refused = geomgen.Refused(r).SQL
+		}
+		rows[i] = fmt.Sprintf("(%d, '%s', %s, %s, %s, %s)", first+i, g.Kind, g.SQL, srid.SQL, geomgen.Geography(r), refused)
+	}
+	return strings.Join(rows, ", ")
+}
+
+func geoSetup(r *rand.Rand) []string {
+	return []string{
+		"CREATE EXTENSION postgis",
+		"CREATE TABLE geo (id int PRIMARY KEY, kind text, g geometry, s geometry, gg geography, r geometry)",
+		"INSERT INTO geo VALUES " + geoValues(r, 1, geoRows, 0),
+		// one large polygon from the start, so every run reads one
+		fmt.Sprintf("INSERT INTO geo (id, kind, g) VALUES (0, 'large', %s)", geomgen.Large(quarterOf(r), quarterOf(r), largeN).SQL),
+		"CREATE INDEX geo_g ON geo USING gist (g)",
+		"CREATE INDEX geo_s ON geo USING gist (s)",
+		"CREATE INDEX geo_gg ON geo USING gist (gg)",
+		"CREATE INDEX geo_r ON geo USING gist (r)",
+		"ANALYZE geo",
+	}
+}
+
+func quarterOf(r *rand.Rand) float64 { return float64(r.Intn(geomgen.Extent*4)) / 4 }
+
+// geoFamilies are the spatial families: writes (with a large polygon one
+// insert in eight), reads with the index and without, nearest neighbours,
+// a transaction with savepoints, and a large polygon's corner moved.
+// GEOS and distance functions read g, s in its own SRID, and gg; r's
+// refused values are read only by && and functions of their points, which
+// take them (GEOS and distances raise errors on them).
+func geoFamilies(r *rand.Rand) []Group {
+	id := 1 + r.Intn(geoRows)
+	w := geomgen.Window(r)
+	pt := geomgen.Point(quarterOf(r), quarterOf(r)).SQL
+	window := w.SQL()
+	changed := func(sql string) string {
+		return "WITH changed AS (" + sql + " RETURNING id, kind, md5(ST_AsEWKB(g)) AS g, md5(ST_AsEWKB(s)) AS s, " +
+			"md5(ST_AsEWKB(gg::geometry)) AS gg, md5(ST_AsEWKB(r)) AS r) SELECT * FROM changed ORDER BY id"
+	}
+	gpt := fmt.Sprintf("'SRID=4326;POINT(%s %s)'::geography", num(float64(r.Intn(1400))/4-175), num(float64(r.Intn(600))/4-75))
+	reads := []string{
+		"SELECT id, kind FROM geo WHERE g && " + window + " ORDER BY id",
+		"SELECT id, kind FROM geo WHERE ST_Intersects(g, " + window + ") ORDER BY id",
+		"SELECT id FROM geo WHERE ST_Contains(" + window + ", g) ORDER BY id",
+		fmt.Sprintf("SELECT id, round(ST_Distance(g, %s)::numeric, 6) FROM geo WHERE ST_DWithin(g, %s, %d) ORDER BY id", pt, pt, 10+r.Intn(90)),
+		// (numeric sums: the same whatever order the rows are scanned in)
+		"SELECT kind, count(*), sum(round(ST_Area(g)::numeric, 6)), sum(round(ST_Length(g)::numeric, 6)), sum(ST_NPoints(g)) FROM geo GROUP BY kind ORDER BY kind",
+		"SELECT ST_AsText(ST_Extent(g)) FROM geo",
+		"SELECT id, ST_SRID(s) FROM geo WHERE s && " + window + " ORDER BY id",
+		"SELECT id FROM geo WHERE ST_Intersects(s, ST_SetSRID(" + window + ", ST_SRID(s))) ORDER BY id",
+		"SELECT ST_SRID(s), count(*), sum(ST_NPoints(s)) FROM geo GROUP BY 1 ORDER BY 1",
+		fmt.Sprintf("SELECT id, round(ST_Distance(gg, %s)::numeric, 3) FROM geo WHERE ST_DWithin(gg, %s, %d) ORDER BY id", gpt, gpt, 100000+r.Intn(900000)),
+		"SELECT count(*), sum(round(ST_Area(gg)::numeric, 1)), sum(round(ST_Length(gg)::numeric, 3)) FROM geo",
+		"SELECT id, ST_NPoints(r), ST_AsText(r) FROM geo WHERE r && " + window + " ORDER BY id",
+		"SELECT count(r), sum(ST_NPoints(r)), ST_AsText(ST_Extent(r)) FROM geo",
+	}
+	knn := fmt.Sprintf("SELECT id, round((g <-> %s)::numeric, 6) AS d FROM geo WHERE NOT ST_IsEmpty(g) ORDER BY g <-> %s, id LIMIT %d",
+		pt, pt, []int{1, 10, 100}[r.Intn(3)])
+	return []Group{
+		{"geo_writes", []string{
+			changed(fmt.Sprintf("INSERT INTO geo VALUES %s ON CONFLICT (id) DO UPDATE SET kind = excluded.kind, g = excluded.g, "+
+				"s = excluded.s, gg = excluded.gg, r = excluded.r", geoValues(r, geoRows+1+r.Intn(geoRows), 1+r.Intn(4), 8))),
+			changed(fmt.Sprintf("UPDATE geo SET g = ST_Translate(g, %[1]d, %[2]d), s = ST_Translate(s, %[1]d, %[2]d), "+
+				"r = ST_Translate(r, %[1]d, %[2]d) WHERE id BETWEEN %[3]d AND %[4]d", r.Intn(21)-10, r.Intn(21)-10, id, id+5)),
+			changed(fmt.Sprintf("UPDATE geo SET r = %s, gg = %s WHERE id = %d", geomgen.Refused(r).SQL, geomgen.Geography(r), id+6)),
+			changed("DELETE FROM geo WHERE g && " + geomgen.Window(r).SQL() + " AND kind <> 'large'"),
+		}},
+		{"geo_reads", reads},
+		{"geo_index_reads", append(append(append([]string{"SET enable_seqscan = off"}, reads[:4]...), reads[6], reads[7], reads[9], reads[11]), knn, "RESET enable_seqscan")},
+		{"geo_knn", []string{knn}},
+		{"geo_savepoints", []string{"BEGIN",
+			changed(fmt.Sprintf("UPDATE geo SET g = ST_Scale(g, 2, 2) WHERE id BETWEEN %d AND %d", id, id+3)),
+			"SAVEPOINT sp", changed(fmt.Sprintf("DELETE FROM geo WHERE id BETWEEN %d AND %d", id, id+10)),
+			"SELECT id FROM geo WHERE g && " + window + " ORDER BY id",
+			"ROLLBACK TO sp", "SELECT count(*) FROM geo", "COMMIT"}},
+		{"geo_large", []string{
+			// (the bottom right corner lowered: the polygon stays simple)
+			changed(fmt.Sprintf("UPDATE geo SET g = ST_MakePolygon(ST_SetPoint(ST_ExteriorRing(g), 1, ST_MakePoint(ST_XMax(g), ST_YMin(g) - %d))) WHERE kind = 'large'", 1+r.Intn(4))),
+			"SELECT id, ST_NPoints(g), md5(ST_AsEWKB(g)), ST_AsText(ST_Envelope(g)) FROM geo WHERE kind = 'large' ORDER BY id",
+			"SELECT id, ST_NPoints(ST_Simplify(g, 0.5)) FROM geo WHERE kind = 'large' ORDER BY id",
+		}},
+	}
+}
+
+func num(f float64) string { return fmt.Sprintf("%g", f) }
 
 // Reduce removes whole transaction groups, preserving setup and failure identity.
 // It is bounded; the result is a smaller reproducer, not necessarily minimal.

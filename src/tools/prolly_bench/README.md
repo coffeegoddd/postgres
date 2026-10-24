@@ -927,6 +927,25 @@ copied from (Dolt's checkout never waits; prolly's first use of a branch
 copies the session's branch's tables under a lock). Doltgres as a third
 engine is not run: the `Engine` interface is ready for it.
 
+With `--postgis` (PostGIS installed in `--pg-bin`'s server: see
+[PostGIS builds](#postgis-builds)), keyed table `t` also has a geometry
+column `g` and a geography column `gg`, each with a GiST index, written
+with `b`: a row's values are a function of its id and `b`. They are
+points (2D, with Z and M, or in SRID 4326), lines, half circles, curve
+polygons, rhombi (some with a cached box), bowties (invalid), one-point
+lines and open rings (which PostGIS's receive refuses, so prolly keeps
+them as text), empties, two points with M, and for rows 4 and 8 a polygon
+of 100,000 vertices, about 1.6 MB, kept out of line; so commits, moves,
+merges and resets carry each kind with the cells it belongs to. After
+every step it also checks each row's `g` and `gg` are its `b`'s (by the
+md5 of their EWKB), and that window queries (`&&`) are read through the
+GiST index (by their plans) and return the rows the model's boxes
+overlap. The generator (`slt/internal/geomgen`) keeps coordinates on a
+grid of quarters and window edges on odd eighths, so the float4 boxes `&&`
+compares decide the same as the model. `--self-test` adds engines that
+read windows without the index (it is dropped) and that lose a row from a
+window query.
+
 The differential runner compares seeded transaction histories with heap:
 
 ```sh
@@ -956,6 +975,31 @@ allowed; matching unexpected errors on both sides fail. After each group,
 the runner compares all fixture rows and checks a sequential scan against
 a verified index scan within each target. Queries that return rows have
 defined ordering.
+
+With `--postgis` (PostGIS installed in `--pg-bin`'s server), the program's
+setup also creates the extension (in the versioned `public` on prolly) and
+a table `geo (id, kind, g, s, gg, r)` with a GiST index on each spatial
+column. `g` holds seeded points, random-walk lines, rectangles and rhombi
+(in 2D or with Z, M or both), collections, half circles, compound curves,
+curve polygons, bowties (invalid), empties, values with a cached box, and
+one polygon of 100,000 to 200,000 vertices (1.6 to 3.2 MB); `s` such
+geometries in SRIDs 0, 4326, 3857 and 2154; `gg` geographies; and `r`, in
+one row in three, a one-point line or an open ring, which PostGIS's
+receive refuses (prolly keeps them as text). Six spatial families join the
+rotation: writes (upserts, with a large polygon one row in eight,
+`ST_Translate` updates, refused values written, deletes by window), reads
+(`&&`, `ST_Intersects`, `ST_Contains`, `ST_DWithin`, areas and lengths as
+numeric sums, `ST_Extent`; `s` in its own SRID; geography distances and
+areas; `r` by `&&` and its points, as GEOS and distances refuse it), the
+same reads through the indexes, nearest neighbours (`<->`, k of 1, 10 or
+100), a transaction with a savepoint rolled back, and a large polygon's
+corner moved and simplified. Each group's state check adds `geo` by the
+md5 of each value's EWKB, and a window read through the GiST index is
+compared with a sequential scan in each target. Tables an extension owns
+(`spatial_ref_sys`) are left out of the AM check. On `prolly`, every run
+(spatial or not) also makes a Dolt commit after each group, so what the
+group changed is folded into canonical form and a value the fold can't
+encode fails the run.
 
 The output directory must be new. It contains the revision, dirty flag,
 server version/settings, runner binary hash, server log, seed programs,

@@ -169,6 +169,7 @@ tests += {
       'truncate_folds',
       'fold_verify',
       'fold_caches',
+      'compared_folds',
       'fold_on_commit',
       'row_locations',
       'describe_caches',
@@ -354,6 +355,7 @@ tests += {
       't/221_reload_first_use.pl',
       't/226_shared_below_sweep.pl',
       't/227_shared_below_drop.pl',
+      't/340_bmap_sweep_dropped_map.pl',
       't/283_renamed_schema_conflict_restart.pl',
       't/225_kept_commit_snapshots.pl',
       't/266_autofold_defers.pl',
@@ -376,6 +378,7 @@ tests += {
       't/310_reflog_after_gc.pl',
       't/313_reflog_gc_slot.pl',
       't/335_fold_worker_pacing.pl',
+      't/336_compared_fold_restart.pl',
     ],
   },
 }

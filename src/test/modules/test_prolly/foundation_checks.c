@@ -1734,6 +1734,43 @@ test_receiver_recv(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(s));
 }
 
+/*
+ * A text-only fixture whose output shows the settings it was printed
+ * under: "value|TimeZone|timezone_abbreviations|lc_monetary|lc_numeric|
+ * lc_time|bytea_output".  Its input takes the value before the first '|',
+ * so the text reads back as the value whatever it shows.  The output fails
+ * while ttx.fail_output is on.
+ */
+PG_FUNCTION_INFO_V1(test_settings_in);
+PG_FUNCTION_INFO_V1(test_settings_out);
+
+Datum
+test_settings_in(PG_FUNCTION_ARGS)
+{
+	char	   *s = PG_GETARG_CSTRING(0);
+	char	   *bar = strchr(s, '|');
+
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(s, bar ? bar - s : strlen(s)));
+}
+
+Datum
+test_settings_out(PG_FUNCTION_ARGS)
+{
+	char	   *value = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	const char *fail = GetConfigOption("ttx.fail_output", true, false);
+	static const char *const shown[] = {"TimeZone", "timezone_abbreviations",
+		"lc_monetary", "lc_numeric", "lc_time", "bytea_output"};
+	StringInfoData out;
+
+	if (fail && strcmp(fail, "on") == 0)
+		elog(ERROR, "test_settings_out fails, as ttx.fail_output asks");
+	initStringInfo(&out);
+	appendStringInfoString(&out, value);
+	for (int i = 0; i < lengthof(shown); i++)
+		appendStringInfo(&out, "|%s", GetConfigOption(shown[i], false, false));
+	PG_RETURN_CSTRING(out.data);
+}
+
 Datum
 test_toast_pointer_value(PG_FUNCTION_ARGS)
 {
