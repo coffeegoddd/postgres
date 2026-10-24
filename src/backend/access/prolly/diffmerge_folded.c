@@ -4647,7 +4647,6 @@ typedef struct CellMerge
 	StringInfoData row;
 	/* (merge_fields()'s, by attribute index; fields NULL: not merged so) */
 	ProllyEncodedField *fields[4];	/* base, ours, theirs, merged */
-	bool	   *compatible;		/* bytes compared as values */
 } CellMerge;
 
 typedef enum FieldsMerge
@@ -4659,16 +4658,16 @@ typedef enum FieldsMerge
 
 /*
  * merge_cells()'s merge of a row by its encoded columns (the keying's
- * row_fields()), none decoded: where every live column's bytes name its
- * value (field_compatible(), as all three versions are this keying's
- * rows), a column one side's bytes leave as base's takes the other's,
- * one both changed alike keeps it, and one they changed differently is a
- * conflict; a stored generated column takes ours'.  The merged row is
- * assembled from the fields taken (encode_row_fields()), its long values'
- * references copied.  FIELDS_DECODE when a column's bytes aren't
- * comparable so (an enum read through a historical mapping, a type
- * defined otherwise) or base's value there is unsure: merge_cells()
- * decodes then.
+ * row_fields()), none decoded.  All three versions are rows of the
+ * merge's keying, the table's as defined now (a version of another shape
+ * is converted to it before it is merged, as_defined_now()), so each
+ * live column's bytes name its value (field_compatible() of the keying
+ * with itself): a column one side's bytes leave as base's takes the
+ * other's, one both changed alike keeps it, and one they changed
+ * differently is a conflict; a stored generated column takes ours'.  The
+ * merged row is assembled from the fields taken (encode_row_fields()),
+ * its long values' references copied.  FIELDS_DECODE when base's value in
+ * a column is unsure (see ReadFor): merge_cells() decodes then.
  */
 static FieldsMerge
 merge_fields(Changes *c, CellMerge *cm, const ProllyValue *rows,
@@ -4693,8 +4692,7 @@ merge_fields(Changes *c, CellMerge *cm, const ProllyValue *rows,
 		m[i] = o[i];
 		if (att->attisdropped || att->attgenerated)
 			continue;
-		if (!cm->compatible[i])
-			return FIELDS_DECODE;
+		Assert(PROLLY_CALL(c->rd.kr, field_compatible, c->rd.k, i, c->rd.k, i));
 		ours_changed = !PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &b[i], &o[i]);
 		theirs_changed = !PROLLY_CALL(c->rd.kr, fields_alike, c->rd.k, i, &b[i], &t[i]);
 		if (ours_changed && theirs_changed &&
@@ -5991,11 +5989,6 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 
 			for (int i = 0; i < 4; i++)
 				mw.cm.fields[i] = palloc0_array(ProllyEncodedField, natts);
-			mw.cm.compatible = palloc0_array(bool, natts);
-			for (int i = 0; i < natts; i++)
-				mw.cm.compatible[i] =
-					PROLLY_CALL(tc.rd.kr, field_compatible, tc.rd.k, i,
-								tc.rd.k, i);
 		}
 		initStringInfo(&mw.cm.row);
 	}
@@ -6060,7 +6053,6 @@ merge_table(Oid relid, const Table *base, const Table *ours,
 		{
 			for (int i = 0; i < 4; i++)
 				pfree(mw.cm.fields[i]);
-			pfree(mw.cm.compatible);
 		}
 	}
 	if (fits.estate)

@@ -197,6 +197,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | pk_or_prefix   | owns_its_memory                | pass
  table_keying  | pk_or_prefix   | row_shapes                     | pass
  table_keying  | pk_or_prefix   | old_shapes                     | pass
+ table_keying  | pk_or_prefix   | assembled_rows                 | pass
  table_keying  | pk_or_prefix   | complete                       | pass
  table_keying  | stub           | identity                       | pass
  table_keying  | stub           | round_trip                     | not implemented (missing open, keyless, encode_row, make_value, parse_value, decode_row, close)
@@ -204,6 +205,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
  table_keying  | stub           | row_shapes                     | not implemented (missing open, close, row_shape, shape_extends)
  table_keying  | stub           | old_shapes                     | not implemented (missing open, encode_row, decode_row, close, row_shape, open_shape)
+ table_keying  | stub           | assembled_rows                 | not implemented (missing open, encode_row, close, row_fields, encode_row_fields)
  table_keying  | stub           | complete                       | not implemented (24 of 24 callbacks missing)
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
@@ -264,7 +266,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(200 rows)
+(202 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

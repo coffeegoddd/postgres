@@ -64,6 +64,7 @@ extern void keying_keys_and_content(const ProllyImplInfo *impl);
 extern void keying_owns_its_memory(const ProllyImplInfo *impl);
 extern void keying_row_shapes(const ProllyImplInfo *impl);
 extern void keying_old_shapes(const ProllyImplInfo *impl);
+extern void keying_assembled_rows(const ProllyImplInfo *impl);
 extern void valenc_decodes_earlier_layouts(const ProllyImplInfo *impl);
 
 #endif							/* TEST_PROLLY_H */

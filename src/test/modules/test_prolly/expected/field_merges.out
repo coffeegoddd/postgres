@@ -4,8 +4,8 @@
 -- merge decodes no column.  (Writing the merged row to the table decodes
 -- what the heap needs.)  The merged rows, conflicts and canonical roots
 -- are those of merging decoded values (an assert-enabled build checks
--- every row so).  A column whose bytes aren't comparable (an enum read
--- through a mapping of its renamed labels) is merged decoded.
+-- every row so).  A row with a column whose base value is unsure (a type
+-- change's text and cast readings) is merged decoded, as before.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
@@ -183,8 +183,73 @@ SELECT dolt_branch('-D', 'fm_side');
  {0}
 (1 row)
 
+-- base's 1.5 isn't an integer's text: unsure, so the row merges decoded;
+-- theirs' 'yes' against ours' 'true' conflicts, n (2 on both) agrees
+CREATE TABLE fm.o (id int PRIMARY KEY, b boolean, n numeric);
+INSERT INTO fm.o VALUES (1, true, 1.5);
+SELECT length(dolt_commit('-Am', 'o base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('fm_o');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+ALTER TABLE fm.o ALTER COLUMN b TYPE text, ALTER COLUMN n TYPE int;
+SELECT length(dolt_commit('-am', 'main: retyped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('fm_o') IS NOT NULL AS on_o;
+ on_o 
+------
+ t
+(1 row)
+
+ALTER TABLE fm.o ALTER COLUMN b TYPE text, ALTER COLUMN n TYPE int;
+UPDATE fm.o SET b = 'yes' WHERE id = 1;
+SELECT length(dolt_commit('-am', 'fm_o: retyped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('fm_o', '-m', 'merged retyped'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT * FROM fm.o ORDER BY id;
+ id |  b   | n 
+----+------+---
+  1 | true | 2
+(1 row)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'fm_o');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA fm CASCADE;
-NOTICE:  drop cascades to table fm.w
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table fm.w
+drop cascades to table fm.o
 SELECT length(dolt_commit('-Am', 'fm gone')::text) AS committed;
  committed 
 -----------

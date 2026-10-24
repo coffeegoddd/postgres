@@ -1156,19 +1156,6 @@ check_same_column(Oid type, bool anull, Datum a, bool bnull, Datum b,
 }
 
 /*
- * fields(), decode_field() and decode_columns() against decode(): every
- * column fields() gives decodes as decode() decodes it, NULLs, dropped
- * columns and columns a row predates (their missing values) included;
- * decode_columns() decodes the columns asked for alike and leaves the
- * others NULL.  An unwanted value out of line is never read: decoding the
- * row's other columns reads no node of the value store.  Rows holding the
- * same long value give that column the same bytes (its reference), and a
- * row with a byte after its values is refused, as decode() refuses it.
- * fields_alike() takes a column a row predates as its missing value, and
- * field_compatible() holds only between columns that encode alike.
- */
-
-/*
  * Rows assembled from encoded fields: encode_fields() of a row's fields()
  * is the row encode() gives for its values (encode() of decode()), and so
  * is a row taking each column from one of two rows: long values by their
@@ -1282,6 +1269,19 @@ valenc_assembled_rows(const ProllyImplInfo *impl)
 	PROLLY_CALL(ve, end, enc);
 	PROLLY_CALL(ve, end, benc);
 }
+
+/*
+ * fields(), decode_field() and decode_columns() against decode(): every
+ * column fields() gives decodes as decode() decodes it, NULLs, dropped
+ * columns and columns a row predates (their missing values) included;
+ * decode_columns() decodes the columns asked for alike and leaves the
+ * others NULL.  An unwanted value out of line is never read: decoding the
+ * row's other columns reads no node of the value store.  Rows holding the
+ * same long value give that column the same bytes (its reference), and a
+ * row with a byte after its values is refused, as decode() refuses it.
+ * fields_alike() takes a column a row predates as its missing value, and
+ * field_compatible() holds only between columns that encode alike.
+ */
 
 void
 valenc_selected_columns(const ProllyImplInfo *impl)
