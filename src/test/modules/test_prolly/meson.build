@@ -340,6 +340,7 @@ tests += {
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
       't/235_bmap_snapshot_owner.pl',
+      't/280_merge_kept_references.pl',
     ],
   },
 }

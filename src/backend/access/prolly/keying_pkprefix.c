@@ -736,6 +736,15 @@ pkprefix_decode_row_kept(ProllyKeying *k, const ProllyValue *row,
 				before, slot, kept);
 }
 
+static void
+pkprefix_encode_row_kept(ProllyKeying *k, TupleTableSlot *slot,
+						 const ProllyValue *before, const bool *kept,
+						 StringInfo row)
+{
+	PROLLY_CALL(k->valenc_routine, encode_kept, k->valenc, slot, before, kept,
+				row);
+}
+
 static int
 pkprefix_compare(ProllyKeying *k, const ProllyKey *a, const ProllyKey *b)
 {
@@ -800,6 +809,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.set_values = pkprefix_set_values,
 	.row_refs = pkprefix_row_refs,
 	.decode_row_kept = pkprefix_decode_row_kept,
+	.encode_row_kept = pkprefix_encode_row_kept,
 	.encode_key = pkprefix_encode_key,
 	.row_shape = pkprefix_row_shape,
 	.shape_extends = pkprefix_shape_extends,
