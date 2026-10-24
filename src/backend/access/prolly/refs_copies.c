@@ -67,9 +67,9 @@
  *				   (see 'N') had before it, when the commit's parents aren't
  *				   just that record's commit (a merge, or a commit after the
  *				   head moved): that commit's id in hex and a newline, then
- *				   a line for each table both records list by relation,
- *				   its name in the commit, a tab, and its name in the
- *				   record before
+ *				   a line for each table both records list by relation:
+ *				   its OID (10 digits), a tab, its name in the commit, a
+ *				   tab, and its name in the record before
  *	'A' name	-> the role that made the branch, which owns it (its OID,
  *				   native byte order); main has none, being the database
  *				   owner's
@@ -249,7 +249,8 @@
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
  * pages retired; 8: a merge's tables in schema conflicts, in its merge
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
- * trees a pin keeps; 12: a schema-conflicted table's names on each side.
+ * trees a pin keeps; 12: a schema-conflicted table's names on each side;
+ * 13: branches', tags' and stashes' makers; 14: commits' lineage notes.
  */
 #define REFS_FORMAT		"14"
 
@@ -4433,6 +4434,8 @@ note_lineage(const ProllyHash *head, const ProllyHash *parents, int nparents,
 
 			if (strncmp(q + 1, line, 11) == 0 && bend - (q + 1) >= 12)
 			{
+				appendBinaryStringInfo(&v, line, 10);
+				appendStringInfoChar(&v, '\t');
 				appendBinaryStringInfo(&v, line + 11, end - (line + 11));
 				appendStringInfoChar(&v, '\t');
 				appendBinaryStringInfo(&v, q + 12, bend - (q + 12));
@@ -4502,8 +4505,47 @@ carry_names_from(const char *name, const char *from, const ProllyHash *head)
 }
 
 /*
+ * Forget the 'L' notes of commits the store no longer has (a collection
+ * took them): a note is kept by its commit's key alone, not as a reference
+ * the collection keeps.
+ */
+static void
+copies_forget_lineage_notes(void)
+{
+	ProllyNodeRef root;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	char		tag = TAG_LINEAGE;
+	ProllyKey	from = {(const uint8 *) &tag, 1};
+	List	   *gone = NIL;
+	ListCell   *lc;
+
+	refs_init();
+	lock_refs();
+	if (!refs_root(&root))
+		return;
+	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
+		   k.len >= 1 && k.data[0] == TAG_LINEAGE)
+	{
+		ProllyHash	commit;
+		ProllyCommitInfo info;
+
+		if (!prolly_hash_from_hex((const char *) k.data + 1, k.len - 1, &commit) ||
+			!copies_commit_get(&commit, &info))
+			gone = lappend(gone, pnstrdup((const char *) k.data, k.len));
+	}
+	PROLLY_CALL(tree, cursor_close, c);
+	foreach(lc, gone)
+		refs_put(lfirst(lc), strlen(lfirst(lc)), NULL);
+}
+
+/*
  * Commit commit's 'L' note: the record's commit before it (*was) and its
- * lines (name in the commit, a tab, name before); false if it has none.
+ * lines (relation, a tab, name in the commit, a tab, name before); false if
+ * it has none.
  */
 static bool
 copies_lineage_note(const ProllyHash *commit, ProllyHash *was, char **lines)
@@ -8136,4 +8178,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_set_creator = copies_tag_set_creator,
 	.stash_maker = copies_stash_maker,
 	.lineage_note = copies_lineage_note,
+	.forget_lineage_notes = copies_forget_lineage_notes,
 };

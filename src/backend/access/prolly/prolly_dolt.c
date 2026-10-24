@@ -6847,6 +6847,7 @@ typedef struct NameLineage
 	HTAB	   *steps;			/* LineageStep, each version reached */
 	List	   *queue;			/* (ProllyHash *, its name) pairs, to walk */
 	List	   *pending;		/* and pairs waiting on lineage_meets() */
+	bool		pending_tried;	/* none of them met it, nothing reached since */
 	bool		started;
 } NameLineage;
 
@@ -6898,7 +6899,10 @@ lineage_enter(NameLineage *l, const char *key, const char *name)
 
 	st = hash_search(l->steps, key, HASH_ENTER, &found);
 	if (!found)
+	{
 		st->name = pstrdup(name);
+		l->pending_tried = false;
+	}
 }
 
 /*
@@ -7011,26 +7015,32 @@ lineage_meets(NameLineage *l, const ProllyHash *at, const char *name)
 }
 
 /*
- * The name of table at_name before commit at (hex), by the branch's record
- * of its tables before the commit (refs' lineage_note()), and the record's
- * commit (*was); NULL if the commit has no such note, or it doesn't list
- * the table.
+ * The name of relation relid, named at_name in commit at (hex), before the
+ * commit, by the branch's record of its tables before it (refs'
+ * lineage_note()), and the record's commit (*was); NULL if the note doesn't
+ * list the relation so.  *noted: the commit has a note at all.
  */
 static char *
-noted_before(const ProllyHash *at, const char *at_name, ProllyHash *was)
+noted_before(const ProllyHash *at, Oid relid, const char *at_name,
+			 ProllyHash *was, bool *noted)
 {
 	char	   *lines;
+	char		want[16];
 	size_t		len = strlen(at_name);
 
+	*noted = false;
 	if (!PROLLY_HAS(refs(), lineage_note) ||
 		!PROLLY_CALL(refs(), lineage_note, at, was, &lines))
 		return NULL;
+	*noted = true;
+	snprintf(want, sizeof(want), "%010u\t", relid);
 	for (char *p = lines; *p;)
 	{
 		char	   *end = strchrnul(p, '\n');
 
-		if (strncmp(p, at_name, len) == 0 && p[len] == '\t')
-			return pnstrdup(p + len + 1, end - (p + len + 1));
+		if (OidIsValid(relid) && strncmp(p, want, 11) == 0 &&
+			strncmp(p + 11, at_name, len) == 0 && p[11 + len] == '\t')
+			return pnstrdup(p + 12 + len, end - (p + 12 + len));
 		p = *end ? end + 1 : end;
 	}
 	return NULL;
@@ -7097,6 +7107,7 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 		ProllyCommitInfo info;
 		ProllyHash	was;
 		char	   *was_name;
+		bool		noted;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -7109,6 +7120,9 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 			List	   *waiting = l->pending;
 			bool		taken = false;
 
+			/* (tried since the lineage last grew: they don't meet it) */
+			if (l->pending_tried)
+				break;
 			l->pending = NIL;
 			for (int i = 0; i + 1 < list_length(waiting); i += 2)
 			{
@@ -7124,7 +7138,10 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 					l->pending = lappend(lappend(l->pending, p), p_name);
 			}
 			if (!taken)
+			{
+				l->pending_tried = true;
 				break;
+			}
 			continue;
 		}
 		at = linitial(l->queue);
@@ -7140,14 +7157,16 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 					 errmsg("prolly commit %s is missing", hex)));
 
 		/*
-		 * (a commit whose branch's record of its tables had the table at
-		 * another commit than its parents, a merge's other branch or a
-		 * head moved and committed, has the table that commit's version:
-		 * walked there too, if it is still in the store; and a parent
-		 * other than that commit is the table's only if a walk back from
-		 * it meets the lineage, as another branch's commit is)
+		 * (a commit whose branch's record of its tables had the table's
+		 * relation at another commit than its parents, a merge's other
+		 * branch or a head moved and committed, has the table that
+		 * commit's version: walked there too, if it is still in the store;
+		 * and a parent other than that commit is the table's only if a
+		 * walk back from it meets the lineage, as another branch's commit
+		 * is.  A noted commit whose note hasn't this relation, of the
+		 * name, vouches for no parent: each waits so.)
 		 */
-		was_name = noted_before(at, at_name, &was);
+		was_name = noted_before(at, l->relid, at_name, &was, &noted);
 		if (was_name != NULL)
 		{
 			ProllyCommitInfo was_info;
@@ -7166,8 +7185,9 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 			before = lineage_name_before(phex, hex, at_name);
 			if (before == NULL)
 				continue;
-			if (was_name != NULL &&
-				!(same_hash(&info.parents[i], &was) && strcmp(before, was_name) == 0))
+			if (noted &&
+				!(was_name != NULL && same_hash(&info.parents[i], &was) &&
+				  strcmp(before, was_name) == 0))
 				l->pending = lappend(lappend(l->pending, copy_hash(&info.parents[i])),
 									 before);
 			else
@@ -9663,6 +9683,9 @@ collect(bool full, const char *what, ProllyGcResult *gc)
 	PreventCommandIfReadOnly(what);
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.reclamation, collect, full, gc);
+	/* (and the lineage notes of the commits it took) */
+	if (PROLLY_HAS(dc.refs, forget_lineage_notes))
+		PROLLY_CALL(dc.refs, forget_lineage_notes);
 	ereport(DEBUG1,
 			(errmsg_internal("%s: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 what,

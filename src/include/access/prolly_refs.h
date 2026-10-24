@@ -772,13 +772,16 @@ typedef struct ProllyRefsRoutine
 	 * recorded_relation) held before the commit, when the commit's parents
 	 * aren't that record's commit alone (a merge; a commit after the head
 	 * moved): the record's commit (*was), and *lines, a line for each table
-	 * both records list by relation, its name in the commit, a tab, and
-	 * its name in the record before (palloc'd).  False if none is kept.  A
-	 * history read takes a parent's version of such a table for the
-	 * table's only if it shares the record's commit's history.
+	 * both records list by relation, its OID (10 digits), a tab, its name
+	 * in the commit, a tab, and its name in the record before (palloc'd).
+	 * False if none is kept.  A history read takes a parent's version of
+	 * such a table for the table's only if it shares the record's commit's
+	 * history.  forget_lineage_notes(): the notes of commits the store no
+	 * longer has, forgotten (after a collection).
 	 */
 	bool		(*lineage_note) (const ProllyHash *commit, ProllyHash *was,
 								 char **lines);
+	void		(*forget_lineage_notes) (void);
 } ProllyRefsRoutine;
 
 /*
@@ -824,9 +827,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
 	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
-	"lineage_note"
+	"lineage_note", "forget_lineage_notes"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK lineage_note
+#define PROLLY_REFS_LAST_CALLBACK forget_lineage_notes
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

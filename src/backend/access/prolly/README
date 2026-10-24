@@ -317,11 +317,18 @@ committed, a merge of a branch still holding it, or a squash of the drop
 into the re-make, doesn't vouch for the old table's versions.  The limits,
 as commits name tables by name and identity alone and a re-made table
 keeps its name's identity (#891): a table dropped and made again within
-one commit, or both in the working set, is taken for one table; a commit
-made in another database (fetched, pulled or pushed here) has no such
-note, so a merge of the old table made there is followed by the names;
-and a merge of a branch still holding the old table merges its rows into
-the new one, whose rows they then are.  Moving a head takes a write role
+one commit, or both in the working set, is taken for one table; notes
+are this database's, so a commit made in another one (fetched, pulled or
+pushed here, or a clone's commits, which reopen every one of these paths
+in the clone after its first commit) has none, and a merge of the old
+table made there is followed by the names; and a move that brings the
+old table's rows (a merge of a branch still holding it, a hard reset to
+its commit, a revert of its drop, a cherry-pick from its branch) writes
+them into the new table, whose rows they then are (#936).  A note names
+the table by its relation, and a noted commit whose note hasn't the
+table's vouches for none of its parents; a walk that finds nothing
+waiting meets the lineage tries it once until the lineage grows, and a
+collection forgets the notes of the commits it takes.  Moving a head takes a write role
 (see Writers), not SELECT alone.  A plan's row estimate of a version, and
 dolt_diff_stat's counts, are read on the same rule.
 

@@ -99,6 +99,13 @@ SELECT length(dolt_commit('--allow-empty', '-m', 'over the old')::text) AS commi
 (1 row)
 
 RESET ROLE;
+SELECT dolt_hashof('HEAD') AS over_commit \gset
+SELECT test_refs_value('L' || :'over_commit') IS NOT NULL AS noted;
+ noted 
+-------
+ t
+(1 row)
+
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.t);
  id |  note  
@@ -290,6 +297,7 @@ SELECT length(dolt_commit('--allow-empty', '-m', 'over the old, fresh')::text) A
 (1 row)
 
 RESET ROLE;
+SELECT dolt_hashof('HEAD') AS fresh_commit \gset
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
 ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
@@ -376,6 +384,70 @@ SELECT dolt_checkout('main');
           dolt_checkout          
 ---------------------------------
  {0,"Switched to branch 'main'"}
+(1 row)
+
+-- the old table's branch merging main in, then merged back (a
+-- fast-forward): its merge's note is of the old table's relation, not
+-- this one's, so it vouches for no parent of its
+SELECT dolt_checkout('keeps_old') IS NOT NULL AS on_old;
+ on_old 
+--------
+ t
+(1 row)
+
+SELECT (dolt_merge('-m', 'main into old', 'main'))[3] AS conflicts;
+ conflicts 
+-----------
+ 0
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT (dolt_merge('keeps_old'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
+ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_at('HEAD^1', NULL::ln.t);
+ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT * FROM dolt_at('keeps_old~', NULL::ln.t);
+ERROR:  dolt_at can't read "ln.t": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+SELECT diff_type, from_row FROM dolt_diff(:'old_commit', 'HEAD', NULL::ln.t);
+ERROR:  dolt_diff can't read "ln.t": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+RESET ROLE;
+-- a collection that takes a noted commit forgets its note
+SELECT dolt_gc('--full') IS NOT NULL AS collected;
+ collected 
+-----------
+ t
+(1 row)
+
+SELECT test_refs_value('L' || :'over_commit') IS NOT NULL AS still_noted;
+ still_noted 
+-------------
+ f
+(1 row)
+
+SELECT test_refs_value('L' || :'fresh_commit') IS NOT NULL AS live_still_noted;
+ live_still_noted 
+------------------
+ t
 (1 row)
 
 \c contrib_regression

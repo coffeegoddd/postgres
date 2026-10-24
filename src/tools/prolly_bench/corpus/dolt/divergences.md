@@ -674,10 +674,14 @@ OF` are built in D18's shapes.
   identity alone and a table made again keeps its name's identity (#891,
   decided: commit identities don't change): a table dropped and made
   again within one commit, or both in the working set, passes the check
-  as one table; a commit made in another database (fetched, pulled or
-  pushed) has no such record, so a merge of the old table made there is
-  followed by name; and a merge of a branch with the old table merges its
-  rows into the new table, where they are the new table's rows. Planner
+  as one table; the records are this database's, so a commit made in
+  another (fetched, pulled or pushed, and a clone's history, where each
+  of these paths opens again after the clone's first commit) has none,
+  and a merge of the old table made there is followed by name; and a
+  move that brings the old table's rows (a merge of a branch with it, a
+  hard reset to its commit, a revert of its drop, a cherry-pick from its
+  branch) writes them into the new table, where they are the new
+  table's rows ([#936](https://github.com/coffeegoddd/postgres/issues/936)). Planner
   estimates of a version's rows and `dolt_diff_stat`'s counts are history
   too: a version the user may not read gives the default estimate, and
   its table is left out of `dolt_diff_stat` (refused when named). Any
