@@ -6987,6 +6987,28 @@ BufferPageIsShared(Buffer buffer)
 }
 
 /*
+ * BufferPageIsSharedElsewhere -- of a page BufferPageIsShared() says is
+ * shared: may another relation hold it, not only the relation's own
+ * snapshots of its pages as they were?
+ *
+ * The page must be locked, in any mode.
+ */
+bool
+BufferPageIsSharedElsewhere(Buffer buffer)
+{
+	BufferDesc *buf_hdr;
+
+	Assert(BufferIsLockedByMe(buffer));
+	if (BufferIsLocal(buffer))
+		return false;
+	buf_hdr = GetBufferDescriptor(buffer - 1);
+	return smgrpagesharedelsewhere(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
+											INVALID_PROC_NUMBER),
+								   BufTagGetForkNum(&buf_hdr->tag),
+								   buf_hdr->tag.blockNum);
+}
+
+/*
  * MarkBufferedRelationShared -- mark a relation fork's cached pages to be
  * prepared before they next change
  *

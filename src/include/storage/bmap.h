@@ -51,6 +51,8 @@ extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
+extern bool bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum);
 extern void bmapprecommitdrop(SMgrRelation reln);
 extern void bmapenddrops(void);
 extern void bmapbeforeextend(SMgrRelation reln, ForkNumber forknum,
@@ -142,7 +144,8 @@ extern void bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids);
 extern bool bmap_snapshot_release(SMgrRelation reln, uint64 id);
 extern int	bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max);
 extern bool bmap_snapshot_unchanged(SMgrRelation reln, uint64 id);
-extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst);
+extern void bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
+								bool replacing);
 
 /* inspection, for tests */
 extern void bmap_inspect_block(SMgrRelation reln, BlockNumber blkno,

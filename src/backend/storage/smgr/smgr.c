@@ -152,6 +152,14 @@ typedef struct f_smgr
 										  bool neutral);
 	bool		(*smgr_pageisshared) (SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, bool *copies);
+
+	/*
+	 * Of a page smgr_pageisshared says is shared: may another relation hold
+	 * it, not only snapshots of this one?  May be NULL (always).
+	 */
+	bool		(*smgr_pagesharedelsewhere) (SMgrRelation reln,
+											 ForkNumber forknum,
+											 BlockNumber blocknum);
 	/* before a relation's buffers are dropped to unlink it; may be NULL */
 	void		(*smgr_predrop) (SMgrRelation reln, bool isRedo);
 
@@ -272,6 +280,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_preparesforchanges = bmappreparesforchanges,
 		.smgr_prepareforchange = bmapprepareforchange,
 		.smgr_pageisshared = bmappageisshared,
+		.smgr_pagesharedelsewhere = bmappagesharedelsewhere,
 		.smgr_predrop = bmappredrop,
 		.smgr_precommitdrop = bmapprecommitdrop,
 		.smgr_enddrops = bmapenddrops,
@@ -831,6 +840,19 @@ smgrpageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	return smgrsw[reln->smgr_which].smgr_pageisshared != NULL &&
 		smgrsw[reln->smgr_which].smgr_pageisshared(reln, forknum, blocknum,
 												   copies);
+}
+
+/*
+ * smgrpagesharedelsewhere() -- Of a shared page: may another relation hold
+ *								it, not only the relation's own snapshots?
+ */
+bool
+smgrpagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum)
+{
+	return smgrsw[reln->smgr_which].smgr_pagesharedelsewhere == NULL ||
+		smgrsw[reln->smgr_which].smgr_pagesharedelsewhere(reln, forknum,
+														   blocknum);
 }
 
 /*

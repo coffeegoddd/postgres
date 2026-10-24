@@ -86,6 +86,8 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # letting go of a branch's storage: flat in the foreground
     ("branch_delete", "rows"): _all("flat", MAP),
     ("branch_delete", "delta"): _all("flat", MAP),
+    # a snapshot mount: the commit's root items, nothing of the table
+    ("mount", "rows"): _all("flat"),
     # a historical point read: a descent of the tree
     ("point_read", "rows"): {"nodes_read": "log"},
     # a commit: tree work of Δ descents, nothing of N

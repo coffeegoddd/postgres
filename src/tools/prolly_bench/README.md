@@ -345,7 +345,8 @@ the two away. Each check must not grow faster than its target
 | `soft_reset` | `dolt_reset('--soft', 'HEAD~1')`, dirty | rows, delta | every work counter flat |
 | `hard_reset` | `dolt_reset('--hard')` to the head, dirty | rows, delta | no rows applied or index entries made; map work flat |
 | `branch_delete` | `dolt_branch('-D')` | rows, delta | map work flat in the foreground |
-| `point_read` | `dolt_at('HEAD~1')` with `WHERE id = 1` | rows | `nodes_read` log |
+| `mount` | `prolly_mount('HEAD~1')` of the table | rows | every work counter flat |
+| `point_read` | the mounted table with `WHERE id = 1` | rows | `nodes_read` log |
 | `commit` | `dolt_commit` of Δ rows | rows; delta | tree work log in N; at most linear in Δ |
 | `diff` | `dolt_diff` of that commit | rows; delta | `nodes_read` log in N; at most linear in Δ |
 | `merge` | `dolt_merge` of Δ rows, main changed elsewhere | rows; delta | tree work and map work log and rows applied flat in N; tree work and rows at most linear in Δ |

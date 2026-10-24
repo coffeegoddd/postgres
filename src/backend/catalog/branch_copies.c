@@ -449,11 +449,12 @@ copy_kept_storage(Form_pg_class c, const BranchKeptRelation *k)
 	if (bmap_snapshot_unchanged(src, k->snapshot))
 	{
 		(void) RelationCreateStorageFromSnapshot(class_locator(c, relnumber),
-												 src, k->snapshot, true, true);
+												 src, k->snapshot, true, false,
+												 true);
 		return relnumber;
 	}
 	(void) RelationCreateStorageFromSnapshot(class_locator(c, relnumber), src,
-											 k->snapshot, false, true);
+											 k->snapshot, false, false, true);
 	if (TransactionIdIsNormal(k->frozenxid))
 		c->relfrozenxid = k->frozenxid;
 	if (MultiXactIdIsValid(k->minmxid))
@@ -1825,7 +1826,7 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 		(void) RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
 												 smgropen(kept_locator(k),
 														  INVALID_PROC_NUMBER),
-												 k->snapshot, false, true);
+												 k->snapshot, false, true, true);
 		renewed[i].relfilenumber = relnumber;
 		taking_add(&taking, class_locator(oc, relnumber), &renewed[i]);
 		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
@@ -1930,7 +1931,7 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
 		(void) RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
 												 smgropen(kept_locator(k),
 														  INVALID_PROC_NUMBER),
-												 k->snapshot, false, true);
+												 k->snapshot, false, false, true);
 		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
 		oc->relfilenode = relnumber;
 		if (TransactionIdIsNormal(k->frozenxid))
