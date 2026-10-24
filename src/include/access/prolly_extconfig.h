@@ -51,9 +51,12 @@ extern char *prolly_extconfig_fingerprint(Oid extoid);
  * configuration tables lack and set the sequences, as a restore of a dump
  * would; without, append to missing what rows the tables lack.  An element
  * naming a table that isn't one of the extension's configuration tables,
- * or a column it lacks, is an error.
+ * or a column it lacks, is an error.  Where elements hold one key with
+ * different values, a restore writes preferred's (sorted; the head a clone
+ * checks out), warning of the others.
  */
 extern void prolly_extconfig_apply(const char *extname, List *elements,
-								   bool restore, StringInfo missing);
+								   List *preferred, bool restore,
+								   StringInfo missing);
 
 #endif							/* PROLLY_EXTCONFIG_H */

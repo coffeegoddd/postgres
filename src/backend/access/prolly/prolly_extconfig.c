@@ -59,6 +59,7 @@
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/typcache.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -89,6 +90,7 @@ typedef struct KeyedRow
 {
 	char	   *key;			/* the key's fields; the row for a keyless table */
 	char	   *row;
+	bool		preferred;		/* (a recorded row) the checked-out head's */
 } KeyedRow;
 
 /* An INSERT into a configuration table, for rows of one set of columns. */
@@ -98,7 +100,17 @@ typedef struct InsertPlan
 	SPIPlanPtr	plan;
 	int			n;
 	ProllyDatumCodec **codecs;
+	Oid		   *types;			/* each column's type */
+	bool	   *nested;			/* holds a domain inside an array or row */
 } InsertPlan;
+
+/* One recorded configuration row, and the table it is of. */
+typedef struct RecordedRow
+{
+	Oid			relid;
+	const char *row;
+	bool		preferred;		/* the checked-out head records it */
+} RecordedRow;
 
 bool
 prolly_extconfig_element(const char *element)
@@ -652,7 +664,94 @@ first_with_key(KeyedRow *rows, int n, const char *key)
 	return lo < n && strcmp(rows[lo].key, key) == 0 ? lo : -1;
 }
 
-/* The INSERT for rows of a recorded row's columns, prepared once.  Inside SPI. */
+/* Whether a type holds a domain within an array or a row type. */
+static bool
+holds_nested_domain(Oid type, int depth)
+{
+	Oid			base = getBaseType(type);
+	Oid			elem;
+
+	check_stack_depth();
+	if (depth > 0 && base != type)
+		return true;
+	elem = get_element_type(base);
+	if (OidIsValid(elem))
+		return holds_nested_domain(elem, depth + 1);
+	if (type_is_rowtype(base))
+	{
+		TupleDesc	desc = lookup_rowtype_tupdesc(base, -1);
+		bool		holds = false;
+
+		for (int i = 0; i < desc->natts && !holds; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				holds = holds_nested_domain(TupleDescAttr(desc, i)->atttypid, depth + 1);
+		ReleaseTupleDesc(desc);
+		return holds;
+	}
+	return false;
+}
+
+/*
+ * Check a decoded value's domains within arrays and rows (each element's,
+ * each attribute's), as coercing it to the column would: the INSERT checks
+ * a column's own domain, but takes an array or a row as it is.
+ */
+static void
+check_nested_domains(Datum value, bool isnull, Oid type, bool top)
+{
+	Oid			base = getBaseType(type);
+	Oid			elem;
+
+	check_stack_depth();
+	if (!top && base != type)
+		domain_check(value, isnull, type, NULL, CurrentMemoryContext);
+	if (isnull)
+		return;
+	elem = get_element_type(base);
+	if (OidIsValid(elem))
+	{
+		ArrayType  *a = DatumGetArrayTypeP(value);
+		int16		len;
+		bool		byval;
+		char		align;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			n;
+
+		get_typlenbyvalalign(elem, &len, &byval, &align);
+		deconstruct_array(a, elem, len, byval, align, &elems, &nulls, &n);
+		for (int i = 0; i < n; i++)
+			check_nested_domains(elems[i], nulls[i], elem, false);
+		return;
+	}
+	if (type_is_rowtype(base))
+	{
+		HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+		TupleDesc	desc = lookup_rowtype_tupdesc(HeapTupleHeaderGetTypeId(rec),
+												  HeapTupleHeaderGetTypMod(rec));
+		HeapTupleData tuple;
+		Datum	   *values = palloc(sizeof(Datum) * Max(desc->natts, 1));
+		bool	   *nulls = palloc(sizeof(bool) * Max(desc->natts, 1));
+
+		tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+		ItemPointerSetInvalid(&tuple.t_self);
+		tuple.t_tableOid = InvalidOid;
+		tuple.t_data = rec;
+		heap_deform_tuple(&tuple, desc, values, nulls);
+		for (int i = 0; i < desc->natts; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				check_nested_domains(values[i], nulls[i], TupleDescAttr(desc, i)->atttypid,
+									 false);
+		ReleaseTupleDesc(desc);
+	}
+}
+
+/*
+ * The INSERT for rows of a recorded row's columns, prepared once.  Inside
+ * SPI.  A column of a domain takes a parameter of the domain's base type,
+ * so the INSERT coerces it to the domain, checking its constraints (NOT
+ * NULL, CHECK, a length), as a restore's input would.
+ */
 static InsertPlan *
 insert_plan(Relation rel, const char *table, const char *row, List **plans)
 {
@@ -687,6 +786,8 @@ insert_plan(Relation rel, const char *table, const char *row, List **plans)
 	p->columns = columns.data;
 	p->n = list_length(names);
 	p->codecs = palloc(sizeof(ProllyDatumCodec *) * Max(p->n, 1));
+	p->types = palloc(sizeof(Oid) * Max(p->n, 1));
+	p->nested = palloc(sizeof(bool) * Max(p->n, 1));
 	types = palloc(sizeof(Oid) * Max(p->n, 1));
 	initStringInfo(&q);
 	initStringInfo(&vals);
@@ -704,7 +805,9 @@ insert_plan(Relation rel, const char *table, const char *row, List **plans)
 					 errmsg("configuration table %s has no column \"%s\", which the commits' rows of it have",
 							table, name)));
 		att = TupleDescAttr(desc, attnum - 1);
-		types[n] = att->atttypid;
+		types[n] = getBaseType(att->atttypid);
+		p->types[n] = att->atttypid;
+		p->nested[n] = holds_nested_domain(att->atttypid, 0);
 		p->codecs[n] = prolly_datum_codec(att->atttypid, att->atttypmod, CurrentMemoryContext);
 		appendStringInfo(&q, "%s%s", n ? ", " : "", quote_identifier(name));
 		appendStringInfo(&vals, "%s$%d", n ? ", " : "", n + 1);
@@ -751,26 +854,65 @@ restore_row(Relation rel, const char *table, const char *row, List **plans)
 			values[n] = prolly_datum_decode(p->codecs[n], bytes, len);
 			nulls[n] = ' ';
 		}
+		if (p->nested[n])
+			check_nested_domains(values[n], nulls[n] == 'n', p->types[n], true);
 		n++;
 	}
 	if (SPI_execute_plan(p->plan, values, nulls, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not write configuration table %s", table);
 }
 
-/* One recorded configuration row, and the table it is of. */
-typedef struct RecordedRow
-{
-	Oid			relid;
-	const char *row;
-} RecordedRow;
-
 /*
  * Check (or, with restore, write) one table's recorded rows against its
  * rows.
  */
+/*
+ * A key's text, "(column, ...)=(value, ...)", for messages: each field
+ * decoded with its column's codec, as the database would print it.
+ */
+static char *
+key_text(Relation rel, const char *key)
+{
+	StringInfoData names;
+	StringInfoData values;
+	char	   *copy = pstrdup(key);
+	char	   *field;
+	char	   *save;
+	int			n = 0;
+
+	initStringInfo(&names);
+	initStringInfo(&values);
+	for (field = strtok_r(copy, ",", &save); field; field = strtok_r(NULL, ",", &save))
+	{
+		char	   *eq = strchr(field, '=');
+		int			len;
+		char	   *name = from_hex(field, eq - field, &len);
+		AttrNumber	attnum = get_attnum(RelationGetRelid(rel), name);
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+
+		appendStringInfo(&names, "%s%s", n ? ", " : "", quote_identifier(name));
+		if (strcmp(eq + 1, "N") == 0)
+			appendStringInfo(&values, "%sNULL", n ? ", " : "");
+		else
+		{
+			char	   *bytes = from_hex(eq + 1, strlen(eq + 1), &len);
+			ProllyDatumCodec *codec = prolly_datum_codec(att->atttypid, att->atttypmod,
+														 CurrentMemoryContext);
+			Oid			out;
+			bool		varlena;
+
+			getTypeOutputInfo(att->atttypid, &out, &varlena);
+			appendStringInfo(&values, "%s%s", n ? ", " : "",
+							 OidOutputFunctionCall(out, prolly_datum_decode(codec, bytes, len)));
+		}
+		n++;
+	}
+	return psprintf("(%s)=(%s)", names.data, values.data);
+}
+
 static void
 apply_table(const char *extname, Oid relid, List *rows, bool restore,
-			StringInfo missing)
+				 StringInfo missing)
 {
 	Relation	rel = table_open(relid, restore ? RowExclusiveLock : AccessShareLock);
 	char	   *table = qualified_name(relid);
@@ -785,6 +927,8 @@ apply_table(const char *extname, Oid relid, List *rows, bool restore,
 	int			wanted = 0;
 	int			lacking = 0;
 	int			differing = 0;
+	int			disagreeing = 0;
+	char	   *disagreed = NULL;
 	int			i;
 
 	/* (the table's own rows are encoded under its name as it is now) */
@@ -798,10 +942,11 @@ apply_table(const char *extname, Oid relid, List *rows, bool restore,
 		i++;
 	}
 	i = 0;
-	foreach_ptr(char, r, rows)
+	foreach_ptr(RecordedRow, r, rows)
 	{
-		rec[i].row = r;
-		rec[i].key = row_key(r, keys, table);
+		rec[i].row = (char *) r->row;
+		rec[i].key = row_key(r->row, keys, table);
+		rec[i].preferred = r->preferred;
 		i++;
 	}
 	qsort(have, nhave, sizeof(KeyedRow), keyed_cmp);
@@ -820,15 +965,33 @@ apply_table(const char *extname, Oid relid, List *rows, bool restore,
 			/*
 			 * One row per key, whatever the commits recorded its other
 			 * columns as (they may differ between commits): the database's
-			 * when it has the key.  A clone's database whose row with the
-			 * key differs from every one the commits record (one its
-			 * extension's script made) can't take the commits' rows.
+			 * when it has the key.  A clone writes the checked-out head's
+			 * (preferred) row, or, for a key only other heads record, the
+			 * first of theirs, and warns where the heads disagree.  A
+			 * clone's database whose row with the key differs from every
+			 * one the commits record (one its extension's script made)
+			 * can't take the commits' rows.
 			 */
 			wanted++;
 			if (at < 0)
 			{
 				if (restore)
-					to_write = lappend(to_write, rec[i].row);
+				{
+					int			chosen = i;
+
+					for (int k = i; k < j; k++)
+						if (rec[k].preferred)
+						{
+							chosen = k;
+							break;
+						}
+					if (j - i > 1 && rec[chosen].preferred)
+					{
+						if (disagreeing++ == 0)
+							disagreed = rec[i].key;
+					}
+					to_write = lappend(to_write, rec[chosen].row);
+				}
 				else
 					lacking++;
 			}
@@ -866,6 +1029,13 @@ apply_table(const char *extname, Oid relid, List *rows, bool restore,
 				 errmsg("configuration table %s of extension %s has other rows with the keys of %d of the rows the commits record",
 						table, extname, differing),
 				 errdetail("A row is matched by the table's key, and the extension made rows with those keys itself.")));
+	if (disagreeing > 0)
+		ereport(WARNING,
+				(errmsg("the fetched heads record %d of the rows of configuration table %s of extension %s with other values",
+						disagreeing, table, extname),
+				 errdetail("The checked-out branch's rows are written, the first with key %s.",
+						   key_text(rel, disagreed)),
+				 errhint("Rows the other branches record with other values are theirs; a move to them finds the key, and keeps this row.")));
 	if (to_write != NIL)
 	{
 		AsOwner		as;
@@ -881,10 +1051,18 @@ apply_table(const char *extname, Oid relid, List *rows, bool restore,
 	table_close(rel, NoLock);
 }
 
-void
-prolly_extconfig_apply(const char *extname, List *elements, bool restore,
-					   StringInfo missing)
+static int
+strptr_cmp(const void *a, const void *b)
 {
+	return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+void
+prolly_extconfig_apply(const char *extname, List *elements, List *preferred,
+					   bool restore, StringInfo missing)
+{
+	int			npreferred = list_length(preferred);
+	char	  **preferred_sorted = palloc(sizeof(char *) * Max(npreferred, 1));
 	Oid			extoid;
 	List	   *relations;
 	List	   *tables = NIL;	/* Oid, those elements name */
@@ -894,6 +1072,9 @@ prolly_extconfig_apply(const char *extname, List *elements, bool restore,
 		return;
 	extoid = get_extension_oid(extname, false);
 	relations = config_relations(extoid);
+	foreach_ptr(char, e, preferred)
+		preferred_sorted[foreach_current_index(e)] = e;
+	qsort(preferred_sorted, npreferred, sizeof(char *), strptr_cmp);
 	foreach_ptr(const char, e, elements)
 	{
 		if (strncmp(e, PROLLY_EXTCONFIG_SEQUENCE, strlen(PROLLY_EXTCONFIG_SEQUENCE)) == 0)
@@ -944,6 +1125,8 @@ prolly_extconfig_apply(const char *extname, List *elements, bool restore,
 			if (get_rel_relkind(r->relid) != RELKIND_RELATION)
 				bad_row();
 			r->row = tab + 1;
+			r->preferred = bsearch(&e, preferred_sorted, npreferred, sizeof(char *),
+								   strptr_cmp) != NULL;
 			recorded = lappend(recorded, r);
 			tables = list_append_unique_oid(tables, r->relid);
 		}
@@ -955,7 +1138,7 @@ prolly_extconfig_apply(const char *extname, List *elements, bool restore,
 
 		foreach_ptr(RecordedRow, r, recorded)
 			if (r->relid == relid)
-				rows = lappend(rows, (char *) r->row);
+				rows = lappend(rows, r);
 		apply_table(extname, relid, rows, restore, missing);
 	}
 }

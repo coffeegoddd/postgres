@@ -200,7 +200,10 @@ commits recording a row the database lacks is refused, naming the table;
 rows the database has besides are its own.  A table with a primary key
 (or a replica identity index) has its rows matched by key, so a row whose
 other columns were edited since is still there; heads recording one key
-with different values give a clone one row for it.  A keyless table's
+with different values give a clone the checked-out branch's row, with a
+warning naming the table and the key.  A clone's writes check its
+extension's domains (on a column, in an array or a row) and lengths, as a
+restore's input would.  A keyless table's
 rows are matched whole, each as many times as recorded.  An element
 naming anything but one of the extension's configuration tables (or a
 sequence one owns) is refused, nothing an element holds is put in a query

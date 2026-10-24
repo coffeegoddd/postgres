@@ -49,6 +49,7 @@ typedef struct NeededExtension
 	List	   *ordering_versions; /* String, exact versions ordering keys */
 	bool		versioned;		/* its schema is a versioned one */
 	List	   *configs;		/* char *: configuration elements, sorted */
+	List	   *preferred;		/* char *: the first tree's, sorted */
 } NeededExtension;
 
 /* An object the commits need. */
@@ -64,6 +65,7 @@ typedef struct Needs
 	List	   *objects;
 	List	   *except;			/* "name\nvalue": already needed, not checked */
 	bool		read;			/* historical rows can be re-sorted */
+	bool		first;			/* collecting the first tree */
 } Needs;
 
 /*
@@ -320,6 +322,11 @@ note_need(const char *name, const char *value, void *arg)
 			e->schemas = lappend(e->schemas, makeString(schema));
 		e->versioned = e->versioned || versioned;
 		note_configs(e, configs);
+		if (needs->first)
+		{
+			e->preferred = list_concat(e->preferred, configs);
+			list_sort(e->preferred, config_cmp);
+		}
 		return;
 	}
 	foreach(lc, needs->objects)
@@ -752,7 +759,11 @@ collect_trees(List *trees, Needs *needs)
 
 	prolly_database_components(&dc);
 	foreach(lc, trees)
+	{
+		needs->first = foreach_current_index(lc) == 0;
 		PROLLY_CALL(dc.canonicalizer, dependencies, lfirst(lc), note_need, needs);
+	}
+	needs->first = false;
 }
 
 /*
@@ -837,7 +848,7 @@ check_configs(Needs *needs, List *installs, const char *what)
 	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
-		prolly_extconfig_apply(e->name, e->configs, find_install(installs, e->name) != NULL,
+		prolly_extconfig_apply(e->name, e->configs, e->preferred, find_install(installs, e->name) != NULL,
 							   &missing);
 	}
 	if (missing.len > 0)

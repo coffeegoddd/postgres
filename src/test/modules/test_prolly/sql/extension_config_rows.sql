@@ -110,12 +110,12 @@ UPDATE ec2.t SET n = n + 0;
 SELECT (dolt_commit('--allow-empty', '-am', 'same rows'))[1] AS h2 \gset
 SELECT md5(test_commit_dependencies(dolt_hashof('HEAD'))::text) = :'deps_other' AS same_dependencies;
 SELECT (dolt_reset('--hard', :'h1'))[1] AS reset_under_other_settings;
--- a commit recording the keyed row id 2 with other values, on main and on
--- a second head
+-- a commit recording the keyed row id 2 with other values (ratio 9), on
+-- main; a second head, other, at the commit recording ratio 0.1
 UPDATE ec2.test_prolly_cfg SET ratio = 9 WHERE id = 2;
 UPDATE ec2.t SET n = n + 1;
 SELECT (dolt_commit('-am', 'edited configuration row'))[1] AS h3 \gset
-SELECT dolt_branch('other') IS NOT NULL AS branched;
+SELECT dolt_branch('other', :'h1') IS NOT NULL AS branched;
 -- a keyed row is matched by its key: one whose other columns changed
 -- since is still the commits' row
 SELECT (dolt_reset('--hard', :'h1'))[1] AS reset_after_edit;
@@ -125,6 +125,7 @@ WHERE ctid = (SELECT min(ctid) FROM ec2.test_prolly_cfg_tags WHERE tag = 'a');
 SELECT dolt_reset('--hard', :'h3');
 SELECT dolt_hashof('HEAD') = :'h1' AS still_at_h1;
 INSERT INTO ec2.test_prolly_cfg_tags VALUES ('a');
+SELECT (dolt_reset('--hard', :'h3'))[1] AS back_to_h3;
 -- A commit's text is checked as text's receive checks it, so a crafted
 -- chunk can't write bytes invalid in the database's encoding into a
 -- table (a clone's configuration rows among them).
@@ -145,8 +146,9 @@ FROM ec2.test_prolly_cfg;
 SELECT at, day, ratio FROM ec2.test_prolly_cfg WHERE id = 2;
 SELECT last_value, is_called FROM ec2.test_prolly_cfg_seq;
 SELECT n FROM ec2.t;
--- one row per key, of the two heads' records of it
-SELECT count(*) AS rows_with_id_2 FROM ec2.test_prolly_cfg WHERE id = 2;
+-- one row per key, the checked-out head's (main's ratio 9, not other's
+-- 0.1, which sorts first), with a warning of the other head's
+SELECT count(*) AS rows_with_id_2, max(ratio) AS ratio FROM ec2.test_prolly_cfg WHERE id = 2;
 -- the keyless rows, each as many times as recorded
 SELECT tag, count(*) FROM ec2.test_prolly_cfg_tags GROUP BY tag ORDER BY tag;
 -- the identity's sequence, as the source's: a new row takes the next id
@@ -157,3 +159,52 @@ VALUES ('2023-01-01 00:00 UTC', '2023-01-01', 1) RETURNING id;
 DROP DATABASE regress_extconfig_clone2;
 DROP DATABASE regress_extconfig_src2;
 DROP ROLE regress_cfg_committer;
+
+-- A clone checks the rows it writes as its own extension's types do: a
+-- domain's CHECK, on a column and on an array's elements, and a length.
+-- (The source's are loosened, so its commits record rows the clone's
+-- extension refuses.)
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/extconfig3-' || txid_current() AS url3 \gset
+CREATE DATABASE regress_extconfig_src3;
+\c regress_extconfig_src3
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA ec3 VERSIONED;
+CREATE EXTENSION test_prolly_ext_config SCHEMA ec3;
+CREATE TABLE ec3.t (id int PRIMARY KEY, n bigint DEFAULT ec3.test_prolly_cfg_count());
+INSERT INTO ec3.t (id) VALUES (1);
+ALTER DOMAIN ec3.test_prolly_cfg_code DROP CONSTRAINT test_prolly_cfg_code_lower;
+ALTER TABLE ec3.test_prolly_cfg_tags ALTER COLUMN short TYPE varchar(10);
+INSERT INTO ec3.test_prolly_cfg_tags (tag, code) VALUES ('x', 'UPPER');
+SELECT (dolt_commit('-Am', 'a domain value the clone refuses'))[1] IS NOT NULL AS committed;
+SELECT dolt_remote('add', 'origin', :'url3') IS NOT NULL AS remote;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+\c :db
+CREATE DATABASE regress_extconfig_clone3;
+\c regress_extconfig_clone3
+SELECT dolt_clone(:'url3') IS NOT NULL AS cloned;
+\c :db
+DROP DATABASE regress_extconfig_clone3;
+\c regress_extconfig_src3
+SET client_min_messages = warning;
+UPDATE ec3.test_prolly_cfg_tags SET code = NULL, codes = ARRAY['ok', 'BAD'];
+SELECT (dolt_commit('--allow-empty', '-am', 'an element the clone refuses'))[1] IS NOT NULL AS committed;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+\c :db
+CREATE DATABASE regress_extconfig_clone3;
+\c regress_extconfig_clone3
+SELECT dolt_clone(:'url3') IS NOT NULL AS cloned;
+\c :db
+DROP DATABASE regress_extconfig_clone3;
+\c regress_extconfig_src3
+SET client_min_messages = warning;
+UPDATE ec3.test_prolly_cfg_tags SET codes = NULL, short = 'toolong';
+SELECT (dolt_commit('--allow-empty', '-am', 'a length the clone refuses'))[1] IS NOT NULL AS committed;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+\c :db
+CREATE DATABASE regress_extconfig_clone3;
+\c regress_extconfig_clone3
+SELECT dolt_clone(:'url3') IS NOT NULL AS cloned;
+\c :db
+DROP DATABASE regress_extconfig_clone3;
+DROP DATABASE regress_extconfig_src3;

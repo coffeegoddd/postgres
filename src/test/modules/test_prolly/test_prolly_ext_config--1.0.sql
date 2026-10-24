@@ -17,8 +17,12 @@ INSERT INTO @extschema@.test_prolly_cfg (at, day, ratio)
 ALTER TABLE @extschema@.test_prolly_cfg ENABLE ROW LEVEL SECURITY;
 CREATE POLICY test_prolly_cfg_none ON @extschema@.test_prolly_cfg USING (false);
 SELECT pg_catalog.pg_extension_config_dump('@extschema@.test_prolly_cfg', 'WHERE id > 1');
--- a keyless configuration table, every row dumped
-CREATE TABLE @extschema@.test_prolly_cfg_tags (tag text);
+-- a keyless configuration table, every row dumped, with a domain's
+-- columns and a length
+CREATE DOMAIN @extschema@.test_prolly_cfg_code AS text
+  CONSTRAINT test_prolly_cfg_code_lower CHECK (VALUE ~ '^[a-z]+$');
+CREATE TABLE @extschema@.test_prolly_cfg_tags (tag text, code @extschema@.test_prolly_cfg_code,
+  codes @extschema@.test_prolly_cfg_code[], short varchar(3));
 SELECT pg_catalog.pg_extension_config_dump('@extschema@.test_prolly_cfg_tags', '');
 CREATE SEQUENCE @extschema@.test_prolly_cfg_seq;
 SELECT pg_catalog.pg_extension_config_dump('@extschema@.test_prolly_cfg_seq', '');
