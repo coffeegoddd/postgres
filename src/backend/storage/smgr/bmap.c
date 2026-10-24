@@ -161,6 +161,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "common/hashfn.h"
 #include "common/int.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
@@ -199,11 +200,12 @@ int			block_map_replay_entries = 65536;
  * The format's version, which headers, allocators' metapages and changes
  * lists' headers carry.  Version 1 maps were flat, an entry per logical
  * block in the relation's own map fork; version 2's were trees of pages of
- * the page store, whose snapshots didn't say who took them.  This server
- * reads only version 3, whose snapshots name the transaction that took
- * them, and refuses anything older (refuse_version()).
+ * the page store, whose snapshots didn't say who took them; version 3's
+ * release queue entries didn't say which drop's transaction they wait for.
+ * This server reads only version 4 and refuses anything older
+ * (refuse_version()).
  */
-#define BMAP_VERSION		3
+#define BMAP_VERSION		4
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -449,6 +451,9 @@ typedef struct BmapWatch
  * which every write of a page store reads without a lock.
  */
 
+/* page stores whose queue was last found empty, remembered at most */
+#define BMAP_QUEUE_HINTS	64
+
 typedef struct BmapShared
 {
 	pg_atomic_uint32 sweeps;	/* running, anywhere */
@@ -464,6 +469,17 @@ typedef struct BmapShared
 	/* the remaps ahead of replay (bmap_ahead), and how many there are */
 	LWLock		ahead_lock;
 	pg_atomic_uint32 nahead;
+
+	/*
+	 * Release queue pushes, counted, and for some page stores (by their
+	 * watch_key(), in the slot it hashes to) the count when their queue was
+	 * last found empty: equal, no queue has had an entry pushed since.  A
+	 * hint, for bmapbeforeextend()'s cheap test: two stores taking one slot
+	 * at once may leave it wrong, which only costs or skips a drain.
+	 */
+	pg_atomic_uint64 queue_pushes;
+	pg_atomic_uint64 queue_empty_key[BMAP_QUEUE_HINTS];
+	pg_atomic_uint64 queue_empty_at[BMAP_QUEUE_HINTS];
 
 	uint64		next_token;		/* a scan's, unique to this shared memory */
 	uint64		watch_clock;
@@ -521,6 +537,12 @@ BmapShmemInit(void *arg)
 	LWLockInitialize(&bmap_shared->ahead_lock,
 					 LWLockNewTrancheId("block map replay"));
 	pg_atomic_init_u32(&bmap_shared->nahead, 0);
+	pg_atomic_init_u64(&bmap_shared->queue_pushes, 0);
+	for (int i = 0; i < BMAP_QUEUE_HINTS; i++)
+	{
+		pg_atomic_init_u64(&bmap_shared->queue_empty_key[i], 0);
+		pg_atomic_init_u64(&bmap_shared->queue_empty_at[i], PG_UINT64_MAX);
+	}
 
 	/*
 	 * Scans' tokens begin anywhere: one remembered from before the server
@@ -6798,6 +6820,8 @@ queue_push(RelFileLocator rel, const BmapQueued *items, uint32 n)
 		END_CRIT_SECTION();
 
 		queue_release(&qp);
+		/* (counted before the metapage is let go: see bmapbeforeextend()) */
+		pg_atomic_fetch_add_u64(&bmap_shared->queue_pushes, 1);
 		UnlockReleaseBuffer(metabuf);
 		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_QUEUED, take);
 		end = XactLastRecEnd;
@@ -7198,9 +7222,11 @@ bmapprecommitdrop(SMgrRelation reln)
 }
 
 /*
- * As a top-level transaction's drops are done, at commit or abort: the
+ * As a top-level transaction's drops are done (their relations' buffers
+ * dropped, before their files are unlinked), at commit or abort: the
  * entries it queued before its commit record (bmapprecommitdrop()) are
- * drained from now on, if it committed.
+ * drained from now on, if it committed.  Called again as the transaction's
+ * deletes end, which finds nothing left to do.
  */
 void
 bmapenddrops(void)
@@ -7212,8 +7238,12 @@ bmapenddrops(void)
 	if (!drop_locked)
 		return;
 	DROP_LOCK(tag, drop_locked_xid);
-	LockRelease(&tag, ExclusiveLock, true);
+
+	/* (an abort lets go of session locks too, before its drops) */
+	if (LockHeldByMe(&tag, ExclusiveLock, false))
+		LockRelease(&tag, ExclusiveLock, true);
 	drop_locked = false;
+	INJECTION_POINT("bmap-drops-done", NULL);
 }
 
 /*
@@ -7755,8 +7785,11 @@ bmap_release_pending(Oid spcOid, Oid dbOid)
  * those pushed after this read are of maps the sweep read before they were
  * dropped (a drop pushes before it lets go of its root page, under its
  * header's lock).  An entry of a drop yet to commit holds nothing (its map,
- * read before, still held what it names), nor does one of a drop that
- * didn't, or is too old to say of (queued_state()).
+ * read before while the drop was yet to commit, still held what it names),
+ * nor does one of a drop that didn't, or is too old to say of.  One of a
+ * committed drop holds, its drop done or not: the drop may have emptied
+ * its map's root page before the map was read (counted twice, if not,
+ * which keeps them).
  */
 static void
 sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
@@ -7766,6 +7799,8 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
 	uint32		n = 0;
 	BmapQueued *entries;
 	SMgrRelation store = store_smgr(rel);
+	FullTransactionId last_owner = InvalidFullTransactionId;
+	OwnerState	last_state = OWNER_NONE;
 
 	if (!queue_exists(rel))
 		return;
@@ -7798,8 +7833,16 @@ sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
 	for (uint32 i = 0; i < n; i++)
 	{
 		BmapEntry	ptr;
+		FullTransactionId owner = queued_owner(&entries[i]);
 
-		if (!queued_holds(queued_state(&entries[i])))
+		/* (a drop's entries are together, of one owner) */
+		if (FullTransactionIdIsValid(owner) &&
+			!FullTransactionIdEquals(owner, last_owner))
+		{
+			last_owner = owner;
+			last_state = owner_state(owner);
+		}
+		if (FullTransactionIdIsValid(owner) && last_state != OWNER_COMMITTED)
 			continue;
 		ptr.block = entries[i].block;
 		ptr.epoch = 0;
@@ -9597,6 +9640,20 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 /* release steps an extension takes at most before the store grows */
 #define BMAP_GROWTH_RELEASE_STEPS	64
 
+/* the free blocks of rel's page store, read under a share lock */
+static uint32
+store_free(RelFileLocator rel)
+{
+	Buffer		buf = alloc_read(rel, 0);
+	uint32		nfree;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+	nfree = PageGetBmapMeta(BufferGetPage(buf))->nfree;
+	UnlockReleaseBuffer(buf);
+	return nfree;
+}
+
 /*
  * Before reln's main fork is extended by nblocks through shared buffers: if
  * its page store has fewer free blocks than that and its release queue
@@ -9615,26 +9672,42 @@ void
 bmapbeforeextend(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		buf;
 	BmapRelease done = {0};
+	uint64		pushes;
+	uint64		key = watch_key(rel);
+	int			hint = (int) (hash_bytes_uint32((uint32) (key ^ (key >> 32))) %
+							  BMAP_QUEUE_HINTS);
 
 	if (forknum != MAIN_FORKNUM || nblocks == 0 || AutoVacuumingActive() ||
 		!IsTransactionState() || CritSectionCount > 0 ||
-		RecoveryInProgress() || !queue_exists(rel) ||
-		bmap_release_pending(rel.spcOid, rel.dbOid) == 0)
+		RecoveryInProgress())
 		return;
+
+	/*
+	 * Cheap tests first: free blocks enough, or no queue has had an entry
+	 * pushed since every one was last found empty.  A queue found empty
+	 * under its metapage's lock had no push counted after 'pushes' was
+	 * read, as a push counts itself before it lets the metapage go.
+	 */
+	if (store_free(rel) >= nblocks)
+		return;
+	pushes = pg_atomic_read_u64(&bmap_shared->queue_pushes);
+	if (pg_atomic_read_u64(&bmap_shared->queue_empty_key[hint]) == key &&
+		pg_atomic_read_u64(&bmap_shared->queue_empty_at[hint]) == pushes)
+		return;
+	pg_memory_barrier();
+	if (!queue_exists(rel) ||
+		bmap_release_pending(rel.spcOid, rel.dbOid) == 0)
+	{
+		pg_atomic_write_u64(&bmap_shared->queue_empty_key[hint], key);
+		pg_atomic_write_u64(&bmap_shared->queue_empty_at[hint], pushes);
+		return;
+	}
 
 	for (int step = 0; step < BMAP_GROWTH_RELEASE_STEPS; step++)
 	{
-		uint32		nfree;
-
-		buf = alloc_read(rel, 0);
-		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		check_page(BufferGetPage(buf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
-		nfree = PageGetBmapMeta(BufferGetPage(buf))->nfree;
-		UnlockReleaseBuffer(buf);
-		if (nfree >= nblocks ||
-			!bmap_release_step(rel.spcOid, rel.dbOid, false, &done))
+		if (!bmap_release_step(rel.spcOid, rel.dbOid, false, &done) ||
+			store_free(rel) >= nblocks)
 			break;
 	}
 	if (done.entries > 0)

@@ -993,6 +993,10 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 */
 	DropRelationsAllBuffers(rels, nrels);
 
+	/* (what the storage managers held off until the buffers went, let go) */
+	if (!isRedo)
+		smgrenddrops();
+
 	/*
 	 * create an array which contains all relations to be dropped, and close
 	 * each relation's forks at the smgr level while at it

@@ -108,6 +108,21 @@ cmp_ok($freed, '>=', $blocks, 'and a drain frees what the table held');
 is(sweep_frees(), '0', 'nothing is left for a sweep');
 is(sql($pending), '0', 'the queue is empty');
 
+# A sweep while a drop's relation has its map emptied, before the drop's
+# end: the queue's entries hold the table's blocks, and the sweep frees
+# none of them; the drain after frees them once.
+make_table('w', 20000);
+my $wblocks = sql(q{SELECT pg_relation_size('w') / 8192});
+sql('CHECKPOINT');
+$s = stopped_at('bmap-dropped', 'DROP TABLE w');
+is(sweep_frees(), '0', 'a sweep after the drop emptied the map frees none of it');
+sql(q{SELECT injection_points_wakeup('bmap-dropped')});
+$s->quit;
+($entries, $freed) = split m{/}, drain();
+cmp_ok($freed, '>=', $wblocks, 'the drain after frees the table');
+is(sweep_frees(), '0', 'and nothing is left, nor freed twice');
+is(sql(q{SELECT count(*) FROM test_bmap_release_drain()}), '1', 'the store reads well');
+
 # A failure after the entries are queued, before the commit: the table
 # stays; a drain pops the entries and frees nothing.
 make_table('b', 5000);
@@ -120,6 +135,7 @@ my ($ret, $out, $err) = $node->psql('postgres', q{
 	DROP TABLE b;
 });
 like($err, qr/bmap-drop-prequeued/, 'the drop failed after queuing');
+unlike($err, qr/you don't own a lock/, 'and let go of its locks quietly');
 is(sql($rows), '5000', 'the table stays');
 cmp_ok(sql($pending), '>', 0, 'its entries are queued');
 ($entries, $freed) = split m{/}, drain();

@@ -129,11 +129,11 @@ standby_agrees('remaps', 't');
 my $free_before = sql(q{SELECT test_bmap_free_blocks()});
 my $drop = $node->background_psql('postgres');
 $drop->query_safe(q{SELECT injection_points_set_local()});
-$drop->query_safe(q{SELECT injection_points_attach('bmap-dropped', 'wait')});
+$drop->query_safe(q{SELECT injection_points_attach('bmap-drops-done', 'wait')});
 $drop->query_until(qr/dropping/, q{\echo dropping
 DROP TABLE t;
 });
-$node->wait_for_event('client backend', 'bmap-dropped');
+$node->wait_for_event('client backend', 'bmap-drops-done');
 # (what the drop queued, let go of by a drain while the map is still there)
 sql(q{SELECT * FROM test_bmap_release_drain()});
 cmp_ok(sql(q{SELECT test_bmap_free_blocks()}), '>', $free_before,
@@ -143,9 +143,9 @@ sql(q{CREATE TABLE r (a int, b text) WITH (fillfactor = 10);
 is(sql(qq{SELECT count(*) FROM test_bmap_tree($rel)}), '0',
 	'the dropped tree\'s map points to no node');
 is(sweep_frees(), '0', 'a sweep reads the dropped tree as holding nothing');
-# (the table's toast relations, dropped after it, don't wait)
-$node->safe_psql('postgres', q{SELECT injection_points_detach('bmap-dropped')});
-$node->safe_psql('postgres', q{SELECT injection_points_wakeup('bmap-dropped')});
+# (the drops' end is reached once more, as the transaction's deletes end)
+$node->safe_psql('postgres', q{SELECT injection_points_detach('bmap-drops-done')});
+$node->safe_psql('postgres', q{SELECT injection_points_wakeup('bmap-drops-done')});
 $drop->quit;
 sql(q{DROP TABLE r});
 is(sweep_frees(), '0', 'dropping the trees freed all they held');
