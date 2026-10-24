@@ -210,6 +210,7 @@ tests += {
       'bmap_tree_snapshots',
       'kept_pages',
       'first_use_kept',
+      'branch_catalog_index',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
