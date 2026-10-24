@@ -361,6 +361,7 @@ tests += {
       't/280_merge_kept_references.pl',
       't/298_rewrite_checkpoint_errors.pl',
       't/310_reflog_after_gc.pl',
+      't/313_reflog_gc_slot.pl',
     ],
   },
 }
