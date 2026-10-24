@@ -1,0 +1,3 @@
+comment = 'An extension whose configuration table holds settings-dependent values, an identity, a generated column and row security, and a configuration sequence'
+default_version = '1.0'
+relocatable = false

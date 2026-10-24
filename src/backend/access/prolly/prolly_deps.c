@@ -24,6 +24,7 @@
 
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_extconfig.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -47,15 +48,8 @@ typedef struct NeededExtension
 	List	   *schemas;		/* String, distinct */
 	List	   *ordering_versions; /* String, exact versions ordering keys */
 	bool		versioned;		/* its schema is a versioned one */
-	List	   *configs;		/* NeededConfig *, a table each */
+	List	   *configs;		/* char *: configuration elements, distinct */
 } NeededExtension;
-
-/* An extension's configuration table's rows the commits record. */
-typedef struct NeededConfig
-{
-	char	   *table;			/* qualified, quoted */
-	List	   *rows;			/* String: each row's text form */
-} NeededConfig;
 
 /* An object the commits need. */
 typedef struct NeededObject
@@ -143,16 +137,16 @@ text_array_elements(const char *literal, int n, const char *what)
 
 /*
  * Canonical order: versioned, then ordering, either of which may be
- * absent, then the configuration tables' rows, if any
- * ("config<tab><table><tab><row>", into *configs, NeededConfig *, when
- * given).
+ * absent, then the extension's configuration elements, if any
+ * (prolly_extconfig.h), into *configs (char *) when given.  An extension
+ * may have any number of them.
  */
 static Datum *
 extension_parts_configs(const char *value, bool *versioned, bool *ordering,
 						List **configs)
 {
 	int			nparts;
-	Datum	   *parts = text_array_elements_upto(value, 2, 1024, &nparts,
+	Datum	   *parts = text_array_elements_upto(value, 2, INT_MAX - 2, &nparts,
 												 "extension");
 	bool		config = false;
 
@@ -160,24 +154,16 @@ extension_parts_configs(const char *value, bool *versioned, bool *ordering,
 	for (int i = 2; i < nparts; i++)
 	{
 		char	   *flag = TextDatumGetCString(parts[i]);
-		char	   *tab;
 
 		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering && !config)
 			*versioned = true;
 		else if (strcmp(flag, "ordering") == 0 && !*ordering && !config)
 			*ordering = true;
-		else if (strncmp(flag, "config\t", 7) == 0 && (tab = strchr(flag + 7, '\t')) != NULL &&
-				 tab > flag + 7)
+		else if (prolly_extconfig_element(flag))
 		{
 			config = true;
 			if (configs)
-			{
-				NeededConfig *c = palloc0(sizeof(NeededConfig));
-
-				c->table = pnstrdup(flag + 7, tab - (flag + 7));
-				c->rows = list_make1(makeString(pstrdup(tab + 1)));
-				*configs = lappend(*configs, c);
-			}
+				*configs = lappend(*configs, flag);
 		}
 		else
 			ereport(ERROR,
@@ -197,28 +183,13 @@ extension_parts(const char *value, bool *versioned, bool *ordering)
 	return extension_parts_configs(value, versioned, ordering, NULL);
 }
 
-/* Merge one commit's configuration rows into an extension's needs. */
+/* Merge one commit's configuration elements into an extension's needs. */
 static void
 note_configs(NeededExtension *e, List *configs)
 {
-	ListCell   *lc;
-
-	foreach(lc, configs)
-	{
-		NeededConfig *c = lfirst(lc);
-		NeededConfig *have = NULL;
-		ListCell   *hc;
-
-		foreach(hc, e->configs)
-			if (strcmp(((NeededConfig *) lfirst(hc))->table, c->table) == 0)
-				have = lfirst(hc);
-		if (have == NULL)
-			e->configs = lappend(e->configs, c);
-		else
-			foreach(hc, c->rows)
-				if (!list_member(have->rows, lfirst(hc)))
-					have->rows = lappend(have->rows, lfirst(hc));
-	}
+	foreach_ptr(char, c, configs)
+		if (!list_member(e->configs, makeString(c)))
+			e->configs = lappend(e->configs, makeString(c));
 }
 
 static NeededExtension *
@@ -816,10 +787,10 @@ problems_hint(const Problems *problems)
 /*
  * Every configuration row the commits record must be in the database's
  * configuration table: the commits' data may refer to them.  An extension
- * just made (by a clone) gets them, as a restore of a dump gives an
- * extension its configuration rows; for one the database had, a lacking
- * row refuses the move.  Rows the database has besides are its own, and
- * fine.
+ * just made (by a clone) gets them, and its sequences' states, as a
+ * restore of a dump gives an extension its configuration; for one the
+ * database had, a lacking row refuses the move.  Rows the database has
+ * besides are its own, and fine.
  */
 static void
 check_configs(Needs *needs, List *installs, const char *what)
@@ -831,45 +802,12 @@ check_configs(Needs *needs, List *installs, const char *what)
 	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
-		bool		made = find_install(installs, e->name) != NULL;
-		ListCell   *cc;
+		List	   *elements = NIL;
 
-		foreach(cc, e->configs)
-		{
-			NeededConfig *c = lfirst(cc);
-			List	   *have = NIL;
-			int			lacking = 0;
-			ListCell   *rc;
-
-			if (SPI_execute(psprintf("SELECT t::text FROM %s t", c->table), true, 0) != SPI_OK_SELECT)
-				elog(ERROR, "could not read configuration table %s", c->table);
-			for (uint64 i = 0; i < SPI_processed; i++)
-				have = lappend(have, makeString(column(i, 1)));
-			foreach(rc, c->rows)
-			{
-				const char *row = strVal(lfirst(rc));
-
-				if (list_member(have, lfirst(rc)))
-					continue;
-				if (!made)
-				{
-					lacking++;
-					continue;
-				}
-				{
-					Oid			types[1] = {TEXTOID};
-					Datum		values[1] = {CStringGetTextDatum(row)};
-
-					if (SPI_execute_with_args(psprintf("INSERT INTO %s SELECT (($1::text)::%s).*",
-													   c->table, c->table),
-											  1, types, values, NULL, false, 0) != SPI_OK_INSERT)
-						elog(ERROR, "could not restore a row of configuration table %s", c->table);
-				}
-			}
-			if (lacking > 0)
-				appendStringInfo(&missing, "\nextension %s: configuration table %s lacks %d of the %d rows the commits record",
-								 e->name, c->table, lacking, list_length(c->rows));
-		}
+		foreach_node(String, c, e->configs)
+			elements = lappend(elements, strVal(c));
+		prolly_extconfig_apply(e->name, elements, find_install(installs, e->name) != NULL,
+							   &missing);
 	}
 	if (missing.len > 0)
 		ereport(ERROR,

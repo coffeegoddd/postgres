@@ -182,16 +182,22 @@ An extension's configuration tables (pg_extension.extconfig, such as
 PostGIS's spatial_ref_sys) are shared by every branch and aren't
 versioned, but the commits' data may refer to their rows (a column of a
 custom SRID).  So since folded format 19 an extension's dependency
-records, after its flags, the rows pg_dump would dump with it (those its
-extcondition selects: a user's, not its script's), one element each,
-"config<tab><table><tab><row>", the row in its text form, in order of
-table and row; an extension without such rows is recorded as before.  A
-clone writes them into the configuration tables of the extension it
-makes, as a restore of a dump does.  A move (checkout, reset, merge,
-cherry-pick, revert) to commits recording a row the database lacks is
-refused, naming the table; rows the database has besides are its own.
-The rows aren't catalogs, so the dependency tree isn't taken from the
-backend's cache while an extension has configuration tables.
+records, after its flags, what pg_dump dumps with it (prolly_extconfig.c):
+each row its extcondition selects (a user's, not its script's), column by
+column by name, each value in its canonical form, so a row is recorded the
+same whatever the committer's settings; and each configuration sequence's
+state, once it has moved from its start.  They are read as the tables'
+owners with row security off, as pg_dump reads them.  An extension
+without such rows is recorded as before.  A clone writes the rows its
+configuration tables lack into the extension it makes (by column name,
+overriding identities, generated columns left to be generated) and sets
+its sequences, as a restore of a dump does.  A move (checkout, reset,
+merge, cherry-pick, revert) to commits recording a row the database lacks
+is refused, naming the table; rows the database has besides are its own.
+An element naming anything but one of the extension's configuration
+tables is refused, and nothing an element holds is put in a query as
+text.  The dependency tree is taken from the backend's cache only while
+the extensions' configuration elements are what they were.
 
 
 Identity across renames

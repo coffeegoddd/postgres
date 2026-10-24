@@ -52,3 +52,67 @@ SELECT n, ec.test_prolly_ext_count() AS counted FROM ec.t;
 \c :db
 DROP DATABASE regress_extconfig_clone;
 DROP DATABASE regress_extconfig_src;
+
+-- A configuration table of values whose text forms follow the session's
+-- settings (recorded in canonical form, so the same whatever they are),
+-- with an identity, a generated column, row security hiding its rows from
+-- everyone but its owner, more rows than any one array element limit,
+-- and a configuration sequence moved from its start.
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/extconfig2-' || txid_current() AS url2 \gset
+CREATE DATABASE regress_extconfig_src2;
+\c regress_extconfig_src2
+SET client_min_messages = warning;
+CREATE EXTENSION test_prolly;
+CREATE SCHEMA ec2 VERSIONED;
+CREATE EXTENSION test_prolly_ext_config SCHEMA ec2;
+CREATE TABLE ec2.t (id int PRIMARY KEY, n bigint DEFAULT ec2.test_prolly_cfg_count());
+INSERT INTO ec2.test_prolly_cfg (at, day, ratio)
+	VALUES ('2021-06-01 12:00 UTC', '2021-06-01', 0.1);
+INSERT INTO ec2.test_prolly_cfg (at, day, ratio)
+	SELECT '2022-01-01 00:00 UTC'::timestamptz + g * interval '1 hour', '2022-01-01'::date + g, g / 3.0
+	FROM generate_series(1, 2500) g;
+SELECT count(*) AS moved FROM (SELECT nextval('ec2.test_prolly_cfg_seq') FROM generate_series(1, 5)) s;
+INSERT INTO ec2.t (id) VALUES (1);
+-- committed by a role the table's policy hides every row from, under
+-- other settings
+CREATE ROLE regress_cfg_committer;
+GRANT USAGE ON SCHEMA ec2 TO regress_cfg_committer;
+GRANT ALL ON ec2.t TO regress_cfg_committer;
+SET ROLE regress_cfg_committer;
+SET DateStyle = 'SQL, DMY';
+SET TimeZone = 'Asia/Kolkata';
+SET extra_float_digits = -3;
+SELECT has_table_privilege('ec2.test_prolly_cfg', 'SELECT') AS can_read;
+SELECT (dolt_commit('-Am', 'configured'))[1] AS h1 \gset
+RESET ROLE;
+-- every row recorded (2501 of them, the script's not), and the sequence
+SELECT (SELECT count(*) FROM regexp_matches(d, 'config\t', 'g')) AS rows_recorded,
+       (SELECT count(*) FROM regexp_matches(d, 'configseq\t', 'g')) AS sequences_recorded
+FROM (SELECT test_commit_dependencies(dolt_hashof('HEAD'))::text AS d) s;
+SELECT md5(test_commit_dependencies(dolt_hashof('HEAD'))::text) AS deps_other \gset
+RESET DateStyle;
+RESET TimeZone;
+RESET extra_float_digits;
+-- recorded the same under the defaults
+UPDATE ec2.t SET n = n + 0;
+SELECT (dolt_commit('--allow-empty', '-am', 'same rows'))[1] AS h2 \gset
+SELECT md5(test_commit_dependencies(dolt_hashof('HEAD'))::text) = :'deps_other' AS same_dependencies;
+SELECT (dolt_reset('--hard', :'h1'))[1] AS reset_under_other_settings;
+SELECT dolt_remote('add', 'origin', :'url2') IS NOT NULL AS remote;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+
+\c :db
+CREATE DATABASE regress_extconfig_clone2;
+\c regress_extconfig_clone2
+SET TimeZone = 'UTC';
+SELECT dolt_clone(:'url2') IS NOT NULL AS cloned;
+SELECT count(*) AS rows, min(id), max(id), sum(doubled) = sum(id) * 2 AS generated
+FROM ec2.test_prolly_cfg;
+SELECT at, day, ratio FROM ec2.test_prolly_cfg WHERE id = 2;
+SELECT last_value, is_called FROM ec2.test_prolly_cfg_seq;
+SELECT n FROM ec2.t;
+
+\c :db
+DROP DATABASE regress_extconfig_clone2;
+DROP DATABASE regress_extconfig_src2;
+DROP ROLE regress_cfg_committer;
