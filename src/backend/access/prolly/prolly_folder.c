@@ -23,7 +23,8 @@
  * until it is written again.  Off, the launcher sleeps until the setting
  * changes.
  *
- * A branch is folded once its writes are due, not at every pass: once the
+ * With prolly_fold_worker_batch_rows set (it is 0, off, by default), a
+ * branch is folded once its writes are due, not at every pass: once the
  * writers that ended since its last fold wrote
  * prolly_fold_worker_batch_rows rows, once the first of them ended
  * prolly_fold_worker_max_delay ago, or once its writes have stopped (none
@@ -72,7 +73,7 @@
 bool		prolly_fold_worker = true;
 int			prolly_fold_worker_max_workers = 2;
 int			prolly_fold_worker_naptime = 200;
-int			prolly_fold_worker_batch_rows = 5000;
+int			prolly_fold_worker_batch_rows = 0;
 int			prolly_fold_worker_max_delay = 1000;
 
 /* The most databases, and branches of one, a pass looks at. */

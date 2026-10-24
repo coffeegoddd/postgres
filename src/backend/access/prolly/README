@@ -532,17 +532,19 @@ debug_prolly_verify_fold_caches folds again and compares.
 
 The fold worker (prolly_folder.c, prolly_fold_worker) takes a working-set
 checkpoint of each branch written, in the background, so a status or a
-commit folds only what came since.  A branch whose writes go on is folded
+commit folds only what came since, by default at every pass.  With
+prolly_fold_worker_batch_rows set, a branch whose writes go on is folded
 once its writers since its last fold wrote prolly_fold_worker_batch_rows
 rows (the refs count them, each row a write changes) or the first of them
 waited prolly_fold_worker_max_delay; one whose writes stopped (nobody
 writing it, and no writer ended for a naptime) at the next pass, as is one
-no writer of which ended since (nothing to batch).  A fold writes the nodes on the paths to
-the rows it changes, so folds of a few rows each write the upper nodes
-again: batching writes keeps a busy branch's chunk writes, WAL and journal
-near its rows' own.  pg_stat_prolly counts the worker's folds
-(fold_worker_folds) and the branches it left for a later pass
-(fold_worker_deferred).
+no writer of which ended since (nothing to batch). A fold writes the nodes
+on the paths to the rows it changes, so folds of a few rows each write the
+upper nodes again: batching writes keeps a busy branch's chunk writes, WAL
+and journal near its rows' own, while a commit or status during the writes
+folds the batch not yet folded itself (so batching is off by default).
+pg_stat_prolly counts the worker's folds (fold_worker_folds) and the
+branches it left for a later pass (fold_worker_deferred).
 
 A rewrite of a versioned table (ALTER TABLE changing a column's type,
 REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
