@@ -825,15 +825,17 @@ folds the batch not yet folded itself (so batching is off by default).
 pg_stat_prolly counts the worker's folds (fold_worker_folds), the
 branches it left for a later pass (fold_worker_deferred), and its
 attempts rolled back, the refs held, the branch moved meanwhile, or a
-lock it needed held, to be made again (fold_worker_retries), each
+relation's lock held, to be made again (fold_worker_retries), each
 branch's tries backed off (after
 1, 3, 7... passes, 63 at most).  The launcher takes the databases written
 in turn, and a worker exits after 64 passes, so a database written
 without pause doesn't keep a slot from the others.  The worker's fold
-never waits for a lock (lock_timeout at its least): it keeps its locks on
-the change logs it consumed past its lock on their tables, so a DROP of
-several tables, holding them and waiting for one's log, would deadlock
-with a fold waiting for the next table.  Autovacuum's
+waits for no relation's lock (checkpoint_unless_moved() sets lmgr.c's
+RelationLocksNoWait through it; a lock not free at once rolls the fold
+back, to be made again): it keeps its locks on the change logs it
+consumed past its lock on their tables, so a DROP of several tables,
+holding them and waiting for one's log, would deadlock with a fold
+waiting for the next table.  Autovacuum's
 automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
 and gives up while another holds them: a commit never waits for it.

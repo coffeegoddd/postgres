@@ -589,7 +589,9 @@ typedef struct ProllyRefsRoutine
 	 * only if free (never waited for): false, nothing set, if another holds
 	 * them or the branch's head or baseline moved meanwhile, and then the
 	 * caller must roll its transaction back (the fold consumed the change
-	 * finder's record of what it folded).
+	 * finder's record of what it folded).  The fold waits for no relation's
+	 * lock either: one not free at once fails it with
+	 * ERRCODE_LOCK_NOT_AVAILABLE, which the caller rolls back the same way.
 	 */
 	bool		(*checkpoint_unless_moved) (ProllyNodeRef *root);
 

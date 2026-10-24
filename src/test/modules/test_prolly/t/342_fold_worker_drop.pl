@@ -6,7 +6,9 @@
 # deadlock with the fold waiting for the next table.  Here the worker
 # stops once it has folded a, then b, holding a's log but not a; a DROP of
 # a and c then waits for a's log; the worker, going on to c, rolls its fold
-# back instead of waiting, and the DROP goes through.
+# back instead of waiting, and the DROP goes through.  The fold given up is
+# a retry, made again later, not an error.  So too with a table locked by
+# LOCK TABLE, which doesn't move the branch.
 
 use strict;
 use warnings FATAL => 'all';
@@ -31,6 +33,8 @@ deadlock_timeout = 100ms
 $node->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
+
+my $retries = q{SELECT value FROM pg_stat_prolly WHERE name = 'fold_worker_retries'};
 
 sql(q{
 	CREATE EXTENSION injection_points;
@@ -67,6 +71,7 @@ is(sql($worker_holds), '{s.b}', 'holding b but not a');
 
 # the DROP holds a and c, and waits for a's log, which the worker holds
 my $log_offset = -s $node->logfile;
+my $retried = sql($retries);
 my $drop = $node->background_psql('postgres', on_error_stop => 0);
 $drop->query_until(qr/started/, q{
 	\echo started
@@ -85,11 +90,38 @@ unlike($drop->{stderr}, qr/ERROR/, 'the drop went through');
 is(sql(q{SELECT count(*) FROM pg_class WHERE relname IN ('a', 'c') AND relnamespace = 's'::regnamespace}),
 	'0', 'a and c are gone');
 ok(!$node->log_contains('deadlock detected', $log_offset), 'no deadlock');
+ok($node->poll_query_until('postgres', qq{SELECT ($retries) > $retried}),
+	'the worker\'s fold given up is a retry');
+ok(!$node->log_contains('could not obtain lock', $log_offset), 'not an error');
 
 # and the worker folds the branch next pass
 my $b_empty = sql(q{SELECT 'SELECT count(*) = 0 FROM pg_toast.pg_prolly_log_' || 's.b'::regclass::oid});
 ok($node->poll_query_until('postgres', $b_empty), 'the worker folds b again');
 
 $drop->quit;
+
+# a table locked by LOCK TABLE: the fold given up, and made once it's free
+$log_offset = -s $node->logfile;
+sql(q{SELECT injection_points_attach('prolly-fold-worker-fold', 'wait')});
+sql(q{UPDATE s.b SET v = 2});
+ok( $node->poll_query_until(
+		'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		  WHERE backend_type = 'prolly fold worker'
+		    AND wait_event = 'prolly-fold-worker-fold'}),
+	'the worker is about to fold b');
+my $locker = $node->background_psql('postgres');
+$locker->query_safe(q{BEGIN; LOCK TABLE s.b IN ACCESS EXCLUSIVE MODE});
+$retried = sql($retries);
+sql(q{SELECT injection_points_detach('prolly-fold-worker-fold')});
+sql(q{SELECT injection_points_wakeup('prolly-fold-worker-fold')});
+ok($node->poll_query_until('postgres', qq{SELECT ($retries) > $retried}),
+	'a fold that would wait for the lock is given up, as a retry');
+is(sql(q{SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'prolly fold worker'
+	AND wait_event_type = 'Lock'}), '0', 'the worker never waits for it');
+$locker->query_safe(q{ROLLBACK});
+$locker->quit;
+ok($node->poll_query_until('postgres', $b_empty), 'b is folded once free');
+ok(!$node->log_contains('could not obtain lock', $log_offset), 'with no error');
+
 $node->stop;
 done_testing();

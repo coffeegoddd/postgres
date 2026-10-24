@@ -18,11 +18,15 @@
  * one branch to a transaction so the refs are held no longer than its
  * fold, and exits once no branch has moved for two passes, or after
  * FOLDER_MAX_PASSES passes (the launcher takes the databases written in
- * turn, so one written without pause doesn't keep a slot from others).  A branch the
- * refs are held for, that moved during its fold, or whose store's root
- * isn't free, is folded again after a backoff (FOLDER_MAX_BACKOFF).  Writers pay nothing: what a fold costs is the worker's, off their
- * transactions.  A worker's error is reported, and the branch passed over
- * until it is written again.  Off, the launcher sleeps until the setting
+ * turn, so one written without pause doesn't keep a slot from others).  A
+ * branch the refs are held for, that moved during its fold, whose store's
+ * root isn't free, or one of whose relations is locked by another (the
+ * fold waits for no relation's lock, so that a DROP holding tables and
+ * waiting for a change log the fold holds can't deadlock with it), is
+ * folded again after a backoff (FOLDER_MAX_BACKOFF).  Writers pay nothing:
+ * what a fold costs is the worker's, off their transactions.  Another
+ * error is reported, and the branch passed over until it is written
+ * again.  Off, the launcher sleeps until the setting
  * changes.
  *
  * With prolly_fold_worker_batch_rows set (it is 0, off, by default), a
@@ -91,7 +95,8 @@ int			prolly_fold_worker_max_delay = 1000;
 
 /*
  * A branch whose fold was given up (the refs held, the branch moved
- * meanwhile, or the store's root not free) is tried again after 2^k - 1
+ * meanwhile, the store's root not free, or a relation's lock held by
+ * another) is tried again after 2^k - 1
  * passes for its k-th time in a row, k at most this: so a transaction
  * holding the refs long is asked of less and less, every 63 passes at the
  * most.
@@ -447,16 +452,6 @@ fold_pass(const ProllyRefsRoutine *refs)
 		StartTransactionCommand();
 		PG_TRY();
 		{
-			/*
-			 * (never waiting for a lock: the fold keeps its locks on the
-			 * change logs it consumed past its table's, and a DROP or other
-			 * DDL holding the tables and waiting for a log would deadlock
-			 * with the fold waiting for the next table; a lock not free at
-			 * once rolls the fold back, to fold again next pass)
-			 */
-			(void) set_config_option("lock_timeout", "1", PGC_USERSET,
-									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
-									 false);
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* (the worker's own branch, the database's default, as it is) */
 			if (moved[i].branch == MyBranch)
@@ -509,7 +504,11 @@ fold_pass(const ProllyRefsRoutine *refs)
 
 			if (locked)
 			{
-				/* (a lock another holds: folded again once backed off) */
+				/*
+				 * (a relation's lock another holds, which the fold doesn't
+				 * wait for: checkpoint_unless_moved(); folded again once
+				 * backed off)
+				 */
 				pending = true;
 				back_off(moved[i].branch);
 				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
