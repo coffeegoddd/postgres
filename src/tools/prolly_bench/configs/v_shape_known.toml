@@ -45,11 +45,3 @@ counter = "bmap_refcount_updates"
 current = "linear"
 issue = "#870"
 reason = "as merge's"
-
-[[known]]
-check = "ff_merge"
-sweep = "rows"
-counter = "bmap_map_pages_copied"
-current = "linear"
-issue = "#870"
-reason = "as merge's"

@@ -7085,7 +7085,13 @@ MarkSharedAndFlushRelations(SMgrRelation *rels, int n)
 	if (n == 0)
 		return;
 
-	/* (every fork's size, to judge: a fork whose size isn't known scans) */
+	/*
+	 * (every fork's size, to judge.  Looking each block up finds what the
+	 * pass would: the caller's lock keeps the relations from being
+	 * extended or truncated meanwhile, a buffer past a fork's end holds no
+	 * valid page of it to mark or write out, and a block-mapped fork's size
+	 * is its header's, which an extension updates as it extends)
+	 */
 	for (int i = 0; i < n && lookup; i++)
 	{
 		for (ForkNumber f = 0; f <= MAX_FORKNUM && lookup; f++)

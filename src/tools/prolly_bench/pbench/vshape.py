@@ -98,8 +98,11 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # of its commit (the map's work of the paths changed)
     ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP)},
     ("merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
-    # a fast-forward merge: the same
-    ("ff_merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP)},
+    # a fast-forward merge: the same, but the map pages it copies, which sit
+    # on the bound between log and linear (0.35): gated at linear, so the
+    # check doesn't flip between met and known with a page more or less
+    ("ff_merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP),
+                           "bmap_map_pages_copied": "linear"},
     ("ff_merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
     # as unrelated objects are added (shared tables, another branch's): a
     # first use's copies, a commit's canonical form and a branch's delete
