@@ -3174,7 +3174,10 @@ static uint64 dependencies_epoch;
 static List *dependencies_configured;
 static char *dependencies_config;
 
-/* The configuration elements of extensions, as one string. */
+/*
+ * A digest of extensions' configuration elements, as one string: read
+ * without encoding the rows (prolly_extconfig_fingerprint()).
+ */
 static char *
 config_fingerprint(List *extoids)
 {
@@ -3183,13 +3186,7 @@ config_fingerprint(List *extoids)
 
 	initStringInfo(&out);
 	foreach(lc, extoids)
-	{
-		bool		has_config = false;
-
-		appendStringInfo(&out, "%u\n", lfirst_oid(lc));
-		foreach_ptr(char, e, prolly_extconfig_elements(lfirst_oid(lc), &has_config))
-			appendStringInfo(&out, "%s\n", e);
-	}
+		appendStringInfoString(&out, prolly_extconfig_fingerprint(lfirst_oid(lc)));
 	return out.data;
 }
 static MadeTree items_made;

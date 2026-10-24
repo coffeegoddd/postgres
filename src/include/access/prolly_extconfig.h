@@ -40,6 +40,12 @@ extern bool prolly_extconfig_element(const char *element);
 extern List *prolly_extconfig_elements(Oid extoid, bool *has_config);
 
 /*
+ * A digest of what prolly_extconfig_elements() would give for extoid, much
+ * cheaper than it: equal digests mean equal elements.
+ */
+extern char *prolly_extconfig_fingerprint(Oid extoid);
+
+/*
  * Check elements (an extension's, by name) against the database: with
  * restore (an extension a clone just made), write the rows the
  * configuration tables lack and set the sequences, as a restore of a dump

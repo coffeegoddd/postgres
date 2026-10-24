@@ -4,7 +4,8 @@
 
 -- A configuration table with values whose text forms follow the session's
 -- settings, an identity, a generated column and row security; the script's
--- own row (id 1) isn't dumped.  And a configuration sequence.
+-- own row (id 1) isn't dumped.  A keyless one.  And a configuration
+-- sequence.
 CREATE TABLE @extschema@.test_prolly_cfg (
 	id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 	at timestamptz,
@@ -16,6 +17,9 @@ INSERT INTO @extschema@.test_prolly_cfg (at, day, ratio)
 ALTER TABLE @extschema@.test_prolly_cfg ENABLE ROW LEVEL SECURITY;
 CREATE POLICY test_prolly_cfg_none ON @extschema@.test_prolly_cfg USING (false);
 SELECT pg_catalog.pg_extension_config_dump('@extschema@.test_prolly_cfg', 'WHERE id > 1');
+-- a keyless configuration table, every row dumped
+CREATE TABLE @extschema@.test_prolly_cfg_tags (tag text);
+SELECT pg_catalog.pg_extension_config_dump('@extschema@.test_prolly_cfg_tags', '');
 CREATE SEQUENCE @extschema@.test_prolly_cfg_seq;
 SELECT pg_catalog.pg_extension_config_dump('@extschema@.test_prolly_cfg_seq', '');
 CREATE FUNCTION @extschema@.test_prolly_cfg_count() RETURNS bigint

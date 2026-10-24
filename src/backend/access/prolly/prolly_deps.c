@@ -48,7 +48,7 @@ typedef struct NeededExtension
 	List	   *schemas;		/* String, distinct */
 	List	   *ordering_versions; /* String, exact versions ordering keys */
 	bool		versioned;		/* its schema is a versioned one */
-	List	   *configs;		/* char *: configuration elements, distinct */
+	List	   *configs;		/* char *: configuration elements, sorted */
 } NeededExtension;
 
 /* An object the commits need. */
@@ -183,13 +183,46 @@ extension_parts(const char *value, bool *versioned, bool *ordering)
 	return extension_parts_configs(value, versioned, ordering, NULL);
 }
 
-/* Merge one commit's configuration elements into an extension's needs. */
+static int
+config_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(lfirst(a), lfirst(b));
+}
+
+/*
+ * Merge one commit's configuration elements into an extension's needs.  An
+ * element may be there more than once (a keyless table's duplicate rows),
+ * so the needs keep each as many times as any one commit records it.
+ */
 static void
 note_configs(NeededExtension *e, List *configs)
 {
-	foreach_ptr(char, c, configs)
-		if (!list_member(e->configs, makeString(c)))
-			e->configs = lappend(e->configs, makeString(c));
+	List	   *add = list_copy(configs);
+	List	   *merged = NIL;
+	int			i = 0;
+	int			j = 0;
+
+	list_sort(add, config_cmp);
+	while (i < list_length(e->configs) || j < list_length(add))
+	{
+		int			c;
+
+		if (i == list_length(e->configs))
+			c = 1;
+		else if (j == list_length(add))
+			c = -1;
+		else
+			c = strcmp(list_nth(e->configs, i), list_nth(add, j));
+		if (c <= 0)
+			merged = lappend(merged, list_nth(e->configs, i++));
+		else
+			merged = lappend(merged, list_nth(add, j));
+		if (c >= 0)
+			j++;
+	}
+	list_free(e->configs);
+	list_free(add);
+	e->configs = merged;
 }
 
 static NeededExtension *
@@ -789,7 +822,9 @@ problems_hint(const Problems *problems)
  * configuration table: the commits' data may refer to them.  An extension
  * just made (by a clone) gets them, and its sequences' states, as a
  * restore of a dump gives an extension its configuration; for one the
- * database had, a lacking row refuses the move.  Rows the database has
+ * database had, a lacking row refuses the move.  A keyed table's row is
+ * there when its key is (the database's other columns are its own); a
+ * keyless table's, as many times as recorded.  Rows the database has
  * besides are its own, and fine.
  */
 static void
@@ -802,11 +837,7 @@ check_configs(Needs *needs, List *installs, const char *what)
 	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
-		List	   *elements = NIL;
-
-		foreach_node(String, c, e->configs)
-			elements = lappend(elements, strVal(c));
-		prolly_extconfig_apply(e->name, elements, find_install(installs, e->name) != NULL,
+		prolly_extconfig_apply(e->name, e->configs, find_install(installs, e->name) != NULL,
 							   &missing);
 	}
 	if (missing.len > 0)

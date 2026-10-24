@@ -185,19 +185,30 @@ custom SRID).  So since folded format 19 an extension's dependency
 records, after its flags, what pg_dump dumps with it (prolly_extconfig.c):
 each row its extcondition selects (a user's, not its script's), column by
 column by name, each value in its canonical form, so a row is recorded the
-same whatever the committer's settings; and each configuration sequence's
-state, once it has moved from its start.  They are read as the tables'
-owners with row security off, as pg_dump reads them.  An extension
+same whatever the committer's settings; and the state of each
+configuration sequence, and of each sequence a configuration table owns
+(an identity's, a serial's), once it has moved from its start.  They are
+read as the tables' owners with row security off, a search path of
+pg_catalog alone and fixed text settings, as pg_dump reads them, so
+nothing in the committer's schemas runs as the owner.  An extension
 without such rows is recorded as before.  A clone writes the rows its
 configuration tables lack into the extension it makes (by column name,
-overriding identities, generated columns left to be generated) and sets
-its sequences, as a restore of a dump does.  A move (checkout, reset,
-merge, cherry-pick, revert) to commits recording a row the database lacks
-is refused, naming the table; rows the database has besides are its own.
-An element naming anything but one of the extension's configuration
-tables is refused, and nothing an element holds is put in a query as
-text.  The dependency tree is taken from the backend's cache only while
-the extensions' configuration elements are what they were.
+overriding identities, generated columns left to be generated, through
+one prepared INSERT per table) and sets its sequences, as a restore of a
+dump does.  A move (checkout, reset, merge, cherry-pick, revert) to
+commits recording a row the database lacks is refused, naming the table;
+rows the database has besides are its own.  A table with a primary key
+(or a replica identity index) has its rows matched by key, so a row whose
+other columns were edited since is still there; heads recording one key
+with different values give a clone one row for it.  A keyless table's
+rows are matched whole, each as many times as recorded.  An element
+naming anything but one of the extension's configuration tables (or a
+sequence one owns) is refused, nothing an element holds is put in a query
+as text, and decoded text is checked to be valid in the database's
+encoding, as text's receive checks it.  The dependency tree is taken from
+the backend's cache only while a digest of the configuration tables
+matches: each visible row's place and inserting transaction, read without
+encoding any row.
 
 
 Identity across renames

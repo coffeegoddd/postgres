@@ -72,20 +72,32 @@ INSERT INTO ec2.test_prolly_cfg (at, day, ratio)
 	SELECT '2022-01-01 00:00 UTC'::timestamptz + g * interval '1 hour', '2022-01-01'::date + g, g / 3.0
 	FROM generate_series(1, 2500) g;
 SELECT count(*) AS moved FROM (SELECT nextval('ec2.test_prolly_cfg_seq') FROM generate_series(1, 5)) s;
+-- a keyless table's rows, one of them twice
+INSERT INTO ec2.test_prolly_cfg_tags VALUES ('a'), ('a'), ('b');
 INSERT INTO ec2.t (id) VALUES (1);
 -- committed by a role the table's policy hides every row from, under
--- other settings
+-- other settings, and with an operator of its own ahead of pg_catalog's:
+-- the extcondition (id > 1) runs as the table's owner, and must not run
+-- the role's
 CREATE ROLE regress_cfg_committer;
 GRANT USAGE ON SCHEMA ec2 TO regress_cfg_committer;
 GRANT ALL ON ec2.t TO regress_cfg_committer;
+GRANT CREATE ON DATABASE regress_extconfig_src2 TO regress_cfg_committer;
 SET ROLE regress_cfg_committer;
+CREATE SCHEMA regress_cfg_evil;
+CREATE FUNCTION regress_cfg_evil.gt(int, int) RETURNS bool LANGUAGE plpgsql
+  AS $$BEGIN RAISE EXCEPTION 'ran as %', current_user; END$$;
+CREATE OPERATOR regress_cfg_evil.> (FUNCTION = regress_cfg_evil.gt, LEFTARG = int, RIGHTARG = int);
+SET search_path = regress_cfg_evil, pg_catalog, public;
 SET DateStyle = 'SQL, DMY';
 SET TimeZone = 'Asia/Kolkata';
 SET extra_float_digits = -3;
 SELECT has_table_privilege('ec2.test_prolly_cfg', 'SELECT') AS can_read;
 SELECT (dolt_commit('-Am', 'configured'))[1] AS h1 \gset
+RESET search_path;
 RESET ROLE;
--- every row recorded (2501 of them, the script's not), and the sequence
+-- every row recorded (2501 of them, the script's not, and the 3 keyless
+-- rows), and both sequences (the configuration one, the identity's)
 SELECT (SELECT count(*) FROM regexp_matches(d, 'config\t', 'g')) AS rows_recorded,
        (SELECT count(*) FROM regexp_matches(d, 'configseq\t', 'g')) AS sequences_recorded
 FROM (SELECT test_commit_dependencies(dolt_hashof('HEAD'))::text AS d) s;
@@ -98,8 +110,30 @@ UPDATE ec2.t SET n = n + 0;
 SELECT (dolt_commit('--allow-empty', '-am', 'same rows'))[1] AS h2 \gset
 SELECT md5(test_commit_dependencies(dolt_hashof('HEAD'))::text) = :'deps_other' AS same_dependencies;
 SELECT (dolt_reset('--hard', :'h1'))[1] AS reset_under_other_settings;
+-- a commit recording the keyed row id 2 with other values, on main and on
+-- a second head
+UPDATE ec2.test_prolly_cfg SET ratio = 9 WHERE id = 2;
+UPDATE ec2.t SET n = n + 1;
+SELECT (dolt_commit('-am', 'edited configuration row'))[1] AS h3 \gset
+SELECT dolt_branch('other') IS NOT NULL AS branched;
+-- a keyed row is matched by its key: one whose other columns changed
+-- since is still the commits' row
+SELECT (dolt_reset('--hard', :'h1'))[1] AS reset_after_edit;
+-- a keyless table's rows, as many times as recorded
+DELETE FROM ec2.test_prolly_cfg_tags
+WHERE ctid = (SELECT min(ctid) FROM ec2.test_prolly_cfg_tags WHERE tag = 'a');
+SELECT dolt_reset('--hard', :'h3');
+SELECT dolt_hashof('HEAD') = :'h1' AS still_at_h1;
+INSERT INTO ec2.test_prolly_cfg_tags VALUES ('a');
+-- A commit's text is checked as text's receive checks it, so a crafted
+-- chunk can't write bytes invalid in the database's encoding into a
+-- table (a clone's configuration rows among them).
+SELECT prolly_canonical_decode('\xff'::bytea, NULL::text);
+SELECT prolly_canonical_decode('\x6100'::bytea, NULL::text);
+SELECT prolly_canonical_decode('\x61'::bytea, NULL::text) AS valid;
 SELECT dolt_remote('add', 'origin', :'url2') IS NOT NULL AS remote;
 SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+SELECT dolt_push('origin', 'other') IS NOT NULL AS pushed_other;
 
 \c :db
 CREATE DATABASE regress_extconfig_clone2;
@@ -111,6 +145,13 @@ FROM ec2.test_prolly_cfg;
 SELECT at, day, ratio FROM ec2.test_prolly_cfg WHERE id = 2;
 SELECT last_value, is_called FROM ec2.test_prolly_cfg_seq;
 SELECT n FROM ec2.t;
+-- one row per key, of the two heads' records of it
+SELECT count(*) AS rows_with_id_2 FROM ec2.test_prolly_cfg WHERE id = 2;
+-- the keyless rows, each as many times as recorded
+SELECT tag, count(*) FROM ec2.test_prolly_cfg_tags GROUP BY tag ORDER BY tag;
+-- the identity's sequence, as the source's: a new row takes the next id
+INSERT INTO ec2.test_prolly_cfg (at, day, ratio)
+VALUES ('2023-01-01 00:00 UTC', '2023-01-01', 1) RETURNING id;
 
 \c :db
 DROP DATABASE regress_extconfig_clone2;
