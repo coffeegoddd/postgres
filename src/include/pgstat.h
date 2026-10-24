@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF9
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFA
 
 typedef struct PgStat_ArchiverStats
 {
@@ -754,9 +754,13 @@ typedef enum PgStat_ProllyCounter
 											 * head */
 	PGSTAT_PROLLY_BMAP_BLOCKS_MOVED,	/* page-store blocks a sweep moved
 										 * down, to shorten the store */
+	PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED,	/* branch checkpoints after
+												 * a table rewrite given up:
+												 * a lock not free, or an
+												 * error */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BLOCKS_MOVED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED + 1)
 
 typedef struct PgStat_ProllyStats
 {
