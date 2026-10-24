@@ -9,7 +9,9 @@
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
  * collection, by the database's reclamation.  Only sizes are read, not the
- * journal.  Then it moves the journal (the reclamation's move(): its
+ * journal.  Another collection running, it skips its own quietly (counted
+ * in pg_stat_prolly's auto_collections_skipped): that one collects what
+ * was due.  Then it moves the journal (the reclamation's move(): its
  * segments rewritten as a table file, nothing freed) once its segments
  * have passed prolly.journal_move_threshold, which bounds what a backend
  * reads to index the journal when collections are rare (a large store) or
@@ -60,6 +62,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -291,18 +294,54 @@ collection_due(void)
 		collected > s.settled * prolly_gc_growth_scale_factor;
 }
 
+/*
+ * A collection is refused while another of the store runs (a lock not
+ * available, never waited for): several workers find the same store due
+ * at once.  The one that runs collects what was due, so the others skip
+ * it quietly, counted (auto_collections_skipped), rather than each
+ * reporting the refusal as an error; dolt_gc() still reports it.
+ */
 static void
 collect(void)
 {
 	ProllyDatabaseComponents dc;
 	ProllyGcResult r;
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
 
 	if (!collection_due())
 		return;
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.reclamation, collect, false, &r);
+	BeginInternalSubTransaction(NULL);
+	PG_TRY();
+	{
+		PROLLY_CALL(dc.reclamation, collect, false, &r);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(cxt);
+		ed = CopyErrorData();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+			ReThrowError(ed);
+		FlushErrorState();
+		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+		ereport(DEBUG1,
+				(errmsg_internal("automatic collection of database \"%s\" skipped: %s",
+								 get_database_name(MyDatabaseId), ed->message)));
+		FreeErrorData(ed);
+		return;
+	}
+	PG_END_TRY();
 	ereport(DEBUG1,
 			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 get_database_name(MyDatabaseId),
