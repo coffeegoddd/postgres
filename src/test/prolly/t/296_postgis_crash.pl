@@ -4,11 +4,12 @@
 # load, the committed geometries are there byte for byte (EWKB digests,
 # never row_to_json, whose GeoJSON keeps 9 digits), the load's are gone,
 # and the GiST index agrees with the table.  Every page replayed is checked
-# against the primary's image (wal_consistency_checking).  On prolly, a
-# crash in the middle of a commit of large geometries (in its fold, and
-# with its chunks reserved but its transaction not committed) leaves the
-# head where it was and the working set as it was; the commit then
-# succeeds, and both commits read back.  Needs PostGIS in the installation
+# against the primary's image (wal_consistency_checking).  A crash in the
+# middle of a statement's writes leaves the same.  On prolly, a crash in
+# the middle of a commit of large geometries (as its fold begins, in its
+# fold, and with its chunks reserved but its transaction not committed)
+# leaves the head where it was and the working set as it was; the commit
+# then succeeds, and both commits read back.  Needs PostGIS in the installation
 # (the Makefile's check-postgis installs it from POSTGIS_BUILD).
 
 use strict;
@@ -32,12 +33,13 @@ setup_target($node, 'postgres', $am);
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
 # Per-table digests over EWKB, and which ids a GiST scan finds (every
-# geometry the probe box meets) against a sequential scan's.
+# geometry the probe box meets, the crashed writes' included) against a
+# sequential scan's.
 my $digest = q{
 	SELECT count(*) || ' ' || md5(string_agg(id || ':' || encode(ST_AsEWKB(g), 'hex'), ',' ORDER BY id))
 	FROM gis_load};
 my $probe = q{SELECT md5(string_agg(id::text, ',' ORDER BY id)) FROM gis_load
-	WHERE g && ST_MakeEnvelope(100, 100, 3000, 3000)};
+	WHERE g && ST_MakeEnvelope(-400, -400, 3000, 3000)};
 sub scans_agree
 {
 	my $index = sql("SET enable_seqscan = off; SET enable_bitmapscan = off; $probe");
@@ -88,18 +90,76 @@ $node->stop('immediate');
 $node->start;
 is(sql($digest), $expect, 'geometries written after recovery survive the next crash');
 
-if ($am eq 'prolly' && $ENV{enable_injection_points} eq 'yes')
-{
-	sql('CREATE EXTENSION injection_points WITH SCHEMA extensions');
-	my $c1 = sql(q{SELECT (dolt_commit('-Am', 'loaded'))[1]});
-	my $at_c1 = sql($digest);
+my $injection = ($ENV{enable_injection_points} // '') eq 'yes';
 
-	# A commit of large geometries, stopped by a crash as its fold reads
-	# the branch's state, and once its chunks are reserved in the journal
-	# but its transaction hasn't committed.
-	sql(q{UPDATE gis_load SET g = ST_Translate(g, 0.5, 0) WHERE id > 5000 OR id % 100 = 1});
-	my $edited = sql($digest);
-	foreach my $point ('prolly-fold-stamp', 'prolly-append-reserved')
+# A statement stopped by a crash in the middle of its writes: its CTE has
+# inserted 300 polygons (heap, TOAST and GiST writes), and its UPDATE
+# waits before its first row.
+SKIP:
+{
+	skip 'needs injection points', 3 unless $injection;
+	sql('CREATE EXTENSION injection_points WITH SCHEMA extensions');
+	my $before = sql($digest);
+	my $writer = $node->background_psql('postgres');
+	$writer->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('heap_update-before-pin', 'wait')});
+	$writer->query_until(qr/started/, q{
+		\echo started
+		WITH ins AS (
+			INSERT INTO gis_load
+			SELECT 20000 + i, ST_Buffer(ST_MakePoint(i, -i), 5, 500) FROM generate_series(1, 300) i
+			RETURNING id)
+		UPDATE gis_load SET g = ST_Translate(g, 3, 3) WHERE id IN (SELECT id - 20000 FROM ins);
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'heap_update-before-pin'}) or die 'the update did not stop';
+	$node->stop('immediate');
+	$writer->quit;
+	$node->start;
+	is(sql($digest), $before, 'a crash mid-statement keeps the committed geometries');
+	is(sql('SELECT count(*) FROM gis_load WHERE id > 20000'), '0',
+		"and none of the statement's");
+	ok(scans_agree(), 'and the GiST index agrees');
+}
+
+# On prolly, a commit of large geometries stopped by a crash: as its fold
+# begins, before it reads anything (prolly-fold-stamp); in the middle of
+# the fold, as it appends its first megabyte of chunks to the journal
+# (prolly-append-reserving, which a trial commit shows comes before the
+# commit's own reservation); and once the commit's chunks are reserved in
+# the journal but its transaction hasn't committed
+# (prolly-append-reserved).
+SKIP:
+{
+	skip 'needs prolly and injection points', 12 unless $am eq 'prolly' && $injection;
+	# (and enough small rows that the fold's new leaves pass a megabyte:
+	# a large value's chunks are written as the row is, not by the fold)
+	sql(q{CREATE TABLE gis_many (id int PRIMARY KEY, g geometry);
+		INSERT INTO gis_many
+		SELECT i, ST_MakePoint(sin(i) * 1000, cos(i * 1.3) * 1000) FROM generate_series(1, 60000) i});
+	my $both = qq{SELECT ($digest) || ' ' || (SELECT md5(string_agg(encode(ST_AsEWKB(g), 'hex'), ',' ORDER BY id)) FROM gis_many)};
+	my $c1 = sql(q{SELECT (dolt_commit('-Am', 'loaded'))[1]});
+	my $at_c1 = sql($both);
+
+	# A commit of an edit this size reserves journal space more than once,
+	# so its first reservation is in its fold, not the commit's own.  (Run
+	# on other values than the edit below, whose chunks it would otherwise
+	# write first, and reset away.)
+	my ($rc, $out, $err) = $node->psql('postgres', q{
+		UPDATE gis_many SET g = ST_Translate(g, 0.75, 0.5);
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('prolly-append-reserving', 'notice');
+		SELECT dolt_commit('-am', 'trial edit');
+	});
+	my $reservations = () = $err =~ /notice triggered for injection point prolly-append-reserving/g;
+	cmp_ok($reservations, '>=', 2,
+		"a commit of this size appends chunks during its fold ($reservations reservations)");
+	sql(qq{SELECT dolt_reset('--hard', '$c1')});
+
+	sql(q{UPDATE gis_load SET g = ST_Translate(g, 0.5, 0) WHERE id > 5000 OR id % 100 = 1;
+		UPDATE gis_many SET g = ST_Translate(g, 0.25, 0.125)});
+	my $edited = sql($both);
+	foreach my $point ('prolly-fold-stamp', 'prolly-append-reserving', 'prolly-append-reserved')
 	{
 		my $committer = $node->background_psql('postgres');
 		$committer->query_safe(qq{SELECT injection_points_set_local();
@@ -116,15 +176,17 @@ if ($am eq 'prolly' && $ENV{enable_injection_points} eq 'yes')
 
 		is(sql(q{SELECT dolt_hashof('HEAD')}), $c1,
 			"a crash at $point leaves the head where it was");
-		is(sql($digest), $edited, 'and the working set as it was');
+		is(sql($both), $edited, 'and the working set as it was');
 	}
-	my $c2 = sql(q{SELECT (dolt_commit('-am', 'large edit'))[1]});
+
+	sql(q{SELECT dolt_commit('-am', 'large edit')});
+	my $c2 = sql(q{SELECT dolt_hashof('HEAD')});
 	isnt($c2, $c1, 'the commit then succeeds');
 	sql(qq{SELECT dolt_reset('--hard', '$c1')});
-	is(sql($digest), $at_c1, 'the commit before the crash reads back');
+	is(sql($both), $at_c1, 'the commit before the crash reads back');
 	ok(scans_agree(), 'the GiST index agrees at it');
 	sql(qq{SELECT dolt_reset('--hard', '$c2')});
-	is(sql($digest), $edited, 'the commit after it reads back');
+	is(sql($both), $edited, 'the commit after it reads back');
 	ok(scans_agree(), 'the GiST index agrees there too');
 }
 
