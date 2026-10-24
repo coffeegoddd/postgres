@@ -447,6 +447,35 @@ prolly_check_row_unique(Relation rel, HeapTuple tuple)
 		check_unique_values(rel, key_bound(rel), tuple);
 }
 
+typedef struct TextCheck
+{
+	KeyBound   *kb;
+	TupleDesc	desc;
+	HeapTuple	tuple;
+} TextCheck;
+
+static void
+check_text_values(void *arg)
+{
+	TextCheck  *check = arg;
+	KeyBound   *kb = check->kb;
+	MemoryContext old = MemoryContextSwitchTo(kb->scratch);
+
+	for (int i = 0; i < kb->ntext; i++)
+	{
+		bool		isnull;
+		Datum		value = heap_getattr(check->tuple, kb->text_atts[i], check->desc, &isnull);
+		StringInfoData buf;
+
+		if (isnull)
+			continue;
+		initStringInfo(&buf);
+		prolly_datum_encode(kb->text_codecs[i], value, &buf);
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(kb->scratch);
+}
+
 void
 prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 					 HeapTuple tuple)
@@ -465,22 +494,10 @@ prolly_check_row_key(Relation rel, const ItemPointerData *otid,
 	 */
 	if (kb->ntext > 0)
 	{
-		MemoryContext old = MemoryContextSwitchTo(kb->scratch);
-		TupleDesc	desc = RelationGetDescr(rel);
+		TextCheck	check = {kb, RelationGetDescr(rel), tuple};
 
-		for (int i = 0; i < kb->ntext; i++)
-		{
-			bool		isnull;
-			Datum		value = heap_getattr(tuple, kb->text_atts[i], desc, &isnull);
-			StringInfoData buf;
-
-			if (isnull)
-				continue;
-			initStringInfo(&buf);
-			prolly_datum_encode(kb->text_codecs[i], value, &buf);
-		}
-		MemoryContextSwitchTo(old);
-		MemoryContextReset(kb->scratch);
+		/* (with the text settings fixed once for the row) */
+		prolly_datum_fixed_text(check_text_values, &check);
 	}
 	check_unique_values(rel, kb, tuple);
 	if (kb->keyless)

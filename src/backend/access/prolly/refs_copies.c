@@ -1352,6 +1352,28 @@ see_head(const char *name)
 	return true;
 }
 
+/*
+ * The baseline of a branch whose working set is being folded only to be
+ * compared (settle_compared()): its trees are the backend's
+ * (prolly_local_chunks_begin()'s), so it is kept here, not in the refs,
+ * whose chunks are the store's, until its chunks are persisted.
+ */
+static struct
+{
+	bool		active;
+	char	   *name;
+	bool		have;
+	ProllyNodeRef baseline;
+	bool		have_root;
+	ProllyNodeRef root;
+}			compared;
+
+static bool
+compared_branch(const char *name)
+{
+	return compared.active && strcmp(compared.name, name) == 0;
+}
+
 /* A branch's baseline; false if it has none. */
 static bool
 branch_baseline(const char *name, ProllyNodeRef *baseline)
@@ -1361,6 +1383,12 @@ branch_baseline(const char *name, ProllyNodeRef *baseline)
 	bool		found;
 	ProllyHash	h;
 
+	if (compared_branch(name))
+	{
+		if (compared.have)
+			*baseline = compared.baseline;
+		return compared.have;
+	}
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -1383,6 +1411,12 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 	bool		found = false;
 	ProllyHash	h;
 
+	if (compared_branch(name))
+	{
+		if (compared.have && compared.have_root)
+			*root = compared.root;
+		return compared.have && compared.have_root;
+	}
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -1415,9 +1449,19 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 {
 	StringInfoData key;
 	StringInfoData v;
-	FullTransactionId xid = baseline ? GetTopFullTransactionId() :
-		InvalidFullTransactionId;
+	FullTransactionId xid;
 
+	if (compared_branch(name))
+	{
+		compared.have = baseline != NULL;
+		if (baseline)
+			compared.baseline = *baseline;
+		compared.have_root = baseline != NULL && root != NULL;
+		if (compared.have_root)
+			compared.root = *root;
+		return;
+	}
+	xid = baseline ? GetTopFullTransactionId() : InvalidFullTransactionId;
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -1580,6 +1624,101 @@ settle(const ProllyCommitInfo *commit, const KnownSource *source)
 				   &commit->root, GetActiveSnapshot());
 }
 
+static bool share_clean_tables(const ProllyNodeRef *target,
+							   ProllyNodeRef *working);
+static bool advance_to_target(const ProllyNodeRef *target,
+							  const ProllyNodeRef *working);
+
+/*
+ * The end of a fold only compared: the branch's baseline as the step left
+ * it, its chunks the backend kept persisted (only those it reaches: a
+ * baseline advanced to the target names the target's trees, stored
+ * already), made the branch's in the refs; the working set's root with it
+ * only if the store has it (the target's).  The rest of what the backend
+ * kept is forgotten.
+ */
+static void
+compared_end(bool keep)
+{
+	char	   *name = compared.name;
+	bool		have = compared.have;
+	ProllyNodeRef baseline = compared.baseline;
+	bool		have_root = compared.have_root;
+	ProllyNodeRef root = compared.root;
+
+	if (keep && have)
+		prolly_local_chunks_persist(&baseline.hash);
+	compared.active = false;
+	prolly_local_chunks_end();
+	if (keep)
+	{
+		refs_init();
+		if (have_root &&
+			!PROLLY_CALL(env.chunk_store, has, env.chunks, &root.hash))
+			have_root = false;
+		branch_set_baseline(name, have ? &baseline : NULL,
+							have_root ? &root : NULL);
+	}
+	pfree(name);
+}
+
+/*
+ * settle_rows() of the session's branch (name, its baseline as given),
+ * whose working set has to be folded to be compared with the target: the
+ * fold, and every tree the move builds on it, kept in the backend's memory
+ * (prolly_local_chunks_begin()), not put in the store.  None of them is
+ * kept once the move is over but the baseline as it then is, which
+ * advance_to_target() has made the target's but for its finders' state:
+ * so only its own few nodes are put.  (Where it couldn't be advanced, the
+ * fold's trees it still names are put too, as they would have been; and
+ * the branch is folded again from it, as settle_rows() does.)  False,
+ * nothing done, where the fold caches can't be used.
+ */
+static bool
+settle_compared(const char *name, const ProllyNodeRef *target,
+				const ProllyNodeRef *baseline)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef working;
+	ProllyNodeRef next;
+	bool		advanced = true;
+
+	if (!fold_caches_usable() || prolly_local_chunks_active() ||
+		RecoveryInProgress())
+		return false;
+	prolly_database_components(&dc);
+	compared.name = MemoryContextStrdup(TopTransactionContext, name);
+	compared.have = baseline != NULL;
+	if (baseline)
+		compared.baseline = *baseline;
+	compared.have_root = false;
+	compared.active = true;
+	prolly_local_chunks_begin();
+	PG_TRY();
+	{
+		fold_from_baseline(&working, &next, false);
+		branch_set_baseline(name, &next, &working);
+		if (!same_hash(&working.hash, &target->hash) &&
+			!(share_clean_tables(target, &working) &&
+			  same_hash(&working.hash, &target->hash)))
+		{
+			PROLLY_CALL(dc.diff_merge, move_to, target, &working);
+			advanced = advance_to_target(target, &working);
+		}
+		compared_end(true);
+	}
+	PG_CATCH();
+	{
+		if (compared.active)
+			compared_end(false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!advanced)
+		fold_as_baseline(NULL);
+	return true;
+}
+
 static void
 settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 {
@@ -1604,6 +1743,8 @@ settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 		{
 			ProllyNodeRef next;
 
+			if (settle_compared(name, target, have ? &baseline : NULL))
+				return;
 			fold_from_baseline(&working, &next, false);
 			branch_set_baseline(name, &next, &working);
 		}
@@ -3800,68 +3941,117 @@ get_time(const StringInfoData *v, TimestampTz *at)
 	return true;
 }
 
+/* The most items a commit has (write_commit's). */
+#define COMMIT_ITEMS	8
+
+/* Is a commit's item k the one named name? */
+static bool
+item_is(const ProllyKey *k, const char *name)
+{
+	return k->len == strlen(name) && memcmp(k->data, name, k->len) == 0;
+}
+
+/* Does item k sort after the one named name (by bytes, as a commit's do)? */
+static bool
+item_after(const ProllyKey *k, const char *name)
+{
+	size_t		len = strlen(name);
+	int			c = memcmp(k->data, name, Min(k->len, len));
+
+	return c > 0 || (c == 0 && k->len > len);
+}
+
+/*
+ * A commit's items are read in one pass: a get of each would descend the
+ * commit's tree once per item.  Any hash may name a commit here (a ref
+ * given in hex), so the pass stops past the last of a commit's items, or
+ * past as many items as a commit has: a descent of whatever tree the hash
+ * names, and a leaf or so.
+ */
 static bool
 copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 {
 	ProllyNodeRef ref;
-	StringInfoData v;
-	ProllyHash	root;
-	const char *p;
-	const char *end;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	bool		has_root = false;
+	int			nitems = 0;
 
 	refs_init();
 	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
 		return false;
 	ref_of(id, &ref);
-	initStringInfo(&v);
-	if (!read_item(&ref, "root", &v))
-		return false;			/* a chunk, but not a commit */
 	memset(info, 0, sizeof(*info));
 	info->id = *id;
-	(void) get_hash(v.data, v.data + v.len, &root);
-	ref_of(&root, &info->root);
-	resetStringInfo(&v);
-	(void) read_item(&ref, "parents", &v);
-	p = v.data;
-	end = v.data + v.len;
-	while (p < end && info->nparents < PROLLY_MAX_PARENTS)
-		p = get_hash(p, end, &info->parents[info->nparents++]);
-	resetStringInfo(&v);
-	(void) read_item(&ref, "author", &v);
-	info->author = pstrdup(v.data);
-	resetStringInfo(&v);
-	(void) read_item(&ref, "message", &v);
-	info->message = pstrdup(v.data);
-	resetStringInfo(&v);
-	if (read_item(&ref, "dependencies", &v))
+	info->author = pstrdup("");
+	info->message = pstrdup("");
+	c = PROLLY_CALL(tree, cursor_open, &env, &ref, CurrentMemoryContext);
+	PROLLY_CALL(tree, cursor_seek, c, NULL, ForwardScanDirection);
+	while (PROLLY_CALL(tree, cursor_next, c, &k, &v))
 	{
-		ProllyHash	deps;
+		const char *p = (const char *) v.data;
+		const char *end = p + v.len;
 
-		(void) get_hash(v.data, v.data + v.len, &deps);
-		ref_of(&deps, &info->dependencies);
-		info->has_dependencies = true;
-	}
-	resetStringInfo(&v);
-	if (read_item(&ref, "height", &v))
-	{
-		uint64		height;
-
-		if (get_uint64(&v, &height) && height > 0 && height <= PG_INT64_MAX)
+		/*
+		 * (past a commit's last item in key order, "time", or past as many
+		 * items as a commit has: whatever else the hash names, no more of
+		 * it is read)
+		 */
+		if (item_after(&k, "time") || ++nitems > COMMIT_ITEMS)
 		{
-			info->height = (int64) height;
-			info->has_height = true;
+			if (nitems > COMMIT_ITEMS)
+				has_root = false;
+			break;
+		}
+		if (item_is(&k, "root"))
+		{
+			ProllyHash	root;
+
+			(void) get_hash(p, end, &root);
+			ref_of(&root, &info->root);
+			has_root = true;
+		}
+		else if (item_is(&k, "parents"))
+		{
+			while (p < end && info->nparents < PROLLY_MAX_PARENTS)
+				p = get_hash(p, end, &info->parents[info->nparents++]);
+		}
+		else if (item_is(&k, "author"))
+			info->author = pnstrdup(p, v.len);
+		else if (item_is(&k, "message"))
+			info->message = pnstrdup(p, v.len);
+		else if (item_is(&k, "dependencies"))
+		{
+			ProllyHash	deps;
+
+			(void) get_hash(p, end, &deps);
+			ref_of(&deps, &info->dependencies);
+			info->has_dependencies = true;
+		}
+		else if (item_is(&k, "height") || item_is(&k, "time"))
+		{
+			StringInfoData n = {unconstify(char *, p), v.len, v.len, 0};
+			uint64		height;
+
+			if (item_is(&k, "time"))
+				(void) get_time(&n, &info->committed_at);
+			else if (get_uint64(&n, &height) && height > 0 &&
+					 height <= PG_INT64_MAX)
+			{
+				info->height = (int64) height;
+				info->has_height = true;
+			}
+		}
+		else if (item_is(&k, "identity") && v.len > 0)
+		{
+			info->identity = pnstrdup(p, v.len);
+			info->identity_len = v.len;
 		}
 	}
-	resetStringInfo(&v);
-	if (read_item(&ref, "identity", &v) && v.len > 0)
-	{
-		info->identity = pnstrdup(v.data, v.len);
-		info->identity_len = v.len;
-	}
-	resetStringInfo(&v);
-	if (read_item(&ref, "time", &v))
-		(void) get_time(&v, &info->committed_at);
-	pfree(v.data);
+	PROLLY_CALL(tree, cursor_close, c);
+	if (!has_root)
+		return false;			/* a chunk, but not a commit */
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS_READ, 1);
 	return true;
 }
@@ -4038,7 +4228,8 @@ publish_fold(const BranchFoldStamp *stamp, Snapshot snap,
 			 const ProllyNodeRef *baseline, const ProllyNodeRef *root,
 			 bool complete)
 {
-	if (fold_caches_usable())
+	/* (not a fold whose trees only this backend has) */
+	if (fold_caches_usable() && !prolly_local_chunks_active())
 		branch_fold_publish(stamp, snap, baseline ? &baseline->hash : NULL,
 							&root->hash, complete);
 }
@@ -5010,9 +5201,9 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
  * whose baseline lags the head keeps it, till the next fold advances it.
  */
 static int
-copies_commit_rows(const char *message, const ProllyRowChanges *changes,
-				   int nchanges, const Oid *sequences, int nsequences,
-				   ProllyHash *commit_id)
+commit_rows(const char *message, const ProllyRowChanges *changes,
+			int nchanges, const Oid *sequences, int nsequences,
+			ProllyHash *commit_id)
 {
 	char	   *name = branch_ops()->current();
 	ProllyHash	head;
@@ -5081,6 +5272,42 @@ copies_commit_rows(const char *message, const ProllyRowChanges *changes,
 			branch_set_baseline(name, &next, NULL);
 	}
 	return 1;
+}
+
+/*
+ * A small commit reads the same nodes again and again: the refs' root for
+ * each entry got and put, the head's commit, the root's and each table's
+ * upper nodes for the seek and then the apply.  Its trees are held (the
+ * branch is locked) till it ends, so it keeps the nodes it reads, and
+ * reads each once.
+ */
+static int
+copies_commit_rows(const char *message, const ProllyRowChanges *changes,
+				   int nchanges, const Oid *sequences, int nsequences,
+				   ProllyHash *commit_id)
+{
+	MemoryContext kept = NULL;
+	int			r;
+
+	refs_init();
+	if (PROLLY_HAS(tree, keep_nodes))
+	{
+		kept = AllocSetContextCreate(CurrentMemoryContext, "commit's kept nodes",
+									 ALLOCSET_DEFAULT_SIZES);
+		PROLLY_CALL(tree, keep_nodes, kept);
+	}
+	PG_TRY();
+	{
+		r = commit_rows(message, changes, nchanges, sequences, nsequences,
+						commit_id);
+	}
+	PG_FINALLY();
+	{
+		if (kept)
+			MemoryContextDelete(kept);
+	}
+	PG_END_TRY();
+	return r;
 }
 
 /*

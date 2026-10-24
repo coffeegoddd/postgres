@@ -304,6 +304,8 @@ extern void DropRelationBuffers(SMgrRelation smgr_reln,
 								int nforks, BlockNumber *firstDelBlock);
 extern void DropRelationsAllBuffers(SMgrRelation *smgr_reln,
 									int nlocators);
+extern void DropUnlinkedRelationsAllBuffers(SMgrRelation *smgr_reln,
+											int nlocators);
 extern void DropDatabaseBuffers(Oid dbid);
 extern void DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
 							BlockNumber blkno);

@@ -14,6 +14,7 @@ backend_sources += files(
   'chunkformat_basic.c',
   'chunker_stub.c',
   'chunkstore_journal.c',
+  'chunkstore_local.c',
   'diffmerge_folded.c',
   'hash_blake3.c',
   'journal_index.c',

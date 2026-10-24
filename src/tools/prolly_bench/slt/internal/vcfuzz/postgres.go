@@ -25,6 +25,11 @@ type Postgres struct {
 	step     int
 	// waits is the sessions whose writes wait for a row lock, by session
 	waits map[int]*wait
+	// postgis: table t has geometry column g (History.PostGIS)
+	postgis bool
+	// geomMD5 is the md5 of each geometry's EWKB, by its SQL, as the
+	// server makes it
+	geomMD5 map[string]string
 }
 
 // wait is a write waiting for the row lock session on's transaction holds.
@@ -37,7 +42,7 @@ type wait struct {
 // names for each history.
 func OpenPostgres(dsn string, timeout time.Duration) Opener {
 	return func(h History) (Engine, error) {
-		p := &Postgres{timeout: timeout, waits: map[int]*wait{}}
+		p := &Postgres{timeout: timeout, waits: map[int]*wait{}, postgis: h.PostGIS, geomMD5: map[string]string{}}
 		admin, err := p.connect(dsn, "postgres")
 		if err != nil {
 			return nil, err
@@ -67,12 +72,23 @@ func OpenPostgres(dsn string, timeout time.Duration) Opener {
 			return nil, err
 		}
 		setup := []string{"DROP SCHEMA public", "CREATE SCHEMA public VERSIONED"}
+		if h.PostGIS {
+			setup = append(setup, "CREATE EXTENSION postgis")
+		}
 		for _, t := range Tables {
 			c := ""
 			if h.Setup.HasC(t) {
 				c = ", c int"
 			}
+			geo := p.geo(t)
+			if geo {
+				c += ", g geometry, gg geography"
+			}
 			setup = append(setup, "CREATE TABLE "+t+" (id int PRIMARY KEY, a int, b int"+c+")")
+			if geo {
+				setup = append(setup, "CREATE INDEX "+t+"_g ON "+t+" USING gist (g)",
+					"CREATE INDEX "+t+"_gg ON "+t+" USING gist (gg)")
+			}
 			ids := make([]int, 0, len(h.Setup[t]))
 			for id := range h.Setup[t] {
 				ids = append(ids, id)
@@ -80,11 +96,14 @@ func OpenPostgres(dsn string, timeout time.Duration) Opener {
 			sort.Ints(ids)
 			for _, id := range ids {
 				r := h.Setup[t][id]
-				if c != "" {
-					setup = append(setup, fmt.Sprintf("INSERT INTO %s VALUES (%d, %d, %d, NULLIF(%d, 0))", t, id, r[0], r[1], r[2]))
-				} else {
-					setup = append(setup, fmt.Sprintf("INSERT INTO %s VALUES (%d, %d, %d)", t, id, r[0], r[1]))
+				cols, vals := "id, a, b", fmt.Sprintf("%d, %d, %d", id, r[0], r[1])
+				if h.Setup.HasC(t) {
+					cols, vals = cols+", c", vals+fmt.Sprintf(", NULLIF(%d, 0)", r[2])
 				}
+				if geo {
+					cols, vals = cols+", g, gg", vals+", "+Geom(id, r[1]).SQL+", "+Geog(id, r[1])
+				}
+				setup = append(setup, fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", t, cols, vals))
 			}
 		}
 		setup = append(setup, "CREATE TABLE "+Keyless+" (a int, b int)")
@@ -104,6 +123,10 @@ func OpenPostgres(dsn string, timeout time.Duration) Opener {
 		return p, nil
 	}
 }
+
+// geo is whether table has the geometry column g: t, in a history with
+// PostGIS.
+func (p *Postgres) geo(table string) bool { return p.postgis && table == "t" }
 
 // content is keyless content n's columns.
 func content(n int) (a, b int) { return (n - 1) / 4, (n - 1) % 4 }
@@ -187,8 +210,8 @@ func classify(pgerr *pgconn.PgError) Outcome {
 }
 
 // rowSQL is a row write's statement.  A keyless write picks one copy of
-// its content.
-func rowSQL(op Op) string {
+// its content.  With geo, a write of b writes g and gg too.
+func rowSQL(op Op, geo bool) string {
 	if op.Table == Keyless {
 		a, b := content(op.ID)
 		copyOf := fmt.Sprintf("ctid = (SELECT ctid FROM %s WHERE a = %d AND b = %d LIMIT 1)", op.Table, a, b)
@@ -203,16 +226,22 @@ func rowSQL(op Op) string {
 	}
 	switch op.Kind {
 	case OpInsert:
+		cols, vals, set := "id, a, b", fmt.Sprintf("%d, %d, %d", op.ID, op.Val, op.Val2), "a = excluded.a, b = excluded.b"
 		if op.C {
-			return fmt.Sprintf("INSERT INTO %s VALUES (%d, %d, %d, NULLIF(%d, 0)) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b, c = excluded.c",
-				op.Table, op.ID, op.Val, op.Val2, op.Val3)
+			cols, vals, set = cols+", c", vals+fmt.Sprintf(", NULLIF(%d, 0)", op.Val3), set+", c = excluded.c"
 		}
-		return fmt.Sprintf("INSERT INTO %s VALUES (%d, %d, %d) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b",
-			op.Table, op.ID, op.Val, op.Val2)
+		if geo {
+			cols, vals, set = cols+", g, gg", vals+", "+Geom(op.ID, op.Val2).SQL+", "+Geog(op.ID, op.Val2),
+				set+", g = excluded.g, gg = excluded.gg"
+		}
+		return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (id) DO UPDATE SET %s", op.Table, cols, vals, set)
 	case OpUpdate:
 		value := strconv.Itoa(op.Val)
 		if op.Col == 2 {
 			value = fmt.Sprintf("NULLIF(%d, 0)", op.Val)
+		}
+		if geo && op.Col == 1 {
+			value += ", g = " + Geom(op.ID, op.Val).SQL + ", gg = " + Geog(op.ID, op.Val)
 		}
 		return fmt.Sprintf("UPDATE %s SET %s = %s WHERE id = %d", op.Table, []string{"a", "b", "c"}[op.Col], value, op.ID)
 	}
@@ -226,7 +255,7 @@ func (p *Postgres) Apply(op Op) (Outcome, error) {
 	var sql string
 	switch op.Kind {
 	case OpInsert, OpUpdate, OpDelete:
-		sql = rowSQL(op)
+		sql = rowSQL(op, p.geo(op.Table))
 		if op.Wait > 0 {
 			return p.waitFor(op, sql)
 		}
@@ -468,8 +497,22 @@ func (p *Postgres) merge(c *pgconn.PgConn, op Op, message string) (Outcome, erro
 func (p *Postgres) Visible(s int) (State, error) {
 	st := emptyState()
 	c := p.sessions[s]
+	rows, err := p.must(c, "SELECT r.relname FROM pg_attribute a JOIN pg_class r ON r.oid = a.attrelid "+
+		"WHERE r.relnamespace = 'public'::regnamespace AND a.attname = 'c' AND NOT a.attisdropped")
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		if i := tableIndex(r[0]); i > 0 {
+			st[Columns][i] = Row{1}
+		}
+	}
 	for _, t := range Tables {
-		rows, err := p.must(c, "SELECT id, a, b, coalesce((to_jsonb(r) ->> 'c')::int, 0) FROM "+t+" r")
+		cval := "0"
+		if st.HasC(t) {
+			cval = "coalesce(c, 0)"
+		}
+		rows, err := p.must(c, "SELECT id, a, b, "+cval+" FROM "+t)
 		if err != nil {
 			return nil, err
 		}
@@ -481,7 +524,7 @@ func (p *Postgres) Visible(s int) (State, error) {
 			st[t][v[0]] = Row{v[1], v[2], v[3]}
 		}
 	}
-	rows, err := p.must(c, "SELECT a * 4 + b + 1, count(*) FROM "+Keyless+" GROUP BY 1")
+	rows, err = p.must(c, "SELECT a * 4 + b + 1, count(*) FROM "+Keyless+" GROUP BY 1")
 	if err != nil {
 		return nil, err
 	}
@@ -490,17 +533,89 @@ func (p *Postgres) Visible(s int) (State, error) {
 		n, _ := strconv.Atoi(r[1])
 		st[Keyless][id] = Row{n}
 	}
-	rows, err = p.must(c, "SELECT r.relname FROM pg_attribute a JOIN pg_class r ON r.oid = a.attrelid "+
-		"WHERE r.relnamespace = 'public'::regnamespace AND a.attname = 'c' AND NOT a.attisdropped")
+	return st, nil
+}
+
+// Windows reads each window through t's GiST index (sequential scans
+// off, for the one statement), and checks from its plan that the index is
+// what it is read through.
+func (p *Postgres) Windows(s int) ([][]int, bool, error) {
+	c := p.sessions[s]
+	out := make([][]int, len(Windows))
+	indexed := true
+	for i, w := range Windows {
+		query := "SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '') FROM t WHERE g && " + w.SQL()
+		plan, err := p.must(c, "SET enable_seqscan = off; EXPLAIN (COSTS OFF) "+query+"; RESET enable_seqscan")
+		if err != nil {
+			return nil, false, err
+		}
+		through := false
+		for _, line := range plan {
+			through = through || strings.Contains(line[0], "Index Scan using t_g ") ||
+				strings.Contains(line[0], "Bitmap Index Scan on t_g")
+		}
+		indexed = indexed && through
+		rows, err := p.must(c, "SET enable_seqscan = off; "+query+"; RESET enable_seqscan")
+		if err != nil {
+			return nil, false, err
+		}
+		out[i] = []int{}
+		if len(rows) != 1 {
+			return nil, false, fmt.Errorf("window %d: %v", i, rows)
+		}
+		if rows[0][0] == "" {
+			continue
+		}
+		for _, f := range strings.Split(rows[0][0], ",") {
+			id, _ := strconv.Atoi(f)
+			out[i] = append(out[i], id)
+		}
+	}
+	return out, indexed, nil
+}
+
+// Misplaced compares each row's g and gg, by the md5 of their EWKB, with
+// its b's as the server makes them (once each, on the observer).
+func (p *Postgres) Misplaced(s int) ([]int, error) {
+	rows, err := p.must(p.sessions[s], "SELECT id, b, coalesce(md5(ST_AsEWKB(g)), 'null'), "+
+		"coalesce(md5(ST_AsEWKB(gg::geometry)), 'null') FROM t ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
+	expected := func(sql string) (string, error) {
+		if want, ok := p.geomMD5[sql]; ok {
+			return want, nil
+		}
+		got, err := p.must(p.observer, "SELECT md5(ST_AsEWKB(("+sql+")::geometry))")
+		if err != nil {
+			return "", err
+		}
+		p.geomMD5[sql] = got[0][0]
+		return got[0][0], nil
+	}
+	var wrong []int
 	for _, r := range rows {
-		if i := tableIndex(r[0]); i > 0 {
-			st[Columns][i] = Row{1}
+		id, _ := strconv.Atoi(r[0])
+		b, _ := strconv.Atoi(r[1])
+		g, err := expected(Geom(id, b).SQL)
+		if err != nil {
+			return nil, err
+		}
+		gg, err := expected(Geog(id, b))
+		if err != nil {
+			return nil, err
+		}
+		if r[2] != g || r[3] != gg {
+			wrong = append(wrong, id)
 		}
 	}
-	return st, nil
+	return wrong, nil
+}
+
+// Exec runs sql in session s, for a self-test's engine wrong on purpose.
+func (p *Postgres) Exec(s int, sql string) error {
+	_, err := p.must(p.sessions[s], sql)
+	return err
 }
 
 func (p *Postgres) Branch(s int) (string, error) {

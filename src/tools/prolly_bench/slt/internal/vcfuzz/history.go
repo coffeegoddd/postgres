@@ -92,6 +92,9 @@ type History struct {
 	Sessions int   `json:"sessions"`
 	Setup    State `json:"setup"`
 	Ops      []Op  `json:"ops"`
+	// PostGIS gives table t a geometry column, written with b (Geom), and
+	// checks window queries through its GiST index against the model.
+	PostGIS bool `json:"postgis,omitempty"`
 }
 
 const keys = 8 // row keys 1..keys, values 0..3: small, so changes collide

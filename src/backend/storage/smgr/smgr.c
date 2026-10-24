@@ -198,6 +198,15 @@ typedef struct f_smgr
 	 * relation's buffers of 'forknum'?  May be NULL (never).
 	 */
 	bool		(*smgr_writesread) (ForkNumber forknum);
+
+	/*
+	 * Does the storage manager read relations whose drop has committed,
+	 * until their files are unlinked (a page sweep counting what every map
+	 * of a store holds)?  Such a read after the relations' buffers were
+	 * dropped brings pages back into shared buffers, so they are dropped
+	 * again once the files are gone.
+	 */
+	bool		smgr_readsdropped;
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
@@ -287,6 +296,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_beforeextend = bmapbeforeextend,
 		.smgr_releasestep = bmapreleasestep,
 		.smgr_writesread = bmapwritesread,
+		.smgr_readsdropped = true,
 		.smgr_unlink = bmapunlink,
 		.smgr_extend = bmapextend,
 		.smgr_zeroextend = bmapzeroextend,
@@ -1061,6 +1071,25 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
+	}
+
+	/*
+	 * The buffers a storage manager's own readers read back between the drop
+	 * of the buffers and the unlink, dropped too.  A reader that reads them
+	 * after this finds the files gone, once it is done with them (or
+	 * fails), and drops them itself.  (Recovery runs no such readers.)
+	 */
+	if (!isRedo)
+	{
+		SMgrRelation *redrop = palloc_array(SMgrRelation, nrels);
+		int			nredrop = 0;
+
+		for (i = 0; i < nrels; i++)
+			if (smgrsw[rels[i]->smgr_which].smgr_readsdropped)
+				redrop[nredrop++] = rels[i];
+		if (nredrop > 0)
+			DropUnlinkedRelationsAllBuffers(redrop, nredrop);
+		pfree(redrop);
 	}
 
 	pfree(rlocators);
