@@ -2899,6 +2899,7 @@ extend_piece(SMgrRelation reln, Buffer headerbuf, const MapPage *leaf,
 	hdelta.nblocks = to;
 	hdelta.epoch = epoch;
 	hdelta.fold_epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch;
+	hdelta.shared_below = 0;
 	ndelta = palloc0(sizeof(xl_bmap_node_delta) + n * sizeof(xl_bmap_entry_delta));
 	ndelta->kind = BMAP_DELTA_NODE;
 	for (uint32 i = 0; i < n; i++)
@@ -4538,6 +4539,7 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 	hdelta.nblocks = header->nblocks;
 	hdelta.epoch = header->epoch + 1;
 	hdelta.fold_epoch = header->epoch + 1;
+	hdelta.shared_below = 0;
 
 	START_CRIT_SECTION();
 	apply_header_delta(BufferGetPage(headerbuf), &hdelta);
@@ -4626,6 +4628,7 @@ bmap_fold_forget(SMgrRelation reln)
 	hdelta.nblocks = header->nblocks;
 	hdelta.epoch = header->epoch;
 	hdelta.fold_epoch = 0;
+	hdelta.shared_below = 0;
 
 	cdelta.kind = BMAP_DELTA_CHANGES_HEAD;
 	cdelta.flags = 0;
@@ -5721,6 +5724,7 @@ snapshot_take_slot(SMgrRelation reln)
 	hdelta.nblocks = header->nblocks;
 	hdelta.epoch = header->epoch + 1;
 	hdelta.fold_epoch = header->fold_epoch;
+	hdelta.shared_below = 0;
 	memset(&sdelta, 0, sizeof(sdelta));
 	sdelta.kind = BMAP_DELTA_SNAPSHOT;
 	sdelta.slot = slot;
@@ -5915,9 +5919,13 @@ bmap_snapshot_unchanged(SMgrRelation reln, uint64 id)
  * and has never been folded.  The snapshot's blocks were preserved and
  * synced when it was taken.  Only the main fork: the caller makes the
  * other forks (src's visibility map says nothing of the snapshot's pages).
+ * With 'replacing', dst is to take src's place, src dropped as the
+ * transaction commits (a restore): dst's entries may then be shared with
+ * another map only where src's might, and src's header is left as it is.
  */
 void
-bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst)
+bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst,
+					bool replacing)
 {
 	RelFileLocator srel = src->smgr_rlocator.locator;
 	RelFileLocator drel = dst->smgr_rlocator.locator;
@@ -5958,7 +5966,8 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst)
 	hdelta.nblocks = root.snap[slot].nblocks;
 	hdelta.epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
 	hdelta.fold_epoch = 0;
-	hdelta.shared_below = hdelta.epoch;
+	hdelta.shared_below = replacing ?
+		PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below : hdelta.epoch;
 	{
 		BmapHeader *sh = PageGetBmapHeader(BufferGetPage(headerbuf));
 
@@ -5970,6 +5979,7 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst)
 		shdelta.shared_below = Max(sh->shared_below, root.snap[slot].epoch);
 	}
 	tree_share_root(src, dst, snapshot_tops(&root.snap[slot]), &hdelta,
+					!replacing &&
 					shdelta.shared_below != PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below ?
 					headerbuf : InvalidBuffer, &shdelta);
 	UnlockReleaseBuffer(headerbuf);
@@ -6038,7 +6048,10 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
  * snapshots) may be; one born since only by its snapshots, which keep the
  * relation's pages as they were for its own branch.  A hint for callers
  * weighing a copy's cost: preparing the page for a change copies it either
- * way.
+ * way.  shared_below only rises (a restore's new storage takes its old
+ * storage's, which goes): once the other map is gone (a branch deleted),
+ * the entries born before it still count as shared elsewhere until they
+ * change, which costs VACUUM's work on them, never their contents.
  */
 bool
 bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
@@ -6358,6 +6371,7 @@ set_length_listed(SMgrRelation reln, RelFileLocator rel, Buffer headerbuf,
 	delta.nblocks = nblocks;
 	delta.epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
 	delta.fold_epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->fold_epoch;
+	delta.shared_below = 0;
 	if (ca)
 	{
 		BmapChange	c;
@@ -9579,6 +9593,7 @@ create_map(SMgrRelation reln)
 	delta.nblocks = 0;
 	delta.epoch = 0;
 	delta.fold_epoch = 0;
+	delta.shared_below = 0;
 	memset(&rdelta, 0, sizeof(rdelta));
 	rdelta.kind = BMAP_DELTA_ROOT;
 	rdelta.flags = BMAP_DELTA_INIT;
@@ -10269,6 +10284,7 @@ truncate_in_recovery(SMgrRelation reln, BlockNumber nblocks)
 			delta.nblocks = nblocks;
 			delta.epoch = header->epoch;
 			delta.fold_epoch = header->fold_epoch;
+			delta.shared_below = 0;
 			apply_header_delta(hpage, &delta);
 			PageSetLSN(hpage, end);
 			MarkBufferDirty(headerbuf);

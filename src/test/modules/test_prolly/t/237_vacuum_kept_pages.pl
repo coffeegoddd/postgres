@@ -71,14 +71,24 @@ cmp_ok(counted('relations_restored'), '>', $restored, 'a reset gives c1\'s pages
 is(sql(q{SELECT count(*) FROM kv.t WHERE v = 'changed'}), '0',
 	'with c1\'s rows');
 
-# Changed and committed again, then frozen: VACUUM FREEZE freezes them, and
-# the table's relfrozenxid moves up to it.
-sql(q{UPDATE kv.t SET v = 'c2' WHERE id % 5 = 0; SELECT dolt_commit('-am', 'c2')});
-sql('VACUUM (FREEZE) kv.t');
+# The restored storage, its old storage gone, shares its pages with no
+# other map (its own snapshot aside): VACUUM sets them all-visible (the
+# restore gives it no visibility map).
+sql('VACUUM kv.t');
 $pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
-is(visible('kv.t'), "$pages/$pages", 'VACUUM FREEZE sets the kept pages all-visible');
-is(sql(q{SELECT age(relfrozenxid) <= 2 FROM pg_class WHERE oid = 'kv.t'::regclass}),
-	't', 'and freezes them');
+is(visible('kv.t'), "$pages/$pages", 'VACUUM sets the restored storage\'s pages all-visible');
+
+# Changed and committed again: a VACUUM that isn't aggressive, freezing
+# what it can, freezes the kept pages too, so the table's relfrozenxid
+# moves up (one left shared would hold it back).
+sql(q{UPDATE kv.t SET v = 'c2' WHERE id % 5 = 0; SELECT dolt_commit('-am', 'c2')});
+# (transactions after c2's, which a page left unfrozen holds it back by)
+sql('SELECT txid_current()') for 1 .. 20;
+sql(q{SET vacuum_freeze_min_age = 0; VACUUM kv.t});
+$pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
+is(visible('kv.t'), "$pages/$pages", 'VACUUM sets c2\'s kept pages all-visible');
+cmp_ok(sql(q{SELECT age(relfrozenxid) FROM pg_class WHERE oid = 'kv.t'::regclass}),
+	'<=', 3, 'and freezes them, moving relfrozenxid up to now');
 sql(q{UPDATE kv.t SET v = 'gone'; SELECT dolt_reset('--hard')});
 is(sql(q{SELECT count(*) FILTER (WHERE v = 'c2') || '/' || count(*) FROM kv.t}),
 	'600/3000', 'a reset still gives c2\'s pages back');
@@ -119,6 +129,11 @@ is(sql(q{SELECT count(*) FILTER (WHERE v = 'c2') || '/' || count(*) FROM kv.t}),
 	'600/3000', 'and a reset gives the kept pages back');
 is($node->safe_psql('postgres/b', 'SELECT count(*) FROM kv.u'), '3000',
 	'b reads its rows');
+
+# what the map knows of b's sharing survives the crash: VACUUM still
+# leaves those pages as they were
+sql('VACUUM kv.u');
+is(visible('kv.u'), "0/$upages", 'after a crash, VACUUM leaves the pages b shares');
 
 $standby->stop;
 $node->stop;
