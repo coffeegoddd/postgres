@@ -44,6 +44,7 @@ backend_sources += files(
   'prolly_shmem.c',
   'prolly_table.c',
   'prolly_dolt.c',
+  'prolly_snapshot.c',
   'prolly_vcs.c',
   'prolly_autovacuum.c',
   'reclaim_copying.c',

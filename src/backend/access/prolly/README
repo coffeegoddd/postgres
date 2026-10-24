@@ -780,6 +780,44 @@ commit amended away has its kept pages let go of, the commit before it
 staying kept.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
+Snapshot mounts (prolly_snapshot.c) are history read through the
+planner: prolly_mount(ref, schema, target) resolves the ref to one commit
+and makes, in the ordinary schema target, a foreign table (foreign data
+wrapper prolly_snapshot, server prolly_local, made at the first mount)
+for each table of schema the commit has, defined as the commit describes
+it: columns, types and collations, no constraints.  Mounting reads the
+commit's root items alone (the canonicalizer's table_metadata()): no row
+is read, re-sorted or written.  It refuses what can't be read as stored:
+a key ordered by a type, operator class or collation that isn't built in,
+a collation whose version changed, an extension ordering it that changed.
+The refs pin the commit under the mount's name ('P', the refs' format
+10), so a collection keeps what it reaches; prolly_unmount() and
+prolly_refresh_mount() drop the mount's tables first, so they wait for
+its scans.  A scan reads only the commit its mount pins, rechecks that
+the reader may read the table's history (SELECT on the table of its name,
+row security not applying), and streams the data tree in key order:
+equalities on the primary key's leading columns and a range on the next
+seek and stop the scan (the keying's encode_key_bound()), the key's order
+is offered to the planner both ways, and an equality joined to another
+relation gives a parameterized path that re-seeks on each rescan.  Only
+the columns the query uses are decoded.  The quals are all kept as the
+plan's filter too.
+
+Commits don't hold secondary indexes.  A mount made with indexes
+(prolly_mount(..., indexes => true)) builds a tree of its own for each
+btree index the version describes (not a partial or expression index, nor
+one ordered by what isn't built in): an entry per row, keyed by the
+index's columns under the version's operator families, collations and
+options, then the row's data-tree key, holding the row with only the
+index's, INCLUDE and primary key columns (the value encoder's project(),
+made of the row's bytes).  The pin keeps those trees too (refs format 11:
+a pin's kept trees).  An index scan seeks and orders as the primary key's
+does, and reads a row from the data tree only where its entry lacks a
+column the query uses.  A refresh brings each tree to the new commit by
+the data trees' differences when the rows are keyed and laid out alike,
+else builds it again; the first build sorts every row's entry in memory
+(maintenance_work_mem).  A plain mount builds none and reads no row.
+
 
 Core hooks
 ----------
