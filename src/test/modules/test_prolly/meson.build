@@ -82,6 +82,7 @@ tests += {
       'move_heads',
       'merge',
       'cell_merges',
+      'field_merges',
       'conflict_rows',
       'cherry_pick',
       'merge_options',

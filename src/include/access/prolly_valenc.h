@@ -152,14 +152,27 @@ typedef struct ProllyValueEncoderRoutine
 	void		(*decode_columns) (ProllyValueEncoder *enc,
 								   const ProllyValue *row, const bool *wanted,
 								   TupleTableSlot *slot);
+
+	/*
+	 * Optional: the row encode() gives for the values fields hold (by
+	 * attribute index, natts entries, each a field fields() gave of a row
+	 * this encoder decodes), assembled from their bytes without decoding
+	 * them: a reference copied, a value long enough to be out of line but
+	 * held inline (a long missing value) written to the value store as
+	 * encode() writes it.  The fields' bytes must be valid while it runs.
+	 */
+	void		(*encode_fields) (ProllyValueEncoder *enc,
+								  const ProllyEncodedField *fields,
+								  StringInfo out);
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
 	"set_values", "refs", "decode_kept", "encode_kept", "fields", \
-	"decode_field", "fields_alike", "field_compatible", "decode_columns"
+	"decode_field", "fields_alike", "field_compatible", "decode_columns", \
+	"encode_fields"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
-#define PROLLY_VALENC_LAST_CALLBACK decode_columns
+#define PROLLY_VALENC_LAST_CALLBACK encode_fields
 
 /* Historical enum decoding for the canonical encoder and nested values. */
 extern bool prolly_canonical_map_enums(ProllyValueEncoder *enc, List *mappings);

@@ -210,6 +210,15 @@ typedef struct ProllyKeyingRoutine
 								 const ProllyEncodedField *b);
 	bool		(*field_compatible) (ProllyKeying *k, int attno,
 									 ProllyKeying *other, int other_attno);
+
+	/*
+	 * Optional: the value encoder's encode_fields() of the keying's own
+	 * columns: the encoded row (as encode_row() appends it, no key) whose
+	 * columns hold fields' values, appended to row.
+	 */
+	void		(*encode_row_fields) (ProllyKeying *k,
+									  const ProllyEncodedField *fields,
+									  StringInfo row);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
@@ -218,9 +227,9 @@ typedef struct ProllyKeyingRoutine
 	"decode_row_kept", "encode_row_kept", "encode_key", "parse_value_as", \
 	"open_described", "row_shape", "shape_extends", "open_shape", \
 	"decode_row_columns", "row_fields", "decode_field", "fields_alike", \
-	"field_compatible"
+	"field_compatible", "encode_row_fields"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK field_compatible
+#define PROLLY_KEYING_LAST_CALLBACK encode_row_fields
 
 /*
  * Set up a data tree's environment and k's value store for each other:

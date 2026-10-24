@@ -36,6 +36,7 @@ extern void valenc_independent_of_history(const ProllyImplInfo *impl);
 extern void valenc_independent_of_session(const ProllyImplInfo *impl);
 extern void valenc_missing_values(const ProllyImplInfo *impl);
 extern void valenc_selected_columns(const ProllyImplInfo *impl);
+extern void valenc_assembled_rows(const ProllyImplInfo *impl);
 
 /* tree_checks.c */
 extern void tree_build_and_get(const ProllyImplInfo *impl);
