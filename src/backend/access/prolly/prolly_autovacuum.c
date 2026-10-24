@@ -25,9 +25,10 @@
  * folds the working set (a checkpoint, as prolly_checkpoint() does) once a
  * table's change log holds more entries than prolly.autofold_threshold of
  * the table's rows, so a commit folds little (#511): folded before the
- * refs are taken, and given up if they're held or the branch moved
- * meanwhile (the refs' checkpoint_unless_moved(), as the fold worker
- * folds), so a commit never waits for it; it is the backstop for a branch
+ * refs are taken, and given up if they're held, the branch moved
+ * meanwhile or a relation it reads is locked by another (the refs'
+ * checkpoint_unless_moved(), as the fold worker folds), so a commit, or a
+ * DROP, never waits for it; it is the backstop for a branch
  * the fold worker doesn't reach.  Each
  * runs in a transaction of its own, an error reported and passed over, as
  * autovacuum's tables' are; a collection, a move and a conjoin read and
@@ -59,6 +60,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bmap.h"
+#include "storage/lmgr.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -568,12 +570,36 @@ autofold(void)
 			 * (a fold given up rolled back: the log's entries it consumed
 			 * given back, for the next fold)
 			 */
+			MemoryContext cxt = CurrentMemoryContext;
+			ResourceOwner owner = CurrentResourceOwner;
+
 			BeginInternalSubTransaction(NULL);
-			folded = components.refs->checkpoint_unless_moved(&root);
+			MemoryContextSwitchTo(cxt);
+			PG_TRY();
+			{
+				folded = components.refs->checkpoint_unless_moved(&root);
+			}
+			PG_CATCH();
+			{
+				/*
+				 * (a relation's lock another holds, which the fold doesn't
+				 * wait for: given up, as if the refs were held)
+				 */
+				Assert(!RelationLocksNoWait);
+				if (geterrcode() != ERRCODE_LOCK_NOT_AVAILABLE ||
+					!RelationLockRefused)
+					PG_RE_THROW();
+				MemoryContextSwitchTo(cxt);
+				FlushErrorState();
+				folded = false;
+			}
+			PG_END_TRY();
 			if (folded)
 				ReleaseCurrentSubTransaction();
 			else
 				RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(cxt);
+			CurrentResourceOwner = owner;
 		}
 		else
 			PROLLY_CALL(components.refs, checkpoint, &root);
@@ -583,7 +609,7 @@ autofold(void)
 									 get_database_name(MyDatabaseId))));
 		else
 			ereport(DEBUG1,
-					(errmsg_internal("automatic fold of database \"%s\" given up: the refs held, or the branch moved",
+					(errmsg_internal("automatic fold of database \"%s\" given up: the refs held, the branch moved, or a relation locked",
 									 get_database_name(MyDatabaseId))));
 	}
 	PopActiveSnapshot();
