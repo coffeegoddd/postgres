@@ -141,9 +141,11 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_FOLD_WORKER_FOLDS] = "fold_worker_folds",
 	[PGSTAT_PROLLY_FOLD_WORKER_DEFERRED] = "fold_worker_deferred",
 	[PGSTAT_PROLLY_FOLD_WORKER_RETRIES] = "fold_worker_retries",
+	[PGSTAT_PROLLY_FOLD_WORKER_COST_DELAYS] = "fold_worker_cost_delays",
 	[PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED] = "rewrite_checkpoints_skipped",
 	[PGSTAT_PROLLY_DEFINITIONS_REUSED] = "definitions_reused",
 	[PGSTAT_PROLLY_STATUS_REUSED] = "status_reused",
+	[PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED] = "auto_collections_skipped",
 };
 
 /*

@@ -407,6 +407,7 @@ extern HTAB *GetLockMethodLocalHash(void);
 #endif
 extern bool LockHasWaiters(const LOCKTAG *locktag,
 						   LOCKMODE lockmode, bool sessionLock);
+extern bool AnyLockHasWaiters(void);
 extern VirtualTransactionId *GetLockConflicts(const LOCKTAG *locktag,
 											  LOCKMODE lockmode, int *countp);
 extern void AtPrepare_Locks(void);

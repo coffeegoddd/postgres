@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFF
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BD01
 
 typedef struct PgStat_ArchiverStats
 {
@@ -770,6 +770,8 @@ typedef enum PgStat_ProllyCounter
 										 * back, the refs held or the
 										 * branch moved meanwhile: tried
 										 * again next pass */
+	PGSTAT_PROLLY_FOLD_WORKER_COST_DELAYS,	/* naps the fold worker's paced
+											 * folds took */
 	PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED,	/* branch checkpoints after
 												 * a table rewrite given up:
 												 * a lock not free, or an
@@ -781,9 +783,12 @@ typedef enum PgStat_ProllyCounter
 									 * status's) that took the last one's,
 									 * only tables written since compared
 									 * again */
+	PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, /* autovacuum's collections
+											 * skipped: another collection
+											 * of the store was running */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_STATUS_REUSED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED + 1)
 
 typedef struct PgStat_ProllyStats
 {

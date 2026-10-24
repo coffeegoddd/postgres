@@ -462,6 +462,24 @@ takes all four of a table's write privileges, as every move does).  A
 change to a definition, or to rows it may not write so, and an
 integration of any other branch, take the head move's privileges.
 
+A move drops and makes again every table's policies and makes each
+definition it changes, as the session's role.  On a writer branch, a move
+whose every definition change makes an object what the writer base's head
+defines (a reset to the base, a merge of it, an integration's
+fast-forward) runs those statements as the least role that may make
+them, restricted (SECURITY_RESTRICTED_OPERATION): the owner of what it
+changes or drops, if they are one role, and the database's owner for what
+it makes; else (several owners, or a kind whose owner isn't looked up)
+the bootstrap superuser.  Otherwise a policy statement runs as its
+table's owner when the move leaves the table's policies as they are, or
+makes them the base's.  This rests on a move running no user code: its
+statements are deparsed definitions, run with check_function_bodies off,
+and no trigger or event trigger fires for its own DDL (internal history
+work's); the rows it writes go as the session's role, under its
+privileges.  A writer with its tables' grants alone so moves to what its
+base's writers defined, never to definitions of its own choosing on
+objects it doesn't own.
+
 Other shared state in the refs is guarded the same way.  Making a tag, and
 adding or removing a remote, takes prolly_writes_refs(); deleting a tag
 takes that or having made it ('G', its maker, recorded by dolt_tag()
@@ -710,7 +728,11 @@ settled, leaves the working set known to be a commit's root, each
 block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
 change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
-since a commit kept already reusing that one's.  Only while nothing else
+since a commit kept already reusing that one's.  A snapshot writes out only
+the relation's pages changed since its last snapshot (those its map walk
+finds), never visiting the buffers; redo of one still flushes the
+relation's buffers in a pass over them all, so a standby or crash recovery
+pays O(the buffers) per snapshot replayed.  Only while nothing else
 can be on the pages: the relations are locked against writers without
 waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is
@@ -865,6 +887,31 @@ automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
 and gives up while another holds them: a commit never waits for it.
 
+The fold worker's folds can be paced as vacuum is, under the cost-based
+delay: prolly_fold_worker_cost_delay (ms; 0, the default, is off) and
+prolly_fold_worker_cost_limit (-1 takes vacuum_cost_limit).  While a fold
+of the worker's is paced, the buffer manager charges the pages it reads
+and dirties (the change logs', the tables', their indexes'), and
+prolly_fold_delay_point(), in the folds' row loops (the log finder's and
+the full fold's), charges the tree nodes read since as hit pages and
+those written as dirtied ones (each is appended, WAL-logged and synced),
+then naps once the limit is spent; pg_stat_prolly's
+fold_worker_cost_delays counts the naps.  So background folds take a
+share of the I/O and CPU, not all they can.  A paced fold holds its locks and its
+snapshot through its naps, so it gives way to whoever waits for them:
+before each nap, if another backend waits for a lock that conflicts with
+one it holds, fast-path ones included, or for its virtual transaction (as
+CREATE INDEX CONCURRENTLY waits for older snapshots) (AnyLockHasWaiters()),
+it gives up, a retry
+(fold_worker_retries), the branch backed off; and it naps 10 s in all at
+most, then goes on unpaced, so its snapshot holds the xmin horizon back
+no longer.  A reload of the settings reaches a fold under way.  The trade: a paced fold
+takes longer, so more writes queue behind it, which batches them (fewer
+chunk writes) but leaves a commit or status during the writes more to
+fold itself.  It is off by default; fold_worker_retries showing folds
+lost to commits, under load, is the reason to turn it on.  No other fold
+(a commit's, a status's, autovacuum's automatic fold) is paced.
+
 A rewrite of a versioned table (ALTER TABLE changing a column's type,
 REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
 branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
@@ -942,8 +989,13 @@ baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
 without rows and asks each table's change finder (from that table's
-baseline entry alone), so a status in full visits every table; but the
-definitions are those the last read here made while nothing they're of
+baseline entry alone), so a status in full visits every table.  A
+materialized view's rows read so are its baseline's: a plain REFRESH
+folds the branch as it ends, but a concurrent one changes the rows in
+place, so a status folds unless each prolly materialized view's change
+finder finds no change since (a keyless table's, only when its log has no
+entry since).  The definitions are those the last read here made while
+nothing they're of
 changed (no catalog change in this backend's epoch, the same deparsing
 settings and baseline, the tree still stored), only every sequence's item
 worked out again (pg_stat_prolly's definitions_reused).  They're kept
@@ -957,8 +1009,10 @@ only those tables are compared again (pg_stat_prolly's status_reused), so
 a status after a row write costs about the tables written, not every
 table.  The answer is this backend's own, and is kept only from a
 comparison of every table's changes read so: a table whose change finder
-can't tell its changes that way (a keyless or partitioned one) makes every
-status a fold, and status_reused never moves.
+can't tell its changes that way (a partitioned one, or a keyless one with
+log entries since its baseline) makes every status a fold, and
+status_reused never moves.  A materialized view written since the mark
+(refreshed concurrently) is asked again as the full comparison asks it.
 debug_prolly_verify_fold_caches reads them all again and compares.
 
 

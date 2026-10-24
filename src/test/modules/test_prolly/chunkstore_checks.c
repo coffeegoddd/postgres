@@ -2198,7 +2198,7 @@ test_chunk_gc(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.reclamation, collect, full, &r);
+	(void) PROLLY_CALL(dc.reclamation, collect, full, false, &r);
 	values[0] = Int64GetDatum((int64) r.chunks_kept);
 	values[1] = Int64GetDatum((int64) r.chunks_freed);
 	values[2] = Int64GetDatum((int64) r.bytes_freed);
