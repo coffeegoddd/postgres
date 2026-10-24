@@ -747,6 +747,19 @@ typedef struct ProllyRefsRoutine
 	 * none is recorded (main, the database owner's, never has one).
 	 */
 	bool		(*branch_creator) (const char *name, Oid *role);
+
+	/*
+	 * Optional: what commit's branch's record of its tables (see
+	 * recorded_relation) held before the commit, when the commit's parents
+	 * aren't that record's commit alone (a merge; a commit after the head
+	 * moved): the record's commit (*was), and *lines, a line for each table
+	 * both records list by relation, its name in the commit, a tab, and
+	 * its name in the record before (palloc'd).  False if none is kept.  A
+	 * history read takes a parent's version of such a table for the
+	 * table's only if it shares the record's commit's history.
+	 */
+	bool		(*lineage_note) (const ProllyHash *commit, ProllyHash *was,
+								 char **lines);
 } ProllyRefsRoutine;
 
 /*
@@ -790,9 +803,10 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator"
+	"pin_set", "pin_get", "pins", "recorded_relation", "branch_creator", \
+	"lineage_note"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK branch_creator
+#define PROLLY_REFS_LAST_CALLBACK lineage_note
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

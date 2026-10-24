@@ -296,13 +296,27 @@ only by the database's owner or a member of pg_read_all_data.  The head's
 version is the table's only through the branch's record of its tables,
 made by its last commit, having the table's relation: at that commit, or
 at a head moved since without a commit to one of its descendants or
-ancestors, the name never without a table between.  A head moved to a
-commit holding a dropped table and then committed, or a merge of a
-branch still holding it, isn't told from the table's own history either;
-moving a head takes a write role (see Writers), not SELECT alone.
-A plan's row estimate of a version, and dolt_diff_stat's counts, are
-read on the same rule.  A table dropped and made again within one commit
-isn't told from one kept (#891).
+ancestors, the name never without a table between.  A branch just made
+starts with its source's record, when that is of the commit it starts at.
+A commit whose parents aren't the record's commit alone (a merge, or a
+commit after the head moved: a reset, a rebase's squash) keeps in the
+refs what the record listed before it ('L', refs format 14): the record's
+commit, and the tables both records list by relation.  Walking back
+through such a commit, the history read goes on to the record's commit
+too, and takes a parent other than it only once a walk back from the
+parent meets what the read has reached, as another branch's commit is
+taken.  So a head moved to a commit holding a dropped table and then
+committed, a merge of a branch still holding it, or a squash of the drop
+into the re-make, doesn't vouch for the old table's versions.  The limits,
+as commits name tables by name and identity alone and a re-made table
+keeps its name's identity (#891): a table dropped and made again within
+one commit, or both in the working set, is taken for one table; a commit
+made in another database (fetched, pulled or pushed here) has no such
+note, so a merge of the old table made there is followed by the names;
+and a merge of a branch still holding the old table merges its rows into
+the new one, whose rows they then are.  Moving a head takes a write role
+(see Writers), not SELECT alone.  A plan's row estimate of a version, and
+dolt_diff_stat's counts, are read on the same rule.
 
 Folded format 18 records identities in commits.  Formats are not kept
 compatible while the prototype iterates: this build reads, moves to and

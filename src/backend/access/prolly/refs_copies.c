@@ -63,6 +63,13 @@
  *				   tablespace, file number, snapshot (8 bytes), and
  *				   oldest unfrozen transaction and multixact ids (4 bytes
  *				   each but the snapshot, native byte order)
+ *	'L' commit	-> the commit's tables that its branch's record of its tables
+ *				   (see 'N') had before it, when the commit's parents aren't
+ *				   just that record's commit (a merge, or a commit after the
+ *				   head moved): that commit's id in hex and a newline, then
+ *				   a line for each table both records list by relation,
+ *				   its name in the commit, a tab, and its name in the
+ *				   record before
  *	'A' name	-> the role that made the branch, which owns it (its OID,
  *				   native byte order); main has none, being the database
  *				   owner's
@@ -231,6 +238,7 @@
 #define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_CREATOR		'A'	/* the role that made a branch */
+#define TAG_LINEAGE		'L'	/* a commit's tables kept from a record */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
@@ -240,7 +248,7 @@
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
  * trees a pin keeps; 12: a schema-conflicted table's names on each side.
  */
-#define REFS_FORMAT		"13"
+#define REFS_FORMAT		"14"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -4235,22 +4243,146 @@ names_key(StringInfo key, const char *name)
 	appendStringInfoString(key, name);
 }
 
+/*
+ * The 'L' note of commit head, whose tables are now (after the hash's
+ * line); before, the branch's record before it (NULL if none): kept when
+ * the commit's parents aren't the record's commit alone.  A table the two
+ * records list by one relation is that relation's at the record's commit;
+ * a commit whose parent is another (a merge's other branch, a commit after
+ * the head moved) can't vouch for that parent's version of the name by the
+ * names alone, so a history read asks then whether the parent's version and
+ * the record's commit's share a history the name stays in.
+ */
+static void
+note_lineage(const ProllyHash *head, const char *now, const char *before)
+{
+	ProllyCommitInfo info;
+	const char *bl = before ? strchr(before, '\n') : NULL;
+	ProllyHash	was;
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex;
+
+	if (bl == NULL || !prolly_hash_from_hex(before, bl - before, &was) ||
+		!copies_commit_get(head, &info) ||
+		(info.nparents == 1 && same_hash(&info.parents[0], &was)))
+		return;
+	hex = prolly_hash_hex(head);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_LINEAGE);
+	appendStringInfoString(&key, hex);
+	appendBinaryStringInfo(&v, before, bl - before);
+	appendStringInfoChar(&v, '\n');
+	for (const char *p = strchr(now, '\n'); p && p[1]; p = strchr(p + 1, '\n'))
+	{
+		const char *line = p + 1;
+		const char *end = strchrnul(line, '\n');
+		const char *q;
+
+		/* (each line "relid name": the same relid in the record before) */
+		if (end - line < 12)
+			continue;
+		for (q = strchr(bl, '\n'); q && q[1]; q = strchr(q + 1, '\n'))
+		{
+			const char *bend = strchrnul(q + 1, '\n');
+
+			if (strncmp(q + 1, line, 11) == 0 && bend - (q + 1) >= 12)
+			{
+				appendBinaryStringInfo(&v, line + 11, end - (line + 11));
+				appendStringInfoChar(&v, '\t');
+				appendBinaryStringInfo(&v, q + 12, bend - (q + 12));
+				appendStringInfoChar(&v, '\n');
+				break;
+			}
+		}
+	}
+	refs_put(key.data, key.len, &v);
+	pfree(hex);
+	pfree(key.data);
+	pfree(v.data);
+}
+
 static void
 note_head_names(const char *name, const ProllyHash *head)
 {
 	StringInfoData key;
 	StringInfoData v;
+	StringInfoData before;
 	char	   *hex = prolly_hash_hex(head);
 
 	initStringInfo(&key);
 	initStringInfo(&v);
+	initStringInfo(&before);
 	names_key(&key, name);
 	appendStringInfo(&v, "%s\n", hex);
 	table_names(&v);
+	note_lineage(head, v.data,
+				 refs_get(key.data, key.len, &before) ? before.data : NULL);
 	refs_put(key.data, key.len, &v);
 	pfree(hex);
 	pfree(key.data);
 	pfree(v.data);
+	pfree(before.data);
+}
+
+static char *head_names(const char *name, const ProllyHash *head);
+
+/*
+ * Branch name, just made at commit head from branch from, starts with
+ * from's record of its tables if that is of head: its tables are from's,
+ * by relation, until a commit of its own.
+ */
+static void
+carry_names_from(const char *name, const char *from, const ProllyHash *head)
+{
+	char	   *lines = head_names(from, head);
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex;
+
+	if (lines == NULL)
+		return;
+	hex = prolly_hash_hex(head);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	appendStringInfo(&v, "%s%s", hex, lines);
+	refs_put(key.data, key.len, &v);
+	pfree(hex);
+	pfree(lines);
+	pfree(key.data);
+	pfree(v.data);
+}
+
+/*
+ * Commit commit's 'L' note: the record's commit before it (*was) and its
+ * lines (name in the commit, a tab, name before); false if it has none.
+ */
+static bool
+copies_lineage_note(const ProllyHash *commit, ProllyHash *was, char **lines)
+{
+	StringInfoData key;
+	StringInfoData v;
+	char	   *hex;
+	char	   *nl;
+	bool		found;
+
+	refs_init();
+	hex = prolly_hash_hex(commit);
+	initStringInfo(&key);
+	initStringInfo(&v);
+	appendStringInfoChar(&key, TAG_LINEAGE);
+	appendStringInfoString(&key, hex);
+	found = refs_get(key.data, key.len, &v) &&
+		(nl = strchr(v.data, '\n')) != NULL &&
+		prolly_hash_from_hex(v.data, nl - v.data, was);
+	if (found)
+		*lines = pstrdup(nl + 1);
+	pfree(hex);
+	pfree(key.data);
+	pfree(v.data);
+	return found;
 }
 
 /*
@@ -4678,6 +4810,8 @@ copies_branch_create(const char *name, const char *start_point)
 				 errmsg("branch or commit \"%s\" does not exist", from)));
 	branch_set_head(name, &id);
 	branch_set_baseline(name, NULL, NULL);
+	if (from_exists)
+		carry_names_from(name, from, &id);
 }
 
 static void
@@ -7809,4 +7943,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.kept_commits = copies_kept_commits,
 	.recorded_relation = copies_recorded_relation,
 	.branch_creator = copies_branch_creator,
+	.lineage_note = copies_lineage_note,
 };

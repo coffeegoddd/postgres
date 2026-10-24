@@ -654,13 +654,20 @@ OF` are built in D18's shapes.
   record of its tables, made by its last commit, that has the table's
   relation: at that commit, or at a head moved since (a fast-forward, a
   reset) to a descendant or an ancestor of it with the name never
-  without a table between. Known gaps, as commits name tables by name and
-  identity alone: a table dropped and made again within one commit or in
-  the working set (#891); a head moved to the dropped table's commit and
-  then committed (a head move takes D27's privileges, not SELECT), an
-  owner's squash,
-  or a merge of a branch that still has the old table, which record the
-  re-made table above a commit holding the dropped one. Planner
+  without a table between. A commit whose parents aren't that record's
+  commit alone (a merge; a commit after a head move, a rebase's squash
+  among them) keeps what the record listed before it, so a head moved to
+  the dropped table's commit and then committed (a head move takes D27's
+  privileges, not `SELECT`), a squash of the drop into the re-make, or a
+  merge of a branch that still has the old table, doesn't vouch for the
+  old table's versions. Known limits, as commits name tables by name and
+  identity alone and a table made again keeps its name's identity (#891,
+  decided: commit identities don't change): a table dropped and made
+  again within one commit, or both in the working set, passes the check
+  as one table; a commit made in another database (fetched, pulled or
+  pushed) has no such record, so a merge of the old table made there is
+  followed by name; and a merge of a branch with the old table merges its
+  rows into the new table, where they are the new table's rows. Planner
   estimates of a version's rows and `dolt_diff_stat`'s counts are history
   too: a version the user may not read gives the default estimate, and
   its table is left out of `dolt_diff_stat` (refused when named). Any
