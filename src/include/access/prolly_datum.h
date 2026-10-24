@@ -39,6 +39,18 @@
  *					UTF-8; tag 1: its
  *					text form.  A value is read back by its tag, whatever
  *					the type's functions are now.
+ *					Tag 1 is written for a type with send and receive when
+ *					its receive refuses the value (a data exception, or an
+ *					internal error its own code raises: PostGIS's refuses a
+ *					one-point LINESTRING its text input takes).  Its text
+ *					must then be stable (read back and written again, the
+ *					same), and the value is stored as its text reads back.
+ *					A refusal is caught in a subtransaction, one for a
+ *					fold's batch of values (prolly_datum_batch()), else
+ *					one per value.  Not caught, so raised: in a parallel
+ *					worker (a parallel index build), where none can be
+ *					begun, and for a range over a row type holding such a
+ *					type, which is untagged.
  *					Receive may normalize different physical spellings to
  *					one value; keys and values store that normalized form.
  *					Keys additionally require it to compare equal to the
@@ -109,6 +121,17 @@ extern bool prolly_datum_codec_checks(const ProllyDatumCodec *c);
 
 /* Whether binary receive may normalize this value, including its children. */
 extern bool prolly_datum_codec_normalizes(const ProllyDatumCodec *c);
+
+/*
+ * Run a fold's encoding of many values (run(arg)) as one batch: an
+ * extension's receive, which encoding a normalizing value calls, is called
+ * unprotected inside one subtransaction, and if it refuses a value the
+ * batch is rolled back and run again, each receive in a subtransaction of
+ * its own, so the values refused are kept as their text form.  run must
+ * be safe to run twice: everything it does between is rolled back.  A
+ * batch inside a batch is run as part of it.
+ */
+extern void prolly_datum_batch(void (*run) (void *arg), void *arg);
 
 /* Append the canonical bytes of a non-NULL value. */
 extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,

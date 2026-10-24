@@ -141,6 +141,27 @@ without that restriction.  Extension I/O must
 still be stable after reconstruction; testing one value is not a certificate
 that an arbitrary extension's send/receive functions satisfy that contract.
 
+An extension's receive may be stricter than its input: PostGIS's text input
+takes a one-point LINESTRING or an unclosed ring that its receive refuses.
+Such a value, which a table may already hold, is kept as its text form
+(tag 1) instead.  Only a data exception (class 22), or an internal error
+raised by the type's own code rather than the server's, counts as a
+refusal; anything else (a cancel, a deadlock, a lock not available, a
+catalog lookup failing) is raised, so a value has one form fold after fold
+and whatever it is folded with.  The text must be stable (read back and
+written again, the same text), and the value is stored as its text reads
+back: a geometry with a cached bounding box reads back without it.  As
+receive is the extension's code, a refusal is caught in a subtransaction:
+a fold encodes each table's rows as one batch (prolly_datum_batch()), with
+receive unprotected inside one subtransaction, and a refusal rolls the
+batch back and runs it again with a subtransaction per value.  Encoding
+outside a batch takes one per value.  Not caught: in a parallel worker (a
+parallel index build), where no subtransaction can be begun, and for a
+range over a row type holding such a type, whose values are untagged;
+there a refusal is raised as before.  Text forms are written with
+extra_float_digits, DateStyle and IntervalStyle fixed, but not TimeZone or
+lc_monetary.
+
 
 Extension ordering and history compatibility
 -------------------------------------------

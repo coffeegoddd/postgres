@@ -11,6 +11,9 @@
 #include "postgres.h"
 
 #include <math.h>
+#ifndef WIN32
+#include <dlfcn.h>
+#endif
 
 #include "access/htup_details.h"
 #include "access/prolly_datum.h"
@@ -563,18 +566,33 @@ end_text_settings(int nest)
  * drops precision (PostGIS's box2d, at 15 significant digits) can't be
  * kept this way, and it is refused where it would be written rather than
  * changed.
+ *
+ * A value of a type with binary send and receive whose receive refused it
+ * (refused) is kept as text too, and its text need only be stable: read
+ * back and written again, the same text.  It is then stored as its text
+ * reads back, as a value receive normalizes is stored as receive gives it
+ * back: a PostGIS geometry with a cached bounding box reads back without
+ * it, the same geometry.
  */
 static void
-encode_output(ProllyDatumCodec *c, Datum value, StringInfo out)
+encode_output(ProllyDatumCodec *c, Datum value, StringInfo out, bool refused)
 {
 	int			nest = fixed_text_settings();
 	char	   *text = OutputFunctionCall(&c->output, value);
 	Datum		back = InputFunctionCall(&c->input, text, c->input_ioparam,
 										 c->typmod);
+	char	   *again = refused ? OutputFunctionCall(&c->output, back) : NULL;
 	char	   *utf8;
 
 	end_text_settings(nest);
-	if (!datum_image_eq(value, back, c->typbyval, c->typlen))
+	if (refused && strcmp(text, again) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("value of type %s can't be stored in a versioned table: its binary receive function refuses it, and its text form doesn't read back as the same text",
+						format_type_be(c->type)),
+				 errdetail("The value is \"%s\".", text),
+				 errhint("A value the type's receive function refuses is kept as its text form.")));
+	if (!refused && !datum_image_eq(value, back, c->typbyval, c->typlen))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("value of type %s can't be stored in a versioned table: its text form doesn't read back as the same value",
@@ -587,6 +605,8 @@ encode_output(ProllyDatumCodec *c, Datum value, StringInfo out)
 	if (utf8 != text)
 		pfree(utf8);
 	pfree(text);
+	if (again)
+		pfree(again);
 }
 
 /* a value's text form (after its tag), read with fixed settings */
@@ -648,15 +668,81 @@ recv_utf8(ProllyDatumCodec *c, const char *data, int len)
 }
 
 /*
+ * Receive refusals.  An extension's receive may be stricter than its input
+ * (PostGIS's refuses a one-point LINESTRING, which its text input takes),
+ * and a value a table already holds must still be committed: a normalizing
+ * value its receive refuses is kept as its text form instead.  As receive
+ * is the extension's code, a refusal is caught only in a subtransaction.
+ * One per value would double the cost of folding such values, so a fold
+ * runs its rows in a batch (prolly_datum_batch()): receive is called
+ * unprotected inside one subtransaction for the batch, and a refusal rolls
+ * the batch back and runs it again with a subtransaction per value, which
+ * finds the values refused.  A value's form depends only on the value.
+ */
+static int	batch_depth = 0;		/* in prolly_datum_batch() */
+static bool batch_unprotected = false;	/* its first run: receive unprotected */
+static bool batch_in_receive = false;	/* in an unprotected receive now */
+
+/*
+ * Was an error raised in the server's own code: in a function the postgres
+ * executable exports (a catalog lookup, say), rather than an extension's?
+ * Where that can't be told, not.
+ */
+static bool
+raised_by_server(const ErrorData *edata)
+{
+#ifndef WIN32
+	void	   *sym;
+	Dl_info		where;
+	Dl_info		server;
+
+	if (edata->funcname == NULL)
+		return false;
+	sym = dlsym(RTLD_DEFAULT, edata->funcname);
+	return sym != NULL && dladdr(sym, &where) != 0 &&
+		dladdr((void *) errstart, &server) != 0 &&
+		where.dli_fname != NULL && server.dli_fname != NULL &&
+		strcmp(where.dli_fname, server.dli_fname) == 0;
+#else
+	return false;
+#endif
+}
+
+/*
+ * May an error a receive raised be taken as its refusal of the value?  Only
+ * a data exception (class 22), or an internal error the type's own code
+ * raised (PostGIS refuses so): those depend on the value alone, so a value
+ * keeps one form, fold after fold.  Anything else (a cancel, a deadlock or
+ * serialization failure, a lock not available, the stack's depth, a
+ * catalog lookup failing) is raised as it is.
+ */
+static bool
+refusal_error(const ErrorData *edata)
+{
+	if (ERRCODE_TO_CATEGORY(edata->sqlerrcode) == ERRCODE_DATA_EXCEPTION)
+		return true;
+	return edata->sqlerrcode == ERRCODE_INTERNAL_ERROR && !raised_by_server(edata);
+}
+
+static bytea *
+round_trip(ProllyDatumCodec *c, bytea *b)
+{
+	Datum		roundtrip = recv_utf8(c, VARDATA(b), VARSIZE(b) - VARHDRSZ);
+	bytea	   *result = send_utf8(&c->send, roundtrip);
+
+	if (!c->typbyval)
+		pfree(DatumGetPointer(roundtrip));
+	return result;
+}
+
+/*
  * A normalizing CODEC_SEND value's binary form as its receive function gives
  * it back: send(receive(b)), or NULL when receive refuses b and the value is
- * tagged, so it can be kept as text instead.  An extension's receive may be
- * stricter than its input (PostGIS's refuses a one-point LINESTRING, which
- * its text input takes), and a value a table already holds must still be
- * committed.  The refusal is caught in a subtransaction, as receive is the
- * extension's code.  Cancels, resource and system errors, and corruption
- * are raised as they are; anything else (PostGIS refuses with an internal
- * error) is a refusal.
+ * tagged, so it can be kept as text instead.  In a batch's first run,
+ * unprotected (a refusal fails the run); otherwise in a subtransaction of
+ * its own.  An untagged value (a range over a row holding an extension
+ * type) can't be kept as text, nor can a subtransaction be begun in
+ * parallel mode: their refusals are raised.
  */
 static bytea *
 received_form(ProllyDatumCodec *c, bytea *b)
@@ -665,25 +751,21 @@ received_form(ProllyDatumCodec *c, bytea *b)
 	ResourceOwner owner = CurrentResourceOwner;
 	bytea	   *result = NULL;
 
-	if (!c->tagged || IsInParallelMode() || !IsTransactionState())
+	if (batch_unprotected)
 	{
-		Datum		roundtrip = recv_utf8(c, VARDATA(b), VARSIZE(b) - VARHDRSZ);
-
-		result = send_utf8(&c->send, roundtrip);
-		if (!c->typbyval)
-			pfree(DatumGetPointer(roundtrip));
+		batch_in_receive = true;
+		result = round_trip(c, b);
+		batch_in_receive = false;
 		return result;
 	}
+	if (!c->tagged || IsInParallelMode() || !IsTransactionState())
+		return round_trip(c, b);
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(mcxt);
 	PG_TRY();
 	{
-		Datum		roundtrip = recv_utf8(c, VARDATA(b), VARSIZE(b) - VARHDRSZ);
-
-		result = send_utf8(&c->send, roundtrip);
-		if (!c->typbyval)
-			pfree(DatumGetPointer(roundtrip));
+		result = round_trip(c, b);
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(mcxt);
 		CurrentResourceOwner = owner;
@@ -691,27 +773,85 @@ received_form(ProllyDatumCodec *c, bytea *b)
 	PG_CATCH();
 	{
 		ErrorData  *edata;
-		int			class;
 
 		MemoryContextSwitchTo(mcxt);
 		edata = CopyErrorData();
-		class = ERRCODE_TO_CATEGORY(edata->sqlerrcode);
-		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
-			class == ERRCODE_INSUFFICIENT_RESOURCES ||
-			class == ERRCODE_OPERATOR_INTERVENTION ||
-			class == ERRCODE_SYSTEM_ERROR ||
-			edata->sqlerrcode == ERRCODE_DATA_CORRUPTED ||
-			edata->sqlerrcode == ERRCODE_INDEX_CORRUPTED)
-			PG_RE_THROW();
 		FlushErrorState();
-		FreeErrorData(edata);
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(mcxt);
 		CurrentResourceOwner = owner;
+		if (!refusal_error(edata))
+			ReThrowError(edata);
+		FreeErrorData(edata);
 		result = NULL;
 	}
 	PG_END_TRY();
 	return result;
+}
+
+void
+prolly_datum_batch(void (*run) (void *arg), void *arg)
+{
+	MemoryContext mcxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	bool		refused = false;
+
+	/* (inside a batch, or where none can be begun: as it is) */
+	if (batch_depth > 0 || IsInParallelMode() || !IsTransactionState())
+	{
+		run(arg);
+		return;
+	}
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(mcxt);
+	batch_depth++;
+	batch_unprotected = true;
+	batch_in_receive = false;
+	PG_TRY();
+	{
+		run(arg);
+		batch_depth--;
+		batch_unprotected = false;
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(mcxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		bool		in_receive = batch_in_receive;
+
+		batch_depth--;
+		batch_unprotected = false;
+		batch_in_receive = false;
+		MemoryContextSwitchTo(mcxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(mcxt);
+		CurrentResourceOwner = owner;
+		if (!in_receive || !refusal_error(edata))
+			ReThrowError(edata);
+		FreeErrorData(edata);
+		refused = true;
+	}
+	PG_END_TRY();
+
+	/* a receive refused a value: again, each receive in its own */
+	if (refused)
+	{
+		batch_depth++;
+		PG_TRY();
+		{
+			run(arg);
+		}
+		PG_FINALLY();
+		{
+			batch_depth--;
+		}
+		PG_END_TRY();
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -1804,7 +1944,7 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 			encode_jsonb(value, out);
 			break;
 		case CODEC_OUTPUT:
-			encode_output(c, value, out);
+			encode_output(c, value, out, false);
 			break;
 		case CODEC_SEND:
 			{
@@ -1829,7 +1969,7 @@ prolly_datum_encode(ProllyDatumCodec *c, Datum value, StringInfo out)
 					{
 						if (canon != value)
 							pfree(DatumGetPointer(canon));
-						encode_output(c, value, out);
+						encode_output(c, value, out, true);
 						break;
 					}
 					b = normalized;
