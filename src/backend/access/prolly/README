@@ -171,7 +171,12 @@ level and a setting changed for each that differs, so loops over many
 values fix them once (prolly_datum_fixed_text()): a fold's batch, a change
 finder's walk of a table (a status, a diff), the rows a reset or merge
 writes (as a restore runs under the settings its dump fixes), and a row's
-values checked as it is written.
+values checked as it is written.  Definitions are described under the
+same settings, with search_path pg_catalog (prolly_datum_fix_text_settings(),
+at the describer's own GUC nest level), so a constant in a default, a
+CHECK, a generated column, an index's expression, a view or a policy
+prints alike in any session, and a move runs the descriptions it makes
+the definitions again from under them too (since folded format 21).
 
 
 Extension ordering and history compatibility

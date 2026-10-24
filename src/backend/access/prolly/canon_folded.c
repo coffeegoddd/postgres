@@ -253,10 +253,15 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "20", whose text forms of values (a type
- * without binary I/O's, or one its receive refuses) are written with times
- * in UTC, hex bytea and the C locale's money, numbers and dates
- * (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
+ * The format a folded root is in: "21", whose definitions (defaults,
+ * checks, generated columns, index expressions, views, policies) are
+ * described with the settings values' text forms are written under fixed
+ * (describing_settings()), so a constant in one prints alike in any
+ * session; "20" printed them under the committer's DateStyle,
+ * IntervalStyle, TimeZone and the rest, and was the first whose text
+ * forms of values (a type without binary I/O's, or one its receive
+ * refuses) are written with times in UTC, hex bytea and the C locale's
+ * money, numbers and dates (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
  * bytea_output, and was the first whose
  * dependencies record each extension's configuration rows (those pg_dump
  * dumps with it: prolly_extconfig.h); "18" didn't, and was the first whose commits record
@@ -296,7 +301,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"20"
+#define FOLDED_FORMAT	"21"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -1600,6 +1605,23 @@ ordering_versions(Relation rel)
 }
 
 static void describe_type(Canon *cn, Form_pg_type typ);
+
+/*
+ * The settings definitions are described under, and their descriptions
+ * run under when a move makes them again, set at the caller's GUC nest
+ * level: search_path pg_catalog, so each name prints qualified, and the
+ * settings values' text forms are written under (TimeZone UTC, ISO dates,
+ * the postgres IntervalStyle, and the rest: prolly_datum.h), so a
+ * constant in a default, a check, an index's expression or a view prints,
+ * and reads back, alike in any session.
+ */
+static void
+describing_settings(void)
+{
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	prolly_datum_fix_text_settings();
+}
 
 /* Type definitions in canonical names and labels, never database-local OIDs. */
 static void
@@ -5122,8 +5144,7 @@ build_all(Canon *cn, ProllyNodeRef *root)
 	if (cn->baseline)
 		load_baseline(cn, cn->baseline);
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	collect(cn);
 	AtEOXact_GUC(false, save_nestlevel);
 	add_collations(cn);
@@ -5336,8 +5357,7 @@ fold_changed_only(Canon *cn, ProllyNodeRef *root)
 	if (cn->baseline && keys != NIL)
 		load_baseline_keys(cn, cn->baseline, keys);
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	foreach_ptr(HeapTupleData, tup, rels)
 		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	AtEOXact_GUC(false, save_nestlevel);
@@ -5486,8 +5506,7 @@ definitions_unchanged(Canon *cn, ProllyNodeRef *root)
 	}
 	cn->partial = true;
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	foreach_ptr(HeapTupleData, tup, rels)
 		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	AtEOXact_GUC(false, save_nestlevel);
@@ -6033,9 +6052,7 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			check_deparse_settings();
 			cn.cached = true;
 			save_nestlevel = NewGUCNestLevel();
-			(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
-									 false);
+			describing_settings();
 			initStringInfo(&desc);
 			if (matview)
 			{
@@ -6453,8 +6470,7 @@ read_ordering(Canon *cn, const ProllyNodeRef *root, const char *name,
 	rel = table_open(relid, NoLock);
 	initStringInfo(&desc);
 	nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	PG_TRY();
 	{
 		describe_table(cn, rel, &desc);
@@ -11311,8 +11327,7 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 								   policy_statement(lfirst(pc), t->name, from, to, base));
 	}
 
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	(void) set_config_option("check_function_bodies", "off", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	/* (what's already gone, an IF EXISTS skips: no notice of it) */
@@ -12259,8 +12274,7 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 
 	/* (described as a commit describes them: every name qualified) */
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	CommandCounterIncrement();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	PG_TRY();
@@ -12389,8 +12403,7 @@ folded_advance_baseline(const ProllyNodeRef *baseline, const ProllyNodeRef *head
 
 	/* (described as a commit describes them: every name qualified) */
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	CommandCounterIncrement();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	PG_TRY();
@@ -12522,8 +12535,7 @@ folded_advance_own(const ProllyNodeRef *baseline,
 
 	/* (described as a commit describes them: every name qualified) */
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	CommandCounterIncrement();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	PG_TRY();
@@ -14465,8 +14477,7 @@ folded_rename_objects(List *renames)
 									  quote_identifier(strVal(llast(to)))));
 	}
 	save_nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	run_statements(first);
@@ -14733,8 +14744,7 @@ folded_table_metadata(const ProllyNodeRef *root, const char *name,
 
 	/* (names as the description writes them: qualified, under pg_catalog) */
 	nestlevel = NewGUCNestLevel();
-	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
-							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	describing_settings();
 	PG_TRY();
 	{
 		t->desc = CreateTemplateTupleDesc(list_length(td.columns));
