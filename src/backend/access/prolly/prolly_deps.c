@@ -374,20 +374,47 @@ installed(const char *name, char **version, char **schema)
 }
 
 /*
- * Whether version of an available extension names schema in its control
- * file (schema = ..., which only a non-relocatable one may): CREATE
- * EXTENSION then makes the schema if the database hasn't it, and takes no
- * SCHEMA but that one.
+ * The schema version of an available extension names in its control file
+ * (schema = ..., which only a non-relocatable one may), or NULL: CREATE
+ * EXTENSION then makes that schema if the database hasn't it, and takes no
+ * other.
  */
-static bool
-fixed_schema(const char *name, const char *version, const char *schema)
+static char *
+control_schema(const char *name, const char *version)
 {
 	const char *params[2] = {name, version};
 
 	query("SELECT schema FROM pg_catalog.pg_available_extension_versions "
 		  "WHERE name = $1 AND version = $2 AND NOT relocatable", 2, params);
-	return SPI_processed > 0 && column(0, 1) != NULL &&
-		strcmp(column(0, 1), schema) == 0;
+	return SPI_processed > 0 ? column(0, 1) : NULL;
+}
+
+/* Whether version's control file fixes schema. */
+static bool
+fixed_schema(const char *name, const char *version, const char *schema)
+{
+	char	   *fixed = control_schema(name, version);
+
+	return fixed != NULL && strcmp(fixed, schema) == 0;
+}
+
+/*
+ * Whether an extension the commits need, which the database hasn't, will
+ * make its schema as it is created: a version of it available fixes that
+ * schema.  Another extension the commits keep there can then be made in it.
+ */
+static bool
+makes_schema(const NeededExtension *e)
+{
+	const char *params[2] = {e->name, strVal(linitial(e->schemas))};
+	char	   *have;
+	char	   *have_schema;
+
+	if (list_length(e->schemas) != 1 || installed(e->name, &have, &have_schema))
+		return false;
+	query("SELECT 1 FROM pg_catalog.pg_available_extension_versions "
+		  "WHERE name = $1 AND NOT relocatable AND schema = $2", 2, params);
+	return SPI_processed > 0;
 }
 
 /* Whether an extension the database has can be moved to another schema. */
@@ -456,7 +483,7 @@ only_version(List *versions, const char *version)
  */
 static char *
 check_extension(NeededExtension *e, StringInfo missing, Problems *problems,
-				bool install)
+				bool install, List *made_schemas)
 {
 	char	   *schema = strVal(linitial(e->schemas));
 	char	   *have;
@@ -557,12 +584,30 @@ check_extension(NeededExtension *e, StringInfo missing, Problems *problems,
 						 e->name, newest);
 		return NULL;
 	}
+	{
+		char	   *fixed = control_schema(e->name, newest);
+
+		/*
+		 * (given another schema, CREATE EXTENSION ... CASCADE would make it
+		 * in the fixed one, where the commits' objects don't look for it)
+		 */
+		if (fixed != NULL && strcmp(fixed, schema) != 0)
+		{
+			appendStringInfo(missing, "\nextension %s: in schema %s, and its control file here fixes schema %s",
+							 e->name, schema, fixed);
+			return NULL;
+		}
+	}
 	if (e->versioned && install)
 		return newest;			/* (the schema made, versioned, first) */
 
-	/* (one whose control file fixes the schema makes it, as ever) */
+	/*
+	 * (one whose control file fixes the schema makes it, as CREATE
+	 * EXTENSION does; and another made after it can be kept there)
+	 */
 	if (!OidIsValid(get_namespace_oid(schema, true)) &&
-		!fixed_schema(e->name, newest, schema))
+		!fixed_schema(e->name, newest, schema) &&
+		!(install && list_member(made_schemas, makeString(schema))))
 	{
 		appendStringInfo(missing, "\nextension %s: schema %s, not in this database",
 						 e->name, schema);
@@ -594,8 +639,10 @@ find_install(List *installs, const char *name)
 
 /*
  * Create an extension, after those it requires that are to be created too:
- * CASCADE would make them at their default versions and in this one's
- * schema.  One made already (by another's CASCADE) must be as needed.
+ * CASCADE would make them at their default versions, in this one's schema
+ * (or, for one whose control file fixes its schema, in the first schema of
+ * the search path, as a plain CREATE EXTENSION does).  One made already
+ * (by another's CASCADE) must be as needed.
  */
 static void
 create_extension(List *installs, Install *e)
@@ -633,8 +680,9 @@ create_extension(List *installs, Install *e)
 	}
 	{
 		/*
-		 * (a schema the control file fixes isn't given: CREATE EXTENSION
-		 * makes it if it is missing only when it isn't)
+		 * (no SCHEMA for one whose control file fixes it: given SCHEMA,
+		 * CREATE EXTENSION requires the schema to exist; without it, it
+		 * makes the fixed schema if it is missing)
 		 */
 		bool		fixed = fixed_schema(e->name, e->version, e->schema);
 		char	   *sql = psprintf("CREATE EXTENSION %s VERSION %s%s%s CASCADE",
@@ -784,6 +832,7 @@ check_needs(Needs *needs, bool install, const char *what)
 {
 	StringInfoData missing;
 	List	   *installs = NIL;
+	List	   *made_schemas = NIL;
 	ListCell   *lc;
 	Problems	problems = {0};
 
@@ -793,10 +842,21 @@ check_needs(Needs *needs, bool install, const char *what)
 	initStringInfo(&missing);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
+
+	/* (the schemas extensions to be made will make, fixed by their control files) */
 	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
-		char	   *version = check_extension(e, &missing, &problems, install);
+
+		if (install && makes_schema(e))
+			made_schemas = lappend(made_schemas,
+								   makeString(strVal(linitial(e->schemas))));
+	}
+	foreach(lc, needs->extensions)
+	{
+		NeededExtension *e = lfirst(lc);
+		char	   *version = check_extension(e, &missing, &problems, install,
+											  made_schemas);
 
 		if (version == NULL)
 			continue;
@@ -866,6 +926,18 @@ check_needs(Needs *needs, bool install, const char *what)
 				names = lappend(names, strVal(lfirst(sc)));
 			PROLLY_CALL(dc.canonicalizer, make_versioned_schemas, names);
 		}
+	}
+
+	/*
+	 * Those that make their schemas first (their control files fix them),
+	 * then the rest, some of which may be kept in those schemas.
+	 */
+	foreach(lc, installs)
+	{
+		Install    *i = lfirst(lc);
+
+		if (fixed_schema(i->name, i->version, i->schema))
+			create_extension(installs, i);
 	}
 	foreach(lc, installs)
 		create_extension(installs, lfirst(lc));
