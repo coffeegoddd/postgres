@@ -176,6 +176,20 @@ class WorkloadTest(unittest.TestCase):
             self.assertIn(needed, sql)
         self.assertIn("release_queue", labels)
 
+    def test_log_problems(self):
+        log = "\n".join([
+            "07:16:20.443 PDT [1] 00000 LOG:  checkpoint complete",
+            "07:16:20.443 PDT [2] 55P03 ERROR:  another collection of this database's "
+            "chunk store is running",
+            "07:16:21.443 PDT [3] 57014 ERROR:  canceling autovacuum task",
+            "07:16:22.000 PDT [4] 57P01 FATAL:  terminating background worker \"prolly fold "
+            "launcher\" due to administrator command",
+            "07:16:23.000 PDT [5] XX000 ERROR:  prolly tree node missing from its chunk store",
+            "07:16:24.000 PDT [6] 01000 WARNING:  page verification failed",
+            "07:16:25.000 PDT [7] 28000 FATAL:  role \"x\" does not exist"])
+        self.assertEqual([line.split("]")[0][-1] for line in V10.log_problems(log)],
+                         ["5", "6", "7"])
+
     def test_sizes(self):
         self.assertEqual(V10.sizes(20000)["big"], 100)
         with self.assertRaises(ValueError):

@@ -901,6 +901,16 @@ class V10(VWorkload):
         ("checkpoint", "CHECKPOINT"),
     )
 
+    # Log errors that are no sign of a cleanup gone wrong: background
+    # workers a shutdown terminates; an autovacuum worker's task cancelled
+    # for a lock another wants; an automatic collection refused because
+    # another collection (another worker's, or dolt_gc's) is running, which
+    # autovacuum reports and passes over (with the journal past
+    # prolly.gc_journal_threshold, each worker finds a collection due).
+    BENIGN = ("due to administrator command",
+              "57014 ERROR:  canceling autovacuum task",
+              "55P03 ERROR:  another collection of this database's chunk store is running")
+
     # the current tables' reads the heap tables repeat
     HEAP_READS = ("point", "range", "full", "toast", "keyless", "remade", "index",
                   "composite", "index_only")
@@ -1158,6 +1168,14 @@ class V10(VWorkload):
         finally:
             ctx.cluster.sql("ALTER SYSTEM RESET autovacuum; "
                             "ALTER SYSTEM RESET autovacuum_naptime; SELECT pg_reload_conf()")
+            # (the workers running finish their pass first, so that the
+            # cleanups after don't run beside them)
+            deadline = time.monotonic() + 300
+            while ctx.cluster.scalar("SELECT count(*) FROM pg_stat_activity WHERE "
+                                     "backend_type = 'autovacuum worker'") != "0":
+                if time.monotonic() > deadline:
+                    raise RuntimeError("V10: autovacuum workers still running after the drain")
+                time.sleep(0.5)
 
     def cleanup(self, ctx) -> dict[str, float]:
         out = {}
@@ -1169,6 +1187,13 @@ class V10(VWorkload):
                 self._sql(ctx, sql)
             out[f"cleanup_{label}_ms"] = (time.monotonic() - t0) * 1000
         return out
+
+    @classmethod
+    def log_problems(cls, log: str) -> list[str]:
+        """The log's errors and warnings, but those BENIGN."""
+        return [line for line in log.splitlines()
+                if re.search(r"\b(ERROR|WARNING|PANIC|FATAL):", line)
+                and not any(b in line for b in cls.BENIGN)]
 
     def check_after(self, ctx, log_pos: int) -> None:
         """Folds match their trees, every index its table (main's and the
@@ -1188,9 +1213,7 @@ class V10(VWorkload):
             out = self._sql(ctx, f"SELECT dolt_checkout('{branch}');\n{indexes};")
             if "v10i|true" not in out:
                 raise RuntimeError(f"V10: amcheck failed on {branch} after the cleanups: {out}")
-        problems = [line for line in ctx.cluster.log_since(log_pos).splitlines()
-                    if re.search(r"\b(ERROR|WARNING|PANIC|FATAL):", line)
-                    and "due to administrator command" not in line]
+        problems = self.log_problems(ctx.cluster.log_since(log_pos))
         if problems:
             raise RuntimeError("V10: the server log has errors or warnings:\n"
                                + "\n".join(problems[:20]))

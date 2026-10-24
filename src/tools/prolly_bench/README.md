@@ -440,7 +440,11 @@ Correctness is a hard failure: a digest of either phase that isn't phase
 1's first fails the cell, naming the queries; so do `dolt_verify_folds()`
 finding a mismatch, `bt_index_check(..., true)` failing on main's or the
 side branch's indexes, and an error or warning in the server log after
-phase 1 began.  Latency is paired: for each query, repetition i of phase 2
+phase 1 began (but for an autovacuum task cancelled for a lock, and an
+automatic collection refused while another runs, which autovacuum
+reports and passes over: at the larger size each worker finds one due).
+Autovacuum's workers finish their pass after the drain before the next
+cleanup starts.  Latency is paired: for each query, repetition i of phase 2
 over repetition i of phase 1, the median of those ratios
 (`<query>_ratio`, with `<query>_p1_ms` and `<query>_p2_ms`), and per
 engine the median ratio (`prolly_ratio_median`, `heap_ratio_median`) and
