@@ -4571,9 +4571,10 @@ changes_blocks(const BmapChange *changes, uint32 n, BlockNumber *blocks)
  * the changes list if the relation has none.  *fold gets the list's lineage,
  * the fold's epoch and the relation's length.
  *
- * Pages cached and already prepared are marked to be prepared again.  A
- * change of one under way (its buffer already locked) completes in place;
- * whoever reads the page after this, with a lock, sees it.
+ * Pages cached and already prepared are to be prepared again: the
+ * generation of sharing is raised (MarkBufferedPagesShared()), visiting no
+ * buffer.  A change of one under way (its buffer already locked) completes
+ * in place; whoever reads the page after this, with a lock, sees it.
  */
 void
 bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
@@ -4668,7 +4669,7 @@ bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
 	UnlockReleaseBuffer(chgbuf);
 	UnlockReleaseBuffer(headerbuf);
 
-	MarkBufferedRelationShared(reln, MAIN_FORKNUM);
+	MarkBufferedPagesShared();
 }
 
 /*
@@ -5490,13 +5491,13 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 
 	/*
 	 * src's cached pages are checked again before they next change, as pages
-	 * read from now on are.  Done once src's map is unlocked, since it visits
-	 * every buffer.  A page found src's own before the epoch was raised may
-	 * change in place until it is marked; with src kept from changing, only
-	 * a hint or pruning can change it, and either holds for dst too, whose
-	 * page is the same (and gets it when flushed, below).
+	 * read from now on are: the generation of sharing is raised, visiting
+	 * no buffer.  A page found src's own before the epoch was raised may
+	 * change in place until then; with src kept from changing, only a hint
+	 * or pruning can change it, and either holds for dst too, whose page is
+	 * the same (and gets it when flushed, below).
 	 */
-	MarkBufferedRelationShared(src, MAIN_FORKNUM);
+	MarkBufferedPagesShared();
 
 	/*
 	 * The shared blocks get src's latest pages, durably.  PRESERVE records
@@ -5730,7 +5731,8 @@ bmap_snapshot_take(SMgrRelation reln)
 
 /*
  * bmap_snapshot_take() of each of rels[] (n of them), their ids into ids[]:
- * their pages marked and written out in one look at the buffers (each
+ * every cached page checked again before it next changes (without visiting
+ * the buffers), their pages written out in one look at the buffers (each
  * block looked up while they are few beside them), and their page
  * stores synced once each, as the transaction commits (bmapsyncshares()),
  * as a share's are.  For a caller that relies on the snapshots only once
