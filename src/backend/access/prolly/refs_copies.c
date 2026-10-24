@@ -43,7 +43,8 @@
  *				   merge recorded them: each table's OID, then its name's
  *				   length (a varint) and bytes; and the tables in schema
  *				   conflicts, kept as the branch has them, each as OID 0
- *				   and its name so
+ *				   and its names so: ours', base's and theirs', NUL
+ *				   between them
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
  *				   then the bytes)
@@ -233,9 +234,9 @@
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
  * pages retired; 8: a merge's tables in schema conflicts, in its merge
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
- * trees a pin keeps.
+ * trees a pin keeps; 12: a schema-conflicted table's names on each side.
  */
-#define REFS_FORMAT		"11"
+#define REFS_FORMAT		"12"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -4227,6 +4228,49 @@ head_names(const char *name, const ProllyHash *head)
 	return lines;
 }
 
+/*
+ * The commit the session branch's record of its tables is of, if it lists
+ * relation relid among them (the head may have moved since, uncommitted).
+ */
+static bool
+copies_recorded_relation(Oid relid, ProllyHash *at)
+{
+	char	   *name = branch_ops()->current();
+	StringInfoData key;
+	StringInfoData v;
+	char	   *nl;
+	char	   *lines;
+	char		want[16];
+	bool		found = false;
+
+	initStringInfo(&key);
+	initStringInfo(&v);
+	names_key(&key, name);
+	if (!refs_get(key.data, key.len, &v) || (nl = strchr(v.data, '\n')) == NULL ||
+		!prolly_hash_from_hex(v.data, nl - v.data, at))
+	{
+		pfree(key.data);
+		pfree(v.data);
+		return false;
+	}
+	lines = pstrdup(nl);
+	pfree(key.data);
+	pfree(v.data);
+	snprintf(want, sizeof(want), "%010u ", relid);
+	for (char *p = lines; p && *p; p = strchr(p, '\n'))
+	{
+		if (*p == '\n')
+			p++;
+		if (strncmp(p, want, strlen(want)) == 0)
+		{
+			found = true;
+			break;
+		}
+	}
+	pfree(lines);
+	return found;
+}
+
 /* The record of head, now of next (a commit that renamed nothing). */
 static void
 carry_head_names(const char *name, const ProllyHash *head, const ProllyHash *next)
@@ -5507,9 +5551,20 @@ merge_names_put(const char *branch, const ProllyMergeState *state)
 		}
 	for (int i = 0; state && i < state->nschema; i++)
 	{
+		const char *base = state->schema_base_tables ?
+			state->schema_base_tables[i] : state->schema_tables[i];
+		const char *theirs = state->schema_their_tables ?
+			state->schema_their_tables[i] : state->schema_tables[i];
+
+		/* (ours' name, then base's and theirs', a NUL before each) */
 		put_be32(&v, InvalidOid);
-		prolly_put_varint(&v, strlen(state->schema_tables[i]));
+		prolly_put_varint(&v, strlen(state->schema_tables[i]) + 1 +
+						  strlen(base) + 1 + strlen(theirs));
 		appendStringInfoString(&v, state->schema_tables[i]);
+		appendStringInfoChar(&v, '\0');
+		appendStringInfoString(&v, base);
+		appendStringInfoChar(&v, '\0');
+		appendStringInfoString(&v, theirs);
 		any = true;
 	}
 	{
@@ -5537,6 +5592,8 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 	state->table_names = NULL;
 	state->nschema = 0;
 	state->schema_tables = NULL;
+	state->schema_base_tables = NULL;
+	state->schema_their_tables = NULL;
 	if (refs_get(key.data, key.len, &v))
 	{
 		const char *p = v.data;
@@ -5545,6 +5602,8 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 
 		state->table_names = palloc0(sizeof(char *) * Max(state->ntables, 1));
 		state->schema_tables = palloc(sizeof(char *) * cap);
+		state->schema_base_tables = palloc(sizeof(char *) * cap);
+		state->schema_their_tables = palloc(sizeof(char *) * cap);
 		while (end - p >= 4)
 		{
 			Oid			oid = get_be32(p);
@@ -5558,13 +5617,36 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 						 errmsg("prolly refs hold an invalid merge state")));
 			if (oid == InvalidOid)
 			{
+				char	   *names = palloc(len + 1);
+				char	   *base;
+				char	   *theirs;
+
+				memcpy(names, p, len);
+				names[len] = '\0';
+				base = names + strlen(names) + 1;
+
+				if (base > names + len)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("prolly refs hold an invalid merge state")));
+				theirs = base + strlen(base) + 1;
+				if (theirs > names + len)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("prolly refs hold an invalid merge state")));
 				if (state->nschema == cap)
 				{
 					cap *= 2;
 					state->schema_tables = repalloc(state->schema_tables,
 													sizeof(char *) * cap);
+					state->schema_base_tables = repalloc(state->schema_base_tables,
+														 sizeof(char *) * cap);
+					state->schema_their_tables = repalloc(state->schema_their_tables,
+														  sizeof(char *) * cap);
 				}
-				state->schema_tables[state->nschema++] = pnstrdup(p, len);
+				state->schema_base_tables[state->nschema] = base;
+				state->schema_their_tables[state->nschema] = theirs;
+				state->schema_tables[state->nschema++] = names;
 			}
 			for (int i = 0; i < state->ntables; i++)
 				if (state->tables[i] == oid)
@@ -6035,10 +6117,13 @@ violations_append(const char *branch, ProllyViolation *const *violations,
 	edits[0].value.len = next.len;
 	for (int i = 0; i < n; i++)
 	{
-		initStringInfo(&keys[i]);
+		/* (sized to them: a batch holds as many as its rows' bytes allow) */
+		initStringInfoExt(&keys[i], prefix.len + 8 + 1);
 		appendBinaryStringInfo(&keys[i], prefix.data, prefix.len);
 		put_be64(&keys[i], place + i);
-		initStringInfo(&values[i]);
+		initStringInfoExt(&values[i], 4 + 3 * 4 + strlen(violations[i]->type) +
+						  strlen(violations[i]->row) +
+						  strlen(violations[i]->info) + 1);
 		put_violation(&values[i], violations[i]);
 		edits[i + 1].key.data = (const uint8 *) keys[i].data;
 		edits[i + 1].key.len = keys[i].len;
@@ -7658,4 +7743,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
 	.kept_commits = copies_kept_commits,
+	.recorded_relation = copies_recorded_relation,
 };

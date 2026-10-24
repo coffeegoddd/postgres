@@ -491,10 +491,14 @@ typedef struct ProllyCanonRoutine
 	 * of each (renames[i], ProllyRename *), and the merged identity record,
 	 * into *identity.  An object renamed on one side takes that side's
 	 * name; renamed otherwise on both, or two objects of one name, is a
-	 * schema conflict, an error.
+	 * schema conflict, an error.  A table keep_ours names (char *, as the
+	 * merge would name it otherwise) takes ours' names instead, its own
+	 * and its columns': a table in a schema conflict, kept as ours has
+	 * it.
 	 */
 	void		(*merge_renames) (const ProllyNodeRef *roots,
 								  const ProllyValue *identities,
+								  List *keep_ours,
 								  List **renames, StringInfo identity);
 
 	/*

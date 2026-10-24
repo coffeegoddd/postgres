@@ -198,8 +198,8 @@ adapts.
   listed in `dolt_schema_conflicts`; `dolt_conflicts_resolve()` refuses it
   and a commit waits for `--abort`, as in Dolt. Other schema conflicts
   (objects other than tables, renames to one name, inheritance and typed
-  tables, enum labels, a conflicted table renamed on either side, or one
-  the other side's objects use in its version) are errors naming the
+  tables, enum labels, or a table the other side's objects use in its
+  version) are errors naming the
   objects, and the merge doesn't happen; so is any schema conflict of a
   cherry-pick or revert. A merge,
   cherry-pick or revert into uncommitted changes is refused when it
@@ -312,9 +312,13 @@ OF` are built in D18's shapes.
   row and those it collides with), once for each unique index it breaks.
 - **Prolly:** the merge doesn't write a row that would break a unique
   constraint: the branch keeps its own version of that key (none, for a
-  new one), and the row not written is recorded alone, once, for the
-  first unique constraint it breaks. Check and not-null constraints are
-  the same: their breaking rows are recorded, not written. A row breaking
+  new one). The violations are Dolt's: the row not written and each row
+  it collides with, once for each unique index it breaks (an index of
+  plain columns, by the index's own equality and collation; for an index
+  of expressions, the row not written alone, for the index its write was
+  refused for). Check and not-null
+  constraints keep their breaking rows out too: those rows are recorded,
+  not written. A row breaking
   an exclusion constraint (which Dolt doesn't have) is handled the same
   way, recorded as an `exclusion constraint` violation naming the
   constraint and its columns. So is a row breaking a `PRIMARY KEY` or
@@ -334,9 +338,10 @@ OF` are built in D18's shapes.
   validated check or not-null constraint refuses a row breaking it); a
   table can't hold both, so there is no state in which Dolt's rows
   exist.
-- **Port:** expected rows and violations follow prolly's: the violation
-  lists the row not written, and the table has one row fewer than
-  Dolt's (a count of its rows, as `DELETE`'s, is one lower).
+- **Port:** expected violations are Dolt's; expected rows follow
+  prolly's: the table has one row fewer than Dolt's for each row the
+  merge didn't write (a count of its rows, as `DELETE`'s, is that much
+  lower).
 
 ## D13. Rows breaking a check a merge adds
 
@@ -630,3 +635,38 @@ OF` are built in D18's shapes.
   the user's review.
 - **Port:** an assertion of Dolt's refusal is omitted (the case is
   partial); test_prolly's `tags` test checks the read-only checkout.
+
+## D26. Reading a table's history takes its grants, over its lineage
+
+- **Dolt:** a user who may read a database reads any table at any commit
+  by hash, `AS OF` or a history table; privileges are on databases and
+  tables by name, not on versions.
+- **Prolly:** every history read of a table's rows (`dolt_at`,
+  `dolt_history_table`, `dolt_diff`, `dolt_diff_table`, by row type or
+  by name) takes `SELECT` on the table here of the version's name, and
+  that grant covers only versions that are that table: back through the
+  working set and the head's history, and forward from it along other
+  branches' commits, with the name never without a table between. A
+  version of another table of its name (one dropped, and a table made
+  again with its name in a later commit) is read only by the database's
+  owner or a member of `pg_read_all_data`. The step from the working set
+  to the head vouches for the head's version only through the branch's
+  record of its tables, made by its last commit, that has the table's
+  relation: at that commit, or at a head moved since (a fast-forward, a
+  reset) to a descendant or an ancestor of it with the name never
+  without a table between. Known gaps, as commits name tables by name and
+  identity alone: a table dropped and made again within one commit or in
+  the working set (#891); a head moved to the dropped table's commit and
+  then committed (#895: such moves need no privilege), an owner's squash,
+  or a merge of a branch that still has the old table, which record the
+  re-made table above a commit holding the dropped one. Planner
+  estimates of a version's rows and `dolt_diff_stat`'s counts are history
+  too: a version the user may not read gives the default estimate, and
+  its table is left out of `dolt_diff_stat` (refused when named). Any
+  commit is otherwise read by hash, as in Dolt.
+- **Why:** Postgres grants are on relations; a table made again with an
+  old name is another relation, and its grants don't cover the dropped
+  one's rows. Commits name tables by name and identity alone, so a table
+  dropped and made again within one commit (or in the working set) isn't
+  told from one kept: #891.
+- **Port:** ports run as a superuser; none is affected.

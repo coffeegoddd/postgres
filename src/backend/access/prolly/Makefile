@@ -48,6 +48,7 @@ OBJS = \
 	prolly_database.o \
 	prolly_datum.o \
 	prolly_deps.o \
+	prolly_extconfig.o \
 	prolly_registry.o \
 	prolly_seen.o \
 	prolly_fold.o \

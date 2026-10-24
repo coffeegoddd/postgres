@@ -128,6 +128,10 @@
       "expect": {
         "rows": [
           [
+            "1",
+            "1"
+          ],
+          [
             "2",
             "1"
           ]
@@ -164,6 +168,10 @@
       "sql": "SELECT violating_row->>'pk', violating_row->>'col1' FROM dolt_constraint_violations('t')",
       "expect": {
         "rows": [
+          [
+            "1",
+            "1"
+          ],
           [
             "2",
             "1"

@@ -174,6 +174,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
+#include "access/prolly_extconfig.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_opclass.h"
@@ -251,9 +252,11 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "18", whose commits record their
- * objects' identities beside it (folded_identify()), which a server of an
- * earlier format would read past, matching renamed objects by name; "17"
+ * The format a folded root is in: "19", whose dependencies record each
+ * extension's configuration rows (those pg_dump dumps with it:
+ * prolly_extconfig.h); "18" didn't, and was the first whose commits record
+ * their objects' identities beside it (folded_identify()), which a server
+ * of an earlier format would read past, matching renamed objects by name; "17"
  * had none, and was the first with extension send values normalized by
  * binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
@@ -288,7 +291,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"18"
+#define FOLDED_FORMAT	"19"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -358,6 +361,68 @@ static char *printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
 						  Form_pg_type domain, ParseExprKind kind);
 static char *constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain);
 static bool list_has_string(List *list, const char *s);
+
+/*
+ * A change finder's fold of a table, and its fold of a transaction's own
+ * rows, each as one batch of encoding (prolly_datum_batch()): run again if
+ * an extension's receive refused a value.
+ */
+typedef struct FinderFold
+{
+	const ProllyChangeFinderRoutine *finder;
+	Relation	rel;
+	const ProllyTreeEnv *env;
+	const ProllyTableFold *baseline;
+	ProllyFullFoldReason why;
+	ProllyNodeRef *data;
+	StringInfo	next;
+	const ProllyNodeRef *data_in;
+	ItemPointerData *tids;
+	int			ntids;
+	bool		folded;
+} FinderFold;
+
+static void
+finder_fold_run(void *arg)
+{
+	FinderFold *f = arg;
+
+	if (f->next)
+		resetStringInfo(f->next);
+	PROLLY_CALL(f->finder, fold, f->rel, f->env, f->baseline, f->why, f->data, f->next);
+}
+
+static void
+finder_fold(const ProllyChangeFinderRoutine *finder, Relation rel,
+			const ProllyTreeEnv *env, const ProllyTableFold *baseline,
+			ProllyFullFoldReason why, ProllyNodeRef *data, StringInfo next)
+{
+	FinderFold	f = {.finder = finder, .rel = rel, .env = env, .baseline = baseline,
+	.why = why, .data = data, .next = next};
+
+	prolly_datum_batch(finder_fold_run, &f);
+}
+
+static void
+finder_fold_rows_run(void *arg)
+{
+	FinderFold *f = arg;
+
+	f->folded = PROLLY_CALL(f->finder, fold_rows, f->rel, f->env, f->data_in,
+							f->tids, f->ntids, f->data);
+}
+
+static bool
+finder_fold_rows(const ProllyChangeFinderRoutine *finder, Relation rel,
+				 const ProllyTreeEnv *env, const ProllyNodeRef *data_in,
+				 ItemPointerData *tids, int ntids, ProllyNodeRef *data)
+{
+	FinderFold	f = {.finder = finder, .rel = rel, .env = env, .data_in = data_in,
+	.tids = tids, .ntids = ntids, .data = data};
+
+	prolly_datum_batch(finder_fold_rows_run, &f);
+	return f.folded;
+}
 
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
@@ -1900,7 +1965,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 	}
 	initStringInfo(&state);
 	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_TABLES, 1);
-	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, why, root,
+	finder_fold(cn->finder, rel, &cn->env, bt ? &tf : NULL, why, root,
 				cn->advance ? &state : NULL);
 	if (cn->advance)
 	{
@@ -3164,6 +3229,30 @@ static HTAB *described = NULL;
 static char *described_settings = NULL;
 static MadeTree dependencies_made;
 static uint64 dependencies_epoch;
+
+/*
+ * The extensions with configuration tables the tree made last recorded,
+ * and their elements then: their rows aren't catalogs, so the tree is
+ * taken again only while they are what they were.
+ */
+static List *dependencies_configured;
+static char *dependencies_config;
+
+/*
+ * A digest of extensions' configuration elements, as one string: read
+ * without encoding the rows (prolly_extconfig_fingerprint()).
+ */
+static char *
+config_fingerprint(List *extoids)
+{
+	StringInfoData out;
+	ListCell   *lc;
+
+	initStringInfo(&out);
+	foreach(lc, extoids)
+		appendStringInfoString(&out, prolly_extconfig_fingerprint(lfirst_oid(lc)));
+	return out.data;
+}
 static MadeTree items_made;
 
 static FoldedAt items_at;
@@ -3812,7 +3901,7 @@ dependency_cmp(const ListCell *a, const ListCell *b)
  * object's address.
  */
 static Dependency *
-describe_dependency(const ObjectAddress *addr, List *ordering)
+describe_dependency(const ObjectAddress *addr, List *ordering, List **configured)
 {
 	Dependency *dep = palloc(sizeof(Dependency));
 	char	   *type = getObjectTypeDescription(addr, false);
@@ -3832,6 +3921,13 @@ describe_dependency(const ObjectAddress *addr, List *ordering)
 			value = lappend(value, "versioned");
 		if (list_member_oid(ordering, addr->objectId))
 			value = lappend(value, "ordering");
+		{
+			bool		has_config = false;
+
+			value = list_concat(value, prolly_extconfig_elements(addr->objectId, &has_config));
+			if (has_config)
+				*configured = lappend_oid(*configured, addr->objectId);
+		}
 		append_utf8(&dep->value, text_array_literal(value));
 	}
 	else
@@ -3902,6 +3998,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	ProllyTreeBuilder *b;
 	uint64		epoch;
 	bool		taken = false;
+	List	   *configured = NIL;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
@@ -3909,7 +4006,9 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	/* (the tree made last, if nothing it was read from changed since: #483) */
 	fold_caches_begin();
 	epoch = catalog_epoch;
-	if (dependencies_epoch == epoch && made_tree_usable(&cn, &dependencies_made))
+	if (dependencies_epoch == epoch && made_tree_usable(&cn, &dependencies_made) &&
+		(dependencies_configured == NIL ||
+		 strcmp(config_fingerprint(dependencies_configured), dependencies_config) == 0))
 	{
 		*out = dependencies_made.root;
 		if (!debug_prolly_verify_fold_caches)
@@ -3988,7 +4087,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			deps = lappend(deps, entry);
 	}
 	foreach(lc, deps)
-		lfirst(lc) = describe_dependency(lfirst(lc), ordering);
+		lfirst(lc) = describe_dependency(lfirst(lc), ordering, &configured);
 
 	list_sort(deps, dependency_cmp);
 	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
@@ -4023,8 +4122,17 @@ folded_fold_dependencies(ProllyNodeRef *out)
 		PROLLY_CALL(cn.tree, build_finish, b, out);
 		if (catalog_epoch == epoch)
 		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
 			made_tree(&dependencies_made, out);
 			dependencies_epoch = epoch;
+			list_free(dependencies_configured);
+			if (dependencies_config)
+				pfree(dependencies_config);
+			dependencies_configured = list_copy(configured);
+			MemoryContextSwitchTo(old);
+			dependencies_config = MemoryContextStrdup(TopMemoryContext,
+													  config_fingerprint(configured));
 		}
 	}
 	hash_destroy(seen);
@@ -11809,8 +11917,8 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 				(void) tree_item(&k, &hv, &data, &described);
 				ok = described.len == (uint32) desc.len &&
 					memcmp(described.data, desc.data, desc.len) == 0 &&
-					PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &data,
-								changes[i].tids, changes[i].ntids, &rows);
+					finder_fold_rows(cn.finder, rel, &cn.env, &data,
+									 changes[i].tids, changes[i].ntids, &rows);
 			}
 			if (ok)
 			{
@@ -12062,8 +12170,8 @@ folded_advance_own(const ProllyNodeRef *baseline,
 				 !cn.finder->can_advance(rel, &(ProllyValue)
 										 {(const uint8 *) a->bt->state.data,
 										  a->bt->state.len})) ||
-				!PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &a->bt->data,
-							 changes[i].tids, changes[i].ntids, &a->now))
+				!finder_fold_rows(cn.finder, rel, &cn.env, &a->bt->data,
+								  changes[i].tids, changes[i].ntids, &a->now))
 			{
 				table_close(rel, AccessShareLock);
 				continue;
@@ -13328,11 +13436,15 @@ settle_merged_names(List *objs, const char *table)
 
 static void
 folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
-					 List **renames, StringInfo identity)
+					 List *keep_ours, List **renames, StringInfo identity)
 {
 	List	   *merged = NIL;
 	List	   *tables = NIL;
+	List	   *kept_as_ours = NIL;
+	List	   *kept_merged_names = NIL;
 	ListCell   *lc;
+	ListCell   *kc;
+	ListCell   *nc;
 
 	for (int i = 0; i < 3; i++)
 	{
@@ -13352,14 +13464,46 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 		MergedObject *m = lfirst(lc);
 		ListCell   *cc;
 
+		bool		ours = false;
+
 		m->id.name = merged_name(m, NULL);
+
+		/* (kept as ours has it: ours' names, the table's and its columns') */
+		foreach_ptr(char, keep, keep_ours)
+			ours |= strcmp(keep, m->id.name) == 0;
+		if (ours && m->in[1])
+		{
+			kept_as_ours = lappend(kept_as_ours, m);
+			kept_merged_names = lappend(kept_merged_names, m->id.name);
+			m->id.name = pstrdup(m->in[1]->name);
+		}
 		foreach(cc, m->columns)
 		{
 			MergedObject *c = lfirst(cc);
 
-			c->id.name = merged_name(c, m->id.name);
+			c->id.name = ours && c->in[1] ? pstrdup(c->in[1]->name) :
+				merged_name(c, m->id.name);
 		}
 		settle_merged_names(m->columns, m->id.name);
+	}
+
+	/*
+	 * (another table the merge keeps under the name a table kept as ours
+	 * has it takes, theirs having swapped their names or made another of
+	 * it: refused, not kept)
+	 */
+	forboth(kc, kept_as_ours, nc, kept_merged_names)
+	{
+		MergedObject *m = lfirst(kc);
+
+		foreach_ptr(MergedObject, x, merged)
+			if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+								(char *) lfirst(nc)),
+						 errdetail("Kept as the branch names it, %s, it would share that name with another table the merge keeps.",
+								   m->id.name)));
 	}
 	settle_merged_names(merged, NULL);
 

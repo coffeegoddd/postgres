@@ -33,6 +33,8 @@
  * what else it requires); without, it is missing too.  An extension the
  * database has is never changed: one older than needed, or in another
  * schema, is an error.  what names the operation, for messages ("clone").
+ * The first tree is the head a clone checks out: where the heads record
+ * one configuration row's key with different values, its row is written.
  */
 extern void prolly_check_dependencies(List *trees, bool install,
 									  const char *what);

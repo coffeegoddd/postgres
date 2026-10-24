@@ -160,7 +160,11 @@ BEGIN;
 SELECT 'merge violating', (dolt_merge('main'))[2:4];
 SELECT 'violations', string_agg(table_name || ' ' || num_violations, ', ' ORDER BY table_name)
 FROM dolt_constraint_violations();
-SELECT 'unique violation', string_agg(violation_type, ',') FROM dolt_constraint_violations('gis_uq');
+-- (as Dolt records them: the merged row its unique index refused, and the
+-- row it collides with)
+SELECT 'unique violation', string_agg(violation_type || ' ' || (violating_row->>'id'), ','
+                                      ORDER BY violating_row->>'id')
+FROM dolt_constraint_violations('gis_uq');
 SELECT 'exclusion violation', string_agg(violation_type, ',') FROM dolt_constraint_violations('gis_ex');
 ROLLBACK;
 SELECT 'nothing merged', (SELECT string_agg(id::text, ',') FROM gis_uq), (SELECT string_agg(id::text, ',') FROM gis_ex);

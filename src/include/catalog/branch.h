@@ -19,6 +19,7 @@
 #include "access/transam.h"
 #include "executor/tuptable.h"
 #include "nodes/pg_list.h"
+#include "storage/locktag.h"
 #include "utils/relcache.h"
 
 /* a branch-aware catalog's branch column */
@@ -157,6 +158,12 @@ extern void set_session_branch(Oid branch);
 
 /* check out a branch, locked while the session is on it; false if gone */
 extern bool check_out_branch(Oid branch);
+
+/*
+ * the lock a branch's sessions hold it by (AccessShareLock) and its
+ * deletion takes (AccessExclusiveLock)
+ */
+extern void branch_locktag(LOCKTAG *tag, Oid branch);
 
 /* lock a branch to delete it; false if a session is on it */
 extern bool lock_branch_for_delete(Oid branch);

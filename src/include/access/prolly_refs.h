@@ -94,6 +94,8 @@ typedef struct ProllyMergeState
 	int			nschema;
 	char	  **schema_tables;	/* in schema conflicts, kept as the branch
 								 * has them (names, qualified; palloc'd) */
+	char	  **schema_base_tables; /* each one's name in the base */
+	char	  **schema_their_tables;	/* and in theirs */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -111,9 +113,10 @@ typedef struct ProllyMergeState
 /*
  * A constraint violation a merge (or cherry-pick) left on a branch: a row
  * of a table, as JSON, that breaks one of its constraints ("foreign key":
- * the row is in the table; "unique index", "exclusion constraint", "check
- * constraint", "not null": the merge didn't write it), and what it breaks,
- * as JSON.
+ * the row is in the table; "exclusion constraint", "check constraint",
+ * "not null": the merge didn't write it; "unique index": the row the merge
+ * didn't write, or a row of the table it collides with), and what it
+ * breaks, as JSON.
  */
 typedef struct ProllyViolation
 {
@@ -726,6 +729,18 @@ typedef struct ProllyRefsRoutine
 	bool		(*pin_get) (const char *name, ProllyHash *commit,
 							StringInfo info);
 	void		(*pins) (ProllyPinVisit visit, void *arg);
+
+	/*
+	 * Optional: the commit (*at) whose tables the session branch's own
+	 * record of them lists relation relid among, the record made by the
+	 * branch's last commit; false if it doesn't (a table made, or dropped
+	 * and made again, since that commit), or there is no record.  The
+	 * branch's head may have moved since without a commit (a reset, a
+	 * fast-forward): the record is still of the commit that made it.  A
+	 * history read takes a version of a table for the table here only
+	 * through this, as a commit holds tables by name and identity alone.
+	 */
+	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
 } ProllyRefsRoutine;
 
 /*
@@ -769,9 +784,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins"
+	"pin_set", "pin_get", "pins", "recorded_relation"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK pins
+#define PROLLY_REFS_LAST_CALLBACK recorded_relation
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

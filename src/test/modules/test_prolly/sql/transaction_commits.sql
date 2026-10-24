@@ -241,6 +241,42 @@ SET dolt.transaction_commit = off;
 SELECT length(dolt_commit('-Am', 'outside')::text) AS committed;
 SET dolt.transaction_commit = on;
 
+-- The chunks a transaction's commit writes go into its backend's chunk
+-- cache as it commits: the next transaction's commit, reading the head
+-- the first made (its commit, root, the table's path and the refs), reads
+-- none of them from the chunk store's files.
+CREATE TABLE tc.cached (id int PRIMARY KEY, v int);
+INSERT INTO tc.cached SELECT g, 0 FROM generate_series(1, 20) g;
+UPDATE tc.cached SET v = 1 WHERE id = 1;
+SELECT pg_stat_force_next_flush();
+SELECT value AS file_reads FROM pg_stat_prolly WHERE name = 'chunk_file_reads' \gset
+UPDATE tc.cached SET v = 1 WHERE id = 2;
+SELECT pg_stat_force_next_flush();
+SELECT value - :file_reads AS file_reads FROM pg_stat_prolly
+  WHERE name = 'chunk_file_reads';
+
+-- What a commit lets into the cache costs nothing per subtransaction: a
+-- commit then many subtransactions in one transaction keep the backend's
+-- memory as it was.
+SET dolt.transaction_commit = off;
+DO $$
+DECLARE
+	before bigint;
+	after bigint;
+BEGIN
+	PERFORM dolt_commit('-Am', 'before subtransactions', '--allow-empty');
+	SELECT sum(total_bytes) INTO before FROM pg_backend_memory_contexts;
+	FOR i IN 1..20000 LOOP
+		BEGIN
+			PERFORM 1;
+		EXCEPTION WHEN OTHERS THEN NULL;
+		END;
+	END LOOP;
+	SELECT sum(total_bytes) INTO after FROM pg_backend_memory_contexts;
+	RAISE NOTICE 'memory bounded: %', after - before < 8 * 1024 * 1024;
+END $$;
+SET dolt.transaction_commit = on;
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');
