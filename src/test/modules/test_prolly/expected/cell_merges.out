@@ -207,8 +207,9 @@ SELECT * FROM cm.u ORDER BY pk;
 SELECT violation_type, violating_row FROM dolt_constraint_violations('cm.u');
  violation_type |          violating_row          
 ----------------+---------------------------------
+ unique index   | {"pk": 1, "col1": 1, "col2": 1}
  unique index   | {"pk": 2, "col1": 1, "col2": 1}
-(1 row)
+(2 rows)
 
 ROLLBACK;
 -- Columns both set to NULL agree; one set to NULL and one changed don't.
@@ -343,7 +344,7 @@ SELECT (dolt_merge('cm_right'))[2:4];
 SELECT * FROM dolt_constraint_violations();
  table_name | num_violations 
 ------------+----------------
- cm.u       |              1
+ cm.u       |              2
 (1 row)
 
 DROP TABLE cm.u;

@@ -2671,7 +2671,7 @@
       "index": 34,
       "name": "unique keys, update violation from left",
       "source_sha256": "fa79d9d0b011afa80f38fd2fa931ead0886b867c004d347173c9e60409902118",
-      "scenario_sha256": "fab84e27b903d0a61d42e6ac76135532e5bef6ebad742ba6959d58915a10367a",
+      "scenario_sha256": "711c457acb0f7dee9e94bc675fb56452dfb80473342ba095f87457fad784fa59",
       "setup": [
         {
           "index": 0,
@@ -2765,14 +2765,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Preserved expected rows and their order. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 3,
@@ -2788,7 +2788,7 @@
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
         "dolt_status names tables schema-qualified (public.t), and staged is a boolean.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -2798,7 +2798,7 @@
       "index": 35,
       "name": "unique keys, update violation from right",
       "source_sha256": "c4198a9d6276c714e3c88b2c59c2eb981c47cdb977ba2923601be8ec913ffa82",
-      "scenario_sha256": "8b65c27445c89463192eb1c416adebee32afe23dcb82183585a99853b51be5cb",
+      "scenario_sha256": "2f2b2fb90daba7e18a01408c222096c688b7c6ede901f6e99c49a43bfc06e2ac",
       "setup": [
         {
           "index": 0,
@@ -2892,14 +2892,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Preserved expected rows and their order. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 3,
@@ -2915,7 +2915,7 @@
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
         "dolt_status names tables schema-qualified (public.t), and staged is a boolean.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -2925,7 +2925,7 @@
       "index": 36,
       "name": "cell-wise merges can result in a unique key violation",
       "source_sha256": "534ef7925e0df26297288c874887cc4327c60ac04a0635af9b6a3b17d30c69d3",
-      "scenario_sha256": "5331c84fb323b77c00a0f7e78c9a7353f306dfab9b07d4f9eab90bbfeff5054d",
+      "scenario_sha256": "816f85270d807c0bc95c807aebcaa1e5efbdb85b30402b5d7d738c6e53626528",
       "setup": [
         {
           "index": 0,
@@ -3019,14 +3019,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Preserved expected rows and their order. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 3,
@@ -3042,7 +3042,7 @@
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
         "dolt_status names tables schema-qualified (public.t), and staged is a boolean.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -5226,7 +5226,7 @@
       "index": 0,
       "name": "Keyless merge with unique indexes documents violations",
       "source_sha256": "68a2a1fd2972eff09b18c33baa4141635b3dbeccc1722155e81b5a49bb6d2aeb",
-      "scenario_sha256": "79e808a5e048d97d4b90c09d39807e1964f67879b3cb6335a2d399eb38b9882e",
+      "scenario_sha256": "67cc118fd4ba7c00b94a6dde329b00c4e72b255fa300c8ad6212047e8f9f769e",
       "setup": [
         {
           "index": 0,
@@ -5313,14 +5313,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Preserved expected rows and their order. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Preserved expected rows and their order. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -5328,7 +5328,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -5470,7 +5470,7 @@
       "index": 3,
       "name": "unique key violation for keyless table",
       "source_sha256": "2805c9090622fde7adb3739674dc22e48d70af34a3edfe633d9c926e95a9c0ea",
-      "scenario_sha256": "d05537b0116684230759c847ee2c3ce03bfd527115fd899fc633a0f4d1feda16",
+      "scenario_sha256": "b3a4d92c573de9b26c324e2482e53f5798a17a09cafac8cac1cca9fdb91c837d",
       "setup": [
         {
           "index": 0,
@@ -5571,7 +5571,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -5579,7 +5579,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -6156,7 +6156,7 @@
       "index": 14,
       "name": "violation system table supports multiple violations per row",
       "source_sha256": "613b687ce04a54e7b5f7c7a256901e8388265bf8db90af6a2b5736a56268ff8a",
-      "scenario_sha256": "a41c01587d8afb9ddbc8f5b4c90c61b95b48e55de688014131c58e11c0672877",
+      "scenario_sha256": "6d25ed82b6213c7f53008a57bc267083970c64bee8ef8c11357d9ef0ab944225",
       "setup": [
         {
           "index": 0,
@@ -6249,35 +6249,35 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 3,
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12). from_root_ish (the commit a violation came from) has no counterpart in prolly's rows; the other columns are checked."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12). from_root_ish (the commit a violation came from) has no counterpart in prolly's rows; the other columns are checked."
         },
         {
           "index": 4,
           "steps": [
             "assert-4"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 5,
           "steps": [
             "assert-5"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -6285,7 +6285,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -6412,7 +6412,7 @@
       "index": 11,
       "name": "Multiple unique key violations part 1 (repro issue #5719)",
       "source_sha256": "568b4e888eb3042912e7e71e8829057279d92d91968a316bafb7c72b125dd9eb",
-      "scenario_sha256": "d0dc87171c063c93166c96695d3453166423c1d59003baee1fe624a73b798baf",
+      "scenario_sha256": "1322093ff023649c16b9b27c3c1d015f9aba1af5047c218148554007e5390599",
       "setup": [
         {
           "index": 0,
@@ -6499,14 +6499,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -6514,7 +6514,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -6524,7 +6524,7 @@
       "index": 12,
       "name": "Multiple unique key violations part 2 (repro issue #5719)",
       "source_sha256": "25721790e85b638d464451010a4b608c291eb16b1c778a0f4fb1b59090f1f9fd",
-      "scenario_sha256": "eff5b8654eb31c233a32b310e262f22a16849c8ec36198010f2d61d75c97a38a",
+      "scenario_sha256": "9a02478831525fb4024372b1a444555beebee4b40a006bf59e33ba94879c9192",
       "setup": [
         {
           "index": 0,
@@ -6618,14 +6618,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -6633,7 +6633,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -6643,7 +6643,7 @@
       "index": 13,
       "name": "Multiple unique key violations part 3 (repro issue #5719)",
       "source_sha256": "434768fb8c6ab432188cec701427c30cfab99cd5bc148e37c0d2d38bdc70751f",
-      "scenario_sha256": "cf580658bcee1d8a8ae53899aa0359a5f4634cf68345d75fb1b90f9856d2e06f",
+      "scenario_sha256": "95d2ddfaebb3e5c4ccc8b010b2ebaf574507e424b565783260ffdb564a2f831d",
       "setup": [
         {
           "index": 0,
@@ -6744,14 +6744,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -6759,7 +6759,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -6879,7 +6879,7 @@
       "index": 6,
       "name": "unique key violation should be thrown even if a PK column is used in the unique index 2",
       "source_sha256": "0b478362e8c52c151b7aa14b61dace318bf4768276ea99c38bb734d3d266ff47",
-      "scenario_sha256": "4ffe175d9a97fc29389a1bf8967c9f184ff7f69088e5880356c533ab1f58af91",
+      "scenario_sha256": "ff6c6ccc1224e7856cd8d920d3994a62cb33ce81003d964f943db6cc0e59700f",
       "setup": [
         {
           "index": 0,
@@ -6966,7 +6966,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -6974,7 +6974,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -6984,7 +6984,7 @@
       "index": 5,
       "name": "unique key violation should be thrown even if a PK column is used in the unique index",
       "source_sha256": "25dc97bf4f4df07c2495bd48d66243ec05660b8d5bdada1eeca629b111a57d4f",
-      "scenario_sha256": "61c456206c47d9a0bfae3dd195cf98cfc50ce912c38f4a44e921a2c98e0fe4c4",
+      "scenario_sha256": "80832c34953600e66cde8be57f60508e199e657013a89b457bb88135daabf8b1",
       "setup": [
         {
           "index": 0,
@@ -7071,7 +7071,7 @@
           "steps": [
             "assert-1"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -7079,7 +7079,7 @@
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
         "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row.",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -7089,7 +7089,7 @@
       "index": 10,
       "name": "Multiple unique key violations for a given row reported",
       "source_sha256": "399f4ed08b98a3efdca0e9c82933d561ee3c735cb2c88486152c4c850f7381a3",
-      "scenario_sha256": "30a1e3340ea4f37375259b2caa6db7bdd43307d091c88cf80f94a2bccbec0450",
+      "scenario_sha256": "7c509f19f2b30d98c8c33fb7704edc694a1841ad7c0ee862f700827c5c6af35c",
       "setup": [
         {
           "index": 0,
@@ -7176,21 +7176,21 @@
           "steps": [
             "assert-1"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified, counts as bigint. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2"
           ],
-          "note": "Preserved expected rows; unordered queries compare bags with duplicates. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Preserved expected rows; unordered queries compare bags with duplicates. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
         "CALL becomes SELECT; DOLT_CHECKOUT('-b') becomes a branch plus a checkout. (D3)",
         "No staging area: dolt_add stages nothing, and -a/-A commit the whole working set. (D1)",
         "dolt_force_transaction_commit becomes dolt.allow_commit_conflicts. (D5)",
-        "Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once, for the first unique constraint it breaks, not the rows it collides with; Dolt writes it and records each row for each constraint. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+        "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
       ]
     },
     {
@@ -9290,7 +9290,7 @@
       "index": 7,
       "name": "unique constraint violation",
       "source_sha256": "2c280c5c7bd4002fa5a9b8d59b02315d277e49c5ef7401e981ab297e17fdbde3",
-      "scenario_sha256": "4e84aaa7aca1f13ba78b861dd32797214f19ce539fd71b3641fbd478d2383806",
+      "scenario_sha256": "1ed3dc5e42a20d82b5d9a02f6db63bc8cea2790ef680cfea5ef49cac3387581c",
       "setup": [
         {
           "index": 0,
@@ -9370,7 +9370,7 @@
             "assert-2-forward",
             "assert-2-flipped"
           ],
-          "note": "The summary is dolt_constraint_violations(), tables schema-qualified. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "The summary is dolt_constraint_violations(), tables schema-qualified. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 3,
@@ -9378,7 +9378,7 @@
             "assert-3-forward",
             "assert-3-flipped"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12). Which row is written depends on the direction: the merged side's row is the one not written."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12). Which row is written depends on the direction: the merged side's row is the one not written."
         },
         {
           "index": 4,
@@ -9386,7 +9386,7 @@
             "assert-4-forward",
             "assert-4-flipped"
           ],
-          "note": "rows Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -10240,7 +10240,7 @@
       "index": 6,
       "name": "adding a unique key, with unique key violation",
       "source_sha256": "33ee38f5d04575eb3bbb550ef520d59ba9a8151c188eee16d8e2a05e3e9f9b8f",
-      "scenario_sha256": "9bb32ac2237c78c93ffbc9583183781143cb024eb7c12dca274c87047b41da73",
+      "scenario_sha256": "5645ea49fec69b37e131d67c38d6f145e20022c4ba8f2c68cd7f645d68f60055",
       "setup": [
         {
           "index": 0,
@@ -10306,14 +10306,14 @@
           "steps": [
             "assert-1-flipped"
           ],
-          "note": "rows Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 2,
           "steps": [
             "assert-2-flipped"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, once; Dolt writes it and records every row involved. Expected rows and violations follow prolly's (an intended divergence, Postgres semantics: D12)."
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -17490,7 +17490,7 @@
       "index": 62,
       "name": "`Delete from table` should keep artifacts - violations",
       "source_sha256": "f85edce565e9ed4c86d0464bd86062c2a7e88b534183709aef5be98e162efb51",
-      "scenario_sha256": "0595e5ada0268b36aa39ce463f79cb7bba2147ab9dbae2964565af1dcd609247",
+      "scenario_sha256": "405fbceb89eb614d8a6440bbaef5d285529a1f33d98f94397c73492bf2635012",
       "shared_setup": "dolt-setup-create-violations",
       "setup": [
         {
@@ -17571,7 +17571,7 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 1,
@@ -17592,7 +17592,7 @@
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Kept when the rows are deleted, as in Dolt. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Kept when the rows are deleted, as in Dolt. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
@@ -17610,7 +17610,7 @@
       "index": 63,
       "name": "`Truncate table` should keep artifacts - violations",
       "source_sha256": "36f003f49b8cfd6a56e9286bbeb2e43a47ba29f54c3d613db2aa0f82e3191c11",
-      "scenario_sha256": "28134fbb9bf9c025528605bfc68a39ae3f91ea4d598bfaee0583e7ff7fc0cc87",
+      "scenario_sha256": "0939618d7c12357fc29dabb31a247ffc19fa2d224e214c95272eb31fba4efb05",
       "shared_setup": "dolt-setup-create-violations",
       "setup": [
         {
@@ -17691,7 +17691,7 @@
           "steps": [
             "assert-0"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         },
         {
           "index": 1,
@@ -17712,7 +17712,7 @@
           "steps": [
             "assert-3"
           ],
-          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Kept when the rows are deleted, as in Dolt. Postgres can't hold rows that break a unique constraint: the merge doesn't write the row that would (the branch keeps its own version), and records that row alone, not the row it collides with; Dolt writes it and records both. Expected rows and violations follow prolly's. (D12)"
+          "note": "dolt_constraint_violations_<t> becomes dolt_constraint_violations('<t>'), whose rows are (violation_type, violating_row jsonb, violation_info): the columns are read from violating_row. Kept when the rows are deleted, as in Dolt. Violations are Dolt's: the row the merge didn't write and each row it collides with, for each unique index it breaks. Postgres can't hold both rows, so the table keeps the branch's own version, not the merged row (D12)."
         }
       ],
       "adaptations": [
