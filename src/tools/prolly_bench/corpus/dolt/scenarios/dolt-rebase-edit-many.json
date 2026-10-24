@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-edit-many",
+  "description": "Reviewed Dolt port: dolt_rebase: multiple edit actions",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase: multiple edit actions"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t on main",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature2"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature2"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (10)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 1",
+        "-a"
+      ],
+      "save": "f1"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (20)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "commit 2",
+        "-a"
+      ],
+      "save": "f2"
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--interactive', 'main')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"interactive rebase started on branch dolt_rebase_feature2; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "UPDATE dolt_rebase SET action = 'edit'",
+      "expect": {
+        "tag": "UPDATE 2"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT r[1], r[2] ~ '^edit action paused at commit [0-9a-f]+ \\(.+\\)\\.\\s+You can now modify the working directory and stage changes\\. When ready, continue the rebase by calling dolt_rebase\\(''--continue''\\)$' FROM dolt_rebase('--continue') r",
+      "expect": {
+        "rows": [
+          [
+            "0",
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT r[1], r[2] ~ '^edit action paused at commit [0-9a-f]+ \\(.+\\)\\.\\s+You can now modify the working directory and stage changes\\. When ready, continue the rebase by calling dolt_rebase\\(''--continue''\\)$' FROM dolt_rebase('--continue') r",
+      "expect": {
+        "rows": [
+          [
+            "0",
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Successfully rebased and updated refs/heads/feature2\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

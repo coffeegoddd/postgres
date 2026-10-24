@@ -934,7 +934,9 @@ qualified_name(Oid relid)
  * --skip-empty (nothing to commit: no commit, and NULL), -f/--force
  * (constraint violations don't stop the commit, as in Dolt; the
  * transaction still can't commit with them unless dolt.allow_commit_conflicts
- * is on).
+ * is on), --amend (the head commit replaced by one of the working set with
+ * its parents, and its message unless -m gives one, as Dolt's: never
+ * empty, and refused with a merge in progress).
  */
 Datum
 dolt_commit(PG_FUNCTION_ARGS)
@@ -947,10 +949,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 	bool		skip_empty = false;
 	bool		force = false;
 	bool		dated = false;
+	bool		amend = false;
 	bool		options = true;	/* until "--" */
 	ProllyHash	id = {0};
 	bool		committed = false;
 	ProllyMergeState ms;
+	ProllyCommitInfo amended;
 	const char *result[1];
 
 	for (int i = 0; i < nargs; i++)
@@ -979,6 +983,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 			skip_empty = true;
 		else if (is_option(a, "force"))
 			force = true;
+		else if (is_option(a, "amend"))
+			amend = true;
 		else if (short_flags(a) != NULL)
 		{
 			/* Short options together, as -Am message. */
@@ -1000,6 +1006,24 @@ dolt_commit(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_commit", a);
 	}
+	if (amend)
+	{
+		ProllyHash	head;
+
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("you are in the middle of a merge -- cannot amend")));
+		memset(&amended, 0, sizeof(amended));
+		if (!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+			!PROLLY_CALL(refs(), commit_get, &head, &amended))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("nothing to amend"),
+					 errdetail("The branch has no commit.")));
+		if (message == NULL)
+			message = amended.message;
+	}
 	if (message == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1018,8 +1042,19 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		note_integration();
-		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, message,
-													 allow_empty, &id));
+		if (amend)
+		{
+			/* (the head the new commit's parent, as a commit on it is made) */
+			if (amended.nparents > 0)
+				PROLLY_CALL(refs(), set_head, &amended.parents[0]);
+			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), commit_with, message,
+											 amended.parents, amended.nparents,
+											 NULL, &id));
+			committed = true;
+		}
+		else
+			BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, message,
+														 allow_empty, &id));
 	}
 	PG_FINALLY();
 	{

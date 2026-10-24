@@ -636,10 +636,15 @@ or fixup then replaces the pick's commit with one of its working set, and
 a commit that became empty is dropped (unless --empty=keep).  The plan is
 edited through the dolt_rebase view, whose INSTEAD OF trigger changes the
 state.  A step that conflicts stops the rebase as a pick in progress
-(outside a transaction block, an error that rolls the whole rebase back),
-and --continue commits its resolution; the last step done, the rebased
-branch is moved to the rebase's head (refused if it moved meanwhile), and
-the rebase's branch deleted.
+(outside a transaction block, an error, which rolls back the statement:
+a rebase it began is gone, one begun before is left as it was, to
+continue or abort), and --continue commits its resolution; a pick whose
+definitions conflict (a schema conflict) is such an error too.  The last
+step done, the rebased branch is moved to the rebase's head (refused if
+it moved meanwhile), and the rebase's branch deleted.  An edit's stop
+may amend the commit it stopped at: dolt_commit('--amend') replaces the
+head commit with one of the working set and the head's parents, its
+message kept unless -m gives one, as Dolt's.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
 

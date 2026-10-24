@@ -166,8 +166,12 @@ adapts.
   working root includes its own (#501). A rebase whose step conflicts
   stops there, in a transaction block (or with
   `dolt.allow_commit_conflicts`), returning `{1, message}` rather than
-  Dolt's error, which here would roll the stop back; outside a block it
-  is an error that rolls the whole rebase back, as Dolt aborts it.
+  Dolt's error, which here would roll the stop back. Outside a block it
+  is an error, and the statement rolls back: a rebase the statement
+  began is gone, as Dolt aborts it, but one begun before (an
+  interactive rebase's `--continue`) stays as it was before the
+  statement, its plan to change or abort, where Dolt aborts it. A
+  schema conflict is such an error, in a block or not.
 - **Why:** Postgres's atomicity: a statement's effects are the
   transaction's.
 - **Port:** a case asserting that reset committed the transaction is

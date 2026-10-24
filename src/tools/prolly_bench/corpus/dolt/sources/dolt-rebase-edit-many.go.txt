@@ -1,0 +1,32 @@
+{
+		Name: "dolt_rebase: multiple edit actions",
+		SetUpScript: []string{
+			"create table t (pk int primary key);",
+			"call dolt_commit('-Am', 'creating table t on main');",
+			"call dolt_branch('feature2');",
+			"call dolt_checkout('feature2');",
+			"insert into t values (10);",
+			"call dolt_commit('-am', 'commit 1');",
+			"insert into t values (20);",
+			"call dolt_commit('-am', 'commit 2');",
+			"call dolt_rebase('--interactive', 'main');",
+			"update dolt_rebase set action = 'edit';",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				// First edit pause
+				Query:    "call dolt_rebase('--continue');",
+				Expected: []sql.Row{{0, editPauseMessage}},
+			},
+			{
+				// Continue first edit without changes - should pause at second edit
+				Query:    "call dolt_rebase('--continue');",
+				Expected: []sql.Row{{0, editPauseMessage}},
+			},
+			{
+				// Continue second edit to complete rebase
+				Query:    "call dolt_rebase('--continue');",
+				Expected: []sql.Row{{0, "Successfully rebased and updated refs/heads/feature2"}},
+			},
+		},
+	}
