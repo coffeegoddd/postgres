@@ -1,0 +1,194 @@
+-- A move shares another branch's storage for a table only if both store it
+-- alike.  Equal definitions don't make equal layouts: a column added and
+-- dropped on one branch leaves its number taken there, so the same table
+-- defined the same way stores its columns at other numbers, and the other
+-- branch's tuples read by this one's descriptor would put a column's
+-- value in the wrong place.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE SCHEMA sl VERSIONED;
+CREATE TABLE sl.t (id int PRIMARY KEY, v text);
+INSERT INTO sl.t SELECT g, 'v' || g FROM generate_series(1, 3000) g;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('lay');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- main: w added.
+ALTER TABLE sl.t ADD COLUMN w text DEFAULT 'w';
+SELECT length(dolt_commit('-am', 'w on main')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- lay: x added (with a value in every row) and dropped, then w: the same
+-- definition as main's, w stored as column 4.
+SELECT dolt_checkout('lay');
+         dolt_checkout          
+--------------------------------
+ {0,"Switched to branch 'lay'"}
+(1 row)
+
+ALTER TABLE sl.t ADD COLUMN x int;
+UPDATE sl.t SET x = id;
+ALTER TABLE sl.t DROP COLUMN x;
+ALTER TABLE sl.t ADD COLUMN w text DEFAULT 'w';
+UPDATE sl.t SET v = 'lay' WHERE id <= 2000;
+SELECT (dolt_commit('-am', 'lay'))[1] AS l1 \gset
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       0
+(1 row)
+
+-- main moved to lay's commit: the same definitions, 2000 rows differ, and
+-- lay is at the commit, but stores t otherwise, so the 2000 rows are
+-- written.  (Shared, its pages would read w as another column, and every
+-- row would be written again once that was found.)
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       0
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since(c) IS NOT NULL AS counting
+FROM unnest(ARRAY['move_tables_shared', 'apply_rows']) c;
+ counting 
+----------
+ t
+ t
+(2 rows)
+
+SELECT dolt_reset('--hard', :'l1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT c AS counter, pg_temp.since(c) AS grew
+FROM unnest(ARRAY['move_tables_shared', 'apply_rows']) c;
+      counter       | grew 
+--------------------+------
+ move_tables_shared |    0
+ apply_rows         | 2000
+(2 rows)
+
+SELECT count(*) FILTER (WHERE w = 'w') AS w_read, count(*) FILTER (WHERE w IS NULL) AS w_null,
+	count(*) FILTER (WHERE v = 'lay') AS from_lay FROM sl.t;
+ w_read | w_null | from_lay 
+--------+--------+----------
+   3000 |      0 |     2000
+(1 row)
+
+SELECT test_fold_root() = prolly_root_hash('HEAD') AS at_target;
+ at_target 
+-----------
+ t
+(1 row)
+
+-- Stored alike (a branch made from main now), it is shared.
+SELECT dolt_branch('alike');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('alike');
+          dolt_checkout           
+----------------------------------
+ {0,"Switched to branch 'alike'"}
+(1 row)
+
+UPDATE sl.t SET v = 'alike' WHERE id <= 2000;
+SELECT (dolt_commit('-am', 'alike'))[1] AS a1 \gset
+SELECT count(*) AS changes FROM dolt_status;
+ changes 
+---------
+       0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('move_tables_shared') IS NOT NULL AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT dolt_reset('--hard', :'a1');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since('move_tables_shared') AS shared;
+ shared 
+--------
+      1
+(1 row)
+
+SELECT count(*) FILTER (WHERE w = 'w') AS w_read, count(*) FILTER (WHERE v = 'alike') AS from_alike
+FROM sl.t;
+ w_read | from_alike 
+--------+------------
+   3000 |       2000
+(1 row)
+
+SELECT dolt_branch('-D', 'lay', 'alike');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA sl CASCADE;
+NOTICE:  drop cascades to table sl.t

@@ -187,6 +187,14 @@ prolly_autovacuum_init(void)
 							 PGC_SIGHUP,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.kept_checkouts",
+							"How many detached checkouts' hidden branches a database keeps after their sessions leave.",
+							"A later checkout of the commit is then a branch switch, and a move or first use can share a kept checkout's tables instead of writing their rows.  0 keeps none.",
+							&prolly_kept_checkouts,
+							4, 0, 1000,
+							PGC_SUSET,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomBoolVariable("prolly.fold_verify_fatal",
 							 "Makes a fold the verifier finds wrong a PANIC, for testing.",
 							 NULL,

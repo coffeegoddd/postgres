@@ -49,6 +49,7 @@ Changes to this design are tracked in GitHub issues:
 	value_memo        prolly_memo.h           shared, stub
 	writers           prolly_writers.h        modes, stub
 	move_planner      prolly_moveplan.h       costs, stub
+	matcache          prolly_matcache.h       branches, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -300,7 +301,14 @@ merge state in the chunk store's root.  Diff and merge ("folded",
 diffmerge_folded.c) compare canonical trees table by table, reading only
 subtrees that differ; moving a branch to another commit writes the
 differences back through the row applier (applier_replication.c), as
-logical replication's apply worker writes rows.
+logical replication's apply worker writes rows.  A commit of a canonical
+state a caller already holds is written by the refs' commit_root(), from
+the root, dependencies, parents and metadata given: it folds nothing,
+reads no catalog for the commit and moves no branch.  The caller names the
+commit in the same transaction: a collection after it ends drops a commit
+no ref names.  commit_with() folds
+the working set (and the dependencies, from the catalogs) and writes its
+commit through it.
 
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk
@@ -390,11 +398,30 @@ comes to change other refs moves the root from then on.  So an operation
 reading another branch's head (a branch made from it, a merge of it)
 reads the head as last committed, not a commit still open there.
 
-A move to a root another branch's working set is known to be gives the
-tables whose rows differ that branch's storage instead, where sharing their
-blocks costs less than writing the rows (branch operations' share(), the
-canonicalizer's splice_baseline()); a branch's first use copies the branch
-nearest its head.  With none at its head, the move planner (moveplan_costs.c)
+A move (or a first use's move of its copies) gives each table whose rows
+differ from the target's the storage of another state that holds the
+target's table, where sharing costs less than writing the rows (branch
+operations' share(), the canonicalizer's splice_baseline()); a branch's
+first use copies the branch nearest its head.  A source is a branch whose
+working set is known (folded, nobody writing it since), or a kept
+materialization (matcache_branches.c): the hidden branch of a detached
+checkout, kept once its sessions leave, which nothing writes again.  Its
+root must hold the target's table, the same data tree and description,
+and its relations must be the same ones (by id) stored alike: the same
+access method, columns as stored (dropped ones, and the values a short
+tuple's missing columns read as, included), TOAST table and index
+definitions.  Sharing a tree-mapped relation copies its root page, so its
+cost doesn't grow with the table; the source is held against deletion to
+the transaction's end.  A kept source is used only by a snapshot that sees
+it made, so every tuple on its pages is one the snapshot sees as committed
+or aborted, and only while its commit's ordering dependencies match the
+installed extensions, under which its indexes were built.  pg_stat_prolly
+counts the tables a move gave another state's storage (move_tables_shared)
+and the tables and materialized views whose rows it wrote
+(move_tables_written): a checkout's work,
+table by table.
+
+With no branch at its head, the move planner (moveplan_costs.c)
 costs moving each branch's copies there, from the root its working set is
 known or thought to be: each table's rows that differ, estimated from its
 trees by diff_estimate() in a bounded number of nodes, and the tables
@@ -416,6 +443,26 @@ constraint, whose rows the applier rechecks a row at a time.  A table the
 head hasn't begins empty too, so the move drops it without its pages
 having been shared (and, for pages no other map held, logged) first.  A
 table whose definition differs keeps its pages: the move may keep its rows.
+
+Kept materializations (prolly.kept_checkouts, 4 by default, per database)
+make a later checkout of the commit a branch switch, its dependencies
+checked as a first use checks them.  At a first use, the move planner
+takes a kept one as any other branch, by its root, and costs every
+candidate's copies with the tables a kept one holds as the target does
+shared rather than written (a copy the planner empties to reload is
+shared into too), so the copies chosen are those cheapest to finish.  A
+checkout's sweep lets go of those
+past the budget, the least recently checked out first (recency is kept in
+shared memory; after a restart, older branches go first).  The budget
+counts idle ones: one a session is on is neither counted nor let go of,
+nor is the one a detached checkout's sweep is on.  One another sweep let
+go of meanwhile counts as gone, so two sweeps at once let go of no more
+than one would.  Letting go of one is deleting its branch, which
+releases its relations' maps.  Writer branches done with are swept as
+before, apart from the budget.  When something depends on a role being
+dropped, DROP ROLE lets go of its database's idle kept checkouts and
+checks again; another database's are let go of only from that database
+(the error then has a hint).
 
 With dolt.transaction_commit on, a transaction that changed a branch makes
 its commit as it commits: the refs, opened by its first write, call

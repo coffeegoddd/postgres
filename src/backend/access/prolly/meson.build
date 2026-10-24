@@ -23,6 +23,8 @@ backend_sources += files(
   'keyenc_stub.c',
   'keying_pkprefix.c',
   'keying_stub.c',
+  'matcache_branches.c',
+  'matcache_stub.c',
   'memo_shared.c',
   'memo_stub.c',
   'merge_stub.c',

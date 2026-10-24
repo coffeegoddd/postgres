@@ -138,7 +138,11 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  bmap_release_drained          |     0
  bmap_release_blocks_freed     |     0
  bmap_release_refcount_updates |     0
-(82 rows)
+ move_tables_shared            |     0
+ kept_checkouts_reused         |     0
+ kept_checkouts_evicted        |     0
+ move_tables_written           |     0
+(86 rows)
 
 SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'chunks_appended') =
 	(SELECT value FROM pg_stat_prolly WHERE name = 'nodes_written') AS each_node_a_chunk,
