@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-branch-exists",
+  "description": "Reviewed Dolt port: dolt_rebase errors: rebase working branch already exists",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase errors: rebase working branch already exists"
+  },
+  "requires": [
+    "sql",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY)",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "creating table t",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "dolt_rebase_branch1"
+      ]
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (0)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 0",
+        "-a"
+      ],
+      "save": "m0"
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "branch1"
+      ]
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 1",
+        "-a"
+      ],
+      "save": "b1"
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (10)",
+      "expect": {
+        "tag": "INSERT 0 1"
+      }
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "inserting row 10",
+        "-a"
+      ],
+      "save": "b10"
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('-i', 'main')",
+      "expect": {
+        "sqlstate": "42710"
+      }
+    }
+  ]
+}

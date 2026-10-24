@@ -313,6 +313,16 @@ CREATE FUNCTION test_chunk_segments(OUT name text, OUT chunks int,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- What reading and editing a value tree of size bytes costs, each way: a
+-- slice of ilen bytes at offset read, the value read whole, the edit (del
+-- bytes at offset replaced by ilen) spliced, and made by rewriting it
+-- whole: the nodes read and written and the time taken.
+CREATE FUNCTION test_value_edit_cost(size int8, "offset" int8, del int8,
+	ilen int8, OUT method text, OUT nodes_read int8, OUT nodes_written int8,
+	OUT usec float8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- Seal the journal's segment: appends go on to a new one.
 CREATE FUNCTION test_chunk_seal()
 RETURNS void
