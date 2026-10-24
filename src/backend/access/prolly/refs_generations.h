@@ -28,7 +28,8 @@ typedef struct BranchFoldStamp
 extern Size branch_generations_shmem_size(void);
 extern void branch_generations_shmem_init(void *area);
 extern void branch_generations_note_write(Oid branch);
-extern void branch_generations_note_relation(Oid branch, Oid relid);
+extern void branch_generations_note_relation(Oid branch, Oid relid,
+											 int nrows);
 
 /* The refs' fold_mark() and written_since() (prolly_refs.h). */
 extern bool branch_fold_mark(Oid branch, Snapshot snap, ProllyFoldMark *mark);
@@ -76,8 +77,7 @@ extern bool branch_writers_settled(Oid branch, Snapshot snap);
  * saw them; and what it saw.
  */
 extern int	branch_generations_moved_databases(Oid *databases, int max);
-extern int	branch_generations_moved(Oid *branches, uint64 *generations,
-									 int max);
+extern int	branch_generations_moved(ProllyMovedBranch *branches, int max);
 extern void branch_generations_saw(Oid branch, uint64 generation);
 extern void branch_generations_saw_database(Oid database);
 

@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFA
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFB
 
 typedef struct PgStat_ArchiverStats
 {
@@ -762,9 +762,13 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS,	/* extensions that took
 												 * release steps before
 												 * the store grew */
+	PGSTAT_PROLLY_FOLD_WORKER_FOLDS,	/* branches the fold worker folded */
+	PGSTAT_PROLLY_FOLD_WORKER_DEFERRED, /* branches a fold worker's pass
+										 * left for a later one, their
+										 * writes not due yet */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_RELEASE_GROWTH_DRAINS + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_WORKER_DEFERRED + 1)
 
 typedef struct PgStat_ProllyStats
 {
