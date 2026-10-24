@@ -356,5 +356,142 @@ SELECT dolt_merge_base('main', 'mb_side') = dolt_hashof('mb_side~1') AS base_pas
  t
 (1 row)
 
+-- a criss-cross history: each side merged the other's first commit, so
+-- both are maximal common ancestors, of the same height: the base is the
+-- one of the least id, whichever way round.  Its candidates found by
+-- heights, none beneath another, it reads the commits above them and their
+-- parents, not the 250 and more beneath to find which is beneath which
+SELECT dolt_branch('cc_a');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('cc_b');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cc_a') IS NOT NULL AS on_a;
+ on_a 
+------
+ t
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'cc a1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('cc_a1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('cc_b') IS NOT NULL AS on_b;
+ on_b 
+------
+ t
+(1 row)
+
+SELECT length(dolt_commit('--allow-empty', '-m', 'cc b1')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('cc_b1');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT (dolt_merge('cc_a1', '--no-ff', '-m', 'cc b2'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT dolt_checkout('cc_a') IS NOT NULL AS on_a;
+ on_a 
+------
+ t
+(1 row)
+
+SELECT (dolt_merge('cc_b1', '--no-ff', '-m', 'cc a2'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT dolt_merge_base('cc_a', 'cc_b') =
+	   least(dolt_hashof('cc_a1'), dolt_hashof('cc_b1')) AS least_of_two;
+ least_of_two 
+--------------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted('commits_read') AS commits_read;
+ commits_read 
+--------------
+            7
+(1 row)
+
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+SELECT dolt_merge_base('cc_b', 'cc_a') =
+	   least(dolt_hashof('cc_a1'), dolt_hashof('cc_b1')) AS either_way;
+ either_way 
+------------
+ t
+(1 row)
+
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT counted('commits_read') AS commits_read;
+ commits_read 
+--------------
+            7
+(1 row)
+
 \c postgres
 DROP DATABASE regress_commit_heights;

@@ -110,5 +110,33 @@ SELECT length(dolt_commit('--allow-empty', '-m', 'mb side 3')::text) AS committe
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_merge_base('main', 'mb_side') = dolt_hashof('mb_side~1') AS base_past_the_merge;
 
+-- a criss-cross history: each side merged the other's first commit, so
+-- both are maximal common ancestors, of the same height: the base is the
+-- one of the least id, whichever way round.  Its candidates found by
+-- heights, none beneath another, it reads the commits above them and their
+-- parents, not the 250 and more beneath to find which is beneath which
+SELECT dolt_branch('cc_a');
+SELECT dolt_branch('cc_b');
+SELECT dolt_checkout('cc_a') IS NOT NULL AS on_a;
+SELECT length(dolt_commit('--allow-empty', '-m', 'cc a1')::text) AS committed;
+SELECT dolt_branch('cc_a1');
+SELECT dolt_checkout('cc_b') IS NOT NULL AS on_b;
+SELECT length(dolt_commit('--allow-empty', '-m', 'cc b1')::text) AS committed;
+SELECT dolt_branch('cc_b1');
+SELECT (dolt_merge('cc_a1', '--no-ff', '-m', 'cc b2'))[3:4];
+SELECT dolt_checkout('cc_a') IS NOT NULL AS on_a;
+SELECT (dolt_merge('cc_b1', '--no-ff', '-m', 'cc a2'))[3:4];
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+:reset
+SELECT dolt_merge_base('cc_a', 'cc_b') =
+	   least(dolt_hashof('cc_a1'), dolt_hashof('cc_b1')) AS least_of_two;
+:flush
+SELECT counted('commits_read') AS commits_read;
+:reset
+SELECT dolt_merge_base('cc_b', 'cc_a') =
+	   least(dolt_hashof('cc_a1'), dolt_hashof('cc_b1')) AS either_way;
+:flush
+SELECT counted('commits_read') AS commits_read;
+
 \c postgres
 DROP DATABASE regress_commit_heights;

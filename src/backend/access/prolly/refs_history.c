@@ -269,17 +269,20 @@ prolly_history_height(const ProllyHash *id, HTAB *heights,
 }
 
 /*
- * The common ancestors of a and b met first, as first_common() finds them,
- * by heights instead of a walk of all of a's ancestors (#720): commits are
- * taken highest first, each marked with the side it was reached from (a's,
- * b's, both), a commit reached from both a candidate and its ancestors
- * marked as beneath one, until every commit still to be taken is beneath
- * one.  A commit's height exceeds its parents', so none is taken before a
- * commit it descends from: the walk reads only the commits above the merge
- * base, and a few beside it, not the whole history.  Every maximal common
- * ancestor is among the candidates (and only common ones are).  False, the
- * caller walking instead, if a commit read has no height recorded (or
- * can't be read).
+ * The maximal common ancestors of a and b (those no other common ancestor
+ * descends from), by heights instead of a walk of all of a's ancestors:
+ * commits are taken highest first, each marked with the side it was
+ * reached from (a's, b's, both), a commit reached from both a candidate
+ * and its ancestors marked as beneath one, until every commit still to be
+ * taken is beneath one.  A commit's height exceeds its parents', so none
+ * is taken before a commit it descends from, and a commit's marks are all
+ * made by the time it is taken: one reached from both sides and not
+ * beneath a candidate then is a maximal one.  The walk reads only the
+ * commits above the merge base, and a few beside it, not the whole
+ * history, and holds marks for those alone.  Each candidate's height is
+ * returned with it.  False, the caller walking instead, if a commit read
+ * has no height recorded, or one no less than a child's (heights that
+ * aren't Dolt's), or can't be read.
  */
 #define PAINT_A			0x01
 #define PAINT_B			0x02
@@ -290,6 +293,7 @@ typedef struct PaintFlags
 {
 	ProllyHash	id;				/* (the key) */
 	uint8		flags;
+	int			queued;			/* how many times it is in the queue */
 } PaintFlags;
 
 typedef struct PaintEntry
@@ -305,10 +309,12 @@ typedef struct PaintQueue
 	PaintEntry *e;
 	int			n;
 	int			cap;
+	int			open;			/* entries not beneath a candidate */
 } PaintQueue;
 
 static void
-paint_push(PaintQueue *q, const ProllyHash *id, const ProllyCommitInfo *info)
+paint_push(PaintQueue *q, PaintFlags *pf, const ProllyHash *id,
+		   const ProllyCommitInfo *info)
 {
 	int64		height = info->height;
 	int			i;
@@ -328,6 +334,9 @@ paint_push(PaintQueue *q, const ProllyHash *id, const ProllyCommitInfo *info)
 	q->e[i].height = height;
 	q->e[i].nparents = info->nparents;
 	memcpy(q->e[i].parents, info->parents, sizeof(ProllyHash) * info->nparents);
+	pf->queued++;
+	if (!(pf->flags & PAINT_BENEATH))
+		q->open++;
 }
 
 static PaintEntry
@@ -355,7 +364,7 @@ paint_pop(PaintQueue *q)
 	return top;
 }
 
-static uint8 *
+static PaintFlags *
 paint_flags(HTAB *flags, const ProllyHash *id)
 {
 	ProllyHash	key = prolly_hash_key(id);
@@ -363,26 +372,26 @@ paint_flags(HTAB *flags, const ProllyHash *id)
 	PaintFlags *pf = hash_search(flags, &key, HASH_ENTER, &found);
 
 	if (!found)
+	{
 		pf->flags = 0;
-	return &pf->flags;
+		pf->queued = 0;
+	}
+	return pf;
 }
 
-/* Is anything still to be taken not beneath a candidate? */
-static bool
-paint_open(PaintQueue *q, HTAB *flags)
+/* pf's marks gain add, the queue's entries of it counted as they now are */
+static void
+paint_mark(PaintQueue *q, PaintFlags *pf, uint8 add)
 {
-	for (int i = 0; i < q->n; i++)
-	{
-		if (!(*paint_flags(flags, &q->e[i].id) & PAINT_BENEATH))
-			return true;
-	}
-	return false;
+	if ((add & PAINT_BENEATH) && !(pf->flags & PAINT_BENEATH))
+		q->open -= pf->queued;
+	pf->flags |= add;
 }
 
 static bool
 paint_common(const ProllyHash *a, const ProllyHash *b,
 			 ProllyCommitLookup lookup, void *lookup_arg,
-			 ProllyHash **found, int *nfound)
+			 ProllyHash **found, int64 **heights, int *nfound)
 {
 	HASHCTL		ctl;
 	HTAB	   *flags;
@@ -398,8 +407,10 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 						HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	q.cap = 64;
 	q.n = 0;
+	q.open = 0;
 	q.e = palloc_array(PaintEntry, q.cap);
 	*found = palloc_array(ProllyHash, cap);
+	*heights = palloc_array(int64, cap);
 	*nfound = 0;
 
 	for (int side = 0; side < 2 && ok; side++)
@@ -410,66 +421,89 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 			ok = false;
 		else
 		{
-			*paint_flags(flags, id) |= side == 0 ? PAINT_A : PAINT_B;
-			paint_push(&q, id, &info);
+			PaintFlags *pf = paint_flags(flags, id);
+
+			paint_mark(&q, pf, side == 0 ? PAINT_A : PAINT_B);
+			paint_push(&q, pf, id, &info);
 		}
 	}
-	while (ok && paint_open(&q, flags))
+	while (ok && q.open > 0)
 	{
 		PaintEntry	e = paint_pop(&q);
-		uint8	   *f = paint_flags(flags, &e.id);
+		PaintFlags *f = paint_flags(flags, &e.id);
 		uint8		down;
 
 		CHECK_FOR_INTERRUPTS();
-		if ((*f & (PAINT_A | PAINT_B | PAINT_BENEATH)) == (PAINT_A | PAINT_B))
+		f->queued--;
+		if (!(f->flags & PAINT_BENEATH))
+			q.open--;
+		if ((f->flags & (PAINT_A | PAINT_B | PAINT_BENEATH)) == (PAINT_A | PAINT_B))
 		{
-			if (!(*f & PAINT_FOUND))
+			if (!(f->flags & PAINT_FOUND))
 			{
 				if (*nfound == cap)
 				{
 					cap *= 2;
 					*found = repalloc_array(*found, ProllyHash, cap);
+					*heights = repalloc_array(*heights, int64, cap);
 				}
-				(*found)[(*nfound)++] = e.id;
-				*f |= PAINT_FOUND;
+				(*found)[*nfound] = e.id;
+				(*heights)[(*nfound)++] = e.height;
+				f->flags |= PAINT_FOUND;
 			}
-			down = (*f & (PAINT_A | PAINT_B)) | PAINT_BENEATH;
+			down = (f->flags & (PAINT_A | PAINT_B)) | PAINT_BENEATH;
 		}
 		else
-			down = *f & (PAINT_A | PAINT_B | PAINT_BENEATH);
+			down = f->flags & (PAINT_A | PAINT_B | PAINT_BENEATH);
 		for (int p = 0; p < e.nparents; p++)
 		{
 			ProllyCommitInfo pinfo;
-			uint8	   *pf = paint_flags(flags, &e.parents[p]);
+			PaintFlags *pf = paint_flags(flags, &e.parents[p]);
 
-			if ((*pf | down) == *pf)
+			if ((pf->flags | down) == pf->flags)
 				continue;
-			*pf |= down;
-			if (!lookup(&e.parents[p], &pinfo, lookup_arg) || !pinfo.has_height)
+			paint_mark(&q, pf, down);
+			if (!lookup(&e.parents[p], &pinfo, lookup_arg) || !pinfo.has_height ||
+				pinfo.height >= e.height)
 			{
 				ok = false;
 				break;
 			}
-			paint_push(&q, &e.parents[p], &pinfo);
+			paint_push(&q, pf, &e.parents[p], &pinfo);
 		}
 	}
 	pfree(q.e);
 	hash_destroy(flags);
 	if (!ok)
+	{
 		pfree(*found);
+		pfree(*heights);
+	}
 	return ok;
 }
 
 /*
- * The best common ancestor of a and b: of those no other common ancestor
- * descends from (two or more, in a criss-cross merge's history), the one
- * of the greatest height, then the least id, as Dolt chooses, so the same
- * whichever way round they're asked for.  False if they have none.
+ * Whether a maximal common ancestor id (of height) is a better merge base
+ * than base (of base_height): the greater height, then the least id, as
+ * Dolt chooses, so the same whichever way round a and b are asked for.
  */
+static bool
+better_base(const ProllyHash *id, int64 height, const ProllyHash *base,
+			int64 base_height)
+{
+	if (height != base_height)
+		return height > base_height;
+	if (id->len != base->len)
+		return id->len < base->len;
+	return memcmp(id->bytes, base->bytes, id->len) < 0;
+}
+
 /*
  * Of candidates common[] (ncommon of them, every maximal common ancestor
  * among them), the best: of those no other descends from, the one of the
- * greatest height, then the least id.  False if there are none.
+ * greatest height, then the least id.  False if there are none.  (For
+ * candidates found walking, whose heights may not be recorded: several
+ * have every ancestor of theirs walked to find those beneath another.)
  */
 static bool
 best_common(const ProllyHash *common, int ncommon, ProllyCommitLookup lookup,
@@ -513,10 +547,7 @@ best_common(const ProllyHash *common, int ncommon, ProllyCommitLookup lookup,
 			continue;
 		if (heights != NULL)
 			height = prolly_history_height(id, heights, lookup, lookup_arg);
-		if (!found || height > best_height ||
-			(height == best_height &&
-			 (id->len < base->len ||
-			  (id->len == base->len && memcmp(id->bytes, base->bytes, id->len) < 0))))
+		if (!found || better_base(id, height, base, best_height))
 		{
 			*base = *id;
 			best_height = height;
@@ -551,15 +582,30 @@ prolly_history_merge_base(const ProllyHash *a, const ProllyHash *b,
 						  ProllyHash *base)
 {
 	ProllyHash *common;
+	int64	   *heights;
 	int			ncommon;
-	bool		found;
+	bool		found = false;
+	int64		best_height = 0;
 
-	if (!paint_common(a, b, lookup, lookup_arg, &common, &ncommon))
+	if (!paint_common(a, b, lookup, lookup_arg, &common, &heights, &ncommon))
 	{
 		ncommon = walked_common(a, b, lookup, lookup_arg, &common);
 		return best_common(common, ncommon, lookup, lookup_arg, base);
 	}
-	found = best_common(common, ncommon, lookup, lookup_arg, base);
+
+	/*
+	 * Every candidate is a maximal one, its height recorded: none is
+	 * beneath another, so nothing beneath them is walked to find out.
+	 */
+	for (int i = 0; i < ncommon; i++)
+	{
+		if (!found || better_base(&common[i], heights[i], base, best_height))
+		{
+			*base = common[i];
+			best_height = heights[i];
+		}
+		found = true;
+	}
 #ifdef USE_ASSERT_CHECKING
 	{
 		/*
