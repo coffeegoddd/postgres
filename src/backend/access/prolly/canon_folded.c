@@ -362,6 +362,68 @@ static char *printed_expr(Datum bin, Relation rel, Form_pg_attribute att,
 static char *constraint_text(HeapTuple tup, Relation rel, Form_pg_type domain);
 static bool list_has_string(List *list, const char *s);
 
+/*
+ * A change finder's fold of a table, and its fold of a transaction's own
+ * rows, each as one batch of encoding (prolly_datum_batch()): run again if
+ * an extension's receive refused a value.
+ */
+typedef struct FinderFold
+{
+	const ProllyChangeFinderRoutine *finder;
+	Relation	rel;
+	const ProllyTreeEnv *env;
+	const ProllyTableFold *baseline;
+	ProllyFullFoldReason why;
+	ProllyNodeRef *data;
+	StringInfo	next;
+	const ProllyNodeRef *data_in;
+	ItemPointerData *tids;
+	int			ntids;
+	bool		folded;
+} FinderFold;
+
+static void
+finder_fold_run(void *arg)
+{
+	FinderFold *f = arg;
+
+	if (f->next)
+		resetStringInfo(f->next);
+	PROLLY_CALL(f->finder, fold, f->rel, f->env, f->baseline, f->why, f->data, f->next);
+}
+
+static void
+finder_fold(const ProllyChangeFinderRoutine *finder, Relation rel,
+			const ProllyTreeEnv *env, const ProllyTableFold *baseline,
+			ProllyFullFoldReason why, ProllyNodeRef *data, StringInfo next)
+{
+	FinderFold	f = {.finder = finder, .rel = rel, .env = env, .baseline = baseline,
+	.why = why, .data = data, .next = next};
+
+	prolly_datum_batch(finder_fold_run, &f);
+}
+
+static void
+finder_fold_rows_run(void *arg)
+{
+	FinderFold *f = arg;
+
+	f->folded = PROLLY_CALL(f->finder, fold_rows, f->rel, f->env, f->data_in,
+							f->tids, f->ntids, f->data);
+}
+
+static bool
+finder_fold_rows(const ProllyChangeFinderRoutine *finder, Relation rel,
+				 const ProllyTreeEnv *env, const ProllyNodeRef *data_in,
+				 ItemPointerData *tids, int ntids, ProllyNodeRef *data)
+{
+	FinderFold	f = {.finder = finder, .rel = rel, .env = env, .data_in = data_in,
+	.tids = tids, .ntids = ntids, .data = data};
+
+	prolly_datum_batch(finder_fold_rows_run, &f);
+	return f.folded;
+}
+
 void
 prolly_folded_tree_env(ProllyTreeEnv *env)
 {
@@ -1903,7 +1965,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 	}
 	initStringInfo(&state);
 	pgstat_count_prolly(PGSTAT_PROLLY_FOLD_TABLES, 1);
-	PROLLY_CALL(cn->finder, fold, rel, &cn->env, bt ? &tf : NULL, why, root,
+	finder_fold(cn->finder, rel, &cn->env, bt ? &tf : NULL, why, root,
 				cn->advance ? &state : NULL);
 	if (cn->advance)
 	{
@@ -11855,8 +11917,8 @@ folded_fold_rows(const ProllyNodeRef *head, const ProllyRowChanges *changes,
 				(void) tree_item(&k, &hv, &data, &described);
 				ok = described.len == (uint32) desc.len &&
 					memcmp(described.data, desc.data, desc.len) == 0 &&
-					PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &data,
-								changes[i].tids, changes[i].ntids, &rows);
+					finder_fold_rows(cn.finder, rel, &cn.env, &data,
+									 changes[i].tids, changes[i].ntids, &rows);
 			}
 			if (ok)
 			{
@@ -12108,8 +12170,8 @@ folded_advance_own(const ProllyNodeRef *baseline,
 				 !cn.finder->can_advance(rel, &(ProllyValue)
 										 {(const uint8 *) a->bt->state.data,
 										  a->bt->state.len})) ||
-				!PROLLY_CALL(cn.finder, fold_rows, rel, &cn.env, &a->bt->data,
-							 changes[i].tids, changes[i].ntids, &a->now))
+				!finder_fold_rows(cn.finder, rel, &cn.env, &a->bt->data,
+								  changes[i].tids, changes[i].ntids, &a->now))
 			{
 				table_close(rel, AccessShareLock);
 				continue;

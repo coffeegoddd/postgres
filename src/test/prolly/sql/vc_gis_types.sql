@@ -79,3 +79,57 @@ DROP TABLE gis_nan;
 SELECT 'reset', (dolt_reset('--hard'))[1] = '0';
 SELECT 'after', string_agg(id || ':' || ST_IsEmpty(g) || ':' || encode(ST_AsEWKB(g), 'hex'), ',' ORDER BY id)
 FROM gis_nan;
+
+-- geometries PostGIS's text input takes but its binary receive refuses (a
+-- one-point LINESTRING, an unclosed ring): kept as their text form, so
+-- they commit and come back byte for byte, alone and in an array
+CREATE TABLE gis_strict (id int PRIMARY KEY, g geometry, ga geometry[]);
+INSERT INTO gis_strict VALUES
+  (1, '0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40', NULL),
+  (2, '0103000000010000000400000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F', NULL),
+  (3, 'LINESTRING(0 0,1 1)', NULL),
+  (4, NULL, ARRAY['010200000001000000000000000000F03F000000000000F03F'::geometry, 'POINT(1 2)']),
+  (5, postgis_addbbox('0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40'::geometry), NULL);
+-- (5 caches its bounding box, which its text form doesn't hold: it is kept
+-- as its text reads back, the same geometry without the cache)
+SELECT 'strict bbox', postgis_hasbbox(g) FROM gis_strict WHERE id = 5;
+SELECT md5(string_agg(id || ':' || coalesce(encode(ST_AsEWKB(g), 'hex'), '')
+                                      || ':' || coalesce(ga::text, ''), ',' ORDER BY id)) AS st1
+FROM gis_strict \gset
+SELECT 'commit strict', (dolt_commit('-Am', 'receive refuses'))[1] ~ '^[0-9a-f]{40}$';
+DROP TABLE gis_strict;
+SELECT 'reset strict', (dolt_reset('--hard'))[1] = '0';
+SELECT 'strict after', md5(string_agg(id || ':' || coalesce(encode(ST_AsEWKB(g), 'hex'), '')
+                                     || ':' || coalesce(ga::text, ''), ',' ORDER BY id)) = :'st1'
+FROM gis_strict;
+SELECT 'strict reads', string_agg(id || ':' || coalesce(ST_NPoints(g), -1), ',' ORDER BY id) FROM gis_strict;
+SELECT 'strict bbox after', postgis_hasbbox(g) FROM gis_strict WHERE id = 5;
+-- a value's form depends on it alone, not on the values folded with it: a
+-- line folded again beside a refused value, and a refused value folded
+-- alone, are kept as they were
+CREATE TABLE gis_batch (id int PRIMARY KEY, g geometry);
+INSERT INTO gis_batch VALUES (1, 'LINESTRING(0 0,1 1)');
+SELECT (dolt_commit('-Am', 'a line alone'))[1] AS b1 \gset
+INSERT INTO gis_batch VALUES (2, '0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40');
+UPDATE gis_batch SET g = ST_Translate(g, 0, 0) WHERE id = 1;
+SELECT (dolt_commit('-Am', 'beside a refused value'))[1] AS b2 \gset
+SELECT 'beside refused', string_agg(diff_type || ':' || coalesce((to_row).id, (from_row).id), ',')
+FROM dolt_diff(:'b1', :'b2', NULL::gis_batch);
+DELETE FROM gis_batch WHERE id = 2;
+SELECT (dolt_commit('-Am', 'without it'))[1] AS b3 \gset
+INSERT INTO gis_batch VALUES (2, '0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40');
+SELECT (dolt_commit('-Am', 'the refused value alone'))[1] AS b4 \gset
+SELECT 'refused alone', count(*) FROM dolt_diff(:'b2', :'b4', NULL::gis_batch);
+-- the pages change finder encodes a table's keys from a copy of each page,
+-- not under its content lock: a key its receive refuses is kept as text
+-- there too
+SET debug_prolly_change_finder = 'pages';
+CREATE TABLE gis_pages_key (g geometry PRIMARY KEY, v int);
+INSERT INTO gis_pages_key
+SELECT ST_MakeLine(ST_MakePoint(i, 0), ST_MakePoint(i, 1)), i FROM generate_series(1, 50) i;
+SELECT 'pages base', (dolt_commit('-Am', 'pages base'))[1] ~ '^[0-9a-f]{40}$';
+INSERT INTO gis_pages_key VALUES ('0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40', 100);
+UPDATE gis_pages_key SET v = v + 1000 WHERE v = 5;
+SELECT 'pages refused key', (dolt_commit('-am', 'pages refused key'))[1] ~ '^[0-9a-f]{40}$';
+RESET debug_prolly_change_finder;
+SELECT 'pages rows', count(*), sum(v) FROM gis_pages_key;

@@ -608,16 +608,23 @@ page_tuples(Finder *f, Page page, BlockNumber blkno, bool current,
 	pfree(pv.keyrow.data);
 }
 
-/* The current version of page blkno, read under a share lock. */
+/*
+ * The current version of page blkno, copied under a share lock and read
+ * after it is released: encoding a key calls its type's functions (an
+ * extension's receive, which may refuse a value), not to be run holding a
+ * buffer's content lock.
+ */
 static void
 current_page(Finder *f, BlockNumber blkno, bool candidates)
 {
 	Buffer		buf = ReadBufferExtended(f->rel, MAIN_FORKNUM, blkno,
 										 RBM_NORMAL, NULL);
+	PGAlignedBlock copy;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page_tuples(f, BufferGetPage(buf), blkno, true, candidates);
+	memcpy(copy.data, BufferGetPage(buf), BLCKSZ);
 	UnlockReleaseBuffer(buf);
+	page_tuples(f, (Page) copy.data, blkno, true, candidates);
 }
 
 /*
