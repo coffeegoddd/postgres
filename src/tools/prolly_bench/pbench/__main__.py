@@ -610,6 +610,8 @@ def main(argv=None) -> int:
     diff.add_argument("--reduce", type=int, default=0, help="bounded reduction attempts on failure")
     diff.add_argument("--replay", type=Path, help="saved program.json or reduced.json")
     diff.add_argument("--self-test", action="store_true", help="also prove the comparator rejects a known mismatch")
+    diff.add_argument("--postgis", action="store_true",
+                      help="add a geometry table and spatial families (PostGIS installed in --pg-bin's server)")
     diff.set_defaults(fn=differential.run)
 
     vcfuzz = sub.add_parser("vcfuzz", help="seeded version-control histories checked against a model")
@@ -623,6 +625,8 @@ def main(argv=None) -> int:
     vcfuzz.add_argument("--reduce", type=int, default=0, help="bounded reduction attempts on failure")
     vcfuzz.add_argument("--replay", help="saved history.json or reduced.json files (a glob)")
     vcfuzz.add_argument("--self-test", action="store_true", help="also prove the checks reject known wrong engines")
+    vcfuzz.add_argument("--postgis", action="store_true",
+                        help="give table t a geometry column written with b, and check window queries")
     vcfuzz.set_defaults(fn=differential.run_vc)
 
     from pbench import vc

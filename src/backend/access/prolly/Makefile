@@ -26,6 +26,7 @@ OBJS = \
 	chunkformat_basic.o \
 	chunker_stub.o \
 	chunkstore_journal.o \
+	chunkstore_local.o \
 	diffmerge_folded.o \
 	hash_blake3.o \
 	journal_index.o \

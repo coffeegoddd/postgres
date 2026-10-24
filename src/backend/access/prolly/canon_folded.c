@@ -252,9 +252,13 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "19", whose dependencies record each
- * extension's configuration rows (those pg_dump dumps with it:
- * prolly_extconfig.h); "18" didn't, and was the first whose commits record
+ * The format a folded root is in: "20", whose text forms of values (a type
+ * without binary I/O's, or one its receive refuses) are written with times
+ * in UTC, hex bytea and the C locale's money, numbers and dates
+ * (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
+ * bytea_output, and was the first whose
+ * dependencies record each extension's configuration rows (those pg_dump
+ * dumps with it: prolly_extconfig.h); "18" didn't, and was the first whose commits record
  * their objects' identities beside it (folded_identify()), which a server
  * of an earlier format would read past, matching renamed objects by name; "17"
  * had none, and was the first with extension send values normalized by
@@ -291,7 +295,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"19"
+#define FOLDED_FORMAT	"20"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -303,8 +307,8 @@ typedef struct BaseTable BaseTable;
  * FOLDED_FORMAT too, and these with it: a fold refuses to run till they
  * agree (folded_encoders_checked()).
  */
-#define FOLDED_KEY_ENCODER		6
-#define FOLDED_VALUE_ENCODER	6
+#define FOLDED_KEY_ENCODER		7
+#define FOLDED_VALUE_ENCODER	7
 #define FOLDED_KEYING			1
 
 /*
@@ -431,7 +435,8 @@ prolly_folded_tree_env(ProllyTreeEnv *env)
 	env->chunk_format = prolly_chunkformat_lookup("basic");
 	env->chunker = prolly_chunker_lookup("bytes");
 	env->hash = prolly_content_hash();
-	env->chunk_store = prolly_chunk_store();
+	/* (reading the chunks a step keeps in the backend, if it keeps any) */
+	env->chunk_store = prolly_local_chunks_reading();
 	env->chunks = PROLLY_CALL(env->chunk_store, open, MyDatabaseId,
 							  MyDatabaseTableSpace);
 	env->compare = prolly_bytes_compare;
@@ -540,6 +545,13 @@ canon_env(Canon *cn)
 	cn->tree = prolly_tree_lookup("cow");
 	prolly_folded_tree_env(&cn->env);
 	prolly_folded_canon_env(&cn->root_env);
+
+	/* (a step that only compares keeps what it builds in the backend) */
+	if (prolly_local_chunks_active())
+	{
+		cn->env.chunk_store = prolly_local_chunks_keeping();
+		cn->root_env.chunk_store = prolly_local_chunks_keeping();
+	}
 }
 
 /* Append s in UTF-8. */
@@ -5937,6 +5949,27 @@ typedef struct TableChangesAsk
 	int			limit;
 } TableChangesAsk;
 
+/* A change finder's walk of one table's changes. */
+typedef struct ChangesRun
+{
+	Canon	   *cn;
+	Relation	rel;
+	ProllyTableFold tf;
+	const TableChangesAsk *ask;
+	bool		ok;
+} ChangesRun;
+
+static void
+changes_run(void *arg)
+{
+	ChangesRun *run = arg;
+
+	run->ok = run->ask->limit > 0 ?
+		run->cn->finder->fewer_changes(run->rel, &run->tf, run->ask->limit) :
+		run->cn->finder->changes(run->rel, &run->cn->env, &run->tf,
+								 run->ask->visit, run->ask->arg);
+}
+
 /*
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
@@ -6020,16 +6053,19 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			AtEOXact_GUC(false, save_nestlevel);
 			if (bt)
 			{
-				ProllyTableFold tf;
+				ChangesRun	run;
 
-				memset(&tf, 0, sizeof(tf));
-				tf.data = bt->data;
-				tf.state.data = (const uint8 *) bt->state.data;
-				tf.state.len = bt->state.len;
+				memset(&run, 0, sizeof(run));
+				run.tf.data = bt->data;
+				run.tf.state.data = (const uint8 *) bt->state.data;
+				run.tf.state.len = bt->state.len;
+				run.cn = &cn;
+				run.rel = rel;
+				run.ask = ask;
 				*data = bt->data;
-				ok = ask->limit > 0 ?
-					cn.finder->fewer_changes(rel, &tf, ask->limit) :
-					cn.finder->changes(rel, &cn.env, &tf, ask->visit, ask->arg);
+				/* (the rows' values encoded with the text settings fixed once) */
+				prolly_datum_fixed_text(changes_run, &run);
+				ok = run.ok;
 			}
 		}
 	}

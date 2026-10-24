@@ -309,7 +309,9 @@ prolly_toast_canonical(const varlena *pointer, Oid typid,
 		return false;
 
 	/* the trees of history's value store are these, in this store */
-	if (values->tree != tree || values->env->chunk_store != env.chunk_store ||
+	if (values->tree != tree ||
+		prolly_local_chunks_store(values->env->chunk_store) !=
+		prolly_local_chunks_store(env.chunk_store) ||
 		values->env->chunks != env.chunks)
 		return false;
 

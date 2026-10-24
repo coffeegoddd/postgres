@@ -162,9 +162,16 @@ parallel index build), where no subtransaction can be begun; while the
 caller holds off interrupts (a buffer's content lock, a critical
 section), so encoders read a page's copy, not the page; and for a range
 over a row type holding such a type, whose values are untagged;
-there a refusal is raised as before.  Text forms are written with
-extra_float_digits, DateStyle and IntervalStyle fixed, but not TimeZone or
-lc_monetary.
+there a refusal is raised as before.  Text forms are written and read
+with extra_float_digits, DateStyle, IntervalStyle, bytea_output (hex),
+TimeZone (UTC), timezone_abbreviations (Default) and lc_monetary, lc_numeric
+and lc_time (C) fixed, so a value's canonical form doesn't depend on the
+committer's session (since folded format 20).  Fixing them costs a GUC nest
+level and a setting changed for each that differs, so loops over many
+values fix them once (prolly_datum_fixed_text()): a fold's batch, a change
+finder's walk of a table (a status, a diff), the rows a reset or merge
+writes (as a restore runs under the settings its dump fixes), and a row's
+values checked as it is written.
 
 
 Extension ordering and history compatibility
@@ -795,6 +802,29 @@ consumed (the canonicalizer's advance_baseline()); where it can't be (the
 definitions moved too, a materialized view's rows did, a table's state
 can't be advanced), the rest is folded as before.  So a move from a dirty
 working set folds it once.
+
+That fold is only compared with: once the baseline is advanced, it names
+the target's trees, not the fold's.  So the fold, and every tree the move
+builds on it, is kept in the backend's memory, not put in the chunk store
+(chunkstore_local.c, refs_copies.c's settle_compared()).  Between
+prolly_local_chunks_begin() and _end(), the canonicalizer's environments
+put their chunks in a table in the backend's memory, and every
+environment of the server's trees (prolly_folded_tree_env()'s) gets them
+from there; their has() and put() stay the store's, so a durable tree
+never takes a chunk only the backend has for stored.  The baseline is
+kept beside the refs meanwhile (the refs' chunks are the store's), the
+fold isn't published to the fold caches, and the value memo remembers
+nothing from it.  At the end, prolly_local_chunks_persist() puts those of
+the backend's chunks the baseline reaches, descending only into chunks
+the store hasn't: its own few nodes when it was advanced, the fold's
+trees it still names where it couldn't be (as before).  So a hard reset
+of 1,000 dirty rows over 100,000 appends 4 chunks, not about 1,250.  The
+table is bounded by maintenance_work_mem: past it, what it keeps is
+persisted and the rest of the step puts in the store as before (a fold of
+most of a table, which the baseline mostly can't be advanced past
+anyway).  A tree only the backend keeps may still take a stored value's
+tree by its TOAST pointer, or the memo's reference to one: each is stored,
+which is where persisting stops.
 
 What a fold works out for every table, changed or not, is cached in the
 backend (canon_folded.c's own): each table's description and the hash its
