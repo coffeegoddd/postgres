@@ -1931,7 +1931,7 @@ copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
 		(void) RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
 												 smgropen(kept_locator(k),
 														  INVALID_PROC_NUMBER),
-												 k->snapshot, false, true);
+												 k->snapshot, false, false, true);
 		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
 		oc->relfilenode = relnumber;
 		if (TransactionIdIsNormal(k->frozenxid))
