@@ -136,10 +136,11 @@
  * - roots() visits the roots the store was moved to that it still
  *   records, oldest first, with the time of each move: what a reflog is
  *   read from.  A collection may forget them; it then sets *before to the
- *   root the store was at before the oldest move visited (the root as the
- *   collection began), so that a reader can tell what each move changed
- *   from what the store already held.  Without one known, *before is
- *   empty (len 0).
+ *   root the store was at before the oldest move visited: the root the
+ *   moves it forgot end at, which is the root as the collection began, or
+ *   an older one when it kept the newest of them (for a logical slot), so
+ *   that a reader can tell what each move changed from what the store
+ *   already held.  Without one known, *before is empty (len 0).
  * - prefetch() is told the chunks a walk is about to read (a node's
  *   children), so that a read-through source can fetch them at once, or
  *   the store read them together (optional): whether it heard them, and
