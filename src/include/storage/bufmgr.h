@@ -348,6 +348,7 @@ extern void MarkBufferedRelationsShared(SMgrRelation *rels, int n,
 extern void BufferPrepareForChange(Buffer buffer);
 extern void LockBufferForNeutralChange(Buffer buffer);
 extern bool BufferPageIsShared(Buffer buffer);
+extern bool BufferPageIsSharedElsewhere(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern void LockBufferForCleanupUnprepared(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
