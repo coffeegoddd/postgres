@@ -277,16 +277,29 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 				 errmsg("invalid snapshot mount record")));
 }
 
-/* The mount called name: its commit and record; false if none. */
+/*
+ * The pin of the mount in schema nsp: named by the schema's OID, which a
+ * rename keeps, so a mount follows its schema and no other schema takes
+ * its name's pin.
+ */
+static char *
+pin_name(Oid nsp)
+{
+	return psprintf("%u", nsp);
+}
+
+/* The mount in schema nsp: its commit and record; false if none. */
 static bool
-mount_lookup(const char *name, ProllyHash *commit, MountInfo *mi)
+mount_lookup(Oid nsp, ProllyHash *commit, MountInfo *mi)
 {
 	StringInfoData info;
 	ProllyHash	ignored;
 	bool		found;
 
+	if (!OidIsValid(nsp))
+		return false;
 	initStringInfo(&info);
-	found = PROLLY_CALL(refs(), pin_get, name, commit ? commit : &ignored,
+	found = PROLLY_CALL(refs(), pin_get, pin_name(nsp), commit ? commit : &ignored,
 						&info);
 	if (found && mi)
 		mount_info_read(info.data, info.len, mi);
@@ -294,9 +307,9 @@ mount_lookup(const char *name, ProllyHash *commit, MountInfo *mi)
 	return found;
 }
 
-/* Pin commit for the mount called name, with its record and index trees. */
+/* Pin commit for the mount in schema nsp, with its record and index trees. */
 static void
-mount_pin(const char *name, const ProllyHash *commit, const MountInfo *mi)
+mount_pin(Oid nsp, const ProllyHash *commit, const MountInfo *mi)
 {
 	StringInfoData rec;
 	ProllyValue recv;
@@ -310,7 +323,7 @@ mount_pin(const char *name, const ProllyHash *commit, const MountInfo *mi)
 	recv.len = rec.len;
 	foreach(lc, mi->built)
 		keep[nkeep++] = ((MountIndex *) lfirst(lc))->root;
-	PROLLY_CALL(refs(), pin_set, name, commit, keep, nkeep, &recv);
+	PROLLY_CALL(refs(), pin_set, pin_name(nsp), commit, keep, nkeep, &recv);
 }
 
 static uint64
@@ -936,9 +949,8 @@ make_tables(const char *target, const ProllyHash *commit,
 								 generate_collation_name(att->attcollation));
 		}
 		appendStringInfo(&sql, ") SERVER " SNAPSHOT_SERVER
-						 " OPTIONS (mount %s, commit %s, source %s)",
-						 quote_literal_cstr(target), quote_literal_cstr(hex),
-						 quote_literal_cstr(name));
+						 " OPTIONS (commit %s, source %s)",
+						 quote_literal_cstr(hex), quote_literal_cstr(name));
 		defs = lappend(defs, sql.data);
 	}
 	foreach(lc, defs)
@@ -1049,7 +1061,7 @@ prolly_mount(PG_FUNCTION_ARGS)
 				 errmsg("prolly_mount's tables can't be empty")));
 	check_target(target);
 	resolve_commit(ref, &commit, &info);
-	if (mount_lookup(target, NULL, NULL))
+	if (mount_lookup(get_namespace_oid(target, true), NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("schema \"%s\" is a snapshot mount already", target),
@@ -1073,7 +1085,7 @@ prolly_mount(PG_FUNCTION_ARGS)
 	make_tables(target, &commit, &info.root, &mi, NULL, NULL, cxt,
 				"prolly_mount");
 	SPI_finish();
-	mount_pin(target, &commit, &mi);
+	mount_pin(nsp, &commit, &mi);
 
 	values[0] = CStringGetTextDatum(target);
 	values[1] = CStringGetTextDatum(prolly_hash_hex(&commit));
@@ -1093,6 +1105,7 @@ Datum
 prolly_refresh_mount(PG_FUNCTION_ARGS)
 {
 	char	   *target;
+	Oid			nsp;
 	MountInfo	mi;
 	MountInfo	old;
 	ProllyHash	oldcommit;
@@ -1107,7 +1120,8 @@ prolly_refresh_mount(PG_FUNCTION_ARGS)
 				 errmsg("prolly_refresh_mount's mount can't be null")));
 	require_snapshots();
 	target = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	if (!mount_lookup(target, &oldcommit, &mi))
+	nsp = get_namespace_oid(target, false);
+	if (!mount_lookup(nsp, &oldcommit, &mi))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("schema \"%s\" is not a snapshot mount", target)));
@@ -1131,7 +1145,7 @@ prolly_refresh_mount(PG_FUNCTION_ARGS)
 	make_tables(target, &commit, &info.root, &mi, &old, &oldinfo.root, cxt,
 				"prolly_refresh_mount");
 	SPI_finish();
-	mount_pin(target, &commit, &mi);
+	mount_pin(nsp, &commit, &mi);
 	PG_RETURN_TEXT_P(cstring_to_text(prolly_hash_hex(&commit)));
 }
 
@@ -1145,6 +1159,7 @@ Datum
 prolly_unmount(PG_FUNCTION_ARGS)
 {
 	char	   *target;
+	Oid			nsp;
 	MountInfo	mi;
 	ProllyHash	commit;
 
@@ -1154,7 +1169,8 @@ prolly_unmount(PG_FUNCTION_ARGS)
 				 errmsg("prolly_unmount's mount can't be null")));
 	require_snapshots();
 	target = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	if (!mount_lookup(target, &commit, &mi))
+	nsp = get_namespace_oid(target, false);
+	if (!mount_lookup(nsp, &commit, &mi))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("schema \"%s\" is not a snapshot mount", target)));
@@ -1163,7 +1179,7 @@ prolly_unmount(PG_FUNCTION_ARGS)
 		elog(ERROR, "SPI_connect failed");
 	drop_tables(target, &mi);
 	SPI_finish();
-	PROLLY_CALL(refs(), pin_set, target, NULL, NULL, 0, NULL);
+	PROLLY_CALL(refs(), pin_set, pin_name(nsp), NULL, NULL, 0, NULL);
 	PG_RETURN_VOID();
 }
 
@@ -1174,17 +1190,16 @@ prolly_unmount(PG_FUNCTION_ARGS)
 void
 prolly_snapshot_schema_dropped(Oid nsp)
 {
-	char	   *name;
 	ProllyHash	commit;
 	const ProllyRefsRoutine *r;
 
 	if (!IsNormalProcessingMode() || namespace_is_versioned(nsp))
 		return;
 	r = refs();
-	if (!PROLLY_HAS(r, pin_get) || (name = get_namespace_name(nsp)) == NULL)
+	if (!PROLLY_HAS(r, pin_get))
 		return;
-	if (PROLLY_CALL(r, pin_get, name, &commit, NULL))
-		PROLLY_CALL(r, pin_set, name, NULL, NULL, 0, NULL);
+	if (PROLLY_CALL(r, pin_get, pin_name(nsp), &commit, NULL))
+		PROLLY_CALL(r, pin_set, pin_name(nsp), NULL, NULL, 0, NULL);
 }
 
 typedef struct MountsVisit
@@ -1208,7 +1223,11 @@ visit_mount(const char *name, const ProllyHash *commit, const ProllyValue *info,
 	elems = palloc(sizeof(Datum) * Max(list_length(mi.tables), 1));
 	foreach(lc, mi.tables)
 		elems[n++] = CStringGetTextDatum(lfirst(lc));
-	values[0] = CStringGetTextDatum(name);
+	{
+		char	   *schema = get_namespace_name((Oid) strtoul(name, NULL, 10));
+
+		values[0] = CStringGetTextDatum(schema ? schema : name);
+	}
 	values[1] = CStringGetTextDatum(prolly_hash_hex(commit));
 	values[2] = CStringGetTextDatum(mi.source_ref);
 	values[3] = CStringGetTextDatum(mi.source_schema);
@@ -1279,8 +1298,8 @@ typedef struct Mounted
 } Mounted;
 
 /*
- * The mounted table relid's snapshot: its options, checked against its
- * mount's pin, and the table as the commit describes it, checked against
+ * The mounted table relid's snapshot: its options, checked against the
+ * pin of the mount in its schema, and the table as the commit describes it, checked against
  * the foreign table's columns; and the keys it can seek by.
  */
 static void
@@ -1304,21 +1323,20 @@ snapshot_open(Oid relid, Mounted *s)
 	{
 		DefElem    *d = lfirst(lc);
 
-		if (strcmp(d->defname, "mount") == 0)
-			s->mount = defGetString(d);
-		else if (strcmp(d->defname, "commit") == 0)
+		if (strcmp(d->defname, "commit") == 0)
 			hex = defGetString(d);
 		else if (strcmp(d->defname, "source") == 0)
 			s->source = defGetString(d);
 	}
-	if (s->mount == NULL || hex == NULL || s->source == NULL ||
+	s->mount = get_namespace_name(get_rel_namespace(relid));
+	if (hex == NULL || s->source == NULL ||
 		!prolly_hash_from_hex(hex, strlen(hex), &s->commit))
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
 				 errmsg("foreign table \"%s\" isn't a snapshot mount's table",
 						get_rel_name(relid)),
 				 errhint("Make snapshot tables with prolly_mount().")));
-	if (!mount_lookup(s->mount, &pinned, &mi) ||
+	if (!mount_lookup(get_rel_namespace(relid), &pinned, &mi) ||
 		pinned.len != s->commit.len ||
 		memcmp(pinned.bytes, s->commit.bytes, pinned.len) != 0)
 		ereport(ERROR,
@@ -1985,6 +2003,30 @@ exact_rows(MountPlan *ps, int ki, const KeyBounds *b)
 	return hi > lo ? (double) (hi - lo) : 0;
 }
 
+/* The clauses that bound key k's columns as bounds b bounds them. */
+static List *
+bound_clauses(RelOptInfo *rel, const Mounted *s, const MountKey *k,
+			  const KeyBounds *b, List *clauses)
+{
+	List	   *used = NIL;
+	ListCell   *lc;
+
+	foreach(lc, clauses)
+	{
+		RestrictInfo *ri = lfirst(lc);
+		int			strat;
+		Expr	   *e;
+
+		for (int c = 0; c <= b->neq && c < k->nkeys; c++)
+			if (key_clause(rel, s, k, c, ri, &strat, &e))
+			{
+				used = lappend(used, ri);
+				break;
+			}
+	}
+	return used;
+}
+
 static void
 snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 					  Oid foreigntableid)
@@ -1993,6 +2035,7 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 	ProllyComponents c;
 	ProllyTreeEnv env;
 	double		best = 0;
+	List	   *best_rest = NIL;
 	bool		counted = false;
 
 	snapshot_open(foreigntableid, &ps->s);
@@ -2020,6 +2063,7 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 		if (ps->s.keys[i].unique && b.neq == ps->s.keys[i].nkeys)
 		{
 			best = 1;
+			best_rest = NIL;
 			counted = true;
 			break;
 		}
@@ -2027,11 +2071,17 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 		if (exact >= 0 && (!counted || exact < best))
 		{
 			best = exact;
+			best_rest = list_difference_ptr(baserel->baserestrictinfo,
+											bound_clauses(baserel, &ps->s,
+														  &ps->s.keys[i], &b,
+														  baserel->baserestrictinfo));
 			counted = true;
 		}
 	}
 	if (counted)
-		baserel->rows = clamp_row_est(best);
+		baserel->rows = clamp_row_est(best *
+									  clauselist_selectivity(root, best_rest, 0,
+															 JOIN_INNER, NULL));
 }
 
 /* How many entries bounds b on key ki reads, of a table of count. */
@@ -2041,8 +2091,7 @@ bounded_rows(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, int ki,
 {
 	const Mounted *s = &ps->s;
 	const MountKey *k = &s->keys[ki];
-	List	   *used = NIL;
-	ListCell   *lc;
+	List	   *used;
 	double		exact;
 
 	if (k->unique && b->neq == k->nkeys)
@@ -2052,19 +2101,7 @@ bounded_rows(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, int ki,
 	exact = exact_rows(ps, ki, b);
 	if (exact >= 0)
 		return clamp_row_est(exact);
-	foreach(lc, clauses)
-	{
-		RestrictInfo *ri = lfirst(lc);
-		int			strat;
-		Expr	   *e;
-
-		for (int c = 0; c <= b->neq && c < k->nkeys; c++)
-			if (key_clause(rel, s, k, c, ri, &strat, &e))
-			{
-				used = lappend(used, ri);
-				break;
-			}
-	}
+	used = bound_clauses(rel, s, k, b, clauses);
 	return clamp_row_est(s->count * clauselist_selectivity(root, used, 0,
 														   JOIN_INNER, NULL));
 }
@@ -2415,28 +2452,27 @@ set_bounds(ForeignScanState *node, MountScan *ss)
 {
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			n = list_length(ss->exprs);
-	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
-	bool	   *nulls = palloc(sizeof(bool) * Max(n, 1));
+	Datum	   *values;
+	bool	   *nulls;
 	ListCell   *lc;
 	int			i = 0;
 	MemoryContext old;
 
+	/* (the values, and what evaluating them makes, freed at the next) */
+	MemoryContextReset(ss->boundcxt);
+	ss->seek.tree_lo = ss->seek.tree_hi = NULL;
+	ss->seek.empty = false;
+	old = MemoryContextSwitchTo(ss->boundcxt);
+	values = palloc(sizeof(Datum) * Max(n, 1));
+	nulls = palloc(sizeof(bool) * Max(n, 1));
 	foreach(lc, ss->exprs)
 	{
 		values[i] = ExecEvalExpr(lfirst(lc), econtext, &nulls[i]);
 		i++;
 	}
-	MemoryContextReset(ss->boundcxt);
-	ss->seek.tree_lo = ss->seek.tree_hi = NULL;
-	ss->seek.empty = false;
 	if (ss->key >= 0)
-	{
-		old = MemoryContextSwitchTo(ss->boundcxt);
 		compute_bounds(&ss->seek, values, nulls, ss->types);
-		MemoryContextSwitchTo(old);
-	}
-	pfree(values);
-	pfree(nulls);
+	MemoryContextSwitchTo(old);
 }
 
 static void

@@ -529,7 +529,7 @@ CREATE SCHEMA rogue;
 CREATE FOREIGN TABLE rogue.t (tenant_id int, id int, email text, payload text)
 	SERVER prolly_local OPTIONS (mount 'nosuch', commit :'c1', source 'ci.users');
 SELECT * FROM rogue.t;
-ERROR:  snapshot mount "nosuch" doesn't pin the commit of table "t"
+ERROR:  snapshot mount "rogue" doesn't pin the commit of table "t"
 HINT:  Mount the commit with prolly_mount(), or refresh the mount.
 CREATE FOREIGN TABLE rogue.u (a int) SERVER prolly_local;
 SELECT * FROM rogue.u;
@@ -592,6 +592,75 @@ DETAIL:  Other commits' rows aren't filtered by its policies.
 HINT:  The table's owner, or a role that bypasses row security, can read them.
 RESET ROLE;
 ALTER TABLE ci.users DISABLE ROW LEVEL SECURITY;
+-- the lineage is the head's: moved back to before the table was made,
+-- this backend refuses it too
+CREATE TABLE ci.later (id int PRIMARY KEY);
+INSERT INTO ci.later VALUES (1);
+SELECT dolt_hashof('HEAD') AS before_later \gset
+SELECT length(dolt_commit('-Am', 'later')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'lat', ARRAY['later']);
+ mount 
+-------
+ lat
+(1 row)
+
+GRANT USAGE ON SCHEMA lat TO regress_mount_reader;
+GRANT SELECT ON ci.later, lat.later TO regress_mount_reader;
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM lat.later;
+ count 
+-------
+     1
+(1 row)
+
+RESET ROLE;
+SELECT dolt_hashof('HEAD') AS with_later \gset
+SELECT dolt_reset('--soft', :'before_later');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM lat.later;
+ERROR:  a snapshot mount can't read "ci.later": the table of that name here isn't the one a version holds
+DETAIL:  The name was without a table since that version, so the table here is another.
+HINT:  The database's owner, or a member of pg_read_all_data, can read it.
+RESET ROLE;
+SELECT dolt_reset('--soft', :'with_later');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM lat.later;
+ count 
+-------
+     1
+(1 row)
+
+RESET ROLE;
+REVOKE ALL ON ci.later, lat.later FROM regress_mount_reader;
+REVOKE ALL ON SCHEMA lat FROM regress_mount_reader;
+SELECT prolly_unmount('lat');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+DROP TABLE ci.later;
+SELECT length(dolt_commit('-Am', 'no later')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
 REVOKE ALL ON ci.users FROM regress_mount_reader;
 REVOKE ALL ON SCHEMA ci, old FROM regress_mount_reader;
 REVOKE ALL ON ALL TABLES IN SCHEMA old FROM regress_mount_reader;
@@ -733,13 +802,15 @@ CREATE UNIQUE INDEX ON ci.wide (s);
 INSERT INTO ci.wide SELECT g, g - 100, g FROM generate_series(1, 200) g;
 CREATE TABLE ci.small (s smallint PRIMARY KEY, v int);
 INSERT INTO ci.small SELECT g, g FROM generate_series(-100, 100) g;
+CREATE TABLE ci.texts (t text PRIMARY KEY, v int);
+INSERT INTO ci.texts SELECT 'k' || g, g FROM generate_series(0, 199) g;
 SELECT length(dolt_commit('-Am', 'integer keys')::text) > 0 AS committed;
  committed 
 -----------
  t
 (1 row)
 
-SELECT mount FROM prolly_mount('HEAD', 'ci', 'ints', ARRAY['wide', 'small']);
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'ints', ARRAY['wide', 'small', 'texts']);
  mount 
 -------
  ints
@@ -823,6 +894,14 @@ SELECT pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4') AS tenan
         1000 |        250 |     2000 |           20
 (1 row)
 
+-- (and the other quals filter those further)
+SELECT pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4 AND email LIKE ''%9''') < 1000
+	AS filtered_further;
+ filtered_further 
+------------------
+ t
+(1 row)
+
 -- Appendrel members: a union, an inheritance child and a partition of
 -- mounted tables, ordered and filtered by their parents' plans.
 SELECT count(*) FROM (SELECT v FROM ints.wide UNION ALL SELECT v FROM ints.wide) u;
@@ -875,7 +954,8 @@ SELECT s FROM public.small_parts WHERE s > 97 ORDER BY s;
 
 ALTER TABLE public.small_parts DETACH PARTITION ints.small;
 DROP TABLE public.small_parts, public.wide_parent;
--- A rescan's bounds are freed for the next: memory stays flat over many.
+-- A rescan's bounds, and what evaluating them made, are freed for the
+-- next: memory stays flat over many, by an integer key and a text one.
 CREATE FUNCTION pg_temp.mem() RETURNS int8 LANGUAGE sql VOLATILE AS
 	$$SELECT sum(total_bytes)::int8 FROM pg_backend_memory_contexts$$;
 SELECT max(m) FILTER (WHERE g > 19000) - max(m) FILTER (WHERE g BETWEEN 900 AND 1000)
@@ -885,6 +965,16 @@ FROM (SELECT g, pg_temp.mem() AS m
 		   LATERAL (SELECT v FROM ints.wide w WHERE w.id = g % 200 OFFSET 0) x) t;
  flat 
 ------
+ t
+(1 row)
+
+SELECT max(m) FILTER (WHERE g > 19000) - max(m) FILTER (WHERE g BETWEEN 900 AND 1000)
+	< 1000000 AS flat_text
+FROM (SELECT g, pg_temp.mem() AS m
+	  FROM generate_series(1, 20000) g,
+		   LATERAL (SELECT v FROM ints.texts x WHERE x.t = 'k' || (g % 200) OFFSET 0) x) t;
+ flat_text 
+-----------
  t
 (1 row)
 
@@ -944,6 +1034,62 @@ SELECT count(*) FROM prolly_mounts() WHERE mount = 'justbag';
 DROP SCHEMA justbag CASCADE;
 NOTICE:  drop cascades to foreign table justbag.bag
 SELECT count(*) FROM prolly_mounts() WHERE mount = 'justbag';
+ count 
+-------
+     0
+(1 row)
+
+-- A mount follows its schema's renames: its pin is the schema's, not its
+-- name's, so another schema of the old name is no mount, and dropping it
+-- leaves the mount be; dropping the renamed schema releases the pin.
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'renamed', ARRAY['bag']);
+  mount  
+---------
+ renamed
+(1 row)
+
+ALTER SCHEMA renamed RENAME TO renamed2;
+SELECT mount FROM prolly_mounts() WHERE mount LIKE 'renamed%';
+  mount   
+----------
+ renamed2
+(1 row)
+
+SELECT count(*) FROM renamed2.bag;
+ count 
+-------
+     3
+(1 row)
+
+GRANT CREATE ON DATABASE regress_snapshot_mounts TO regress_mount_other;
+SET ROLE regress_mount_other;
+CREATE SCHEMA renamed;
+SELECT prolly_unmount('renamed');
+ERROR:  schema "renamed" is not a snapshot mount
+DROP SCHEMA renamed;
+RESET ROLE;
+REVOKE CREATE ON DATABASE regress_snapshot_mounts FROM regress_mount_other;
+SELECT mount FROM prolly_mounts() WHERE mount LIKE 'renamed%';
+  mount   
+----------
+ renamed2
+(1 row)
+
+SELECT count(*) FROM renamed2.bag;
+ count 
+-------
+     3
+(1 row)
+
+SELECT prolly_refresh_mount('renamed2') IS NOT NULL AS refreshed;
+ refreshed 
+-----------
+ t
+(1 row)
+
+DROP SCHEMA renamed2 CASCADE;
+NOTICE:  drop cascades to foreign table renamed2.bag
+SELECT count(*) FROM prolly_mounts() WHERE mount LIKE 'renamed%';
  count 
 -------
      0

@@ -211,6 +211,32 @@ SET ROLE regress_mount_reader;
 SELECT count(*) FROM old.users;
 RESET ROLE;
 ALTER TABLE ci.users DISABLE ROW LEVEL SECURITY;
+-- the lineage is the head's: moved back to before the table was made,
+-- this backend refuses it too
+CREATE TABLE ci.later (id int PRIMARY KEY);
+INSERT INTO ci.later VALUES (1);
+SELECT dolt_hashof('HEAD') AS before_later \gset
+SELECT length(dolt_commit('-Am', 'later')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'lat', ARRAY['later']);
+GRANT USAGE ON SCHEMA lat TO regress_mount_reader;
+GRANT SELECT ON ci.later, lat.later TO regress_mount_reader;
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM lat.later;
+RESET ROLE;
+SELECT dolt_hashof('HEAD') AS with_later \gset
+SELECT dolt_reset('--soft', :'before_later');
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM lat.later;
+RESET ROLE;
+SELECT dolt_reset('--soft', :'with_later');
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM lat.later;
+RESET ROLE;
+REVOKE ALL ON ci.later, lat.later FROM regress_mount_reader;
+REVOKE ALL ON SCHEMA lat FROM regress_mount_reader;
+SELECT prolly_unmount('lat');
+DROP TABLE ci.later;
+SELECT length(dolt_commit('-Am', 'no later')::text) > 0 AS committed;
 REVOKE ALL ON ci.users FROM regress_mount_reader;
 REVOKE ALL ON SCHEMA ci, old FROM regress_mount_reader;
 REVOKE ALL ON ALL TABLES IN SCHEMA old FROM regress_mount_reader;
@@ -255,8 +281,10 @@ CREATE UNIQUE INDEX ON ci.wide (s);
 INSERT INTO ci.wide SELECT g, g - 100, g FROM generate_series(1, 200) g;
 CREATE TABLE ci.small (s smallint PRIMARY KEY, v int);
 INSERT INTO ci.small SELECT g, g FROM generate_series(-100, 100) g;
+CREATE TABLE ci.texts (t text PRIMARY KEY, v int);
+INSERT INTO ci.texts SELECT 'k' || g, g FROM generate_series(0, 199) g;
 SELECT length(dolt_commit('-Am', 'integer keys')::text) > 0 AS committed;
-SELECT mount FROM prolly_mount('HEAD', 'ci', 'ints', ARRAY['wide', 'small']);
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'ints', ARRAY['wide', 'small', 'texts']);
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 SELECT v FROM ints.wide WHERE id = 42;
 SELECT v FROM ints.wide WHERE id = 42::smallint;
@@ -280,6 +308,9 @@ SELECT pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4') AS tenan
 	pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4 AND id < 250') AS range_rows,
 	pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id >= 8') AS last_two,
 	pg_temp.plan_rows('SELECT * FROM ints.wide WHERE id BETWEEN 11 AND 30') AS between_rows;
+-- (and the other quals filter those further)
+SELECT pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4 AND email LIKE ''%9''') < 1000
+	AS filtered_further;
 
 -- Appendrel members: a union, an inheritance child and a partition of
 -- mounted tables, ordered and filtered by their parents' plans.
@@ -298,7 +329,8 @@ SELECT s FROM public.small_parts WHERE s > 97 ORDER BY s;
 ALTER TABLE public.small_parts DETACH PARTITION ints.small;
 DROP TABLE public.small_parts, public.wide_parent;
 
--- A rescan's bounds are freed for the next: memory stays flat over many.
+-- A rescan's bounds, and what evaluating them made, are freed for the
+-- next: memory stays flat over many, by an integer key and a text one.
 CREATE FUNCTION pg_temp.mem() RETURNS int8 LANGUAGE sql VOLATILE AS
 	$$SELECT sum(total_bytes)::int8 FROM pg_backend_memory_contexts$$;
 SELECT max(m) FILTER (WHERE g > 19000) - max(m) FILTER (WHERE g BETWEEN 900 AND 1000)
@@ -306,6 +338,11 @@ SELECT max(m) FILTER (WHERE g > 19000) - max(m) FILTER (WHERE g BETWEEN 900 AND 
 FROM (SELECT g, pg_temp.mem() AS m
 	  FROM generate_series(1, 20000) g,
 		   LATERAL (SELECT v FROM ints.wide w WHERE w.id = g % 200 OFFSET 0) x) t;
+SELECT max(m) FILTER (WHERE g > 19000) - max(m) FILTER (WHERE g BETWEEN 900 AND 1000)
+	< 1000000 AS flat_text
+FROM (SELECT g, pg_temp.mem() AS m
+	  FROM generate_series(1, 20000) g,
+		   LATERAL (SELECT v FROM ints.texts x WHERE x.t = 'k' || (g % 200) OFFSET 0) x) t;
 SELECT prolly_unmount('ints');
 
 -- A foreign table naming a mount's pin and commit, but a table the mount
@@ -339,6 +376,25 @@ RESET ROLE;
 SELECT count(*) FROM prolly_mounts() WHERE mount = 'justbag';
 DROP SCHEMA justbag CASCADE;
 SELECT count(*) FROM prolly_mounts() WHERE mount = 'justbag';
+-- A mount follows its schema's renames: its pin is the schema's, not its
+-- name's, so another schema of the old name is no mount, and dropping it
+-- leaves the mount be; dropping the renamed schema releases the pin.
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'renamed', ARRAY['bag']);
+ALTER SCHEMA renamed RENAME TO renamed2;
+SELECT mount FROM prolly_mounts() WHERE mount LIKE 'renamed%';
+SELECT count(*) FROM renamed2.bag;
+GRANT CREATE ON DATABASE regress_snapshot_mounts TO regress_mount_other;
+SET ROLE regress_mount_other;
+CREATE SCHEMA renamed;
+SELECT prolly_unmount('renamed');
+DROP SCHEMA renamed;
+RESET ROLE;
+REVOKE CREATE ON DATABASE regress_snapshot_mounts FROM regress_mount_other;
+SELECT mount FROM prolly_mounts() WHERE mount LIKE 'renamed%';
+SELECT count(*) FROM renamed2.bag;
+SELECT prolly_refresh_mount('renamed2') IS NOT NULL AS refreshed;
+DROP SCHEMA renamed2 CASCADE;
+SELECT count(*) FROM prolly_mounts() WHERE mount LIKE 'renamed%';
 -- (rolled back: the pin stays)
 SELECT mount FROM prolly_mount('HEAD', 'ci', 'kept', ARRAY['bag']);
 BEGIN;
