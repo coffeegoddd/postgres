@@ -165,8 +165,9 @@ SELECT * FROM dolt_at('k4~', NULL::ln.t);
 RESET ROLE;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 
--- a table made on a branch and merged in is made again here, a relation
--- of its own: its branch's history isn't its grantee's (it fails closed)
+-- a table made on a branch and merged in is a relation made here, of the
+-- class of the branch's relation it was made from: its branch's history
+-- is its grantee's
 SELECT dolt_branch('feature') IS NOT NULL AS made;
 SELECT dolt_checkout('feature') IS NOT NULL AS on_feature;
 CREATE TABLE ln.f (id int PRIMARY KEY);
@@ -282,6 +283,67 @@ SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
+
+-- the same, a definition changed by the move too (an unrelated table
+-- altered): the uncommitted changes set aside, the branch moved to its
+-- head, so the remade table holds the head's rows; still not recorded made
+-- from it
+CREATE TABLE ln.u (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'u')::text) AS committed;
+SELECT dolt_branch('alters') IS NOT NULL AS made;
+SELECT dolt_checkout('alters') IS NOT NULL AS on_alters;
+ALTER TABLE ln.u ADD COLUMN c int;
+SELECT length(dolt_commit('-am', 'alter to pick')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS alter_pick \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ALTER TABLE ln.u ADD COLUMN d int;
+SELECT length(dolt_commit('-am', 'alter to revert')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS alter_revert \gset
+SELECT dolt_hashof('HEAD') AS secrets2_head \gset
+-- (a merge)
+SELECT pg_temp.remake('sm');
+SELECT (dolt_merge('--no-ff', '-m', 'alters in', 'alters'))[3] AS conflicts;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.sm);
+RESET ROLE;
+CREATE SCHEMA lb_snap2;
+SELECT mount FROM prolly_mount('HEAD', 'ln', 'lb_snap2', ARRAY['sm']);
+GRANT USAGE ON SCHEMA lb_snap2 TO regress_lb_reader;
+GRANT SELECT ON lb_snap2.sm TO regress_lb_reader;
+SET ROLE regress_lb_reader;
+SELECT * FROM lb_snap2.sm;
+RESET ROLE;
+SELECT prolly_unmount('lb_snap2');
+SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+-- (a cherry-pick)
+SELECT pg_temp.remake('sp');
+SELECT (dolt_cherry_pick(:'alter_pick'))[1] IS NOT NULL AS picked;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.sp);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+-- (a revert)
+SELECT pg_temp.remake('sr');
+SELECT (dolt_revert(:'alter_revert'))[1] IS NOT NULL AS reverted;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.sr);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+
+-- a branch first used after the table changed on main: its copies, moved
+-- back to the table's definition at its start, are a relation made again
+-- (a column renamed back), the same table's: its commits read
+SELECT dolt_branch('late_side') IS NOT NULL AS made;
+ALTER TABLE ln.t RENAME COLUMN note TO note2;
+SELECT length(dolt_commit('-am', 'renamed note')::text) AS committed;
+SELECT dolt_checkout('late_side') IS NOT NULL AS on_late;
+INSERT INTO ln.t VALUES (60, 'late side');
+SELECT length(dolt_commit('-am', 'late side row')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_lb_reader;
+SELECT id FROM dolt_at('late_side', NULL::ln.t) WHERE id = 60;
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
 
 -- a commit of dolt.transaction_commit's records its relations too: the
 -- table's history reads through it

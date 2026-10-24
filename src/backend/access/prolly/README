@@ -315,15 +315,23 @@ old table's commit from the new one; the records can.  A commit that
 isn't its working set folded (a merge's, a pick's or a revert's, over
 uncommitted changes) is recorded made only from the relations its first
 parent's record and the working set both have, as it holds a table
-dropped and made again in the working set as the parent had it.  What
-the records can't: a branch's first use may
-make its copies from another branch's relation (the table here's, moved
-to the old rows), and its commits are then that relation's; a move that
-brings the old table's rows (a merge, a hard reset, a revert of the drop,
-a cherry-pick) writes them into the new table, whose rows they then are
-(#936); a table a merge makes here is a relation of its own, so its
-branch's history isn't its grantee's here (it fails closed); and a role
-given a dropped relation's OID again would read that relation's versions.
+dropped and made again in the working set as the parent had it; and a
+table such a move changed in the working set, uncommitted (set aside, or
+left out of the commit), is recorded only as of a relation of the class
+its first parent's record lists (refs' prolly_commit_local_tables, as the
+merge, pick or revert tells it).  Relations are compared by equivalence
+class ('Q', refs format 15): a relation a move makes again of a table (a
+definition it can't alter in place, as a branch's first use may when its
+copies are moved to its head), or a merge, pick or revert makes of the
+other side's table (the class of the relation the commit it takes the
+version from was made from: prolly_move_provenance), is the same table
+as the one it comes from, whatever its OID.  What the records can't: a
+branch's first use may make its copies from another branch's relation
+(the table here's, moved to the old rows), and its commits are then that
+relation's; a move that brings the old table's rows (a merge, a hard
+reset, a revert of the drop, a cherry-pick) writes them into the new
+table, whose rows they then are (#936); and a role given a dropped
+relation's OID again would read that relation's versions.
 A refused read reads each commit's record about once: a walk that meets
 nothing marks the commits it saw apart.  Moving a head takes a write role
 (see Writers), not SELECT alone.  A plan's row estimate of a version, and

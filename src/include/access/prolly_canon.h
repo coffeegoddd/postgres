@@ -555,6 +555,14 @@ typedef struct ProllyCanonRoutine
 #define PROLLY_CANON_LAST_CALLBACK table_names
 
 /*
+ * While set, the commits (ProllyHash *) a move takes its versions from: a
+ * table the move makes joins the equivalence class of the relation a
+ * commit of them was made from for its name (refs' relation_class()); one
+ * it makes again of a table stays in that table's class.
+ */
+extern PGDLLIMPORT List *prolly_move_provenance;
+
+/*
  * The tree environment of folded canonical trees: the chunk store's,
  * ordered by bytes.
  */
