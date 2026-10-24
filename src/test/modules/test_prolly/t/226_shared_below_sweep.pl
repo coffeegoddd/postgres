@@ -22,6 +22,8 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
+# (VACUUM sets kept pages all-visible only with this on)
+prolly.vacuum_copy_kept_pages = on
 });
 $node->start;
 $node->backup('base');
