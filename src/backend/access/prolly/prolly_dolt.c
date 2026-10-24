@@ -6434,25 +6434,41 @@ typedef struct NameLineage
 /*
  * The name in from of to's table name: name if the step's changes don't
  * list it; NULL if to made it (from has none), or a read left it out.
+ * The step's summary is made in a context of its own, freed after: only
+ * the name is kept, in the caller's.
  */
 static char *
 lineage_name_before(const char *from, const char *to, const char *name)
 {
+	MemoryContext caller = CurrentMemoryContext;
+	MemoryContext step = AllocSetContextCreate(caller, "prolly lineage step",
+											   ALLOCSET_DEFAULT_SIZES);
 	List	   *rows = NIL;
 	ListCell   *lc;
+	const char *before = name;
 
+	MemoryContextSwitchTo(step);
 	PROLLY_CALL(diff_merge(), summary, from, to, false, collect_change, &rows);
 	foreach(lc, rows)
 	{
 		SummaryRow *r = lfirst(lc);
 
 		if (r->not_covered && r->from_name && strcmp(r->from_name, name) == 0)
-			return NULL;
+		{
+			before = NULL;
+			break;
+		}
 		if (r->object == PROLLY_OBJECT_TABLE && r->to_name &&
 			strcmp(r->to_name, name) == 0)
-			return r->from_name;
+		{
+			before = r->from_name;
+			break;
+		}
 	}
-	return pstrdup(name);
+	MemoryContextSwitchTo(caller);
+	before = before ? pstrdup(before) : NULL;
+	MemoryContextDelete(step);
+	return (char *) before;
 }
 
 static void
@@ -6702,6 +6718,77 @@ prolly_check_history_by_name(const char *name, const char *commit,
 		}
 		(void) hash_search(lineages_known, key, HASH_ENTER, &found);
 	}
+}
+
+/*
+ * A reader of a table's history, version by version: who may read it
+ * (checked once) and the table's lineage (walked once, as far as the
+ * versions asked of need).
+ */
+struct ProllyHistoryReader
+{
+	char	   *name;			/* the table's name here */
+	bool		reads_all;		/* the database's owner, or pg_read_all_data */
+	MemoryContext cxt;			/* its lineage's, as long as the reader */
+	List	   *lineages;
+	const char *fn;
+};
+
+ProllyHistoryReader *
+prolly_history_reader_begin(const char *name, const char *fn)
+{
+	ProllyHistoryReader *r = palloc0(sizeof(ProllyHistoryReader));
+	Oid			relid;
+	AclResult	aclresult;
+
+	r->name = pstrdup(name);
+	r->fn = fn;
+	r->cxt = CurrentMemoryContext;
+	r->reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+	if (r->reads_all)
+		return r;
+	relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
+							 NoLock, true);
+	if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
+						fn, name),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+	check_history_rls(relid, fn);
+	return r;
+}
+
+/*
+ * Refuse reading the version commit (hex) has of the reader's table, by
+ * the name it has there, unless it is the table here (its lineage reaches
+ * back to it), as dolt_history_table() by name refuses it.
+ */
+void
+prolly_history_reader_check(ProllyHistoryReader *r, const char *commit,
+							const char *version_name)
+{
+	MemoryContext old;
+	bool		has;
+
+	if (r->reads_all)
+		return;
+	/* (the lineage, walked as far as asked, kept for the next commit) */
+	old = MemoryContextSwitchTo(r->cxt);
+	has = lineage_has(name_lineage(&r->lineages, r->name), commit, version_name);
+	MemoryContextSwitchTo(old);
+	if (!has)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
+						r->fn, version_name),
+				 errdetail("The name was without a table since commit %s, so the table here is another.",
+						   commit),
+				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
 }
 
 /* rows_begin_described() of a table's version, or refused. */
@@ -7754,13 +7841,15 @@ typedef struct ConflictSide
 } ConflictSide;
 
 /*
- * Table name in from and to (refs), if it changed between them, as
- * dolt_schema_diff() lists it: each side's item and statements (a side
- * without it: "<deleted>").  Sides already found are left as they are.
+ * A table in from and to (refs), named from_name in from and to_name in
+ * to, if it changed between them, as dolt_schema_diff() lists it: each
+ * side's item and statements (a side without it: "<deleted>").  Sides
+ * already found are left as they are.
  */
 static void
-conflict_sides(const char *from, const char *to, const char *name,
-			   ConflictSide *from_side, ConflictSide *to_side)
+conflict_sides(const char *from, const char *to, const char *from_name,
+			   const char *to_name, ConflictSide *from_side,
+			   ConflictSide *to_side)
 {
 	ListCell   *lc;
 
@@ -7769,8 +7858,8 @@ conflict_sides(const char *from, const char *to, const char *name,
 		SummaryRow *r = lfirst(lc);
 
 		if (r->object != PROLLY_OBJECT_TABLE ||
-			!((r->from_name && strcmp(r->from_name, name) == 0) ||
-			  (r->to_name && strcmp(r->to_name, name) == 0)))
+			!((r->from_name && strcmp(r->from_name, from_name) == 0) ||
+			  (r->to_name && strcmp(r->to_name, to_name) == 0)))
 			continue;
 		if (!from_side->found)
 		{
@@ -7901,14 +7990,18 @@ dolt_schema_conflicts(PG_FUNCTION_ARGS)
 	for (int i = 0; i < ms.nschema; i++)
 	{
 		const char *name = ms.schema_tables[i];
+
+		/* (each side by its own name: one may have renamed it) */
+		const char *base_name = ms.schema_base_tables ? ms.schema_base_tables[i] : name;
+		const char *their_name = ms.schema_their_tables ? ms.schema_their_tables[i] : name;
 		ConflictSide b = {0};
 		ConflictSide o = {0};
 		ConflictSide t = {0};
 		Datum		values[5];
 		bool		nulls[5] = {0};
 
-		conflict_sides(base, ours, name, &b, &o);
-		conflict_sides(base, theirs, name, &b, &t);
+		conflict_sides(base, ours, base_name, name, &b, &o);
+		conflict_sides(base, theirs, base_name, their_name, &b, &t);
 		/* (a side that changed only the table's rows: as listed from base) */
 		if (!b.found)
 		{
@@ -8008,7 +8101,8 @@ dolt_constraint_violations(PG_FUNCTION_ARGS)
  * table holds no row breaking one validated).  Their recorded violations
  * are replaced by what is found now, unless --output-only: rows a merge
  * didn't write for breaking a unique, check or not-null constraint are
- * dropped, what to do with them is the user's.  Only the rows changed
+ * dropped (and the rows a unique one's collided with), what to do with
+ * them is the user's.  Only the rows changed
  * since the head commit are checked (and those referencing rows removed
  * or changed), and every row of a table with violations recorded, so one
  * still holding is kept, unless --all: every row.  Status 1 if any are found, else 0.

@@ -354,14 +354,17 @@ A table both sides of a merge changed in ways that don't merge (its
 definitions changed differently, or one dropped it and the other changed
 it, its definition or only its rows) is a schema conflict.  dolt_merge()
 keeps it as the branch has it, definition and rows, records it in the
-merge in progress (the refs' merge names entry, by name, OID 0: refs
-format 8) and merges the other tables, as Dolt does;
+merge in progress (the refs' merge names entry, OID 0 and its names on
+each side: refs format 12) and merges the other tables, as Dolt does;
 dolt_schema_conflicts shows its statements in the base, the head and
-theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
-committed until it is aborted.  A cherry-pick or revert, schema conflicts
-of other objects, a conflicted table renamed on either side, and one the
-other side's objects use in its version (a view over a column it added)
-fail as before, the last two saying so.
+theirs, each under its own name.  A table a side renamed (matched by
+identity) is kept under ours' names, its own and its columns': the
+merge's names are made again so (merge_renames()'s keep_ours), found by
+merging the definitions once before the merge does.
+dolt_conflicts_resolve() refuses it, and the merge can't be committed
+until it is aborted.  A cherry-pick or revert, schema conflicts of other
+objects, and a table the other side's objects use in its version (a view
+over a column it added) fail as before, the last saying so.
 
 A keyed row both sides of a merge changed is merged column by column, on
 its encoded fields (the keying's row_fields()): all three versions are
@@ -417,6 +420,25 @@ look up, are held in memory up to work_mem, then sorted with a tuplesort
 and written once each, in order, to an image file and a fixed-size entry
 file that lookups search by halving.  All of these files close when the
 table is written and go with their resource owner on error or cancellation.
+
+A row a merge didn't write for breaking a unique index is recorded as
+Dolt records it: once for each unique index it breaks, and so is each
+row of the table it collides with there (the table keeping those).
+Those kept are spooled to a tuplesort of their own; once the merge's
+rows are written, they are matched a batch at a time, by a query per
+unique index of plain columns (its predicate, if any, held by both rows;
+each column compared by the index's own equality and collation, so the
+index serves the lookup), against the rows
+they collide with, as the merge's other checks run (seeing its writes,
+as the table's owner, row security aside: an owner who can't use the
+table's schema fails the merge, as its foreign key checks do), and the
+violations found are kept as any other.  A refused row is looked up as
+it was, read back from its row type's text kept with it (floats in
+full), not from its JSON, which loses a jsonb null, an array's bounds
+and a float's digits.  With NULLs not distinct, each pattern of the
+refused row's NULLs (up to four key columns) is a lookup of its own, so
+the index serves those too.  A refused row colliding with none now, or refused
+for an index of expressions, keeps its refusal's own record.
 
 The violations a merge keeps go to a tuplesort of their own (work_mem,
 spilling past it).  To publish them, the branch's violations are visited
@@ -817,6 +839,32 @@ column the query uses.  A refresh brings each tree to the new commit by
 the data trees' differences when the rows are keyed and laid out alike,
 else builds it again; the first build sorts every row's entry in memory
 (maintenance_work_mem).  A plain mount builds none and reads no row.
+
+A history mount (prolly_mount(..., history => true)) is dolt_history_table()
+as a foreign table: each table's columns as the mounted commit has them,
+then commit_hash, committer and commit_date, with a row for each row at
+each commit the mounted one reaches (each commit once, merges' parents
+too), read as dolt_history_table(NULL::t) reads it: the commit's table
+of the name (a table renamed since isn't followed to its old name, as the
+functions don't follow it), its columns by identity (one renamed since by
+its name there, one retyped since converted, a value that doesn't convert
+NULL with a warning once a scan, one the commit hasn't NULL).  A commit
+whose table can't be read here (its key ordered by what isn't built in)
+is an error, as a commit missing from the store is.  A reader other than
+the database's owner or pg_read_all_data is refused a commit whose table
+of the name isn't the one here (its lineage, walked once a scan, doesn't
+reach it), as dolt_history_table() by name refuses it.  A scan reads a
+commit at a time and streams its rows, so LIMIT stops it.  An equality
+on commit_hash (a constant, a parameter, or a join's outer row) reads
+that commit alone, if the mounted commit reaches it: the history is
+walked highest commit first down to that commit's height, and what is
+found is kept for the scan's next rescan, so one lookup reads the
+commits above it and a join reads each commit once.  The primary key's
+bounds seek in each commit whose key is the version's, and a commit keyed
+otherwise is read whole.  Planning reads no history (the commits are
+estimated by the mounted one's height).  prolly_mounts() shows which
+mounts are history mounts.  The dolt_history_table() functions still read
+every commit.
 
 
 Core hooks

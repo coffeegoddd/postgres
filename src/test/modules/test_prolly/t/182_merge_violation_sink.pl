@@ -132,16 +132,18 @@ for my $n (5000, 50000)
 	$node->safe_psql($db, q{SELECT injection_points_detach('prolly-merge-violations-added');
 		SELECT injection_points_wakeup('prolly-merge-violations-added')});
 	$s->query_safe('SELECT 1');
+	# (each refused row, and the row of ours' it collides with, as Dolt
+	# records them)
 	is($s->query_safe(q{SELECT count(*) FROM dolt_constraint_violations('s.t')}),
-		$n, "$n violations: each is recorded");
+		2 * $n, "$n violations: each is recorded");
 	is($s->query_safe(q{SELECT count(DISTINCT violating_row) FROM dolt_constraint_violations('s.t')}),
-		$n, "$n violations: each once");
+		2 * $n, "$n violations: each once");
 	is($s->query_safe(qq{SELECT count(*) FROM s.t WHERE pk <= $n AND b = 1000000 + pk}),
 		$n, "$n violations: the rows refused stay as the branch has them");
 
 	$s->query_safe(q{SELECT dolt_commit('-afm', 'merged with violations')});
 	is($s->query_safe(q{SELECT count(*) FROM dolt_constraint_violations('s.t')}),
-		$n, "$n violations: committed, the branch keeps them");
+		2 * $n, "$n violations: committed, the branch keeps them");
 
 	# Merged again, the branch's violations are found again and kept once;
 	# the new ones follow them, in the order found.
@@ -158,16 +160,17 @@ for my $n (5000, 50000)
 	$node->safe_psql($db, q{SELECT injection_points_detach('prolly-merge-publishing-violations');
 		SELECT injection_points_wakeup('prolly-merge-publishing-violations')});
 	$s->query_safe('SELECT 1');
+	# (the new rows collide with ours' rows recorded already)
 	is($s->query_safe(q{SELECT count(*) FROM dolt_constraint_violations('s.t')}),
-		2 * $n, "$n violations: those found again are kept once");
+		3 * $n, "$n violations: those found again are kept once");
 	is($s->query_safe(q{SELECT count(*) FROM (
 		SELECT violating_row->>'pk' AS pk,
 		  row_number() OVER () AS place
 		FROM dolt_constraint_violations('s.t')) v
-		WHERE (place <= } . $n . q{) = ((pk::int) < 20000000)}),
-		2 * $n, "$n violations: the new ones follow those the branch had");
+		WHERE (place <= } . (2 * $n) . q{) = ((pk::int) < 20000000)}),
+		3 * $n, "$n violations: the new ones follow those the branch had");
 	is($s->query_safe(q{SELECT num_violations FROM dolt_constraint_violations()}),
-		2 * $n, "$n violations: the summary counts them all");
+		3 * $n, "$n violations: the summary counts them all");
 	is(temp_bytes($db, $pid), 0, "$n violations: the merges remove their files");
 	$s->quit;
 }

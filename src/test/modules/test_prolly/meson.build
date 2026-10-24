@@ -44,6 +44,8 @@ test_install_data += files(
   'test_prolly_ext_detach--1.0.sql',
   'test_prolly_ext_readd.control',
   'test_prolly_ext_readd--1.0.sql',
+  'test_prolly_fixed.control',
+  'test_prolly_fixed--1.0.sql',
 )
 
 tests += {
@@ -216,6 +218,7 @@ tests += {
       'branch_catalog_index',
       'kept_commit_shares',
       'snapshot_mounts',
+      'history_mounts',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -345,8 +348,10 @@ tests += {
       't/212_vacuum_release_bounds.pl',
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
+      't/283_renamed_schema_conflict_restart.pl',
       't/225_kept_commit_snapshots.pl',
       't/266_autofold_defers.pl',
+      't/268_kept_pages_buffers.pl',
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
       't/237_vacuum_kept_pages.pl',
@@ -357,8 +362,11 @@ tests += {
       't/312_amend_race.pl',
       't/250_snapshot_mount_pins.pl',
       't/280_merge_kept_references.pl',
+      't/281_unique_collation_collisions.pl',
+      't/282_unique_collision_queries.pl',
       't/298_rewrite_checkpoint_errors.pl',
       't/310_reflog_after_gc.pl',
+      't/313_reflog_gc_slot.pl',
     ],
   },
 }

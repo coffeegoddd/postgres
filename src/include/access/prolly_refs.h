@@ -94,6 +94,8 @@ typedef struct ProllyMergeState
 	int			nschema;
 	char	  **schema_tables;	/* in schema conflicts, kept as the branch
 								 * has them (names, qualified; palloc'd) */
+	char	  **schema_base_tables; /* each one's name in the base */
+	char	  **schema_their_tables;	/* and in theirs */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -111,9 +113,10 @@ typedef struct ProllyMergeState
 /*
  * A constraint violation a merge (or cherry-pick) left on a branch: a row
  * of a table, as JSON, that breaks one of its constraints ("foreign key":
- * the row is in the table; "unique index", "exclusion constraint", "check
- * constraint", "not null": the merge didn't write it), and what it breaks,
- * as JSON.
+ * the row is in the table; "exclusion constraint", "check constraint",
+ * "not null": the merge didn't write it; "unique index": the row the merge
+ * didn't write, or a row of the table it collides with), and what it
+ * breaks, as JSON.
  */
 typedef struct ProllyViolation
 {
