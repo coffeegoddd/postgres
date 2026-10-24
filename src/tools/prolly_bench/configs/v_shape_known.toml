@@ -17,3 +17,39 @@ counter = "nodes_read"
 current = "linear"
 issue = "#697"
 reason = "dolt_at reads every row of the table at the commit; no key access path"
+
+# A merge keeps its commit's pages (prolly.kept_commits): the snapshot's
+# map work (the paths copied, their subtrees' holders) grows with the
+# table today, as does the merge's own first writes into pages shared with
+# the branch merged.
+[[known]]
+check = "merge"
+sweep = "rows"
+counter = "bmap_refcount_updates"
+current = "linear"
+issue = "#870"
+reason = "a merge's kept snapshot and its copies of shared paths update holders in proportion to the table"
+
+[[known]]
+check = "merge"
+sweep = "rows"
+counter = "bmap_map_pages_copied"
+current = "linear"
+issue = "#870"
+reason = "map pages a merge copies grow with the table"
+
+[[known]]
+check = "ff_merge"
+sweep = "rows"
+counter = "bmap_refcount_updates"
+current = "linear"
+issue = "#870"
+reason = "as merge's"
+
+[[known]]
+check = "ff_merge"
+sweep = "rows"
+counter = "bmap_map_pages_copied"
+current = "linear"
+issue = "#870"
+reason = "as merge's"
