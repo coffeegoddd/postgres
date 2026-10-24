@@ -231,6 +231,25 @@
       "session": "a",
       "op": "query",
       "requires": [
+        "vc.core",
+        "vc.rebase"
+      ],
+      "sql": "SELECT active_branch(), (SELECT count(*) FROM dolt_rebase)",
+      "expect": {
+        "rows": [
+          [
+            "dolt_rebase_branch1",
+            "3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
         "vc.rebase"
       ],
       "sql": "SELECT dolt_rebase('--abort')",
@@ -244,7 +263,7 @@
       }
     },
     {
-      "id": "assert-5",
+      "id": "assert-6",
       "session": "a",
       "op": "exec",
       "requires": [
@@ -256,7 +275,7 @@
       }
     },
     {
-      "id": "assert-6",
+      "id": "assert-7",
       "session": "a",
       "op": "query",
       "requires": [

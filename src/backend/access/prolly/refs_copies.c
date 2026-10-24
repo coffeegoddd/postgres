@@ -2374,6 +2374,20 @@ kept_settled(void *arg)
  * Nothing is kept if a lock isn't free or another's writes may be on the
  * pages: a move back to the commit then writes its rows.
  */
+static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+
+/* Was kept commit o replaced by commit_id: another made on its parent? */
+static bool
+kept_replaced(const KeptCommit *o, const ProllyHash *commit_id)
+{
+	ProllyCommitInfo made;
+	ProllyCommitInfo was;
+
+	return copies_commit_get(commit_id, &made) && made.nparents > 0 &&
+		copies_commit_get(&o->commit, &was) && was.nparents > 0 &&
+		same_hash(&made.parents[0], &was.parents[0]);
+}
+
 static void
 keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 		   Snapshot snap)
@@ -2482,14 +2496,18 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 	/*
 	 * (the commit first, then the others kept till there are enough; the
 	 * rest retired, let go of by a later keep once this transaction
-	 * commits, as a branch may be being made of them meanwhile)
+	 * commits, as a branch may be being made of them meanwhile.  One the
+	 * commit replaced, made on the same parent, is retired too: amended
+	 * away, or reworded or squashed by a rebase, it is no longer the
+	 * branch's, and kept it would push out the parent a reset goes back to)
 	 */
 	next = list_make1(kc);
 	foreach_ptr(KeptCommit, o, holding)
 	{
 		if (FullTransactionIdIsValid(o->retired))
 			next = lappend(next, o);
-		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits)
+		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits &&
+				 !kept_replaced(o, commit_id))
 		{
 			next = lappend(next, o);
 			live++;

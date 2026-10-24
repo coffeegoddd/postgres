@@ -644,7 +644,12 @@ step done, the rebased branch is moved to the rebase's head (refused if
 it moved meanwhile), and the rebase's branch deleted.  An edit's stop
 may amend the commit it stopped at: dolt_commit('--amend') replaces the
 head commit with one of the working set and the head's parents, its
-message kept unless -m gives one, as Dolt's.
+message kept unless -m gives one, as Dolt's, refused with constraint
+violations unless forced as a commit is.  An amend and a rebase's steps
+replace commits from the head they read, so they hold the branch first,
+and fail (40001, to retry) if another's commit moved it meanwhile; the
+commit amended away has its kept pages let go of, the commit before it
+staying kept.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
 

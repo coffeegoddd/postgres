@@ -924,6 +924,32 @@ qualified_name(Oid relid)
 
 
 /*
+ * Hold the refs (to the transaction's end) before what reads the head and
+ * then replaces commits from it, as an amend or a rebase does: a commit
+ * another session made in between would be dropped from the branch, the
+ * head moved back past it.  The head read before is checked against the
+ * head once held: moved meanwhile, a serialization failure, to retry.
+ * True if a newer snapshot was pushed (refs' hold()), for the caller to pop.
+ */
+static bool
+hold_unmoved(const char *what)
+{
+	ProllyHash	seen;
+	ProllyHash	now;
+	bool		had = PROLLY_CALL(refs(), resolve, "HEAD", &seen);
+	bool		pushed = PROLLY_CALL(refs(), hold);
+	bool		has = PROLLY_CALL(refs(), resolve, "HEAD", &now);
+
+	if (had != has || (had && !same_hash(&seen, &now)))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" moved while %s waited for it",
+						branch_ops()->current(), what),
+				 errhint("The transaction might succeed if retried.")));
+	return pushed;
+}
+
+/*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
  *
  * -m/--message message (required, not empty), --author "Name <email>" (or
@@ -955,6 +981,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	bool		committed = false;
 	ProllyMergeState ms;
 	ProllyCommitInfo amended;
+	bool		amend_pushed = false;
 	const char *result[1];
 
 	for (int i = 0; i < nargs; i++)
@@ -1010,6 +1037,7 @@ dolt_commit(PG_FUNCTION_ARGS)
 	{
 		ProllyHash	head;
 
+		amend_pushed = hold_unmoved("dolt_commit('--amend')");
 		if (PROLLY_CALL(refs(), merge_state, &ms))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1044,6 +1072,12 @@ dolt_commit(PG_FUNCTION_ARGS)
 		note_integration();
 		if (amend)
 		{
+			if (!prolly_allow_commit_conflicts() &&
+				PROLLY_CALL(refs(), violations) != NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot commit with constraint violations"),
+						 errhint("Fix the rows and check them again with dolt_verify_constraints().")));
 			/* (the head the new commit's parent, as a commit on it is made) */
 			if (amended.nparents > 0)
 				PROLLY_CALL(refs(), set_head, &amended.parents[0]);
@@ -1063,6 +1097,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 		date_given = false;
 	}
 	PG_END_TRY();
+	if (amend_pushed)
+		PopActiveSnapshot();
 
 	/* Nothing changed: the root is its parent's, and nothing was recorded. */
 	if (!committed && skip_empty && !PROLLY_CALL(refs(), merge_state, &ms))
@@ -4575,7 +4611,11 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	}
 	if (continue_rebase)
 	{
+		bool		pushed = hold_unmoved("dolt_rebase('--continue')");
+
 		rebase_continue(result);
+		if (pushed)
+			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
 	}
 	if (npositional == 0)
@@ -4590,7 +4630,11 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	rebase_start(upstream, keep_empty);
 	if (!interactive)
 	{
+		bool		pushed = hold_unmoved("dolt_rebase()");
+
 		rebase_continue(result);
+		if (pushed)
+			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
 	}
 	result[1] = psprintf("interactive rebase started on branch %s; "

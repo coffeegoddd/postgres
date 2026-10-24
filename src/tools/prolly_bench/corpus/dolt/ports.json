@@ -42005,7 +42005,7 @@
       "index": 12,
       "name": "dolt_rebase errors: data conflicts when @@autocommit is enabled",
       "source_sha256": "028308a9527093249b1b2fba958091147b3d81da436a62a94dcc319b4840498e",
-      "scenario_sha256": "4156a91a8380dc799c27fa3b79194db9e3c89a37f38e0950cd5f46b342c04829",
+      "scenario_sha256": "1a59abd11b3bf02f20c36fce0f7ed36d8a1c9a9cb8e9750d0e7454ec9356744a",
       "setup": [
         {
           "index": 0,
@@ -42105,35 +42105,36 @@
           "index": 3,
           "steps": [
             "assert-3",
-            "assert-4"
+            "assert-4",
+            "assert-5"
           ],
-          "note": "Dolt's ErrRebaseDataConflictsCantBeResolved: outside a transaction block the conflicts fail the statement, 40001 (D4), and its error rolls it back, the rebase left as it was before it, where Dolt aborts the rebase as it fails (D5): the abort is made here, so the state after is Dolt's."
+          "note": "Dolt's ErrRebaseDataConflictsCantBeResolved: outside a transaction block the conflicts fail the statement, 40001 (D4), and its error rolls it back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
         },
         {
           "index": 4,
           "steps": [
-            "assert-5"
+            "assert-6"
           ],
           "note": "Preserved expected rows; active_branch() as a function call."
         },
         {
           "index": 5,
           "steps": [
-            "assert-6"
+            "assert-7"
           ],
           "note": "Preserved expected rows, compared as a bag."
         },
         {
           "index": 6,
           "steps": [
-            "assert-7"
+            "assert-8"
           ],
           "note": "Expected error checked as its SQLSTATE: the plan is there only during a rebase, 42P01 as Dolt's missing table. (D4)"
         },
         {
           "index": 7,
           "steps": [
-            "assert-8"
+            "assert-9"
           ],
           "note": "Preserved expected rows."
         }
@@ -43445,7 +43446,7 @@
       "index": 24,
       "name": "dolt_rebase: schema conflicts",
       "source_sha256": "f9f2656196884cae0f67e5c0b547e8941eced7bcd816a9f92959be4c1cdd6136",
-      "scenario_sha256": "ada63a0e0eb2b4fe02dc471e3bc90f962bcb3be50dad898da9f5012c84d614b1",
+      "scenario_sha256": "731a10f14908ab7bc7de6ba3b139d68746551c74c8f8710ff042929d440fa880",
       "setup": [
         {
           "index": 0,
@@ -43560,21 +43561,22 @@
           "index": 3,
           "steps": [
             "assert-3",
-            "assert-4"
+            "assert-4",
+            "assert-5"
           ],
-          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back, the rebase left as it was before it, where Dolt aborts the rebase as it fails (D5): the abort is made here, so the state after is Dolt's."
+          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
         },
         {
           "index": 4,
           "steps": [
-            "assert-5"
+            "assert-6"
           ],
           "note": "Expected error checked as its SQLSTATE: no rebase in progress, 55000. (D4)"
         },
         {
           "index": 5,
           "steps": [
-            "assert-6"
+            "assert-7"
           ],
           "note": "Preserved expected rows; active_branch() as a function call."
         },

@@ -206,6 +206,12 @@ SELECT dolt_commit('-am', 'not with violations');
 ROLLBACK TO s;
 SELECT length(dolt_commit('-afm', 'forced')::text) AS committed;
 SELECT length(dolt_commit('--force', '--allow-empty', '-m', 'forced again')::text) AS committed;
+-- an amend too: refused with them, unless forced
+SAVEPOINT s;
+SELECT dolt_commit('--amend', '-m', 'amended with violations');
+ROLLBACK TO s;
+SELECT length(dolt_commit('--amend', '-f', '-m', 'amended, forced')::text) AS committed;
+SELECT message FROM dolt_log('main') LIMIT 1;
 COMMIT;
 SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
 
