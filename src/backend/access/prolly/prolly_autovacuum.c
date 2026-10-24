@@ -9,7 +9,9 @@
  * not settled, received since) has passed prolly.gc_journal_threshold and
  * the settled files' size times prolly.gc_growth_scale_factor: a default
  * collection, by the database's reclamation.  Only sizes are read, not the
- * journal.  Then it moves the journal (the reclamation's move(): its
+ * journal.  Another collection running, it skips its own quietly (counted
+ * in pg_stat_prolly's auto_collections_skipped): that one collects what
+ * was due.  Then it moves the journal (the reclamation's move(): its
  * segments rewritten as a table file, nothing freed) once its segments
  * have passed prolly.journal_move_threshold, which bounds what a backend
  * reads to index the journal when collections are rare (a large store) or
@@ -291,6 +293,13 @@ collection_due(void)
 		collected > s.settled * prolly_gc_growth_scale_factor;
 }
 
+/*
+ * A collection is refused while another of the store runs (its lock tried,
+ * never waited for): several workers find the same store due at once.
+ * The one that runs collects what was due, so the others skip it quietly,
+ * counted (auto_collections_skipped), rather than each reporting the
+ * refusal as an error; dolt_gc() still reports it.
+ */
 static void
 collect(void)
 {
@@ -302,7 +311,14 @@ collect(void)
 	VacuumUpdateCosts();
 	VacuumCostBalance = 0;
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.reclamation, collect, false, &r);
+	if (!PROLLY_CALL(dc.reclamation, collect, false, true, &r))
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_AUTO_COLLECTIONS_SKIPPED, 1);
+		ereport(DEBUG1,
+				(errmsg_internal("automatic collection of database \"%s\" skipped: another collection of its chunk store is running",
+								 get_database_name(MyDatabaseId))));
+		return;
+	}
 	ereport(DEBUG1,
 			(errmsg_internal("automatic collection of database \"%s\": %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 get_database_name(MyDatabaseId),
