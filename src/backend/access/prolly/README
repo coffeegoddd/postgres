@@ -327,10 +327,11 @@ its commit, a revert of its drop, a cherry-pick from its branch) writes
 them into the new table, whose rows they then are (#936).  A note names
 the table by its relation, and a noted commit whose note hasn't the
 table's vouches for none of its parents; a walk that finds nothing
-waiting meets the lineage tries it once until the lineage grows, and a
-collection forgets the notes of the commits it takes.  Moving a head takes a write role
-(see Writers), not SELECT alone.  A plan's row estimate of a version, and
-dolt_diff_stat's counts, are read on the same rule.
+waiting meets the lineage tries it once until the lineage grows.  A
+note outlives its commit, if a collection takes that (#939).
+Moving a head takes a write role (see Writers), not SELECT alone.  A
+plan's row estimate of a version, and dolt_diff_stat's counts, are read
+on the same rule.
 
 Folded format 18 records identities in commits.  Formats are not kept
 compatible while the prototype iterates: this build reads, moves to and

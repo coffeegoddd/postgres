@@ -46,8 +46,6 @@ SET ROLE regress_lb_writer;
 SELECT dolt_reset('--soft', :'old_commit') IS NOT NULL AS moved;
 SELECT length(dolt_commit('--allow-empty', '-m', 'over the old')::text) AS committed;
 RESET ROLE;
-SELECT dolt_hashof('HEAD') AS over_commit \gset
-SELECT test_refs_value('L' || :'over_commit') IS NOT NULL AS noted;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
@@ -106,7 +104,6 @@ SET ROLE regress_lb_writer;
 SELECT dolt_reset('--soft', :'old_commit') IS NOT NULL AS moved;
 SELECT length(dolt_commit('--allow-empty', '-m', 'over the old, fresh')::text) AS committed;
 RESET ROLE;
-SELECT dolt_hashof('HEAD') AS fresh_commit \gset
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
 RESET ROLE;
@@ -148,11 +145,6 @@ SELECT * FROM dolt_at('HEAD^1', NULL::ln.t);
 SELECT * FROM dolt_at('keeps_old~', NULL::ln.t);
 SELECT diff_type, from_row FROM dolt_diff(:'old_commit', 'HEAD', NULL::ln.t);
 RESET ROLE;
-
--- a collection that takes a noted commit forgets its note
-SELECT dolt_gc('--full') IS NOT NULL AS collected;
-SELECT test_refs_value('L' || :'over_commit') IS NOT NULL AS still_noted;
-SELECT test_refs_value('L' || :'fresh_commit') IS NOT NULL AS live_still_noted;
 
 \c contrib_regression
 DROP DATABASE regress_lineage_breaks;

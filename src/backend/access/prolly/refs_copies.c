@@ -4505,44 +4505,6 @@ carry_names_from(const char *name, const char *from, const ProllyHash *head)
 }
 
 /*
- * Forget the 'L' notes of commits the store no longer has (a collection
- * took them): a note is kept by its commit's key alone, not as a reference
- * the collection keeps.
- */
-static void
-copies_forget_lineage_notes(void)
-{
-	ProllyNodeRef root;
-	ProllyTreeCursor *c;
-	ProllyKey	k;
-	ProllyValue v;
-	char		tag = TAG_LINEAGE;
-	ProllyKey	from = {(const uint8 *) &tag, 1};
-	List	   *gone = NIL;
-	ListCell   *lc;
-
-	refs_init();
-	lock_refs();
-	if (!refs_root(&root))
-		return;
-	c = PROLLY_CALL(tree, cursor_open, &env, &root, CurrentMemoryContext);
-	PROLLY_CALL(tree, cursor_seek, c, &from, ForwardScanDirection);
-	while (PROLLY_CALL(tree, cursor_next, c, &k, &v) &&
-		   k.len >= 1 && k.data[0] == TAG_LINEAGE)
-	{
-		ProllyHash	commit;
-		ProllyCommitInfo info;
-
-		if (!prolly_hash_from_hex((const char *) k.data + 1, k.len - 1, &commit) ||
-			!copies_commit_get(&commit, &info))
-			gone = lappend(gone, pnstrdup((const char *) k.data, k.len));
-	}
-	PROLLY_CALL(tree, cursor_close, c);
-	foreach(lc, gone)
-		refs_put(lfirst(lc), strlen(lfirst(lc)), NULL);
-}
-
-/*
  * Commit commit's 'L' note: the record's commit before it (*was) and its
  * lines (relation, a tab, name in the commit, a tab, name before); false if
  * it has none.
@@ -8178,5 +8140,4 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tag_set_creator = copies_tag_set_creator,
 	.stash_maker = copies_stash_maker,
 	.lineage_note = copies_lineage_note,
-	.forget_lineage_notes = copies_forget_lineage_notes,
 };

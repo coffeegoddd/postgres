@@ -9683,9 +9683,6 @@ collect(bool full, const char *what, ProllyGcResult *gc)
 	PreventCommandIfReadOnly(what);
 	prolly_database_components(&dc);
 	PROLLY_CALL(dc.reclamation, collect, full, gc);
-	/* (and the lineage notes of the commits it took) */
-	if (PROLLY_HAS(dc.refs, forget_lineage_notes))
-		PROLLY_CALL(dc.refs, forget_lineage_notes);
 	ereport(DEBUG1,
 			(errmsg_internal("%s: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 what,
