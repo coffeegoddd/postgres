@@ -315,23 +315,33 @@ old table's commit from the new one; the records can.  A commit that
 isn't its working set folded (a merge's, a pick's or a revert's, over
 uncommitted changes) is recorded made only from the relations its first
 parent's record and the working set both have, as it holds a table
-dropped and made again in the working set as the parent had it.  A
-move (a hard reset, a merge or pull, a cherry-pick, a revert) or a
-branch's first use that changes a table's version to one the commits it
-came from weren't made from the table's relation (their records don't
-list it, or they have none: commits made elsewhere) makes the table
-again: a relation of its own, the mover's (a first use's, the branch
-owner's), with no grants (prolly_remake_foreign_versions(), through the
-canonicalizer's move with prolly_move_remade).  The rows are as the move
-left them, and a commit the move made is recorded made from the new
-relation.  So the old table's rows never land in the new table's
+dropped and made again in the working set as the parent had it; and a
+table such a move changed in the working set, uncommitted (set aside, or
+left out of the commit), is recorded only as of a relation of the class
+its first parent's record lists (refs' prolly_commit_local_tables, as the
+merge, pick or revert tells it).  Relations are compared by equivalence
+class ('Q', refs format 15): a relation a move makes again of a table (a
+definition it can't alter in place, as a branch's first use may when its
+copies are moved to its head), or a merge, pick or revert makes of the
+other side's table (the class of the relation the commit it takes the
+version from was made from: prolly_move_provenance), is the same table
+as the one it comes from, whatever its OID.  A move (a hard
+reset, a merge or pull, a cherry-pick, a revert) or a branch's first use
+that changes a table's version to one a commit made here holds of another
+table (its record lists no relation of the table's class) makes the table
+again: a relation and a class of its own, the mover's (a first use's, the
+branch owner's), with no grants (prolly_remake_foreign_versions(), through
+the canonicalizer's move with prolly_move_remade).  The rows are as the
+move left them, and a commit the move made is recorded made from the new
+relation.  So the old table's rows don't land in the new table's
 relation, under its grants: its grants must be given again, to whom
-they're for, once the rows are the ones meant.  The mover needs what
-dropping and making the table takes (its owner's privileges, CREATE on
-its schema).  A move within the table's own history keeps it.  What the
-records can't: a table a merge makes here is a relation of its own, so its
-branch's history isn't its grantee's here (it fails closed); and a role
-given a dropped relation's OID again would read that relation's versions.
+they're for.  The mover needs what dropping and making the table takes
+(its owner's privileges, CREATE on its schema).  What the records can't:
+a version of a commit made elsewhere (fetched, cloned, pushed: no record)
+keeps the relation and its grants, so an old table's version come back
+from a remote can land its rows in the table here (its history stays
+refused); and a role given a dropped relation's OID again would read
+that relation's versions.
 A refused read reads each commit's record about once: a walk that meets
 nothing marks the commits it saw apart.  Moving a head takes a write role
 (see Writers), not SELECT alone.  A plan's row estimate of a version, and

@@ -1043,7 +1043,7 @@ prolly_check_branch_rename(const char *newname)
  * After a move from before (the branch folded then, had: one there was)
  * bringing versions from the commits from (n of them), and having made
  * commit made (NULL: none): the tables whose versions came from another
- * relation's commits made again, relations of their own
+ * table's commits made again, relations of their own
  * (prolly_remake_foreign_versions()).
  */
 static void
@@ -1054,6 +1054,28 @@ remake_moved(bool had, const ProllyNodeRef *before, const ProllyHash *from,
 		BRANCH_WRITES_HUSHED(prolly_remake_foreign_versions(before, from, n,
 															made));
 }
+
+/*
+ * Run fn(arg) with prolly_move_provenance the commits from (n of them): the
+ * commits a move takes versions from, which the tables it makes take their
+ * relations' equivalence classes from.
+ */
+#define WITH_PROVENANCE(from_, n_, ...) \
+	do { \
+		List	   *prov_ = NIL; \
+		for (int pi_ = 0; pi_ < (n_); pi_++) \
+			prov_ = lappend(prov_, (void *) &(from_)[pi_]); \
+		prolly_move_provenance = prov_; \
+		PG_TRY(_provenance); \
+		{ \
+			__VA_ARGS__; \
+		} \
+		PG_FINALLY(_provenance); \
+		{ \
+			prolly_move_provenance = NIL; \
+		} \
+		PG_END_TRY(_provenance); \
+	} while (0)
 
 /*
  * Hold the refs (to the transaction's end) before what reads the head and
@@ -2421,7 +2443,7 @@ dolt_merge(PG_FUNCTION_ARGS)
 	ProllyHash	before = {0};
 	ProllyHash	theirs = {0};
 	ProllyNodeRef folded;
-	bool		had_folded;
+	bool		had_folded = false;
 	ProllyHash	id = {0};
 	bool		had_head;
 	bool		abort_merge = false;
@@ -2508,11 +2530,13 @@ dolt_merge(PG_FUNCTION_ARGS)
 	(void) PROLLY_CALL(refs(), resolve, branch, &theirs);
 	known = violations_kept();
 	date_given = dated;
-	had_folded = PROLLY_CALL(refs(), working_set, NULL, &folded);
 	PG_TRY();
 	{
-		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, branch,
-													 message, flags, &id));
+		had_folded = PROLLY_CALL(refs(), working_set, NULL, &folded);
+		WITH_PROVENANCE(&theirs, theirs.len > 0 ? 1 : 0,
+						BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge,
+																	 branch, message,
+																	 flags, &id)));
 	}
 	PG_FINALLY();
 	{
@@ -3309,13 +3333,15 @@ dolt_reset(PG_FUNCTION_ARGS)
 		PROLLY_CALL(writers(), take, MyBranch);
 	note_integration();
 	{
+		ProllyHash	target = {0};
 		ProllyNodeRef folded;
 		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
-		ProllyHash	target;
 
-		BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset, ref ? ref : "HEAD"));
-		if (PROLLY_CALL(refs(), resolve, "HEAD", &target))
-			remake_moved(had, &folded, &target, 1, NULL);
+		(void) PROLLY_CALL(refs(), resolve, ref ? ref : "HEAD", &target);
+		WITH_PROVENANCE(&target, target.len > 0 ? 1 : 0,
+						BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), reset,
+														 ref ? ref : "HEAD")));
+		remake_moved(had, &folded, &target, target.len > 0 ? 1 : 0, NULL);
 	}
 	settled();
 	PG_RETURN_DATUM(text_array(1, result));
@@ -3919,15 +3945,17 @@ dolt_cherry_pick(PG_FUNCTION_ARGS)
 	refuse_violations("cherry-pick");
 	note_integration();
 	{
+		ProllyHash	picked = {0};
 		ProllyNodeRef folded;
 		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
-		ProllyHash	picked;
 
-		BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
-													 &ref, 1, allow_empty, &id));
-		if (PROLLY_CALL(refs(), resolve, ref, &picked))
-			remake_moved(had, &folded, &picked, 1,
-						 conflicts == 0 && id.len > 0 ? &id : NULL);
+		(void) PROLLY_CALL(refs(), resolve, ref, &picked);
+		WITH_PROVENANCE(&picked, picked.len > 0 ? 1 : 0,
+						BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), cherry_pick,
+																	 &ref, 1, allow_empty,
+																	 &id)));
+		remake_moved(had, &folded, &picked, picked.len > 0 ? 1 : 0,
+					 conflicts == 0 && id.len > 0 ? &id : NULL);
 	}
 	must_commit(conflicts, "a cherry-pick");
 	if (conflicts > 0)
@@ -3964,10 +3992,10 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 	refuse_violations("revert");
 	note_integration();
 	{
-		ProllyNodeRef folded;
-		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
 		ProllyHash *from = palloc0(sizeof(ProllyHash) * Max(n, 1));
 		int			nfrom = 0;
+		ProllyNodeRef folded;
+		bool		had = PROLLY_CALL(refs(), working_set, NULL, &folded);
 
 		/* (a revert brings back what each commit's parent had) */
 		for (int i = 0; i < n; i++)
@@ -3979,8 +4007,10 @@ revert_series(const char *const *ids, int n, const ProllyHash *series_head,
 				PROLLY_CALL(refs(), commit_get, &c, &info) && info.nparents > 0)
 				from[nfrom++] = info.parents[0];
 		}
-		BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert, ids, n,
-												   series_head, &id));
+		WITH_PROVENANCE(from, nfrom,
+						BRANCH_WRITES_HUSHED(stopped = PROLLY_CALL(diff_merge(), revert,
+																   ids, n, series_head,
+																   &id)));
 		remake_moved(had, &folded, from, nfrom,
 					 stopped == 0 && id.len > 0 ? &id : NULL);
 	}
@@ -6912,28 +6942,67 @@ typedef struct NameLineage
 	HTAB	   *steps;			/* LineageStep, each version reached */
 	List	   *queue;			/* (ProllyHash *, its name) pairs, to walk */
 	HTAB	   *apart;			/* commits a walk back from found apart */
+	HTAB	   *classes;		/* relations' classes, as read (RelClass) */
+	Oid			cls;			/* relid's */
 	bool		started;
 } NameLineage;
 
+typedef struct RelClass
+{
+	Oid			relid;
+	Oid			cls;
+} RelClass;
+
+/* relid's equivalence class (refs' relation_class()), read once a lineage */
+static Oid
+lineage_class(NameLineage *l, Oid relid)
+{
+	RelClass   *rc;
+	bool		found;
+
+	if (!PROLLY_HAS(refs(), relation_class))
+		return relid;
+	if (l->classes == NULL)
+	{
+		HASHCTL		ctl = {0};
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(RelClass);
+		ctl.hcxt = CurrentMemoryContext;
+		l->classes = hash_create("prolly relation classes", 64, &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	rc = hash_search(l->classes, &relid, HASH_ENTER, &found);
+	if (!found)
+		rc->cls = PROLLY_CALL(refs(), relation_class, relid);
+	return rc->cls;
+}
+
 /*
- * The name relid's table had in commit, as its record has it; NULL if the
- * commit wasn't made from that relation, or has no record.
+ * The name l's table had in commit, as its record has it; NULL if the
+ * commit wasn't made from a relation of the table's class (the relation
+ * itself, or one the same table as it: refs' relation_class()), or has no
+ * record.
  */
 static char *
-made_from(const ProllyHash *commit, Oid relid)
+made_from(NameLineage *l, const ProllyHash *commit)
 {
 	char	   *lines;
 	char		want[16];
 
-	if (!OidIsValid(relid) || !PROLLY_HAS(refs(), commit_relations) ||
+	if (!OidIsValid(l->relid) || !PROLLY_HAS(refs(), commit_relations) ||
 		!PROLLY_CALL(refs(), commit_relations, commit, &lines))
 		return NULL;
-	snprintf(want, sizeof(want), "%010u ", relid);
+	if (!OidIsValid(l->cls))
+		l->cls = lineage_class(l, l->relid);
+	snprintf(want, sizeof(want), "%010u ", l->relid);
 	for (char *p = lines; *p;)
 	{
 		char	   *end = strchrnul(p, '\n');
 
-		if (strncmp(p, want, 11) == 0)
+		if (end - p > 11 &&
+			(strncmp(p, want, 11) == 0 ||
+			 lineage_class(l, (Oid) strtoul(p, NULL, 10)) == l->cls))
 			return pnstrdup(p + 11, end - (p + 11));
 		p = *end ? end + 1 : end;
 	}
@@ -6969,7 +7038,7 @@ parents_made_from(NameLineage *l, const ProllyHash *commit, List *queue,
 
 		if (hash_search(seen, hash_hex(&info.parents[i]), HASH_FIND, NULL) != NULL)
 			continue;
-		if ((name = made_from(&info.parents[i], l->relid)) != NULL)
+		if ((name = made_from(l, &info.parents[i])) != NULL)
 			queue = lappend(lappend(queue, copy_hash(&info.parents[i])), name);
 	}
 	return queue;
@@ -7003,7 +7072,7 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 		lineage_enter(l, "WORKING", l->now);
 		/* (the head's version is the table's if the head was made of it) */
 		if (PROLLY_CALL(refs(), resolve, "HEAD", &h) &&
-			(at_name = made_from(&h, l->relid)) != NULL)
+			(at_name = made_from(l, &h)) != NULL)
 			l->queue = lappend(lappend(l->queue, copy_hash(&h)), at_name);
 	}
 	while ((st = hash_search(l->steps, key, HASH_FIND, NULL)) == NULL &&
@@ -7059,7 +7128,7 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 	if (ref == NULL || pg_strcasecmp(ref, "WORKING") == 0 ||
 		pg_strcasecmp(ref, "STAGED") == 0 ||
 		!PROLLY_CALL(refs(), resolve, ref, &h) ||
-		(at_name = made_from(&h, l->relid)) == NULL ||
+		(at_name = made_from(l, &h)) == NULL ||
 		strcmp(at_name, name) != 0)
 		return false;
 	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
@@ -7105,7 +7174,7 @@ lineage_reaches(NameLineage *l, const char *ref, const char *name)
 
 			if (hash_search(l->apart, phex, HASH_FIND, NULL) != NULL ||
 				hash_search(seen, phex, HASH_FIND, NULL) != NULL ||
-				(pname = made_from(&info.parents[i], l->relid)) == NULL)
+				(pname = made_from(l, &info.parents[i])) == NULL)
 				continue;
 			ps = hash_search(seen, phex, HASH_ENTER, &dup);
 			strlcpy(ps->child, hex, sizeof(ps->child));

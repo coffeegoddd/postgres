@@ -766,6 +766,15 @@ typedef struct ProllyRefsRoutine
 	bool		(*commit_relations) (const ProllyHash *commit, char **lines);
 
 	/*
+	 * Optional: relation relid's equivalence class, the relation it is the
+	 * same table as (relid itself, if none is recorded), and setting it: a
+	 * relation a move made again of a table, or a merge of the other
+	 * side's, is the same table as the one it comes from.
+	 */
+	Oid			(*relation_class) (Oid relid);
+	void		(*set_relation_class) (Oid relid, Oid cls);
+
+	/*
 	 * Optional: record commit as made from the relations lines lists (as
 	 * commit_relations() gives them): a move that made a commit and then
 	 * made one of its tables again, a relation of its own, says so.
@@ -797,6 +806,13 @@ extern PGDLLIMPORT int prolly_kept_commits;
  */
 extern PGDLLIMPORT int prolly_restore_min_changes;
 
+/*
+ * While set, the tables (qualified names) a commit being made changed in the
+ * working set before the move it commits: recorded made only from a
+ * relation of the class its first parent's record lists.
+ */
+extern PGDLLIMPORT List *prolly_commit_local_tables;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
@@ -817,7 +833,8 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
 	"pin_set", "pin_get", "pins", "branch_creator", \
 	"branch_set_creator", "tag_creator", "stash_maker", "tag_set_creator", \
-	"commit_relations", "set_commit_relations"
+	"commit_relations", "relation_class", "set_relation_class", \
+	"set_commit_relations"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
 #define PROLLY_REFS_LAST_CALLBACK set_commit_relations
 

@@ -4661,14 +4661,16 @@ folded_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
 
 /*
  * After a move from before (the branch folded then) that brought versions
- * from commit provenance (the commit moved to, a merge's other side, the
- * commit a pick takes or a revert goes back to): each table whose version
- * the move changed and that provenance wasn't made from the table's
- * relation (its record doesn't list it; or it has none, a commit made
- * elsewhere) is made again, a relation of its own (a new OID, the session
- * role's, no grants), its rows as the move left them.  The relation's
- * grants, which covered the rows its own history holds, don't cover those
- * another relation's version brought.
+ * from the commits provenance (the commit moved to, a merge's other side,
+ * the commit a pick takes or a revert goes back to): each table whose
+ * version the move changed, and that a commit of them made here wasn't
+ * made from (its record lists no relation of the table's equivalence
+ * class), is made again, a relation of its own (a new OID and class, the
+ * session role's, no grants), its rows as the move left them.  The
+ * relation's grants, which covered the rows its own history holds, don't
+ * cover those another table's version brought.  A commit made elsewhere
+ * (fetched, cloned, pushed here: no record) can't be told so, and keeps
+ * the relation; its versions stay refused to history reads.
  */
 void
 prolly_remake_foreign_versions(const ProllyNodeRef *before,
@@ -4709,17 +4711,37 @@ prolly_remake_foreign_versions(const ProllyNodeRef *before,
 		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
 			continue;
 		{
-			char	   *line = psprintf("%010u %s\n", relid, t->name);
-			char	   *nl_line = psprintf("\n%s", line);
-			bool		every = true;
+			Oid			cls = PROLLY_HAS(dc.refs, relation_class) ?
+				PROLLY_CALL(dc.refs, relation_class, relid) : relid;
+			bool		foreign = false;
 
-			/* (each commit the versions came from made from this relation) */
-			for (int i = 0; i < nprovenance && every; i++)
-				every = PROLLY_HAS(dc.refs, commit_relations) &&
-					PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &lines) &&
-					(strncmp(lines, line, strlen(line)) == 0 ||
-					 strstr(lines, nl_line) != NULL);
-			if (every)
+			/*
+			 * (a commit made here, recorded as made from no relation of the
+			 * table's class: another table's version.  One made elsewhere,
+			 * unrecorded, keeps the relation: its history stays refused)
+			 */
+			for (int i = 0; i < nprovenance && !foreign; i++)
+			{
+				bool		same = false;
+
+				if (!PROLLY_HAS(dc.refs, commit_relations) ||
+					!PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &lines))
+					continue;
+				for (char *p = lines; *p && !same;)
+				{
+					char	   *end = strchrnul(p, '\n');
+					Oid			r = (Oid) strtoul(p, NULL, 10);
+
+					if (end - p > 11 &&
+						(r == relid ||
+						 (PROLLY_HAS(dc.refs, relation_class) &&
+						  PROLLY_CALL(dc.refs, relation_class, r) == cls)))
+						same = true;
+					p = *end ? end + 1 : end;
+				}
+				foreign = !same;
+			}
+			if (!foreign)
 				continue;
 		}
 		remade = lappend(remade, pstrdup(t->name));
@@ -12171,6 +12193,29 @@ without_local(const Local *l, ProllyNodeRef *root)
 }
 
 /*
+ * Commit as refs' commit_with() does, the uncommitted changes l names (if
+ * any) told to the refs (prolly_commit_local_tables): the commit holds those
+ * tables as its first parent did, set aside or left out, so its record of
+ * the relations it was made from lists only those of the parent's class.
+ */
+static void
+commit_over_local(const Local *l, const char *message, const ProllyHash *parents,
+				  int nparents, const ProllyNodeRef *root, ProllyHash *commit_id)
+{
+	prolly_commit_local_tables = has_local_changes(l) ? l->tables : NIL;
+	PG_TRY();
+	{
+		PROLLY_CALL(components().refs, commit_with, message, parents, nparents,
+					root, commit_id);
+	}
+	PG_FINALLY();
+	{
+		prolly_commit_local_tables = NIL;
+	}
+	PG_END_TRY();
+}
+
+/*
  * Uncommitted changes a merge (or pick, or revert) changing definitions
  * goes ahead over: the branch moved to its head, writing only what they
  * changed, so the merge is made as over a clean working set and its
@@ -12695,8 +12740,8 @@ merge_held(const char *branch, const char *message, int flags,
 
 		if (has_local_changes(&local))
 			without_local(&local, &merged);
-		PROLLY_CALL(dc.refs, commit_with, message, parents, 1,
-					has_local_changes(&local) ? &merged : NULL, commit_id);
+		commit_over_local(&local, message, parents, 1,
+						  has_local_changes(&local) ? &merged : NULL, commit_id);
 		put_back(&local, "merge");
 		return 0;
 	}
@@ -12706,10 +12751,10 @@ merge_held(const char *branch, const char *message, int flags,
 		ProllyNodeRef merged;
 
 		without_local(&local, &merged);
-		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, &merged, commit_id);
+		commit_over_local(&local, message, parents, 2, &merged, commit_id);
 	}
 	else
-		PROLLY_CALL(dc.refs, commit_with, message, parents, 2, NULL, commit_id);
+		commit_over_local(&local, message, parents, 2, NULL, commit_id);
 	put_back(&local, "merge");
 	return 0;
 }
@@ -12774,17 +12819,15 @@ static void
 commit_one_parent(const char *message, const ProllyHash *head, const Local *l,
 				  ProllyHash *commit_id)
 {
-	ProllyDatabaseComponents dc = components();
-
 	if (has_local_changes(l))
 	{
 		ProllyNodeRef root;
 
 		without_local(l, &root);
-		PROLLY_CALL(dc.refs, commit_with, message, head, 1, &root, commit_id);
+		commit_over_local(l, message, head, 1, &root, commit_id);
 	}
 	else
-		PROLLY_CALL(dc.refs, commit_with, message, head, 1, NULL, commit_id);
+		commit_over_local(l, message, head, 1, NULL, commit_id);
 }
 
 /*

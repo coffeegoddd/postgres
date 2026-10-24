@@ -671,16 +671,23 @@ OF` are built in D18's shapes.
   one commit (its record names the new relation, its parent's the old).
   A merge, pick or revert committed over uncommitted changes is recorded
   made only from what its first parent's record and the working set both
-  have. A move (a hard reset, a merge or pull, a cherry-pick, a
-  revert) or a branch's first use that changes a table's version to one
-  whose commits weren't made from the table's relation (or have no record)
-  makes the table again, a relation of its own: the mover's (a first use's,
-  the branch owner's), with no grants, which must be given again
-  ([#936](https://github.com/coffeegoddd/postgres/issues/936)). In Dolt,
-  grants are on table names and survive any move. Known limits, as commits name tables by name and identity alone
-  and a table made again keeps its name's identity (#891, decided: commit
-  identities don't change): a table a merge makes is a relation of its own, so its source branch's history
-  isn't its grantee's (this and the unrecorded commits fail closed); and
+  have. A move (a hard reset, a merge or pull, a cherry-pick, a revert) or
+  a branch's first use that changes a table's version to one a commit made
+  here holds of another table makes the table again, a relation of its
+  own: the mover's (a first use's, the branch owner's), with no grants,
+  which must be given again
+  ([#936](https://github.com/coffeegoddd/postgres/issues/936)); in Dolt,
+  grants are on table names and survive any move. Further, a table such a
+  move changed in the working set is recorded only as
+  of the class its first parent's record lists. Relations are compared by
+  equivalence class: a relation a move makes again of a table, or a merge,
+  pick or revert makes of the other side's, is the same table as the one
+  it comes from. Known limits, as commits name tables by name and identity
+  alone and a table made again keeps its name's identity (#891, decided:
+  commit identities don't change): unrecorded commits (made elsewhere)
+  fail closed for history, but a move to one keeps the relation, so an old
+  table's version come back from a remote can land its rows in the table
+  here; and
   a role given a dropped relation's OID again would read that relation's
   versions. Planner estimates of a version's rows and `dolt_diff_stat`'s
   counts are history too: a version the user may not read gives the
