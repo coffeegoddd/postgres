@@ -559,6 +559,8 @@ end_text_settings(int nest)
 		AtEOXact_GUC(true, nest);
 }
 
+static bytea *send_utf8(FmgrInfo *send, Datum value);
+
 /*
  * A CODEC_OUTPUT value: TAG_OUTPUT, then its text form in UTF-8, written
  * with fixed settings.  The text must read back as the value, byte for
@@ -568,11 +570,10 @@ end_text_settings(int nest)
  * changed.
  *
  * A value of a type with binary send and receive whose receive refused it
- * (refused) is kept as text too, and its text need only be stable: read
- * back and written again, the same text.  It is then stored as its text
- * reads back, as a value receive normalizes is stored as receive gives it
- * back: a PostGIS geometry with a cached bounding box reads back without
- * it, the same geometry.
+ * (refused) is kept as text too, and its text must read back as a value
+ * the type sends as it sends this one: the same binary form, though not
+ * always the same bytes in memory (a PostGIS geometry with a cached
+ * bounding box reads back without the cache, which send doesn't hold).
  */
 static void
 encode_output(ProllyDatumCodec *c, Datum value, StringInfo out, bool refused)
@@ -581,17 +582,26 @@ encode_output(ProllyDatumCodec *c, Datum value, StringInfo out, bool refused)
 	char	   *text = OutputFunctionCall(&c->output, value);
 	Datum		back = InputFunctionCall(&c->input, text, c->input_ioparam,
 										 c->typmod);
-	char	   *again = refused ? OutputFunctionCall(&c->output, back) : NULL;
 	char	   *utf8;
 
 	end_text_settings(nest);
-	if (refused && strcmp(text, again) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("value of type %s can't be stored in a versioned table: its binary receive function refuses it, and its text form doesn't read back as the same text",
-						format_type_be(c->type)),
-				 errdetail("The value is \"%s\".", text),
-				 errhint("A value the type's receive function refuses is kept as its text form.")));
+	if (refused)
+	{
+		bytea	   *sent = send_utf8(&c->send, value);
+		bytea	   *sent_back = send_utf8(&c->send, back);
+		bool		same = VARSIZE(sent) == VARSIZE(sent_back) &&
+			memcmp(VARDATA(sent), VARDATA(sent_back), VARSIZE(sent) - VARHDRSZ) == 0;
+
+		pfree(sent);
+		pfree(sent_back);
+		if (!same)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("value of type %s can't be stored in a versioned table: its binary receive function refuses it, and its text form doesn't read back as the same value",
+							format_type_be(c->type)),
+					 errdetail("The value is \"%s\".", text),
+					 errhint("A value the type's receive function refuses is kept as its text form.")));
+	}
 	if (!refused && !datum_image_eq(value, back, c->typbyval, c->typlen))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -605,8 +615,6 @@ encode_output(ProllyDatumCodec *c, Datum value, StringInfo out, bool refused)
 	if (utf8 != text)
 		pfree(utf8);
 	pfree(text);
-	if (again)
-		pfree(again);
 }
 
 /* a value's text form (after its tag), read with fixed settings */
@@ -686,7 +694,10 @@ static bool batch_in_receive = false;	/* in an unprotected receive now */
 /*
  * Was an error raised in the server's own code: in a function the postgres
  * executable exports (a catalog lookup, say), rather than an extension's?
- * Where that can't be told, not.
+ * Where that can't be told, not: an error raised in a static or inlined
+ * server function (load_rangetype_info()'s cache lookup, on range_recv()'s
+ * way) is taken as the type's own, and on Windows, without dladdr(), so is
+ * every one.
  */
 static bool
 raised_by_server(const ErrorData *edata)
@@ -742,7 +753,9 @@ round_trip(ProllyDatumCodec *c, bytea *b)
  * unprotected (a refusal fails the run); otherwise in a subtransaction of
  * its own.  An untagged value (a range over a row holding an extension
  * type) can't be kept as text, nor can a subtransaction be begun in
- * parallel mode: their refusals are raised.
+ * parallel mode, nor while the caller holds off interrupts (a buffer's
+ * content lock, a critical section), whose state a subtransaction's abort
+ * would undo under it: their refusals are raised.
  */
 static bytea *
 received_form(ProllyDatumCodec *c, bytea *b)
@@ -758,7 +771,8 @@ received_form(ProllyDatumCodec *c, bytea *b)
 		batch_in_receive = false;
 		return result;
 	}
-	if (!c->tagged || IsInParallelMode() || !IsTransactionState())
+	if (!c->tagged || IsInParallelMode() || !IsTransactionState() ||
+		InterruptHoldoffCount > 0 || CritSectionCount > 0)
 		return round_trip(c, b);
 
 	BeginInternalSubTransaction(NULL);
@@ -797,7 +811,8 @@ prolly_datum_batch(void (*run) (void *arg), void *arg)
 	bool		refused = false;
 
 	/* (inside a batch, or where none can be begun: as it is) */
-	if (batch_depth > 0 || IsInParallelMode() || !IsTransactionState())
+	if (batch_depth > 0 || IsInParallelMode() || !IsTransactionState() ||
+		InterruptHoldoffCount > 0 || CritSectionCount > 0)
 	{
 		run(arg);
 		return;

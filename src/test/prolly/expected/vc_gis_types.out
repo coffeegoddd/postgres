@@ -42,3 +42,6 @@ strict reads|1:1,2:4,3:2,4:-1,5:1
 strict bbox after|f
 beside refused|added:2
 refused alone|0
+pages base|t
+pages refused key|t
+pages rows|51|2375

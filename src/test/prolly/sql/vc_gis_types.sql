@@ -120,3 +120,16 @@ SELECT (dolt_commit('-Am', 'without it'))[1] AS b3 \gset
 INSERT INTO gis_batch VALUES (2, '0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40');
 SELECT (dolt_commit('-Am', 'the refused value alone'))[1] AS b4 \gset
 SELECT 'refused alone', count(*) FROM dolt_diff(:'b2', :'b4', NULL::gis_batch);
+-- the pages change finder encodes a table's keys from a copy of each page,
+-- not under its content lock: a key its receive refuses is kept as text
+-- there too
+SET debug_prolly_change_finder = 'pages';
+CREATE TABLE gis_pages_key (g geometry PRIMARY KEY, v int);
+INSERT INTO gis_pages_key
+SELECT ST_MakeLine(ST_MakePoint(i, 0), ST_MakePoint(i, 1)), i FROM generate_series(1, 50) i;
+SELECT 'pages base', (dolt_commit('-Am', 'pages base'))[1] ~ '^[0-9a-f]{40}$';
+INSERT INTO gis_pages_key VALUES ('0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40', 100);
+UPDATE gis_pages_key SET v = v + 1000 WHERE v = 5;
+SELECT 'pages refused key', (dolt_commit('-am', 'pages refused key'))[1] ~ '^[0-9a-f]{40}$';
+RESET debug_prolly_change_finder;
+SELECT 'pages rows', count(*), sum(v) FROM gis_pages_key;

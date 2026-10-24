@@ -43,14 +43,15 @@
  *					its receive refuses the value (a data exception, or an
  *					internal error its own code raises: PostGIS's refuses a
  *					one-point LINESTRING its text input takes).  Its text
- *					must then be stable (read back and written again, the
- *					same), and the value is stored as its text reads back.
+ *					must then read back as a value sent the same, and the
+ *					value is stored as its text reads back.
  *					A refusal is caught in a subtransaction, one for a
  *					fold's batch of values (prolly_datum_batch()), else
  *					one per value.  Not caught, so raised: in a parallel
  *					worker (a parallel index build), where none can be
- *					begun, and for a range over a row type holding such a
- *					type, which is untagged.
+ *					begun; while interrupts are held off (a buffer's
+ *					content lock held); and for a range over a row type
+ *					holding such a type, which is untagged.
  *					Receive may normalize different physical spellings to
  *					one value; keys and values store that normalized form.
  *					Keys additionally require it to compare equal to the
