@@ -1765,6 +1765,20 @@ shape_mappable(Canon *cn, Relation rel, BaseTable *bt,
 }
 
 /*
+ * Will a fold from bt map its rows to rel's shape now, *was getting the
+ * shape they were folded under: they can be (shape_mappable()), and doing
+ * so costs less than reading rel in full (prolly_fold_map_cheaper()).
+ * Asked by table_root() and dolt_pending_full_folds() alike.
+ */
+static bool
+shape_will_map(Canon *cn, Relation rel, BaseTable *bt,
+			   const StringInfoData *now, ProllyValue *was)
+{
+	return shape_mappable(cn, rel, bt, now, was) &&
+		prolly_fold_map_cheaper(rel);
+}
+
+/*
  * A prolly table's shape: the content hash of its baseline_shape()
  * (described in 'description'), and the collations ordering its keys,
  * added to the fold's (and to *collations if given).
@@ -1820,9 +1834,8 @@ table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
  * the change finder: from its baseline if it has one that holds for this
  * definition (described in 'description', dh its table_shape(): the same,
  * or one shape_holds() says its rows are as they were under), or one whose
- * rows map to it (shape_mappable()) where mapping them costs less than
- * reading the table (prolly_fold_map_cheaper()); with a next baseline being made, its
- * entry there too.  The same rows give the same
+ * rows will be mapped to it (shape_will_map()); with a next baseline
+ * being made, its entry there too.  The same rows give the same
  * tree whatever pages, order or history they come from.
  */
 static void
@@ -1850,8 +1863,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		/* (when reading another table: not mapped, as its rows aren't read) */
 		if (!cn->no_rows &&
 			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
-			shape_mappable(cn, rel, bt, &shape, &tf.shape) &&
-			prolly_fold_map_cheaper(rel))
+			shape_will_map(cn, rel, bt, &shape, &tf.shape))
 			tf.reshaped = true;
 		else
 			bt = NULL;
@@ -5482,8 +5494,7 @@ folded_pending_full(const ProllyNodeRef *baseline,
 					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
 					 !shape_holds(rel, base_shape(&cn, bt),
 								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
-					 (!shape_mappable(&cn, rel, bt, &shape, &tf.shape) ||
-					  !prolly_fold_map_cheaper(rel)))
+					 !shape_will_map(&cn, rel, bt, &shape, &tf.shape))
 				why = PROLLY_FULL_SHAPE_CHANGED;
 			else if (PROLLY_HAS(cn.finder, full_reason))
 			{

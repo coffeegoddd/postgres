@@ -338,6 +338,10 @@ SELECT length(dolt_commit('-Am', 'cost')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 ALTER TABLE sf.cost ADD COLUMN w int DEFAULT 7;
 SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+-- (mapped whatever it costs: pending none)
+SET prolly.map_reshaped_dead_ratio = 0;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+RESET prolly.map_reshaped_dead_ratio;
 :check
 UPDATE sf.cost SET v = v + 1;
 UPDATE sf.cost SET v = v + 1;

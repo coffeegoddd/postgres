@@ -2029,6 +2029,14 @@ SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.
  sf.cost    | shape_changed
 (1 row)
 
+-- (mapped whatever it costs: pending none)
+SET prolly.map_reshaped_dead_ratio = 0;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+ table_name | reason 
+------------+--------
+(0 rows)
+
+RESET prolly.map_reshaped_dead_ratio;
 :check
  same 
 ------

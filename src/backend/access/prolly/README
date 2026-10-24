@@ -307,8 +307,11 @@ shape without being written (a column added with a default, one dropped,
 the key moved) is folded from its baseline's rows mapped to the shape now
 only where that costs less than reading it: both read every row, and
 decoding the baseline's costs more per row than scanning the heap's until
-the heap holds prolly.map_reshaped_dead_ratio (1.5) dead versions a live
-row, as its statistics count them.  Changes past maintenance_work_mem
+the heap holds about prolly.map_reshaped_dead_ratio (1.5, a rough
+break-even) dead versions a live row, as its statistics count them (which
+lag, and count none after a VACUUM or on a standby: a wrong choice costs
+only time, the tree made being the same).  dolt_pending_full_folds() asks
+the same.  Changes past maintenance_work_mem
 are not a reason: they are sorted, spilling to disk, and applied a part at
 a time in key order, so the fold's work stays that of the rows changed
 (pg_stat_prolly's fold_changes_spilled).  A transaction commit's own

@@ -230,8 +230,9 @@ extern bool prolly_fold_mappable(Relation rel, const ProllyValue *old);
  * Would mapping rel's baseline cost less than reading rel in full?  Both
  * read every row: a map decodes and encodes the baseline's, while a full
  * fold scans the heap, dead versions and all, and encodes the live ones,
- * which costs less per row.  So a map is chosen only once the heap holds
- * prolly.map_reshaped_dead_ratio dead versions for each live row (0: always).
+ * which costs less per row.  So a map is chosen only once the table's
+ * statistics count prolly.map_reshaped_dead_ratio dead versions for each
+ * live row (0: always), a rough break-even.
  */
 extern PGDLLIMPORT double prolly_map_reshaped_dead_ratio;
 extern bool prolly_fold_map_cheaper(Relation rel);

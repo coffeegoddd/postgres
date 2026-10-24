@@ -722,10 +722,14 @@ prolly_fold_mappable(Relation rel, const ProllyValue *old)
 }
 
 /*
- * (measured: a map costs about 0.46 us a row, a full fold 0.36 us a live
- * row and 0.07 us a dead version, so a map wins past about 1.5 dead
- * versions a live row; the table's statistics count them, as autovacuum
- * reads them, and a table they don't know of yet is read in full)
+ * (measured, roughly: a map costs about 0.46 us a row, a full fold about
+ * 0.36 us a live row and 0.07 us a dead version, so a map wins past a
+ * dead version or two a live row.  The dead versions are the table's
+ * statistics', as autovacuum reads them, and those can be wrong: they lag
+ * the writes by up to a second, are lost with a reset or a crash, are
+ * empty on a standby, and drop to none after a VACUUM though the heap
+ * stays as long.  Wrong, the choice costs only time, as both folds make
+ * the same tree; a table the statistics don't know of is read in full.)
  */
 bool
 prolly_fold_map_cheaper(Relation rel)
