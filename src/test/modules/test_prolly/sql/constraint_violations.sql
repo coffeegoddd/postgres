@@ -141,7 +141,9 @@ SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
 -- writes each row, as one that isn't deferrable is: a row breaking it is
 -- recorded, not left for the end of the merge or the commit to refuse.
 -- So is a deferrable primary key, or one WITHOUT OVERLAPS (neither keys
--- its table's rows, so the merge doesn't decide rows by it).
+-- its table's rows, so the merge doesn't decide rows by it).  A row breaking
+-- an exclusion constraint (one WITHOUT OVERLAPS's too) is recorded as an
+-- "exclusion constraint", not a "unique index", naming the constraint.
 CREATE SCHEMA dv VERSIONED;
 CREATE TABLE dv.later (pk int PRIMARY KEY,
 	x int UNIQUE DEFERRABLE INITIALLY DEFERRED);

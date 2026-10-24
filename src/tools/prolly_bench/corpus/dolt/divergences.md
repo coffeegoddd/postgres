@@ -300,7 +300,10 @@ OF` are built in D18's shapes.
   constraint: the branch keeps its own version of that key (none, for a
   new one), and the row not written is recorded alone, once, for the
   first unique constraint it breaks. Check and not-null constraints are
-  the same: their breaking rows are recorded, not written.
+  the same: their breaking rows are recorded, not written. A row breaking
+  an exclusion constraint (which Dolt doesn't have) is handled the same
+  way, recorded as an `exclusion constraint` violation naming the
+  constraint and its columns.
   For a keyless table, a removal cannot be paired with a rejected insert.
   If a merge that removes rows of a keyless table refuses a row it writes
   (a unique, exclusion, check, not-null or domain violation), the merge is

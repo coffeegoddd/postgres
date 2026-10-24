@@ -2185,7 +2185,8 @@ typedef struct Recorded
 	Tuplesortstate *forgotten;	/* handles, as int8 */
 	int			nforgotten;
 	bool		attempting;
-	bool		last_unique;	/* the one recorded last breaks a unique index */
+	bool		last_unique;	/* the one recorded last breaks a unique index
+								 * or exclusion constraint */
 	StringInfoData buf;			/* (reading the attempt's back) */
 } Recorded;
 
@@ -2512,7 +2513,8 @@ violation_record(Oid relid, const char *type, const char *row,
 {
 	AttemptViolation av;
 
-	recorded->last_unique = strcmp(type, "unique index") == 0;
+	recorded->last_unique = strcmp(type, "unique index") == 0 ||
+		strcmp(type, "exclusion constraint") == 0;
 	if (!recorded->attempting)
 	{
 		violation_keep(relid, type, row, info);
@@ -3500,7 +3502,8 @@ check_expr(Oid con)
 
 /*
  * What a row a merge couldn't write breaks (ed, the error writing it
- * raised), as Dolt describes it: a unique index by its name and columns, a
+ * raised), as Dolt describes it: a unique index (or an exclusion
+ * constraint, which Dolt hasn't) by its name and columns, a
  * check constraint by its name and expression (a domain's, of the domain
  * ed names), a not-null constraint by its column (a domain's, by the
  * column of the domain's value).
@@ -3575,8 +3578,9 @@ refusal_type(int sqlerrcode)
 	switch (sqlerrcode)
 	{
 		case ERRCODE_UNIQUE_VIOLATION:
-		case ERRCODE_EXCLUSION_VIOLATION:
 			return "unique index";
+		case ERRCODE_EXCLUSION_VIOLATION:
+			return "exclusion constraint";
 		case ERRCODE_CHECK_VIOLATION:
 			return "check constraint";
 		case ERRCODE_NOT_NULL_VIOLATION:
@@ -4489,7 +4493,8 @@ typedef struct KeyWrite
 	/* (in a pass:) */
 	bool		refused;		/* row refused, old in its place */
 	int			violation;		/* its handle, as recorded (-1: none) */
-	bool		unique;			/* it breaks a unique index */
+	bool		unique;			/* it breaks a unique index or exclusion
+								 * constraint */
 } KeyWrite;
 
 /*
