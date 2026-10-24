@@ -1957,7 +1957,7 @@ relation_consume(Relation rel, Snapshot snapshot)
 							 FullTransactionIdFromU64(U64FromFullTransactionId(below) - 1),
 							 true, trim_row, &t);
 			index_close(index, NoLock);
-			delete_rows(log, t.tids, t.n, true);
+			delete_rows(log, t.tids, t.n, false);
 			if (t.n > 0)
 				INJECTION_POINT("prolly-log-trimmed", NULL);
 		}
