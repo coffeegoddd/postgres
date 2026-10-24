@@ -65,6 +65,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
@@ -493,7 +494,8 @@ fold_pass(const ProllyRefsRoutine *refs)
 		}
 		PG_CATCH();
 		{
-			bool		locked = geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE;
+			bool		locked = geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE &&
+				RelationLockRefused;
 
 			HOLD_INTERRUPTS();
 			if (!locked)
@@ -501,6 +503,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
 			RESUME_INTERRUPTS();
+			Assert(!RelationLocksNoWait);
 
 			if (locked)
 			{
@@ -549,6 +552,14 @@ ProllyFolderWorkerMain(Datum main_arg)
 	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
 	SetConfigOption("application_name", "prolly fold worker", PGC_USERSET,
 					PGC_S_SESSION);
+
+	/*
+	 * The waits a fold makes (other than for a relation's lock, which it
+	 * never waits for) are made to the end, as autovacuum's are: one cut
+	 * short by a lock_timeout from the configuration would roll the fold
+	 * back for nothing.
+	 */
+	SetConfigOption("lock_timeout", "0", PGC_SUSET, PGC_S_OVERRIDE);
 	prolly_database_components(&dc);
 	if (!PROLLY_HAS(dc.refs, moved_branches))
 		proc_exit(0);

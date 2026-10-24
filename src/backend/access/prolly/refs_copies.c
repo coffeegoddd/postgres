@@ -5138,6 +5138,7 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	 * to roll back and fold again later)
 	 */
 	RelationLocksNoWait = true;
+	RelationLockRefused = false;
 	PG_TRY();
 	{
 		fold_from_baseline(root, &next, false);

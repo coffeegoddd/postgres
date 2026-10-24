@@ -591,7 +591,8 @@ typedef struct ProllyRefsRoutine
 	 * caller must roll its transaction back (the fold consumed the change
 	 * finder's record of what it folded).  The fold waits for no relation's
 	 * lock either: one not free at once fails it with
-	 * ERRCODE_LOCK_NOT_AVAILABLE, which the caller rolls back the same way.
+	 * ERRCODE_LOCK_NOT_AVAILABLE, RelationLockRefused set (lmgr.h), which
+	 * the caller rolls back the same way.
 	 */
 	bool		(*checkpoint_unless_moved) (ProllyNodeRef *root);
 

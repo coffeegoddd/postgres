@@ -157,9 +157,12 @@ SetLocktagHeldRelationOid(LOCKTAG *tag, Oid relid, LOCKMODE lockmode)
  * that keeps locks a foreground transaction may wait for, and so must
  * never wait for that transaction's in turn.  Other locks (a relation's
  * extension, a transaction's) are waited for as ever.  Whoever sets it
- * resets it, on error too.
+ * resets it, on error too.  RelationLockRefused is set once such a lock
+ * was refused, for the caller to tell that error from another lock's
+ * timeout.
  */
 bool		RelationLocksNoWait = false;
+bool		RelationLockRefused = false;
 
 /*
  *		LockRelationOid
@@ -179,9 +182,12 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
 	res = LockAcquireExtended(&tag, lockmode, false, RelationLocksNoWait,
 							  true, &locallock, false);
 	if (res == LOCKACQUIRE_NOT_AVAIL)
+	{
+		RelationLockRefused = true;
 		ereport(ERROR,
 				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 				 errmsg("could not obtain lock on relation %u", relid)));
+	}
 
 	/*
 	 * Now that we have the lock, check for invalidation messages, so that we

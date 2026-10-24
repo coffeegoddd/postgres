@@ -2328,6 +2328,9 @@ CommitTransaction(void)
 
 	ShowTransactionState("CommitTransaction");
 
+	/* (whoever set it, to take relation locks only if free, reset it) */
+	Assert(!RelationLocksNoWait);
+
 	/*
 	 * check the current transaction state
 	 */
@@ -2922,6 +2925,9 @@ AbortTransaction(void)
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
+
+	/* (whoever set it, to take relation locks only if free, reset it) */
+	Assert(!RelationLocksNoWait);
 
 	/* Disable transaction timeout */
 	if (TransactionTimeout > 0)

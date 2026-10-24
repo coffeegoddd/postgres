@@ -123,5 +123,8 @@ $locker->quit;
 ok($node->poll_query_until('postgres', $b_empty), 'b is folded once free');
 ok(!$node->log_contains('could not obtain lock', $log_offset), 'with no error');
 
+
+# (and no process failed on the way)
+ok(!$node->log_contains(qr/TRAP|terminated by signal/), 'no process failed');
 $node->stop;
 done_testing();

@@ -38,6 +38,7 @@ extern void RelationInitLockInfo(Relation relation);
 
 /* Lock a relation */
 extern PGDLLIMPORT bool RelationLocksNoWait;
+extern PGDLLIMPORT bool RelationLockRefused;
 extern void LockRelationOid(Oid relid, LOCKMODE lockmode);
 extern void LockRelationId(LockRelId *relid, LOCKMODE lockmode);
 extern bool ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode);

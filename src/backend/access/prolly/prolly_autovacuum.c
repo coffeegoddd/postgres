@@ -58,6 +58,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bmap.h"
+#include "storage/lmgr.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -568,7 +569,9 @@ autofold(void)
 				 * (a relation's lock another holds, which the fold doesn't
 				 * wait for: given up, as if the refs were held)
 				 */
-				if (geterrcode() != ERRCODE_LOCK_NOT_AVAILABLE)
+				Assert(!RelationLocksNoWait);
+				if (geterrcode() != ERRCODE_LOCK_NOT_AVAILABLE ||
+					!RelationLockRefused)
 					PG_RE_THROW();
 				MemoryContextSwitchTo(cxt);
 				FlushErrorState();

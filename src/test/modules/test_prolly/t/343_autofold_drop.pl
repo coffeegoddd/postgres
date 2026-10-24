@@ -88,5 +88,8 @@ ok(!$node->log_contains('could not obtain lock', $log_offset), 'nor an error');
 ok($node->poll_query_until('postgres', $b_empty), 'b is folded again');
 
 $drop->quit;
+
+# (and no process failed on the way)
+ok(!$node->log_contains(qr/TRAP|terminated by signal/), 'no process failed');
 $node->stop;
 done_testing();
