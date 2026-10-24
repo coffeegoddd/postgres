@@ -13869,13 +13869,16 @@ renamed_relid(const char *name)
 /*
  * Rename the session branch's tables and columns as renames say, each
  * first to a name of its own, so names swapped or passed along don't
- * collide on the way: columns, by their tables' names before, then tables.
+ * collide on the way: columns, by their tables' names before, both of
+ * their steps, then tables (so a column of a table renamed too is renamed
+ * while its table still has the name it is named by).
  */
 static void
 folded_rename_objects(List *renames)
 {
 	List	   *first = NIL;
 	List	   *then = NIL;
+	List	   *columns_then = NIL;
 	ListCell   *lc;
 	int			save_nestlevel;
 	int			k = 0;
@@ -13897,10 +13900,12 @@ folded_rename_objects(List *renames)
 		first = lappend(first, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
 										table, quote_identifier(r->column),
 										quote_identifier(step)));
-		then = lappend(then, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
-									  table, quote_identifier(step),
-									  quote_identifier(r->to)));
+		columns_then = lappend(columns_then,
+							   psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+										table, quote_identifier(step),
+										quote_identifier(r->to)));
 	}
+	first = list_concat(first, columns_then);
 	foreach(lc, renames)
 	{
 		ProllyRename *r = lfirst(lc);
