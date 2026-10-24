@@ -684,15 +684,29 @@ OF` are built in D18's shapes.
   `dolt.transaction_commit`, `dolt_reset` of any kind, `dolt_merge`,
   `dolt_pull`, `dolt_cherry_pick`, `dolt_revert`, `dolt_rebase`,
   `dolt_integrate`, and `dolt_branch`'s delete, rename and forced move)
-  take one of: owning the branch (having made it; main is the database
-  owner's), owning the database, the database's `CREATE` privilege, or
+  take one of: owning the branch (having made it; main, and a branch
+  whose maker was dropped, is the database owner's; `dolt_branches.creator`
+  shows it), owning the database, the database's `CREATE` privilege, or
   the privileges of the predefined role `pg_prolly_write`. Privileges on
   the branch's tables alone don't give them: a role with `SELECT` can't
   move a branch every other session on it reads, nor undo the move to
-  hide it. Deleting and renaming branches, the database owner's alone
-  before, take the same. There is no per-branch table of grants:
-  protected branches (the writer modes) stay the database owner's to
-  move outside integrations.
+  hide it. Deleting a branch, the database owner's alone before, takes
+  the same; a rename's new name takes `CREATE` or `pg_prolly_write`, as
+  making a branch takes `CREATE`. Making a tag, and adding or removing a
+  remote, take `CREATE` or `pg_prolly_write` (or owning the database);
+  deleting a tag takes those or having made it. A stash is dropped or
+  popped only by the role that pushed it or one with those privileges,
+  and a clear by another role clears only its own. In the writer modes a
+  writer with only table grants commits on its writer branch and
+  integrates its own writer branch into the protected base when every
+  change it brings is to rows of tables it may write as they changed
+  (`INSERT`, `UPDATE`, `DELETE`, as each change needs); a change to a
+  definition or to rows it may not write so, or another branch's
+  integration, takes the privileges above. There is no per-branch table of grants:
+  protected branches stay the database owner's to move outside
+  integrations. A branch's owner is recorded by role OID, not as a
+  dependency: `DROP ROLE` doesn't refuse it, `REASSIGN OWNED` and
+  `DROP OWNED` don't move or drop it.
 - **Why:** Postgres has no default write grant on a database to mirror
   Dolt's default row; its roles and `CREATE` (which already makes
   branches) are the native way to say who may change shared state, and

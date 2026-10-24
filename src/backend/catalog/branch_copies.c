@@ -1028,13 +1028,9 @@ copies_rename(const char *name, const char *newname, bool force)
 	HeapTuple	tup;
 	NameData	brname;
 
-	/*
-	 * (the branch stays, under a new name: a head move's privileges, not
-	 * the database's privilege to make branches, with the new name's rules)
-	 */
+	/* (the branch moved away from its name, and a new name taken) */
 	copies_check_drop(name);
-	if (!branch_name_ok(newname))
-		copies_check_create(newname);
+	prolly_check_branch_rename(newname);
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
 	branch = branch_oid(name, false);
 	if (branch == BRANCH_MAIN_OID)

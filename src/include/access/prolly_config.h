@@ -104,12 +104,20 @@ extern const ProllyChangeFinderRoutine *prolly_change_finder(void);
  * each tuple version a write to one made or replaced.
  */
 /*
- * Refuse the session's role a move of branch name's head (a commit, reset,
- * merge, cherry-pick, revert or rebase, its deletion or rename) unless it
- * owns the branch or the database, or has the database's CREATE privilege
- * or pg_prolly_write's privileges.
+ * Privileges over the version control's shared state.  prolly_writes_refs():
+ * the role owns the database, has its CREATE privilege, or has
+ * pg_prolly_write's privileges.  prolly_branch_owner(): the role that made a
+ * branch, else (main, a maker unrecorded or dropped) the database's owner.
+ * A move of a branch's head (a commit, reset, merge, cherry-pick, revert or
+ * rebase, its deletion or rename) takes either (prolly_may_move_head(),
+ * prolly_check_head_move()); a rename's new name takes the first, as
+ * making a branch does (prolly_check_branch_rename()).
  */
+extern bool prolly_writes_refs(void);
+extern Oid	prolly_branch_owner(const char *name);
+extern bool prolly_may_move_head(const char *name);
 extern void prolly_check_head_move(const char *name);
+extern void prolly_check_branch_rename(const char *newname);
 
 extern void prolly_make_change_log(Oid relid, LOCKMODE lockmode);
 extern void prolly_change_logs_flush(void);
