@@ -2067,6 +2067,7 @@ move_settled(void *arg)
  * the change is known to commit.
  */
 int			prolly_kept_commits = 2;
+int			prolly_restore_min_changes = 2;
 
 typedef struct KeptTable
 {
@@ -2542,12 +2543,44 @@ keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
 }
 
 /*
+ * Giving a table its kept pages back costs a constant (new storage for
+ * each of its relations, its catalog row and caches), while writing its
+ * rows back costs each row its pages, which the commit's pages kept again
+ * after the move then sync: at 1M rows, with fsync on, ~11 ms restored
+ * against ~7 ms for one row written, ~11 ms for four and ~20 ms for eight.
+ * So fewer than prolly.restore_min_changes changed since a baseline
+ * holding the commit's rows are written instead.
+ */
+
+/*
+ * Would writing table relid's rows back to the commit's (data) cost less
+ * than restoring its pages: its baseline holds the commit's rows, and
+ * fewer than prolly.restore_min_changes of them changed since, as its
+ * change finder tells from no more than that many of its records?
+ */
+static bool
+few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
+			Oid relid, const ProllyNodeRef *data)
+{
+	ProllyNodeRef base;
+
+	if (prolly_restore_min_changes <= 0 ||
+		!PROLLY_HAS(dc->canonicalizer, table_fewer_changes) ||
+		!dc->canonicalizer->table_fewer_changes(baseline, relid,
+												prolly_restore_min_changes,
+												&base))
+		return false;
+	return same_hash(&base.hash, &data->hash);
+}
+
+/*
  * Before a move of the session's branch to commit: if its pages are kept
  * as of the commit, each table's given back (those that changed since,
  * O(1) each), and its baseline entry made the kept one's.  A table not on
  * the branch as it was then (another name, other relations, storage
  * replaced since), or not restored (a lock not free, its snapshot gone),
- * is left for the move to write.
+ * is left for the move to write, as is one with so few rows changed that
+ * writing them costs less (few_changes()).
  */
 static void
 restore_pages(const ProllyCommitInfo *commit)
@@ -2602,18 +2635,25 @@ restore_pages(const ProllyCommitInfo *commit)
 	foreach_ptr(NamedTree, t, tables)
 	{
 		if (t->readable)
-			readable = lappend(readable, t->name);
+			readable = lappend(readable, t);
 	}
 	for (int t = 0; t < kc->ntables; t++)
 	{
 		KeptTable  *kt = &kc->tables[t];
 		Oid			relid = table_named(kt->name);
+		NamedTree  *target = NULL;
 		BranchKeptRelation *renewed;
 		bool		any = false;
 
-		if (!name_listed(readable, kt->name) ||
+		foreach_ptr(NamedTree, r, readable)
+		{
+			if (strcmp(r->name, kt->name) == 0)
+				target = r;
+		}
+		if (target == NULL ||
 			!OidIsValid(relid) || relid != kt->rels[0].relid ||
-			!same_relations(kept_relations(relid), kt) || !may_restore(relid))
+			!same_relations(kept_relations(relid), kt) || !may_restore(relid) ||
+			few_changes(&dc, &baseline, relid, &target->data))
 			continue;
 		renewed = palloc_array(BranchKeptRelation, kt->nrels);
 		if (!branch_ops()->restore(kt->rels, kt->nrels, renewed))

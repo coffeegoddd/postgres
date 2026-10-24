@@ -689,6 +689,13 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  */
 extern PGDLLIMPORT int prolly_kept_commits;
 
+/*
+ * prolly.restore_min_changes: how many of a table's rows must differ from
+ * a kept commit's, since a baseline holding them, before a move back to it
+ * gives the table its pages back rather than write those rows (0: always).
+ */
+extern PGDLLIMPORT int prolly_restore_min_changes;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \

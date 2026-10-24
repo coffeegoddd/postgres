@@ -28,6 +28,7 @@ prolly_fold_worker = off
 shared_buffers = 16MB
 checkpoint_timeout = 1h
 wal_keep_size = '1GB'
+prolly.restore_min_changes = 0
 });
 $node->start;
 $node->safe_psql('postgres',

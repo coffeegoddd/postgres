@@ -538,9 +538,16 @@ storage was replaced since (a rewrite, a truncation), an index was made or
 dropped, it was renamed, its rows' transaction ids are older than the
 database still knows, its rows in the commit can't be read here, the user
 couldn't write its rows, or one of its relations is in use (its locks are
-tried, not waited for): its rows are written.  Like TRUNCATE, a restore
-isn't MVCC-safe: a snapshot taken before the move commits reads the
-restored pages after it.
+tried, not waited for): its rows are written.  Nor is one whose baseline
+holds the commit's rows with fewer than prolly.restore_min_changes (2) of
+them changed since, as its change finder tells from no more than that many
+of its records (the log's entries, none read as a fold reads them):
+restoring a table costs about as much as writing a few rows back and
+syncing their pages as the commit's are kept again, so a reset of a row
+writes it.  Like TRUNCATE, a restore isn't MVCC-safe: a
+snapshot taken before the move commits reads the restored pages after
+it.  So a small reset, its rows written, is MVCC-safe, and a large one,
+restored, isn't, for a snapshot older than the move.
 
 A branch's first use at a commit another branch keeps the pages of is
 made of those pages (branch operations' make_kept()): each such table's
