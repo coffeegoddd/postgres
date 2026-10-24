@@ -1258,6 +1258,27 @@ index_alike(Oid relid, Oid source)
 }
 
 /*
+ * Is relation relid stored alike on the session's branch (its row oc) and
+ * on source (tc): the same kind, access method, columns as stored and
+ * TOAST table, an index the same index, both permanent and in the same
+ * tablespace?  Tuples from one are then read rightly by the other's
+ * descriptor.
+ */
+static bool
+stored_alike(Oid relid, Oid source, Form_pg_class oc, Form_pg_class tc)
+{
+	return oc->relkind == tc->relkind && RELKIND_HAS_STORAGE(oc->relkind) &&
+		oc->relam == tc->relam && oc->relnatts == tc->relnatts &&
+		oc->reltoastrelid == tc->reltoastrelid &&
+		columns_alike(relid, source) &&
+		(oc->relkind != RELKIND_INDEX || index_alike(relid, source)) &&
+		oc->relpersistence == RELPERSISTENCE_PERMANENT &&
+		tc->relpersistence == RELPERSISTENCE_PERMANENT &&
+		oc->reltablespace == tc->reltablespace &&
+		RelFileNumberIsValid(oc->relfilenode);
+}
+
+/*
  * Give the session branch's relations relids the source branch's storage
  * (#491): each a share of the source's (copy_storage()'s), its row taking
  * the source's say of how old its oldest row is and how big it is (the
@@ -1312,15 +1333,7 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 		}
 		oc = (Form_pg_class) GETSTRUCT(o);
 		tc = (Form_pg_class) GETSTRUCT(t);
-		if (oc->relkind != tc->relkind || !RELKIND_HAS_STORAGE(oc->relkind) ||
-			oc->relam != tc->relam || oc->relnatts != tc->relnatts ||
-			oc->reltoastrelid != tc->reltoastrelid ||
-			!columns_alike(relid, source) ||
-			(oc->relkind == RELKIND_INDEX && !index_alike(relid, source)) ||
-			oc->relpersistence != RELPERSISTENCE_PERMANENT ||
-			tc->relpersistence != RELPERSISTENCE_PERMANENT ||
-			oc->reltablespace != tc->reltablespace ||
-			!RelFileNumberIsValid(oc->relfilenode) ||
+		if (!stored_alike(relid, source, oc, tc) ||
 			!RelFileNumberIsValid(tc->relfilenode) ||
 			RelFileLocatorSkippingWAL(class_locator(tc, tc->relfilenode)) ||
 			!smgrcanshare(smgropen(class_locator(tc, tc->relfilenode),
@@ -1842,6 +1855,106 @@ copies_restore(const BranchKeptRelation *kept, int nkept,
 	return ok;
 }
 
+/*
+ * Give the session branch's relations kept[] storage made of the pages
+ * keep() kept of branch source's (see branch_ops.h).
+ */
+static bool
+copies_share_kept(Oid source, const BranchKeptRelation *kept, int nkept)
+{
+	bool		other = source != MyBranch;
+	Relation	pg_class;
+	HeapTuple  *rows = palloc0_array(HeapTuple, Max(nkept, 1));
+	bool		ok = true;
+
+	/* (not the pages of a branch being deleted) */
+	if (other && !pin_branch(source))
+		return false;
+
+	/*
+	 * (ours as TRUNCATE locks them; the source's against letting go of the
+	 * pages kept, as a branch made of them holds them)
+	 */
+	for (int i = 0; i < nkept; i++)
+	{
+		LOCKTAG		tag;
+
+		if (!ConditionalLockRelationOid(kept[i].relid, AccessExclusiveLock))
+			return false;
+		if (!other)
+			continue;
+		SET_LOCKTAG_BRANCH_RELATION(tag, MyDatabaseId, kept[i].relid, source);
+		if (LockAcquire(&tag, ShareUpdateExclusiveLock, false, true) ==
+			LOCKACQUIRE_NOT_AVAIL)
+			return false;
+	}
+	AcceptInvalidationMessages();
+
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+	for (int i = 0; i < nkept && ok; i++)
+	{
+		HeapTuple	t = other ? class_row(pg_class, kept[i].relid, source) : NULL;
+
+		rows[i] = class_row(pg_class, kept[i].relid, MyBranch);
+		if (rows[i] == NULL || (other && t == NULL))
+			ok = false;
+		else if (!other)
+			ok = can_restore((Form_pg_class) GETSTRUCT(rows[i]), &kept[i]);
+		else
+			ok = can_restore((Form_pg_class) GETSTRUCT(t), &kept[i]) &&
+				stored_alike(kept[i].relid, source,
+							 (Form_pg_class) GETSTRUCT(rows[i]),
+							 (Form_pg_class) GETSTRUCT(t));
+		if (t)
+			heap_freetuple(t);
+	}
+
+	/* (nor while this session uses one's storage, as restore() refuses) */
+	for (int i = 0; i < nkept && ok; i++)
+	{
+		Relation	rel = relation_open(kept[i].relid, NoLock);
+
+		if (rel->rd_refcnt != 1 || AfterTriggerPendingOnRel(kept[i].relid))
+			ok = false;
+		relation_close(rel, NoLock);
+	}
+
+	for (int i = 0; i < nkept && ok; i++)
+	{
+		const BranchKeptRelation *k = &kept[i];
+		HeapTuple	o = rows[i];
+		Form_pg_class oc = (Form_pg_class) GETSTRUCT(o);
+		RelFileNumber relnumber;
+
+		relnumber = GetNewRelFileNumber(oc->reltablespace, NULL,
+										oc->relpersistence);
+		(void) RelationCreateStorageFromSnapshot(class_locator(oc, relnumber),
+												 smgropen(kept_locator(k),
+														  INVALID_PROC_NUMBER),
+												 k->snapshot, false, true);
+		RelationDropStorageByLocator(class_locator(oc, oc->relfilenode));
+		oc->relfilenode = relnumber;
+		if (TransactionIdIsNormal(k->frozenxid))
+			oc->relfrozenxid = k->frozenxid;
+		if (MultiXactIdIsValid(k->minmxid))
+			oc->relminmxid = k->minmxid;
+		oc->relallvisible = 0;
+		oc->relallfrozen = 0;
+		CatalogTupleUpdate(pg_class, &o->t_self, o);
+		pgstat_count_prolly(PGSTAT_PROLLY_RELATIONS_RESTORED, 1);
+	}
+	if (ok)
+		CommandCounterIncrement();
+	table_close(pg_class, RowExclusiveLock);
+	for (int i = 0; i < nkept; i++)
+	{
+		if (rows[i])
+			heap_freetuple(rows[i]);
+	}
+	pfree(rows);
+	return ok;
+}
+
 static void
 copies_let_go(const BranchKeptRelation *kept)
 {
@@ -1866,6 +1979,7 @@ static const BranchOpsRoutine branch_copies = {
 	.make_kept = copies_make_kept,
 	.restore = copies_restore,
 	.let_go = copies_let_go,
+	.share_kept = copies_share_kept,
 };
 
 const BranchOpsRoutine *

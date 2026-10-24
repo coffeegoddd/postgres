@@ -204,13 +204,24 @@ class BackgroundPgbench:
     """pgbench running alongside a measurement, reporting progress each
     second, so its throughput during the window can be computed."""
 
-    def __init__(self, ctx: Context, builtin: str, clients: int, tag: str):
+    def __init__(self, ctx: Context, builtin: Optional[str], clients: int, tag: str,
+                 scripts: Optional[list[tuple[str, int]]] = None,
+                 defines: Optional[dict[str, object]] = None):
+        """A builtin script, or scripts (of scripts/, with weights) and
+        their defines."""
         self.ctx = ctx
         self.out_path = ctx.raw_dir / f"pgbench-{tag}.out"
         self.args = [ctx.cluster.bin("pgbench"), "-n", "-c", str(clients),
                      "-j", str(max(1, min(clients, os.cpu_count() or 1))),
                      "--random-seed", str(ctx.params.get("seed", 1)),
-                     "-T", "86400", "-P", "1", "-b", builtin, ctx.dbname]
+                     "-T", "86400", "-P", "1"]
+        if builtin:
+            self.args += ["-b", builtin]
+        for name, weight in scripts or []:
+            self.args += ["-f", f"{SCRIPTS_DIR / name}@{weight}"]
+        for k, v in (defines or {}).items():
+            self.args += ["-D", f"{k}={v}"]
+        self.args.append(ctx.dbname)
         self.proc: Optional[subprocess.Popen] = None
 
     def __enter__(self):

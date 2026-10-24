@@ -1765,6 +1765,20 @@ shape_mappable(Canon *cn, Relation rel, BaseTable *bt,
 }
 
 /*
+ * Will a fold from bt map its rows to rel's shape now, *was getting the
+ * shape they were folded under: they can be (shape_mappable()), and doing
+ * so costs less than reading rel in full (prolly_fold_map_cheaper()).
+ * Asked by table_root() and dolt_pending_full_folds() alike.
+ */
+static bool
+shape_will_map(Canon *cn, Relation rel, BaseTable *bt,
+			   const StringInfoData *now, ProllyValue *was)
+{
+	return shape_mappable(cn, rel, bt, now, was) &&
+		prolly_fold_map_cheaper(rel);
+}
+
+/*
  * A prolly table's shape: the content hash of its baseline_shape()
  * (described in 'description'), and the collations ordering its keys,
  * added to the fold's (and to *collations if given).
@@ -1820,8 +1834,8 @@ table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
  * the change finder: from its baseline if it has one that holds for this
  * definition (described in 'description', dh its table_shape(): the same,
  * or one shape_holds() says its rows are as they were under), or one whose
- * rows map to it (shape_mappable()); with a next baseline being made, its
- * entry there too.  The same rows give the same
+ * rows will be mapped to it (shape_will_map()); with a next baseline
+ * being made, its entry there too.  The same rows give the same
  * tree whatever pages, order or history they come from.
  */
 static void
@@ -1849,7 +1863,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		/* (when reading another table: not mapped, as its rows aren't read) */
 		if (!cn->no_rows &&
 			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
-			shape_mappable(cn, rel, bt, &shape, &tf.shape))
+			shape_will_map(cn, rel, bt, &shape, &tf.shape))
 			tf.reshaped = true;
 		else
 			bt = NULL;
@@ -5483,7 +5497,7 @@ folded_pending_full(const ProllyNodeRef *baseline,
 					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
 					 !shape_holds(rel, base_shape(&cn, bt),
 								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
-					 !shape_mappable(&cn, rel, bt, &shape, &tf.shape))
+					 !shape_will_map(&cn, rel, bt, &shape, &tf.shape))
 				why = PROLLY_FULL_SHAPE_CHANGED;
 			else if (PROLLY_HAS(cn.finder, full_reason))
 			{
@@ -5566,6 +5580,17 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 }
 
 /*
+ * What table_changes() and table_fewer_changes() ask of the change finder:
+ * the changes visited, or (limit > 0) whether fewer than limit changed.
+ */
+typedef struct TableChangesAsk
+{
+	ProllyRowChangeVisit visit;
+	void	   *arg;
+	int			limit;
+} TableChangesAsk;
+
+/*
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
  * a table collect() describes as a table and reads (not a partition, nor
@@ -5573,9 +5598,8 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
  * definition now.
  */
 static bool
-folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
-					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
-					 void *arg)
+table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
+					ProllyNodeRef *data, const TableChangesAsk *ask)
 {
 	Canon		cn;
 	Relation	rel;
@@ -5586,7 +5610,8 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	cn.reading = true;
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
-	if (!PROLLY_HAS(cn.finder, changes))
+	if (ask->limit > 0 ? !PROLLY_HAS(cn.finder, fewer_changes) :
+		!PROLLY_HAS(cn.finder, changes))
 		return false;
 	load_baseline(&cn, baseline);
 
@@ -5654,7 +5679,9 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 				tf.state.data = (const uint8 *) bt->state.data;
 				tf.state.len = bt->state.len;
 				*data = bt->data;
-				ok = cn.finder->changes(rel, &cn.env, &tf, visit, arg);
+				ok = ask->limit > 0 ?
+					cn.finder->fewer_changes(rel, &tf, ask->limit) :
+					cn.finder->changes(rel, &cn.env, &tf, ask->visit, ask->arg);
 			}
 		}
 	}
@@ -5665,6 +5692,25 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	PG_END_TRY();
 	table_close(rel, AccessShareLock);
 	return ok;
+}
+
+static bool
+folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
+					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
+					 void *arg)
+{
+	TableChangesAsk ask = {visit, arg, 0};
+
+	return table_changes_asked(baseline, relid, data, &ask);
+}
+
+static bool
+folded_table_fewer_changes(const ProllyNodeRef *baseline, Oid relid,
+						   int limit, ProllyNodeRef *data)
+{
+	TableChangesAsk ask = {NULL, NULL, Max(limit, 1)};
+
+	return table_changes_asked(baseline, relid, data, &ask);
 }
 
 /*
@@ -11058,11 +11104,12 @@ string_change_merges(const char *from, const char *to)
  * definition one side changed, fails to merge as a schema conflict where
  * that side changed a column's type in a way Dolt doesn't merge
  * (string_change_merges()).  A column both changed differently is a
- * conflict already (merge_table_defs()).
+ * conflict already (merge_table_defs()).  With keep, true for such a
+ * conflict instead of the error.
  */
-static void
+static bool
 check_type_changes(const char *name, const char *base, const char *ours,
-				   const char *theirs)
+				   const char *theirs, bool keep)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
 	TableLine  *tl[3];
@@ -11070,7 +11117,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
 		!split_table_def(theirs, sec[2]))
-		return;
+		return false;
 	for (int side = 0; side < 3; side++)
 	{
 		tl[side] = table_lines(0, sec[side][0]);
@@ -11100,6 +11147,9 @@ check_type_changes(const char *name, const char *base, const char *ours,
 			char	   *other = type[3 - side];
 
 			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
+				!string_change_merges(type[0], type[side]) && keep)
+				return true;
+			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
 				!string_change_merges(type[0], type[side]))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -11108,6 +11158,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 						 errdetail("A change of type merges with the other side's changes only as a string type made no shorter.")));
 		}
 	}
+	return false;
 }
 
 
@@ -11245,7 +11296,8 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
  */
 static void
 folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_root,
-					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged)
+					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged,
+					List **kept_conflicts)
 {
 	Canon		cn;
 	ProllyTreeCursor *cur[3];
@@ -11285,6 +11337,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		const ProllyValue *take = NULL;
 		ProllyValue table;
 		char	   *merged_def = NULL;
+		bool		retyped = false;
 
 		/* the least key of the three, and which have it */
 		for (int i = 0; i < 3; i++)
@@ -11301,11 +11354,26 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 #define CHANGED(a) (v[a].len != v[0].len || memcmp(v[a].data, v[0].data, v[0].len) != 0)
 		if (least->data[0] == 't' && has[0] && has[1] && has[2] &&
 			CHANGED(1) && CHANGED(2) && !(SAME(0, 1) && SAME(0, 2)) && !SAME(1, 2))
-			check_type_changes(from_utf8(least->data + 2, least->len - 2),
-							   pnstrdup((const char *) def[0].data, def[0].len),
-							   pnstrdup((const char *) def[1].data, def[1].len),
-							   pnstrdup((const char *) def[2].data, def[2].len));
-		if (SAME(0, 2))
+			retyped = check_type_changes(from_utf8(least->data + 2, least->len - 2),
+										 pnstrdup((const char *) def[0].data, def[0].len),
+										 pnstrdup((const char *) def[1].data, def[1].len),
+										 pnstrdup((const char *) def[2].data, def[2].len),
+										 kept_conflicts != NULL);
+		/*
+		 * (a table one side dropped and the other changed, its rows or its
+		 * definition: kept, a schema conflict, as Dolt keeps it)
+		 */
+		if (!retyped && kept_conflicts != NULL && least->data[0] == 't' &&
+			has[0] && has[1] != has[2] && CHANGED(has[1] ? 1 : 2))
+			retyped = true;
+		if (retyped)
+		{
+			/* (kept as ours has it, or gone if ours dropped it) */
+			take = has[1] ? &v[1] : NULL;
+			*kept_conflicts = lappend(*kept_conflicts,
+									  from_utf8(least->data + 2, least->len - 2));
+		}
+		else if (SAME(0, 2))
 			take = has[1] ? &v[1] : NULL;	/* theirs left it: ours */
 		else if (SAME(0, 1) || SAME(1, 2))
 			take = has[2] ? &v[2] : NULL;	/* ours left it, or both alike: theirs */
@@ -11326,6 +11394,13 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			table.data = (const uint8 *) item.data;
 			table.len = item.len;
 			take = &table;
+		}
+		else if (kept_conflicts != NULL && least->data[0] == 't')
+		{
+			/* (kept as ours has it, or gone if ours dropped it) */
+			take = has[1] ? &v[1] : NULL;
+			*kept_conflicts = lappend(*kept_conflicts,
+									  from_utf8(least->data + 2, least->len - 2));
 		}
 		else
 			ereport(ERROR,
@@ -13645,6 +13720,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.read_definitions = folded_read_definitions,
 	.table_changes = folded_table_changes,
+	.table_fewer_changes = folded_table_fewer_changes,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,

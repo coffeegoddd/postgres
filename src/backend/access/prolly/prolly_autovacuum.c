@@ -171,11 +171,27 @@ prolly_autovacuum_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomRealVariable("prolly.map_reshaped_dead_ratio",
+							 "Dead row versions per live row past which a table whose row shape changed is folded by mapping its baseline's rows, not by reading it in full.",
+							 "Both read every row; a full fold reads the heap's, which costs less per row than decoding the baseline's until dead versions dominate the heap.  0 always maps.",
+							 &prolly_map_reshaped_dead_ratio,
+							 1.5, 0.0, 1000.0,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.kept_commits",
 							"How many of the commits each branch was last at its pages are kept as of.",
 							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",
 							&prolly_kept_commits,
 							2, 0, 8,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.restore_min_changes",
+							"How many of a table's rows must have changed since a kept commit before a move back to it gives the table its kept pages back, rather than writing those rows.",
+							"Restoring a table's pages costs about as much as writing a few of its rows back and syncing them.  0 always restores.",
+							&prolly_restore_min_changes,
+							2, 0, INT_MAX,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);

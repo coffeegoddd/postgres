@@ -1,0 +1,435 @@
+{
+  "version": 1,
+  "id": "dolt-rebase-edit-conflict",
+  "description": "Reviewed Dolt port: dolt_rebase: edit action followed by conflict",
+  "source": {
+    "repository": "https://github.com/dolthub/dolt",
+    "revision": "51cc4458b740ac132cb2302fe5394a2abbfba39d",
+    "path": "go/libraries/doltcore/sqle/enginetest/dolt_queries_rebase.go",
+    "case": "DoltRebaseScriptTests: dolt_rebase: edit action followed by conflict"
+  },
+  "requires": [
+    "sql",
+    "vc.conflicts",
+    "vc.core",
+    "vc.rebase"
+  ],
+  "sessions": [
+    "a"
+  ],
+  "steps": [
+    {
+      "id": "init",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "Initialize data repository",
+        "--allow-empty"
+      ],
+      "save": "init"
+    },
+    {
+      "id": "setup-0",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SET dolt.allow_commit_conflicts = on",
+      "expect": {
+        "tag": "SET"
+      }
+    },
+    {
+      "id": "setup-1",
+      "session": "a",
+      "op": "exec",
+      "sql": "CREATE TABLE t (pk int PRIMARY KEY, val varchar(100))",
+      "expect": {
+        "tag": "CREATE TABLE"
+      }
+    },
+    {
+      "id": "setup-2",
+      "session": "a",
+      "op": "exec",
+      "sql": "INSERT INTO t VALUES (1, 'original1'), (2, 'original2'), (3, 'original3')",
+      "expect": {
+        "tag": "INSERT 0 3"
+      }
+    },
+    {
+      "id": "setup-3",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "initial table with data",
+        "-A"
+      ],
+      "save": "c1"
+    },
+    {
+      "id": "setup-4",
+      "session": "a",
+      "op": "branch",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "setup-5",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET val = 'main_updated_row2' WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-6",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "main updates row 2",
+        "-a"
+      ],
+      "save": "m2"
+    },
+    {
+      "id": "setup-7",
+      "session": "a",
+      "op": "checkout",
+      "args": [
+        "feature"
+      ]
+    },
+    {
+      "id": "setup-8",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET val = 'feature_updated_row1' WHERE pk = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-9",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "feature updates row 1",
+        "-a"
+      ],
+      "save": "f1"
+    },
+    {
+      "id": "setup-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET val = 'feature_updated_row2' WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "setup-11",
+      "session": "a",
+      "op": "commit",
+      "args": [
+        "feature updates row 2",
+        "-a"
+      ],
+      "save": "f2"
+    },
+    {
+      "id": "setup-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--interactive', 'main')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"interactive rebase started on branch dolt_rebase_feature; adjust the rebase plan in the dolt_rebase table, then continue rebasing by calling dolt_rebase('--continue')\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "setup-13",
+      "session": "a",
+      "op": "exec",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "UPDATE dolt_rebase SET action = 'edit' WHERE rebase_order = 1",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "assert-0",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order",
+      "expect": {
+        "rows": [
+          [
+            "1.00",
+            "edit",
+            "feature updates row 1"
+          ],
+          [
+            "2.00",
+            "pick",
+            "feature updates row 2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-1",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT r[1], r[2] ~ '^edit action paused at commit [0-9a-f]+ \\(.+\\)\\.\\s+You can now modify the working directory and stage changes\\. When ready, continue the rebase by calling dolt_rebase\\(''--continue''\\)$' FROM dolt_rebase('--continue') r",
+      "expect": {
+        "rows": [
+          [
+            "0",
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-2",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "feature_updated_row1"
+          ],
+          [
+            "2",
+            "main_updated_row2"
+          ],
+          [
+            "3",
+            "original3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-3",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET val = 'edited_during_rebase_row3' WHERE pk = 3",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "assert-4",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-5",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT length(dolt_commit('--amend', '-m', 'feature updates row 1 and 3 (edited)')::text) > 0",
+      "expect": {
+        "rows": [
+          [
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-6",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT r[1], r[2] LIKE 'data conflict detected while rebasing commit % (feature updates row 2). %' FROM dolt_rebase('--continue') r",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "t"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-7",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT count(*) FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-8",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT * FROM dolt_conflicts",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "1"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-9",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT dolt_conflicts_resolve('--ours', 't')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-10",
+      "session": "a",
+      "op": "exec",
+      "sql": "UPDATE t SET val = 'resolved_conflict_row2' WHERE pk = 2",
+      "expect": {
+        "tag": "UPDATE 1"
+      }
+    },
+    {
+      "id": "assert-11",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT dolt_add('t')",
+      "expect": {
+        "rows": [
+          [
+            "{0}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-12",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.rebase"
+      ],
+      "sql": "SELECT dolt_rebase('--continue')",
+      "expect": {
+        "rows": [
+          [
+            "{0,\"Successfully rebased and updated refs/heads/feature\"}"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-13",
+      "session": "a",
+      "op": "query",
+      "sql": "SELECT * FROM t ORDER BY pk",
+      "expect": {
+        "rows": [
+          [
+            "1",
+            "feature_updated_row1"
+          ],
+          [
+            "2",
+            "resolved_conflict_row2"
+          ],
+          [
+            "3",
+            "edited_during_rebase_row3"
+          ]
+        ],
+        "order": "ordered"
+      }
+    },
+    {
+      "id": "assert-14",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT message FROM dolt_log LIMIT 1",
+      "expect": {
+        "rows": [
+          [
+            "feature updates row 2"
+          ]
+        ],
+        "order": "ordered"
+      }
+    }
+  ]
+}

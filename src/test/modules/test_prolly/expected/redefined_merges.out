@@ -167,8 +167,9 @@ SELECT length(dolt_commit('-am', 'main: n bigint')::text) AS committed;
 (1 row)
 
 SELECT (dolt_merge('feature', '-m', 'not merged'))[3:4];
-ERROR:  schema conflict: column n of rm.t changed type from integer to bigint on one side, and the other side changed the table
-DETAIL:  A change of type merges with the other side's changes only as a string type made no shorter.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table rm.t was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM rm.t ORDER BY id;
  id |       v       |  n  
 ----+---------------+-----

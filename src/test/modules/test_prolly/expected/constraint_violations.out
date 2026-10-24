@@ -658,6 +658,24 @@ SELECT length(dolt_commit('--force', '--allow-empty', '-m', 'forced again')::tex
         42
 (1 row)
 
+-- an amend too: refused with them, unless forced
+SAVEPOINT s;
+SELECT dolt_commit('--amend', '-m', 'amended with violations');
+ERROR:  cannot commit with constraint violations
+HINT:  Fix the rows and check them again with dolt_verify_constraints().
+ROLLBACK TO s;
+SELECT length(dolt_commit('--amend', '-f', '-m', 'amended, forced')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT message FROM dolt_log('main') LIMIT 1;
+     message     
+-----------------
+ amended, forced
+(1 row)
+
 COMMIT;
 ERROR:  cannot commit a transaction with constraint violations
 DETAIL:  Table "child" has a row with a foreign key violation on branch "main".

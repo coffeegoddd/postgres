@@ -151,7 +151,7 @@ POSTGIS_BUILD ?=
 # PostGIS's TAP tests: concurrency and durability on the AM under test,
 # network remotes on prolly
 POSTGIS_TAP = t/295_postgis_isolation.pl t/296_postgis_crash.pl \
-	t/297_postgis_network.pl
+	t/297_postgis_network.pl t/299_postgis_regress.pl
 
 check-postgis: check-postgis-semantics check-postgis-isolation \
 	check-postgis-durability check-vc-postgis check-tap-vc-postgis
@@ -181,6 +181,14 @@ check-tap-vc-postgis: PROVE_TESTS = t/297_postgis_network.pl
 check-tap-vc-postgis: check-vc-target-prolly require-tap postgis-install
 	$(prove_check)
 
+# PostGIS's own regression suite on versioned tables, judged against heap
+# (not part of check-postgis: it takes long; POSTGIS_REGRESS_SUITES and
+# POSTGIS_REGRESS_MODES narrow it, see the test)
+check-postgis-regress: PROVE_TESTS = t/299_postgis_regress.pl
+check-postgis-regress: export POSTGIS_BUILD := $(abspath $(POSTGIS_BUILD))
+check-postgis-regress: require-tap postgis-install
+	$(prove_check)
+
 check-vc-postgis: postgis-install check-vc-target-prolly vc.conf
 	$(pg_regress_check) --temp-config=$(CURDIR)/vc.conf \
 		--schedule=$(srcdir)/vc_postgis_schedule
@@ -202,5 +210,5 @@ clean distclean:
 .PHONY: check check-target check-vc-target check-vc-target-prolly check-vc-target-guard check-semantics check-vc check-isolation check-vc-isolation \
 	check-tap check-tap-durability check-tap-vc check-heap \
 	check-postgis postgis-install check-postgis-semantics check-postgis-isolation \
-	check-postgis-durability check-vc-postgis check-tap-vc-postgis \
+	check-postgis-durability check-vc-postgis check-tap-vc-postgis check-postgis-regress \
 	check-upstream-bmap require-tap FORCE

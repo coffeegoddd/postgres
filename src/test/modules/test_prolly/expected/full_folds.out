@@ -7,6 +7,9 @@ CREATE DATABASE regress_full_folds;
 -- (no checkpoint as a rewrite ends, prolly.fold_on_rewrite: what is
 -- counted here is what the next fold reads after one)
 SET prolly.fold_on_rewrite = off;
+-- (a reshaped table's baseline mapped where it can be, whatever reading the
+-- table would cost: shape_folds tests that choice)
+SET prolly.map_reshaped_dead_ratio = 0;
 CREATE EXTENSION test_prolly;
 CREATE FUNCTION full_folds() RETURNS TABLE (reason text, n bigint) LANGUAGE sql AS $$
 	SELECT substr(name, 11), value FROM pg_stat_prolly
