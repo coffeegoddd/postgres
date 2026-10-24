@@ -241,6 +241,20 @@ SET dolt.transaction_commit = off;
 SELECT length(dolt_commit('-Am', 'outside')::text) AS committed;
 SET dolt.transaction_commit = on;
 
+-- The chunks a transaction's commit writes go into its backend's chunk
+-- cache as it commits: the next transaction's commit, reading the head
+-- the first made (its commit, root, the table's path and the refs), reads
+-- none of them from the chunk store's files.
+CREATE TABLE tc.cached (id int PRIMARY KEY, v int);
+INSERT INTO tc.cached SELECT g, 0 FROM generate_series(1, 20) g;
+UPDATE tc.cached SET v = 1 WHERE id = 1;
+SELECT pg_stat_force_next_flush();
+SELECT value AS file_reads FROM pg_stat_prolly WHERE name = 'chunk_file_reads' \gset
+UPDATE tc.cached SET v = 1 WHERE id = 2;
+SELECT pg_stat_force_next_flush();
+SELECT value - :file_reads AS file_reads FROM pg_stat_prolly
+  WHERE name = 'chunk_file_reads';
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');

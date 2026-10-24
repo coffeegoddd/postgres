@@ -97,6 +97,10 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # a merge: the differences examined and written
     ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY)},
     ("merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
+    # a transaction's own commit: Δ descents of the tree, and the chunks
+    # the last one wrote read from the cache, not the files
+    ("txn_commit", "rows"): {**_all("log", TREE), "chunk_file_reads": "log"},
+    ("txn_commit", "delta"): _all("linear", TREE),
     # as unrelated objects are added (shared tables, another branch's): a
     # first use's copies, a commit's canonical form and a branch's delete
     # read the branch's catalog rows only

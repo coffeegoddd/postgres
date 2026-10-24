@@ -111,14 +111,14 @@ WHERE name NOT IN ('journal_bytes_written', 'journal_bytes_scanned');
  gc_bytes_freed                |     0
  conjoins                      |     0
  gc_window_usec                |     0
- chunk_file_reads              |     9
+ chunk_file_reads              |     0
  gc_pages_scanned              |     0
  commits_read                  |     2
  folds_reused                  |     0
  describe_cache_hits           |     1
  apply_rows_batched            |     0
  apply_loads                   |     0
- chunk_cache_hits              |    38
+ chunk_cache_hits              |    47
  fold_rows_located             |  1000
  bmap_map_pages_copied         |     0
  bmap_refcount_updates         |     0

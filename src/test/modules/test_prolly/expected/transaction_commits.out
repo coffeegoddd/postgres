@@ -498,13 +498,41 @@ SELECT length(dolt_commit('-Am', 'outside')::text) AS committed;
 (1 row)
 
 SET dolt.transaction_commit = on;
+-- The chunks a transaction's commit writes go into its backend's chunk
+-- cache as it commits: the next transaction's commit, reading the head
+-- the first made (its commit, root, the table's path and the refs), reads
+-- none of them from the chunk store's files.
+CREATE TABLE tc.cached (id int PRIMARY KEY, v int);
+INSERT INTO tc.cached SELECT g, 0 FROM generate_series(1, 20) g;
+UPDATE tc.cached SET v = 1 WHERE id = 1;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value AS file_reads FROM pg_stat_prolly WHERE name = 'chunk_file_reads' \gset
+UPDATE tc.cached SET v = 1 WHERE id = 2;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value - :file_reads AS file_reads FROM pg_stat_prolly
+  WHERE name = 'chunk_file_reads';
+ file_reads 
+------------
+          0
+(1 row)
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');
 SELECT pg_temp.commits() - :before AS commits;
  commits 
 ---------
-      24
+      28
 (1 row)
 
 SELECT dolt_reset('--hard');
@@ -521,7 +549,7 @@ SELECT dolt_branch('-D', 'tc_f');
 
 DROP TABLE tc_plain;
 DROP SCHEMA tc CASCADE;
-NOTICE:  drop cascades to 9 other objects
+NOTICE:  drop cascades to 10 other objects
 DETAIL:  drop cascades to table tc.t
 drop cascades to table tc.child
 drop cascades to table tc.u
@@ -531,6 +559,7 @@ drop cascades to table tc.sb
 drop cascades to table tc.sa
 drop cascades to table tc.num
 drop cascades to table tc.nbag
+drop cascades to table tc.cached
 SELECT length(dolt_commit('-Am', 'tc gone')::text) AS committed;
  committed 
 -----------

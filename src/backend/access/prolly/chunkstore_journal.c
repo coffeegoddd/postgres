@@ -677,9 +677,10 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
  * store still has it: a collection may remove it.  So the cache is of a
  * collection's generation (the manifest's gc_generation), and let go of
  * whole once a read sees another, as the store's own reads then find
- * nothing of what was removed.  Only those read from the files (not the
- * transaction's own, pending or transient, which an abort takes back, nor
- * one read through a source).
+ * nothing of what was removed.  Those read from the files, and the
+ * transaction's own once it commits (an eighth of the cache's bytes at
+ * most): not while pending or transient, which an abort takes back, nor
+ * one read through a source.
  *
  * A chunk is kept the second time it is read from the files, not the
  * first: the hashes of those read once are remembered (as many as the

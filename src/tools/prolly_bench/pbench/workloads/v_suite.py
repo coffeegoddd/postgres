@@ -551,8 +551,9 @@ class V9(VWorkload):
     of the load commit (point_read); Δ rows changed again, the head reset
     softly to the load commit (soft_reset) and hard, discarding the
     working set (hard_reset); Δ rows committed again, main changed in
-    another row, and the branch merged into main (merge); the branch
-    deleted (branch_delete)."""
+    another row, and the branch merged into main (merge); Δ rows changed in
+    a transaction that commits as it ends (dolt.transaction_commit), after
+    another such (txn_commit); the branch deleted (branch_delete)."""
 
     id, title = "V9", "Growth shapes"
 
@@ -647,6 +648,12 @@ class V9(VWorkload):
             ("", f"UPDATE v9 SET v = 9 WHERE id = {n}"),
             ("", "SELECT dolt_commit('-am', 'v9 on main')"),
             ("merge", "SELECT dolt_merge('v9_b')"),
+            # (Δ rows changed in a transaction that commits as it ends,
+            # after another such: its commit reads what the last one made)
+            ("", "SET dolt.transaction_commit = on"),
+            ("", f"UPDATE v9 SET v = 6 WHERE id = {n}"),
+            ("txn_commit", self.change(n, d, 5)),
+            ("", "RESET dolt.transaction_commit"),
             ("branch_delete", "SELECT dolt_branch('-D', 'v9_b')"),
         ]
 
