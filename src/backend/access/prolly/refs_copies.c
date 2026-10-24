@@ -38,7 +38,8 @@
  *	'C' name	-> a database setting's value (text)
  *	'N' name	-> the head's tables, as the commit that made it of the
  *				   working set named them: the head's hash, then a line
- *				   per table (its OID, then its qualified name)
+ *				   per table (its OID, then its qualified name, as 'L'
+ *				   lines are)
  *	'Q' name	-> the branch's merge's conflicted tables' names, as the
  *				   merge recorded them: each table's OID, then its name's
  *				   length (a varint) and bytes; and the tables in schema
@@ -66,8 +67,9 @@
  *	'L' commit	-> the relations the commit was made from, as this database
  *				   made it (commits fetched, cloned or pushed here have
  *				   none): a line for each prolly table, its OID (10 digits),
- *				   a space, and its qualified name
- *	'Q' relid	-> the relation (its OID, 10 digits) relation relid (the
+ *				   a space, and its qualified name (a backslash in it
+ *				   written as two, a newline as a backslash and 'n')
+ *	'J' relid	-> the relation (its OID, 10 digits) relation relid (the
  *				   same) is the same table as, its class's: a relation a
  *				   move made again of a table, or a merge made of the
  *				   other side's, is its; one without an entry is its own
@@ -243,7 +245,7 @@
 #define TAG_CREATOR		'A'	/* the role that made a branch */
 #define TAG_TAG_CREATOR	'G'	/* and a tag */
 #define TAG_LINEAGE		'L'	/* the relations a commit was made from */
-#define TAG_CLASS		'Q'	/* the relation a relation is the same table as */
+#define TAG_CLASS		'J'	/* the relation a relation is the same table as */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
 /*
@@ -253,9 +255,10 @@
  * names entry; 9: kept pages' keeping transaction; 10: pins; 11: the
  * trees a pin keeps; 12: a schema-conflicted table's names on each side;
  * 13: branches', tags' and stashes' makers; 14: the relations commits were
- * made from; 15: relations' equivalence classes.
+ * made from; 15: relations' equivalence classes; 16: names in records of
+ * tables escaped, and classes under their own tag.
  */
-#define REFS_FORMAT		"15"
+#define REFS_FORMAT		"16"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -1153,16 +1156,17 @@ branch_entry(const char *key, int keylen)
 
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
- * transaction holds, or the relation record of a commit it makes (keyed by
- * the commit, which no other transaction writes), not having held every
- * ref nor begun to commit?
+ * transaction holds, the relation record of a commit it makes (keyed by
+ * the commit, which no other transaction writes), or the class of a
+ * relation it makes (keyed by the relation, which no other transaction
+ * has), not having held every ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
 {
 	if (published || whole)
 		return false;
-	if (keylen > 1 && key[0] == TAG_LINEAGE)
+	if (keylen > 1 && (key[0] == TAG_LINEAGE || key[0] == TAG_CLASS))
 		return true;
 	return branch_entry(key, keylen) && branch_held(key + 1, keylen - 1);
 }
@@ -4488,8 +4492,82 @@ line_cmp(const ListCell *a, const ListCell *b)
 }
 
 /*
- * The session's prolly tables, each "relid name" on a line, by relid: as
- * the branch's catalog names them now.
+ * A relation's line in a record of tables: its OID (10 digits), a space,
+ * and its qualified name, each backslash in it written as two and each
+ * newline as a backslash and 'n', so that no name, whatever it holds,
+ * makes a line of its own; then a newline.
+ */
+static void
+relation_line(StringInfo out, Oid relid, const char *name)
+{
+	appendStringInfo(out, "%010u ", relid);
+	for (const char *c = name; *c; c++)
+	{
+		if (*c == '\\')
+			appendStringInfoString(out, "\\\\");
+		else if (*c == '\n')
+			appendStringInfoString(out, "\\n");
+		else
+			appendStringInfoChar(out, *c);
+	}
+	appendStringInfoChar(out, '\n');
+}
+
+/*
+ * The relations a record of tables lists (relation_line()'s lines, from
+ * data on), each a ProllyCommitRelation: a line of any other form is
+ * refused, as a damaged record, never read in part.
+ */
+static List *
+relation_lines(const char *data)
+{
+	List	   *out = NIL;
+
+	for (const char *p = data; *p;)
+	{
+		ProllyCommitRelation *r = palloc(sizeof(ProllyCommitRelation));
+		StringInfoData name;
+		const char *c = p + 11;
+
+		for (int i = 0; i < 10; i++)
+			if (!isdigit((unsigned char) p[i]))
+				goto bad;
+		if (p[10] != ' ')
+			goto bad;
+		r->relid = (Oid) strtoul(p, NULL, 10);
+		initStringInfo(&name);
+		for (; *c && *c != '\n'; c++)
+		{
+			if (*c != '\\')
+				appendStringInfoChar(&name, *c);
+			else if (c[1] == '\\')
+				appendStringInfoChar(&name, *++c);
+			else if (c[1] == 'n')
+			{
+				appendStringInfoChar(&name, '\n');
+				c++;
+			}
+			else
+				goto bad;
+		}
+		if (*c != '\n' || name.len == 0)
+			goto bad;
+		r->name = name.data;
+		out = lappend(out, r);
+		p = c + 1;
+	}
+	return out;
+
+bad:
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("prolly refs hold a damaged record of relations")));
+	return NIL;
+}
+
+/*
+ * The session's prolly tables, each a relation_line(), by relid: as the
+ * branch's catalog names them now.
  */
 static void
 table_names(StringInfo out)
@@ -4505,18 +4583,21 @@ table_names(StringInfo out)
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
 		if (c->relam == PROLLY_TABLE_AM_OID && c->relkind == RELKIND_RELATION)
-			lines = lappend(lines, psprintf("%010u %s", c->oid,
-											quote_qualified_identifier(get_namespace_name(c->relnamespace),
-																	   NameStr(c->relname))));
+		{
+			StringInfoData line;
+
+			initStringInfo(&line);
+			relation_line(&line, c->oid,
+						  quote_qualified_identifier(get_namespace_name(c->relnamespace),
+													 NameStr(c->relname)));
+			lines = lappend(lines, line.data);
+		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 	list_sort(lines, line_cmp);
 	foreach(lc, lines)
-	{
 		appendStringInfoString(out, lfirst(lc));
-		appendStringInfoChar(out, '\n');
-	}
 }
 
 /*
@@ -4630,16 +4711,28 @@ note_relations(const ProllyHash *commit, const char *lines)
 	pfree(v.data);
 }
 
+/* Record commit as made from relations (ProllyCommitRelation *). */
 static void
-copies_set_commit_relations(const ProllyHash *commit, const char *lines)
+copies_set_commit_relations(const ProllyHash *commit, List *relations)
 {
+	StringInfoData lines;
+	ListCell   *lc;
+
 	refs_init();
-	note_relations(commit, lines);
+	initStringInfo(&lines);
+	foreach(lc, relations)
+		relation_line(&lines, ((ProllyCommitRelation *) lfirst(lc))->relid,
+					  ((ProllyCommitRelation *) lfirst(lc))->name);
+	note_relations(commit, lines.data);
+	pfree(lines.data);
 }
 
-/* The relations commit was made from (palloc'd lines); false if unrecorded. */
+/*
+ * The relations commit was made from (ProllyCommitRelation *); false if
+ * unrecorded.
+ */
 static bool
-copies_commit_relations(const ProllyHash *commit, char **lines)
+copies_commit_relations(const ProllyHash *commit, List **relations)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -4651,18 +4744,19 @@ copies_commit_relations(const ProllyHash *commit, char **lines)
 	relations_key(&key, commit);
 	found = refs_get(key.data, key.len, &v);
 	if (found)
-		*lines = pstrdup(v.data);
+		*relations = relation_lines(v.data);
 	pfree(key.data);
 	pfree(v.data);
 	return found;
 }
 
 /*
- * Of the first parent's relation record (parent), the lines of relations
- * the session still has: a commit that isn't its working set (a merge's,
- * a pick's or a revert's, made over uncommitted changes) holds a table as
- * the parent's relation made it, or one made by the move, never the
- * working set's own, so it is recorded made only from what both hold.
+ * Of the first parent's relation record (parent, or its lines had), the
+ * lines of relations the session still has (of now's): a commit that
+ * isn't its working set (a merge's, a pick's or a revert's, made over
+ * uncommitted changes) holds a table as the parent's relation made it, or
+ * one made by the move, never the working set's own, so it is recorded
+ * made only from what both hold.
  */
 static char *
 relations_kept(const ProllyHash *parent, const char *had, const char *now,
@@ -4672,6 +4766,8 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 	StringInfoData v;
 	StringInfoData out;
 	bool		have;
+	List	   *before = NIL;
+	ListCell   *lc;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
@@ -4681,64 +4777,49 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 	else
 		relations_key(&key, parent);
 	have = had != NULL || refs_get(key.data, key.len, &v);
-	for (const char *p = now; *p;)
+	if (have)
+		before = relation_lines(v.data);
+	foreach(lc, relation_lines(now))
 	{
-		const char *end = strchrnul(p, '\n');
+		ProllyCommitRelation *r = lfirst(lc);
 		bool		keep = false;
+		bool		changed = false;
+		ListCell   *nc;
 
-		if (end - p > 11)
+		/*
+		 * (a table the commit holds as the working set has it: one the
+		 * working set didn't change, when the uncommitted changes are named)
+		 */
+		foreach(nc, local)
+			if (strcmp(lfirst(nc), r->name) == 0)
+				changed = true;
+		if (local != NIL && !changed)
+			keep = true;
+
+		/*
+		 * (else as the parent had it: the same relation, or the same table,
+		 * by its class, asked only when the relation isn't there)
+		 */
+		else if (have)
 		{
-			char	   *name = pnstrdup(p + 11, end - (p + 11));
-			Oid			relid = (Oid) strtoul(p, NULL, 10);
+			ListCell   *bc;
+			Oid			cls = InvalidOid;
 
-			/*
-			 * (a table the commit holds as the working set has it: one the
-			 * working set didn't change, when the uncommitted changes are
-			 * named)
-			 */
-			bool		changed = false;
-			ListCell   *lc;
-
-			foreach(lc, local)
-				if (strcmp(lfirst(lc), name) == 0)
-					changed = true;
-			if (local != NIL && !changed)
-				keep = true;
-			/*
-			 * (else as the parent had it: the same relation, or the same
-			 * table, by its class, asked only when the relation isn't there)
-			 */
-			else if (have)
-			{
-				char		want[16];
-				Oid			cls;
-
-				snprintf(want, sizeof(want), "\n%010u ", relid);
-				if (strncmp(v.data, want + 1, 11) == 0 || strstr(v.data, want) != NULL)
-				{
+			foreach(bc, before)
+				if (((ProllyCommitRelation *) lfirst(bc))->relid == r->relid)
 					keep = true;
-					cls = InvalidOid;
-				}
-				else
-					cls = relation_class(relid);
-				for (const char *q = v.data; *q && !keep;)
-				{
-					const char *qend = strchrnul(q, '\n');
-
-					if (qend - q > 11 &&
-						relation_class((Oid) strtoul(q, NULL, 10)) == cls)
-						keep = true;
-					q = *qend ? qend + 1 : qend;
-				}
+			if (!keep)
+				cls = relation_class(r->relid);
+			foreach(bc, before)
+			{
+				if (keep)
+					break;
+				if (relation_class(((ProllyCommitRelation *) lfirst(bc))->relid) == cls)
+					keep = true;
 			}
-			pfree(name);
 		}
 		if (keep)
-		{
-			appendBinaryStringInfo(&out, p, end - p);
-			appendStringInfoChar(&out, '\n');
-		}
-		p = *end ? end + 1 : end;
+			relation_line(&out, r->relid, r->name);
 	}
 	pfree(key.data);
 	pfree(v.data);
@@ -5018,17 +5099,25 @@ copies_anchor_identity(const ProllyValue *identity)
 	anchor_working(NULL, identity);
 }
 
-/* Are rel's name now and its name at head the same? */
+/*
+ * Are rel's name now and its name at head the same?  at_head: the
+ * relations of head_names()'s lines.
+ */
 static bool
-named_as_at_head(const char *lines, Relation rel)
+named_as_at_head(List *at_head, Relation rel)
 {
-	char	   *line = psprintf("\n%010u %s\n", RelationGetRelid(rel),
-								quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-														   RelationGetRelationName(rel)));
-	bool		same = strstr(lines, line) != NULL;
+	char	   *name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+												  RelationGetRelationName(rel));
+	ListCell   *lc;
 
-	pfree(line);
-	return same;
+	foreach(lc, at_head)
+	{
+		ProllyCommitRelation *r = lfirst(lc);
+
+		if (r->relid == RelationGetRelid(rel) && strcmp(r->name, name) == 0)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -5412,7 +5501,9 @@ copies_checkpoint(ProllyNodeRef *root)
  * by another as it begins, nothing is folded at all.  The fold is by a
  * snapshot taken after the baseline and head are read: one taken before
  * would see none of a fold that moved the baseline in between (the check
- * then passing), and read every table in full.
+ * then passing), and read every table in full.  The fold waits for no
+ * relation's lock: one not free at once fails it, with
+ * ERRCODE_LOCK_NOT_AVAILABLE.
  */
 static bool
 copies_checkpoint_unless_moved(ProllyNodeRef *root)
@@ -5435,7 +5526,26 @@ copies_checkpoint_unless_moved(ProllyNodeRef *root)
 	had = branch_baseline(name, &baseline);
 	had_head = branch_head(name, &head);
 	PushActiveSnapshot(GetLatestSnapshot());
-	fold_from_baseline(root, &next, false);
+
+	/*
+	 * (never waiting for a relation's lock either: the fold keeps its locks
+	 * on the change logs it consumed past its lock on their table, so a
+	 * DROP of several tables, holding them and waiting for one's log, would
+	 * deadlock with the fold waiting for the next table; a lock not free at
+	 * once fails the fold with ERRCODE_LOCK_NOT_AVAILABLE, for the caller
+	 * to roll back and fold again later)
+	 */
+	RelationLocksNoWait = true;
+	RelationLockRefused = false;
+	PG_TRY();
+	{
+		fold_from_baseline(root, &next, false);
+	}
+	PG_FINALLY();
+	{
+		RelationLocksNoWait = false;
+	}
+	PG_END_TRY();
 	PopActiveSnapshot();
 
 	/*
@@ -5607,6 +5717,7 @@ commit_rows(const char *message, const ProllyRowChanges *changes,
 	ProllyNodeRef root;
 	ProllyDatabaseComponents dc;
 	char	   *names;
+	List	   *at_head;
 
 	lock_branch(name);
 	if (!branch_head(name, &head) || !copies_commit_get(&head, &info) ||
@@ -5621,10 +5732,11 @@ commit_rows(const char *message, const ProllyRowChanges *changes,
 	names = head_names(name, &head);
 	if (names == NULL)
 		return -1;
+	at_head = relation_lines(names[0] == '\n' ? names + 1 : names);
 	for (int i = 0; i < nchanges; i++)
 	{
 		Relation	rel = try_table_open(changes[i].relid, AccessShareLock);
-		bool		same = rel != NULL && named_as_at_head(names, rel);
+		bool		same = rel != NULL && named_as_at_head(at_head, rel);
 
 		if (rel)
 			table_close(rel, AccessShareLock);

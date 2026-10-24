@@ -148,7 +148,25 @@ SELECT * FROM dolt_at('keeps_old', NULL::ln.t);
 SELECT * FROM dolt_at('HEAD^2^1', NULL::ln.t);
 SELECT count(*) AS rows_now FROM ln.t;
 SELECT * FROM dolt_at('HEAD^1', NULL::ln.t) ORDER BY id;
+SELECT * FROM dolt_at('k3', NULL::ln.t) ORDER BY id;
+SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
 RESET ROLE;
+SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
+
+-- a branch made at the old table's commit after the re-make, first used
+-- there, with a commit of its own, merged in
+SELECT dolt_branch('late2', :'old_commit') IS NOT NULL AS made;
+SELECT dolt_checkout('late2') IS NOT NULL AS on_late2;
+INSERT INTO ln.t VALUES (3, 'late2 row');
+SELECT length(dolt_commit('-am', 'late2 row')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', '-m', 'late2 in', 'late2'))[3] AS conflicts;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD^2', NULL::ln.t) ORDER BY id;
+SELECT * FROM dolt_at('late2', NULL::ln.t) ORDER BY id;
+SELECT * FROM dolt_at(:'old_commit', NULL::ln.t);
+RESET ROLE;
+SELECT count(*) AS owner_reads FROM dolt_at('late2', NULL::ln.t);
 SELECT dolt_reset('--hard', :'before_k') IS NOT NULL AS back;
 
 -- a branch made at the new table's commit by hash, its head moved to the
@@ -164,6 +182,36 @@ SELECT * FROM dolt_at('HEAD~', NULL::ln.t);
 SELECT * FROM dolt_at('k4~', NULL::ln.t);
 RESET ROLE;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+
+-- a table's name can't forge a line of a commit's record: one whose name
+-- holds a newline and the new table's line, made on the old table's
+-- branch, leaves that branch's commits the old table's
+SELECT dolt_hashof('main') AS before_f \gset
+SELECT lpad('ln.t'::regclass::oid::text, 10, '0') AS new_relid \gset
+SELECT dolt_checkout('keeps_old') IS NOT NULL AS on_old;
+SELECT dolt_checkout('-b', 'forger') IS NOT NULL AS made;
+SELECT format('CREATE TABLE ln.%I (id int PRIMARY KEY)',
+			  E'a\n' || :'new_relid' || E' ln.t\nb') AS forge \gset
+:forge;
+SELECT length(dolt_commit('-Am', 'forged')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', '-m', 'forger in', 'forger'))[3] AS conflicts;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD^2', NULL::ln.t);
+SELECT * FROM dolt_at('forger', NULL::ln.t);
+RESET ROLE;
+-- (the forging table's own history is its own, its name read back as it
+-- was: merged in, it is of the class of the relation forger's record lists
+-- under that name)
+SELECT E'a\n' || :'new_relid' || E' ln.t\nb' AS forge_name \gset
+SELECT format('GRANT SELECT ON ln.%I TO regress_lb_reader', :'forge_name') AS grant_forge \gset
+:grant_forge;
+SET ROLE regress_lb_reader;
+SELECT format('SELECT count(*) AS forged_rows FROM dolt_at(%L, NULL::ln.%I)',
+			  'HEAD^2', :'forge_name') AS read_forge \gset
+:read_forge;
+RESET ROLE;
+SELECT dolt_reset('--hard', :'before_f') IS NOT NULL AS back;
 
 -- a table made on a branch and merged in is a relation made here, of the
 -- class of the branch's relation it was made from: its branch's history
@@ -345,6 +393,41 @@ SELECT id FROM dolt_at('late_side', NULL::ln.t) WHERE id = 60;
 RESET ROLE;
 SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
 
+-- a class is no branch's entry: a branch named as a relation's class is
+-- keyed, its merge's conflicted names written and dropped, leaves it
+CREATE TABLE ln.c (id int PRIMARY KEY, a int, note text);
+GRANT SELECT ON ln.c TO regress_lb_reader;
+SELECT length(dolt_commit('-Am', 'c')::text) AS committed;
+SELECT dolt_branch('c_late') IS NOT NULL AS made;
+ALTER TABLE ln.c DROP COLUMN a;
+SELECT length(dolt_commit('-am', 'c without a')::text) AS committed;
+SELECT dolt_checkout('c_late') IS NOT NULL AS on_late;
+INSERT INTO ln.c VALUES (1, 1, 'late c');
+SELECT length(dolt_commit('-am', 'late c row')::text) AS committed;
+SELECT lpad('ln.c'::regclass::oid::text, 10, '0') AS c_relid \gset
+SELECT test_refs_value('J' || :'c_relid') IS NOT NULL AS classed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_lb_reader;
+SELECT id, note FROM dolt_at('c_late', NULL::ln.c);
+RESET ROLE;
+SELECT dolt_branch(:'c_relid') IS NOT NULL AS made;
+SELECT dolt_branch('c_other') IS NOT NULL AS made;
+SELECT dolt_checkout('c_other') IS NOT NULL AS on_other;
+INSERT INTO ln.c VALUES (2, 'other');
+SELECT length(dolt_commit('-am', 'other c')::text) AS committed;
+SELECT dolt_checkout(:'c_relid') IS NOT NULL AS on_named;
+INSERT INTO ln.c VALUES (2, 'mine');
+SELECT length(dolt_commit('-am', 'my c')::text) AS committed;
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('c_other'))[3] AS conflicts;
+SELECT dolt_merge('--abort') IS NOT NULL AS aborted;
+RESET dolt.allow_commit_conflicts;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_lb_reader;
+SELECT id, note FROM dolt_at('c_late', NULL::ln.c);
+RESET ROLE;
+SELECT dolt_reset('--hard', :'secrets2_head') IS NOT NULL AS back;
+
 -- a commit of dolt.transaction_commit's records its relations too: the
 -- table's history reads through it
 SET dolt.transaction_commit = on;
@@ -386,6 +469,96 @@ SELECT value - :read_before AS side_read FROM pg_stat_prolly WHERE name = 'commi
 SELECT :side_read <= 8 * :side_commits AS linear;
 SELECT prolly_unmount('lb_mnt');
 
+-- uncommitted changes set aside for a move that changes definitions, and
+-- put back after it, are the branch's own: a table made again in the
+-- working set doesn't join the class of the other side's table of its name
+CREATE TABLE ln.p (id int PRIMARY KEY, note text);
+CREATE TABLE ln.pu (id int PRIMARY KEY);
+INSERT INTO ln.p VALUES (1, 'old secret p');
+SELECT length(dolt_commit('-Am', 'old p')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS p_old \gset
+SELECT dolt_branch('pside') IS NOT NULL AS made;
+SELECT dolt_checkout('pside') IS NOT NULL AS on_pside;
+ALTER TABLE ln.pu ADD COLUMN c int;
+SELECT length(dolt_commit('-am', 'pside alter')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS p_alter \gset
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+DROP TABLE ln.p;
+SELECT length(dolt_commit('-Am', 'dropped p')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS p_dropped \gset
+-- (a cherry-pick: the table made again has no class of another's)
+CREATE TABLE ln.p (id int PRIMARY KEY, note text);
+SELECT (dolt_cherry_pick(:'p_alter'))[1] IS NOT NULL AS picked;
+SELECT test_refs_value('J' || lpad('ln.p'::regclass::oid::text, 10, '0')) IS NULL
+	AS own_class;
+SELECT dolt_reset('--hard', :'p_dropped') IS NOT NULL AS back;
+-- (a merge, then the side merged again: the side's commits, and the old
+-- table's, stay another table's)
+CREATE TABLE ln.p (id int PRIMARY KEY, note text);
+INSERT INTO ln.p VALUES (10, 'public p');
+SELECT (dolt_merge('--no-ff', '-m', 'pside in', 'pside'))[3] AS conflicts;
+SELECT length(dolt_commit('-Am', 'new p')::text) AS committed;
+SELECT dolt_checkout('pside') IS NOT NULL AS on_pside;
+INSERT INTO ln.pu VALUES (1, 1);
+SELECT length(dolt_commit('-am', 'pside row')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT (dolt_merge('--no-ff', '-m', 'pside in again', 'pside'))[3] AS conflicts;
+GRANT SELECT ON ln.p TO regress_lb_reader;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.p);
+SELECT * FROM dolt_at('HEAD^2', NULL::ln.p);
+SELECT * FROM dolt_at('pside', NULL::ln.p);
+SELECT * FROM dolt_at(:'p_old', NULL::ln.p);
+RESET ROLE;
+
+-- an uncommitted row change to the reader's table, set aside and put back
+-- over such a merge, is the same table's: its history reads through it
+SELECT dolt_checkout('pside') IS NOT NULL AS on_pside;
+ALTER TABLE ln.pu ADD COLUMN e int;
+SELECT length(dolt_commit('-am', 'pside alter again')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+INSERT INTO ln.p VALUES (11, 'public p, uncommitted');
+SELECT (dolt_merge('--no-ff', '-m', 'pside in, over a row', 'pside'))[3] AS conflicts;
+SET ROLE regress_lb_reader;
+SELECT * FROM ln.p ORDER BY id;
+SELECT * FROM dolt_at('HEAD', NULL::ln.p) ORDER BY id;
+SELECT * FROM dolt_at('HEAD~', NULL::ln.p) ORDER BY id;
+RESET ROLE;
+SELECT length(dolt_commit('-am', 'the row')::text) AS committed;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.p) ORDER BY id;
+SELECT * FROM dolt_at('HEAD~', NULL::ln.p) ORDER BY id;
+RESET ROLE;
+
+-- commits made elsewhere (cloned) have no records: their versions are
+-- read by full readers only, and stay so under a commit made here
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/lineage-' || txid_current() AS lb_url \gset
+SELECT dolt_remote('add', 'origin', :'lb_url') IS NOT NULL AS added;
+SELECT dolt_push('origin', 'main') IS NOT NULL AS pushed;
+CREATE DATABASE regress_lineage_clone;
+\c regress_lineage_clone
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SELECT dolt_clone(:'lb_url') IS NOT NULL AS cloned;
+GRANT USAGE ON SCHEMA ln TO regress_lb_reader;
+GRANT SELECT ON ln.p TO regress_lb_reader;
+SET ROLE regress_lb_reader;
+SELECT * FROM dolt_at('HEAD', NULL::ln.p);
+SELECT * FROM dolt_at('HEAD~', NULL::ln.p);
+RESET ROLE;
+SELECT count(*) AS owner_reads FROM dolt_at('HEAD~', NULL::ln.p);
+INSERT INTO ln.p VALUES (12, 'made here');
+SELECT length(dolt_commit('-am', 'here')::text) AS committed;
+SET ROLE regress_lb_reader;
+SELECT count(*) AS rows_here FROM dolt_at('HEAD', NULL::ln.p);
+SELECT * FROM dolt_at('HEAD~', NULL::ln.p);
+RESET ROLE;
+\c regress_lineage_breaks
+SELECT dolt_remote('remove', 'origin') IS NOT NULL AS removed;
+
 \c contrib_regression
 DROP DATABASE regress_lineage_breaks;
+DROP DATABASE regress_lineage_clone;
 DROP ROLE regress_lb_reader, regress_lb_writer;

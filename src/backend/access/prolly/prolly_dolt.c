@@ -7002,24 +7002,20 @@ lineage_class(NameLineage *l, Oid relid)
 static char *
 made_from(NameLineage *l, const ProllyHash *commit)
 {
-	char	   *lines;
-	char		want[16];
+	List	   *relations;
+	ListCell   *lc;
 
 	if (!OidIsValid(l->relid) || !PROLLY_HAS(refs(), commit_relations) ||
-		!PROLLY_CALL(refs(), commit_relations, commit, &lines))
+		!PROLLY_CALL(refs(), commit_relations, commit, &relations))
 		return NULL;
 	if (!OidIsValid(l->cls))
 		l->cls = lineage_class(l, l->relid);
-	snprintf(want, sizeof(want), "%010u ", l->relid);
-	for (char *p = lines; *p;)
+	foreach(lc, relations)
 	{
-		char	   *end = strchrnul(p, '\n');
+		ProllyCommitRelation *r = lfirst(lc);
 
-		if (end - p > 11 &&
-			(strncmp(p, want, 11) == 0 ||
-			 lineage_class(l, (Oid) strtoul(p, NULL, 10)) == l->cls))
-			return pnstrdup(p + 11, end - (p + 11));
-		p = *end ? end + 1 : end;
+		if (r->relid == l->relid || lineage_class(l, r->relid) == l->cls)
+			return r->name;
 	}
 	return NULL;
 }

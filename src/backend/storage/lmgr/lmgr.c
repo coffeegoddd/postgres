@@ -152,6 +152,20 @@ SetLocktagHeldRelationOid(LOCKTAG *tag, Oid relid, LOCKMODE lockmode)
 }
 
 /*
+ * While set, LockRelationOid() takes a lock only if it is free at once,
+ * failing with ERRCODE_LOCK_NOT_AVAILABLE otherwise: for background work
+ * that keeps locks a foreground transaction may wait for, and so must
+ * never wait for that transaction's in turn.  Other locks (a relation's
+ * extension, a transaction's) are waited for as ever.  Whoever sets it
+ * resets it, on error too; a transaction's abort resets it as well, for a
+ * FATAL exits without unwinding to them.  RelationLockRefused is set once such a lock
+ * was refused, for the caller to tell that error from another lock's
+ * timeout.
+ */
+bool		RelationLocksNoWait = false;
+bool		RelationLockRefused = false;
+
+/*
  *		LockRelationOid
  *
  * Lock a relation given only its OID.  This should generally be used
@@ -166,8 +180,15 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock,
-							  false);
+	res = LockAcquireExtended(&tag, lockmode, false, RelationLocksNoWait,
+							  true, &locallock, false);
+	if (res == LOCKACQUIRE_NOT_AVAIL)
+	{
+		RelationLockRefused = true;
+		ereport(ERROR,
+				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+				 errmsg("could not obtain lock on relation %u", relid)));
+	}
 
 	/*
 	 * Now that we have the lock, check for invalidation messages, so that we

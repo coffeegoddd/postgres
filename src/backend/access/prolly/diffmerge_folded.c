@@ -4725,36 +4725,24 @@ prolly_versions_may_be_foreign(const ProllyHash *provenance, int n)
 		return false;
 	for (int i = 0; i < n; i++)
 	{
-		char	   *lines;
+		List	   *relations;
+		ListCell   *lc;
 
-		if (!PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &lines))
+		if (!PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &relations))
 			continue;
-		for (char *p = lines; *p;)
+		foreach(lc, relations)
 		{
-			char	   *end = strchrnul(p, '\n');
+			ProllyCommitRelation *r = lfirst(lc);
+			Oid			here;
 
-			if (end - p > 11)
-			{
-				Oid			r = (Oid) strtoul(p, NULL, 10);
-				char	   *name = pnstrdup(p + 11, end - (p + 11));
-				Oid			here;
-
-				here = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(name, NULL)),
-										NoLock, true);
-				if (OidIsValid(here) ?
-					(here != r &&
-					 PROLLY_CALL(dc.refs, relation_class, here) !=
-					 PROLLY_CALL(dc.refs, relation_class, r)) :
-					get_rel_relkind(r) != RELKIND_RELATION)
-				{
-					pfree(name);
-					return true;
-				}
-				pfree(name);
-			}
-			p = *end ? end + 1 : end;
+			here = rel_named(r->name, true);
+			if (OidIsValid(here) ?
+				(here != r->relid &&
+				 PROLLY_CALL(dc.refs, relation_class, here) !=
+				 PROLLY_CALL(dc.refs, relation_class, r->relid)) :
+				get_rel_relkind(r->relid) != RELKIND_RELATION)
+				return true;
 		}
-		pfree(lines);
 	}
 	return false;
 }
@@ -4781,7 +4769,7 @@ prolly_remake_foreign_versions(const ProllyNodeRef *before,
 	ProllyNodeRef after;
 	Tables		b = {NIL};
 	Tables		a = {NIL};
-	char	   *lines = NULL;
+	List	   *relations;
 	List	   *remade = NIL;
 	List	   *old_relids = NIL;
 	ListCell   *lc;
@@ -4806,8 +4794,7 @@ prolly_remake_foreign_versions(const ProllyNodeRef *before,
 			(same_hash(&f->data.hash, &t->data.hash) && f->textlen == t->textlen &&
 			 memcmp(f->text, t->text, t->textlen) == 0))
 			continue;
-		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(t->name, NULL)),
-								 NoLock, true);
+		relid = rel_named(t->name, true);
 		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
 			continue;
 		{
@@ -4823,21 +4810,19 @@ prolly_remake_foreign_versions(const ProllyNodeRef *before,
 			for (int i = 0; i < nprovenance && !foreign; i++)
 			{
 				bool		same = false;
+				ListCell   *rc;
 
 				if (!PROLLY_HAS(dc.refs, commit_relations) ||
-					!PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &lines))
+					!PROLLY_CALL(dc.refs, commit_relations, &provenance[i], &relations))
 					continue;
-				for (char *p = lines; *p && !same;)
+				foreach(rc, relations)
 				{
-					char	   *end = strchrnul(p, '\n');
-					Oid			r = (Oid) strtoul(p, NULL, 10);
+					ProllyCommitRelation *r = lfirst(rc);
 
-					if (end - p > 11 &&
-						(r == relid ||
-						 (PROLLY_HAS(dc.refs, relation_class) &&
-						  PROLLY_CALL(dc.refs, relation_class, r) == cls)))
+					if (r->relid == relid ||
+						(PROLLY_HAS(dc.refs, relation_class) &&
+						 PROLLY_CALL(dc.refs, relation_class, r->relid) == cls))
 						same = true;
-					p = *end ? end + 1 : end;
 				}
 				foreign = !same;
 			}
@@ -4869,42 +4854,40 @@ prolly_remake_foreign_versions(const ProllyNodeRef *before,
 	 */
 	if (made != NULL && PROLLY_HAS(dc.refs, commit_relations) &&
 		PROLLY_HAS(dc.refs, set_commit_relations) &&
-		PROLLY_CALL(dc.refs, commit_relations, made, &lines))
+		PROLLY_CALL(dc.refs, commit_relations, made, &relations))
 	{
-		StringInfoData out;
-		ListCell   *nc;
-		ListCell   *oc;
+		List	   *out = NIL;
+		ListCell   *rc;
 
-		initStringInfo(&out);
-		for (char *p = lines; *p;)
+		foreach(rc, relations)
 		{
-			char	   *end = strchrnul(p, '\n');
+			ProllyCommitRelation *r = lfirst(rc);
+			ListCell   *nc;
+			ListCell   *oc;
 			bool		replaced = false;
 
 			forboth(nc, remade, oc, old_relids)
 			{
-				char		want[16];
-
-				snprintf(want, sizeof(want), "%010u ", lfirst_oid(oc));
-				if (strncmp(p, want, 11) == 0)
+				if (r->relid == lfirst_oid(oc))
 				{
-					Oid			now = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(lfirst(nc), NULL)),
-													   NoLock, true);
+					Oid			now = rel_named(lfirst(nc), true);
 
 					if (OidIsValid(now))
-						appendStringInfo(&out, "%010u %s\n", now, (char *) lfirst(nc));
+					{
+						ProllyCommitRelation *n = palloc(sizeof(ProllyCommitRelation));
+
+						n->relid = now;
+						n->name = lfirst(nc);
+						out = lappend(out, n);
+					}
 					replaced = true;
 					break;
 				}
 			}
-			if (!replaced && end > p)
-			{
-				appendBinaryStringInfo(&out, p, end - p);
-				appendStringInfoChar(&out, '\n');
-			}
-			p = *end ? end + 1 : end;
+			if (!replaced)
+				out = lappend(out, r);
 		}
-		PROLLY_CALL(dc.refs, set_commit_relations, made, out.data);
+		PROLLY_CALL(dc.refs, set_commit_relations, made, out);
 	}
 }
 
@@ -12316,6 +12299,29 @@ commit_over_local(const Local *l, const char *message, const ProllyHash *parents
 }
 
 /*
+ * folded_move_to() for a move of the branch's own (setting its uncommitted
+ * changes aside, or putting them back): what it makes is the branch's, not
+ * of the commits the merge, pick or revert around it takes versions from,
+ * so it runs without their provenance (prolly_move_provenance).
+ */
+static void
+own_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
+{
+	List	   *provenance = prolly_move_provenance;
+
+	prolly_move_provenance = NIL;
+	PG_TRY();
+	{
+		folded_move_to(target, folded);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_provenance = provenance;
+	}
+	PG_END_TRY();
+}
+
+/*
  * Uncommitted changes a merge (or pick, or revert) changing definitions
  * goes ahead over: the branch moved to its head, writing only what they
  * changed, so the merge is made as over a clean working set and its
@@ -12324,7 +12330,7 @@ commit_over_local(const Local *l, const char *message, const ProllyHash *parents
 static void
 set_aside(Local *l)
 {
-	folded_move_to(&l->head, &l->working);
+	own_move_to(&l->head, &l->working);
 	l->aside = true;
 }
 
@@ -12487,7 +12493,7 @@ put_back(const Local *l, const char *what)
 
 	PG_TRY();
 	{
-		folded_move_to(&target, &merged);
+		own_move_to(&target, &merged);
 	}
 	PG_CATCH();
 	{

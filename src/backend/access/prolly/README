@@ -297,7 +297,9 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 14: each table's OID and qualified name), and a version is the
+format 16: each table's OID and qualified name, a line each, the name's
+backslashes and newlines escaped so that no name makes a line of its
+own; read strictly, a damaged record refused), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as
@@ -320,12 +322,16 @@ table such a move changed in the working set, uncommitted (set aside, or
 left out of the commit), is recorded only as of a relation of the class
 its first parent's record lists (refs' prolly_commit_local_tables, as the
 merge, pick or revert tells it).  Relations are compared by equivalence
-class ('Q', refs format 15): a relation a move makes again of a table (a
+class ('J'): a relation a move makes again of a table (a
 definition it can't alter in place, as a branch's first use may when its
 copies are moved to its head), or a merge, pick or revert makes of the
 other side's table (the class of the relation the commit it takes the
 version from was made from: prolly_move_provenance), is the same table
-as the one it comes from, whatever its OID.  A move (a hard
+as the one it comes from, whatever its OID; what the move sets aside of
+the uncommitted changes and puts back is the branch's own, taking no
+class from those commits.  A class outlives its relation's drop: commits
+made from the dropped relation are still read through it, and a branch's
+copy of the relation, of the same OID, may still be in use.  A move (a hard
 reset, a merge or pull, a cherry-pick, a revert) or a branch's first use
 that changes a table's version to one a commit made here holds of another
 table (its record lists no relation of the table's class) makes the table
@@ -878,11 +884,18 @@ and journal near its rows' own, while a commit or status during the writes
 folds the batch not yet folded itself (so batching is off by default).
 pg_stat_prolly counts the worker's folds (fold_worker_folds), the
 branches it left for a later pass (fold_worker_deferred), and its
-attempts rolled back, the refs held or the branch moved meanwhile, to be
-made again (fold_worker_retries), each branch's tries backed off (after
+attempts rolled back, the refs held, the branch moved meanwhile, or a
+relation's lock held, to be made again (fold_worker_retries), each
+branch's tries backed off (after
 1, 3, 7... passes, 63 at most).  The launcher takes the databases written
 in turn, and a worker exits after 64 passes, so a database written
-without pause doesn't keep a slot from the others.  Autovacuum's
+without pause doesn't keep a slot from the others.  The worker's fold
+waits for no relation's lock (checkpoint_unless_moved() sets lmgr.c's
+RelationLocksNoWait through it; a lock not free at once rolls the fold
+back, to be made again): it keeps its locks on the change logs it
+consumed past its lock on their tables, so a DROP of several tables,
+holding them and waiting for one's log, would deadlock with a fold
+waiting for the next table.  Autovacuum's
 automatic fold (prolly.autofold_threshold), the backstop for the
 database's default branch, folds the same way, before taking the refs,
 and gives up while another holds them: a commit never waits for it.
