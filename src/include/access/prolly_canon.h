@@ -401,12 +401,13 @@ typedef struct ProllyCanonRoutine
 									 ProllyNodeRef *root, List **left_out);
 
 	/*
-	 * Optional: the rows of the session branch's table relid that differ
-	 * from baseline's, without folding them: the change finder's changes()
-	 * from the baseline's data tree for the table as defined now, which is
-	 * put in *data.  False, having visited nothing, where the baseline
-	 * hasn't the table as defined now, the canonical form wouldn't read it
-	 * as a table, or the finder can't: the caller folds.
+	 * Optional: the rows of the session branch's table (or prolly
+	 * materialized view) relid that differ from baseline's, without
+	 * folding them: the change finder's changes() from the baseline's data
+	 * tree for it as defined now, which is put in *data.  False, having
+	 * visited nothing, where the baseline hasn't it as defined now, the
+	 * canonical form wouldn't read its rows, or the finder can't: the
+	 * caller folds.
 	 */
 	bool		(*table_changes) (const ProllyNodeRef *baseline, Oid relid,
 								  ProllyNodeRef *data,

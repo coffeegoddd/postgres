@@ -7674,8 +7674,8 @@ gc_add_segment(ProllyChunkGc *gc, GcFile *f)
 }
 
 static ProllyChunkGc *
-journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
-				 uint64 *nslots)
+journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, bool if_free,
+				 ProllyHash *root, uint64 *nslots)
 {
 	bool		full = (scope == PROLLY_GC_FULL);
 	MemoryContext cxt;
@@ -7702,18 +7702,23 @@ journal_gc_begin(ProllyChunkStore *s, ProllyGcScope scope, ProllyHash *root,
 
 	/*
 	 * One at a time, a second refused rather than waiting: the first waits
-	 * for every transaction running at its swap, the second among them.  No
-	 * conjoin or new table file until the swap (from then on a transfer
-	 * older than the swap is refused, not waited for).
+	 * for every transaction running at its swap, the second among them
+	 * (with if_free, told so, nothing begun).  No conjoin or new table file
+	 * until the swap (from then on a transfer older than the swap is
+	 * refused, not waited for).
 	 */
 	{
 		LOCKTAG		tag;
 
 		SET_LOCKTAG_OBJECT(tag, s->dboid, GC_LOCK_CLASSID, 0, 0);
 		if (LockAcquire(&tag, ExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		{
+			if (if_free)
+				return NULL;
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 					 errmsg("another collection of this database's chunk store is running")));
+		}
 	}
 
 	cxt = AllocSetContextCreate(TopTransactionContext, "prolly collection",

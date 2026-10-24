@@ -717,8 +717,40 @@ GetLockMethodLocalHash(void)
 #endif
 
 /*
+ * Does another backend wait for a lock conflicting with the one this
+ * backend holds as 'locallock'?  A fast-path lock this backend holds has
+ * no shared lock object of its own: a strong locker transfers it to the
+ * shared table before it waits, so there can be waiters only if the lock
+ * object is found there, their modes in its waitMask.
+ */
+static bool
+locallock_has_waiters(LOCALLOCK *locallock)
+{
+	LockMethod	lockMethodTable = LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)];
+	LWLock	   *partitionLock = LockHashPartitionLock(locallock->hashcode);
+	LOCK	   *lock;
+	bool		hasWaiters = false;
+
+	LWLockAcquire(partitionLock, LW_SHARED);
+	lock = locallock->lock;
+	if (lock == NULL)
+		lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+													&locallock->tag.lock,
+													locallock->hashcode,
+													HASH_FIND, NULL);
+	if (lock != NULL &&
+		(lockMethodTable->conflictTab[locallock->tag.mode] &
+		 lock->waitMask) != 0)
+		hasWaiters = true;
+	LWLockRelease(partitionLock);
+	return hasWaiters;
+}
+
+/*
  * LockHasWaiters -- look up 'locktag' and check if releasing this
  *		lock would wake up other processes waiting for it.
+ *
+ * The lock may have been taken by the fast path (locallock_has_waiters()).
  */
 bool
 LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
@@ -766,6 +798,10 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		return false;
 	}
 
+	/* (taken by the fast path: no proclock of ours to check against) */
+	if (locallock->lock == NULL)
+		return locallock_has_waiters(locallock);
+
 	/*
 	 * Check the shared lock table.
 	 */
@@ -805,6 +841,74 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 
 	LWLockRelease(partitionLock);
 
+	return hasWaiters;
+}
+
+/*
+ * AnyLockHasWaiters -- whether another backend waits for a lock that
+ *		conflicts with one this backend holds (any lock method, any mode
+ *		held, fast-path ones included), or for its virtual transaction
+ *
+ * For work that holds its locks long and would rather give way than keep
+ * others waiting.  A fast-path lock this backend holds is found in the
+ * shared table only once a strong locker transferred it there, which it
+ * does before it waits, so a waiter conflicting with it is seen too.  So
+ * is the virtual transaction's own lock, which is in no local lock table:
+ * a backend waiting for it (WaitForLockers(), WaitForOlderSnapshots(), as
+ * the concurrent index and partition commands do) moves it to the shared
+ * table first (VirtualXactLock()).
+ */
+bool
+AnyLockHasWaiters(void)
+{
+	HASH_SEQ_STATUS status;
+	LOCALLOCK  *locallock;
+	bool		hasWaiters = false;
+
+	hash_seq_init(&status, LockMethodLocalHash);
+	while (!hasWaiters &&
+		   (locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
+	{
+		if (locallock->nLocks > 0)
+			hasWaiters = locallock_has_waiters(locallock);
+	}
+	if (hasWaiters)
+		hash_seq_term(&status);
+	else
+	{
+		LocalTransactionId lxid;
+		bool		fastpath;
+
+		LWLockAcquire(&MyProc->fpInfoLock, LW_SHARED);
+		fastpath = MyProc->fpVXIDLock;
+		lxid = MyProc->fpLocalTransactionId;
+		LWLockRelease(&MyProc->fpInfoLock);
+
+		/* (as VirtualXactLockTableCleanup(): moved to the shared table) */
+		if (!fastpath && LocalTransactionIdIsValid(lxid))
+		{
+			VirtualTransactionId vxid;
+			LOCKTAG		locktag;
+			uint32		hashcode;
+			LWLock	   *partitionLock;
+			LOCK	   *lock;
+
+			vxid.procNumber = MyProcNumber;
+			vxid.localTransactionId = lxid;
+			SET_LOCKTAG_VIRTUALTRANSACTION(locktag, vxid);
+			hashcode = LockTagHashCode(&locktag);
+			partitionLock = LockHashPartitionLock(hashcode);
+			LWLockAcquire(partitionLock, LW_SHARED);
+			lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+														&locktag, hashcode,
+														HASH_FIND, NULL);
+			if (lock != NULL &&
+				(LockMethods[DEFAULT_LOCKMETHOD]->conflictTab[ExclusiveLock] &
+				 lock->waitMask) != 0)
+				hasWaiters = true;
+			LWLockRelease(partitionLock);
+		}
+	}
 	return hasWaiters;
 }
 

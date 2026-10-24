@@ -80,7 +80,9 @@
  *   to be the table's baseline: the transaction's own entries are marked
  *   consumed (the next fold reads its transaction's again, but those), and
  *   those of transactions every
- *   snapshot sees finished that this one saw (trimmed); the others it read
+ *   snapshot sees finished that this one saw (trimmed, never waiting for
+ *   another fold trimming them meanwhile: that one's to trim, or, if it
+ *   aborts, a later fold's); the others it read
  *   are behind the baseline's position.  If the transaction aborts, they
  *   come back with the old baseline.
  * - written_unseen() (optional): whether a transaction the snapshot doesn't

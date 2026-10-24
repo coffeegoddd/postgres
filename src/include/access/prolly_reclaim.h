@@ -20,7 +20,8 @@
  * - collect() reclaims the current database's chunk store: by default what
  *   was written since the last collection (the store's settled files are
  *   kept whole), or every chunk if full; result says what was kept and
- *   freed.  A crash at any point leaves the store as it was or as the
+ *   freed.  Another collection of the store running, it is refused: an
+ *   error, or with if_free, false returned, nothing done.  A crash at any point leaves the store as it was or as the
  *   collection made it, never with a live chunk missing.
  * - move() rewrites the journal's sealed segments into a table file, every
  *   chunk, garbage and all (not settled: the next default collection still
@@ -47,9 +48,10 @@ typedef struct ProllyReclaimRoutine
 
 	/*
 	 * Collect the current database's chunk store: what was written since
-	 * the last collection, or (full) all of it.
+	 * the last collection, or (full) all of it.  False if if_free and
+	 * another collection of the store is running.
 	 */
-	void		(*collect) (bool full, ProllyGcResult *result);
+	bool		(*collect) (bool full, bool if_free, ProllyGcResult *result);
 
 	/* Move what was written since the last collection, freeing nothing. */
 	void		(*move) (ProllyGcResult *result);

@@ -9577,7 +9577,7 @@ collect(bool full, const char *what, ProllyGcResult *gc)
 						   "pg_maintain")));
 	PreventCommandIfReadOnly(what);
 	prolly_database_components(&dc);
-	PROLLY_CALL(dc.reclamation, collect, full, gc);
+	(void) PROLLY_CALL(dc.reclamation, collect, full, false, gc);
 	ereport(DEBUG1,
 			(errmsg_internal("%s: %llu chunks kept, %llu freed, %llu bytes freed, appends held off %llu us",
 							 what,
