@@ -16,8 +16,8 @@ branch side|t
 checkout side|t
 side commit|t
 checkout main|t
-ERROR:  cannot drop operator class gist_geometry_ops_2d for access method gist because objects on branch "side" depend on it
-ERROR:  cannot drop operator class gist_geometry_ops_2d for access method gist because objects on branch "side" depend on it
+ERROR:  cannot drop extension postgis because objects on branch "side" depend on it
+ERROR:  cannot drop extension postgis because objects on branch "side" depend on it
 still installed|1
 reset main|t
 checkout side|t
