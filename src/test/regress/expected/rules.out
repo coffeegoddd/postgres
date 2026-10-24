@@ -1341,6 +1341,12 @@ dolt_remotes| SELECT name,
     fetch_specs,
     params
    FROM dolt_remotes() dolt_remotes(name, url, fetch_specs, params);
+dolt_schema_conflicts| SELECT table_name,
+    base_schema,
+    our_schema,
+    their_schema,
+    description
+   FROM dolt_schema_conflicts() dolt_schema_conflicts(table_name, base_schema, our_schema, their_schema, description);
 dolt_stashes| SELECT name,
     stash_id,
     branch,
