@@ -1120,6 +1120,157 @@ SELECT pid FROM cv.child WHERE id = 90;
 (1 row)
 
 DELETE FROM cv.child WHERE id = 90;
+-- A row refused for an exclusion constraint is tried again after the
+-- others, as one refused for a unique index is: a later row may free its
+-- value.  Theirs shifts c down the 101..105 run (and pk 101's onto pk 3's
+-- old value), each row onto the value the next frees, so each, refused at
+-- first, is written once the row holding its value has moved: none of
+-- them is left a violation.  (pk 1's and 2's b collide with ours' unique
+-- index for good.)
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE SCHEMA ex VERSIONED;
+CREATE TABLE ex.a (pk int PRIMARY KEY, b int, c int);
+INSERT INTO ex.a VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+INSERT INTO ex.a SELECT 100 + g, 1000 + g, 100000 + g FROM generate_series(1, 5) g;
+SELECT length(dolt_commit('-Am', 'ex base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('ex_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+CREATE UNIQUE INDEX a_b ON ex.a (b);
+ALTER TABLE ex.a ADD CONSTRAINT a_c EXCLUDE USING gist (c WITH =);
+SELECT length(dolt_commit('-Am', 'ex ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ex_side');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'ex_side'"}
+(1 row)
+
+UPDATE ex.a SET b = 20 WHERE pk = 1;
+UPDATE ex.a SET b = 30, c = 999 WHERE pk = 2;
+UPDATE ex.a SET b = 77, c = 999 WHERE pk = 3;
+UPDATE ex.a SET c = CASE pk WHEN 101 THEN 300 ELSE 100000 + pk - 101 END
+WHERE pk > 100;
+SELECT length(dolt_commit('-Am', 'ex theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('ex_side'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violating_row->>'pk' AS pk, violation_type
+FROM dolt_constraint_violations('ex.a') ORDER BY 1;
+ pk | violation_type 
+----+----------------
+ 1  | unique index
+ 2  | unique index
+(2 rows)
+
+SELECT * FROM ex.a ORDER BY pk;
+ pk  |  b   |   c    
+-----+------+--------
+   1 |   10 |    100
+   2 |   20 |    200
+   3 |   77 |    999
+ 101 | 1001 |    300
+ 102 | 1002 | 100001
+ 103 | 1003 | 100002
+ 104 | 1004 | 100003
+ 105 | 1005 | 100004
+(8 rows)
+
+ROLLBACK;
+SELECT dolt_branch('-D', 'ex_side');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- a commit of a transaction holding one is refused, naming it
+CREATE TABLE ex.x (pk int PRIMARY KEY, c int, EXCLUDE USING gist (c WITH =));
+SELECT length(dolt_commit('-Am', 'ex x')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('ex_x');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO ex.x VALUES (1, 5);
+SELECT length(dolt_commit('-am', 'ex x ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ex_x');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'ex_x'"}
+(1 row)
+
+INSERT INTO ex.x VALUES (2, 5);
+SELECT length(dolt_commit('-am', 'ex x theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('ex_x'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+COMMIT;
+ERROR:  cannot commit a transaction with constraint violations
+DETAIL:  Table "x" has a row with an exclusion constraint violation on branch "main".
+HINT:  Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.
+SELECT dolt_branch('-D', 'ex_x');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA ex CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table ex.a
+drop cascades to table ex.x
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------
