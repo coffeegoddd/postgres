@@ -196,6 +196,24 @@ typedef struct BranchOpsRoutine
 	Oid			(*make_kept) (const char *name, const char *source,
 							  const BranchKeptTable *tables, int ntables,
 							  bool *used, List *emptied, bool nowait);
+
+	/*
+	 * Optional: give the session branch's relations kept[] (nkept of them,
+	 * a table's together) new storage made of the pages keep() kept of
+	 * branch source's (the session's own, or another's), O(1) each, as
+	 * restore() gives them, whatever source's working set is now.  Each
+	 * must be stored alike on both branches, as share() requires, with
+	 * source's still on the storage that kept it, its snapshot there and
+	 * its rows' transaction ids ones the database still knows.  The source
+	 * is held against deletion and its relations against letting go of the
+	 * pages (ShareUpdateExclusiveLock), the session's locked as TRUNCATE
+	 * locks them (and refused while the session has one open, as restore()
+	 * refuses), each tried without waiting.  All or none: false, nothing
+	 * changed, otherwise (the locks taken are kept).  Not MVCC-safe, as
+	 * TRUNCATE isn't.
+	 */
+	bool		(*share_kept) (Oid source, const BranchKeptRelation *kept,
+							   int nkept);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

@@ -51,7 +51,8 @@
  *	'K' name	-> the commits the branch's pages are kept as of, newest
  *				   first (see "Kept pages"): each the transaction that
  *				   retired it (a FullTransactionId, native byte order; 0
- *				   while it is kept), its id and the branch's
+ *				   while it is kept), the transaction that kept it (the
+ *				   same), its id and the branch's
  *				   baseline then (hash length, hash each), the count of
  *				   tables (a varint), and for each its qualified name (a
  *				   varint length, then the bytes), the count of its
@@ -223,7 +224,7 @@
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
  * pages retired.
  */
-#define REFS_FORMAT		"5"
+#define REFS_FORMAT		"6"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -1707,6 +1708,9 @@ typedef struct ShareSource
 	ProllyNodeRef baseline;
 	bool		kept;			/* a kept materialization; else known: */
 	BranchFoldStamp at;			/* what it was known at */
+	const ProllyKeptCommit *kept_commit;	/* a kept commit's pages: its
+											 * tables given storage made of
+											 * them (share_kept()) */
 	List	   *tables;			/* NamedTree *: root's, once read */
 	bool		read;
 	List	   *shared;			/* names of the tables shared from it */
@@ -1747,19 +1751,62 @@ find_kept_source(const ProllyKeptState *state, void *arg)
 	ShareSource *s;
 	ProllyNodeRef baseline;
 
-	foreach_ptr(ShareSource, known, ss->sources)
-		if (known->branch == state->branch)
+	if (state->kind == PROLLY_KEPT_COMMIT)
+	{
+		/* (its baseline then, which the tables' change logs go on from) */
+		if (state->kept->baseline.len == 0)
 			return;
-	if (!branch_baseline(state->name, &baseline))
-		return;
+		foreach_ptr(ShareSource, known, ss->sources)
+			if (known->kept_commit && known->branch == state->branch &&
+				same_hash(&known->kept_commit->commit, &state->commit))
+				return;
+		ref_of(&state->kept->baseline, &baseline);
+	}
+	else
+	{
+		foreach_ptr(ShareSource, known, ss->sources)
+			if (known->branch == state->branch && known->kept_commit == NULL)
+				return;
+		if (!branch_baseline(state->name, &baseline))
+			return;
+	}
 	s = palloc0(sizeof(ShareSource));
 	s->name = pstrdup(state->name);
 	s->branch = state->branch;
 	s->root = state->root;
 	s->baseline = baseline;
 	s->kept = true;
+	s->kept_commit = state->kept;
 	ss->sources = lappend(ss->sources, s);
 }
+
+/* A kept commit's table called name, or NULL. */
+static const ProllyKeptTable *
+kept_table(const ProllyKeptCommit *kc, const char *name)
+{
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		if (strcmp(kc->tables[t].name, name) == 0)
+			return &kc->tables[t];
+	}
+	return NULL;
+}
+
+/* Are relids just the relations kept (nrels of them, in any order)? */
+static bool
+same_relation_set(List *relids, const BranchKeptRelation *rels, int nrels)
+{
+	if (list_length(relids) != nrels)
+		return false;
+	for (int r = 0; r < nrels; r++)
+	{
+		if (!list_member_oid(relids, rels[r].relid))
+			return false;
+	}
+	return true;
+}
+
+static bool may_restore(Oid relid);
 
 /*
  * Is source still at its root: a known one as it was known (asked of what
@@ -1860,6 +1907,21 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
+
+		/*
+		 * (a kept commit's only where its pages are the table's relations,
+		 * and the user could write its rows, as restore_pages() asks)
+		 */
+		if (s->kept_commit != NULL)
+		{
+			const ProllyKeptTable *kt = kept_table(s->kept_commit, t->name);
+
+			if (branch_ops()->share_kept == NULL || kt == NULL ||
+				kt->rels[0].relid != relid ||
+				!same_relation_set(relids, kt->rels, kt->nrels) ||
+				!may_restore(relid))
+				continue;
+		}
 		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
 					&changes);
 		if ((double) changes * MOVE_ROW_USEC <=
@@ -1874,7 +1936,7 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 		return false;
 	if (debug_prolly_verify_fold_caches)
 		foreach_ptr(ShareSource, s, ss.sources)
-			if (list_member_ptr(from, s))
+			if (list_member_ptr(from, s) && s->kept_commit == NULL)
 				verify_known(s->name, false, &s->root);
 
 	/*
@@ -1885,8 +1947,18 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	forthree(a, chosen, b, relations, c, from)
 	{
 		ShareSource *s = lfirst(c);
+		const char *table = ((NamedTree *) lfirst(a))->name;
+		bool		done;
 
-		if (branch_ops()->share(s->branch, lfirst(b), still_at_root, s))
+		if (s->kept_commit != NULL)
+		{
+			const ProllyKeptTable *kt = kept_table(s->kept_commit, table);
+
+			done = branch_ops()->share_kept(s->branch, kt->rels, kt->nrels);
+		}
+		else
+			done = branch_ops()->share(s->branch, lfirst(b), still_at_root, s);
+		if (done)
 		{
 			s->shared = lappend(s->shared, ((NamedTree *) lfirst(a))->name);
 			nshared++;
@@ -2063,6 +2135,8 @@ typedef struct KeptCommit
 {
 	FullTransactionId retired;	/* by whom, its pages to be let go of
 								 * (invalid: kept) */
+	FullTransactionId kept_by;	/* who kept them, having seen every writer
+								 * of the pages end */
 	ProllyHash	commit;
 	ProllyHash	baseline;		/* the branch's then (len 0: none) */
 	int			ntables;
@@ -2084,6 +2158,7 @@ kept_encode(StringInfo v, List *kept)
 	foreach_ptr(KeptCommit, kc, kept)
 	{
 		appendBinaryStringInfo(v, &kc->retired, sizeof(FullTransactionId));
+		appendBinaryStringInfo(v, &kc->kept_by, sizeof(FullTransactionId));
 		put_hash(v, &kc->commit);
 		put_hash(v, &kc->baseline);
 		prolly_put_varint(v, kc->ntables);
@@ -2128,9 +2203,11 @@ kept_decode(const char *p, const char *end)
 		KeptCommit *kc = palloc0(sizeof(KeptCommit));
 		uint64		n;
 
-		if (end - p < (ptrdiff_t) sizeof(FullTransactionId))
+		if (end - p < (ptrdiff_t) (2 * sizeof(FullTransactionId)))
 			kept_corrupt();
 		memcpy(&kc->retired, p, sizeof(FullTransactionId));
+		p += sizeof(FullTransactionId);
+		memcpy(&kc->kept_by, p, sizeof(FullTransactionId));
 		p += sizeof(FullTransactionId);
 		p = get_hash(p, end, &kc->commit);
 		p = get_hash(p, end, &kc->baseline);
@@ -2224,6 +2301,33 @@ kept_find(List *kept, const ProllyHash *commit)
 			return kc;
 	}
 	return NULL;
+}
+
+/* Visit the commits branch name's pages are kept as of, but those retired. */
+static void
+copies_kept_commits(const char *name, ProllyKeptCommitVisit visit, void *arg)
+{
+	foreach_ptr(KeptCommit, kc, kept_get(name))
+	{
+		ProllyKeptCommit k;
+		ProllyKeptTable *tables;
+
+		if (FullTransactionIdIsValid(kc->retired))
+			continue;
+		tables = palloc_array(ProllyKeptTable, Max(kc->ntables, 1));
+		for (int t = 0; t < kc->ntables; t++)
+		{
+			tables[t].name = kc->tables[t].name;
+			tables[t].nrels = kc->tables[t].nrels;
+			tables[t].rels = kc->tables[t].rels;
+		}
+		k.commit = kc->commit;
+		k.baseline = kc->baseline;
+		k.kept_by = kc->kept_by;
+		k.ntables = kc->ntables;
+		k.tables = tables;
+		visit(&k, arg);
+	}
 }
 
 /* Does one of kept's commits keep relation k's pages by k's snapshot? */
@@ -2464,6 +2568,7 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 		return;
 
 	kc = palloc0(sizeof(KeptCommit));
+	kc->kept_by = GetTopFullTransactionId();
 	kc->commit = *commit_id;
 	if (branch_baseline(name, &baseline))
 		kc->baseline = baseline.hash;
@@ -2546,6 +2651,7 @@ restore_pages(const ProllyCommitInfo *commit)
 	 */
 	kc = palloc(sizeof(KeptCommit));
 	*kc = *was;
+	kc->kept_by = GetTopFullTransactionId();
 	kc->tables = palloc_array(KeptTable, Max(was->ntables, 1));
 	for (int t = 0; t < was->ntables; t++)
 	{
@@ -2867,34 +2973,26 @@ rank_source(const char *name, Oid branch, void *arg)
 }
 
 /*
- * A branch with copies whose pages are kept as of a commit.  Not a kept
- * materialization: the move's shares (share_clean_tables()) and the
- * planner's costs (kept_shareable()) take its tables, by what the
- * materialization cache says it holds, so a first use made of kept pages
- * and the shares that follow it never both claim one.
+ * The kept commit a first use is made of (the materialization cache's,
+ * whose kept commits the move's shares and the planner's costs take too):
+ * one at the branch's head, the session's branch's if it keeps it.
  */
 typedef struct KeptSource
 {
 	const ProllyHash *commit;
-	char	   *name;
-	KeptCommit *kc;
+	const ProllyKeptState *state;
 } KeptSource;
 
-static bool branch_kept(const char *name);
-
 static void
-find_kept_commit(const char *name, Oid branch, void *arg)
+find_kept_commit(const ProllyKeptState *state, void *arg)
 {
 	KeptSource *ks = arg;
-	KeptCommit *kc;
 
-	if ((ks->kc != NULL && branch != MyBranch) || branch_kept(name))
+	if (state->kind != PROLLY_KEPT_COMMIT ||
+		!same_hash(&state->commit, ks->commit) ||
+		(ks->state != NULL && state->branch != MyBranch))
 		return;
-	if ((kc = kept_find(kept_get(name), ks->commit)) != NULL)
-	{
-		ks->name = pstrdup(name);
-		ks->kc = kc;
-	}
+	ks->state = state;
 }
 
 /*
@@ -3138,7 +3236,9 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 	SourceCandidates sc = {GetActiveSnapshot(), false, NIL, NIL, NIL};
 	List	   *emptied = NIL;
 	ProllyDatabaseComponents dc;
-	KeptSource	ks = {&commit->id, NULL, NULL};
+	KeptSource	ks = {&commit->id, NULL};
+	const ProllyKeptCommit *kc;
+	const char *source;
 	BranchKeptTable *tables;
 	bool	   *used;
 	List	   *names = NIL;
@@ -3148,18 +3248,22 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 
 	prolly_database_components(&dc);
 	if (prolly_kept_commits <= 0 || branch_ops()->make_kept == NULL ||
-		dc.canonicalizer->splice_baseline == NULL)
+		dc.canonicalizer->splice_baseline == NULL ||
+		dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
 		return false;
-	branch_ops()->branches(find_kept_commit, &ks);
-	if (ks.kc == NULL || ks.kc->baseline.len == 0 ||
-		!branch_baseline(ks.name, &baseline))
+	PROLLY_CALL(dc.matcache, visit, sc.snap, find_kept_commit, &ks);
+	if (ks.state == NULL)
+		return false;
+	kc = ks.state->kept;
+	source = ks.state->name;
+	if (kc->baseline.len == 0 || !branch_baseline(source, &baseline))
 		return false;
 
 	/*
 	 * (the plan of the move from what the source is thought to be, for the
 	 * tables not kept: those to begin empty)
 	 */
-	sc.others = strcmp(ks.name, branch_ops()->current()) != 0;
+	sc.others = strcmp(source, branch_ops()->current()) != 0;
 	branch_ops()->branches(note_candidate, &sc);
 	if (sc.names != NIL)
 	{
@@ -3168,37 +3272,37 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 
 		for (int i = 0; i < list_length(sc.names); i++)
 		{
-			if (strcmp(list_nth(sc.names, i), ks.name) != 0)
+			if (strcmp(list_nth(sc.names, i), source) != 0)
 				continue;
 			po.from = list_nth(sc.roots, i);
-			branch_ops()->run_on(ks.name, plan_here, &po);
+			branch_ops()->run_on(source, plan_here, &po);
 			pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
 			reloaded_tables(&plan, &emptied);
 			break;
 		}
 	}
-	tables = palloc_array(BranchKeptTable, Max(ks.kc->ntables, 1));
-	used = palloc0_array(bool, Max(ks.kc->ntables, 1));
-	for (int t = 0; t < ks.kc->ntables; t++)
+	tables = palloc_array(BranchKeptTable, Max(kc->ntables, 1));
+	used = palloc0_array(bool, Max(kc->ntables, 1));
+	for (int t = 0; t < kc->ntables; t++)
 	{
-		tables[t].nrels = ks.kc->tables[t].nrels;
-		tables[t].rels = ks.kc->tables[t].rels;
+		tables[t].nrels = kc->tables[t].nrels;
+		tables[t].rels = kc->tables[t].rels;
 	}
-	if (!OidIsValid(branch_ops()->make_kept(name, ks.name, tables, ks.kc->ntables,
+	if (!OidIsValid(branch_ops()->make_kept(name, source, tables, kc->ntables,
 											used, emptied, sc.others)))
 	{
 		pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
 		return false;
 	}
-	for (int t = 0; t < ks.kc->ntables; t++)
+	for (int t = 0; t < kc->ntables; t++)
 	{
 		if (used[t])
-			names = lappend(names, ks.kc->tables[t].name);
+			names = lappend(names, pstrdup(kc->tables[t].name));
 	}
 	pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT, list_length(names));
 	if (names != NIL)
 	{
-		ref_of(&ks.kc->baseline, &from);
+		ref_of(&kc->baseline, &from);
 		PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &from, names,
 					&spliced);
 		baseline = spliced;
@@ -7262,4 +7366,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.rebase_state = copies_rebase_state,
 	.set_rebase_state = copies_set_rebase_state,
 	.commit_root = copies_commit_root,
+	.kept_commits = copies_kept_commits,
 };
