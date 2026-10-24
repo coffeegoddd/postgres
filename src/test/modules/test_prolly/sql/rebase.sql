@@ -226,5 +226,75 @@ DELETE FROM dolt_rebase WHERE rebase_order = 1;
 SELECT dolt_rebase('--continue');
 SELECT dolt_rebase('--abort');
 
+-- dolt_commit --amend: the head replaced by a commit of the working set
+-- with its parents, its message kept unless one is given
+SELECT active_branch();
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS clean;
+SELECT dolt_checkout('-b', 'amending') IS NOT NULL AS on_amending;
+INSERT INTO rb.t VALUES (90, 'first');
+SELECT dolt_commit('-am', 'row 90') IS NOT NULL AS committed;
+SELECT dolt_hashof('HEAD~1') AS parent \gset
+UPDATE rb.t SET v = 'amended' WHERE pk = 90;
+SELECT dolt_commit('--amend') IS NOT NULL AS amended;
+SELECT message FROM dolt_log LIMIT 1;
+SELECT dolt_hashof('HEAD~1') = :'parent' AS same_parent;
+SELECT count(*) AS changes FROM dolt_status;
+SELECT v FROM dolt_at('HEAD', NULL::rb.t) WHERE pk = 90;
+SELECT dolt_commit('--amend', '-m', 'row 90, reworded') IS NOT NULL AS amended;
+SELECT message FROM dolt_log LIMIT 2;
+SELECT dolt_hashof('HEAD~1') = :'parent' AS same_parent;
+-- refused with a merge in progress
+SELECT dolt_checkout('-b', 'amend_other', 'HEAD~1') IS NOT NULL AS on_other;
+INSERT INTO rb.t VALUES (90, 'other');
+SELECT dolt_commit('-am', 'other row 90') IS NOT NULL AS committed;
+BEGIN;
+SELECT m[3] AS conflicts FROM dolt_merge('amending') m;
+SELECT dolt_commit('--amend', '-m', 'mid-merge');
+ROLLBACK;
+
+-- commits that change the schema, rebased: each pick merges its
+-- definitions as a cherry-pick does
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE rb.s (pk int PRIMARY KEY, a text);
+INSERT INTO rb.s VALUES (1, 'one'), (2, 'two');
+SELECT dolt_commit('-Am', 'creating table s') IS NOT NULL AS committed;
+SELECT dolt_branch('schemas');
+INSERT INTO rb.s VALUES (3, 'three');
+SELECT dolt_commit('-am', 'main row 3 of s') IS NOT NULL AS committed;
+SELECT dolt_checkout('schemas') IS NOT NULL AS on_schemas;
+ALTER TABLE rb.s ADD COLUMN b int NOT NULL DEFAULT 0;
+SELECT dolt_commit('-am', 'adding b') IS NOT NULL AS committed;
+UPDATE rb.s SET b = pk * 10;
+SELECT dolt_commit('-am', 'filling b') IS NOT NULL AS committed;
+ALTER TABLE rb.s RENAME COLUMN a TO name;
+SELECT dolt_commit('-am', 'renaming a') IS NOT NULL AS committed;
+CREATE INDEX s_b ON rb.s (b);
+SELECT dolt_commit('-am', 'indexing b') IS NOT NULL AS committed;
+SELECT dolt_rebase('main');
+SELECT pk, name, b FROM rb.s ORDER BY pk;
+SELECT indexname FROM pg_indexes WHERE schemaname = 'rb' AND tablename = 's' ORDER BY 1;
+SELECT message FROM dolt_log LIMIT 5;
+-- reordered so a pick's definitions conflict with the head's: an error,
+-- which rolls the --continue back, the rebase left at its plan to change
+-- or abort (Dolt aborts it)
+SELECT dolt_branch('schemas2', 'HEAD~4');
+SELECT dolt_checkout('schemas2') IS NOT NULL AS on_schemas2;
+INSERT INTO rb.s VALUES (4, 'four');
+SELECT dolt_commit('-am', 'row 4 of s') IS NOT NULL AS committed;
+ALTER TABLE rb.s ADD COLUMN c text NOT NULL DEFAULT '';
+SELECT dolt_commit('-am', 'adding c') IS NOT NULL AS committed;
+ALTER TABLE rb.s ALTER COLUMN c DROP NOT NULL;
+SELECT dolt_commit('-am', 'altering c') IS NOT NULL AS committed;
+SELECT dolt_rebase('-i', 'main') IS NOT NULL AS started;
+UPDATE dolt_rebase SET rebase_order = 3.1 WHERE rebase_order = 2;
+\set VERBOSITY terse
+SELECT dolt_rebase('--continue');
+\set VERBOSITY default
+SELECT active_branch();
+SELECT rebase_order, action, commit_message FROM dolt_rebase ORDER BY rebase_order;
+SELECT dolt_rebase('--abort');
+SELECT active_branch();
+SELECT message FROM dolt_log LIMIT 1;
+
 \c postgres
 DROP DATABASE regress_rebase;

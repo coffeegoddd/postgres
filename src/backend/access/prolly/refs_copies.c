@@ -41,7 +41,9 @@
  *				   per table (its OID, then its qualified name)
  *	'Q' name	-> the branch's merge's conflicted tables' names, as the
  *				   merge recorded them: each table's OID, then its name's
- *				   length (a varint) and bytes
+ *				   length (a varint) and bytes; and the tables in schema
+ *				   conflicts, kept as the branch has them, each as OID 0
+ *				   and its name so
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
  *				   then the bytes)
@@ -221,9 +223,10 @@
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
- * pages retired.
+ * pages retired; 8: a merge's tables in schema conflicts, in its merge
+ * names entry.
  */
-#define REFS_FORMAT		"5"
+#define REFS_FORMAT		"8"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -654,6 +657,13 @@ check_merge_conflicts(const char *what)
 					 errdetail("Table \"%s\" has conflicts on branch \"%s\".",
 							   name, branch),
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+		if (ms.nschema > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cannot %s a transaction with unresolved merge conflicts", what),
+					 errdetail("Table %s has a schema conflict on branch \"%s\".",
+							   ms.schema_tables[0], branch),
+					 errhint("Abort the merge, make the definitions agree on one side, and merge again; or set dolt.allow_commit_conflicts to keep them.")));
 		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
 		{
@@ -1535,7 +1545,8 @@ static void anchor_at_commit(const ProllyCommitInfo *commit);
 static void settle_rows(const ProllyNodeRef *target, const KnownSource *source);
 
 static void restore_pages(const ProllyCommitInfo *commit);
-static void keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
+static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
+					   const ProllyNodeRef *root,
 					   Snapshot snap);
 
 static void
@@ -1546,7 +1557,8 @@ settle(const ProllyCommitInfo *commit, const KnownSource *source)
 	settle_rows(&commit->root, source);
 	anchor_at_commit(commit);
 	if (ActiveSnapshotSet())
-		keep_pages(&commit->id, &commit->root, GetActiveSnapshot());
+		keep_pages(&commit->id, commit->nparents > 0 ? &commit->parents[0] : NULL,
+				   &commit->root, GetActiveSnapshot());
 }
 
 static void
@@ -2378,9 +2390,27 @@ kept_settled(void *arg)
  * Nothing is kept if a lock isn't free or another's writes may be on the
  * pages: a move back to the commit then writes its rows.
  */
+static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+
+/*
+ * Was kept commit o replaced by a commit made on parent (NULL: not known),
+ * itself made on that parent?  (The parent itself, kept as a commit's
+ * usually is, isn't: no commit is read for it.)
+ */
+static bool
+kept_replaced(const KeptCommit *o, const ProllyHash *parent)
+{
+	ProllyCommitInfo was;
+
+	return parent != NULL && !same_hash(&o->commit, parent) &&
+		copies_commit_get(&o->commit, &was) && was.nparents > 0 &&
+		same_hash(&was.parents[0], parent);
+}
+
+/* (parent: the commit's first parent, NULL if it has none or isn't known) */
 static void
-keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
-		   Snapshot snap)
+keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
+		   const ProllyNodeRef *root, Snapshot snap)
 {
 	ProllyDatabaseComponents dc;
 	char	   *name;
@@ -2486,14 +2516,18 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 	/*
 	 * (the commit first, then the others kept till there are enough; the
 	 * rest retired, let go of by a later keep once this transaction
-	 * commits, as a branch may be being made of them meanwhile)
+	 * commits, as a branch may be being made of them meanwhile.  One the
+	 * commit replaced, made on the same parent, is retired too: amended
+	 * away, or reworded or squashed by a rebase, it is no longer the
+	 * branch's, and kept it would push out the parent a reset goes back to)
 	 */
 	next = list_make1(kc);
 	foreach_ptr(KeptCommit, o, holding)
 	{
 		if (FullTransactionIdIsValid(o->retired))
 			next = lappend(next, o);
-		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits)
+		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits &&
+				 !kept_replaced(o, parent))
 		{
 			next = lappend(next, o);
 			live++;
@@ -4216,7 +4250,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
 	note_anchor(name, commit_id, &anchor);
-	keep_pages(commit_id, &root, snap);
+	keep_pages(commit_id, nparents > 0 ? &parents[0] : NULL, &root, snap);
 	UnregisterSnapshot(snap);
 	return true;
 }
@@ -4705,6 +4739,12 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 					 errdetail("Table \"%s\" has conflicts.",
 							   get_rel_name(ms.tables[0])),
 					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
+		if (ms.nschema > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot commit with unresolved merge conflicts"),
+					 errdetail("Table %s has a schema conflict.", ms.schema_tables[0]),
+					 errhint("Abort the merge, make the definitions agree on one side, and merge again.")));
 		if (!ms.pick)
 			parents[nparents++] = ms.theirs;
 	}
@@ -4838,7 +4878,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	note_anchor(name, commit_id, &anchor);
 	/* (kept only if the working set is what was committed) */
 	if (same_hash(&root.hash, &working_set->hash))
-		keep_pages(commit_id, &root, snap);
+		keep_pages(commit_id, nparents > 0 ? &parents[0] : NULL, &root, snap);
 	UnregisterSnapshot(snap);
 }
 
@@ -5235,7 +5275,9 @@ merge_key(StringInfo key, const char *branch)
 /*
  * A branch's merge's conflicted tables' names, as the merge recorded them,
  * under a key of their own (the merge state's value ends with a message):
- * each table's OID, then its name's length (a varint) and bytes.
+ * each table's OID, then its name's length (a varint) and bytes.  Then the
+ * tables in schema conflicts, by name alone (OID 0: one the branch dropped
+ * has none).
  */
 static void
 merge_names_key(StringInfo key, const char *branch)
@@ -5262,6 +5304,13 @@ merge_names_put(const char *branch, const ProllyMergeState *state)
 			appendStringInfoString(&v, state->table_names[i]);
 			any = true;
 		}
+	for (int i = 0; state && i < state->nschema; i++)
+	{
+		put_be32(&v, InvalidOid);
+		prolly_put_varint(&v, strlen(state->schema_tables[i]));
+		appendStringInfoString(&v, state->schema_tables[i]);
+		any = true;
+	}
 	{
 		StringInfoData had;
 
@@ -5285,12 +5334,16 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 	initStringInfo(&v);
 	merge_names_key(&key, branch);
 	state->table_names = NULL;
+	state->nschema = 0;
+	state->schema_tables = NULL;
 	if (refs_get(key.data, key.len, &v))
 	{
 		const char *p = v.data;
 		const char *end = v.data + v.len;
+		int			cap = 4;
 
 		state->table_names = palloc0(sizeof(char *) * Max(state->ntables, 1));
+		state->schema_tables = palloc(sizeof(char *) * cap);
 		while (end - p >= 4)
 		{
 			Oid			oid = get_be32(p);
@@ -5302,6 +5355,16 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("prolly refs hold an invalid merge state")));
+			if (oid == InvalidOid)
+			{
+				if (state->nschema == cap)
+				{
+					cap *= 2;
+					state->schema_tables = repalloc(state->schema_tables,
+													sizeof(char *) * cap);
+				}
+				state->schema_tables[state->nschema++] = pnstrdup(p, len);
+			}
 			for (int i = 0; i < state->ntables; i++)
 				if (state->tables[i] == oid)
 					state->table_names[i] = pnstrdup(p, len);

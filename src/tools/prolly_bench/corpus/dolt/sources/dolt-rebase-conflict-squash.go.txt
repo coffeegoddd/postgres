@@ -1,0 +1,157 @@
+{
+		Name: "dolt_rebase: data conflicts with squash",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(100));",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('branch1');",
+
+			"insert into t values (0, 'zero');",
+			"call dolt_commit('-am', 'inserting row 0 on main');",
+
+			"call dolt_checkout('branch1');",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-am', 'inserting row 1 on branch1');",
+			"update t set c1='uno' where pk=1;",
+			"call dolt_commit('-am', 'updating row 1 on branch1');",
+			"update t set c1='ein' where pk=1;",
+			"call dolt_commit('-am', 'updating row 1, again, on branch1');",
+
+			"set @@autocommit=0;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "call dolt_rebase('-i', 'main');",
+				Expected: []sql.Row{{0, "interactive rebase started on branch dolt_rebase_branch1; " +
+					"adjust the rebase plan in the dolt_rebase table, then " +
+					"continue rebasing by calling dolt_rebase('--continue')"}},
+			},
+			{
+				Query: "select * from dolt_rebase order by rebase_order ASC;",
+				Expected: []sql.Row{
+					{"1", "pick", doltCommit, "inserting row 1 on branch1"},
+					{"2", "pick", doltCommit, "updating row 1 on branch1"},
+					{"3", "pick", doltCommit, "updating row 1, again, on branch1"},
+				},
+			},
+			{
+				Query: "update dolt_rebase set rebase_order=3.5 where rebase_order=2;",
+				Expected: []sql.Row{{gmstypes.OkResult{RowsAffected: uint64(1), Info: plan.UpdateInfo{
+					Matched: 1,
+					Updated: 1,
+				}}}},
+			},
+			{
+				Query: "update dolt_rebase set action='squash' where rebase_order=3;",
+				Expected: []sql.Row{{gmstypes.OkResult{RowsAffected: uint64(1), Info: plan.UpdateInfo{
+					Matched: 1,
+					Updated: 1,
+				}}}},
+			},
+			{
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseDataConflict,
+			},
+			{
+				// We remain on the rebase working branch while resolving conflicts
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"dolt_rebase_branch1"}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				// The base of the cherry-picked commit has (1, "uno"), but ours has (1, "one"), so this is a data
+				// conflict. The cherry-picked commit is trying to modify the row to (1, "ein").
+				Query:    "select base_pk, base_c1, our_pk, our_c1, our_diff_type, their_pk, their_c1, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{{1, "uno", 1, "one", "modified", 1, "ein", "modified"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"inserting row 1 on branch1"},
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				// Resolve conflicts, by accepting theirs, which inserts (1, "ein") into t
+				// When we continue the rebase, a Dolt commit will be created for these changes
+				Query:    "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 't');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				// Table t includes the change from the tip of main (0, "zero"), as well as the conflict we just resolved
+				Query:    "SELECT * FROM t;",
+				Expected: []sql.Row{{0, "zero"}, {1, "ein"}},
+			},
+			{
+				// If we don't stage the table, then rebase will give us an error about having unstaged changes
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseUnstagedChanges,
+			},
+			{
+				Query:    "call dolt_add('t');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseDataConflict,
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{0, "zero"}, {1, "ein"}},
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"dolt_rebase_branch1"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"inserting row 1 on branch1\n\nupdating row 1, again, on branch1"},
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				// Now we're resolving a conflict from updating (1, "one") to (1, "uno"). Our side currently has
+				// (1, "ein"), so this is marked as a conflict.
+				Query:    "select base_pk, base_c1, our_pk, our_c1, our_diff_type, their_pk, their_c1, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{{1, "one", 1, "ein", "modified", 1, "uno", "modified"}},
+			},
+			{
+				// Accept the new values from the cherry-picked commit (1, "uno").
+				Query:    "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 't');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "CALL DOLT_COMMIT('-am', 'OVERRIDDEN COMMIT MESSAGE');",
+				Expected: []sql.Row{{doltCommit}},
+			},
+			{
+				Query:    "call dolt_rebase('--continue');",
+				Expected: []sql.Row{{0, "Successfully rebased and updated refs/heads/branch1"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{0, "zero"}, {1, "uno"}},
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"branch1"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"OVERRIDDEN COMMIT MESSAGE"},
+					{"inserting row 1 on branch1\n\nupdating row 1, again, on branch1"},
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+		},
+	}
