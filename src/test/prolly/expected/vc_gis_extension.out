@@ -1,0 +1,55 @@
+--
+-- PostGIS's lifecycle with commits in place, in a database of its own:
+-- ALTER EXTENSION postgis UPDATE, with committed and uncommitted
+-- versioned data on two branches, keeps every value and index, leaves
+-- nothing new to commit and still enforces typmods; commits from before
+-- and after it check out, reset, diff and merge.  (A PostGIS build has one
+-- version, so the update goes to PostGIS's "ANY" version, which runs no
+-- SQL, and back from it through the upgrade script every PostGIS release
+-- ships, which replaces each of its functions, operators and operator
+-- classes.)  DROP EXTENSION postgis is refused while versioned columns on
+-- another branch use it, CASCADE or not.
+--
+\set ECHO none
+c1|t
+branch side|t
+checkout side|t
+side commit|t
+checkout main|t
+ERROR:  cannot drop operator class gist_geometry_ops_2d for access method gist because objects on branch "side" depend on it
+ERROR:  cannot drop operator class gist_geometry_ops_2d for access method gist because objects on branch "side" depend on it
+still installed|1
+reset main|t
+checkout side|t
+side intact|t
+checkout main|t
+version|ANY
+main values|t
+main index|t
+main status|public.gis_ext modified
+commit at ANY|t
+version again|t
+main values|t
+main index|t
+main status|0
+checkout side|t
+side values|t
+side index|t
+side status|public.gis_side modified
+side commit|t
+ERROR:  Geometry type (Point) does not match column type (Polygon)
+checkout main|t
+merge side|{0,0,"merge successful"}
+merged|t
+merged index|t
+diff c1..c2|20|modified
+reset to c1|t
+c1 values|t
+c1 index|t
+reset to c2|t
+c2 values|t
+branch at c1|t
+checkout old|t
+old values|t
+old index|t
+checkout main|t

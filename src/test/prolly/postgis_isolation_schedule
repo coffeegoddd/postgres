@@ -1,0 +1,5 @@
+# PostGIS concurrency: must match stock Postgres (expected output comes
+# from heap).  Needs PostGIS installed (the Makefile's check-postgis).
+test: iso_gis_serializable
+test: iso_gis_exclusion
+test: iso_gis_knn_locks
