@@ -1726,6 +1726,25 @@ typedef struct TreeLeaf
  * needs the old.)  So the block's records from before then are skipped,
  * and its pages go nowhere: TREE_UNAVAILABLE.
  */
+/*
+ * In recovery: has reln's map no root page, neither on disk nor in a buffer
+ * (one made in this replay has it in a buffer until it is written out)?
+ * Then it is a map dropped later in the WAL, whose header an earlier
+ * record's image made again (redo makes a missing file to restore an image
+ * in), or one that lost its pages.
+ */
+static bool
+map_root_lost(SMgrRelation reln)
+{
+	PrefetchBufferResult r;
+
+	if (!mdexists(reln, BMAP_FORKNUM) ||
+		mdnblocks(reln, BMAP_FORKNUM) >= BMAP_TREE_MAP_PAGES)
+		return false;
+	r = PrefetchSharedBuffer(reln, BMAP_FORKNUM, 1);
+	return !BufferIsValid(r.recent_buffer);
+}
+
 static TreeFound
 tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 		  bool cached_only, uint32 n, BmapEntry *entries, TreeLeaf *leaf)
@@ -1737,6 +1756,10 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 	tree_path(blkno, &path);
 	n = Min(n, BMAP_TREE_FANOUT - path.slot[0]);
 	Assert(n > 0);
+
+	/* (a map with no root in recovery: the relation's pages go nowhere) */
+	if (RecoveryInProgress() && !cached_only && map_root_lost(reln))
+		return TREE_UNAVAILABLE;
 
 	for (;;)
 	{
@@ -4096,6 +4119,20 @@ bmapreplacedafter(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BmapEntry	entry;
 	MapPage		mp;
 	bool		unavailable;
+
+	/*
+	 * A map with no root page (map_root_lost()): the record is skipped, and
+	 * its page noted invalid as md.c notes a page of a missing file.  The
+	 * drop's replay forgets it; an archive recovery that reaches
+	 * consistency without one fails.  (An image of the page is restored to
+	 * its buffer, which goes nowhere when written out: tree_find().)
+	 */
+	if (map_root_lost(reln))
+	{
+		XLogNoteInvalidPage(rel, forknum, blocknum, false);
+		DropBufferBlock(rel, forknum, blocknum);
+		return true;
+	}
 
 	if (lookup_entry_at(reln, blocknum, &entry, &mp, &unavailable))
 	{
@@ -9513,24 +9550,6 @@ bmapclaims(RelFileLocatorBackend rlocator)
 		rlocator.locator.relNumber == BMAP_REFS_RELNUMBER ||
 		rlocator.locator.relNumber == BMAP_QUEUE_RELNUMBER)
 		return false;
-
-	/*
-	 * In recovery, a map without its root page is none: a relation's map
-	 * has both its pages from when it is made, so a shorter one is one
-	 * dropped later in the WAL, whose header an earlier record's image made
-	 * again (redo makes a missing file to restore an image in), or a map
-	 * that lost its pages.  The relation is then md.c's, whose redo notes
-	 * its records' pages as invalid: the drop's replay forgets them, and
-	 * recovery fails as it ends if no drop comes.
-	 */
-	if (RecoveryInProgress())
-	{
-		RelPathStr	path = relpathperm(rlocator.locator, BMAP_FORKNUM);
-		struct stat st;
-
-		return stat(path.str, &st) == 0 &&
-			st.st_size >= (off_t) BMAP_TREE_MAP_PAGES * BLCKSZ;
-	}
 	return bmap_relation_exists(rlocator.locator);
 }
 
@@ -10734,18 +10753,34 @@ keep_newer_entries(Buffer buf, char *newer)
 }
 
 /*
- * In redo: does page-store block 'blk' hold, on disk, a page that is no
- * tree's node (nor all zeroes)?  Read as it is, not through a buffer.
+ * In redo: does page-store block 'blk' hold a page that is no tree's node
+ * (nor all zeroes)?  As replay has it in a buffer, if it does; else on
+ * disk, read as it is (through a buffer, a relation's page would fail its
+ * checksum, which is of its logical block).
  */
 static bool
 redo_block_not_node(RelFileLocator rel, BlockNumber blk)
 {
 	SMgrRelation ssrel = store_smgr(rel);
+	RelFileLocator sloc = with_relnumber(rel, BMAP_STORE_RELNUMBER);
+	PrefetchBufferResult r;
 	PGIOAlignedBlock page;
 	void	   *pages[1] = {page.data};
 
 	if (blk >= mdnblocks(ssrel, MAIN_FORKNUM))
 		return false;
+	r = PrefetchSharedBuffer(ssrel, MAIN_FORKNUM, blk);
+	if (BufferIsValid(r.recent_buffer) &&
+		ReadRecentBuffer(sloc, MAIN_FORKNUM, blk, r.recent_buffer))
+	{
+		bool		other;
+
+		LockBuffer(r.recent_buffer, BUFFER_LOCK_SHARE);
+		other = !PageIsNew(BufferGetPage(r.recent_buffer)) &&
+			!tree_node_any(BufferGetPage(r.recent_buffer));
+		UnlockReleaseBuffer(r.recent_buffer);
+		return other;
+	}
 	mdreadv(ssrel, MAIN_FORKNUM, blk, pages, 1);
 	return !PageIsNew(page.data) && !tree_node_any(page.data);
 }
