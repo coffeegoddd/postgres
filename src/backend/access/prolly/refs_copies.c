@@ -73,6 +73,7 @@
  *	'A' name	-> the role that made the branch, which owns it (its OID,
  *				   native byte order); main has none, being the database
  *				   owner's
+ *	'G' name	-> the role that made the tag (the same)
  *	'!'			-> the refs' format (REFS_FORMAT, text): refs without it, or
  *				   of another, are refused
  *	'T' name	-> a tag: its tag object, then that tag's commit (hash
@@ -238,6 +239,7 @@
 #define TAG_KEPT		'K'	/* the commits a branch's pages are kept as of */
 #define TAG_PIN			'P'	/* a commit pinned for a reader, by name */
 #define TAG_CREATOR		'A'	/* the role that made a branch */
+#define TAG_TAG_CREATOR	'G'	/* and a tag */
 #define TAG_LINEAGE		'L'	/* a commit's tables kept from a record */
 #define TAG_FORMAT		'!'	/* the refs' format, REFS_FORMAT */
 
@@ -499,16 +501,16 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			kept_declare(p, end, refs);
 			break;
 		case TAG_STASH:
-			/* (each entry: its commit, then its branch's name) */
+			/* (each entry: its commit, its branch's name, its maker) */
 			while (p < end)
 			{
 				uint64		blen;
 
 				p = declare_hashes(p, end, 1, refs);
 				blen = prolly_get_varint(&p, end);
-				if (blen > (uint64) (end - p))
+				if (blen + sizeof(Oid) > (uint64) (end - p))
 					break;
-				p += blen;
+				p += blen + sizeof(Oid);
 			}
 			break;
 		default:
@@ -1254,16 +1256,16 @@ branch_head(const char *name, ProllyHash *head)
 	return found && head->len > 0;
 }
 
-/* Record role (InvalidOid: none) as the role that made branch name. */
+/* Record role (InvalidOid: none) as the role that made branch (tag) name. */
 static void
-creator_put(const char *name, Oid role)
+maker_put(char tag, const char *name, Oid role)
 {
 	StringInfoData key;
 	StringInfoData v;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	appendStringInfoChar(&key, TAG_CREATOR);
+	appendStringInfoChar(&key, tag);
 	appendStringInfoString(&key, name);
 	appendBinaryStringInfo(&v, &role, sizeof(role));
 	refs_put(key.data, key.len, OidIsValid(role) ? &v : NULL);
@@ -1271,9 +1273,9 @@ creator_put(const char *name, Oid role)
 	pfree(v.data);
 }
 
-/* The role that made branch name; false if none is recorded. */
+/* The role that made branch (tag) name; false if none is recorded. */
 static bool
-creator_get(const char *name, Oid *role)
+maker_get(char tag, const char *name, Oid *role)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -1281,7 +1283,7 @@ creator_get(const char *name, Oid *role)
 
 	initStringInfo(&key);
 	initStringInfo(&v);
-	appendStringInfoChar(&key, TAG_CREATOR);
+	appendStringInfoChar(&key, tag);
 	appendStringInfoString(&key, name);
 	found = refs_get(key.data, key.len, &v) && v.len == sizeof(Oid);
 	if (found)
@@ -1310,8 +1312,8 @@ branch_set_head(const char *name, const ProllyHash *head)
 	initStringInfo(&v);
 	branch_key(name, &key);
 	if (head && strcmp(name, "main") != 0 && !refs_get(key.data, key.len, &v) &&
-		!creator_get(name, &role))
-		creator_put(name, GetUserId());
+		!maker_get(TAG_CREATOR, name, &role))
+		maker_put(TAG_CREATOR, name, GetUserId());
 	resetStringInfo(&v);
 	if (head)
 		put_hash(&v, head);
@@ -4415,7 +4417,23 @@ static bool
 copies_branch_creator(const char *name, Oid *role)
 {
 	refs_init();
-	return creator_get(name, role);
+	return maker_get(TAG_CREATOR, name, role);
+}
+
+static void
+copies_branch_set_creator(const char *name, Oid role)
+{
+	refs_init();
+	lock_refs();
+	if (strcmp(name, "main") != 0)
+		maker_put(TAG_CREATOR, name, role);
+}
+
+static bool
+copies_tag_creator(const char *name, Oid *role)
+{
+	refs_init();
+	return maker_get(TAG_TAG_CREATOR, name, role);
 }
 
 /*
@@ -4778,7 +4796,7 @@ copies_branch_create(const char *name, const char *start_point)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", name)));
-	creator_put(name, GetUserId());
+	maker_put(TAG_CREATOR, name, GetUserId());
 
 	/*
 	 * A branch starts at its start point's head commit, as in Dolt: a
@@ -4878,7 +4896,7 @@ copies_branch_delete(const char *name, bool force)
 		refs_put(key.data, key.len, NULL);
 		pfree(key.data);
 	}
-	creator_put(name, InvalidOid);
+	maker_put(TAG_CREATOR, name, InvalidOid);
 	/* (and the commits its pages were kept as of: they went with them) */
 	kept_put(name, NIL);
 }
@@ -4924,14 +4942,9 @@ copies_branch_rename(const char *name, const char *newname, bool force)
 		branch_ops()->rename(name, newname, force);
 	else
 	{
-		/*
-		 * (one with only a head: no session is on it; checked as a rename
-		 * with copies is, the new name by its rules alone, which
-		 * check_create says how it breaks)
-		 */
+		/* (one with only a head: no session is on it; checked as one with copies) */
 		branch_ops()->check_drop(name);
-		if (!branch_ops()->name_ok(newname))
-			branch_ops()->check_create(newname);
+		prolly_check_branch_rename(newname);
 	}
 	/*
 	 * (violations, kept one entry each, moved apart from the tags'; the
@@ -7446,6 +7459,11 @@ copies_tag_set(const char *name, const ProllyHash *expected,
 		put_hash(&v, &info.commit);
 	}
 	refs_put(key.data, key.len, tag ? &v : NULL);
+	/* (a tag made here is its session role's; one deleted, no one's) */
+	if (tag == NULL)
+		maker_put(TAG_TAG_CREATOR, name, InvalidOid);
+	else if (!exists)
+		maker_put(TAG_TAG_CREATOR, name, GetUserId());
 	pfree(key.data);
 	pfree(v.data);
 	return true;
@@ -7682,7 +7700,8 @@ copies_set_rebase_state(const ProllyRebaseState *state)
 
 /* ------------------------------------------------------------------------
  * Stashes: TAG_STASH and a list's name, its entries newest first, each its
- * commit's hash, then its branch's name (a varint length, then the bytes).
+ * commit's hash, then its branch's name (a varint length, then the bytes),
+ * then the role that pushed it (its OID, native byte order).
  * ------------------------------------------------------------------------
  */
 
@@ -7690,6 +7709,7 @@ typedef struct StashEntry
 {
 	ProllyHash	stash;
 	char	   *branch;
+	Oid			maker;
 } StashEntry;
 
 static List *
@@ -7704,12 +7724,14 @@ stash_list(const char *p, const char *end)
 
 		p = get_hash(p, end, &e->stash);
 		blen = prolly_get_varint(&p, end);
-		if (blen > (uint64) (end - p))
+		if (blen + sizeof(Oid) > (uint64) (end - p))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("corrupt prolly stash list")));
 		e->branch = pnstrdup(p, blen);
 		p += blen;
+		memcpy(&e->maker, p, sizeof(Oid));
+		p += sizeof(Oid);
 		entries = lappend(entries, e);
 	}
 	return entries;
@@ -7758,6 +7780,7 @@ stash_set(const char *name, List *entries)
 		put_hash(&v, &e->stash);
 		prolly_put_varint(&v, strlen(e->branch));
 		appendStringInfoString(&v, e->branch);
+		appendBinaryStringInfo(&v, &e->maker, sizeof(Oid));
 	}
 	refs_put(key.data, key.len, entries ? &v : NULL);
 	pfree(key.data);
@@ -7788,7 +7811,23 @@ copies_stash_push(const char *name, const ProllyNodeRef *root, ProllyHash *stash
 	}
 	e->stash = *stash;
 	e->branch = pstrdup(branch);
+	e->maker = GetUserId();
 	stash_set(name, lcons(e, entries));
+}
+
+/* The role that pushed name's nth stash; false if it has none. */
+static bool
+copies_stash_maker(const char *name, int n, Oid *role)
+{
+	List	   *entries;
+
+	refs_init();
+	lock_refs();
+	entries = stash_get(name);
+	if (n < 0 || n >= list_length(entries))
+		return false;
+	*role = ((StashEntry *) list_nth(entries, n))->maker;
+	return true;
 }
 
 static void
@@ -7944,5 +7983,8 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.kept_commits = copies_kept_commits,
 	.recorded_relation = copies_recorded_relation,
 	.branch_creator = copies_branch_creator,
+	.branch_set_creator = copies_branch_set_creator,
+	.tag_creator = copies_tag_creator,
+	.stash_maker = copies_stash_maker,
 	.lineage_note = copies_lineage_note,
 };

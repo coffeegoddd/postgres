@@ -46,7 +46,7 @@
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_branch.h"
-#include "catalog/pg_database_d.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
@@ -925,35 +925,118 @@ qualified_name(Oid relid)
  * ------------------------------------------------------------------------
  */
 
+/* a rebase's own branch: dolt_rebase_<the branch rebased> */
+#define REBASE_BRANCH_PREFIX "dolt_rebase_"
+
+
+/*
+ * Does the session's role write the version control's shared state at
+ * large: own the database, have its CREATE privilege (which makes
+ * branches), or have the privileges of pg_prolly_write?
+ */
+bool
+prolly_writes_refs(void)
+{
+	Oid			user = GetUserId();
+
+	return object_ownercheck(DatabaseRelationId, MyDatabaseId, user) ||
+		has_privs_of_role(user, ROLE_PG_PROLLY_WRITE) ||
+		object_aclcheck(DatabaseRelationId, MyDatabaseId, user,
+						ACL_CREATE) == ACLCHECK_OK;
+}
+
+/* the database's owner */
+static Oid
+database_owner_role(void)
+{
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	Oid			owner;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	owner = ((Form_pg_database) GETSTRUCT(tup))->datdba;
+	ReleaseSysCache(tup);
+	return owner;
+}
+
+/* Does role exist (a role dropped leaves its OID where it was recorded)? */
+static bool
+role_exists(Oid role)
+{
+	return OidIsValid(role) &&
+		SearchSysCacheExists1(AUTHOID, ObjectIdGetDatum(role));
+}
+
+/*
+ * The role that owns branch name: the role that made it, or, for main, a
+ * branch whose maker isn't recorded, or one whose maker was dropped, the
+ * database's owner.
+ */
+Oid
+prolly_branch_owner(const char *name)
+{
+	Oid			creator;
+
+	if (strcmp(name, "main") != 0 && PROLLY_HAS(refs(), branch_creator) &&
+		PROLLY_CALL(refs(), branch_creator, name, &creator) &&
+		role_exists(creator))
+		return creator;
+	return database_owner_role();
+}
 
 /*
  * Refuse the session's role a move of branch name's head (a commit, reset,
  * merge, cherry-pick, revert or rebase onto it, its deletion or rename)
- * unless it owns the branch (made it; main is the database owner's), owns
- * the database, has the database's CREATE privilege (which makes branches),
- * or has the privileges of pg_prolly_write.  A branch's head is what every
- * session on it reads and commits on, so moving it is a write to the
- * branch: privileges on its tables alone don't give it.
+ * unless it has the privileges of the branch's owner (prolly_branch_owner())
+ * or writes the shared state at large (prolly_writes_refs()).  A branch's
+ * head is what every session on it reads and commits on, so moving it is a
+ * write to the branch: privileges on its tables alone don't give it.
  */
+bool
+prolly_may_move_head(const char *name)
+{
+	return prolly_writes_refs() ||
+		has_privs_of_role(GetUserId(), prolly_branch_owner(name));
+}
+
 void
 prolly_check_head_move(const char *name)
 {
-	Oid			user = GetUserId();
-	Oid			creator;
+	if (!prolly_may_move_head(name))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to move the head of branch \"%s\"", name),
+				 errdetail("Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role may.")));
+}
 
-	if (object_ownercheck(DatabaseRelationId, MyDatabaseId, user) ||
-		has_privs_of_role(user, ROLE_PG_PROLLY_WRITE) ||
-		object_aclcheck(DatabaseRelationId, MyDatabaseId, user,
-						ACL_CREATE) == ACLCHECK_OK)
-		return;
-	if (strcmp(name, "main") != 0 && PROLLY_HAS(refs(), branch_creator) &&
-		PROLLY_CALL(refs(), branch_creator, name, &creator) &&
-		has_privs_of_role(user, creator))
-		return;
-	ereport(ERROR,
-			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("permission denied to move the head of branch \"%s\"", name),
-			 errdetail("Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role may.")));
+/* Refuse the session's role a change to the shared refs: see prolly_writes_refs(). */
+static void
+check_writes_refs(const char *what)
+{
+	if (!prolly_writes_refs())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to %s", what),
+				 errdetail("Only the database's owner, and roles with the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role, may.")));
+}
+
+/*
+ * Refuse a rename of a branch to newname that the session's role may not
+ * make: a branch's name follows its rules, and taking a new one takes what
+ * making a branch of it takes, or pg_prolly_write's privileges (a rename
+ * would otherwise make a branch of any name from one made on the role's
+ * behalf).
+ */
+void
+prolly_check_branch_rename(const char *newname)
+{
+	if (!branch_ops()->name_ok(newname))
+		branch_ops()->check_create(newname);	/* (which says how it breaks) */
+	if (!prolly_writes_refs())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to rename a branch to \"%s\"", newname),
+				 errdetail("A branch's new name takes the database's CREATE privilege, as making a branch does, or the privileges of the \"pg_prolly_write\" role.")));
 }
 
 /*
@@ -1268,8 +1351,28 @@ force_branch(const char *name, const char *from)
 		if (!PROLLY_CALL(refs(), resolve, from ? from : "HEAD", &head) ||
 			!PROLLY_CALL(refs(), resolve, name, &at))
 		{
+			Oid			creator = InvalidOid;
+
+			/*
+			 * (the same branch, moved: made again on the session's behalf,
+			 * its move checked already, and its owner kept)
+			 */
+			if (PROLLY_HAS(refs(), branch_creator) &&
+				!PROLLY_CALL(refs(), branch_creator, name, &creator))
+				creator = InvalidOid;
 			PROLLY_CALL(refs(), branch_delete, name, true);
-			create_branch(name, from);
+			BranchCreateOnBehalf = true;
+			PG_TRY(_remade);
+			{
+				create_branch(name, from);
+			}
+			PG_FINALLY(_remade);
+			{
+				BranchCreateOnBehalf = false;
+			}
+			PG_END_TRY(_remade);
+			if (PROLLY_HAS(refs(), branch_set_creator))
+				PROLLY_CALL(refs(), branch_set_creator, name, creator);
 			moved = true;
 		}
 		else
@@ -2084,6 +2187,13 @@ dolt_branch(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("a writer's branch can't be renamed")));
+		/* (nor a rebase's, made on the session's behalf for the rebase alone) */
+		if (strncmp(linitial(names), REBASE_BRANCH_PREFIX,
+					strlen(REBASE_BRANCH_PREFIX)) == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("a rebase's branch can't be renamed"),
+					 errhint("Finish the rebase with dolt_rebase('--continue'), or abort it.")));
 		was_protected = PROLLY_CALL(writers(), protected, linitial(names));
 		/* (the branch a forced rename replaces) */
 		replaces_protected = force &&
@@ -2567,10 +2677,16 @@ move_to_writer_branch(bool *same)
 	CommandCounterIncrement();
 	moved_lxid = MyProc->vxid.lxid;
 	moved_subid = GetCurrentSubTransactionId();
-	ereport(NOTICE,
-			(errmsg("writing on branch \"%s\"", name),
-			 errdetail("Branch \"%s\" is protected.", base),
-			 errhint("Integrate the writes with dolt_integrate('-m', ...).")));
+	if (prolly_may_move_head(base))
+		ereport(NOTICE,
+				(errmsg("writing on branch \"%s\"", name),
+				 errdetail("Branch \"%s\" is protected.", base),
+				 errhint("Integrate the writes with dolt_integrate('-m', ...).")));
+	else
+		ereport(NOTICE,
+				(errmsg("writing on branch \"%s\"", name),
+				 errdetail("Branch \"%s\" is protected.", base),
+				 errhint("Integrate the writes with dolt_integrate('-m', ...): rows of tables this role may write as they changed integrate; a change to a definition, or to rows it may not write so, takes the privileges of the \"pg_prolly_write\" role or the database's CREATE privilege.")));
 	return true;
 }
 
@@ -2898,6 +3014,10 @@ writer_branch_hooks(void)
 	RegisterXactCallback(writer_xact_callback, NULL);
 }
 
+static bool writer_may_integrate(const char *mine, const char *target,
+								 const ProllyHash *head, List **needs);
+static void check_integrated_rows(const char *target, List *needs);
+
 /*
  * dolt_integrate(VARIADIC args text[]) returns text[]:
  *	  {commit id, fast_forward}
@@ -2928,6 +3048,8 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	bool		had_head;
 	bool		committed;
 	int			conflicts;
+	bool		rows_only = false;
+	List	   *needs = NIL;
 	const char *result[2];
 
 	for (int i = 0; i < nargs; i++)
@@ -2972,9 +3094,8 @@ dolt_integrate(PG_FUNCTION_ARGS)
 				 errhint("Check out a branch with dolt_checkout('-b', ...) first.")));
 
 	PreventCommandIfReadOnly("dolt_integrate()");
-	/* (it commits on the branch, and merges into target) */
+	/* (it commits on the branch, and merges into target: checked below) */
 	prolly_check_head_move(mine);
-	prolly_check_head_move(target);
 	/* (failing, the session stays on its branch, as everything else does) */
 	returning = branch_return_on_abort();
 
@@ -2985,9 +3106,18 @@ dolt_integrate(PG_FUNCTION_ARGS)
 	if (committed)
 		settled();
 	(void) PROLLY_CALL(refs(), resolve, "HEAD", &mine_head);
+	if (!prolly_may_move_head(target))
+	{
+		needs = NIL;
+		if (!writer_may_integrate(mine, target, &mine_head, &needs))
+			prolly_check_head_move(target);
+		rows_only = true;
+	}
 
 	/* merged into target, as it commits */
 	checkout_branch(target);
+	if (rows_only)
+		check_integrated_rows(target, needs);
 	note_integration();
 	had_head = PROLLY_CALL(refs(), resolve, "HEAD", &before);
 	BRANCH_WRITES_HUSHED(conflicts = PROLLY_CALL(diff_merge(), merge, mine,
@@ -3191,6 +3321,33 @@ no_stashes(void)
 }
 
 /*
+ * May the session's role drop name's nth stash: the role that pushed it,
+ * or one that writes the shared refs (prolly_writes_refs())?  A stash holds
+ * changes set aside from a branch every session on it shares; dropping it
+ * can't be undone.
+ */
+static bool
+may_drop_stash(const char *name, int n)
+{
+	Oid			maker;
+
+	return prolly_writes_refs() ||
+		(PROLLY_HAS(refs(), stash_maker) &&
+		 PROLLY_CALL(refs(), stash_maker, name, n, &maker) &&
+		 role_exists(maker) && has_privs_of_role(GetUserId(), maker));
+}
+
+static void
+check_drop_stash(const char *name, int n)
+{
+	if (!may_drop_stash(name, n))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to drop stash@{%d} of \"%s\"", n, name),
+				 errdetail("Only the role that pushed it, the database's owner, and roles with the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role may.")));
+}
+
+/*
  * dolt_stash(VARIADIC args text[]) returns text[]: {status}
  *
  * As Dolt's, but for the working set alone (there is no staging area, so
@@ -3290,6 +3447,9 @@ dolt_stash(PG_FUNCTION_ARGS)
 		 */
 		if (!PROLLY_CALL(refs(), stash_select, name, n, &stash))
 			no_stashes();
+		/* (a pop drops it) */
+		if (strcmp(cmd, "pop") == 0)
+			check_drop_stash(name, n);
 		refuse_violations("stash");
 
 		/*
@@ -3304,14 +3464,35 @@ dolt_stash(PG_FUNCTION_ARGS)
 	}
 	else if (strcmp(cmd, "drop") == 0)
 	{
-		if (!PROLLY_CALL(refs(), stash_drop, name, stash_index(which)))
+		ProllyHash	stash;
+		int			n = stash_index(which);
+
+		if (!PROLLY_CALL(refs(), stash_select, name, n, &stash))
+			no_stashes();
+		check_drop_stash(name, n);
+		if (!PROLLY_CALL(refs(), stash_drop, name, n))
 			no_stashes();
 	}
 	else if (strcmp(cmd, "clear") == 0)
 	{
 		if (which)
 			unexpected("dolt_stash", which);
-		PROLLY_CALL(refs(), stash_clear, name);
+		/* (a role that may drop only its own stashes clears only those) */
+		if (prolly_writes_refs())
+			PROLLY_CALL(refs(), stash_clear, name);
+		else
+		{
+			ProllyHash	stash;
+			int			n = 0;
+
+			while (PROLLY_CALL(refs(), stash_select, name, n, &stash))
+			{
+				if (may_drop_stash(name, n))
+					(void) PROLLY_CALL(refs(), stash_drop, name, n);
+				else
+					n++;
+			}
+		}
 	}
 	else
 		ereport(ERROR,
@@ -3476,6 +3657,20 @@ dolt_tag_change(char **names, int nnames, bool delete, const char *message,
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_tag: -d and -m cannot be used together")));
+		/* (a tag is its maker's to delete, or a role's that writes the refs) */
+		for (int i = 0; i < nnames; i++)
+		{
+			Oid			creator;
+
+			if (!prolly_writes_refs() &&
+				!(PROLLY_HAS(tag_refs(), tag_creator) &&
+				  PROLLY_CALL(tag_refs(), tag_creator, names[i], &creator) &&
+				  role_exists(creator) && has_privs_of_role(GetUserId(), creator)))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission denied to delete tag \"%s\"", names[i]),
+						 errdetail("Only the tag's maker, the database's owner, and roles with the database's CREATE privilege or the privileges of the \"pg_prolly_write\" role may.")));
+		}
 		for (int i = 0; i < nnames; i++)
 			if (!PROLLY_CALL(tag_refs(), tag_set, names[i], NULL, NULL))
 				ereport(ERROR,
@@ -3492,6 +3687,7 @@ dolt_tag_change(char **names, int nnames, bool delete, const char *message,
 		if (nnames > 2)
 			unexpected("dolt_tag", names[2]);
 		given_author("dolt_tag", author);
+		check_writes_refs("make a tag");
 		if (PROLLY_CALL(r, tag_lookup, names[0], &tag))
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -4099,7 +4295,6 @@ all_log_entries(void)
  * the commit replayed onto, which becomes the rebased branch's head once
  * every step is done.  (Git rebases on a detached HEAD; Dolt has none.)
  */
-#define REBASE_BRANCH_PREFIX "dolt_rebase_"
 
 /* numeric(6,2)'s typmod: a rebase order's */
 #define REBASE_ORDER_TYPMOD (((6 << 16) | 2) + VARHDRSZ)
@@ -4986,8 +5181,8 @@ static void
 branch_row(const char *name, const ProllyHash *head, void *arg)
 {
 	BranchRows *br = arg;
-	Datum		values[12];
-	bool		nulls[12] = {0};
+	Datum		values[13];
+	bool		nulls[13] = {0};
 	char	   *writer;
 	char	   *base;
 	Oid			writer_role;
@@ -5067,6 +5262,12 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
 		values[10] = CStringGetTextDatum("branch");
 		nulls[11] = true;
 	}
+	/* (the role that owns it, whose head moves need nothing more) */
+	{
+		const char *creator = GetUserNameFromId(prolly_branch_owner(name), true);
+
+		values[12] = CStringGetTextDatum(creator ? creator : "?");
+	}
 	tuplestore_putvalues(br->rsinfo->setResult, br->rsinfo->setDesc, values,
 						 nulls);
 }
@@ -5079,6 +5280,10 @@ branch_row(const char *name, const ProllyHash *head, void *arg)
  *	  returns setof record
  *
  * dirty: the branch's working set has changes since its head commit.
+ * (Then owner and owner_role, the writer whose changes it holds; protected;
+ * kind and base, a writer branch's; and creator, the role that owns the
+ * branch: its maker, or the database's owner for main, a branch whose maker
+ * isn't recorded, or one whose maker was dropped.)
  */
 Datum
 dolt_branches(PG_FUNCTION_ARGS)
@@ -6077,6 +6282,123 @@ table_item_data(const char *item, int len, ProllyNodeRef *data)
 				 errmsg("a canonical table item without its rows")));
 	data->hash.len = (uint8) item[0];
 	memcpy(data->hash.bytes, item + 1, data->hash.len);
+}
+
+/* The kinds of row changes a diff of a table's trees finds (bits by kind). */
+static void
+note_change_kind(ProllyDiffKind kind, const ProllyKey *key,
+				 const ProllyValue *before, const ProllyValue *after, void *arg)
+{
+	*(int *) arg |= 1 << kind;
+}
+
+/* A table an integration changes rows of, and the privileges it needs. */
+typedef struct IntegratedRows
+{
+	Oid			relid;
+	AclMode		need;
+} IntegratedRows;
+
+/*
+ * In a writer mode, may the session's role integrate its own writer branch
+ * mine (whose head is now head) into target, its base, without the
+ * privileges of a head move there?  Only if every change the branch brings
+ * since it and target last met is to the rows of a table the role may
+ * write as the change needs: INSERT for rows added, DELETE for rows
+ * removed, UPDATE for rows changed (of a table without a key, whose changed
+ * rows are counts of copies, INSERT and DELETE).  A change to any
+ * definition, or to another object, takes the head move's privileges.
+ * *needs: the tables and privileges, checked on target's catalogs
+ * (check_integrated_rows()), whose grants are the ones its rows take.
+ */
+static bool
+writer_may_integrate(const char *mine, const char *target, const ProllyHash *head,
+					 List **needs)
+{
+	char	   *writer;
+	char	   *base;
+	Oid			role;
+	ProllyHash	at;
+	ProllyHash	met;
+	List	   *rows = NIL;
+	ListCell   *lc;
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyTreeEnv env;
+
+	if (PROLLY_CALL(writers(), mode) == PROLLY_WRITERS_SHARED ||
+		!writer_branch_name(mine) ||
+		!PROLLY_CALL(writers(), writer_branch, mine, &writer, &base, &role) ||
+		strcmp(base, target) != 0 || !role_exists(role) ||
+		!has_privs_of_role(GetUserId(), role) ||
+		!PROLLY_HAS(tree, diff_unordered))
+		return false;
+	if (!PROLLY_CALL(refs(), resolve, target, &at) ||
+		!PROLLY_CALL(refs(), merge_base, head, &at, &met))
+		return false;
+	PROLLY_CALL(diff_merge(), summary, hash_hex(&met), hash_hex(head), false,
+				collect_change, &rows);
+	prolly_folded_tree_env(&env);
+	foreach(lc, rows)
+	{
+		SummaryRow *r = lfirst(lc);
+		ProllyNodeRef fd;
+		ProllyNodeRef td;
+		ProllyValue d;
+		bool		keyed;
+		int			kinds = 0;
+		Oid			relid;
+		AclMode		need = 0;
+
+		if (r->object != PROLLY_OBJECT_TABLE || r->not_covered ||
+			r->schema_change || r->from_name == NULL || r->to_name == NULL ||
+			strcmp(r->from_name, r->to_name) != 0 ||
+			r->from_item == NULL || r->to_item == NULL)
+			return false;
+		if (!r->data_change)
+			continue;
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(r->to_name, NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid))
+			return false;
+		table_item_data(r->from_item, r->from_len, &fd);
+		table_item_data(r->to_item, r->to_len, &td);
+		PROLLY_CALL(tree, diff_unordered, &env, &fd, &td, note_change_kind, &kinds);
+		d.data = (const uint8 *) r->to_item + 1 + td.hash.len;
+		d.len = r->to_len - 1 - td.hash.len;
+		(void) PROLLY_CALL(canonicalizer(), table_columns, &d, &keyed);
+		if (kinds & (1 << PROLLY_DIFF_ADDED))
+			need |= ACL_INSERT;
+		if (kinds & (1 << PROLLY_DIFF_REMOVED))
+			need |= ACL_DELETE;
+		if (kinds & (1 << PROLLY_DIFF_MODIFIED))
+			need |= keyed ? ACL_UPDATE : (ACL_INSERT | ACL_DELETE);
+		if (kinds & (1 << PROLLY_DIFF_NOT_COVERED))
+			return false;
+		{
+			IntegratedRows *ir = palloc(sizeof(IntegratedRows));
+
+			ir->relid = relid;
+			ir->need = need;
+			*needs = lappend(*needs, ir);
+		}
+	}
+	return true;
+}
+
+/* writer_may_integrate()'s privileges, as target (the session's now) grants them */
+static void
+check_integrated_rows(const char *target, List *needs)
+{
+	ListCell   *lc;
+
+	foreach(lc, needs)
+	{
+		IntegratedRows *ir = lfirst(lc);
+
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(ir->relid)) ||
+			pg_class_aclmask(ir->relid, GetUserId(), ir->need, ACLMASK_ALL) != ir->need)
+			prolly_check_head_move(target);
+	}
 }
 
 /*
@@ -8913,6 +9235,7 @@ dolt_remote(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_remote add needs a name and a URL")));
 		PreventCommandIfReadOnly("dolt_remote()");
+		check_writes_refs("add a remote");
 		add_remote(args[1], args[2]);
 	}
 	else if (nargs >= 1 && (strcmp(args[0], "remove") == 0 ||
@@ -8923,6 +9246,7 @@ dolt_remote(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("dolt_remote remove needs a name")));
 		PreventCommandIfReadOnly("dolt_remote()");
+		check_writes_refs("remove a remote");
 		(void) need_remote(args[1]);
 		PROLLY_CALL(remote_refs(), remote_set, args[1], NULL);
 	}
