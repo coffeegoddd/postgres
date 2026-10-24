@@ -373,6 +373,23 @@ installed(const char *name, char **version, char **schema)
 	return true;
 }
 
+/*
+ * Whether version of an available extension names schema in its control
+ * file (schema = ..., which only a non-relocatable one may): CREATE
+ * EXTENSION then makes the schema if the database hasn't it, and takes no
+ * SCHEMA but that one.
+ */
+static bool
+fixed_schema(const char *name, const char *version, const char *schema)
+{
+	const char *params[2] = {name, version};
+
+	query("SELECT schema FROM pg_catalog.pg_available_extension_versions "
+		  "WHERE name = $1 AND version = $2 AND NOT relocatable", 2, params);
+	return SPI_processed > 0 && column(0, 1) != NULL &&
+		strcmp(column(0, 1), schema) == 0;
+}
+
 /* Whether an extension the database has can be moved to another schema. */
 static bool
 relocatable(const char *name)
@@ -542,7 +559,10 @@ check_extension(NeededExtension *e, StringInfo missing, Problems *problems,
 	}
 	if (e->versioned && install)
 		return newest;			/* (the schema made, versioned, first) */
-	if (!OidIsValid(get_namespace_oid(schema, true)))
+
+	/* (one whose control file fixes the schema makes it, as ever) */
+	if (!OidIsValid(get_namespace_oid(schema, true)) &&
+		!fixed_schema(e->name, newest, schema))
 	{
 		appendStringInfo(missing, "\nextension %s: schema %s, not in this database",
 						 e->name, schema);
@@ -612,10 +632,16 @@ create_extension(List *installs, Install *e)
 		return;
 	}
 	{
-		char	   *sql = psprintf("CREATE EXTENSION %s VERSION %s SCHEMA %s CASCADE",
+		/*
+		 * (a schema the control file fixes isn't given: CREATE EXTENSION
+		 * makes it if it is missing only when it isn't)
+		 */
+		bool		fixed = fixed_schema(e->name, e->version, e->schema);
+		char	   *sql = psprintf("CREATE EXTENSION %s VERSION %s%s%s CASCADE",
 								   quote_identifier(e->name),
 								   quote_literal_cstr(e->version),
-								   quote_identifier(e->schema));
+								   fixed ? "" : " SCHEMA ",
+								   fixed ? "" : quote_identifier(e->schema));
 
 		if (SPI_execute(sql, false, 0) != SPI_OK_UTILITY)
 			elog(ERROR, "SPI_execute failed: %s", sql);

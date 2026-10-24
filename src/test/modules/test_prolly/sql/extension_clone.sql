@@ -75,3 +75,29 @@ SELECT id, name FROM geo.g;
 \c :db
 DROP DATABASE regress_extclone_dst2;
 DROP DATABASE regress_extclone_src2;
+
+-- an extension whose control file fixes its schema, which isn't versioned:
+-- the clone makes it as CREATE EXTENSION does, schema and all
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/extclone3-' || txid_current() AS url3 \gset
+CREATE DATABASE regress_extclone_src3;
+\c regress_extclone_src3
+CREATE EXTENSION test_prolly_fixed;
+DROP SCHEMA public;
+CREATE SCHEMA public VERSIONED;
+CREATE TABLE public.t (id int PRIMARY KEY, n prolly_fixed.posint);
+INSERT INTO public.t VALUES (1, 7);
+SELECT length(dolt_commit('-Am', 'a fixed schema')::text) AS committed;
+SELECT dolt_remote('add', 'origin', :'url3');
+SELECT dolt_push('origin', 'main');
+\c :db
+CREATE DATABASE regress_extclone_dst3;
+\c regress_extclone_dst3
+SELECT dolt_clone(:'url3');
+SELECT extname, extnamespace::regnamespace AS schema FROM pg_extension
+ WHERE extname = 'test_prolly_fixed';
+SELECT nspname, nspversioned FROM pg_namespace WHERE nspname = 'prolly_fixed';
+SELECT id, n FROM public.t;
+INSERT INTO public.t VALUES (2, -1);
+\c :db
+DROP DATABASE regress_extclone_dst3;
+DROP DATABASE regress_extclone_src3;
