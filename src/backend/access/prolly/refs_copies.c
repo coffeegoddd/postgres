@@ -3800,6 +3800,9 @@ get_time(const StringInfoData *v, TimestampTz *at)
 	return true;
 }
 
+/* The most items a commit has (write_commit's). */
+#define COMMIT_ITEMS	8
+
 /* Is a commit's item k the one named name? */
 static bool
 item_is(const ProllyKey *k, const char *name)
@@ -3807,9 +3810,22 @@ item_is(const ProllyKey *k, const char *name)
 	return k->len == strlen(name) && memcmp(k->data, name, k->len) == 0;
 }
 
+/* Does item k sort after the one named name (by bytes, as a commit's do)? */
+static bool
+item_after(const ProllyKey *k, const char *name)
+{
+	size_t		len = strlen(name);
+	int			c = memcmp(k->data, name, Min(k->len, len));
+
+	return c > 0 || (c == 0 && k->len > len);
+}
+
 /*
  * A commit's items are read in one pass: a get of each would descend the
- * commit's tree once per item.
+ * commit's tree once per item.  Any hash may name a commit here (a ref
+ * given in hex), so the pass stops past the last of a commit's items, or
+ * past as many items as a commit has: a descent of whatever tree the hash
+ * names, and a leaf or so.
  */
 static bool
 copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
@@ -3819,6 +3835,7 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 	ProllyKey	k;
 	ProllyValue v;
 	bool		has_root = false;
+	int			nitems = 0;
 
 	refs_init();
 	if (id->len == 0 || !PROLLY_CALL(env.chunk_store, has, env.chunks, id))
@@ -3835,6 +3852,17 @@ copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info)
 		const char *p = (const char *) v.data;
 		const char *end = p + v.len;
 
+		/*
+		 * (past a commit's last item in key order, "time", or past as many
+		 * items as a commit has: whatever else the hash names, no more of
+		 * it is read)
+		 */
+		if (item_after(&k, "time") || ++nitems > COMMIT_ITEMS)
+		{
+			if (nitems > COMMIT_ITEMS)
+				has_root = false;
+			break;
+		}
 		if (item_is(&k, "root"))
 		{
 			ProllyHash	root;

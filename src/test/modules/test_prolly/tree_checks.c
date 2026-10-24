@@ -960,6 +960,60 @@ tree_apply_reads_paths_once(const ProllyImplInfo *impl)
 				 (unsigned long long) reads[1], (unsigned long long) reads[2],
 				 nodes.levels, nodes.levels);
 		pfree(v.data);
+
+		/*
+		 * A scope keeps no more than maintenance_work_mem of nodes: many
+		 * applies in one write far more internal nodes than that, and
+		 * those past it are read again, every read still right.
+		 */
+		{
+			int			saved = maintenance_work_mem;
+			volatile Size kept = 0;
+			int			napplied = 400;
+
+			cxt = AllocSetContextCreate(CurrentMemoryContext, "kept nodes",
+										ALLOCSET_DEFAULT_SIZES);
+			maintenance_work_mem = 64;
+			PG_TRY();
+			{
+				PROLLY_CALL(tr, keep_nodes, cxt);
+				for (int i = 0; i < napplied; i++)
+				{
+					int			k = (i * 4999) % MAX_KEY;
+					int			version = 9 + i;
+
+					apply_batch(tr, &env, ref, &k, &version, 1, &root);
+				}
+				kept = MemoryContextMemAllocated(cxt, true);
+			}
+			PG_FINALLY();
+			{
+				maintenance_work_mem = saved;
+			}
+			PG_END_TRY();
+			MemoryContextDelete(cxt);
+			if (kept > 4 * 64 * 1024)
+				elog(ERROR, "a scope kept %zu bytes of nodes over %d applies, past four times maintenance_work_mem's 64kB",
+					 (Size) kept, napplied);
+			initStringInfo(&v);
+			for (int i = 0; i < napplied; i++)
+			{
+				int			k = (i * 4999) % MAX_KEY;
+				KeyBuf		kb2;
+				ProllyKey	kk = key_of(k, &kb2);
+
+				resetStringInfo(&v);
+				if (!PROLLY_CALL(tr, get, &env, &root, &kk, &v))
+					elog(ERROR, "get did not find key %d after applies past the budget", k);
+				{
+					ProllyValue pv = {(const uint8 *) v.data, v.len};
+
+					if (!same_value(&pv, k, ref->version[k]))
+						elog(ERROR, "key %d has the wrong value after applies past the budget", k);
+				}
+			}
+			pfree(v.data);
+		}
 	}
 }
 

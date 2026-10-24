@@ -294,6 +294,41 @@ SELECT value - :nodes AS nodes_read FROM pg_stat_prolly
 SELECT CASE WHEN :nodes_read <= 25 THEN 'at most 25' ELSE :nodes_read::text END
   AS nodes_read;
 
+-- A hash that names a tree but no commit (here, a commit's root, of many
+-- items) is found not to be one from a descent of that tree, not a read
+-- of all of it.
+DO $$
+BEGIN
+	FOR i IN 1..150 LOOP
+		EXECUTE format('CREATE TABLE tc.wide%s (id int PRIMARY KEY, %s)', i,
+			(SELECT string_agg(format('column_with_a_long_name_%s text', c), ', ')
+			 FROM generate_series(1, 12) c));
+	END LOOP;
+END $$;
+SELECT length(dolt_commit('-Am', 'wide')::text) > 0 AS committed;
+CREATE FUNCTION pg_temp.names_commit(h text) RETURNS bool LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM dolt_hashof(h);
+	RETURN true;
+EXCEPTION WHEN OTHERS THEN
+	RETURN false;
+END $$;
+SELECT root AS wide_root FROM test_commit_roots('HEAD') \gset
+SELECT pg_stat_force_next_flush();
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SELECT pg_temp.names_commit(:'wide_root') AS names_commit;
+SELECT pg_stat_force_next_flush();
+SELECT value - :nodes AS nodes_read FROM pg_stat_prolly
+  WHERE name = 'nodes_read' \gset
+SELECT CASE WHEN :nodes_read <= 6 THEN 'at most 6' ELSE :nodes_read::text END
+  AS nodes_read;
+DO $$
+BEGIN
+	FOR i IN 1..150 LOOP
+		EXECUTE format('DROP TABLE tc.wide%s', i);
+	END LOOP;
+END $$;
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');
