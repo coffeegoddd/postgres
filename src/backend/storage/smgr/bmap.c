@@ -8278,12 +8278,17 @@ block_list_add(BlockList *l, BlockNumber b)
  * keeps its epoch, so a page as of a fold stays one.  The image restores
  * the page whatever records redo skips for it from before the move.
  *
- * A tree's nodes stay where they are: a node moved would get a new pointer,
- * and recovery skips the records of every page under a pointer newer than
- * them (tree_find()), which only a share's flushing and syncing of those
- * pages makes safe; so does anything shared, a snapshot's, on a changes
- * list, or busy (a pinned buffer).  A node in the tail ends what the store
- * can be shortened by.  A crash between a move and the freeing of
+ * A tree's node the relation owns, its path too, moves after them, as a new
+ * incarnation at the lower block, its parent pointed to it
+ * (tree_move_node()): recovery skips the records of every page under a
+ * pointer it can't follow (tree_find()), so the copy is written and synced
+ * before the record that points to it, and the parents are written and
+ * synced before the old blocks are freed, so that redo from any point
+ * follows a pointer to a version of the node.  Not while an online backup
+ * runs, which could copy a parent after the move and the copy's block
+ * before it was written; one starting meanwhile fails at its stop.
+ * Anything shared, a snapshot's, on a changes list, or busy (a pinned
+ * buffer) stays where it is.  A crash between a move and the freeing of
  * its old block leaves that block allocated and held by nothing, for the
  * next sweep.  At wal_level minimal, a relation whose data skips WAL (made
  * in a transaction not yet committed) isn't moved: its later changes reach
@@ -8298,6 +8303,14 @@ typedef struct CompactMove
 	BlockNumber blkno;
 } CompactMove;
 
+/* a tree's node to move */
+typedef struct CompactNode
+{
+	BlockNumber phys;
+	uint16		level;
+	BlockNumber first;
+} CompactNode;
+
 typedef struct CompactWalk
 {
 	BlockNumber target;			/* move the blocks from here */
@@ -8305,6 +8318,9 @@ typedef struct CompactWalk
 	CompactMove *moves;
 	uint32		n;
 	uint32		cap;
+	CompactNode *nodes;
+	uint32		nnodes;
+	uint32		capnodes;
 } CompactWalk;
 
 static void
@@ -8325,6 +8341,22 @@ compact_note(CompactWalk *cw, BlockNumber phys, BlockNumber blkno)
 static bool
 compact_visit_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
 {
+	CompactWalk *cw = arg;
+
+	if (node >= cw->target)
+	{
+		if (cw->nnodes == cw->capnodes)
+		{
+			cw->capnodes = Max(cw->capnodes * 2, 16);
+			cw->nodes = cw->nodes ?
+				repalloc_array(cw->nodes, CompactNode, cw->capnodes) :
+				palloc_array(CompactNode, cw->capnodes);
+		}
+		cw->nodes[cw->nnodes].phys = node;
+		cw->nodes[cw->nnodes].level = level;
+		cw->nodes[cw->nnodes].first = first;
+		cw->nnodes++;
+	}
 	return true;
 }
 
@@ -8545,6 +8577,258 @@ compact_page(SMgrRelation reln, BlockNumber blkno, BlockNumber phys)
 	return true;
 }
 
+/* the pages pointing to nodes moved, to be written out and synced */
+typedef struct CompactParents
+{
+	TreeParent *parents;
+	uint32		n;
+	uint32		cap;
+} CompactParents;
+
+/*
+ * Move a tree's node down: 'entries', those of node 'old_block' that
+ * 'parent' points to, made again at a lower free block, and the parent
+ * pointed to the copy.  The copy is a new incarnation, born at a position
+ * reserved before it is written, and it is written out and the page store
+ * synced before the record that points the parent to it: a parent on disk
+ * naming the copy was written after the record, so the copy is on disk
+ * then too, and redo, from any point, finds a version of the node where
+ * the parent points (a newer version than its records, which the map's
+ * redo follows as it does any; nothing is skipped).  The pointer is newer
+ * than any image of the parent from before the move, so an older image
+ * restored over it keeps it (keep_newer_entries()).  The old block is
+ * freed by the caller, once the parent is durable too.  InvalidBlockNumber
+ * if no lower block could be had (nothing is changed then).
+ */
+static BlockNumber
+tree_move_node(SMgrRelation reln, const TreeParent *parent, uint32 epoch,
+			   uint16 level, BlockNumber first, const BmapEntry *entries,
+			   BlockNumber old_block)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		parentbuf;
+	Buffer		nodebuf;
+	BlockNumber node;
+	Allocation	alloc;
+	xl_bmap_tree xlrec;
+	struct
+	{
+		xl_bmap_node_delta d;
+		xl_bmap_entry_delta e;
+	}			pdelta;
+	XLogRecPtr	born;
+	XLogRecPtr	lsn;
+	Page		page;
+	int			id = 0;
+
+	parentbuf = parent_read(reln, parent);
+	alloc_take(rel, 1, &node, &alloc);
+	if (node >= old_block)
+	{
+		/* (the room taken meanwhile: nothing is changed yet) */
+		alloc_release(&alloc);
+		ReleaseBuffer(parentbuf);
+		return InvalidBlockNumber;
+	}
+	prepare_node_store(rel, node, alloc.old_hw, alloc.new_hw);
+	nodebuf = tree_read(rel, node, RBM_ZERO_AND_LOCK);
+	map_locked_as_new(nodebuf);
+
+	/* the copy, on disk before anything can point to it */
+	born = GetXLogInsertRecPtr();
+	page = BufferGetPage(nodebuf);
+	init_tree_node(page, level, first, born);
+	memcpy(PageGetBmapEntries(page), entries,
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	MarkBufferDirty(nodebuf);
+	FlushOneBuffer(nodebuf);
+	mdimmedsync(store_smgr(rel), MAIN_FORKNUM);
+	INJECTION_POINT("bmap-compact-node-written", NULL);
+
+	/* (a backup that began before the copy was written can't be used) */
+	XLogNoteBackupUnsafe(GetXLogInsertRecPtr());
+
+	map_lock(parentbuf, false);
+	parent_check(reln, parent, BufferGetPage(parentbuf));
+
+	xlrec.locator = rel;
+	xlrec.op = BMAP_TREE_NODE;
+	xlrec.flags = BMAP_TREE_INSTALL | BMAP_TREE_MOVED;
+	xlrec.node = node;
+	xlrec.from = old_block;
+	xlrec.old_hw = alloc.old_hw;
+	xlrec.new_hw = alloc.new_hw;
+
+	XLogEnsureRecordSpace(2 + BMAP_ALLOC_MAX_PAGES, 0);
+	pdelta.d.kind = BMAP_DELTA_NODE;
+	pdelta.d.flags = 0;
+	pdelta.d.nentries = 1;
+	pdelta.d.since = born;
+	pdelta.e.slot = parent->slot;
+	pdelta.e.block = node;
+	pdelta.e.epoch = epoch;
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(nodebuf);
+	apply_node_delta(BufferGetPage(parentbuf), &pdelta.d);
+	MarkBufferDirty(parentbuf);
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	XLogRegisterBuffer(id++, parentbuf, REGBUF_STANDARD);
+	XLogRegisterBufData(0, &pdelta, sizeof(pdelta));
+	XLogRegisterBuffer(id++, nodebuf, REGBUF_FORCE_IMAGE);
+	alloc_apply_register(&alloc, id);
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
+	PageSetLSN(page, lsn);
+	PageSetLSN(BufferGetPage(parentbuf), lsn);
+	alloc_set_lsn(&alloc, lsn);
+	END_CRIT_SECTION();
+
+	alloc_release(&alloc);
+	map_unlock(parentbuf);
+	ReleaseBuffer(parentbuf);
+	map_unlock(nodebuf);
+	ReleaseBuffer(nodebuf);
+	INJECTION_POINT("bmap-compact-node-moved", NULL);
+	return node;
+}
+
+/*
+ * Move node 'phys' of reln, of 'level', mapping from 'first', to a lower
+ * free block (tree_move_node()), if it and every node above it are the
+ * relation's own and nothing else holds it, adding its parent to
+ * 'parents'.  True if it moved (and 'phys' is to be freed, once the
+ * parents are durable).  Under the header held exclusively, so the tree
+ * changes no other way meanwhile; lookups (a page written out) read the
+ * parent's pointer under its lock, and the old node stays as it was until
+ * it is freed.
+ *
+ * Not while an online backup runs: one copying the parent after the move
+ * and the copy's block before it was written couldn't be recovered from
+ * (redo from its start would read some other page as the node).  Every
+ * move notes the position (XLogNoteBackupUnsafe()), so that a backup that
+ * began before it fails as it stops.
+ */
+static bool
+compact_node(SMgrRelation reln, int level, BlockNumber first,
+			 BlockNumber phys, CompactParents *parents)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		headerbuf;
+	Buffer		buf;
+	uint32		epoch;
+	TreePath	path;
+	TreeParent	parent;
+	BmapEntry	ptr;
+	BmapEntry  *entries;
+	BlockNumber made;
+	bool		found = false;
+
+	if (!compact_has_room(rel, phys))
+		return false;
+
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
+	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
+
+	/* the path down to it, every node on it the relation's own */
+	tree_path(first, &path);
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	ptr = PageGetBmapRoot(BufferGetPage(buf))->top[path.top];
+	UnlockReleaseBuffer(buf);
+	parent.root = true;
+	parent.slot = path.top;
+	for (int l = path.top; l >= level && BlockNumberIsValid(ptr.block); l--)
+	{
+		if (!tree_node_own(rel, &ptr, epoch, true))
+			break;
+		if (l == level)
+		{
+			found = ptr.block == phys && path.first[l] == first;
+			break;
+		}
+		parent.root = false;
+		parent.blk = ptr.block;
+		parent.level = l;
+		parent.first = path.first[l];
+		parent.born = ptr.since;
+		parent.slot = path.slot[l];
+		buf = tree_read(rel, ptr.block, RBM_NORMAL);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		parent_check(reln, &parent, BufferGetPage(buf));
+		ptr = PageGetBmapEntries(BufferGetPage(buf))[parent.slot];
+		UnlockReleaseBuffer(buf);
+	}
+	if (!found || lookup_ref(rel, phys) != 0)
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return false;
+	}
+
+	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	buf = tree_read(rel, phys, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), level, first, ptr.since))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of \"%s\" is not the node of its block map it was",
+						phys, relpath(reln->smgr_rlocator, MAIN_FORKNUM).str)));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	made = tree_move_node(reln, &parent, epoch, level, first, entries, phys);
+	pfree(entries);
+	UnlockReleaseBuffer(headerbuf);
+	if (!BlockNumberIsValid(made))
+		return false;
+
+	if (parents->n == parents->cap)
+	{
+		parents->cap = Max(parents->cap * 2, 16);
+		parents->parents = parents->parents ?
+			repalloc_array(parents->parents, TreeParent, parents->cap) :
+			palloc_array(TreeParent, parents->cap);
+	}
+	parents->parents[parents->n++] = parent;
+	return true;
+}
+
+/*
+ * Write out the pages that point to nodes moved, and sync the files they
+ * are in: the relation's map fork for its root page, the page store for a
+ * node.  A parent made something else since (moved itself, its copy then
+ * durable) is written as it is, which does no harm.
+ */
+static void
+compact_sync_parents(SMgrRelation reln, const CompactParents *parents)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	bool		root = false;
+	bool		nodes = false;
+
+	for (uint32 i = 0; i < parents->n; i++)
+	{
+		const TreeParent *p = &parents->parents[i];
+		Buffer		buf = p->root ? map_read(rel, 1) :
+			tree_read(rel, p->blk, RBM_NORMAL);
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
+		FlushOneBuffer(buf);
+		UnlockReleaseBuffer(buf);
+		if (p->root)
+			root = true;
+		else
+			nodes = true;
+	}
+	if (root)
+		mdimmedsync(reln, BMAP_FORKNUM);
+	if (nodes)
+		mdimmedsync(store_smgr(rel), MAIN_FORKNUM);
+}
+
 static int
 cmp_move_desc(const void *a, const void *b)
 {
@@ -8562,10 +8846,11 @@ static uint64
 compact_relation(SMgrRelation reln, BlockNumber target)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
-	CompactWalk cw = {target, 0, NULL, 0, 0};
+	CompactWalk cw = {target, 0, NULL, 0, 0, NULL, 0, 0};
 	Buffer		headerbuf;
 	BlockList	freed = {NULL, 0, 0};
 	uint64		moved = 0;
+	CompactParents parents = {0};
 
 	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0)
 		return 0;
@@ -8580,10 +8865,11 @@ compact_relation(SMgrRelation reln, BlockNumber target)
 	cw.nblocks = PageGetBmapHeader(BufferGetPage(headerbuf))->nblocks;
 	tree_walk(reln, compact_visit_node, compact_visit_entry, &cw);
 	UnlockReleaseBuffer(headerbuf);
-	if (cw.n == 0)
+	if (cw.n == 0 && cw.nnodes == 0)
 		return 0;
 
-	qsort(cw.moves, cw.n, sizeof(CompactMove), cmp_move_desc);
+	if (cw.n > 0)
+		qsort(cw.moves, cw.n, sizeof(CompactMove), cmp_move_desc);
 	for (uint32 i = 0; i < cw.n; i++)
 	{
 		const CompactMove *m = &cw.moves[i];
@@ -8595,14 +8881,55 @@ compact_relation(SMgrRelation reln, BlockNumber target)
 		}
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	/*
+	 * The nodes, not while an online backup runs (see compact_node()); one
+	 * starting meanwhile fails at its stop.
+	 */
+	if (cw.nnodes > 0 && !XLogBackupInProgress())
+	{
+		INJECTION_POINT("bmap-compact-nodes", NULL);
+		for (uint32 i = 0; i < cw.nnodes; i++)
+		{
+			const CompactNode *m = &cw.nodes[i];
+
+			if (compact_node(reln, m->level, m->first, m->phys, &parents))
+			{
+				block_list_add(&freed, m->phys);
+				moved++;
+			}
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
 	INJECTION_POINT("bmap-compact-moved", NULL);
+
+	/*
+	 * A moved node's old block may be taken again once freed: first, the
+	 * pages pointing to the copies are written out and synced, so that no
+	 * redo, however early it begins, reads an old parent's pointer to the
+	 * old block made something else.
+	 */
+	if (parents.n > 0)
+	{
+		compact_sync_parents(reln, &parents);
+		INJECTION_POINT("bmap-compact-parents-synced", NULL);
+	}
 	if (freed.n > 0)
 	{
 		qsort(freed.blocks, freed.n, sizeof(BlockNumber), cmp_block);
 		free_blocks(rel, freed.blocks, freed.n);
 		pfree(freed.blocks);
 	}
-	pfree(cw.moves);
+	if (parents.n > 0)
+	{
+		/* (a backup that began before the frees can't be used) */
+		XLogNoteBackupUnsafe(GetXLogInsertRecPtr());
+		pfree(parents.parents);
+	}
+	if (cw.moves)
+		pfree(cw.moves);
+	if (cw.nodes)
+		pfree(cw.nodes);
 	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_BLOCKS_MOVED, moved);
 	return moved;
 }
@@ -10882,6 +11209,27 @@ forget_cached_size(RelFileLocator rel)
 	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 }
 
+/*
+ * In redo: block 'block_id' of the record, as replayed, written out and its
+ * file synced.
+ */
+static void
+redo_flush_block(XLogReaderState *record, uint8 block_id)
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	Buffer		buf;
+
+	XLogRecGetBlockTag(record, block_id, &rlocator, &forknum, &blkno);
+	buf = ReadBufferWithoutRelcache(rlocator, forknum, blkno, RBM_NORMAL,
+									NULL, true);
+	LockBuffer(buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
+	FlushOneBuffer(buf);
+	UnlockReleaseBuffer(buf);
+	mdimmedsync(smgropen(rlocator, INVALID_PROC_NUMBER), forknum);
+}
+
 void
 bmap_redo(XLogReaderState *record)
 {
@@ -10966,6 +11314,26 @@ bmap_redo(XLogReaderState *record)
 				if (xlrec->op == BMAP_TREE_NODE || xlrec->op == BMAP_TREE_COPY)
 					prepare_node_store(xlrec->locator, xlrec->node,
 									   xlrec->old_hw, xlrec->new_hw);
+
+				/*
+				 * A node moved down: as the primary did, the copy durable
+				 * before the parent takes it, and the parent durable after,
+				 * before a later record can take the old block again (see
+				 * tree_move_node()).  A backup taken here meanwhile can't be
+				 * used.
+				 */
+				if (xlrec->op == BMAP_TREE_NODE &&
+					(xlrec->flags & BMAP_TREE_MOVED) != 0)
+				{
+					redo_block(record, 1);
+					redo_flush_block(record, 1);
+					redo_block(record, 0);
+					redo_flush_block(record, 0);
+					for (uint8 id = 2; id <= XLogRecMaxBlockId(record); id++)
+						redo_block(record, id);
+					XLogNoteBackupUnsafe(record->ReadRecPtr);
+					break;
+				}
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
 

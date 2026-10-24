@@ -2,8 +2,9 @@
 
 # A page sweep moves the data pages past the page store's allocated count
 # down into the holes freeing left (a table's blocks among a dropped
-# one's), and shortens the store past them: its file then ends at its last
-# allocated block or the last tree node past the count, as nodes stay.
+# one's), and the tree nodes too, and shortens the store past them: its
+# file then ends at its last allocated block, or a node that couldn't move
+# (one another relation shares).
 # The moves are logged as copies before a change are: a standby replays
 # them, as does crash recovery, every page checked against the primary's
 # (wal_consistency_checking).  Blocks another relation shares stay, a
@@ -97,7 +98,8 @@ my ($freed, $truncated, $nmoved) = split / /, sql($sweep);
 cmp_ok($nmoved, '>', 0, 'a sweep moves blocks down');
 is(sql($moved) - $before, $nmoved, 'pg_stat_prolly counts the moves the sweep returns');
 cmp_ok($truncated, '>', 0, 'and shortens the store past them');
-is(sql($nodes), $nodes_before, 'no tree node is moved');
+isnt(sql($nodes), $nodes_before, 'tree nodes are moved down too');
+cmp_ok(sql($last_node), '<', store_blocks($node), 'and are all within the store');
 my $allocated = store_blocks($node) - sql('SELECT test_bmap_free_blocks()');
 my $end = sql($last_node) + 1;
 is(store_blocks($node), $allocated > $end ? $allocated : $end,

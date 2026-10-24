@@ -557,6 +557,13 @@ typedef struct XLogCtlData
 	 */
 	XLogRecPtr	lastFpwDisableRecPtr;
 
+	/*
+	 * lastBackupUnsafePtr: an online backup whose start point isn't past it
+	 * may have copied files, as storage changed them, in an order its
+	 * recovery can't follow (XLogNoteBackupUnsafe()); its stop fails.
+	 */
+	XLogRecPtr	lastBackupUnsafePtr;
+
 	/* current data checksum state of this node */
 	uint32		data_checksum_version;
 
@@ -7295,6 +7302,22 @@ XLogBackupInProgress(void)
 }
 
 /*
+ * Note that an online backup whose start point isn't past 'lsn' can't be
+ * used: a storage manager changed files then in a way a backup copying
+ * them meanwhile can't be recovered from (block-mapped storage moving a
+ * tree's node).  Its do_pg_backup_stop() fails, on a primary or, for the
+ * records replayed, on a standby.
+ */
+void
+XLogNoteBackupUnsafe(XLogRecPtr lsn)
+{
+	SpinLockAcquire(&XLogCtl->info_lck);
+	if (XLogCtl->lastBackupUnsafePtr < lsn)
+		XLogCtl->lastBackupUnsafePtr = lsn;
+	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+/*
  * GetInsertRecPtr -- Returns the current insert position.
  *
  * NOTE: The value *actually* returned is the position of the last full
@@ -10398,6 +10421,22 @@ do_pg_backup_stop(BackupState *state, bool waitforarchive)
 	sessionBackupState = SESSION_BACKUP_NONE;
 
 	WALInsertLockRelease();
+
+	/* storage changed in a way the files copied can't be recovered from */
+	{
+		XLogRecPtr	unsafe;
+
+		SpinLockAcquire(&XLogCtl->info_lck);
+		unsafe = XLogCtl->lastBackupUnsafePtr;
+		SpinLockRelease(&XLogCtl->info_lck);
+		if (state->startpoint <= unsafe)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("block-mapped storage moved tree nodes during online backup"),
+					 errhint("This means that the backup being taken is corrupt "
+							 "and should not be used. "
+							 "Try taking another online backup.")));
+	}
 
 	/*
 	 * If we are taking an online backup from the standby, we confirm that the
