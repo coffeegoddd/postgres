@@ -11313,10 +11313,17 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 										 pnstrdup((const char *) def[1].data, def[1].len),
 										 pnstrdup((const char *) def[2].data, def[2].len),
 										 kept_conflicts != NULL);
+		/*
+		 * (a table one side dropped and the other changed, its rows or its
+		 * definition: kept, a schema conflict, as Dolt keeps it)
+		 */
+		if (!retyped && kept_conflicts != NULL && least->data[0] == 't' &&
+			has[0] && has[1] != has[2] && CHANGED(has[1] ? 1 : 2))
+			retyped = true;
 		if (retyped)
 		{
-			/* (kept as ours has it: a schema conflict) */
-			take = &v[1];
+			/* (kept as ours has it, or gone if ours dropped it) */
+			take = has[1] ? &v[1] : NULL;
 			*kept_conflicts = lappend(*kept_conflicts,
 									  from_utf8(least->data + 2, least->len - 2));
 		}

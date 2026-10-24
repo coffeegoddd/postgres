@@ -8619,6 +8619,13 @@ typedef struct MergeRows
 static bool keep_schema_conflicts = false;
 static List *schema_conflicted = NIL;
 
+/*
+ * The tables a merge's alignment renamed on some side (each rename's table
+ * and, for a table's, what it is renamed to): a schema conflict in one
+ * isn't kept, as the branch's table would no longer be as it has it.
+ */
+static List *merge_renamed_tables = NIL;
+
 static bool
 schema_conflicted_table(const MergeRows *mr, const char *name)
 {
@@ -9185,6 +9192,19 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 				PG_RE_THROW();
 		}
 		FlushErrorState();
+
+		/*
+		 * (with a table kept as the branch has it, the other side's objects
+		 * may use its version: say so, the conflict not being kept)
+		 */
+		if (mr->schema_conflicts != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("schema conflict: %s was changed differently on both sides, and the other side's objects use its version of it",
+							(char *) linitial(mr->schema_conflicts)),
+					 errdetail("Kept as the branch has it, the table doesn't fit the other side's objects: %s",
+							   ed->message),
+					 errhint("Make the definitions agree on one side, and merge again.")));
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("schema conflict: the merged definitions don't fit together"),
@@ -9236,6 +9256,19 @@ align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
 	PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, renames, identity);
 	if (renames[0] == NIL && renames[1] == NIL && renames[2] == NIL)
 		return false;
+	for (int i = 0; i < 3; i++)
+	{
+		ListCell   *lc;
+
+		foreach(lc, renames[i])
+		{
+			ProllyRename *r = lfirst(lc);
+
+			merge_renamed_tables = lappend(merge_renamed_tables, r->table);
+			if (r->column == NULL)
+				merge_renamed_tables = lappend(merge_renamed_tables, r->to);
+		}
+	}
 	for (int i = 0; i < 3; i += 2)
 		if (renames[i] != NIL)
 			PROLLY_CALL(dc.canonicalizer, rename_root, &roots[i], renames[i],
@@ -9272,6 +9305,7 @@ merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
 	int			conflicts;
 
 	initStringInfo(&identity);
+	merge_renamed_tables = NIL;
 	renamed = align_merge(roots, commits, aligned, &identity);
 	conflicts = merge_aligned(aligned, commits, fail_on_conflict, what, name,
 							  conflicted);
@@ -9313,6 +9347,22 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 					keep_schema_conflicts && !fail_on_conflict ?
 					&mr.schema_conflicts : NULL);
 		schema_conflicted = mr.schema_conflicts;
+
+		/*
+		 * (a table renamed on a side: kept, it would take the merged name,
+		 * and its versions be found under other names; refused instead)
+		 */
+		foreach_ptr(char, kept, mr.schema_conflicts)
+		{
+			foreach_ptr(char, renamed, merge_renamed_tables)
+				if (strcmp(kept, renamed) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+							 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+									kept),
+							 errdetail("A schema conflict is kept only for a table neither side renamed."),
+							 errhint("Make the definitions agree on one side, or rename the table on the other side too, and merge again.")));
+		}
 		move_schema_merging(&roots[1], &merged, &mr);
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		return mr.conflicts;

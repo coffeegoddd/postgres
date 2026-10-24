@@ -194,8 +194,10 @@ adapts.
   listed in `dolt_schema_conflicts`; `dolt_conflicts_resolve()` refuses it
   and a commit waits for `--abort`, as in Dolt. Other schema conflicts
   (objects other than tables, renames to one name, inheritance and typed
-  tables, enum labels) are errors naming the objects, and the merge
-  doesn't happen; so is any schema conflict of a cherry-pick or revert. A merge,
+  tables, enum labels, a conflicted table renamed on either side, or one
+  the other side's objects use in its version) are errors naming the
+  objects, and the merge doesn't happen; so is any schema conflict of a
+  cherry-pick or revert. A merge,
   cherry-pick or revert into uncommitted changes is refused when it
   would change a table, sequence or materialized view with uncommitted
   changes, as Dolt's is. When definitions change, on either side or

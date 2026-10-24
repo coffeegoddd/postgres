@@ -161,8 +161,86 @@ COMMIT;
 SELECT dolt_checkout('drop_left') IS NOT NULL AS on_left;
 SELECT dolt_cherry_pick('drop_right');
 
+-- a table one side dropped and the other changed only the rows of: a
+-- schema conflict too, as in Dolt ("a table deletion with data
+-- modification"), both ways round
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE sc.d (pk int PRIMARY KEY, v int);
+INSERT INTO sc.d VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'd')::text) AS committed;
+SELECT dolt_branch('d_rows');
+SELECT dolt_branch('d_drop');
+SELECT dolt_checkout('d_rows') IS NOT NULL AS on_rows;
+INSERT INTO sc.d VALUES (2, 2);
+SELECT length(dolt_commit('-am', 'd rows')::text) AS committed;
+SELECT dolt_checkout('d_drop') IS NOT NULL AS on_drop;
+DROP TABLE sc.d;
+SELECT length(dolt_commit('-Am', 'd dropped')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('d_rows'))[2:4];
+SELECT table_name, our_schema, description FROM dolt_schema_conflicts;
+SELECT to_regclass('sc.d') IS NULL AS still_dropped;
+SELECT (dolt_merge('--abort'))[4];
+COMMIT;
+SELECT dolt_checkout('d_rows') IS NOT NULL AS on_rows;
+BEGIN;
+SELECT (dolt_merge('d_drop'))[2:4];
+SELECT table_name, their_schema, description FROM dolt_schema_conflicts;
+SELECT pk FROM sc.d ORDER BY pk;
+SELECT (dolt_merge('--abort'))[4];
+COMMIT;
+
+-- the description names built-in types alike, unqualified
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('ty_text');
+SELECT dolt_branch('ty_big');
+SELECT dolt_checkout('ty_text') IS NOT NULL AS on_text;
+ALTER TABLE sc.d ALTER COLUMN v TYPE text;
+SELECT length(dolt_commit('-am', 'v text')::text) AS committed;
+SELECT dolt_checkout('ty_big') IS NOT NULL AS on_big;
+ALTER TABLE sc.d ALTER COLUMN v TYPE bigint;
+SELECT length(dolt_commit('-am', 'v bigint')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('ty_text'))[2:4];
+SELECT table_name, description FROM dolt_schema_conflicts;
+SELECT (dolt_merge('--abort'))[4];
+COMMIT;
+
+-- theirs' objects using theirs' version of the kept table: the merge
+-- fails, saying which table's conflict it is
+SELECT dolt_checkout('ty_text') IS NOT NULL AS on_text;
+ALTER TABLE sc.d ADD COLUMN w int;
+CREATE VIEW sc.dv AS SELECT pk, w FROM sc.d;
+SELECT length(dolt_commit('-Am', 'view on w')::text) AS committed;
+SELECT dolt_checkout('ty_big') IS NOT NULL AS on_big;
+BEGIN;
+SELECT (dolt_merge('ty_text'))[2:4];
+ROLLBACK;
+
+-- a table renamed on one side (matched by identity) in such a conflict:
+-- not kept, as the branch's table would take the merged name; refused,
+-- both ways round
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT dolt_branch('rn_retype');
+SELECT dolt_branch('rn_rename');
+SELECT dolt_checkout('rn_retype') IS NOT NULL AS on_retype;
+ALTER TABLE sc.d ALTER COLUMN v TYPE text;
+SELECT length(dolt_commit('-am', 'rn text')::text) AS committed;
+SELECT dolt_checkout('rn_rename') IS NOT NULL AS on_rename;
+ALTER TABLE sc.d RENAME TO e;
+ALTER TABLE sc.e ALTER COLUMN v TYPE bigint;
+SELECT length(dolt_commit('-am', 'rn renamed')::text) AS committed;
+BEGIN;
+SELECT (dolt_merge('rn_retype'))[2:4];
+ROLLBACK;
+SELECT dolt_checkout('rn_retype') IS NOT NULL AS on_retype;
+BEGIN;
+SELECT (dolt_merge('rn_rename'))[2:4];
+ROLLBACK;
+
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
-	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left']) b;
+	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left',
+	'd_rows', 'd_drop', 'ty_text', 'ty_big', 'rn_retype', 'rn_rename']) b;
 DROP SCHEMA sc CASCADE;
 SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;

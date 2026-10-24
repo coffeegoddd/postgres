@@ -520,6 +520,279 @@ SELECT dolt_checkout('drop_left') IS NOT NULL AS on_left;
 SELECT dolt_cherry_pick('drop_right');
 ERROR:  schema conflict: sc.other was changed differently on both sides
 DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+-- a table one side dropped and the other changed only the rows of: a
+-- schema conflict too, as in Dolt ("a table deletion with data
+-- modification"), both ways round
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE sc.d (pk int PRIMARY KEY, v int);
+INSERT INTO sc.d VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'd')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('d_rows');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('d_drop');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('d_rows') IS NOT NULL AS on_rows;
+ on_rows 
+---------
+ t
+(1 row)
+
+INSERT INTO sc.d VALUES (2, 2);
+SELECT length(dolt_commit('-am', 'd rows')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('d_drop') IS NOT NULL AS on_drop;
+ on_drop 
+---------
+ t
+(1 row)
+
+DROP TABLE sc.d;
+SELECT length(dolt_commit('-Am', 'd dropped')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('d_rows'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, our_schema, description FROM dolt_schema_conflicts;
+ table_name | our_schema |                     description                      
+------------+------------+------------------------------------------------------
+ sc.d       | <deleted>  | cannot merge a table deletion with data modification
+(1 row)
+
+SELECT to_regclass('sc.d') IS NULL AS still_dropped;
+ still_dropped 
+---------------
+ t
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+SELECT dolt_checkout('d_rows') IS NOT NULL AS on_rows;
+ on_rows 
+---------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('d_drop'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, their_schema, description FROM dolt_schema_conflicts;
+ table_name | their_schema |                     description                      
+------------+--------------+------------------------------------------------------
+ sc.d       | <deleted>    | cannot merge a table deletion with data modification
+(1 row)
+
+SELECT pk FROM sc.d ORDER BY pk;
+ pk 
+----
+  1
+  2
+(2 rows)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+-- the description names built-in types alike, unqualified
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('ty_text');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('ty_big');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('ty_text') IS NOT NULL AS on_text;
+ on_text 
+---------
+ t
+(1 row)
+
+ALTER TABLE sc.d ALTER COLUMN v TYPE text;
+SELECT length(dolt_commit('-am', 'v text')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ty_big') IS NOT NULL AS on_big;
+ on_big 
+--------
+ t
+(1 row)
+
+ALTER TABLE sc.d ALTER COLUMN v TYPE bigint;
+SELECT length(dolt_commit('-am', 'v bigint')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('ty_text'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, description FROM dolt_schema_conflicts;
+ table_name |                        description                        
+------------+-----------------------------------------------------------
+ sc.d       | incompatible column types for column 'v': bigint and text
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+-- theirs' objects using theirs' version of the kept table: the merge
+-- fails, saying which table's conflict it is
+SELECT dolt_checkout('ty_text') IS NOT NULL AS on_text;
+ on_text 
+---------
+ t
+(1 row)
+
+ALTER TABLE sc.d ADD COLUMN w int;
+CREATE VIEW sc.dv AS SELECT pk, w FROM sc.d;
+SELECT length(dolt_commit('-Am', 'view on w')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('ty_big') IS NOT NULL AS on_big;
+ on_big 
+--------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('ty_text'))[2:4];
+ERROR:  schema conflict: sc.d was changed differently on both sides, and the other side's objects use its version of it
+DETAIL:  Kept as the branch has it, the table doesn't fit the other side's objects: column "w" does not exist
+HINT:  Make the definitions agree on one side, and merge again.
+ROLLBACK;
+-- a table renamed on one side (matched by identity) in such a conflict:
+-- not kept, as the branch's table would take the merged name; refused,
+-- both ways round
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('rn_retype');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('rn_rename');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('rn_retype') IS NOT NULL AS on_retype;
+ on_retype 
+-----------
+ t
+(1 row)
+
+ALTER TABLE sc.d ALTER COLUMN v TYPE text;
+SELECT length(dolt_commit('-am', 'rn text')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('rn_rename') IS NOT NULL AS on_rename;
+ on_rename 
+-----------
+ t
+(1 row)
+
+ALTER TABLE sc.d RENAME TO e;
+ALTER TABLE sc.e ALTER COLUMN v TYPE bigint;
+SELECT length(dolt_commit('-am', 'rn renamed')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('rn_retype'))[2:4];
+ERROR:  schema conflict: sc.e was changed differently on both sides, and renamed on one
+DETAIL:  A schema conflict is kept only for a table neither side renamed.
+HINT:  Make the definitions agree on one side, or rename the table on the other side too, and merge again.
+ROLLBACK;
+SELECT dolt_checkout('rn_retype') IS NOT NULL AS on_retype;
+ on_retype 
+-----------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('rn_rename'))[2:4];
+ERROR:  schema conflict: sc.e was changed differently on both sides, and renamed on one
+DETAIL:  A schema conflict is kept only for a table neither side renamed.
+HINT:  Make the definitions agree on one side, or rename the table on the other side too, and merge again.
+ROLLBACK;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  on_main 
 ---------
@@ -527,7 +800,8 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 (1 row)
 
 SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
-	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left']) b;
+	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left',
+	'd_rows', 'd_drop', 'ty_text', 'ty_big', 'rn_retype', 'rn_rename']) b;
  dolt_branch 
 -------------
  {0}
@@ -537,12 +811,19 @@ SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
  {0}
  {0}
  {0}
-(7 rows)
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+(13 rows)
 
 DROP SCHEMA sc CASCADE;
-NOTICE:  drop cascades to 2 other objects
+NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to table sc.t
 drop cascades to table sc.other
+drop cascades to table sc.d
 SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
  committed 
 -----------

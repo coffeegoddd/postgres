@@ -223,9 +223,10 @@
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
- * pages retired.
+ * pages retired; 8: a merge's tables in schema conflicts, in its merge
+ * names entry.
  */
-#define REFS_FORMAT		"5"
+#define REFS_FORMAT		"8"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a

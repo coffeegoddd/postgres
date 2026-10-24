@@ -7655,6 +7655,13 @@ column_named(List *columns, const char *name)
 	return NULL;
 }
 
+/* A column's type as a description names it: built-in types unqualified. */
+static const char *
+shown_type(const char *type)
+{
+	return strncmp(type, "pg_catalog.", 11) == 0 ? type + 11 : type;
+}
+
 /*
  * What conflicts in a table both sides changed, in Dolt's words where it
  * has them: a column the sides give types that differ, one a side
@@ -7688,9 +7695,9 @@ conflict_description(const ConflictSide *base, const ConflictSide *ours,
 		ProllyTableColumn *oc = column_named(o, bc->name);
 		ProllyTableColumn *tc = column_named(t, bc->name);
 
-		if (oc && tc && strcmp(oc->type, tc->type) != 0)
+		if (oc && tc && strcmp(shown_type(oc->type), shown_type(tc->type)) != 0)
 			return psprintf("incompatible column types for column '%s': %s and %s",
-							bc->name, oc->type, tc->type);
+							bc->name, shown_type(oc->type), shown_type(tc->type));
 		if ((oc == NULL) != (tc == NULL) &&
 			strcmp((oc ? oc : tc)->type, bc->type) != 0)
 			return psprintf("column '%s' was dropped on one side and changed on the other",
