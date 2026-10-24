@@ -224,6 +224,7 @@ tests += {
       'kept_commit_shares',
       'snapshot_mounts',
       'history_mounts',
+      'head_move_privileges',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],

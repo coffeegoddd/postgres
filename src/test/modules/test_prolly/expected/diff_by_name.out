@@ -380,17 +380,23 @@ SELECT table_name, rows_added FROM dolt_diff_stat('HEAD~', 'HEAD');
 (1 row)
 
 RESET ROLE;
--- the head moved back to the dropped table's commit, by the reader: the
--- head's version is no longer this table's by the branch's record of its
--- head, so the step from the working set to the head vouches for nothing
+-- the head moved back to the dropped table's commit: not by the reader,
+-- whose SELECT moves no head; by the owner, after which the head's version
+-- is no longer this table's by the branch's record of its head, so the
+-- step from the working set to the head vouches for nothing
 SELECT dolt_hashof('HEAD') AS secret_head \gset
 SET ROLE regress_dn_reader;
+SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
+ERROR:  permission denied to move the head of branch "main"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
+RESET ROLE;
 SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
  moved 
 -------
  t
 (1 row)
 
+SET ROLE regress_dn_reader;
 SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
 ERROR:  dolt_at can't read "dn.secret": the table of that name here isn't the one a version holds
 DETAIL:  The name was without a table since that version, or the branch's head was moved to it since its last commit, so the table here may be another.
