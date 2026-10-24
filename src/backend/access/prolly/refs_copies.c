@@ -4504,7 +4504,7 @@ copies_commit_relations(const ProllyHash *commit, char **lines)
  * working set's own, so it is recorded made only from what both hold.
  */
 static char *
-relations_kept(const ProllyHash *parent, const char *now)
+relations_kept(const ProllyHash *parent, const char *had, const char *now)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -4513,8 +4513,11 @@ relations_kept(const ProllyHash *parent, const char *now)
 	initStringInfo(&key);
 	initStringInfo(&v);
 	initStringInfo(&out);
-	relations_key(&key, parent);
-	if (refs_get(key.data, key.len, &v))
+	if (had != NULL)
+		appendStringInfoString(&v, had);
+	else
+		relations_key(&key, parent);
+	if (had != NULL || refs_get(key.data, key.len, &v))
 	{
 		for (char *p = v.data; *p;)
 		{
@@ -4539,9 +4542,10 @@ relations_kept(const ProllyHash *parent, const char *now)
 
 /*
  * The branch's record of its head's tables, and the head's relation
- * record: of the working set, or (partial: the head isn't the working set
- * folded) only of what its first parent's record and the working set both
- * hold (relations_kept()).
+ * record (the same lines): of the working set, or (partial: the head isn't
+ * the working set folded) only of what its first parent's record and the
+ * working set both hold (relations_kept()): the parent's taken from the
+ * branch's record, when that is of it, which the record's put reads anyway.
  */
 static void
 note_head_names(const char *name, const ProllyHash *head,
@@ -4550,17 +4554,37 @@ note_head_names(const char *name, const ProllyHash *head,
 	StringInfoData key;
 	StringInfoData v;
 	char	   *hex = prolly_hash_hex(head);
+	char	   *lines;
 
 	initStringInfo(&key);
 	initStringInfo(&v);
 	names_key(&key, name);
-	appendStringInfo(&v, "%s\n", hex);
-	table_names(&v);
-	refs_put(key.data, key.len, &v);
 	if (partial != NULL)
-		note_relations(head, relations_kept(partial, v.data + strlen(hex) + 1));
+	{
+		char	   *phex = prolly_hash_hex(partial);
+		char	   *had = NULL;
+		StringInfoData now;
+
+		if (refs_get(key.data, key.len, &v) &&
+			strncmp(v.data, phex, strlen(phex)) == 0 && v.data[strlen(phex)] == '\n')
+			had = pstrdup(v.data + strlen(phex) + 1);
+		initStringInfo(&now);
+		table_names(&now);
+		lines = relations_kept(partial, had, now.data);
+		pfree(phex);
+	}
 	else
-		note_relations(head, v.data + strlen(hex) + 1);
+	{
+		StringInfoData now;
+
+		initStringInfo(&now);
+		table_names(&now);
+		lines = now.data;
+	}
+	resetStringInfo(&v);
+	appendStringInfo(&v, "%s\n%s", hex, lines);
+	refs_put(key.data, key.len, &v);
+	note_relations(head, lines);
 	pfree(hex);
 	pfree(key.data);
 	pfree(v.data);

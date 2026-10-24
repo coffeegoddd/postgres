@@ -258,6 +258,15 @@ SELECT (dolt_merge('--no-ff', '-m', 'picks in', 'picks'))[3] AS conflicts;
 SET ROLE regress_lb_reader;
 SELECT * FROM dolt_at('HEAD', NULL::ln.sm);
 RESET ROLE;
+-- (nor through a snapshot mount of it)
+CREATE SCHEMA lb_snap;
+SELECT mount FROM prolly_mount('HEAD', 'ln', 'lb_snap', ARRAY['sm']);
+GRANT USAGE ON SCHEMA lb_snap TO regress_lb_reader;
+GRANT SELECT ON lb_snap.sm TO regress_lb_reader;
+SET ROLE regress_lb_reader;
+SELECT * FROM lb_snap.sm;
+RESET ROLE;
+SELECT prolly_unmount('lb_snap');
 SELECT dolt_reset('--hard', :'secrets_head') IS NOT NULL AS back;
 -- (a cherry-pick)
 SELECT pg_temp.remake('sp');
