@@ -230,6 +230,25 @@ static void commit_root(const ProllyHash *id, ProllyNodeRef *root);
 static List *tables_in_root(const ProllyNodeRef *root, const ProllyHash *commit,
 							bool exact);
 
+/*
+ * An error caught inside an internal subtransaction (ed, copied into cxt),
+ * raised again once the subtransaction is rolled back.  Raised with it
+ * still open, whatever catches the error next would find the wrong
+ * (sub)transaction current: a PL/pgSQL EXCEPTION block would roll back
+ * this one rather than its own, and prolly_datum_fixed_text() would
+ * restore its settings below this one's nest level, which the
+ * subtransaction's abort then finds already gone.
+ */
+pg_noreturn static void
+rethrow_rolled_back(ErrorData *ed, MemoryContext cxt, ResourceOwner owner)
+{
+	FlushErrorState();
+	RollbackAndReleaseCurrentSubTransaction();
+	MemoryContextSwitchTo(cxt);
+	CurrentResourceOwner = owner;
+	ReThrowError(ed);
+}
+
 static ProllyDatabaseComponents
 components(void)
 {
@@ -3990,7 +4009,7 @@ try_write(Relation rel, const ProllyApplierRoutine *ar, ProllyApplier *a,
 		MemoryContextSwitchTo(cxt);
 		ed = CopyErrorData();
 		if (refusal_type(ed->sqlerrcode) == NULL)
-			PG_RE_THROW();
+			rethrow_rolled_back(ed, cxt, owner);
 		FlushErrorState();
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
@@ -4441,7 +4460,20 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 	 * a value; their writes too, as a restore's run under the settings its
 	 * dump fixes)
 	 */
-	prolly_datum_fixed_text(apply_passes, &ap);
+	PG_TRY();
+	{
+		prolly_datum_fixed_text(apply_passes, &ap);
+	}
+	PG_CATCH();
+	{
+		if (ap.put_back)
+		{
+			MemoryContextSwitchTo(cxt);
+			rethrow_rolled_back(CopyErrorData(), cxt, owner);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (recording && ap.keyless)
 		refuse_keyless_violations(ap.rel, ap.removed_rows);
 	if (ap.put_back)
@@ -5827,7 +5859,16 @@ write_keys(KeyWriter *kw)
 		INJECTION_POINT("prolly-merge-write-attempt", NULL);
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
-		written = write_keys_once(kw);
+		PG_TRY();
+		{
+			written = write_keys_once(kw);
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(cxt);
+			rethrow_rolled_back(CopyErrorData(), cxt, owner);
+		}
+		PG_END_TRY();
 		if (written)
 			ReleaseCurrentSubTransaction();
 		else
@@ -7869,7 +7910,7 @@ done:
 		ed = CopyErrorData();
 		if (ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_DATA_EXCEPTION &&
 			ERRCODE_TO_CATEGORY(ed->sqlerrcode) != ERRCODE_INTEGRITY_CONSTRAINT_VIOLATION)
-			PG_RE_THROW();
+			rethrow_rolled_back(ed, cxt, owner);
 		FlushErrorState();
 		FreeErrorData(ed);
 		RollbackAndReleaseCurrentSubTransaction();
@@ -9117,6 +9158,8 @@ typedef struct MergeRows
 	const ProllyNodeRef *now_root;	/* the branch, if known (as now) */
 	const MergeCommits *commits;	/* the roots' commits */
 	List	   *schema_conflicts;	/* tables kept as ours has them (names) */
+	bool		matviews_later; /* merge_rows() leaves materialized views to
+								 * its caller */
 } MergeRows;
 
 /*
@@ -9425,16 +9468,21 @@ static void merge_tables_rows(void *arg);
  * written under fixed (prolly_datum_fixed_text(): TimeZone UTC, ISO dates,
  * the C locale's money, numbers and times, hex bytea, and the rest), not
  * the merging session's: the same merge makes the same rows, and the same
- * commit, in any session.  ALTER TABLE ... TYPE converts under the
- * session's own settings, so a merged row's value can differ from the one
- * a side's own ALTER wrote, where that session's settings weren't these.
+ * commit, in any session.  A side's own ALTER TABLE ... TYPE converted
+ * under that session's settings, so a merged row's value can differ from
+ * the one it wrote, where that session's settings weren't these.  (A merge
+ * that moves the definitions first runs this so too, its statements under
+ * the same settings: move_schema_merging().)
  */
 static void
 merge_rows(void *arg)
 {
-	prolly_datum_fixed_text(merge_tables_rows, arg);
+	MergeRows  *mr = arg;
+
+	prolly_datum_fixed_text(merge_tables_rows, mr);
 	/* (a materialized view's query runs under the session's settings) */
-	merge_matviews((MergeRows *) arg);
+	if (!mr->matviews_later)
+		merge_matviews(mr);
 }
 
 /* merge_rows()'s rows, with the text settings fixed */
@@ -9693,22 +9741,48 @@ refuse_local_changes(const char *what)
 			 errhint("Commit them, or reset the branch, first.")));
 }
 
+/* A merge's move of the branch's definitions, as move_schema_merging()'s */
+typedef struct SchemaMerging
+{
+	const ProllyNodeRef *ours;
+	const ProllyNodeRef *merged;
+	MergeRows  *mr;
+} SchemaMerging;
+
+static void
+moving_schema(void *arg)
+{
+	SchemaMerging *sm = arg;
+
+	PROLLY_CALL(components().canonicalizer, move_schema, sm->ours,
+				sm->merged, merge_rows, take_breaking_rows, sm->mr, false);
+}
+
 /*
  * The branch's definitions made the merged ones, its rows merged as mr
  * says.  What one side dropped that the other's new objects use (a
  * function a view calls, a table a foreign key points at) fails there: a
  * schema conflict, as is an object both changed.
+ *
+ * The move's statements run with the text settings fixed, as the rows'
+ * conversions do (merge_rows()): an ALTER TABLE ... TYPE's USING, a
+ * default an added column is filled with, a CHECK the rows are tested
+ * against, all convert alike in any session, so the merge succeeds or
+ * fails alike in any.  The definitions they replay were written so too.
+ * The materialized views are refreshed after, under the session's
+ * settings, as merge_rows() refreshes them.
  */
 static void
 move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 					MergeRows *mr)
 {
 	MemoryContext cxt = CurrentMemoryContext;
+	SchemaMerging sm = {ours, merged, mr};
 
+	mr->matviews_later = true;
 	PG_TRY();
 	{
-		PROLLY_CALL(components().canonicalizer, move_schema, ours, merged,
-					merge_rows, take_breaking_rows, mr, false);
+		prolly_datum_fixed_text(moving_schema, &sm);
 	}
 	PG_CATCH();
 	{
@@ -9749,6 +9823,7 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
 						   ed->message)));
 	}
 	PG_END_TRY();
+	merge_matviews(mr);
 }
 
 /*
