@@ -339,6 +339,7 @@ tests += {
       't/212_vacuum_release_bounds.pl',
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
+      't/235_bmap_snapshot_owner.pl',
     ],
   },
 }

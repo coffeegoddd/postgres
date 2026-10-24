@@ -333,11 +333,14 @@ typedef struct xl_bmap_root_delta
 
 /*
  * A snapshot a tree's root page keeps: its id (0: the slot is free), the
- * relation's length and last fold's epoch then, and the subtrees it holds.
+ * (sub)transaction that took it (a FullTransactionId), the relation's length
+ * and last fold's epoch then, and the subtrees it holds.  A snapshot whose
+ * transaction ended without committing, a crash included, is kept by nobody.
  */
 typedef struct xl_bmap_snapshot
 {
 	uint64		id;
+	uint64		owner;
 	BlockNumber nblocks;
 	uint32		fold_epoch;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
