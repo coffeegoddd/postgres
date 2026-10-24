@@ -169,6 +169,7 @@ tests += {
       'truncate_folds',
       'fold_verify',
       'fold_caches',
+      'compared_folds',
       'fold_on_commit',
       'row_locations',
       'describe_caches',

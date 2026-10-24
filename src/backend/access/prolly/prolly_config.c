@@ -437,7 +437,9 @@ prolly_keying_use_env(ProllyKeyingRefs *refs, const ProllyKeyingRoutine *routine
 	refs->keying = k;
 	refs->values.tree = tree;
 	refs->values.env = env;
-	refs->values.memo = (const ProllyValueMemoRoutine *)
+	/* (the trees of chunks kept in the backend are no one else's to take) */
+	refs->values.memo = prolly_local_chunks_kept(env->chunk_store) ? NULL :
+		(const ProllyValueMemoRoutine *)
 		profile_impl(history_profile, PROLLY_IFACE_VALUE_MEMO);
 	refs->values.pointers = false;
 	PROLLY_CALL(routine, set_values, k, &refs->values);

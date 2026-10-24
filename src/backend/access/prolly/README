@@ -796,6 +796,23 @@ definitions moved too, a materialized view's rows did, a table's state
 can't be advanced), the rest is folded as before.  So a move from a dirty
 working set folds it once.
 
+That fold is only compared with: once the baseline is advanced, it names
+the target's trees, not the fold's.  So the fold, and every tree the move
+builds on it, is kept in the backend's memory, not put in the chunk store
+(chunkstore_local.c, refs_copies.c's settle_compared()).  Between
+prolly_local_chunks_begin() and _end(), the canonicalizer's environments
+put their chunks in a table in the backend's memory, and every
+environment of the server's trees (prolly_folded_tree_env()'s) gets them
+from there; their has() and put() stay the store's, so a durable tree
+never takes a chunk only the backend has for stored.  The baseline is
+kept beside the refs meanwhile (the refs' chunks are the store's), the
+fold isn't published to the fold caches, and the value memo remembers
+nothing from it.  At the end, prolly_local_chunks_persist() puts those of
+the backend's chunks the baseline reaches, descending only into chunks
+the store hasn't: its own few nodes when it was advanced, the fold's
+trees it still names where it couldn't be (as before).  So a hard reset
+of 1,000 dirty rows over 100,000 appends 4 chunks, not about 1,250.
+
 What a fold works out for every table, changed or not, is cached in the
 backend (canon_folded.c's own): each table's description and the hash its
 baseline is kept by, dropped by a relcache invalidation of the table or a
