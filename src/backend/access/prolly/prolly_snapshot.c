@@ -45,6 +45,12 @@
  * the new commit by the rows that differ.  Without indexes, a mount reads
  * no row.
  *
+ * A history mount (prolly_mount(..., history => true)) is the table at
+ * every commit the mounted one reaches, as dolt_history_table() gives it
+ * (see "History" below), its rows streamed a commit at a time: an
+ * equality on commit_hash reads that commit alone, and the primary key's
+ * bounds seek in each commit.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_snapshot.c
  *
@@ -69,6 +75,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
 #include "common/hashfn.h"
@@ -99,13 +106,17 @@
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
 #define SNAPSHOT_FDW	"prolly_snapshot"
 #define SNAPSHOT_SERVER "prolly_local"
 
 /* A pin's record: its format, then lines of text (mount_info_write()). */
-#define PIN_FORMAT		"mount 2"
+#define PIN_FORMAT		"mount 3"
+
+/* a history mount's columns after the table's: commit_hash, committer, commit_date */
+#define HISTORY_COLUMNS 3
 
 /* ------------------------------------------------------------------------
  * Components
@@ -164,15 +175,15 @@ typedef struct MountInfo
 	char	   *source_schema;
 	bool		all;			/* every table of the schema, at each refresh */
 	bool		indexes;		/* with its tables' index trees */
+	bool		history;		/* its tables at every commit it reaches */
 	List	   *tables;			/* unqualified names */
 	List	   *built;			/* MountIndex */
 } MountInfo;
 
 /*
  * The record: its format, its owner (a local role), the source ref and
- * schema, whether every table
- * and whether indexes are mounted, then a line per table ("t", a tab, its
- * name) and per index tree ("x", then its table, index, definition's hash
+ * schema, whether every table, whether indexes and whether history are
+ * mounted, then a line per table ("t", a tab, its name) and per index tree ("x", then its table, index, definition's hash
  * and root, tab-separated).  Names never hold a newline: mounts refuse
  * one; a tab only ends the index's name, the last of the names.
  */
@@ -181,9 +192,10 @@ mount_info_write(const MountInfo *mi, StringInfo out)
 {
 	ListCell   *lc;
 
-	appendStringInfo(out, "%s\n%u\n%s\n%s\n%c\n%c\n", PIN_FORMAT, mi->owner,
-					 mi->source_ref, mi->source_schema, mi->all ? 'a' : 'n',
-					 mi->indexes ? 'i' : 'n');
+	appendStringInfo(out, "%s\n%u\n%s\n%s\n%c\n%c\n%c\n", PIN_FORMAT,
+					 mi->owner, mi->source_ref, mi->source_schema,
+					 mi->all ? 'a' : 'n', mi->indexes ? 'i' : 'n',
+					 mi->history ? 'h' : 'n');
 	foreach(lc, mi->tables)
 		appendStringInfo(out, "t\t%s\n", (char *) lfirst(lc));
 	foreach(lc, mi->built)
@@ -235,6 +247,9 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 			case 5:
 				mi->indexes = (line[0] == 'i');
 				break;
+			case 6:
+				mi->history = (line[0] == 'h');
+				break;
 			default:
 				if (strncmp(line, "t\t", 2) == 0)
 					mi->tables = lappend(mi->tables, pstrdup(line + 2));
@@ -271,7 +286,7 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 				break;
 		}
 	}
-	if (n < 6)
+	if (n < 7)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid snapshot mount record")));
@@ -932,6 +947,18 @@ make_tables(const char *target, const ProllyHash *commit,
 		prolly_check_history_by_name(name, hex, true, fn);
 		if (mi->indexes)
 			make_indexes(mi, table, name, &t, old, oldroot, cxt);
+		for (int i = 0; mi->history && i < t.desc->natts; i++)
+		{
+			const char *col = NameStr(TupleDescAttr(t.desc, i)->attname);
+
+			if (strcmp(col, "commit_hash") == 0 || strcmp(col, "committer") == 0 ||
+				strcmp(col, "commit_date") == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_COLUMN),
+						 errmsg("%s can't mount the history of \"%s\": it has a column \"%s\"",
+								fn, name, col),
+						 errdetail("A history mount's table adds commit_hash, committer and commit_date.")));
+		}
 
 		initStringInfo(&sql);
 		appendStringInfo(&sql, "CREATE FOREIGN TABLE %s (",
@@ -948,9 +975,13 @@ make_tables(const char *target, const ProllyHash *commit,
 				appendStringInfo(&sql, " COLLATE %s",
 								 generate_collation_name(att->attcollation));
 		}
+		if (mi->history)
+			appendStringInfoString(&sql, ", commit_hash text, committer text, "
+								   "commit_date timestamptz");
 		appendStringInfo(&sql, ") SERVER " SNAPSHOT_SERVER
-						 " OPTIONS (commit %s, source %s)",
-						 quote_literal_cstr(hex), quote_literal_cstr(name));
+						 " OPTIONS (commit %s, source %s%s)",
+						 quote_literal_cstr(hex), quote_literal_cstr(name),
+						 mi->history ? ", history 'true'" : "");
 		defs = lappend(defs, sql.data);
 	}
 	foreach(lc, defs)
@@ -1004,7 +1035,8 @@ check_target(const char *target)
 /*
  * prolly_mount(source_ref text, source_schema text, target_schema text,
  *				tables text[] DEFAULT NULL, indexes boolean DEFAULT false,
- *				OUT mount text, OUT commit text) returns record
+ *				history boolean DEFAULT false, OUT mount text, OUT commit text)
+ *	  returns record
  */
 Datum
 prolly_mount(PG_FUNCTION_ARGS)
@@ -1035,6 +1067,12 @@ prolly_mount(PG_FUNCTION_ARGS)
 	mi.owner = GetUserId();
 	mi.all = PG_ARGISNULL(3);
 	mi.indexes = !PG_ARGISNULL(4) && PG_GETARG_BOOL(4);
+	mi.history = !PG_ARGISNULL(5) && PG_GETARG_BOOL(5);
+	if (mi.indexes && mi.history)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a history mount can't build index trees"),
+				 errhint("Mount the history without indexes, or a commit with them.")));
 	if (!mi.all)
 	{
 		Datum	   *elems;
@@ -1295,6 +1333,7 @@ typedef struct Mounted
 	double		count;			/* the tree's items */
 	int			nkeys;
 	MountKey   *keys;			/* the primary key's first, if keyed */
+	bool		history;		/* every commit's rows, with the commit's */
 } Mounted;
 
 /*
@@ -1327,6 +1366,8 @@ snapshot_open(Oid relid, Mounted *s)
 			hex = defGetString(d);
 		else if (strcmp(d->defname, "source") == 0)
 			s->source = defGetString(d);
+		else if (strcmp(d->defname, "history") == 0)
+			s->history = defGetBoolean(d);
 	}
 	s->mount = get_namespace_name(get_rel_namespace(relid));
 	if (hex == NULL || s->source == NULL ||
@@ -1373,8 +1414,12 @@ snapshot_open(Oid relid, Mounted *s)
 	/* the foreign table's columns must still be the version's */
 	rel = table_open(relid, NoLock);
 	desc = RelationGetDescr(rel);
-	found = desc->natts == s->t.desc->natts;
-	for (int i = 0; found && i < desc->natts; i++)
+	found = desc->natts == s->t.desc->natts + (s->history ? HISTORY_COLUMNS : 0);
+	for (int i = s->t.desc->natts; found && i < desc->natts; i++)
+		found = !TupleDescAttr(desc, i)->attisdropped &&
+			TupleDescAttr(desc, i)->atttypid ==
+			(i == desc->natts - 1 ? TIMESTAMPTZOID : TEXTOID);
+	for (int i = 0; found && i < s->t.desc->natts; i++)
 		found = !TupleDescAttr(desc, i)->attisdropped &&
 			TupleDescAttr(desc, i)->atttypid == TupleDescAttr(s->t.desc, i)->atttypid &&
 			TupleDescAttr(desc, i)->atttypmod == TupleDescAttr(s->t.desc, i)->atttypmod;
@@ -1406,7 +1451,7 @@ snapshot_open(Oid relid, Mounted *s)
 		MountIndex *x;
 		MountKey   *k;
 
-		if (ix->unusable)
+		if (ix->unusable || s->history)
 			continue;
 		x = built_before(&mi, table, ix->name, definition_hash(ix->definition));
 		if (x == NULL)
@@ -1422,6 +1467,111 @@ snapshot_open(Oid relid, Mounted *s)
 		k->root.hash = x->root;
 		k->covered = index_covered(&s->t, ix);
 	}
+}
+
+/* ------------------------------------------------------------------------
+ * History
+ *
+ * A history mount's table has the version's columns, then commit_hash,
+ * committer and commit_date: a row for each row of the table at each
+ * commit the mounted commit reaches (that has the table), as
+ * dolt_history_table() gives them, each read as its own commit defines
+ * the table, by the columns' names (a column the commit hasn't, or holds
+ * as another type, is NULL).  A scan visits the commits one at a time and
+ * streams each one's rows, so LIMIT stops it; an equality on commit_hash
+ * visits that commit alone, if the mounted commit reaches it; and the
+ * primary key's bounds seek in each commit whose key is the version's.
+ * ------------------------------------------------------------------------
+ */
+
+
+/* Whether the history mount's commit reaches commit c (or is it). */
+static bool
+history_reaches(const ProllyHash *head, const ProllyHash *c)
+{
+	ProllyHash	base;
+
+	if (head->len == c->len && memcmp(head->bytes, c->bytes, c->len) == 0)
+		return true;
+	return PROLLY_CALL(refs(), merge_base, head, c, &base) &&
+		base.len == c->len && memcmp(base.bytes, c->bytes, c->len) == 0;
+}
+
+/*
+ * Whether clause is commit_hash = expr (or expr = commit_hash), expr not
+ * of rel and not volatile: the commit it selects.
+ */
+static bool
+commit_clause(RelOptInfo *rel, const Mounted *s, RestrictInfo *ri, Expr **expr)
+{
+	OpExpr	   *op;
+	Node	   *left;
+	Node	   *right;
+	AttrNumber	attno = s->t.desc->natts + 1;
+
+	if (!IsA(ri->clause, OpExpr))
+		return false;
+	op = (OpExpr *) ri->clause;
+	if (op->opno != TextEqualOperator || list_length(op->args) != 2)
+		return false;
+	left = linitial(op->args);
+	right = lsecond(op->args);
+	if (!(IsA(left, Var) && ((Var *) left)->varno == rel->relid &&
+		  ((Var *) left)->varattno == attno && ((Var *) left)->varlevelsup == 0))
+	{
+		Node	   *tmp = left;
+
+		left = right;
+		right = tmp;
+		if (!(IsA(left, Var) && ((Var *) left)->varno == rel->relid &&
+			  ((Var *) left)->varattno == attno &&
+			  ((Var *) left)->varlevelsup == 0))
+			return false;
+	}
+	if (bms_is_member(rel->relid, pull_varnos(NULL, right)) ||
+		contain_volatile_functions(right))
+		return false;
+	*expr = (Expr *) right;
+	return true;
+}
+
+/*
+ * How many commits the mounted commit reaches, counted by walking back
+ * at most max of them (each read once): max if there are more.
+ */
+static int
+history_commits(const ProllyHash *head, int max)
+{
+	List	   *queue = list_make1((ProllyHash *) head);
+	List	   *seen = NIL;
+	int			n = 0;
+
+	while (queue != NIL && n < max)
+	{
+		ProllyHash *h = linitial(queue);
+		ProllyCommitInfo info;
+		ListCell   *lc;
+		bool		dup = false;
+
+		queue = list_delete_first(queue);
+		foreach(lc, seen)
+			if (memcmp(lfirst(lc), h, sizeof(ProllyHash)) == 0)
+				dup = true;
+		if (dup)
+			continue;
+		seen = lappend(seen, h);
+		n++;
+		if (!PROLLY_CALL(refs(), commit_get, h, &info))
+			continue;
+		for (int i = 0; i < info.nparents; i++)
+		{
+			ProllyHash *p = palloc0(sizeof(ProllyHash));
+
+			*p = info.parents[i];
+			queue = lappend(queue, p);
+		}
+	}
+	return n;
 }
 
 /* ------------------------------------------------------------------------
@@ -1862,6 +2012,8 @@ typedef struct MountPlan
 {
 	Mounted		s;
 	KeyTree    *trees;			/* each key's, for counting; opened on use */
+	double		commits;		/* (history) the commits a scan reads */
+	Expr	   *commit;			/* (history) commit_hash's equality */
 } MountPlan;
 
 /* Key k's order as pathkeys (NIL where it can't be told the planner). */
@@ -2047,6 +2199,27 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 	ps->s.count = (double) PROLLY_CALL(c.tree, count, &env, &ps->s.t.data);
 	baserel->fdw_private = ps;
 	baserel->tuples = ps->s.count;
+	if (ps->s.history)
+	{
+		List	   *rest = NIL;
+
+		/* (an equality on commit_hash: one commit, if any) */
+		foreach_node(RestrictInfo, ri, baserel->baserestrictinfo)
+		{
+			Expr	   *e;
+
+			if (ps->commit == NULL && commit_clause(baserel, &ps->s, ri, &e))
+				ps->commit = e;
+			else
+				rest = lappend(rest, ri);
+		}
+		ps->commits = ps->commit ? 1 : history_commits(&ps->s.commit, 10000);
+		baserel->tuples = ps->s.count * ps->commits;
+		baserel->rows = clamp_row_est(baserel->tuples *
+									  clauselist_selectivity(root, rest, 0,
+															 JOIN_INNER, NULL));
+		return;
+	}
 	baserel->rows = clamp_row_est(ps->s.count *
 								  clauselist_selectivity(root,
 														 baserel->baserestrictinfo,
@@ -2290,11 +2463,130 @@ add_parameterized_paths(PlannerInfo *root, RelOptInfo *baserel, MountPlan *ps,
 	}
 }
 
+/*
+ * A history scan's path: the commits it reads (one, by an equality on
+ * commit_hash), each bounded by the primary key's quals among clauses; in
+ * no order.  Parameterized as ppi says, if it isn't NULL.
+ */
+static void
+history_path(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, List *clauses,
+			 ParamPathInfo *ppi)
+{
+	KeyBounds	b;
+	Expr	   *commit = NULL;
+	double		commits;
+	double		per;
+	double		rows;
+	Cost		startup;
+	Cost		run;
+	List	   *priv;
+	List	   *how;
+	double		depth;
+
+	memset(&b, 0, sizeof(b));
+	foreach_node(RestrictInfo, ri, clauses)
+		if (commit == NULL && commit_clause(rel, &ps->s, ri, &commit))
+			break;
+	if (ppi && commit == NULL)
+		return;
+	commits = commit ? 1 : ps->commits;
+	if (ps->s.t.keyed)
+		key_bounds(rel, &ps->s, &ps->s.keys[0], clauses, &b);
+	per = (b.neq > 0 || b.lo || b.hi) && ps->s.t.keyed ?
+		bounded_rows(root, rel, ps, 0, &b, clauses) :
+		Max(ps->s.count, 1);
+	rows = ppi ? clamp_row_est(per * clauselist_selectivity(root, ppi->ppi_clauses,
+															0, JOIN_INNER, NULL)) :
+		rel->rows;
+	if (ppi)
+		ppi->ppi_rows = rows;
+	depth = ps->s.count > 1 ? ceil(log(ps->s.count) / log(64.0)) + 1 : 1;
+	startup = depth * random_page_cost;
+	run = commits * (per * (ITEM_COST + DECODE_COST) + depth * random_page_cost) +
+		per * commits * cpu_operator_cost * list_length(clauses);
+	priv = path_private(&ps->s, &b, ps->s.t.keyed ? 0 : -1, false);
+	how = linitial(priv);
+	how = lappend(how, makeInteger(commit != NULL));
+	linitial(priv) = how;
+	priv = lappend(priv, commit ? (Node *) commit : (Node *) makeInteger(0));
+	add_path(rel, (Path *)
+			 create_foreignscan_path(root, rel, NULL, rows, 0, startup,
+									 startup + run, NIL,
+									 ppi ? ppi->ppi_req_outer : NULL,
+									 NULL, NIL, priv));
+}
+
+static bool
+commit_member(PlannerInfo *root, RelOptInfo *rel, EquivalenceClass *ec,
+			  EquivalenceMember *em, void *arg)
+{
+	Var		   *v = (Var *) em->em_expr;
+	MountPlan  *ps = arg;
+
+	return IsA(v, Var) && v->varno == rel->relid && v->varlevelsup == 0 &&
+		v->varattno == ps->s.t.desc->natts + 1;
+}
+
+/*
+ * A history scan's paths: unparameterized, and by an equality of
+ * commit_hash to another relation's expression (a join to the log), each
+ * outer row's commit read alone.
+ */
+static void
+history_paths(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps)
+{
+	List	   *ppis = NIL;
+	List	   *clauses = NIL;
+	ListCell   *lc;
+
+	history_path(root, rel, ps, rel->baserestrictinfo, NULL);
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *ri = lfirst(lc);
+		Expr	   *e;
+
+		if (join_clause_is_movable_to(ri, rel) &&
+			commit_clause(rel, &ps->s, ri, &e))
+			clauses = lappend(clauses, ri);
+	}
+	if (rel->has_eclass_joins)
+		clauses = list_concat(clauses,
+							  generate_implied_equalities_for_column(root, rel,
+																	 commit_member, ps,
+																	 rel->lateral_referencers));
+	foreach(lc, clauses)
+	{
+		RestrictInfo *ri = lfirst(lc);
+		Relids		outer;
+
+		if (!join_clause_is_movable_to(ri, rel))
+			continue;
+		outer = bms_del_member(bms_union(ri->clause_relids, rel->lateral_relids),
+							   rel->relid);
+		if (!bms_is_empty(outer))
+			ppis = list_append_unique_ptr(ppis,
+										  get_baserel_parampathinfo(root, rel, outer));
+	}
+	foreach(lc, ppis)
+	{
+		ParamPathInfo *ppi = lfirst(lc);
+
+		history_path(root, rel, ps,
+					 list_concat_copy(rel->baserestrictinfo, ppi->ppi_clauses), ppi);
+	}
+}
+
 static void
 snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
 				   Oid foreigntableid)
 {
 	MountPlan  *ps = baserel->fdw_private;
+
+	if (ps->s.history)
+	{
+		history_paths(root, baserel, ps);
+		return;
+	}
 
 	add_paths(root, baserel, ps, -1, NIL, NULL);
 	for (int ki = 0; ki < ps->s.nkeys; ki++)
@@ -2345,6 +2637,9 @@ snapshot_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		exprs = lappend(exprs, lo);
 	if (!IsA(hi, Integer))
 		exprs = lappend(exprs, hi);
+	/* (a history scan's commit_hash, last) */
+	if (list_length(priv) > 5 && !IsA(list_nth(priv, 5), Integer))
+		exprs = lappend(exprs, list_nth(priv, 5));
 	return make_foreignscan(tlist, quals, baserel->relid, exprs,
 							list_make5(linitial(priv),
 									   makeInteger(list_length(eqs)),
@@ -2359,9 +2654,35 @@ snapshot_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
  * ------------------------------------------------------------------------
  */
 
+/* A history scan's commits and the one it reads. */
+typedef struct HistoryScan
+{
+	bool		has_commit;		/* the last bound expression is commit_hash's */
+	bool		started;
+	bool		single;			/* that commit alone */
+	List	   *queue;			/* (ProllyHash *) commits to read */
+	HTAB	   *seen;			/* and read already */
+	Datum	   *values;			/* the bound expressions' values */
+	bool	   *nulls;
+	MemoryContext cxt;			/* the commit's, reset for the next */
+
+	bool		open;			/* a commit is being read: */
+	Mounted		cur;			/* its table */
+	KeyTree		kt;
+	Seek		seek;			/* the version's key bounds, if its key's */
+	ProllyTreeCursor *cursor;
+	int		   *map;			/* the version's columns in its, or -1 */
+	bool	   *wanted;			/* its columns decoded */
+	TupleTableSlot *slot;		/* a row of it */
+	Datum		commit_hash;
+	Datum		committer;
+	Datum		commit_date;
+} HistoryScan;
+
 typedef struct MountScan
 {
 	Mounted		s;
+	HistoryScan h;
 	KeyTree		kt;				/* the tree the scan reads */
 	Seek		seek;
 	int			key;			/* -1: the data tree in full; else s.keys' */
@@ -2405,6 +2726,7 @@ snapshot_begin(ForeignScanState *node, int eflags)
 	ss->seek.has_hi = lsecond_int(has);
 	ss->seek.lo_strict = linitial_int(strict);
 	ss->seek.hi_strict = lsecond_int(strict);
+	ss->h.has_commit = list_length(how) > 3 && intVal(list_nth(how, 3)) != 0;
 	ss->exprs = ExecInitExprList(fs->fdw_exprs, (PlanState *) node);
 	ss->types = palloc(sizeof(Oid) * Max(list_length(fs->fdw_exprs), 1));
 	foreach(lc, fs->fdw_exprs)
@@ -2433,6 +2755,9 @@ snapshot_begin(ForeignScanState *node, int eflags)
 	key_tree_open(&ss->kt, &ss->s, ss->key >= 0 ? &ss->s.keys[ss->key] : NULL,
 				  ss->cxt);
 	ss->seek.kt = &ss->kt;
+	if (ss->s.history)
+		ss->h.cxt = AllocSetContextCreate(ss->cxt, "prolly history commit",
+										  ALLOCSET_DEFAULT_SIZES);
 	if (ss->key >= 0 && ss->s.keys[ss->key].ix)
 	{
 		MountKey   *k = &ss->s.keys[ss->key];
@@ -2540,6 +2865,344 @@ before_start(MountScan *ss, const ProllyKey *key)
 	return c <= 0;
 }
 
+/* ------------------------------------------------------------------------
+ * Scanning history
+ * ------------------------------------------------------------------------
+ */
+
+/* Is key past a forward seek's end? */
+static bool
+seek_past_end(Seek *sk, const ProllyKey *key)
+{
+	ProllyKey	b;
+	int			c;
+
+	if (sk->tree_hi == NULL)
+		return false;
+	b.data = (const uint8 *) sk->tree_hi->data;
+	b.len = sk->tree_hi->len;
+	c = key_tree_compare(sk->kt, key, &b);
+	return sk->tree_hi_strict ? c >= 0 : c > 0;
+}
+
+/* Is key short of a forward seek's strict start? */
+static bool
+seek_before_start(Seek *sk, const ProllyKey *key)
+{
+	ProllyKey	b;
+
+	if (sk->tree_lo == NULL || !sk->tree_lo_strict)
+		return false;
+	b.data = (const uint8 *) sk->tree_lo->data;
+	b.len = sk->tree_lo->len;
+	return key_tree_compare(sk->kt, key, &b) <= 0;
+}
+
+/* The commit being read: its table, keys, cursor and column map. */
+static void
+history_close_commit(MountScan *ss)
+{
+	HistoryScan *h = &ss->h;
+
+	if (!h->open)
+		return;
+	if (h->cursor)
+		PROLLY_CALL(ss->kt.c.tree, cursor_close, h->cursor);
+	h->cursor = NULL;
+	ExecDropSingleTupleTableSlot(h->slot);
+	key_tree_close(&h->kt);
+	h->open = false;
+	MemoryContextReset(h->cxt);
+}
+
+/*
+ * Whether the commit's primary key is the mounted version's (by its
+ * columns' names and types, operator families, collations and options):
+ * then the version's key bounds seek in its tree too.
+ */
+static bool
+history_same_key(const Mounted *head, const Mounted *cur, const int *map)
+{
+	if (!head->t.keyed || !cur->t.keyed || head->t.nkeys != cur->t.nkeys)
+		return false;
+	for (int k = 0; k < head->t.nkeys; k++)
+	{
+		int			ha = head->t.key_attnos[k] - 1;
+
+		if (map[ha] != cur->t.key_attnos[k] - 1 ||
+			head->t.opfamilies[k] != cur->t.opfamilies[k] ||
+			head->t.collations[k] != cur->t.collations[k] ||
+			head->t.options[k] != cur->t.options[k])
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Open the next commit of the history that has the table and can be
+ * read here, seeking its tree by the bounds; false when there are none.
+ */
+static bool
+history_next_commit(MountScan *ss)
+{
+	HistoryScan *h = &ss->h;
+
+	history_close_commit(ss);
+	while (h->queue != NIL)
+	{
+		ProllyHash *id = linitial(h->queue);
+		ProllyCommitInfo info;
+		ProllyHistoricalTable t;
+		bool		found;
+		const char *why;
+		MemoryContext old;
+		TupleDesc	hd = ss->s.t.desc;
+		Mounted    *cur = &h->cur;
+		char	   *hex;
+		ProllyKey	at;
+		char	   *email;
+
+		CHECK_FOR_INTERRUPTS();
+		h->queue = list_delete_first(h->queue);
+		(void) hash_search(h->seen, id, HASH_FIND, &found);
+		if (found)
+			continue;
+		(void) hash_search(h->seen, id, HASH_ENTER, &found);
+		if (!PROLLY_CALL(refs(), commit_get, id, &info))
+			continue;
+		if (!h->single)
+		{
+			old = MemoryContextSwitchTo(ss->boundcxt);
+			for (int i = 0; i < info.nparents; i++)
+			{
+				ProllyHash *p = palloc0(sizeof(ProllyHash));
+
+				*p = info.parents[i];
+				h->queue = lappend(h->queue, p);
+			}
+			MemoryContextSwitchTo(old);
+		}
+
+		old = MemoryContextSwitchTo(h->cxt);
+		why = PROLLY_CALL(canonicalizer(), table_metadata, &info.root,
+						  ss->s.source, &t, &found);
+		if (!found || why)
+		{
+			/* (a commit without the table, or one it can't read here) */
+			MemoryContextSwitchTo(old);
+			MemoryContextReset(h->cxt);
+			continue;
+		}
+		memset(cur, 0, sizeof(*cur));
+		cur->source = ss->s.source;
+		cur->commit = info.id;
+		cur->t = t;
+		cur->keys = palloc0(sizeof(MountKey));
+		if (t.keyed)
+		{
+			MountKey   *k = &cur->keys[cur->nkeys++];
+
+			k->nkeys = t.nkeys;
+			k->attnos = cur->t.key_attnos;
+			k->opfamilies = cur->t.opfamilies;
+			k->collations = cur->t.collations;
+			k->options = cur->t.options;
+			k->unique = true;
+			k->root = t.data;
+		}
+
+		/* the version's columns, by name in the commit; others NULL */
+		h->map = palloc(sizeof(int) * Max(hd->natts, 1));
+		h->wanted = palloc0(sizeof(bool) * Max(t.desc->natts, 1));
+		for (int i = 0; i < hd->natts; i++)
+		{
+			Form_pg_attribute ha = TupleDescAttr(hd, i);
+
+			h->map[i] = -1;
+			for (int j = 0; j < t.desc->natts; j++)
+			{
+				Form_pg_attribute ca = TupleDescAttr(t.desc, j);
+
+				if (strcmp(NameStr(ha->attname), NameStr(ca->attname)) == 0 &&
+					ha->atttypid == ca->atttypid && ha->atttypmod == ca->atttypmod)
+					h->map[i] = j;
+			}
+			if (h->map[i] >= 0 && (ss->wanted == NULL || ss->wanted[i]))
+				h->wanted[h->map[i]] = true;
+		}
+		key_tree_open(&h->kt, cur, t.keyed ? &cur->keys[0] : NULL, h->cxt);
+		h->slot = MakeSingleTupleTableSlot(t.desc, &TTSOpsVirtual);
+		h->open = true;
+
+		/* the commit's own columns */
+		hex = prolly_hash_hex(&info.id);
+		h->commit_hash = CStringGetTextDatum(hex);
+		email = strchr(info.author, '<');
+		h->committer = CStringGetTextDatum(email && email > info.author ?
+										   pnstrdup(info.author,
+													email - info.author - 1) :
+										   info.author);
+		h->commit_date = TimestampTzGetDatum(info.committed_at);
+
+		/* the version's key bounds, where the commit's key is the version's */
+		memset(&h->seek, 0, sizeof(h->seek));
+		h->seek.kt = &h->kt;
+		if (ss->seek.neq > 0 || ss->seek.has_lo || ss->seek.has_hi)
+		{
+			if (history_same_key(&ss->s, cur, h->map))
+			{
+				h->seek.neq = ss->seek.neq;
+				h->seek.has_lo = ss->seek.has_lo;
+				h->seek.has_hi = ss->seek.has_hi;
+				h->seek.lo_strict = ss->seek.lo_strict;
+				h->seek.hi_strict = ss->seek.hi_strict;
+				compute_bounds(&h->seek, h->values, h->nulls, ss->types);
+			}
+		}
+		MemoryContextSwitchTo(old);
+		if (h->seek.empty)
+		{
+			history_close_commit(ss);
+			continue;
+		}
+		h->cursor = PROLLY_CALL(ss->kt.c.tree, cursor_open, key_tree_env(&h->kt),
+								&cur->t.data, h->cxt);
+		if (h->seek.tree_lo)
+		{
+			at.data = (const uint8 *) h->seek.tree_lo->data;
+			at.len = h->seek.tree_lo->len;
+		}
+		PROLLY_CALL(ss->kt.c.tree, cursor_seek, h->cursor,
+					h->seek.tree_lo ? &at : NULL, ForwardScanDirection);
+		return true;
+	}
+	return false;
+}
+
+/*
+ * (Re)start a history scan: the commits it visits, from the bound
+ * expressions' values now: the commit an equality on commit_hash names,
+ * if the mount's commit reaches it, else every commit it reaches.
+ */
+static void
+history_start(ForeignScanState *node, MountScan *ss)
+{
+	HistoryScan *h = &ss->h;
+	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	int			n = list_length(ss->exprs);
+	ListCell   *lc;
+	int			i = 0;
+	MemoryContext old;
+	HASHCTL		ctl = {0};
+
+	history_close_commit(ss);
+	MemoryContextReset(ss->boundcxt);
+	old = MemoryContextSwitchTo(ss->boundcxt);
+	h->values = palloc(sizeof(Datum) * Max(n, 1));
+	h->nulls = palloc(sizeof(bool) * Max(n, 1));
+	foreach(lc, ss->exprs)
+	{
+		h->values[i] = ExecEvalExpr(lfirst(lc), econtext, &h->nulls[i]);
+		i++;
+	}
+	ctl.keysize = sizeof(ProllyHash);
+	ctl.entrysize = sizeof(ProllyHash);
+	ctl.hcxt = ss->boundcxt;
+	h->seen = hash_create("prolly history commits seen", 64, &ctl,
+						  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	h->queue = NIL;
+	h->single = h->has_commit;
+	ss->copies = 0;
+	ss->done = false;
+	if (h->has_commit)
+	{
+		ProllyHash *c = palloc0(sizeof(ProllyHash));
+		char	   *hex;
+
+		if (h->nulls[n - 1])
+			ss->done = true;
+		else
+		{
+			hex = TextDatumGetCString(h->values[n - 1]);
+			if (!prolly_hash_from_hex(hex, strlen(hex), c) ||
+				!history_reaches(&ss->s.commit, c))
+				ss->done = true;
+			else
+				h->queue = list_make1(c);
+		}
+	}
+	else
+	{
+		ProllyHash *c = palloc0(sizeof(ProllyHash));
+
+		*c = ss->s.commit;
+		h->queue = list_make1(c);
+	}
+	MemoryContextSwitchTo(old);
+	h->started = true;
+}
+
+static TupleTableSlot *
+history_iterate(ForeignScanState *node, MountScan *ss)
+{
+	HistoryScan *h = &ss->h;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	int			natts = ss->s.t.desc->natts;
+
+	if (!h->started)
+		history_start(node, ss);
+	if (ss->copies > 0 && !TTS_EMPTY(slot))
+	{
+		ss->copies--;
+		return slot;
+	}
+	ExecClearTuple(slot);
+	while (!ss->done)
+	{
+		ProllyKey	key;
+		ProllyValue value;
+		ProllyValue row;
+		uint64		count;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!h->open && !history_next_commit(ss))
+		{
+			ss->done = true;
+			break;
+		}
+		if (!PROLLY_CALL(ss->kt.c.tree, cursor_next, h->cursor, &key, &value) ||
+			seek_past_end(&h->seek, &key))
+		{
+			history_close_commit(ss);
+			continue;
+		}
+		if (seek_before_start(&h->seek, &key))
+			continue;
+		PROLLY_CALL(h->kt.c.keying, parse_value_as, h->kt.k, !h->cur.t.keyed,
+					&value, &row, &count);
+		PROLLY_CALL(h->kt.c.keying, decode_row_columns, h->kt.k, &row,
+					h->wanted, h->slot);
+		for (int i = 0; i < natts; i++)
+		{
+			int			j = h->map[i];
+
+			slot->tts_isnull[i] = j < 0 || h->slot->tts_isnull[j];
+			slot->tts_values[i] = j < 0 ? (Datum) 0 : h->slot->tts_values[j];
+		}
+		slot->tts_values[natts] = h->commit_hash;
+		slot->tts_isnull[natts] = false;
+		slot->tts_values[natts + 1] = h->committer;
+		slot->tts_isnull[natts + 1] = false;
+		slot->tts_values[natts + 2] = h->commit_date;
+		slot->tts_isnull[natts + 2] = false;
+		ExecStoreVirtualTuple(slot);
+		ss->rows_read++;
+		ss->copies = count - 1;
+		return slot;
+	}
+	return slot;
+}
+
 static TupleTableSlot *
 snapshot_iterate(ForeignScanState *node)
 {
@@ -2549,6 +3212,8 @@ snapshot_iterate(ForeignScanState *node)
 	ProllyKey	key;
 	ProllyValue value;
 
+	if (ss->s.history)
+		return history_iterate(node, ss);
 	if (ss->cursor == NULL && !ss->done)
 		start_scan(node, ss);
 	/* (the slot still holds the row, decoded once for all its copies) */
@@ -2614,6 +3279,11 @@ snapshot_rescan(ForeignScanState *node)
 	MountScan  *ss = node->fdw_state;
 
 	ss->done = false;
+	if (ss->s.history)
+	{
+		history_start(node, ss);
+		return;
+	}
 	start_scan(node, ss);
 }
 
@@ -2625,6 +3295,8 @@ snapshot_end(ForeignScanState *node)
 	if (ss == NULL || ss->cxt == NULL)
 		return;
 	ss->nodes_read = pgstat_prolly_tree_counters()->nodes_read - ss->nodes_before;
+	if (ss->s.history)
+		history_close_commit(ss);
 	if (ss->cursor)
 		PROLLY_CALL(ss->kt.c.tree, cursor_close, ss->cursor);
 	ss->cursor = NULL;
@@ -2646,6 +3318,9 @@ snapshot_explain(ForeignScanState *node, ExplainState *es)
 	StringInfoData access;
 
 	initStringInfo(&access);
+	if (list_length(how) > 3)
+		appendStringInfo(&access, "history%s, ",
+						 intVal(list_nth(how, 3)) ? " of one commit" : "");
 	if (neq == 0 && !linitial_int(has) && !lsecond_int(has) && index[0] == 0)
 		appendStringInfoString(&access, "full");
 	else
