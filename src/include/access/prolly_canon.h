@@ -371,6 +371,17 @@ typedef struct ProllyCanonRoutine
 								  ProllyRowChangeVisit visit, void *arg);
 
 	/*
+	 * Optional: whether fewer than limit of table relid's rows differ from
+	 * baseline's (true), as table_changes() would find them but from the
+	 * change finder's fewer_changes(): no more of its record read than
+	 * limit entries, and no fold's work counted.  The baseline's data tree
+	 * for the table is put in *data.  False where that isn't known.
+	 */
+	bool		(*table_fewer_changes) (const ProllyNodeRef *baseline,
+										Oid relid, int limit,
+										ProllyNodeRef *data);
+
+	/*
 	 * Optional: baseline with the current transaction's own row changes to
 	 * these tables applied to its rows, and each table's change finder
 	 * state advanced past them, into *next: a fold of the transaction's
@@ -470,7 +481,7 @@ typedef struct ProllyCanonRoutine
 	"fold_dependencies", "dependencies", \
 	"merge_schema", "walk_baseline", "table_columns", "type_definitions", "read_fold", \
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
-	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
+	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "table_fewer_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
 	"rename_description", "rename_root", "rename_objects"
 #define PROLLY_CANON_FIRST_CALLBACK walk

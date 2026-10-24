@@ -5566,6 +5566,17 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 }
 
 /*
+ * What table_changes() and table_fewer_changes() ask of the change finder:
+ * the changes visited, or (limit > 0) whether fewer than limit changed.
+ */
+typedef struct TableChangesAsk
+{
+	ProllyRowChangeVisit visit;
+	void	   *arg;
+	int			limit;
+} TableChangesAsk;
+
+/*
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
  * a table collect() describes as a table and reads (not a partition, nor
@@ -5573,9 +5584,8 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
  * definition now.
  */
 static bool
-folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
-					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
-					 void *arg)
+table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
+					ProllyNodeRef *data, const TableChangesAsk *ask)
 {
 	Canon		cn;
 	Relation	rel;
@@ -5586,7 +5596,8 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	cn.reading = true;
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
-	if (!PROLLY_HAS(cn.finder, changes))
+	if (ask->limit > 0 ? !PROLLY_HAS(cn.finder, fewer_changes) :
+		!PROLLY_HAS(cn.finder, changes))
 		return false;
 	load_baseline(&cn, baseline);
 
@@ -5654,7 +5665,9 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 				tf.state.data = (const uint8 *) bt->state.data;
 				tf.state.len = bt->state.len;
 				*data = bt->data;
-				ok = cn.finder->changes(rel, &cn.env, &tf, visit, arg);
+				ok = ask->limit > 0 ?
+					cn.finder->fewer_changes(rel, &tf, ask->limit) :
+					cn.finder->changes(rel, &cn.env, &tf, ask->visit, ask->arg);
 			}
 		}
 	}
@@ -5665,6 +5678,25 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	PG_END_TRY();
 	table_close(rel, AccessShareLock);
 	return ok;
+}
+
+static bool
+folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
+					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
+					 void *arg)
+{
+	TableChangesAsk ask = {visit, arg, 0};
+
+	return table_changes_asked(baseline, relid, data, &ask);
+}
+
+static bool
+folded_table_fewer_changes(const ProllyNodeRef *baseline, Oid relid,
+						   int limit, ProllyNodeRef *data)
+{
+	TableChangesAsk ask = {NULL, NULL, Max(limit, 1)};
+
+	return table_changes_asked(baseline, relid, data, &ask);
 }
 
 /*
@@ -13645,6 +13677,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.read_definitions = folded_read_definitions,
 	.table_changes = folded_table_changes,
+	.table_fewer_changes = folded_table_fewer_changes,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,

@@ -2516,34 +2516,25 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
  * since a baseline holding the commit's rows are written instead.
  */
 
-/* (a table's changes since its baseline, counted to the setting) */
-static bool
-count_restore_change(ProllyDiffKind kind, const ProllyKey *key,
-					 const ProllyValue *before, const ProllyValue *after,
-					 void *arg)
-{
-	return ++*(int *) arg < prolly_restore_min_changes;
-}
-
 /*
  * Would writing table relid's rows back to the commit's (data) cost less
  * than restoring its pages: its baseline holds the commit's rows, and
  * fewer than prolly.restore_min_changes of them changed since, as its
- * change finder reads them?
+ * change finder tells from no more than that many of its records?
  */
 static bool
 few_changes(const ProllyDatabaseComponents *dc, const ProllyNodeRef *baseline,
 			Oid relid, const ProllyNodeRef *data)
 {
 	ProllyNodeRef base;
-	int			n = 0;
 
 	if (prolly_restore_min_changes <= 0 ||
-		!PROLLY_HAS(dc->canonicalizer, table_changes) ||
-		!dc->canonicalizer->table_changes(baseline, relid, &base,
-										  count_restore_change, &n))
+		!PROLLY_HAS(dc->canonicalizer, table_fewer_changes) ||
+		!dc->canonicalizer->table_fewer_changes(baseline, relid,
+												prolly_restore_min_changes,
+												&base))
 		return false;
-	return same_hash(&base.hash, &data->hash) && n < prolly_restore_min_changes;
+	return same_hash(&base.hash, &data->hash);
 }
 
 /*

@@ -310,13 +310,18 @@ SELECT dolt_reset('--hard') IS NOT NULL AS reset;
 SELECT pg_stat_force_next_flush();
 SELECT since(:'before') ->> 'relations_restored' AS restored,
 	   since(:'before') ->> 'apply_rows' AS applied;
+-- (the threshold asked of the log's entries alone: no row of the reset's
+-- read as a fold reads them)
 UPDATE kp.t SET v = v + 1 WHERE id <= 64;
 SELECT pg_stat_force_next_flush();
 SELECT now_counted() AS before \gset
+SELECT value AS candidates FROM pg_stat_prolly WHERE name = 'fold_candidates' \gset
 SELECT dolt_reset('--hard') IS NOT NULL AS reset;
 SELECT pg_stat_force_next_flush();
 SELECT (since(:'before') ->> 'relations_restored')::int > 0 AS restored,
-	   since(:'before') ->> 'apply_rows' AS applied;
+	   since(:'before') ->> 'apply_rows' AS applied,
+	   (SELECT value FROM pg_stat_prolly WHERE name = 'fold_candidates') -
+	   :candidates AS candidates;
 SELECT rows_digest() = :'at_threshold' AS as_committed, clean(), indexes_valid();
 RESET prolly.restore_min_changes;
 
