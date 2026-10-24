@@ -13,7 +13,10 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('first_use_lock');
 $node->init;
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+# (first uses that copy the source's storage: one made of pages kept as of
+# its head holds none of the rows written since, nor waits for writers;
+# t/203_first_use_kept_snapshots.pl tests those)
+$node->append_conf('postgresql.conf', "autovacuum = off\nprolly.kept_commits = 0");
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
