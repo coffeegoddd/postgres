@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_matcache.h"
 #include "access/prolly_memo.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_registry.h"
@@ -28,6 +29,7 @@ static const ProllyInterface shmem_interfaces[] = {
 	PROLLY_IFACE_CHUNK_STORE,
 	PROLLY_IFACE_VALUE_MEMO,
 	PROLLY_IFACE_REFS,
+	PROLLY_IFACE_MATERIALIZATION_CACHE,
 };
 
 #define MAX_AREAS 64
@@ -66,6 +68,12 @@ impl_shmem_size(const ProllyImplInfo *impl)
 
 				return r->shmem_size ? r->shmem_size() : 0;
 			}
+		case PROLLY_IFACE_MATERIALIZATION_CACHE:
+			{
+				const ProllyMatCacheRoutine *r = (const ProllyMatCacheRoutine *) impl;
+
+				return r->shmem_size ? r->shmem_size() : 0;
+			}
 		default:
 			return 0;
 	}
@@ -84,6 +92,9 @@ impl_shmem_init(const ProllyImplInfo *impl, void *area)
 			break;
 		case PROLLY_IFACE_REFS:
 			PROLLY_CALL(((const ProllyRefsRoutine *) impl), shmem_init, area);
+			break;
+		case PROLLY_IFACE_MATERIALIZATION_CACHE:
+			PROLLY_CALL(((const ProllyMatCacheRoutine *) impl), shmem_init, area);
 			break;
 		default:
 			elog(ERROR, "prolly %s implementations have no shared memory",

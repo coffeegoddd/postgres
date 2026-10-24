@@ -56,15 +56,20 @@
 #include "catalog/branch_ops.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_branch.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_index.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/trigger.h"
 #include "catalog/versioned.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/bufmgr.h"
@@ -76,10 +81,12 @@
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -303,10 +310,10 @@ flush_relations(List *relids)
  * or lock_timeout passes (0, the default, waits for as long as it takes).
  * Nor does the deadlock detector see this wait: lock_timeout or
  * statement_timeout bounds it.  The catalogs are read again after, as the
- * locks left them.
+ * locks left them.  nowait: tried once; false, none taken, if one is held.
  */
-static void
-lock_relations(List *relids, LOCKMODE mode)
+static bool
+lock_relations(List *relids, LOCKMODE mode, bool nowait)
 {
 	TimestampTz start = 0;
 	long		delay = 1;
@@ -314,6 +321,8 @@ lock_relations(List *relids, LOCKMODE mode)
 
 	while (OidIsValid(busy = lock_all_or_none(relids, mode)))
 	{
+		if (nowait)
+			return false;
 		if (start == 0)
 			start = GetCurrentTimestamp();
 		else if (LockTimeout > 0 &&
@@ -337,6 +346,7 @@ lock_relations(List *relids, LOCKMODE mode)
 		delay = Min(delay * 2, COPY_LOCK_MAX_DELAY_MS);
 	}
 	InvalidateCatalogSnapshot();
+	return true;
 }
 
 /*
@@ -344,15 +354,21 @@ lock_relations(List *relids, LOCKMODE mode)
  * copy is of a state no writer is in the middle of (lock_relations()).
  * Returns them, for unlock_relations().  The source's dirty pages are
  * written first, outside the locks, so that what the copy writes under
- * them is only what changed meanwhile.
+ * them is only what changed meanwhile.  nowait: tried once; if a writer
+ * holds one, none is taken and *busy set.
  */
 static List *
-lock_versioned_relations(void)
+lock_versioned_relations(bool nowait, bool *busy)
 {
 	List	   *relids = branch_relations();
 
 	flush_relations(relids);
-	lock_relations(relids, ShareLock);
+	if (!lock_relations(relids, ShareLock, nowait))
+	{
+		*busy = true;
+		list_free(relids);
+		return NIL;
+	}
 	return relids;
 }
 
@@ -364,6 +380,51 @@ unlock_relations(List *relids, LOCKMODE mode)
 
 	foreach(lc, relids)
 		UnlockRelationOid(lfirst_oid(lc), mode);
+}
+
+/*
+ * The relations of the session branch's tables named in emptied whose
+ * copies begin with no rows: each plain table's, its TOAST table's and
+ * both's indexes.  (Its change log is shared still: it is told the table
+ * was emptied.)  Returns the tables, adding them all to *relids.
+ */
+static List *
+emptied_relations(List *emptied, List **relids)
+{
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	foreach(lc, emptied)
+	{
+		Oid			relid;
+		Oid			toast;
+		List	   *rels;
+
+		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(lfirst(lc), NULL)),
+								 NoLock, true);
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION ||
+			list_member_oid(tables, relid))
+			continue;
+		tables = lappend_oid(tables, relid);
+		rels = list_make1_oid(relid);
+		{
+			Relation	r = table_open(relid, AccessShareLock);
+
+			toast = r->rd_rel->reltoastrelid;
+			table_close(r, AccessShareLock);
+		}
+		if (OidIsValid(toast))
+			rels = lappend_oid(rels, toast);
+		foreach_oid(rel, rels)
+		{
+			Relation	r = table_open(rel, AccessShareLock);
+
+			*relids = list_concat(*relids, RelationGetIndexList(r));
+			table_close(r, AccessShareLock);
+		}
+		*relids = list_concat(*relids, rels);
+	}
+	return tables;
 }
 
 /*
@@ -416,12 +477,14 @@ kept_of(const BranchKeptRelation *const *kept, int nkept, Oid relid)
 }
 
 /*
- * Copy every row of the session branch into branch 'target'; a relation
- * of kept[] (nkept of them) gets storage made of the pages kept, the
- * others a copy of their storage as it is.
+ * Copy every row of the session branch into branch 'target'; the
+ * relations in fresh get new, empty storage rather than a share of the
+ * session branch's, a relation of kept[] (nkept of them) storage made of
+ * the pages kept, the others a copy of their storage as it is.
  */
 static void
-copy_rows(Oid target, const BranchKeptRelation *const *kept, int nkept)
+copy_rows(Oid target, List *fresh, const BranchKeptRelation *const *kept,
+		  int nkept)
 {
 	int			ncatalogs;
 	const CatalogBranchInfo *catalogs = catalog_branch_catalogs(&ncatalogs);
@@ -460,7 +523,18 @@ copy_rows(Oid target, const BranchKeptRelation *const *kept, int nkept)
 					if (!RelFileNumberIsValid(c->relfilenode))
 						elog(ERROR, "versioned relation \"%s\" is mapped",
 							 NameStr(c->relname));
-					c->relfilenode = k ? copy_kept_storage(c, k) : copy_storage(c);
+					if (list_member_oid(fresh, c->oid))
+					{
+						RelFileNumber relnumber;
+
+						relnumber = GetNewRelFileNumber(c->reltablespace, NULL,
+														c->relpersistence);
+						(void) RelationCreateStorage(class_locator(c, relnumber),
+													 c->relpersistence, true);
+						c->relfilenode = relnumber;
+					}
+					else
+						c->relfilenode = k ? copy_kept_storage(c, k) : copy_storage(c);
 				}
 			}
 
@@ -539,32 +613,53 @@ on_branch(Oid branch, void (*fn) (void *arg), void *arg)
 	PG_END_TRY();
 }
 
+/*
+ * A branch's copies to make: the branch's id, the tables to empty, and,
+ * nowait, whether a writer held them up; with tables (ntables of them),
+ * made of the pages kept of those still kept (used[] says which), as
+ * copy_from_kept() makes them.
+ */
+typedef struct CopyTo
+{
+	Oid			branch;
+	List	   *emptied;		/* names, then the tables' ids */
+	bool		nowait;
+	bool		busy;
+	const BranchKeptTable *tables;
+	int			ntables;
+	bool	   *used;
+} CopyTo;
+
+static void copy_from_kept(CopyTo *ct);
+
 static void
 copy_from_here(void *arg)
 {
+	CopyTo	   *ct = arg;
 	List	   *locked;
+	List	   *fresh = NIL;
+
+	if (ct->tables != NULL)
+	{
+		copy_from_kept(ct);
+		return;
+	}
 
 	/*
 	 * (the change logs' entries the transaction holds, of rows on the pages
 	 * the copy shares, written first: the copy's log holds them too)
 	 */
 	prolly_change_logs_flush();
-	locked = lock_versioned_relations();
+	locked = lock_versioned_relations(ct->nowait, &ct->busy);
+	if (ct->busy)
+		return;
 
-	copy_rows(*(Oid *) arg, NULL, 0);
-	copyBranchSharedDependencies(MyBranch, *(Oid *) arg);
+	ct->emptied = emptied_relations(ct->emptied, &fresh);
+	copy_rows(ct->branch, fresh, NULL, 0);
+	copyBranchSharedDependencies(MyBranch, ct->branch);
 	unlock_relations(locked, ShareLock);
 	list_free(locked);
 }
-
-/* A branch made of the pages kept of the source's tables (make_kept()). */
-typedef struct MakeKept
-{
-	Oid			target;
-	const BranchKeptTable *tables;
-	int			ntables;
-	bool	   *used;
-} MakeKept;
 
 static bool can_restore(Form_pg_class c, const BranchKeptRelation *k);
 
@@ -596,14 +691,16 @@ still_kept(Relation pg_class, const BranchKeptRelation *k)
  * once and tried, never queued for; only the relations not copied from
  * kept pages (a table whose storage was replaced since, a sequence) are
  * locked against writers too, as a copy locks them, and their pages
- * written out first.
+ * written out first.  Of the tables emptied names, those not made of kept
+ * pages begin empty, as a copy's do (the others are their head already).
+ * nowait: tried once each; if one is held, nothing is made, ct->busy set.
  */
 static void
-copy_from_kept(void *arg)
+copy_from_kept(CopyTo *ct)
 {
-	MakeKept   *mk = arg;
 	List	   *all;
 	List	   *rest = NIL;
+	List	   *fresh = NIL;
 	const BranchKeptRelation **kept;
 	int			nkept = 0;
 	int			max = 0;
@@ -611,21 +708,26 @@ copy_from_kept(void *arg)
 
 	prolly_change_logs_flush();
 	all = branch_relations();
-	lock_relations(all, ShareUpdateExclusiveLock);
+	if (!lock_relations(all, ShareUpdateExclusiveLock, ct->nowait))
+	{
+		ct->busy = true;
+		list_free(all);
+		return;
+	}
 
 	pg_class = table_open(RelationRelationId, AccessShareLock);
-	for (int t = 0; t < mk->ntables; t++)
-		max += mk->tables[t].nrels;
+	for (int t = 0; t < ct->ntables; t++)
+		max += ct->tables[t].nrels;
 	kept = palloc_array(const BranchKeptRelation *, Max(max, 1));
-	for (int t = 0; t < mk->ntables; t++)
+	for (int t = 0; t < ct->ntables; t++)
 	{
-		const BranchKeptTable *kt = &mk->tables[t];
+		const BranchKeptTable *kt = &ct->tables[t];
 
-		mk->used[t] = true;
-		for (int r = 0; r < kt->nrels && mk->used[t]; r++)
-			mk->used[t] = list_member_oid(all, kt->rels[r].relid) &&
+		ct->used[t] = true;
+		for (int r = 0; r < kt->nrels && ct->used[t]; r++)
+			ct->used[t] = list_member_oid(all, kt->rels[r].relid) &&
 				still_kept(pg_class, &kt->rels[r]);
-		if (mk->used[t])
+		if (ct->used[t])
 			for (int r = 0; r < kt->nrels; r++)
 				kept[nkept++] = &kt->rels[r];
 	}
@@ -638,14 +740,72 @@ copy_from_kept(void *arg)
 
 	/* (an error lets go of the locks as the transaction aborts) */
 	flush_relations(rest);
-	lock_relations(rest, ShareLock);
-	copy_rows(mk->target, kept, nkept);
-	copyBranchSharedDependencies(MyBranch, mk->target);
+	if (!lock_relations(rest, ShareLock, ct->nowait))
+	{
+		ct->busy = true;
+		unlock_relations(all, ShareUpdateExclusiveLock);
+		list_free(all);
+		list_free(rest);
+		pfree(kept);
+		return;
+	}
+	ct->emptied = emptied_relations(ct->emptied, &fresh);
+	{
+		List	   *empty = NIL;
+
+		/* (a table made of kept pages is its head already: not emptied) */
+		foreach_oid(relid, ct->emptied)
+		{
+			if (kept_of(kept, nkept, relid) == NULL)
+				empty = lappend_oid(empty, relid);
+		}
+		foreach_oid(relid, fresh)
+		{
+			if (kept_of(kept, nkept, relid) != NULL)
+				fresh = foreach_delete_current(fresh, relid);
+		}
+		ct->emptied = empty;
+	}
+	copy_rows(ct->branch, fresh, kept, nkept);
+	copyBranchSharedDependencies(MyBranch, ct->branch);
 	unlock_relations(rest, ShareLock);
 	unlock_relations(all, ShareUpdateExclusiveLock);
 	list_free(all);
 	list_free(rest);
 	pfree(kept);
+}
+
+/*
+ * Each of the new branch's copies of tables (their storage new and empty,
+ * copy_rows()'s fresh) made valid as TRUNCATE leaves a table, under the
+ * ACCESS EXCLUSIVE lock it takes: the table and its TOAST table given new
+ * storage in the transaction (so a load into it builds its indexes once,
+ * after its rows), each index built over no rows, and the change log told
+ * the table was emptied.
+ */
+static void
+empty_here(void *arg)
+{
+	ReindexParams params = {0};
+
+	foreach_oid(relid, (List *) arg)
+	{
+		Relation	rel = table_open(relid, AccessExclusiveLock);
+		Oid			toast = rel->rd_rel->reltoastrelid;
+
+		RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+		if (OidIsValid(toast))
+		{
+			Relation	t = table_open(toast, AccessExclusiveLock);
+
+			RelationSetNewRelfilenumber(t, t->rd_rel->relpersistence);
+			table_close(t, NoLock);
+		}
+		(void) reindex_relation(NULL, relid, REINDEX_REL_PROCESS_TOAST, &params);
+		prolly_note_emptied(rel);
+		table_close(rel, NoLock);
+	}
+	CommandCounterIncrement();
 }
 
 static void
@@ -723,11 +883,15 @@ copies_check_create(const char *name)
 					   get_database_name(MyDatabaseId));
 }
 
+/*
+ * Make branch name, the copies of branch source's (ct says how), its
+ * pg_branch row first; InvalidOid, nothing made, if ct->nowait and a
+ * writer held them up.
+ */
 static Oid
-copies_make(const char *name, const char *start_point)
+make_branch(const char *name, Oid source, CopyTo *ct)
 {
 	Relation	brel;
-	Oid			source;
 	Oid			branch;
 	Datum		values[Natts_pg_branch];
 	bool		nulls[Natts_pg_branch] = {0};
@@ -739,7 +903,6 @@ copies_make(const char *name, const char *start_point)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("branch \"%s\" already exists", name)));
-	source = start_point ? branch_oid(start_point, false) : MyBranch;
 
 	branch = GetNewOidWithIndex(brel, BranchOidIndexId, Anum_pg_branch_oid);
 	namestrcpy(&brname, name);
@@ -749,15 +912,39 @@ copies_make(const char *name, const char *start_point)
 	nulls[Anum_pg_branch_browner - 1] = true;	/* (a new branch is clean) */
 	tup = heap_form_tuple(RelationGetDescr(brel), values, nulls);
 	CatalogTupleInsert(brel, tup);
-	heap_freetuple(tup);
 	CommandCounterIncrement();
 
-	on_branch(source, copy_from_here, &branch);
+	ct->branch = branch;
+	on_branch(source, copy_from_here, ct);
+	if (ct->busy)
+	{
+		/* (nothing copied: the row taken back, as if never made) */
+		CatalogTupleDelete(brel, &tup->t_self);
+		heap_freetuple(tup);
+		CommandCounterIncrement();
+		table_close(brel, NoLock);
+		return InvalidOid;
+	}
+	heap_freetuple(tup);
 	CommandCounterIncrement();
 	note_new_branch(branch);
+	if (ct->emptied != NIL)
+		on_branch(branch, empty_here, ct->emptied);
 
 	table_close(brel, NoLock);
 	return branch;
+}
+
+static Oid
+copies_make(const char *name, const char *start_point, List *emptied,
+			bool nowait)
+{
+	CopyTo		ct = {0};
+
+	ct.emptied = emptied;
+	ct.nowait = nowait;
+	return make_branch(name, start_point ? branch_oid(start_point, false) : MyBranch,
+					   &ct);
 }
 
 /*
@@ -766,52 +953,24 @@ copies_make(const char *name, const char *start_point)
  */
 static Oid
 copies_make_kept(const char *name, const char *source,
-				 const BranchKeptTable *tables, int ntables, bool *used)
+				 const BranchKeptTable *tables, int ntables, bool *used,
+				 List *emptied, bool nowait)
 {
-	Relation	brel;
-	Oid			from;
-	Oid			branch;
-	Datum		values[Natts_pg_branch];
-	bool		nulls[Natts_pg_branch] = {0};
-	NameData	brname;
-	HeapTuple	tup;
-	MakeKept	mk;
+	CopyTo		ct = {0};
 
-	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
-	if (OidIsValid(branch_oid(name, true)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("branch \"%s\" already exists", name)));
-	from = branch_oid(source, false);
-
-	branch = GetNewOidWithIndex(brel, BranchOidIndexId, Anum_pg_branch_oid);
-	namestrcpy(&brname, name);
-	values[Anum_pg_branch_oid - 1] = ObjectIdGetDatum(branch);
-	values[Anum_pg_branch_brname - 1] = NameGetDatum(&brname);
-	values[Anum_pg_branch_brownerrole - 1] = ObjectIdGetDatum(InvalidOid);
-	nulls[Anum_pg_branch_browner - 1] = true;	/* (a new branch is clean) */
-	tup = heap_form_tuple(RelationGetDescr(brel), values, nulls);
-	CatalogTupleInsert(brel, tup);
-	heap_freetuple(tup);
-	CommandCounterIncrement();
-
-	mk.target = branch;
-	mk.tables = tables;
-	mk.ntables = ntables;
-	mk.used = used;
-	on_branch(from, copy_from_kept, &mk);
-	CommandCounterIncrement();
-	note_new_branch(branch);
-
-	table_close(brel, NoLock);
-	return branch;
+	ct.emptied = emptied;
+	ct.nowait = nowait;
+	ct.tables = tables;
+	ct.ntables = ntables;
+	ct.used = used;
+	return make_branch(name, branch_oid(source, false), &ct);
 }
 
 static Oid
 copies_create(const char *name, const char *start_point)
 {
 	copies_check_create(name);
-	return copies_make(name, start_point);
+	return copies_make(name, start_point, NIL, false);
 }
 
 static void
@@ -973,11 +1132,142 @@ class_row(Relation pg_class, Oid relid, Oid branch)
 }
 
 /*
+ * Copies of the rows a branch-aware catalog has for relation relid on
+ * branch, found by an index whose first column is the relation, in its
+ * order.
+ */
+static List *
+branch_rows(Oid catalog, Oid index, AttrNumber relattr, Oid relid,
+			Oid branch)
+{
+	Relation	rel = table_open(catalog, AccessShareLock);
+	const CatalogBranchInfo *info = catalog_branch_info(catalog);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *rows = NIL;
+
+	ScanKeyInit(&key, relattr, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(rel, index, true, NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+			if (catalog_row_branch(info, tup) == branch)
+				rows = lappend(rows, heap_copytuple(tup));
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+	return rows;
+}
+
+/* Is column attnum of two rows of catalog the same value? */
+static bool
+same_column(Oid catalog, HeapTuple a, HeapTuple b, AttrNumber attnum)
+{
+	Relation	rel = table_open(catalog, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+	bool		anull;
+	bool		bnull;
+	Datum		av = heap_getattr(a, attnum, desc, &anull);
+	Datum		bv = heap_getattr(b, attnum, desc, &bnull);
+	bool		same;
+
+	same = anull == bnull &&
+		(anull || datum_image_eq(av, bv, att->attbyval, att->attlen));
+	table_close(rel, AccessShareLock);
+	return same;
+}
+
+/*
+ * Are relation relid's columns, on the session's branch and on source,
+ * stored alike: the same numbers, types, lengths, alignment, storage,
+ * compression, collations and dropped columns, and the same values for a
+ * column a row too short to hold it is read as having?  A share gives the
+ * relation the source's tuples, which are read by the session branch's
+ * descriptor: equal definitions don't make equal layouts (a dropped
+ * column, still in the tuples written before the drop, is described by
+ * neither).
+ */
+static bool
+columns_alike(Oid relid, Oid source)
+{
+	List	   *ours = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+								   Anum_pg_attribute_attrelid, relid, MyBranch);
+	List	   *theirs = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+									 Anum_pg_attribute_attrelid, relid, source);
+	ListCell   *a;
+	ListCell   *b;
+
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	forboth(a, ours, b, theirs)
+	{
+		Form_pg_attribute o = (Form_pg_attribute) GETSTRUCT((HeapTuple) lfirst(a));
+		Form_pg_attribute t = (Form_pg_attribute) GETSTRUCT((HeapTuple) lfirst(b));
+
+		if (o->attnum != t->attnum || o->atttypid != t->atttypid ||
+			o->atttypmod != t->atttypmod || o->attlen != t->attlen ||
+			o->attbyval != t->attbyval || o->attalign != t->attalign ||
+			o->attstorage != t->attstorage ||
+			o->attcompression != t->attcompression ||
+			o->attisdropped != t->attisdropped ||
+			o->attcollation != t->attcollation ||
+			o->atthasmissing != t->atthasmissing ||
+			(o->atthasmissing &&
+			 !same_column(AttributeRelationId, lfirst(a), lfirst(b),
+						  Anum_pg_attribute_attmissingval)))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Is index relid defined alike on the session's branch and on source: the
+ * same columns, expressions, operator classes, collations, options,
+ * predicate and uniqueness?  (Not one the source has rebuilt otherwise.)
+ */
+static bool
+index_alike(Oid relid, Oid source)
+{
+	static const AttrNumber compared[] = {
+		Anum_pg_index_indnatts, Anum_pg_index_indnkeyatts,
+		Anum_pg_index_indisunique, Anum_pg_index_indnullsnotdistinct,
+		Anum_pg_index_indisprimary, Anum_pg_index_indisexclusion,
+		Anum_pg_index_indkey, Anum_pg_index_indcollation,
+		Anum_pg_index_indclass, Anum_pg_index_indoption,
+		Anum_pg_index_indexprs, Anum_pg_index_indpred,
+	};
+	List	   *ours = branch_rows(IndexRelationId, IndexRelidIndexId,
+								   Anum_pg_index_indexrelid, relid, MyBranch);
+	List	   *theirs = branch_rows(IndexRelationId, IndexRelidIndexId,
+									 Anum_pg_index_indexrelid, relid, source);
+
+	if (list_length(ours) != 1 || list_length(theirs) != 1)
+		return false;
+	for (int i = 0; i < lengthof(compared); i++)
+		if (!same_column(IndexRelationId, linitial(ours), linitial(theirs),
+						 compared[i]))
+			return false;
+	return true;
+}
+
+/*
  * Give the session branch's relations relids the source branch's storage
  * (#491): each a share of the source's (copy_storage()'s), its row taking
  * the source's say of how old its oldest row is and how big it is (the
- * pages are the source's).  Checked first, all of them, so a refusal
- * changes nothing.
+ * pages are the source's).  The source is held against deletion first
+ * (pin_branch()), and each relation must be stored alike on both: the
+ * same kind, access method, columns as stored and TOAST table, and an
+ * index the same index.  Checked first, all of them, so a refusal changes
+ * nothing.
  */
 static bool
 copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
@@ -989,6 +1279,10 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	ListCell   *a;
 	ListCell   *b;
 	bool		alike = true;
+
+	/* (not the storage of a branch being deleted) */
+	if (!pin_branch(source))
+		return false;
 
 	/* (ours as TRUNCATE locks them; the source's as a copy does, its own) */
 	foreach_oid(relid, relids)
@@ -1021,6 +1315,10 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 		oc = (Form_pg_class) GETSTRUCT(o);
 		tc = (Form_pg_class) GETSTRUCT(t);
 		if (oc->relkind != tc->relkind || !RELKIND_HAS_STORAGE(oc->relkind) ||
+			oc->relam != tc->relam || oc->relnatts != tc->relnatts ||
+			oc->reltoastrelid != tc->reltoastrelid ||
+			!columns_alike(relid, source) ||
+			(oc->relkind == RELKIND_INDEX && !index_alike(relid, source)) ||
 			oc->relpersistence != RELPERSISTENCE_PERMANENT ||
 			tc->relpersistence != RELPERSISTENCE_PERMANENT ||
 			oc->reltablespace != tc->reltablespace ||

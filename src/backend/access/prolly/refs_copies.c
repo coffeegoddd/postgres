@@ -147,6 +147,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include <ctype.h>
 
 #include "access/prolly_builtins.h"
@@ -1584,72 +1586,37 @@ settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 }
 
 /*
- * Sharing pages instead of writing rows (#491).  A move to a root another
- * branch's working set is known to be (nobody writing it, every writer
- * that ended seen) gives each table whose rows differ that branch's
- * storage instead, the table's with its indexes', TOAST table's and change
- * log's, when sharing their blocks costs less than writing the rows that
- * differ (about 10 us a block against 11 a row): its pages, maps and log
- * then are that branch's, and the baseline takes that branch's entry for
- * it, which its log goes on from.  Only a move of rows (the two roots
- * define the same objects), only of tables whose relations are that
- * branch's too (made from the same, so the same ids), and only where the
- * locks are free now (share()'s: this branch's copies as TRUNCATE locks
- * them, that branch's against its writers), that branch still known at
- * the root as it was known once they are held (the first table shared
- * changes pg_class, after which nothing new is known in the transaction).
- * Not at a first use: the copies' catalog rows, made in the transaction,
- * keep anything from being known after them, and a branch known at the
- * root was copied already.  As TRUNCATE, it isn't MVCC-safe: a snapshot
- * taken before the move commits reads the shared storage after.
+ * Sharing pages instead of writing rows (#491).  A move whose target has a
+ * table whose rows differ from the working set's gives the table the
+ * storage of another state that holds the target's (the table's with its
+ * indexes', TOAST table's and change log's), when sharing costs less than
+ * writing the rows that differ: its pages, maps and log then are that
+ * state's, and the baseline takes that state's entry for it, which its log
+ * goes on from.  A source is a branch other than the session's whose
+ * working set is a root known: one known as folded (nobody writing it,
+ * every writer that ended seen), or a kept materialization (the
+ * materialization cache's: immutable, made before the snapshot), whose
+ * root has the target's table, the same data tree and definition.  Only a
+ * move of rows (the two roots define the same objects), only of tables
+ * whose relations are the source's too (made from the same, so the same
+ * ids) and stored alike, and only where the locks are free now (share()'s:
+ * this branch's copies as TRUNCATE locks them, the source's against its
+ * writers and its deletion), a known source still known at its root as it
+ * was known once they are held (the first table shared changes pg_class,
+ * after which nothing new is known in the transaction).  At a first use
+ * only kept sources serve: the copies' catalog rows, made in the
+ * transaction, keep anything from being known after them.  As TRUNCATE,
+ * it isn't MVCC-safe: a snapshot taken before the move commits reads the
+ * shared storage after.
+ *
+ * Sharing a block-mapped relation copies its map's root page, each subtree
+ * gaining a holder, and its free space and visibility maps: a constant for
+ * each relation, and a little for each block those maps cover, against
+ * about 11 us for each row written.
  */
 #define MOVE_ROW_USEC		11
-#define SHARE_BLOCK_USEC	10
-
-/* A branch other than the session's whose working set is known to be root. */
-typedef struct CleanAt
-{
-	const ProllyHash *root;
-	Snapshot	snap;
-	char	   *name;
-	Oid			branch;
-	ProllyNodeRef baseline;
-	BranchFoldStamp at;			/* what it was known at */
-} CleanAt;
-
-static void
-find_clean_at(const char *name, Oid branch, void *arg)
-{
-	CleanAt    *ca = arg;
-	ProllyNodeRef baseline;
-	ProllyHash	h;
-
-	if (ca->name != NULL || branch == MyBranch ||
-		!branch_baseline(name, &baseline))
-		return;
-	if (branch_fold_known_at(branch, ca->snap, &baseline.hash, false, &h,
-							 &ca->at) &&
-		same_hash(&h, ca->root))
-	{
-		ca->name = pstrdup(name);
-		ca->branch = branch;
-		ca->baseline = baseline;
-	}
-}
-
-/*
- * Is ca's branch still at its root, as it was known to be?  Asked of what
- * was known then: the first table shared changes pg_class, after which
- * nothing new is known in the transaction, though nothing about the other
- * branch changed.
- */
-static bool
-still_clean(void *arg)
-{
-	CleanAt    *ca = arg;
-
-	return branch_fold_unchanged(&ca->at);
-}
+#define SHARE_RELATION_USEC	300
+#define SHARE_BLOCKS_PER_USEC	64
 
 /* A root's table, as tables() visits it. */
 typedef struct NamedTree
@@ -1657,18 +1624,36 @@ typedef struct NamedTree
 	char	   *name;
 	ProllyNodeRef data;
 	bool		readable;
+	char	   *description;	/* its description's bytes, and their length */
+	uint32		description_len;
 } NamedTree;
 
 static void
 note_table(const char *name, const ProllyNodeRef *data,
 		   const ProllyValue *description, const char *unreadable, void *arg)
 {
-	NamedTree  *t = palloc(sizeof(NamedTree));
+	NamedTree  *t = palloc0(sizeof(NamedTree));
 
 	t->name = pstrdup(name);
 	t->data = *data;
 	t->readable = unreadable == NULL;
+	if (description != NULL)
+	{
+		t->description = palloc(Max(description->len, 1));
+		memcpy(t->description, description->data, description->len);
+		t->description_len = description->len;
+	}
 	*(List **) arg = lappend(*(List **) arg, t);
+}
+
+/* Are two roots' tables the same: name, rows and definition? */
+static bool
+same_table(const NamedTree *a, const NamedTree *b)
+{
+	return a->readable && b->readable && strcmp(a->name, b->name) == 0 &&
+		same_hash(&a->data.hash, &b->data.hash) &&
+		a->description_len == b->description_len &&
+		memcmp(a->description, b->description, a->description_len) == 0;
 }
 
 static void
@@ -1713,41 +1698,142 @@ stored_with(Oid relid, uint64 *blocks)
 	return relids;
 }
 
+/* A state another branch holds, whose tables a move can share. */
+typedef struct ShareSource
+{
+	char	   *name;
+	Oid			branch;
+	ProllyNodeRef root;			/* its working set */
+	ProllyNodeRef baseline;
+	bool		kept;			/* a kept materialization; else known: */
+	BranchFoldStamp at;			/* what it was known at */
+	List	   *tables;			/* NamedTree *: root's, once read */
+	bool		read;
+	List	   *shared;			/* names of the tables shared from it */
+} ShareSource;
+
+typedef struct ShareSources
+{
+	Snapshot	snap;
+	List	   *sources;		/* ShareSource * */
+} ShareSources;
+
+static void
+find_known_source(const char *name, Oid branch, void *arg)
+{
+	ShareSources *ss = arg;
+	ShareSource *s;
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	BranchFoldStamp at;
+
+	if (branch == MyBranch || !branch_baseline(name, &baseline) ||
+		!branch_fold_known_at(branch, ss->snap, &baseline.hash, false, &h,
+							  &at))
+		return;
+	s = palloc0(sizeof(ShareSource));
+	s->name = pstrdup(name);
+	s->branch = branch;
+	ref_of(&h, &s->root);
+	s->baseline = baseline;
+	s->at = at;
+	ss->sources = lappend(ss->sources, s);
+}
+
+static void
+find_kept_source(const ProllyKeptState *state, void *arg)
+{
+	ShareSources *ss = arg;
+	ShareSource *s;
+	ProllyNodeRef baseline;
+
+	foreach_ptr(ShareSource, known, ss->sources)
+		if (known->branch == state->branch)
+			return;
+	if (!branch_baseline(state->name, &baseline))
+		return;
+	s = palloc0(sizeof(ShareSource));
+	s->name = pstrdup(state->name);
+	s->branch = state->branch;
+	s->root = state->root;
+	s->baseline = baseline;
+	s->kept = true;
+	ss->sources = lappend(ss->sources, s);
+}
+
+/*
+ * Is source still at its root: a known one as it was known (asked of what
+ * was known then: the first table shared changes pg_class, after which
+ * nothing new is known in the transaction, though nothing about the other
+ * branch changed), a kept one always (share() holds it against deletion).
+ */
+static bool
+still_at_root(void *arg)
+{
+	ShareSource *s = arg;
+
+	return s->kept || branch_fold_unchanged(&s->at);
+}
+
+/* The source with table t as the target has it, or NULL. */
+static ShareSource *
+source_of(List *sources, const NamedTree *t)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	foreach_ptr(ShareSource, s, sources)
+	{
+		if (!s->read)
+		{
+			PROLLY_CALL(dc.canonicalizer, tables, &s->root, NULL, note_table,
+						&s->tables);
+			s->read = true;
+		}
+		foreach_ptr(NamedTree, theirs, s->tables)
+			if (same_table(theirs, t))
+				return s;
+	}
+	return NULL;
+}
+
 /*
  * The tables of the session's branch whose rows differ from target's made
- * the copies another branch has where that costs less (true: some were);
+ * the copies another state has where that costs less (true: some were);
  * *working is then the branch's working set, folded as its baseline.
  */
 static bool
 share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 {
 	ProllyDatabaseComponents dc;
-	CleanAt		ca = {0};
+	ShareSources ss = {0};
 	List	   *ours = NIL;
 	List	   *theirs = NIL;
 	List	   *chosen = NIL;	/* NamedTree *, then each one's relations */
 	List	   *relations = NIL;
-	List	   *shared = NIL;
+	List	   *from = NIL;		/* and its source */
 	ProllyTreeEnv denv;
 	ProllyNodeRef baseline;
-	ProllyNodeRef spliced;
 	ProllyNodeRef next;
 	ListCell   *a;
 	ListCell   *b;
+	ListCell   *c;
 	char	   *current = branch_ops()->current();
+	int			nshared = 0;
 
 	prolly_database_components(&dc);
 	if (branch_ops()->share == NULL || dc.canonicalizer->splice_baseline == NULL ||
 		!fold_caches_usable() || !branch_baseline(current, &baseline))
 		return false;
-	ca.root = &target->hash;
-	ca.snap = fold_snapshot();
-	branch_ops()->branches(find_clean_at, &ca);
-	if (ca.name == NULL ||
+	ss.snap = fold_snapshot();
+	branch_ops()->branches(find_known_source, &ss);
+	if (dc.matcache && PROLLY_HAS(dc.matcache, visit))
+		PROLLY_CALL(dc.matcache, visit, ss.snap, find_kept_source, &ss);
+	if (ss.sources == NIL ||
 		!PROLLY_CALL(dc.canonicalizer, same_schema, working, target))
 		return false;
 
-	/* the tables whose rows differ, where sharing costs less */
+	/* the tables whose rows differ, where a source has them and sharing costs less */
 	PROLLY_CALL(dc.canonicalizer, tables, working, NULL, note_table, &ours);
 	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
 	if (list_length(ours) != list_length(theirs))
@@ -1757,6 +1843,7 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 	{
 		NamedTree  *o = lfirst(a);
 		NamedTree  *t = lfirst(b);
+		ShareSource *s;
 		uint64		changes = 0;
 		uint64		blocks;
 		Oid			relid;
@@ -1769,36 +1856,56 @@ share_clean_tables(const ProllyNodeRef *target, ProllyNodeRef *working)
 			continue;
 		relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(o->name, NULL)),
 								 NoLock, true);
-		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION)
+		if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_RELATION ||
+			(s = source_of(ss.sources, t)) == NULL)
 			continue;
 		relids = stored_with(relid, &blocks);
 		PROLLY_CALL(tree, diff, &denv, &o->data, &t->data, count_change,
 					&changes);
-		if ((double) changes * MOVE_ROW_USEC <= (double) blocks * SHARE_BLOCK_USEC)
+		if ((double) changes * MOVE_ROW_USEC <=
+			(double) list_length(relids) * SHARE_RELATION_USEC +
+			(double) blocks / SHARE_BLOCKS_PER_USEC)
 			continue;
 		chosen = lappend(chosen, o);
 		relations = lappend(relations, relids);
+		from = lappend(from, s);
 	}
 	if (chosen == NIL)
 		return false;
 	if (debug_prolly_verify_fold_caches)
-		verify_known(ca.name, false, target);
+		foreach_ptr(ShareSource, s, ss.sources)
+			if (list_member_ptr(from, s))
+				verify_known(s->name, false, &s->root);
 
 	/*
-	 * (each shared if nobody uses it now, and the other branch is still at
-	 * the target with it locked: none of its writers ended since, nor can
-	 * write it now)
+	 * (each shared if nobody uses it now, and its source is still at its
+	 * root with it locked: none of its writers ended since, nor can write it
+	 * now)
 	 */
-	forboth(a, chosen, b, relations)
+	forthree(a, chosen, b, relations, c, from)
 	{
-		if (branch_ops()->share(ca.branch, lfirst(b), still_clean, &ca))
-			shared = lappend(shared, ((NamedTree *) lfirst(a))->name);
+		ShareSource *s = lfirst(c);
+
+		if (branch_ops()->share(s->branch, lfirst(b), still_at_root, s))
+		{
+			s->shared = lappend(s->shared, ((NamedTree *) lfirst(a))->name);
+			nshared++;
+		}
 	}
-	if (shared == NIL)
+	if (nshared == 0)
 		return false;
-	PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &ca.baseline,
-				shared, &spliced);
-	branch_set_baseline(current, &spliced, NULL);
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_TABLES_SHARED, nshared);
+	foreach_ptr(ShareSource, s, ss.sources)
+	{
+		ProllyNodeRef spliced;
+
+		if (s->shared == NIL)
+			continue;
+		PROLLY_CALL(dc.canonicalizer, splice_baseline, &baseline, &s->baseline,
+					s->shared, &spliced);
+		baseline = spliced;
+	}
+	branch_set_baseline(current, &baseline, NULL);
 	fold_from_baseline(working, &next, false);
 	branch_set_baseline(current, &next, working);
 	return true;
@@ -2759,7 +2866,13 @@ rank_source(const char *name, Oid branch, void *arg)
 	}
 }
 
-/* A branch with copies whose pages are kept as of a commit. */
+/*
+ * A branch with copies whose pages are kept as of a commit.  Not a kept
+ * materialization: the move's shares (share_clean_tables()) and the
+ * planner's costs (kept_shareable()) take its tables, by what the
+ * materialization cache says it holds, so a first use made of kept pages
+ * and the shares that follow it never both claim one.
+ */
 typedef struct KeptSource
 {
 	const ProllyHash *commit;
@@ -2767,13 +2880,15 @@ typedef struct KeptSource
 	KeptCommit *kc;
 } KeptSource;
 
+static bool branch_kept(const char *name);
+
 static void
-find_kept_source(const char *name, Oid branch, void *arg)
+find_kept_commit(const char *name, Oid branch, void *arg)
 {
 	KeptSource *ks = arg;
 	KeptCommit *kc;
 
-	if (ks->kc != NULL && branch != MyBranch)
+	if ((ks->kc != NULL && branch != MyBranch) || branch_kept(name))
 		return;
 	if ((kc = kept_find(kept_get(name), ks->commit)) != NULL)
 	{
@@ -2783,18 +2898,245 @@ find_kept_source(const char *name, Oid branch, void *arg)
 }
 
 /*
+ * With no branch at the root: the branch whose copies would cost least to
+ * move there, as the move planner estimates the move from what its working
+ * set is known or thought to be (its working set known, else its
+ * baseline's fold, else its head; one changed since is only a hint, the
+ * move folding the copies as they are).  The session's branch is planned
+ * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
+ * after it, each stopped once it costs more than the best yet, each planned
+ * on its own branch (its tables' indexes are its own).  NULL if
+ * none is cheaper than the session's branch.  A kept materialization is a
+ * branch, so a candidate by the root it holds; and each plan is costed with
+ * the tables any kept one holds as the target does shared, not written
+ * (cost_with_shares()), as the move then shares them (share_clean_tables():
+ * an emptied copy too), so the copies chosen are those cheapest to finish
+ * with the shares, not without them; and then, with tables to share, a
+ * candidate isn't stopped at the best's cost.  The copies are new in the
+ * transaction, which no other sees: the tables of the chosen plan that
+ * cost less emptied and loaded than moved row by row (#713), and those the
+ * head hasn't, which the move drops (#714), are added to *emptied, for
+ * their copies to begin empty: no page of theirs is shared only to be
+ * written over or dropped.  Those of the session's branch's plan go to
+ * *own_emptied, for the copies made of it instead if the chosen branch is
+ * busy.
+ */
+#define SOURCE_CANDIDATES	16
+
+/* Is branch name a kept materialization (the materialization cache's)? */
+static bool
+branch_kept(const char *name)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	return dc.matcache != NULL && PROLLY_HAS(dc.matcache, kept) &&
+		PROLLY_CALL(dc.matcache, kept, name);
+}
+
+typedef struct SourceCandidates
+{
+	Snapshot	snap;
+	bool		others;			/* the others noted now, not the session's */
+	List	   *kept_seen;		/* OIDs of the kept materializations snap
+								 * sees made: no other kept one is a
+								 * candidate */
+	List	   *names;			/* char *, the session's branch first */
+	List	   *roots;			/* ProllyNodeRef *, what each is thought to be */
+} SourceCandidates;
+
+static void
+note_candidate(const char *name, Oid branch, void *arg)
+{
+	SourceCandidates *sc = arg;
+	ProllyNodeRef *root = palloc(sizeof(ProllyNodeRef));
+	ProllyNodeRef baseline;
+	ProllyHash	h;
+	ProllyCommitInfo info;
+	BranchFoldStamp at;
+
+	if ((branch != MyBranch) != sc->others ||
+		list_length(sc->names) > SOURCE_CANDIDATES)
+		return;
+	/* (one the snapshot doesn't see made holds rows it can't see) */
+	if (sc->others && !list_member_oid(sc->kept_seen, branch) &&
+		branch_kept(name))
+		return;
+	if (fold_caches_usable() &&
+		branch_fold_known_at(branch, sc->snap,
+							 branch_baseline(name, &baseline) ? &baseline.hash : NULL,
+							 false, &h, &at))
+		ref_of(&h, root);
+	else if (branch_baseline_root(name, root))
+		;
+	else if (branch_head(name, &h) && copies_commit_get(&h, &info))
+		*root = info.root;
+	else
+		return;
+	sc->names = lappend(sc->names, pstrdup(name));
+	sc->roots = lappend(sc->roots, root);
+}
+
+/* The tables of a plan whose copies begin empty, added to *emptied. */
+static void
+reloaded_tables(const ProllyMovePlan *plan, List **emptied)
+{
+	ListCell   *lc;
+
+	foreach(lc, plan->tables)
+	{
+		ProllyTableMove *m = lfirst(lc);
+
+		if (m->kind == PROLLY_TABLE_RELOAD || m->kind == PROLLY_TABLE_DROPPED)
+			*emptied = lappend(*emptied, m->name);
+	}
+}
+
+/* A plan made on a candidate's branch (run_on()). */
+typedef struct PlanOn
+{
+	const ProllyMovePlannerRoutine *planner;
+	const ProllyNodeRef *from;
+	const ProllyNodeRef *to;
+	double		bound;
+	ProllyMovePlan *plan;
+} PlanOn;
+
+static void
+plan_here(void *arg)
+{
+	PlanOn	   *po = arg;
+
+	PROLLY_CALL(po->planner, plan, po->from, po->to, PROLLY_PLAN_RELOADS,
+				po->bound, po->plan);
+}
+
+/*
+ * The target's tables a kept materialization holds as the target has them
+ * (the materialization cache's, made before snap): a first use's move
+ * shares each of these instead of writing its rows (share_clean_tables()),
+ * where its definitions are the target's.  Their names, as Strings; and
+ * the kept materializations snap sees made, into *seen.
+ */
+static List *
+kept_shareable(const ProllyNodeRef *target, Snapshot snap, List **seen)
+{
+	ProllyDatabaseComponents dc;
+	ShareSources ss = {snap, NIL};
+	List	   *theirs = NIL;
+	List	   *names = NIL;
+
+	prolly_database_components(&dc);
+	if (dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
+		return NIL;
+	PROLLY_CALL(dc.matcache, visit, snap, find_kept_source, &ss);
+	foreach_ptr(ShareSource, s, ss.sources)
+		*seen = lappend_oid(*seen, s->branch);
+	if (ss.sources == NIL)
+		return NIL;
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
+	foreach_ptr(NamedTree, t, theirs)
+		if (source_of(ss.sources, t) != NULL)
+			names = lappend(names, makeString(t->name));
+	return names;
+}
+
+/*
+ * A plan's cost with the tables a kept materialization holds as shared
+ * instead of written: each costs no more than sharing a table and the
+ * relations stored with it.  Only a plan of rows alone (the definitions
+ * alike), as a share is made only then.
+ */
+#define SHARE_TABLE_USEC	(4 * SHARE_RELATION_USEC)
+
+static double
+cost_with_shares(const ProllyMovePlan *plan, List *shareable)
+{
+	double		cost = plan->cost;
+
+	if (shareable == NIL)
+		return cost;
+	foreach_ptr(ProllyTableMove, m, plan->tables)
+		if (m->kind != PROLLY_TABLE_ROWS && m->kind != PROLLY_TABLE_RELOAD)
+			return cost;
+	foreach_ptr(ProllyTableMove, m, plan->tables)
+		if (m->cost > SHARE_TABLE_USEC && list_member(shareable, makeString(m->name)))
+			cost -= m->cost - SHARE_TABLE_USEC;
+	return cost;
+}
+
+static char *
+estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
+				 List **own_emptied)
+{
+	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
+	SourceCandidates sc = {snap, false, NIL, NIL, NIL};
+	ProllyMovePlan plan;
+	ProllyMovePlan best;
+	double		best_cost;
+	char	   *source = NULL;
+	List	   *shareable;
+
+	/* (the session's branch first, then the others) */
+	branch_ops()->branches(note_candidate, &sc);
+	if (sc.names == NIL)
+		return NULL;
+	shareable = kept_shareable(target, snap, &sc.kept_seen);
+	sc.others = true;
+	branch_ops()->branches(note_candidate, &sc);
+	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
+				INFINITY, &best);
+	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+	reloaded_tables(&best, own_emptied);
+	best_cost = cost_with_shares(&best, shareable);
+	for (int i = 1; i < list_length(sc.names); i++)
+	{
+		/*
+		 * (with tables to share, not bounded by the best's cost: one past it
+		 * may cost less once they are shared)
+		 */
+		PlanOn		po = {planner, list_nth(sc.roots, i), target,
+		shareable ? INFINITY : best_cost, &plan};
+		double		cost;
+
+		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
+		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+		cost = cost_with_shares(&plan, shareable);
+		if (!plan.over && cost < best_cost)
+		{
+			best = plan;
+			best_cost = cost;
+			source = list_nth(sc.names, i);
+		}
+	}
+	if (source != NULL)
+		reloaded_tables(&best, emptied);
+	else
+		*emptied = list_copy(*own_emptied);
+	return source;
+}
+
+/*
  * Make the copies of branch name, whose head is commit, of the pages a
  * branch keeps as of the commit, if one does (#489): the session's, or
  * another.  Each table whose pages are still kept shares them, O(1), with
  * no lock on the source that holds up its writers; the rest are copied as
- * any first use copies them.  The baseline is the source's, with each
- * table made of kept pages taking its entry from the kept baseline, as
- * its change log is as it was then.  False, nothing made, if no branch
- * keeps the commit's pages (or the source has no baseline).
+ * any first use copies them, those the move planner would reload or the
+ * move drops (#713, #714) begun empty.  The baseline is the source's, with
+ * each table made of kept pages taking its entry from the kept baseline,
+ * as its change log is as it was then.  False, nothing made, if no branch
+ * keeps the commit's pages (or the source has no baseline), or if the
+ * source is another branch whose copied relations have a writer in the
+ * middle of changing them (as for make()'s nowait).  This comes before
+ * any source the planner would cost: the pages kept are the head's, with
+ * nothing to move and no writer to wait for.
  */
 static bool
 make_of_kept(const char *name, const ProllyCommitInfo *commit)
 {
+	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
+	SourceCandidates sc = {GetActiveSnapshot(), false, NIL, NIL, NIL};
+	List	   *emptied = NIL;
 	ProllyDatabaseComponents dc;
 	KeptSource	ks = {&commit->id, NULL, NULL};
 	BranchKeptTable *tables;
@@ -2808,10 +3150,33 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 	if (prolly_kept_commits <= 0 || branch_ops()->make_kept == NULL ||
 		dc.canonicalizer->splice_baseline == NULL)
 		return false;
-	branch_ops()->branches(find_kept_source, &ks);
+	branch_ops()->branches(find_kept_commit, &ks);
 	if (ks.kc == NULL || ks.kc->baseline.len == 0 ||
 		!branch_baseline(ks.name, &baseline))
 		return false;
+
+	/*
+	 * (the plan of the move from what the source is thought to be, for the
+	 * tables not kept: those to begin empty)
+	 */
+	sc.others = strcmp(ks.name, branch_ops()->current()) != 0;
+	branch_ops()->branches(note_candidate, &sc);
+	if (sc.names != NIL)
+	{
+		ProllyMovePlan plan;
+		PlanOn		po = {planner, NULL, &commit->root, INFINITY, &plan};
+
+		for (int i = 0; i < list_length(sc.names); i++)
+		{
+			if (strcmp(list_nth(sc.names, i), ks.name) != 0)
+				continue;
+			po.from = list_nth(sc.roots, i);
+			branch_ops()->run_on(ks.name, plan_here, &po);
+			pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
+			reloaded_tables(&plan, &emptied);
+			break;
+		}
+	}
 	tables = palloc_array(BranchKeptTable, Max(ks.kc->ntables, 1));
 	used = palloc0_array(bool, Max(ks.kc->ntables, 1));
 	for (int t = 0; t < ks.kc->ntables; t++)
@@ -2819,7 +3184,12 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 		tables[t].nrels = ks.kc->tables[t].nrels;
 		tables[t].rels = ks.kc->tables[t].rels;
 	}
-	branch_ops()->make_kept(name, ks.name, tables, ks.kc->ntables, used);
+	if (!OidIsValid(branch_ops()->make_kept(name, ks.name, tables, ks.kc->ntables,
+											used, emptied, sc.others)))
+	{
+		pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
+		return false;
+	}
 	for (int t = 0; t < ks.kc->ntables; t++)
 	{
 		if (used[t])
@@ -2839,10 +3209,11 @@ make_of_kept(const char *name, const ProllyCommitInfo *commit)
 
 /*
  * Make the copies of a branch that has only its head: of the pages a
- * branch keeps as of its head (make_of_kept()), or else a copy of the
- * nearest branch's to its head's root (#491), or else the session's (each
- * has the same changes since the same baseline as the copy), moved to the
- * root.
+ * branch keeps as of its head (make_of_kept()), else a copy of the
+ * nearest branch's to its head's root (#491), else of the branch the
+ * move planner estimates is cheapest to move there, or else the
+ * session's (each has the same changes since the same baseline as the
+ * copy), moved to the root.
  */
 static void
 materialize(const char *name)
@@ -2854,6 +3225,8 @@ materialize(const char *name)
 	bool		was_read_only = XactReadOnly;
 	int			hush;
 	NearestSource ns = {0};
+	List	   *emptied = NIL;
+	List	   *own_emptied = NIL;
 	MoveCopies	mc;
 	char	   *source;
 
@@ -2898,18 +3271,38 @@ materialize(const char *name)
 		ns.snap = IsolationUsesXactSnapshot() ? GetActiveSnapshot() :
 			GetLatestSnapshot();
 		mc.commit = &info;
+		mc.source = NULL;
 		if (!make_of_kept(name, &info))
 		{
 			branch_ops()->branches(rank_source, &ns);
-			source = ns.rank > 0 ? ns.name : branch_ops()->current();
-			branch_ops()->make(name, ns.rank > 0 ? source : NULL);
+			if (ns.rank == 0)
+				ns.name = estimated_source(&info.root, ns.snap, &emptied,
+										   &own_emptied);
+			source = ns.name != NULL ? ns.name : branch_ops()->current();
+
+			/*
+			 * (another branch's copies only if none of its writers is in the
+			 * middle of changing it: waiting for one, with the refs held, would
+			 * hold up every commit of the session's branch for as long as that
+			 * writer's transaction lasts; else the session's own, whose writers
+			 * a first use waits for, as ever, with the tables its own plan
+			 * empties)
+			 */
+			if (ns.name == NULL ||
+				!OidIsValid(branch_ops()->make(name, source, emptied, true)))
+			{
+				if (ns.name != NULL)
+					pgstat_count_prolly(PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY, 1);
+				ns.name = NULL;
+				ns.rank = 0;
+				source = branch_ops()->current();
+				branch_ops()->make(name, NULL, own_emptied, false);
+			}
 			branch_set_baseline(name,
 								branch_baseline(source, &baseline) ? &baseline : NULL,
 								NULL);
 			mc.source = ns.rank == 3 ? &ns.known : NULL;
 		}
-		else
-			mc.source = NULL;
 
 		/*
 		 * (moved to the head, unless the copies are there already: those of
@@ -3043,29 +3436,30 @@ parents_height(const ProllyHash *parents, int nparents)
 }
 
 /*
- * Write a commit's tree; its id is the root's hash.  What its versioned
- * objects need from outside is folded now, from the catalogs as the
- * transaction sees them.  It is dated now, as Dolt's are, not at the
- * transaction's start, so a parent another session committed since then is
- * older than it; and never at or before a parent's date (the clock may have
- * stepped back, or a parent come from a remote whose clock runs ahead), so
- * along history the dates only rise.  (A parent dated outside timestamp's
- * range, or at its last microsecond, which only a foreign or corrupt commit
- * could be, leaves the date as it is.)  A date the commit was given
- * (dolt_commit --date) is its date, as Dolt's is.
+ * Write a commit's tree of root and dependencies (what its versioned
+ * objects need from outside); its id is the root's hash.  It is dated now,
+ * as Dolt's are, not at the transaction's start, so a parent another
+ * session committed since then is older than it; and never at or before a
+ * parent's date (the clock may have stepped back, or a parent come from a
+ * remote whose clock runs ahead), so along history the dates only rise.
+ * (A parent dated outside timestamp's range, or at its last microsecond,
+ * which only a foreign or corrupt commit could be, leaves the date as it
+ * is.)  A date the commit was given (dolt_commit --date) is its date, as
+ * Dolt's is.  Nothing is folded and no branch is moved.
  */
 static void
-write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
-			 const char *author, const char *message,
-			 const StringInfoData *identity, ProllyHash *id)
+copies_commit_root(const ProllyHash *root, const ProllyHash *dependencies,
+				   const ProllyHash *parents, int nparents,
+				   const char *author, const char *message,
+				   const StringInfoData *identity, ProllyHash *id)
 {
 	TimestampTz at = GetCurrentTimestamp();
 	int			nparents_dated = nparents;
 	ProllyTreeBuilder *b;
 	StringInfoData v;
 	ProllyNodeRef ref;
-	ProllyNodeRef deps;
-	ProllyDatabaseComponents dc;
+
+	refs_init();
 
 	/* (a date given, as dolt_commit --date: as given, whatever the parents') */
 	if (prolly_commit_date(&at))
@@ -3078,8 +3472,6 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 			IS_VALID_TIMESTAMP(parent_at) && IS_VALID_TIMESTAMP(parent_at + 1))
 			at = parent_at + 1;
 	}
-	prolly_database_components(&dc);
-	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
 	b = PROLLY_CALL(tree, build_begin, &commit_env, CurrentMemoryContext);
 
 	/*
@@ -3090,7 +3482,7 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	appendStringInfoString(&v, author);
 	add_item(b, "author", &v);
 	resetStringInfo(&v);
-	put_hash(&v, &deps.hash);
+	put_hash(&v, dependencies);
 	add_item(b, "dependencies", &v);
 	resetStringInfo(&v);
 	put_uint64(&v, (uint64) parents_height(parents, nparents));
@@ -3114,6 +3506,24 @@ write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
 	*id = ref.hash;
 	pfree(v.data);
 	pgstat_count_prolly(PGSTAT_PROLLY_COMMITS, 1);
+}
+
+/*
+ * A commit of root whose dependencies are folded now, from the catalogs as
+ * the transaction sees them (copies_commit_root()).
+ */
+static void
+write_commit(const ProllyHash *root, const ProllyHash *parents, int nparents,
+			 const char *author, const char *message,
+			 const StringInfoData *identity, ProllyHash *id)
+{
+	ProllyNodeRef deps;
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	PROLLY_CALL(dc.canonicalizer, fold_dependencies, &deps);
+	copies_commit_root(root, &deps.hash, parents, nparents, author, message,
+					   identity, id);
 }
 
 static bool
@@ -6851,4 +7261,5 @@ const ProllyRefsRoutine prolly_refs_copies = {
 	.tags = copies_tags,
 	.rebase_state = copies_rebase_state,
 	.set_rebase_state = copies_set_rebase_state,
+	.commit_root = copies_commit_root,
 };

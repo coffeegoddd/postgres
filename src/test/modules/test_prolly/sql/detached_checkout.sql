@@ -7,6 +7,10 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 RESET client_min_messages;
 
+-- (none kept once its sessions leave, so a hidden branch nobody is on is
+-- deleted: kept_checkouts.sql tests keeping them)
+SET prolly.kept_checkouts = 0;
+
 CREATE SCHEMA dc VERSIONED;
 CREATE TABLE dc.t (id int PRIMARY KEY, v text);
 INSERT INTO dc.t VALUES (1, 'one');
@@ -209,3 +213,4 @@ SELECT count(*) AS hidden_left FROM pg_branch WHERE brname LIKE 'detached/%';
 SELECT dolt_reset('--hard');
 SELECT dolt_branch('-D', 'from_first', 'also_first');
 DROP SCHEMA dc CASCADE;
+RESET prolly.kept_checkouts;

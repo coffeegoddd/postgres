@@ -24,7 +24,9 @@
 #include "access/prolly_hash.h"
 #include "access/prolly_keyenc.h"
 #include "access/prolly_keying.h"
+#include "access/prolly_matcache.h"
 #include "access/prolly_memo.h"
+#include "access/prolly_moveplan.h"
 #include "access/prolly_merge.h"
 #include "access/prolly_reclaim.h"
 #include "access/prolly_refs.h"
@@ -58,6 +60,7 @@ typedef struct ProllyDatabaseComponents
 	const ProllyCanonRoutine *canonicalizer;
 	const ProllyReclaimRoutine *reclamation;
 	const ProllyWritersRoutine *writers;
+	const ProllyMatCacheRoutine *matcache;
 } ProllyDatabaseComponents;
 
 /* Components for rel: a prolly table, or an index on one (an error otherwise). */

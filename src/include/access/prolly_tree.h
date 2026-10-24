@@ -299,6 +299,18 @@ typedef struct ProllyTreeRoutine
 								   const ProllyNodeRef *from,
 								   const ProllyNodeRef *to,
 								   ProllyTreeVisitChange visit, void *arg);
+
+	/*
+	 * Optional: how many keys diff() would report, estimated reading at
+	 * most max_nodes nodes, for a caller choosing whether a diff is worth
+	 * walking.  Exact where the nodes that differ fit in max_nodes; past
+	 * it, never less than diff's count (each node left unread counted as
+	 * if every item it holds changed).
+	 */
+	uint64		(*diff_estimate) (const ProllyTreeEnv *env,
+								  const ProllyNodeRef *from,
+								  const ProllyNodeRef *to,
+								  uint64 max_nodes);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
@@ -306,9 +318,9 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
 	"value_present", "value_reference", "value_root", "key_max", \
-	"diff_unordered"
+	"diff_unordered", "diff_estimate"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK diff_unordered
+#define PROLLY_TREE_LAST_CALLBACK diff_estimate
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

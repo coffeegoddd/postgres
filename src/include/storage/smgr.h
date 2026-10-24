@@ -122,6 +122,7 @@ extern bool smgrpreparesforchanges(SMgrRelation reln, ForkNumber forknum);
 extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer,
 								 bool neutral);
+extern uint32 smgrreleasestep(SMgrRelation reln);
 extern bool smgrpageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);

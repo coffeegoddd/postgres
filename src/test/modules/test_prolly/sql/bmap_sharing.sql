@@ -33,10 +33,20 @@ SELECT test_bmap_epoch(:src) AS src_epoch, test_bmap_epoch(:copy) AS copy_epoch;
 SELECT bool_and(epoch < 1) AS entries_older FROM test_bmap_map(:copy);
 
 -- Dropping the source frees none of its blocks, which the copy holds (only
--- its change log's).
+-- its change log's).  The drop queues them, to be let go of by a drain:
+-- itself it frees nothing, and leaves the copy's counts as they were.
+-- (what earlier tests dropped, let go of first)
+SELECT entries >= 0 AS drained_before FROM test_bmap_release_drain();
 SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT test_bmap_digest(:copy) AS copy_digest \gset
+SELECT test_bmap_release_pending() AS pending_before \gset
 DROP TABLE cow.t;
+SELECT test_bmap_free_blocks() = :free_before AS drop_freed_none,
+       test_bmap_release_pending() > :pending_before AS drop_queued;
+SELECT bool_and(refs = 1) AS copy_counts_kept FROM test_bmap_map(:copy);
+SELECT freed = :tlog + :tlog_nodes AS drain_freed_log
+  FROM test_bmap_release_drain();
+SELECT test_bmap_release_pending() AS pending_drained;
 SELECT test_bmap_free_blocks() - :free_before = :tlog + :tlog_nodes AS nothing_freed;
 SELECT test_bmap_digest(:copy) = :'copy_digest' AS copy_intact;
 SELECT bool_and(refs = 0) AS copy_holds_alone FROM test_bmap_map(:copy);

@@ -626,6 +626,25 @@ typedef struct ProllyRefsRoutine
 	 */
 	bool		(*rebase_state) (ProllyRebaseState *state);
 	void		(*set_rebase_state) (const ProllyRebaseState *state);
+
+	/*
+	 * Write a commit of a canonical state the caller already holds: root,
+	 * with dependencies (what its objects need from outside, as
+	 * fold_dependencies() records it), these parents, author and message,
+	 * and identity (its "identity" item; NULL or empty: none), dated as
+	 * commit_with() dates one.  Nothing is folded, no catalog read for it,
+	 * and no branch moved: the caller names the commit (branch_move(),
+	 * set_head()) in the same transaction.  Until a ref names it nothing
+	 * holds it, and a chunk-store collection after the transaction ends may
+	 * drop it as unreachable.  commit_with() folds, then writes its commit
+	 * with this.
+	 */
+	void		(*commit_root) (const ProllyHash *root,
+								const ProllyHash *dependencies,
+								const ProllyHash *parents, int nparents,
+								const char *author, const char *message,
+								const StringInfoData *identity,
+								ProllyHash *commit_id);
 } ProllyRefsRoutine;
 
 /*
@@ -661,9 +680,9 @@ extern PGDLLIMPORT int prolly_kept_commits;
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state"
+	"rebase_state", "set_rebase_state", "commit_root"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK set_rebase_state
+#define PROLLY_REFS_LAST_CALLBACK commit_root
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

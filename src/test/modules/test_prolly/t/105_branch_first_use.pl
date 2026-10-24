@@ -42,6 +42,8 @@ sql(q{
 	INSERT INTO app.b1 SELECT i, i % 7, CASE WHEN i % 100 = 0
 		THEN repeat('y', 3000) ELSE repeat('z', 50) END
 		FROM generate_series(1, 1000) i;
+	CREATE TABLE app.far (id int PRIMARY KEY);
+	INSERT INTO app.far SELECT generate_series(1, 3000);
 	CREATE TABLE app.b20 (LIKE app.b1 INCLUDING ALL);
 	INSERT INTO app.b20 SELECT i, i % 7, CASE WHEN i % 1000 = 0
 		THEN repeat('y', 3000) ELSE NULL END
@@ -58,12 +60,14 @@ my $user = $node->background_psql('postgres', on_error_stop => 0);
 
 my $rows = q{SELECT string_agg(id || ':' || v, ',' ORDER BY id) FROM app.t};
 
-# A branch used, made to differ from its head before it is left: a first
-# use copies the branch nearest its head (#491), and each case here is of
-# copies of main, waiting for its writers.
+# A branch used, made to differ from its head before it is left, and to be
+# further from it than main (far's rows deleted): a first use copies the
+# branch nearest its head (#491), or estimated cheapest to move there
+# (#715), and each case here is of copies of main, waiting for its
+# writers.
 sub apart
 {
-	$user->query_safe(q{INSERT INTO app.t VALUES (77, 77);
+	$user->query_safe(q{INSERT INTO app.t VALUES (77, 77); DELETE FROM app.far;
 		SELECT dolt_commit('-am', 'apart')});
 }
 
@@ -157,7 +161,7 @@ $user->query_safe('ROLLBACK');
 $user->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1');
 $user->query_safe(q{SELECT dolt_checkout('rrn')});
 is(rows_of($user), '1:1,2:2 0', 'and retried');
-$user->query_safe(q{INSERT INTO app.t VALUES (77, 77);
+$user->query_safe(q{INSERT INTO app.t VALUES (77, 77); DELETE FROM app.far;
 	SELECT dolt_commit('-am', 'on rrn')});
 is(rows_of($user), '1:1,2:2,77:77 0', 'committed to, clean');
 $user->query_safe('COMMIT');
@@ -221,7 +225,7 @@ $user->query_safe(q{SELECT dolt_checkout('rrbig')});
 is($user->query_safe($big), $big_head, 'tables of many pages, every row');
 is($user->query_safe($by_index), $by_index_head, 'and by their indexes');
 is($user->query_safe(q{SELECT count(*) FROM dolt_status}), '0', 'clean');
-$user->query_safe(q{INSERT INTO app.b1 VALUES (5000, 0, 'w');
+$user->query_safe(q{INSERT INTO app.b1 VALUES (5000, 0, 'w'); DELETE FROM app.far;
 	SELECT dolt_commit('-am', 'on rrbig')});
 $user->query_safe('COMMIT');
 $user->query_safe(q{SELECT dolt_reset('--hard')});
@@ -270,6 +274,7 @@ is($user->{stderr}, '', 'and checks out');
 is(rows_of($user), '1:5,2:2,3:3 0', 'the branch as its head has it, clean');
 $user->query_safe('COMMIT');
 is(rows_of($user), '1:5,2:2,3:3 0', 'and after the commit');
+$user->query_safe(q{DELETE FROM app.far; SELECT dolt_commit('-am', 'apart')});
 $user->query_safe(q{SELECT dolt_checkout('main')});
 is(sql($rows), '1:5,3:3,102:102', 'main keeps the writer\'s rows');
 

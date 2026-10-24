@@ -51,6 +51,7 @@ extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
+extern uint32 bmapreleasestep(SMgrRelation reln);
 extern bool bmapwritesread(ForkNumber forknum);
 extern void bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   bool isRedo);
@@ -87,11 +88,6 @@ extern void bmapimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void bmapregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	bmapfd(SMgrRelation reln, ForkNumber forknum,
 				   BlockNumber blocknum, uint32 *off);
-
-/* sync handler callbacks (maps unlinked after a checkpoint) */
-extern int	bmapsyncfiletag(const FileTag *ftag, char *path);
-extern int	bmapunlinkfiletag(const FileTag *ftag, char *path);
-extern bool bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate);
 
 /* remove a database's unused block map from a tablespace's directory */
 extern void bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path);
@@ -168,6 +164,29 @@ typedef struct BmapSweep
 } BmapSweep;
 
 extern void bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result);
+
+/*
+ * The release queue: a dropped map's subtrees and blocks, queued as it is
+ * dropped (in O(1) of the relation's size: its root page's pointers, and
+ * its changes list's blocks), each holding what it names until a drain
+ * lets go of it as a drop of the map would have: a count one less, or the
+ * block freed, a node's children queued in its place.  A step is one
+ * record: some entries popped, what they let go of, the children pushed.
+ * Steps are taken by one backend of a page store at a time; another, or a
+ * sweep counting holders, makes a step take none.
+ */
+typedef struct BmapRelease
+{
+	uint64		entries;		/* entries popped */
+	uint64		freed;			/* blocks freed */
+	uint64		unrefs;			/* counts made one less (or more) */
+} BmapRelease;
+
+extern bool bmap_release_step(Oid spcOid, Oid dbOid, bool wait,
+							  BmapRelease *done);
+extern void bmap_release_drain(Oid spcOid, Oid dbOid, uint64 max_entries,
+							   BmapRelease *done);
+extern uint64 bmap_release_pending(Oid spcOid, Oid dbOid);
 extern bool bmap_sweep_due(Oid spcOid, Oid dbOid);
 
 /*

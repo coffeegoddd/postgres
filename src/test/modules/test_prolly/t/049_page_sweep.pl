@@ -128,6 +128,7 @@ $node->safe_psql('sw2', q{
 	CREATE TABLE cow.x (a int8);
 	INSERT INTO cow.x SELECT g FROM generate_series(1, 5000) g;
 	DROP TABLE cow.x;
+	SELECT * FROM test_bmap_release_drain();
 });
 my $free2 = $node->safe_psql('sw2', 'SELECT test_bmap_free_blocks()');
 cmp_ok($free2, '>', 0, 'the other store has free blocks');

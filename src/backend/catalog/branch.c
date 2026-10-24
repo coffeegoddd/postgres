@@ -766,6 +766,49 @@ lock_branch_for_delete(Oid branch)
 		LOCKACQUIRE_NOT_AVAIL;
 }
 
+/*
+ * Is another session on the branch (or deleting it, or holding it against
+ * deletion)?  Its lock is tried as a deletion takes it, without waiting,
+ * and let go of at once: an answer of now, which may change at any time.
+ */
+bool
+branch_in_use(Oid branch)
+{
+	LOCKTAG		tag;
+	LockAcquireResult res;
+
+	branch_locktag(&tag, branch);
+	res = LockAcquire(&tag, AccessExclusiveLock, false, true);
+	if (res == LOCKACQUIRE_NOT_AVAIL)
+		return true;
+	if (res == LOCKACQUIRE_OK)
+		LockRelease(&tag, AccessExclusiveLock, false);
+	return false;
+}
+
+/*
+ * Hold a branch against deletion until the transaction ends: its lock
+ * taken as a session on it takes it, but for the transaction alone, and
+ * not waited for (a deletion holds it until it commits).  False if it
+ * isn't free, or the branch is gone.
+ */
+bool
+pin_branch(Oid branch)
+{
+	LOCKTAG		tag;
+
+	if (branch != BRANCH_MAIN_OID)
+	{
+		branch_locktag(&tag, branch);
+		if (LockAcquire(&tag, AccessShareLock, false, true) ==
+			LOCKACQUIRE_NOT_AVAIL)
+			return false;
+		/* a deletion that held the lock has committed or not: see which */
+		AcceptInvalidationMessages();
+	}
+	return SearchSysCacheExists1(BRANCHOID, ObjectIdGetDatum(branch));
+}
+
 /* (a transaction's lock on a branch, kept by it once prepared) */
 static void
 branch_xact_locktag(LOCKTAG *tag, Oid branch)
