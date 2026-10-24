@@ -62,7 +62,13 @@ adapts.
   reset leaves the head and the working set ports. Where Dolt runs `dolt_add` to mark conflicts
   resolved before `--continue`, prolly resolves with
   `dolt_conflicts_resolve()` (or the rows fixed by hand and resolved),
-  then `dolt_commit` or `--continue`.
+  then `dolt_commit` or `--continue`. Dolt refuses a rebase's
+  `--continue` while the resolution is unstaged ("cannot continue a
+  rebase with unstaged changes"); prolly has no such state, since the
+  resolution is staged as it is made, so its first `--continue` goes on.
+  A port checks that assertion as `dolt_status` showing the resolved
+  table staged, and runs the `--continue` after Dolt's `dolt_add` as
+  Dolt's second; the case is ported, the divergence intended.
 
 ## D2. Only versioned schemas are versioned
 
