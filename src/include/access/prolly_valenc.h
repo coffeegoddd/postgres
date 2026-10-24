@@ -84,13 +84,45 @@ typedef struct ProllyValueEncoderRoutine
 	void		(*decode_kept) (ProllyValueEncoder *enc, const ProllyValue *row,
 								const ProllyValue *before,
 								TupleTableSlot *slot, bool *kept);
+
+	/*
+	 * Optional: the columns an encoded row holds, by attribute index of the
+	 * encoder's descriptor (fields gets natts entries), parsed in one pass
+	 * and checked whole as decode() checks a row.  No value is decoded or
+	 * read out of line.  A dropped column is not stored.  Two rows of the
+	 * same layout hold a column alike exactly when their fields are alike:
+	 * both NULL, or the same bytes (canonical bytes, or the same reference),
+	 * so a caller can compare columns without decoding them.
+	 */
+	void		(*fields) (ProllyValueEncoder *enc, const ProllyValue *row,
+						   ProllyEncodedField *fields);
+
+	/*
+	 * Optional: a field of attribute index attno that fields() gave, as a
+	 * datum in the current memory context: its missing value or NULL if not
+	 * stored, read from its value tree if out of line.
+	 */
+	Datum		(*decode_field) (ProllyValueEncoder *enc, int attno,
+								 const ProllyEncodedField *field,
+								 bool *isnull);
+
+	/*
+	 * Optional: decode(), except only the attributes wanted marks (by
+	 * attribute index; NULL: all of them).  The others are left NULL,
+	 * neither decoded nor read out of line.  The row is still checked
+	 * whole.
+	 */
+	void		(*decode_columns) (ProllyValueEncoder *enc,
+								   const ProllyValue *row, const bool *wanted,
+								   TupleTableSlot *slot);
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
-	"set_values", "refs", "decode_kept"
+	"set_values", "refs", "decode_kept", "fields", "decode_field", \
+	"decode_columns"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
-#define PROLLY_VALENC_LAST_CALLBACK decode_kept
+#define PROLLY_VALENC_LAST_CALLBACK decode_columns
 
 /* Historical enum decoding for the canonical encoder and nested values. */
 extern bool prolly_canonical_map_enums(ProllyValueEncoder *enc, List *mappings);

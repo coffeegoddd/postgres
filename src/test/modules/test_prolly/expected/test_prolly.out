@@ -103,6 +103,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder | canonical      | missing_values                 | pass
  value_encoder | canonical      | decodes_earlier_layouts        | pass
  value_encoder | canonical      | long_values                    | pass
+ value_encoder | canonical      | selected_columns               | pass
  value_encoder | canonical      | complete                       | pass
  value_encoder | stub           | identity                       | pass
  value_encoder | stub           | round_trip                     | not implemented (missing begin, encode, decode, end)
@@ -112,7 +113,8 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  value_encoder | stub           | missing_values                 | not implemented (missing begin, encode, decode, end)
  value_encoder | stub           | decodes_earlier_layouts        | not implemented (missing begin, layout, begin_layout, encode, decode, end)
  value_encoder | stub           | long_values                    | not implemented (missing begin, encode, decode, end, set_values, refs)
- value_encoder | stub           | complete                       | not implemented (9 of 9 callbacks missing)
+ value_encoder | stub           | selected_columns               | not implemented (missing begin, encode, decode, end, set_values, fields, decode_field, decode_columns)
+ value_encoder | stub           | complete                       | not implemented (12 of 12 callbacks missing)
  reclamation   | copying        | identity                       | pass
  reclamation   | copying        | live_chunks_never_freed        | no checks yet
  reclamation   | copying        | keeps_what_writers_reference   | no checks yet
@@ -198,7 +200,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  table_keying  | stub           | owns_its_memory                | not implemented (missing open, encode_row, decode_row, close)
  table_keying  | stub           | row_shapes                     | not implemented (missing open, close, row_shape, shape_extends)
  table_keying  | stub           | old_shapes                     | not implemented (missing open, encode_row, decode_row, close, row_shape, open_shape)
- table_keying  | stub           | complete                       | not implemented (17 of 17 callbacks missing)
+ table_keying  | stub           | complete                       | not implemented (20 of 20 callbacks missing)
  canonicalizer | folded         | identity                       | pass
  canonicalizer | folded         | complete                       | pass
  canonicalizer | stub           | identity                       | pass
@@ -258,7 +260,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(194 rows)
+(196 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

@@ -70,6 +70,7 @@
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
 #include "common/hashfn.h"
+#include "pgstat.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "varatt.h"
@@ -449,13 +450,65 @@ row_refs_by_column(ProllyValueEncoder *enc, const ProllyValue *row, int *n)
 }
 
 /*
- * Decode value into slot; with before, each column whose value is out of
- * line with the same reference in before is left NULL, unread, and marked
- * in kept.
+ * The value of attribute i stored as len bytes at p (out_of_line: a
+ * reference to its value tree), in the current memory context.
+ */
+static Datum
+decode_value(ProllyValueEncoder *enc, int i, const char *p, uint64 len,
+			 bool out_of_line)
+{
+	ProllyValue ref = {(const uint8 *) p, (uint32) len};
+	ProllyHash	root;
+	uint64		vlen;
+	varlena    *pointer;
+	Datum		d;
+
+	pgstat_count_prolly(PGSTAT_PROLLY_COLUMNS_DECODED, 1);
+	if (!out_of_line)
+		return prolly_datum_decode(enc->codecs[i], p, (int) len);
+	if (enc->values == NULL)
+		no_values();
+
+	/* a tree a hash pointer can name: named, not read */
+	pointer = NULL;
+	if (enc->values->pointers)
+	{
+		PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
+		pointer = prolly_toast_pointer(&root, vlen,
+									   TupleDescAttr(enc->desc, i)->atttypid);
+	}
+	if (pointer != NULL)
+		return PointerGetDatum(pointer);
+
+	INJECTION_POINT("prolly-value-read", NULL);
+	resetStringInfo(&enc->scratch);
+	PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
+				&ref, 0, PG_UINT64_MAX, &enc->scratch);
+	pgstat_count_prolly(PGSTAT_PROLLY_VALUES_READ, 1);
+	pgstat_count_prolly(PGSTAT_PROLLY_VALUE_BYTES_READ, enc->scratch.len);
+	d = prolly_datum_decode(enc->codecs[i], enc->scratch.data,
+							enc->scratch.len);
+	if (enc->scratch.maxlen > 64 * 1024)
+	{
+		/* (a long value's buffer isn't kept for the rows after it) */
+		MemoryContext cxt = MemoryContextSwitchTo(GetMemoryChunkContext(enc));
+
+		pfree(enc->scratch.data);
+		initStringInfo(&enc->scratch);
+		MemoryContextSwitchTo(cxt);
+	}
+	return d;
+}
+
+/*
+ * Decode value into slot, only the attributes wanted marks (NULL: all);
+ * with before, each column whose value is out of line with the same
+ * reference in before is left NULL, unread, and marked in kept.
  */
 static void
 decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
-			const ProllyValue *before, TupleTableSlot *slot, bool *kept)
+			const ProllyValue *before, const bool *wanted,
+			TupleTableSlot *slot, bool *kept)
 {
 	TupleDesc	desc = enc->desc;
 	const char *p = (const char *) value->data;
@@ -490,11 +543,12 @@ decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
 	for (int j = 0; j < enc->nlive; j++)
 	{
 		int			i = enc->live_attno[j];
+		bool		want = (wanted == NULL || wanted[i]);
 
 		if (j >= n)
 		{
 			/* Absent: the row predates the column. */
-			if (enc->has_missing[j])
+			if (enc->has_missing[j] && want)
 				slot->tts_values[i] = getmissingattr(desc, i + 1,
 													 &slot->tts_isnull[i]);
 			continue;
@@ -511,45 +565,18 @@ decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("invalid canonical prolly row: value runs past the end")));
 
-			/* No codec: the column was dropped after the row was encoded. */
-			if (enc->codecs[i] != NULL && out_of_line && j < nb &&
-				brefs[j].len == len && memcmp(brefs[j].data, p, len) == 0)
+			/*
+			 * No codec: the column was dropped after the row was encoded.
+			 * Not wanted: skipped by its length, neither decoded nor read.
+			 */
+			if (enc->codecs[i] == NULL || !want)
+				;
+			else if (out_of_line && j < nb &&
+					 brefs[j].len == len && memcmp(brefs[j].data, p, len) == 0)
 				kept[i] = true;
-			else if (enc->codecs[i] != NULL && out_of_line)
+			else
 			{
-				ProllyValue ref = {(const uint8 *) p, (uint32) len};
-				ProllyHash	root;
-				uint64		vlen;
-				varlena    *pointer;
-
-				if (enc->values == NULL)
-					no_values();
-
-				/* a tree a hash pointer can name: named, not read */
-				pointer = NULL;
-				if (enc->values->pointers)
-				{
-					PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
-					pointer = prolly_toast_pointer(&root, vlen,
-												   TupleDescAttr(desc, i)->atttypid);
-				}
-				if (pointer != NULL)
-					slot->tts_values[i] = PointerGetDatum(pointer);
-				else
-				{
-					INJECTION_POINT("prolly-value-read", NULL);
-					resetStringInfo(&enc->scratch);
-					PROLLY_CALL(enc->values->tree, value_read, enc->values->env,
-								&ref, 0, PG_UINT64_MAX, &enc->scratch);
-					slot->tts_values[i] = prolly_datum_decode(enc->codecs[i],
-															  enc->scratch.data,
-															  enc->scratch.len);
-				}
-				slot->tts_isnull[i] = false;
-			}
-			else if (enc->codecs[i] != NULL)
-			{
-				slot->tts_values[i] = prolly_datum_decode(enc->codecs[i], p, (int) len);
+				slot->tts_values[i] = decode_value(enc, i, p, len, out_of_line);
 				slot->tts_isnull[i] = false;
 			}
 			p += len;
@@ -561,7 +588,8 @@ decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
 	{
 		int			i = enc->extra_attno[x];
 
-		if (TupleDescAttr(desc, i)->atthasmissing)
+		if (TupleDescAttr(desc, i)->atthasmissing &&
+			(wanted == NULL || wanted[i]))
 			slot->tts_values[i] = getmissingattr(desc, i + 1, &slot->tts_isnull[i]);
 	}
 	if (p != end)
@@ -574,22 +602,13 @@ decode_into(ProllyValueEncoder *enc, const ProllyValue *value,
 	ExecStoreVirtualTuple(slot);
 	ExecMaterializeSlot(slot);	/* copy values out of tmpcxt */
 	MemoryContextReset(enc->tmpcxt);
-	if (enc->scratch.maxlen > 64 * 1024)
-	{
-		/* (a long value's buffer isn't kept for the rows after it) */
-		MemoryContext cxt = MemoryContextSwitchTo(GetMemoryChunkContext(enc));
-
-		pfree(enc->scratch.data);
-		initStringInfo(&enc->scratch);
-		MemoryContextSwitchTo(cxt);
-	}
 }
 
 static void
 canonical_decode(ProllyValueEncoder *enc, const ProllyValue *value,
 				 TupleTableSlot *slot)
 {
-	decode_into(enc, value, NULL, slot, NULL);
+	decode_into(enc, value, NULL, NULL, slot, NULL);
 }
 
 static void
@@ -597,7 +616,106 @@ canonical_decode_kept(ProllyValueEncoder *enc, const ProllyValue *value,
 					  const ProllyValue *before, TupleTableSlot *slot,
 					  bool *kept)
 {
-	decode_into(enc, value, before, slot, kept);
+	decode_into(enc, value, before, NULL, slot, kept);
+}
+
+static void
+canonical_decode_columns(ProllyValueEncoder *enc, const ProllyValue *value,
+						 const bool *wanted, TupleTableSlot *slot)
+{
+	decode_into(enc, value, NULL, wanted, slot, NULL);
+}
+
+/*
+ * The fields of an encoded row, by attribute index: one pass over its
+ * header and length prefixes, checked as decode_into() checks them.
+ */
+static void
+canonical_fields(ProllyValueEncoder *enc, const ProllyValue *row,
+				 ProllyEncodedField *fields)
+{
+	const char *p = (const char *) row->data;
+	const char *end = p + row->len;
+	const char *nulls;
+	int			n;
+
+	for (int i = 0; i < enc->desc->natts; i++)
+	{
+		fields[i].stored = false;
+		fields[i].isnull = true;
+		fields[i].out_of_line = false;
+		fields[i].bytes.data = NULL;
+		fields[i].bytes.len = 0;
+	}
+	n = (int) prolly_get_varint(&p, end);
+	if (n > enc->nlive || end - p < (n + 7) / 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row header")));
+	nulls = p;
+	p += (n + 7) / 8;
+	for (int j = 0; j < n; j++)
+	{
+		int			i = enc->live_attno[j];
+		uint64		len;
+		bool		out_of_line;
+
+		if (((uint8) nulls[j / 8] >> (j % 8)) & 1)
+		{
+			if (enc->codecs[i] != NULL)
+				fields[i].stored = true;
+			continue;
+		}
+		len = prolly_get_varint(&p, end);
+		out_of_line = len > VALUE_INLINE_MAX;
+		if (out_of_line)
+			len -= VALUE_INLINE_MAX + 1;
+		if (len > (uint64) (end - p))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid canonical prolly row: value runs past the end")));
+		/* (a column dropped since the row was encoded isn't the row's now) */
+		if (enc->codecs[i] != NULL)
+		{
+			fields[i].stored = true;
+			fields[i].isnull = false;
+			fields[i].out_of_line = out_of_line;
+			fields[i].bytes.data = (const uint8 *) p;
+			fields[i].bytes.len = (uint32) len;
+		}
+		p += len;
+	}
+	if (p != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid canonical prolly row: %d trailing bytes",
+						(int) (end - p))));
+}
+
+static Datum
+canonical_decode_field(ProllyValueEncoder *enc, int attno,
+					   const ProllyEncodedField *field, bool *isnull)
+{
+	Form_pg_attribute att;
+
+	if (attno < 0 || attno >= enc->desc->natts)
+		elog(ERROR, "attribute index %d is not one of a prolly row's", attno);
+	att = TupleDescAttr(enc->desc, attno);
+	*isnull = true;
+	if (att->attisdropped || enc->codecs[attno] == NULL)
+		return (Datum) 0;
+	if (!field->stored)
+	{
+		/* (absent from the row: the row predates the column) */
+		if (att->atthasmissing)
+			return getmissingattr(enc->desc, attno + 1, isnull);
+		return (Datum) 0;
+	}
+	if (field->isnull)
+		return (Datum) 0;
+	*isnull = false;
+	return decode_value(enc, attno, (const char *) field->bytes.data,
+						field->bytes.len, field->out_of_line);
 }
 
 static void
@@ -650,4 +768,7 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.set_values = canonical_set_values,
 	.refs = canonical_refs,
 	.decode_kept = canonical_decode_kept,
+	.fields = canonical_fields,
+	.decode_field = canonical_decode_field,
+	.decode_columns = canonical_decode_columns,
 };

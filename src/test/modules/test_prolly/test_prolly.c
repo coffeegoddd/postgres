@@ -117,6 +117,9 @@ static const ConformanceCase cases[] = {
 	valenc_decodes_earlier_layouts},
 	{PROLLY_IFACE_VALUE_ENCODER, "long_values",
 	"begin encode decode end set_values refs", valenc_long_values},
+	{PROLLY_IFACE_VALUE_ENCODER, "selected_columns",
+	"begin encode decode end set_values fields decode_field decode_columns",
+	valenc_selected_columns},
 
 	/* reclamation */
 	{PROLLY_IFACE_RECLAMATION, "live_chunks_never_freed", "collect", NULL},
