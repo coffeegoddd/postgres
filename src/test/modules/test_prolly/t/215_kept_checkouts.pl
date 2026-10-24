@@ -62,8 +62,8 @@ my $state = q{SELECT count(*) || ' ' || count(*) FILTER (WHERE v <> id) FROM s.b
 
 # A REPEATABLE READ transaction whose snapshot was taken before c1's kept
 # branch was made: its checkout of c2 writes big's rows rather than take
-# the kept branch's pages, whose rows its snapshot doesn't see, and it
-# reads c2's rows.
+# the kept branch's pages (shared, or its copies chosen whole), whose rows
+# its snapshot doesn't see, and it reads c2's rows.
 my $r = $node->background_psql('postgres');
 $r->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
 $r->query_safe('SELECT count(*) FROM s.small');
@@ -86,10 +86,12 @@ sql(qq{SET prolly.kept_checkouts = 0; SELECT dolt_checkout('$c1'); SELECT dolt_c
 sql(qq{SELECT dolt_checkout('$c1'); SELECT dolt_checkout('main')});
 is(sql(q{SELECT count(*) FROM pg_branch WHERE brname LIKE 'detached/%'}), '1',
 	'only c1 kept');
-$shared = grew($r, 'move_tables_shared', sub {
+# (the move planner takes c1's copies, big as c2 has it: only small's row
+# is written, not big's 1000)
+my $written = grew($r, 'apply_rows', sub {
 	$r->query_safe(qq{SELECT dolt_checkout('$c2')});
 });
-is($shared, 1, 'a snapshot that sees it made shares big');
+is($written, 1, 'a snapshot that sees it made takes its pages');
 is($r->query_safe($state), '4000 1000', 'reading c2\'s rows');
 $r->query_safe(q{SELECT dolt_checkout('main')});
 
@@ -116,10 +118,10 @@ is($copied, 0, 'after a restart, a kept commit\'s checkout copies nothing');
 is($b->query_safe($state), '4000 1000', 'and reads c1\'s rows');
 is($b->query_safe(q{SELECT v FROM s.small}), 'c1', 'and c1\'s small');
 $b->query_safe(q{SELECT dolt_checkout('main')});
-$shared = grew($b, 'move_tables_shared', sub {
+$written = grew($b, 'apply_rows', sub {
 	$b->query_safe(qq{SELECT dolt_checkout('$c2')});
 });
-is($shared, 1, 'and a move shares from it');
+is($written, 1, 'and a first use takes its pages');
 is($b->query_safe($state), '4000 1000', 'reading c2\'s rows');
 is($b->query_safe(q{SELECT v FROM s.small}), 'c2', 'and c2\'s small');
 is($b->query_safe(q{SELECT test_fold_root() = prolly_root_hash('HEAD')}), 't',

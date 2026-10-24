@@ -2267,10 +2267,24 @@ rank_source(const char *name, Oid branch, void *arg)
  */
 #define SOURCE_CANDIDATES	16
 
+/* Is branch name a kept materialization (the materialization cache's)? */
+static bool
+branch_kept(const char *name)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	return dc.matcache != NULL && PROLLY_HAS(dc.matcache, kept) &&
+		PROLLY_CALL(dc.matcache, kept, name);
+}
+
 typedef struct SourceCandidates
 {
 	Snapshot	snap;
 	bool		others;			/* the others noted now, not the session's */
+	List	   *kept_seen;		/* OIDs of the kept materializations snap
+								 * sees made: no other kept one is a
+								 * candidate */
 	List	   *names;			/* char *, the session's branch first */
 	List	   *roots;			/* ProllyNodeRef *, what each is thought to be */
 } SourceCandidates;
@@ -2287,6 +2301,10 @@ note_candidate(const char *name, Oid branch, void *arg)
 
 	if ((branch != MyBranch) != sc->others ||
 		list_length(sc->names) > SOURCE_CANDIDATES)
+		return;
+	/* (one the snapshot doesn't see made holds rows it can't see) */
+	if (sc->others && !list_member_oid(sc->kept_seen, branch) &&
+		branch_kept(name))
 		return;
 	if (fold_caches_usable() &&
 		branch_fold_known_at(branch, sc->snap,
@@ -2341,10 +2359,11 @@ plan_here(void *arg)
  * The target's tables a kept materialization holds as the target has them
  * (the materialization cache's, made before snap): a first use's move
  * shares each of these instead of writing its rows (share_clean_tables()),
- * where its definitions are the target's.  Their names, as Strings.
+ * where its definitions are the target's.  Their names, as Strings; and
+ * the kept materializations snap sees made, into *seen.
  */
 static List *
-kept_shareable(const ProllyNodeRef *target, Snapshot snap)
+kept_shareable(const ProllyNodeRef *target, Snapshot snap, List **seen)
 {
 	ProllyDatabaseComponents dc;
 	ShareSources ss = {snap, NIL};
@@ -2355,6 +2374,8 @@ kept_shareable(const ProllyNodeRef *target, Snapshot snap)
 	if (dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
 		return NIL;
 	PROLLY_CALL(dc.matcache, visit, snap, find_kept_source, &ss);
+	foreach_ptr(ShareSource, s, ss.sources)
+		*seen = lappend_oid(*seen, s->branch);
 	if (ss.sources == NIL)
 		return NIL;
 	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
@@ -2393,7 +2414,7 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 				 List **own_emptied)
 {
 	const ProllyMovePlannerRoutine *planner = prolly_move_planner_lookup("costs");
-	SourceCandidates sc = {snap, false, NIL, NIL};
+	SourceCandidates sc = {snap, false, NIL, NIL, NIL};
 	ProllyMovePlan plan;
 	ProllyMovePlan best;
 	double		best_cost;
@@ -2404,9 +2425,9 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 	branch_ops()->branches(note_candidate, &sc);
 	if (sc.names == NIL)
 		return NULL;
+	shareable = kept_shareable(target, snap, &sc.kept_seen);
 	sc.others = true;
 	branch_ops()->branches(note_candidate, &sc);
-	shareable = kept_shareable(target, snap);
 	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
 				INFINITY, &best);
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
