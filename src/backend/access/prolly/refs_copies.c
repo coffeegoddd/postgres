@@ -2055,7 +2055,7 @@ move_settled(void *arg)
  * the change is known to commit.
  */
 int			prolly_kept_commits = 2;
-int			prolly_restore_min_changes = 64;
+int			prolly_restore_min_changes = 2;
 
 typedef struct KeptTable
 {
@@ -2509,11 +2509,13 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 }
 
 /*
- * Giving a table its kept pages back costs about as much as writing a
- * hundred rows (new storage for each of its relations, its catalog row
- * and caches: measured ~18 ms, against ~3 ms for a row and ~20 ms for a
- * hundred, at 1M rows), so fewer than prolly.restore_min_changes changed
- * since a baseline holding the commit's rows are written instead.
+ * Giving a table its kept pages back costs a constant (new storage for
+ * each of its relations, its catalog row and caches), while writing its
+ * rows back costs each row its pages, which the commit's pages kept again
+ * after the move then sync: at 1M rows, with fsync on, ~11 ms restored
+ * against ~7 ms for one row written, ~11 ms for four and ~20 ms for eight.
+ * So fewer than prolly.restore_min_changes changed since a baseline
+ * holding the commit's rows are written instead.
  */
 
 /*

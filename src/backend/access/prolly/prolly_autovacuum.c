@@ -181,9 +181,9 @@ prolly_autovacuum_init(void)
 							NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.restore_min_changes",
 							"How many of a table's rows must have changed since a kept commit before a move back to it gives the table its kept pages back, rather than writing those rows.",
-							"Restoring a table's pages costs about as much as writing a hundred rows.  0 always restores.",
+							"Restoring a table's pages costs about as much as writing a few of its rows back and syncing them.  0 always restores.",
 							&prolly_restore_min_changes,
-							64, 0, INT_MAX,
+							2, 0, INT_MAX,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
