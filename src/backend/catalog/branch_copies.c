@@ -2017,9 +2017,11 @@ class_row_named(Oid branch, const char *nspname, const char *relname)
 }
 
 /*
- * Set the privileges of relation relid's row in catalog (pg_class, or its
- * column attnum's pg_attribute row: tup, a modifiable copy) to acl, as
- * owner's, recording its grantees' shared dependencies.
+ * Add acl to the privileges of relation relid's row in catalog (pg_class,
+ * or its column attnum's pg_attribute row: tup, a modifiable copy), as
+ * owner's, recording its grantees' shared dependencies.  The privileges
+ * the row has already stay: the ones its making gave it, as this branch's
+ * default privileges do.
  */
 static void
 set_privileges(Relation catalog, HeapTuple tup, AttrNumber aclattr,
@@ -2035,9 +2037,12 @@ set_privileges(Relation catalog, HeapTuple tup, AttrNumber aclattr,
 	Oid		   *newmembers = NULL;
 	int			noldmembers = isnull ? 0 :
 		aclmembers(DatumGetAclP(old), &oldmembers);
-	int			nnewmembers = aclmembers(acl, &newmembers);
+	int			nnewmembers;
 	HeapTuple	newtup;
 
+	if (!isnull)
+		acl = aclmerge(DatumGetAclP(old), acl, owner);
+	nnewmembers = aclmembers(acl, &newmembers);
 	values[aclattr - 1] = PointerGetDatum(acl);
 	replaces[aclattr - 1] = true;
 	newtup = heap_modify_tuple(tup, desc, values, nulls, replaces);
@@ -2048,7 +2053,7 @@ set_privileges(Relation catalog, HeapTuple tup, AttrNumber aclattr,
 }
 
 /*
- * Give each of the session branch's relations relids the privileges its
+ * Add to each of the session branch's relations relids the privileges its
  * namesake on branch source has (the relation of its schema's and its own
  * name there), the relation's and each column's (by the column's name),
  * as the relation's owner here gives them.  Nothing for one source hasn't,

@@ -1,7 +1,8 @@
 -- A table a merge (or a fast-forward) makes on the branch, new to it, has
--- the privileges the source branch's table of its name has: commits hold
+-- the privileges the source branch's table of its name has, with the ones its
+-- making gives it (the branch's default privileges): commits hold
 -- no privileges, but a branch of this database does.  One a remote's ref
--- brings (a fetch, a pull) arrives with none, as commits leave it.
+-- brings (a fetch, a pull) arrives with only the ones its making gives it.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
 DROP ROLE IF EXISTS regress_mg_r;
@@ -101,8 +102,7 @@ SELECT dolt_reset('--hard') IS NOT NULL AS reset;
  t
 (1 row)
 
--- Made on a branch while main moved on: merged with a commit (--no-ff
--- alike), the same.
+-- Made on a branch while main moved on: merged with a commit, the same.
 SELECT dolt_checkout('-b', 'mg_m') IS NOT NULL AS on_m;
  on_m 
 ------
@@ -111,6 +111,10 @@ SELECT dolt_checkout('-b', 'mg_m') IS NOT NULL AS on_m;
 
 CREATE TABLE mg.m (id int PRIMARY KEY, c text);
 GRANT SELECT, UPDATE (c) ON mg.m TO regress_mg_r;
+-- (its row security, which commits hold, comes too)
+ALTER TABLE mg.m ENABLE ROW LEVEL SECURITY;
+CREATE POLICY mg_p ON mg.m FOR SELECT TO regress_mg_r USING (id > 1);
+INSERT INTO mg.m VALUES (1, 'one'), (2, 'two');
 SELECT length(dolt_commit('-Am', 'm')::text) AS committed;
  committed 
 -----------
@@ -123,6 +127,8 @@ SELECT dolt_checkout('main') IS NOT NULL AS on_main;
  t
 (1 row)
 
+-- (main's default privileges, which the branch hasn't, apply as well)
+ALTER DEFAULT PRIVILEGES IN SCHEMA mg GRANT UPDATE ON TABLES TO regress_mg_w;
 CREATE TABLE mg.o (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'o')::text) AS committed;
  committed 
@@ -137,18 +143,27 @@ SELECT (dolt_merge('mg_m', '-m', 'merged m'))[2:2] AS fast_forward;
 (1 row)
 
 SELECT pg_temp.grants('mg.m');
-                    grants                    
-----------------------------------------------
- regress_mg_r SELECT, regress_mg_r UPDATE (c)
+                              grants                               
+-------------------------------------------------------------------
+ regress_mg_r SELECT, regress_mg_r UPDATE (c), regress_mg_w UPDATE
 (1 row)
 
--- (main's own new table: no grants, as main made it)
+SET ROLE regress_mg_r;
+SELECT id, c FROM mg.m;
+ id |  c  
+----+-----
+  2 | two
+(1 row)
+
+RESET ROLE;
+-- (main's own new table: main's default privileges only, as main made it)
 SELECT pg_temp.grants('mg.o');
- grants 
---------
- none
+       grants        
+---------------------
+ regress_mg_w UPDATE
 (1 row)
 
+ALTER DEFAULT PRIVILEGES IN SCHEMA mg REVOKE UPDATE ON TABLES FROM regress_mg_w;
 -- --no-ff where a fast-forward would do.
 SELECT dolt_checkout('-b', 'mg_noff') IS NOT NULL AS on_noff;
  on_noff 
@@ -180,6 +195,118 @@ SELECT pg_temp.grants('mg.q');
        grants        
 ---------------------
  regress_mg_r SELECT
+(1 row)
+
+-- The other way: made and granted on main, merged into a branch.
+SELECT dolt_checkout('-b', 'mg_rev') IS NOT NULL AS on_rev;
+ on_rev 
+--------
+ t
+(1 row)
+
+CREATE TABLE mg.rev (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'rev')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+CREATE TABLE mg.back (id int PRIMARY KEY);
+GRANT SELECT ON mg.back TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'back')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('mg_rev') IS NOT NULL AS on_rev;
+ on_rev 
+--------
+ t
+(1 row)
+
+SELECT (dolt_merge('main', '-m', 'main in'))[2:2] AS fast_forward;
+ fast_forward 
+--------------
+ {0}
+(1 row)
+
+SELECT pg_temp.grants('mg.back');
+       grants        
+---------------------
+ regress_mg_r SELECT
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- Integrated: dolt_integrate() merges the branch into main, the same.
+SELECT dolt_checkout('-b', 'mg_int') IS NOT NULL AS on_int;
+ on_int 
+--------
+ t
+(1 row)
+
+CREATE TABLE mg.i (id int PRIMARY KEY);
+GRANT SELECT ON mg.i TO regress_mg_r;
+SELECT (dolt_integrate('main', '-m', 'i in'))[2] AS fast_forward;
+ fast_forward 
+--------------
+ 1
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT pg_temp.grants('mg.i');
+       grants        
+---------------------
+ regress_mg_r SELECT
+(1 row)
+
+-- Cherry-picked: a commit, not a branch, gives none.
+SELECT dolt_checkout('-b', 'mg_cp') IS NOT NULL AS on_cp;
+ on_cp 
+-------
+ t
+(1 row)
+
+CREATE TABLE mg.cp (id int PRIMARY KEY);
+GRANT SELECT ON mg.cp TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'cp')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT length(dolt_cherry_pick('mg_cp')::text) > 0 AS picked;
+ picked 
+--------
+ t
+(1 row)
+
+SELECT pg_temp.grants('mg.cp');
+ grants 
+--------
+ none
 (1 row)
 
 -- Fetched: pushed to a remote and fetched back, the branch deleted here,
@@ -267,13 +394,34 @@ SELECT dolt_branch('-D', 'mg_noff');
  {0}
 (1 row)
 
+SELECT dolt_branch('-D', 'mg_rev');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mg_int');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mg_cp');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA mg CASCADE;
-NOTICE:  drop cascades to 6 other objects
+NOTICE:  drop cascades to 9 other objects
 DETAIL:  drop cascades to table mg.t
 drop cascades to table mg.n
 drop cascades to table mg.o
 drop cascades to table mg.m
 drop cascades to table mg.q
+drop cascades to table mg.back
+drop cascades to table mg.i
+drop cascades to table mg.cp
 drop cascades to table mg.far
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
  committed 

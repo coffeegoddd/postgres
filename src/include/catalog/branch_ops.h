@@ -218,11 +218,12 @@ typedef struct BranchOpsRoutine
 							   int nkept);
 
 	/*
-	 * Optional: give each of the session branch's relations relids the
+	 * Optional: add to each of the session branch's relations relids the
 	 * privileges its namesake on branch source has (the relation called as
-	 * it is, in the schema called as its is), the relation's and each
-	 * column's (by name), as the relation's owner here: for a relation a
-	 * merge of source made here, whose commits hold no privileges.  None
+	 * it is, in the schema called as it is), the relation's and each
+	 * column's (by name), as the relation's owner here, keeping those it
+	 * has: for a relation a merge of source made here, whose commits hold
+	 * no privileges.  None
 	 * for one source hasn't, nor where source is no branch with copies
 	 * (a remote's ref, a tag, a commit, a branch never used).
 	 */

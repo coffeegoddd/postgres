@@ -12641,7 +12641,7 @@ typedef struct NamedRelation
 	Oid			relid;
 } NamedRelation;
 
-/* the hash key of relation rel (pg_class row): its schema's name and its */
+/* the hash key of relation rel (pg_class row): its schema's name and its own */
 static void
 relation_key(Form_pg_class rel, char *key)
 {
@@ -12764,7 +12764,7 @@ folded_merge(const char *branch, const char *message, int flags,
 	int			result;
 
 	/*
-	 * A relation the merge makes here, new to the branch, has the
+	 * A relation the merge makes here, new to the branch, has too the
 	 * privileges of the source branch's of its name: its commits hold none,
 	 * and a branch of this database has them (one merged as a remote's
 	 * ref, a tag or a commit has none to give).

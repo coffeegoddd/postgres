@@ -1,7 +1,8 @@
 -- A table a merge (or a fast-forward) makes on the branch, new to it, has
--- the privileges the source branch's table of its name has: commits hold
+-- the privileges the source branch's table of its name has, with the ones its
+-- making gives it (the branch's default privileges): commits hold
 -- no privileges, but a branch of this database does.  One a remote's ref
--- brings (a fetch, a pull) arrives with none, as commits leave it.
+-- brings (a fetch, a pull) arrives with only the ones its making gives it.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -55,19 +56,28 @@ SELECT pg_temp.grants('mg.t');
 DROP ROLE regress_mg_r;
 SELECT dolt_reset('--hard') IS NOT NULL AS reset;
 
--- Made on a branch while main moved on: merged with a commit (--no-ff
--- alike), the same.
+-- Made on a branch while main moved on: merged with a commit, the same.
 SELECT dolt_checkout('-b', 'mg_m') IS NOT NULL AS on_m;
 CREATE TABLE mg.m (id int PRIMARY KEY, c text);
 GRANT SELECT, UPDATE (c) ON mg.m TO regress_mg_r;
+-- (its row security, which commits hold, comes too)
+ALTER TABLE mg.m ENABLE ROW LEVEL SECURITY;
+CREATE POLICY mg_p ON mg.m FOR SELECT TO regress_mg_r USING (id > 1);
+INSERT INTO mg.m VALUES (1, 'one'), (2, 'two');
 SELECT length(dolt_commit('-Am', 'm')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+-- (main's default privileges, which the branch hasn't, apply as well)
+ALTER DEFAULT PRIVILEGES IN SCHEMA mg GRANT UPDATE ON TABLES TO regress_mg_w;
 CREATE TABLE mg.o (id int PRIMARY KEY);
 SELECT length(dolt_commit('-Am', 'o')::text) AS committed;
 SELECT (dolt_merge('mg_m', '-m', 'merged m'))[2:2] AS fast_forward;
 SELECT pg_temp.grants('mg.m');
--- (main's own new table: no grants, as main made it)
+SET ROLE regress_mg_r;
+SELECT id, c FROM mg.m;
+RESET ROLE;
+-- (main's own new table: main's default privileges only, as main made it)
 SELECT pg_temp.grants('mg.o');
+ALTER DEFAULT PRIVILEGES IN SCHEMA mg REVOKE UPDATE ON TABLES FROM regress_mg_w;
 
 -- --no-ff where a fast-forward would do.
 SELECT dolt_checkout('-b', 'mg_noff') IS NOT NULL AS on_noff;
@@ -77,6 +87,36 @@ SELECT length(dolt_commit('-Am', 'q')::text) AS committed;
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT (dolt_merge('--no-ff', 'mg_noff', '-m', 'merged q'))[2:2] AS fast_forward;
 SELECT pg_temp.grants('mg.q');
+
+-- The other way: made and granted on main, merged into a branch.
+SELECT dolt_checkout('-b', 'mg_rev') IS NOT NULL AS on_rev;
+CREATE TABLE mg.rev (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'rev')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+CREATE TABLE mg.back (id int PRIMARY KEY);
+GRANT SELECT ON mg.back TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'back')::text) AS committed;
+SELECT dolt_checkout('mg_rev') IS NOT NULL AS on_rev;
+SELECT (dolt_merge('main', '-m', 'main in'))[2:2] AS fast_forward;
+SELECT pg_temp.grants('mg.back');
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+
+-- Integrated: dolt_integrate() merges the branch into main, the same.
+SELECT dolt_checkout('-b', 'mg_int') IS NOT NULL AS on_int;
+CREATE TABLE mg.i (id int PRIMARY KEY);
+GRANT SELECT ON mg.i TO regress_mg_r;
+SELECT (dolt_integrate('main', '-m', 'i in'))[2] AS fast_forward;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT pg_temp.grants('mg.i');
+
+-- Cherry-picked: a commit, not a branch, gives none.
+SELECT dolt_checkout('-b', 'mg_cp') IS NOT NULL AS on_cp;
+CREATE TABLE mg.cp (id int PRIMARY KEY);
+GRANT SELECT ON mg.cp TO regress_mg_r;
+SELECT length(dolt_commit('-Am', 'cp')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SELECT length(dolt_cherry_pick('mg_cp')::text) > 0 AS picked;
+SELECT pg_temp.grants('mg.cp');
 
 -- Fetched: pushed to a remote and fetched back, the branch deleted here,
 -- its table arrives with none.
@@ -99,6 +139,9 @@ SELECT dolt_remote('remove', 'mg_origin');
 SELECT dolt_branch('-D', 'mg_ff');
 SELECT dolt_branch('-D', 'mg_m');
 SELECT dolt_branch('-D', 'mg_noff');
+SELECT dolt_branch('-D', 'mg_rev');
+SELECT dolt_branch('-D', 'mg_int');
+SELECT dolt_branch('-D', 'mg_cp');
 DROP SCHEMA mg CASCADE;
 SELECT length(dolt_commit('-Am', 'mg gone')::text) AS committed;
 DROP ROLE regress_mg_r;
