@@ -104,7 +104,7 @@ is(sql(q{SELECT count(*) FROM prolly_page_sweep() WHERE freed = 0}), '1',
 
 # a relation's moves stop once a DDL waits for compaction's hold on it
 sql(q{
-	CREATE TABLE t2 (a int PRIMARY KEY, b text) WITH (fillfactor = 10);
+	CREATE TABLE t2 (a int, b text) WITH (fillfactor = 10);
 	CREATE TABLE x2 (a int, b text) WITH (fillfactor = 10);
 });
 sql(q{DO $$
@@ -117,6 +117,7 @@ sql(q{DO $$
 sql(q{DROP TABLE x2});
 sql(q{SELECT test_bmap_release_drain()});
 my $sweep = $node->background_psql('postgres');
+my $sweeper = $sweep->query_safe(q{SELECT pg_backend_pid()});
 $sweep->query_safe(q{SELECT injection_points_set_local();
 	SELECT injection_points_attach('bmap-compact-room', 'wait')});
 $sweep->query_until(qr/started/, q{
@@ -124,8 +125,17 @@ $sweep->query_until(qr/started/, q{
 	SELECT 'moved ' || moved FROM prolly_page_sweep();
 	\echo done
 });
-$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-	WHERE wait_event = 'bmap-compact-room'}) or die 'the compaction did not stop';
+
+# stopped before a move, holding t2 (whose pages, past x2's freed ones,
+# are the only ones to move: it has no index)
+$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE pid = $sweeper AND wait_event = 'bmap-compact-room'})
+  or die 'the compaction did not stop';
+is( sql(qq{SELECT count(*) FROM pg_locks
+	WHERE pid = $sweeper AND locktype = 'relation'
+	  AND relation = 't2'::regclass AND granted}),
+	'1', 'the compaction stopped holding t2');
+
 my $ddl = $node->background_psql('postgres');
 $ddl->query_until(qr/started/, q{
 	\echo started
@@ -133,16 +143,16 @@ $ddl->query_until(qr/started/, q{
 	\echo done
 });
 ok( $node->poll_query_until(
-		'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
-		  WHERE query LIKE 'ALTER TABLE t2%' AND wait_event_type = 'Lock'}),
+		'postgres', q{SELECT count(*) > 0 FROM pg_locks
+		  WHERE locktype = 'relation' AND relation = 't2'::regclass
+		    AND mode = 'AccessExclusiveLock' AND NOT granted}),
 	'a DDL waits for the compaction');
 sql(q{SELECT injection_points_detach('bmap-compact-room')});
 sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
 my $swept = $sweep->query_until(qr/done/, '');
 $ddl->query_until(qr/done/, '');
 my ($nmoved) = $swept =~ /moved (\d+)/;
-# (t2's moves stop after the one under way; other relations' go on)
-cmp_ok($nmoved, '<', 50, 'which stops its moves of t2 (of some 500)');
+cmp_ok($nmoved, '<=', 2, 'which stops its moves of t2 after about one (of some 500)');
 $sweep->quit;
 $ddl->quit;
 cmp_ok(sql(q{SELECT moved FROM prolly_page_sweep()}), '>', 0, 'a later sweep moves the rest');
