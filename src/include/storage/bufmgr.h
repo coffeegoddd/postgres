@@ -343,8 +343,7 @@ LockBuffer(Buffer buffer, BufferLockMode mode)
 
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern void MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum);
-extern void MarkBufferedRelationsShared(SMgrRelation *rels, int n,
-										ForkNumber forknum);
+extern void MarkSharedAndFlushRelations(SMgrRelation *rels, int n);
 extern void BufferPrepareForChange(Buffer buffer);
 extern void LockBufferForNeutralChange(Buffer buffer);
 extern bool BufferPageIsShared(Buffer buffer);

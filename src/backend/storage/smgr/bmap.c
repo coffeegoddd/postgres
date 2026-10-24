@@ -5586,8 +5586,7 @@ bmap_snapshot_take(SMgrRelation reln)
 	uint64		id = snapshot_take_slot(reln);
 
 	/* as after a share (bmapshare()), but synced before it is relied on */
-	MarkBufferedRelationShared(reln, MAIN_FORKNUM);
-	FlushRelationsAllBuffers(&reln, 1);
+	MarkSharedAndFlushRelations(&reln, 1);
 	mdimmedsync(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM);
 	INJECTION_POINT("bmap-snapshot-taken", NULL);
 	return id;
@@ -5595,7 +5594,8 @@ bmap_snapshot_take(SMgrRelation reln)
 
 /*
  * bmap_snapshot_take() of each of rels[] (n of them), their ids into ids[]:
- * their pages written out in one pass over the buffers, and their page
+ * their pages marked and written out in one look at the buffers (each
+ * block looked up while they are few beside them), and their page
  * stores synced once each, as the transaction commits (bmapsyncshares()),
  * as a share's are.  For a caller that relies on the snapshots only once
  * its transaction has committed: until then a crash leaves them unsynced,
@@ -5612,9 +5612,8 @@ bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 		ids[i] = snapshot_take_slot(rels[i]);
 		INJECTION_POINT("bmap-snapshot-slot-taken", NULL);
 	}
-	MarkBufferedRelationsShared(rels, n, MAIN_FORKNUM);
-	if (n > 0)
-		FlushRelationsAllBuffers(rels, n);
+	/* (one look at the buffers for them all: each block's, if they're few) */
+	MarkSharedAndFlushRelations(rels, n);
 	for (int i = 0; i < n; i++)
 		sync_store_later(rels[i]->smgr_rlocator.locator);
 	if (n > 0)

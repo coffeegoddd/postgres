@@ -94,9 +94,13 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # a diff: the differing paths
     ("diff", "rows"): {"nodes_read": "log"},
     ("diff", "delta"): {"nodes_read": "linear"},
-    # a merge: the differences examined and written
-    ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY)},
+    # a merge: the differences examined and written, and the pages kept as
+    # of its commit (the map's work of the paths changed)
+    ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP)},
     ("merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
+    # a fast-forward merge: the same
+    ("ff_merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP)},
+    ("ff_merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
     # as unrelated objects are added (shared tables, another branch's): a
     # first use's copies, a commit's canonical form and a branch's delete
     # read the branch's catalog rows only
