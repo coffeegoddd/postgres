@@ -1741,12 +1741,14 @@ log_changes(Relation rel, const ProllyTreeEnv *env,
 		ProllyLogPosition pos = {st.fxmax, st.fown, st.nxip, st.fxip};
 		EntryCount	count = {0, 1, false};
 
-		(void) PROLLY_CALL(c.change_log, read, f.rel, f.snap, &pos,
-						   count_entry, &count);
+		/* (a read refused, an entry to read the table in full: unknown) */
+		ok = PROLLY_CALL(c.change_log, read, f.rel, f.snap, &pos,
+						 count_entry, &count) &&
+			!count.unknown && count.n == 0;
 		finder_close(&f);
 		MemoryContextSwitchTo(old);
 		MemoryContextDelete(cxt);
-		return !count.unknown && count.n == 0;
+		return ok;
 	}
 	if (ok)
 	{
@@ -1798,9 +1800,15 @@ log_fewer_changes(Relation rel, const ProllyTableFold *baseline, int limit)
 		storage_unseen(rel, snap))
 		return false;
 	pos = (ProllyLogPosition) {st.fxmax, st.fown, st.nxip, st.fxip};
-	(void) PROLLY_CALL(c.change_log, read, rel, snap, &pos, count_entry,
-					   &count);
-	return !count.unknown && count.n < count.limit;
+
+	/*
+	 * (false from the read: the count reached limit, a visit stopping it,
+	 * or an entry says to read the table in full, which says nothing of
+	 * how many rows changed)
+	 */
+	return PROLLY_CALL(c.change_log, read, rel, snap, &pos, count_entry,
+					   &count) &&
+		!count.unknown && count.n < count.limit;
 }
 
 /*

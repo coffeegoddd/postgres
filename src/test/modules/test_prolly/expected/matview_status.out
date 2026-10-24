@@ -93,10 +93,133 @@ SELECT dolt_reset('--hard') IS NOT NULL AS reset;
 (1 row)
 
 RESET debug_prolly_verify_fold_caches;
+-- A status after a status takes the last one's answer, asking again only
+-- what was written since: a materialized view refreshed concurrently in
+-- between is one of those.
+SET debug_prolly_verify_fold_caches = off;
+UPDATE ms.t SET v = v + 1 WHERE pk = 3;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.t       | t      | modified
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.t       | t      | modified
+(1 row)
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY ms.mv;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.mv      | t      | modified
+ ms.t       | t      | modified
+(2 rows)
+
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+RESET debug_prolly_verify_fold_caches;
+UPDATE ms.t SET v = v + 1 WHERE pk = 3;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.t       | t      | modified
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.t       | t      | modified
+(1 row)
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY ms.mv;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.mv      | t      | modified
+ ms.t       | t      | modified
+(2 rows)
+
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+-- A keyless row too long for its log entry is an entry to read the table
+-- in full: not a change the log can rule out.  A keyless table, and a
+-- materialized view refreshed concurrently with such a row; a hard reset
+-- then undoes the rows.
+CREATE TABLE ms.k (v text STORAGE PLAIN);
+CREATE TABLE ms.wide (pk int PRIMARY KEY, w text);
+CREATE MATERIALIZED VIEW ms.kv AS SELECT pk, w FROM ms.wide;
+ALTER MATERIALIZED VIEW ms.kv ALTER COLUMN w SET STORAGE PLAIN;
+CREATE UNIQUE INDEX ON ms.kv (pk);
+SELECT length(dolt_commit('-Am', 'wide rows')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+INSERT INTO ms.k VALUES (repeat('x', 8100));
+INSERT INTO ms.wide VALUES (1, repeat('y', 8100));
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.k       | t      | modified
+ ms.wide    | t      | modified
+(2 rows)
+
+REFRESH MATERIALIZED VIEW CONCURRENTLY ms.kv;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.k       | t      | modified
+ ms.kv      | t      | modified
+ ms.wide    | t      | modified
+(3 rows)
+
+SET debug_prolly_verify_fold_caches = off;
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged |  status  
+------------+--------+----------
+ ms.k       | t      | modified
+ ms.kv      | t      | modified
+ ms.wide    | t      | modified
+(3 rows)
+
+RESET debug_prolly_verify_fold_caches;
+SELECT dolt_reset('--hard') IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM ms.k) AS k_rows,
+	(SELECT count(*) FROM ms.kv) AS kv_rows;
+ k_rows | kv_rows 
+--------+---------
+      0 |       0
+(1 row)
+
+SELECT * FROM dolt_status ORDER BY 1;
+ table_name | staged | status 
+------------+--------+--------
+(0 rows)
+
 DROP SCHEMA ms CASCADE;
-NOTICE:  drop cascades to 2 other objects
+NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table ms.t
 drop cascades to materialized view ms.mv
+drop cascades to table ms.k
+drop cascades to table ms.wide
+drop cascades to materialized view ms.kv
 DROP FUNCTION ms_folded();
 SELECT length(dolt_commit('-Am', 'ms gone')::text) > 0 AS committed;
  committed 

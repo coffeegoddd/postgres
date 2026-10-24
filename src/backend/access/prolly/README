@@ -926,8 +926,10 @@ only those tables are compared again (pg_stat_prolly's status_reused), so
 a status after a row write costs about the tables written, not every
 table.  The answer is this backend's own, and is kept only from a
 comparison of every table's changes read so: a table whose change finder
-can't tell its changes that way (a keyless or partitioned one) makes every
-status a fold, and status_reused never moves.
+can't tell its changes that way (a partitioned one, or a keyless one with
+log entries since its baseline) makes every status a fold, and
+status_reused never moves.  A materialized view written since the mark
+(refreshed concurrently) is asked again as the full comparison asks it.
 debug_prolly_verify_fold_caches reads them all again and compares.
 
 
