@@ -8,34 +8,6 @@
 # then the change that met it removes the entry, and the check is enforced
 # from then on.  An entry naming nothing the run checked fails too.
 
-# A hard reset to the head gives each changed table the pages kept as of
-# the head (new storage made of a snapshot) and drops the storage it had
-# at commit, in the foreground: the map nodes and blocks its changes
-# copied are freed then, each node's children counted down.
-[[known]]
-check = "hard_reset"
-sweep = "rows"
-counter = "bmap_refcount_updates"
-current = "linear"
-issue = "#768"
-reason = "the swapped-out storage's copied nodes let go of at commit, a count down for each block under them"
-
-[[known]]
-check = "hard_reset"
-sweep = "rows"
-counter = "bmap_blocks_freed"
-current = "log"
-issue = "#768"
-reason = "the swapped-out storage's own nodes and blocks freed at commit rather than in the background"
-
-[[known]]
-check = "hard_reset"
-sweep = "delta"
-counter = "bmap_blocks_freed"
-current = "linear"
-issue = "#768"
-reason = "the blocks the dirty rows' pages were copied to, freed at commit rather than in the background"
-
 # A historical point read decodes the commit's whole table (dolt_at is a
 # full scan).
 [[known]]
@@ -45,15 +17,3 @@ counter = "nodes_read"
 current = "linear"
 issue = "#697"
 reason = "dolt_at reads every row of the table at the commit; no key access path"
-
-# A branch's first use shares each relation's blocks, and before a block
-# the relation alone held is shared, its page image is logged (PRESERVE):
-# redo may skip the source's older records for it once the source's map
-# moves on, and zero it again where it was reused after the redo point.
-[[known]]
-check = "first_use"
-sweep = "rows"
-counter = "bmap_pages_preserved"
-current = "linear"
-issue = "#810"
-reason = "an image of each block the relation alone holds, logged before it is shared"
