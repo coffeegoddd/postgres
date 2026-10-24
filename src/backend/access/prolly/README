@@ -350,6 +350,19 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+A table both sides of a merge changed in ways that don't merge (its
+definitions changed differently, or one dropped it and the other changed
+it, its definition or only its rows) is a schema conflict.  dolt_merge()
+keeps it as the branch has it, definition and rows, records it in the
+merge in progress (the refs' merge names entry, by name, OID 0: refs
+format 8) and merges the other tables, as Dolt does;
+dolt_schema_conflicts shows its statements in the base, the head and
+theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
+committed until it is aborted.  A cherry-pick or revert, schema conflicts
+of other objects, a conflicted table renamed on either side, and one the
+other side's objects use in its version (a view over a column it added)
+fail as before, the last two saying so.
+
 A keyed row both sides of a merge changed is merged column by column, on
 its encoded fields (the keying's row_fields()): all three versions are
 rows of the table as defined now (a version of another shape is converted
@@ -588,6 +601,22 @@ dirtiness) takes that root while the generation and epoch stay and the
 reader's snapshot sees every writer that ended.
 debug_prolly_verify_fold_caches folds again and compares.
 
+The fold worker (prolly_folder.c, prolly_fold_worker) takes a working-set
+checkpoint of each branch written, in the background, so a status or a
+commit folds only what came since, by default at every pass.  With
+prolly_fold_worker_batch_rows set, a branch whose writes go on is folded
+once its writers since its last fold wrote prolly_fold_worker_batch_rows
+rows (the refs count them, each row a write changes) or the first of them
+waited prolly_fold_worker_max_delay; one whose writes stopped (nobody
+writing it, and no writer ended for a naptime) at the next pass, as is one
+no writer of which ended since (nothing to batch). A fold writes the nodes
+on the paths to the rows it changes, so folds of a few rows each write the
+upper nodes again: batching writes keeps a busy branch's chunk writes, WAL
+and journal near its rows' own, while a commit or status during the writes
+folds the batch not yet folded itself (so batching is off by default).
+pg_stat_prolly counts the worker's folds (fold_worker_folds) and the
+branches it left for a later pass (fold_worker_deferred).
+
 A rewrite of a versioned table (ALTER TABLE changing a column's type,
 REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
 branch is folded as a checkpoint (prolly.fold_on_rewrite, prolly_vcs.c's
@@ -596,7 +625,11 @@ commit after, the fold worker off or in the same transaction, folds only
 what changed since.  The checkpoint never waits for a lock (the rewrite
 holds its table exclusively, and a commit holding the branch may be about
 to read it): a lock not free at once skips it, leaving the table's next
-fold to read it in full.  dolt_pending_full_folds() lists the tables whose next
+fold to read it in full.  So does any other error the fold meets (it
+folds every table of the branch, and one may hold what a commit refuses),
+logged with the error's fields; a cancel, or an internal error (class
+XX), fails the rewrite instead.  pg_stat_prolly's
+rewrite_checkpoints_skipped counts the checkpoints skipped.  dolt_pending_full_folds() lists the tables whose next
 fold would read them in full, and why, from the baseline, the catalogs and
 each change finder's full_reason(), reading no rows.
 

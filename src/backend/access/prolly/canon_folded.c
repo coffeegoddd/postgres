@@ -11072,11 +11072,12 @@ string_change_merges(const char *from, const char *to)
  * definition one side changed, fails to merge as a schema conflict where
  * that side changed a column's type in a way Dolt doesn't merge
  * (string_change_merges()).  A column both changed differently is a
- * conflict already (merge_table_defs()).
+ * conflict already (merge_table_defs()).  With keep, true for such a
+ * conflict instead of the error.
  */
-static void
+static bool
 check_type_changes(const char *name, const char *base, const char *ours,
-				   const char *theirs)
+				   const char *theirs, bool keep)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
 	TableLine  *tl[3];
@@ -11084,7 +11085,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
 		!split_table_def(theirs, sec[2]))
-		return;
+		return false;
 	for (int side = 0; side < 3; side++)
 	{
 		tl[side] = table_lines(0, sec[side][0]);
@@ -11114,6 +11115,9 @@ check_type_changes(const char *name, const char *base, const char *ours,
 			char	   *other = type[3 - side];
 
 			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
+				!string_change_merges(type[0], type[side]) && keep)
+				return true;
+			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
 				!string_change_merges(type[0], type[side]))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -11122,6 +11126,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 						 errdetail("A change of type merges with the other side's changes only as a string type made no shorter.")));
 		}
 	}
+	return false;
 }
 
 
@@ -11259,7 +11264,8 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
  */
 static void
 folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_root,
-					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged)
+					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged,
+					List **kept_conflicts)
 {
 	Canon		cn;
 	ProllyTreeCursor *cur[3];
@@ -11299,6 +11305,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		const ProllyValue *take = NULL;
 		ProllyValue table;
 		char	   *merged_def = NULL;
+		bool		retyped = false;
 
 		/* the least key of the three, and which have it */
 		for (int i = 0; i < 3; i++)
@@ -11315,11 +11322,26 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 #define CHANGED(a) (v[a].len != v[0].len || memcmp(v[a].data, v[0].data, v[0].len) != 0)
 		if (least->data[0] == 't' && has[0] && has[1] && has[2] &&
 			CHANGED(1) && CHANGED(2) && !(SAME(0, 1) && SAME(0, 2)) && !SAME(1, 2))
-			check_type_changes(from_utf8(least->data + 2, least->len - 2),
-							   pnstrdup((const char *) def[0].data, def[0].len),
-							   pnstrdup((const char *) def[1].data, def[1].len),
-							   pnstrdup((const char *) def[2].data, def[2].len));
-		if (SAME(0, 2))
+			retyped = check_type_changes(from_utf8(least->data + 2, least->len - 2),
+										 pnstrdup((const char *) def[0].data, def[0].len),
+										 pnstrdup((const char *) def[1].data, def[1].len),
+										 pnstrdup((const char *) def[2].data, def[2].len),
+										 kept_conflicts != NULL);
+		/*
+		 * (a table one side dropped and the other changed, its rows or its
+		 * definition: kept, a schema conflict, as Dolt keeps it)
+		 */
+		if (!retyped && kept_conflicts != NULL && least->data[0] == 't' &&
+			has[0] && has[1] != has[2] && CHANGED(has[1] ? 1 : 2))
+			retyped = true;
+		if (retyped)
+		{
+			/* (kept as ours has it, or gone if ours dropped it) */
+			take = has[1] ? &v[1] : NULL;
+			*kept_conflicts = lappend(*kept_conflicts,
+									  from_utf8(least->data + 2, least->len - 2));
+		}
+		else if (SAME(0, 2))
 			take = has[1] ? &v[1] : NULL;	/* theirs left it: ours */
 		else if (SAME(0, 1) || SAME(1, 2))
 			take = has[2] ? &v[2] : NULL;	/* ours left it, or both alike: theirs */
@@ -11340,6 +11362,13 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			table.data = (const uint8 *) item.data;
 			table.len = item.len;
 			take = &table;
+		}
+		else if (kept_conflicts != NULL && least->data[0] == 't')
+		{
+			/* (kept as ours has it, or gone if ours dropped it) */
+			take = has[1] ? &v[1] : NULL;
+			*kept_conflicts = lappend(*kept_conflicts,
+									  from_utf8(least->data + 2, least->len - 2));
 		}
 		else
 			ereport(ERROR,

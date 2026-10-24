@@ -24,6 +24,7 @@
 #include "catalog/versioned.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc.h"
@@ -152,9 +153,13 @@ dolt_pending_full_folds(PG_FUNCTION_ARGS)
  * table a rewrite elsewhere holds) could deadlock, and would hold the
  * table from readers meanwhile.  It is made in a subtransaction with
  * lock_timeout at its least; a lock not free at once rolls it back, and
- * the table's next fold reads it in full, as without the checkpoint.
- * True if relid was such a table (folded or not): the branch's fold is
- * then tried, and needn't be for another table of the same rewrite.
+ * the table's next fold reads it in full, as without the checkpoint.  Any
+ * other error does the same, logged, but for a cancel or an internal
+ * error (class XX): the checkpoint is an optimization, never a reason for
+ * the rewrite to fail.  Each skipped checkpoint is counted
+ * (pg_stat_prolly's rewrite_checkpoints_skipped).  True if relid was such
+ * a table (folded or not): the branch's fold is then tried, and needn't be
+ * for another table of the same rewrite.
  */
 bool
 prolly_fold_rewritten(Oid relid)
@@ -196,9 +201,33 @@ prolly_fold_rewritten(Oid relid)
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(cxt);
 		CurrentResourceOwner = owner;
-		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+		/*
+		 * Nor does any other error the fold meets fail the rewrite: the
+		 * checkpoint folds every table of the branch, and one the next
+		 * commit refuses (a value its type's text form no longer reads
+		 * back as, say) is that commit's to report, not this table's
+		 * ALTER's.  A cancel still cancels, and an internal error or
+		 * corruption (class XX) is never set aside.  Another error is
+		 * logged as it was raised, its fields kept, under a message
+		 * naming the table.
+		 */
+		if (ed->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			ERRCODE_TO_CATEGORY(ed->sqlerrcode) ==
+			ERRCODE_TO_CATEGORY(ERRCODE_INTERNAL_ERROR))
 			ReThrowError(ed);
 		FlushErrorState();
+		pgstat_count_prolly(PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED, 1);
+		if (ed->sqlerrcode != ERRCODE_LOCK_NOT_AVAILABLE)
+		{
+			char	   *nsp = get_namespace_name(get_rel_namespace(relid));
+			char	   *name = quote_qualified_identifier(nsp, get_rel_name(relid));
+
+			ed->elevel = LOG;
+			ed->output_to_client = false;
+			ed->message = psprintf("branch not checkpointed after rewriting %s: %s",
+								   name, ed->message);
+			ThrowErrorData(ed);
+		}
 		FreeErrorData(ed);
 	}
 	PG_END_TRY();

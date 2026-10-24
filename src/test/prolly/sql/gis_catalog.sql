@@ -135,7 +135,7 @@ DECLARE
 BEGIN
   FOR m IN SELECT c.name, c.kind, c.covered_by, x.oid FROM gis_check.coverage() c
            JOIN gis_check.members() x ON x.kind = c.kind AND x.name = c.name
-           WHERE c.covered_by IN ('evaluated', 'called') ORDER BY c.kind, c.name LOOP
+           WHERE c.covered_by IN ('evaluated', 'called') ORDER BY c.kind COLLATE "C", c.name COLLATE "C" LOOP
     name := m.kind || ' ' || m.name;
     IF m.covered_by = 'called' THEN
       BEGIN
@@ -190,8 +190,8 @@ BEGIN
   END LOOP;
 END $$;
 
-SELECT kind, name, covered_by FROM gis_check.coverage() ORDER BY kind, name;
+SELECT kind, name, covered_by FROM gis_check.coverage() ORDER BY kind COLLATE "C", name COLLATE "C";
 CREATE TABLE gis_check.answers AS SELECT * FROM gis_check.evaluate();
-SELECT * FROM gis_check.answers ORDER BY name;
+SELECT * FROM gis_check.answers ORDER BY name COLLATE "C";
 -- (no call may be of nothing: an aggregate of no rows is null)
-SELECT name FROM gis_check.answers WHERE answer = left(md5('null'), 12) ORDER BY name;
+SELECT name FROM gis_check.answers WHERE answer = left(md5('null'), 12) ORDER BY name COLLATE "C";
