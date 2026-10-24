@@ -2,6 +2,7 @@ package vcfuzz
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -47,7 +48,10 @@ type Report struct {
 // a transaction) whether its branch has uncommitted changes.  For an
 // engine with commit identities, it checks each branch's head is the
 // commit the model has there, and that commits with the same rows have
-// the same root hash and commits with different rows different ones.
+// the same root hash and commits with different rows different ones.  For
+// a history with PostGIS, on an engine with geometries (Spatial), it
+// checks each row of t holds its b's geometry and each window query
+// returns the rows the model's geometries overlap.
 // Ops the model holds illegal are skipped.  An error is the harness's.
 func Run(h History, open Opener) (Report, error) {
 	r := Report{Outcomes: map[string]int{}}
@@ -62,6 +66,10 @@ func Run(h History, open Opener) (Report, error) {
 	roots := map[string]string{}  // a state's root hash
 	states := map[string]string{} // and back
 	identities, _ := e.(Identities)
+	spatial, _ := e.(Spatial)
+	if !h.PostGIS {
+		spatial = nil
+	}
 	check := func(step int, op Op) (*Failure, error) {
 		for s := range m.Sessions {
 			// (a session waiting on a row lock can't be asked: it is, once
@@ -83,8 +91,31 @@ func Run(h History, open Opener) (Report, error) {
 			if err != nil {
 				return nil, err
 			}
-			if want := m.Visible(s); !rows.equal(want) {
+			want := m.Visible(s)
+			if !rows.equal(want) {
 				return fail("rows", want.key(), rows.key()), nil
+			}
+			if spatial != nil {
+				wrong, err := spatial.Misplaced(s)
+				if err != nil {
+					return nil, err
+				}
+				if len(wrong) > 0 {
+					return fail("geometries not their rows'", []int{}, wrong), nil
+				}
+				got, err := spatial.Windows(s)
+				if err != nil {
+					return nil, err
+				}
+				for i, ids := range WindowIDs(want) {
+					if i >= len(got) || !slices.Equal(ids, got[i]) {
+						var g []int
+						if i < len(got) {
+							g = got[i]
+						}
+						return fail(fmt.Sprintf("window %d", i), ids, g), nil
+					}
+				}
 			}
 			if m.Sessions[s].InTxn {
 				continue

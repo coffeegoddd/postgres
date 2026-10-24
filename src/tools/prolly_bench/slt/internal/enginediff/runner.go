@@ -146,11 +146,15 @@ THEN RAISE EXCEPTION 'table, index or TOAST is not block-mapped'; END IF; END $$
 	return s.must("DROP TABLE target_canary")
 }
 
+// checkAM checks every table in public is am's, apart from an extension's
+// own (PostGIS's spatial_ref_sys).
 func (s *session) checkAM(am string) error {
 	return s.must(`DO $$ BEGIN IF EXISTS (
 SELECT FROM pg_class c JOIN pg_am a ON a.oid = c.relam
 WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r','m')
-AND a.amname <> '` + am + `') THEN RAISE EXCEPTION 'wrong table AM'; END IF; END $$`)
+AND a.amname <> '` + am + `' AND NOT EXISTS (SELECT FROM pg_depend d
+  WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'))
+THEN RAISE EXCEPTION 'wrong table AM'; END IF; END $$`)
 }
 
 func (s *session) requirePlan(sql, node string) error {
@@ -171,6 +175,31 @@ var snapshots = []string{
 	"SELECT id, v, n, txt, b FROM t ORDER BY id",
 	"SELECT id, parent FROM child ORDER BY id",
 	"SELECT id, v FROM audit ORDER BY id, v",
+}
+
+// geoSnapshot is the spatial table's state, by EWKB (whose md5 keeps a
+// large polygon's row small).
+const geoSnapshot = "SELECT id, kind, md5(ST_AsEWKB(g)) FROM geo ORDER BY id"
+
+// indexProbe is a query compared, within each target, between a scan
+// that doesn't use the index and one that does (node).
+type indexProbe struct {
+	query, node string
+	off, on     string // the settings for each
+}
+
+var pkProbe = indexProbe{
+	query: "SELECT id, v, n, txt, b FROM t WHERE id BETWEEN 1 AND 250 ORDER BY id", node: "Index Scan",
+	off: "SET enable_indexscan = off; SET enable_bitmapscan = off",
+	on:  "SET enable_indexscan = on; SET enable_seqscan = off; SET enable_indexonlyscan = off",
+}
+
+// geoProbe reads a window through the GiST index.
+var geoProbe = indexProbe{
+	query: "SELECT id, md5(ST_AsEWKB(g)) FROM geo WHERE g && ST_MakeEnvelope(100.125, 100.125, 600.125, 600.125) ORDER BY id",
+	node:  "Index Scan",
+	off:   "SET enable_indexscan = off; SET enable_bitmapscan = off",
+	on:    "SET enable_indexscan = on; SET enable_seqscan = off; SET enable_bitmapscan = off",
 }
 
 // Compare uses fresh, randomly named databases for every replay. SQL errors are
@@ -249,43 +278,53 @@ func Compare(dsn, am string, p Program, timeout time.Duration) (*Failure, error)
 				return nil, err
 			}
 		}
-		for _, sql := range snapshots {
+		states := snapshots
+		probes := []indexProbe{pkProbe}
+		if p.PostGIS {
+			states = append(append([]string{}, snapshots...), geoSnapshot)
+			probes = append(probes, geoProbe)
+		}
+		for _, sql := range states {
 			if f, err := compare(g.Name+"/state", sql); f != nil || err != nil {
 				return f, err
 			}
 		}
-		// Exercise the primary-key index separately and compare it with a scan
-		// within each target as well as with heap. The index path is verified.
-		query := "SELECT id, v, n, txt, b FROM t WHERE id BETWEEN 1 AND 250 ORDER BY id"
-		for i, s := range sessions {
-			if err := s.must("SET enable_indexscan = off; SET enable_bitmapscan = off"); err != nil {
-				return nil, err
+		// Exercise each index separately and compare it with a scan within
+		// each target as well as with heap. The index path is verified.
+		for _, probe := range probes {
+			for i, s := range sessions {
+				if err := s.must(probe.off); err != nil {
+					return nil, err
+				}
+				if err := s.requirePlan(probe.query, "Seq Scan"); err != nil {
+					return nil, err
+				}
+				scan, err := s.exec(probe.query)
+				if err != nil {
+					return nil, err
+				}
+				if scan.SQLState != "" {
+					return nil, fmt.Errorf("scan failed with SQLSTATE %s", scan.SQLState)
+				}
+				if err := s.must(probe.on); err != nil {
+					return nil, err
+				}
+				if err := s.requirePlan(probe.query, probe.node); err != nil {
+					return nil, err
+				}
+				indexed, err := s.exec(probe.query)
+				if err != nil {
+					return nil, err
+				}
+				if !reflect.DeepEqual(scan, indexed) {
+					return &Failure{Kind: "index_scan_mismatch", Group: g.Name, SQL: probe.query, Baseline: scan, Candidate: indexed, Target: []string{"heap", am}[i]}, nil
+				}
+				if err := s.must("RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan; RESET enable_indexonlyscan"); err != nil {
+					return nil, err
+				}
 			}
-			if err := s.requirePlan(query, "Seq Scan"); err != nil {
-				return nil, err
-			}
-			scan, err := s.exec(query)
-			if err != nil {
-				return nil, err
-			}
-			if scan.SQLState != "" {
-				return nil, fmt.Errorf("scan failed with SQLSTATE %s", scan.SQLState)
-			}
-			if err := s.must("SET enable_indexscan = on; SET enable_seqscan = off; SET enable_indexonlyscan = off"); err != nil {
-				return nil, err
-			}
-			if err := s.requirePlan(query, "Index Scan"); err != nil {
-				return nil, err
-			}
-			indexed, err := s.exec(query)
-			if err != nil {
-				return nil, err
-			}
-			if !reflect.DeepEqual(scan, indexed) {
-				return &Failure{Kind: "index_scan_mismatch", Group: g.Name, SQL: query, Baseline: scan, Candidate: indexed, Target: []string{"heap", am}[i]}, nil
-			}
-			if err := s.must("RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan; RESET enable_indexonlyscan"); err != nil {
-				return nil, err
+			if f, err := compare(g.Name+"/probe", probe.query); f != nil || err != nil {
+				return f, err
 			}
 		}
 	}

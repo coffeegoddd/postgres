@@ -927,6 +927,20 @@ copied from (Dolt's checkout never waits; prolly's first use of a branch
 copies the session's branch's tables under a lock). Doltgres as a third
 engine is not run: the `Engine` interface is ready for it.
 
+With `--postgis` (PostGIS installed in `--pg-bin`'s server: see
+[PostGIS builds](#postgis-builds)), keyed table `t` also has a geometry
+column `g` with a GiST index, written with `b`: each row's geometry is a
+function of its id and `b` (a point, a line, a rhombus, and a fourth kind
+that is empty, two points, or, for rows 4 and 8, a polygon of 100,000
+vertices, about 1.6 MB, kept out of line). Merges so carry geometries with
+the cells they belong to. After every step it also checks each row's `g`
+is its `b`'s (by the md5 of its EWKB) and that window queries (`&&`)
+through the GiST index return the rows the model's geometries' boxes
+overlap. The generator (`slt/internal/geomgen`) keeps coordinates on a
+grid of quarters and window edges on odd eighths, so the float4 boxes `&&`
+compares decide the same as the model. `--self-test` adds an engine that
+loses a row from a window query.
+
 The differential runner compares seeded transaction histories with heap:
 
 ```sh
@@ -956,6 +970,21 @@ allowed; matching unexpected errors on both sides fail. After each group,
 the runner compares all fixture rows and checks a sequential scan against
 a verified index scan within each target. Queries that return rows have
 defined ordering.
+
+With `--postgis` (PostGIS installed in `--pg-bin`'s server), the program's
+setup also creates the extension (in the versioned `public` on prolly) and
+a table `geo (id, kind, g geometry)` of seeded points, random-walk lines,
+rectangles, rhombi, collections and empties, one polygon of 100,000 to
+200,000 vertices (1.6 to 3.2 MB), and a GiST index; and six spatial
+families join the rotation: writes (upserts, with a large polygon one row
+in eight, `ST_Translate` updates, deletes by window), reads (`&&`,
+`ST_Intersects`, `ST_Contains`, `ST_DWithin`, areas and lengths as numeric
+sums, `ST_Extent`), the same reads through the index, nearest neighbours
+(`<->`, k of 1, 10 or 100), a transaction with a savepoint rolled back,
+and a large polygon's corner moved and simplified. Each group's state
+check adds `geo` by the md5 of each row's EWKB, and a window read through
+the GiST index is compared with a sequential scan in each target. Tables
+an extension owns (`spatial_ref_sys`) are left out of the AM check.
 
 The output directory must be new. It contains the revision, dirty flag,
 server version/settings, runner binary hash, server log, seed programs,

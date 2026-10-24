@@ -44,6 +44,17 @@ type Identities interface {
 	RootHash(commit string) (string, error)
 }
 
+// Spatial is implemented by engines that, for a history with PostGIS,
+// give table t a geometry column g written with b: Geom(id, b).
+type Spatial interface {
+	// Windows is, for each of Windows, the ids of the rows of t session s
+	// sees whose g overlaps it (&&), read through t's GiST index, in order.
+	Windows(s int) ([][]int, error)
+	// Misplaced is the ids of the rows of t session s sees whose g isn't
+	// Geom(id, b), in order.
+	Misplaced(s int) ([]int, error)
+}
+
 // Opener opens an engine at a history's setup: Tables holding the setup
 // rows on main, committed, and the history's sessions on main.
 type Opener func(h History) (Engine, error)
