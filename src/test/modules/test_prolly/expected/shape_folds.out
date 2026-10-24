@@ -2023,6 +2023,12 @@ SELECT pg_stat_force_next_flush();
 (1 row)
 
 ALTER TABLE sf.cost ADD COLUMN w int DEFAULT 7;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+ table_name |    reason     
+------------+---------------
+ sf.cost    | shape_changed
+(1 row)
+
 :check
  same 
 ------
@@ -2081,6 +2087,11 @@ SELECT n_dead_tup >= 1.5 * n_live_tup AS mostly_dead
 (1 row)
 
 ALTER TABLE sf.cost ADD COLUMN x int DEFAULT 8;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
+ table_name | reason 
+------------+--------
+(0 rows)
+
 :check
  same 
 ------

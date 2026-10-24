@@ -5482,7 +5482,8 @@ folded_pending_full(const ProllyNodeRef *baseline,
 					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
 					 !shape_holds(rel, base_shape(&cn, bt),
 								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
-					 !shape_mappable(&cn, rel, bt, &shape, &tf.shape))
+					 (!shape_mappable(&cn, rel, bt, &shape, &tf.shape) ||
+					  !prolly_fold_map_cheaper(rel)))
 				why = PROLLY_FULL_SHAPE_CHANGED;
 			else if (PROLLY_HAS(cn.finder, full_reason))
 			{

@@ -337,6 +337,7 @@ INSERT INTO sf.cost SELECT g, 0 FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-Am', 'cost')::text) > 0 AS committed;
 SELECT pg_stat_force_next_flush();
 ALTER TABLE sf.cost ADD COLUMN w int DEFAULT 7;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
 :check
 UPDATE sf.cost SET v = v + 1;
 UPDATE sf.cost SET v = v + 1;
@@ -345,6 +346,7 @@ SELECT pg_stat_force_next_flush();
 SELECT n_dead_tup >= 1.5 * n_live_tup AS mostly_dead
   FROM pg_stat_user_tables WHERE relid = 'sf.cost'::regclass;
 ALTER TABLE sf.cost ADD COLUMN x int DEFAULT 8;
+SELECT table_name, reason FROM dolt_pending_full_folds() WHERE table_name = 'sf.cost';
 :check
 SELECT count(*), sum(w), sum(x) FROM sf.cost;
 
