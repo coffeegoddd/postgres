@@ -545,8 +545,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('settings_conflict');
-ERROR:  schema conflict: settings.opts was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table settings.opts was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
  same_root 
 -----------
@@ -592,8 +593,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('identity_conflict');
-ERROR:  schema conflict: settings.repl was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table settings.repl was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
  same_root 
 -----------
@@ -654,8 +656,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('identity_index');
-ERROR:  schema conflict: settings.ri was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table settings.ri was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT test_fold_root() = prolly_root_hash('main') AS same_root;
  same_root 
 -----------
@@ -674,8 +677,9 @@ SELECT dolt_checkout('identity_index');
 (1 row)
 
 SELECT dolt_merge('main');
-ERROR:  schema conflict: settings.ri was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table settings.ri was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT test_fold_root() = prolly_root_hash('identity_index') AS same_root;
  same_root 
 -----------

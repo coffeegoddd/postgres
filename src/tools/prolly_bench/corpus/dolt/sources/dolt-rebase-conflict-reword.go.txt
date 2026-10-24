@@ -1,0 +1,153 @@
+{
+		Name: "dolt_rebase: data conflicts with reword",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(100));",
+			"insert into t values (-1, 'negative');",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('branch1');",
+			"insert into t values (0, 'zero');",
+			"call dolt_commit('-am', 'inserting row 0 on main');",
+
+			"call dolt_checkout('branch1');",
+			"update t set c1='-1' where pk=-1;",
+			"call dolt_commit('-am', 'updating row -1 on branch1');",
+			"delete from t where c1 = '-1';",
+			"call dolt_commit('-am', 'deleting -1 on branch1');",
+			"insert into t values (999, 'nines');",
+			"call dolt_commit('-am', 'inserting row 999 on branch1');",
+
+			"set @@autocommit=0;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "call dolt_rebase('-i', 'main');",
+				Expected: []sql.Row{{0, "interactive rebase started on branch dolt_rebase_branch1; " +
+					"adjust the rebase plan in the dolt_rebase table, then " +
+					"continue rebasing by calling dolt_rebase('--continue')"}},
+			},
+			{
+				Query: "select * from dolt_rebase order by rebase_order ASC;",
+				Expected: []sql.Row{
+					{"1", "pick", doltCommit, "updating row -1 on branch1"},
+					{"2", "pick", doltCommit, "deleting -1 on branch1"},
+					{"3", "pick", doltCommit, "inserting row 999 on branch1"},
+				},
+			},
+			{
+				Query: "update dolt_rebase set rebase_order=3.5, action='reword', commit_message='reworded message!' where rebase_order=1;",
+				Expected: []sql.Row{{gmstypes.OkResult{RowsAffected: uint64(1), Info: plan.UpdateInfo{
+					Matched: 1,
+					Updated: 1,
+				}}}},
+			},
+			{
+				Query: "select * from dolt_rebase order by rebase_order ASC;",
+				Expected: []sql.Row{
+					{"2", "pick", doltCommit, "deleting -1 on branch1"},
+					{"3", "pick", doltCommit, "inserting row 999 on branch1"},
+					{"3.50", "reword", doltCommit, "reworded message!"},
+				},
+			},
+			{
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseDataConflict,
+			},
+			{
+				// We remain on the rebase working branch while resolving conflicts
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"dolt_rebase_branch1"}},
+			},
+			{
+				Query:    "select * from dolt_conflicts;",
+				Expected: []sql.Row{{"t", uint64(1)}},
+			},
+			{
+				// The base of the cherry-picked commit has (-1, "-1"), but ours has (-1, "negative"), so this is a
+				// data conflict. The cherry-picked commit is trying to delete the row, but can't find an exact match.
+				Query:    "select base_pk, base_c1, our_pk, our_c1, our_diff_type, their_pk, their_c1, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{{-1, "-1", -1, "negative", "modified", nil, nil, "removed"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				// Resolve conflicts, by accepting theirs, which inserts (1, "ein") into t
+				// When we continue the rebase, a Dolt commit will be created for these changes
+				Query:    "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 't');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "SELECT * FROM t;",
+				Expected: []sql.Row{{0, "zero"}},
+			},
+			{
+				// If we don't stage the table, then rebase will give us an error about having unstaged changes
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseUnstagedChanges,
+			},
+			{
+				Query:    "call dolt_add('t');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseDataConflict,
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{0, "zero"}, {999, "nines"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"inserting row 999 on branch1"},
+					{"deleting -1 on branch1"},
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+			{
+				// Now we're resolving a conflict where row -1 is updated, but it has already been deleted
+				Query:    "select base_pk, base_c1, our_pk, our_c1, our_diff_type, their_pk, their_c1, their_diff_type from dolt_conflicts_t;",
+				Expected: []sql.Row{{-1, "negative", nil, nil, "removed", -1, "-1", "modified"}},
+			},
+			{
+				// Accept the new values from the cherry-picked commit (-1, "-1")
+				Query:    "CALL DOLT_CONFLICTS_RESOLVE('--theirs', 't');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "call dolt_add('t');",
+				Expected: []sql.Row{{0}},
+			},
+			{
+				Query:    "call dolt_rebase('--continue');",
+				Expected: []sql.Row{{0, "Successfully rebased and updated refs/heads/branch1"}},
+			},
+			{
+				Query:    "select * from t;",
+				Expected: []sql.Row{{-1, "-1"}, {0, "zero"}, {999, "nines"}},
+			},
+			{
+				Query:    "select active_branch();",
+				Expected: []sql.Row{{"branch1"}},
+			},
+			{
+				Query: "select message from dolt_log;",
+				Expected: []sql.Row{
+					{"reworded message!"},
+					{"inserting row 999 on branch1"},
+					{"deleting -1 on branch1"},
+					{"inserting row 0 on main"},
+					{"creating table t"},
+					{"Initialize data repository"},
+				},
+			},
+		},
+	}

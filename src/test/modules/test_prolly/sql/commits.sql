@@ -106,13 +106,14 @@ SELECT dolt_hashof('HEAD') = :'before_drop' AS same_head;
 SELECT length(dolt_commit('-Am', 'drop the schema')::text) AS committed;
 SELECT dolt_hashof('HEAD~1') = :'before_drop' AS continues_it;
 
--- A commit needs a message, and --amend isn't one of its options; its
+-- A commit needs a message, and --skip-verification isn't one of its
+-- options (prolly has no commit verification); its
 -- author is dolt.author, else the session user with no email.
 CREATE SCHEMA ca VERSIONED;
 CREATE TABLE ca.t (id int PRIMARY KEY);
 INSERT INTO ca.t VALUES (1);
 SELECT dolt_commit('-A');
-SELECT dolt_commit('-Am', 'ca', '--amend');
+SELECT dolt_commit('-Am', 'ca', '--skip-verification');
 SET dolt.author = 'Ada Lovelace <ada@example.com>';
 SELECT length(dolt_commit('-Am', 'by ada')::text) AS committed;
 RESET dolt.author;

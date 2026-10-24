@@ -169,6 +169,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | cow            | nodes_are_valid                | pass
  tree          | cow            | large_values                   | pass
  tree          | cow            | held_references                | pass
+ tree          | cow            | value_splices                  | pass
  tree          | cow            | complete                       | pass
  tree          | stub           | identity                       | pass
  tree          | stub           | build_and_get                  | not implemented (missing build_begin, build_add, build_finish, get, cursor_open, cursor_seek, cursor_next, cursor_close, count)
@@ -190,7 +191,8 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
  tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
  tree          | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
- tree          | stub           | complete                       | not implemented (23 of 23 callbacks missing)
+ tree          | stub           | value_splices                  | not implemented (missing value_write, value_read, value_root, value_splice)
+ tree          | stub           | complete                       | not implemented (24 of 24 callbacks missing)
  table_keying  | pk_or_prefix   | identity                       | pass
  table_keying  | pk_or_prefix   | round_trip                     | pass
  table_keying  | pk_or_prefix   | keys_and_content               | pass
@@ -264,7 +266,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(200 rows)
+(202 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -291,8 +293,9 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | nodes_are_valid           | pass
  tree      | cow            | large_values              | pass
  tree      | cow            | held_references           | pass
+ tree      | cow            | value_splices             | pass
  tree      | cow            | complete                  | pass
-(21 rows)
+(22 rows)
 
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        

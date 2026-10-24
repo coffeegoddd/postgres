@@ -51,6 +51,7 @@ typedef FormData_pg_enum *Form_pg_enum;
 DECLARE_UNIQUE_INDEX_PKEY(pg_enum_oid_index, 3502, EnumOidIndexId, pg_enum, btree(oid oid_ops, enumbranch oid_ops));
 DECLARE_UNIQUE_INDEX(pg_enum_typid_label_index, 3503, EnumTypIdLabelIndexId, pg_enum, btree(enumtypid oid_ops, enumlabel name_ops, enumbranch oid_ops));
 DECLARE_UNIQUE_INDEX(pg_enum_typid_sortorder_index, 3534, EnumTypIdSortOrderIndexId, pg_enum, btree(enumtypid oid_ops, enumsortorder float4_ops, enumbranch oid_ops));
+DECLARE_INDEX(pg_enum_branch_index, 9172, EnumBranchIndexId, pg_enum, btree(enumbranch oid_ops));
 
 MAKE_SYSCACHE(ENUMOID, pg_enum_oid_index, 8);
 MAKE_SYSCACHE(ENUMTYPOIDNAME, pg_enum_typid_label_index, 8);

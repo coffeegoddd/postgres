@@ -28,6 +28,7 @@ $node->append_conf(
 	'postgresql.conf', q{
 debug_block_mapped_heap = on
 autovacuum = off
+max_prepared_transactions = 2
 checkpoint_timeout = 1h
 wal_keep_size = '1GB'
 });
@@ -188,6 +189,8 @@ is(sql(q{SELECT freed FROM prolly_page_sweep()}), '0', 'none leaked');
 
 # A drop whose queuing fails part way (after the changes list's blocks,
 # before the subtrees) leaves nothing queued that its map still reaches.
+# (A prepared transaction's drop, which queues at COMMIT PREPARED: a
+# commit's queues before its commit record, which a failure aborts.)
 # While the drop waits to unlink the map, a drain frees none of the map's
 # nodes, so a sweep reading the map reads it whole, even with freed blocks
 # taken again; once the map is gone, a sweep frees what it held.
@@ -198,7 +201,7 @@ $d5->query_safe(q{SELECT injection_points_set_local();
 	SELECT injection_points_attach('bmap-drop-changes-queued', 'error');
 	SELECT injection_points_attach('bmap-dropped', 'wait')});
 $d5->query_until(qr/dropping/, q{\echo dropping
-DROP TABLE t5;
+BEGIN; DROP TABLE t5; PREPARE TRANSACTION 'd5'; COMMIT PREPARED 'd5';
 \echo dropped
 });
 $node->wait_for_event('client backend', 'bmap-dropped');
