@@ -97,12 +97,14 @@ typedef struct ProllyEncodedField
 {
 	bool		stored;			/* the row holds the column; false: the row
 								 * ends before it, or the column was added
-								 * after the row's layout, so it reads as
-								 * its missing value or NULL */
-	bool		isnull;			/* stored as NULL (or not stored) */
+								 * after the row's layout, so it is its
+								 * missing value or NULL */
+	bool		missing;		/* not stored: the column's missing value */
+	bool		isnull;			/* NULL, stored or not */
 	bool		out_of_line;	/* bytes is a reference to a value tree */
 	ProllyValue bytes;			/* the column's canonical bytes, or the
-								 * reference */
+								 * reference (a missing value's: in the
+								 * encoder, while it is open) */
 } ProllyEncodedField;
 
 /* Tree nodes read from and written to a chunk store, for counting work. */

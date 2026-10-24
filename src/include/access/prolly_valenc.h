@@ -89,10 +89,10 @@ typedef struct ProllyValueEncoderRoutine
 	 * Optional: the columns an encoded row holds, by attribute index of the
 	 * encoder's descriptor (fields gets natts entries), parsed in one pass
 	 * and checked whole as decode() checks a row.  No value is decoded or
-	 * read out of line.  A dropped column is not stored.  Two rows of the
-	 * same layout hold a column alike exactly when their fields are alike:
-	 * both NULL, or the same bytes (canonical bytes, or the same reference),
-	 * so a caller can compare columns without decoding them.
+	 * read out of line.  A dropped column is not stored.  A column the row
+	 * predates (absent from it, or added after its layout) is its missing
+	 * value if it has one (missing: its nullness and canonical bytes, held
+	 * inline whatever their length), else NULL.
 	 */
 	void		(*fields) (ProllyValueEncoder *enc, const ProllyValue *row,
 						   ProllyEncodedField *fields);
@@ -105,6 +105,32 @@ typedef struct ProllyValueEncoderRoutine
 	Datum		(*decode_field) (ProllyValueEncoder *enc, int attno,
 								 const ProllyEncodedField *field,
 								 bool *isnull);
+
+	/*
+	 * Optional: whether two fields of attribute attno (fields() of two rows
+	 * this encoder decodes) hold the same value, without decoding them:
+	 * both NULL, or the same canonical bytes, whether a row stores the
+	 * value or predates its column and has it as its missing value.  Equal
+	 * bytes are usually enough, but a long missing value is held inline
+	 * and a stored one by reference: that pair is compared by reading the
+	 * stored value.
+	 */
+	bool		(*fields_alike) (ProllyValueEncoder *enc, int attno,
+								 const ProllyEncodedField *a,
+								 const ProllyEncodedField *b);
+
+	/*
+	 * Optional: whether fields of attribute attno of enc's rows and of
+	 * other_attno of other's can be compared by fields_alike() (of either
+	 * encoder): the same bytes are the same value, and different bytes
+	 * different values.  False across a change of type, typmod or the
+	 * type's definition (a column dropped and another added under its name
+	 * is another attribute), or when either decodes enum labels through a
+	 * historical mapping: compare decoded values then.
+	 */
+	bool		(*field_compatible) (ProllyValueEncoder *enc, int attno,
+									 ProllyValueEncoder *other,
+									 int other_attno);
 
 	/*
 	 * Optional: decode(), except only the attributes wanted marks (by
@@ -120,7 +146,7 @@ typedef struct ProllyValueEncoderRoutine
 #define PROLLY_VALENC_CALLBACK_NAMES \
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
 	"set_values", "refs", "decode_kept", "fields", "decode_field", \
-	"decode_columns"
+	"fields_alike", "field_compatible", "decode_columns"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
 #define PROLLY_VALENC_LAST_CALLBACK decode_columns
 

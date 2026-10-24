@@ -190,6 +190,16 @@ typedef struct ProllyKeyingRoutine
 	Datum		(*decode_field) (ProllyKeying *k, int attno,
 								 const ProllyEncodedField *field,
 								 bool *isnull);
+
+	/*
+	 * Optional: the value encoder's fields_alike() and field_compatible()
+	 * of the keyings' own columns.
+	 */
+	bool		(*fields_alike) (ProllyKeying *k, int attno,
+								 const ProllyEncodedField *a,
+								 const ProllyEncodedField *b);
+	bool		(*field_compatible) (ProllyKeying *k, int attno,
+									 ProllyKeying *other, int other_attno);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
@@ -197,9 +207,9 @@ typedef struct ProllyKeyingRoutine
 	"decode_row", "compare", "close", "set_values", "row_refs", \
 	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
 	"row_shape", "shape_extends", "open_shape", "decode_row_columns", \
-	"row_fields", "decode_field"
+	"row_fields", "decode_field", "fields_alike", "field_compatible"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK decode_field
+#define PROLLY_KEYING_LAST_CALLBACK field_compatible
 
 /*
  * Set up a data tree's environment and k's value store for each other:
