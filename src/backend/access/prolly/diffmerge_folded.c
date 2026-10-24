@@ -74,6 +74,7 @@
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/typcache.h"
@@ -1477,6 +1478,224 @@ working_rows_differ(const Table *r, const Table *t, bool *known)
 	return any || !same_hash(&base.hash, &r->data.hash);
 }
 
+/* A change visited, kept for comparing two reads and for visiting again. */
+typedef struct NotedChange
+{
+	char	   *name;
+	ProllyDiffKind kind;
+	char		object;
+} NotedChange;
+
+/*
+ * The last answer of tables_into_working() from definitions read without
+ * rows, to answer the next from: the two roots it compared, a mark taken
+ * before it asked any table's change finder, and what it found, the
+ * tables' changes (in the canonical tree's order) apart from the rest.
+ * With the same two roots, nothing a table's description, its version's
+ * rows or the baseline's rows hold has changed (the definitions' root
+ * holds each table's description and its baseline's rows), nor anything
+ * the other objects' comparison or the names left out depend on; only
+ * the rows written since the baseline may have, and those of the tables
+ * written since the mark (the refs' written_since()) are the only ones
+ * that may have since the last answer.  (A writer that rolled back, or a
+ * subtransaction, is one of those too: its relations are kept.)
+ */
+typedef struct LastTables
+{
+	bool		valid;
+	ProllyFoldMark mark;
+	ProllyHash	from_root;
+	ProllyHash	to_root;
+	List	   *tables;			/* NotedChange *, the tables' */
+	List	   *rest;			/* NotedChange *, after the tables' */
+} LastTables;
+
+static LastTables last_tables;
+static MemoryContext last_tables_cxt = NULL;
+
+static NotedChange *
+noted(const char *name, ProllyDiffKind kind, char object)
+{
+	NotedChange *c = palloc(sizeof(NotedChange));
+
+	c->name = pstrdup(name);
+	c->kind = kind;
+	c->object = object;
+	return c;
+}
+
+/* (a table's change, in the canonical tree's order: by its UTF-8 name) */
+static char *
+noted_utf8(const NotedChange *c)
+{
+	return pg_server_to_any(c->name, strlen(c->name), PG_UTF8);
+}
+
+/* A table's change and its name in UTF-8, to sort by. */
+typedef struct SortedChange
+{
+	char	   *utf8;
+	NotedChange *change;
+} SortedChange;
+
+static int
+sorted_change_cmp(const void *a, const void *b)
+{
+	return strcmp(((const SortedChange *) a)->utf8,
+				  ((const SortedChange *) b)->utf8);
+}
+
+static bool
+list_member_name(List *names, const char *name)
+{
+	foreach_ptr(char, n, names)
+		if (strcmp(n, name) == 0)
+			return true;
+	return false;
+}
+
+/*
+ * Keep an answer: the roots, the mark (taken before it), and its changes
+ * (tables' first, then the rest, as visited).
+ */
+static void
+remember_tables(const ProllyFoldMark *mark, const ProllyNodeRef *from_root,
+				const ProllyNodeRef *to_root, List *tables, List *rest)
+{
+	/* (copied into a new context first: tables and rest may be the last's) */
+	MemoryContext cxt = AllocSetContextCreate(TopMemoryContext,
+											  "prolly last status",
+											  ALLOCSET_SMALL_SIZES);
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	List	   *t = NIL;
+	List	   *r = NIL;
+
+	foreach_ptr(NotedChange, c, tables)
+		t = lappend(t, noted(c->name, c->kind, c->object));
+	foreach_ptr(NotedChange, c, rest)
+		r = lappend(r, noted(c->name, c->kind, c->object));
+	MemoryContextSwitchTo(old);
+	if (last_tables_cxt != NULL)
+		MemoryContextDelete(last_tables_cxt);
+	last_tables_cxt = cxt;
+	last_tables.tables = t;
+	last_tables.rest = r;
+	last_tables.mark = *mark;
+	last_tables.from_root = from_root->hash;
+	last_tables.to_root = to_root->hash;
+	last_tables.valid = true;
+}
+
+/*
+ * Answer from the last answer (true), if it compared the same two roots
+ * and the refs know which tables were written since its mark: each of
+ * those is compared again (it can only have become modified or not, as
+ * the two roots name the same tables), the rest of the answer stands.
+ * Into *next_mark, the mark taken now, for the answer to be kept as of.
+ * False where it can't be told so: the caller compares every table.
+ */
+static bool
+tables_from_last(const char *from_ref, const ProllyNodeRef *from_root,
+				 const ProllyNodeRef *to_root, ProllyTableChangeVisit visit,
+				 void *arg, const ProllyFoldMark *next_mark)
+{
+	const ProllyRefsRoutine *refs = components().refs;
+	Oid		   *relids;
+	int			nrelids;
+	List	   *tables;
+	List	   *redone = NIL;
+
+	if (!last_tables.valid || last_tables.mark.branch != MyBranch ||
+		!same_hash(&last_tables.from_root, &from_root->hash) ||
+		!same_hash(&last_tables.to_root, &to_root->hash) ||
+		!PROLLY_HAS(refs, written_since) ||
+		!PROLLY_CALL(refs, written_since, &last_tables.mark,
+					 GetActiveSnapshot(), &relids, &nrelids))
+		return false;
+
+	/* each table written since, as the full comparison would find it */
+	tables = list_copy(last_tables.tables);
+	for (int i = 0; i < nrelids; i++)
+	{
+		List	   *from = root_tables(from_root, from_ref, relids[i]);
+		List	   *to = root_tables(to_root, "WORKING", relids[i]);
+		Table	   *ta;
+		Table	   *tb;
+		bool		known = true;
+		bool		differ;
+
+		if (from == NIL || to == NIL)
+			continue;			/* (not a table both have: as it was) */
+		ta = linitial(from);
+		tb = linitial(to);
+		if (list_member_name(redone, ta->name))
+			continue;
+		differ = !same_description(ta, tb) ||
+			working_rows_differ(ta, tb, &known);
+		if (!known)
+			return false;
+		foreach_ptr(NotedChange, c, tables)
+		{
+			if (strcmp(c->name, ta->name) == 0)
+			{
+				tables = foreach_delete_current(tables, c);
+				break;
+			}
+		}
+		if (differ)
+			tables = lappend(tables, noted(ta->name, PROLLY_DIFF_MODIFIED,
+										   PROLLY_OBJECT_TABLE));
+		redone = lappend(redone, ta->name);
+	}
+	if (redone != NIL)
+	{
+		/* (back in the canonical tree's order: by UTF-8 name, each once) */
+		int			n = list_length(tables);
+		SortedChange *sorted = palloc_array(SortedChange, Max(n, 1));
+		int			i = 0;
+
+		foreach_ptr(NotedChange, c, tables)
+		{
+			sorted[i].utf8 = noted_utf8(c);
+			sorted[i++].change = c;
+		}
+		qsort(sorted, n, sizeof(SortedChange), sorted_change_cmp);
+		tables = NIL;
+		for (i = 0; i < n; i++)
+			tables = lappend(tables, sorted[i].change);
+		pfree(sorted);
+	}
+	foreach_ptr(NotedChange, c, tables)
+		visit(c->name, c->kind, c->object, arg);
+	foreach_ptr(NotedChange, c, last_tables.rest)
+		visit(c->name, c->kind, c->object, arg);
+	pgstat_count_prolly(PGSTAT_PROLLY_STATUS_REUSED, 1);
+	remember_tables(next_mark, from_root, to_root, tables, last_tables.rest);
+	return true;
+}
+
+/* Collects what a full comparison visits, tables' changes apart. */
+typedef struct SplitChanges
+{
+	ProllyTableChangeVisit visit;
+	void	   *arg;
+	List	   *tables;
+	List	   *rest;
+	bool		past_tables;
+} SplitChanges;
+
+static void
+split_change(const char *name, ProllyDiffKind kind, char object, void *arg)
+{
+	SplitChanges *sc = arg;
+
+	if (!sc->past_tables)
+		sc->tables = lappend(sc->tables, noted(name, kind, object));
+	else
+		sc->rest = lappend(sc->rest, noted(name, kind, object));
+	sc->visit(name, kind, object, sc->arg);
+}
+
 /*
  * The working set's materialized views, as its definitions read without
  * rows have them (root), hold their baselines' rows: true if each prolly
@@ -1515,10 +1734,15 @@ working_matviews_unchanged(const ProllyNodeRef *root)
  * working set known (rows and all) is compared as it is.
  */
 static bool
-tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
-					void *arg, bool *read_changes)
+tables_into_working(const char *from_ref, ProllyTableChangeVisit outer_visit,
+					void *outer_arg, bool *read_changes)
 {
 	const ProllyRefsRoutine *refs = components().refs;
+	ProllyFoldMark mark;
+	bool		marked;
+	SplitChanges sc = {outer_visit, outer_arg, NIL, NIL, false};
+	ProllyTableChangeVisit visit = split_change;
+	void	   *arg = &sc;
 	List	   *left_out = NIL;
 	ListCell   *lc;
 	ProllyNodeRef from_root;
@@ -1535,9 +1759,25 @@ tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
 	if (!PROLLY_HAS(refs, read_definitions) ||
 		!PROLLY_HAS(refs, working_changes) || debug_prolly_force_full_fold)
 		return false;
-	from = tables_of_reading(from_ref, InvalidOid, &left_out, &from_root);
+	/* (the version's tables listed only if the last answer can't be taken) */
+	Assert(!is_working(from_ref));
+	root_of(from_ref, &from_root);
 	refs->read_definitions(&to_root, &left_out, &rows, &read);
 	*read_changes = !rows;
+
+	/*
+	 * (marked before any table's change finder is asked: a table written
+	 * after it is asked again next time)
+	 */
+	marked = !rows && ActiveSnapshotSet() && !XactHasInvalidations() &&
+		PROLLY_HAS(refs, fold_mark) && PROLLY_HAS(refs, written_since) &&
+		PROLLY_CALL(refs, fold_mark, MyBranch, GetActiveSnapshot(), &mark);
+	if (!marked)
+		last_tables.valid = false;
+	else if (tables_from_last(from_ref, &from_root, &to_root, outer_visit,
+							  outer_arg, &mark))
+		return true;
+	from = root_tables(&from_root, from_ref, InvalidOid);
 	read_tables(&to_root, &ts);
 	types_of_ref(ts.types, "WORKING");
 	a = list_head(from);
@@ -1584,6 +1824,7 @@ tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
 		return false;
 
 	/* the other objects (the definitions' are the working set's) */
+	sc.past_tables = true;
 	if (PROLLY_HAS(components().canonicalizer, objects) &&
 		!same_hash(&from_root.hash, &to_root.hash))
 	{
@@ -1609,6 +1850,8 @@ tables_into_working(const char *from_ref, ProllyTableChangeVisit visit,
 			strcmp(lfirst(lc), list_nth(left_out, foreach_current_index(lc) - 1)) != 0)
 			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, PROLLY_OBJECT_UNKNOWN, arg);
 	}
+	if (marked)
+		remember_tables(&mark, &from_root, &to_root, sc.tables, sc.rest);
 	return true;
 }
 
@@ -1682,14 +1925,6 @@ tables_of_both(const char *from_ref, const char *to_ref,
 			visit(lfirst(lc), PROLLY_DIFF_NOT_COVERED, PROLLY_OBJECT_UNKNOWN, arg);
 	}
 }
-
-/* A change visited, kept for comparing two reads and for visiting again. */
-typedef struct NotedChange
-{
-	char	   *name;
-	ProllyDiffKind kind;
-	char		object;
-} NotedChange;
 
 static void
 note_table_change(const char *name, ProllyDiffKind kind, char object,

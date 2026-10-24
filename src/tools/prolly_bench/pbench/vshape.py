@@ -111,6 +111,9 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # the changes it keeps, maintenance_work_mem's, it commits the working
     # set, a fold, as it should)
     ("txn_commit", "rows"): {**_all("log", TREE), "chunk_file_reads": "log"},
+    # and as unrelated objects are added: the paths of its rows, the refs
+    # and the head's commit and root, each read once, whatever is beside
+    ("txn_commit", "catalog"): _all("flat", TREE),
     # as unrelated objects are added (shared tables, another branch's): a
     # first use's copies, a commit's canonical form and a branch's delete
     # read the branch's catalog rows only

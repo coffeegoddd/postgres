@@ -351,7 +351,7 @@ the two away. Each check must not grow faster than its target
 | `diff` | `dolt_diff` of that commit | rows; delta | `nodes_read` log in N; at most linear in Δ |
 | `merge` | `dolt_merge` of Δ rows, main changed elsewhere | rows; delta | tree work and map work log and rows applied flat in N; tree work and rows at most linear in Δ |
 | `ff_merge` | `dolt_merge` of Δ rows into main untouched since (a fast-forward) | rows; delta | as `merge` |
-| `txn_commit` | Δ rows committed as their transaction ends (`dolt.transaction_commit`), after another such | rows | tree work and chunk-file reads log in N |
+| `txn_commit` | Δ rows committed as their transaction ends (`dolt.transaction_commit`), after another such | rows; catalog | tree work and chunk-file reads log in N; tree work flat in unrelated objects |
 
 The work counters are tree work (`nodes_read`, `nodes_written`,
 `chunks_appended`, `fold_rows_read`, `log_pages_read`), map work
@@ -402,6 +402,82 @@ machine.  The readings are in the cell's raw directory,
 
 ```sh
 src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V8 --config src/tools/prolly_bench/configs/v_storage.toml
+```
+
+### Cleanup invariance (V10)
+
+`configs/v_cleanup.toml` runs V10: storage cleanup must free only what no
+read needs.  A history that shares storage every way it can (a keyed
+table with a secondary and a composite index, values out of line, a
+keyless table; kept commits, `prolly.kept_commits` 4, and a kept detached
+checkout; a branch used and deleted whose commit a snapshot mount still
+reads, and another nothing reads; a table dropped, and one dropped and
+made again; a merge; a snapshot mount of the first commit and a history
+mount; dirty working sets on main and a side branch) is read by a fixed
+query set Q: point, range, index, index-only, composite-index and full
+scans of the current tables; `dolt_at`, the mounts and the history mount
+at older commits, filtered; `dolt_diff` and `dolt_log`; checkouts of a
+kept commit and of the side branch, and a hard reset to a kept commit,
+each read after.  Heap tables beside it, in `public`, hold main's rows as
+they are, with the same indexes, and are read the same way: their digests
+must equal prolly's, and their latencies show what the cleanups cost a
+table without version control.
+
+Phase 1 reads Q `reps` times (5); then every cleanup runs, in order:
+`VACUUM`, `VACUUM (FREEZE)`, `VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP
+ON)`, the first two again with `prolly.vacuum_copy_kept_pages` on, `VACUUM
+(ANALYZE)`, the release queue drained by autovacuum (a branch deleted and
+a table dropped first; autovacuum on, its automatic collections off, until
+`pg_stat_prolly`'s `bmap_release_drained` reaches `bmap_release_queued`,
+then every worker done), `dolt_gc('--full')`, `dolt_gc()`,
+`prolly_page_sweep()` and `CHECKPOINT`.  Each is timed
+(`cleanup_<step>_ms`), and its growth of `pg_stat_prolly`'s
+`gc_chunks_freed`, `gc_bytes_freed`, `bmap_blocks_freed`,
+`bmap_release_blocks_freed`, `bmap_release_drained`, `page_copies_shared`
+and `bmap_blocks_moved` recorded (`cleanup_<step>_<counter>`), with the
+sweep's row (`cleanup_page_sweep_freed`, `_recounted`, `_truncated`,
+`_moved`); each step's output and counts are in `v10-cleanups.json`.  The
+full collection must free chunks and the drain blocks, or the cell fails.
+After each, the blocks freed are written again (a table on a branch no
+query reads, made again) and every buffer evicted (`pg_buffercache`), so
+that a read of a block a cleanup freed finds that table's page; then Q is
+read, every digest checked.  Then phase 2 as phase 1.  The `warm` variant
+reads Q once unrecorded before each phase; `cold` restarts the server
+before every pass (the OS cache stays warm).  Each read runs with its
+rows discarded, timed as a client waits for it, then again inside a
+digest of its rows sorted by their text (count and md5), untimed.
+
+Correctness is a hard failure: a digest of either phase, or of a read
+after a cleanup, that isn't phase 1's first fails the cell, naming the
+queries; so do `dolt_verify_folds()` finding a mismatch,
+`bt_index_check(..., true)` failing on main's or the side branch's
+indexes, and any error or warning in the server log after phase 1 began
+(autovacuum's too).  Latency is paired: for each query, repetition i of
+phase 2 over repetition i of phase 1, the median of those ratios
+(`<query>_ratio`, with `<query>_p1_ms` and `<query>_p2_ms`), and per
+engine the median ratio (`prolly_ratio_median`, `heap_ratio_median`) and
+the queries slower (`prolly_queries_slower`): a ratio over the query's
+tolerance by more than 1 ms.  A query's tolerance is 1.10, or more for one
+whose phase 1 repetitions spread: 1 plus 3 times their median absolute
+deviation over their median.  `vclean` reports every query as a table,
+with phase 1's range and the tolerance; latency fails it only with
+`--gate-latency`.  Each cell's per-pass digests and latencies are in its
+raw directory (`v10-series.json`), with every pass's script and output.
+
+CI runs the `pr` size (20,000 rows) on every pull request (`prolly.yml`'s
+release build), the correctness gated and the latencies reported in the
+job summary, and the `nightly` size (500,000 rows) nightly; the dedicated
+host (#247) runs it at full scale.  `src/test/modules/test_prolly`'s
+`t/360_cleanup_invariance.pl` is the correctness half without the
+harness, reading after each cleanup in turn, a restart and a crash,
+with a history shaped so that each cleanup has work to do (kept-only
+pages, commits pushed out of the kept window, leaked blocks, stuck
+counts, a sweep's moves and its lowering of shared_below), and asserting
+that it did it.
+
+```sh
+src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V10 --config src/tools/prolly_bench/configs/v_cleanup.toml --out G
+src/tools/prolly_bench/prolly_bench vclean G/*-V-prolly --markdown cleanup.md
 ```
 
 ## Write amplification
@@ -837,7 +913,7 @@ file; the driver doesn't change.
 | Interface | Implementations | Directory |
 |---|---|---|
 | `Suite` | S, V, C, G, GV ([Suites](#suites)) | `pbench/suites/` |
-| `Workload` | S1-S10 and S13, V1-V4 and V6-V9, C1-C4 | `pbench/workloads/` |
+| `Workload` | S1-S10 and S13, V1-V4 and V6-V10, C1-C4 | `pbench/workloads/` |
 | `Collector` | wal, diskstats, pg_stat_io, cpu, space, engine_counters, write_amp, instructions, cachegrind, perf, vacuum, recovery | `pbench/collectors/` |
 | `Sink` | console, files | `pbench/sinks/` |
 | `Cluster` | local, cachegrind | `pbench/clusters/` |
@@ -927,6 +1003,25 @@ copied from (Dolt's checkout never waits; prolly's first use of a branch
 copies the session's branch's tables under a lock). Doltgres as a third
 engine is not run: the `Engine` interface is ready for it.
 
+With `--postgis` (PostGIS installed in `--pg-bin`'s server: see
+[PostGIS builds](#postgis-builds)), keyed table `t` also has a geometry
+column `g` and a geography column `gg`, each with a GiST index, written
+with `b`: a row's values are a function of its id and `b`. They are
+points (2D, with Z and M, or in SRID 4326), lines, half circles, curve
+polygons, rhombi (some with a cached box), bowties (invalid), one-point
+lines and open rings (which PostGIS's receive refuses, so prolly keeps
+them as text), empties, two points with M, and for rows 4 and 8 a polygon
+of 100,000 vertices, about 1.6 MB, kept out of line; so commits, moves,
+merges and resets carry each kind with the cells it belongs to. After
+every step it also checks each row's `g` and `gg` are its `b`'s (by the
+md5 of their EWKB), and that window queries (`&&`) are read through the
+GiST index (by their plans) and return the rows the model's boxes
+overlap. The generator (`slt/internal/geomgen`) keeps coordinates on a
+grid of quarters and window edges on odd eighths, so the float4 boxes `&&`
+compares decide the same as the model. `--self-test` adds engines that
+read windows without the index (it is dropped) and that lose a row from a
+window query.
+
 The differential runner compares seeded transaction histories with heap:
 
 ```sh
@@ -956,6 +1051,31 @@ allowed; matching unexpected errors on both sides fail. After each group,
 the runner compares all fixture rows and checks a sequential scan against
 a verified index scan within each target. Queries that return rows have
 defined ordering.
+
+With `--postgis` (PostGIS installed in `--pg-bin`'s server), the program's
+setup also creates the extension (in the versioned `public` on prolly) and
+a table `geo (id, kind, g, s, gg, r)` with a GiST index on each spatial
+column. `g` holds seeded points, random-walk lines, rectangles and rhombi
+(in 2D or with Z, M or both), collections, half circles, compound curves,
+curve polygons, bowties (invalid), empties, values with a cached box, and
+one polygon of 100,000 to 200,000 vertices (1.6 to 3.2 MB); `s` such
+geometries in SRIDs 0, 4326, 3857 and 2154; `gg` geographies; and `r`, in
+one row in three, a one-point line or an open ring, which PostGIS's
+receive refuses (prolly keeps them as text). Six spatial families join the
+rotation: writes (upserts, with a large polygon one row in eight,
+`ST_Translate` updates, refused values written, deletes by window), reads
+(`&&`, `ST_Intersects`, `ST_Contains`, `ST_DWithin`, areas and lengths as
+numeric sums, `ST_Extent`; `s` in its own SRID; geography distances and
+areas; `r` by `&&` and its points, as GEOS and distances refuse it), the
+same reads through the indexes, nearest neighbours (`<->`, k of 1, 10 or
+100), a transaction with a savepoint rolled back, and a large polygon's
+corner moved and simplified. Each group's state check adds `geo` by the
+md5 of each value's EWKB, and a window read through the GiST index is
+compared with a sequential scan in each target. Tables an extension owns
+(`spatial_ref_sys`) are left out of the AM check. On `prolly`, every run
+(spatial or not) also makes a Dolt commit after each group, so what the
+group changed is folded into canonical form and a value the fold can't
+encode fails the run.
 
 The output directory must be new. It contains the revision, dirty flag,
 server version/settings, runner binary hash, server log, seed programs,

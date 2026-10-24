@@ -890,6 +890,134 @@ tree_seeks_in_order(const ProllyImplInfo *impl)
 }
 
 /*
+ * An apply reads each node of an edit's path once, though each level's
+ * pass starts from the root: one edit reads its path, and at most a
+ * neighbour where the new chunking runs on past the old node.  And within
+ * a keep_nodes() scope, reading the same key again reads only its leaf;
+ * once the scope ends, the whole path again.
+ */
+void
+tree_apply_reads_paths_once(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *ref = palloc(sizeof(Ref));
+	ProllyNodeRef root;
+	HashSet		nodes = {0};
+	ProllyNodeCounters cnt = {0};
+
+	make_env(&env);
+	fill_ref(ref, 1, 1);
+	build_ref(tr, &env, ref, &root);
+	PROLLY_CALL(tr, walk, &env, &root, collect_node, &nodes);
+	if (nodes.levels < 3)
+		elog(ERROR, "test tree has only %d levels", nodes.levels);
+
+	for (int t = 0; t < 4; t++)
+	{
+		int			key = t * (MAX_KEY / 4) + 101;
+		int			version = 7;
+		uint64		bound = (uint64) nodes.levels + 1;
+
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		apply_batch(tr, &env, ref, &key, &version, 1, &root);
+		env.counters = NULL;
+		if (cnt.nodes_read > bound)
+			elog(ERROR, "an apply of one edit to a %d-level tree read %llu nodes, more than %llu",
+				 nodes.levels, (unsigned long long) cnt.nodes_read,
+				 (unsigned long long) bound);
+	}
+
+	if (PROLLY_HAS(tr, keep_nodes))
+	{
+		MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+												  "kept nodes",
+												  ALLOCSET_DEFAULT_SIZES);
+		KeyBuf		kb;
+		ProllyKey	key = key_of(MAX_KEY / 2, &kb);
+		StringInfoData v;
+		uint64		reads[3];
+
+		initStringInfo(&v);
+		env.counters = &cnt;
+		PROLLY_CALL(tr, keep_nodes, cxt);
+		for (int i = 0; i < 3; i++)
+		{
+			if (i == 2)
+				MemoryContextDelete(cxt);
+			memset(&cnt, 0, sizeof(cnt));
+			resetStringInfo(&v);
+			if (!PROLLY_CALL(tr, get, &env, &root, &key, &v))
+				elog(ERROR, "get did not find key %d", MAX_KEY / 2);
+			reads[i] = cnt.nodes_read;
+		}
+		env.counters = NULL;
+		if (reads[0] != (uint64) nodes.levels || reads[1] != 1 ||
+			reads[2] != (uint64) nodes.levels)
+			elog(ERROR, "gets of a key in a %d-level tree, kept and then not, read %llu, %llu and %llu nodes, expected %d, 1 and %d",
+				 nodes.levels, (unsigned long long) reads[0],
+				 (unsigned long long) reads[1], (unsigned long long) reads[2],
+				 nodes.levels, nodes.levels);
+		pfree(v.data);
+
+		/*
+		 * A scope keeps no more than maintenance_work_mem of nodes: many
+		 * applies in one write far more internal nodes than that, and
+		 * those past it are read again, every read still right.
+		 */
+		{
+			int			saved = maintenance_work_mem;
+			volatile Size kept = 0;
+			int			napplied = 400;
+
+			cxt = AllocSetContextCreate(CurrentMemoryContext, "kept nodes",
+										ALLOCSET_DEFAULT_SIZES);
+			maintenance_work_mem = 64;
+			PG_TRY();
+			{
+				PROLLY_CALL(tr, keep_nodes, cxt);
+				for (int i = 0; i < napplied; i++)
+				{
+					int			k = (i * 4999) % MAX_KEY;
+					int			version = 9 + i;
+
+					apply_batch(tr, &env, ref, &k, &version, 1, &root);
+				}
+				kept = MemoryContextMemAllocated(cxt, true);
+			}
+			PG_FINALLY();
+			{
+				maintenance_work_mem = saved;
+			}
+			PG_END_TRY();
+			MemoryContextDelete(cxt);
+			if (kept > 4 * 64 * 1024)
+				elog(ERROR, "a scope kept %zu bytes of nodes over %d applies, past four times maintenance_work_mem's 64kB",
+					 (Size) kept, napplied);
+			initStringInfo(&v);
+			for (int i = 0; i < napplied; i++)
+			{
+				int			k = (i * 4999) % MAX_KEY;
+				KeyBuf		kb2;
+				ProllyKey	kk = key_of(k, &kb2);
+
+				resetStringInfo(&v);
+				if (!PROLLY_CALL(tr, get, &env, &root, &kk, &v))
+					elog(ERROR, "get did not find key %d after applies past the budget", k);
+				{
+					ProllyValue pv = {(const uint8 *) v.data, v.len};
+
+					if (!same_value(&pv, k, ref->version[k]))
+						elog(ERROR, "key %d has the wrong value after applies past the budget", k);
+				}
+			}
+			pfree(v.data);
+		}
+	}
+}
+
+/*
  * Diff reads only what changed: with d changed keys spread over the tree,
  * it reads O(d log n) nodes, a few root-to-leaf paths per change, never
  * every leaf.  A tree diffed against itself reads nothing, and against the

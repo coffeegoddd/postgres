@@ -673,6 +673,8 @@ static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 								IOObject io_object, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
+static void drop_relations_all_buffers(SMgrRelation *smgr_reln,
+									   int nlocators, bool sized);
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -688,6 +690,47 @@ static void AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode);
 static void PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr,
 								   bool neutral);
 static bool HintMayReachSharedPage(BufferDesc *buf_hdr);
+
+/*
+ * Read a page's preparation flags into *buf_state: true if they are
+ * settled at the current generation, so that they hold.  Lock-free: a check
+ * settling them (under the header's spinlock) sets the generation before it
+ * unlocks, so a generation read as current, before flags read unlocked, is
+ * theirs.  Flags read locked may be mid-settle: read again once the header
+ * is unlocked (as briefly as any holder of it keeps it).
+ */
+static inline bool
+BufferSmgrSettled(BufferDesc *buf_hdr, uint64 *buf_state)
+{
+	for (;;)
+	{
+		uint64		gen = pg_atomic_read_u64(&buf_hdr->smgr_gen);
+
+		pg_read_barrier();
+		*buf_state = pg_atomic_read_u64(&buf_hdr->state);
+		if (likely(!(*buf_state & BM_LOCKED)))
+			return gen == pg_atomic_read_u64(BufferSmgrGeneration);
+		(void) WaitBufHdrUnlocked(buf_hdr);
+	}
+}
+
+/*
+ * Must the page's storage manager prepare it before it next changes?  Every
+ * test of that comes through here: a page of a storage manager that
+ * prepares pages is to be prepared unless it was found not to be at the
+ * current generation of sharing.
+ */
+static inline bool
+BufferNeedsSmgrPrepare(BufferDesc *buf_hdr)
+{
+	uint64		buf_state = pg_atomic_read_u64(&buf_hdr->state);
+
+	if (likely(!(buf_state & BM_SMGR_PREPARES)))
+		return false;
+	if (!BufferSmgrSettled(buf_hdr, &buf_state))
+		return true;
+	return (buf_state & BM_SMGR_PREPARE) != 0;
+}
 static int	rlocator_comparator(const void *p1, const void *p2);
 static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb);
 static inline int ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b);
@@ -1221,7 +1264,7 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 			TerminateBufferIO(bufHdr, false, BM_VALID, true, false);
 
 			/* locked before it was valid, so not prepared then */
-			if (unlikely(pg_atomic_read_u64(&bufHdr->state) & BM_SMGR_PREPARE))
+			if (unlikely(BufferNeedsSmgrPrepare(bufHdr)))
 				PrepareBufferForChange(buffer, bufHdr, false);
 		}
 	}
@@ -2373,7 +2416,10 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * checked before its first change (PrepareBufferForChange()).
 	 */
 	if (smgrpreparesforchanges(smgr, forkNum))
-		set_bits |= BM_SMGR_PREPARE;
+	{
+		set_bits |= BM_SMGR_PREPARES | BM_SMGR_PREPARE;
+		pg_atomic_write_u64(&victim_buf_hdr->smgr_gen, 0);
+	}
 
 	UnlockBufHdrExt(victim_buf_hdr, victim_buf_state,
 					set_bits, 0, 0);
@@ -3052,6 +3098,22 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			set_bits |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
 			if (bmr.relpersistence == RELPERSISTENCE_PERMANENT || fork == INIT_FORKNUM)
 				set_bits |= BM_PERMANENT;
+
+			/*
+			 * A page the extension maps is the relation's own, so it needs
+			 * no preparing, until the next generation of sharing: settled
+			 * now, at the current one, before the storage manager maps it.
+			 * Not in recovery, which raises no generation as it replays a
+			 * share or snapshot: a page extended then is settled at none,
+			 * to be checked before its first change once recovery ends.
+			 */
+			if (smgrpreparesforchanges(BMR_GET_SMGR(bmr), fork))
+			{
+				set_bits |= BM_SMGR_PREPARES;
+				pg_atomic_write_u64(&victim_buf_hdr->smgr_gen,
+									RecoveryInProgress() ? 0 :
+									pg_atomic_read_u64(BufferSmgrGeneration));
+			}
 
 			UnlockBufHdrExt(victim_buf_hdr, buf_state,
 							set_bits, 0,
@@ -5085,13 +5147,34 @@ DropBufferBlock(RelFileLocator rlocator, ForkNumber forkNum,
 void
 DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 {
+	drop_relations_all_buffers(smgr_reln, nlocators, true);
+}
+
+/* ---------------------------------------------------------------------
+ *		DropUnlinkedRelationsAllBuffers
+ *
+ *		DropRelationsAllBuffers() for relations whose files are already
+ *		unlinked: what was read of them before the unlink is dropped.  Their
+ *		forks' sizes can't be known, so the whole buffer pool is scanned.
+ *		--------------------------------------------------------------------
+ */
+void
+DropUnlinkedRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
+{
+	drop_relations_all_buffers(smgr_reln, nlocators, false);
+}
+
+static void
+drop_relations_all_buffers(SMgrRelation *smgr_reln, int nlocators,
+						   bool sized)
+{
 	int			i;
 	int			n = 0;
 	SMgrRelation *rels;
 	BlockNumber (*block)[MAX_FORKNUM + 1];
 	uint64		nBlocksToInvalidate = 0;
 	RelFileLocator *locators;
-	bool		cached = true;
+	bool		cached = sized;
 	bool		use_bsearch;
 	DropPasses	passes;
 	bool		deferred = false;
@@ -6805,42 +6888,65 @@ UnlockBuffer(Buffer buffer)
 }
 
 /*
- * Pages a storage manager prepares before they change (BM_SMGR_PREPARE), so
- * that a page it shares with another relation is copied first.  The flag is
- * set when a page is loaded, and again when the storage manager begins
- * sharing the relation's pages (MarkBufferedRelationShared()).  It is
- * cleared once the page is prepared, or found not to need it; a page found
- * shared keeps it, with BM_SMGR_SHARED, until a change copies it, and one
- * found not shared that preparing would still copy (for the storage
- * manager's own reasons) keeps it with BM_SMGR_OWN.
+ * Pages a storage manager prepares before they change (BM_SMGR_PREPARES),
+ * so that a page it shares with another relation is copied first.  Whether
+ * a page is to be prepared is settled at a generation of sharing
+ * (BufferSmgrGeneration), which the buffer records (smgr_gen): the storage
+ * manager raises the generation when it begins sharing pages with another
+ * relation (MarkBufferedPagesShared()), so that every page settled
+ * before then is checked again before it next changes, without visiting
+ * them.  A page loaded is settled at no generation.  A check settles it:
+ * found shared, it keeps BM_SMGR_PREPARE, with BM_SMGR_SHARED, until a
+ * change copies it; found not shared but to be copied all the same (for the
+ * storage manager's own reasons), it keeps it with BM_SMGR_OWN; else it
+ * loses it.
  *
- * A check notes the marks made while it ran: marking sets BM_SMGR_REMARKED,
- * which a check clears as it begins, and a check that finds it set again
- * leaves the page as marked, since its answer may predate the sharing.
+ * A check notes the generation as it begins, and one that ends at a later
+ * generation leaves the page as it was, unsettled: its answer may predate
+ * the sharing.
  */
 
+static uint64
+BufferSmgrCheckBegin(void)
+{
+	uint64		gen = pg_atomic_read_u64(BufferSmgrGeneration);
+
+	/* (the storage manager's state is read after) */
+	pg_memory_barrier();
+	return gen;
+}
+
+/*
+ * Settle the page at generation 'gen', with set_bits set and unset_bits
+ * cleared, unless the generation has moved on since.
+ */
 static void
-BufferSmgrCheckBegin(BufferDesc *buf_hdr)
+BufferSmgrSettle(BufferDesc *buf_hdr, uint64 gen, uint64 set_bits,
+				 uint64 unset_bits)
 {
 	uint64		buf_state = LockBufHdr(buf_hdr);
 
-	UnlockBufHdrExt(buf_hdr, buf_state, 0, BM_SMGR_REMARKED, 0);
+	if (pg_atomic_read_u64(BufferSmgrGeneration) != gen)
+	{
+		UnlockBufHdr(buf_hdr);
+		return;
+	}
+	pg_atomic_write_u64(&buf_hdr->smgr_gen, gen);
+	UnlockBufHdrExt(buf_hdr, buf_state, set_bits, unset_bits, 0);
 }
 
 static void
-BufferSmgrCheckEnd(BufferDesc *buf_hdr, bool shared, bool copies)
+BufferSmgrCheckEnd(BufferDesc *buf_hdr, uint64 gen, bool shared, bool copies)
 {
-	uint64		buf_state = LockBufHdr(buf_hdr);
-
-	if (buf_state & BM_SMGR_REMARKED)
-		UnlockBufHdr(buf_hdr);
-	else if (shared)
-		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_SHARED, BM_SMGR_OWN, 0);
+	if (shared)
+		BufferSmgrSettle(buf_hdr, gen, BM_SMGR_PREPARE | BM_SMGR_SHARED,
+						 BM_SMGR_OWN);
 	else if (copies)
-		UnlockBufHdrExt(buf_hdr, buf_state, BM_SMGR_OWN, BM_SMGR_SHARED, 0);
+		BufferSmgrSettle(buf_hdr, gen, BM_SMGR_PREPARE | BM_SMGR_OWN,
+						 BM_SMGR_SHARED);
 	else
-		UnlockBufHdrExt(buf_hdr, buf_state,
-						0, BM_SMGR_PREPARE | BM_SMGR_SHARED | BM_SMGR_OWN, 0);
+		BufferSmgrSettle(buf_hdr, gen, 0,
+						 BM_SMGR_PREPARE | BM_SMGR_SHARED | BM_SMGR_OWN);
 }
 
 /*
@@ -6853,11 +6959,13 @@ BufferSmgrCheckEnd(BufferDesc *buf_hdr, bool shared, bool copies)
 static void
 PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr, bool neutral)
 {
+	uint64		gen;
+
 	if (!(pg_atomic_read_u64(&buf_hdr->state) & BM_VALID) ||
 		RecoveryInProgress())
 		return;
 
-	BufferSmgrCheckBegin(buf_hdr);
+	gen = BufferSmgrCheckBegin();
 	smgrprepareforchange(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 								  INVALID_PROC_NUMBER),
 						 BufTagGetForkNum(&buf_hdr->tag),
@@ -6865,19 +6973,18 @@ PrepareBufferForChange(Buffer buffer, BufferDesc *buf_hdr, bool neutral)
 	if (neutral)
 	{
 		/* not shared any more, but perhaps still to be copied */
-		uint64		buf_state = LockBufHdr(buf_hdr);
-
-		UnlockBufHdrExt(buf_hdr, buf_state, 0, BM_SMGR_SHARED | BM_SMGR_OWN, 0);
+		BufferSmgrSettle(buf_hdr, gen, BM_SMGR_PREPARE,
+						 BM_SMGR_SHARED | BM_SMGR_OWN);
 	}
 	else
-		BufferSmgrCheckEnd(buf_hdr, false, false);
+		BufferSmgrCheckEnd(buf_hdr, gen, false, false);
 }
 
 /*
- * Is a page with BM_SMGR_PREPARE shared, so that preparing it copies it?
- * Asked of the storage manager once, and remembered.  The caller holds the
- * page's content lock, in any mode, so the page isn't being prepared
- * meanwhile.
+ * Is a page to be prepared shared, so that preparing it copies it?  Asked
+ * of the storage manager once a generation, and remembered.  The caller
+ * holds the page's content lock, in any mode, so the page isn't being
+ * prepared meanwhile.
  */
 static bool
 BufferSmgrPageIsShared(BufferDesc *buf_hdr)
@@ -6885,20 +6992,27 @@ BufferSmgrPageIsShared(BufferDesc *buf_hdr)
 	uint64		buf_state = pg_atomic_read_u64(&buf_hdr->state);
 	bool		shared;
 	bool		copies;
+	uint64		gen;
 
-	if (!(buf_state & BM_SMGR_PREPARE))
+	if (!(buf_state & BM_SMGR_PREPARES))
 		return false;
-	if (buf_state & BM_SMGR_SHARED)
-		return true;
-	if (buf_state & BM_SMGR_OWN)
-		return false;
+	if (BufferSmgrSettled(buf_hdr, &buf_state))
+	{
+		if (!(buf_state & BM_SMGR_PREPARE))
+			return false;
+		if (buf_state & BM_SMGR_SHARED)
+			return true;
+		if (buf_state & BM_SMGR_OWN)
+			return false;
+	}
 
-	BufferSmgrCheckBegin(buf_hdr);
+	gen = BufferSmgrCheckBegin();
 	shared = smgrpageisshared(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
 									   INVALID_PROC_NUMBER),
 							  BufTagGetForkNum(&buf_hdr->tag),
 							  buf_hdr->tag.blockNum, &copies);
-	BufferSmgrCheckEnd(buf_hdr, shared, copies);
+	INJECTION_POINT("buffer-smgr-checked", NULL);
+	BufferSmgrCheckEnd(buf_hdr, gen, shared, copies);
 	return shared;
 }
 
@@ -6914,8 +7028,7 @@ BufferSmgrPageIsShared(BufferDesc *buf_hdr)
 static bool
 HintMayReachSharedPage(BufferDesc *buf_hdr)
 {
-	if (likely(!(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE)) ||
-		RecoveryInProgress())
+	if (likely(!BufferNeedsSmgrPrepare(buf_hdr)) || RecoveryInProgress())
 		return false;
 	if (CritSectionCount > 0)
 		return true;
@@ -6945,7 +7058,7 @@ BufferPrepareForChange(Buffer buffer)
 	/* preparing it is a change of its own */
 	GetPrivateRefCountEntry(buffer, false)->data.unprepared = false;
 #endif
-	if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
+	if (unlikely(BufferNeedsSmgrPrepare(buf_hdr)))
 		PrepareBufferForChange(buffer, buf_hdr, true);
 }
 
@@ -6967,7 +7080,7 @@ LockBufferForNeutralChange(Buffer buffer)
 		return;
 	buf_hdr = GetBufferDescriptor(buffer - 1);
 	BufferLockAcquire(buffer, buf_hdr, BUFFER_LOCK_EXCLUSIVE);
-	if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
+	if (unlikely(BufferNeedsSmgrPrepare(buf_hdr)))
 		PrepareBufferForChange(buffer, buf_hdr, true);
 }
 
@@ -7009,48 +7122,28 @@ BufferPageIsSharedElsewhere(Buffer buffer)
 }
 
 /*
- * MarkBufferedRelationShared -- mark a relation fork's cached pages to be
- * prepared before they next change
+ * MarkBufferedPagesShared -- have every cached page a storage manager
+ * prepares be prepared again before it next changes
  *
- * For a storage manager that has just begun sharing the fork's pages with
- * another relation: pages already prepared (or found not shared) would
- * otherwise change in place.
+ * For a storage manager that has just begun sharing pages of a relation
+ * with another: pages already prepared (or found not shared) would
+ * otherwise change in place.  O(1): it raises the generation of sharing,
+ * at which every page is checked again (BufferNeedsSmgrPrepare()), each
+ * page's next change paying the storage manager's check.
  */
 void
-MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum)
+MarkBufferedPagesShared(void)
 {
-	RelFileLocator rlocator = reln->smgr_rlocator.locator;
-
-	for (int i = 0; i < NBuffers; i++)
-	{
-		BufferDesc *buf_hdr = GetBufferDescriptor(i);
-		uint64		buf_state;
-
-		/* unlocked precheck, as in DropRelationBuffers */
-		if (!BufTagMatchesRelFileLocator(&buf_hdr->tag, &rlocator))
-			continue;
-
-		buf_state = LockBufHdr(buf_hdr);
-		if (BufTagMatchesRelFileLocator(&buf_hdr->tag, &rlocator) &&
-			BufTagGetForkNum(&buf_hdr->tag) == forknum &&
-			(buf_state & BM_TAG_VALID))
-			UnlockBufHdrExt(buf_hdr, buf_state,
-							BM_SMGR_PREPARE | BM_SMGR_REMARKED,
-							BM_SMGR_SHARED | BM_SMGR_OWN, 0);
-		else
-			UnlockBufHdr(buf_hdr);
-	}
+	(void) pg_atomic_fetch_add_u64(BufferSmgrGeneration, 1);
 }
 
 /*
- * One buffer of MarkSharedAndFlushRelations(): marked as
- * MarkBufferedRelationShared() marks one, if it is a main fork's page of
- * rlocator, then written out if dirty, as FlushRelationsAllBuffers() writes
- * one out.
+ * One buffer of MarkSharedAndFlushRelations(): written out if it is a valid
+ * and dirty page of rlocator, as FlushRelationsAllBuffers() writes one out.
  */
 static void
-mark_shared_and_flush_buffer(BufferDesc *bufHdr, const RelFileLocator *rlocator,
-							 SMgrRelation srel)
+flush_relation_buffer(BufferDesc *bufHdr, const RelFileLocator *rlocator,
+					  SMgrRelation srel)
 {
 	uint64		buf_state;
 
@@ -7059,25 +7152,8 @@ mark_shared_and_flush_buffer(BufferDesc *bufHdr, const RelFileLocator *rlocator,
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 
 	buf_state = LockBufHdr(bufHdr);
-	if (!BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator))
-	{
-		UnlockBufHdr(bufHdr);
-		return;
-	}
-	if (BufTagGetForkNum(&bufHdr->tag) == MAIN_FORKNUM &&
-		(buf_state & BM_TAG_VALID))
-	{
-		UnlockBufHdrExt(bufHdr, buf_state,
-						BM_SMGR_PREPARE | BM_SMGR_REMARKED,
-						BM_SMGR_SHARED | BM_SMGR_OWN, 0);
-		buf_state = LockBufHdr(bufHdr);
-		if (!BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator))
-		{
-			UnlockBufHdr(bufHdr);
-			return;
-		}
-	}
-	if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+	if (BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator) &&
+		(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 	{
 		PinBuffer_Locked(bufHdr);
 		FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
@@ -7088,12 +7164,12 @@ mark_shared_and_flush_buffer(BufferDesc *bufHdr, const RelFileLocator *rlocator,
 }
 
 /*
- * MarkSharedAndFlushRelations -- MarkBufferedRelationShared() of the main
- * forks of rels[] (n of them) and FlushRelationsAllBuffers() of them, as a
- * snapshot of their pages needs, together: when their blocks are few beside
- * the buffers (as DropRelationsAllBuffers() judges), by looking each block
- * up, else in one pass over the buffers.  The caller keeps their pages from
- * changing meanwhile.
+ * MarkSharedAndFlushRelations -- MarkBufferedPagesShared(), and
+ * FlushRelationsAllBuffers() of rels[] (n of them), as a snapshot of their
+ * pages needs: when their blocks are few beside the buffers (as
+ * DropRelationsAllBuffers() judges), by looking each block up, else in one
+ * pass over the buffers.  The caller keeps their pages from changing
+ * meanwhile.
  */
 void
 MarkSharedAndFlushRelations(SMgrRelation *rels, int n)
@@ -7106,12 +7182,13 @@ MarkSharedAndFlushRelations(SMgrRelation *rels, int n)
 
 	if (n == 0)
 		return;
+	MarkBufferedPagesShared();
 
 	/*
 	 * (every fork's size, to judge.  Looking each block up finds what the
 	 * pass would: the caller's lock keeps the relations from being
 	 * extended or truncated meanwhile, a buffer past a fork's end holds no
-	 * valid page of it to mark or write out, and a block-mapped fork's size
+	 * valid page of it to write out, and a block-mapped fork's size
 	 * is its header's, which an extension updates as it extends)
 	 */
 	for (int i = 0; i < n && lookup; i++)
@@ -7153,7 +7230,7 @@ MarkSharedAndFlushRelations(SMgrRelation *rels, int n)
 						/* (the buffer's own fork and block, rechecked locked) */
 						if (BufTagGetForkNum(&bufHdr->tag) == f &&
 							bufHdr->tag.blockNum == b)
-							mark_shared_and_flush_buffer(bufHdr, &rlocator, rels[i]);
+							flush_relation_buffer(bufHdr, &rlocator, rels[i]);
 					}
 				}
 			}
@@ -7192,7 +7269,7 @@ MarkSharedAndFlushRelations(SMgrRelation *rels, int n)
 							  rlocator_comparator);
 		}
 		if (srelent != NULL)
-			mark_shared_and_flush_buffer(bufHdr, &srelent->rlocator, srelent->srel);
+			flush_relation_buffer(bufHdr, &srelent->rlocator, srelent->srel);
 	}
 	pfree(srels);
 }
@@ -7233,7 +7310,7 @@ LockBufferInternal(Buffer buffer, BufferLockMode mode)
 	else if (mode == BUFFER_LOCK_EXCLUSIVE)
 	{
 		BufferLockAcquire(buffer, buf_hdr, BUFFER_LOCK_EXCLUSIVE);
-		if (unlikely(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE))
+		if (unlikely(BufferNeedsSmgrPrepare(buf_hdr)))
 			PrepareBufferForChange(buffer, buf_hdr, false);
 	}
 	else if (mode == BUFFER_LOCK_SHARE_EXCLUSIVE)
@@ -7268,7 +7345,7 @@ ConditionalLockBuffer(Buffer buffer)
 	 * lock instead would make callers that retry until they get it (an
 	 * SP-GiST insertion) loop for as long as the page is shared.
 	 */
-	if (unlikely(pg_atomic_read_u64(&buf->state) & BM_SMGR_PREPARE))
+	if (unlikely(BufferNeedsSmgrPrepare(buf)))
 		PrepareBufferForChange(buffer, buf, false);
 	return true;
 }
@@ -7303,7 +7380,7 @@ CheckBufferIsPinnedOnce(Buffer buffer)
 static void
 CleanupLockPrepare(Buffer buffer, BufferDesc *buf_hdr, bool prepare)
 {
-	if (likely(!(pg_atomic_read_u64(&buf_hdr->state) & BM_SMGR_PREPARE)))
+	if (likely(!BufferNeedsSmgrPrepare(buf_hdr)))
 		return;
 	if (prepare)
 		PrepareBufferForChange(buffer, buf_hdr, false);
