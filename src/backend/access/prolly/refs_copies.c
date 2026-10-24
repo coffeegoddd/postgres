@@ -1404,6 +1404,28 @@ see_head(const char *name)
 	return true;
 }
 
+/*
+ * The baseline of a branch whose working set is being folded only to be
+ * compared (settle_compared()): its trees are the backend's
+ * (prolly_local_chunks_begin()'s), so it is kept here, not in the refs,
+ * whose chunks are the store's, until its chunks are persisted.
+ */
+static struct
+{
+	bool		active;
+	char	   *name;
+	bool		have;
+	ProllyNodeRef baseline;
+	bool		have_root;
+	ProllyNodeRef root;
+}			compared;
+
+static bool
+compared_branch(const char *name)
+{
+	return compared.active && strcmp(compared.name, name) == 0;
+}
+
 /* A branch's baseline; false if it has none. */
 static bool
 branch_baseline(const char *name, ProllyNodeRef *baseline)
@@ -1413,6 +1435,12 @@ branch_baseline(const char *name, ProllyNodeRef *baseline)
 	bool		found;
 	ProllyHash	h;
 
+	if (compared_branch(name))
+	{
+		if (compared.have)
+			*baseline = compared.baseline;
+		return compared.have;
+	}
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -1435,6 +1463,12 @@ branch_baseline_root(const char *name, ProllyNodeRef *root)
 	bool		found = false;
 	ProllyHash	h;
 
+	if (compared_branch(name))
+	{
+		if (compared.have && compared.have_root)
+			*root = compared.root;
+		return compared.have && compared.have_root;
+	}
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -1467,9 +1501,19 @@ branch_set_baseline(const char *name, const ProllyNodeRef *baseline,
 {
 	StringInfoData key;
 	StringInfoData v;
-	FullTransactionId xid = baseline ? GetTopFullTransactionId() :
-		InvalidFullTransactionId;
+	FullTransactionId xid;
 
+	if (compared_branch(name))
+	{
+		compared.have = baseline != NULL;
+		if (baseline)
+			compared.baseline = *baseline;
+		compared.have_root = baseline != NULL && root != NULL;
+		if (compared.have_root)
+			compared.root = *root;
+		return;
+	}
+	xid = baseline ? GetTopFullTransactionId() : InvalidFullTransactionId;
 	initStringInfo(&key);
 	initStringInfo(&v);
 	appendStringInfoChar(&key, TAG_BASELINE);
@@ -1632,6 +1676,101 @@ settle(const ProllyCommitInfo *commit, const KnownSource *source)
 				   &commit->root, GetActiveSnapshot());
 }
 
+static bool share_clean_tables(const ProllyNodeRef *target,
+							   ProllyNodeRef *working);
+static bool advance_to_target(const ProllyNodeRef *target,
+							  const ProllyNodeRef *working);
+
+/*
+ * The end of a fold only compared: the branch's baseline as the step left
+ * it, its chunks the backend kept persisted (only those it reaches: a
+ * baseline advanced to the target names the target's trees, stored
+ * already), made the branch's in the refs; the working set's root with it
+ * only if the store has it (the target's).  The rest of what the backend
+ * kept is forgotten.
+ */
+static void
+compared_end(bool keep)
+{
+	char	   *name = compared.name;
+	bool		have = compared.have;
+	ProllyNodeRef baseline = compared.baseline;
+	bool		have_root = compared.have_root;
+	ProllyNodeRef root = compared.root;
+
+	if (keep && have)
+		prolly_local_chunks_persist(&baseline.hash);
+	compared.active = false;
+	prolly_local_chunks_end();
+	if (keep)
+	{
+		refs_init();
+		if (have_root &&
+			!PROLLY_CALL(env.chunk_store, has, env.chunks, &root.hash))
+			have_root = false;
+		branch_set_baseline(name, have ? &baseline : NULL,
+							have_root ? &root : NULL);
+	}
+	pfree(name);
+}
+
+/*
+ * settle_rows() of the session's branch (name, its baseline as given),
+ * whose working set has to be folded to be compared with the target: the
+ * fold, and every tree the move builds on it, kept in the backend's memory
+ * (prolly_local_chunks_begin()), not put in the store.  None of them is
+ * kept once the move is over but the baseline as it then is, which
+ * advance_to_target() has made the target's but for its finders' state:
+ * so only its own few nodes are put.  (Where it couldn't be advanced, the
+ * fold's trees it still names are put too, as they would have been; and
+ * the branch is folded again from it, as settle_rows() does.)  False,
+ * nothing done, where the fold caches can't be used.
+ */
+static bool
+settle_compared(const char *name, const ProllyNodeRef *target,
+				const ProllyNodeRef *baseline)
+{
+	ProllyDatabaseComponents dc;
+	ProllyNodeRef working;
+	ProllyNodeRef next;
+	bool		advanced = true;
+
+	if (!fold_caches_usable() || prolly_local_chunks_active() ||
+		RecoveryInProgress())
+		return false;
+	prolly_database_components(&dc);
+	compared.name = MemoryContextStrdup(TopTransactionContext, name);
+	compared.have = baseline != NULL;
+	if (baseline)
+		compared.baseline = *baseline;
+	compared.have_root = false;
+	compared.active = true;
+	prolly_local_chunks_begin();
+	PG_TRY();
+	{
+		fold_from_baseline(&working, &next, false);
+		branch_set_baseline(name, &next, &working);
+		if (!same_hash(&working.hash, &target->hash) &&
+			!(share_clean_tables(target, &working) &&
+			  same_hash(&working.hash, &target->hash)))
+		{
+			PROLLY_CALL(dc.diff_merge, move_to, target, &working);
+			advanced = advance_to_target(target, &working);
+		}
+		compared_end(true);
+	}
+	PG_CATCH();
+	{
+		if (compared.active)
+			compared_end(false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!advanced)
+		fold_as_baseline(NULL);
+	return true;
+}
+
 static void
 settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 {
@@ -1656,6 +1795,8 @@ settle_rows(const ProllyNodeRef *target, const KnownSource *source)
 		{
 			ProllyNodeRef next;
 
+			if (settle_compared(name, target, have ? &baseline : NULL))
+				return;
 			fold_from_baseline(&working, &next, false);
 			branch_set_baseline(name, &next, &working);
 		}
@@ -4090,7 +4231,8 @@ publish_fold(const BranchFoldStamp *stamp, Snapshot snap,
 			 const ProllyNodeRef *baseline, const ProllyNodeRef *root,
 			 bool complete)
 {
-	if (fold_caches_usable())
+	/* (not a fold whose trees only this backend has) */
+	if (fold_caches_usable() && !prolly_local_chunks_active())
 		branch_fold_publish(stamp, snap, baseline ? &baseline->hash : NULL,
 							&root->hash, complete);
 }
