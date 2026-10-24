@@ -64,7 +64,6 @@ typedef FormData_pg_cast *Form_pg_cast;
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_cast_oid_index, 2660, CastOidIndexId, pg_cast, btree(oid oid_ops, castbranch oid_ops));
 DECLARE_UNIQUE_INDEX(pg_cast_source_target_index, 2661, CastSourceTargetIndexId, pg_cast, btree(castsource oid_ops, casttarget oid_ops, castbranch oid_ops));
-DECLARE_INDEX(pg_cast_branch_index, 9196, CastBranchIndexId, pg_cast, btree(castbranch oid_ops));
 
 MAKE_SYSCACHE(CASTSOURCETARGET, pg_cast_source_target_index, 256);
 

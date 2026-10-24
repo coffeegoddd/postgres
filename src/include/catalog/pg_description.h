@@ -71,7 +71,6 @@ typedef FormData_pg_description * Form_pg_description;
 DECLARE_TOAST(pg_description, 2834, 2835);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_description_o_c_o_index, 2675, DescriptionObjIndexId, pg_description, btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops, objbranch oid_ops));
-DECLARE_INDEX(pg_description_branch_index, 9174, DescriptionBranchIndexId, pg_description, btree(objbranch oid_ops));
 
 /* We do not use BKI_LOOKUP here because it causes problems for genbki.pl */
 DECLARE_FOREIGN_KEY((classoid), pg_class, (oid));

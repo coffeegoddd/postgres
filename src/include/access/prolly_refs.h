@@ -90,6 +90,9 @@ typedef struct ProllyMergeState
 	char	  **table_names;	/* each one's name (qualified) when the merge
 								 * recorded it, as tables[] (NULL, or an
 								 * entry NULL: not known) */
+	int			nschema;
+	char	  **schema_tables;	/* in schema conflicts, kept as the branch
+								 * has them (names, qualified; palloc'd) */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 

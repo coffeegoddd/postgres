@@ -1,8 +1,7 @@
 # The V suite's growth shapes (V9): each version-control operation's work,
-# counted in pg_stat_prolly, as the table grows (rows, Δ fixed), as the
-# change grows (delta, N fixed, up to 70% of the rows) and as unrelated
-# objects are added (catalog, N and Δ fixed), each point on a fresh
-# database.  vshape fits each counter's growth and gates it against
+# counted in pg_stat_prolly, as the table grows (rows, Δ fixed) and as the
+# change grows (delta, N fixed, up to 70% of the rows), each point on a
+# fresh database.  vshape fits each counter's growth and gates it against
 # the operation's target; known exceptions, each owned by an issue, are in
 # v_shape_known.toml.  Counts, not timings: they repeat on any machine.
 
@@ -47,7 +46,3 @@ delta = 10
 # Δ for the delta sweep (64x, to 70% of the rows), at delta_rows rows
 delta_rows = 64000
 deltas = [700, 2800, 11200, 44800]
-# K for the catalog sweep (64x): K shared tables and K tables on another
-# branch beside the table, at others_rows rows
-others = [32, 128, 512, 2048]
-others_rows = 4000

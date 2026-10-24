@@ -142,7 +142,6 @@ typedef FormData_pg_statistic *Form_pg_statistic;
 DECLARE_TOAST(pg_statistic, 2840, 2841);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696, StatisticRelidAttnumInhIndexId, pg_statistic, btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops, stabranch oid_ops));
-DECLARE_INDEX(pg_statistic_branch_index, 9176, StatisticBranchIndexId, pg_statistic, btree(stabranch oid_ops));
 
 MAKE_SYSCACHE(STATRELATTINH, pg_statistic_relid_att_inh_index, 128);
 

@@ -90,7 +90,6 @@ DECLARE_TOAST(pg_trigger, 2336, 2337);
 DECLARE_INDEX(pg_trigger_tgconstraint_index, 2699, TriggerConstraintIndexId, pg_trigger, btree(tgconstraint oid_ops));
 DECLARE_UNIQUE_INDEX(pg_trigger_tgrelid_tgname_index, 2701, TriggerRelidNameIndexId, pg_trigger, btree(tgrelid oid_ops, tgname name_ops, tgbranch oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_trigger_oid_index, 2702, TriggerOidIndexId, pg_trigger, btree(oid oid_ops, tgbranch oid_ops));
-DECLARE_INDEX(pg_trigger_branch_index, 9169, TriggerBranchIndexId, pg_trigger, btree(tgbranch oid_ops));
 
 DECLARE_ARRAY_FOREIGN_KEY((tgrelid, tgattr), pg_attribute, (attrelid, attnum));
 

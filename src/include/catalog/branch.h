@@ -14,7 +14,6 @@
 #ifndef CATALOG_BRANCH_H
 #define CATALOG_BRANCH_H
 
-#include "access/genam.h"
 #include "access/htup.h"
 #include "access/transam.h"
 #include "executor/tuptable.h"
@@ -27,7 +26,6 @@ typedef struct CatalogBranchInfo
 	Oid			relid;			/* the catalog */
 	Size		offset;			/* the column's offset in the row's struct */
 	AttrNumber	attnum;			/* the column */
-	Oid			indexid;		/* an index on the column alone */
 } CatalogBranchInfo;
 
 /* the session's branch: a versioned object's rows on it are the ones seen */
@@ -137,14 +135,6 @@ extern const CatalogBranchInfo *catalog_branch_catalogs(int *n);
 
 /* a row's branch: its branch column (0 for shared rows) */
 extern Oid	catalog_row_branch(const CatalogBranchInfo *info, HeapTuple tup);
-
-/*
- * A scan of a branch-aware catalog's rows on branch, by its index on the
- * branch column: work in the rows on that branch, however many rows other
- * branches and shared objects have.  A versioned schema's objects (but an
- * extension's members, which are shared) are rows of the session's branch.
- */
-extern SysScanDesc catalog_branch_beginscan(Relation rel, Oid branch);
 
 /* check out the pg_branch row a connection named; false if there is none */
 extern bool branch_session_init(const char *branch);

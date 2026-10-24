@@ -499,43 +499,26 @@ branches_depending(const ObjectAddress *object, bool data_only)
  * object, which is about to be dropped.  Only a shared object can have
  * such dependents: a versioned one is the session's branch's own copy.
  * Callers dropping many objects ask other_branches_have_copies() once
- * first.  named is the object the statement drops that object goes with
- * (an extension, for one of its members), and is what the error names, as
- * a refused drop does on one branch; object itself is in the detail.
+ * first.
  */
 void
-check_other_branch_dependents(const ObjectAddress *object,
-							  const ObjectAddress *named)
+check_other_branch_dependents(const ObjectAddress *object)
 {
 	List	   *others;
-	bool		member;
 
 	if (object_is_versioned(object))
 		return;
 	others = branches_depending(object, false);
-	if (others == NIL)
-		return;
-	member = named != NULL &&
-		(named->classId != object->classId ||
-		 named->objectId != object->objectId ||
-		 named->objectSubId != object->objectSubId);
-	ereport(ERROR,
-			(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-			 errmsg("cannot drop %s because objects on branch \"%s\" depend on it",
-					getObjectDescription(member ? named : object, false),
-					branch_name_for_message(linitial_oid(others))),
-			 member && list_length(others) > 1 ?
-			 errdetail("Objects on %d branches other than the session's depend on %s, which dropping %s would drop.",
-					   list_length(others), getObjectDescription(object, false),
-					   getObjectDescription(named, false)) :
-			 member ?
-			 errdetail("They depend on %s, which dropping %s would drop.",
-					   getObjectDescription(object, false),
-					   getObjectDescription(named, false)) :
-			 list_length(others) > 1 ?
-			 errdetail("Objects on %d branches other than the session's depend on it.",
-					   list_length(others)) : 0,
-			 errhint("It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.")));
+	if (others != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot drop %s because objects on branch \"%s\" depend on it",
+						getObjectDescription(object, false),
+						branch_name_for_message(linitial_oid(others))),
+				 list_length(others) > 1 ?
+				 errdetail("Objects on %d branches other than the session's depend on it.",
+						   list_length(others)) : 0,
+				 errhint("It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.")));
 }
 
 /*

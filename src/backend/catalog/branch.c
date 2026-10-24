@@ -137,44 +137,44 @@ static List *write_callbacks = NIL;
 bool		CatalogAllBranches = false;
 
 static const CatalogBranchInfo branch_catalogs[] = {
-	{NamespaceRelationId, offsetof(FormData_pg_namespace, nspbranch), Anum_pg_namespace_nspbranch, NamespaceBranchIndexId},
-	{RelationRelationId, offsetof(FormData_pg_class, relbranch), Anum_pg_class_relbranch, ClassBranchIndexId},
-	{AttributeRelationId, offsetof(FormData_pg_attribute, attbranch), Anum_pg_attribute_attbranch, AttributeBranchIndexId},
-	{TypeRelationId, offsetof(FormData_pg_type, typbranch), Anum_pg_type_typbranch, TypeBranchIndexId},
-	{ProcedureRelationId, offsetof(FormData_pg_proc, probranch), Anum_pg_proc_probranch, ProcedureBranchIndexId},
-	{IndexRelationId, offsetof(FormData_pg_index, indbranch), Anum_pg_index_indbranch, IndexBranchIndexId},
-	{ConstraintRelationId, offsetof(FormData_pg_constraint, conbranch), Anum_pg_constraint_conbranch, ConstraintBranchIndexId},
-	{AttrDefaultRelationId, offsetof(FormData_pg_attrdef, adbranch), Anum_pg_attrdef_adbranch, AttrDefaultBranchIndexId},
-	{DependRelationId, offsetof(FormData_pg_depend, depbranch), Anum_pg_depend_depbranch, DependBranchIndexId},
-	{TriggerRelationId, offsetof(FormData_pg_trigger, tgbranch), Anum_pg_trigger_tgbranch, TriggerBranchIndexId},
-	{RewriteRelationId, offsetof(FormData_pg_rewrite, ev_branch), Anum_pg_rewrite_ev_branch, RewriteBranchIndexId},
-	{PolicyRelationId, offsetof(FormData_pg_policy, polbranch), Anum_pg_policy_polbranch, PolicyBranchIndexId},
-	{EnumRelationId, offsetof(FormData_pg_enum, enumbranch), Anum_pg_enum_enumbranch, EnumBranchIndexId},
-	{SequenceRelationId, offsetof(FormData_pg_sequence, seqbranch), Anum_pg_sequence_seqbranch, SequenceBranchIndexId},
-	{DescriptionRelationId, offsetof(FormData_pg_description, objbranch), Anum_pg_description_objbranch, DescriptionBranchIndexId},
-	{InheritsRelationId, offsetof(FormData_pg_inherits, inhbranch), Anum_pg_inherits_inhbranch, InheritsBranchIndexId},
-	{StatisticRelationId, offsetof(FormData_pg_statistic, stabranch), Anum_pg_statistic_stabranch, StatisticBranchIndexId},
-	{StatisticExtRelationId, offsetof(FormData_pg_statistic_ext, stxbranch), Anum_pg_statistic_ext_stxbranch, StatisticExtBranchIndexId},
-	{StatisticExtDataRelationId, offsetof(FormData_pg_statistic_ext_data, stxdbranch), Anum_pg_statistic_ext_data_stxdbranch, StatisticExtDataBranchIndexId},
-	{PartitionedRelationId, offsetof(FormData_pg_partitioned_table, partbranch), Anum_pg_partitioned_table_partbranch, PartitionedBranchIndexId},
-	{AggregateRelationId, offsetof(FormData_pg_aggregate, aggbranch), Anum_pg_aggregate_aggbranch, AggregateBranchIndexId},
-	{OperatorRelationId, offsetof(FormData_pg_operator, oprbranch), Anum_pg_operator_oprbranch, OperatorBranchIndexId},
-	{OperatorClassRelationId, offsetof(FormData_pg_opclass, opcbranch), Anum_pg_opclass_opcbranch, OperatorClassBranchIndexId},
-	{OperatorFamilyRelationId, offsetof(FormData_pg_opfamily, opfbranch), Anum_pg_opfamily_opfbranch, OperatorFamilyBranchIndexId},
-	{AccessMethodOperatorRelationId, offsetof(FormData_pg_amop, amopbranch), Anum_pg_amop_amopbranch, AccessMethodOperatorBranchIndexId},
-	{AccessMethodProcedureRelationId, offsetof(FormData_pg_amproc, amprocbranch), Anum_pg_amproc_amprocbranch, AccessMethodProcedureBranchIndexId},
-	{CollationRelationId, offsetof(FormData_pg_collation, collbranch), Anum_pg_collation_collbranch, CollationBranchIndexId},
-	{ConversionRelationId, offsetof(FormData_pg_conversion, conbranch), Anum_pg_conversion_conbranch, ConversionBranchIndexId},
-	{TSConfigRelationId, offsetof(FormData_pg_ts_config, cfgbranch), Anum_pg_ts_config_cfgbranch, TSConfigBranchIndexId},
-	{TSConfigMapRelationId, offsetof(FormData_pg_ts_config_map, mapbranch), Anum_pg_ts_config_map_mapbranch, TSConfigMapBranchIndexId},
-	{TSDictionaryRelationId, offsetof(FormData_pg_ts_dict, dictbranch), Anum_pg_ts_dict_dictbranch, TSDictionaryBranchIndexId},
-	{TSParserRelationId, offsetof(FormData_pg_ts_parser, prsbranch), Anum_pg_ts_parser_prsbranch, TSParserBranchIndexId},
-	{TSTemplateRelationId, offsetof(FormData_pg_ts_template, tmplbranch), Anum_pg_ts_template_tmplbranch, TSTemplateBranchIndexId},
-	{SecLabelRelationId, offsetof(FormData_pg_seclabel, objbranch), Anum_pg_seclabel_objbranch, SecLabelBranchIndexId},
-	{DefaultAclRelationId, offsetof(FormData_pg_default_acl, defaclbranch), Anum_pg_default_acl_defaclbranch, DefaultAclBranchIndexId},
-	{RangeRelationId, offsetof(FormData_pg_range, rngbranch), Anum_pg_range_rngbranch, RangeBranchIndexId},
-	{CastRelationId, offsetof(FormData_pg_cast, castbranch), Anum_pg_cast_castbranch, CastBranchIndexId},
-	{ForeignTableRelationId, offsetof(FormData_pg_foreign_table, ftbranch), Anum_pg_foreign_table_ftbranch, ForeignTableBranchIndexId},
+	{NamespaceRelationId, offsetof(FormData_pg_namespace, nspbranch), Anum_pg_namespace_nspbranch},
+	{RelationRelationId, offsetof(FormData_pg_class, relbranch), Anum_pg_class_relbranch},
+	{AttributeRelationId, offsetof(FormData_pg_attribute, attbranch), Anum_pg_attribute_attbranch},
+	{TypeRelationId, offsetof(FormData_pg_type, typbranch), Anum_pg_type_typbranch},
+	{ProcedureRelationId, offsetof(FormData_pg_proc, probranch), Anum_pg_proc_probranch},
+	{IndexRelationId, offsetof(FormData_pg_index, indbranch), Anum_pg_index_indbranch},
+	{ConstraintRelationId, offsetof(FormData_pg_constraint, conbranch), Anum_pg_constraint_conbranch},
+	{AttrDefaultRelationId, offsetof(FormData_pg_attrdef, adbranch), Anum_pg_attrdef_adbranch},
+	{DependRelationId, offsetof(FormData_pg_depend, depbranch), Anum_pg_depend_depbranch},
+	{TriggerRelationId, offsetof(FormData_pg_trigger, tgbranch), Anum_pg_trigger_tgbranch},
+	{RewriteRelationId, offsetof(FormData_pg_rewrite, ev_branch), Anum_pg_rewrite_ev_branch},
+	{PolicyRelationId, offsetof(FormData_pg_policy, polbranch), Anum_pg_policy_polbranch},
+	{EnumRelationId, offsetof(FormData_pg_enum, enumbranch), Anum_pg_enum_enumbranch},
+	{SequenceRelationId, offsetof(FormData_pg_sequence, seqbranch), Anum_pg_sequence_seqbranch},
+	{DescriptionRelationId, offsetof(FormData_pg_description, objbranch), Anum_pg_description_objbranch},
+	{InheritsRelationId, offsetof(FormData_pg_inherits, inhbranch), Anum_pg_inherits_inhbranch},
+	{StatisticRelationId, offsetof(FormData_pg_statistic, stabranch), Anum_pg_statistic_stabranch},
+	{StatisticExtRelationId, offsetof(FormData_pg_statistic_ext, stxbranch), Anum_pg_statistic_ext_stxbranch},
+	{StatisticExtDataRelationId, offsetof(FormData_pg_statistic_ext_data, stxdbranch), Anum_pg_statistic_ext_data_stxdbranch},
+	{PartitionedRelationId, offsetof(FormData_pg_partitioned_table, partbranch), Anum_pg_partitioned_table_partbranch},
+	{AggregateRelationId, offsetof(FormData_pg_aggregate, aggbranch), Anum_pg_aggregate_aggbranch},
+	{OperatorRelationId, offsetof(FormData_pg_operator, oprbranch), Anum_pg_operator_oprbranch},
+	{OperatorClassRelationId, offsetof(FormData_pg_opclass, opcbranch), Anum_pg_opclass_opcbranch},
+	{OperatorFamilyRelationId, offsetof(FormData_pg_opfamily, opfbranch), Anum_pg_opfamily_opfbranch},
+	{AccessMethodOperatorRelationId, offsetof(FormData_pg_amop, amopbranch), Anum_pg_amop_amopbranch},
+	{AccessMethodProcedureRelationId, offsetof(FormData_pg_amproc, amprocbranch), Anum_pg_amproc_amprocbranch},
+	{CollationRelationId, offsetof(FormData_pg_collation, collbranch), Anum_pg_collation_collbranch},
+	{ConversionRelationId, offsetof(FormData_pg_conversion, conbranch), Anum_pg_conversion_conbranch},
+	{TSConfigRelationId, offsetof(FormData_pg_ts_config, cfgbranch), Anum_pg_ts_config_cfgbranch},
+	{TSConfigMapRelationId, offsetof(FormData_pg_ts_config_map, mapbranch), Anum_pg_ts_config_map_mapbranch},
+	{TSDictionaryRelationId, offsetof(FormData_pg_ts_dict, dictbranch), Anum_pg_ts_dict_dictbranch},
+	{TSParserRelationId, offsetof(FormData_pg_ts_parser, prsbranch), Anum_pg_ts_parser_prsbranch},
+	{TSTemplateRelationId, offsetof(FormData_pg_ts_template, tmplbranch), Anum_pg_ts_template_tmplbranch},
+	{SecLabelRelationId, offsetof(FormData_pg_seclabel, objbranch), Anum_pg_seclabel_objbranch},
+	{DefaultAclRelationId, offsetof(FormData_pg_default_acl, defaclbranch), Anum_pg_default_acl_defaclbranch},
+	{RangeRelationId, offsetof(FormData_pg_range, rngbranch), Anum_pg_range_rngbranch},
+	{CastRelationId, offsetof(FormData_pg_cast, castbranch), Anum_pg_cast_castbranch},
+	{ForeignTableRelationId, offsetof(FormData_pg_foreign_table, ftbranch), Anum_pg_foreign_table_ftbranch},
 };
 
 /* every branch-aware catalog's OID is below this; a table indexes them */
@@ -217,18 +217,6 @@ catalog_tuple_on_branch(HeapTuple tup)
 		return true;
 	branch = catalog_row_branch(info, tup);
 	return branch == InvalidOid || branch == MyBranch;
-}
-
-SysScanDesc
-catalog_branch_beginscan(Relation rel, Oid branch)
-{
-	const CatalogBranchInfo *info = catalog_branch_info(RelationGetRelid(rel));
-	ScanKeyData key;
-
-	Assert(info != NULL);
-	ScanKeyInit(&key, info->attnum, BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(branch));
-	return systable_beginscan(rel, info->indexid, true, NULL, 1, &key);
 }
 
 Oid

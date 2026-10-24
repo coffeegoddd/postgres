@@ -116,7 +116,6 @@ typedef FormData_pg_aggregate *Form_pg_aggregate;
 DECLARE_TOAST(pg_aggregate, 4159, 4160);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650, AggregateFnoidIndexId, pg_aggregate, btree(aggfnoid oid_ops, aggbranch oid_ops));
-DECLARE_INDEX(pg_aggregate_branch_index, 9180, AggregateBranchIndexId, pg_aggregate, btree(aggbranch oid_ops));
 
 MAKE_SYSCACHE(AGGFNOID, pg_aggregate_fnoid_index, 16);
 

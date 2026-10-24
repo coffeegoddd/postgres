@@ -85,6 +85,5 @@ typedef FormData_pg_shdepend *Form_pg_shdepend;
 
 DECLARE_INDEX(pg_shdepend_depender_index, 1232, SharedDependDependerIndexId, pg_shdepend, btree(dbid oid_ops, classid oid_ops, objid oid_ops, objsubid int4_ops));
 DECLARE_INDEX(pg_shdepend_reference_index, 1233, SharedDependReferenceIndexId, pg_shdepend, btree(refclassid oid_ops, refobjid oid_ops));
-DECLARE_INDEX(pg_shdepend_branch_index, 9198, SharedDependBranchIndexId, pg_shdepend, btree(dbid oid_ops, objbranch oid_ops));
 
 #endif							/* PG_SHDEPEND_H */

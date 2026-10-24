@@ -1,0 +1,551 @@
+-- Schema conflicts kept, as Dolt keeps them: a table both branches changed
+-- in ways that don't merge (its definitions changed differently, or one
+-- dropped it and the other changed it) is left as the branch has it, its
+-- rows unmerged, and the conflict is recorded in the merge in progress.
+-- The other tables merge.  dolt_schema_conflicts lists each with its
+-- statements in the base, ours and theirs; dolt_conflicts_resolve()
+-- refuses them, as Dolt's does; a commit is refused while they remain;
+-- dolt_merge('--abort') ends the merge.  Dolt's cases from its
+-- SchemaChangeTestsSchemaConflicts, in both directions.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE SCHEMA sc VERSIONED;
+CREATE TABLE sc.t (pk int PRIMARY KEY, col1 int, col2 varchar(100));
+CREATE TABLE sc.other (id int PRIMARY KEY, v text);
+INSERT INTO sc.t VALUES (1, 10, 'a'), (2, 20, 'b');
+INSERT INTO sc.other VALUES (1, 'one');
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Dolt's "changing the type of a column": theirs retypes col1 and adds
+-- rows, ours adds rows; and both change sc.other's rows, which merge
+SELECT dolt_checkout('right') IS NOT NULL AS on_right;
+ on_right 
+----------
+ t
+(1 row)
+
+ALTER TABLE sc.t ALTER COLUMN col1 TYPE varchar(100);
+INSERT INTO sc.t VALUES (3, 'thirty', 'c');
+INSERT INTO sc.other VALUES (3, 'three');
+SELECT length(dolt_commit('-am', 'right')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+INSERT INTO sc.t VALUES (5, 50, 'e');
+INSERT INTO sc.other VALUES (5, 'five');
+SELECT length(dolt_commit('-am', 'left')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+-- outside a transaction block: refused, as Dolt's autocommit merge is
+SELECT dolt_merge('right');
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table sc.t was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
+SELECT count(*) AS no_merge_state FROM dolt_schema_conflicts;
+ no_merge_state 
+----------------
+              0
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, description FROM dolt_schema_conflicts;
+ table_name |                                   description                                   
+------------+---------------------------------------------------------------------------------
+ sc.t       | incompatible column types for column 'col1': integer and character varying(100)
+(1 row)
+
+SELECT base_schema = our_schema AS ours_unchanged,
+	   their_schema LIKE '%col1 character varying(100)%' AS theirs_retyped,
+	   our_schema LIKE '%col1 integer%' AS ours_integer
+FROM dolt_schema_conflicts;
+ ours_unchanged | theirs_retyped | ours_integer 
+----------------+----------------+--------------
+ t              | t              | t
+(1 row)
+
+-- the table is the branch's, its rows unmerged; the other table merged
+SELECT pk, col1 FROM sc.t ORDER BY pk;
+ pk | col1 
+----+------
+  1 |   10
+  2 |   20
+  5 |   50
+(3 rows)
+
+SELECT pg_typeof(col1) FROM sc.t LIMIT 1;
+ pg_typeof 
+-----------
+ integer
+(1 row)
+
+SELECT id, v FROM sc.other ORDER BY id;
+ id |   v   
+----+-------
+  1 | one
+  3 | three
+  5 | five
+(3 rows)
+
+SELECT table_name, staged, status FROM dolt_status ORDER BY table_name;
+ table_name | staged |     status      
+------------+--------+-----------------
+ sc.other   | t      | modified
+ sc.t       | f      | schema conflict
+(2 rows)
+
+-- an ordinary table meanwhile
+INSERT INTO sc.t VALUES (7, 70, 'g');
+SAVEPOINT s;
+UPDATE sc.t SET col1 = 71 WHERE pk = 7;
+ROLLBACK TO SAVEPOINT s;
+SELECT col1 FROM sc.t WHERE pk = 7;
+ col1 
+------
+   70
+(1 row)
+
+-- not resolved, as in Dolt
+SAVEPOINT r;
+SELECT dolt_conflicts_resolve('--ours', 'sc.t');
+ERROR:  unable to automatically resolve schema conflicts, since data changes may not have been fully merged yet
+DETAIL:  Table sc.t has a schema conflict.
+HINT:  Abort the merge with dolt_merge('--abort'), change either side of the merge so the definitions agree, then merge again.
+ROLLBACK TO SAVEPOINT r;
+SAVEPOINT c;
+SELECT dolt_commit('-am', 'merged');
+ERROR:  cannot commit with unresolved merge conflicts
+DETAIL:  Table sc.t has a schema conflict.
+HINT:  Abort the merge, make the definitions agree on one side, and merge again.
+ROLLBACK TO SAVEPOINT c;
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+SELECT count(*) AS after_abort FROM dolt_schema_conflicts;
+ after_abort 
+-------------
+           0
+(1 row)
+
+SELECT pk FROM sc.t ORDER BY pk;
+ pk 
+----
+  1
+  2
+  5
+(3 rows)
+
+SELECT id FROM sc.other ORDER BY id;
+ id 
+----
+  1
+  5
+(2 rows)
+
+COMMIT;
+-- the same, the other way round: theirs is main
+SELECT dolt_checkout('right') IS NOT NULL AS on_right;
+ on_right 
+----------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('main'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, description FROM dolt_schema_conflicts;
+ table_name |                                   description                                   
+------------+---------------------------------------------------------------------------------
+ sc.t       | incompatible column types for column 'col1': character varying(100) and integer
+(1 row)
+
+SELECT our_schema LIKE '%col1 character varying(100)%' AS ours_retyped,
+	   their_schema = base_schema AS theirs_unchanged
+FROM dolt_schema_conflicts;
+ ours_retyped | theirs_unchanged 
+--------------+------------------
+ t            | t
+(1 row)
+
+SELECT pk, col1 FROM sc.t ORDER BY pk;
+ pk |  col1  
+----+--------
+  1 | 10
+  2 | 20
+  3 | thirty
+(3 rows)
+
+SELECT id FROM sc.other ORDER BY id;
+ id 
+----
+  1
+  3
+  5
+(3 rows)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+-- with dolt.allow_commit_conflicts, a merge outside a block keeps them;
+-- the branch can't commit until the merge is aborted
+SET dolt.allow_commit_conflicts = on;
+SELECT (dolt_merge('right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name FROM dolt_schema_conflicts;
+ table_name 
+------------
+ sc.t
+(1 row)
+
+SELECT dolt_commit('-am', 'merged');
+ERROR:  cannot commit with unresolved merge conflicts
+DETAIL:  Table sc.t has a schema conflict.
+HINT:  Abort the merge, make the definitions agree on one side, and merge again.
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+RESET dolt.allow_commit_conflicts;
+-- Dolt's "type changes to a column on both sides of a merge"
+SELECT dolt_branch('both_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('both_left');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('both_right') IS NOT NULL AS on_right;
+ on_right 
+----------
+ t
+(1 row)
+
+ALTER TABLE sc.t ALTER COLUMN col2 TYPE text;
+SELECT length(dolt_commit('-am', 'text')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('both_left') IS NOT NULL AS on_left;
+ on_left 
+---------
+ t
+(1 row)
+
+ALTER TABLE sc.t ALTER COLUMN col2 TYPE varchar(10);
+SELECT length(dolt_commit('-am', 'varchar')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('both_right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name FROM dolt_schema_conflicts;
+ table_name 
+------------
+ sc.t
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+-- Dolt's "both sides add an index with the same name, same columns, but
+-- different type" (here: one partial)
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('idx_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('idx_left');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('idx_right') IS NOT NULL AS on_right;
+ on_right 
+----------
+ t
+(1 row)
+
+CREATE INDEX idx1 ON sc.t (col2) WHERE pk > 1;
+INSERT INTO sc.t VALUES (10, 100, '100');
+SELECT length(dolt_commit('-am', 'idx partial')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('idx_left') IS NOT NULL AS on_left;
+ on_left 
+---------
+ t
+(1 row)
+
+CREATE INDEX idx1 ON sc.t (col2);
+INSERT INTO sc.t VALUES (20, 200, '200');
+SELECT length(dolt_commit('-am', 'idx')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('idx_right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, our_schema LIKE '%idx1%' AS ours_has_idx1,
+	   their_schema LIKE '%WHERE%' AS theirs_partial
+FROM dolt_schema_conflicts;
+ table_name | ours_has_idx1 | theirs_partial 
+------------+---------------+----------------
+ sc.t       | t             | t
+(1 row)
+
+SELECT pk FROM sc.t ORDER BY pk;
+ pk 
+----
+  1
+  2
+  5
+ 20
+(4 rows)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+-- Dolt's "modifying a column on one side of a merge, and deleting it on
+-- the other"; and a table dropped on one side and changed on the other
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('drop_right');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('drop_left');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('drop_right') IS NOT NULL AS on_right;
+ on_right 
+----------
+ t
+(1 row)
+
+ALTER TABLE sc.t DROP COLUMN col1;
+DROP TABLE sc.other;
+SELECT length(dolt_commit('-Am', 'drops')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('drop_left') IS NOT NULL AS on_left;
+ on_left 
+---------
+ t
+(1 row)
+
+ALTER TABLE sc.t ALTER COLUMN col1 TYPE bigint;
+ALTER TABLE sc.other ADD COLUMN w int;
+SELECT length(dolt_commit('-am', 'changes')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('drop_right'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, their_schema, description FROM dolt_schema_conflicts
+WHERE table_name LIKE '%other';
+ table_name | their_schema |                      description                       
+------------+--------------+--------------------------------------------------------
+ sc.other   | <deleted>    | cannot merge a table deletion with schema modification
+(1 row)
+
+SELECT table_name FROM dolt_schema_conflicts ORDER BY table_name;
+ table_name 
+------------
+ sc.other
+ sc.t
+(2 rows)
+
+SELECT count(*) AS other_kept FROM sc.other;
+ other_kept 
+------------
+          2
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+-- and the other way round: ours dropped it
+SELECT dolt_checkout('drop_right') IS NOT NULL AS on_right;
+ on_right 
+----------
+ t
+(1 row)
+
+BEGIN;
+SELECT (dolt_merge('drop_left'))[2:4];
+       dolt_merge        
+-------------------------
+ {0,1,"conflicts found"}
+(1 row)
+
+SELECT table_name, our_schema, description FROM dolt_schema_conflicts
+WHERE table_name LIKE '%other';
+ table_name | our_schema |                      description                       
+------------+------------+--------------------------------------------------------
+ sc.other   | <deleted>  | cannot merge a table deletion with schema modification
+(1 row)
+
+SELECT to_regclass('sc.other') IS NULL AS still_dropped;
+ still_dropped 
+---------------
+ t
+(1 row)
+
+SELECT (dolt_merge('--abort'))[4];
+  dolt_merge   
+---------------
+ merge aborted
+(1 row)
+
+COMMIT;
+-- a pick or a revert still refuses a schema conflict
+SELECT dolt_checkout('drop_left') IS NOT NULL AS on_left;
+ on_left 
+---------
+ t
+(1 row)
+
+SELECT dolt_cherry_pick('drop_right');
+ERROR:  schema conflict: sc.other was changed differently on both sides
+DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('-D', b) FROM unnest(ARRAY['right', 'both_right',
+	'both_left', 'idx_right', 'idx_left', 'drop_right', 'drop_left']) b;
+ dolt_branch 
+-------------
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+ {0}
+(7 rows)
+
+DROP SCHEMA sc CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to table sc.t
+drop cascades to table sc.other
+SELECT length(dolt_commit('-Am', 'sc gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+

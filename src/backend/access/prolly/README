@@ -19,20 +19,6 @@ content-addressed prolly trees, kept in the database's chunk store, and
 names the canonical root (canon_folded.c).  Diffs and merges compare
 those trees; remotes exchange their chunks.
 
-Each versioned object has catalog rows on every branch that has used it,
-each carrying its branch (catalog/branch.c).  Every branch-aware catalog
-has an index on its branch column alone (pg_shdepend one on its database
-and branch), and what reads a branch's objects reads them by it
-(catalog_branch_beginscan()): a branch's first use copies the rows on its
-source, a branch's delete removes the rows on it, and a commit's
-canonical form, and the checks of a working set against a commit, read
-the rows on the session's branch.  That work is in the objects on the
-branch, however many rows other branches and shared objects have.  One
-catalog is still read whole for the canonical form: pg_cast
-(describe_casts()), since a cast between a type an extension has in a
-versioned schema and a type outside it, made outside the extension, is
-shared yet described; pg_cast grows only with user casts.
-
 
 Interfaces and implementations
 ------------------------------
@@ -335,6 +321,16 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+A table both sides of a merge changed in ways that don't merge (its
+definitions changed differently, or one dropped it and the other changed
+it) is a schema conflict.  dolt_merge() keeps it as the branch has it,
+definition and rows, records it in the merge in progress (the refs' merge
+names entry, by name, OID 0) and merges the other tables, as Dolt does;
+dolt_schema_conflicts shows its statements in the base, the head and
+theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
+committed until it is aborted.  A cherry-pick or revert, and schema
+conflicts of other objects, fail as before.
+
 A keyed row both sides of a merge changed is merged column by column.  A
 long value is held out of line by a reference naming its canonical bytes,
 so where a side's reference is base's, decoded by the same keying, that
@@ -492,11 +488,7 @@ waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is
 kept.  Not at a transaction's own commit (dolt.transaction_commit), whose
 head moves every transaction.  The refs record each kept commit with the
-branch's baseline then and each table's relations and snapshots ('K').
-A snapshot's slot names the transaction that took it, so one whose
-transaction doesn't commit (a crash between the keep and the commit
-included) is kept by nobody: the relation's next snapshot, or a page
-sweep, lets go of it.  A
+branch's baseline then and each table's relations and snapshots ('K').  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's

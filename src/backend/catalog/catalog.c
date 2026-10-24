@@ -360,7 +360,6 @@ IsSharedRelation(Oid relationId)
 		relationId == ReplicationOriginNameIndex ||
 		relationId == SharedDependDependerIndexId ||
 		relationId == SharedDependReferenceIndexId ||
-		relationId == SharedDependBranchIndexId ||
 		relationId == SharedDescriptionObjIndexId ||
 		relationId == SharedSecLabelObjectIndexId ||
 		relationId == SubscriptionNameIndexId ||

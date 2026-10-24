@@ -1910,7 +1910,7 @@ copyBranchSharedDependencies(Oid source, Oid target)
 {
 	Relation	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
 	CatalogIndexState indstate = CatalogOpenIndexes(sdepRel);
-	ScanKeyData key[2];
+	ScanKeyData key[1];
 	SysScanDesc scan;
 	HeapTuple	tup;
 	List	   *copies = NIL;
@@ -1920,16 +1920,14 @@ copyBranchSharedDependencies(Oid source, Oid target)
 				Anum_pg_shdepend_dbid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(MyDatabaseId));
-	ScanKeyInit(&key[1],
-				Anum_pg_shdepend_objbranch,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(source));
-	scan = systable_beginscan(sdepRel, SharedDependBranchIndexId, true,
-							  NULL, 2, key);
+	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
+							  NULL, 1, key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
 		HeapTuple	copy;
 
+		if (((Form_pg_shdepend) GETSTRUCT(tup))->objbranch != source)
+			continue;
 		copy = heap_copytuple(tup);
 		((Form_pg_shdepend) GETSTRUCT(copy))->objbranch = target;
 		copies = lappend(copies, copy);
@@ -1953,7 +1951,7 @@ void
 dropBranchSharedDependencies(Oid branch)
 {
 	Relation	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
-	ScanKeyData key[2];
+	ScanKeyData key[1];
 	SysScanDesc scan;
 	HeapTuple	tup;
 
@@ -1961,14 +1959,13 @@ dropBranchSharedDependencies(Oid branch)
 				Anum_pg_shdepend_dbid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(MyDatabaseId));
-	ScanKeyInit(&key[1],
-				Anum_pg_shdepend_objbranch,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(branch));
-	scan = systable_beginscan(sdepRel, SharedDependBranchIndexId, true,
-							  NULL, 2, key);
+	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true,
+							  NULL, 1, key);
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-		CatalogTupleDelete(sdepRel, &tup->t_self);
+	{
+		if (((Form_pg_shdepend) GETSTRUCT(tup))->objbranch == branch)
+			CatalogTupleDelete(sdepRel, &tup->t_self);
+	}
 	systable_endscan(scan);
 	table_close(sdepRel, RowExclusiveLock);
 }

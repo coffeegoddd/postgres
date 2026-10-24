@@ -51,7 +51,6 @@ typedef FormData_pg_foreign_table *Form_pg_foreign_table;
 DECLARE_TOAST(pg_foreign_table, 4153, 4154);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_foreign_table_relid_index, 3119, ForeignTableRelidIndexId, pg_foreign_table, btree(ftrelid oid_ops, ftbranch oid_ops));
-DECLARE_INDEX(pg_foreign_table_branch_index, 9197, ForeignTableBranchIndexId, pg_foreign_table, btree(ftbranch oid_ops));
 
 MAKE_SYSCACHE(FOREIGNTABLEREL, pg_foreign_table_relid_index, 4);
 

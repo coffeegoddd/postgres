@@ -97,10 +97,7 @@
  * interrupt, which the header's lock holds off) between the records
  * letting go of a truncation's blocks and those freeing them, and a count
  * stuck at 255 maps.
- * A sweep lets go of the snapshots their takers never committed (a crash
- * between a snapshot's taking and its transaction's commit leaves one,
- * whose slot names that transaction: snapshot_abandoned()), drains the
- * release queue, then counts exactly what every
+ * A sweep drains the release queue first, then counts exactly what every
  * map (and changes list) of a database's page store holds, each
  * relation's read under its header's lock, and what the queue still holds
  * (drains held off meanwhile), and
@@ -151,7 +148,6 @@
 #include <unistd.h>
 
 #include "access/bufmask.h"
-#include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -174,7 +170,6 @@
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/proc.h"
-#include "storage/procarray.h"
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "utils/hsearch.h"
@@ -196,12 +191,11 @@ int			block_map_replay_entries = 65536;
 /*
  * The format's version, which headers, allocators' metapages and changes
  * lists' headers carry.  Version 1 maps were flat, an entry per logical
- * block in the relation's own map fork; version 2's were trees of pages of
- * the page store, whose snapshots didn't say who took them.  This server
- * reads only version 3, whose snapshots name the transaction that took
- * them, and refuses anything older (refuse_version()).
+ * block in the relation's own map fork; this server reads only version 2,
+ * whose maps are trees of pages of the page store, and refuses anything
+ * older (refuse_version()).
  */
-#define BMAP_VERSION		3
+#define BMAP_VERSION		2
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -5415,95 +5409,10 @@ snapshot_slot(SMgrRelation reln, uint64 id, BmapRoot *root)
 }
 
 /*
- * Is snapshot 'snap' kept by nobody, the (sub)transaction that took it
- * having ended without committing?  A snapshot is in the storage, not the
- * transaction: one taken by a transaction that aborts, or that a crash
- * ends, would otherwise hold its subtrees for as long as the relation
- * lasts.  Its owner is a FullTransactionId, so it is never mistaken for a
- * later transaction of the same 32-bit id; one too old for the commit log
- * to say is taken as committed (kept), as is one still running or
- * prepared.  As for a tuple, the transaction is asked whether it is in
- * progress before the commit log is: a commit sets the log first.
- */
-static bool
-snapshot_abandoned(const xl_bmap_snapshot *snap)
-{
-	FullTransactionId owner = FullTransactionIdFromU64(snap->owner);
-	TransactionId xid = XidFromFullTransactionId(owner);
-	FullTransactionId now;
-	bool		abandoned = false;
-
-	if (snap->id == 0 || !TransactionIdIsNormal(xid) || RecoveryInProgress())
-		return false;
-	if (TransactionIdIsCurrentTransactionId(xid))
-		return false;
-	now = ReadNextFullTransactionId();
-	if (!FullTransactionIdPrecedes(owner, now))
-		return false;
-	LWLockAcquire(XactTruncationLock, LW_SHARED);
-	if (!FullTransactionIdPrecedes(owner,
-								   FullTransactionIdFromAllowableAt(now,
-																	TransamVariables->oldestClogXid)) &&
-		!TransactionIdIsInProgress(xid) && !TransactionIdDidCommit(xid))
-		abandoned = true;
-	LWLockRelease(XactTruncationLock);
-	return abandoned;
-}
-
-/*
- * Let go of the snapshots of reln that nobody keeps (snapshot_abandoned()),
- * as bmap_snapshot_release() does: how many.  Not under any of its pages'
- * locks.  A map not made yet (its header page, or its root page, all
- * zeroes, as a crash part way through making one leaves it) keeps none.
- */
-static int
-snapshot_reclaim(SMgrRelation reln)
-{
-	RelFileLocator rel = reln->smgr_rlocator.locator;
-	Buffer		headerbuf;
-	Buffer		rootbuf;
-	BmapRoot	root;
-	int			n = 0;
-
-	if (RecoveryInProgress())
-		return 0;
-	headerbuf = map_read(rel, 0);
-	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
-	if (PageIsNew(BufferGetPage(headerbuf)))
-	{
-		UnlockReleaseBuffer(headerbuf);
-		return 0;
-	}
-	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
-	rootbuf = map_read(rel, 1);
-	LockBuffer(rootbuf, BUFFER_LOCK_SHARE);
-	if (PageIsNew(BufferGetPage(rootbuf)))
-	{
-		UnlockReleaseBuffer(rootbuf);
-		UnlockReleaseBuffer(headerbuf);
-		return 0;
-	}
-	UnlockReleaseBuffer(rootbuf);
-	(void) snapshot_slot(reln, 0, &root);
-	UnlockReleaseBuffer(headerbuf);
-	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
-	{
-		/* (an abandoned snapshot stays so: its slot is let go of once) */
-		if (snapshot_abandoned(&root.snap[s]) &&
-			bmap_snapshot_release(reln, root.snap[s].id))
-			n++;
-	}
-	return n;
-}
-
-/*
  * Keep a snapshot of reln's pages as they are: a slot of its root page holds
  * the subtrees it has now, and its length and last fold's epoch, each
  * subtree gaining a holder, and the map's epoch is raised, as by a share,
- * so that a page changed from now on is copied first.  The slot names the
- * (sub)transaction taking it: if that doesn't commit, the snapshot is kept
- * by nobody, and the next snapshot taken of reln, or the next sweep of its
- * page store, lets go of it (snapshot_reclaim()).  O(1) in the
+ * so that a page changed from now on is copied first.  O(1) in the
  * relation's size, but for the blocks of its own leaves a base backup may
  * need preserved (as a share does) and the page store's sync.  Returns its
  * id, which names it until bmap_snapshot_release().  Only a tree keeps
@@ -5577,16 +5486,11 @@ snapshot_take_slot(SMgrRelation reln)
 	xl_bmap_tree xlrec;
 	XLogRecPtr	lsn;
 	uint64		id;
-	FullTransactionId owner;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot keep a snapshot of a relation during recovery")));
-
-	/* the snapshots nobody keeps let go of, and this one's owner named */
-	(void) snapshot_reclaim(reln);
-	owner = GetCurrentFullTransactionId();
 
 	/* not while a sweep counts what the maps hold */
 	SET_LOCKTAG_OBJECT(sweeptag, rel.dbOid, BMAP_SWEEP_CLASSID, rel.spcOid, 0);
@@ -5632,7 +5536,6 @@ snapshot_take_slot(SMgrRelation reln)
 	memset(&sdelta, 0, sizeof(sdelta));
 	sdelta.kind = BMAP_DELTA_SNAPSHOT;
 	sdelta.slot = slot;
-	sdelta.snap.owner = U64FromFullTransactionId(owner);
 	sdelta.snap.nblocks = header->nblocks;
 	sdelta.snap.fold_epoch = header->fold_epoch;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
@@ -5703,7 +5606,6 @@ bmap_snapshot_release(SMgrRelation reln, uint64 id)
 		return false;
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
-	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	slot = snapshot_slot(reln, id, &root);
 	if (slot < 0)
 	{
@@ -5745,8 +5647,7 @@ bmap_snapshot_release(SMgrRelation reln, uint64 id)
 
 /*
  * The snapshots reln keeps, at most 'max' of them into snaps[]: how many it
- * keeps.  Not those nobody keeps (snapshot_abandoned()), whose slots the
- * next snapshot taken lets go of.
+ * keeps (none for a flat map).
  */
 int
 bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max)
@@ -5762,7 +5663,7 @@ bmap_snapshot_list(SMgrRelation reln, BmapSnapshot *snaps, int max)
 	UnlockReleaseBuffer(headerbuf);
 	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
 	{
-		if (root.snap[s].id == 0 || snapshot_abandoned(&root.snap[s]))
+		if (root.snap[s].id == 0)
 			continue;
 		if (n < max)
 		{
@@ -8173,51 +8074,6 @@ compact_store(RelFileLocator rel, const char *path)
 	return moved;
 }
 
-/*
- * The snapshots nobody keeps (snapshot_abandoned()) of every map of rel's
- * page store, let go of: how many.  As sweep_relation() reads them: a map
- * dropped since the directory was read is passed over (its snapshots queued
- * by its drop), as is one with no pages, or whose header or root page is
- * all zeroes (a crash part way through making it), and a map dropped while
- * it was read leaves none of its pages in shared buffers.
- */
-static uint64
-reclaim_store_snapshots(RelFileLocator rel, const char *path)
-{
-	DIR		   *dir;
-	struct dirent *de;
-	uint64		n = 0;
-
-	dir = AllocateDir(path);
-	while ((de = ReadDir(dir, path)) != NULL)
-	{
-		RelFileNumber relnumber;
-		char	   *end;
-		RelFileLocator loc;
-		SMgrRelation reln;
-
-		relnumber = (RelFileNumber) strtoul(de->d_name, &end, 10);
-		if (end == de->d_name || strcmp(end, "_bmap") != 0)
-			continue;
-		loc = with_relnumber(rel, relnumber);
-		reln = smgropen(loc, INVALID_PROC_NUMBER);
-		if (!mdexists(reln, BMAP_FORKNUM) ||
-			mdnblocks(reln, BMAP_FORKNUM) < BMAP_TREE_MAP_PAGES)
-			continue;
-		n += snapshot_reclaim(reln);
-		if (!bmap_relation_exists(loc))
-		{
-			ForkNumber	forks[2] = {BMAP_FORKNUM, BMAP_CHANGES_FORKNUM};
-			BlockNumber firsts[2] = {0, 0};
-
-			DropRelationBuffers(reln, forks, 2, firsts);
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
-	FreeDir(dir);
-	return n;
-}
-
 void
 bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 {
@@ -8232,9 +8088,6 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 				 errmsg("cannot sweep a page store during recovery")));
 	if (!alloc_exists(rel))
 		return;
-
-	/* the snapshots nobody keeps, let go of before the queue is drained */
-	(void) reclaim_store_snapshots(rel, path);
 
 	/* what dropped maps held, let go of first: the sweep counts the rest */
 	{

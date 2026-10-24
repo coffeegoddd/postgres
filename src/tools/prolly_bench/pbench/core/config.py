@@ -237,8 +237,7 @@ def validate(cfg: dict, suite: str) -> None:
             "V3": {"background", "changes", "locality", "conflict_percent"}, "V4": {"background", "changes"},
             "V6": {"background", "branches", "changes"}, "V7": {"background", "commit_modes", "commits"},
             "V8": {"background", "commits", "update_percent"},
-            "V9": {"background", "rows", "delta", "delta_rows", "deltas", "others",
-                   "others_rows"}}
+            "V9": {"background", "rows", "delta", "delta_rows", "deltas"}}
     keys.update({f"C{i}": {"workers", "sample"} for i in range(1, 5)})
     keys.update({f"S{i}": set() for i in (1, 2, 4, 6, 7)})
     # Workloads of the suites that register their parameters.

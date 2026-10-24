@@ -41,7 +41,9 @@
  *				   per table (its OID, then its qualified name)
  *	'Q' name	-> the branch's merge's conflicted tables' names, as the
  *				   merge recorded them: each table's OID, then its name's
- *				   length (a varint) and bytes
+ *				   length (a varint) and bytes; and the tables in schema
+ *				   conflicts, kept as the branch has them, each as OID 0
+ *				   and its name so
  *	'Z' name	-> a list of stashes, newest first: each its commit (hash
  *				   length, hash), then its branch's name (a varint length,
  *				   then the bytes)
@@ -654,6 +656,13 @@ check_merge_conflicts(const char *what)
 					 errdetail("Table \"%s\" has conflicts on branch \"%s\".",
 							   name, branch),
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
+		if (ms.nschema > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("cannot %s a transaction with unresolved merge conflicts", what),
+					 errdetail("Table %s has a schema conflict on branch \"%s\".",
+							   ms.schema_tables[0], branch),
+					 errhint("Abort the merge, make the definitions agree on one side, and merge again; or set dolt.allow_commit_conflicts to keep them.")));
 		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
 			ereport(ERROR,
@@ -2722,7 +2731,7 @@ copies_hold_unseen(void)
 	bool		found = false;
 
 	classes = table_open(RelationRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(classes, MyBranch);
+	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
@@ -3908,7 +3917,7 @@ static void
 table_names(StringInfo out)
 {
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	HeapTuple	tup;
 	List	   *lines = NIL;
 	ListCell   *lc;
@@ -4701,6 +4710,12 @@ copies_commit(const char *message, bool allow_empty, ProllyHash *commit_id)
 					 errdetail("Table \"%s\" has conflicts.",
 							   get_rel_name(ms.tables[0])),
 					 errhint("Resolve them with dolt_conflicts_resolve(), or abort the merge.")));
+		if (ms.nschema > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot commit with unresolved merge conflicts"),
+					 errdetail("Table %s has a schema conflict.", ms.schema_tables[0]),
+					 errhint("Abort the merge, make the definitions agree on one side, and merge again.")));
 		if (!ms.pick)
 			parents[nparents++] = ms.theirs;
 	}
@@ -5231,7 +5246,9 @@ merge_key(StringInfo key, const char *branch)
 /*
  * A branch's merge's conflicted tables' names, as the merge recorded them,
  * under a key of their own (the merge state's value ends with a message):
- * each table's OID, then its name's length (a varint) and bytes.
+ * each table's OID, then its name's length (a varint) and bytes.  Then the
+ * tables in schema conflicts, by name alone (OID 0: one the branch dropped
+ * has none).
  */
 static void
 merge_names_key(StringInfo key, const char *branch)
@@ -5258,6 +5275,13 @@ merge_names_put(const char *branch, const ProllyMergeState *state)
 			appendStringInfoString(&v, state->table_names[i]);
 			any = true;
 		}
+	for (int i = 0; state && i < state->nschema; i++)
+	{
+		put_be32(&v, InvalidOid);
+		prolly_put_varint(&v, strlen(state->schema_tables[i]));
+		appendStringInfoString(&v, state->schema_tables[i]);
+		any = true;
+	}
 	{
 		StringInfoData had;
 
@@ -5281,12 +5305,16 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 	initStringInfo(&v);
 	merge_names_key(&key, branch);
 	state->table_names = NULL;
+	state->nschema = 0;
+	state->schema_tables = NULL;
 	if (refs_get(key.data, key.len, &v))
 	{
 		const char *p = v.data;
 		const char *end = v.data + v.len;
+		int			cap = 4;
 
 		state->table_names = palloc0(sizeof(char *) * Max(state->ntables, 1));
+		state->schema_tables = palloc(sizeof(char *) * cap);
 		while (end - p >= 4)
 		{
 			Oid			oid = get_be32(p);
@@ -5298,6 +5326,16 @@ merge_names_get(const char *branch, ProllyMergeState *state)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_CORRUPTED),
 						 errmsg("prolly refs hold an invalid merge state")));
+			if (oid == InvalidOid)
+			{
+				if (state->nschema == cap)
+				{
+					cap *= 2;
+					state->schema_tables = repalloc(state->schema_tables,
+													sizeof(char *) * cap);
+				}
+				state->schema_tables[state->nschema++] = pnstrdup(p, len);
+			}
 			for (int i = 0; i < state->ntables; i++)
 				if (state->tables[i] == oid)
 					state->table_names[i] = pnstrdup(p, len);

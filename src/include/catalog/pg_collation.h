@@ -66,7 +66,6 @@ DECLARE_TOAST(pg_collation, 6175, 6176);
 
 DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164, CollationNameEncNspIndexId, pg_collation, btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops, collbranch oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_collation_oid_index, 3085, CollationOidIndexId, pg_collation, btree(oid oid_ops, collbranch oid_ops));
-DECLARE_INDEX(pg_collation_branch_index, 9186, CollationBranchIndexId, pg_collation, btree(collbranch oid_ops));
 
 MAKE_SYSCACHE(COLLNAMEENCNSP, pg_collation_name_enc_nsp_index, 8);
 MAKE_SYSCACHE(COLLOID, pg_collation_oid_index, 8);

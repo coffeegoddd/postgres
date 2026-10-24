@@ -79,7 +79,6 @@ DECLARE_TOAST_WITH_MACRO(pg_index, 6351, 6352, PgIndexToastTable, PgIndexToastIn
 
 DECLARE_INDEX(pg_index_indrelid_index, 2678, IndexIndrelidIndexId, pg_index, btree(indrelid oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_index_indexrelid_index, 2679, IndexRelidIndexId, pg_index, btree(indexrelid oid_ops, indbranch oid_ops));
-DECLARE_INDEX(pg_index_branch_index, 9165, IndexBranchIndexId, pg_index, btree(indbranch oid_ops));
 
 MAKE_SYSCACHE(INDEXRELID, pg_index_indexrelid_index, 64);
 

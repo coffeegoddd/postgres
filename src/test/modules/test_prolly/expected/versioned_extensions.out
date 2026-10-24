@@ -200,8 +200,8 @@ SELECT length(dolt_commit('-Am', 'tables gone')::text) AS committed;
 (1 row)
 
 DROP EXTENSION citext;		-- ve_before's ve.u, ve_after's ve.t
-ERROR:  cannot drop extension citext because objects on branch "ve_before" depend on it
-DETAIL:  Objects on 2 branches other than the session's depend on type citext, which dropping extension citext would drop.
+ERROR:  cannot drop type citext because objects on branch "ve_before" depend on it
+DETAIL:  Objects on 2 branches other than the session's depend on it.
 HINT:  It is shared by every branch.  Drop or change what depends on it on each branch first; CASCADE reaches only the session's branch.
 SELECT dolt_branch('-D', 've_after');
  dolt_branch 

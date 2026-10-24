@@ -61,7 +61,6 @@ typedef FormData_pg_ts_parser *Form_pg_ts_parser;
 
 DECLARE_UNIQUE_INDEX(pg_ts_parser_prsname_index, 3606, TSParserNameNspIndexId, pg_ts_parser, btree(prsname name_ops, prsnamespace oid_ops, prsbranch oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_ts_parser_oid_index, 3607, TSParserOidIndexId, pg_ts_parser, btree(oid oid_ops, prsbranch oid_ops));
-DECLARE_INDEX(pg_ts_parser_branch_index, 9191, TSParserBranchIndexId, pg_ts_parser, btree(prsbranch oid_ops));
 
 MAKE_SYSCACHE(TSPARSERNAMENSP, pg_ts_parser_prsname_index, 2);
 MAKE_SYSCACHE(TSPARSEROID, pg_ts_parser_oid_index, 2);

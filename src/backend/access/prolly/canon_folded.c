@@ -3846,7 +3846,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	 * comparators they call.  Inspect every canonical table's key types.
 	 */
 	rel = table_open(RelationRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(rel, MyBranch);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
@@ -3865,7 +3865,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	table_close(rel, AccessShareLock);
 
 	rel = table_open(DependRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(rel, MyBranch);
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
@@ -4391,7 +4391,7 @@ collect(Canon *cn)
 
 	/* Relations. */
 	pg_class = table_open(RelationRelationId, AccessShareLock);
-	scan = catalog_branch_beginscan(pg_class, MyBranch);
+	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
 	while ((tup = systable_getnext(scan)) != NULL)
 		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	systable_endscan(scan);
@@ -4401,7 +4401,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_ns = table_open(NamespaceRelationId, AccessShareLock);
 
-		scan = catalog_branch_beginscan(pg_ns, MyBranch);
+		scan = systable_beginscan(pg_ns, InvalidOid, false, NULL, 0, NULL);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
@@ -4417,7 +4417,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_type = table_open(TypeRelationId, AccessShareLock);
 
-		scan = catalog_branch_beginscan(pg_type, MyBranch);
+		scan = systable_beginscan(pg_type, InvalidOid, false, NULL, 0, NULL);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
@@ -4441,7 +4441,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_proc = table_open(ProcedureRelationId, AccessShareLock);
 
-		scan = catalog_branch_beginscan(pg_proc, MyBranch);
+		scan = systable_beginscan(pg_proc, InvalidOid, false, NULL, 0, NULL);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
@@ -4535,7 +4535,7 @@ refuse_undescribed(Canon *cn)
 			continue;
 		oidatt = get_object_attnum_oid(classid);
 		rel = table_open(classid, AccessShareLock);
-		scan = catalog_branch_beginscan(rel, MyBranch);
+		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			bool		isnull;
@@ -4584,7 +4584,7 @@ static void
 describe_collations(Canon *cn)
 {
 	Relation	rel = table_open(CollationRelationId, AccessShareLock);
-	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
+	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 	HeapTuple	tup;
 
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -4628,10 +4628,7 @@ describe_collations(Canon *cn)
  * type's to its multirange type): "x:" items named "source AS target",
  * each its method ("function" and the function's qualified signature,
  * "inout" or "binary") and its context ("explicit", "assignment" or
- * "implicit"), a line each.  (What initdb made casts no such type.)  Every
- * cast is read, not only the branch's: one between a type an extension has
- * in a versioned schema and a type outside, made outside the extension, is
- * shared, as both its types are.
+ * "implicit"), a line each.  (What initdb made casts no such type.)
  */
 static void
 describe_casts(Canon *cn)
@@ -5438,7 +5435,7 @@ folded_pending_full(const ProllyNodeRef *baseline,
 	PG_TRY();
 	{
 		classes = table_open(RelationRelationId, AccessShareLock);
-		scan = catalog_branch_beginscan(classes, MyBranch);
+		scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
@@ -11058,11 +11055,12 @@ string_change_merges(const char *from, const char *to)
  * definition one side changed, fails to merge as a schema conflict where
  * that side changed a column's type in a way Dolt doesn't merge
  * (string_change_merges()).  A column both changed differently is a
- * conflict already (merge_table_defs()).
+ * conflict already (merge_table_defs()).  With keep, true for such a
+ * conflict instead of the error.
  */
-static void
+static bool
 check_type_changes(const char *name, const char *base, const char *ours,
-				   const char *theirs)
+				   const char *theirs, bool keep)
 {
 	List	   *sec[3][NUM_TABLE_SECTIONS];
 	TableLine  *tl[3];
@@ -11070,7 +11068,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 
 	if (!split_table_def(base, sec[0]) || !split_table_def(ours, sec[1]) ||
 		!split_table_def(theirs, sec[2]))
-		return;
+		return false;
 	for (int side = 0; side < 3; side++)
 	{
 		tl[side] = table_lines(0, sec[side][0]);
@@ -11100,6 +11098,9 @@ check_type_changes(const char *name, const char *base, const char *ours,
 			char	   *other = type[3 - side];
 
 			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
+				!string_change_merges(type[0], type[side]) && keep)
+				return true;
+			if (strcmp(type[side], type[0]) != 0 && strcmp(other, type[0]) == 0 &&
 				!string_change_merges(type[0], type[side]))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -11108,6 +11109,7 @@ check_type_changes(const char *name, const char *base, const char *ours,
 						 errdetail("A change of type merges with the other side's changes only as a string type made no shorter.")));
 		}
 	}
+	return false;
 }
 
 
@@ -11245,7 +11247,8 @@ check_merged_inheritance(List *tables, List *table_defs, List *types,
  */
 static void
 folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_root,
-					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged)
+					const ProllyNodeRef *theirs_root, ProllyNodeRef *merged,
+					List **kept_conflicts)
 {
 	Canon		cn;
 	ProllyTreeCursor *cur[3];
@@ -11285,6 +11288,7 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 		const ProllyValue *take = NULL;
 		ProllyValue table;
 		char	   *merged_def = NULL;
+		bool		retyped = false;
 
 		/* the least key of the three, and which have it */
 		for (int i = 0; i < 3; i++)
@@ -11301,11 +11305,19 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 #define CHANGED(a) (v[a].len != v[0].len || memcmp(v[a].data, v[0].data, v[0].len) != 0)
 		if (least->data[0] == 't' && has[0] && has[1] && has[2] &&
 			CHANGED(1) && CHANGED(2) && !(SAME(0, 1) && SAME(0, 2)) && !SAME(1, 2))
-			check_type_changes(from_utf8(least->data + 2, least->len - 2),
-							   pnstrdup((const char *) def[0].data, def[0].len),
-							   pnstrdup((const char *) def[1].data, def[1].len),
-							   pnstrdup((const char *) def[2].data, def[2].len));
-		if (SAME(0, 2))
+			retyped = check_type_changes(from_utf8(least->data + 2, least->len - 2),
+										 pnstrdup((const char *) def[0].data, def[0].len),
+										 pnstrdup((const char *) def[1].data, def[1].len),
+										 pnstrdup((const char *) def[2].data, def[2].len),
+										 kept_conflicts != NULL);
+		if (retyped)
+		{
+			/* (kept as ours has it: a schema conflict) */
+			take = &v[1];
+			*kept_conflicts = lappend(*kept_conflicts,
+									  from_utf8(least->data + 2, least->len - 2));
+		}
+		else if (SAME(0, 2))
 			take = has[1] ? &v[1] : NULL;	/* theirs left it: ours */
 		else if (SAME(0, 1) || SAME(1, 2))
 			take = has[2] ? &v[2] : NULL;	/* ours left it, or both alike: theirs */
@@ -11326,6 +11338,13 @@ folded_merge_schema(const ProllyNodeRef *base_root, const ProllyNodeRef *ours_ro
 			table.data = (const uint8 *) item.data;
 			table.len = item.len;
 			take = &table;
+		}
+		else if (kept_conflicts != NULL && least->data[0] == 't')
+		{
+			/* (kept as ours has it, or gone if ours dropped it) */
+			take = has[1] ? &v[1] : NULL;
+			*kept_conflicts = lappend(*kept_conflicts,
+									  from_utf8(least->data + 2, least->len - 2));
 		}
 		else
 			ereport(ERROR,
@@ -12674,7 +12693,8 @@ folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
 	else
 	{
 		Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-		SysScanDesc scan = catalog_branch_beginscan(pg_class, MyBranch);
+		SysScanDesc scan = systable_beginscan(pg_class, InvalidOid, false,
+											  NULL, 0, NULL);
 		HeapTuple	tup;
 
 		while ((tup = systable_getnext(scan)) != NULL)

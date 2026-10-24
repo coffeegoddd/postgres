@@ -2287,7 +2287,21 @@ dolt_merge(PG_FUNCTION_ARGS)
 		/* (the violations it found, besides those the branch had) */
 		int			nviolations = violations_kept() - known;
 
+		ProllyMergeState ms;
+
 		conflicts -= nviolations;
+		/* (a table's definitions in conflict, as Dolt's message says) */
+		if (!IsTransactionBlock() && !prolly_allow_commit_conflicts() &&
+			PROLLY_CALL(refs(), merge_state, &ms) && ms.nschema > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("merge conflict detected, transaction rolled back"),
+					 ms.nschema == 1 ?
+					 errdetail("Table %s was changed differently on both branches: a schema conflict.",
+							   ms.schema_tables[0]) :
+					 errdetail("Tables %s and %d others were changed differently on both branches: schema conflicts.",
+							   ms.schema_tables[0], ms.nschema - 1),
+					 errhint("Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.")));
 		stopped_outside_block("merge", "Merge", "branches", conflicts, nviolations);
 		result[0] = "";
 		result[1] = "0";
@@ -5752,15 +5766,10 @@ dolt_schema_diff(PG_FUNCTION_ARGS)
  * any it had (none for a table dropped)
  */
 static List *
-with_status(List *names, Oid relid, const char *status)
+with_status_named(List *names, const char *name, const char *status)
 {
-	char	   *name = qualified_name(relid);
-	size_t		len;
+	size_t		len = strlen(name);
 	ListCell   *lc;
-
-	if (name == NULL)
-		return names;
-	len = strlen(name);
 
 	foreach(lc, names)
 	{
@@ -5773,6 +5782,14 @@ with_status(List *names, Oid relid, const char *status)
 	return lappend(names, psprintf("%s\t%s", name, status));
 }
 
+static List *
+with_status(List *names, Oid relid, const char *status)
+{
+	char	   *name = qualified_name(relid);
+
+	return name ? with_status_named(names, name, status) : names;
+}
+
 /*
  * dolt_status(OUT table_name text, OUT staged bool, OUT status text)
  *	  returns setof record
@@ -5780,7 +5797,8 @@ with_status(List *names, Oid relid, const char *status)
  * The tables changed since the session branch's head commit (before its
  * first, since the empty root: everything is new): rows changed
  * ("modified"), made ("new table"), dropped ("deleted") or, with a merge
- * in progress, with conflicts ("conflict", not staged), or with constraint
+ * in progress, with conflicts ("conflict", or "schema conflict", not
+ * staged), or with constraint
  * violations ("constraint violation", not staged); the other objects
  * changed (schemas, routines with their argument types, views, types,
  * sequences), with the tables' statuses, as Doltgres lists them; and
@@ -5818,6 +5836,9 @@ dolt_status(PG_FUNCTION_ARGS)
 		{
 			for (int i = 0; i < ms.ntables; i++)
 				names = with_status(names, ms.tables[i], "conflict");
+			for (int i = 0; i < ms.nschema; i++)
+				names = with_status_named(names, ms.schema_tables[i],
+										  "schema conflict");
 		}
 	}
 	else
@@ -5859,6 +5880,7 @@ dolt_status(PG_FUNCTION_ARGS)
 		values[0] = CStringGetTextDatum(lfirst(lc));
 		/* (a conflict, or an object a commit refuses, isn't committed) */
 		values[1] = BoolGetDatum(strcmp(tab + 1, "conflict") != 0 &&
+								 strcmp(tab + 1, "schema conflict") != 0 &&
 								 strcmp(tab + 1, "constraint violation") != 0 &&
 								 strcmp(tab + 1, "not covered") != 0);
 		values[2] = CStringGetTextDatum(tab + 1);
@@ -7561,6 +7583,184 @@ dolt_conflicts_summary(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* A version of a table in a schema conflict: its item, and statements. */
+typedef struct ConflictSide
+{
+	bool		found;			/* listed in a diff from the base */
+	char	   *item;			/* NULL: none (dropped) */
+	int			len;
+	char	   *sql;
+} ConflictSide;
+
+/*
+ * Table name in from and to (refs), if it changed between them, as
+ * dolt_schema_diff() lists it: each side's item and statements (a side
+ * without it: "<deleted>").  Sides already found are left as they are.
+ */
+static void
+conflict_sides(const char *from, const char *to, const char *name,
+			   ConflictSide *from_side, ConflictSide *to_side)
+{
+	ListCell   *lc;
+
+	foreach(lc, summary_rows(from, to, NULL, true))
+	{
+		SummaryRow *r = lfirst(lc);
+
+		if (r->object != PROLLY_OBJECT_TABLE ||
+			!((r->from_name && strcmp(r->from_name, name) == 0) ||
+			  (r->to_name && strcmp(r->to_name, name) == 0)))
+			continue;
+		if (!from_side->found)
+		{
+			from_side->found = true;
+			from_side->item = r->from_item;
+			from_side->len = r->from_len;
+			from_side->sql = r->from_item ?
+				render_item(r->object, r->from_name, r->from_item, r->from_len) :
+				pstrdup("<deleted>");
+		}
+		to_side->found = true;
+		to_side->item = r->to_item;
+		to_side->len = r->to_len;
+		to_side->sql = r->to_item ?
+			render_item(r->object, r->to_name, r->to_item, r->to_len) :
+			pstrdup("<deleted>");
+	}
+}
+
+/* A table version's live columns (ProllyTableColumn *). */
+static List *
+side_columns(const ConflictSide *side)
+{
+	ProllyValue v = {(const uint8 *) side->item, side->len};
+	ProllyValue desc;
+	ProllyNodeRef data;
+	bool		keyed;
+
+	table_item_data(side->item, side->len, &data);
+	desc.data = v.data + 1 + data.hash.len;
+	desc.len = v.len - 1 - data.hash.len;
+	return PROLLY_CALL(canonicalizer(), table_columns, &desc, &keyed);
+}
+
+static ProllyTableColumn *
+column_named(List *columns, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, columns)
+		if (strcmp(((ProllyTableColumn *) lfirst(lc))->name, name) == 0)
+			return lfirst(lc);
+	return NULL;
+}
+
+/*
+ * What conflicts in a table both sides changed, in Dolt's words where it
+ * has them: a column the sides give types that differ, one a side
+ * dropped and the other changed, else the definitions at large.
+ */
+static char *
+conflict_description(const ConflictSide *base, const ConflictSide *ours,
+					 const ConflictSide *theirs)
+{
+	List	   *b;
+	List	   *o;
+	List	   *t;
+	ListCell   *lc;
+
+	if (ours->item == NULL || theirs->item == NULL)
+	{
+		const ConflictSide *kept = ours->item ? ours : theirs;
+
+		return pstrdup(strcmp(kept->sql, base->sql) == 0 ?
+					   "cannot merge a table deletion with data modification" :
+					   "cannot merge a table deletion with schema modification");
+	}
+	if (base->item == NULL)
+		return pstrdup("both branches made the table, defined differently");
+	b = side_columns(base);
+	o = side_columns(ours);
+	t = side_columns(theirs);
+	foreach(lc, b)
+	{
+		ProllyTableColumn *bc = lfirst(lc);
+		ProllyTableColumn *oc = column_named(o, bc->name);
+		ProllyTableColumn *tc = column_named(t, bc->name);
+
+		if (oc && tc && strcmp(oc->type, tc->type) != 0)
+			return psprintf("incompatible column types for column '%s': %s and %s",
+							bc->name, oc->type, tc->type);
+		if ((oc == NULL) != (tc == NULL) &&
+			strcmp((oc ? oc : tc)->type, bc->type) != 0)
+			return psprintf("column '%s' was dropped on one side and changed on the other",
+							bc->name);
+	}
+	return pstrdup("both branches changed the table's definition, and the changes don't merge");
+}
+
+/*
+ * dolt_schema_conflicts(OUT table_name text, OUT base_schema text, OUT
+ * our_schema text, OUT their_schema text, OUT description text) returns
+ * setof record
+ *
+ * The tables the merge in progress kept as the branch has them, as Dolt's
+ * dolt_schema_conflicts lists them: each one's statements in the merge
+ * base, the branch's head and the merged commit (as dolt_schema_diff()
+ * gives them; "<deleted>" where that side dropped it), and what conflicts.
+ */
+Datum
+dolt_schema_conflicts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProllyMergeState ms;
+	ProllyHash	head;
+	char	   *base;
+	char	   *ours;
+	char	   *theirs;
+
+	InitMaterializedSRF(fcinfo, 0);
+	if (!PROLLY_CALL(refs(), merge_state, &ms) || ms.nschema == 0 ||
+		!PROLLY_CALL(refs(), resolve, "HEAD", &head))
+		return (Datum) 0;
+	if (!PROLLY_HAS(canonicalizer(), render))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("the database's canonical form can't be shown as statements")));
+	base = hash_hex(&ms.base);
+	ours = hash_hex(&head);
+	theirs = hash_hex(&ms.theirs);
+	for (int i = 0; i < ms.nschema; i++)
+	{
+		const char *name = ms.schema_tables[i];
+		ConflictSide b = {0};
+		ConflictSide o = {0};
+		ConflictSide t = {0};
+		Datum		values[5];
+		bool		nulls[5] = {0};
+
+		conflict_sides(base, ours, name, &b, &o);
+		conflict_sides(base, theirs, name, &b, &t);
+		/* (a side that changed only the table's rows: as listed from base) */
+		if (!b.found)
+		{
+			b.sql = pstrdup("<deleted>");
+			b.found = true;
+		}
+		if (!o.found)
+			o = b;
+		if (!t.found)
+			t = b;
+		values[0] = CStringGetTextDatum(name);
+		values[1] = CStringGetTextDatum(b.sql);
+		values[2] = CStringGetTextDatum(o.sql);
+		values[3] = CStringGetTextDatum(t.sql);
+		values[4] = CStringGetTextDatum(conflict_description(&b, &o, &t));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
 /*
  * dolt_constraint_violations(OUT table_name text, OUT num_violations int8)
  *
@@ -7815,6 +8015,17 @@ dolt_conflicts_resolve(PG_FUNCTION_ARGS)
 	ProllyMergeState ms;
 	const char *result[1] = {"0"};
 
+	/*
+	 * Schema conflicts aren't resolved so, as in Dolt: the tables in them
+	 * hold the branch's rows, theirs not merged, so neither side's choice
+	 * would be the merge.
+	 */
+	if (PROLLY_CALL(refs(), merge_state, &ms) && ms.nschema > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to automatically resolve schema conflicts, since data changes may not have been fully merged yet"),
+				 errdetail("Table %s has a schema conflict.", ms.schema_tables[0]),
+				 errhint("Abort the merge with dolt_merge('--abort'), change either side of the merge so the definitions agree, then merge again.")));
 	for (int i = 0; i < nargs; i++)
 	{
 		char	   *a = args[i];

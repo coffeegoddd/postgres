@@ -45,7 +45,6 @@ END_CATALOG_STRUCT
 typedef FormData_pg_sequence *Form_pg_sequence;
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_sequence_seqrelid_index, 5002, SequenceRelidIndexId, pg_sequence, btree(seqrelid oid_ops, seqbranch oid_ops));
-DECLARE_INDEX(pg_sequence_branch_index, 9173, SequenceBranchIndexId, pg_sequence, btree(seqbranch oid_ops));
 
 MAKE_SYSCACHE(SEQRELID, pg_sequence_seqrelid_index, 32);
 
