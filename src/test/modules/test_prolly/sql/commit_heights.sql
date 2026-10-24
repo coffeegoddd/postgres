@@ -172,5 +172,37 @@ SELECT test_commit_height(:'low') AS recorded_low;
 SELECT dolt_merge_base('main', :'low') = dolt_hashof('main~1') AS base_by_walk;
 SELECT dolt_merge_base(:'low', 'main') = dolt_hashof('main~1') AS either_way;
 
+-- such a commit is refused from a remote: its height isn't one more than
+-- its parent's, and a merge base's walk would take it on trust.  A fetch
+-- and a clone refuse it, receiving nothing
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/heights-' ||
+	txid_current() AS heights_url \gset
+SELECT dolt_branch('forged', :'low');
+SELECT dolt_remote('add', 'hr', :'heights_url');
+SELECT dolt_push('hr', 'forged') AS pushed;
+CREATE DATABASE regress_heights_received;
+\c regress_heights_received
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{32,}', '<hash>', 'g');
+END $$;
+SELECT pg_temp.err(format('SELECT dolt_clone(%L)', :'heights_url')) AS cloned;
+SELECT count(*) AS branches FROM dolt_branches;
+CREATE SCHEMA hr VERSIONED;
+CREATE TABLE hr.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'own')::text) AS committed;
+SELECT dolt_remote('add', 'hr', :'heights_url');
+SELECT pg_temp.err('SELECT dolt_fetch(''hr'')') AS fetched;
+SELECT count(*) AS tracking FROM dolt_remote_branches;
+\c regress_commit_heights
+DROP DATABASE regress_heights_received;
+
 \c postgres
 DROP DATABASE regress_commit_heights;

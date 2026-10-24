@@ -284,9 +284,9 @@ prolly_history_height(const ProllyHash *id, HTAB *heights,
  * history reaches beneath the base.  Each candidate's height is returned
  * with it.  False, the caller walking instead, if a commit read has no
  * height recorded, or one no less than a child's (heights that aren't
- * Dolt's), or can't be read.  Heights are trusted elsewhere: a history
- * whose heights are wrong only on edges the walk doesn't take may give
- * another base.
+ * Dolt's), or can't be read.  The edges it doesn't take are trusted: a
+ * commit records its height as it is made, and one from a remote is
+ * refused unless its height is its parents' (transfer_chunks.c).
  */
 #define PAINT_A			0x01
 #define PAINT_B			0x02
