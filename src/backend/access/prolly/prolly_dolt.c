@@ -6713,6 +6713,7 @@ struct ProllyHistoryReader
 {
 	char	   *name;			/* the table's name here */
 	bool		reads_all;		/* the database's owner, or pg_read_all_data */
+	MemoryContext cxt;			/* its lineage's, as long as the reader */
 	List	   *lineages;
 	const char *fn;
 };
@@ -6726,6 +6727,7 @@ prolly_history_reader_begin(const char *name, const char *fn)
 
 	r->name = pstrdup(name);
 	r->fn = fn;
+	r->cxt = CurrentMemoryContext;
 	r->reads_all = object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
 		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
 	if (r->reads_all)
@@ -6754,9 +6756,16 @@ void
 prolly_history_reader_check(ProllyHistoryReader *r, const char *commit,
 							const char *version_name)
 {
+	MemoryContext old;
+	bool		has;
+
 	if (r->reads_all)
 		return;
-	if (!lineage_has(name_lineage(&r->lineages, r->name), commit, version_name))
+	/* (the lineage, walked as far as asked, kept for the next commit) */
+	old = MemoryContextSwitchTo(r->cxt);
+	has = lineage_has(name_lineage(&r->lineages, r->name), commit, version_name);
+	MemoryContextSwitchTo(old);
+	if (!has)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",

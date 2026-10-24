@@ -86,6 +86,7 @@
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
+#include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -1555,11 +1556,17 @@ snapshot_open(Oid relid, Mounted *s)
  * A history mount's table has the version's columns, then commit_hash,
  * committer and commit_date: a row for each row of the table at each
  * commit the mounted commit reaches (that has the table), as
- * dolt_history_table() gives them, each read as its own commit defines
- * the table, by the columns' names (a column the commit hasn't, or holds
- * as another type, is NULL).  A scan visits the commits one at a time and
- * streams each one's rows, so LIMIT stops it; an equality on commit_hash
- * visits that commit alone, if the mounted commit reaches it; and the
+ * dolt_history_table(NULL::t) gives them: the commit's table of the name
+ * (one renamed since isn't followed), each read as its own commit defines
+ * it, its columns by identity (renamed since by their names there,
+ * retyped since converted: a value that doesn't convert is NULL, with a
+ * warning once a scan; one the commit hasn't is NULL).  A commit whose
+ * table can't be read here is an error, as is one missing from the store;
+ * a reader is refused a commit whose table isn't the one here, as
+ * dolt_history_table() by name refuses it.  A scan visits the commits one
+ * at a time and streams each one's rows, so LIMIT stops it; an equality
+ * on commit_hash visits that commit alone, if the mounted commit reaches
+ * it (found by walking down to its height, kept for rescans); and the
  * primary key's bounds seek in each commit whose key is the version's.
  * ------------------------------------------------------------------------
  */
@@ -2709,8 +2716,9 @@ typedef struct HistoryScan
 	ProllyNodeRef head_root;	/* the mounted commit's root */
 	char	   *head_identity;	/* and identity record */
 	int			head_identity_len;
-	HTAB	   *reachable;		/* the commits the mounted one reaches, made
-								 * once a commit_hash equality needs it */
+	HTAB	   *reachable;		/* commits the mounted one reaches, found */
+	pairingheap *frontier;		/* (Reach) found, their parents not yet */
+	HTAB	   *heights;
 
 	bool		open;			/* a commit is being read: */
 	Mounted		cur;			/* its table */
@@ -2722,7 +2730,8 @@ typedef struct HistoryScan
 	FmgrInfo   *out;			/* (converted: its output function there) */
 	FmgrInfo   *in;				/* (and its input function now) */
 	Oid		   *ioparam;
-	bool	   *warned;			/* a value didn't convert (warned once) */
+	bool	   *warned;			/* a value didn't convert (warned once a
+								 * scan) */
 	bool	   *wanted;			/* its columns decoded */
 	TupleTableSlot *slot;		/* a row of it */
 	Datum		commit_hash;
@@ -2815,6 +2824,7 @@ snapshot_begin(ForeignScanState *node, int eflags)
 										  ALLOCSET_DEFAULT_SIZES);
 		ss->h.reader = prolly_history_reader_begin(ss->s.source,
 												   "a history mount");
+		ss->h.warned = palloc0(sizeof(bool) * Max(ss->s.t.desc->natts, 1));
 		if (!PROLLY_CALL(refs(), commit_get, &ss->s.commit, &head))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -3008,10 +3018,12 @@ history_same_key(const Mounted *head, const Mounted *cur, const int *map)
 }
 
 /*
- * The name the mount's table has in commit info, by identity (a table
- * renamed since by its name there), and the renames from that commit's
- * names to the mounted commit's (*renames); NULL if the commit has no
- * table of its identity.
+ * The renames that read commit info's version of the mount's table as the
+ * mounted commit names its columns (*renames); and its name there, the
+ * mount's.  As dolt_history_table() reads a version, its table is the one
+ * of that name there: a table renamed since isn't followed to its old
+ * name, and the columns of a table renamed (or moved aside) are read by
+ * their names there.
  */
 static char *
 history_version_name(MountScan *ss, const ProllyCommitInfo *info, List **renames)
@@ -3019,29 +3031,25 @@ history_version_name(MountScan *ss, const ProllyCommitInfo *info, List **renames
 	HistoryScan *h = &ss->h;
 	ProllyValue from = {(const uint8 *) info->identity, info->identity_len};
 	ProllyValue to = {(const uint8 *) h->head_identity, h->head_identity_len};
-	char	   *name = ss->s.source;
+	List	   *all;
 	ListCell   *lc;
 
 	*renames = NIL;
 	if ((info->identity == NULL && h->head_identity == NULL) ||
 		!PROLLY_HAS(canonicalizer(), renames))
-		return name;
-	*renames = PROLLY_CALL(canonicalizer(), renames, &info->root,
-						   info->identity ? &from : NULL, &h->head_root,
-						   h->head_identity ? &to : NULL);
-	foreach(lc, *renames)
+		return ss->s.source;
+	all = PROLLY_CALL(canonicalizer(), renames, &info->root,
+					  info->identity ? &from : NULL, &h->head_root,
+					  h->head_identity ? &to : NULL);
+	foreach(lc, all)
 	{
 		ProllyRename *r = lfirst(lc);
 
-		if (r->column != NULL)
-			continue;
-		if (strcmp(r->to, ss->s.source) == 0)
-			return r->table;
-		/* (the commit's table of the name is another one, moved aside) */
-		if (strcmp(r->table, ss->s.source) == 0)
-			name = NULL;
+		if (r->column == NULL && strcmp(r->table, ss->s.source) == 0)
+			return ss->s.source;
 	}
-	return name;
+	*renames = all;
+	return ss->s.source;
 }
 
 /* A column of table (by its name in a commit) by its name in the mount's. */
@@ -3095,7 +3103,11 @@ history_next_commit(MountScan *ss)
 			continue;
 		(void) hash_search(h->seen, id, HASH_ENTER, &found);
 		if (!PROLLY_CALL(refs(), commit_get, id, &info))
-			continue;
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit is missing"),
+					 errdetail("The history of \"%s\" reaches commit %s.",
+							   ss->s.source, prolly_hash_hex(id))));
 		if (!h->single)
 		{
 			old = MemoryContextSwitchTo(ss->boundcxt);
@@ -3158,7 +3170,6 @@ history_next_commit(MountScan *ss)
 		h->out = palloc0(sizeof(FmgrInfo) * Max(hd->natts, 1));
 		h->in = palloc0(sizeof(FmgrInfo) * Max(hd->natts, 1));
 		h->ioparam = palloc0(sizeof(Oid) * Max(hd->natts, 1));
-		h->warned = palloc0(sizeof(bool) * Max(hd->natts, 1));
 		h->wanted = palloc0(sizeof(bool) * Max(t.desc->natts, 1));
 		for (int i = 0; i < hd->natts; i++)
 		{
@@ -3240,52 +3251,118 @@ history_next_commit(MountScan *ss)
 	return false;
 }
 
+/* A commit the mounted one reaches, its parents not yet looked at. */
+typedef struct Reach
+{
+	pairingheap_node node;
+	int64		height;
+	int			nparents;
+	ProllyHash *parents;
+} Reach;
+
+/* (the highest first: a commit reaches only commits below it) */
+static int
+reach_compare(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	int64		ha = pairingheap_const_container(Reach, node, a)->height;
+	int64		hb = pairingheap_const_container(Reach, node, b)->height;
+
+	return ha < hb ? -1 : ha > hb ? 1 : 0;
+}
+
+static bool
+history_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	return PROLLY_CALL(refs(), commit_get, id, info);
+}
+
+/* A commit's height, its info read already. */
+static int64
+history_height(HistoryScan *h, const ProllyCommitInfo *info)
+{
+	if (info->has_height)
+		return info->height;
+	return prolly_history_height(&info->id, h->heights, history_lookup, NULL);
+}
+
+/* Found reachable: remembered, its parents to be looked at. */
+static void
+history_reach(HistoryScan *h, const ProllyHash *id)
+{
+	ProllyCommitInfo info;
+	Reach	   *r;
+	bool		found;
+
+	(void) hash_search(h->reachable, id, HASH_ENTER, &found);
+	if (found)
+		return;
+	if (!PROLLY_CALL(refs(), commit_get, id, &info))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit is missing"),
+				 errdetail("The history reaches commit %s.",
+						   prolly_hash_hex(id))));
+	r = palloc(sizeof(Reach));
+	r->height = history_height(h, &info);
+	r->nparents = info.nparents;
+	r->parents = palloc(sizeof(ProllyHash) * Max(info.nparents, 1));
+	memcpy(r->parents, info.parents, sizeof(ProllyHash) * info.nparents);
+	pairingheap_add(h->frontier, &r->node);
+}
+
 /*
- * Whether the mounted commit reaches commit c (or is it): by the set of
- * every commit it reaches, made the first time a scan asks (each commit
- * read once), so each rescan's question is a lookup.
+ * Whether the mounted commit reaches commit c (or is it).  Its history is
+ * walked highest first, only down to c's height (none beneath reaches
+ * c), and what is found is kept for the next question: a scan reads each
+ * commit once however many it asks of, and one question reads the
+ * commits above c.
  */
 static bool
 history_reachable(MountScan *ss, const ProllyHash *c)
 {
 	HistoryScan *h = &ss->h;
+	ProllyCommitInfo info;
+	int64		height;
 	bool		found;
+	MemoryContext old = MemoryContextSwitchTo(ss->cxt);
 
 	if (h->reachable == NULL)
 	{
 		HASHCTL		ctl = {0};
-		List	   *queue;
-		MemoryContext old = MemoryContextSwitchTo(ss->cxt);
-		ProllyHash *head = palloc(sizeof(ProllyHash));
 
 		ctl.keysize = sizeof(ProllyHash);
 		ctl.entrysize = sizeof(ProllyHash);
 		ctl.hcxt = ss->cxt;
 		h->reachable = hash_create("prolly history reachable", 256, &ctl,
 								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-		*head = ss->s.commit;
-		queue = list_make1(head);
-		while (queue != NIL)
-		{
-			ProllyHash *id = linitial(queue);
-			ProllyCommitInfo info;
-
-			CHECK_FOR_INTERRUPTS();
-			queue = list_delete_first(queue);
-			(void) hash_search(h->reachable, id, HASH_ENTER, &found);
-			if (found || !PROLLY_CALL(refs(), commit_get, id, &info))
-				continue;
-			for (int i = 0; i < info.nparents; i++)
-			{
-				ProllyHash *p = palloc0(sizeof(ProllyHash));
-
-				*p = info.parents[i];
-				queue = lappend(queue, p);
-			}
-		}
-		MemoryContextSwitchTo(old);
+		h->frontier = pairingheap_allocate(reach_compare, NULL);
+		h->heights = prolly_history_heights();
+		history_reach(h, &ss->s.commit);
 	}
 	(void) hash_search(h->reachable, c, HASH_FIND, &found);
+	if (!found && PROLLY_CALL(refs(), commit_get, c, &info))
+	{
+		height = history_height(h, &info);
+		while (!found && !pairingheap_is_empty(h->frontier))
+		{
+			Reach	   *r = pairingheap_container(Reach, node,
+												  pairingheap_first(h->frontier));
+
+			CHECK_FOR_INTERRUPTS();
+			if (r->height <= height)
+				break;
+			(void) pairingheap_remove_first(h->frontier);
+			for (int i = 0; i < r->nparents; i++)
+			{
+				history_reach(h, &r->parents[i]);
+				if (memcmp(&r->parents[i], c, sizeof(ProllyHash)) == 0)
+					found = true;
+			}
+			pfree(r->parents);
+			pfree(r);
+		}
+	}
+	MemoryContextSwitchTo(old);
 	return found;
 }
 

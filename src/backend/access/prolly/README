@@ -814,14 +814,27 @@ A history mount (prolly_mount(..., history => true)) is dolt_history_table()
 as a foreign table: each table's columns as the mounted commit has them,
 then commit_hash, committer and commit_date, with a row for each row at
 each commit the mounted one reaches (each commit once, merges' parents
-too), read as that commit describes the table, column by name (one the
-commit hasn't, or holds as another type, is NULL).  A scan reads a commit
-at a time and streams its rows, so LIMIT stops it.  An equality on
-commit_hash (a constant, a parameter, or a join's outer row) reads that
-commit alone, if the mounted commit reaches it (the refs' merge_base());
-the primary key's bounds seek in each commit whose key is the version's,
-and a commit keyed otherwise is read whole.  The dolt_history_table()
-functions still read every commit.
+too), read as dolt_history_table(NULL::t) reads it: the commit's table
+of the name (a table renamed since isn't followed to its old name, as the
+functions don't follow it), its columns by identity (one renamed since by
+its name there, one retyped since converted, a value that doesn't convert
+NULL with a warning once a scan, one the commit hasn't NULL).  A commit
+whose table can't be read here (its key ordered by what isn't built in)
+is an error, as a commit missing from the store is.  A reader other than
+the database's owner or pg_read_all_data is refused a commit whose table
+of the name isn't the one here (its lineage, walked once a scan, doesn't
+reach it), as dolt_history_table() by name refuses it.  A scan reads a
+commit at a time and streams its rows, so LIMIT stops it.  An equality
+on commit_hash (a constant, a parameter, or a join's outer row) reads
+that commit alone, if the mounted commit reaches it: the history is
+walked highest commit first down to that commit's height, and what is
+found is kept for the scan's next rescan, so one lookup reads the
+commits above it and a join reads each commit once.  The primary key's
+bounds seek in each commit whose key is the version's, and a commit keyed
+otherwise is read whole.  Planning reads no history (the commits are
+estimated by the mounted one's height).  prolly_mounts() shows which
+mounts are history mounts.  The dolt_history_table() functions still read
+every commit.
 
 
 Core hooks

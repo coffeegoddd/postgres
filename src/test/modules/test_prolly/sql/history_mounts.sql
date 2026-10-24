@@ -150,13 +150,15 @@ SELECT a, count(*) FROM hk.rekeyed WHERE b = 20 GROUP BY a;
 CREATE TABLE hs.ident (id int PRIMARY KEY, old_name text, n text);
 INSERT INTO hs.ident VALUES (1, 'one', '10'), (2, 'two', 'x');
 SELECT length(dolt_commit('-Am', 'ident')::text) > 0 AS committed;
+UPDATE hs.ident SET old_name = 'uno' WHERE id = 1;
+SELECT length(dolt_commit('-Am', 'ident again')::text) > 0 AS committed;
 ALTER TABLE hs.ident RENAME COLUMN old_name TO new_name;
 UPDATE hs.ident SET n = '20' WHERE id = 2;
 ALTER TABLE hs.ident ALTER COLUMN n TYPE int USING n::int;
 SELECT length(dolt_commit('-Am', 'renamed and retyped')::text) > 0 AS committed;
 SELECT mount FROM prolly_mount('HEAD', 'hs', 'hi', ARRAY['ident'], false, true);
 \set VERBOSITY terse
-SELECT id, new_name, n FROM hi.ident ORDER BY commit_date, id;
+SELECT id, new_name, n FROM hi.ident ORDER BY commit_date, id, new_name;
 SELECT (SELECT count(*) FROM (
 		SELECT id, new_name, n, commit_hash FROM hi.ident
 		EXCEPT ALL
@@ -217,6 +219,57 @@ DROP TABLE hs.ordered;
 DROP EXTENSION test_prolly_ordering;
 SELECT length(dolt_commit('-Am', 'no ordered')::text) > 0 AS committed;
 
+-- A role granted the table reads its whole history, commit by commit.
+CREATE TABLE hs.many (id int PRIMARY KEY, v int);
+INSERT INTO hs.many VALUES (1, 0);
+SELECT length(dolt_commit('-Am', 'many 0')::text) > 0 AS committed;
+DO $$
+BEGIN
+	FOR i IN 1..20 LOOP
+		UPDATE hs.many SET v = i;
+		PERFORM dolt_commit('-Am', 'many ' || i);
+	END LOOP;
+END $$;
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'hm', ARRAY['many'], false, true);
+CREATE ROLE regress_history_many;
+GRANT USAGE ON SCHEMA hs, hm TO regress_history_many;
+GRANT SELECT ON hs.many, hm.many TO regress_history_many;
+SET ROLE regress_history_many;
+SELECT count(*), sum(v) FROM hm.many;
+SELECT count(*), sum((row).v) FROM dolt_history_table(NULL::hs.many);
+RESET ROLE;
+REVOKE ALL ON hs.many, hm.many FROM regress_history_many;
+REVOKE ALL ON SCHEMA hs, hm FROM regress_history_many;
+DROP ROLE regress_history_many;
+SELECT prolly_unmount('hm');
+DROP TABLE hs.many;
+SELECT length(dolt_commit('-Am', 'no many')::text) > 0 AS committed;
+
+-- A table renamed since: its versions are those of its name, as
+-- dolt_history_table() reads them (the old name's aren't followed).
+CREATE TABLE hs.before (id int PRIMARY KEY, v text);
+INSERT INTO hs.before VALUES (1, 'b1');
+SELECT length(dolt_commit('-Am', 'before')::text) > 0 AS committed;
+ALTER TABLE hs.before RENAME TO after;
+INSERT INTO hs.after VALUES (2, 'a2');
+SELECT length(dolt_commit('-Am', 'after')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'hr', ARRAY['after'], false, true);
+SELECT id, v FROM hr.after ORDER BY id;
+SELECT (SELECT count(*) FROM (
+		SELECT id, v, commit_hash FROM hr.after
+		EXCEPT ALL
+		SELECT (row).id, (row).v, commit_hash
+		FROM dolt_history_table(NULL::hs.after)) d) AS only_mount,
+	(SELECT count(*) FROM (
+		SELECT (row).id, (row).v, commit_hash
+		FROM dolt_history_table(NULL::hs.after)
+		EXCEPT ALL
+		SELECT id, v, commit_hash FROM hr.after) d) AS only_function,
+	(SELECT count(*) FROM dolt_history_table('hs.after')) AS by_name;
+SELECT prolly_unmount('hr');
+DROP TABLE hs.after;
+SELECT length(dolt_commit('-Am', 'no after')::text) > 0 AS committed;
+
 -- Work: planning reads no history; LIMIT reads few commits; a join to
 -- every commit reads each once (reachability found once per scan).
 SELECT count(*) FILTER (WHERE length(dolt_commit('--allow-empty', '-m', 'empty ' || g)::text) > 0) AS empties
@@ -240,6 +293,21 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('commits_read') < :commits * 5 AS join_reads_each_commit_once;
+-- One commit's lookup reads the commits above it, not the history.
+SELECT dolt_hashof(commit || '~1') AS parent FROM prolly_mounts() WHERE mount = 'h' \gset
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') >= 0 AS counting;
+SELECT count(*) FROM h.users WHERE commit_hash = :'parent' AND tenant_id = 4 AND id = 42;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') < 10 AS lookup_reads_few;
+-- (a commit made since, which the mounted one doesn't reach: none read)
+SELECT length(dolt_commit('--allow-empty', '-m', 'since')::text) > 0 AS committed;
+SELECT dolt_hashof('HEAD') AS since \gset
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') >= 0 AS counting;
+SELECT count(*) FROM h.users WHERE commit_hash = :'since' AND tenant_id = 4 AND id = 42;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('commits_read') < 10 AS unreached_reads_few;
 SELECT mount, history FROM prolly_mounts() ORDER BY mount;
 
 -- Refused: a history mount with index trees, or of a table with a column
