@@ -1,14 +1,17 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Crash recovery replays records of block-mapped storage that is dropped
-# later in the WAL (a hard reset's restore replacing a kept table's
-# storage), whose map is gone from disk.  A record's image of the map's
-# header makes the map's file again, with no root page.  The relation's
-# later records then find no map to follow and are skipped, as a record of
-# a relation whose files are gone is, rather than failing recovery
-# ("could not read blocks 1..1" of the map).  The steps are those of
-# t/237's, with another versioned table committed early, which makes the
-# order of records that hit it.
+# later in the WAL, whose map is gone from disk.  An earlier record's image
+# of the map's header makes the map's file again (redo makes a missing file
+# to restore an image in), with no root page.  In recovery such a map is
+# none: the relation is md.c's, whose redo notes its records' pages as
+# invalid, and the drop's replay forgets them, so recovery completes; it
+# doesn't fail looking up the relation's pages in a map with no root
+# ("could not read blocks 1..1").  A record of a node of the dropped map,
+# whose block was freed and made another relation's page since, leaves that
+# page alone (with full_page_writes off, nothing else restores it).  A live
+# relation whose map lost its root page is none either, and recovery fails
+# as it ends: its records' pages stay invalid.
 
 use strict;
 use warnings FATAL => 'all';
@@ -16,133 +19,117 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $node = PostgreSQL::Test::Cluster->new('redo_dropped_map');
-$node->init(allows_streaming => 1);
-$node->append_conf(
-	'postgresql.conf', q{
+sub map_path
+{
+	my ($node, $rel) = @_;
+	return $node->data_dir . '/'
+	  . $node->safe_psql('postgres', qq{SELECT pg_relation_filepath('$rel')})
+	  . '_bmap';
+}
+
+sub run_case
+{
+	my ($fpw) = @_;
+	my $name = "dropped_map_fpw_$fpw";
+	my $node = PostgreSQL::Test::Cluster->new($name);
+	$node->init;
+	$node->append_conf(
+		'postgresql.conf', qq{
+debug_block_mapped_heap = on
 autovacuum = off
-prolly_fold_worker = off
 checkpoint_timeout = 1h
-wal_keep_size = '256MB'
-wal_consistency_checking = 'all'
+full_page_writes = $fpw
+shared_buffers = 64MB
+log_min_messages = debug1
 });
-$node->start;
-$node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
-$node->backup('base');
-my $standby = PostgreSQL::Test::Cluster->new('redo_dropped_map_standby');
-$standby->init_from_backup($node, 'base', has_streaming => 1);
-$standby->start;
+	$node->start;
+	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
+	$sql->('CREATE EXTENSION test_prolly; CREATE EXTENSION pg_buffercache');
 
-sub sql { return $node->safe_psql('postgres', $_[0]); }
+	# s: extended and changed after a checkpoint (its header's image logged
+	# first), then dropped, its blocks freed and taken by t, whose pages
+	# are written out before a crash.
+	$sql->(q{CREATE TABLE s (a int, b text) WITH (fillfactor = 20);
+		INSERT INTO s SELECT g, repeat('s', 200) FROM generate_series(1, 100) g});
+	$sql->('CHECKPOINT');
+	my $spath = map_path($node, 's');
+	my $srel = $sql->(q{SELECT pg_relation_filepath('s')});
+	open(my $fh, '<:raw', $spath) or die "open $spath: $!";
+	read($fh, my $header, 8192) == 8192 or die "short read";
+	close($fh);
+	$sql->(q{INSERT INTO s SELECT g, repeat('s', 200) FROM generate_series(101, 3000) g;
+		UPDATE s SET b = 'u' WHERE a % 5 = 0});
+	$sql->(q{DROP TABLE s; SELECT * FROM test_bmap_release_drain()});
+	$sql->(q{CREATE TABLE t (a int, b text) WITH (fillfactor = 20);
+		INSERT INTO t SELECT g, repeat('t', 200) FROM generate_series(1, 3000) g});
+	my $want = $sql->(q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM t});
+	my $trel = $sql->(q{SELECT pg_relation_filenode('t')});
+	$sql->(qq{SELECT count(*) FROM pg_buffercache WHERE relfilenode = $trel
+		AND (pg_buffercache_evict(bufferid)).buffer_evicted});
+	ok(!-e $spath, "fpw $fpw: s's map is gone");
+	$node->stop('immediate');
 
-sub visible
-{
-	my ($t, $db) = @_;
-	$db //= 'postgres';
-	return $node->safe_psql($db, qq{
-		SELECT relallvisible || '/' || relpages FROM pg_class
-		WHERE oid = '$t'::regclass});
+	# (s's map as an earlier record's image of its header makes it again)
+	open($fh, '>:raw', $spath) or die "open $spath: $!";
+	print $fh $header or die "write: $!";
+	close($fh) or die "close: $!";
+	my $log_from = -s $node->logfile;
+	ok($node->start(fail_ok => 1), "fpw $fpw: recovery replays s's records");
+	my $log = substr(slurp_file($node->logfile), $log_from);
+	unlike($log, qr/could not read blocks|invalid page in block/,
+		"fpw $fpw: without failing on s's map or the blocks t took");
+	# (with full_page_writes on, their images are restored in md.c's file)
+	like($log, qr/page \d+ of relation \Q$srel\E does not exist/,
+		"fpw $fpw: s's pages are noted invalid, as md.c's")
+	  if $fpw eq 'off';
+	is($sql->(q{SELECT count(*) || ':' || md5(string_agg(a || b, ',' ORDER BY a)) FROM t}),
+		$want, "fpw $fpw: t reads its rows");
+	ok(!-e $spath, "fpw $fpw: and s's map is gone again");
+
+	$node->stop;
 }
 
-sub counted
+run_case('on');
+run_case('off');
+
+# A live map that lost its root page, on a standby restarting from a
+# restartpoint before a change of the relation: the relation is md.c's, its
+# page invalid, and recovery fails reaching consistency, as for a relation
+# whose file is lost.  (Crash recovery, as for md.c, notes it and goes on.)
 {
-	my ($name) = @_;
-	return sql(qq{SELECT pg_stat_force_next_flush();
-		SELECT value FROM pg_stat_prolly WHERE name = '$name'});
+	my $node = PostgreSQL::Test::Cluster->new('lost_root');
+	$node->init(allows_streaming => 1);
+	$node->append_conf(
+		'postgresql.conf', q{
+debug_block_mapped_heap = on
+autovacuum = off
+checkpoint_timeout = 1h
+full_page_writes = off
+});
+	$node->start;
+	my $sql = sub { return $node->safe_psql('postgres', $_[0]); };
+	$sql->(q{CREATE TABLE t (a int, b text);
+		INSERT INTO t SELECT g, repeat('t', 200) FROM generate_series(1, 1000) g});
+	$node->backup('base');
+	my $standby = PostgreSQL::Test::Cluster->new('lost_root_standby');
+	$standby->init_from_backup($node, 'base', has_streaming => 1);
+	$standby->start;
+	$sql->('CHECKPOINT');
+	$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+	$standby->safe_psql('postgres', 'CHECKPOINT');
+	$sql->(q{UPDATE t SET b = 'x' WHERE a = 7});
+	$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
+	my $tpath = $standby->data_dir . '/'
+	  . $sql->(q{SELECT pg_relation_filepath('t')}) . '_bmap';
+	$standby->stop('immediate');
+	truncate($tpath, 8192) or die "truncate $tpath: $!";
+	my $log_from = -s $standby->logfile;
+	$standby->start(fail_ok => 1);
+	ok($standby->wait_for_log(qr/PANIC:  WAL contains references to invalid pages/,
+			$log_from),
+		'a standby whose map lost its root page fails recovery, its page invalid');
+	$standby->stop('immediate', fail_ok => 1);
+	$node->stop;
 }
 
-sql(q{
-	CREATE SCHEMA kv VERSIONED;
-	CREATE TABLE kv.t (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
-	INSERT INTO kv.t SELECT g, repeat('x', 100) FROM generate_series(1, 3000) g;
-	SELECT dolt_commit('-Am', 'c1');
-});
-my $pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
-cmp_ok($pages, '>', 20, 'the table has some pages');
-is(sql(q{SELECT count(*) FROM test_bmap_snapshots(pg_relation_filenode('kv.t'))}),
-	'1', 'c1 keeps it by a snapshot');
-
-# (another versioned table, committed: its storage made, and kept)
-sql(q{CREATE TABLE kv.z (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
-	INSERT INTO kv.z SELECT g, repeat('z', 100) FROM generate_series(1, 3000) g;
-	SELECT dolt_commit('-Am', 'z')});
-
-# Its pages are shared only with c1's snapshot: VACUUM sets them all-visible.
-sql('VACUUM kv.t');
-is(visible('kv.t'), "$pages/$pages", 'VACUUM sets every page kept by c1 all-visible');
-
-# c1's pages are as they were: a hard reset gives them back.
-sql(q{UPDATE kv.t SET v = 'changed' WHERE id % 7 = 0});
-my $restored = counted('relations_restored');
-sql(q{SELECT dolt_reset('--hard')});
-cmp_ok(counted('relations_restored'), '>', $restored, 'a reset gives c1\'s pages back');
-is(sql(q{SELECT count(*) FROM kv.t WHERE v = 'changed'}), '0',
-	'with c1\'s rows');
-
-# The restored storage, its old storage gone, shares its pages with no
-# other map (its own snapshot aside): VACUUM sets them all-visible (the
-# restore gives it no visibility map).
-sql('VACUUM kv.t');
-$pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
-is(visible('kv.t'), "$pages/$pages", 'VACUUM sets the restored storage\'s pages all-visible');
-
-# Changed and committed again: a VACUUM that isn't aggressive, freezing
-# what it can, freezes the kept pages too, so the table's relfrozenxid
-# moves up (one left shared would hold it back).
-sql(q{UPDATE kv.t SET v = 'c2' WHERE id % 5 = 0; SELECT dolt_commit('-am', 'c2')});
-# (transactions after c2's, which a page left unfrozen holds it back by)
-sql('SELECT txid_current()') for 1 .. 20;
-sql(q{SET vacuum_freeze_min_age = 0; VACUUM kv.t});
-$pages = sql(q{SELECT pg_relation_size('kv.t') / 8192});
-is(visible('kv.t'), "$pages/$pages", 'VACUUM sets c2\'s kept pages all-visible');
-cmp_ok(sql(q{SELECT age(relfrozenxid) FROM pg_class WHERE oid = 'kv.t'::regclass}),
-	'<=', 3, 'and freezes them, moving relfrozenxid up to now');
-sql(q{UPDATE kv.t SET v = 'gone'; SELECT dolt_reset('--hard')});
-is(sql(q{SELECT count(*) FILTER (WHERE v = 'c2') || '/' || count(*) FROM kv.t}),
-	'600/3000', 'a reset still gives c2\'s pages back');
-
-# A branch first used of the kept pages shares them with another map:
-# VACUUM leaves them as before, uncopied.
-sql(q{
-	CREATE TABLE kv.u (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
-	INSERT INTO kv.u SELECT g, repeat('y', 100) FROM generate_series(1, 3000) g;
-	SELECT dolt_commit('-Am', 'c3');
-	SELECT dolt_branch('b');
-});
-my $kept = counted('first_use_tables_kept');
-is($node->safe_psql('postgres/b', 'SELECT count(*) FROM kv.u'), '3000',
-	'b is first used');
-cmp_ok(counted('first_use_tables_kept'), '>', $kept, 'made of the pages main keeps');
-my $upages = sql(q{SELECT pg_relation_size('kv.u') / 8192});
-sql('VACUUM kv.u');
-is(visible('kv.u'), "0/$upages", 'VACUUM leaves the pages b shares as they were');
-
-# and on b, whose pages are main's too
-$node->safe_psql('postgres/b', 'VACUUM kv.u');
-is(visible('kv.u', 'postgres/b'), "0/$upages", 'nor b\'s');
-
-# the standby replays it all
-$node->wait_for_catchup($standby, 'replay', $node->lsn('insert'));
-is($standby->safe_psql('postgres',
-		q{SELECT count(*) FILTER (WHERE v = 'c2') || '/' || count(*) FROM kv.t}),
-	'600/3000', 'the standby reads the vacuumed table');
-
-# a crash after: the table and the kept pages as they were
-$node->stop('immediate');
-$node->start;
-is(sql(q{SELECT count(*) FILTER (WHERE v = 'c2') || '/' || count(*) FROM kv.t}),
-	'600/3000', 'after a crash, the table as it was');
-sql(q{UPDATE kv.t SET v = 'again'; SELECT dolt_reset('--hard')});
-is(sql(q{SELECT count(*) FILTER (WHERE v = 'c2') || '/' || count(*) FROM kv.t}),
-	'600/3000', 'and a reset gives the kept pages back');
-is($node->safe_psql('postgres/b', 'SELECT count(*) FROM kv.u'), '3000',
-	'b reads its rows');
-
-# what the map knows of b's sharing survives the crash: VACUUM still
-# leaves those pages as they were
-sql('VACUUM kv.u');
-is(visible('kv.u'), "0/$upages", 'after a crash, VACUUM leaves the pages b shares');
-
-$standby->stop;
-$node->stop;
 done_testing();

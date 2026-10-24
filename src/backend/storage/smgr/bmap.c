@@ -1738,18 +1738,6 @@ tree_find(SMgrRelation reln, BlockNumber blkno, bool for_write,
 	n = Min(n, BMAP_TREE_FANOUT - path.slot[0]);
 	Assert(n > 0);
 
-	/*
-	 * In recovery, a map with no root page on disk is one dropped after the
-	 * record being replayed, whose header an earlier record's image made
-	 * again (redo makes a missing file to restore an image in): the
-	 * relation's pages go nowhere, as a relation's whose files are gone,
-	 * and the map goes again as its drop is replayed.
-	 */
-	if (InRecovery && !cached_only &&
-		(!mdexists(reln, BMAP_FORKNUM) ||
-		 mdnblocks(reln, BMAP_FORKNUM) < BMAP_TREE_MAP_PAGES))
-		return TREE_UNAVAILABLE;
-
 	for (;;)
 	{
 		PGIOAlignedBlock page;
@@ -9525,6 +9513,24 @@ bmapclaims(RelFileLocatorBackend rlocator)
 		rlocator.locator.relNumber == BMAP_REFS_RELNUMBER ||
 		rlocator.locator.relNumber == BMAP_QUEUE_RELNUMBER)
 		return false;
+
+	/*
+	 * In recovery, a map without its root page is none: a relation's map
+	 * has both its pages from when it is made, so a shorter one is one
+	 * dropped later in the WAL, whose header an earlier record's image made
+	 * again (redo makes a missing file to restore an image in), or a map
+	 * that lost its pages.  The relation is then md.c's, whose redo notes
+	 * its records' pages as invalid: the drop's replay forgets them, and
+	 * recovery fails as it ends if no drop comes.
+	 */
+	if (RecoveryInProgress())
+	{
+		RelPathStr	path = relpathperm(rlocator.locator, BMAP_FORKNUM);
+		struct stat st;
+
+		return stat(path.str, &st) == 0 &&
+			st.st_size >= (off_t) BMAP_TREE_MAP_PAGES * BLCKSZ;
+	}
 	return bmap_relation_exists(rlocator.locator);
 }
 
@@ -10727,6 +10733,23 @@ keep_newer_entries(Buffer buf, char *newer)
 	}
 }
 
+/*
+ * In redo: does page-store block 'blk' hold, on disk, a page that is no
+ * tree's node (nor all zeroes)?  Read as it is, not through a buffer.
+ */
+static bool
+redo_block_not_node(RelFileLocator rel, BlockNumber blk)
+{
+	SMgrRelation ssrel = store_smgr(rel);
+	PGIOAlignedBlock page;
+	void	   *pages[1] = {page.data};
+
+	if (blk >= mdnblocks(ssrel, MAIN_FORKNUM))
+		return false;
+	mdreadv(ssrel, MAIN_FORKNUM, blk, pages, 1);
+	return !PageIsNew(page.data) && !tree_node_any(page.data);
+}
+
 static void
 redo_block(XLogReaderState *record, uint8 block_id)
 {
@@ -10791,6 +10814,20 @@ redo_block(XLogReaderState *record, uint8 block_id)
 	memcpy(copy, data, len);
 	memcpy(&kind, copy, sizeof(uint16));
 	memcpy(&flags, copy + sizeof(uint16), sizeof(uint16));
+
+	/*
+	 * A node's entries changed, on a block holding something else on disk
+	 * now (freed since and made a relation's page, written out before a
+	 * crash): the node was let go of after the record, and nothing reads it
+	 * any more.  The block is left as it is; read through a buffer, a
+	 * relation's page would fail its checksum, which is of its logical
+	 * block.
+	 */
+	if (node && !(flags & BMAP_DELTA_INIT) && redo_block_not_node(rlocator, blkno))
+	{
+		pfree(copy);
+		return;
+	}
 
 	if (flags & BMAP_DELTA_INIT)
 	{
