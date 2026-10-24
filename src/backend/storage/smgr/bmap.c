@@ -6039,7 +6039,8 @@ snapshot_take_slot(SMgrRelation reln, BlockList *own)
 	MarkBufferDirty(headerbuf);
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	XLogRegisterBuffer(0, rootbuf, REGBUF_STANDARD);
+	/* (the slot's delta kept with an image too: redo walks what it names) */
+	XLogRegisterBuffer(0, rootbuf, REGBUF_STANDARD | REGBUF_KEEP_DATA);
 	XLogRegisterBufData(0, &sdelta, sizeof(sdelta));
 	XLogRegisterBuffer(1, headerbuf, REGBUF_STANDARD);
 	XLogRegisterBufData(1, &hdelta, sizeof(hdelta));
@@ -11763,10 +11764,12 @@ bmap_redo(XLogReaderState *record)
 					Size		len;
 					char	   *data = XLogRecGetBlockData(record, 0, &len);
 
-					Assert(len == sizeof(sdelta));
-					memcpy(&sdelta, data, sizeof(sdelta));
-					walked = redo_own_blocks(xlrec->locator, &sdelta.snap,
-											 record->ReadRecPtr, &own);
+					if (data != NULL && len == sizeof(sdelta))
+					{
+						memcpy(&sdelta, data, sizeof(sdelta));
+						walked = redo_own_blocks(xlrec->locator, &sdelta.snap,
+												 record->ReadRecPtr, &own);
+					}
 				}
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
