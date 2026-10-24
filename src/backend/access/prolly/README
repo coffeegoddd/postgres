@@ -90,6 +90,17 @@ send formats produced with the client encoding fixed to UTF-8
 and composites.  valenc_canonical.c stores live columns only, without
 trailing NULLs, and decodes rows encoded under an earlier layout.
 
+A reader that needs only some columns asks for those (the value encoder's
+decode_columns(), the keying's decode_row_columns()): the others are
+skipped by their length prefixes, so no type decoder runs for them and no
+long value of theirs is read from its tree.  fields() gives each column's
+encoded bytes, or its value tree's reference, without decoding anything,
+for callers that compare columns by their bytes (two rows hold a column
+alike exactly when its bytes are the same) and decode only some
+(decode_field()).  pg_stat_prolly counts the columns decoded
+(columns_decoded) and the long values read whole (values_read,
+value_bytes_read).
+
 Folded format 17 (key/value encoder version 6) normalizes binary I/O for
 extension base types and for ranges whose bounds reach one (including
 through a composite or array subtype): send(receive(send(value))).
