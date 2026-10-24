@@ -176,7 +176,7 @@ jobs:
         contains(github.event.pull_request.labels.*.name, 'area:postgis')))
     continue-on-error: ${{ startsWith(github.head_ref || '', 'upstream-sync-') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
 
@@ -208,6 +208,10 @@ jobs:
         run: |
           make -C src/test/prolly check-postgis-semantics check-postgis-isolation \
             check-postgis-durability PROLLY_AM=heap POSTGIS_BUILD="${{ steps.postgis.outputs.build-dir }}"
+
+      # (PostGIS's own suite on versioned tables, judged against heap)
+      - name: PostGIS regression suite on versioned tables
+        run: make -C src/test/prolly check-postgis-regress POSTGIS_BUILD="${{ steps.postgis.outputs.build-dir }}"
 
       - name: Upload logs
         if: always()

@@ -138,6 +138,25 @@ gis_catalog's list changes when PostGIS adds a type, operator class,
 operator or aggregate: the group fails until the new member is covered or
 excluded there with a reason.
 
+PostGIS's own regression suite runs separately, as it takes longer:
+
+	make -C src/test/prolly check-postgis-regress POSTGIS_BUILD=DIR
+
+t/299_postgis_regress.pl runs regress/run_test.pl, with PostGIS's own
+hooks, for each suite (core, raster, topology, and sfcgal when built) in
+each mode: heap; prolly (public versioned, and every table a test makes
+in it checked to be a prolly table as it is made); prolly_txn (every
+transaction a Dolt commit); and heap_dump and prolly_dump
+(--dumprestore).  Each prolly mode's per-test outcomes are classified
+against its heap baseline: agree, regression, postgres_semantics (an
+intended difference, listed in postgis_regress_known with its issue),
+known_bug (a difference listed there with the issue that will fix it),
+crashed or timeout.  A regression, crash or timeout fails the group, and
+so does a listed difference that no longer differs.  The classification
+is in tmp_check/postgis_regress/summary.txt.  POSTGIS_REGRESS_SUITES and
+POSTGIS_REGRESS_MODES narrow a run, POSTGIS_REGRESS_TIMEOUT (seconds,
+3600) bounds each.
+
 Validating the tests themselves
 -------------------------------
 
