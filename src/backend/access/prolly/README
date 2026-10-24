@@ -653,6 +653,30 @@ branch is moved to the rebase's head (refused if it moved meanwhile), and
 the rebase's branch deleted.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
+Snapshot mounts (prolly_snapshot.c) are history read through the
+planner: prolly_mount(ref, schema, target) resolves the ref to one commit
+and makes, in the ordinary schema target, a foreign table (foreign data
+wrapper prolly_snapshot, server prolly_local, made at the first mount)
+for each table of schema the commit has, defined as the commit describes
+it: columns, types and collations, no constraints.  Mounting reads the
+commit's root items alone (the canonicalizer's table_metadata()): no row
+is read, re-sorted or written.  It refuses what can't be read as stored:
+a key ordered by a type, operator class or collation that isn't built in,
+a collation whose version changed, an extension ordering it that changed.
+The refs pin the commit under the mount's name ('P', the refs' format
+6), so a collection keeps what it reaches; prolly_unmount() and
+prolly_refresh_mount() drop the mount's tables first, so they wait for
+its scans.  A scan reads only the commit its mount pins, rechecks that
+the reader may read the table's history (SELECT on the table of its name,
+row security not applying), and streams the data tree in key order:
+equalities on the primary key's leading columns and a range on the next
+seek and stop the scan (the keying's encode_key_bound()), the key's order
+is offered to the planner both ways, and an equality joined to another
+relation gives a parameterized path that re-seeks on each rescan.  Only
+the columns the query uses are decoded.  The quals are all kept as the
+plan's filter too.  Secondary indexes aren't persisted in commits, so a
+mount has the primary key's access paths alone.
+
 
 Core hooks
 ----------
