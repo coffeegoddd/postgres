@@ -547,12 +547,14 @@ class V9(VWorkload):
     the load commit and first used (first_use); Δ rows changed on it;
     another branch made from it, dirty (create_branch); a checkout of
     main, used and clean, from the dirty branch (checkout_used); back;
-    the Δ rows committed (commit); the commit's diff (diff); a point read
-    of the load commit (point_read); Δ rows changed again, the head reset
+    the Δ rows committed (commit); the commit's diff (diff); the load
+    commit mounted (mount) and a point read of it by its key (point_read);
+    Δ rows changed again, the head reset
     softly to the load commit (soft_reset) and hard, discarding the
     working set (hard_reset); Δ rows committed again, main changed in
-    another row, and the branch merged into main (merge); the branch
-    deleted (branch_delete)."""
+    another row, and the branch merged into main (merge); another branch of
+    main with Δ rows changed and committed, merged into main untouched since
+    (ff_merge); the first branch deleted (branch_delete)."""
 
     id, title = "V9", "Growth shapes"
 
@@ -636,7 +638,9 @@ class V9(VWorkload):
             ("", "SELECT dolt_checkout('v9_b')"),
             ("commit", "SELECT dolt_commit('-am', 'v9 changes')"),
             ("diff", "SELECT count(*) FROM dolt_diff('HEAD~1', 'HEAD', NULL::v9)"),
-            ("point_read", "SELECT v FROM dolt_at('HEAD~1', NULL::v9) WHERE id = 1"),
+            ("mount", "SELECT prolly_mount('HEAD~1', current_schema(), 'v9m', ARRAY['v9'])"),
+            ("point_read", "SELECT v FROM v9m.v9 WHERE id = 1"),
+            ("", "SELECT prolly_unmount('v9m')"),
             ("", self.change(n, d, 2)),
             ("soft_reset", "SELECT dolt_reset('--soft', 'HEAD~1')"),
             ("hard_reset", "SELECT dolt_reset('--hard')"),
@@ -647,6 +651,14 @@ class V9(VWorkload):
             ("", f"UPDATE v9 SET v = 9 WHERE id = {n}"),
             ("", "SELECT dolt_commit('-am', 'v9 on main')"),
             ("merge", "SELECT dolt_merge('v9_b')"),
+            # (a branch of main, Δ rows changed and committed on it, merged
+            # into main untouched since: a fast-forward)
+            ("", "SELECT dolt_branch('v9_f')"),
+            ("", "SELECT dolt_checkout('v9_f')"),
+            ("", self.change(n, d, 4)),
+            ("", "SELECT dolt_commit('-am', 'v9 to fast-forward')"),
+            ("", "SELECT dolt_checkout('main')"),
+            ("ff_merge", "SELECT dolt_merge('v9_f')"),
             ("branch_delete", "SELECT dolt_branch('-D', 'v9_b')"),
         ]
 

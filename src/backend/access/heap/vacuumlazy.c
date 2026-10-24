@@ -160,9 +160,10 @@
 
 
 /*
- * Does VACUUM freeze, and set all-visible, a block-mapped page shared only
- * with its relation's own snapshots (the pages a commit keeps), copying it?
- * (prolly.vacuum_copy_kept_pages)
+ * prolly.vacuum_copy_kept_pages: when set, VACUUM freezes and sets
+ * all-visible a block-mapped page shared only with its relation's own
+ * snapshots (the pages a commit keeps), copying it; otherwise it leaves
+ * such a page as it leaves any shared page with nothing to reclaim.
  */
 bool		vacuum_copy_kept_pages = false;
 

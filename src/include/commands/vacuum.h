@@ -339,7 +339,6 @@ typedef struct PVWorkerUsage
 /* GUC parameters */
 extern PGDLLIMPORT int default_statistics_target;	/* PGDLLIMPORT for PostGIS */
 extern PGDLLIMPORT int vacuum_freeze_min_age;
-extern PGDLLIMPORT bool vacuum_copy_kept_pages;
 extern PGDLLIMPORT int vacuum_freeze_table_age;
 extern PGDLLIMPORT int vacuum_multixact_freeze_min_age;
 extern PGDLLIMPORT int vacuum_multixact_freeze_table_age;
@@ -347,6 +346,9 @@ extern PGDLLIMPORT int vacuum_failsafe_age;
 extern PGDLLIMPORT int vacuum_multixact_failsafe_age;
 extern PGDLLIMPORT bool track_cost_delay_timing;
 extern PGDLLIMPORT bool vacuum_truncate;
+
+/* block-mapped storage: see vacuumlazy.c */
+extern PGDLLIMPORT bool vacuum_copy_kept_pages;
 
 /*
  * Relevant for vacuums implementing eager scanning. Normal vacuums may

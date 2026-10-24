@@ -358,5 +358,26 @@ SELECT test_commit_identity('plain') IS DISTINCT FROM test_commit_identity('rena
 SELECT test_commit_identity('renamed') LIKE '%app.made%' AS renamed_recorded;
 SELECT dolt_checkout('main');
 
+-- Theirs renames a table and a column of it; ours changes another table:
+-- the merge renames the branch's table and its column, the column first,
+-- while the table still has the name its rename names it by.
+CREATE TABLE app.rn (pk int PRIMARY KEY, v int);
+CREATE TABLE app.rn_other (pk int PRIMARY KEY);
+INSERT INTO app.rn VALUES (1, 10);
+SELECT length(dolt_commit('-Am', 'rn base')::text) AS committed;
+SELECT dolt_branch('rn_theirs');
+INSERT INTO app.rn_other VALUES (1);
+SELECT length(dolt_commit('-am', 'rn ours')::text) AS committed;
+SELECT dolt_checkout('rn_theirs');
+ALTER TABLE app.rn RENAME TO rn2;
+ALTER TABLE app.rn2 RENAME COLUMN v TO w;
+INSERT INTO app.rn2 VALUES (2, 20);
+SELECT length(dolt_commit('-am', 'rn theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+SELECT (dolt_merge('rn_theirs'))[3:4] AS merged;
+SELECT * FROM app.rn2 ORDER BY pk;
+SELECT to_regclass('app.rn') IS NULL AS no_rn;
+SELECT count(*) AS changes FROM dolt_status;
+
 \c contrib_regression
 DROP DATABASE regress_identity_renames;
