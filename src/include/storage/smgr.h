@@ -123,6 +123,10 @@ extern void smgrprepareforchange(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber blocknum, Buffer buffer,
 								 bool neutral);
 extern uint32 smgrreleasestep(SMgrRelation reln);
+extern void smgrprecommitdrop(SMgrRelation reln);
+extern void smgrenddrops(void);
+extern void smgrbeforeextend(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber nblocks);
 extern bool smgrpageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
