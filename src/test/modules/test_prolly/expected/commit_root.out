@@ -1,0 +1,143 @@
+-- A commit written from a canonical state already held (the refs'
+-- commit_root()): its root and dependencies exactly those given, nothing
+-- folded and no change log read, however dirty the working set, and no
+-- branch moved.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked, the session's counts flushed first (:flush, a statement of its
+-- own).
+\set flush 'SELECT pg_stat_force_next_flush();'
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE SCHEMA cr VERSIONED;
+CREATE TABLE cr.t (id int PRIMARY KEY, v text);
+INSERT INTO cr.t SELECT g, 'v' || g FROM generate_series(1, 500) g;
+SELECT (dolt_commit('-Am', 'first'))[1] AS c1 \gset
+-- A dirty working set: any fold would read these rows.
+UPDATE cr.t SET v = 'dirty' WHERE id <= 200;
+CREATE TABLE cr.u (a int PRIMARY KEY);
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_temp.since(c) IS NOT NULL AS counting
+FROM unnest(ARRAY['fold_rows_read', 'fold_tables', 'fold_pages',
+				  'log_pages_read', 'fold_catalog_scans', 'commits']) c;
+ counting 
+----------
+ t
+ t
+ t
+ t
+ t
+ t
+(6 rows)
+
+SELECT test_commit_root(:'c1', :'c1') AS rooted \gset
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT c AS counter, pg_temp.since(c) AS grew
+FROM unnest(ARRAY['fold_rows_read', 'fold_tables', 'fold_pages',
+				  'log_pages_read', 'fold_catalog_scans', 'commits']) c;
+      counter       | grew 
+--------------------+------
+ fold_rows_read     |    0
+ fold_tables        |    0
+ fold_pages         |    0
+ log_pages_read     |    0
+ fold_catalog_scans |    0
+ commits            |    1
+(6 rows)
+
+-- Its root and dependencies are the ones given; it is a new commit, whose
+-- parent is the one given.
+SELECT :'rooted' <> :'c1' AS new_commit;
+ new_commit 
+------------
+ t
+(1 row)
+
+SELECT (SELECT r FROM test_commit_roots(:'rooted') r)
+	 = (SELECT r FROM test_commit_roots(:'c1') r) AS same_roots;
+ same_roots 
+------------
+ t
+(1 row)
+
+SELECT dolt_branch('rooted', :'rooted');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_hashof('rooted~1') = :'c1' AS parent_given;
+ parent_given 
+--------------
+ t
+(1 row)
+
+SELECT message FROM dolt_log('rooted') LIMIT 1;
+    message     
+----------------
+ committed root
+(1 row)
+
+-- No branch moved, and the working set is as it was.
+SELECT dolt_hashof('HEAD') = :'c1' AS head_unmoved;
+ head_unmoved 
+--------------
+ t
+(1 row)
+
+SELECT table_name, status FROM dolt_status ORDER BY 1;
+ table_name |  status   
+------------+-----------
+ cr.t       | modified
+ cr.u       | new table
+(2 rows)
+
+-- The commit reads as the root given: c1's rows.
+SELECT dolt_reset('--hard');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('rooted');
+           dolt_checkout           
+-----------------------------------
+ {0,"Switched to branch 'rooted'"}
+(1 row)
+
+SELECT count(*) AS rows, count(*) FILTER (WHERE v = 'dirty') AS dirty FROM cr.t;
+ rows | dirty 
+------+-------
+  500 |     0
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'rooted');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA cr CASCADE;
+NOTICE:  drop cascades to table cr.t

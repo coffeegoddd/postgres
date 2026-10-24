@@ -9768,6 +9768,26 @@ bmap_redo(XLogReaderState *record)
 									   xlrec->old_hw, xlrec->new_hw);
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
+
+				/*
+				 * A snapshot kept (its header changed too, which a let-go
+				 * leaves): as the primary did, the relation's pages as of
+				 * this record written to the blocks the snapshot holds, and
+				 * durably.  Without online backups no image of them is
+				 * logged, and the pages redo made of the records before
+				 * this go elsewhere once a remap moves the relation off
+				 * them: the snapshot's blocks would keep what they had
+				 * when redo began.
+				 */
+				if (xlrec->op == BMAP_TREE_SNAPSHOT &&
+					XLogRecHasBlockRef(record, 1))
+				{
+					SMgrRelation reln = smgropen(xlrec->locator,
+												 INVALID_PROC_NUMBER);
+
+					FlushRelationsAllBuffers(&reln, 1);
+					mdimmedsync(store_smgr(xlrec->locator), MAIN_FORKNUM);
+				}
 				break;
 			}
 		case XLOG_BMAP_FREE:

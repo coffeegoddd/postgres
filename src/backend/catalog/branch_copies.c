@@ -59,9 +59,11 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_branch.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_index.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/trigger.h"
@@ -79,6 +81,7 @@
 #include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -1129,11 +1132,142 @@ class_row(Relation pg_class, Oid relid, Oid branch)
 }
 
 /*
+ * Copies of the rows a branch-aware catalog has for relation relid on
+ * branch, found by an index whose first column is the relation, in its
+ * order.
+ */
+static List *
+branch_rows(Oid catalog, Oid index, AttrNumber relattr, Oid relid,
+			Oid branch)
+{
+	Relation	rel = table_open(catalog, AccessShareLock);
+	const CatalogBranchInfo *info = catalog_branch_info(catalog);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *rows = NIL;
+
+	ScanKeyInit(&key, relattr, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(rel, index, true, NULL, 1, &key);
+		while ((tup = systable_getnext(scan)) != NULL)
+			if (catalog_row_branch(info, tup) == branch)
+				rows = lappend(rows, heap_copytuple(tup));
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(rel, AccessShareLock);
+	return rows;
+}
+
+/* Is column attnum of two rows of catalog the same value? */
+static bool
+same_column(Oid catalog, HeapTuple a, HeapTuple b, AttrNumber attnum)
+{
+	Relation	rel = table_open(catalog, AccessShareLock);
+	TupleDesc	desc = RelationGetDescr(rel);
+	Form_pg_attribute att = TupleDescAttr(desc, attnum - 1);
+	bool		anull;
+	bool		bnull;
+	Datum		av = heap_getattr(a, attnum, desc, &anull);
+	Datum		bv = heap_getattr(b, attnum, desc, &bnull);
+	bool		same;
+
+	same = anull == bnull &&
+		(anull || datum_image_eq(av, bv, att->attbyval, att->attlen));
+	table_close(rel, AccessShareLock);
+	return same;
+}
+
+/*
+ * Are relation relid's columns, on the session's branch and on source,
+ * stored alike: the same numbers, types, lengths, alignment, storage,
+ * compression, collations and dropped columns, and the same values for a
+ * column a row too short to hold it is read as having?  A share gives the
+ * relation the source's tuples, which are read by the session branch's
+ * descriptor: equal definitions don't make equal layouts (a dropped
+ * column, still in the tuples written before the drop, is described by
+ * neither).
+ */
+static bool
+columns_alike(Oid relid, Oid source)
+{
+	List	   *ours = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+								   Anum_pg_attribute_attrelid, relid, MyBranch);
+	List	   *theirs = branch_rows(AttributeRelationId, AttributeRelidNumIndexId,
+									 Anum_pg_attribute_attrelid, relid, source);
+	ListCell   *a;
+	ListCell   *b;
+
+	if (list_length(ours) != list_length(theirs))
+		return false;
+	forboth(a, ours, b, theirs)
+	{
+		Form_pg_attribute o = (Form_pg_attribute) GETSTRUCT((HeapTuple) lfirst(a));
+		Form_pg_attribute t = (Form_pg_attribute) GETSTRUCT((HeapTuple) lfirst(b));
+
+		if (o->attnum != t->attnum || o->atttypid != t->atttypid ||
+			o->atttypmod != t->atttypmod || o->attlen != t->attlen ||
+			o->attbyval != t->attbyval || o->attalign != t->attalign ||
+			o->attstorage != t->attstorage ||
+			o->attcompression != t->attcompression ||
+			o->attisdropped != t->attisdropped ||
+			o->attcollation != t->attcollation ||
+			o->atthasmissing != t->atthasmissing ||
+			(o->atthasmissing &&
+			 !same_column(AttributeRelationId, lfirst(a), lfirst(b),
+						  Anum_pg_attribute_attmissingval)))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Is index relid defined alike on the session's branch and on source: the
+ * same columns, expressions, operator classes, collations, options,
+ * predicate and uniqueness?  (Not one the source has rebuilt otherwise.)
+ */
+static bool
+index_alike(Oid relid, Oid source)
+{
+	static const AttrNumber compared[] = {
+		Anum_pg_index_indnatts, Anum_pg_index_indnkeyatts,
+		Anum_pg_index_indisunique, Anum_pg_index_indnullsnotdistinct,
+		Anum_pg_index_indisprimary, Anum_pg_index_indisexclusion,
+		Anum_pg_index_indkey, Anum_pg_index_indcollation,
+		Anum_pg_index_indclass, Anum_pg_index_indoption,
+		Anum_pg_index_indexprs, Anum_pg_index_indpred,
+	};
+	List	   *ours = branch_rows(IndexRelationId, IndexRelidIndexId,
+								   Anum_pg_index_indexrelid, relid, MyBranch);
+	List	   *theirs = branch_rows(IndexRelationId, IndexRelidIndexId,
+									 Anum_pg_index_indexrelid, relid, source);
+
+	if (list_length(ours) != 1 || list_length(theirs) != 1)
+		return false;
+	for (int i = 0; i < lengthof(compared); i++)
+		if (!same_column(IndexRelationId, linitial(ours), linitial(theirs),
+						 compared[i]))
+			return false;
+	return true;
+}
+
+/*
  * Give the session branch's relations relids the source branch's storage
  * (#491): each a share of the source's (copy_storage()'s), its row taking
  * the source's say of how old its oldest row is and how big it is (the
- * pages are the source's).  Checked first, all of them, so a refusal
- * changes nothing.
+ * pages are the source's).  The source is held against deletion first
+ * (pin_branch()), and each relation must be stored alike on both: the
+ * same kind, access method, columns as stored and TOAST table, and an
+ * index the same index.  Checked first, all of them, so a refusal changes
+ * nothing.
  */
 static bool
 copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
@@ -1145,6 +1279,10 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 	ListCell   *a;
 	ListCell   *b;
 	bool		alike = true;
+
+	/* (not the storage of a branch being deleted) */
+	if (!pin_branch(source))
+		return false;
 
 	/* (ours as TRUNCATE locks them; the source's as a copy does, its own) */
 	foreach_oid(relid, relids)
@@ -1177,6 +1315,10 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
 		oc = (Form_pg_class) GETSTRUCT(o);
 		tc = (Form_pg_class) GETSTRUCT(t);
 		if (oc->relkind != tc->relkind || !RELKIND_HAS_STORAGE(oc->relkind) ||
+			oc->relam != tc->relam || oc->relnatts != tc->relnatts ||
+			oc->reltoastrelid != tc->reltoastrelid ||
+			!columns_alike(relid, source) ||
+			(oc->relkind == RELKIND_INDEX && !index_alike(relid, source)) ||
 			oc->relpersistence != RELPERSISTENCE_PERMANENT ||
 			tc->relpersistence != RELPERSISTENCE_PERMANENT ||
 			oc->reltablespace != tc->reltablespace ||

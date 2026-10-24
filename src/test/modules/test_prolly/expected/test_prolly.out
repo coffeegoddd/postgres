@@ -54,7 +54,9 @@ FROM prolly_implementations();
  change_log    | stub         |       0 |              0
  move_planner  | costs        |       1 |              1
  move_planner  | stub         |       0 |              0
-(45 rows)
+ matcache      | branches     |       1 |              1
+ matcache      | stub         |       0 |              0
+(47 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -128,7 +130,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  refs          | stub           | branch_lifecycle               | not implemented (missing branch_create, branch_lookup, branch_delete)
  refs          | stub           | commit_then_resolve            | not implemented (missing commit, resolve, commit_get)
  refs          | stub           | merge_base                     | not implemented (missing commit, merge_base)
- refs          | stub           | complete                       | not implemented (71 of 71 callbacks missing)
+ refs          | stub           | complete                       | not implemented (72 of 72 callbacks missing)
  transfer      | chunks         | identity                       | pass
  transfer      | chunks         | receive_then_send              | no checks yet
  transfer      | chunks         | complete                       | pass
@@ -252,7 +254,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  move_planner  | costs          | complete                       | pass
  move_planner  | stub           | identity                       | pass
  move_planner  | stub           | complete                       | not implemented (1 of 1 callbacks missing)
-(190 rows)
+ matcache      | branches       | identity                       | pass
+ matcache      | branches       | complete                       | pass
+ matcache      | stub           | identity                       | pass
+ matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+(194 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

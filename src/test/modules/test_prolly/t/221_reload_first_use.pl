@@ -14,7 +14,9 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('reload_first_use');
 $node->init(allows_streaming => 1);
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+# (the move planner's sources, not pages kept as of the head, which come
+# before them and move nothing: t/203 and t/204 test those)
+$node->append_conf('postgresql.conf', "autovacuum = off\nprolly.kept_commits = 0");
 $node->start;
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
