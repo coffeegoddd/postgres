@@ -355,7 +355,8 @@ SELECT name FROM dolt_branches() ORDER BY name;
  quick
 (4 rows)
 
--- Making a branch takes CREATE on the database; deleting one, owning it.
+-- Making a branch takes CREATE on the database; deleting one, a head
+-- move's privileges: owning the branch (having made it) is enough.
 CREATE ROLE regress_branch_user;
 SET ROLE regress_branch_user;
 DO $$ BEGIN
@@ -376,12 +377,8 @@ SELECT dolt_branch('by_user');
  {0}
 (1 row)
 
-\set VERBOSITY terse
-SELECT dolt_branch('-d', 'by_user');
-ERROR:  permission denied to delete branch "by_user"
-\set VERBOSITY default
 RESET ROLE;
-SELECT dolt_branch('-d', 'by_user');
+SELECT dolt_branch('by_owner');
  dolt_branch 
 -------------
  {0}
@@ -391,6 +388,24 @@ DO $$ BEGIN
 	EXECUTE format('REVOKE CREATE ON DATABASE %I FROM regress_branch_user',
 				   current_database());
 END $$;
+SET ROLE regress_branch_user;
+\set VERBOSITY terse
+SELECT dolt_branch('-d', 'by_owner');
+ERROR:  permission denied to move the head of branch "by_owner"
+\set VERBOSITY default
+SELECT dolt_branch('-d', 'by_user');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+RESET ROLE;
+SELECT dolt_branch('-d', 'by_owner');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP ROLE regress_branch_user;
 -- A role a branch's copy references can't be dropped, even once no other
 -- branch's copy does; dropping what it owns there, or the branch, frees it.

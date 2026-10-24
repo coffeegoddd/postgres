@@ -224,6 +224,7 @@ tests += {
       'kept_commit_shares',
       'snapshot_mounts',
       'history_mounts',
+      'head_move_privileges',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
@@ -382,6 +383,7 @@ tests += {
       't/335_fold_worker_pacing.pl',
       't/336_compared_fold_restart.pl',
       't/337_lock_has_waiters.pl',
+      't/360_cleanup_invariance.pl',
     ],
   },
 }
