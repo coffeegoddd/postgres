@@ -252,3 +252,15 @@ SELECT dolt_remote('remove', 'large');
 
 DROP SCHEMA lv CASCADE;
 SELECT length(dolt_commit('-Am', 'lv gone')::text) AS committed;
+
+-- An edit of a value tree spliced in place reads the nodes on its path
+-- and the leaves around it, as a slice does, whatever the value's size,
+-- and writes the nodes along its path; a rewrite reads every leaf.  (The
+-- splice runs first and writes the nodes, so the rewrite, giving the same
+-- tree, finds them stored.)
+SELECT s.size, c.method, c.nodes_read, c.nodes_written
+FROM (VALUES (1048576::int8), (16777216)) s(size),
+	LATERAL test_value_edit_cost(s.size, s.size / 2, 10, 10) c
+ORDER BY 1, 2;
+SELECT method, nodes_read, nodes_written
+FROM test_value_edit_cost(16777216, 0, 0, 65536);

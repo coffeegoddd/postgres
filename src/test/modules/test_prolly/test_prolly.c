@@ -210,6 +210,8 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_TREE, "held_references",
 	"build_begin build_add build_finish apply get cursor_open cursor_seek cursor_next cursor_close walk diff diff_nodes value_write value_read",
 	tree_held_references},
+	{PROLLY_IFACE_TREE, "value_splices",
+	"value_write value_read value_root value_splice", tree_value_splices},
 };
 
 /* ------------------------------------------------------------------------

@@ -1,0 +1,24 @@
+{
+		Name: "dolt_rebase errors: rebase working branch already exists",
+		SetUpScript: []string{
+			"create table t (pk int primary key);",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('branch1');",
+			"call dolt_branch('dolt_rebase_branch1');",
+
+			"insert into t values (0);",
+			"call dolt_commit('-am', 'inserting row 0');",
+
+			"call dolt_checkout('branch1');",
+			"insert into t values (1);",
+			"call dolt_commit('-am', 'inserting row 1');",
+			"insert into t values (10);",
+			"call dolt_commit('-am', 'inserting row 10');",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query:          "call dolt_rebase('-i', 'main');",
+				ExpectedErrStr: "fatal: A branch named 'dolt_rebase_branch1' already exists.",
+			},
+		},
+	}

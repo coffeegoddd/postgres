@@ -269,8 +269,14 @@ of its own (valenc_canonical.c, through the tree's value_write()), so
 rows holding the same value share it, and a row that is still long goes
 out of line whole.  Value trees are cut by a rolling hash and addressed
 by byte counts, so an insertion rewrites the chunks around it and a
-slice reads only its own.  A leaf records the references its value
-holds, so walks reach those trees without knowing the rows' layout.  The
+slice reads only its own.  An edit can be spliced into a value tree
+(the tree's value_splice()), giving the tree a write of the edited bytes
+would: the leaves around the edit are cut again, and each level above
+made again from the node on the edit's path until its nodes end where
+the old ones did, so it reads and writes the nodes along that path and
+the bytes around the edit, as a slice reads, whatever the value's size.
+A leaf records the references its value holds, so walks reach those
+trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
@@ -316,7 +322,16 @@ in full the first time, then from its baseline using the per-table change
 log (the default finder "log", changes_log.c). The older "pages" finder
 (changes_pages.c) remains registered. Incremental folds can fall back to a
 full fold when the log or baseline cannot be used, or when more rows
-changed than reading the table costs.  Changes past maintenance_work_mem
+changed than reading the table costs.  A table whose rows' bytes changed
+shape without being written (a column added with a default, one dropped,
+the key moved) is folded from its baseline's rows mapped to the shape now
+only where that costs less than reading it: both read every row, and
+decoding the baseline's costs more per row than scanning the heap's until
+the heap holds about prolly.map_reshaped_dead_ratio (1.5, a rough
+break-even) dead versions a live row, as its statistics count them (which
+lag, and count none after a VACUUM or on a standby: a wrong choice costs
+only time, the tree made being the same).  dolt_pending_full_folds() asks
+the same.  Changes past maintenance_work_mem
 are not a reason: they are sorted, spilling to disk, and applied a part at
 a time in key order, so the fold's work stays that of the rows changed
 (pg_stat_prolly's fold_changes_spilled).  A transaction commit's own
@@ -669,10 +684,20 @@ or fixup then replaces the pick's commit with one of its working set, and
 a commit that became empty is dropped (unless --empty=keep).  The plan is
 edited through the dolt_rebase view, whose INSTEAD OF trigger changes the
 state.  A step that conflicts stops the rebase as a pick in progress
-(outside a transaction block, an error that rolls the whole rebase back),
-and --continue commits its resolution; the last step done, the rebased
-branch is moved to the rebase's head (refused if it moved meanwhile), and
-the rebase's branch deleted.
+(outside a transaction block, an error, which rolls back the statement:
+a rebase it began is gone, one begun before is left as it was, to
+continue or abort), and --continue commits its resolution; a pick whose
+definitions conflict (a schema conflict) is such an error too.  The last
+step done, the rebased branch is moved to the rebase's head (refused if
+it moved meanwhile), and the rebase's branch deleted.  An edit's stop
+may amend the commit it stopped at: dolt_commit('--amend') replaces the
+head commit with one of the working set and the head's parents, its
+message kept unless -m gives one, as Dolt's, refused with constraint
+violations unless forced as a commit is.  An amend and a rebase's steps
+replace commits from the head they read, so they hold the branch first,
+and fail (40001, to retry) if another's commit moved it meanwhile; the
+commit amended away has its kept pages let go of, the commit before it
+staying kept.
 prolly_vcs.c adds prolly_root_hash() and prolly_checkpoint().
 
 
