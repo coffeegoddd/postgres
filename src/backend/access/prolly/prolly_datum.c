@@ -2048,6 +2048,8 @@ prolly_datum_decode(ProllyDatumCodec *c, const char *data, int len)
 				return Float8GetDatum(f);
 			}
 		case CODEC_TEXT:
+			/* (as text's receive does: a commit's bytes aren't trusted) */
+			(void) pg_verify_mbstr(PG_UTF8, data, len, false);
 			return PointerGetDatum(cstring_to_text_with_len(data, len));
 		case CODEC_ARRAY:
 			result = decode_array(&c->elem, &p, end);
