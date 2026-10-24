@@ -532,7 +532,11 @@ sweep, lets go of it.  VACUUM freezes and sets all-visible the pages a
 relation shares only with its own snapshots, copying them (the kept
 version goes once its commit stops being kept), but leaves as they are
 the pages another branch shares, which the block map tells apart by when
-each page's entry was born (its header's shared_below).  A
+each page's entry was born (its header's shared_below).  A share
+raises shared_below; once the other branch's map is let go of, a page
+sweep (prolly_page_sweep()), having counted every holder, lowers it to
+the newest entry another map still holds, so VACUUM treats those pages
+as unshared again.  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's

@@ -79,6 +79,65 @@ is($standby->safe_psql('postgres', 'SELECT count(*) FROM kv.u'), '3000',
 sql(q{UPDATE kv.u SET v = 'changed' WHERE id % 3 = 0; SELECT dolt_reset('--hard')});
 is(sql(q{SELECT count(*) FROM kv.u WHERE v = 'changed'}), '0', 'a reset gives c1\'s rows back');
 
+# main written after a branch's first use of its kept pages: the path to
+# the page written is copied, and the subtrees main's tree has in common
+# with the kept snapshot are reached through that snapshot by the branch
+# too.  A sweep, with the branch still sharing them, changes nothing VACUUM
+# does.
+sub table_pages
+{
+	my ($t) = @_;
+	return sql(qq{SELECT pg_relation_size('kv.$t') / 8192});
+}
+
+sub visible_of
+{
+	my ($t) = @_;
+	return sql(qq{SELECT relallvisible FROM pg_class WHERE oid = 'kv.$t'::regclass});
+}
+
+sql(q{
+	CREATE TABLE kv.w (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	INSERT INTO kv.w SELECT g, repeat('w', 100) FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-Am', 'c2');
+	SELECT dolt_branch('e');
+});
+is($node->safe_psql('postgres/e', 'SELECT count(*) FROM kv.w'), '3000', 'e is first used');
+sql(q{UPDATE kv.w SET v = 'z' WHERE id = 1});
+sql('VACUUM kv.w');
+my $before = visible_of('w');
+cmp_ok($before, '<', table_pages('w') / 2, 'VACUUM leaves most of the pages e shares');
+sql(q{SELECT count(*) FROM prolly_page_sweep()});
+sql('VACUUM kv.w');
+is(visible_of('w'), $before,
+	'main written since e\'s first use: with e still sharing, a sweep changes nothing VACUUM does');
+
+# the same with a plain share (a first use not made of kept pages, while
+# main keeps a snapshot)
+sql(q{
+	CREATE TABLE kv.x (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	INSERT INTO kv.x SELECT g, repeat('x', 100) FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-Am', 'c3');
+	SELECT dolt_branch('f');
+});
+is((split /\n/, sql(q{SET prolly.kept_commits = 0; SELECT dolt_checkout('f');
+	SELECT count(*) FROM kv.x}))[-1], '3000', 'f is first used, sharing main\'s storage');
+sql(q{UPDATE kv.x SET v = 'z' WHERE id = 1});
+sql('VACUUM kv.x');
+$before = visible_of('x');
+cmp_ok($before, '<', table_pages('x') / 2, 'VACUUM leaves most of the pages f shares');
+sql(q{SELECT count(*) FROM prolly_page_sweep()});
+sql('VACUUM kv.x');
+is(visible_of('x'), $before,
+	'with f still sharing, a sweep changes nothing VACUUM does');
+
+# and once e and f are deleted and swept, every page is vacuumed
+sql(q{SELECT dolt_branch('-D', 'e'); SELECT dolt_branch('-D', 'f')});
+sql(q{SELECT count(*) FROM prolly_page_sweep()});
+sql('VACUUM kv.w; VACUUM kv.x');
+is(visible_of('w'), table_pages('w'), 'e gone: every page of w all-visible');
+is(visible_of('x'), table_pages('x'), 'f gone: every page of x all-visible');
+
 $standby->stop;
 $node->stop;
 done_testing();

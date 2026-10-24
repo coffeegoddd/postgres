@@ -160,12 +160,17 @@
 #include <unistd.h>
 
 #include "access/bufmask.h"
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "catalog/branch.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
@@ -188,11 +193,14 @@
 #include "storage/procarray.h"
 #include "storage/spin.h"
 #include "storage/subsystems.h"
+#include "utils/fmgroids.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/relfilenumbermap.h"
 #include "utils/resowner.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 bool		debug_block_mapped_heap = false;
@@ -8080,15 +8088,24 @@ sweep_relation(SMgrRelation reln, uint16 *holders, uint64 *reached,
  * A relation's own holders of each block, as the sweep counts every
  * relation's (sweep_node(), sweep_entry()): its tree's and its snapshots'
  * nodes once for each of its pages pointing to them, a node's children
- * once.  Then, walking its tree alone, which of its entries another map
- * may hold: one whose block, or a node on whose path, more hold than the
- * relation does.
+ * once.  Then which of its tree's entries another map may hold.  A node
+ * or a block is held elsewhere if more hold it than the relation does, or
+ * if any of the relation's nodes pointing to it is (a snapshot's too:
+ * another map sharing a snapshot's subtree shares everything under it,
+ * the subtrees and blocks the tree has in common with the snapshot among
+ * them, through a copy of a node as much as through the node itself); an
+ * entry is, if its leaf or its block is.  The
+ * snapshots' subtrees are walked first, a node reached again walked again
+ * when it is newly held elsewhere, so that the tree's walk, last, finds
+ * each node's mark as every pointer to it leaves it.
  */
 typedef struct OwnHolder
 {
 	BlockNumber block;
 	uint32		count;
-	bool		reached;
+	bool		reached;		/* by the count */
+	bool		walked;			/* by the walk marking what is elsewhere */
+	bool		elsewhere;
 } OwnHolder;
 
 typedef struct OwnHolders
@@ -8096,10 +8113,12 @@ typedef struct OwnHolders
 	HTAB	   *own;
 	const uint16 *holders;		/* every relation's */
 	BlockNumber hw;
+	bool		tree;			/* the tree walked now, not a snapshot */
 	bool		elsewhere[BMAP_TREE_TOPS + 1];	/* each level's node on the
-												 * path so far */
+												 * path now */
 	uint32		below;			/* how far shared_below goes down */
 	uint32		shared_below;	/* as it was */
+	uint64		entries;		/* the tree's entries walked */
 } OwnHolders;
 
 static OwnHolder *
@@ -8112,6 +8131,8 @@ own_holder(OwnHolders *oh, BlockNumber b)
 	{
 		h->count = 0;
 		h->reached = false;
+		h->walked = false;
+		h->elsewhere = false;
 	}
 	return h;
 }
@@ -8154,36 +8175,205 @@ held_elsewhere(OwnHolders *oh, BlockNumber b)
 }
 
 /*
- * (the tree's tops come first, a level each from the leaves up, so a top's
- * parent's flag, a level above any reached yet, is still false)
+ * A node reached from the one above it on the path now (elsewhere[level +
+ * 1]; a top has none, the flags cleared before each).  In a snapshot's
+ * walk, a node walked already is walked again only if it is newly held
+ * elsewhere; the tree's walk, each node of the tree reached once, walks
+ * them all.
  */
 static bool
 shared_node(BlockNumber node, uint16 level, BlockNumber first, void *arg)
 {
 	OwnHolders *oh = arg;
 	OwnHolder  *h;
+	bool		newly;
 
-	oh->elsewhere[level] = oh->elsewhere[level + 1] || held_elsewhere(oh, node);
 	if (node >= oh->hw)
+	{
+		oh->elsewhere[level] = true;
 		return true;
-	/* (each node once: the snapshots' subtrees the tree has are walked) */
+	}
 	h = own_holder(oh, node);
-	if (!h->reached)
-		return false;
-	h->reached = false;
-	return true;
+	newly = !h->elsewhere &&
+		(oh->elsewhere[level + 1] || held_elsewhere(oh, node));
+	h->elsewhere |= newly;
+	oh->elsewhere[level] = h->elsewhere;
+	if (oh->tree || !h->walked)
+	{
+		h->walked = true;
+		return true;
+	}
+	return newly;
 }
 
+/*
+ * An entry: in a snapshot's leaf held elsewhere, its block is marked so
+ * (the tree's leaf holding the same block, a copy, shares it no less); in
+ * the tree's, it counts if its leaf or its block is held elsewhere.
+ */
 static void
 shared_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
 {
 	OwnHolders *oh = arg;
+	OwnHolder  *h;
 
-	/* (the tree's own entries, not a snapshot's) */
-	if (!BlockNumberIsValid(blkno) || entry->epoch >= oh->shared_below)
+	if (!oh->tree)
+	{
+		if (oh->elsewhere[0] && entry->block < oh->hw)
+			own_holder(oh, entry->block)->elsewhere = true;
 		return;
-	if (oh->elsewhere[0] || held_elsewhere(oh, entry->block))
+	}
+	oh->entries++;
+	if (entry->epoch >= oh->shared_below)
+		return;
+	h = entry->block < oh->hw ?
+		hash_search(oh->own, &entry->block, HASH_FIND, NULL) : NULL;
+	if (oh->elsewhere[0] || held_elsewhere(oh, entry->block) ||
+		(h != NULL && h->elsewhere))
 		oh->below = Max(oh->below, entry->epoch + 1);
+}
+
+/* The snapshots' subtrees, then the tree, marking what is held elsewhere. */
+static void
+shared_walk(SMgrRelation reln, OwnHolders *oh)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	BmapRoot	root;
+	Buffer		buf = map_read(rel, 1);
+	uint64		first;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
+	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+	oh->tree = false;
+	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
+	{
+		const BmapEntry *tops = snapshot_tops(&root.snap[s]);
+
+		if (root.snap[s].id == 0)
+			continue;
+		first = 0;
+		for (int k = 0; k < BMAP_TREE_TOPS; k++)
+		{
+			memset(oh->elsewhere, 0, sizeof(oh->elsewhere));
+			if (BlockNumberIsValid(tops[k].block))
+				tree_walk_node(reln, &tops[k], k, (BlockNumber) first, true,
+							   shared_node, shared_entry, oh);
+			first += tree_span(k);
+		}
+	}
+	oh->tree = true;
+	first = 0;
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		memset(oh->elsewhere, 0, sizeof(oh->elsewhere));
+		if (BlockNumberIsValid(root.top[k].block))
+			tree_walk_node(reln, &root.top[k], k, (BlockNumber) first, false,
+						   shared_node, shared_entry, oh);
+		first += tree_span(k);
+	}
+}
+
+/*
+ * Hold the relation whose storage rel is against its storage's drop, as
+ * long as the sweep reads and changes its map: its row in pg_class (any
+ * branch's), seen committed by a snapshot now, locked as its readers lock
+ * it (a drop of the table, a rewrite, a restore, a share take
+ * AccessExclusiveLock), and its branch as its sessions hold it (a branch's
+ * deletion drops every relation of it), each tried, not waited for, then
+ * the row found again.  A relation made by a transaction not yet committed
+ * (and dropped if it aborts) has no row a snapshot sees.  False, nothing
+ * held, if any of this fails (or the store is another database's).
+ */
+typedef struct HeldRelation
+{
+	LOCKTAG		rel;
+	LOCKTAG		branch;
+	bool		branch_held;
+} HeldRelation;
+
+static bool
+class_row_of(RelFileLocator rel, Oid *relid, Oid *branch)
+{
+	Relation	pg_class;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	InvalidateCatalogSnapshot();
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key[0], Anum_pg_class_reltablespace, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(rel.spcOid == MyDatabaseTableSpace ?
+										  InvalidOid : rel.spcOid));
+	ScanKeyInit(&key[1], Anum_pg_class_relfilenode, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(rel.relNumber));
+	CatalogAllBranches = true;
+	PG_TRY();
+	{
+		scan = systable_beginscan(pg_class, ClassTblspcRelfilenodeIndexId, true,
+								  NULL, 2, key);
+		if (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			*relid = ((Form_pg_class) GETSTRUCT(tup))->oid;
+			*branch = ((Form_pg_class) GETSTRUCT(tup))->relbranch;
+			found = true;
+		}
+		systable_endscan(scan);
+	}
+	PG_FINALLY();
+	{
+		CatalogAllBranches = false;
+	}
+	PG_END_TRY();
+	table_close(pg_class, AccessShareLock);
+	return found;
+}
+
+static bool
+hold_relation(RelFileLocator rel, HeldRelation *held)
+{
+	Oid			relid;
+	Oid			branch;
+	Oid			again_relid;
+	Oid			again_branch;
+
+	if (rel.dbOid != MyDatabaseId || !IsTransactionState() ||
+		!class_row_of(rel, &relid, &branch))
+		return false;
+	SET_LOCKTAG_BRANCH_RELATION(held->rel, MyDatabaseId, relid, branch);
+	if (LockAcquire(&held->rel, AccessShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+	held->branch_held = OidIsValid(branch);
+	if (held->branch_held)
+	{
+		branch_locktag(&held->branch, branch);
+		if (LockAcquire(&held->branch, AccessShareLock, false, true) ==
+			LOCKACQUIRE_NOT_AVAIL)
+		{
+			LockRelease(&held->rel, AccessShareLock, false);
+			return false;
+		}
+	}
+	AcceptInvalidationMessages();
+	if (!class_row_of(rel, &again_relid, &again_branch) ||
+		again_relid != relid || again_branch != branch)
+	{
+		if (held->branch_held)
+			LockRelease(&held->branch, AccessShareLock, false);
+		LockRelease(&held->rel, AccessShareLock, false);
+		return false;
+	}
+	return true;
+}
+
+static void
+let_go_relation(HeldRelation *held)
+{
+	if (held->branch_held)
+		LockRelease(&held->branch, AccessShareLock, false);
+	LockRelease(&held->rel, AccessShareLock, false);
 }
 
 /*
@@ -8195,7 +8385,8 @@ shared_entry(const BmapEntry *entry, BlockNumber blkno, void *arg)
  * or a page meanwhile only adds holders, of blocks the counts already
  * hold or of blocks newer than any counted, which count as held
  * elsewhere.  Under the header's lock, WAL-logged as a header delta, the
- * relation's length as it is (a truncation's record, which carries one).
+ * relation's length as it is (a truncation's record, which carries one),
+ * the relation held against its drop meanwhile (hold_relation()).
  */
 static void
 sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
@@ -8205,15 +8396,36 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	BmapHeader *header;
 	HASHCTL		ctl;
 	OwnHolders	oh;
+	HeldRelation held;
 
 	if (!mdexists(reln, BMAP_FORKNUM) || mdnblocks(reln, BMAP_FORKNUM) == 0 ||
 		!bmap_relation_exists(rel))
+		return;
+
+	/* (most have none to lower: their headers read first, holding nothing) */
+	headerbuf = map_read(rel, 0);
+	LockBuffer(headerbuf, BUFFER_LOCK_SHARE);
+	if (PageIsNew(BufferGetPage(headerbuf)) ||
+		PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below == 0)
+	{
+		UnlockReleaseBuffer(headerbuf);
+		return;
+	}
+	UnlockReleaseBuffer(headerbuf);
+
+	/*
+	 * (held against its drop: else a drop committed before the lowering's
+	 * record would be replayed before it, and a header dirtied after the
+	 * drop's buffers are dropped would be written to a fork unlinked)
+	 */
+	if (!hold_relation(rel, &held))
 		return;
 	headerbuf = map_read(rel, 0);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	if (PageIsNew(BufferGetPage(headerbuf)))
 	{
 		UnlockReleaseBuffer(headerbuf);
+		let_go_relation(&held);
 		return;
 	}
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
@@ -8221,6 +8433,7 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	if (header->shared_below == 0)
 	{
 		UnlockReleaseBuffer(headerbuf);
+		let_go_relation(&held);
 		return;
 	}
 
@@ -8234,10 +8447,11 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 	oh.hw = hw;
 	oh.shared_below = header->shared_below;
 	tree_walk(reln, own_node, own_entry, &oh);
-	tree_walk(reln, shared_node, shared_entry, &oh);
+	shared_walk(reln, &oh);
 	hash_destroy(oh.own);
 
-	if (oh.below < header->shared_below)
+	/* (a tree of no entries, as a dropped map's is: nothing to change) */
+	if (oh.entries > 0 && oh.below < header->shared_below)
 	{
 		xl_bmap_header_delta delta;
 		XLogRecPtr	lsn;
@@ -8260,6 +8474,20 @@ sweep_shared_below(SMgrRelation reln, const uint16 *holders, BlockNumber hw)
 		END_CRIT_SECTION();
 	}
 	UnlockReleaseBuffer(headerbuf);
+	let_go_relation(&held);
+
+	/*
+	 * (dropped meanwhile all the same, by what holds nothing the sweep
+	 * tried: none of its pages stays in shared buffers, as sweep_relation()
+	 * makes sure)
+	 */
+	if (!bmap_relation_exists(rel))
+	{
+		ForkNumber	forks[2] = {BMAP_FORKNUM, BMAP_CHANGES_FORKNUM};
+		BlockNumber firsts[2] = {0, 0};
+
+		DropRelationBuffers(reln, forks, 2, firsts);
+	}
 }
 
 /*
