@@ -887,8 +887,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('local_drop');
-ERROR:  schema conflict: lm.c was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.c was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM lm.c;
  a field | b  
 ---------+----
@@ -928,8 +929,9 @@ SELECT dolt_checkout('local_drop');
 (1 row)
 
 SELECT dolt_merge('main');
-ERROR:  schema conflict: lm.c was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.c was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM lm.c;
  b  
 ----
@@ -999,8 +1001,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('local_drop');
-ERROR:  schema conflict: lm.d was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.d was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT conname, conislocal, coninhcount FROM pg_constraint
   WHERE conrelid = 'lm.d'::regclass ORDER BY conname;
  conname  | conislocal | coninhcount 
@@ -1044,8 +1047,9 @@ SELECT dolt_checkout('local_drop');
 (1 row)
 
 SELECT dolt_merge('main');
-ERROR:  schema conflict: lm.d was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.d was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT conname, conislocal, coninhcount FROM pg_constraint
   WHERE conrelid = 'lm.d'::regclass ORDER BY conname;
  conname | conislocal | coninhcount 
@@ -1108,8 +1112,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('local_drop');
-ERROR:  schema conflict: lm.c was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.c was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM lm.c;
  a field | b  
 ---------+----
@@ -1154,8 +1159,9 @@ SELECT dolt_checkout('local_drop');
 (1 row)
 
 SELECT dolt_merge('main');
-ERROR:  schema conflict: lm.c was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.c was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM lm.c;
  b  
 ----
@@ -1228,8 +1234,9 @@ SELECT dolt_checkout('main');
 (1 row)
 
 SELECT dolt_merge('local_drop');
-ERROR:  schema conflict: lm.d was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.d was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM lm.d;
  check me 
 ----------
@@ -1278,8 +1285,9 @@ SELECT dolt_checkout('local_drop');
 (1 row)
 
 SELECT dolt_merge('main');
-ERROR:  schema conflict: lm.d was changed differently on both sides
-DETAIL:  Both branches made, dropped or redefined it since their common ancestor.
+ERROR:  merge conflict detected, transaction rolled back
+DETAIL:  Table lm.d was changed differently on both branches: a schema conflict.
+HINT:  Merge in a transaction block to see the conflicts in dolt_schema_conflicts, or set dolt.allow_commit_conflicts to keep them.
 SELECT * FROM lm.d;
  check me 
 ----------

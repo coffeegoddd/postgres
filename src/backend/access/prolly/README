@@ -350,6 +350,19 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+A table both sides of a merge changed in ways that don't merge (its
+definitions changed differently, or one dropped it and the other changed
+it, its definition or only its rows) is a schema conflict.  dolt_merge()
+keeps it as the branch has it, definition and rows, records it in the
+merge in progress (the refs' merge names entry, by name, OID 0: refs
+format 8) and merges the other tables, as Dolt does;
+dolt_schema_conflicts shows its statements in the base, the head and
+theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
+committed until it is aborted.  A cherry-pick or revert, schema conflicts
+of other objects, a conflicted table renamed on either side, and one the
+other side's objects use in its version (a view over a column it added)
+fail as before, the last two saying so.
+
 A keyed row both sides of a merge changed is merged column by column.  A
 long value is held out of line by a reference naming its canonical bytes,
 so where a side's reference is base's, decoded by the same keying, that

@@ -16642,7 +16642,7 @@
       "index": 3,
       "name": "index conflicts: both sides add an index with the same name, same columns, but different type",
       "source_sha256": "09c3374057198709c2c1087dd8f8f84712083f12ad336b7b67fecc801c04a60a",
-      "scenario_sha256": "bcb2790e2fabbb8dfdb675e93cb8d0ce00927413fe86e45788cd5ea095ac29d4",
+      "scenario_sha256": "0e5a487355c75c8c13ca787bf2dea1d4505dd18ca974f0f2073ddb669aa37c11",
       "setup": [
         {
           "index": 0,
@@ -16705,12 +16705,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name; its schemas are Postgres's statements, not MySQL's, so they are checked for what Dolt's show: each side added an index the base lacks, defined differently. (D6, D16)"
         }
       ],
       "adaptations": [
@@ -16725,7 +16727,7 @@
       "index": 4,
       "name": "modifying a column on one side of a merge, and deleting it on the other",
       "source_sha256": "e71a824e079f618713b19efa45c11d8d9a1796de1f6496a5b2ba5659e6deb3ff",
-      "scenario_sha256": "8ce96258e051f227efc0d5cca305244aa562e6071231fab4228a9e43561fa5ac",
+      "scenario_sha256": "d04339fdc522b1344920487d5acd8ac983f5ff000222f06cd75f1037a2c10bee",
       "setup": [
         {
           "index": 0,
@@ -16774,12 +16776,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name. (D6)"
         }
       ],
       "adaptations": [
@@ -16794,7 +16798,7 @@
       "index": 5,
       "name": "type changes to a column on both sides of a merge",
       "source_sha256": "a1866bb24374e8a9ff045f9d1a57e44c9945ce6baa70017579e0bf02bd23f33f",
-      "scenario_sha256": "ee09e93292b56978b45707b29a3f5e93c7858413a14c8ebdf6712b0f68bd137d",
+      "scenario_sha256": "cac22824c58d229a92ad007c869f5eb124498027abc36f2e1c3f5976933d9eec",
       "setup": [
         {
           "index": 0,
@@ -16843,12 +16847,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A schema conflict is an error, 40001, naming the table, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name. (D6)"
         }
       ],
       "adaptations": [
@@ -16863,7 +16869,7 @@
       "index": 6,
       "name": "changing the type of a column",
       "source_sha256": "1630635691fee1f75c87aeda6be2b763db10d0cb803abb8ab391b510faa26a2b",
-      "scenario_sha256": "234369754089273771d08f4c0f0831c49b1b594648d1838daae975851204ecb5",
+      "scenario_sha256": "9bc642f9487426057821e06ca15c275da88ea956de2347f5b8e34ec3eb5d713e",
       "setup": [
         {
           "index": 0,
@@ -16926,12 +16932,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name; its schemas are Postgres's statements, not MySQL's, so they are checked for what Dolt's show: one side as base, the other retyped (in either direction). (D6, D16)"
         }
       ],
       "adaptations": [
@@ -16946,7 +16954,7 @@
       "index": 7,
       "name": "changing the type of a column with an index",
       "source_sha256": "02ae88bbc8cbd935809e90072879a65df02ae74e7779e9fd8a3447aba623a9a4",
-      "scenario_sha256": "5986c07b0440e605646fa7d6ffdbd9c848065e05948657339bb41aa3a2e5e589",
+      "scenario_sha256": "384ae76d352183213370d50cec5ce9fb0ed3a5fc1b43c23f838f909025c48061",
       "setup": [
         {
           "index": 0,
@@ -17010,12 +17018,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name; its schemas are Postgres's statements, not MySQL's, so they are checked for what Dolt's show: one side as base, the other retyped (in either direction). (D6, D16)"
         }
       ],
       "adaptations": [
@@ -17030,7 +17040,7 @@
       "index": 12,
       "name": "varchar narrowing",
       "source_sha256": "1aec957e69fa2a382784cc4a2d7283a7198753ea206620598163219f55bfcfe7",
-      "scenario_sha256": "0e1784d027b531804b39ee2e3e73ed7b8872a4085289a44a927c49501051ba62",
+      "scenario_sha256": "b24420cc74ef2a291f699e4461ffa2ec3658d7d37daf33fd06fe5d6cce8d0c8b",
       "setup": [
         {
           "index": 0,
@@ -17100,12 +17110,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name, with Dolt's description of the column whose types differ. (D6)"
         }
       ],
       "adaptations": [
@@ -17120,7 +17132,7 @@
       "index": 13,
       "name": "TEXT to VARCHAR narrowing",
       "source_sha256": "d1cd6415fe6b4a0bbef976eaab20b2115ac41cd57fdfe0884a82bbda9f1c2289",
-      "scenario_sha256": "40daf1a811eed93064e3696840f64471c00a8cf74d62ecc7b8a584f4acca009f",
+      "scenario_sha256": "9f6a67bf84e3a136919258514b5ccbcb11cfd9458a761d044854934b5351aff2",
       "setup": [
         {
           "index": 0,
@@ -17190,12 +17202,14 @@
           "steps": [
             "assert-1"
           ],
-          "note": "A column one side changed type that Dolt can't merge across the other side's changes (only a string type made no shorter merges) is a schema conflict: an error, 40001, naming the table and column, and the merge doesn't happen; Dolt's merge reports conflicts found and records a dolt_schema_conflicts row. (D4, D6)"
+          "note": "A table schema conflict is kept, as Dolt keeps it: the merge reports conflicts found, the table left as the branch has it, and records it in dolt_schema_conflicts. (D3, D6)"
         },
         {
           "index": 2,
-          "steps": [],
-          "note": "dolt_schema_conflicts: prolly's schema conflicts are errors, so there is no row to read (D6): not ported, so the case is partial."
+          "steps": [
+            "assert-2"
+          ],
+          "note": "dolt_schema_conflicts lists the table, by its qualified name, with Dolt's description of the column whose types differ. (D6)"
         }
       ],
       "adaptations": [

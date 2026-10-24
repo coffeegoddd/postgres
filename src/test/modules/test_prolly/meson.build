@@ -90,6 +90,7 @@ tests += {
       'schema_moves',
       'sequences',
       'schema_merges',
+      'schema_conflicts',
       'merge_truth',
       'table_files',
       'conjoin_choice',

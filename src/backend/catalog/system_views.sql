@@ -1625,5 +1625,8 @@ CREATE VIEW dolt_status AS
 CREATE VIEW dolt_diff AS
     SELECT * FROM dolt_diff();
 
+CREATE VIEW dolt_schema_conflicts AS
+    SELECT * FROM dolt_schema_conflicts();
+
 CREATE VIEW dolt_conflicts AS
     SELECT * FROM dolt_conflicts();
