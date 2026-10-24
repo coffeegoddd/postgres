@@ -694,9 +694,10 @@ change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
 since a commit kept already reusing that one's.  A snapshot writes out only
 the relation's pages changed since its last snapshot (those its map walk
-finds), never visiting the buffers; redo of one still flushes the
-relation's buffers in a pass over them all, so a standby or crash recovery
-pays O(the buffers) per snapshot replayed.  Only while nothing else
+finds), never visiting the buffers, and so does redo of one, walking the
+snapshot's own leaves as the record names them; only a map page newer
+than the replay (a crash's, or a base backup's) sends redo through every
+buffer of the relation instead.  Only while nothing else
 can be on the pages: the relations are locked against writers without
 waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is

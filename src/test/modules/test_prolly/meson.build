@@ -359,6 +359,8 @@ tests += {
       't/226_shared_below_sweep.pl',
       't/227_shared_below_drop.pl',
       't/344_compact_dropped_map.pl',
+      't/386_kept_pages_redo_flush.pl',
+      't/387_kept_pages_standby_redo_flush.pl',
       't/340_bmap_sweep_dropped_map.pl',
       't/341_fold_trim_no_wait.pl',
       't/342_fold_worker_drop.pl',

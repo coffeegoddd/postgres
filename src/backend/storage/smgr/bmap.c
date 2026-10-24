@@ -5305,6 +5305,126 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
 }
 
 /*
+ * In redo, the count of 'phys' into *count, as lookup_ref() reads it; false
+ * if its page is newer than 'lsn' (see redo_own_blocks()).
+ */
+static bool
+redo_lookup_ref(RelFileLocator rel, BlockNumber phys, XLogRecPtr lsn,
+				uint8 *count)
+{
+	Buffer		buf;
+	bool		older;
+
+	*count = 0;
+	if (REF_PAGE(phys) >= refs_nblocks(rel))
+		return true;
+	buf = refs_read(rel, REF_PAGE(phys));
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_refs_page(BufferGetPage(buf), rel, REF_PAGE(phys));
+	older = PageGetLSN(BufferGetPage(buf)) <= lsn;
+	*count = page_ref(BufferGetPage(buf), phys);
+	UnlockReleaseBuffer(buf);
+	return older;
+}
+
+static bool
+redo_own_node(RelFileLocator rel, const BmapEntry *ptr, uint16 level,
+			  BlockNumber first, BlockNumber nblocks, uint32 epoch,
+			  XLogRecPtr lsn, BlockList *own)
+{
+	BmapEntry  *entries;
+	Buffer		buf;
+	uint8		count;
+	bool		ok = true;
+
+	if (first >= nblocks)
+		return true;
+	if (ptr->epoch < epoch)
+	{
+		if (!redo_lookup_ref(rel, ptr->block, lsn, &count))
+			return false;
+		if (count > 0)
+			return true;
+	}
+	/* (a pointer of a page newer than the replay may be past the store) */
+	if (ptr->block >= smgrnblocks(store_smgr(rel), MAIN_FORKNUM))
+		return false;
+	buf = tree_read(rel, ptr->block, RBM_NORMAL);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (PageGetLSN(BufferGetPage(buf)) > lsn ||
+		!tree_node_is(BufferGetPage(buf), level, first, ptr->since))
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+	entries = palloc(BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	memcpy(entries, PageGetBmapEntries(BufferGetPage(buf)),
+		   BMAP_TREE_FANOUT * sizeof(BmapEntry));
+	UnlockReleaseBuffer(buf);
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT && ok; i++)
+	{
+		uint64		child = (uint64) first + (level == 0 ? i :
+											   i * tree_span(level - 1));
+
+		if (!BlockNumberIsValid(entries[i].block) || child >= nblocks)
+			continue;
+		if (level > 0)
+			ok = redo_own_node(rel, &entries[i], level - 1,
+							   (BlockNumber) child, nblocks, epoch, lsn, own);
+		else if (!redo_lookup_ref(rel, entries[i].block, lsn, &count))
+			ok = false;
+		else if (count == 0)
+			block_list_add(own, (BlockNumber) child);
+	}
+	pfree(entries);
+	return ok;
+}
+
+/*
+ * In redo of a snapshot kept ('snap', the record's, which begins at
+ * 'lsn'), its own blocks into 'own', as tree_preserve() collects them where
+ * it was taken: the only pages of the relation that may be dirty in their
+ * buffers only, redo having written out at the relation's last snapshot or
+ * share (or begun after it) what changed before.  Called before the
+ * record's own changes are redone, so that the counts are those the
+ * primary read.
+ *
+ * Recovery may read a map page, or a count page, newer than the replay: a
+ * version written past this point before a crash, or a base backup's.  Its
+ * pointers and counts may name as shared a subtree that changed since the
+ * last snapshot, and the walk would miss a page redo dirtied there.  So
+ * every page the walk reads is to be older than the record, or the walk
+ * gives up (false): the caller writes out every buffer of the relation
+ * instead.
+ */
+static bool
+redo_own_blocks(RelFileLocator rel, const xl_bmap_snapshot *snap,
+				XLogRecPtr lsn, BlockList *own)
+{
+	uint64		first = 0;
+
+	/* (the map's epoch before the snapshot raised it) */
+	uint32		epoch = snap->epoch - 1;
+
+	for (int k = 0; k < BMAP_TREE_TOPS && first < snap->nblocks; k++)
+	{
+		if (BlockNumberIsValid(snap->tops[k].block))
+		{
+			BmapEntry	top;
+
+			top.block = snap->tops[k].block;
+			top.epoch = snap->tops[k].epoch;
+			top.since = snap->tops[k].since;
+			if (!redo_own_node(rel, &top, k, (BlockNumber) first,
+							   snap->nblocks, epoch, lsn, own))
+				return false;
+		}
+		first += tree_span(k);
+	}
+	return true;
+}
+
+/*
  * A tree shared: dst's root page (made with no subtrees) gets src's
  * pointers, and each subtree a holder more, in one record.  That is all the
  * map a share copies: the subtrees stay shared until either relation
@@ -11628,10 +11748,26 @@ bmap_redo(XLogReaderState *record)
 			{
 				xl_bmap_tree *xlrec = (xl_bmap_tree *) XLogRecGetData(record);
 
+				BlockList	own = {0};
+				bool		kept = xlrec->op == BMAP_TREE_SNAPSHOT &&
+					XLogRecHasBlockRef(record, 1);
+				bool		walked = false;
+
 				/* the store reaches a node made, which its image makes */
 				if (xlrec->op == BMAP_TREE_NODE || xlrec->op == BMAP_TREE_COPY)
 					prepare_node_store(xlrec->locator, xlrec->node,
 									   xlrec->old_hw, xlrec->new_hw);
+				if (kept)
+				{
+					xl_bmap_snapshot_delta sdelta;
+					Size		len;
+					char	   *data = XLogRecGetBlockData(record, 0, &len);
+
+					Assert(len == sizeof(sdelta));
+					memcpy(&sdelta, data, sizeof(sdelta));
+					walked = redo_own_blocks(xlrec->locator, &sdelta.snap,
+											 record->ReadRecPtr, &own);
+				}
 				for (uint8 id = 0; id <= XLogRecMaxBlockId(record); id++)
 					redo_block(record, id);
 
@@ -11643,19 +11779,29 @@ bmap_redo(XLogReaderState *record)
 				 * logged, and the pages redo made of the records before
 				 * this go elsewhere once a remap moves the relation off
 				 * them: the snapshot's blocks would keep what they had
-				 * when redo began.  (Every buffer is visited, as before:
-				 * redo doesn't yet write only the pages changed since the
-				 * last snapshot, as bmap_snapshot_take() does, so a standby
-				 * or crash recovery replays each snapshot in O(the
-				 * buffers).)
+				 * when redo began.  The pages written are those of the
+				 * snapshot's own blocks (redo_own_blocks()), each looked up
+				 * in the buffers, as bmap_snapshot_take() writes them: as
+				 * many as changed since the last snapshot.  Only if the
+				 * walk read a page newer than the replay is every buffer
+				 * visited.
 				 */
-				if (xlrec->op == BMAP_TREE_SNAPSHOT &&
-					XLogRecHasBlockRef(record, 1))
+				if (kept)
 				{
 					SMgrRelation reln = smgropen(xlrec->locator,
 												 INVALID_PROC_NUMBER);
 
-					FlushRelationsAllBuffers(&reln, 1);
+					if (walked)
+						FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks,
+											own.n);
+					else
+					{
+						elog(DEBUG1, "redo of a snapshot of %s writes out every buffer of it: its map is newer than the replay",
+							 relpathperm(xlrec->locator, MAIN_FORKNUM).str);
+						FlushRelationsAllBuffers(&reln, 1);
+					}
+					if (own.blocks)
+						pfree(own.blocks);
 					mdimmedsync(store_smgr(xlrec->locator), MAIN_FORKNUM);
 				}
 				break;
