@@ -243,7 +243,10 @@ typedef struct xl_bmap_release
  * An entry of the release queue: a tree's node of 'level', mapping from
  * 'first', born at 'since' (the pointer to it, as a map has it); or a data
  * block (level BMAP_QUEUED_BLOCK).  It holds the block as a map's pointer
- * or entry does.
+ * or entry does.  An entry pushed by a drop before its transaction commits
+ * names that transaction (owner_hi and owner_lo, the low 48 bits of its
+ * FullTransactionId; zero: none): it holds the block only once that
+ * commits, and is let go of with nothing released if it doesn't.
  */
 #define BMAP_QUEUED_BLOCK		0xFFFF
 
@@ -251,9 +254,9 @@ typedef struct BmapQueued
 {
 	BlockNumber block;
 	uint16		level;
-	uint16		unused;
+	uint16		owner_hi;
 	BlockNumber first;
-	uint32		unused2;
+	uint32		owner_lo;
 	XLogRecPtr	since;
 } BmapQueued;
 
