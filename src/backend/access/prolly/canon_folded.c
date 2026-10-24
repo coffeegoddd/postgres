@@ -157,6 +157,7 @@
 #include "access/xlog.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
+#include "catalog/pg_authid_d.h"
 #include "catalog/dependency.h"
 #include "catalog/objectaddress.h"
 #include "catalog/objectaccess.h"
@@ -5974,8 +5975,8 @@ changes_run(void *arg)
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
  * a table collect() describes as a table and reads (not a partition, nor
- * one with columns of types that hold OIDs), whose baseline is of its
- * definition now.
+ * one with columns of types that hold OIDs), or a prolly materialized
+ * view, whose baseline is of its definition now.
  */
 static bool
 table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
@@ -6007,7 +6008,8 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 	PG_TRY();
 	{
 		form = rel->rd_rel;
-		if (form->relkind == RELKIND_RELATION &&
+		if ((form->relkind == RELKIND_RELATION ||
+			 form->relkind == RELKIND_MATVIEW) &&
 			form->relam == PROLLY_TABLE_AM_OID && !form->relispartition &&
 			canon_namespace(form->relnamespace) &&
 			!in_extension(RelationRelationId, relid) &&
@@ -6018,9 +6020,10 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			ProllyHash	dh;
 			BaseTable  *bt;
 			int			save_nestlevel;
+			bool		matview = form->relkind == RELKIND_MATVIEW;
 
 			initStringInfo(&key);
-			appendStringInfoString(&key, "t:");
+			appendStringInfoString(&key, matview ? "m:" : "t:");
 			append_utf8(&key, qualified(form->relnamespace,
 										NameStr(form->relname)));
 			/* (the table's entry alone: a status asks each table so) */
@@ -6034,7 +6037,18 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 									 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
 									 false);
 			initStringInfo(&desc);
-			table_description(&cn, rel, &desc, &dh);
+			if (matview)
+			{
+				/* (as collect_relation() describes one) */
+				append_matview_state(&desc, form);
+				append_utf8(&desc,
+							TextDatumGetCString(DirectFunctionCall2(pg_get_viewdef_ext,
+																	ObjectIdGetDatum(relid),
+																	BoolGetDatum(false))));
+				table_shape(&cn, rel, &desc, &dh, NULL);
+			}
+			else
+				table_description(&cn, rel, &desc, &dh);
 
 			/*
 			 * (its rows folded under the shape they have now, as table_root()
@@ -10409,6 +10423,294 @@ restore_locality(List *tables, List *to)
 	CommandCounterIncrement();
 }
 
+/* the database's owner */
+static Oid
+get_database_owner_role(void)
+{
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	Oid			owner;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	owner = ((Form_pg_database) GETSTRUCT(tup))->datdba;
+	ReleaseSysCache(tup);
+	return owner;
+}
+
+/* A table's policies, as items has its definition (NIL: none, or no table). */
+static List *
+table_policies(List *items, const char *name)
+{
+	MoveItem   *it = items ? find_item(items, 't', name) : NULL;
+	TableDef	td;
+
+	if (it == NULL)
+		return NIL;
+	parse_table_def(it->def, &td);
+	return td.policies;
+}
+
+static bool
+same_statements(List *a, List *b)
+{
+	ListCell   *la;
+	ListCell   *lb;
+
+	if (list_length(a) != list_length(b))
+		return false;
+	forboth(la, a, lb, b)
+		if (strcmp(lfirst(la), lfirst(lb)) != 0)
+			return false;
+	return true;
+}
+
+/*
+ * A policy statement of a move, on table, and whether it may run as the
+ * table's owner when the session's role isn't it: the move leaves the
+ * table's policies as they are, or makes them its writer branch's base's.
+ */
+typedef struct PolicyStatement
+{
+	char	   *sql;
+	char	   *table;
+	bool		owners;
+} PolicyStatement;
+
+static PolicyStatement *
+policy_statement(char *sql, const char *table, List *from, List *to, List *base)
+{
+	PolicyStatement *ps = palloc(sizeof(PolicyStatement));
+	List	   *now = table_policies(to, table);
+
+	ps->sql = sql;
+	ps->table = pstrdup(table);
+	ps->owners = same_statements(table_policies(from, table), now) ||
+		(base != NIL && same_statements(table_policies(base, table), now));
+	return ps;
+}
+
+/*
+ * Run the policy statements, each as the session's role, or, where it may
+ * (PolicyStatement.owners) and the role hasn't its table owner's privileges,
+ * as that owner.  A move drops and makes again every table's policies, as
+ * they may use what it changes; one whose table's policies it leaves as
+ * they are, or makes as the base's, writes no policy of the role's own
+ * making, so the table's owner's authority is the one it needs.
+ */
+static void
+run_policy_statements(List *stmts)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmts)
+	{
+		PolicyStatement *ps = lfirst(lc);
+		Oid			relid = InvalidOid;
+		Oid			owner = InvalidOid;
+		Oid			save_user;
+		int			save_sec;
+		int			rc;
+
+		if (ps->owners)
+		{
+			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(ps->table, NULL)),
+									 NoLock, true);
+			if (OidIsValid(relid))
+			{
+				HeapTuple	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+
+				if (HeapTupleIsValid(tup))
+				{
+					owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
+					ReleaseSysCache(tup);
+				}
+			}
+		}
+		GetUserIdAndSecContext(&save_user, &save_sec);
+		if (OidIsValid(owner) && !has_privs_of_role(save_user, owner))
+		{
+			SetUserIdAndSecContext(owner, save_sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
+			PG_TRY();
+			{
+				rc = SPI_execute(ps->sql, false, 0);
+			}
+			PG_FINALLY();
+			{
+				SetUserIdAndSecContext(save_user, save_sec);
+			}
+			PG_END_TRY();
+		}
+		else
+			rc = SPI_execute(ps->sql, false, 0);
+		if (rc < 0)
+			elog(ERROR, "could not run \"%s\": %s", ps->sql,
+				 SPI_result_code_string(rc));
+	}
+}
+
+/*
+ * Does every definition a move changes (to's objects defined otherwise than
+ * from's, or that from hasn't; from's that to hasn't) become its writer
+ * branch's base's (base, the base's head's items)?  Then the move makes only
+ * what the base's writers defined, which a writer branch's role may take
+ * from its base whatever it owns: a reset to the base, a merge of it, the
+ * fast-forward of an integration.
+ */
+static bool
+definitions_of_base(List *from, List *to, List *base)
+{
+	ListCell   *lc;
+
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+		MoveItem   *b;
+
+		if (f != NULL && strcmp(f->def, t->def) == 0)
+			continue;
+		b = find_item(base, t->kind, t->name);
+		if (b == NULL || strcmp(b->def, t->def) != 0)
+			return false;
+	}
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+
+		if (find_item(to, f->kind, f->name) == NULL &&
+			find_item(base, f->kind, f->name) != NULL)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The owner of the object a move's item names, as the session's branch has
+ * it now; InvalidOid if it has none of the name, or the item is of a kind
+ * whose owner isn't looked up so (routines, types, collations).
+ */
+static Oid
+item_owner(const MoveItem *it, bool *known)
+{
+	Oid			owner = InvalidOid;
+
+	*known = true;
+	if (it->kind == 'n')
+	{
+		HeapTuple	tup = SearchSysCache1(NAMESPACENAME,
+										  CStringGetDatum(unquoted(it->name)));
+
+		if (HeapTupleIsValid(tup))
+		{
+			owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+			ReleaseSysCache(tup);
+		}
+	}
+	else if (it->kind == 't' || it->kind == 'v' || it->kind == 'm' ||
+			 it->kind == 's' || it->kind == 'f')
+	{
+		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(it->name, NULL)),
+											 NoLock, true);
+		HeapTuple	tup;
+
+		if (OidIsValid(relid) &&
+			HeapTupleIsValid(tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid))))
+		{
+			owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
+			ReleaseSysCache(tup);
+		}
+	}
+	else
+		*known = false;
+	return owner;
+}
+
+/*
+ * The role a writer branch's move to its base's definitions
+ * (definitions_of_base()) runs its statements as: the least that may make
+ * them.  The owner of every object it changes or drops, if they are one
+ * role, and the database's owner for those it makes (made by it, they are
+ * its, as the base's writers' would be theirs had they made them here);
+ * else, objects of several owners, or of a kind whose owner isn't looked
+ * up, the bootstrap superuser, as no one role may make all of it.  The
+ * move runs no user code with it: its statements are deparsed definitions,
+ * run with check_function_bodies off, and neither triggers nor event
+ * triggers fire for a move's own DDL (internal history work's), so the
+ * authority makes only the base's definitions.
+ */
+static Oid
+move_authority(List *from, List *to)
+{
+	Oid			authority = InvalidOid;
+	ListCell   *lc;
+
+#define AUTHORITY_IS(role) \
+	do { \
+		if (!OidIsValid(authority)) \
+			authority = (role); \
+		else if (authority != (role)) \
+			return BOOTSTRAP_SUPERUSERID; \
+	} while (0)
+
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+		bool		known;
+		Oid			owner;
+
+		if (f != NULL && strcmp(f->def, t->def) == 0)
+			continue;
+		owner = item_owner(t, &known);
+		if (!known)
+			return BOOTSTRAP_SUPERUSERID;
+		AUTHORITY_IS(OidIsValid(owner) ? owner : get_database_owner_role());
+	}
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		bool		known;
+		Oid			owner;
+
+		if (find_item(to, f->kind, f->name) != NULL)
+			continue;
+		owner = item_owner(f, &known);
+		if (!known || !OidIsValid(owner))
+			return BOOTSTRAP_SUPERUSERID;
+		AUTHORITY_IS(owner);
+	}
+#undef AUTHORITY_IS
+	return OidIsValid(authority) ? authority : get_database_owner_role();
+}
+
+/*
+ * The definitions of the session's branch's writer base, if the session is
+ * on a writer branch: its head commit's items (NIL: not a writer branch, or
+ * a base without commits), and *root, the head's root.
+ */
+static List *
+writer_base_items(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyDatabaseComponents dc;
+	char	   *writer;
+	char	   *base;
+	Oid			role;
+	ProllyHash	head;
+	ProllyCommitInfo info;
+
+	memset(root, 0, sizeof(*root));
+	prolly_database_components(&dc);
+	if (!PROLLY_HAS(dc.writers, writer_branch) ||
+		!PROLLY_CALL(dc.writers, writer_branch, branch_ops()->current(),
+					 &writer, &base, &role) ||
+		!PROLLY_CALL(dc.refs, resolve, base, &head) ||
+		!PROLLY_CALL(dc.refs, commit_get, &head, &info))
+		return NIL;
+	*root = info.root;
+	return move_items(cn, &info.root);
+}
+
 /*
  * Make the session branch's objects defined as to has them, from as from
  * has them (the branch folded now): the statements before the rows, then
@@ -10448,6 +10750,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *aggregates_made = NIL;
 	List	   *policy_drops = NIL;
 	List	   *policy_makes = NIL;
+	List	   *base;			/* the writer base's items, if any */
+	ProllyNodeRef base_root;
+	bool		as_base;		/* the move makes only the base's definitions:
+								 * its statements run as authority */
+	Oid			authority = InvalidOid;
+	Oid			session_user = InvalidOid;
+	int			session_sec = 0;
 	List	   *remade = NIL;
 	List	   *schemas = NIL;
 	List	   *type_drops = NIL;
@@ -10468,7 +10777,16 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	canon_env(&cn);
 	check_format(&cn, to_root, "moved to");
 	from = move_items(&cn, from_root);
+	base = writer_base_items(&cn, &base_root);
 	to = move_items(&cn, to_root);
+	as_base = base != NIL && definitions_of_base(from, to, base);
+	if (as_base)
+	{
+		authority = move_authority(from, to);
+		/* (a role that may make them all already: as itself) */
+		if (has_privs_of_role(GetUserId(), authority))
+			as_base = false;
+	}
 	tm = type_moves(from, to);
 
 	/*
@@ -10974,19 +11292,23 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 		parse_table_def(f->def, &td);
 		foreach(pc, td.policies)
 			policy_drops = lappend(policy_drops,
-								   psprintf("DROP POLICY IF EXISTS %s ON %s",
-											object_name(lfirst(pc), "CREATE POLICY "),
-											f->name));
+								   policy_statement(psprintf("DROP POLICY IF EXISTS %s ON %s",
+															 object_name(lfirst(pc), "CREATE POLICY "),
+															 f->name),
+													f->name, from, to, base));
 	}
 	foreach(lc, to)
 	{
 		MoveItem   *t = lfirst(lc);
 		TableDef	td;
+		ListCell   *pc;
 
 		if (t->kind != 't')
 			continue;
 		parse_table_def(t->def, &td);
-		policy_makes = list_concat(policy_makes, td.policies);
+		foreach(pc, td.policies)
+			policy_makes = lappend(policy_makes,
+								   policy_statement(lfirst(pc), t->name, from, to, base));
 	}
 
 	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
@@ -10997,8 +11319,20 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
+	/*
+	 * (the authority, restricted, for the statements; the session's role for
+	 * the rows.  An error between gives the session its role back as the
+	 * (sub)transaction aborts, which restores the user and security context
+	 * it began with.)
+	 */
+	if (as_base)
+	{
+		GetUserIdAndSecContext(&session_user, &session_sec);
+		SetUserIdAndSecContext(authority, session_sec | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_RESTRICTED_OPERATION);
+	}
 	places = index_places(from);
-	run_statements(policy_drops);
+	run_policy_statements(policy_drops);
 
 	/*
 	 * Rows to go before their columns change type (with every row written
@@ -11040,7 +11374,12 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	{
 		MemoryContext spi = MemoryContextSwitchTo(caller);
 
+		if (as_base)
+			SetUserIdAndSecContext(session_user, session_sec);
 		rows(arg);
+		if (as_base)
+			SetUserIdAndSecContext(authority, session_sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
 		MemoryContextSwitchTo(spi);
 	}
 	run_statements(sm.after);
@@ -11051,7 +11390,12 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 
 		CommandCounterIncrement();
 		spi = MemoryContextSwitchTo(caller);
+		if (as_base)
+			SetUserIdAndSecContext(session_user, session_sec);
 		breaking(sm.added, arg);
+		if (as_base)
+			SetUserIdAndSecContext(authority, session_sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
 		MemoryContextSwitchTo(spi);
 	}
 	run_statements(sm.validations);
@@ -11060,8 +11404,10 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	run_statements(links);
 	restore_locality(relinked, to);
 	make_views(list_concat(sql_bodies, views));
-	run_statements(policy_makes);
+	run_policy_statements(policy_makes);
 	restore_index_places(places);
+	if (as_base)
+		SetUserIdAndSecContext(session_user, session_sec);
 	if (matviews_made)
 	{
 		MemoryContext spi;

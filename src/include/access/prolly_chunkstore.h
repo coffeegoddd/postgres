@@ -84,7 +84,9 @@
  *   (prolly_reclaim.h), in this order, in one transaction:
  *   gc_begin() holds off conjoins and new table files until the
  *   transaction ends (another collection meanwhile is refused, as is one
- *   in a transaction that used the store), seals the journal, and numbers
+ *   in a transaction that used the store; with if_free, the refusal of
+ *   one because another runs is NULL returned, nothing begun, rather than
+ *   an error), seals the journal, and numbers
  *   the chunks collected (slots 0 .. *nslots - 1): the sealed segments',
  *   and the table files' (as scope says: those not settled, all of them,
  *   or none),
@@ -325,7 +327,8 @@ typedef struct ProllyChunkStoreRoutine
 
 	/* Garbage collection: marks are a bit a slot, slot 0 the low bit of 0. */
 	ProllyChunkGc *(*gc_begin) (ProllyChunkStore *store, ProllyGcScope scope,
-								ProllyHash *root, uint64 *nslots);
+								bool if_free, ProllyHash *root,
+								uint64 *nslots);
 	void		(*gc_files) (ProllyChunkGc *gc, ProllyChunkGcFileVisit visit,
 							 void *arg);
 	int64		(*gc_find) (ProllyChunkGc *gc, const ProllyHash *hash);

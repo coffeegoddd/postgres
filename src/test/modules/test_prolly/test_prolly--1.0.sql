@@ -629,3 +629,8 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 -- entry, no index), as a table logged before the format changed has.
 CREATE FUNCTION test_make_format1_change_log(tbl regclass) RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- Whether another backend waits for a lock this one holds, or for its
+-- virtual transaction (what a paced fold gives way to).
+CREATE FUNCTION test_any_lock_has_waiters() RETURNS bool
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -43,6 +43,10 @@
  * batch's rows, or what came in the last max_delay.  A branch not yet due
  * keeps the worker running, as a pending one does.
  *
+ * With prolly_fold_worker_cost_delay set (0, off, by default), the
+ * worker's folds are paced by the cost-based delay, as vacuum is: see
+ * pace_begin() below.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_folder.c
  *
@@ -53,22 +57,27 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_folder.h"
+#include "access/prolly_types.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_database.h"
 #include "commands/dbcommands.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -82,6 +91,9 @@ int			prolly_fold_worker_max_workers = 2;
 int			prolly_fold_worker_naptime = 200;
 int			prolly_fold_worker_batch_rows = 0;
 int			prolly_fold_worker_max_delay = 1000;
+double		prolly_fold_worker_cost_delay = 0;
+int			prolly_fold_worker_cost_limit = -1;
+bool		prolly_fold_paced = false;
 
 /* The most databases, and branches of one, a pass looks at. */
 #define FOLDER_MAX_DATABASES	64
@@ -285,6 +297,152 @@ fold_branch(void *arg)
 	}
 }
 
+/*
+ * Pacing.  A fold of the worker's, with prolly_fold_worker_cost_delay set,
+ * runs under the cost-based delay as a vacuum does: the buffer manager
+ * charges the pages it reads and dirties (the change logs', the tables',
+ * their indexes'), and prolly_fold_delay_point() the tree nodes it reads
+ * (as hit pages: decoded nodes are cached, and the store's files are read
+ * through the kernel's cache mostly) and writes (as dirtied pages: each is
+ * appended, WAL-logged and synced), then naps once the fold has spent
+ * prolly_fold_worker_cost_limit.  Off, nothing is charged, nor any delay
+ * point reached: a fold costs what it did.
+ *
+ * A paced fold holds its locks (the table's, its index's, its change
+ * log's) and its snapshot through its naps, so it gives way to whoever
+ * waits for them: before each nap, if another backend waits for a lock
+ * that conflicts with one it holds, or for its virtual transaction (a
+ * concurrent index build waiting out older snapshots), the fold gives up
+ * (an error the pass takes as a retry, the branch backed off), and is
+ * made again later.  And it
+ * naps for FOLDER_MAX_PACED_NAPS_MS in all at most, then goes on unpaced,
+ * so its snapshot holds the xmin horizon back no longer than that.  A
+ * configuration reload is taken at the delay points, so a change of the
+ * settings reaches the fold under way (0: unpaced from then on).
+ */
+#define FOLDER_MAX_PACED_NAPS_MS	10000
+
+static uint64 paced_nodes_read;
+static uint64 paced_nodes_written;
+static double paced_nap_ms;
+static bool fold_gave_way = false;
+
+static void
+paced_nodes_seen(void)
+{
+	ProllyNodeCounters *c = pgstat_prolly_tree_counters();
+
+	paced_nodes_read = c->nodes_read;
+	paced_nodes_written = c->nodes_written;
+}
+
+static void pace_end(void);
+
+/* The settings as they are now, taken (0: unpaced). */
+static void
+pace_settings(void)
+{
+	if (prolly_fold_worker_cost_delay <= 0)
+	{
+		pace_end();
+		return;
+	}
+	vacuum_cost_delay = prolly_fold_worker_cost_delay;
+	vacuum_cost_limit = prolly_fold_worker_cost_limit > 0 ?
+		prolly_fold_worker_cost_limit : VacuumCostLimit;
+}
+
+static void
+pace_begin(void)
+{
+	fold_gave_way = false;
+	if (prolly_fold_worker_cost_delay <= 0)
+		return;
+	pace_settings();
+	VacuumCostBalance = 0;
+	VacuumCostActive = true;
+	paced_nodes_seen();
+	paced_nap_ms = 0;
+	prolly_fold_paced = true;
+}
+
+static void
+pace_end(void)
+{
+	if (!prolly_fold_paced)
+		return;
+	prolly_fold_paced = false;
+	VacuumCostActive = false;
+	VacuumCostBalance = 0;
+}
+
+void
+prolly_fold_delay_point_paced(void)
+{
+	ProllyNodeCounters *c = pgstat_prolly_tree_counters();
+
+	/* (the counts move to the statistics when they're flushed) */
+	if (c->nodes_read < paced_nodes_read ||
+		c->nodes_written < paced_nodes_written)
+		paced_nodes_read = paced_nodes_written = 0;
+	VacuumCostBalance += (int) ((c->nodes_read - paced_nodes_read) *
+								VacuumCostPageHit +
+								(c->nodes_written - paced_nodes_written) *
+								VacuumCostPageDirty);
+	paced_nodes_seen();
+	if (ConfigReloadPending)
+	{
+		ConfigReloadPending = false;
+		ProcessConfigFile(PGC_SIGHUP);
+		pace_settings();
+		if (!prolly_fold_paced)
+			return;
+	}
+	if (VacuumCostActive && VacuumCostBalance >= vacuum_cost_limit &&
+		INTERRUPTS_CAN_BE_PROCESSED())
+	{
+		instr_time	start;
+		instr_time	napped;
+
+		if (AnyLockHasWaiters())
+		{
+			fold_gave_way = true;
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("fold worker gave way to a lock request")));
+		}
+		if (paced_nap_ms >= FOLDER_MAX_PACED_NAPS_MS)
+		{
+			pace_end();
+			return;
+		}
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_COST_DELAYS, 1);
+		INSTR_TIME_SET_CURRENT(start);
+		vacuum_delay_point(false);
+		INSTR_TIME_SET_CURRENT(napped);
+		INSTR_TIME_SUBTRACT(napped, start);
+		paced_nap_ms += INSTR_TIME_GET_MILLISEC(napped);
+		return;
+	}
+	vacuum_delay_point(false);
+}
+
+/*
+ * As autovacuum_vacuum_cost_limit's: -1 takes vacuum_cost_limit, and 0,
+ * which would mean nothing, is refused.
+ */
+bool
+check_prolly_fold_worker_cost_limit(int *newval, void **extra,
+									GucSource source)
+{
+	if (*newval == 0)
+	{
+		GUC_check_errdetail("prolly_fold_worker_cost_limit must be -1 or between 1 and 10000.");
+		return false;
+	}
+	return true;
+}
+
 typedef struct Moved
 {
 	ProllyMovedBranch *branches;
@@ -454,11 +612,13 @@ fold_pass(const ProllyRefsRoutine *refs)
 		PG_TRY();
 		{
 			PushActiveSnapshot(GetTransactionSnapshot());
+			pace_begin();
 			/* (the worker's own branch, the database's default, as it is) */
 			if (moved[i].branch == MyBranch)
 				fold_branch(&folded);
 			else
 				branch_ops()->run_on(names[i], fold_branch, &folded);
+			pace_end();
 			PopActiveSnapshot();
 			if (folded)
 			{
@@ -494,30 +654,35 @@ fold_pass(const ProllyRefsRoutine *refs)
 		}
 		PG_CATCH();
 		{
-			bool		locked = geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE &&
-				RelationLockRefused;
+			/*
+			 * (a retry: a paced fold that gave way to a lock request, or a
+			 * relation's lock another holds, which the fold doesn't wait
+			 * for: checkpoint_unless_moved())
+			 */
+			bool		retry = fold_gave_way ||
+				(geterrcode() == ERRCODE_LOCK_NOT_AVAILABLE &&
+				 RelationLockRefused);
 
+			pace_end();
+			fold_gave_way = false;
 			HOLD_INTERRUPTS();
-			if (!locked)
+			if (!retry)
 				EmitErrorReport();
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
 			RESUME_INTERRUPTS();
 			Assert(!RelationLocksNoWait);
 
-			if (locked)
+			if (retry)
 			{
-				/*
-				 * (a relation's lock another holds, which the fold doesn't
-				 * wait for: checkpoint_unless_moved(); folded again once
-				 * backed off)
-				 */
+				/* (folded again once its backoff is over, as a retry) */
 				pending = true;
 				back_off(moved[i].branch);
 				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
 				AtEOXact_PgStat_Prolly();
 				elog(DEBUG1, "fold worker left branch %u for its next pass: "
-					 "a lock it needed was held", moved[i].branch);
+					 "it gave way to a lock request, or a lock it needed was held",
+					 moved[i].branch);
 			}
 			else
 			{

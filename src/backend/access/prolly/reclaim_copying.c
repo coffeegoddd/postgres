@@ -378,8 +378,8 @@ horizon_read_end(int code, Datum arg)
 	WalSndHorizonReadEnd();
 }
 
-static void
-copying_collect(bool full, ProllyGcResult *result)
+static bool
+copying_collect(bool full, bool if_free, ProllyGcResult *result)
 {
 	const ProllyChunkStoreRoutine *cs = prolly_chunk_store();
 	ProllyChunkStore *store = PROLLY_CALL(cs, open, MyDatabaseId,
@@ -394,8 +394,10 @@ copying_collect(bool full, ProllyGcResult *result)
 	memset(&mk, 0, sizeof(mk));
 	mk.cs = cs;
 	mk.gc = PROLLY_CALL(cs, gc_begin, store,
-						full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT,
+						full ? PROLLY_GC_FULL : PROLLY_GC_DEFAULT, if_free,
 						&root, &mk.nslots);
+	if (mk.gc == NULL)
+		return false;			/* (another collection running) */
 	mk.marks = MemoryContextAllocHuge(CurrentMemoryContext, mk.nslots / 8 + 1);
 	memset(mk.marks, 0, mk.nslots / 8 + 1);
 	mk.cap = Max((uint64) maintenance_work_mem * 1024 / sizeof(uint64), 1024);
@@ -483,6 +485,7 @@ copying_collect(bool full, ProllyGcResult *result)
 	PROLLY_CALL(cs, gc_retire, mk.gc);
 	if (mk.spill != NULL)
 		BufFileClose(mk.spill);
+	return true;
 }
 
 /* (nothing to mark: every chunk is) */
@@ -510,7 +513,8 @@ copying_move(ProllyGcResult *result)
 	int			nfiles = 0;
 	bool	   *keep;
 
-	gc = PROLLY_CALL(cs, gc_begin, store, PROLLY_GC_JOURNAL, &root, &nslots);
+	gc = PROLLY_CALL(cs, gc_begin, store, PROLLY_GC_JOURNAL, false, &root,
+					 &nslots);
 	marks = MemoryContextAllocHuge(CurrentMemoryContext, nslots / 8 + 1);
 	memset(marks, 0xFF, nslots / 8 + 1);
 	PROLLY_CALL(cs, gc_files, gc, count_file, &nfiles);
