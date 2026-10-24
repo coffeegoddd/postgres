@@ -18,7 +18,7 @@ FROM prolly_implementations();
  content_hash  | test_broken  |    9002 |              0
  key_encoder   | ordered      |       1 |              7
  key_encoder   | stub         |       0 |              0
- value_encoder | canonical    |       2 |              7
+ value_encoder | canonical    |       2 |              8
  value_encoder | stub         |       0 |              0
  reclamation   | copying      |       1 |              1
  reclamation   | stub         |       0 |              0
@@ -56,7 +56,9 @@ FROM prolly_implementations();
  move_planner  | stub         |       0 |              0
  matcache      | branches     |       1 |              1
  matcache      | stub         |       0 |              0
-(47 rows)
+ json_tree     | paths        |       1 |              1
+ json_tree     | stub         |       0 |              0
+(49 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but
@@ -272,7 +274,11 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(208 rows)
+ json_tree     | paths          | identity                       | pass
+ json_tree     | paths          | complete                       | pass
+ json_tree     | stub           | identity                       | pass
+ json_tree     | stub           | complete                       | not implemented (6 of 6 callbacks missing)
+(212 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.

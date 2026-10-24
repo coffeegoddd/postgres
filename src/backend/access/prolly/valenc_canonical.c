@@ -28,7 +28,15 @@
  * and is stored inline).  Decoding for rows written back to a table (the
  * value store's pointers) gives a long value whose tree a hash pointer can
  * name as that pointer, unread (prolly_toast_pointer()): the row holds the
- * tree history has, and a value no one reads is never fetched.  A value TOAST stored out of line in a TOAST
+ * tree history has, and a value no one reads is never fetched.
+ *
+ * With prolly.structural_jsonb on (prolly_toast.h), a jsonb value whose
+ * canonical bytes are longer than VALUE_INLINE_MAX is out of line as a
+ * JSON tree (prolly_jsontree.h) instead: the reference names its root,
+ * with length 0, which no value tree out of line has (a value tree holds
+ * more than VALUE_INLINE_MAX bytes).  Decoding reads the document from
+ * it.  Walks and collections follow the reference as any, the JSON tree
+ * being a tree of the same nodes.  A value TOAST stored out of line in a TOAST
  * relation is looked up in the value store's memo
  * by its pointer first: a fold that meets a pointer an UPDATE of another
  * column kept writes the reference the fold before made, without reading
@@ -70,7 +78,10 @@
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_datum.h"
 #include "access/prolly_toast.h"
+#include "catalog/pg_type.h"
 #include "common/hashfn.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "pgstat.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -98,6 +109,7 @@ struct ProllyValueEncoder
 	uint64	   *typdefs;		/* per attribute: its type's definition,
 								 * hashed, for the memo; once asked */
 	bool	   *typdef_known;
+	bool	   *jsonb;			/* per attribute: of a jsonb type */
 	StringInfoData scratch;		/* a value read from out of line */
 
 	/* Columns' missing values as fields(), per attribute; once asked. */
@@ -148,6 +160,7 @@ begin_columns(TupleDesc desc, const int *attnos, int nattnos, MemoryContext mcxt
 	enc->extra_attno = MemoryContextAlloc(mcxt, sizeof(int) * Max(natts, 1));
 	enc->typdefs = MemoryContextAlloc(mcxt, sizeof(uint64) * Max(natts, 1));
 	enc->typdef_known = MemoryContextAllocZero(mcxt, sizeof(bool) * Max(natts, 1));
+	enc->jsonb = MemoryContextAllocZero(mcxt, sizeof(bool) * Max(natts, 1));
 	enc->missing_known = MemoryContextAllocZero(mcxt, sizeof(bool) * Max(natts, 1));
 	enc->missing_null = MemoryContextAllocZero(mcxt, sizeof(bool) * Max(natts, 1));
 	enc->missing_bytes = MemoryContextAllocZero(mcxt, sizeof(StringInfoData) * Max(natts, 1));
@@ -180,6 +193,7 @@ begin_columns(TupleDesc desc, const int *attnos, int nattnos, MemoryContext mcxt
 			continue;
 		}
 		enc->codecs[i] = prolly_datum_codec(att->atttypid, att->atttypmod, mcxt);
+		enc->jsonb[i] = (getBaseType(att->atttypid) == JSONBOID);
 		enc->live_attno[enc->nlive] = i;
 		enc->has_missing[enc->nlive] = att->atthasmissing;
 		enc->nlive++;
@@ -221,6 +235,65 @@ column_typdef(ProllyValueEncoder *enc, int i)
 		pfree(def.data);
 	}
 	return enc->typdefs[i];
+}
+
+/* Whether attribute i's long values are JSON trees. */
+static bool
+json_tree_column(ProllyValueEncoder *enc, int i)
+{
+	return enc->jsonb[i] && prolly_json_tree_wanted();
+}
+
+static const ProllyJsonTreeRoutine *
+json_tree(void)
+{
+	static const ProllyJsonTreeRoutine *jt = NULL;
+
+	if (jt == NULL)
+		jt = prolly_jsontree_lookup("paths");
+	return jt;
+}
+
+/*
+ * The JSON tree of document doc, its reference appended to ref; false
+ * (nothing appended) if it can't be one.
+ */
+static bool
+write_json_tree(ProllyValueEncoder *enc, Datum doc, StringInfo ref)
+{
+	ProllyNodeRef root;
+	Jsonb	   *jb = DatumGetJsonbP(doc);
+	bool		made;
+
+	made = PROLLY_CALL(json_tree(), build, enc->values->env, jb, &root);
+	if (made)
+		PROLLY_CALL(enc->values->tree, value_reference, &root.hash, 0, ref);
+	if ((Pointer) jb != DatumGetPointer(doc))
+		pfree(jb);
+	return made;
+}
+
+/*
+ * The reference for attribute i's canonical bytes, len of them (longer
+ * than VALUE_INLINE_MAX), appended to ref: their value tree's, or the
+ * document's JSON tree's.  value, if not 0, is the value they encode.
+ */
+static void
+write_long_value(ProllyValueEncoder *enc, int i, Datum value,
+				 const uint8 *bytes, Size len, StringInfo ref)
+{
+	if (enc->values == NULL)
+		no_values();
+	if (json_tree_column(enc, i))
+	{
+		Datum		doc = value != (Datum) 0 ? value :
+			prolly_datum_decode(enc->codecs[i], (const char *) bytes, (int) len);
+
+		if (write_json_tree(enc, doc, ref))
+			return;
+	}
+	PROLLY_CALL(enc->values->tree, value_write, enc->values->env, bytes, len,
+				ref);
 }
 
 static ProllyValueEncoder *
@@ -358,8 +431,12 @@ encode_into(ProllyValueEncoder *enc, TupleTableSlot *slot,
 			}
 		}
 
-		/* A value TOAST stored out of line: its reference, if remembered. */
+		/*
+		 * A value TOAST stored out of line: its reference, if remembered (a
+		 * document's isn't, when it would be a JSON tree).
+		 */
 		if (att->attlen == -1 && enc->values && enc->values->memo &&
+			!json_tree_column(enc, i) &&
 			VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(slot->tts_values[i])))
 		{
 			toasted = DatumGetPointer(slot->tts_values[i]);
@@ -383,8 +460,8 @@ encode_into(ProllyValueEncoder *enc, TupleTableSlot *slot,
 				resetStringInfo(&ref);	/* (the lookup's) */
 			else
 				initStringInfo(&ref);
-			PROLLY_CALL(enc->values->tree, value_write, enc->values->env,
-						(const uint8 *) val.data, val.len, &ref);
+			write_long_value(enc, i, slot->tts_values[i],
+							 (const uint8 *) val.data, val.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 			appendBinaryStringInfo(out, ref.data, ref.len);
 			/*
@@ -470,11 +547,9 @@ canonical_encode_fields(ProllyValueEncoder *enc,
 		{
 			StringInfoData ref;
 
-			if (enc->values == NULL)
-				no_values();
 			initStringInfo(&ref);
-			PROLLY_CALL(enc->values->tree, value_write, enc->values->env,
-						f->bytes.data, f->bytes.len, &ref);
+			write_long_value(enc, enc->live_attno[j], (Datum) 0,
+							 f->bytes.data, f->bytes.len, &ref);
 			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
 			appendBinaryStringInfo(out, ref.data, ref.len);
 			pfree(ref.data);
@@ -585,14 +660,29 @@ decode_value(ProllyValueEncoder *enc, int i, const char *p, uint64 len,
 	if (enc->values == NULL)
 		no_values();
 
+	PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
+
+	/* a document's JSON tree: the document read from it */
+	if (vlen == 0)
+	{
+		ProllyNodeRef jroot;
+
+		if (!enc->jsonb[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("a JSON tree in a prolly row's column of type %s",
+							format_type_be(TupleDescAttr(enc->desc, i)->atttypid))));
+		jroot.hash = root;
+		pgstat_count_prolly(PGSTAT_PROLLY_VALUES_READ, 1);
+		return JsonbPGetDatum(PROLLY_CALL(json_tree(), read, enc->values->env,
+										  &jroot));
+	}
+
 	/* a tree a hash pointer can name: named, not read */
 	pointer = NULL;
 	if (enc->values->pointers)
-	{
-		PROLLY_CALL(enc->values->tree, value_root, &ref, &root, &vlen);
 		pointer = prolly_toast_pointer(&root, vlen,
 									   TupleDescAttr(enc->desc, i)->atttypid);
-	}
 	if (pointer != NULL)
 		return PointerGetDatum(pointer);
 
@@ -967,6 +1057,21 @@ canonical_fields_alike(ProllyValueEncoder *enc, int attno,
 		no_values();
 	r = ref->bytes;
 	PROLLY_CALL(enc->values->tree, value_root, &r, &root, &vlen);
+	if (vlen == 0)
+	{
+		/* a JSON tree: its document's canonical bytes */
+		StringInfoData bytes;
+
+		initStringInfo(&bytes);
+		prolly_datum_encode(enc->codecs[attno],
+							decode_value(enc, attno, (const char *) r.data,
+										 r.len, true),
+							&bytes);
+		same = bytes.len == (int) inl->bytes.len &&
+			memcmp(bytes.data, inl->bytes.data, inl->bytes.len) == 0;
+		pfree(bytes.data);
+		return same;
+	}
 	if (vlen != inl->bytes.len)
 		return false;
 	resetStringInfo(&enc->scratch);
@@ -1050,7 +1155,7 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 		.iface = PROLLY_IFACE_VALUE_ENCODER,
 		.impl_id = 2,
 		/* (pinned by canon_folded.c: change FOLDED_FORMAT with it) */
-		.format_version = 7,		/* 6: extension send round trips; 7: text forms under fixed settings */
+		.format_version = 8,		/* 7: text forms under fixed settings; 8: JSON trees */
 		.name = "canonical",
 		.description = "portable rows of live columns, trailing NULLs omitted, "
 		"no local OIDs, long values out of line",

@@ -34,6 +34,7 @@
 #include "access/prolly_autovacuum.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_snapshot.h"
+#include "access/prolly_toast.h"
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
 #include "access/prolly_xact.h"
@@ -268,6 +269,14 @@ prolly_session_init(const char *branch)
 								 &prolly_fold_on_commit,
 								 false,
 								 PGC_USERSET,
+								 0,
+								 NULL, NULL, NULL);
+		DefineCustomBoolVariable("prolly.structural_jsonb",
+								 "Stores long jsonb documents of versioned tables as JSON trees, and folds them so.",
+								 "A JSON tree reads a path and sets a value without the whole document (prolly_jsonb_get(), prolly_jsonb_set()). A prototype: every server writing a history must agree on it, since it changes the trees folds write.",
+								 &prolly_structural_jsonb,
+								 false,
+								 PGC_SUSET,
 								 0,
 								 NULL, NULL, NULL);
 		DefineCustomBoolVariable("dolt.allow_commit_conflicts",

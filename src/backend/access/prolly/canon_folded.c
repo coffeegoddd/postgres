@@ -253,7 +253,10 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "20", whose text forms of values (a type
+ * The format a folded root is in: "21", whose rows may hold a long jsonb
+ * document as a JSON tree (valenc_canonical.c); "20" held every long value
+ * as a value tree of its bytes, and was the first whose text forms of
+ * values (a type
  * without binary I/O's, or one its receive refuses) are written with times
  * in UTC, hex bytea and the C locale's money, numbers and dates
  * (prolly_datum.c); "19" had them in the committer's TimeZone, locale and
@@ -296,7 +299,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"20"
+#define FOLDED_FORMAT	"21"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -309,7 +312,7 @@ typedef struct BaseTable BaseTable;
  * agree (folded_encoders_checked()).
  */
 #define FOLDED_KEY_ENCODER		7
-#define FOLDED_VALUE_ENCODER	7
+#define FOLDED_VALUE_ENCODER	8
 #define FOLDED_KEYING			1
 
 /*

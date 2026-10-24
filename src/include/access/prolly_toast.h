@@ -17,6 +17,16 @@
  * pointer doesn't say its type, so fetching couldn't decode them): their
  * pointers' hashes aren't the columns' references.
  *
+ * With prolly.structural_jsonb on, a long jsonb document is stored as a
+ * JSON tree (prolly_jsontree.h) in a UTF-8 database, and a fold makes it
+ * the column's tree: a pointer of form PROLLY_TOAST_FORM_JSON_TREE names
+ * its root, its sizes those of the document's jsonb (after an edit by
+ * path, estimated: see prolly_jsontree.h), and a reference to it in a row
+ * records length 0, which no value tree out of line has.  With it off,
+ * such a document folds as its bytes, read whole.  The setting changes
+ * what a fold writes, so every server writing one history must agree on
+ * it.
+ *
  * src/include/access/prolly_toast.h
  *
  *-------------------------------------------------------------------------
@@ -25,6 +35,7 @@
 #define PROLLY_TOAST_H
 
 #include "access/prolly_chunkstore.h"
+#include "access/prolly_jsontree.h"
 #include "access/prolly_tree.h"
 #include "access/toast_destination.h"
 #include "access/xlogdefs.h"
@@ -34,6 +45,16 @@
 #define PROLLY_TOAST_FORM_BYTES		0	/* the value's bytes */
 #define PROLLY_TOAST_FORM_UTF8		1	/* a text-like value's, in UTF-8 */
 #define PROLLY_TOAST_FORM_JSONB		2	/* a document's canonical bytes */
+#define PROLLY_TOAST_FORM_JSON_TREE	3	/* a document's JSON tree */
+
+/*
+ * A jsonb document whose canonical bytes are longer is a JSON tree when
+ * those are wanted: the length past which a row holds a value out of line.
+ */
+#define PROLLY_JSON_TREE_MIN		2048
+
+/* prolly.structural_jsonb */
+extern PGDLLIMPORT bool prolly_structural_jsonb;
 
 /* the destination of the prolly access method's tables */
 extern PGDLLIMPORT const ToastDestinationRoutine prolly_toast_chunkstore;
@@ -97,6 +118,29 @@ extern void prolly_toast_roots(ProllyChunkRefVisit visit, void *arg);
  */
 extern void prolly_toast_wal_roots(XLogRecPtr from, ProllyChunkRefVisit visit,
 								   void *arg);
+
+/*
+ * Whether long jsonb documents are stored, and folded, as JSON trees: the
+ * setting is on and the database's encoding UTF-8.
+ */
+extern bool prolly_json_tree_wanted(void);
+
+/*
+ * Whether a value is a hash pointer to a JSON tree: its root, and the
+ * document's jsonb size as the pointer has it (*rawsize, with its header).
+ */
+extern bool prolly_toast_json_tree(const varlena *pointer, ProllyNodeRef *root,
+								   Size *rawsize);
+
+/* A hash pointer to the JSON tree at root, of a document of rawsize bytes. */
+extern varlena *prolly_toast_json_pointer(const ProllyNodeRef *root,
+										  Size rawsize);
+
+/*
+ * The environment values stored by content are written and read in, the
+ * current database's: for the JSON trees hash pointers name.
+ */
+extern const ProllyTreeEnv *prolly_toast_env(void);
 
 /*
  * The value tree nodes this backend read and wrote through this

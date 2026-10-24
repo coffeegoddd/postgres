@@ -200,6 +200,7 @@ tests += {
       'described_properties',
       'table_settings',
       'jsonb_canonical',
+      'structural_jsonb',
       'float_canonical',
       'send_canonical',
       'receive_refusals',

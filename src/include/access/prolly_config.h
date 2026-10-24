@@ -22,6 +22,7 @@
 #include "access/prolly_chunkformat.h"
 #include "access/prolly_chunkstore.h"
 #include "access/prolly_hash.h"
+#include "access/prolly_jsontree.h"
 #include "access/prolly_keyenc.h"
 #include "access/prolly_keying.h"
 #include "access/prolly_matcache.h"

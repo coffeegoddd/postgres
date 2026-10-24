@@ -64,6 +64,7 @@ Changes to this design are tracked in GitHub issues:
 	writers           prolly_writers.h        modes, stub
 	move_planner      prolly_moveplan.h       costs, stub
 	matcache          prolly_matcache.h       branches, stub
+	json_tree         prolly_jsontree.h       paths, stub
 
 An interface header declares a routine struct: a ProllyImplInfo (interface,
 name, impl_id, format_version) followed only by callback pointers, with the
@@ -370,6 +371,26 @@ trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
+
+JSON trees (a prototype, prolly.structural_jsonb, off by default).  With
+the setting on, a jsonb document whose canonical bytes are longer than
+2048 is stored by content, and folded, as a JSON tree (prolly_jsontree.h,
+jsontree_paths.c) rather than a value tree of its bytes: a tree of the
+tree interface whose items are the document's scalars keyed by their
+paths, the keys' bytes sorting as jsonb orders the document, each empty
+container an item of its own.  Its root is a function of the document,
+so equal documents share it however they were made, and a fold takes the
+tree from the row's hash pointer unread.  A row's reference to one
+records length 0, which no value tree out of line has; decoding reads
+the document from its items.  prolly_jsonb.c's SQL functions take the
+value as stored: prolly_jsonb_get() reads only the items under a path,
+prolly_jsonb_set() applies edits for the items under it (an UPDATE then
+writes the nodes on that path, not the document), and prolly_jsonb_diff()
+diffs two trees by their nodes; anything a tree doesn't handle, and any
+document that isn't one, they do whole, as #>, jsonb_set() and a diff of
+the documents would.  PostgreSQL's own jsonb functions read the document
+whole.  The setting changes what folds write, so every server writing a
+history must agree on it.
 
 
 Writers
@@ -1015,6 +1036,9 @@ change: refs or a manifest of another format are refused, never read.
 
 SQL
 ---
+
+prolly_jsonb.c is the prolly_jsonb_* functions, on JSON trees (Trees and
+chunks, above).
 
 prolly_dolt.c is the dolt_* functions and system views, with Doltgres's
 arguments and results, so scripts written for Doltgres run here.  A tag
