@@ -56,7 +56,7 @@ FROM prolly_implementations();
  move_planner  | stub         |       0 |              0
  matcache      | branches     |       1 |              1
  matcache      | stub         |       0 |              0
-(45 rows)
+(47 rows)
 
 -- Conformance suites against every built-in implementation.  Interfaces
 -- that only have stubs report "not implemented" for everything but

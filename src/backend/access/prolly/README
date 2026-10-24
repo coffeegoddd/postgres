@@ -442,7 +442,12 @@ table whose definition differs keeps its pages: the move may keep its rows.
 
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies
-checked as a first use checks them.  A checkout's sweep lets go of those
+checked as a first use checks them.  At a first use, the move planner
+takes a kept one as any other branch, by its root, and costs every
+candidate's copies with the tables a kept one holds as the target does
+shared rather than written (a copy the planner empties to reload is
+shared into too), so the copies chosen are those cheapest to finish.  A
+checkout's sweep lets go of those
 past the budget, the least recently checked out first (recency is kept in
 shared memory; after a restart, older branches go first).  The budget
 counts idle ones: one a session is on is neither counted nor let go of,

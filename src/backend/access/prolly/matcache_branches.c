@@ -117,9 +117,12 @@ made_seen(Oid branch, Snapshot snap)
 
 	ScanKeyInit(&key, Anum_pg_branch_oid, BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(branch));
+	/* (registered for the scan: a caller's may be one it hasn't, as the latest) */
+	snap = RegisterSnapshot(snap);
 	scan = systable_beginscan(brel, BranchOidIndexId, true, snap, 1, &key);
 	seen = HeapTupleIsValid(systable_getnext(scan));
 	systable_endscan(scan);
+	UnregisterSnapshot(snap);
 	table_close(brel, AccessShareLock);
 	return seen;
 }

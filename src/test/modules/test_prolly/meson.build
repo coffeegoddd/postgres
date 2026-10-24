@@ -101,6 +101,7 @@ tests += {
       'dirty_merges',
       'commit_root',
       'kept_checkouts',
+      'kept_planned',
       'share_layouts',
       'constraint_violations',
       'keyless_violations',

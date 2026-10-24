@@ -2250,9 +2250,13 @@ rank_source(const char *name, Oid branch, void *arg)
  * first and kept on a tie; at most SOURCE_CANDIDATES others are planned
  * after it, each stopped once it costs more than the best yet, each planned
  * on its own branch (its tables' indexes are its own).  NULL if
- * none is cheaper than the session's branch.  (A source a move could start
- * from without a branch's copies, as a kept materialization, would be
- * planned among these, by the root it holds.)  The copies are new in the
+ * none is cheaper than the session's branch.  A kept materialization is a
+ * branch, so a candidate by the root it holds; and each plan is costed with
+ * the tables any kept one holds as the target does shared, not written
+ * (cost_with_shares()), as the move then shares them (share_clean_tables():
+ * an emptied copy too), so the copies chosen are those cheapest to finish
+ * with the shares, not without them; and then, with tables to share, a
+ * candidate isn't stopped at the best's cost.  The copies are new in the
  * transaction, which no other sees: the tables of the chosen plan that
  * cost less emptied and loaded than moved row by row (#713), and those the
  * head hasn't, which the move drops (#714), are added to *emptied, for
@@ -2333,6 +2337,57 @@ plan_here(void *arg)
 				po->bound, po->plan);
 }
 
+/*
+ * The target's tables a kept materialization holds as the target has them
+ * (the materialization cache's, made before snap): a first use's move
+ * shares each of these instead of writing its rows (share_clean_tables()),
+ * where its definitions are the target's.  Their names, as Strings.
+ */
+static List *
+kept_shareable(const ProllyNodeRef *target, Snapshot snap)
+{
+	ProllyDatabaseComponents dc;
+	ShareSources ss = {snap, NIL};
+	List	   *theirs = NIL;
+	List	   *names = NIL;
+
+	prolly_database_components(&dc);
+	if (dc.matcache == NULL || !PROLLY_HAS(dc.matcache, visit))
+		return NIL;
+	PROLLY_CALL(dc.matcache, visit, snap, find_kept_source, &ss);
+	if (ss.sources == NIL)
+		return NIL;
+	PROLLY_CALL(dc.canonicalizer, tables, target, NULL, note_table, &theirs);
+	foreach_ptr(NamedTree, t, theirs)
+		if (source_of(ss.sources, t) != NULL)
+			names = lappend(names, makeString(t->name));
+	return names;
+}
+
+/*
+ * A plan's cost with the tables a kept materialization holds as shared
+ * instead of written: each costs no more than sharing a table and the
+ * relations stored with it.  Only a plan of rows alone (the definitions
+ * alike), as a share is made only then.
+ */
+#define SHARE_TABLE_USEC	(4 * SHARE_RELATION_USEC)
+
+static double
+cost_with_shares(const ProllyMovePlan *plan, List *shareable)
+{
+	double		cost = plan->cost;
+
+	if (shareable == NIL)
+		return cost;
+	foreach_ptr(ProllyTableMove, m, plan->tables)
+		if (m->kind != PROLLY_TABLE_ROWS && m->kind != PROLLY_TABLE_RELOAD)
+			return cost;
+	foreach_ptr(ProllyTableMove, m, plan->tables)
+		if (m->cost > SHARE_TABLE_USEC && list_member(shareable, makeString(m->name)))
+			cost -= m->cost - SHARE_TABLE_USEC;
+	return cost;
+}
+
 static char *
 estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 				 List **own_emptied)
@@ -2341,7 +2396,9 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 	SourceCandidates sc = {snap, false, NIL, NIL};
 	ProllyMovePlan plan;
 	ProllyMovePlan best;
+	double		best_cost;
 	char	   *source = NULL;
+	List	   *shareable;
 
 	/* (the session's branch first, then the others) */
 	branch_ops()->branches(note_candidate, &sc);
@@ -2349,19 +2406,29 @@ estimated_source(const ProllyNodeRef *target, Snapshot snap, List **emptied,
 		return NULL;
 	sc.others = true;
 	branch_ops()->branches(note_candidate, &sc);
+	shareable = kept_shareable(target, snap);
 	PROLLY_CALL(planner, plan, linitial(sc.roots), target, PROLLY_PLAN_RELOADS,
 				INFINITY, &best);
 	pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
 	reloaded_tables(&best, own_emptied);
+	best_cost = cost_with_shares(&best, shareable);
 	for (int i = 1; i < list_length(sc.names); i++)
 	{
-		PlanOn		po = {planner, list_nth(sc.roots, i), target, best.cost, &plan};
+		/*
+		 * (with tables to share, not bounded by the best's cost: one past it
+		 * may cost less once they are shared)
+		 */
+		PlanOn		po = {planner, list_nth(sc.roots, i), target,
+		shareable ? INFINITY : best_cost, &plan};
+		double		cost;
 
 		branch_ops()->run_on(list_nth(sc.names, i), plan_here, &po);
 		pgstat_count_prolly(PGSTAT_PROLLY_MOVE_PLANS, 1);
-		if (!plan.over && plan.cost < best.cost)
+		cost = cost_with_shares(&plan, shareable);
+		if (!plan.over && cost < best_cost)
 		{
 			best = plan;
+			best_cost = cost;
 			source = list_nth(sc.names, i);
 		}
 	}
