@@ -6522,8 +6522,14 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
 }
 
-/* the versions and tables lineage_has() found alike, this backend's */
-static List *lineages_known = NIL;
+/*
+ * The versions and tables lineage_has() found alike, this backend's, as
+ * of a head: a lineage is walked back from the working set, so moving the
+ * head (a reset to before the table was made) asks again.  Emptied when
+ * full.
+ */
+#define LINEAGES_KNOWN_MAX	1024
+static HTAB *lineages_known = NULL;
 
 /*
  * check_named_rows() of one version, commit, of the table named name.
@@ -6560,13 +6566,26 @@ prolly_check_history_by_name(const char *name, const char *commit,
 	 * another relation, so asks again)
 	 */
 	{
-		char	   *key = psprintf("%u %s %s", relid, commit, name);
-		ListCell   *lc;
-		MemoryContext old;
+		ProllyHash	head;
+		char		key[NAMEDATALEN * 4 + 4 * PROLLY_HASH_MAX_LEN];
+		bool		found;
 
-		foreach(lc, lineages_known)
-			if (strcmp(lfirst(lc), key) == 0)
-				return;
+		if (!PROLLY_CALL(refs(), resolve, "HEAD", &head))
+			head.len = 0;
+		snprintf(key, sizeof(key), "%u %s %s %s", relid, commit,
+				 head.len ? hash_hex(&head) : "", name);
+		if (lineages_known == NULL)
+		{
+			HASHCTL		ctl = {0};
+
+			ctl.keysize = sizeof(key);
+			ctl.entrysize = sizeof(key);
+			lineages_known = hash_create("prolly known lineages",
+										 LINEAGES_KNOWN_MAX, &ctl,
+										 HASH_ELEM | HASH_STRINGS);
+		}
+		if (hash_search(lineages_known, key, HASH_FIND, NULL))
+			return;
 		if (!lineage_has(name_lineage(&lineages, name), commit, name))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -6574,11 +6593,13 @@ prolly_check_history_by_name(const char *name, const char *commit,
 							fn, name),
 					 errdetail("The name was without a table since that version, so the table here is another."),
 					 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
-		old = MemoryContextSwitchTo(TopMemoryContext);
-		if (list_length(lineages_known) >= 64)
-			lineages_known = list_delete_first(lineages_known);
-		lineages_known = lappend(lineages_known, pstrdup(key));
-		MemoryContextSwitchTo(old);
+		if (hash_get_num_entries(lineages_known) >= LINEAGES_KNOWN_MAX)
+		{
+			hash_destroy(lineages_known);
+			lineages_known = NULL;
+			return;
+		}
+		(void) hash_search(lineages_known, key, HASH_ENTER, &found);
 	}
 }
 
