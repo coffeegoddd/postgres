@@ -5426,6 +5426,8 @@ definitions_unchanged(Canon *cn, ProllyNodeRef *root)
 	{
 		Canon		full;
 		ProllyNodeRef expect;
+		ListCell   *a;
+		ListCell   *b;
 		PgStat_Counter *stats = palloc_array(PgStat_Counter, PGSTAT_PROLLY_NUM_COUNTERS);
 		ProllyNodeCounters tree = *pgstat_prolly_tree_counters();
 
@@ -5452,6 +5454,20 @@ definitions_unchanged(Canon *cn, ProllyNodeRef *root)
 		*pgstat_prolly_tree_counters() = tree;
 		pfree(stats);
 		check_applied("definitions read again", root, &expect);
+		/* (and what they left out, the same objects) */
+		if (list_length(full.left_out) != list_length(cn->left_out))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly definitions taken from this backend's last read leave out %d objects, read again %d",
+							list_length(cn->left_out), list_length(full.left_out))));
+		forboth(a, full.left_out, b, cn->left_out)
+		{
+			if (strcmp(lfirst(a), lfirst(b)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("prolly definitions taken from this backend's last read leave out \"%s\", read again \"%s\"",
+								(char *) lfirst(b), (char *) lfirst(a))));
+		}
 	}
 	return true;
 }
