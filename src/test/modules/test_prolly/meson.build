@@ -355,6 +355,7 @@ tests += {
       't/221_reload_first_use.pl',
       't/226_shared_below_sweep.pl',
       't/227_shared_below_drop.pl',
+      't/340_bmap_sweep_dropped_map.pl',
       't/283_renamed_schema_conflict_restart.pl',
       't/225_kept_commit_snapshots.pl',
       't/266_autofold_defers.pl',
