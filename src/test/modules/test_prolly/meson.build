@@ -344,6 +344,7 @@ tests += {
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
       't/225_kept_commit_snapshots.pl',
+      't/266_autofold_defers.pl',
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
       't/237_vacuum_kept_pages.pl',
