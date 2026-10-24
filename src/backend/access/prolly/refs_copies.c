@@ -1148,13 +1148,18 @@ branch_entry(const char *key, int keylen)
 
 /*
  * May the entry key be changed in the scoped changes: one of a branch the
- * transaction holds, not having held every ref nor begun to commit?
+ * transaction holds, or the relation record of a commit it makes (keyed by
+ * the commit, which no other transaction writes), not having held every
+ * ref nor begun to commit?
  */
 static bool
 scoped_key(const char *key, int keylen)
 {
-	return !published && !whole && branch_entry(key, keylen) &&
-		branch_held(key + 1, keylen - 1);
+	if (published || whole)
+		return false;
+	if (keylen > 1 && key[0] == TAG_LINEAGE)
+		return true;
+	return branch_entry(key, keylen) && branch_held(key + 1, keylen - 1);
 }
 
 static bool
