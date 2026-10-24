@@ -2,13 +2,17 @@
 # against the job's server installation, for src/test/prolly's
 # check-postgis groups (POSTGIS_BUILD) and the G and GV suites.
 #
-# GEOS, PROJ, GDAL and the rest come from the runner's Ubuntu packages, not
-# from the pin, so the build is made with --allow-library-mismatch: the
-# versions found, and how they differ from the pin's, are in the build's
-# manifest (BUILD_DIR/pbench-postgis.json) and the job summary.
+# GEOS is built at the pin's version, from its release tarball (checked by
+# sha256 below), because PostGIS's answers depend on it: overlay results
+# and buffer vertex counts differ between Ubuntu 24.04's GEOS 3.12 and the
+# pin.  PROJ, GDAL and the rest come from the runner's Ubuntu packages, so
+# the PostGIS build is made with --allow-library-mismatch: the versions
+# found, and how they differ from the pin's, are in the build's manifest
+# (BUILD_DIR/pbench-postgis.json) and the job summary.
 #
-# The build is cached by the server's commit, the PostGIS commit and the
-# runner image: a PostGIS build is made against one server's headers.
+# GEOS is cached by its version and the runner image; PostGIS by the
+# server's commit, the PostGIS commit, the GEOS version and the runner
+# image, since a PostGIS build is made against one server's headers.
 
 name: PostGIS
 description: Build the pinned PostGIS against the job's server installation
@@ -37,7 +41,7 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          autoconf automake libtool pkg-config xsltproc \
+          autoconf automake libtool pkg-config xsltproc cmake \
           libgeos-dev libproj-dev libgdal-dev libjson-c-dev libprotobuf-c-dev \
           protobuf-c-compiler libxml2-dev libsfcgal-dev
 
@@ -45,18 +49,64 @@ runs:
       id: pin
       shell: bash
       run: |
-        commit=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["commit"])' \
-          "$GITHUB_WORKSPACE/src/tools/prolly_bench/configs/postgis.toml")
-        echo "commit=$commit" >> "$GITHUB_OUTPUT"
+        python3 - "$GITHUB_WORKSPACE/src/tools/prolly_bench/configs/postgis.toml" >> "$GITHUB_OUTPUT" <<'PY'
+        import sys, tomllib
+        pin = tomllib.load(open(sys.argv[1], "rb"))
+        print(f"commit={pin['commit']}")
+        print(f"geos={pin['libraries']['geos']}")
+        PY
         # (the runner image: ImageOS and ImageVersion are set on hosted runners)
         echo "image=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore a cached GEOS
+      id: geos-cache
+      uses: actions/cache@v4
+      with:
+        path: /opt/geos-${{ steps.pin.outputs.geos }}
+        key: geos-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ steps.pin.outputs.geos }}
+
+    - name: Build the pinned GEOS
+      if: steps.geos-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GEOS: ${{ steps.pin.outputs.geos }}
+      run: |
+        # (a new pin needs its tarball's hash here)
+        case "$GEOS" in
+          3.15.0) sha=d5e5192a686d065eaed082de14dd26244c5c8e02bff16b2c6cce3265f648e00e ;;
+          *) echo "no sha256 for GEOS $GEOS in .github/actions/postgis"; exit 1 ;;
+        esac
+        work="$RUNNER_TEMP/geos"
+        mkdir -p "$work"
+        curl -sSfL -o "$work/geos.tar.bz2" "https://download.osgeo.org/geos/geos-$GEOS.tar.bz2"
+        echo "$sha  $work/geos.tar.bz2" | sha256sum -c -
+        tar -xjf "$work/geos.tar.bz2" -C "$work"
+        sudo mkdir -p "/opt/geos-$GEOS"
+        sudo chown "$(id -u)" "/opt/geos-$GEOS"
+        cmake -S "$work/geos-$GEOS" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="/opt/geos-$GEOS" > "$work/cmake.log"
+        cmake --build "$work/build" -j "${{ inputs.jobs }}" > "$work/build.log"
+        cmake --install "$work/build" > /dev/null
+
+    # (ahead of Ubuntu's GEOS, which GDAL's packages bring: geos-config on
+    # the path, and the library ahead of the system's for the loader)
+    - name: Use the pinned GEOS
+      shell: bash
+      env:
+        GEOS: ${{ steps.pin.outputs.geos }}
+      run: |
+        echo "/opt/geos-$GEOS/bin" >> "$GITHUB_PATH"
+        libdir=$(dirname "$(find "/opt/geos-$GEOS" -name 'libgeos_c.so*' | head -n 1)")
+        echo "$libdir" | sudo tee /etc/ld.so.conf.d/00-geos.conf > /dev/null
+        sudo ldconfig
+        "/opt/geos-$GEOS/bin/geos-config" --version
 
     - name: Restore a cached build
       id: cache
       uses: actions/cache@v4
       with:
         path: ${{ inputs.build-dir }}
-        key: postgis-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ github.sha }}-${{ steps.pin.outputs.commit }}
+        key: postgis-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ github.sha }}-${{ steps.pin.outputs.commit }}-geos${{ steps.pin.outputs.geos }}
 
     - name: Build the pinned PostGIS
       if: steps.cache.outputs.cache-hit != 'true'
