@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF1
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCF4
 
 typedef struct PgStat_ArchiverStats
 {
@@ -701,7 +701,8 @@ typedef enum PgStat_ProllyCounter
 											 * shares, drops, copies on write,
 											 * truncations, sweeps */
 	PGSTAT_PROLLY_BMAP_BLOCKS_FREED,	/* page-store blocks given back to
-										 * the allocator */
+										 * the allocator (but by the
+										 * release queue's drain) */
 	PGSTAT_PROLLY_APPLY_ROWS,	/* rows the row applier inserted, updated
 								 * or deleted */
 	PGSTAT_PROLLY_APPLY_INDEX_TUPLES,	/* index entries its writes made,
@@ -719,6 +720,22 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_TABLES,	/* tables whose rows folds folded */
 	PGSTAT_PROLLY_FOLD_INCREMENTAL, /* folds that worked out again only
 									 * what changed since the last */
+	PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, /* page images of the blocks a
+										 * relation alone held, logged as a
+										 * share or snapshot shares them */
+	PGSTAT_PROLLY_MOVE_PLANS,	/* moves the move planner costed: the
+								 * sources a branch's first use weighed */
+	PGSTAT_PROLLY_FIRST_USE_SOURCES_BUSY,	/* first uses that copied the
+											 * session's branch, the one
+											 * chosen having a writer in
+											 * flight */
+	PGSTAT_PROLLY_BMAP_RELEASE_QUEUED,	/* release queue entries pushed:
+										 * dropped maps' subtrees and
+										 * blocks, a node's children */
+	PGSTAT_PROLLY_BMAP_RELEASE_DRAINED, /* and those its drain popped */
+	PGSTAT_PROLLY_BMAP_RELEASE_BLOCKS_FREED,	/* blocks the drain freed */
+	PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES,	/* and the counts it
+													 * set */
 	PGSTAT_PROLLY_PAGES_KEPT,	/* relations' pages kept as of a commit, a
 								 * snapshot of each taken */
 	PGSTAT_PROLLY_RELATIONS_RESTORED,	/* relations a move gave back the

@@ -114,6 +114,9 @@ my $store_size = sub {
 };
 sql(q{CREATE TABLE first AS SELECT generate_series(1, 100000) AS id});
 sql('DROP TABLE first');
+# (its storage, queued by the drop, let go of)
+sql(q{CREATE EXTENSION test_prolly});
+sql(q{SELECT * FROM test_bmap_release_drain()});
 sql('CHECKPOINT');
 my $size = $store_size->();
 sql(q{CREATE TABLE second AS SELECT generate_series(1, 100000) AS id});

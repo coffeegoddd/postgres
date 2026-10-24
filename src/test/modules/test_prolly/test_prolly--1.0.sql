@@ -129,8 +129,20 @@ CREATE FUNCTION test_bmap_sweep_due()
 RETURNS bool
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION test_bmap_unlink(relnumber oid)
+-- drain: the release queue drained after, as a drop's blocks were freed
+-- before the queue (false leaves them queued)
+CREATE FUNCTION test_bmap_unlink(relnumber oid, drain bool DEFAULT true)
 RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- the release queue drained, of at most max_entries entries (0: all)
+CREATE FUNCTION test_bmap_release_drain(max_entries int8 DEFAULT 0,
+	OUT entries int8, OUT freed int8, OUT unrefs int8)
+RETURNS record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION test_bmap_release_pending()
+RETURNS int8
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION test_bmap_truncate(relnumber oid, nblocks int,

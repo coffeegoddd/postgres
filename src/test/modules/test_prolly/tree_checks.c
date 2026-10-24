@@ -1179,6 +1179,111 @@ tree_diff_unordered_matches(const ProllyImplInfo *impl)
 	}
 }
 
+/* How many keys a and b hold differently. */
+static int
+changed_keys(const Ref *a, const Ref *b)
+{
+	int			n = 0;
+
+	for (int k = 0; k < MAX_KEY; k++)
+		if (a->version[k] != b->version[k])
+			n++;
+	return n;
+}
+
+static void
+check_estimate(const ProllyTreeRoutine *tr, ProllyTreeEnv *env,
+			   const ProllyNodeRef *a, const ProllyNodeRef *b, int want,
+			   const char *what)
+{
+	ProllyNodeCounters cnt = {0};
+	uint64		got;
+
+	got = PROLLY_CALL(tr, diff_estimate, env, a, b, UINT64_MAX);
+	if (got != (uint64) want)
+		elog(ERROR, "diff estimate of %s gave %llu changes, expected %d", what,
+			 (unsigned long long) got, want);
+	for (uint64 budget = 1; budget <= 64; budget *= 4)
+	{
+		memset(&cnt, 0, sizeof(cnt));
+		env->counters = &cnt;
+		got = PROLLY_CALL(tr, diff_estimate, env, a, b, budget);
+		env->counters = NULL;
+		if (got < (uint64) want)
+			elog(ERROR, "diff estimate of %s in %llu nodes gave %llu changes, fewer than %d",
+				 what, (unsigned long long) budget, (unsigned long long) got, want);
+		if (cnt.nodes_read > Max(budget, 2) + 2)
+			elog(ERROR, "diff estimate of %s in %llu nodes read %llu", what,
+				 (unsigned long long) budget,
+				 (unsigned long long) cnt.nodes_read);
+	}
+}
+
+/*
+ * diff_estimate() gives diff's count where the nodes that differ fit
+ * (after random edits, across heights, of unrelated trees), nothing and no
+ * read for a tree with itself; and given fewer nodes than that, reads no
+ * more than it was given and estimates no fewer changes than there are.
+ */
+void
+tree_diff_estimate_bounds(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	Ref		   *from = palloc(sizeof(Ref));
+	Ref		   *to = palloc(sizeof(Ref));
+	Ref		   *small = palloc(sizeof(Ref));
+	Ref		   *odd = palloc(sizeof(Ref));
+	ProllyNodeRef rfrom;
+	ProllyNodeRef rto;
+	ProllyNodeRef rsmall;
+	ProllyNodeRef rodd;
+	pg_prng_state rng;
+	int		   *keys = palloc(sizeof(int) * MAX_KEY);
+	int		   *versions = palloc(sizeof(int) * MAX_KEY);
+	ProllyNodeCounters cnt = {0};
+
+	make_env(&env);
+	fill_ref(from, 2, 1);
+	build_ref(tr, &env, from, &rfrom);
+	memcpy(to, from, sizeof(Ref));
+	rto = rfrom;
+	pg_prng_seed(&rng, 13);
+
+	for (int round = 0; round < 5; round++)
+	{
+		int			n = random_batch(&rng, 60, MAX_KEY, 10 + round, keys, versions);
+
+		apply_batch(tr, &env, to, keys, versions, n, &rto);
+		check_estimate(tr, &env, &rfrom, &rto, changed_keys(from, to),
+					   "random edits");
+	}
+
+	/* itself: nothing, nothing read */
+	env.counters = &cnt;
+	if (PROLLY_CALL(tr, diff_estimate, &env, &rfrom, &rfrom, UINT64_MAX) != 0 ||
+		cnt.nodes_read != 0)
+		elog(ERROR, "a tree's diff estimate against itself read nodes or found changes");
+	env.counters = NULL;
+
+	/* across heights, both ways */
+	fill_ref(small, 1, ABSENT);
+	for (int k = 0; k < MAX_KEY; k += 997)
+		small->version[k] = (k / 997) % 2 == 0 ? 2 : 3;
+	build_ref(tr, &env, small, &rsmall);
+	check_estimate(tr, &env, &rsmall, &rfrom, changed_keys(small, from),
+				   "trees of two heights");
+	check_estimate(tr, &env, &rfrom, &rsmall, changed_keys(from, small),
+				   "trees of two heights");
+
+	/* unrelated: every key of both */
+	for (int k = 0; k < MAX_KEY; k++)
+		odd->version[k] = k % 2 == 1 ? 7 : ABSENT;
+	build_ref(tr, &env, odd, &rodd);
+	check_estimate(tr, &env, &rfrom, &rodd, changed_keys(from, odd),
+				   "unrelated trees");
+}
+
 /*
  * Keys of five bytes whose order ignores the last (a "spelling"), as a
  * collation can find 'a' and 'A' equal.

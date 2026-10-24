@@ -2,7 +2,8 @@
  *
  * prolly_autovacuum.h
  *	  Prolly's stores reclaimed by autovacuum: the chunk store collected,
- *	  its journal moved, and the page stores swept, when due.
+ *	  its journal moved, the page stores' release queues drained, and the
+ *	  page stores swept, when due.
  *
  * src/include/access/prolly_autovacuum.h
  *
@@ -22,6 +23,8 @@ extern PGDLLIMPORT int prolly_journal_move_threshold;
 extern PGDLLIMPORT int prolly_conjoin_max_files;
 /* prolly.autofold_threshold (a fraction of a table's size; 0: off) */
 extern PGDLLIMPORT double prolly_autofold_threshold;
+/* prolly.release_max_per_pass: release queue entries a pass lets go of */
+extern PGDLLIMPORT int prolly_release_max_per_pass;
 /* prolly.gc_file_size (kB): how large a collection's files grow */
 extern PGDLLIMPORT int prolly_gc_file_size;
 /*
@@ -38,6 +41,9 @@ extern void prolly_autovacuum_init(void);
  * each in a transaction of its own, an error reported and passed over.
  */
 extern void prolly_autovacuum(void);
+
+/* The current database's release queues drained, a pass's worth. */
+extern void prolly_release_page_stores(BmapRelease *total);
 
 /* The current database's page stores swept (due_only: those due). */
 extern void prolly_sweep_page_stores(bool due_only, BmapSweep *total);

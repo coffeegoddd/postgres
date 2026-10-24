@@ -36,11 +36,12 @@ SELECT pg_stat_force_next_flush();
 SELECT * FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}');
 SELECT pg_stat_reset_shared('prolly');
 SELECT test_bmap_free_blocks() AS free_before \gset
+-- Dropping the copy queues its subtree, and the drain counts it down.
 SELECT test_bmap_unlink(:copy);
 SELECT pg_stat_force_next_flush();
-SELECT * FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}');
--- Dropping the source, the last holder, frees every block, counting none
--- down.
+SELECT * FROM pg_temp.counted('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed,bmap_release_queued,bmap_release_drained,bmap_release_blocks_freed,bmap_release_refcount_updates}');
+-- Dropping the source, the last holder, does no map work itself; the drain
+-- frees every block, counting none down.
 SELECT pg_stat_reset_shared('prolly');
 SELECT test_bmap_share(:src) AS copy \gset
 SELECT test_bmap_unlink(:copy);
@@ -48,10 +49,16 @@ SELECT pg_stat_force_next_flush();
 SELECT pg_stat_reset_shared('prolly');
 DROP TABLE sm.b;
 SELECT pg_stat_force_next_flush();
-SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') =
-	test_bmap_free_blocks() - :free_before AS freed_counted,
-	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') >= :nblocks AS freed_all,
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') = 0 AND
 	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_refcount_updates') = 0
+	AS drop_did_no_map_work,
+	test_bmap_free_blocks() = :free_before AS drop_freed_none;
+SELECT freed >= :nblocks AS drain_freed_all FROM test_bmap_release_drain();
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_release_blocks_freed') =
+	test_bmap_free_blocks() - :free_before AS freed_counted,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_release_blocks_freed') >= :nblocks AS freed_all,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_release_refcount_updates') = 0
 	AS none_counted_down;
 
 -- A table whose updates of v aren't heap-only (an index on v): a row
@@ -168,10 +175,17 @@ SELECT pg_stat_reset_shared('prolly');
 SELECT test_bmap_free_blocks() AS free_before \gset
 SELECT dolt_branch('-D', 'other');
 SELECT pg_stat_force_next_flush();
-SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') =
+-- (the branch's storage queued, its blocks let go of by the drain)
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') = 0 AND
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_refcount_updates') = 0
+	AS delete_did_no_map_work,
+	test_bmap_release_pending() > 0 AS delete_queued;
+SELECT entries > 0 AS drained FROM test_bmap_release_drain();
+SELECT pg_stat_force_next_flush();
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'bmap_release_blocks_freed') =
 	test_bmap_free_blocks() - :free_before AS freed_counted,
-	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_blocks_freed') > 0 AS some_freed,
-	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_refcount_updates') > 0 AS some_counted_down,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_release_blocks_freed') > 0 AS some_freed,
+	(SELECT value FROM pg_stat_prolly WHERE name = 'bmap_release_refcount_updates') > 0 AS some_counted_down,
 	(SELECT value FROM pg_stat_prolly WHERE name = 'catalog_rows_copied') = 0 AS nothing_copied;
 
 \c :home

@@ -39,8 +39,10 @@
  * each subtree gaining a holder; the first change under a shared node copies
  * the path down to the leaf (tree_copy_node()), each copy's children
  * gaining a holder, and the data block is then copied as any shared block
- * is.  A drop lets go of each subtree: a count less where another holds it,
- * else freed, its children let go of the same way.  A node is an
+ * is.  A drop queues its subtrees, and its changes list's blocks, on its
+ * page store's release queue, in O(1) of its size; a background drain
+ * lets go of each: a count less where another holds it, else freed, its
+ * children let go of the same way (see "The release queue").  A node is an
  * incarnation of its block, which the pointer to it names by the record
  * that made it: a lookup that finds another there (a node freed and made
  * something else under it; in recovery, a version written before a crash)
@@ -90,13 +92,15 @@
  * the header, which the backend writing it out may hold exclusively.
  *
  * The sweep (bmap_sweep()).  Freeing is by reference count, which leaks in
- * four cases: a crash between a drop's commit and the records freeing its
+ * four cases: a crash between a drop's commit and the records queuing its
  * blocks, a crash part way through a prune, a crash (or an error, not an
  * interrupt, which the header's lock holds off) between the records
  * letting go of a truncation's blocks and those freeing them, and a count
  * stuck at 255 maps.
- * A sweep counts exactly what every map (and changes list) of a database's
- * page store holds, each relation's read under its header's lock, and
+ * A sweep drains the release queue first, then counts exactly what every
+ * map (and changes list) of a database's page store holds, each
+ * relation's read under its header's lock, and what the queue still holds
+ * (drains held off meanwhile), and
  * frees the blocks allocated as it began that nothing holds, rewrites the
  * stuck counts that now fit, and shortens the store to its last allocated
  * block (SHRINK, which redo truncates by too).  Branch creation (a share,
@@ -104,9 +108,11 @@
  * allocator reuses no freed block of the store while a sweep of it runs:
  * one freed and taken again meanwhile could be held by a map the sweep
  * read before.  A dropped
- * relation's map stays until the next checkpoint, and counts until then
- * (a tree's root page is written out with no subtrees first, as the nodes
- * it named are freed).  A tree's node counts once for each page pointing to
+ * relation's map counts until it is removed, once its blocks are queued
+ * (a tree's root page is written out with no subtrees once they are
+ * queued, as the nodes it named may be freed); an empty main fork file
+ * then keeps its relation file number until the next checkpoint, as
+ * md.c's does.  A tree's node counts once for each page pointing to
  * it, its children once however many reach it.  A path copy (not held off)
  * adds holders only to blocks held already; one adding a holder to a stuck
  * count makes a sweep under way leave the stuck counts as they are.
@@ -196,6 +202,8 @@ int			block_map_replay_entries = 65536;
 #define BMAP_PAGE_CHANGES	7
 #define BMAP_PAGE_ROOT		8		/* a tree's root page: block 1 */
 #define BMAP_PAGE_TREE		9		/* a tree's node, in the page store */
+#define BMAP_PAGE_QUEUE_META	10	/* the release queue's metapage */
+#define BMAP_PAGE_QUEUE		11		/* and its pages of entries */
 
 typedef struct BmapPageOpaqueData
 {
@@ -255,6 +263,13 @@ typedef struct BmapMeta
 #define BMAP_BITS_PER_PAGE \
 	((uint32) ((BMAP_CONTENT_SIZE / sizeof(uint64)) * 64))
 
+/* the release queue's metapage: how many entries are queued */
+typedef struct BmapQueueMeta
+{
+	uint32		version;
+	uint32		nentries;
+} BmapQueueMeta;
+
 #define BMAP_REFS_PER_PAGE	((uint32) BMAP_CONTENT_SIZE)
 #define BMAP_CHANGES_PER_PAGE \
 	((uint32) (BMAP_CONTENT_SIZE / sizeof(BmapChange)))
@@ -262,6 +277,12 @@ typedef struct BmapMeta
 /* the changes list's page and slot of entry 'i' */
 #define CHANGE_PAGE(i)		((BlockNumber) (1 + (i) / BMAP_CHANGES_PER_PAGE))
 #define CHANGE_SLOT(i)		((uint32) ((i) % BMAP_CHANGES_PER_PAGE))
+
+/* the release queue's page and slot of entry 'i' */
+#define BMAP_QUEUE_PER_PAGE \
+	((uint32) (BMAP_CONTENT_SIZE / sizeof(BmapQueued)))
+#define QUEUE_PAGE(i)		((BlockNumber) (1 + (i) / BMAP_QUEUE_PER_PAGE))
+#define QUEUE_SLOT(i)		((uint32) ((i) % BMAP_QUEUE_PER_PAGE))
 
 /* a count that reaches this stays, until a sweep counts it exactly */
 #define BMAP_REFS_STUCK		255
@@ -355,6 +376,8 @@ StaticAssertDecl(BMAP_DELTA_ROOT_TOPS == BMAP_TREE_TOPS,
 #define PageGetBmapRefs(page)	((uint8 *) PageGetContents(page))
 #define PageGetBmapChangesHead(page)	((BmapChangesHead *) PageGetContents(page))
 #define PageGetBmapChanges(page)	((BmapChange *) PageGetContents(page))
+#define PageGetBmapQueueMeta(page)	((BmapQueueMeta *) PageGetContents(page))
+#define PageGetBmapQueued(page)	((BmapQueued *) PageGetContents(page))
 
 static const PGIOAlignedBlock zero_block;
 
@@ -721,6 +744,13 @@ refs_smgr(RelFileLocator rel)
 					INVALID_PROC_NUMBER);
 }
 
+static SMgrRelation
+queue_smgr(RelFileLocator rel)
+{
+	return smgropen(with_relnumber(rel, BMAP_QUEUE_RELNUMBER),
+					INVALID_PROC_NUMBER);
+}
+
 /*
  * Does a relation file number name a block-mapped relation?  It does if its
  * map fork exists.
@@ -775,7 +805,7 @@ check_page(Page page, uint16 type, RelFileLocator rel, ForkNumber fork,
 
 	/* (the pages that say their version: the first word of their contents) */
 	if ((type == BMAP_PAGE_HEADER || type == BMAP_PAGE_META ||
-		 type == BMAP_PAGE_CHANGES_HEAD) &&
+		 type == BMAP_PAGE_CHANGES_HEAD || type == BMAP_PAGE_QUEUE_META) &&
 		*(uint32 *) PageGetContents(page) != BMAP_VERSION)
 		refuse_version(*(uint32 *) PageGetContents(page), rel, fork);
 }
@@ -1253,15 +1283,18 @@ alloc_initialized(RelFileLocator rel)
 	return initialized;
 }
 
+static void ensure_queue(RelFileLocator rel);
+
 /*
- * Make sure the tablespace and database of 'rel' have an allocator and a
- * page store.
+ * Make sure the tablespace and database of 'rel' have an allocator, a page
+ * store and a release queue.
  */
 static void
 ensure_alloc(RelFileLocator rel)
 {
 	LOCKTAG		tag;
 
+	ensure_queue(rel);
 	if (alloc_initialized(rel))
 		return;
 
@@ -1386,6 +1419,49 @@ refs_nblocks(RelFileLocator rel)
 	if (!smgrexists(rsrel, MAIN_FORKNUM))
 		return 0;
 	return smgrnblocks(rsrel, MAIN_FORKNUM);
+}
+
+/*
+ * The release queue's file (see "The release queue" below), made with the
+ * allocator, of its metapage at least: the page itself is initialized by
+ * the first record that pushes an entry.  The file is logged as made; its
+ * pages aren't, as reference-count pages aren't (refs_cover()), so a
+ * standby, or a server restored from a backup, may have the file without
+ * its metapage, which it then gets here.
+ */
+static void
+ensure_queue(RelFileLocator rel)
+{
+	SMgrRelation qsrel = queue_smgr(rel);
+	LOCKTAG		tag;
+
+	if (smgrexists(qsrel, MAIN_FORKNUM) && smgrnblocks(qsrel, MAIN_FORKNUM) > 0)
+		return;
+	SET_LOCKTAG_RELATION(tag, rel.dbOid, BMAP_QUEUE_RELNUMBER);
+	(void) LockAcquire(&tag, AccessExclusiveLock, false, false);
+	if (!smgrexists(qsrel, MAIN_FORKNUM))
+	{
+		RelFileLocator qloc = with_relnumber(rel, BMAP_QUEUE_RELNUMBER);
+
+		smgrcreate(qsrel, MAIN_FORKNUM, false);
+		log_smgrcreate(&qloc, MAIN_FORKNUM);
+	}
+	check_may_read();
+	if (smgrnblocks(qsrel, MAIN_FORKNUM) == 0)
+		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(qsrel, RELPERSISTENCE_PERMANENT),
+										  MAIN_FORKNUM, NULL,
+										  EB_SKIP_EXTENSION_LOCK, 1,
+										  RBM_NORMAL));
+	LockRelease(&tag, AccessExclusiveLock, false);
+}
+
+/* does rel's store have a release queue? */
+static bool
+queue_exists(RelFileLocator rel)
+{
+	SMgrRelation qsrel = queue_smgr(rel);
+
+	return smgrexists(qsrel, MAIN_FORKNUM) && smgrnblocks(qsrel, MAIN_FORKNUM) > 0;
 }
 
 /* ----------------------------------------------------------------
@@ -3230,9 +3306,10 @@ refs_get(RefsPages *rp, BlockNumber phys)
 	return page_ref(BufferGetPage(rp->buf[refs_find(rp, phys)]), phys);
 }
 
-/* set a block's count when the record is made */
+/* set a block's count when the record is made, counted as 'counter' */
 static void
-refs_set(RefsPages *rp, BlockNumber phys, uint8 count)
+refs_set_counted(RefsPages *rp, BlockNumber phys, uint8 count,
+				 PgStat_ProllyCounter counter)
 {
 	xl_bmap_refs_delta *delta = rp->delta[refs_find(rp, phys)];
 	xl_bmap_ref_delta *ref = (xl_bmap_ref_delta *) (delta + 1);
@@ -3240,7 +3317,13 @@ refs_set(RefsPages *rp, BlockNumber phys, uint8 count)
 	ref[delta->nrefs].slot = REF_SLOT(phys);
 	ref[delta->nrefs].count = count;
 	delta->nrefs++;
-	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_REFCOUNT_UPDATES, 1);
+	pgstat_count_prolly(counter, 1);
+}
+
+static void
+refs_set(RefsPages *rp, BlockNumber phys, uint8 count)
+{
+	refs_set_counted(rp, phys, count, PGSTAT_PROLLY_BMAP_REFCOUNT_UPDATES);
 }
 
 /*
@@ -4953,6 +5036,7 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys)
 	XLogRegisterBlock(0, &rel, MAIN_FORKNUM, blkno, copy.data,
 					 REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 	XLogInsert(RM_BMAP_ID, XLOG_BMAP_PRESERVE);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_PAGES_PRESERVED, 1);
 }
 
 /*
@@ -6223,14 +6307,355 @@ tree_release_tops(SMgrRelation reln, const BmapEntry *tops)
 	}
 }
 
+/* ----------------------------------------------------------------
+ * The release queue
+ * ----------------------------------------------------------------
+ */
+
 /*
- * drop_blocks() of a tree: each subtree let go of, its snapshots' too.  The
- * map stays until the relation is unlinked, and a sweep reads it until then
- * (see sweep_relation()),
- * but the nodes it points to are freed, and may be made something else: so
- * its root page is first written out with no subtrees, under the header's
- * lock (which a sweep reads it under), and with no record, the relation's
- * drop being logged already (redo removes the map).
+ * A database's page store in a tablespace has a release queue
+ * (BMAP_QUEUE_RELNUMBER): a stack of entries (BmapQueued), each holding the
+ * node or data block it names as the map it came from held it.  Block 0 is
+ * its metapage, saying how many entries there are; entry i is slot
+ * QUEUE_SLOT(i) of block QUEUE_PAGE(i).  Dropping a relation pushes its
+ * root page's pointers (its snapshots' too) and its changes list's blocks,
+ * so letting go of a relation's storage costs its root page and its
+ * changes list, not its size.  A drain pops entries from the top, a step
+ * at a time (bmap_release_step()), and lets go of each as tree_release()
+ * would: one holder less, or, if nothing else held the block, the block
+ * freed, a node's children pushed in its place.  A node another map still
+ * holds is only counted down; its subtree isn't read.
+ *
+ * A step is one record: the entries popped, the counts they change, the
+ * blocks they free and the children they push.  A crash replays it whole
+ * or not at all, so no entry is let go of twice and none is lost; what the
+ * queue holds counts as held after a crash as before it.  Steps are
+ * serialized per store by a lock (DRAIN_LOCK), and held off while a sweep
+ * counts holders, which counts the queue's entries as holders too
+ * (sweep_queue()).
+ *
+ * Drains run in autovacuum workers (prolly_autovacuum()), in a sweep before
+ * it counts, and before a VACUUM of a relation of the store
+ * (bmapreleasestep()): a page a dropped map still holds counts as shared,
+ * which VACUUM would otherwise leave as it is or copy to change.
+ *
+ * Locks: the metapage, exclusively, for a push or a step; a push then
+ * locks the pages it writes.  A step reads the pages it pops from under
+ * share locks, then locks the reference-count pages, the allocator's, and
+ * the pages it pushes children onto, in that order.  A drop pushes under
+ * its relation's header, held exclusively; nothing that holds the queue's
+ * metapage waits for a map's header.  The file grows to the deepest the
+ * stack has been, under the metapage's lock, and never shrinks.
+ */
+
+/* a step's locks: one store's drain at a time, and a sweep's counting */
+#define DRAIN_LOCK(tag, rel) \
+	SET_LOCKTAG_OBJECT(tag, (rel).dbOid, BMAP_SWEEP_CLASSID, (rel).spcOid, 2)
+#define SWEEP_LOCK(tag, rel) \
+	SET_LOCKTAG_OBJECT(tag, (rel).dbOid, BMAP_SWEEP_CLASSID, (rel).spcOid, 0)
+
+/* queue pages one record changes at most */
+#define BMAP_QUEUE_PAGES_PER_RECORD	8
+
+/*
+ * Entries one step pops at most, and the reference-count and bitmap pages
+ * their blocks may lie on: with the metapage, the pages a node's children
+ * are pushed onto and the allocator's metapage, all one record.
+ */
+#define BMAP_RELEASE_STEP		128
+#define BMAP_RELEASE_REFS_PAGES	16
+#define BMAP_RELEASE_BITS_PAGES	4
+
+StaticAssertDecl(BMAP_RELEASE_REFS_PAGES <= BMAP_REFS_PER_RECORD,
+				 "a step's count pages are locked at once");
+StaticAssertDecl(1 + 3 + BMAP_RELEASE_REFS_PAGES + 1 + BMAP_RELEASE_BITS_PAGES <=
+				 XLR_MAX_BLOCK_ID + 1,
+				 "a step's pages fit one record");
+StaticAssertDecl(BMAP_TREE_FANOUT <= 2 * BMAP_QUEUE_PER_PAGE,
+				 "a node's children are pushed onto three pages at most");
+
+static Buffer
+queue_read(RelFileLocator rel, BlockNumber blkno)
+{
+	check_may_read();
+	return ReadBufferWithoutRelcache(with_relnumber(rel, BMAP_QUEUE_RELNUMBER),
+									 MAIN_FORKNUM, blkno, RBM_NORMAL, NULL,
+									 true);
+}
+
+/*
+ * Give the queue 'need' pages, all zeroes until a record initializes one.
+ * Under the metapage's exclusive lock, which serializes the file's growth.
+ */
+static void
+queue_cover(RelFileLocator rel, BlockNumber need)
+{
+	SMgrRelation qsrel = queue_smgr(rel);
+
+	check_may_read();
+	if (smgrnblocks(qsrel, MAIN_FORKNUM) < need)
+		ReleaseBuffer(ExtendBufferedRelTo(BMR_SMGR(qsrel, RELPERSISTENCE_PERMANENT),
+										  MAIN_FORKNUM, NULL,
+										  EB_SKIP_EXTENSION_LOCK, need,
+										  RBM_NORMAL));
+}
+
+static void
+apply_queue_meta_delta(Page page, const xl_bmap_queue_meta_delta *delta)
+{
+	if (delta->flags & BMAP_DELTA_INIT)
+	{
+		init_page(page, BMAP_PAGE_QUEUE_META);
+		PageGetBmapQueueMeta(page)->version = BMAP_VERSION;
+	}
+	PageGetBmapQueueMeta(page)->nentries = delta->nentries;
+}
+
+static void
+apply_queue_delta(Page page, const xl_bmap_queue_delta *delta)
+{
+	if (delta->flags & BMAP_DELTA_INIT)
+		init_page(page, BMAP_PAGE_QUEUE);
+	Assert(delta->first + delta->n <= BMAP_QUEUE_PER_PAGE);
+	memcpy(PageGetBmapQueued(page) + delta->first, delta + 1,
+		   delta->n * sizeof(BmapQueued));
+}
+
+static Size
+queue_delta_size(const xl_bmap_queue_delta *d)
+{
+	return sizeof(xl_bmap_queue_delta) + d->n * sizeof(BmapQueued);
+}
+
+/*
+ * The queue's metapage, read and locked exclusively; *nentries gets the
+ * count of entries, and *isnew whether the page is yet to be initialized.
+ */
+static Buffer
+queue_lock_meta(RelFileLocator rel, uint32 *nentries, bool *isnew)
+{
+	Buffer		buf = queue_read(rel, 0);
+	Page		page = BufferGetPage(buf);
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	*isnew = PageIsNew(page);
+	if (*isnew)
+		*nentries = 0;
+	else
+	{
+		check_page(page, BMAP_PAGE_QUEUE_META,
+				   with_relnumber(rel, BMAP_QUEUE_RELNUMBER), MAIN_FORKNUM, 0);
+		*nentries = PageGetBmapQueueMeta(page)->nentries;
+	}
+	return buf;
+}
+
+/* Queue pages locked for one record, each with the delta that will change it. */
+typedef struct QueuePages
+{
+	int			n;
+	Buffer		buf[BMAP_QUEUE_PAGES_PER_RECORD];
+	xl_bmap_queue_delta *delta[BMAP_QUEUE_PAGES_PER_RECORD];
+} QueuePages;
+
+/*
+ * Lock the pages of entries [pos, pos + n), which the file has, and make the
+ * deltas setting them to items[].  A page the stack hasn't reached yet is
+ * all zeroes, and reached from its first slot: its delta initializes it.
+ */
+static void
+queue_write(RelFileLocator rel, QueuePages *qp, uint32 pos,
+			const BmapQueued *items, uint32 n)
+{
+	RelFileLocator qloc = with_relnumber(rel, BMAP_QUEUE_RELNUMBER);
+	uint32		i = 0;
+
+	qp->n = 0;
+	while (i < n)
+	{
+		BlockNumber blk = QUEUE_PAGE(pos + i);
+		uint32		slot = QUEUE_SLOT(pos + i);
+		uint32		take = Min(n - i, BMAP_QUEUE_PER_PAGE - slot);
+		Buffer		buf;
+		Page		page;
+		xl_bmap_queue_delta *delta;
+
+		if (qp->n == BMAP_QUEUE_PAGES_PER_RECORD)
+			elog(ERROR, "release queue entries span too many pages for one record");
+		buf = queue_read(rel, blk);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buf);
+		delta = palloc0(sizeof(xl_bmap_queue_delta) + take * sizeof(BmapQueued));
+		delta->kind = BMAP_DELTA_QUEUE;
+		if (PageIsNew(page))
+		{
+			if (slot != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("block %u of \"%s\" is not an initialized block map page",
+								blk, relpathperm(qloc, MAIN_FORKNUM).str)));
+			delta->flags |= BMAP_DELTA_INIT;
+		}
+		else
+			check_page(page, BMAP_PAGE_QUEUE, qloc, MAIN_FORKNUM, blk);
+		delta->first = slot;
+		delta->n = take;
+		memcpy(delta + 1, items + i, take * sizeof(BmapQueued));
+		qp->buf[qp->n] = buf;
+		qp->delta[qp->n] = delta;
+		qp->n++;
+		i += take;
+	}
+}
+
+/* in the record's critical section, as refs_apply_register() */
+static int
+queue_apply_register(QueuePages *qp, int first)
+{
+	int			id = first;
+
+	for (int k = 0; k < qp->n; k++)
+	{
+		apply_queue_delta(BufferGetPage(qp->buf[k]), qp->delta[k]);
+		MarkBufferDirty(qp->buf[k]);
+		XLogRegisterBuffer(id, qp->buf[k], REGBUF_STANDARD |
+						   ((qp->delta[k]->flags & BMAP_DELTA_INIT) ?
+							REGBUF_WILL_INIT : 0));
+		XLogRegisterBufData(id, qp->delta[k], queue_delta_size(qp->delta[k]));
+		id++;
+	}
+	return id;
+}
+
+static void
+queue_set_lsn(QueuePages *qp, XLogRecPtr lsn)
+{
+	for (int k = 0; k < qp->n; k++)
+		PageSetLSN(BufferGetPage(qp->buf[k]), lsn);
+}
+
+static void
+queue_release(QueuePages *qp)
+{
+	for (int k = 0; k < qp->n; k++)
+	{
+		UnlockReleaseBuffer(qp->buf[k]);
+		pfree(qp->delta[k]);
+	}
+	qp->n = 0;
+}
+
+/* in the record's critical section: the metapage's count set, as block 0 */
+static void
+register_queue_meta(Buffer metabuf, bool isnew,
+					xl_bmap_queue_meta_delta *mdelta, uint32 nentries)
+{
+	mdelta->kind = BMAP_DELTA_QUEUE_META;
+	mdelta->flags = isnew ? BMAP_DELTA_INIT : 0;
+	mdelta->nentries = nentries;
+	apply_queue_meta_delta(BufferGetPage(metabuf), mdelta);
+	MarkBufferDirty(metabuf);
+	XLogRegisterBuffer(0, metabuf, REGBUF_STANDARD |
+					   (isnew ? REGBUF_WILL_INIT : 0));
+	XLogRegisterBufData(0, mdelta, sizeof(*mdelta));
+}
+
+/*
+ * Push items[0 .. n) onto rel's store's queue, in records of a few pages
+ * each; returns the end of the last.  A crash between them leaves those not
+ * pushed allocated, held by nothing, for a sweep.
+ */
+static XLogRecPtr
+queue_push(RelFileLocator rel, const BmapQueued *items, uint32 n)
+{
+	uint32		i = 0;
+	XLogRecPtr	end = InvalidXLogRecPtr;
+
+	if (n == 0)
+		return end;
+	ensure_queue(rel);
+	while (i < n)
+	{
+		uint32		nentries;
+		bool		isnew;
+		Buffer		metabuf = queue_lock_meta(rel, &nentries, &isnew);
+		uint32		take;
+		QueuePages	qp;
+		xl_bmap_queue_meta_delta mdelta;
+		xl_bmap_release xlrec;
+		XLogRecPtr	lsn;
+
+		take = Min(n - i, BMAP_QUEUE_PAGES_PER_RECORD * BMAP_QUEUE_PER_PAGE -
+				   QUEUE_SLOT(nentries));
+		if ((uint64) nentries + take > PG_UINT32_MAX)
+			elog(ERROR, "release queue of database %u is full", rel.dbOid);
+		queue_cover(rel, QUEUE_PAGE(nentries + take - 1) + 1);
+		queue_write(rel, &qp, nentries, items + i, take);
+
+		xlrec.locator = with_relnumber(rel, BMAP_QUEUE_RELNUMBER);
+		xlrec.op = BMAP_RELEASE_QUEUE;
+		xlrec.npopped = 0;
+		XLogEnsureRecordSpace(qp.n, 2 + qp.n);
+		START_CRIT_SECTION();
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		register_queue_meta(metabuf, isnew, &mdelta, nentries + take);
+		queue_apply_register(&qp, 1);
+		lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_RELEASE);
+		PageSetLSN(BufferGetPage(metabuf), lsn);
+		queue_set_lsn(&qp, lsn);
+		END_CRIT_SECTION();
+
+		queue_release(&qp);
+		UnlockReleaseBuffer(metabuf);
+		pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_QUEUED, take);
+		end = XactLastRecEnd;
+		i += take;
+	}
+	return end;
+}
+
+static inline BmapQueued
+queued(BlockNumber block, uint16 level, BlockNumber first, XLogRecPtr since)
+{
+	BmapQueued	q;
+
+	memset(&q, 0, sizeof(q));
+	q.block = block;
+	q.level = level;
+	q.first = first;
+	q.since = since;
+	return q;
+}
+
+/* the subtrees 'tops' points to (a root page's, or a snapshot's), as entries */
+static uint32
+queued_tops(const BmapEntry *tops, BmapQueued *items)
+{
+	uint64		first = 0;
+	uint32		n = 0;
+
+	for (int k = 0; k < BMAP_TREE_TOPS; k++)
+	{
+		if (BlockNumberIsValid(tops[k].block))
+			items[n++] = queued(tops[k].block, (uint16) k, (BlockNumber) first,
+								tops[k].since);
+		first += tree_span(k);
+	}
+	return n;
+}
+
+/*
+ * drop_blocks(): the map's subtrees, its snapshots' and its changes list's
+ * blocks queued, to be let go of in the background.  The map stays until
+ * the relation is unlinked, and a sweep reads it until then (see
+ * sweep_relation()), but once queued the nodes it points to may be freed,
+ * and made something else: so its root page is written out with no
+ * subtrees, under the header's lock (which a sweep reads it under), and
+ * with no record, the relation's drop being logged already (redo removes
+ * the map).  The queue's records come first, under the same lock: a sweep
+ * that reads the map with its subtrees gone reads the queue after, with
+ * them.
  */
 static void
 tree_drop(SMgrRelation reln)
@@ -6241,12 +6666,71 @@ tree_drop(SMgrRelation reln)
 	Buffer		buf;
 	PGIOAlignedBlock copy;
 	void	   *pages[1] = {copy.data};
+	BmapQueued *items;
+	uint32		n = 0;
+	BmapChangesHead head;
+	uint32		nchanges = 0;
+	BmapChange *changes;
 
+	/* (a queue to make takes a lock, not to be waited for under the header) */
+	ensure_queue(rel);
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	buf = map_read(rel, 1);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	check_page(BufferGetPage(buf), BMAP_PAGE_ROOT, rel, BMAP_FORKNUM, 1);
 	root = *PageGetBmapRoot(BufferGetPage(buf));
+	UnlockReleaseBuffer(buf);
+
+	/*
+	 * The changes list's blocks first, in as many records as they take, and
+	 * the subtrees last, in one record of their own: a failure before it
+	 * leaves nothing queued that the root page still reaches (the blocks
+	 * queued are listed by the changes list too, so counted twice, which
+	 * keeps them).  The root page is written out with no subtrees only
+	 * once they are queued.
+	 */
+	changes = changes_read(reln, InvalidBuffer, &head, &nchanges);
+	items = palloc_array(BmapQueued, Max(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS),
+										 changes ? nchanges : 0));
+	if (changes != NULL)
+	{
+		BlockNumber *held = palloc_array(BlockNumber, Max(nchanges, 1));
+		uint32		nheld = changes_blocks(changes, nchanges, held);
+
+		for (uint32 i = 0; i < nheld; i++)
+			items[n++] = queued(held[i], BMAP_QUEUED_BLOCK, 0, InvalidXLogRecPtr);
+		pfree(held);
+		pfree(changes);
+	}
+
+	/*
+	 * The drop's commit is flushed, these records maybe not: the WAL writer
+	 * is asked to flush them soon, not waited for.  A crash first leaves
+	 * the blocks held by nothing, as a crash before the push does, for the
+	 * sweep a restart makes due (bmap_sweep_due()).
+	 */
+	{
+		XLogRecPtr	end;
+
+		(void) queue_push(rel, items, n);
+		INJECTION_POINT("bmap-drop-changes-queued", NULL);
+		n = queued_tops(root.top, items);
+		for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
+			if (root.snap[s].id != 0)
+				n += queued_tops(snapshot_tops(&root.snap[s]), items + n);
+		StaticAssertStmt(BMAP_TREE_TOPS * (1 + BMAP_TREE_SNAPSHOTS) <=
+						 (BMAP_QUEUE_PAGES_PER_RECORD - 1) * BMAP_QUEUE_PER_PAGE,
+						 "a map's subtrees are queued in one record");
+		end = queue_push(rel, items, n);
+		if (!XLogRecPtrIsInvalid(end))
+			XLogSetAsyncXactLSN(end);
+		else if (!XLogRecPtrIsInvalid(XactLastRecEnd))
+			XLogSetAsyncXactLSN(XactLastRecEnd);
+	}
+	pfree(items);
+
+	buf = map_read(rel, 1);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 		PageGetBmapRoot(BufferGetPage(buf))->top[k].block = InvalidBlockNumber;
 	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
@@ -6256,19 +6740,15 @@ tree_drop(SMgrRelation reln)
 	mdwritev(reln, BMAP_FORKNUM, 1, (const void **) pages, 1, false);
 	UnlockReleaseBuffer(buf);
 	UnlockReleaseBuffer(headerbuf);
-
-	tree_release_tops(reln, root.top);
-	for (int s = 0; s < BMAP_TREE_SNAPSHOTS; s++)
-		if (root.snap[s].id != 0)
-			tree_release_tops(reln, snapshot_tops(&root.snap[s]));
 }
 
 /*
- * Free every physical block a dropped relation's map or changes list holds
- * that no other map holds too; the others lose a reference.  The records
- * name only the allocator's pages: a standby has removed the relation's map
- * by the time it replays them.  Runs after commit or abort, so it must not
- * fail: a problem is reported and the blocks are left allocated.
+ * Let go of every physical block a dropped relation's map or changes list
+ * holds: queued, for a drain to free those no other map holds and count
+ * the others down.  The records name only the queue's pages: a standby has
+ * removed the relation's map by the time it replays them.  Runs after
+ * commit or abort, so it must not fail: a problem is reported and the
+ * blocks are left allocated, for a sweep.
  */
 static void
 drop_blocks(SMgrRelation reln)
@@ -6282,29 +6762,7 @@ drop_blocks(SMgrRelation reln)
 	CurrentResourceOwner = owner;
 	PG_TRY();
 	{
-		/* the tree's subtrees */
 		tree_drop(reln);
-
-		/* and those the changes list holds */
-		{
-			BmapChangesHead head;
-			uint32		nchanges;
-			BmapChange *changes = changes_read(reln, InvalidBuffer, &head,
-											   &nchanges);
-
-			if (changes != NULL)
-			{
-				BlockNumber *held = palloc_array(BlockNumber, Max(nchanges, 1));
-				BlockNumber *free_held = palloc_array(BlockNumber, Max(nchanges, 1));
-				uint32		nheld = changes_blocks(changes, nchanges, held);
-
-				nheld = unref_blocks(rel, held, nheld, free_held);
-				free_blocks(rel, free_held, nheld);
-				pfree(held);
-				pfree(free_held);
-				pfree(changes);
-			}
-		}
 	}
 	PG_CATCH();
 	{
@@ -6327,6 +6785,520 @@ drop_blocks(SMgrRelation reln)
 	ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, false, true);
 	CurrentResourceOwner = save;
 	ResourceOwnerDelete(owner);
+}
+
+/* a block popped, and how many of the entries popped hold it */
+typedef struct Popped
+{
+	BlockNumber block;
+	uint32		holders;
+} Popped;
+
+static int
+cmp_popped(const void *a, const void *b)
+{
+	return pg_cmp_u32(((const Popped *) a)->block, ((const Popped *) b)->block);
+}
+
+/* is 'page' one of pages[0 .. *n), or is there room to add it? */
+static bool
+page_fits(BlockNumber page, BlockNumber *pages, int *n, int max)
+{
+	for (int i = 0; i < *n; i++)
+		if (pages[i] == page)
+			return true;
+	if (*n == max)
+		return false;
+	pages[(*n)++] = page;
+	return true;
+}
+
+static int
+cmp_queued_block(const void *a, const void *b)
+{
+	return pg_cmp_u32(((const BmapQueued *) a)->block,
+					  ((const BmapQueued *) b)->block);
+}
+
+/*
+ * A node popped: its children, as entries, into children[]; their count,
+ * which the caller pushes if the node is freed.  Shared, the node changes
+ * no more; held by the queue alone, nothing else reaches it.  One that
+ * isn't the incarnation its entry names (-1) is reported, and its entry
+ * dropped with nothing let go of: what it held is left for a sweep.
+ */
+static int
+queued_children(RelFileLocator rel, const BmapQueued *node,
+				BmapQueued *children)
+{
+	Buffer		buf = tree_read(rel, node->block, RBM_NORMAL);
+	const BmapEntry *entries;
+	int			n = 0;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!tree_node_is(BufferGetPage(buf), node->level, node->first, node->since))
+	{
+		UnlockReleaseBuffer(buf);
+		ereport(WARNING,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("block %u of the page store of database %u is not the node its release queue entry names",
+						node->block, rel.dbOid),
+				 errdetail("What the node held is left allocated, for a page sweep.")));
+		return -1;
+	}
+	entries = PageGetBmapEntries(BufferGetPage(buf));
+	for (uint32 i = 0; i < BMAP_TREE_FANOUT; i++)
+	{
+		if (!BlockNumberIsValid(entries[i].block))
+			continue;
+		if (node->level == 0)
+			children[n++] = queued(entries[i].block, BMAP_QUEUED_BLOCK, 0,
+								   InvalidXLogRecPtr);
+		else
+			children[n++] = queued(entries[i].block, node->level - 1,
+								   (BlockNumber) Min((uint64) node->first +
+													 i * tree_span(node->level - 1),
+													 (uint64) MaxBlockNumber),
+								   entries[i].since);
+	}
+	UnlockReleaseBuffer(buf);
+
+	/*
+	 * A leaf holds each block it maps once, however many of its entries map
+	 * it (as tree_copy_node() counts it): each is queued once.
+	 */
+	if (node->level == 0 && n > 1)
+	{
+		int			u = 0;
+
+		qsort(children, n, sizeof(BmapQueued), cmp_queued_block);
+		for (int i = 0; i < n; i++)
+			if (u == 0 || children[u - 1].block != children[i].block)
+				children[u++] = children[i];
+		n = u;
+	}
+	return n;
+}
+
+/*
+ * One step of a drain: entries popped from the top of the queue, as many as
+ * one record lets go of (up to and including the first node), and let go
+ * of, all in one record.  False if the queue is empty.
+ */
+static bool
+release_step(RelFileLocator rel, BmapRelease *done)
+{
+	uint32		n;
+	bool		isnew;
+	Buffer		metabuf;
+	BmapQueued	popped[BMAP_RELEASE_STEP];
+	Popped		blocks[BMAP_RELEASE_STEP];
+	BlockNumber sorted[BMAP_RELEASE_STEP];
+	BlockNumber tofree[BMAP_RELEASE_STEP];
+	uint32		k = 0;
+	uint32		nblocks = 0;
+	uint32		nfree = 0;
+	uint32		freed = 0;
+	uint32		unrefs = 0;
+	BmapQueued *children = NULL;
+	int			nchildren = 0;
+	uint32		npushed = 0;
+	uint32		nlet = 0;
+	const BmapQueued *node = NULL;
+	BlockNumber nrefpages;
+	RefsPages	rp;
+	QueuePages	qp;
+	Buffer		allocbuf = InvalidBuffer;
+	BitsChange	bits[BMAP_RELEASE_BITS_PAGES];
+	int			nbits = 0;
+	int			nblockids;
+	xl_bmap_meta_delta adelta;
+	xl_bmap_queue_meta_delta mdelta;
+	xl_bmap_release xlrec;
+	XLogRecPtr	lsn;
+	int			id;
+
+	metabuf = queue_lock_meta(rel, &n, &isnew);
+	if (n == 0)
+	{
+		UnlockReleaseBuffer(metabuf);
+		return false;
+	}
+
+	/*
+	 * The entries from the top, until one is a node (whose children may
+	 * take its place) or their blocks would lie on more count or bitmap
+	 * pages than a record changes.
+	 */
+	{
+		BlockNumber refpages[BMAP_RELEASE_REFS_PAGES];
+		BlockNumber bitpages[BMAP_RELEASE_BITS_PAGES];
+		int			nref = 0;
+		int			nbit = 0;
+		Buffer		buf = InvalidBuffer;
+		BlockNumber cur = InvalidBlockNumber;
+
+		while (k < BMAP_RELEASE_STEP && k < n)
+		{
+			uint32		pos = n - 1 - k;
+			BmapQueued	e;
+			int			saveref = nref;
+
+			if (QUEUE_PAGE(pos) != cur)
+			{
+				if (BufferIsValid(buf))
+					UnlockReleaseBuffer(buf);
+				cur = QUEUE_PAGE(pos);
+				buf = queue_read(rel, cur);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				check_page(BufferGetPage(buf), BMAP_PAGE_QUEUE,
+						   with_relnumber(rel, BMAP_QUEUE_RELNUMBER),
+						   MAIN_FORKNUM, cur);
+			}
+			e = PageGetBmapQueued(BufferGetPage(buf))[QUEUE_SLOT(pos)];
+			if (!page_fits(REF_PAGE(e.block), refpages, &nref,
+						   BMAP_RELEASE_REFS_PAGES))
+				break;
+			if (!page_fits(e.block / BMAP_BITS_PER_PAGE, bitpages, &nbit,
+						   BMAP_RELEASE_BITS_PAGES))
+			{
+				nref = saveref;
+				break;
+			}
+			popped[k++] = e;
+			if (e.level != BMAP_QUEUED_BLOCK)
+			{
+				node = &popped[k - 1];
+				break;
+			}
+		}
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+	}
+	Assert(k > 0);
+
+	/* a node's children, read first (an entry not naming its node: none) */
+	nlet = k;
+	if (node != NULL)
+	{
+		children = palloc_array(BmapQueued, BMAP_TREE_FANOUT);
+		nchildren = queued_children(rel, node, children);
+		if (nchildren < 0)
+		{
+			nlet = k - 1;
+			node = NULL;
+		}
+	}
+
+	/* the blocks, each with how many of the entries popped hold it */
+	for (uint32 i = 0; i < nlet; i++)
+	{
+		blocks[i].block = popped[i].block;
+		blocks[i].holders = 1;
+	}
+	qsort(blocks, nlet, sizeof(Popped), cmp_popped);
+	for (uint32 i = 0; i < nlet; i++)
+	{
+		if (nblocks > 0 && blocks[nblocks - 1].block == blocks[i].block)
+			blocks[nblocks - 1].holders++;
+		else
+			blocks[nblocks++] = blocks[i];
+	}
+
+	/*
+	 * Their counts, those holders fewer; a block they leave held by nothing
+	 * is freed (blocks past the counts' pages count zero).
+	 */
+	nrefpages = refs_nblocks(rel);
+	rp.n = 0;
+	{
+		uint32		ncounted = 0;
+
+		for (uint32 i = 0; i < nblocks; i++)
+			if (REF_PAGE(blocks[i].block) < nrefpages)
+				sorted[ncounted++] = blocks[i].block;
+		if (ncounted > 0 && refs_lock(rel, sorted, ncounted, &rp) != ncounted)
+			elog(ERROR, "a release queue step locks too many count pages");
+	}
+	for (uint32 i = 0; i < nblocks; i++)
+	{
+		BlockNumber b = blocks[i].block;
+		uint32		h = blocks[i].holders;
+		uint8		c = REF_PAGE(b) < nrefpages ? refs_get(&rp, b) : 0;
+
+		if (c == BMAP_REFS_STUCK)
+		{
+			for (uint32 j = 0; j < h; j++)
+				stuck_released(rel);
+			continue;
+		}
+		if (c >= h)
+		{
+			refs_set_counted(&rp, b, c - h,
+							 PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES);
+			unrefs++;
+			continue;
+		}
+		/* (the entries were all the holders it had) */
+		Assert(c + 1 == h);
+		if (c > 0)
+			refs_set_counted(&rp, b, 0,
+							 PGSTAT_PROLLY_BMAP_RELEASE_REFCOUNT_UPDATES);
+		tofree[nfree++] = b;
+		if (node != NULL && b == node->block)
+			npushed = (uint32) nchildren;
+	}
+
+	/* the frees: a bit cleared for each, if set (a block is freed once) */
+	if (nfree > 0)
+	{
+		BmapMeta   *meta;
+		uint32		hint;
+
+		allocbuf = alloc_read(rel, 0);
+		LockBuffer(allocbuf, BUFFER_LOCK_EXCLUSIVE);
+		check_page(BufferGetPage(allocbuf), BMAP_PAGE_META, rel, MAIN_FORKNUM, 0);
+		meta = PageGetBmapMeta(BufferGetPage(allocbuf));
+		hint = meta->hint;
+		for (uint32 i = 0; i < nfree; i++)
+		{
+			uint32		pageno = tofree[i] / BMAP_BITS_PER_PAGE;
+			uint32		bit = tofree[i] % BMAP_BITS_PER_PAGE;
+			BitsChange *bc = NULL;
+			uint64	   *words;
+
+			if (pageno >= meta->nbitmap || tofree[i] >= meta->hw)
+				elog(ERROR, "block-mapped storage of database %u frees block %u past its end",
+					 rel.dbOid, tofree[i]);
+			for (int j = 0; j < nbits; j++)
+				if (bits[j].pageno == pageno)
+					bc = &bits[j];
+			if (bc == NULL)
+			{
+				Buffer		buf;
+
+				Assert(nbits < BMAP_RELEASE_BITS_PAGES);
+				buf = alloc_read(rel, meta->bitmap[pageno]);
+				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+				check_page(BufferGetPage(buf), BMAP_PAGE_BITMAP, rel,
+						   MAIN_FORKNUM, meta->bitmap[pageno]);
+				bc = bits_change(bits, &nbits, buf, pageno, 0, false, nfree);
+			}
+			words = PageGetBmapBits(BufferGetPage(bc->buf));
+			if (words[bit / 64] & (UINT64CONST(1) << (bit % 64)))
+			{
+				((uint32 *) (bc->delta + 1))[bc->delta->nbits++] = bit;
+				freed++;
+			}
+			hint = Min(hint, pageno);
+		}
+		adelta.kind = BMAP_DELTA_META;
+		adelta.flags = 0;
+		adelta.hw = meta->hw;
+		adelta.nfree = meta->nfree + freed;
+		adelta.hint = hint;
+		adelta.nbitmap_added = 0;
+	}
+
+	/* a node freed: its children, in the place of the entries popped */
+	qp.n = 0;
+	if (npushed > 0)
+	{
+		queue_cover(rel, QUEUE_PAGE(n - k + npushed - 1) + 1);
+		queue_write(rel, &qp, n - k, children, npushed);
+	}
+
+	xlrec.locator = with_relnumber(rel, BMAP_QUEUE_RELNUMBER);
+	xlrec.op = BMAP_RELEASE_DRAIN;
+	xlrec.npopped = k;
+	nblockids = 1 + qp.n + rp.n + (nfree > 0 ? 1 + nbits : 0);
+	XLogEnsureRecordSpace(nblockids - 1, 1 + nblockids);
+	INJECTION_POINT("bmap-release-step", NULL);
+	START_CRIT_SECTION();
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xlrec));
+	register_queue_meta(metabuf, isnew, &mdelta, n - k + npushed);
+	id = queue_apply_register(&qp, 1);
+	id = refs_apply_register(&rp, id);
+	if (nfree > 0)
+	{
+		apply_meta_delta(BufferGetPage(allocbuf), &adelta);
+		MarkBufferDirty(allocbuf);
+		XLogRegisterBuffer(id, allocbuf, REGBUF_STANDARD);
+		XLogRegisterBufData(id, &adelta, sizeof(adelta));
+		id++;
+		for (int j = 0; j < nbits; j++)
+		{
+			apply_bits_delta(BufferGetPage(bits[j].buf), bits[j].delta);
+			MarkBufferDirty(bits[j].buf);
+			XLogRegisterBuffer(id, bits[j].buf, REGBUF_STANDARD);
+			XLogRegisterBufData(id, bits[j].delta, bits_delta_size(bits[j].delta));
+			id++;
+		}
+	}
+	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_RELEASE);
+	PageSetLSN(BufferGetPage(metabuf), lsn);
+	queue_set_lsn(&qp, lsn);
+	refs_set_lsn(&rp, lsn);
+	if (nfree > 0)
+	{
+		PageSetLSN(BufferGetPage(allocbuf), lsn);
+		for (int j = 0; j < nbits; j++)
+			PageSetLSN(BufferGetPage(bits[j].buf), lsn);
+	}
+	END_CRIT_SECTION();
+
+	for (int j = 0; j < nbits; j++)
+	{
+		UnlockReleaseBuffer(bits[j].buf);
+		pfree(bits[j].delta);
+	}
+	if (BufferIsValid(allocbuf))
+		UnlockReleaseBuffer(allocbuf);
+	queue_release(&qp);
+	refs_release(&rp);
+	UnlockReleaseBuffer(metabuf);
+	if (children)
+		pfree(children);
+
+	/* (what a scan found in them no longer holds) */
+	for (uint32 i = 0; i < nfree; i++)
+		store_written(rel, tofree[i], 1);
+
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_DRAINED, k);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_BLOCKS_FREED, freed);
+	pgstat_count_prolly(PGSTAT_PROLLY_BMAP_RELEASE_QUEUED, npushed);
+	done->entries += k;
+	done->freed += freed;
+	done->unrefs += unrefs;
+	return true;
+}
+
+/*
+ * Take one step of the drain of a database's release queue in a
+ * tablespace, adding what it let go of to *done.  False if it took none:
+ * the queue is empty, or (unless 'wait') another backend drains it or a
+ * sweep counts what it holds.  In a transaction.
+ */
+bool
+bmap_release_step(Oid spcOid, Oid dbOid, bool wait, BmapRelease *done)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	LOCKTAG		draintag;
+	LOCKTAG		sweeptag;
+	bool		stepped;
+
+	if (RecoveryInProgress() || !alloc_exists(rel) || !queue_exists(rel))
+		return false;
+	DRAIN_LOCK(draintag, rel);
+	if (LockAcquire(&draintag, ExclusiveLock, false, !wait) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
+	SWEEP_LOCK(sweeptag, rel);
+	if (LockAcquire(&sweeptag, ShareLock, false, !wait) == LOCKACQUIRE_NOT_AVAIL)
+	{
+		LockRelease(&draintag, ExclusiveLock, false);
+		return false;
+	}
+	stepped = release_step(rel, done);
+	LockRelease(&sweeptag, ShareLock, false);
+	LockRelease(&draintag, ExclusiveLock, false);
+	return stepped;
+}
+
+/*
+ * Drain the release queue, waiting for another drain or a sweep, until it
+ * is empty or (max_entries > 0) that many entries were popped.
+ */
+void
+bmap_release_drain(Oid spcOid, Oid dbOid, uint64 max_entries,
+				   BmapRelease *done)
+{
+	while ((max_entries == 0 || done->entries < max_entries) &&
+		   bmap_release_step(spcOid, dbOid, true, done))
+		CHECK_FOR_INTERRUPTS();
+}
+
+/* How many entries the release queue holds. */
+uint64
+bmap_release_pending(Oid spcOid, Oid dbOid)
+{
+	RelFileLocator rel = {spcOid, dbOid, InvalidRelFileNumber};
+	Buffer		buf;
+	uint64		n = 0;
+
+	if (!queue_exists(rel))
+		return 0;
+	buf = queue_read(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (!PageIsNew(BufferGetPage(buf)))
+	{
+		check_page(BufferGetPage(buf), BMAP_PAGE_QUEUE_META,
+				   with_relnumber(rel, BMAP_QUEUE_RELNUMBER), MAIN_FORKNUM, 0);
+		n = PageGetBmapQueueMeta(BufferGetPage(buf))->nentries;
+	}
+	UnlockReleaseBuffer(buf);
+	return n;
+}
+
+/*
+ * A sweep counts what the queue holds, as it would a map's: each entry a
+ * holder of its block, a node's subtree counted as tree_walk() counts it.
+ * The sweep holds drains off, so entries are only pushed meanwhile, and
+ * those pushed after this read are of maps the sweep read before they were
+ * dropped (a drop pushes before it lets go of its root page, under its
+ * header's lock).
+ */
+static void
+sweep_queue(RelFileLocator rel, TreeNodeVisit visit_node,
+			TreeEntryVisit visit_entry, void *arg)
+{
+	Buffer		metabuf;
+	uint32		n = 0;
+	BmapQueued *entries;
+	SMgrRelation store = store_smgr(rel);
+
+	if (!queue_exists(rel))
+		return;
+	metabuf = queue_read(rel, 0);
+	LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+	if (!PageIsNew(BufferGetPage(metabuf)))
+	{
+		check_page(BufferGetPage(metabuf), BMAP_PAGE_QUEUE_META,
+				   with_relnumber(rel, BMAP_QUEUE_RELNUMBER), MAIN_FORKNUM, 0);
+		n = PageGetBmapQueueMeta(BufferGetPage(metabuf))->nentries;
+	}
+	entries = MemoryContextAllocHuge(CurrentMemoryContext,
+									 Max(n, 1) * sizeof(BmapQueued));
+	for (uint32 i = 0; i < n;)
+	{
+		Buffer		buf = queue_read(rel, QUEUE_PAGE(i));
+		uint32		take = Min(n - i, BMAP_QUEUE_PER_PAGE - QUEUE_SLOT(i));
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		check_page(BufferGetPage(buf), BMAP_PAGE_QUEUE,
+				   with_relnumber(rel, BMAP_QUEUE_RELNUMBER), MAIN_FORKNUM,
+				   QUEUE_PAGE(i));
+		memcpy(entries + i, PageGetBmapQueued(BufferGetPage(buf)) + QUEUE_SLOT(i),
+			   take * sizeof(BmapQueued));
+		UnlockReleaseBuffer(buf);
+		i += take;
+	}
+	UnlockReleaseBuffer(metabuf);
+
+	for (uint32 i = 0; i < n; i++)
+	{
+		BmapEntry	ptr;
+
+		ptr.block = entries[i].block;
+		ptr.epoch = 0;
+		ptr.since = entries[i].since;
+		if (entries[i].level == BMAP_QUEUED_BLOCK)
+			visit_entry(&ptr, InvalidBlockNumber, arg);
+		else
+			tree_walk_node(store, &ptr, entries[i].level, entries[i].first,
+						   true, visit_node, visit_entry, arg);
+	}
+	pfree(entries);
 }
 
 /* ----------------------------------------------------------------
@@ -6600,7 +7572,8 @@ sweep_shrink(RelFileLocator rel)
  * block-mapped relation there holds (every branch's copies, so every
  * catalog row of every branch: their maps are files), then free the
  * blocks allocated when the sweep began that nothing holds (left by a
- * crash after a drop's commit or part way through a prune), rewrite the
+ * crash after a drop's commit or part way through a prune), what the
+ * release queue holds let go of first and the rest counted, rewrite the
  * stuck counts whose holders now fit one, and shorten the store to its
  * last allocated block.  Branch creation (bmapshare()) is held off while
  * the maps are read and the counts rewritten; extensions and remaps go on,
@@ -6651,6 +7624,14 @@ bmap_sweep(Oid spcOid, Oid dbOid, BmapSweep *result)
 				 errmsg("cannot sweep a page store during recovery")));
 	if (!alloc_exists(rel))
 		return;
+
+	/* what dropped maps held, let go of first: the sweep counts the rest */
+	{
+		BmapRelease done = {0};
+
+		bmap_release_drain(spcOid, dbOid, 0, &done);
+	}
+	INJECTION_POINT("bmap-sweep-drained", NULL);
 	swept_note(rel, true, &released);
 	sweep_note(rel, true);
 	PG_ENSURE_ERROR_CLEANUP(sweep_done, PointerGetDatum(&rel));
@@ -7152,6 +8133,13 @@ sweep_store(RelFileLocator rel, const char *path, BmapSweep *result)
 	}
 	FreeDir(dir);
 
+	/* and what the release queue holds, read after them */
+	{
+		SweepHolders sh = {holders, reached, hw};
+
+		sweep_queue(rel, sweep_node, sweep_entry, &sh);
+	}
+
 	/* nothing holds them: freed; stuck counts that fit: rewritten */
 	nrefpages = refs_nblocks(rel);
 	for (BlockNumber b = 0; b < hw; b++)
@@ -7225,7 +8213,7 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 	char		suffix[16];
 	size_t		suffixlen;
 	RelFileLocator rel;
-	SMgrRelation srels[3];
+	SMgrRelation srels[4];
 
 	snprintf(suffix, sizeof(suffix), "_%s", forkNames[BMAP_FORKNUM]);
 	suffixlen = strlen(suffix);
@@ -7253,12 +8241,14 @@ bmap_drop_unused(Oid spcOid, Oid dbOid, const char *path)
 	srels[0] = alloc_smgr(rel);
 	srels[1] = store_smgr(rel);
 	srels[2] = refs_smgr(rel);
+	srels[3] = queue_smgr(rel);
 	if (!smgrexists(srels[0], MAIN_FORKNUM) &&
 		!smgrexists(srels[1], MAIN_FORKNUM) &&
-		!smgrexists(srels[2], MAIN_FORKNUM))
+		!smgrexists(srels[2], MAIN_FORKNUM) &&
+		!smgrexists(srels[3], MAIN_FORKNUM))
 		return;
 	/* at once, as in redo: nothing may use the tablespace any more */
-	smgrdounlinkall(srels, 3, true);
+	smgrdounlinkall(srels, 4, true);
 	store_unwatch(rel);
 }
 
@@ -7399,7 +8389,8 @@ bmapclaims(RelFileLocatorBackend rlocator)
 		return false;
 	if (rlocator.locator.relNumber == BMAP_ALLOC_RELNUMBER ||
 		rlocator.locator.relNumber == BMAP_STORE_RELNUMBER ||
-		rlocator.locator.relNumber == BMAP_REFS_RELNUMBER)
+		rlocator.locator.relNumber == BMAP_REFS_RELNUMBER ||
+		rlocator.locator.relNumber == BMAP_QUEUE_RELNUMBER)
 		return false;
 	return bmap_relation_exists(rlocator.locator);
 }
@@ -7556,6 +8547,8 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		DropRelationBuffers(smgropen(rlocator.locator, INVALID_PROC_NUMBER),
 							forks, 2, firsts);
 		mdunlink(rlocator, BMAP_FORKNUM, true);
+		/* (and the empty main fork file the drop kept, if redo made the map again) */
+		mdunlink(rlocator, MAIN_FORKNUM, true);
 		forget_recovery_length(rlocator.locator);
 		return;
 	}
@@ -7565,20 +8558,30 @@ bmapunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		return;
 
 	/*
-	 * Keep the map until after the next checkpoint, as md.c keeps a main
-	 * fork's first segment: until then, its relation file number must not
-	 * be used again, since crash recovery may still replay records for it.
+	 * The map goes at once, but the relation file number must not be used
+	 * again until after the next checkpoint, since crash recovery may still
+	 * replay records for it.  An empty main fork file keeps it, as md.c's
+	 * truncated first segment keeps a dropped relation's, and md.c removes
+	 * it after the checkpoint.  Redo, finding no map, replays the
+	 * relation's records onto that file as md.c's, until the drop's record
+	 * removes it.  (A binary upgrade gives out relation file numbers
+	 * itself, and md.c keeps nothing then.)
 	 */
+	if (!IsBinaryUpgrade)
 	{
-		FileTag		tag;
+		RelPathStr	path = relpath(rlocator, MAIN_FORKNUM);
+		int			fd = OpenTransientFile(path.str, O_RDWR | O_CREAT | PG_BINARY);
 
-		memset(&tag, 0, sizeof(tag));
-		tag.handler = SYNC_HANDLER_BMAP;
-		tag.forknum = BMAP_FORKNUM;
-		tag.rlocator = rlocator.locator;
-		tag.segno = 0;
-		RegisterSyncRequest(&tag, SYNC_UNLINK_REQUEST, true);
+		if (fd < 0)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not create file \"%s\": %m", path.str)));
+		else
+			CloseTransientFile(fd);
 	}
+	mdunlink(rlocator, BMAP_FORKNUM, false);
+	if (!IsBinaryUpgrade)
+		mdunlink(rlocator, MAIN_FORKNUM, false);
 }
 
 /*
@@ -7605,6 +8608,20 @@ bmappredrop(SMgrRelation reln, bool isRedo)
 	INJECTION_POINT("bmap-predrop", NULL);
 	drop_blocks(reln);
 	INJECTION_POINT("bmap-dropped", NULL);
+}
+
+/*
+ * One step of the drain of the release queue of reln's page store, not
+ * waiting for another drain or a sweep: the entries it let go of.
+ */
+uint32
+bmapreleasestep(SMgrRelation reln)
+{
+	BmapRelease done = {0};
+
+	(void) bmap_release_step(reln->smgr_rlocator.locator.spcOid,
+							 reln->smgr_rlocator.locator.dbOid, false, &done);
+	return (uint32) done.entries;
 }
 
 /*
@@ -8361,46 +9378,6 @@ bmapfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /* ----------------------------------------------------------------
- * Sync handler: maps removed after a checkpoint
- * ----------------------------------------------------------------
- */
-
-int
-bmapsyncfiletag(const FileTag *ftag, char *path)
-{
-	/* only unlink requests are queued with this handler */
-	strlcpy(path, relpathperm(ftag->rlocator, BMAP_FORKNUM).str, MAXPGPATH);
-	return 0;
-}
-
-int
-bmapunlinkfiletag(const FileTag *ftag, char *path)
-{
-	RelPathStr	base = relpathperm(ftag->rlocator, BMAP_FORKNUM);
-	int			ret;
-
-	/* the first segment's result is the request's; later ones follow it */
-	strlcpy(path, base.str, MAXPGPATH);
-	ret = unlink(path);
-	for (int segno = 1; ret == 0; segno++)
-	{
-		char		segpath[MAXPGPATH];
-
-		snprintf(segpath, sizeof(segpath), "%s.%d", base.str, segno);
-		if (unlink(segpath) < 0)
-			break;
-	}
-	return ret;
-}
-
-bool
-bmapfiletagmatches(const FileTag *ftag, const FileTag *candidate)
-{
-	/* used to forget a dropped database's requests */
-	return ftag->rlocator.dbOid == candidate->rlocator.dbOid;
-}
-
-/* ----------------------------------------------------------------
  * Redo
  * ----------------------------------------------------------------
  */
@@ -8680,6 +9657,12 @@ redo_block(XLogReaderState *record, uint8 block_id)
 			case BMAP_DELTA_CHANGES:
 				apply_changes_delta(page, (xl_bmap_changes_delta *) copy);
 				break;
+			case BMAP_DELTA_QUEUE_META:
+				apply_queue_meta_delta(page, (xl_bmap_queue_meta_delta *) copy);
+				break;
+			case BMAP_DELTA_QUEUE:
+				apply_queue_delta(page, (xl_bmap_queue_delta *) copy);
+				break;
 			default:
 				elog(PANIC, "unknown block map delta %u", kind);
 		}
@@ -8789,6 +9772,7 @@ bmap_redo(XLogReaderState *record)
 			}
 		case XLOG_BMAP_FREE:
 		case XLOG_BMAP_UNREF:
+		case XLOG_BMAP_RELEASE:
 		case XLOG_BMAP_FOLD:
 		case XLOG_BMAP_CHANGES:
 		case XLOG_BMAP_SHARE_CHANGES:

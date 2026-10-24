@@ -14,6 +14,9 @@ CREATE FUNCTION counted(name text) RETURNS bigint LANGUAGE sql AS $$
 $$;
 \set reset 'SELECT pg_stat_force_next_flush(); SELECT pg_stat_reset_shared(''prolly'');'
 \set flush 'SELECT pg_stat_force_next_flush();'
+-- (each session's counts flushed before it reconnects: a session's last
+-- counts, flushed only as it exits, could reach the view after the next
+-- session's reset, and be counted as that session's)
 
 SELECT count(test_chunk_put(test_noise('in the journal ' || g, 500)))
 FROM generate_series(1, 10) g;
@@ -22,6 +25,7 @@ FROM generate_series(1, 10) g;
 
 -- Ten the journal has, ten a table file has, five new, each put twice:
 -- the five are appended, once each.
+:flush
 \c puts_db
 SELECT journal_bytes() AS before \gset
 :reset
@@ -43,6 +47,7 @@ WHERE (kind <> 'new ' OR g <= 5) AND test_chunk_has(test_content_hash(test_noise
 -- that one appended, before the commit.
 SELECT count(test_chunk_put(test_noise('big ' || g, 100000)))
 FROM generate_series(1, 12) g;
+:flush
 \c puts_db
 SELECT journal_bytes() AS before \gset
 :reset
@@ -58,6 +63,7 @@ SELECT counted('chunks_appended') AS appended;
 -- A savepoint after chunks the store has, a batch of them all dropped
 -- (nothing appended), then a chunk put and rolled back to the savepoint:
 -- the chunk is gone with it, and the commit appends nothing.
+:flush
 \c puts_db
 SELECT journal_bytes() AS before \gset
 BEGIN;
@@ -70,6 +76,7 @@ SELECT test_chunk_put(test_noise('rolled back', 1000)) IS NOT NULL AS put;
 ROLLBACK TO a;
 COMMIT;
 SELECT journal_bytes() = :before AS nothing_appended;
+:flush
 \c puts_db
 SELECT test_chunk_has(test_content_hash(test_noise('rolled back', 1000))) AS rolled_back_found;
 SELECT test_chunk_has(test_content_hash(test_noise('big 12', 100000))) AS big_found;
