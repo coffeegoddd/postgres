@@ -62,7 +62,9 @@
  *					tag 1, then its text form (its output function's) in
  *					UTF-8, written with the settings it may depend on fixed
  *					(extra_float_digits 1, DateStyle ISO, MDY, IntervalStyle
- *					postgres), read back with its input function and the
+ *					postgres, bytea_output hex, TimeZone UTC,
+ *					timezone_abbreviations Default, lc_monetary, lc_numeric
+ *					and lc_time C), read back with its input function and the
  *					column's typmod.  A value whose text doesn't read back
  *					as the same value (datum_image_eq) isn't stored:
  *					encoding refuses it, and so do writes to a versioned
@@ -130,9 +132,20 @@ extern bool prolly_datum_codec_normalizes(const ProllyDatumCodec *c);
  * batch is rolled back and run again, each receive in a subtransaction of
  * its own, so the values refused are kept as their text form.  run must
  * be safe to run twice: everything it does between is rolled back.  A
- * batch inside a batch is run as part of it.
+ * batch inside a batch is run as part of it.  The batch runs in
+ * prolly_datum_fixed_text().
  */
 extern void prolly_datum_batch(void (*run) (void *arg), void *arg);
+
+/*
+ * Run run(arg) with the settings text forms are written and read under
+ * fixed once (rather than once a value): for a loop encoding or decoding
+ * many values.  Nothing it runs may depend on the session's own settings
+ * (TimeZone, DateStyle, the locale's): it sees the fixed ones.  On an
+ * error, the settings are restored before it is raised.  Nested, the inner
+ * run is part of the outer.
+ */
+extern void prolly_datum_fixed_text(void (*run) (void *arg), void *arg);
 
 /* Append the canonical bytes of a non-NULL value. */
 extern void prolly_datum_encode(ProllyDatumCodec *codec, Datum value,

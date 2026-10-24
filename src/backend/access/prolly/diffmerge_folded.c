@@ -3797,6 +3797,11 @@ typedef struct Applying
 	TupleTableSlot **batch;		/* those to insert, BATCH_ROWS slots */
 	int			nbatch;
 	Size		batch_bytes;
+	/* the diff apply_passes() walks */
+	const ProllyTreeRoutine *tree;
+	ProllyTreeEnv *env;
+	const Table *from;
+	const Table *to;
 } Applying;
 
 /*
@@ -4071,6 +4076,21 @@ apply_change(ProllyDiffKind kind, const ProllyKey *key,
 	}
 }
 
+/* The removals, then the inserts, and the last batch written. */
+static void
+apply_passes(void *arg)
+{
+	Applying   *ap = arg;
+
+	for (int pass = 0; pass < 2; pass++)
+	{
+		ap->inserting = (pass == 1);
+		PROLLY_CALL(ap->tree, diff, ap->env, &ap->from->data, &ap->to->data,
+					apply_change, ap);
+	}
+	batch_flush(ap);
+}
+
 /*
  * Write the rows of relation relid that differ between from and to: the
  * removals, then the inserts (a row taking a unique value another gives
@@ -4130,12 +4150,17 @@ apply_rows(Oid relid, const Table *from, const Table *to)
 		BeginInternalSubTransaction(NULL);
 		MemoryContextSwitchTo(cxt);
 	}
-	for (int pass = 0; pass < 2; pass++)
-	{
-		ap.inserting = (pass == 1);
-		PROLLY_CALL(tree, diff, &env, &from->data, &to->data, apply_change, &ap);
-	}
-	batch_flush(&ap);
+	ap.tree = tree;
+	ap.env = &env;
+	ap.from = from;
+	ap.to = to;
+
+	/*
+	 * (the rows' values decoded with the text settings fixed once, not once
+	 * a value; their writes too, as a restore's run under the settings its
+	 * dump fixes)
+	 */
+	prolly_datum_fixed_text(apply_passes, &ap);
 	if (recording && ap.keyless)
 		refuse_keyless_violations(ap.rel, ap.removed_rows);
 	if (ap.put_back)
