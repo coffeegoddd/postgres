@@ -653,14 +653,16 @@ typedef struct ProllyRefsRoutine
 	/*
 	 * Optional, together: pins.  A pin keeps a commit, and everything it
 	 * reaches, from collection under a name, for a reader outside the refs
-	 * that names the commit (a snapshot mount); info is the reader's,
-	 * kept beside it.  pin_set() sets name's pin (commit NULL: removes it),
-	 * holding the refs; pin_get() reads one (false: none), appending its
-	 * info; pins() visits each, by name.  Changes are with the transaction,
-	 * as any change to the refs.  Pins are the database's own: transfers
-	 * never send them.
+	 * that names the commit (a snapshot mount), with the nkeep trees keep
+	 * names (the reader's own, as a mount's index trees), which must be in
+	 * the store; info is the reader's, kept beside it.  pin_set() sets
+	 * name's pin (commit NULL: removes it), holding the refs; pin_get()
+	 * reads one (false: none), appending its info; pins() visits each, by
+	 * name.  Changes are with the transaction, as any change to the refs.
+	 * Pins are the database's own: transfers never send them.
 	 */
 	void		(*pin_set) (const char *name, const ProllyHash *commit,
+							const ProllyHash *keep, int nkeep,
 							const ProllyValue *info);
 	bool		(*pin_get) (const char *name, ProllyHash *commit,
 							StringInfo info);

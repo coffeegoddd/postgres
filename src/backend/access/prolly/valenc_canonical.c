@@ -783,6 +783,57 @@ canonical_fields(ProllyValueEncoder *enc, const ProllyValue *row,
 	}
 }
 
+/*
+ * The row with only the attributes wanted marks, the others NULL: made of
+ * row's own bytes (its values' canonical bytes and references copied), so
+ * nothing is decoded, read or written, and the references it holds are
+ * some of row's.
+ */
+static void
+canonical_project(ProllyValueEncoder *enc, const ProllyValue *row,
+				  const bool *wanted, StringInfo out)
+{
+	ProllyEncodedField *fields = palloc(sizeof(ProllyEncodedField) *
+										Max(enc->desc->natts, 1));
+	int			n = 0;
+
+	canonical_fields(enc, row, fields);
+	for (int j = 0; j < enc->nlive; j++)
+	{
+		int			i = enc->live_attno[j];
+
+		if (wanted[i] && fields[i].stored && !fields[i].isnull)
+			n = j + 1;
+	}
+	prolly_put_varint(out, n);
+	for (int j = 0; j < n; j += 8)
+	{
+		uint8		b = 0;
+
+		for (int k = 0; k < 8 && j + k < n; k++)
+		{
+			int			i = enc->live_attno[j + k];
+
+			if (!(wanted[i] && fields[i].stored && !fields[i].isnull))
+				b |= 1 << k;
+		}
+		appendStringInfoChar(out, (char) b);
+	}
+	for (int j = 0; j < n; j++)
+	{
+		int			i = enc->live_attno[j];
+		ProllyEncodedField *f = &fields[i];
+
+		if (!(wanted[i] && f->stored && !f->isnull))
+			continue;
+		prolly_put_varint(out, f->out_of_line ?
+						  VALUE_INLINE_MAX + 1 + (uint64) f->bytes.len :
+						  (uint64) f->bytes.len);
+		appendBinaryStringInfo(out, (const char *) f->bytes.data, f->bytes.len);
+	}
+	pfree(fields);
+}
+
 static Datum
 canonical_decode_field(ProllyValueEncoder *enc, int attno,
 					   const ProllyEncodedField *field, bool *isnull)
@@ -941,4 +992,5 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.fields_alike = canonical_fields_alike,
 	.field_compatible = canonical_field_compatible,
 	.decode_columns = canonical_decode_columns,
+	.project = canonical_project,
 };

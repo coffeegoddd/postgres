@@ -233,6 +233,10 @@ typedef struct ProllyKeyingRoutine
 	bool		(*encode_key_bound) (ProllyKeying *k, const Datum *values,
 									 const bool *isnull, int n, bool high,
 									 StringInfo out);
+
+	/* Optional: the value encoder's project() of an encoded row. */
+	void		(*project_row) (ProllyKeying *k, const ProllyValue *row,
+								const bool *wanted, StringInfo out);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
@@ -242,9 +246,9 @@ typedef struct ProllyKeyingRoutine
 	"open_described", "row_shape", "shape_extends", "open_shape", \
 	"decode_row_columns", "row_fields", "decode_field", "fields_alike", \
 	"field_compatible", \
-	"open_keyed", "encode_key_bound"
+	"open_keyed", "encode_key_bound", "project_row"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK encode_key_bound
+#define PROLLY_KEYING_LAST_CALLBACK project_row
 
 /*
  * Set up a data tree's environment and k's value store for each other:

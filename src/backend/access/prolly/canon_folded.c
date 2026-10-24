@@ -13653,19 +13653,126 @@ collation_item_name(Oid coll)
 }
 
 /*
+ * The key columns of an index statement of a table's description (and
+ * its INCLUDE columns, if include isn't NULL), resolved in this database:
+ * NULL, or why they can't be ordered here as the version's index orders
+ * them.  Built-in types, operator classes and collations only: an
+ * extension's comparator may order keys otherwise than the version did,
+ * and nothing proves it doesn't.
+ */
+static const char *
+index_columns(const char *what, const ProllyComponents *c, List *stale,
+			  IndexStmt *stmt,
+			  List *colnames, TupleDesc desc, int *nkeys, AttrNumber *attnos,
+			  Oid *opfamilies, Oid *collations, int16 *options,
+			  int *ninclude, AttrNumber *include)
+{
+	ListCell   *lc;
+
+	*nkeys = 0;
+	if (ninclude)
+		*ninclude = 0;
+	if (strcmp(stmt->accessMethod, "btree") != 0)
+		return psprintf("%s isn't a btree index", what);
+	if (list_length(stmt->indexParams) + list_length(stmt->indexIncludingParams) >
+		INDEX_MAX_KEYS)
+		return psprintf("%s has too many columns", what);
+	if (stmt->whereClause != NULL)
+		return psprintf("%s is a partial index", what);
+	foreach(lc, stmt->indexParams)
+	{
+		IndexElem  *e = lfirst_node(IndexElem, lc);
+		int			attno = 0;
+		Oid			type;
+		Oid			opclass;
+		Oid			coll;
+		int16		option = 0;
+		ListCell   *cl;
+		int			i = 0;
+
+		if (e->name == NULL)
+			return psprintf("%s has an expression", what);
+		foreach(cl, colnames)
+		{
+			i++;
+			if (strcmp(lfirst(cl), e->name) == 0)
+				attno = i;
+		}
+		if (attno == 0)
+			return psprintf("%s names a column the table hasn't", what);
+		type = TupleDescAttr(desc, attno - 1)->atttypid;
+		opclass = e->opclass == NIL ? GetDefaultOpClass(type, BTREE_AM_OID) :
+			get_opclass_oid(BTREE_AM_OID, e->opclass, true);
+		coll = e->collation == NIL ? TupleDescAttr(desc, attno - 1)->attcollation :
+			get_collation_oid(e->collation, true);
+		if (!OidIsValid(opclass) || (e->collation != NIL && !OidIsValid(coll)))
+			return psprintf("%s has an operator class or collation this database hasn't", what);
+		if (type >= FirstNormalObjectId || opclass >= FirstNormalObjectId ||
+			coll >= FirstNormalObjectId)
+			return psprintf("%s is ordered by a type, operator class or collation that isn't built in", what);
+		if (OidIsValid(coll))
+		{
+			char	   *cname = collation_item_name(coll);
+
+			for (int j = 0; j + 1 < list_length(stale); j += 2)
+				if (strcmp(strVal(list_nth(stale, j)), cname) == 0)
+					return strVal(list_nth(stale, j + 1));
+		}
+		if (e->ordering == SORTBY_DESC)
+			option |= INDOPTION_DESC | INDOPTION_NULLS_FIRST;
+		if (e->nulls_ordering == SORTBY_NULLS_FIRST)
+			option |= INDOPTION_NULLS_FIRST;
+		else if (e->nulls_ordering == SORTBY_NULLS_LAST)
+			option &= ~INDOPTION_NULLS_FIRST;
+		attnos[*nkeys] = attno;
+		opfamilies[*nkeys] = get_opclass_family(opclass);
+		collations[*nkeys] = coll;
+		options[*nkeys] = option;
+		if (!PROLLY_CALL(c->key_encoder, supports, opfamilies[*nkeys], type, coll))
+			return psprintf("the key encoder can't order %s", what);
+		(*nkeys)++;
+	}
+	foreach(lc, stmt->indexIncludingParams)
+	{
+		IndexElem  *e = lfirst_node(IndexElem, lc);
+		ListCell   *cl;
+		int			i = 0;
+		int			attno = 0;
+
+		if (include == NULL)
+			continue;
+		if (e->name == NULL)
+			return psprintf("%s includes an expression", what);
+		foreach(cl, colnames)
+		{
+			i++;
+			if (strcmp(lfirst(cl), e->name) == 0)
+				attno = i;
+		}
+		if (attno == 0)
+			return psprintf("%s includes a column the table hasn't", what);
+		include[(*ninclude)++] = attno;
+	}
+	return NULL;
+}
+
+/*
  * The primary key's columns of a table's description (its PRIMARY KEY
- * constraint's index statement) into t: NULL, or why they can't be ordered
- * here as the version's tree is.
+ * constraint's index statement) into t, and its other indexes: NULL, or
+ * why the rows can't be read here in the order the version's tree has
+ * them.  An index that can't be followed is listed, with why.
  */
 static const char *
 historical_key(Canon *cn, const ProllyNodeRef *root, const char *name,
 			   const TableDef *td, List *colnames, ProllyHistoricalTable *t)
 {
 	char	   *pkname = NULL;
-	IndexStmt  *stmt = NULL;
+	IndexStmt  *pk = NULL;
+	List	   *others = NIL;
 	ListCell   *lc;
 	ProllyComponents c;
 	List	   *stale;
+	const char *why;
 
 	foreach(lc, td->constraints)
 	{
@@ -13679,8 +13786,6 @@ historical_key(Canon *cn, const ProllyNodeRef *root, const char *name,
 			pkname = unquoted(first_field(line));
 	}
 	t->keyed = (pkname != NULL);
-	if (!t->keyed)
-		return NULL;
 	foreach(lc, td->indexes)
 	{
 		List	   *parsed = raw_parser(lfirst(lc), RAW_PARSE_DEFAULT);
@@ -13689,79 +13794,45 @@ historical_key(Canon *cn, const ProllyNodeRef *root, const char *name,
 		if (list_length(parsed) != 1)
 			continue;
 		n = linitial_node(RawStmt, parsed)->stmt;
-		if (IsA(n, IndexStmt) && ((IndexStmt *) n)->idxname &&
-			strcmp(((IndexStmt *) n)->idxname, pkname) == 0)
-			stmt = (IndexStmt *) n;
+		if (!IsA(n, IndexStmt) || ((IndexStmt *) n)->idxname == NULL)
+			continue;
+		if (pkname && strcmp(((IndexStmt *) n)->idxname, pkname) == 0)
+			pk = (IndexStmt *) n;
+		else
+			others = lappend(others, list_make2(n, lfirst(lc)));
 	}
-	if (stmt == NULL || strcmp(stmt->accessMethod, "btree") != 0 ||
-		list_length(stmt->indexParams) > INDEX_MAX_KEYS)
-		return "its primary key's index isn't one a seek can follow";
-
 	prolly_history_components(&c);
 	stale = stale_collations(cn, root);
-	t->nkeys = 0;
-	foreach(lc, stmt->indexParams)
+	if (t->keyed)
 	{
-		IndexElem  *e = lfirst_node(IndexElem, lc);
-		int			attno = 0;
-		Oid			type;
-		Oid			opclass;
-		Oid			coll;
-		int16		option = 0;
-		char	   *cname;
-		ListCell   *cl;
-		int			i = 0;
+		if (pk == NULL)
+			return "its primary key's index isn't one a seek can follow";
+		why = index_columns("its primary key", &c, stale, pk, colnames, t->desc, &t->nkeys,
+							t->key_attnos, t->opfamilies, t->collations,
+							t->options, NULL, NULL);
+		if (why)
+			return why;
+	}
 
-		if (e->name == NULL)
-			return "its primary key has an expression";
-		foreach(cl, colnames)
-		{
-			i++;
-			if (strcmp(lfirst(cl), e->name) == 0)
-				attno = i;
-		}
-		if (attno == 0)
-			return "its primary key names a column it hasn't";
-		type = TupleDescAttr(t->desc, attno - 1)->atttypid;
-		opclass = e->opclass == NIL ? GetDefaultOpClass(type, BTREE_AM_OID) :
-			get_opclass_oid(BTREE_AM_OID, e->opclass, true);
-		coll = e->collation == NIL ? TupleDescAttr(t->desc, attno - 1)->attcollation :
-			get_collation_oid(e->collation, true);
-		if (!OidIsValid(opclass) || (e->collation != NIL && !OidIsValid(coll)))
-			return "its primary key's operator class or collation isn't one this database has";
+	/* the other indexes, each usable or not on its own */
+	foreach(lc, others)
+	{
+		IndexStmt  *stmt = linitial(lfirst(lc));
+		ProllyHistoricalIndex *ix = palloc0(sizeof(ProllyHistoricalIndex));
 
-		/*
-		 * Built-in types, operator classes and collations only: an
-		 * extension's comparator may order keys otherwise than the
-		 * version's tree, and nothing proves it doesn't.
-		 */
-		if (type >= FirstNormalObjectId || opclass >= FirstNormalObjectId ||
-			coll >= FirstNormalObjectId)
-			return "its primary key is ordered by a type, operator class or collation that isn't built in";
-		if (OidIsValid(coll))
-		{
-			cname = collation_item_name(coll);
-			for (int j = 0; j + 1 < list_length(stale); j += 2)
-				if (strcmp(strVal(list_nth(stale, j)), cname) == 0)
-					return strVal(list_nth(stale, j + 1));
-		}
-		if (e->ordering == SORTBY_DESC)
-			option |= INDOPTION_DESC | INDOPTION_NULLS_FIRST;
-		if (e->nulls_ordering == SORTBY_NULLS_FIRST)
-			option |= INDOPTION_NULLS_FIRST;
-		else if (e->nulls_ordering == SORTBY_NULLS_LAST)
-			option &= ~INDOPTION_NULLS_FIRST;
-		t->key_attnos[t->nkeys] = attno;
-		t->opfamilies[t->nkeys] = get_opclass_family(opclass);
-		t->collations[t->nkeys] = coll;
-		t->options[t->nkeys] = option;
-		if (!PROLLY_CALL(c.key_encoder, supports, t->opfamilies[t->nkeys],
-						 type, coll))
-			return "the key encoder can't order its primary key";
-		t->nkeys++;
+		ix->name = pstrdup(stmt->idxname);
+		ix->definition = pstrdup(lsecond(lfirst(lc)));
+		ix->unique = stmt->unique;
+		ix->unusable = index_columns("the index", &c, stale, stmt, colnames,
+									 t->desc,
+									 &ix->nkeys, ix->attnos, ix->opfamilies,
+									 ix->collations, ix->options,
+									 &ix->ninclude, ix->include);
+		t->indexes = lappend(t->indexes, ix);
 	}
 
 	/* an ordering an extension recorded, changed since: refused, not re-sorted */
+	if (t->keyed)
 	{
 		StringInfoData value;
 		char	   *keyname = psprintf("%s%s", ORDERING_PREFIX, name);

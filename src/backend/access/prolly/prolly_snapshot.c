@@ -36,6 +36,15 @@
  * decode_row_columns()): a long value of a column not used is never read.
  * A table keyed by content gives each copy of a row.
  *
+ * A mount made with indexes (prolly_mount(..., indexes => true)) also
+ * builds a tree for each btree index the version describes (see "Index
+ * trees" below), ordered as the version's index orders its columns, and
+ * the pin keeps those trees too.  Their scans seek and order as the
+ * primary key's do, reading each row from the data tree unless the
+ * index's entries hold every column used.  A refresh brings the trees to
+ * the new commit by the rows that differ.  Without indexes, a mount reads
+ * no row.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_snapshot.c
  *
@@ -49,6 +58,7 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_canon.h"
 #include "access/prolly_config.h"
+#include "access/prolly_datum.h"
 #include "access/prolly_keying.h"
 #include "access/prolly_refs.h"
 #include "access/prolly_snapshot.h"
@@ -61,6 +71,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/versioned.h"
+#include "common/hashfn.h"
 #include "commands/defrem.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
@@ -94,7 +105,7 @@
 #define SNAPSHOT_SERVER "prolly_local"
 
 /* A pin's record: its format, then lines of text (mount_info_write()). */
-#define PIN_FORMAT		"mount 1"
+#define PIN_FORMAT		"mount 2"
 
 /* ------------------------------------------------------------------------
  * Components
@@ -137,26 +148,52 @@ require_snapshots(void)
  * ------------------------------------------------------------------------
  */
 
+/* An index tree a mount built: its table, index, definition and root. */
+typedef struct MountIndex
+{
+	char	   *table;			/* unqualified */
+	char	   *index;
+	uint64		definition;		/* its statement, hashed */
+	ProllyHash	root;
+} MountIndex;
+
 typedef struct MountInfo
 {
 	char	   *source_ref;
 	char	   *source_schema;
 	bool		all;			/* every table of the schema, at each refresh */
+	bool		indexes;		/* with its tables' index trees */
 	List	   *tables;			/* unqualified names */
+	List	   *built;			/* MountIndex */
 } MountInfo;
 
+/*
+ * The record: its format, the source ref and schema, whether every table
+ * and whether indexes are mounted, then a line per table ("t", a tab, its
+ * name) and per index tree ("x", then its table, index, definition's hash
+ * and root, tab-separated).  Names never hold a newline: mounts refuse
+ * one; a tab only ends the index's name, the last of the names.
+ */
 static void
 mount_info_write(const MountInfo *mi, StringInfo out)
 {
 	ListCell   *lc;
 
-	appendStringInfo(out, "%s\n%s\n%s\n%c\n", PIN_FORMAT, mi->source_ref,
-					 mi->source_schema, mi->all ? 'a' : 'n');
+	appendStringInfo(out, "%s\n%s\n%s\n%c\n%c\n", PIN_FORMAT, mi->source_ref,
+					 mi->source_schema, mi->all ? 'a' : 'n',
+					 mi->indexes ? 'i' : 'n');
 	foreach(lc, mi->tables)
-		appendStringInfo(out, "%s\n", (char *) lfirst(lc));
+		appendStringInfo(out, "t\t%s\n", (char *) lfirst(lc));
+	foreach(lc, mi->built)
+	{
+		MountIndex *x = lfirst(lc);
+
+		appendStringInfo(out, "x\t%s\t%016" PRIx64 "\t%s\t%s\n",
+						 prolly_hash_hex(&x->root), x->definition, x->table,
+						 x->index);
+	}
 }
 
-/* (names never hold a newline: mount refuses one) */
 static void
 mount_info_read(const char *data, int len, MountInfo *mi)
 {
@@ -190,12 +227,46 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 			case 3:
 				mi->all = (line[0] == 'a');
 				break;
+			case 4:
+				mi->indexes = (line[0] == 'i');
+				break;
 			default:
-				mi->tables = lappend(mi->tables, pstrdup(line));
+				if (strncmp(line, "t\t", 2) == 0)
+					mi->tables = lappend(mi->tables, pstrdup(line + 2));
+				else if (strncmp(line, "x\t", 2) == 0)
+				{
+					MountIndex *x = palloc0(sizeof(MountIndex));
+					char	   *f[4];
+					char	   *p = line + 2;
+
+					for (int i = 0; i < 3; i++)
+					{
+						f[i] = p;
+						p = strchr(p, '\t');
+						if (p == NULL)
+							ereport(ERROR,
+									(errcode(ERRCODE_DATA_CORRUPTED),
+									 errmsg("invalid snapshot mount record")));
+						*p++ = '\0';
+					}
+					f[3] = p;
+					if (!prolly_hash_from_hex(f[0], strlen(f[0]), &x->root))
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("invalid snapshot mount record")));
+					x->definition = strtou64(f[1], NULL, 16);
+					x->table = pstrdup(f[2]);
+					x->index = pstrdup(f[3]);
+					mi->built = lappend(mi->built, x);
+				}
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("invalid snapshot mount record")));
 				break;
 		}
 	}
-	if (n < 4)
+	if (n < 5)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid snapshot mount record")));
@@ -216,6 +287,424 @@ mount_lookup(const char *name, ProllyHash *commit, MountInfo *mi)
 		mount_info_read(info.data, info.len, mi);
 	pfree(info.data);
 	return found;
+}
+
+/* Pin commit for the mount called name, with its record and index trees. */
+static void
+mount_pin(const char *name, const ProllyHash *commit, const MountInfo *mi)
+{
+	StringInfoData rec;
+	ProllyValue recv;
+	ProllyHash *keep = palloc(sizeof(ProllyHash) * Max(list_length(mi->built), 1));
+	int			nkeep = 0;
+	ListCell   *lc;
+
+	initStringInfo(&rec);
+	mount_info_write(mi, &rec);
+	recv.data = (const uint8 *) rec.data;
+	recv.len = rec.len;
+	foreach(lc, mi->built)
+		keep[nkeep++] = ((MountIndex *) lfirst(lc))->root;
+	PROLLY_CALL(refs(), pin_set, name, commit, keep, nkeep, &recv);
+}
+
+static uint64
+definition_hash(const char *definition)
+{
+	return hash_bytes_extended((const unsigned char *) definition,
+							   strlen(definition), 0);
+}
+
+/* ------------------------------------------------------------------------
+ * Index trees
+ *
+ * A mount's index tree holds an entry for each row of the version (each
+ * distinct row of a table keyed by content): its key the index's columns
+ * as the key encoder encodes them (under the version's operator families,
+ * collations and options) after their length (a varint), then the row's
+ * key in the data tree; its value the row with only the columns the index
+ * holds (its key and INCLUDE columns, and the primary key's), as the
+ * keying makes a tree value of it, with the row's copies.  So entries
+ * order by the index's columns, then the data tree's order, and a scan of
+ * the index can find the row in the data tree, or read the columns it
+ * holds from the entry alone.  A bound to seek by (index_bound()) is the
+ * index's columns' bound with a single byte for the row's key: 0 before
+ * every row with those columns, 1 after; no row's key is one byte.  An
+ * entry is a function of the row and the index's definition alone, so the
+ * same version's index has the same tree in any database.
+ * ------------------------------------------------------------------------
+ */
+
+typedef struct IndexOrder
+{
+	const ProllyKeyEncoderRoutine *ke;
+	ProllyKeyEncoder *ienc;		/* the index's columns */
+	const ProllyKeyingRoutine *kr;
+	ProllyKeying *k;			/* the data tree's keys */
+} IndexOrder;
+
+static void
+split_entry(const ProllyKey *e, ProllyKey *idx, ProllyKey *row)
+{
+	const char *p = (const char *) e->data;
+	const char *end = p + e->len;
+	uint64		len = prolly_get_varint(&p, end);
+
+	if (len > (uint64) (end - p))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid snapshot index entry")));
+	idx->data = (const uint8 *) p;
+	idx->len = (uint32) len;
+	row->data = (const uint8 *) p + len;
+	row->len = (uint32) (end - p - len);
+}
+
+static int
+entry_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	IndexOrder *o = arg;
+	ProllyKey	ia;
+	ProllyKey	ib;
+	ProllyKey	ra;
+	ProllyKey	rb;
+	int			r;
+
+	split_entry(a, &ia, &ra);
+	split_entry(b, &ib, &rb);
+	r = PROLLY_CALL(o->ke, compare, o->ienc, &ia, &ib);
+	if (r != 0)
+		return r;
+	/* (a bound's single byte: before or after every row with its columns) */
+	if (ra.len == 1 || rb.len == 1)
+	{
+		int			sa = ra.len == 1 ? (ra.data[0] ? 1 : -1) : 0;
+		int			sb = rb.len == 1 ? (rb.data[0] ? 1 : -1) : 0;
+
+		return (sa > sb) - (sa < sb);
+	}
+	return PROLLY_CALL(o->kr, compare, o->k, &ra, &rb);
+}
+
+/* The key encoder of an index's columns, in the table's descriptor. */
+static ProllyKeyEncoder *
+index_encoder(const ProllyComponents *c, TupleDesc desc,
+			  const ProllyHistoricalIndex *ix, MemoryContext mcxt)
+{
+	ProllyKeyDesc kd;
+	Oid		   *types = MemoryContextAlloc(mcxt, sizeof(Oid) * Max(ix->nkeys, 1));
+
+	for (int i = 0; i < ix->nkeys; i++)
+		types[i] = TupleDescAttr(desc, ix->attnos[i] - 1)->atttypid;
+	kd.nkeys = ix->nkeys;
+	kd.types = types;
+	kd.opfamilies = ix->opfamilies;
+	kd.collations = ix->collations;
+	kd.options = ix->options;
+	return PROLLY_CALL(c->key_encoder, begin, &kd, mcxt);
+}
+
+/* The columns an index's entries hold: its own, INCLUDE's, the key's. */
+static bool *
+index_covered(const ProllyHistoricalTable *t, const ProllyHistoricalIndex *ix)
+{
+	bool	   *covered = palloc0(sizeof(bool) * Max(t->desc->natts, 1));
+
+	for (int i = 0; i < ix->nkeys; i++)
+		covered[ix->attnos[i] - 1] = true;
+	for (int i = 0; i < ix->ninclude; i++)
+		covered[ix->include[i] - 1] = true;
+	for (int i = 0; t->keyed && i < t->nkeys; i++)
+		covered[t->key_attnos[i] - 1] = true;
+	return covered;
+}
+
+/* The keying of a version's rows: by its primary key, or by content. */
+static ProllyKeying *
+open_rows(const ProllyComponents *c, const ProllyHistoricalTable *t,
+		  const char *source, MemoryContext mcxt)
+{
+	ProllyKeying *k;
+
+	if (!t->keyed)
+		return PROLLY_CALL(c->keying, open_described, t->desc, mcxt);
+	if (!PROLLY_HAS(c->keying, open_keyed) ||
+		(k = PROLLY_CALL(c->keying, open_keyed, t->desc, t->nkeys,
+						 t->key_attnos, t->opfamilies, t->collations,
+						 t->options, mcxt)) == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("can't order the keys of \"%s\" as its version stores them",
+						source)));
+	return k;
+}
+
+typedef struct IndexBuild
+{
+	const ProllyHistoricalTable *t;
+	const ProllyHistoricalIndex *ix;
+	ProllyComponents c;
+	IndexOrder	order;
+	ProllyTreeEnv denv;			/* the data tree's */
+	ProllyKeyingRefs drefs;
+	ProllyTreeEnv ienv;			/* the index tree's */
+	ProllyKeyingRefs irefs;
+	TupleTableSlot *slot;
+	bool	   *keycols;		/* the index's columns, to decode */
+	bool	   *covered;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	MemoryContext cxt;
+	Size		used;			/* bytes of entries held */
+	Size		budget;
+} IndexBuild;
+
+static int
+data_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	IndexOrder *o = arg;
+
+	return PROLLY_CALL(o->kr, compare, o->k, a, b);
+}
+
+static void
+index_build_begin(IndexBuild *ib, const ProllyHistoricalTable *t,
+				  const ProllyHistoricalIndex *ix, const char *source)
+{
+	memset(ib, 0, sizeof(*ib));
+	ib->t = t;
+	ib->ix = ix;
+	ib->cxt = CurrentMemoryContext;
+	prolly_history_components(&ib->c);
+	ib->order.ke = ib->c.key_encoder;
+	ib->order.ienc = index_encoder(&ib->c, t->desc, ix, ib->cxt);
+	ib->order.kr = ib->c.keying;
+	ib->order.k = open_rows(&ib->c, t, source, ib->cxt);
+	prolly_folded_tree_env(&ib->denv);
+	ib->denv.compare = data_compare;
+	ib->denv.compare_arg = &ib->order;
+	prolly_keying_use_env(&ib->drefs, ib->c.keying, ib->order.k, ib->c.tree,
+						  &ib->denv);
+	prolly_folded_tree_env(&ib->ienv);
+	ib->ienv.compare = entry_compare;
+	ib->ienv.compare_arg = &ib->order;
+	prolly_keying_use_env(&ib->irefs, ib->c.keying, ib->order.k, ib->c.tree,
+						  &ib->ienv);
+	ib->slot = MakeSingleTupleTableSlot(t->desc, &TTSOpsVirtual);
+	ib->keycols = palloc0(sizeof(bool) * Max(t->desc->natts, 1));
+	for (int i = 0; i < ix->nkeys; i++)
+		ib->keycols[ix->attnos[i] - 1] = true;
+	ib->covered = index_covered(t, ix);
+	ib->budget = (Size) maintenance_work_mem * 1024;
+}
+
+/* The entry of a data tree item (its key and tree value). */
+static void
+index_entry(IndexBuild *ib, const ProllyKey *dkey, const ProllyValue *dvalue,
+			ProllyEdit *e)
+{
+	ProllyValue row;
+	uint64		count;
+	StringInfoData idx;
+	StringInfoData key;
+	StringInfoData proj;
+	StringInfoData value;
+	ProllyValue p;
+
+	PROLLY_CALL(ib->c.keying, parse_value_as, ib->order.k, !ib->t->keyed,
+				dvalue, &row, &count);
+	PROLLY_CALL(ib->c.keying, decode_row_columns, ib->order.k, &row,
+				ib->keycols, ib->slot);
+	for (int i = 0; i < ib->ix->nkeys; i++)
+	{
+		ib->values[i] = ib->slot->tts_values[ib->ix->attnos[i] - 1];
+		ib->isnull[i] = ib->slot->tts_isnull[ib->ix->attnos[i] - 1];
+	}
+	initStringInfo(&idx);
+	PROLLY_CALL(ib->c.key_encoder, encode, ib->order.ienc, ib->values,
+				ib->isnull, &idx);
+	initStringInfo(&key);
+	prolly_put_varint(&key, idx.len);
+	appendBinaryStringInfo(&key, idx.data, idx.len);
+	appendBinaryStringInfo(&key, (const char *) dkey->data, dkey->len);
+	initStringInfo(&proj);
+	PROLLY_CALL(ib->c.keying, project_row, ib->order.k, &row, ib->covered,
+				&proj);
+	p.data = (const uint8 *) proj.data;
+	p.len = proj.len;
+	initStringInfo(&value);
+	PROLLY_CALL(ib->c.keying, make_value, ib->order.k, &p, count, &value);
+	ExecClearTuple(ib->slot);
+	e->key.data = (const uint8 *) key.data;
+	e->key.len = key.len;
+	e->value.data = (const uint8 *) value.data;
+	e->value.len = value.len;
+	e->is_delete = false;
+	pfree(idx.data);
+	pfree(proj.data);
+	ib->used += key.len + value.len + sizeof(ProllyEdit);
+	if (ib->used > ib->budget)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("index \"%s\" is too large to build within maintenance_work_mem",
+						ib->ix->name),
+				 errhint("Raise maintenance_work_mem, or mount without indexes.")));
+}
+
+static int
+edit_compare(const void *a, const void *b, void *arg)
+{
+	const ProllyEdit *ea = a;
+	const ProllyEdit *eb = b;
+	int			r = entry_compare(&ea->key, &eb->key, arg);
+
+	/* (a key both removed and added: the addition after) */
+	if (r == 0)
+		r = (ea->is_delete ? 0 : 1) - (eb->is_delete ? 0 : 1);
+	return r;
+}
+
+typedef struct DiffEdits
+{
+	IndexBuild *ib;
+	ProllyEdit *edits;
+	int			n;
+	int			max;
+} DiffEdits;
+
+static void
+add_edit(DiffEdits *d, const ProllyEdit *e)
+{
+	if (d->n == d->max)
+	{
+		d->max = Max(64, d->max * 2);
+		d->edits = d->edits ? repalloc_array(d->edits, ProllyEdit, d->max) :
+			palloc_array(ProllyEdit, d->max);
+	}
+	d->edits[d->n++] = *e;
+}
+
+static void
+diff_entry(ProllyDiffKind kind, const ProllyKey *key, const ProllyValue *before,
+		   const ProllyValue *after, void *arg)
+{
+	DiffEdits  *d = arg;
+	ProllyEdit	e;
+
+	CHECK_FOR_INTERRUPTS();
+	if (before)
+	{
+		index_entry(d->ib, key, before, &e);
+		e.is_delete = true;
+		add_edit(d, &e);
+	}
+	if (after)
+	{
+		index_entry(d->ib, key, after, &e);
+		add_edit(d, &e);
+	}
+}
+
+/*
+ * The index tree of t's index ix: from old, the index tree of the same
+ * index over olddata (a data tree whose rows are keyed and laid out as
+ * t's), by the rows that differ, if old isn't NULL; else from every row.
+ */
+static ProllyHash
+build_index(const ProllyHistoricalTable *t, const ProllyHistoricalIndex *ix,
+			const char *source, const ProllyNodeRef *olddata,
+			const ProllyHash *old)
+{
+	IndexBuild	ib;
+	DiffEdits	d = {0};
+	ProllyNodeRef root;
+	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
+											  "prolly snapshot index",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext prev = MemoryContextSwitchTo(cxt);
+	ProllyHash	result;
+
+	index_build_begin(&ib, t, ix, source);
+	d.ib = &ib;
+	if (old)
+	{
+		ProllyNodeRef oldroot = {0};
+
+		oldroot.hash = *old;
+		PROLLY_CALL(ib.c.tree, diff, &ib.denv, olddata, &t->data, diff_entry, &d);
+		qsort_arg(d.edits, d.n, sizeof(ProllyEdit), edit_compare, &ib.order);
+
+		/* (a key removed and added again: only the addition, its new value) */
+		{
+			int			w = 0;
+
+			for (int i = 0; i < d.n; i++)
+			{
+				if (i + 1 < d.n && d.edits[i].is_delete &&
+					entry_compare(&d.edits[i].key, &d.edits[i + 1].key,
+								  &ib.order) == 0)
+					continue;
+				d.edits[w++] = d.edits[i];
+			}
+			d.n = w;
+		}
+		PROLLY_CALL(ib.c.tree, apply, &ib.ienv, &oldroot, d.edits, d.n, &root);
+	}
+	else
+	{
+		ProllyTreeCursor *c = PROLLY_CALL(ib.c.tree, cursor_open, &ib.denv,
+										  &t->data, cxt);
+		ProllyKey	k;
+		ProllyValue v;
+		ProllyTreeBuilder *b;
+
+		PROLLY_CALL(ib.c.tree, cursor_seek, c, NULL, ForwardScanDirection);
+		while (PROLLY_CALL(ib.c.tree, cursor_next, c, &k, &v))
+		{
+			ProllyEdit	e;
+
+			CHECK_FOR_INTERRUPTS();
+			index_entry(&ib, &k, &v, &e);
+			add_edit(&d, &e);
+		}
+		PROLLY_CALL(ib.c.tree, cursor_close, c);
+		qsort_arg(d.edits, d.n, sizeof(ProllyEdit), edit_compare, &ib.order);
+		b = PROLLY_CALL(ib.c.tree, build_begin, &ib.ienv, cxt);
+		for (int i = 0; i < d.n; i++)
+			PROLLY_CALL(ib.c.tree, build_add, b, &d.edits[i].key,
+						&d.edits[i].value);
+		PROLLY_CALL(ib.c.tree, build_finish, b, &root);
+	}
+	result = root.hash;
+	ExecDropSingleTupleTableSlot(ib.slot);
+	PROLLY_CALL(ib.c.key_encoder, end, ib.order.ienc);
+	PROLLY_CALL(ib.c.keying, close, ib.order.k);
+	MemoryContextSwitchTo(prev);
+	MemoryContextDelete(cxt);
+	return result;
+}
+
+/*
+ * Whether a version's index trees built over old's rows can be brought to
+ * new's by their differences: the rows keyed and laid out alike.
+ */
+static bool
+same_rows(const ProllyHistoricalTable *old, const ProllyHistoricalTable *new)
+{
+	if (old->keyed != new->keyed || old->nkeys != new->nkeys ||
+		old->desc->natts != new->desc->natts)
+		return false;
+	for (int i = 0; i < old->desc->natts; i++)
+		if (TupleDescAttr(old->desc, i)->atttypid != TupleDescAttr(new->desc, i)->atttypid ||
+			TupleDescAttr(old->desc, i)->atttypmod != TupleDescAttr(new->desc, i)->atttypmod)
+			return false;
+	for (int i = 0; i < old->nkeys; i++)
+		if (old->key_attnos[i] != new->key_attnos[i] ||
+			old->opfamilies[i] != new->opfamilies[i] ||
+			old->collations[i] != new->collations[i] ||
+			old->options[i] != new->options[i])
+			return false;
+	return true;
 }
 
 /* ------------------------------------------------------------------------
@@ -297,15 +786,84 @@ run_ddl(const char *sql)
 		elog(ERROR, "could not run \"%s\"", sql);
 }
 
+/* The index tree old (a mount's record before) has of table's index. */
+static MountIndex *
+built_before(const MountInfo *old, const char *table, const char *index,
+			 uint64 definition)
+{
+	ListCell   *lc;
+
+	foreach(lc, old ? old->built : NIL)
+	{
+		MountIndex *x = lfirst(lc);
+
+		if (strcmp(x->table, table) == 0 && strcmp(x->index, index) == 0 &&
+			x->definition == definition)
+			return x;
+	}
+	return NULL;
+}
+
+/*
+ * The index trees of table (t, at commit) for mi: each index of the
+ * version that can be followed, brought from old's (the mount's record
+ * before a refresh, at oldroot, or NULL) by the rows that differ where
+ * old has it and the rows are alike, else built from every row.
+ */
+static void
+make_indexes(MountInfo *mi, const char *table, const char *name,
+			 const ProllyHistoricalTable *t, const MountInfo *old,
+			 const ProllyNodeRef *oldroot, MemoryContext cxt)
+{
+	ListCell   *lc;
+
+	foreach(lc, t->indexes)
+	{
+		ProllyHistoricalIndex *ix = lfirst(lc);
+		uint64		def;
+		MountIndex *before;
+		MountIndex *x;
+		ProllyHash	root;
+		ProllyHistoricalTable ot;
+		bool		incremental = false;
+		MemoryContext prev;
+
+		if (ix->unusable || strchr(ix->name, '\n') || strchr(ix->name, '\t'))
+			continue;
+		def = definition_hash(ix->definition);
+		before = built_before(old, table, ix->name, def);
+		if (before && oldroot)
+		{
+			bool		found;
+
+			incremental = PROLLY_CALL(canonicalizer(), table_metadata, oldroot,
+									  name, &ot, &found) == NULL &&
+				found && same_rows(&ot, t);
+		}
+		root = build_index(t, ix, name, incremental ? &ot.data : NULL,
+						   incremental ? &before->root : NULL);
+		prev = MemoryContextSwitchTo(cxt);
+		x = palloc0(sizeof(MountIndex));
+		x->table = pstrdup(table);
+		x->index = pstrdup(ix->name);
+		x->definition = def;
+		x->root = root;
+		mi->built = lappend(mi->built, x);
+		MemoryContextSwitchTo(prev);
+	}
+}
+
 /*
  * Make mi's tables of commit (root) in target, as the user: each foreign
- * table defined as the commit describes its table.  Refused, before any is
- * made, if one can't be read here as stored, or the user may not read it.
+ * table defined as the commit describes its table, and, if mi has
+ * indexes, its index trees (old: the mount's record before a refresh, at
+ * oldroot).  Refused, before any is made, if one can't be read here as
+ * stored, or the user may not read it.
  */
 static void
 make_tables(const char *target, const ProllyHash *commit,
-			const ProllyNodeRef *root, MountInfo *mi, MemoryContext cxt,
-			const char *fn)
+			const ProllyNodeRef *root, MountInfo *mi, const MountInfo *old,
+			const ProllyNodeRef *oldroot, MemoryContext cxt, const char *fn)
 {
 	char	   *hex = prolly_hash_hex(commit);
 	List	   *defs = NIL;
@@ -316,7 +874,7 @@ make_tables(const char *target, const ProllyHash *commit,
 		List	   *names = PROLLY_CALL(canonicalizer(), table_names, root,
 										mi->source_schema);
 
-		MemoryContext old = MemoryContextSwitchTo(cxt);
+		MemoryContext prev = MemoryContextSwitchTo(cxt);
 
 		/* (the record outlives SPI's memory) */
 		mi->tables = NIL;
@@ -326,8 +884,9 @@ make_tables(const char *target, const ProllyHash *commit,
 
 			mi->tables = lappend(mi->tables, pstrdup(strVal(lsecond(parts))));
 		}
-		MemoryContextSwitchTo(old);
+		MemoryContextSwitchTo(prev);
 	}
+	mi->built = NIL;
 	foreach(lc, mi->tables)
 	{
 		const char *table = lfirst(lc);
@@ -348,6 +907,8 @@ make_tables(const char *target, const ProllyHash *commit,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("%s can't mount \"%s\": %s", fn, name, why)));
 		prolly_check_history_by_name(name, hex, true, fn);
+		if (mi->indexes)
+			make_indexes(mi, table, name, &t, old, oldroot, cxt);
 
 		initStringInfo(&sql);
 		appendStringInfo(&sql, "CREATE FOREIGN TABLE %s (",
@@ -399,8 +960,8 @@ check_mount_owner(const char *target)
 
 /*
  * prolly_mount(source_ref text, source_schema text, target_schema text,
- *				tables text[] DEFAULT NULL, OUT mount text, OUT commit text)
- *	  returns record
+ *				tables text[] DEFAULT NULL, indexes boolean DEFAULT false,
+ *				OUT mount text, OUT commit text) returns record
  */
 Datum
 prolly_mount(PG_FUNCTION_ARGS)
@@ -411,8 +972,6 @@ prolly_mount(PG_FUNCTION_ARGS)
 	ProllyHash	commit;
 	ProllyCommitInfo info;
 	Oid			nsp;
-	StringInfoData rec;
-	ProllyValue recv;
 	TupleDesc	tupdesc;
 	Datum		values[2];
 	bool		nulls[2] = {false, false};
@@ -431,6 +990,7 @@ prolly_mount(PG_FUNCTION_ARGS)
 	check_name(target, "schema");
 	mi.source_ref = ref;
 	mi.all = PG_ARGISNULL(3);
+	mi.indexes = !PG_ARGISNULL(4) && PG_GETARG_BOOL(4);
 	if (!mi.all)
 	{
 		Datum	   *elems;
@@ -473,14 +1033,10 @@ prolly_mount(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("a snapshot mount can't be in versioned schema \"%s\"", target),
 				 errdetail("A commit would hold its tables' definitions.")));
-	make_tables(target, &commit, &info.root, &mi, cxt, "prolly_mount");
+	make_tables(target, &commit, &info.root, &mi, NULL, NULL, cxt,
+				"prolly_mount");
 	SPI_finish();
-
-	initStringInfo(&rec);
-	mount_info_write(&mi, &rec);
-	recv.data = (const uint8 *) rec.data;
-	recv.len = rec.len;
-	PROLLY_CALL(refs(), pin_set, target, &commit, &recv);
+	mount_pin(target, &commit, &mi);
 
 	values[0] = CStringGetTextDatum(target);
 	values[1] = CStringGetTextDatum(prolly_hash_hex(&commit));
@@ -493,18 +1049,19 @@ prolly_mount(PG_FUNCTION_ARGS)
  *	  returns text
  *
  * The mount moved to the commit source_ref names now (NULL: the ref it was
- * mounted from): its tables dropped and made again, as of that commit.
+ * mounted from): its tables dropped and made again, as of that commit,
+ * and its index trees brought there by the rows that differ.
  */
 Datum
 prolly_refresh_mount(PG_FUNCTION_ARGS)
 {
 	char	   *target;
 	MountInfo	mi;
-	ProllyHash	old;
+	MountInfo	old;
+	ProllyHash	oldcommit;
+	ProllyCommitInfo oldinfo;
 	ProllyHash	commit;
 	ProllyCommitInfo info;
-	StringInfoData rec;
-	ProllyValue recv;
 	MemoryContext cxt;
 
 	if (PG_ARGISNULL(0))
@@ -513,10 +1070,11 @@ prolly_refresh_mount(PG_FUNCTION_ARGS)
 				 errmsg("prolly_refresh_mount's mount can't be null")));
 	require_snapshots();
 	target = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	if (!mount_lookup(target, &old, &mi))
+	if (!mount_lookup(target, &oldcommit, &mi))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("schema \"%s\" is not a snapshot mount", target)));
+	old = mi;
 	check_mount_owner(target);
 	if (!PG_ARGISNULL(1))
 	{
@@ -524,26 +1082,27 @@ prolly_refresh_mount(PG_FUNCTION_ARGS)
 		check_name(mi.source_ref, "ref");
 	}
 	resolve_commit(mi.source_ref, &commit, &info);
+	if (!PROLLY_CALL(refs(), commit_get, &oldcommit, &oldinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("prolly commit %s is missing", prolly_hash_hex(&oldcommit))));
 	cxt = CurrentMemoryContext;
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	drop_tables(target, &mi);
+	drop_tables(target, &old);
 	CommandCounterIncrement();
-	make_tables(target, &commit, &info.root, &mi, cxt, "prolly_refresh_mount");
+	make_tables(target, &commit, &info.root, &mi, &old, &oldinfo.root, cxt,
+				"prolly_refresh_mount");
 	SPI_finish();
-	initStringInfo(&rec);
-	mount_info_write(&mi, &rec);
-	recv.data = (const uint8 *) rec.data;
-	recv.len = rec.len;
-	PROLLY_CALL(refs(), pin_set, target, &commit, &recv);
+	mount_pin(target, &commit, &mi);
 	PG_RETURN_TEXT_P(cstring_to_text(prolly_hash_hex(&commit)));
 }
 
 /*
  * prolly_unmount(mount text) returns void
  *
- * The mount's tables dropped, then its pin: the commit is collected once
- * nothing else keeps it.
+ * The mount's tables dropped, then its pin: the commit and the mount's
+ * index trees are collected once nothing else keeps them.
  */
 Datum
 prolly_unmount(PG_FUNCTION_ARGS)
@@ -567,7 +1126,7 @@ prolly_unmount(PG_FUNCTION_ARGS)
 		elog(ERROR, "SPI_connect failed");
 	drop_tables(target, &mi);
 	SPI_finish();
-	PROLLY_CALL(refs(), pin_set, target, NULL, NULL);
+	PROLLY_CALL(refs(), pin_set, target, NULL, NULL, 0, NULL);
 	PG_RETURN_VOID();
 }
 
@@ -582,8 +1141,8 @@ visit_mount(const char *name, const ProllyHash *commit, const ProllyValue *info,
 {
 	MountsVisit *mv = arg;
 	MountInfo	mi;
-	Datum		values[5];
-	bool		nulls[5] = {0};
+	Datum		values[6];
+	bool		nulls[6] = {0};
 	Datum	   *elems;
 	int			n = 0;
 	ListCell   *lc;
@@ -597,13 +1156,25 @@ visit_mount(const char *name, const ProllyHash *commit, const ProllyValue *info,
 	values[2] = CStringGetTextDatum(mi.source_ref);
 	values[3] = CStringGetTextDatum(mi.source_schema);
 	values[4] = PointerGetDatum(construct_array_builtin(elems, n, TEXTOID));
+	elems = palloc(sizeof(Datum) * Max(list_length(mi.built), 1));
+	n = 0;
+	foreach(lc, mi.built)
+	{
+		MountIndex *x = lfirst(lc);
+
+		elems[n++] = CStringGetTextDatum(psprintf("%s.%s",
+												  quote_identifier(x->table),
+												  quote_identifier(x->index)));
+	}
+	values[5] = PointerGetDatum(construct_array_builtin(elems, n, TEXTOID));
 	tuplestore_putvalues(mv->rsinfo->setResult, mv->rsinfo->setDesc, values,
 						 nulls);
 }
 
 /*
  * prolly_mounts(OUT mount text, OUT commit text, OUT source_ref text,
- *				 OUT source_schema text, OUT tables text[]) returns setof record
+ *				 OUT source_schema text, OUT tables text[], OUT indexes text[])
+ *	  returns setof record
  */
 Datum
 prolly_mounts(PG_FUNCTION_ARGS)
@@ -622,6 +1193,23 @@ prolly_mounts(PG_FUNCTION_ARGS)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * A key a scan can seek by: the primary key's (the data tree), or a built
+ * index's (its tree), its columns as the version orders them.
+ */
+typedef struct MountKey
+{
+	const ProllyHistoricalIndex *ix;	/* NULL: the primary key */
+	int			nkeys;
+	const AttrNumber *attnos;
+	const Oid  *opfamilies;
+	const Oid  *collations;
+	const int16 *options;
+	bool		unique;
+	ProllyHash	root;			/* an index's tree */
+	bool	   *covered;		/* (an index) the columns its entries hold */
+} MountKey;
+
 typedef struct Mounted
 {
 	char	   *mount;
@@ -629,12 +1217,14 @@ typedef struct Mounted
 	ProllyHash	commit;
 	ProllyHistoricalTable t;
 	double		count;			/* the tree's items */
+	int			nkeys;
+	MountKey   *keys;			/* the primary key's first, if keyed */
 } Mounted;
 
 /*
  * The mounted table relid's snapshot: its options, checked against its
  * mount's pin, and the table as the commit describes it, checked against
- * the foreign table's columns.
+ * the foreign table's columns; and the keys it can seek by.
  */
 static void
 snapshot_open(Oid relid, Mounted *s)
@@ -643,11 +1233,14 @@ snapshot_open(Oid relid, Mounted *s)
 	char	   *hex = NULL;
 	ProllyHash	pinned;
 	ProllyCommitInfo info;
+	MountInfo	mi;
 	ListCell   *lc;
 	bool		found;
 	const char *why;
 	Relation	rel;
 	TupleDesc	desc;
+	List	   *source_parts;
+	char	   *table;
 
 	require_snapshots();
 	memset(s, 0, sizeof(*s));
@@ -669,7 +1262,7 @@ snapshot_open(Oid relid, Mounted *s)
 				 errmsg("foreign table \"%s\" isn't a snapshot mount's table",
 						get_rel_name(relid)),
 				 errhint("Make snapshot tables with prolly_mount().")));
-	if (!mount_lookup(s->mount, &pinned, NULL) ||
+	if (!mount_lookup(s->mount, &pinned, &mi) ||
 		pinned.len != s->commit.len ||
 		memcmp(pinned.bytes, s->commit.bytes, pinned.len) != 0)
 		ereport(ERROR,
@@ -708,6 +1301,44 @@ snapshot_open(Oid relid, Mounted *s)
 				 errmsg("foreign table \"%s\" no longer has the columns of \"%s\" as its commit has them",
 						get_rel_name(relid), s->source),
 				 errhint("Refresh its mount with prolly_refresh_mount().")));
+
+	/* the keys: the primary key, then each index the mount built */
+	s->keys = palloc0(sizeof(MountKey) * (1 + list_length(s->t.indexes)));
+	if (s->t.keyed)
+	{
+		MountKey   *k = &s->keys[s->nkeys++];
+
+		k->nkeys = s->t.nkeys;
+		k->attnos = s->t.key_attnos;
+		k->opfamilies = s->t.opfamilies;
+		k->collations = s->t.collations;
+		k->options = s->t.options;
+		k->unique = true;
+	}
+	source_parts = stringToQualifiedNameList(s->source, NULL);
+	table = strVal(llast(source_parts));
+	foreach(lc, s->t.indexes)
+	{
+		ProllyHistoricalIndex *ix = lfirst(lc);
+		MountIndex *x;
+		MountKey   *k;
+
+		if (ix->unusable)
+			continue;
+		x = built_before(&mi, table, ix->name, definition_hash(ix->definition));
+		if (x == NULL)
+			continue;
+		k = &s->keys[s->nkeys++];
+		k->ix = ix;
+		k->nkeys = ix->nkeys;
+		k->attnos = ix->attnos;
+		k->opfamilies = ix->opfamilies;
+		k->collations = ix->collations;
+		k->options = ix->options;
+		k->unique = ix->unique;
+		k->root = x->root;
+		k->covered = index_covered(&s->t, ix);
+	}
 }
 
 /* ------------------------------------------------------------------------
@@ -716,9 +1347,9 @@ snapshot_open(Oid relid, Mounted *s)
  */
 
 /*
- * What a path's quals bound of the key: the expressions the leading neq
- * key columns equal, then a lower and an upper bound (in SQL's order, not
- * the tree's) on the column after them.
+ * What a path's quals bound of a key: the expressions the leading neq key
+ * columns equal, then a lower and an upper bound (in SQL's order, not the
+ * tree's) on the column after them.
  */
 typedef struct KeyBounds
 {
@@ -731,20 +1362,20 @@ typedef struct KeyBounds
 } KeyBounds;
 
 /*
- * Whether clause bounds key column k of rel: Var op expr (or expr op Var),
- * op a btree operator of the column's family for its type on both sides,
- * under the column's collation, expr not of rel and not volatile.  Sets
- * the strategy (as Var op expr) and expr.
+ * Whether clause bounds column c of key k of rel: Var op expr (or expr op
+ * Var), op a btree operator of the column's family for its type on both
+ * sides, under the key column's collation, expr not of rel and not
+ * volatile.  Sets the strategy (as Var op expr) and expr.
  */
 static bool
-key_clause(RelOptInfo *rel, const Mounted *s, int k, RestrictInfo *ri,
-		   int *strategy, Expr **expr)
+key_clause(RelOptInfo *rel, const Mounted *s, const MountKey *k, int c,
+		   RestrictInfo *ri, int *strategy, Expr **expr)
 {
 	OpExpr	   *op;
 	Node	   *left;
 	Node	   *right;
 	Oid			opno;
-	AttrNumber	attno = s->t.key_attnos[k];
+	AttrNumber	attno = k->attnos[c];
 	Oid			type = TupleDescAttr(s->t.desc, attno - 1)->atttypid;
 	int			strat;
 	Oid			lefttype;
@@ -775,27 +1406,26 @@ key_clause(RelOptInfo *rel, const Mounted *s, int k, RestrictInfo *ri,
 	if (bms_is_member(rel->relid, pull_varnos(NULL, right)) ||
 		contain_volatile_functions(right))
 		return false;
-	if (!op_in_opfamily(opno, s->t.opfamilies[k]))
+	if (!op_in_opfamily(opno, k->opfamilies[c]))
 		return false;
-	get_op_opfamily_properties(opno, s->t.opfamilies[k], false, &strat,
+	get_op_opfamily_properties(opno, k->opfamilies[c], false, &strat,
 							   &lefttype, &righttype);
 	if (lefttype != type || righttype != type || exprType(right) != type)
 		return false;
-	if (OidIsValid(s->t.collations[k]) && op->inputcollid != s->t.collations[k])
+	if (OidIsValid(k->collations[c]) && op->inputcollid != k->collations[c])
 		return false;
 	*strategy = strat;
 	*expr = (Expr *) right;
 	return true;
 }
 
-/* The bounds clauses (RestrictInfos) put on rel's key. */
+/* The bounds clauses (RestrictInfos) put on key k of rel. */
 static void
-key_bounds(RelOptInfo *rel, const Mounted *s, List *clauses, KeyBounds *b)
+key_bounds(RelOptInfo *rel, const Mounted *s, const MountKey *k, List *clauses,
+		   KeyBounds *b)
 {
 	memset(b, 0, sizeof(*b));
-	if (!s->t.keyed)
-		return;
-	for (int k = 0; k < s->t.nkeys; k++)
+	for (int c = 0; c < k->nkeys; c++)
 	{
 		ListCell   *lc;
 		bool		eq = false;
@@ -805,11 +1435,11 @@ key_bounds(RelOptInfo *rel, const Mounted *s, List *clauses, KeyBounds *b)
 			int			strat;
 			Expr	   *e;
 
-			if (!key_clause(rel, s, k, lfirst(lc), &strat, &e))
+			if (!key_clause(rel, s, k, c, lfirst(lc), &strat, &e))
 				continue;
 			if (strat == BTEqualStrategyNumber)
 			{
-				b->eq[k] = e;
+				b->eq[c] = e;
 				eq = true;
 				break;
 			}
@@ -824,7 +1454,7 @@ key_bounds(RelOptInfo *rel, const Mounted *s, List *clauses, KeyBounds *b)
 			int			strat;
 			Expr	   *e;
 
-			if (!key_clause(rel, s, k, lfirst(lc), &strat, &e))
+			if (!key_clause(rel, s, k, c, lfirst(lc), &strat, &e))
 				continue;
 			if ((strat == BTGreaterStrategyNumber ||
 				 strat == BTGreaterEqualStrategyNumber) && b->lo == NULL)
@@ -848,46 +1478,49 @@ key_bounds(RelOptInfo *rel, const Mounted *s, List *clauses, KeyBounds *b)
  * ------------------------------------------------------------------------
  */
 
-/* Per-tuple costs: reading a leaf item, and decoding a row. */
+/*
+ * Per-tuple costs: reading a leaf item, decoding a row, and an index
+ * entry's look-up of its row in the data tree.
+ */
 #define ITEM_COST		(cpu_tuple_cost)
 #define DECODE_COST		(4 * cpu_operator_cost)
+#define LOOKUP_COST		(2 * cpu_tuple_cost)
 
 typedef struct MountPlan
 {
-	Mounted	s;
-	List	   *pathkeys;		/* the key's order, forward */
-	List	   *backward;		/* and backward */
+	Mounted		s;
 } MountPlan;
 
-/* The key's order as pathkeys (NIL where it can't be told the planner). */
+/* Key k's order as pathkeys (NIL where it can't be told the planner). */
 static List *
 key_pathkeys(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
-			 bool backward)
+			 const MountKey *k, bool backward)
 {
 	List	   *keys = NIL;
 
-	if (!s->t.keyed)
-		return NIL;
-	for (int k = 0; k < s->t.nkeys; k++)
+	for (int c = 0; c < k->nkeys; c++)
 	{
-		Form_pg_attribute att = TupleDescAttr(s->t.desc, s->t.key_attnos[k] - 1);
+		Form_pg_attribute att = TupleDescAttr(s->t.desc, k->attnos[c] - 1);
 		Var		   *var;
-		bool		desc = (s->t.options[k] & INDOPTION_DESC) != 0;
-		bool		nulls_first = (s->t.options[k] & INDOPTION_NULLS_FIRST) != 0;
+		bool		desc = (k->options[c] & INDOPTION_DESC) != 0;
+		bool		nulls_first = (k->options[c] & INDOPTION_NULLS_FIRST) != 0;
 		Oid			opno;
 		List	   *pk;
 
-		/* (a key ordered by another collation than its column's: not told) */
-		if (att->attcollation != s->t.collations[k] || nulls_first != desc)
+		/*
+		 * (a key ordered by another collation than its column's, or with
+		 * NULLs where a sort by its operator wouldn't put them: not told)
+		 */
+		if (att->attcollation != k->collations[c] || nulls_first != desc)
 			break;
 		if (backward)
 			desc = !desc;
-		opno = get_opfamily_member(s->t.opfamilies[k], att->atttypid,
+		opno = get_opfamily_member(k->opfamilies[c], att->atttypid,
 								   att->atttypid,
 								   desc ? BTGreaterStrategyNumber : BTLessStrategyNumber);
 		if (!OidIsValid(opno))
 			break;
-		var = makeVar(rel->relid, s->t.key_attnos[k], att->atttypid,
+		var = makeVar(rel->relid, k->attnos[c], att->atttypid,
 					  att->atttypmod, att->attcollation, 0);
 		pk = build_expression_pathkey(root, (Expr *) var, opno, rel->relids,
 									  true);
@@ -911,7 +1544,6 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 	MountPlan  *ps = palloc0(sizeof(MountPlan));
 	const ProllyTreeRoutine *tree;
 	ProllyTreeEnv env;
-	KeyBounds	b;
 
 	snapshot_open(foreigntableid, &ps->s);
 	prolly_check_history_by_name(ps->s.source, prolly_hash_hex(&ps->s.commit),
@@ -925,20 +1557,25 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 								  clauselist_selectivity(root,
 														 baserel->baserestrictinfo,
 														 0, JOIN_INNER, NULL));
-	key_bounds(baserel, &ps->s, baserel->baserestrictinfo, &b);
-	if (b.neq == ps->s.t.nkeys && ps->s.t.keyed)
-		baserel->rows = 1;
+	for (int i = 0; i < ps->s.nkeys; i++)
+	{
+		KeyBounds	b;
+
+		key_bounds(baserel, &ps->s, &ps->s.keys[i], baserel->baserestrictinfo, &b);
+		if (ps->s.keys[i].unique && b.neq == ps->s.keys[i].nkeys)
+			baserel->rows = 1;
+	}
 }
 
-/* How many rows bounds b reads, of a table of count. */
+/* How many rows bounds b on key k reads, of a table of count. */
 static double
 bounded_rows(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
-			 const KeyBounds *b, List *clauses)
+			 const MountKey *k, const KeyBounds *b, List *clauses)
 {
 	List	   *used = NIL;
 	ListCell   *lc;
 
-	if (s->t.keyed && b->neq == s->t.nkeys)
+	if (k->unique && b->neq == k->nkeys)
 		return 1;
 	if (b->neq == 0 && b->lo == NULL && b->hi == NULL)
 		return Max(s->count, 1);
@@ -948,8 +1585,8 @@ bounded_rows(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
 		int			strat;
 		Expr	   *e;
 
-		for (int k = 0; k <= b->neq && k < s->t.nkeys; k++)
-			if (key_clause(rel, s, k, ri, &strat, &e))
+		for (int c = 0; c <= b->neq && c < k->nkeys; c++)
+			if (key_clause(rel, s, k, c, ri, &strat, &e))
 			{
 				used = lappend(used, ri);
 				break;
@@ -959,45 +1596,80 @@ bounded_rows(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
 														   JOIN_INNER, NULL));
 }
 
-/* A path's private list: direction, then the bounds (fdw_private). */
+/* A path's private list: direction, key, then the bounds (fdw_private). */
 static List *
-path_private(const KeyBounds *b, bool backward)
+path_private(const KeyBounds *b, int key, bool backward)
 {
 	List	   *eqs = NIL;
 
-	for (int k = 0; k < b->neq; k++)
-		eqs = lappend(eqs, b->eq[k]);
-	return list_make5(makeInteger(backward ? 1 : 0), eqs,
+	for (int c = 0; c < b->neq; c++)
+		eqs = lappend(eqs, b->eq[c]);
+	return list_make5(list_make2_int(backward ? 1 : 0, key), eqs,
 					  b->lo ? (Node *) b->lo : (Node *) makeInteger(0),
 					  b->hi ? (Node *) b->hi : (Node *) makeInteger(0),
 					  list_make2_int(b->lo_strict, b->hi_strict));
 }
 
-static void
-add_paths(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, List *clauses,
-		  ParamPathInfo *ppi)
+/* Whether an index's entries hold every column the query uses of rel. */
+static bool
+index_covers(RelOptInfo *rel, const MountKey *k)
 {
+	Bitmapset  *attrs = NULL;
+	int			x = -1;
+
+	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &attrs);
+	foreach_node(RestrictInfo, ri, rel->baserestrictinfo)
+		pull_varattnos((Node *) ri->clause, rel->relid, &attrs);
+	while ((x = bms_next_member(attrs, x)) >= 0)
+	{
+		AttrNumber	attno = x + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno <= 0 || !k->covered[attno - 1])
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The paths that scan by key ki (-1: the full scan, in the primary key's
+ * order if there is one), bounded by clauses (and parameterized as ppi
+ * says, if it isn't NULL).
+ */
+static void
+add_paths(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, int ki,
+		  List *clauses, ParamPathInfo *ppi)
+{
+	const MountKey *k = ki >= 0 ? &ps->s.keys[ki] : NULL;
 	KeyBounds	b;
 	double		read;
 	double		rows;
 	Cost		startup;
 	Cost		run;
 	double		depth;
+	bool		lookups;
 
-	key_bounds(rel, &ps->s, clauses, &b);
-	if (ppi && b.neq == 0 && b.lo == NULL && b.hi == NULL)
+	memset(&b, 0, sizeof(b));
+	if (k)
+		key_bounds(rel, &ps->s, k, clauses, &b);
+	/* (an index scan without bounds only for its order) */
+	if (k && b.neq == 0 && b.lo == NULL && b.hi == NULL &&
+		(ppi || k->ix == NULL || root->query_pathkeys == NIL))
 		return;
-	read = bounded_rows(root, rel, &ps->s, &b, clauses);
+	read = k ? bounded_rows(root, rel, &ps->s, k, &b, clauses) : Max(ps->s.count, 1);
 	rows = ppi ? clamp_row_est(Min(read, ppi->ppi_rows)) : rel->rows;
 	if (ppi)
 		ppi->ppi_rows = rows;
+	lookups = k && k->ix && !index_covers(rel, k);
 	depth = ps->s.count > 1 ? ceil(log(ps->s.count) / log(64.0)) + 1 : 1;
 	startup = depth * random_page_cost;
 	run = read * (ITEM_COST + DECODE_COST) +
 		read * cpu_operator_cost * list_length(rel->baserestrictinfo);
+	if (lookups)
+		run += read * (LOOKUP_COST + depth * cpu_operator_cost);
 	for (int dir = 0; dir < 2; dir++)
 	{
-		List	   *pathkeys = dir ? ps->backward : ps->pathkeys;
+		const MountKey *ok = k ? k : (ps->s.t.keyed ? &ps->s.keys[0] : NULL);
+		List	   *pathkeys = ok ? key_pathkeys(root, rel, &ps->s, ok, dir == 1) : NIL;
 
 		/* (backward only where it gives an order) */
 		if (dir == 1 && pathkeys == NIL)
@@ -1007,15 +1679,16 @@ add_paths(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, List *clauses,
 										 startup + run, pathkeys,
 										 ppi ? ppi->ppi_req_outer : NULL,
 										 NULL, NIL,
-										 path_private(&b, dir == 1)));
+										 path_private(&b, k ? ki : (ps->s.t.keyed ? 0 : -1),
+													  dir == 1)));
 	}
 }
 
 typedef struct KeyMemberArg
 {
-	const Mounted *s;
+	const MountKey *k;
 	Index		relid;
-	int			k;				/* the key column sought */
+	int			c;				/* the key column sought */
 } KeyMemberArg;
 
 static bool
@@ -1026,28 +1699,22 @@ key_member(PlannerInfo *root, RelOptInfo *rel, EquivalenceClass *ec,
 	Var		   *v = (Var *) em->em_expr;
 
 	return IsA(v, Var) && v->varno == a->relid && v->varlevelsup == 0 &&
-		v->varattno == a->s->t.key_attnos[a->k];
+		v->varattno == a->k->attnos[a->c];
 }
 
+/*
+ * Paths parameterized by an equality of key k's leading column to another
+ * relation's expression, from the join clauses and the equivalence
+ * classes: a nested loop re-seeks for each outer row.
+ */
 static void
-snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
-				   Oid foreigntableid)
+add_parameterized_paths(PlannerInfo *root, RelOptInfo *baserel, MountPlan *ps,
+						int ki)
 {
-	MountPlan  *ps = baserel->fdw_private;
+	const MountKey *k = &ps->s.keys[ki];
 	List	   *ppis = NIL;
 	ListCell   *lc;
 
-	ps->pathkeys = key_pathkeys(root, baserel, &ps->s, false);
-	ps->backward = key_pathkeys(root, baserel, &ps->s, true);
-	add_paths(root, baserel, ps, baserel->baserestrictinfo, NULL);
-	if (!ps->s.t.keyed)
-		return;
-
-	/*
-	 * Parameterized by an equality of a key column to another relation's
-	 * expression, from the join clauses and the equivalence classes: a
-	 * nested loop re-seeks for each outer row.
-	 */
 	foreach(lc, baserel->joininfo)
 	{
 		RestrictInfo *ri = lfirst(lc);
@@ -1057,8 +1724,8 @@ snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
 
 		if (!join_clause_is_movable_to(ri, baserel))
 			continue;
-		for (int k = 0; k < ps->s.t.nkeys; k++)
-			if (key_clause(baserel, &ps->s, k, ri, &strat, &e) &&
+		for (int c = 0; c < k->nkeys; c++)
+			if (key_clause(baserel, &ps->s, k, c, ri, &strat, &e) &&
 				strat == BTEqualStrategyNumber)
 			{
 				outer = bms_del_member(bms_union(ri->clause_relids,
@@ -1072,9 +1739,9 @@ snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
 	}
 	if (baserel->has_eclass_joins)
 	{
-		for (int k = 0; k < ps->s.t.nkeys; k++)
+		for (int c = 0; c < k->nkeys; c++)
 		{
-			KeyMemberArg a = {&ps->s, baserel->relid, k};
+			KeyMemberArg a = {k, baserel->relid, c};
 			List	   *clauses = generate_implied_equalities_for_column(root, baserel,
 																		 key_member, &a,
 																		 baserel->lateral_referencers);
@@ -1099,9 +1766,23 @@ snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
 	{
 		ParamPathInfo *ppi = lfirst(lc);
 
-		add_paths(root, baserel, ps,
+		add_paths(root, baserel, ps, ki,
 				  list_concat_copy(baserel->baserestrictinfo, ppi->ppi_clauses),
 				  ppi);
+	}
+}
+
+static void
+snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
+				   Oid foreigntableid)
+{
+	MountPlan  *ps = baserel->fdw_private;
+
+	add_paths(root, baserel, ps, -1, NIL, NULL);
+	for (int ki = 0; ki < ps->s.nkeys; ki++)
+	{
+		add_paths(root, baserel, ps, ki, baserel->baserestrictinfo, NULL);
+		add_parameterized_paths(root, baserel, ps, ki);
 	}
 }
 
@@ -1162,13 +1843,14 @@ snapshot_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 
 typedef struct MountScan
 {
-	Mounted	s;
+	Mounted		s;
 	ProllyComponents c;
-	ProllyKeying *k;
-	ProllyTreeEnv env;
+	ProllyKeying *k;			/* the data tree's keys */
+	ProllyTreeEnv env;			/* the data tree's */
 	ProllyKeyingRefs refs;
 	const ProllyTreeRoutine *tree;
 	ProllyTreeCursor *cursor;
+	int			key;			/* -1: none; else s.keys' */
 	bool		backward;
 	int			neq;
 	bool		has_lo;
@@ -1177,6 +1859,14 @@ typedef struct MountScan
 	bool		hi_strict;
 	List	   *exprs;			/* ExprStates of the bounds */
 	bool	   *wanted;			/* attributes decoded; NULL: all */
+
+	/* scanning an index's tree */
+	bool		index;
+	IndexOrder	order;
+	ProllyTreeEnv ienv;
+	ProllyKeyingRefs irefs;
+	bool		lookups;		/* rows read from the data tree */
+	StringInfoData row;			/* a row looked up */
 
 	/* the bounds as keys of the tree's order; NULL: none */
 	StringInfo	tree_lo;
@@ -1209,13 +1899,15 @@ snapshot_begin(ForeignScanState *node, int eflags)
 	MountScan  *ss = palloc0(sizeof(MountScan));
 	Relation	rel = node->ss.ss_currentRelation;
 	List	   *priv = fs->fdw_private;
+	List	   *how = linitial(priv);
 	List	   *has = lthird(priv);
 	List	   *strict = lfourth(priv);
 	List	   *cols = (List *) list_nth(priv, 4);
 	MemoryContext old;
 
 	node->fdw_state = ss;
-	ss->backward = intVal(linitial(priv)) != 0;
+	ss->backward = linitial_int(how) != 0;
+	ss->key = lsecond_int(how);
 	ss->neq = intVal(lsecond(priv));
 	ss->has_lo = linitial_int(has);
 	ss->has_hi = lsecond_int(has);
@@ -1236,36 +1928,47 @@ snapshot_begin(ForeignScanState *node, int eflags)
 	snapshot_open(RelationGetRelid(rel), &ss->s);
 	prolly_check_history_by_name(ss->s.source, prolly_hash_hex(&ss->s.commit),
 								 false, "a snapshot mount");
+	if (ss->key >= ss->s.nkeys)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the plan's index of \"%s\" is no longer its mount's",
+						ss->s.source)));
 	ss->cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly snapshot scan",
 									ALLOCSET_DEFAULT_SIZES);
 	old = MemoryContextSwitchTo(ss->cxt);
 	prolly_history_components(&ss->c);
 	ss->tree = ss->c.tree;
-	if (ss->s.t.keyed)
-	{
-		if (!PROLLY_HAS(ss->c.keying, open_keyed) ||
-			(ss->k = PROLLY_CALL(ss->c.keying, open_keyed, ss->s.t.desc,
-								 ss->s.t.nkeys, ss->s.t.key_attnos,
-								 ss->s.t.opfamilies, ss->s.t.collations,
-								 ss->s.t.options, ss->cxt)) == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("can't order the keys of \"%s\" as commit %s stores them",
-							ss->s.source, prolly_hash_hex(&ss->s.commit))));
-	}
-	else
-		ss->k = PROLLY_CALL(ss->c.keying, open_described, ss->s.t.desc, ss->cxt);
+	ss->k = open_rows(&ss->c, &ss->s.t, ss->s.source, ss->cxt);
 	prolly_folded_tree_env(&ss->env);
 	ss->env.compare = keying_compare;
 	ss->env.compare_arg = ss;
 	prolly_keying_use_env(&ss->refs, ss->c.keying, ss->k, ss->tree, &ss->env);
+	if (ss->key >= 0 && ss->s.keys[ss->key].ix)
+	{
+		MountKey   *k = &ss->s.keys[ss->key];
+
+		ss->index = true;
+		ss->order.ke = ss->c.key_encoder;
+		ss->order.ienc = index_encoder(&ss->c, ss->s.t.desc, k->ix, ss->cxt);
+		ss->order.kr = ss->c.keying;
+		ss->order.k = ss->k;
+		prolly_folded_tree_env(&ss->ienv);
+		ss->ienv.compare = entry_compare;
+		ss->ienv.compare_arg = &ss->order;
+		prolly_keying_use_env(&ss->irefs, ss->c.keying, ss->k, ss->tree, &ss->ienv);
+		ss->lookups = (ss->wanted == NULL);
+		for (int i = 0; !ss->lookups && i < ss->s.t.desc->natts; i++)
+			ss->lookups = ss->wanted[i] && !k->covered[i];
+		initStringInfo(&ss->row);
+	}
 	MemoryContextSwitchTo(old);
 	ss->nodes_before = pgstat_prolly_tree_counters()->nodes_read;
 }
 
 /*
  * One of the tree's bounds: the equality prefix, then v (if has_v), as the
- * least key with them (high: the greatest).
+ * least key with them (high: the greatest).  On an index, the bound of its
+ * columns with the byte that puts it before (after) every row's.
  */
 static StringInfo
 tree_bound(MountScan *ss, Datum *values, bool *isnull, bool has_v, Datum v,
@@ -1280,8 +1983,20 @@ tree_bound(MountScan *ss, Datum *values, bool *isnull, bool has_v, Datum v,
 		isnull[n] = false;
 		n++;
 	}
-	PROLLY_CALL(ss->c.keying, encode_key_bound, ss->k, values, isnull, n,
-				high, key);
+	if (ss->index)
+	{
+		StringInfoData idx;
+
+		initStringInfo(&idx);
+		PROLLY_CALL(ss->c.key_encoder, encode_bound, ss->order.ienc, values,
+					isnull, n, high, &idx);
+		prolly_put_varint(key, idx.len);
+		appendBinaryStringInfo(key, idx.data, idx.len);
+		appendStringInfoChar(key, high ? 1 : 0);
+	}
+	else
+		PROLLY_CALL(ss->c.keying, encode_key_bound, ss->k, values, isnull, n,
+					high, key);
 	return key;
 }
 
@@ -1337,8 +2052,8 @@ set_bounds(ForeignScanState *node, MountScan *ss)
 			hi = d;
 		i++;
 	}
-	desc = ss->neq < ss->s.t.nkeys &&
-		(ss->s.t.options[ss->neq] & INDOPTION_DESC) != 0;
+	desc = ss->neq < ss->s.keys[ss->key].nkeys &&
+		(ss->s.keys[ss->key].options[ss->neq] & INDOPTION_DESC) != 0;
 	has_tlo = desc ? ss->has_hi : ss->has_lo;
 	has_thi = desc ? ss->has_lo : ss->has_hi;
 	tlo = desc ? hi : lo;
@@ -1374,8 +2089,19 @@ start_scan(ForeignScanState *node, MountScan *ss)
 	if (ss->done)
 		return;
 	if (ss->cursor == NULL)
-		ss->cursor = PROLLY_CALL(ss->tree, cursor_open, &ss->env, &ss->s.t.data,
-								 ss->cxt);
+	{
+		if (ss->index)
+		{
+			ProllyNodeRef iroot = {0};
+
+			iroot.hash = ss->s.keys[ss->key].root;
+			ss->cursor = PROLLY_CALL(ss->tree, cursor_open, &ss->ienv, &iroot,
+									 ss->cxt);
+		}
+		else
+			ss->cursor = PROLLY_CALL(ss->tree, cursor_open, &ss->env,
+									 &ss->s.t.data, ss->cxt);
+	}
 	from = ss->backward ? ss->tree_hi : ss->tree_lo;
 	if (from)
 	{
@@ -1391,10 +2117,12 @@ compare_bound(MountScan *ss, const ProllyKey *key, StringInfo bound)
 {
 	ProllyKey	b = {(const uint8 *) bound->data, bound->len};
 
+	if (ss->index)
+		return entry_compare(key, &b, &ss->order);
 	return PROLLY_CALL(ss->c.keying, compare, ss->k, key, &b);
 }
 
-/* Is key past the end the scan goes toward (or short of its start)? */
+/* Is key past the end the scan goes toward? */
 static bool
 past_end(MountScan *ss, const ProllyKey *key)
 {
@@ -1410,6 +2138,7 @@ past_end(MountScan *ss, const ProllyKey *key)
 	return strict ? c >= 0 : c > 0;
 }
 
+/* Is key short of a strict start, a seek having put the scan at it? */
 static bool
 before_start(MountScan *ss, const ProllyKey *key)
 {
@@ -1462,6 +2191,27 @@ snapshot_iterate(ForeignScanState *node)
 			continue;
 		PROLLY_CALL(ss->c.keying, parse_value_as, ss->k, !ss->s.t.keyed, &value,
 					&row, &count);
+		if (ss->index && ss->lookups)
+		{
+			ProllyKey	idx;
+			ProllyKey	dkey;
+			ProllyValue dvalue;
+			uint64		dcount;
+
+			/* (the entry's row, from the data tree) */
+			split_entry(&key, &idx, &dkey);
+			resetStringInfo(&ss->row);
+			if (!PROLLY_CALL(ss->tree, get, &ss->env, &ss->s.t.data, &dkey,
+							 &ss->row))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("a snapshot index entry of \"%s\" names no row",
+								ss->s.source)));
+			dvalue.data = (const uint8 *) ss->row.data;
+			dvalue.len = ss->row.len;
+			PROLLY_CALL(ss->c.keying, parse_value_as, ss->k, !ss->s.t.keyed,
+						&dvalue, &row, &dcount);
+		}
 		PROLLY_CALL(ss->c.keying, decode_row_columns, ss->k, &row, ss->wanted,
 					slot);
 		ss->rows_read++;
@@ -1491,6 +2241,8 @@ snapshot_end(ForeignScanState *node)
 	if (ss->cursor)
 		PROLLY_CALL(ss->tree, cursor_close, ss->cursor);
 	ss->cursor = NULL;
+	if (ss->index)
+		PROLLY_CALL(ss->c.key_encoder, end, ss->order.ienc);
 	PROLLY_CALL(ss->c.keying, close, ss->k);
 	MemoryContextDelete(ss->cxt);
 	ss->cxt = NULL;
@@ -1502,20 +2254,32 @@ snapshot_explain(ForeignScanState *node, ExplainState *es)
 	MountScan  *ss = node->fdw_state;
 	ForeignScan *fs = (ForeignScan *) node->ss.ps.plan;
 	List	   *priv = fs->fdw_private;
+	List	   *how = linitial(priv);
 	List	   *has = lthird(priv);
 	int			neq = intVal(lsecond(priv));
+	int			key = lsecond_int(how);
 	StringInfoData access;
 
 	initStringInfo(&access);
-	if (neq == 0 && !linitial_int(has) && !lsecond_int(has))
+	if (neq == 0 && !linitial_int(has) && !lsecond_int(has) &&
+		(key <= 0 || ss == NULL || ss->s.keys == NULL || ss->s.keys[key].ix == NULL))
 		appendStringInfoString(&access, "full");
 	else
 	{
-		appendStringInfo(&access, "primary key, %d equal", neq);
+		if (ss && ss->s.keys && key >= 0 && ss->s.keys[key].ix)
+			appendStringInfo(&access, "index %s",
+							 quote_identifier(ss->s.keys[key].ix->name));
+		else if (key > 0)
+			appendStringInfoString(&access, "index");
+		else
+			appendStringInfoString(&access, "primary key");
+		appendStringInfo(&access, ", %d equal", neq);
 		if (linitial_int(has) || lsecond_int(has))
 			appendStringInfoString(&access, ", range");
+		if (ss && ss->index && ss->lookups)
+			appendStringInfoString(&access, ", row lookups");
 	}
-	if (intVal(linitial(priv)))
+	if (linitial_int(how))
 		appendStringInfoString(&access, ", backward");
 	ExplainPropertyText("Snapshot Access", access.data, es);
 	if (es->verbose && ss && ss->s.source)

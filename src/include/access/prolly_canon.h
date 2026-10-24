@@ -159,8 +159,25 @@ typedef struct ProllyTableColumn
  * root's items alone (table_metadata()): its data tree, its columns (names,
  * types and collations resolved in this database, in the order its rows
  * encode them), and the primary key keying its rows, with each key column's
- * btree operator family, collation and INDOPTION_* options.
+ * btree operator family, collation and INDOPTION_* options; and its other
+ * indexes, alike, each with why it can't be followed here (not a btree, a
+ * partial or expression index, an ordering not built in), if it can't.
  */
+typedef struct ProllyHistoricalIndex
+{
+	char	   *name;
+	char	   *definition;		/* its statement, as the version has it */
+	bool		unique;
+	int			nkeys;
+	AttrNumber	attnos[INDEX_MAX_KEYS]; /* 1-based, in the table's desc */
+	Oid			opfamilies[INDEX_MAX_KEYS];
+	Oid			collations[INDEX_MAX_KEYS];
+	int16		options[INDEX_MAX_KEYS];
+	int			ninclude;
+	AttrNumber	include[INDEX_MAX_KEYS];	/* INCLUDE columns */
+	const char *unusable;		/* why it can't be followed here, or NULL */
+} ProllyHistoricalIndex;
+
 typedef struct ProllyHistoricalTable
 {
 	ProllyNodeRef data;
@@ -171,6 +188,7 @@ typedef struct ProllyHistoricalTable
 	Oid			opfamilies[INDEX_MAX_KEYS];
 	Oid			collations[INDEX_MAX_KEYS];
 	int16		options[INDEX_MAX_KEYS];
+	List	   *indexes;		/* its other indexes (ProllyHistoricalIndex) */
 } ProllyHistoricalTable;
 
 /* A saved named type; enum labels are String nodes in sort order. */

@@ -66,8 +66,10 @@
  *				   resolving a tag, or reading an old root's refs, reads
  *				   no tag object)
  *	'P' name	-> a pin: a commit kept for a reader outside the refs (a
- *				   snapshot mount), named by it (hash length, hash), then
- *				   the reader's own record of it
+ *				   snapshot mount), named by it (hash length, hash), the
+ *				   count (a varint) and roots (hash length, hash each) of
+ *				   the trees it keeps beside it, then the reader's own
+ *				   record of it
  *	'E' name	-> the branch's rebase in progress: the branch rebased (a
  *				   varint length, then the bytes), its head then and the
  *				   commit replayed onto (hash length, hash each), a flags
@@ -225,9 +227,9 @@
 /*
  * The refs tree's format, kept in it: a tree of another (an older build's)
  * is refused, never read.  2: tags; 3: rebases; 4: kept pages; 5: kept
- * pages retired; 6: pins.
+ * pages retired; 6: pins; 7: the trees a pin keeps.
  */
-#define REFS_FORMAT		"6"
+#define REFS_FORMAT		"7"
 
 /*
  * A branch's own lock (an object lock in the database, of this class, by a
@@ -432,7 +434,13 @@ refs_chunk_refs(const ProllyKey *key, const ProllyValue *value, void *arg,
 			(void) declare_hashes(p, end, 2, refs);
 			break;
 		case TAG_PIN:
-			(void) declare_hashes(p, end, 1, refs);
+			{
+				uint64		n;
+
+				p = declare_hashes(p, end, 1, refs);
+				n = prolly_get_varint(&p, end);
+				(void) declare_hashes(p, end, (int) Min(n, INT_MAX), refs);
+			}
 			break;
 		case TAG_MERGE:
 			{
@@ -6957,7 +6965,7 @@ pin_key(const char *name, StringInfo key)
  */
 static void
 copies_pin_set(const char *name, const ProllyHash *commit,
-			   const ProllyValue *info)
+			   const ProllyHash *keep, int nkeep, const ProllyValue *info)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -6979,6 +6987,15 @@ copies_pin_set(const char *name, const ProllyHash *commit,
 	if (commit)
 	{
 		put_hash(&v, commit);
+		prolly_put_varint(&v, nkeep);
+		for (int i = 0; i < nkeep; i++)
+		{
+			if (!PROLLY_CALL(env.chunk_store, has, env.chunks, &keep[i]))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("tree %s does not exist", prolly_hash_hex(&keep[i]))));
+			put_hash(&v, &keep[i]);
+		}
 		if (info)
 			appendBinaryStringInfo(&v, (const char *) info->data, info->len);
 	}
@@ -7001,8 +7018,13 @@ copies_pin_get(const char *name, ProllyHash *commit, StringInfo info)
 	found = refs_get(key.data, key.len, &v);
 	if (found)
 	{
-		const char *p = get_hash(v.data, v.data + v.len, commit);
+		const char *end = v.data + v.len;
+		const char *p = get_hash(v.data, end, commit);
+		uint64		n = prolly_get_varint(&p, end);
+		ProllyHash	h;
 
+		for (uint64 i = 0; i < n && p < end; i++)
+			p = get_hash(p, end, &h);
 		if (info)
 			appendBinaryStringInfo(info, p, v.data + v.len - p);
 	}
@@ -7025,7 +7047,14 @@ visit_pin_entry(const ProllyKey *k, const ProllyValue *v, void *arg)
 	const char *end = (const char *) v->data + v->len;
 	ProllyHash	commit;
 	const char *p = get_hash((const char *) v->data, end, &commit);
-	ProllyValue info = {(const uint8 *) p, (uint32) (end - p)};
+	uint64		n = prolly_get_varint(&p, end);
+	ProllyHash	h;
+	ProllyValue info;
+
+	for (uint64 i = 0; i < n && p < end; i++)
+		p = get_hash(p, end, &h);
+	info.data = (const uint8 *) p;
+	info.len = (uint32) (end - p);
 
 	pv->visit(name, &commit, &info, pv->arg);
 	pfree(name);
