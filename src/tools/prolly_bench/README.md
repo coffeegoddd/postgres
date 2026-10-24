@@ -532,8 +532,35 @@ IDs are the suite's letters and a number (`G3`, `GV2`).  A new suite is a
 new file; its workloads, size keys and parameters register with it.  (The
 S, V and C workloads' parameter keys are still listed in `config.py`.)
 
-G and GV have no workloads yet: the suites, their builds and their targets
-come first.  A database of either installs PostGIS where its tables are:
+G's and GV's workloads are in `pbench/workloads/g_suite.py`:
+
+| ID | Workload | Measures |
+|---|---|---|
+| G1 | COPY of points and buildings, then GiST, SP-GiST and BRIN builds | load and build seconds, index bytes per AM |
+| G2 | random windows over buildings: `&&` (`bbox`) or `ST_Intersects` (`intersects`), pgbench | tps, latency |
+| G3 | KNN, `ORDER BY g <-> point LIMIT k`, k swept, pgbench | tps, latency |
+| G4 | points in zones, and up to `large_points` points in large polygons by a nested loop (PostGIS's toast cache), `parallel` workers swept | query ms |
+| G5 | moving objects: moves, inserts of new vehicles and deletes of existing ones (8:1:1, counts checked), pgbench | tps, latency, writes, each script's count |
+| G6 | large polygons: full read, `ST_Simplify`, a one-vertex rewrite | ms per statement |
+| G7 | `ST_AsMVT` over a fixed tile list, zooms 4 to 7 | ms per tile |
+| G8 | geography `ST_DWithin`, pgbench | tps, latency |
+| G9 | ANALYZE of every table; plans of window, KNN, join and geography queries | ANALYZE ms; plans must be heap's |
+| GV1 | a commit after N points and a large polygon moved, N swept | commit ms against N |
+| GV2 | diff and merge of two branches moving disjoint or the same bands of points | diff and merge ms |
+| GV3 | push to a file remote, clone, a change pushed, the clone's fetch | ms, remote bytes |
+| GV4 | many small commits, a point and one vertex of a large polygon each | chunk-store bytes per commit |
+| GV5 | a new branch's checkout and first window and KNN queries, against second ones | ms |
+
+GV workloads run with nothing in the background or with G5 (`background`
+`none`, `G5`).  The data is a deterministic synthetic generator in SQL (clustered
+points, rotated buildings, zones of about 2000 vertices, large polygons of
+`g_large_vertices` vertices, a fleet, geography points), sized by the
+`g_*` `[sizes]` keys.  Every G cell records its answers (an md5 of each of
+a fixed set of queries' results, over EWKB) in `raw/answers.json`; runs
+whose answers differ aren't comparable, whatever their timings.
+`configs/g_smoke.toml` is a quick run of both suites at small sizes.
+
+A database of either installs PostGIS where its tables are:
 in the versioned schema on prolly, where the extension is shared by every
 branch but not versioned, and in `public` on heap.  `postgis_topology`
 keeps its own `topology` schema.  Workload SQL names PostGIS objects
