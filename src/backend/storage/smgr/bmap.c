@@ -9129,7 +9129,11 @@ compact_read(SMgrRelation reln, void *arg)
  * Move the blocks of a database's page store in a tablespace (directory
  * 'path') that lie past its allocated count: how many moved.  Each relation
  * is moved in a subtransaction of its own, so one dropped or truncated
- * meanwhile is passed over.
+ * meanwhile is passed over, and held against its drop (hold_relation()):
+ * one whose drop is in flight, its map about to be let go of and its
+ * buffers dropped already, isn't moved at all (its pages would come back
+ * into shared buffers, dirty, to be dropped again, and its blocks are
+ * about to be freed anyway), nor is one locked by another.
  */
 static uint64
 compact_store(RelFileLocator rel, const char *path)
@@ -9175,8 +9179,13 @@ compact_store(RelFileLocator rel, const char *path)
 		PG_TRY();
 		{
 			CompactRead cr = {target, 0};
+			HeldRelation held;
 
-			read_maybe_dropped(reln, compact_read, &cr);
+			if (hold_relation(reln->smgr_rlocator.locator, &held))
+			{
+				read_maybe_dropped(reln, compact_read, &cr);
+				let_go_relation(&held);
+			}
 			moved += cr.moved;
 			ReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(oldcxt);
