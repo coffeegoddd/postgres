@@ -5103,6 +5103,28 @@ share_changes(SMgrRelation src, SMgrRelation dst)
  * ----------------------------------------------------------------
  */
 
+/* blocks found, as many as there are (a sweep's, a snapshot's own) */
+typedef struct BlockList
+{
+	BlockNumber *blocks;
+	uint32		n;
+	uint32		cap;
+} BlockList;
+
+static void
+block_list_add(BlockList *l, BlockNumber b)
+{
+	if (l->n == l->cap)
+	{
+		l->cap = Max(l->cap * 2, 1024);
+		l->blocks = l->blocks ?
+			repalloc_huge(l->blocks, l->cap * sizeof(BlockNumber)) :
+			MemoryContextAllocHuge(CurrentMemoryContext,
+								   l->cap * sizeof(BlockNumber));
+	}
+	l->blocks[l->n++] = b;
+}
+
 /*
  * Before a private block is shared, log its contents with its physical
  * address.  A base backup may have read the page store before our flush,
@@ -5117,16 +5139,25 @@ share_changes(SMgrRelation src, SMgrRelation dst)
  * by their first share or REMAP, and cannot change in place.  Do not read
  * or log them again.  The caller holds the source's header exclusively
  * and keeps its writers out, but has not locked the destination map page.
+ *
+ * With 'own', the block is added to it whether logged or not: a page that
+ * may be only in its buffer, to be written out (see bmap_snapshot_take()).
  */
 static void
-preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys)
+preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys,
+					 BlockList *own)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	PGIOAlignedBlock copy;
 	Buffer		buf;
 
+	if (lookup_ref(rel, phys) > 0)
+		return;
+	if (own)
+		block_list_add(own, blkno);
+
 	/* Without online backups or standbys, the share's flush is sufficient. */
-	if (!XLogIsNeeded() || lookup_ref(rel, phys) > 0)
+	if (!XLogIsNeeded())
 		return;
 
 	buf = ReadBufferWithoutRelcache(rel, MAIN_FORKNUM, blkno,
@@ -5147,12 +5178,14 @@ preserve_shared_page(SMgrRelation src, BlockNumber blkno, BlockNumber phys)
  * Before a tree is shared, preserve (preserve_shared_page()) the blocks of
  * its own leaves, under its length: those of shared ones were preserved when
  * they came to be shared, and can't change in place since.  So a share that
- * follows another walks only what changed in between.  The header is held
+ * follows another walks only what changed in between.  With 'own', the
+ * blocks are collected into it, at any WAL level.  The header is held
  * exclusively.
  */
 static void
 tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
-				   BlockNumber first, BlockNumber nblocks, uint32 epoch)
+				   BlockNumber first, BlockNumber nblocks, uint32 epoch,
+				   BlockList *own)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	BmapEntry  *entries;
@@ -5179,16 +5212,18 @@ tree_preserve_node(SMgrRelation src, const BmapEntry *ptr, uint16 level,
 		if (!BlockNumberIsValid(entries[i].block) || child >= nblocks)
 			continue;
 		if (level == 0)
-			preserve_shared_page(src, (BlockNumber) child, entries[i].block);
+			preserve_shared_page(src, (BlockNumber) child, entries[i].block,
+								 own);
 		else
 			tree_preserve_node(src, &entries[i], level - 1,
-							   (BlockNumber) child, nblocks, epoch);
+							   (BlockNumber) child, nblocks, epoch, own);
 	}
 	pfree(entries);
 }
 
 static void
-tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch)
+tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch,
+			  BlockList *own)
 {
 	RelFileLocator rel = src->smgr_rlocator.locator;
 	BmapRoot	root;
@@ -5196,7 +5231,7 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch)
 	uint64		first = 0;
 
 	/* (preserve_shared_page() logs nothing without online backups) */
-	if (!XLogIsNeeded())
+	if (!XLogIsNeeded() && own == NULL)
 		return;
 	buf = map_read(rel, 1);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -5207,7 +5242,7 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch)
 	{
 		if (BlockNumberIsValid(root.top[k].block))
 			tree_preserve_node(src, &root.top[k], k, (BlockNumber) first,
-							   nblocks, epoch);
+							   nblocks, epoch, own);
 		first += tree_span(k);
 	}
 }
@@ -5388,7 +5423,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	epoch = PageGetBmapHeader(BufferGetPage(sheader))->epoch;
 
 	/* src's own blocks preserved, its subtrees a holder more */
-	tree_preserve(src, nblocks, epoch);
+	tree_preserve(src, nblocks, epoch, NULL);
 	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
@@ -5655,18 +5690,32 @@ snapshot_reclaim(SMgrRelation reln)
  *
  * As for a share, the caller keeps reln from changing meanwhile; the pages
  * are written out, and the page store synced, before this returns: the
- * blocks then hold what the snapshot holds, which redo skipping a page's
+ * blocks then hold what the snapshot holds, which a relation made of the
+ * snapshot reads (bmap_share_snapshot()), and which redo skipping a page's
  * records from before a copy of its path relies on (tree_find()).
+ *
+ * Only the snapshot's own blocks can hold a page that is only in its
+ * buffer: one changed since the relation's last snapshot or share was
+ * written out by it, and changes since only by being copied, which writes
+ * the old block first (bmapprepareforchange()).  So the pages written out
+ * are those the snapshot's walk of its own leaves finds (tree_preserve()),
+ * each looked up in the buffers, never the buffers visited: as many as
+ * changed since, whatever the relation's size.  They are written once
+ * every page is to be checked before it next changes, so that no hint
+ * (true of the relation alone) reaches a page after it is written.
  */
-static uint64 snapshot_take_slot(SMgrRelation reln);
+static uint64 snapshot_take_slot(SMgrRelation reln, BlockList *own);
 
 uint64
 bmap_snapshot_take(SMgrRelation reln)
 {
-	uint64		id = snapshot_take_slot(reln);
+	BlockList	own = {0};
+	uint64		id = snapshot_take_slot(reln, &own);
 
-	/* as after a share (bmapshare()), but synced before it is relied on */
-	MarkSharedAndFlushRelations(&reln, 1);
+	MarkBufferedPagesShared();
+	FlushRelationBlocks(reln, MAIN_FORKNUM, own.blocks, own.n);
+	if (own.blocks)
+		pfree(own.blocks);
 	mdimmedsync(store_smgr(reln->smgr_rlocator.locator), MAIN_FORKNUM);
 	INJECTION_POINT("bmap-snapshot-taken", NULL);
 	return id;
@@ -5674,10 +5723,8 @@ bmap_snapshot_take(SMgrRelation reln)
 
 /*
  * bmap_snapshot_take() of each of rels[] (n of them), their ids into ids[]:
- * every cached page checked again before it next changes (without visiting
- * the buffers), their pages written out in one look at the buffers (each
- * block looked up while they are few beside them), and their page
- * stores synced once each, as the transaction commits (bmapsyncshares()),
+ * every cached page checked again before it next changes, once, their own
+ * pages written out, and their page stores synced once each, as the transaction commits (bmapsyncshares()),
  * as a share's are.  For a caller that relies on the snapshots only once
  * its transaction has committed: until then a crash leaves them unsynced,
  * kept by nobody.  Each id is set as its snapshot is taken (the others 0),
@@ -5686,24 +5733,35 @@ bmap_snapshot_take(SMgrRelation reln)
 void
 bmap_snapshot_take_many(SMgrRelation *rels, int n, uint64 *ids)
 {
+	BlockList  *own = palloc0_array(BlockList, Max(n, 1));
+
 	for (int i = 0; i < n; i++)
 		ids[i] = 0;
 	for (int i = 0; i < n; i++)
 	{
-		ids[i] = snapshot_take_slot(rels[i]);
+		ids[i] = snapshot_take_slot(rels[i], &own[i]);
 		INJECTION_POINT("bmap-snapshot-slot-taken", NULL);
 	}
-	/* (one look at the buffers for them all: each block's, if they're few) */
-	MarkSharedAndFlushRelations(rels, n);
+	MarkBufferedPagesShared();
 	for (int i = 0; i < n; i++)
+	{
+		FlushRelationBlocks(rels[i], MAIN_FORKNUM, own[i].blocks, own[i].n);
+		if (own[i].blocks)
+			pfree(own[i].blocks);
 		sync_store_later(rels[i]->smgr_rlocator.locator);
+	}
+	pfree(own);
 	if (n > 0)
 		INJECTION_POINT("bmap-snapshot-taken", NULL);
 }
 
-/* A snapshot's slot of reln set, the map's epoch raised: its id. */
+/*
+ * A snapshot's slot of reln set, the map's epoch raised: its id.  Its own
+ * blocks (those no other map holds, under its length) are added to 'own':
+ * every page that may be only in its buffer is one of them.
+ */
 static uint64
-snapshot_take_slot(SMgrRelation reln)
+snapshot_take_slot(SMgrRelation reln, BlockList *own)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	LOCKTAG		sweeptag;
@@ -5745,7 +5803,7 @@ snapshot_take_slot(SMgrRelation reln)
 	LockBuffer(headerbuf, BUFFER_LOCK_EXCLUSIVE);
 	check_page(BufferGetPage(headerbuf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
 	header = PageGetBmapHeader(BufferGetPage(headerbuf));
-	tree_preserve(reln, header->nblocks, header->epoch);
+	tree_preserve(reln, header->nblocks, header->epoch, own);
 
 	slot = snapshot_slot(reln, 0, &root);
 	if (slot < 0)
@@ -8685,27 +8743,6 @@ sweep_done(int code, Datum arg)
 static void sweep_store(RelFileLocator rel, const char *path,
 						BmapSweep *result);
 
-/* blocks a sweep found, as many as it finds */
-typedef struct BlockList
-{
-	BlockNumber *blocks;
-	uint32		n;
-	uint32		cap;
-} BlockList;
-
-static void
-block_list_add(BlockList *l, BlockNumber b)
-{
-	if (l->n == l->cap)
-	{
-		l->cap = Max(l->cap * 2, 1024);
-		l->blocks = l->blocks ?
-			repalloc_huge(l->blocks, l->cap * sizeof(BlockNumber)) :
-			MemoryContextAllocHuge(CurrentMemoryContext,
-								   l->cap * sizeof(BlockNumber));
-	}
-	l->blocks[l->n++] = b;
-}
 
 /* ----------------------------------------------------------------
  * Compaction: the blocks past where the page store would end moved down
