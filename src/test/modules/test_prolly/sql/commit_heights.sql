@@ -110,5 +110,99 @@ SELECT length(dolt_commit('--allow-empty', '-m', 'mb side 3')::text) AS committe
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_merge_base('main', 'mb_side') = dolt_hashof('mb_side~1') AS base_past_the_merge;
 
+-- a criss-cross history: each side merged the other's first commit, so
+-- both are maximal common ancestors, of the same height: the base is the
+-- one of the least id, whichever way round.  Its candidates found by
+-- heights, none beneath another, it reads the commits above them and their
+-- parents, not the 250 and more beneath to find which is beneath which
+SELECT dolt_branch('cc_a');
+SELECT dolt_branch('cc_b');
+SELECT dolt_checkout('cc_a') IS NOT NULL AS on_a;
+SELECT length(dolt_commit('--allow-empty', '-m', 'cc a1')::text) AS committed;
+SELECT dolt_branch('cc_a1');
+SELECT dolt_checkout('cc_b') IS NOT NULL AS on_b;
+SELECT length(dolt_commit('--allow-empty', '-m', 'cc b1')::text) AS committed;
+SELECT dolt_branch('cc_b1');
+SELECT (dolt_merge('cc_a1', '--no-ff', '-m', 'cc b2'))[3:4];
+SELECT dolt_checkout('cc_a') IS NOT NULL AS on_a;
+SELECT (dolt_merge('cc_b1', '--no-ff', '-m', 'cc a2'))[3:4];
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+:reset
+SELECT dolt_merge_base('cc_a', 'cc_b') =
+	   least(dolt_hashof('cc_a1'), dolt_hashof('cc_b1')) AS least_of_two;
+:flush
+SELECT counted('commits_read') AS commits_read;
+:reset
+SELECT dolt_merge_base('cc_b', 'cc_a') =
+	   least(dolt_hashof('cc_a1'), dolt_hashof('cc_b1')) AS either_way;
+:flush
+SELECT counted('commits_read') AS commits_read;
+
+-- a branch forked long ago and brought up to date by merging main as it
+-- was a few commits back: the base is that commit, and the walk ends once
+-- every commit left is below it, though the branch's own first commits
+-- reach on beneath it
+SELECT dolt_branch('sb_feat');
+DO $$
+BEGIN
+	FOR i IN 1..40 LOOP
+		PERFORM dolt_commit('--allow-empty', '-m', 'sb main ' || i);
+	END LOOP;
+END
+$$;
+SELECT dolt_branch('sb_main_old', 'main~5');
+SELECT dolt_checkout('sb_feat') IS NOT NULL AS on_feat;
+SELECT length(dolt_commit('--allow-empty', '-m', 'sb f1')::text) AS committed;
+SELECT (dolt_merge('sb_main_old', '--no-ff', '-m', 'sb f merged'))[3:4];
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+:reset
+SELECT dolt_merge_base('main', 'sb_feat') = dolt_hashof('sb_main_old') AS base_is_merged_main;
+:flush
+SELECT counted('commits_read') AS commits_read;
+:reset
+SELECT dolt_merge_base('sb_feat', 'main') = dolt_hashof('sb_main_old') AS either_way;
+:flush
+SELECT counted('commits_read') AS commits_read;
+
+-- a commit recording a height no greater than its parent's (made
+-- elsewhere): the walk meeting it walks all of the ancestors instead, and
+-- the base is the same
+SELECT test_commit_at_height(dolt_hashof('main~1'), 1) AS low \gset
+SELECT test_commit_height(:'low') AS recorded_low;
+SELECT dolt_merge_base('main', :'low') = dolt_hashof('main~1') AS base_by_walk;
+SELECT dolt_merge_base(:'low', 'main') = dolt_hashof('main~1') AS either_way;
+
+-- such a commit is refused from a remote: its height isn't one more than
+-- its parent's, and a merge base's walk would take it on trust.  A fetch
+-- and a clone refuse it, receiving nothing
+\getenv abs_builddir PG_ABS_BUILDDIR
+SELECT 'file://' || :'abs_builddir' || '/tmp_check/remotes/heights-' ||
+	txid_current() AS heights_url \gset
+SELECT dolt_branch('forged', :'low');
+SELECT dolt_remote('add', 'hr', :'heights_url');
+SELECT dolt_push('hr', 'forged') AS pushed;
+CREATE DATABASE regress_heights_received;
+\c regress_heights_received
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+CREATE FUNCTION pg_temp.err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	RETURN regexp_replace(SQLERRM, '[0-9a-f]{32,}', '<hash>', 'g');
+END $$;
+SELECT pg_temp.err(format('SELECT dolt_clone(%L)', :'heights_url')) AS cloned;
+SELECT count(*) AS branches FROM dolt_branches;
+CREATE SCHEMA hr VERSIONED;
+CREATE TABLE hr.t (id int PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'own')::text) AS committed;
+SELECT dolt_remote('add', 'hr', :'heights_url');
+SELECT pg_temp.err('SELECT dolt_fetch(''hr'')') AS fetched;
+SELECT count(*) AS tracking FROM dolt_remote_branches;
+\c regress_commit_heights
+DROP DATABASE regress_heights_received;
+
 \c postgres
 DROP DATABASE regress_commit_heights;

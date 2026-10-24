@@ -9,7 +9,8 @@
  * bytes the chunk store and the block map write to their files
  * themselves, the journal read to index it, and the chunk store's
  * collections, moves and conjoins with what collections kept and freed
- * and the page-store blocks they read.
+ * and the page-store blocks they read, and the canonical columns decoded
+ * and long values read.
  * It is kept separate from pgstat.c to enforce the line between the
  * statistics access / storage implementation and the details about
  * individual types of statistics.
@@ -133,6 +134,9 @@ static const char *const counter_names[PGSTAT_PROLLY_NUM_COUNTERS] = {
 	[PGSTAT_PROLLY_RELATIONS_RESTORED] = "relations_restored",
 	[PGSTAT_PROLLY_FIRST_USE_TABLES_KEPT] = "first_use_tables_kept",
 	[PGSTAT_PROLLY_BMAP_BLOCKS_MOVED] = "bmap_blocks_moved",
+	[PGSTAT_PROLLY_COLUMNS_DECODED] = "columns_decoded",
+	[PGSTAT_PROLLY_VALUES_READ] = "values_read",
+	[PGSTAT_PROLLY_VALUE_BYTES_READ] = "value_bytes_read",
 };
 
 /*

@@ -1,0 +1,59 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s2_begin s1_take s2_take s1_busy s1_commit s2_commit
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_take: SELECT id FROM gis_fleet WHERE NOT busy ORDER BY g <-> ST_MakePoint(0, 0) LIMIT 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_take: SELECT id FROM gis_fleet WHERE NOT busy ORDER BY g <-> ST_MakePoint(0, 0) LIMIT 1 FOR UPDATE; <waiting ...>
+step s1_busy: UPDATE gis_fleet SET busy = true WHERE id = 1;
+step s1_commit: COMMIT;
+step s2_take: <... completed>
+id
+--
+ 2
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_take s2_take s1_move s1_commit s2_commit
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_take: SELECT id FROM gis_fleet WHERE NOT busy ORDER BY g <-> ST_MakePoint(0, 0) LIMIT 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_take: SELECT id FROM gis_fleet WHERE NOT busy ORDER BY g <-> ST_MakePoint(0, 0) LIMIT 1 FOR UPDATE; <waiting ...>
+step s1_move: UPDATE gis_fleet SET g = ST_MakePoint(100, 100) WHERE id = 1;
+step s1_commit: COMMIT;
+step s2_take: <... completed>
+id
+--
+ 1
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_take s2_skip s1_commit s2_commit
+step s1_begin: BEGIN;
+step s2_begin: BEGIN;
+step s1_take: SELECT id FROM gis_fleet WHERE NOT busy ORDER BY g <-> ST_MakePoint(0, 0) LIMIT 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_skip: SELECT id FROM gis_fleet WHERE NOT busy ORDER BY g <-> ST_MakePoint(0, 0) LIMIT 1 FOR UPDATE SKIP LOCKED;
+id
+--
+ 2
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
