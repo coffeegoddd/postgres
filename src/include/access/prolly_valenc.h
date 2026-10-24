@@ -164,15 +164,25 @@ typedef struct ProllyValueEncoderRoutine
 	void		(*encode_fields) (ProllyValueEncoder *enc,
 								  const ProllyEncodedField *fields,
 								  StringInfo out);
+
+	/*
+	 * Optional: append the encoding of row with only the attributes wanted
+	 * marks, the others NULL, made of row's own bytes: nothing decoded,
+	 * read out of line or written, and the references it holds are some
+	 * of row's.  decode_columns() of it gives the wanted columns as row
+	 * has them.
+	 */
+	void		(*project) (ProllyValueEncoder *enc, const ProllyValue *row,
+							const bool *wanted, StringInfo out);
 } ProllyValueEncoderRoutine;
 
 #define PROLLY_VALENC_CALLBACK_NAMES \
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
 	"set_values", "refs", "decode_kept", "encode_kept", "fields", \
 	"decode_field", "fields_alike", "field_compatible", "decode_columns", \
-	"encode_fields"
+	"encode_fields", "project"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
-#define PROLLY_VALENC_LAST_CALLBACK encode_fields
+#define PROLLY_VALENC_LAST_CALLBACK project
 
 /* Historical enum decoding for the canonical encoder and nested values. */
 extern bool prolly_canonical_map_enums(ProllyValueEncoder *enc, List *mappings);

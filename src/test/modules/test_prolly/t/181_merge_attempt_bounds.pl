@@ -133,7 +133,7 @@ for my $n (400, 4000)
 		SELECT injection_points_wakeup('prolly-merge-retrying-refused')});
 	$s->query_safe('SELECT 1');
 	is($s->query_safe(q{SELECT count(*) FROM dolt_constraint_violations('s.t')}),
-		$n + 2, "$n rows: theirs' changes refused are recorded once each");
+		2 * ($n + 2), "$n rows: theirs' changes refused are recorded once each, with the rows they collide with");
 	is($s->query_safe(q{SELECT string_agg(format('%s:%s:%s', pk, b, c), ' ' ORDER BY pk)
 		FROM s.t WHERE pk < 100}), '1:4:1 2:3:2 3:2:4',
 		"$n rows: the rows refused stay as the branch has them");
@@ -174,7 +174,7 @@ note("memory left by passes rolled back: @leak bytes; rows held: @held bytes in 
 # holds c = 300 until it is updated, last, and theirs' n other rows form a
 # chain, the first taking 300 and each next the c the one before it gives
 # up: each is refused, put back, and written when tried again.  Only rows 1
-# and 2 keep violations.
+# and 2 keep violations, with the rows they collide with (2 and 3).
 for my $n (500, 5000)
 {
 	my $db = "retried$n";
@@ -216,7 +216,7 @@ for my $n (500, 5000)
 		SELECT injection_points_wakeup('prolly-merge-retrying-refused')});
 	$s->query_safe('SELECT 1');
 	is($s->query_safe(q{SELECT string_agg(violating_row->>'pk', ' ' ORDER BY violating_row->>'pk')
-		FROM dolt_constraint_violations('s.a')}), '1 2',
+		FROM dolt_constraint_violations('s.a')}), '1 2 2 3',
 		"$n rows: only the rows still refused have violations");
 	is($s->query_safe(q{SELECT string_agg(format('%s:%s:%s', pk, b, c), ' ' ORDER BY pk)
 		FROM s.a WHERE pk < 100}), '1:10:100 2:20:200 3:77:999',

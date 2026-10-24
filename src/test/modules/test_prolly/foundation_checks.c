@@ -1404,6 +1404,54 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 			if (wanted[1] && fields[1].out_of_line &&
 				counters.nodes_read == read_before)
 				elog(ERROR, "row %d: a long value asked for was not read", r);
+
+			/*
+			 * project(): the row with only the wanted columns, made of its
+			 * bytes alone (no value read), decoding as decode() does for
+			 * them, NULL for the others; its references some of the row's.
+			 */
+			{
+				StringInfoData proj;
+				StringInfoData prefs;
+				StringInfoData rrefs;
+				ProllyValue pv;
+
+				initStringInfo(&proj);
+				read_before = counters.nodes_read;
+				PROLLY_CALL(ve, project, enc, &row, wanted, &proj);
+				if (counters.nodes_read != read_before)
+					elog(ERROR, "row %d: project() read a value", r);
+				pv.data = (const uint8 *) proj.data;
+				pv.len = proj.len;
+				PROLLY_CALL(ve, decode, enc, &pv, some);
+				slot_getallattrs(some);
+				for (int c = 0; c < natts; c++)
+				{
+					if (TupleDescAttr(desc, c)->attisdropped ||
+						(r % 12 == 11 && c >= 4))
+						continue;
+					if (!wanted[c])
+					{
+						/* (a column with a missing value isn't NULL absent) */
+						if (!some->tts_isnull[c] &&
+							!TupleDescAttr(desc, c)->atthasmissing)
+							elog(ERROR, "row %d column %d: project() kept a column not asked for",
+								 r, c + 1);
+						continue;
+					}
+					check_same_column(TupleDescAttr(desc, c)->atttypid,
+									  all->tts_isnull[c], all->tts_values[c],
+									  some->tts_isnull[c], some->tts_values[c],
+									  r, c, "project()");
+				}
+				initStringInfo(&prefs);
+				initStringInfo(&rrefs);
+				PROLLY_CALL(ve, refs, enc, &pv, &prefs);
+				PROLLY_CALL(ve, refs, enc, &row, &rrefs);
+				if (prefs.len > rrefs.len)
+					elog(ERROR, "row %d: project() holds references the row doesn't", r);
+				pfree(proj.data);
+			}
 		}
 	}
 
@@ -1447,6 +1495,37 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 					elog(ERROR, "a missing 5 and a stored %s compare %s",
 						 stored[s] < 0 ? "NULL" : psprintf("%d", stored[s]),
 						 alike ? "alike" : "different");
+			}
+
+			/*
+			 * project() of the stored value alone, and of the column before
+			 * it alone: a stored NULL stays NULL, not the missing value; a
+			 * column not asked for is NULL too; and the missing value of a
+			 * row that predates the column is kept where asked for.
+			 */
+			for (int w = 0; w < 3; w++)
+			{
+				StringInfoData proj;
+				ProllyValue pv;
+				ProllyValue from = w == 2 ? (ProllyValue) {(const uint8 *) buf2.data, buf2.len} : b;
+
+				memset(wanted, 0, sizeof(bool) * natts);
+				wanted[w == 1 ? 5 : 6] = true;
+				initStringInfo(&proj);
+				PROLLY_CALL(ve, project, enc, &from, wanted, &proj);
+				pv.data = (const uint8 *) proj.data;
+				pv.len = proj.len;
+				PROLLY_CALL(ve, decode, enc, &pv, some);
+				slot_getallattrs(some);
+				if (w == 0 && (stored[s] < 0) != some->tts_isnull[6])
+					elog(ERROR, "project() of a stored %s gave %s",
+						 stored[s] < 0 ? "NULL" : "value",
+						 some->tts_isnull[6] ? "NULL" : "a value");
+				if (w == 1 && !some->tts_isnull[6])
+					elog(ERROR, "project() gave a value to a column not asked for");
+				if (w == 2 && (some->tts_isnull[6] || DatumGetInt32(some->tts_values[6]) != 5))
+					elog(ERROR, "project() lost a predating row's missing value");
+				pfree(proj.data);
 			}
 		}
 	}
