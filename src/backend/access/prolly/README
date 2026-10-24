@@ -304,8 +304,9 @@ version is the table's only through the branch's record of its tables,
 made by its last commit, having the table's relation: at that commit, or
 at a head moved since without a commit to one of its descendants or
 ancestors, the name never without a table between.  A head moved to a
-commit holding a dropped table and then committed (#895), or a merge of a
-branch still holding it, isn't told from the table's own history either.
+commit holding a dropped table and then committed, or a merge of a
+branch still holding it, isn't told from the table's own history either;
+moving a head takes a write role (see Writers), not SELECT alone.
 A plan's row estimate of a version, and dolt_diff_stat's counts, are
 read on the same rule.  A table dropped and made again within one commit
 isn't told from one kept (#891).
@@ -392,6 +393,50 @@ moves the session to its writer branch (writer/<writer>/<base>), forked
 from the base as the transaction's snapshot saw it and swept once it is
 clean and merged.  The mode, protections and writer branches are
 database settings kept in the refs.
+
+Moving a branch's head is a write to the branch, whatever its tables'
+grants: a commit (dolt_commit, or dolt.transaction_commit's at a
+transaction's end), a reset of any kind (a hard reset to the head too, as
+it drops the branch's changes), a merge or pull into it, a cherry-pick,
+revert or rebase onto it, an integration (of the branch, and into its
+target), and the branch's deletion, rename or forced move
+(dolt_branch('-f', ...)).  Each takes prolly_check_head_move(): the role
+has the privileges of the branch's owner, or writes the refs at large
+(prolly_writes_refs(): it owns the database, has the database's CREATE
+privilege, which makes branches, or has the privileges of
+pg_prolly_write).  A branch's owner is the role that made it, recorded in
+the refs ('A', refs format 13) as it is made, its first head set by a
+fetch, clone or push included, kept by a rename and by a forced move that
+makes a branch without commits again; main, a branch whose maker isn't
+recorded, and one whose maker was dropped are the database owner's.
+dolt_branches shows it (creator).  The record is a role's OID, not a
+dependency: DROP ROLE doesn't refuse a role that owns branches (its
+branches fall to the database's owner), REASSIGN OWNED and DROP OWNED
+don't see them, and a role given the dropped one's OID again would own
+them.  A rename's new name takes what making a branch of it takes, or
+pg_prolly_write's privileges, and a rebase's own branch isn't renamed: a
+rebase's branch and a writer branch are made on the session's behalf,
+without the privilege to make branches, and are its role's.  In the
+writer modes a writer with only its tables' grants writes and commits on
+its writer branch, and integrates its own writer branch into its base if
+every change the branch brings is to rows of tables it may write as they
+changed (INSERT for rows added, DELETE for rows removed, UPDATE for rows
+changed, as the base's catalogs grant them; the move that applies them
+takes all four of a table's write privileges, as every move does).  A
+change to a definition, or to rows it may not write so, and an
+integration of any other branch, take the head move's privileges.
+
+Other shared state in the refs is guarded the same way.  Making a tag, and
+adding or removing a remote, takes prolly_writes_refs(); deleting a tag
+takes that or having made it ('G', its maker, recorded by dolt_tag()
+alone: a tag fetched or pushed is no one's).  A fetch sets the remote's
+tags here only for a role that writes the refs; another's fetch leaves
+them, with a notice.  A stash records the role
+that pushed it; dropping or popping it takes that role's privileges or
+prolly_writes_refs(), and a clear by a role without the latter clears only
+its own.  dolt_serve_move_head(), a push from another database, takes
+pg_prolly_push's privileges instead; deleting a branch through it is a
+deletion, and takes these.
 
 Automatic forks happen before parse analysis (including modifying CTEs)
 and before cached statements reacquire relation locks. Creators therefore
@@ -742,6 +787,13 @@ trees (fold_rows), with no fold and no snapshot checked.  A transaction
 that changed definitions, or more rows than it keeps (or than
 maintenance_work_mem holds), or whose rows can't be applied so (a table
 the head describes otherwise), commits its working set instead.
+Such a commit descends the same trees many times (the refs' root for each
+entry it gets and puts, the head's commit and root, each row's path for its
+seek and then its apply), so it opens a tree keep_nodes() scope: each node
+above the leaves, and each root, is read from the chunk store once (up to
+maintenance_work_mem of them), and a
+3-row commit reads about its rows' paths.  An apply keeps them so on its
+own too, as each level's pass starts from the root.
 
 A fold isn't made again while nothing it reads has changed: the refs
 (refs_generations.c) keep in shared memory each branch's generation,
@@ -854,13 +906,23 @@ baseline from the one this backend built last, only the written tables'
 entries changed.  debug_prolly_verify_fold_caches then folds everything
 else again (its work not counted) and compares.  dolt_status reads definitions
 without rows and asks each table's change finder (from that table's
-baseline entry alone), so it still visits every table; but the
+baseline entry alone), so a status in full visits every table; but the
 definitions are those the last read here made while nothing they're of
 changed (no catalog change in this backend's epoch, the same deparsing
 settings and baseline, the tree still stored), only every sequence's item
 worked out again (pg_stat_prolly's definitions_reused).  They're kept
 apart from the folds' items, so a status between two commits leaves the
 second's fold to work out only what was written.
+A later status takes the last one's answer too, when it compared the same
+two roots (the version's and the definitions', which holds every table's
+description and baseline rows) and the refs know which tables were written
+since a mark it took before asking any change finder (written_since()):
+only those tables are compared again (pg_stat_prolly's status_reused), so
+a status after a row write costs about the tables written, not every
+table.  The answer is this backend's own, and is kept only from a
+comparison of every table's changes read so: a table whose change finder
+can't tell its changes that way (a keyless or partitioned one) makes every
+status a fold, and status_reused never moves.
 debug_prolly_verify_fold_caches reads them all again and compares.
 
 

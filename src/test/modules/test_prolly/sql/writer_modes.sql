@@ -237,10 +237,16 @@ BEGIN;
 SELECT dolt_reset('--hard');
 INSERT INTO wm.t VALUES (13, 'after an integration');
 ROLLBACK;
+-- (a head move at all takes a write role: without one, even to the head)
+SET ROLE wm_other;
+SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset_to_head;
+RESET ROLE;
+GRANT pg_prolly_write TO wm_other;
 SET ROLE wm_other;
 SELECT dolt_reset('--hard', 'HEAD~1');
 SELECT dolt_reset('--hard', 'HEAD') IS NOT NULL AS reset_to_head;
 RESET ROLE;
+REVOKE pg_prolly_write FROM wm_other;
 -- Once an integration is done, a checkout after it isn't undone if the
 -- transaction aborts.
 SELECT dolt_checkout('-b', 'wm_ivy');

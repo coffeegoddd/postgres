@@ -52,6 +52,7 @@ func run() error {
 	reduce := flag.Int("reduce", 0, "maximum runs to reduce a failing history")
 	timeout := flag.Duration("timeout", 30*time.Second, "timeout per statement")
 	self := flag.Bool("self-test", false, "first prove the checks reject engines wrong in known ways")
+	postgis := flag.Bool("postgis", false, "give table t a geometry column written with b, and check window queries (needs PostGIS installed)")
 	flag.Parse()
 	if *dsn == "" || *out == "" || *seeds < 1 || *steps < 1 || *timeout <= 0 || *reduce < 0 || *sessions < 0 {
 		return fmt.Errorf("requires -dsn, -out, positive -seeds/-steps/-timeout and nonnegative -reduce/-sessions")
@@ -78,7 +79,9 @@ func run() error {
 			if n == 0 {
 				n = 1 + int(uint64(s)%3)
 			}
-			histories = append(histories, vcfuzz.Generate(s, *steps, n))
+			h := vcfuzz.Generate(s, *steps, n)
+			h.PostGIS = *postgis
+			histories = append(histories, h)
 		}
 	}
 	// Persist every planned history before the first runs, so a crash
@@ -88,7 +91,7 @@ func run() error {
 	}
 	open := vcfuzz.OpenPostgres(*dsn, *timeout)
 	if *self {
-		if err := selfTest(open); err != nil {
+		if err := selfTest(open, *postgis); err != nil {
 			return fmt.Errorf("self-test: %w", err)
 		}
 	}
