@@ -270,19 +270,23 @@ prolly_history_height(const ProllyHash *id, HTAB *heights,
 
 /*
  * The maximal common ancestors of a and b (those no other common ancestor
- * descends from), by heights instead of a walk of all of a's ancestors:
- * commits are taken highest first, each marked with the side it was
- * reached from (a's, b's, both), a commit reached from both a candidate
- * and its ancestors marked as beneath one, until every commit still to be
- * taken is beneath one.  A commit's height exceeds its parents', so none
- * is taken before a commit it descends from, and a commit's marks are all
- * made by the time it is taken: one reached from both sides and not
- * beneath a candidate then is a maximal one.  The walk reads only the
- * commits above the merge base, and a few beside it, not the whole
- * history, and holds marks for those alone.  Each candidate's height is
- * returned with it.  False, the caller walking instead, if a commit read
- * has no height recorded, or one no less than a child's (heights that
- * aren't Dolt's), or can't be read.
+ * descends from) that may be the best, by heights instead of a walk of
+ * all of a's ancestors: commits are taken highest first, each marked with
+ * the side it was reached from (a's, b's, both), a commit reached from
+ * both a candidate and its ancestors marked as beneath one, until every
+ * commit still to be taken is beneath one or lower than the first
+ * candidate.  A commit's height exceeds its parents', so none is taken
+ * before a commit it descends from, and a commit's marks are all made by
+ * the time it is taken: one reached from both sides and not beneath a
+ * candidate then is a maximal one, and none lower than the first can be
+ * the best.  The walk reads the commits above the merge base and their
+ * parents, and holds marks for those alone, however far one side's
+ * history reaches beneath the base.  Each candidate's height is returned
+ * with it.  False, the caller walking instead, if a commit read has no
+ * height recorded, or one no less than a child's (heights that aren't
+ * Dolt's), or can't be read.  Heights are trusted elsewhere: a history
+ * whose heights are wrong only on edges the walk doesn't take may give
+ * another base.
  */
 #define PAINT_A			0x01
 #define PAINT_B			0x02
@@ -427,7 +431,14 @@ paint_common(const ProllyHash *a, const ProllyHash *b,
 			paint_push(&q, pf, id, &info);
 		}
 	}
-	while (ok && q.open > 0)
+	/*
+	 * Once a candidate is found, every commit still to be taken that is
+	 * lower than the first (the highest) can be no better a merge base, nor
+	 * mark one it found as beneath another: the walk ends there, however
+	 * far one side's commits reach beneath it.
+	 */
+	while (ok && q.open > 0 &&
+		   !(*nfound > 0 && q.e[0].height < (*heights)[0]))
 	{
 		PaintEntry	e = paint_pop(&q);
 		PaintFlags *f = paint_flags(flags, &e.id);

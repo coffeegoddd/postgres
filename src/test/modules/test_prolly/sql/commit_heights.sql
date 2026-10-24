@@ -138,5 +138,39 @@ SELECT dolt_merge_base('cc_b', 'cc_a') =
 :flush
 SELECT counted('commits_read') AS commits_read;
 
+-- a branch forked long ago and brought up to date by merging main as it
+-- was a few commits back: the base is that commit, and the walk ends once
+-- every commit left is below it, though the branch's own first commits
+-- reach on beneath it
+SELECT dolt_branch('sb_feat');
+DO $$
+BEGIN
+	FOR i IN 1..40 LOOP
+		PERFORM dolt_commit('--allow-empty', '-m', 'sb main ' || i);
+	END LOOP;
+END
+$$;
+SELECT dolt_branch('sb_main_old', 'main~5');
+SELECT dolt_checkout('sb_feat') IS NOT NULL AS on_feat;
+SELECT length(dolt_commit('--allow-empty', '-m', 'sb f1')::text) AS committed;
+SELECT (dolt_merge('sb_main_old', '--no-ff', '-m', 'sb f merged'))[3:4];
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+:reset
+SELECT dolt_merge_base('main', 'sb_feat') = dolt_hashof('sb_main_old') AS base_is_merged_main;
+:flush
+SELECT counted('commits_read') AS commits_read;
+:reset
+SELECT dolt_merge_base('sb_feat', 'main') = dolt_hashof('sb_main_old') AS either_way;
+:flush
+SELECT counted('commits_read') AS commits_read;
+
+-- a commit recording a height no greater than its parent's (made
+-- elsewhere): the walk meeting it walks all of the ancestors instead, and
+-- the base is the same
+SELECT test_commit_at_height(dolt_hashof('main~1'), 1) AS low \gset
+SELECT test_commit_height(:'low') AS recorded_low;
+SELECT dolt_merge_base('main', :'low') = dolt_hashof('main~1') AS base_by_walk;
+SELECT dolt_merge_base(:'low', 'main') = dolt_hashof('main~1') AS either_way;
+
 \c postgres
 DROP DATABASE regress_commit_heights;
