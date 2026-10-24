@@ -1,0 +1,47 @@
+# The V suite's cleanup invariance (V10): a history that shares storage
+# every way it can, read by a fixed query set before and after every
+# cleanup (each VACUUM variant, the release queue drained by autovacuum,
+# dolt_gc('--full'), dolt_gc(), prolly_page_sweep(), CHECKPOINT), warm
+# and with a restart before each pass (cold).  The digests gate (a cell
+# whose reads differ fails); `prolly_bench vclean` reports each query's
+# paired latency ratio, and gates it with --gate-latency.  The "pr" size
+# runs in pull-request CI, "nightly" nightly.
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1]
+warmup_seconds = 0
+measure_seconds = 1            # (unused: the work is fixed)
+sizes = ["pr"]
+workloads = ["V10"]
+fio_baseline = false
+seed = 1
+collectors = []
+
+[postgres]
+shared_buffers = "256MB"
+# (on only while the release queue drains, between the phases)
+autovacuum = "off"
+# (no fold worker: what it folds, and when, would differ between phases)
+prolly_fold_worker = "off"
+# (main's last four commits kept: the commits the queries check out and
+# reset to among them)
+"prolly.kept_commits" = 4
+checkpoint_timeout = "1d"
+max_wal_size = "16GB"
+max_connections = 32
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+
+[sizes.pr]
+v_rows = 20000
+
+[sizes.nightly]
+v_rows = 500000
+
+[workloads.V10]
+background = ["none"]
+caches = ["warm", "cold"]
+reps = 5

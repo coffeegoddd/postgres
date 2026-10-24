@@ -381,6 +381,7 @@ tests += {
       't/310_reflog_after_gc.pl',
       't/313_reflog_gc_slot.pl',
       't/336_compared_fold_restart.pl',
+      't/360_cleanup_invariance.pl',
     ],
   },
 }
