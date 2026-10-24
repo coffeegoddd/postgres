@@ -809,6 +809,54 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 }
 
 /*
+ * AnyLockHasWaiters -- whether another backend waits for a lock that
+ *		conflicts with one this backend holds (any lock method, any mode
+ *		held, fast-path ones included)
+ *
+ * For work that holds its locks long and would rather give way than keep
+ * others waiting, as autovacuum is made to by the deadlock checker.  A
+ * fast-path lock this backend holds is found in the shared table only
+ * once a strong locker transferred it there, which it does before it
+ * waits, so a waiter conflicting with it is seen too.
+ */
+bool
+AnyLockHasWaiters(void)
+{
+	HASH_SEQ_STATUS status;
+	LOCALLOCK  *locallock;
+	bool		hasWaiters = false;
+
+	hash_seq_init(&status, LockMethodLocalHash);
+	while (!hasWaiters &&
+		   (locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
+	{
+		LockMethod	lockMethodTable;
+		LWLock	   *partitionLock;
+		LOCK	   *lock;
+
+		if (locallock->nLocks <= 0)
+			continue;
+		lockMethodTable = LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)];
+		partitionLock = LockHashPartitionLock(locallock->hashcode);
+		LWLockAcquire(partitionLock, LW_SHARED);
+		lock = locallock->lock;
+		if (lock == NULL)
+			lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+														&locallock->tag.lock,
+														locallock->hashcode,
+														HASH_FIND, NULL);
+		if (lock != NULL &&
+			(lockMethodTable->conflictTab[locallock->tag.mode] &
+			 lock->waitMask) != 0)
+			hasWaiters = true;
+		LWLockRelease(partitionLock);
+	}
+	if (hasWaiters)
+		hash_seq_term(&status);
+	return hasWaiters;
+}
+
+/*
  * LockAcquire -- Check for lock conflicts, sleep if conflict found,
  *		set lock if/when no conflicts.
  *

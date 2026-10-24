@@ -5,6 +5,8 @@
 # on, a fold that has spent prolly_fold_worker_cost_limit naps
 # (fold_worker_cost_delays counts the naps), and folds the same rows.  Off
 # again, it naps no more: nothing of the pacing outlives the folds paced.
+# A paced fold gives way to a lock request on what it holds (a retry), naps
+# for 10 s in all at most, and takes a reload of the settings under way.
 
 use strict;
 use warnings FATAL => 'all';
@@ -82,6 +84,55 @@ fold_writes('off again', 'unpaced again');
 is(counter('fold_worker_cost_delays'), $naps, 'unpaced again, no more naps');
 is(sql(q{SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::s.t)}),
 	'500', 'the working set is the last writes');
+
+# A fold paced to take minutes (100 ms naps at every delay point): one in
+# a nap, waited for.
+set_conf('prolly_fold_worker_cost_delay', '100ms');
+my $napping = q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE application_name = 'prolly fold worker'
+	AND wait_event = 'VacuumDelay'};
+
+# It gives way to a lock request on what it holds: the lock is had at
+# once, not after the fold; the fold is given up as a retry, and made
+# after.
+my $retries = counter('fold_worker_retries');
+sql(q{UPDATE s.t SET v = 'locked' WHERE id <= 500});
+ok($node->poll_query_until('postgres', $napping), 'a paced fold naps');
+my $t0 = time;
+is( sql(q{
+	SET lock_timeout = '20s';
+	BEGIN;
+	LOCK TABLE s.t IN ACCESS EXCLUSIVE MODE;
+	COMMIT;
+	SELECT 'locked'}), 'locked', 'the lock is had');
+cmp_ok(time - $t0, '<', 8, 'promptly');
+ok( $node->poll_query_until(
+		'postgres',
+		qq{SELECT value > $retries FROM pg_stat_prolly
+		   WHERE name = 'fold_worker_retries'}),
+	'the fold gave way, a retry');
+
+# A paced fold naps 10 s in all at most, then goes on unpaced: the writes
+# are folded long before 100 ms naps would let them be.
+ok($node->poll_query_until('postgres', $folded), 'folded after giving way');
+sql(q{UPDATE s.t SET v = 'capped' WHERE id <= 500});
+$t0 = time;
+ok($node->poll_query_until('postgres', $napping), 'napping again');
+ok($node->poll_query_until('postgres', $folded), 'folded');
+cmp_ok(time - $t0, '<', 40, 'within its naps\' cap');
+
+# A reload reaches the fold under way: pacing turned off, it ends at once.
+sql(q{UPDATE s.t SET v = 'reloaded' WHERE id <= 500});
+ok($node->poll_query_until('postgres', $napping), 'napping once more');
+$t0 = time;
+set_conf('prolly_fold_worker_cost_delay', '0');
+ok($node->poll_query_until('postgres', $folded), 'folded after the reload');
+cmp_ok(time - $t0, '<', 6, 'at once, not after its naps');
+
+# A limit of 0 means nothing, and is refused.
+my ($ret, $out, $err) = $node->psql('postgres',
+	q{ALTER SYSTEM SET prolly_fold_worker_cost_limit = 0});
+like($err, qr/must be -1 or between 1 and 10000/, 'a limit of 0 is refused');
 
 $node->stop;
 done_testing();

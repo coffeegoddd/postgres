@@ -2497,7 +2497,7 @@
 
 { name => 'prolly_fold_worker_cost_delay', type => 'real', context => 'PGC_SIGHUP', group => 'VACUUM_AUTOVACUUM',
   short_desc => 'Cost delay of the fold worker\'s folds, in milliseconds, as vacuum_cost_delay is vacuum\'s.',
-  long_desc => 'A fold that has spent prolly_fold_worker_cost_limit sleeps this long, so background folds take a share of the I/O and CPU, not all they can. 0 turns pacing off.',
+  long_desc => 'A fold that has spent prolly_fold_worker_cost_limit sleeps this long, so background folds take a share of the I/O and CPU, not all they can. A paced fold gives way to a conflicting lock request, and naps 10 s in all at most. A change reaches the fold under way. 0 turns pacing off.',
   flags => 'GUC_UNIT_MS',
   variable => 'prolly_fold_worker_cost_delay',
   boot_val => '0',
@@ -2509,6 +2509,7 @@
   short_desc => 'Cost a fold of the fold worker\'s spends before it sleeps.',
   long_desc => 'Pages read and dirtied cost as vacuum_cost_page_hit, _miss and _dirty say; tree nodes read cost as hit pages, and nodes written as dirtied ones. -1 takes vacuum_cost_limit.',
   variable => 'prolly_fold_worker_cost_limit',
+  check_hook => 'check_prolly_fold_worker_cost_limit',
   boot_val => '-1',
   min => '-1',
   max => '10000',

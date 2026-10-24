@@ -26,8 +26,10 @@ extern PGDLLIMPORT int prolly_fold_worker_max_delay;
  * vacuum's are.  While a fold of the worker's is paced, the pages it reads
  * and dirties are charged as vacuum's are, and prolly_fold_delay_point(),
  * called in the folds' loops, charges the tree nodes read and written
- * since its last call, then naps once the fold has spent its limit.  It
- * does nothing in any other fold.
+ * since its last call, then naps once the fold has spent its limit; or,
+ * if another backend waits for a lock the fold's holds, gives up the fold
+ * (an error the worker takes as a retry).  It does nothing in any other
+ * fold.
  */
 extern PGDLLIMPORT double prolly_fold_worker_cost_delay;
 extern PGDLLIMPORT int prolly_fold_worker_cost_limit;

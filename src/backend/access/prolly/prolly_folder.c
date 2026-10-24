@@ -56,20 +56,23 @@
 #include "access/prolly_types.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
-#include "commands/vacuum.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_database.h"
 #include "commands/dbcommands.h"
+#include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lock.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -298,9 +301,23 @@ fold_branch(void *arg)
  * appended, WAL-logged and synced), then naps once the fold has spent
  * prolly_fold_worker_cost_limit.  Off, nothing is charged, nor any delay
  * point reached: a fold costs what it did.
+ *
+ * A paced fold holds its locks (the table's, its index's, its change
+ * log's) and its snapshot through its naps, so it gives way as autovacuum
+ * is made to: before each nap, if another backend waits for a lock that
+ * conflicts with one it holds, the fold gives up (an error the pass takes
+ * as a retry, the branch backed off), and is made again later.  And it
+ * naps for FOLDER_MAX_PACED_NAPS_MS in all at most, then goes on unpaced,
+ * so its snapshot holds the xmin horizon back no longer than that.  A
+ * configuration reload is taken at the delay points, so a change of the
+ * settings reaches the fold under way (0: unpaced from then on).
  */
+#define FOLDER_MAX_PACED_NAPS_MS	10000
+
 static uint64 paced_nodes_read;
 static uint64 paced_nodes_written;
+static double paced_nap_ms;
+static bool fold_gave_way = false;
 
 static void
 paced_nodes_seen(void)
@@ -311,17 +328,33 @@ paced_nodes_seen(void)
 	paced_nodes_written = c->nodes_written;
 }
 
+static void pace_end(void);
+
+/* The settings as they are now, taken (0: unpaced). */
 static void
-pace_begin(void)
+pace_settings(void)
 {
 	if (prolly_fold_worker_cost_delay <= 0)
+	{
+		pace_end();
 		return;
+	}
 	vacuum_cost_delay = prolly_fold_worker_cost_delay;
 	vacuum_cost_limit = prolly_fold_worker_cost_limit > 0 ?
 		prolly_fold_worker_cost_limit : VacuumCostLimit;
+}
+
+static void
+pace_begin(void)
+{
+	fold_gave_way = false;
+	if (prolly_fold_worker_cost_delay <= 0)
+		return;
+	pace_settings();
 	VacuumCostBalance = 0;
 	VacuumCostActive = true;
 	paced_nodes_seen();
+	paced_nap_ms = 0;
 	prolly_fold_paced = true;
 }
 
@@ -349,10 +382,57 @@ prolly_fold_delay_point_paced(void)
 								(c->nodes_written - paced_nodes_written) *
 								VacuumCostPageDirty);
 	paced_nodes_seen();
+	if (ConfigReloadPending)
+	{
+		ConfigReloadPending = false;
+		ProcessConfigFile(PGC_SIGHUP);
+		pace_settings();
+		if (!prolly_fold_paced)
+			return;
+	}
 	if (VacuumCostActive && VacuumCostBalance >= vacuum_cost_limit &&
 		INTERRUPTS_CAN_BE_PROCESSED())
+	{
+		instr_time	start;
+		instr_time	napped;
+
+		if (AnyLockHasWaiters())
+		{
+			fold_gave_way = true;
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("fold worker gave way to a lock request")));
+		}
+		if (paced_nap_ms >= FOLDER_MAX_PACED_NAPS_MS)
+		{
+			pace_end();
+			return;
+		}
 		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_COST_DELAYS, 1);
+		INSTR_TIME_SET_CURRENT(start);
+		vacuum_delay_point(false);
+		INSTR_TIME_SET_CURRENT(napped);
+		INSTR_TIME_SUBTRACT(napped, start);
+		paced_nap_ms += INSTR_TIME_GET_MILLISEC(napped);
+		return;
+	}
 	vacuum_delay_point(false);
+}
+
+/*
+ * As autovacuum_vacuum_cost_limit's: -1 takes vacuum_cost_limit, and 0,
+ * which would mean nothing, is refused.
+ */
+bool
+check_prolly_fold_worker_cost_limit(int *newval, void **extra,
+									GucSource source)
+{
+	if (*newval == 0)
+	{
+		GUC_check_errdetail("prolly_fold_worker_cost_limit must be -1 or between 1 and 10000.");
+		return false;
+	}
+	return true;
 }
 
 typedef struct Moved
@@ -566,19 +646,35 @@ fold_pass(const ProllyRefsRoutine *refs)
 		}
 		PG_CATCH();
 		{
+			bool		gave_way = fold_gave_way;
+
 			pace_end();
+			fold_gave_way = false;
 			HOLD_INTERRUPTS();
-			EmitErrorReport();
+			if (!gave_way)
+				EmitErrorReport();
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
 			RESUME_INTERRUPTS();
-
-			/*
-			 * (passed over until written again: an error that recurs isn't
-			 * met again every pass)
-			 */
-			refs->saw_branch(moved[i].branch, moved[i].generation);
-			backed_off_done(moved[i].branch);
+			if (gave_way)
+			{
+				/* (folded again once its backoff is over, as a retry) */
+				pending = true;
+				back_off(moved[i].branch);
+				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
+				AtEOXact_PgStat_Prolly();
+				elog(DEBUG1, "fold worker left branch %u for its next pass: "
+					 "it gave way to a lock request", moved[i].branch);
+			}
+			else
+			{
+				/*
+				 * (passed over until written again: an error that recurs
+				 * isn't met again every pass)
+				 */
+				refs->saw_branch(moved[i].branch, moved[i].generation);
+				backed_off_done(moved[i].branch);
+			}
 		}
 		PG_END_TRY();
 		any = any || folded;
