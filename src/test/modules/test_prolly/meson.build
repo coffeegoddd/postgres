@@ -363,6 +363,7 @@ tests += {
       't/327_kept_pages_crash_copied_path.pl',
       't/328_kept_pages_standby.pl',
       't/329_kept_pages_base_backup.pl',
+      't/330_bmap_extended_in_recovery.pl',
       't/235_bmap_snapshot_owner.pl',
       't/236_bmap_release_window.pl',
       't/237_vacuum_kept_pages.pl',

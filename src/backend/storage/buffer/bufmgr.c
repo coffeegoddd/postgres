@@ -694,17 +694,22 @@ static bool HintMayReachSharedPage(BufferDesc *buf_hdr);
  * settled at the current generation, so that they hold.  Lock-free: a check
  * settling them (under the header's spinlock) sets the generation before it
  * unlocks, so a generation read as current, before flags read unlocked, is
- * theirs; flags read locked are taken as unsettled.
+ * theirs.  Flags read locked may be mid-settle: read again once the header
+ * is unlocked (as briefly as any holder of it keeps it).
  */
 static inline bool
 BufferSmgrSettled(BufferDesc *buf_hdr, uint64 *buf_state)
 {
-	uint64		gen = pg_atomic_read_u64(&buf_hdr->smgr_gen);
+	for (;;)
+	{
+		uint64		gen = pg_atomic_read_u64(&buf_hdr->smgr_gen);
 
-	pg_read_barrier();
-	*buf_state = pg_atomic_read_u64(&buf_hdr->state);
-	return !(*buf_state & BM_LOCKED) &&
-		gen == pg_atomic_read_u64(BufferSmgrGeneration);
+		pg_read_barrier();
+		*buf_state = pg_atomic_read_u64(&buf_hdr->state);
+		if (likely(!(*buf_state & BM_LOCKED)))
+			return gen == pg_atomic_read_u64(BufferSmgrGeneration);
+		(void) WaitBufHdrUnlocked(buf_hdr);
+	}
 }
 
 /*
@@ -3096,11 +3101,15 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 * A page the extension maps is the relation's own, so it needs
 			 * no preparing, until the next generation of sharing: settled
 			 * now, at the current one, before the storage manager maps it.
+			 * Not in recovery, which raises no generation as it replays a
+			 * share or snapshot: a page extended then is settled at none,
+			 * to be checked before its first change once recovery ends.
 			 */
 			if (smgrpreparesforchanges(BMR_GET_SMGR(bmr), fork))
 			{
 				set_bits |= BM_SMGR_PREPARES;
 				pg_atomic_write_u64(&victim_buf_hdr->smgr_gen,
+									RecoveryInProgress() ? 0 :
 									pg_atomic_read_u64(BufferSmgrGeneration));
 			}
 
