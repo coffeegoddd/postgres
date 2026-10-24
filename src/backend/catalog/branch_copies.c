@@ -132,6 +132,21 @@ branch_name(Oid branch)
 
 static HeapTuple class_row(Relation pg_class, Oid relid, Oid branch);
 
+/*
+ * A scan of the session branch's rows of a branch-aware catalog, by its
+ * index on the branch column: the work is the branch's rows, however many
+ * rows other branches and shared objects have.
+ */
+static SysScanDesc
+session_branch_scan(Relation rel, const CatalogBranchInfo *info)
+{
+	ScanKeyData key;
+
+	ScanKeyInit(&key, info->attnum, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(MyBranch));
+	return systable_beginscan(rel, info->indexid, true, NULL, 1, &key);
+}
+
 /* the storage locator of a pg_class row */
 static RelFileLocator
 class_locator(Form_pg_class c, RelFileNumber relnumber)
@@ -249,13 +264,12 @@ branch_relations(void)
 	List	   *relids = NIL;
 	List	   *toasts = NIL;
 
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	scan = session_branch_scan(rel, catalog_branch_info(RelationRelationId));
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relbranch != MyBranch)
-			continue;
+		Assert(c->relbranch == MyBranch);
 		if (c->relkind == RELKIND_TOASTVALUE)
 			toasts = lappend_oid(toasts, c->oid);
 		else
@@ -499,13 +513,12 @@ copy_rows(Oid target, List *fresh, const BranchKeptRelation *const *kept,
 		HeapTuple	tup;
 
 		/* rows added here are the target's, not seen by this scan */
-		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		scan = session_branch_scan(rel, info);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			HeapTuple	copy;
 
-			if (catalog_row_branch(info, tup) != MyBranch)
-				continue;
+			Assert(catalog_row_branch(info, tup) == MyBranch);
 
 			/* out-of-line values get their own copies, as rows of their own */
 			copy = HeapTupleHasExternal(tup) ? toast_flatten_tuple(tup, desc)
@@ -571,11 +584,10 @@ delete_rows(void)
 		SysScanDesc scan;
 		HeapTuple	tup;
 
-		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		scan = session_branch_scan(rel, info);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
-			if (catalog_row_branch(info, tup) != MyBranch)
-				continue;
+			Assert(catalog_row_branch(info, tup) == MyBranch);
 			if (info->relid == RelationRelationId)
 			{
 				Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);

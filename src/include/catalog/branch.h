@@ -26,6 +26,7 @@ typedef struct CatalogBranchInfo
 	Oid			relid;			/* the catalog */
 	Size		offset;			/* the column's offset in the row's struct */
 	AttrNumber	attnum;			/* the column */
+	Oid			indexid;		/* an index on the column alone */
 } CatalogBranchInfo;
 
 /* the session's branch: a versioned object's rows on it are the ones seen */
