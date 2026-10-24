@@ -312,9 +312,13 @@ OF` are built in D18's shapes.
   row and those it collides with), once for each unique index it breaks.
 - **Prolly:** the merge doesn't write a row that would break a unique
   constraint: the branch keeps its own version of that key (none, for a
-  new one), and the row not written is recorded alone, once, for the
-  first unique constraint it breaks. Check and not-null constraints are
-  the same: their breaking rows are recorded, not written. A row breaking
+  new one). The violations are Dolt's: the row not written and each row
+  it collides with, once for each unique index it breaks (an index of
+  plain columns, by the index's own equality and collation; for an index
+  of expressions, the row not written alone, for the index its write was
+  refused for). Check and not-null
+  constraints keep their breaking rows out too: those rows are recorded,
+  not written. A row breaking
   an exclusion constraint (which Dolt doesn't have) is handled the same
   way, recorded as an `exclusion constraint` violation naming the
   constraint and its columns. So is a row breaking a `PRIMARY KEY` or
@@ -334,9 +338,10 @@ OF` are built in D18's shapes.
   validated check or not-null constraint refuses a row breaking it); a
   table can't hold both, so there is no state in which Dolt's rows
   exist.
-- **Port:** expected rows and violations follow prolly's: the violation
-  lists the row not written, and the table has one row fewer than
-  Dolt's (a count of its rows, as `DELETE`'s, is one lower).
+- **Port:** expected violations are Dolt's; expected rows follow
+  prolly's: the table has one row fewer than Dolt's for each row the
+  merge didn't write (a count of its rows, as `DELETE`'s, is that much
+  lower).
 
 ## D13. Rows breaking a check a merge adds
 

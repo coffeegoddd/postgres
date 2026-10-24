@@ -360,6 +360,8 @@ tests += {
       't/312_amend_race.pl',
       't/250_snapshot_mount_pins.pl',
       't/280_merge_kept_references.pl',
+      't/281_unique_collation_collisions.pl',
+      't/282_unique_collision_queries.pl',
       't/298_rewrite_checkpoint_errors.pl',
       't/310_reflog_after_gc.pl',
       't/313_reflog_gc_slot.pl',
