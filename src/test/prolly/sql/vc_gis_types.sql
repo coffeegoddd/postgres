@@ -79,3 +79,23 @@ DROP TABLE gis_nan;
 SELECT 'reset', (dolt_reset('--hard'))[1] = '0';
 SELECT 'after', string_agg(id || ':' || ST_IsEmpty(g) || ':' || encode(ST_AsEWKB(g), 'hex'), ',' ORDER BY id)
 FROM gis_nan;
+
+-- geometries PostGIS's text input takes but its binary receive refuses (a
+-- one-point LINESTRING, an unclosed ring): kept as their text form, so
+-- they commit and come back byte for byte, alone and in an array
+CREATE TABLE gis_strict (id int PRIMARY KEY, g geometry, ga geometry[]);
+INSERT INTO gis_strict VALUES
+  (1, '0102000020E6100000010000006D1092A47FF33440AD4ECD9B00334A40', NULL),
+  (2, '0103000000010000000400000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F', NULL),
+  (3, 'LINESTRING(0 0,1 1)', NULL),
+  (4, NULL, ARRAY['010200000001000000000000000000F03F000000000000F03F'::geometry, 'POINT(1 2)']);
+SELECT md5(string_agg(id || ':' || coalesce(encode(ST_AsEWKB(g), 'hex'), '')
+                                      || ':' || coalesce(ga::text, ''), ',' ORDER BY id)) AS st1
+FROM gis_strict \gset
+SELECT 'commit strict', (dolt_commit('-Am', 'receive refuses'))[1] ~ '^[0-9a-f]{40}$';
+DROP TABLE gis_strict;
+SELECT 'reset strict', (dolt_reset('--hard'))[1] = '0';
+SELECT 'strict after', md5(string_agg(id || ':' || coalesce(encode(ST_AsEWKB(g), 'hex'), '')
+                                     || ':' || coalesce(ga::text, ''), ',' ORDER BY id)) = :'st1'
+FROM gis_strict;
+SELECT 'strict reads', string_agg(id || ':' || coalesce(ST_NPoints(g), -1), ',' ORDER BY id) FROM gis_strict;
