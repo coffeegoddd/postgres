@@ -8,12 +8,30 @@
 # then the change that met it removes the entry, and the check is enforced
 # from then on.  An entry naming nothing the run checked fails too.
 
-# A historical point read decodes the commit's whole table (dolt_at is a
-# full scan).
+# A merge keeps its commit's pages (prolly.kept_commits): the snapshot's
+# map work (the paths copied, their subtrees' holders) grows with the
+# table today, as does the merge's own first writes into pages shared with
+# the branch merged.
 [[known]]
-check = "point_read"
+check = "merge"
 sweep = "rows"
-counter = "nodes_read"
+counter = "bmap_refcount_updates"
 current = "linear"
-issue = "#697"
-reason = "dolt_at reads every row of the table at the commit; no key access path"
+issue = "#870"
+reason = "a merge's kept snapshot and its copies of shared paths update holders in proportion to the table"
+
+[[known]]
+check = "merge"
+sweep = "rows"
+counter = "bmap_map_pages_copied"
+current = "linear"
+issue = "#870"
+reason = "map pages a merge copies grow with the table"
+
+[[known]]
+check = "ff_merge"
+sweep = "rows"
+counter = "bmap_refcount_updates"
+current = "linear"
+issue = "#870"
+reason = "as merge's"

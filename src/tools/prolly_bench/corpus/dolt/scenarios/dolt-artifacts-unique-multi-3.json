@@ -175,7 +175,7 @@
         "rows": [
           [
             "public.t",
-            "1"
+            "2"
           ]
         ],
         "order": "bag"
@@ -191,6 +191,12 @@
       "sql": "SELECT violating_row->>'id', violating_row->>'col1', violating_row->>'col2', violating_row->>'col3' FROM dolt_constraint_violations('t')",
       "expect": {
         "rows": [
+          [
+            "1",
+            "val1",
+            "val1",
+            "val2"
+          ],
           [
             "3",
             "val1",

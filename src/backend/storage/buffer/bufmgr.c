@@ -6987,6 +6987,28 @@ BufferPageIsShared(Buffer buffer)
 }
 
 /*
+ * BufferPageIsSharedElsewhere -- of a page BufferPageIsShared() says is
+ * shared: may another relation hold it, not only the relation's own
+ * snapshots of its pages as they were?
+ *
+ * The page must be locked, in any mode.
+ */
+bool
+BufferPageIsSharedElsewhere(Buffer buffer)
+{
+	BufferDesc *buf_hdr;
+
+	Assert(BufferIsLockedByMe(buffer));
+	if (BufferIsLocal(buffer))
+		return false;
+	buf_hdr = GetBufferDescriptor(buffer - 1);
+	return smgrpagesharedelsewhere(smgropen(BufTagGetRelFileLocator(&buf_hdr->tag),
+											INVALID_PROC_NUMBER),
+								   BufTagGetForkNum(&buf_hdr->tag),
+								   buf_hdr->tag.blockNum);
+}
+
+/*
  * MarkBufferedRelationShared -- mark a relation fork's cached pages to be
  * prepared before they next change
  *
@@ -7021,64 +7043,158 @@ MarkBufferedRelationShared(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
- * MarkBufferedRelationsShared -- MarkBufferedRelationShared() of each of
- * rels[] (n of them), in one pass over the buffers.
+ * One buffer of MarkSharedAndFlushRelations(): marked as
+ * MarkBufferedRelationShared() marks one, if it is a main fork's page of
+ * rlocator, then written out if dirty, as FlushRelationsAllBuffers() writes
+ * one out.
+ */
+static void
+mark_shared_and_flush_buffer(BufferDesc *bufHdr, const RelFileLocator *rlocator,
+							 SMgrRelation srel)
+{
+	uint64		buf_state;
+
+	/* (before the header is locked: the pin a write takes) */
+	ReservePrivateRefCountEntry();
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+
+	buf_state = LockBufHdr(bufHdr);
+	if (!BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator))
+	{
+		UnlockBufHdr(bufHdr);
+		return;
+	}
+	if (BufTagGetForkNum(&bufHdr->tag) == MAIN_FORKNUM &&
+		(buf_state & BM_TAG_VALID))
+	{
+		UnlockBufHdrExt(bufHdr, buf_state,
+						BM_SMGR_PREPARE | BM_SMGR_REMARKED,
+						BM_SMGR_SHARED | BM_SMGR_OWN, 0);
+		buf_state = LockBufHdr(bufHdr);
+		if (!BufTagMatchesRelFileLocator(&bufHdr->tag, rlocator))
+		{
+			UnlockBufHdr(bufHdr);
+			return;
+		}
+	}
+	if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+	{
+		PinBuffer_Locked(bufHdr);
+		FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		UnpinBuffer(bufHdr);
+	}
+	else
+		UnlockBufHdr(bufHdr);
+}
+
+/*
+ * MarkSharedAndFlushRelations -- MarkBufferedRelationShared() of the main
+ * forks of rels[] (n of them) and FlushRelationsAllBuffers() of them, as a
+ * snapshot of their pages needs, together: when their blocks are few beside
+ * the buffers (as DropRelationsAllBuffers() judges), by looking each block
+ * up, else in one pass over the buffers.  The caller keeps their pages from
+ * changing meanwhile.
  */
 void
-MarkBufferedRelationsShared(SMgrRelation *rels, int n, ForkNumber forknum)
+MarkSharedAndFlushRelations(SMgrRelation *rels, int n)
 {
-	RelFileLocator *locs;
-	bool		use_bsearch = n > RELS_BSEARCH_THRESHOLD;
+	BlockNumber nblocks[MAX_FORKNUM + 1];
+	uint64		total = 0;
+	bool		lookup = true;
+	SMgrSortArray *srels;
+	bool		use_bsearch;
 
 	if (n == 0)
 		return;
-	if (n == 1)
+
+	/*
+	 * (every fork's size, to judge.  Looking each block up finds what the
+	 * pass would: the caller's lock keeps the relations from being
+	 * extended or truncated meanwhile, a buffer past a fork's end holds no
+	 * valid page of it to mark or write out, and a block-mapped fork's size
+	 * is its header's, which an extension updates as it extends)
+	 */
+	for (int i = 0; i < n && lookup; i++)
 	{
-		MarkBufferedRelationShared(rels[0], forknum);
+		for (ForkNumber f = 0; f <= MAX_FORKNUM && lookup; f++)
+		{
+			if (!smgrexists(rels[i], f))
+				continue;
+			total += smgrnblocks(rels[i], f);
+			lookup = total < BUF_DROP_FULL_SCAN_THRESHOLD;
+		}
+	}
+	if (lookup)
+	{
+		for (int i = 0; i < n; i++)
+		{
+			RelFileLocator rlocator = rels[i]->smgr_rlocator.locator;
+
+			for (ForkNumber f = 0; f <= MAX_FORKNUM; f++)
+			{
+				nblocks[f] = smgrexists(rels[i], f) ? smgrnblocks(rels[i], f) : 0;
+				for (BlockNumber b = 0; b < nblocks[f]; b++)
+				{
+					BufferTag	tag;
+					uint32		hash;
+					LWLock	   *partition;
+					int			buf_id;
+
+					InitBufferTag(&tag, &rlocator, f, b);
+					hash = BufTableHashCode(&tag);
+					partition = BufMappingPartitionLock(hash);
+					LWLockAcquire(partition, LW_SHARED);
+					buf_id = BufTableLookup(&tag, hash);
+					LWLockRelease(partition);
+					if (buf_id >= 0)
+					{
+						BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
+
+						/* (the buffer's own fork and block, rechecked locked) */
+						if (BufTagGetForkNum(&bufHdr->tag) == f &&
+							bufHdr->tag.blockNum == b)
+							mark_shared_and_flush_buffer(bufHdr, &rlocator, rels[i]);
+					}
+				}
+			}
+		}
 		return;
 	}
-	locs = palloc_array(RelFileLocator, n);
-	for (int i = 0; i < n; i++)
-		locs[i] = rels[i]->smgr_rlocator.locator;
-	if (use_bsearch)
-		qsort(locs, n, sizeof(RelFileLocator), rlocator_comparator);
 
+	srels = palloc_array(SMgrSortArray, n);
+	for (int i = 0; i < n; i++)
+	{
+		srels[i].rlocator = rels[i]->smgr_rlocator.locator;
+		srels[i].srel = rels[i];
+	}
+	use_bsearch = n > RELS_BSEARCH_THRESHOLD;
+	if (use_bsearch)
+		qsort(srels, n, sizeof(SMgrSortArray), rlocator_comparator);
 	for (int i = 0; i < NBuffers; i++)
 	{
-		BufferDesc *buf_hdr = GetBufferDescriptor(i);
-		RelFileLocator *match = NULL;
-		uint64		buf_state;
+		SMgrSortArray *srelent = NULL;
+		BufferDesc *bufHdr = GetBufferDescriptor(i);
 
-		/* unlocked precheck, as in DropRelationsAllBuffers */
+		/* (an unlocked precheck, as in DropRelationBuffers) */
 		if (!use_bsearch)
 		{
-			for (int j = 0; j < n && match == NULL; j++)
+			for (int j = 0; j < n && srelent == NULL; j++)
 			{
-				if (BufTagMatchesRelFileLocator(&buf_hdr->tag, &locs[j]))
-					match = &locs[j];
+				if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srels[j].rlocator))
+					srelent = &srels[j];
 			}
 		}
 		else
 		{
-			RelFileLocator rlocator = BufTagGetRelFileLocator(&buf_hdr->tag);
+			RelFileLocator rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
 
-			match = bsearch(&rlocator, locs, n, sizeof(RelFileLocator),
-							rlocator_comparator);
+			srelent = bsearch(&rlocator, srels, n, sizeof(SMgrSortArray),
+							  rlocator_comparator);
 		}
-		if (match == NULL)
-			continue;
-
-		buf_state = LockBufHdr(buf_hdr);
-		if (BufTagMatchesRelFileLocator(&buf_hdr->tag, match) &&
-			BufTagGetForkNum(&buf_hdr->tag) == forknum &&
-			(buf_state & BM_TAG_VALID))
-			UnlockBufHdrExt(buf_hdr, buf_state,
-							BM_SMGR_PREPARE | BM_SMGR_REMARKED,
-							BM_SMGR_SHARED | BM_SMGR_OWN, 0);
-		else
-			UnlockBufHdr(buf_hdr);
+		if (srelent != NULL)
+			mark_shared_and_flush_buffer(bufHdr, &srelent->rlocator, srelent->srel);
 	}
-	pfree(locs);
+	pfree(srels);
 }
 
 /*

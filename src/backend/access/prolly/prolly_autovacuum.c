@@ -22,7 +22,11 @@
  * delay.  It sweeps a page store when bmap_sweep_due() says so.  It
  * folds the working set (a checkpoint, as prolly_checkpoint() does) once a
  * table's change log holds more entries than prolly.autofold_threshold of
- * the table's rows, so a commit folds little (#511).  Each
+ * the table's rows, so a commit folds little (#511): folded before the
+ * refs are taken, and given up if they're held or the branch moved
+ * meanwhile (the refs' checkpoint_unless_moved(), as the fold worker
+ * folds), so a commit never waits for it; it is the backstop for a branch
+ * the fold worker doesn't reach.  Each
  * runs in a transaction of its own, an error reported and passed over, as
  * autovacuum's tables' are; a collection, a move and a conjoin read and
  * copy under autovacuum's cost-based delay.
@@ -157,7 +161,7 @@ prolly_autovacuum_init(void)
 							 NULL, NULL, NULL);
 	DefineCustomRealVariable("prolly.autofold_threshold",
 							 "How large a versioned table's change log grows, as a fraction of the table's size, before autovacuum folds the working set.",
-							 "So a commit folds little.  0 turns it off; a table with autovacuum_enabled = false is passed over.",
+							 "So a commit folds little.  0 turns it off; a table with autovacuum_enabled = false is passed over.  The fold never waits for the refs: held, it is tried again next time.",
 							 &prolly_autofold_threshold,
 							 0.05, 0.0, 100.0,
 							 PGC_SUSET,
@@ -184,6 +188,14 @@ prolly_autovacuum_init(void)
 							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",
 							&prolly_kept_commits,
 							2, 0, 8,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.restore_min_changes",
+							"How many of a table's rows must have changed since a kept commit before a move back to it gives the table its kept pages back, rather than writing those rows.",
+							"Restoring a table's pages costs about as much as writing a few of its rows back and syncing them.  0 always restores.",
+							&prolly_restore_min_changes,
+							2, 0, INT_MAX,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
@@ -523,11 +535,32 @@ autofold(void)
 	table_close(classrel, AccessShareLock);
 	if (due)
 	{
+		bool		folded = true;
+
 		prolly_database_components(&components);
-		PROLLY_CALL(components.refs, checkpoint, &root);
-		ereport(DEBUG1,
-				(errmsg_internal("automatic fold of database \"%s\"",
-								 get_database_name(MyDatabaseId))));
+		if (PROLLY_HAS(components.refs, checkpoint_unless_moved))
+		{
+			/*
+			 * (a fold given up rolled back: the log's entries it consumed
+			 * given back, for the next fold)
+			 */
+			BeginInternalSubTransaction(NULL);
+			folded = components.refs->checkpoint_unless_moved(&root);
+			if (folded)
+				ReleaseCurrentSubTransaction();
+			else
+				RollbackAndReleaseCurrentSubTransaction();
+		}
+		else
+			PROLLY_CALL(components.refs, checkpoint, &root);
+		if (folded)
+			ereport(DEBUG1,
+					(errmsg_internal("automatic fold of database \"%s\"",
+									 get_database_name(MyDatabaseId))));
+		else
+			ereport(DEBUG1,
+					(errmsg_internal("automatic fold of database \"%s\" given up: the refs held, or the branch moved",
+									 get_database_name(MyDatabaseId))));
 	}
 	PopActiveSnapshot();
 }

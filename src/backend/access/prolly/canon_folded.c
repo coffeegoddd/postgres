@@ -150,6 +150,7 @@
 #include "access/relation.h"
 #include "access/reloptions.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
@@ -178,6 +179,7 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_ts_config.h"
@@ -3199,6 +3201,24 @@ static int	nmade_sequences = 0;
 static MemoryContext items_cxt = NULL;
 static CanonItem *made_items = NULL;	/* items_made's, in key order */
 static int	nmade_items = 0;
+
+/*
+ * The last definitions read here (a fold of no table's rows, from a
+ * baseline): their tree, its items, sequences and what it left out, as of
+ * the catalog epoch it began at and the baseline it took the rows of.
+ * Kept apart from the folds' own items, which the next fold works out the
+ * changes from.
+ */
+static MadeTree defs_made;
+static bool defs_valid = false;
+static uint64 defs_epoch;
+static ProllyHash defs_baseline;
+static MemoryContext defs_cxt = NULL;
+static CanonItem *defs_items = NULL;
+static int	ndefs_items = 0;
+static Oid *defs_sequences = NULL;
+static int	ndefs_sequences = 0;
+static List *defs_left_out = NIL;	/* char *, in defs_cxt */
 static MemoryContext members_cxt = NULL;
 static HTAB *members = NULL;	/* Member, by object */
 static uint64 members_epoch;
@@ -3283,6 +3303,7 @@ fold_caches_xact(XactEvent event, void *arg)
 			made_tree_end(&dependencies_made, true);
 			made_tree_end(&items_made, true);
 			made_tree_end(&baseline_made, true);
+			made_tree_end(&defs_made, true);
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
@@ -3290,6 +3311,7 @@ fold_caches_xact(XactEvent event, void *arg)
 			made_tree_end(&dependencies_made, false);
 			made_tree_end(&items_made, false);
 			made_tree_end(&baseline_made, false);
+			made_tree_end(&defs_made, false);
 			break;
 		default:
 			break;
@@ -3315,6 +3337,7 @@ fold_caches_subxact(SubXactEvent event, SubTransactionId mySubid,
 	made_tree_sub(&dependencies_made, event, mySubid, parentSubid);
 	made_tree_sub(&items_made, event, mySubid, parentSubid);
 	made_tree_sub(&baseline_made, event, mySubid, parentSubid);
+	made_tree_sub(&defs_made, event, mySubid, parentSubid);
 }
 
 /*
@@ -3347,6 +3370,9 @@ fold_caches_begin(void)
 		members_cxt = AllocSetContextCreate(CacheMemoryContext,
 											"prolly extension members",
 											ALLOCSET_DEFAULT_SIZES);
+		defs_cxt = AllocSetContextCreate(CacheMemoryContext,
+										 "prolly folded definitions",
+										 ALLOCSET_DEFAULT_SIZES);
 		fold_caches_registered = true;
 	}
 	AcceptInvalidationMessages();
@@ -3367,6 +3393,7 @@ check_deparse_settings(void)
 		forget_descriptions();
 		items_at.valid = false;
 		baseline_at.valid = false;
+		defs_valid = false;
 		if (described_settings)
 			pfree(described_settings);
 		described_settings = MemoryContextStrdup(CacheMemoryContext, now.data);
@@ -3700,6 +3727,46 @@ remember_items(Canon *cn, const ProllyNodeRef *root)
 			made_sequences[nmade_sequences++] = made_items[i].relid;
 	}
 	made_tree(&items_made, root);
+}
+
+/*
+ * Keep cn's items (sorted), a fold of no table's rows from cn's baseline,
+ * as the last definitions read: not if the transaction changed a catalog
+ * (what it read is so only if it commits).
+ */
+static void
+remember_definitions(Canon *cn, const ProllyNodeRef *root)
+{
+	MemoryContext old;
+
+	defs_valid = false;
+	if (cn->baseline == NULL || XactHasInvalidations() || defs_cxt == NULL)
+		return;
+	MemoryContextReset(defs_cxt);
+	old = MemoryContextSwitchTo(defs_cxt);
+	defs_items = palloc_array(CanonItem, Max(list_length(cn->items), 1));
+	defs_sequences = palloc_array(Oid, Max(list_length(cn->items), 1));
+	ndefs_items = ndefs_sequences = 0;
+	foreach_ptr(CanonItem, it, cn->items)
+	{
+		CanonItem  *m = &defs_items[ndefs_items++];
+
+		initStringInfo(&m->key);
+		appendBinaryStringInfo(&m->key, it->key.data, it->key.len);
+		initStringInfo(&m->value);
+		appendBinaryStringInfo(&m->value, it->value.data, it->value.len);
+		m->relid = it->relid;
+		if (OidIsValid(it->relid) && strncmp(it->key.data, "s:", 2) == 0)
+			defs_sequences[ndefs_sequences++] = it->relid;
+	}
+	defs_left_out = NIL;
+	foreach_ptr(char, name, cn->left_out)
+		defs_left_out = lappend(defs_left_out, pstrdup(name));
+	MemoryContextSwitchTo(old);
+	defs_baseline = cn->baseline->hash;
+	defs_epoch = cn->at.catalog_epoch;
+	made_tree(&defs_made, root);
+	defs_valid = true;
 }
 
 /* An extension's version, from its catalog row. */
@@ -5008,7 +5075,11 @@ build_all(Canon *cn, ProllyNodeRef *root)
 			check_applied("canonical", root, &built);
 		*root = built;
 	}
-	if (!cn->verifying)
+	if (cn->verifying)
+		return;
+	if (cn->no_rows)
+		remember_definitions(cn, root);
+	else
 		remember_items(cn, root);
 }
 
@@ -5288,6 +5359,167 @@ fold_changed_only(Canon *cn, ProllyNodeRef *root)
 	return true;
 }
 
+static int
+defs_item_cmp(const void *a, const void *b)
+{
+	const CanonItem *x = a;
+	const CanonItem *y = b;
+	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
+	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
+
+	return prolly_bytes_compare(&kx, &ky, NULL);
+}
+
+/*
+ * The definitions as the last read here, if nothing they're of changed
+ * since (true): no catalog change since (this backend's catalog epoch,
+ * which every invalidation moves, and every one sent is taken in as the
+ * read begins), the same deparsing settings, the same baseline (each
+ * table's rows are its), and the tree still in the store.  Rows written
+ * since don't change them; sequences' values do, outside transactions, so
+ * every sequence's item is worked out again and applied.  With
+ * debug_prolly_verify_fold_caches, everything is read again and compared.
+ */
+static bool
+definitions_unchanged(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyFullFoldReason reason;
+	ProllyEdit *edits;
+	CanonItem **changed;
+	int			nedits = 0;
+	int			save_nestlevel;
+	List	   *rels = NIL;
+
+	if (!defs_valid || cn->baseline == NULL || OidIsValid(cn->only) ||
+		defs_epoch != catalog_epoch || XactHasInvalidations() ||
+		prolly_full_fold_wanted(&reason) ||
+		defs_baseline.len != cn->baseline->hash.len ||
+		memcmp(defs_baseline.bytes, cn->baseline->hash.bytes,
+			   defs_baseline.len) != 0 ||
+		!made_tree_usable(cn, &defs_made))
+		return false;
+
+	for (int i = 0; i < ndefs_sequences; i++)
+	{
+		HeapTuple	tup = SearchSysCacheCopy1(RELOID,
+											  ObjectIdGetDatum(defs_sequences[i]));
+
+		/* (gone: a catalog change, which the epoch would have seen) */
+		if (!HeapTupleIsValid(tup))
+			return false;
+		rels = lappend(rels, tup);
+	}
+	cn->partial = true;
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	foreach_ptr(HeapTupleData, tup, rels)
+		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
+	AtEOXact_GUC(false, save_nestlevel);
+
+	list_sort(cn->items, item_cmp);
+	edits = palloc_array(ProllyEdit, Max(list_length(cn->items), 1));
+	changed = palloc_array(CanonItem *, Max(list_length(cn->items), 1));
+	foreach_ptr(CanonItem, it, cn->items)
+	{
+		CanonItem	probe;
+		CanonItem  *m;
+
+		probe.key = it->key;
+		m = bsearch(&probe, defs_items, ndefs_items, sizeof(CanonItem),
+					defs_item_cmp);
+		if (m == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly definitions read again found an object the last read didn't hold")));
+		if (m->value.len == it->value.len &&
+			memcmp(m->value.data, it->value.data, it->value.len) == 0)
+			continue;
+		changed[nedits] = it;
+		edits[nedits].key = (ProllyKey) {(const uint8 *) it->key.data, it->key.len};
+		edits[nedits].value = (ProllyValue) {(const uint8 *) it->value.data, it->value.len};
+		edits[nedits++].is_delete = false;
+	}
+	if (nedits == 0)
+		*root = defs_made.root;
+	else
+		PROLLY_CALL(cn->tree, apply, &cn->root_env, &defs_made.root, edits,
+					nedits, root);
+	for (int i = 0; i < nedits; i++)
+	{
+		CanonItem	probe;
+		CanonItem  *m;
+		MemoryContext old;
+
+		probe.key = changed[i]->key;
+		m = bsearch(&probe, defs_items, ndefs_items, sizeof(CanonItem),
+					defs_item_cmp);
+		old = MemoryContextSwitchTo(defs_cxt);
+		resetStringInfo(&m->value);
+		appendBinaryStringInfo(&m->value, changed[i]->value.data,
+							   changed[i]->value.len);
+		MemoryContextSwitchTo(old);
+	}
+	pfree(edits);
+	pfree(changed);
+	if (nedits > 0)
+		made_tree(&defs_made, root);
+	cn->left_out = NIL;
+	foreach_ptr(char, name, defs_left_out)
+		cn->left_out = lappend(cn->left_out, pstrdup(name));
+	pgstat_count_prolly(PGSTAT_PROLLY_DEFINITIONS_REUSED, 1);
+
+	/* (checked against reading them all again, its work not counted) */
+	if (debug_prolly_verify_fold_caches)
+	{
+		Canon		full;
+		ProllyNodeRef expect;
+		ListCell   *a;
+		ListCell   *b;
+		PgStat_Counter *stats = palloc_array(PgStat_Counter, PGSTAT_PROLLY_NUM_COUNTERS);
+		ProllyNodeCounters tree = *pgstat_prolly_tree_counters();
+
+		memcpy(stats, PendingProllyStats, sizeof(PendingProllyStats));
+		memset(&full, 0, sizeof(full));
+		full.reading = cn->reading;
+		full.no_rows = true;
+		canon_env(&full);
+		full.finder = cn->finder;
+		full.baseline = cn->baseline;
+		full.cached = true;
+		full.verifying = true;
+		prolly_fold_counted = false;
+		PG_TRY();
+		{
+			build_all(&full, &expect);
+		}
+		PG_FINALLY();
+		{
+			prolly_fold_counted = true;
+		}
+		PG_END_TRY();
+		memcpy(PendingProllyStats, stats, sizeof(PendingProllyStats));
+		*pgstat_prolly_tree_counters() = tree;
+		pfree(stats);
+		check_applied("definitions read again", root, &expect);
+		/* (and what they left out, the same objects) */
+		if (list_length(full.left_out) != list_length(cn->left_out))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly definitions taken from this backend's last read leave out %d objects, read again %d",
+							list_length(cn->left_out), list_length(full.left_out))));
+		forboth(a, full.left_out, b, cn->left_out)
+		{
+			if (strcmp(lfirst(a), lfirst(b)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("prolly definitions taken from this backend's last read leave out \"%s\", read again \"%s\"",
+								(char *) lfirst(b), (char *) lfirst(a))));
+		}
+	}
+	return true;
+}
+
 /*
  * The canonical tree: the last one built here with only what changed
  * since worked out again, if it can be (fold_changed_only()), else
@@ -5315,6 +5547,13 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 		PROLLY_CALL(dc.refs, fold_mark, MyBranch, GetActiveSnapshot(),
 					&cn->at.mark);
 	cn->at.valid = cn->marked;
+	if (cn->no_rows)
+	{
+		/* (definitions: the folds' items, and what they're as of, kept) */
+		if (!definitions_unchanged(cn, root))
+			build_all(cn, root);
+		return;
+	}
 	if (!fold_changed_only(cn, root))
 		build_all(cn, root);
 	if (cn->left_out != NIL)
@@ -5626,6 +5865,17 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
 }
 
 /*
+ * What table_changes() and table_fewer_changes() ask of the change finder:
+ * the changes visited, or (limit > 0) whether fewer than limit changed.
+ */
+typedef struct TableChangesAsk
+{
+	ProllyRowChangeVisit visit;
+	void	   *arg;
+	int			limit;
+} TableChangesAsk;
+
+/*
  * Table relid's rows that differ from the baseline's, read by the change
  * finder from what it recorded, as table_root() would fold them: only for
  * a table collect() describes as a table and reads (not a partition, nor
@@ -5633,9 +5883,8 @@ folded_read_definitions(const ProllyNodeRef *baseline, ProllyNodeRef *root,
  * definition now.
  */
 static bool
-folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
-					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
-					 void *arg)
+table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
+					ProllyNodeRef *data, const TableChangesAsk *ask)
 {
 	Canon		cn;
 	Relation	rel;
@@ -5646,9 +5895,9 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	cn.reading = true;
 	canon_env(&cn);
 	cn.finder = prolly_change_finder();
-	if (!PROLLY_HAS(cn.finder, changes))
+	if (ask->limit > 0 ? !PROLLY_HAS(cn.finder, fewer_changes) :
+		!PROLLY_HAS(cn.finder, changes))
 		return false;
-	load_baseline(&cn, baseline);
 
 	/* (the fold's snapshot: the transaction's writes, this statement's too) */
 	if (!IsInParallelMode())
@@ -5679,6 +5928,8 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 			appendStringInfoString(&key, "t:");
 			append_utf8(&key, qualified(form->relnamespace,
 										NameStr(form->relname)));
+			/* (the table's entry alone: a status asks each table so) */
+			load_baseline_keys(&cn, baseline, list_make1(&key));
 			/* (described as collect() describes it: see build_canonical()) */
 			fold_caches_begin();
 			check_deparse_settings();
@@ -5714,7 +5965,9 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 				tf.state.data = (const uint8 *) bt->state.data;
 				tf.state.len = bt->state.len;
 				*data = bt->data;
-				ok = cn.finder->changes(rel, &cn.env, &tf, visit, arg);
+				ok = ask->limit > 0 ?
+					cn.finder->fewer_changes(rel, &tf, ask->limit) :
+					cn.finder->changes(rel, &cn.env, &tf, ask->visit, ask->arg);
 			}
 		}
 	}
@@ -5725,6 +5978,25 @@ folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
 	PG_END_TRY();
 	table_close(rel, AccessShareLock);
 	return ok;
+}
+
+static bool
+folded_table_changes(const ProllyNodeRef *baseline, Oid relid,
+					 ProllyNodeRef *data, ProllyRowChangeVisit visit,
+					 void *arg)
+{
+	TableChangesAsk ask = {visit, arg, 0};
+
+	return table_changes_asked(baseline, relid, data, &ask);
+}
+
+static bool
+folded_table_fewer_changes(const ProllyNodeRef *baseline, Oid relid,
+						   int limit, ProllyNodeRef *data)
+{
+	TableChangesAsk ask = {NULL, NULL, Max(limit, 1)};
+
+	return table_changes_asked(baseline, relid, data, &ask);
 }
 
 /*
@@ -13102,11 +13374,15 @@ settle_merged_names(List *objs, const char *table)
 
 static void
 folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
-					 List **renames, StringInfo identity)
+					 List *keep_ours, List **renames, StringInfo identity)
 {
 	List	   *merged = NIL;
 	List	   *tables = NIL;
+	List	   *kept_as_ours = NIL;
+	List	   *kept_merged_names = NIL;
 	ListCell   *lc;
+	ListCell   *kc;
+	ListCell   *nc;
 
 	for (int i = 0; i < 3; i++)
 	{
@@ -13126,14 +13402,46 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 		MergedObject *m = lfirst(lc);
 		ListCell   *cc;
 
+		bool		ours = false;
+
 		m->id.name = merged_name(m, NULL);
+
+		/* (kept as ours has it: ours' names, the table's and its columns') */
+		foreach_ptr(char, keep, keep_ours)
+			ours |= strcmp(keep, m->id.name) == 0;
+		if (ours && m->in[1])
+		{
+			kept_as_ours = lappend(kept_as_ours, m);
+			kept_merged_names = lappend(kept_merged_names, m->id.name);
+			m->id.name = pstrdup(m->in[1]->name);
+		}
 		foreach(cc, m->columns)
 		{
 			MergedObject *c = lfirst(cc);
 
-			c->id.name = merged_name(c, m->id.name);
+			c->id.name = ours && c->in[1] ? pstrdup(c->in[1]->name) :
+				merged_name(c, m->id.name);
 		}
 		settle_merged_names(m->columns, m->id.name);
+	}
+
+	/*
+	 * (another table the merge keeps under the name a table kept as ours
+	 * has it takes, theirs having swapped their names or made another of
+	 * it: refused, not kept)
+	 */
+	forboth(kc, kept_as_ours, nc, kept_merged_names)
+	{
+		MergedObject *m = lfirst(kc);
+
+		foreach_ptr(MergedObject, x, merged)
+			if (x != m && merge_keeps(x) && strcmp(x->id.name, m->id.name) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
+								(char *) lfirst(nc)),
+						 errdetail("Kept as the branch names it, %s, it would share that name with another table the merge keeps.",
+								   m->id.name)));
 	}
 	settle_merged_names(merged, NULL);
 
@@ -13645,13 +13953,16 @@ renamed_relid(const char *name)
 /*
  * Rename the session branch's tables and columns as renames say, each
  * first to a name of its own, so names swapped or passed along don't
- * collide on the way: columns, by their tables' names before, then tables.
+ * collide on the way: columns, by their tables' names before, both of
+ * their steps, then tables (so a column of a table renamed too is renamed
+ * while its table still has the name it is named by).
  */
 static void
 folded_rename_objects(List *renames)
 {
 	List	   *first = NIL;
 	List	   *then = NIL;
+	List	   *columns_then = NIL;
 	ListCell   *lc;
 	int			save_nestlevel;
 	int			k = 0;
@@ -13673,10 +13984,12 @@ folded_rename_objects(List *renames)
 		first = lappend(first, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
 										table, quote_identifier(r->column),
 										quote_identifier(step)));
-		then = lappend(then, psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
-									  table, quote_identifier(step),
-									  quote_identifier(r->to)));
+		columns_then = lappend(columns_then,
+							   psprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+										table, quote_identifier(step),
+										quote_identifier(r->to)));
 	}
+	first = list_concat(first, columns_then);
 	foreach(lc, renames)
 	{
 		ProllyRename *r = lfirst(lc);
@@ -13719,6 +14032,346 @@ folded_rename_objects(List *renames)
 	CommandCounterIncrement();
 }
 
+/*
+ * The name a root's "c:" items give a collation: "default", or the
+ * collation qualified.
+ */
+static char *
+collation_item_name(Oid coll)
+{
+	HeapTuple	tup;
+	Form_pg_collation form;
+	char	   *name;
+
+	if (coll == DEFAULT_COLLATION_OID)
+		return pstrdup("default");
+	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(coll));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for collation %u", coll);
+	form = (Form_pg_collation) GETSTRUCT(tup);
+	name = qualified(form->collnamespace, NameStr(form->collname));
+	ReleaseSysCache(tup);
+	return name;
+}
+
+/*
+ * The key columns of an index statement of a table's description (and
+ * its INCLUDE columns, if include isn't NULL), resolved in this database:
+ * NULL, or why they can't be ordered here as the version's index orders
+ * them.  Built-in types, operator classes and collations only: an
+ * extension's comparator may order keys otherwise than the version did,
+ * and nothing proves it doesn't.
+ */
+static const char *
+index_columns(const char *what, const ProllyComponents *c, List *stale,
+			  IndexStmt *stmt,
+			  List *colnames, TupleDesc desc, int *nkeys, AttrNumber *attnos,
+			  Oid *opfamilies, Oid *collations, int16 *options,
+			  int *ninclude, AttrNumber *include)
+{
+	ListCell   *lc;
+
+	*nkeys = 0;
+	if (ninclude)
+		*ninclude = 0;
+	if (strcmp(stmt->accessMethod, "btree") != 0)
+		return psprintf("%s isn't a btree index", what);
+	if (list_length(stmt->indexParams) + list_length(stmt->indexIncludingParams) >
+		INDEX_MAX_KEYS)
+		return psprintf("%s has too many columns", what);
+	if (stmt->whereClause != NULL)
+		return psprintf("%s is a partial index", what);
+	foreach(lc, stmt->indexParams)
+	{
+		IndexElem  *e = lfirst_node(IndexElem, lc);
+		int			attno = 0;
+		Oid			type;
+		Oid			opclass;
+		Oid			coll;
+		int16		option = 0;
+		ListCell   *cl;
+		int			i = 0;
+
+		if (e->name == NULL)
+			return psprintf("%s has an expression", what);
+		foreach(cl, colnames)
+		{
+			i++;
+			if (strcmp(lfirst(cl), e->name) == 0)
+				attno = i;
+		}
+		if (attno == 0)
+			return psprintf("%s names a column the table hasn't", what);
+		type = TupleDescAttr(desc, attno - 1)->atttypid;
+		opclass = e->opclass == NIL ? GetDefaultOpClass(type, BTREE_AM_OID) :
+			get_opclass_oid(BTREE_AM_OID, e->opclass, true);
+		coll = e->collation == NIL ? TupleDescAttr(desc, attno - 1)->attcollation :
+			get_collation_oid(e->collation, true);
+		if (!OidIsValid(opclass) || (e->collation != NIL && !OidIsValid(coll)))
+			return psprintf("%s has an operator class or collation this database hasn't", what);
+		if (type >= FirstNormalObjectId || opclass >= FirstNormalObjectId ||
+			coll >= FirstNormalObjectId)
+			return psprintf("%s is ordered by a type, operator class or collation that isn't built in", what);
+		if (OidIsValid(coll))
+		{
+			char	   *cname = collation_item_name(coll);
+
+			for (int j = 0; j + 1 < list_length(stale); j += 2)
+				if (strcmp(strVal(list_nth(stale, j)), cname) == 0)
+					return strVal(list_nth(stale, j + 1));
+		}
+		if (e->ordering == SORTBY_DESC)
+			option |= INDOPTION_DESC | INDOPTION_NULLS_FIRST;
+		if (e->nulls_ordering == SORTBY_NULLS_FIRST)
+			option |= INDOPTION_NULLS_FIRST;
+		else if (e->nulls_ordering == SORTBY_NULLS_LAST)
+			option &= ~INDOPTION_NULLS_FIRST;
+		attnos[*nkeys] = attno;
+		opfamilies[*nkeys] = get_opclass_family(opclass);
+		collations[*nkeys] = coll;
+		options[*nkeys] = option;
+		if (!PROLLY_CALL(c->key_encoder, supports, opfamilies[*nkeys], type, coll))
+			return psprintf("the key encoder can't order %s", what);
+		(*nkeys)++;
+	}
+	foreach(lc, stmt->indexIncludingParams)
+	{
+		IndexElem  *e = lfirst_node(IndexElem, lc);
+		ListCell   *cl;
+		int			i = 0;
+		int			attno = 0;
+
+		if (include == NULL)
+			continue;
+		if (e->name == NULL)
+			return psprintf("%s includes an expression", what);
+		foreach(cl, colnames)
+		{
+			i++;
+			if (strcmp(lfirst(cl), e->name) == 0)
+				attno = i;
+		}
+		if (attno == 0)
+			return psprintf("%s includes a column the table hasn't", what);
+		include[(*ninclude)++] = attno;
+	}
+	return NULL;
+}
+
+/*
+ * The primary key's columns of a table's description (its PRIMARY KEY
+ * constraint's index statement) into t, and its other indexes: NULL, or
+ * why the rows can't be read here in the order the version's tree has
+ * them.  An index that can't be followed is listed, with why.
+ */
+static const char *
+historical_key(Canon *cn, const ProllyNodeRef *root, const char *name,
+			   const TableDef *td, List *colnames, ProllyHistoricalTable *t)
+{
+	char	   *pkname = NULL;
+	IndexStmt  *pk = NULL;
+	List	   *others = NIL;
+	ListCell   *lc;
+	ProllyComponents c;
+	List	   *stale;
+	const char *why;
+
+	foreach(lc, td->constraints)
+	{
+		const char *line = lfirst(lc);
+		const char *def = strchr(line, '\t');
+
+		/* (as folded_table_columns() has it: one that keys the rows) */
+		if (def && strncmp(def + 1, "PRIMARY KEY", 11) == 0 &&
+			strstr(def, "DEFERRABLE") == NULL &&
+			strstr(def, "WITHOUT OVERLAPS") == NULL)
+			pkname = unquoted(first_field(line));
+	}
+	t->keyed = (pkname != NULL);
+	foreach(lc, td->indexes)
+	{
+		List	   *parsed = raw_parser(lfirst(lc), RAW_PARSE_DEFAULT);
+		Node	   *n;
+
+		if (list_length(parsed) != 1)
+			continue;
+		n = linitial_node(RawStmt, parsed)->stmt;
+		if (!IsA(n, IndexStmt) || ((IndexStmt *) n)->idxname == NULL)
+			continue;
+		if (pkname && strcmp(((IndexStmt *) n)->idxname, pkname) == 0)
+			pk = (IndexStmt *) n;
+		else
+			others = lappend(others, list_make2(n, lfirst(lc)));
+	}
+	prolly_history_components(&c);
+	stale = stale_collations(cn, root);
+	if (t->keyed)
+	{
+		if (pk == NULL)
+			return "its primary key's index isn't one a seek can follow";
+		why = index_columns("its primary key", &c, stale, pk, colnames, t->desc, &t->nkeys,
+							t->key_attnos, t->opfamilies, t->collations,
+							t->options, NULL, NULL);
+		if (why)
+			return why;
+	}
+
+	/* the other indexes, each usable or not on its own */
+	foreach(lc, others)
+	{
+		IndexStmt  *stmt = linitial(lfirst(lc));
+		ProllyHistoricalIndex *ix = palloc0(sizeof(ProllyHistoricalIndex));
+
+		ix->name = pstrdup(stmt->idxname);
+		ix->definition = pstrdup(lsecond(lfirst(lc)));
+		ix->unique = stmt->unique;
+		ix->unusable = index_columns("the index", &c, stale, stmt, colnames,
+									 t->desc,
+									 &ix->nkeys, ix->attnos, ix->opfamilies,
+									 ix->collations, ix->options,
+									 &ix->ninclude, ix->include);
+		t->indexes = lappend(t->indexes, ix);
+	}
+
+	/* an ordering an extension recorded, changed since: refused, not re-sorted */
+	if (t->keyed)
+	{
+		StringInfoData value;
+		char	   *keyname = psprintf("%s%s", ORDERING_PREFIX, name);
+		ProllyKey	key = {(const uint8 *) keyname, strlen(keyname)};
+
+		initStringInfo(&value);
+		if (PROLLY_CALL(cn->tree, get, &cn->env, root, &key, &value))
+		{
+			char	   *recorded = pg_any_to_server(value.data, value.len, PG_UTF8);
+			char	   *versions = strchr(recorded, '\n');
+
+			if (versions == NULL)
+				elog(ERROR, "invalid historical ordering metadata");
+			if (!ordering_current(versions + 1))
+				return "an extension ordering its primary key changed since";
+		}
+	}
+	return NULL;
+}
+
+static const char *
+folded_table_metadata(const ProllyNodeRef *root, const char *name,
+					  ProllyHistoricalTable *t, bool *found)
+{
+	Canon		cn;
+	char	   *utf8 = pg_server_to_any(name, strlen(name), PG_UTF8);
+	char	   *keyname = psprintf("t:%s", utf8);
+	ProllyKey	key = {(const uint8 *) keyname, strlen(keyname)};
+	StringInfoData item;
+	ProllyValue v;
+	ProllyValue description;
+	TableDef	td;
+	List	   *colnames = NIL;
+	ListCell   *lc;
+	int			i = 0;
+	int			nestlevel;
+	const char *why = NULL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	memset(t, 0, sizeof(*t));
+	initStringInfo(&item);
+	*found = PROLLY_CALL(cn.tree, get, &cn.env, root, &key, &item);
+	if (!*found)
+		return NULL;
+	if (!root_in_format(&cn, root))
+		return PROLLY_UNREADABLE_OLDER_FORMAT;
+	v.data = (const uint8 *) item.data;
+	v.len = item.len;
+	(void) tree_item(&key, &v, &t->data, &description);
+	parse_table_def(from_utf8(description.data, description.len), &td);
+
+	/* (names as the description writes them: qualified, under pg_catalog) */
+	nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	PG_TRY();
+	{
+		t->desc = CreateTemplateTupleDesc(list_length(td.columns));
+		foreach(lc, td.columns)
+		{
+			const char *line = lfirst(lc);
+			const char *type = strchr(line, '\t');
+			const char *collate = strstr(line, "\tcollate ");
+			ErrorSaveContext escontext = {T_ErrorSaveContext};
+			char	   *colname = unquoted(first_field(line));
+			Oid			typid;
+			int32		typmod;
+			Oid			coll;
+
+			if (type == NULL ||
+				!parseTypeString(first_field(type + 1), &typid, &typmod,
+								 (Node *) &escontext) || !OidIsValid(typid))
+			{
+				why = "one of its columns' types isn't one this database has";
+				break;
+			}
+			TupleDescInitEntry(t->desc, ++i, colname, typid, typmod, 0);
+			coll = get_typcollation(typid);
+			if (collate)
+			{
+				coll = get_collation_oid(stringToQualifiedNameList(first_field(collate + 9),
+																   NULL), true);
+				if (!OidIsValid(coll))
+				{
+					why = "one of its columns' collations isn't one this database has";
+					break;
+				}
+			}
+			TupleDescInitEntryCollation(t->desc, i, coll);
+			colnames = lappend(colnames, colname);
+		}
+		if (why == NULL)
+		{
+			TupleDescFinalize(t->desc);
+			why = historical_key(&cn, root, utf8, &td, colnames, t);
+		}
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, nestlevel);
+	}
+	PG_END_TRY();
+	return why;
+}
+
+static List *
+folded_table_names(const ProllyNodeRef *root, const char *schema)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyKey	from = {(const uint8 *) "t:", 2};
+	List	   *names = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		char	   *name;
+		List	   *parts;
+
+		if (k.len < 2 || memcmp(k.data, "t:", 2) != 0)
+			break;
+		name = pg_any_to_server(pnstrdup((const char *) k.data + 2, k.len - 2),
+								k.len - 2, PG_UTF8);
+		parts = stringToQualifiedNameList(name, NULL);
+		if (list_length(parts) == 2 && strcmp(strVal(linitial(parts)), schema) == 0)
+			names = lappend(names, name);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	return names;
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -13734,6 +14387,7 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.read_fold = folded_read_fold,
 	.read_definitions = folded_read_definitions,
 	.table_changes = folded_table_changes,
+	.table_fewer_changes = folded_table_fewer_changes,
 	.discard_undescribed = folded_discard_undescribed,
 	.fold_rows = folded_fold_rows,
 	.advance_baseline = folded_advance_baseline,
@@ -13764,4 +14418,6 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.rename_description = folded_rename_description,
 	.rename_root = folded_rename_root,
 	.rename_objects = folded_rename_objects,
+	.table_metadata = folded_table_metadata,
+	.table_names = folded_table_names,
 };

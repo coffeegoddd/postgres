@@ -51,7 +51,13 @@ INSERT INTO gis_geoms VALUES
 INSERT INTO gis_geoms
 SELECT 36 + n, ST_MakeLine(array_agg(ST_MakePoint(i * 0.5, sin(i * 0.37) * 100 + n) ORDER BY i))
 FROM (VALUES (1, 20), (2, 2000)) v(n, points), generate_series(1, points) i GROUP BY n;
-INSERT INTO gis_geoms VALUES (39, ST_Buffer('POINT(0 0)'::geometry, 1000, 20000));
+-- (a circle of 80,000 vertices, made point by point: ST_Buffer's vertex
+-- count depends on the GEOS version)
+INSERT INTO gis_geoms
+SELECT 39, ST_MakePolygon(ST_MakeLine(array_agg(
+  ST_MakePoint(1000 * cos(2 * pi() * (i % 80000) / 80000), 1000 * sin(2 * pi() * (i % 80000) / 80000))
+  ORDER BY i)))
+FROM generate_series(0, 80000) i;
 
 CREATE TABLE gis_geogs (id int PRIMARY KEY, g geography);
 INSERT INTO gis_geogs VALUES

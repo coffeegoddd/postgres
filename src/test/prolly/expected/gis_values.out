@@ -22,7 +22,7 @@ WHERE relname LIKE 'gis\_%' AND relkind = 'r' ORDER BY 1;
 SELECT 'geoms', gis_check.digest('gis_geoms');
  ?column? |              digest              
 ----------+----------------------------------
- geoms    | d2b391b9992fbd215eaaafb62df8d5c8
+ geoms    | ad784a52a63d14b9ad944390e9229e82
 (1 row)
 
 SELECT 'geogs', gis_check.digest('gis_geogs');
@@ -87,7 +87,7 @@ FROM gis_geoms ORDER BY id;
  36 |         |                    |          |         |         |            |            | 
  37 |       0 | LINESTRING         |        2 | f       | f       | f          |         20 | f
  38 |       0 | LINESTRING         |        2 | f       | f       | f          |       2000 | t
- 39 |       0 | POLYGON            |        2 | f       | f       | f          |      40001 | t
+ 39 |       0 | POLYGON            |        2 | f       | f       | f          |      80001 | t
 (39 rows)
 
 SELECT id, round(ST_Area(g)::numeric, 3) AS area, round(ST_Length(g)::numeric, 3) AS len
@@ -128,7 +128,7 @@ FROM gis_geoms WHERE id >= 37 ORDER BY id;
 ----+---------+--------------------+------------+----------------------------------
  37 |     0.5 |   100.588084453764 |         20 | 03409a76fc106d3ed7240bfd9ba588d3
  38 |     0.5 | 101.99975682825487 |       2000 | aec7a5958ba6d011e081227b5f53029d
- 39 |   -1000 |               1000 |      40001 | a906e80efe6f794f187eee2cded128d9
+ 39 |   -1000 |               1000 |      80001 | 6e638c69bac9e8ca367a66b1d70b16b5
 (3 rows)
 
 CREATE TABLE gis_big AS

@@ -29,6 +29,7 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "access/transam.h"
+#include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
 #include "utils/snapshot.h"
 
@@ -93,6 +94,8 @@ typedef struct ProllyMergeState
 	int			nschema;
 	char	  **schema_tables;	/* in schema conflicts, kept as the branch
 								 * has them (names, qualified; palloc'd) */
+	char	  **schema_base_tables; /* each one's name in the base */
+	char	  **schema_their_tables;	/* and in theirs */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 
@@ -110,9 +113,10 @@ typedef struct ProllyMergeState
 /*
  * A constraint violation a merge (or cherry-pick) left on a branch: a row
  * of a table, as JSON, that breaks one of its constraints ("foreign key":
- * the row is in the table; "unique index", "exclusion constraint", "check
- * constraint", "not null": the merge didn't write it), and what it breaks,
- * as JSON.
+ * the row is in the table; "exclusion constraint", "check constraint",
+ * "not null": the merge didn't write it; "unique index": the row the merge
+ * didn't write, or a row of the table it collides with), and what it
+ * breaks, as JSON.
  */
 typedef struct ProllyViolation
 {
@@ -166,6 +170,10 @@ typedef struct ProllyRebaseState
 	int			nsteps;
 	ProllyRebaseStep *steps;	/* (palloc'd) */
 } ProllyRebaseState;
+
+/* Visits a pin: its name, its commit and the record kept beside it. */
+typedef void (*ProllyPinVisit) (const char *name, const ProllyHash *commit,
+								const ProllyValue *info, void *arg);
 
 /* Visits a tag: its name, its tag object and that tag's commit. */
 typedef void (*ProllyTagVisit) (const char *name, const ProllyHash *tag,
@@ -222,6 +230,30 @@ typedef struct ProllyMovedBranch
 	TimestampTz last_ended;
 	int			writers;
 } ProllyMovedBranch;
+
+/*
+ * A commit a branch's pages are kept as of: each table's relations as
+ * branch operations' keep() kept them (the table's own first), the
+ * branch's baseline then (len 0: none), and the transaction that kept
+ * them, which saw every writer of the pages end.
+ */
+typedef struct ProllyKeptTable
+{
+	const char *name;			/* qualified, as tables() names it */
+	int			nrels;
+	const BranchKeptRelation *rels;
+} ProllyKeptTable;
+
+typedef struct ProllyKeptCommit
+{
+	ProllyHash	commit;
+	ProllyHash	baseline;
+	FullTransactionId kept_by;
+	int			ntables;
+	const ProllyKeptTable *tables;
+} ProllyKeptCommit;
+
+typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
 
 typedef struct ProllyRefsRoutine
 {
@@ -671,6 +703,32 @@ typedef struct ProllyRefsRoutine
 								const char *author, const char *message,
 								const StringInfoData *identity,
 								ProllyHash *commit_id);
+
+	/*
+	 * Optional: visit the commits branch name's pages are kept as of (see
+	 * prolly.kept_commits), newest first; not those retired.  What is
+	 * visited is the refs' as this transaction reads them.
+	 */
+	void		(*kept_commits) (const char *name, ProllyKeptCommitVisit visit,
+								 void *arg);
+
+	/*
+	 * Optional, together: pins.  A pin keeps a commit, and everything it
+	 * reaches, from collection under a name, for a reader outside the refs
+	 * that names the commit (a snapshot mount), with the nkeep trees keep
+	 * names (the reader's own, as a mount's index trees), which must be in
+	 * the store; info is the reader's, kept beside it.  pin_set() sets
+	 * name's pin (commit NULL: removes it), holding the refs; pin_get()
+	 * reads one (false: none), appending its info; pins() visits each, by
+	 * name.  Changes are with the transaction, as any change to the refs.
+	 * Pins are the database's own: transfers never send them.
+	 */
+	void		(*pin_set) (const char *name, const ProllyHash *commit,
+							const ProllyHash *keep, int nkeep,
+							const ProllyValue *info);
+	bool		(*pin_get) (const char *name, ProllyHash *commit,
+							StringInfo info);
+	void		(*pins) (ProllyPinVisit visit, void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -689,6 +747,13 @@ extern PGDLLIMPORT ProllyRefsEndHook prolly_refs_end_hook;
  */
 extern PGDLLIMPORT int prolly_kept_commits;
 
+/*
+ * prolly.restore_min_changes: how many of a table's rows must differ from
+ * a kept commit's, since a baseline holding them, before a move back to it
+ * gives the table its pages back rather than write those rows (0: always).
+ */
+extern PGDLLIMPORT int prolly_restore_min_changes;
+
 #define PROLLY_REFS_CALLBACK_NAMES \
 	"branch_create", "branch_delete", "branch_lookup", "checkout", \
 	"commit", "resolve", "commit_get", "merge_base", "commit_working_set", \
@@ -706,9 +771,10 @@ extern PGDLLIMPORT int prolly_kept_commits;
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root"
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
+	"pin_set", "pin_get", "pins"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK commit_root
+#define PROLLY_REFS_LAST_CALLBACK pins
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

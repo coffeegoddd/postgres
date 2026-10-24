@@ -418,6 +418,68 @@ canonical_encode_kept(ProllyValueEncoder *enc, TupleTableSlot *slot,
 	encode_into(enc, slot, before, kept, out);
 }
 
+/*
+ * The row encode() gives for the values fields hold (by attribute index,
+ * as fields() gives them), from their bytes: a reference copied, bytes
+ * VALUE_INLINE_MAX or shorter inline, and longer ones (a long missing
+ * value, held inline) written out of line as encode() writes them.  A
+ * column the fields leave NULL is NULL, so trailing NULLs are left off
+ * but for a column with a missing value, as encode() does.
+ */
+static void
+canonical_encode_fields(ProllyValueEncoder *enc,
+						const ProllyEncodedField *fields, StringInfo out)
+{
+	int			n = 0;
+
+	if (enc->decode_only)
+		elog(ERROR, "a prolly encoder for an earlier row layout can only decode");
+	for (int j = 0; j < enc->nlive; j++)
+	{
+		int			i = enc->live_attno[j];
+
+		enc->nulls[j] = fields[i].isnull;
+		if (!enc->nulls[j] || enc->has_missing[j])
+			n = j + 1;
+	}
+	prolly_put_varint(out, n);
+	for (int j = 0; j < n; j += 8)
+	{
+		uint8		b = 0;
+
+		for (int k = 0; k < 8 && j + k < n; k++)
+			if (enc->nulls[j + k])
+				b |= 1 << k;
+		appendStringInfoChar(out, (char) b);
+	}
+	for (int j = 0; j < n; j++)
+	{
+		const ProllyEncodedField *f = &fields[enc->live_attno[j]];
+
+		if (enc->nulls[j])
+			continue;
+		if (f->out_of_line)
+			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) f->bytes.len);
+		else if (f->bytes.len > VALUE_INLINE_MAX)
+		{
+			StringInfoData ref;
+
+			if (enc->values == NULL)
+				no_values();
+			initStringInfo(&ref);
+			PROLLY_CALL(enc->values->tree, value_write, enc->values->env,
+						f->bytes.data, f->bytes.len, &ref);
+			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
+			appendBinaryStringInfo(out, ref.data, ref.len);
+			pfree(ref.data);
+			continue;
+		}
+		else
+			prolly_put_varint(out, f->bytes.len);
+		appendBinaryStringInfo(out, (const char *) f->bytes.data, f->bytes.len);
+	}
+}
+
 /* Called with each out-of-line value of a row: its column and reference. */
 typedef void (*RowRefVisit) (int column, const char *ref, uint64 len,
 							 void *arg);
@@ -783,6 +845,67 @@ canonical_fields(ProllyValueEncoder *enc, const ProllyValue *row,
 	}
 }
 
+/*
+ * The row with only the attributes wanted marks, the others NULL: made of
+ * row's own bytes (its values' canonical bytes and references copied), so
+ * nothing is decoded, read or written, and the references it holds are
+ * some of row's.
+ */
+static void
+canonical_project(ProllyValueEncoder *enc, const ProllyValue *row,
+				  const bool *wanted, StringInfo out)
+{
+	ProllyEncodedField *fields = palloc(sizeof(ProllyEncodedField) *
+										Max(enc->desc->natts, 1));
+	int			n = 0;
+
+	canonical_fields(enc, row, fields);
+
+	/*
+	 * Columns up to the last wanted that isn't NULL, or that has a missing
+	 * value: a column a row ends before reads as its missing value, so one
+	 * that is NULL (wanted or not) must be stored as NULL.
+	 */
+	for (int j = 0; j < enc->nlive; j++)
+	{
+		int			i = enc->live_attno[j];
+
+		if ((wanted[i] && !fields[i].isnull) || enc->has_missing[j])
+			n = j + 1;
+	}
+	prolly_put_varint(out, n);
+	for (int j = 0; j < n; j += 8)
+	{
+		uint8		b = 0;
+
+		for (int k = 0; k < 8 && j + k < n; k++)
+		{
+			int			i = enc->live_attno[j + k];
+
+			if (!wanted[i] || fields[i].isnull)
+				b |= 1 << k;
+		}
+		appendStringInfoChar(out, (char) b);
+	}
+	for (int j = 0; j < n; j++)
+	{
+		int			i = enc->live_attno[j];
+		ProllyEncodedField *f = &fields[i];
+
+		if (!wanted[i] || f->isnull)
+			continue;
+		if (f->missing && f->bytes.len > VALUE_INLINE_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("a row's long missing value can't be projected")));
+		prolly_put_varint(out, f->out_of_line ?
+						  VALUE_INLINE_MAX + 1 + (uint64) f->bytes.len :
+						  (uint64) f->bytes.len);
+		appendBinaryStringInfo(out, (const char *) f->bytes.data, f->bytes.len);
+	}
+	pfree(fields);
+}
+
 static Datum
 canonical_decode_field(ProllyValueEncoder *enc, int attno,
 					   const ProllyEncodedField *field, bool *isnull)
@@ -941,4 +1064,6 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.fields_alike = canonical_fields_alike,
 	.field_compatible = canonical_field_compatible,
 	.decode_columns = canonical_decode_columns,
+	.encode_fields = canonical_encode_fields,
+	.project = canonical_project,
 };

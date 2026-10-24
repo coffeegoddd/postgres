@@ -275,7 +275,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFB
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCFD
 
 typedef struct PgStat_ArchiverStats
 {
@@ -766,9 +766,20 @@ typedef enum PgStat_ProllyCounter
 	PGSTAT_PROLLY_FOLD_WORKER_DEFERRED, /* branches a fold worker's pass
 										 * left for a later one, their
 										 * writes not due yet */
+	PGSTAT_PROLLY_FOLD_WORKER_RETRIES,	/* fold worker attempts rolled
+										 * back, the refs held or the
+										 * branch moved meanwhile: tried
+										 * again next pass */
+	PGSTAT_PROLLY_REWRITE_CHECKPOINTS_SKIPPED,	/* branch checkpoints after
+												 * a table rewrite given up:
+												 * a lock not free, or an
+												 * error */
+	PGSTAT_PROLLY_DEFINITIONS_REUSED,	/* definitions reads (a status's)
+										 * that took the last one's, only
+										 * sequences read again */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_WORKER_DEFERRED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_DEFINITIONS_REUSED + 1)
 
 typedef struct PgStat_ProllyStats
 {

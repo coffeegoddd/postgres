@@ -281,14 +281,16 @@ RelationCreateStorageShared(RelFileLocator rlocator, SMgrRelation src,
  * claims no page all-visible and knows of no free space until vacuumed.
  * With with_maps (the caller knows src's pages are the snapshot's still,
  * and VACUUM kept from setting a bit meanwhile), they are copies of src's,
- * as RelationCreateStorageShared() makes them.  As
+ * as RelationCreateStorageShared() makes them.  With replacing, the copy
+ * is to take src's place, src dropped as the transaction commits (a
+ * restore), so it shares the pages with no other relation for that.  As
  * RelationCreateStorage(), the storage is deleted if the transaction
  * aborts when register_delete.
  */
 SMgrRelation
 RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 								  uint64 snapshot, bool with_maps,
-								  bool register_delete)
+								  bool replacing, bool register_delete)
 {
 	SMgrRelation srel;
 
@@ -310,7 +312,7 @@ RelationCreateStorageFromSnapshot(RelFileLocator rlocator, SMgrRelation src,
 	}
 
 	srel = smgropen(rlocator, INVALID_PROC_NUMBER);
-	bmap_share_snapshot(src, snapshot, srel);
+	bmap_share_snapshot(src, snapshot, srel, replacing);
 	log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 	if (with_maps)
 	{

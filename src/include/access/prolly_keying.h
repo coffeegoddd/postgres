@@ -210,6 +210,42 @@ typedef struct ProllyKeyingRoutine
 								 const ProllyEncodedField *b);
 	bool		(*field_compatible) (ProllyKeying *k, int attno,
 									 ProllyKeying *other, int other_attno);
+
+	/*
+	 * Optional: the value encoder's encode_fields() of the keying's own
+	 * columns: the encoded row (as encode_row() appends it, no key) whose
+	 * columns hold fields' values, appended to row.
+	 */
+	void		(*encode_row_fields) (ProllyKeying *k,
+									  const ProllyEncodedField *fields,
+									  StringInfo row);
+
+	/*
+	 * Optional: open_described(), keyed instead by a primary key of nkeys
+	 * of desc's columns (attnos, 1-based), with their btree operator
+	 * families, collations and INDOPTION_* options, as a version of a table
+	 * only its commits describe keyed its rows: compare() orders its keys
+	 * as that version's tree.  NULL if the key encoder can't order such a
+	 * key.
+	 */
+	ProllyKeying *(*open_keyed) (TupleDesc desc, int nkeys,
+								 const AttrNumber *attnos,
+								 const Oid *opfamilies,
+								 const Oid *collations,
+								 const int16 *options, MemoryContext mcxt);
+
+	/*
+	 * Optional: a bound for seeking keys whose first n key columns have
+	 * values (the key encoder's encode_bound()), appended to out; false,
+	 * appending nothing, for a keying that keys rows by content.
+	 */
+	bool		(*encode_key_bound) (ProllyKeying *k, const Datum *values,
+									 const bool *isnull, int n, bool high,
+									 StringInfo out);
+
+	/* Optional: the value encoder's project() of an encoded row. */
+	void		(*project_row) (ProllyKeying *k, const ProllyValue *row,
+								const bool *wanted, StringInfo out);
 } ProllyKeyingRoutine;
 
 #define PROLLY_KEYING_CALLBACK_NAMES \
@@ -218,9 +254,10 @@ typedef struct ProllyKeyingRoutine
 	"decode_row_kept", "encode_row_kept", "encode_key", "parse_value_as", \
 	"open_described", "row_shape", "shape_extends", "open_shape", \
 	"decode_row_columns", "row_fields", "decode_field", "fields_alike", \
-	"field_compatible"
+	"field_compatible", "encode_row_fields", \
+	"open_keyed", "encode_key_bound", "project_row"
 #define PROLLY_KEYING_FIRST_CALLBACK open
-#define PROLLY_KEYING_LAST_CALLBACK field_compatible
+#define PROLLY_KEYING_LAST_CALLBACK project_row
 
 /*
  * Set up a data tree's environment and k's value store for each other:
