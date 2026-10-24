@@ -1,0 +1,748 @@
+-- Snapshot mounts: a commit's tables as read-only foreign tables
+-- (prolly_mount()), read from the commit's trees.  Mounting reads no row;
+-- a scan seeks by the primary key's equalities and range, streams in key
+-- order and stops when its consumer does, decodes only the columns used,
+-- and reads only what its mount pins.
+CREATE DATABASE regress_snapshot_mounts;
+\c regress_snapshot_mounts
+CREATE EXTENSION test_prolly;
+-- since(counter): pg_stat_prolly's counter's growth since it was last
+-- asked of (the session's counts flushed by the statement before).
+CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
+CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
+	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
+	ON CONFLICT (name) DO UPDATE SET n = excluded.n
+	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
+$$;
+CREATE SCHEMA ci VERSIONED;
+CREATE TABLE ci.users (
+	tenant_id int, id int, email text, payload text,
+	PRIMARY KEY (tenant_id, id));
+INSERT INTO ci.users
+SELECT g / 1000, g % 1000, 'person' || lpad((g % 1000)::text, 3, '0'),
+	CASE WHEN g % 7 = 0 THEN NULL ELSE repeat('x', 20) END
+FROM generate_series(0, 9999) g;
+-- a text key under the C collation
+CREATE TABLE ci.words (w text COLLATE "C" PRIMARY KEY, n int);
+INSERT INTO ci.words VALUES ('apple', 1), ('Banana', 2), ('cherry', 3), ('date', 4);
+-- keyless, with copies
+CREATE TABLE ci.bag (v int, note text);
+INSERT INTO ci.bag VALUES (7, 'seven'), (7, 'seven'), (8, 'eight');
+-- long values out of line
+CREATE TABLE ci.docs (id int PRIMARY KEY, title text, body text STORAGE EXTERNAL);
+INSERT INTO ci.docs SELECT g, 'doc ' || g, repeat(md5(g::text), 500) FROM generate_series(1, 20) g;
+SELECT length(dolt_commit('-Am', 'first')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS c1 \gset
+-- later changes: the mount keeps the commit's rows
+UPDATE ci.users SET email = 'changed' WHERE tenant_id = 4 AND id = 42;
+DELETE FROM ci.users WHERE tenant_id = 9;
+ALTER TABLE ci.words ADD COLUMN extra int;
+SELECT length(dolt_commit('-Am', 'second')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- Mounting reads the commit's root items alone: no row decoded, no value
+-- read, nothing folded.
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting,
+	pg_temp.since('fold_rows_read') >= 0 AS counting,
+	pg_temp.since('nodes_read') >= 0 AS counting;
+ counting | counting | counting 
+----------+----------+----------
+ t        | t        | t
+(1 row)
+
+SELECT mount, commit = :'c1' AS at_c1 FROM prolly_mount(:'c1', 'ci', 'old');
+ mount | at_c1 
+-------+-------
+ old   | t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS decoded,
+	pg_temp.since('fold_rows_read') AS folded,
+	pg_temp.since('nodes_read') < 50 AS few_nodes;
+ decoded | folded | few_nodes 
+---------+--------+-----------
+       0 |      0 | t
+(1 row)
+
+SELECT mount, source_ref = :'c1' AS ref, source_schema, tables FROM prolly_mounts();
+ mount | ref | source_schema |         tables         
+-------+-----+---------------+------------------------
+ old   | t   | ci            | {bag,docs,users,words}
+(1 row)
+
+-- each foreign table as the commit describes the table
+SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod) AS type,
+	a.attcollation <> 0 AND a.attcollation <> 100 AS own_collation,
+	a.attnotnull
+FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE c.relnamespace = 'old'::regnamespace AND a.attnum > 0
+ORDER BY c.relname, a.attnum;
+ relname |  attname  |  type   | own_collation | attnotnull 
+---------+-----------+---------+---------------+------------
+ bag     | v         | integer | f             | f
+ bag     | note      | text    | f             | f
+ docs    | id        | integer | f             | f
+ docs    | title     | text    | f             | f
+ docs    | body      | text    | f             | f
+ users   | tenant_id | integer | f             | f
+ users   | id        | integer | f             | f
+ users   | email     | text    | f             | f
+ users   | payload   | text    | f             | f
+ words   | w         | text    | t             | f
+ words   | n         | integer | f             | f
+(11 rows)
+
+SELECT c.relname, s.srvname, o.option_value = :'c1' AS at_c1,
+	(SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'source') AS source
+FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid
+JOIN pg_foreign_server s ON s.oid = ft.ftserver,
+	pg_options_to_table(ft.ftoptions) o
+WHERE c.relnamespace = 'old'::regnamespace AND o.option_name = 'commit'
+ORDER BY 1;
+ relname |   srvname    | at_c1 |  source  
+---------+--------------+-------+----------
+ bag     | prolly_local | t     | ci.bag
+ docs    | prolly_local | t     | ci.docs
+ users   | prolly_local | t     | ci.users
+ words   | prolly_local | t     | ci.words
+(4 rows)
+
+-- A point lookup by the whole key reads its row alone; an old value.
+SELECT * FROM old.users WHERE tenant_id = 4 AND id = 42;
+ tenant_id | id |   email   |       payload        
+-----------+----+-----------+----------------------
+         4 | 42 | person042 | xxxxxxxxxxxxxxxxxxxx
+(1 row)
+
+SELECT * FROM ci.users WHERE tenant_id = 4 AND id = 42;
+ tenant_id | id |  email  |       payload        
+-----------+----+---------+----------------------
+         4 | 42 | changed | xxxxxxxxxxxxxxxxxxxx
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM old.users WHERE tenant_id = 4 AND id = 42;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Foreign Scan on users (actual rows=1.00 loops=1)
+   Filter: ((tenant_id = 4) AND (id = 42))
+   Snapshot Access: primary key, 2 equal
+   Rows Read: 1
+(4 rows)
+
+SELECT count(*) FROM old.users WHERE tenant_id = 9;
+ count 
+-------
+  1000
+(1 row)
+
+-- equality on the leading column and a range after it; the key's order
+-- serves ORDER BY, and LIMIT stops the scan
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM old.users WHERE tenant_id = 4 AND id >= 40 AND id < 50
+ORDER BY id LIMIT 5;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   ->  Foreign Scan on users (actual rows=5.00 loops=1)
+         Filter: ((id >= 40) AND (id < 50) AND (tenant_id = 4))
+         Snapshot Access: primary key, 1 equal, range
+         Rows Read: 5
+(5 rows)
+
+SELECT tenant_id, id, email FROM old.users WHERE tenant_id = 4 AND id > 40 AND id <= 45 ORDER BY id;
+ tenant_id | id |   email   
+-----------+----+-----------
+         4 | 41 | person041
+         4 | 42 | person042
+         4 | 43 | person043
+         4 | 44 | person044
+         4 | 45 | person045
+(5 rows)
+
+SELECT tenant_id, id FROM old.users WHERE tenant_id = 4 AND id < 3 ORDER BY id DESC;
+ tenant_id | id 
+-----------+----
+         4 |  2
+         4 |  1
+         4 |  0
+(3 rows)
+
+SELECT tenant_id, id FROM old.users WHERE tenant_id = 4 AND id > 997;
+ tenant_id | id  
+-----------+-----
+         4 | 998
+         4 | 999
+(2 rows)
+
+-- a range on the leading column alone
+SELECT count(*), min(tenant_id), max(tenant_id) FROM old.users WHERE tenant_id >= 8;
+ count | min | max 
+-------+-----+-----
+  2000 |   8 |   9
+(1 row)
+
+-- backward, for ORDER BY ... DESC
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT tenant_id, id FROM old.users ORDER BY tenant_id DESC, id DESC LIMIT 3;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Limit (actual rows=3.00 loops=1)
+   ->  Foreign Scan on users (actual rows=3.00 loops=1)
+         Snapshot Access: full, backward
+         Rows Read: 3
+(4 rows)
+
+SELECT tenant_id, id FROM old.users ORDER BY tenant_id DESC, id DESC LIMIT 3;
+ tenant_id | id  
+-----------+-----
+         9 | 999
+         9 | 998
+         9 | 997
+(3 rows)
+
+-- a key column the query bounds otherwise (a function of it, another
+-- operator) is a filter only
+EXPLAIN (COSTS OFF) SELECT * FROM old.users WHERE tenant_id + 0 = 4 AND id = 1;
+                   QUERY PLAN                   
+------------------------------------------------
+ Foreign Scan on users
+   Filter: ((id = 1) AND ((tenant_id + 0) = 4))
+   Snapshot Access: full
+(3 rows)
+
+SELECT count(*) FROM old.users WHERE tenant_id + 0 = 4 AND id = 1;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM old.users WHERE tenant_id = 4 AND id = NULL::int;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM old.users WHERE tenant_id = 4 AND id = ANY (ARRAY[1, 2, 3]);
+ count 
+-------
+     3
+(1 row)
+
+-- a parameterized nested loop re-seeks for each outer row
+EXPLAIN (COSTS OFF)
+SELECT u.* FROM (VALUES (1, 5), (4, 42), (9, 1)) v(t, i)
+JOIN old.users u ON u.tenant_id = v.t AND u.id = v.i;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Nested Loop
+   ->  Values Scan on "*VALUES*"
+   ->  Foreign Scan on users u
+         Filter: ((tenant_id = "*VALUES*".column1) AND ("*VALUES*".column2 = id))
+         Snapshot Access: primary key, 2 equal
+(5 rows)
+
+SELECT u.tenant_id, u.id, u.email FROM (VALUES (1, 5), (4, 42), (9, 1)) v(t, i)
+JOIN old.users u ON u.tenant_id = v.t AND u.id = v.i ORDER BY 1;
+ tenant_id | id |   email   
+-----------+----+-----------
+         1 |  5 | person005
+         4 | 42 | person042
+         9 |  1 | person001
+(3 rows)
+
+PREPARE byid(int, int) AS SELECT email FROM old.users WHERE tenant_id = $1 AND id = $2;
+EXECUTE byid(4, 42);
+   email   
+-----------
+ person042
+(1 row)
+
+EXECUTE byid(2, 7);
+   email   
+-----------
+ person007
+(1 row)
+
+DEALLOCATE byid;
+-- text keys: the C collation's order, bounds under it; a comparison under
+-- another collation is a filter only
+SELECT w FROM old.words ORDER BY w;
+   w    
+--------
+ Banana
+ apple
+ cherry
+ date
+(4 rows)
+
+SELECT w FROM old.words WHERE w >= 'b';
+   w    
+--------
+ cherry
+ date
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT w FROM old.words WHERE w = 'date';
+               QUERY PLAN                
+-----------------------------------------
+ Foreign Scan on words
+   Filter: (w = 'date'::text)
+   Snapshot Access: primary key, 1 equal
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT w FROM old.words WHERE w = 'date' COLLATE "POSIX";
+                  QUERY PLAN                  
+----------------------------------------------
+ Foreign Scan on words
+   Filter: (w = 'date'::text COLLATE "POSIX")
+   Snapshot Access: full
+(3 rows)
+
+SELECT w FROM old.words WHERE w > 'b' COLLATE "POSIX";
+   w    
+--------
+ cherry
+ date
+(2 rows)
+
+-- the commit's columns, not the table's now (it has extra now)
+SELECT * FROM old.words WHERE w = 'apple';
+   w   | n 
+-------+---
+ apple | 1
+(1 row)
+
+-- keyless: each copy of a row
+SELECT v, note, count(*) FROM old.bag GROUP BY v, note ORDER BY v;
+ v | note  | count 
+---+-------+-------
+ 7 | seven |     2
+ 8 | eight |     1
+(2 rows)
+
+SELECT count(*) FROM old.bag;
+ count 
+-------
+     3
+(1 row)
+
+-- A narrow projection reads no long value of a column it doesn't use.
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('values_read') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT count(*), max(title) FROM old.docs;
+ count |  max  
+-------+-------
+    20 | doc 9
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('values_read') AS long_values_read;
+ long_values_read 
+------------------
+                0
+(1 row)
+
+SELECT id, length(body) FROM old.docs WHERE id = 3;
+ id | length 
+----+--------
+  3 |  16000
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('values_read') AS long_values_read;
+ long_values_read 
+------------------
+                1
+(1 row)
+
+SELECT sum(length(body)) FROM old.docs;
+  sum   
+--------
+ 320000
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('values_read') AS long_values_read;
+ long_values_read 
+------------------
+               20
+(1 row)
+
+-- Mounting reads no more as the table grows, nor does a selective lookup:
+-- the columns decoded by a key lookup and a LIMIT, at two sizes.
+CREATE TABLE ci.grow (id int PRIMARY KEY, v int);
+INSERT INTO ci.grow SELECT g, g FROM generate_series(1, 1000) g;
+SELECT length(dolt_commit('-Am', 'small')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('nodes_read') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'small', ARRAY['grow']);
+ mount 
+-------
+ small
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('nodes_read') AS small_mount_nodes \gset
+INSERT INTO ci.grow SELECT g, g FROM generate_series(1001, 100000) g;
+SELECT length(dolt_commit('-Am', 'large')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('nodes_read') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'large', ARRAY['grow']);
+ mount 
+-------
+ large
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+-- (the root's items and the table's description: flat in the rows)
+SELECT pg_temp.since('nodes_read') <= :small_mount_nodes + 2 AS mount_flat_in_rows;
+ mount_flat_in_rows 
+--------------------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT v FROM small.grow WHERE id = 500;
+  v  
+-----
+ 500
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS small_lookup_decoded;
+ small_lookup_decoded 
+----------------------
+                    2
+(1 row)
+
+SELECT v FROM large.grow WHERE id = 500;
+  v  
+-----
+ 500
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS large_lookup_decoded;
+ large_lookup_decoded 
+----------------------
+                    2
+(1 row)
+
+SELECT v FROM large.grow ORDER BY id LIMIT 3;
+ v 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS large_limit_decoded;
+ large_limit_decoded 
+---------------------
+                   6
+(1 row)
+
+SELECT count(*) FROM large.grow;
+ count  
+--------
+ 100000
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS count_decoded;
+ count_decoded 
+---------------
+             0
+(1 row)
+
+SELECT prolly_unmount('small'), prolly_unmount('large');
+ prolly_unmount | prolly_unmount 
+----------------+----------------
+                | 
+(1 row)
+
+-- Refused: the working set, a versioned target, a mount there already, a
+-- table the commit hasn't, a foreign table of the server without a mount.
+SELECT * FROM prolly_mount('WORKING', 'ci', 'w');
+ERROR:  a snapshot mount reads a commit, not the working set
+HINT:  Commit the working set, then mount the commit.
+SELECT * FROM prolly_mount(:'c1', 'ci', 'ci');
+ERROR:  a snapshot mount can't be in versioned schema "ci"
+DETAIL:  A commit would hold its tables' definitions.
+SELECT * FROM prolly_mount(:'c1', 'ci', 'old');
+ERROR:  schema "old" is a snapshot mount already
+HINT:  Refresh it with prolly_refresh_mount(), or unmount it first.
+SELECT * FROM prolly_mount('main', 'ci', 'none', ARRAY['missing']);
+ERROR:  main has no table "ci.missing"
+SELECT count(*) FROM pg_namespace WHERE nspname = 'none';
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM prolly_mount('nosuchref', 'ci', 'none');
+ERROR:  prolly ref "nosuchref" does not exist
+CREATE SCHEMA rogue;
+CREATE FOREIGN TABLE rogue.t (tenant_id int, id int, email text, payload text)
+	SERVER prolly_local OPTIONS (mount 'nosuch', commit :'c1', source 'ci.users');
+SELECT * FROM rogue.t;
+ERROR:  snapshot mount "nosuch" doesn't pin the commit of table "t"
+HINT:  Mount the commit with prolly_mount(), or refresh the mount.
+CREATE FOREIGN TABLE rogue.u (a int) SERVER prolly_local;
+SELECT * FROM rogue.u;
+ERROR:  foreign table "u" isn't a snapshot mount's table
+HINT:  Make snapshot tables with prolly_mount().
+-- a mount's table whose columns were changed: refused, not misread
+ALTER FOREIGN TABLE old.bag ADD COLUMN more int;
+SELECT * FROM old.bag;
+ERROR:  foreign table "bag" no longer has the columns of "ci.bag" as its commit has them
+HINT:  Refresh its mount with prolly_refresh_mount().
+ALTER FOREIGN TABLE old.bag DROP COLUMN more;
+SELECT * FROM old.bag;
+ERROR:  foreign table "bag" no longer has the columns of "ci.bag" as its commit has them
+HINT:  Refresh its mount with prolly_refresh_mount().
+-- an extension's type keying a table: refused at mount
+CREATE EXTENSION test_prolly_ordering VERSION '1.0';
+CREATE TABLE ci.extkey (k test_ordering PRIMARY KEY);
+SELECT length(dolt_commit('-Am', 'extkey')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT * FROM prolly_mount('HEAD', 'ci', 'ext', ARRAY['extkey']);
+ERROR:  prolly_mount can't mount "ci.extkey": its primary key is ordered by a type, operator class or collation that isn't built in
+DROP TABLE ci.extkey;
+SELECT length(dolt_commit('-Am', 'no extkey')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- Who may read: SELECT on the table of that name here, row security not
+-- applying, both at mount and at each scan.
+CREATE ROLE regress_mount_reader;
+GRANT USAGE ON SCHEMA ci, old TO regress_mount_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA old TO regress_mount_reader;
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM old.users;
+ERROR:  permission denied for table users
+SELECT * FROM prolly_mount(:'c1', 'ci', 'mine', ARRAY['bag']);
+ERROR:  permission denied for database regress_snapshot_mounts
+CONTEXT:  SQL statement "CREATE SCHEMA mine"
+RESET ROLE;
+GRANT SELECT ON ci.users TO regress_mount_reader;
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM old.users;
+ count 
+-------
+ 10000
+(1 row)
+
+SELECT prolly_unmount('old');
+ERROR:  must be owner of schema old
+RESET ROLE;
+ALTER TABLE ci.users ENABLE ROW LEVEL SECURITY;
+SET ROLE regress_mount_reader;
+SELECT count(*) FROM old.users;
+ERROR:  a snapshot mount can't read "users": row security applies to you
+DETAIL:  Other commits' rows aren't filtered by its policies.
+HINT:  The table's owner, or a role that bypasses row security, can read them.
+RESET ROLE;
+ALTER TABLE ci.users DISABLE ROW LEVEL SECURITY;
+REVOKE ALL ON ci.users FROM regress_mount_reader;
+REVOKE ALL ON SCHEMA ci, old FROM regress_mount_reader;
+REVOKE ALL ON ALL TABLES IN SCHEMA old FROM regress_mount_reader;
+DROP ROLE regress_mount_reader;
+-- Refresh moves the mount to what its ref names now; a cached plan
+-- reads the new commit's tables.
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'head', ARRAY['users']);
+ mount 
+-------
+ head
+(1 row)
+
+PREPARE n AS SELECT count(*) FROM head.users;
+EXECUTE n;
+ count 
+-------
+  9000
+(1 row)
+
+DELETE FROM ci.users WHERE tenant_id = 8;
+SELECT length(dolt_commit('-Am', 'third')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+EXECUTE n;
+ count 
+-------
+  9000
+(1 row)
+
+SELECT prolly_refresh_mount('head') = dolt_hashof('HEAD') AS refreshed;
+ refreshed 
+-----------
+ t
+(1 row)
+
+EXECUTE n;
+ count 
+-------
+  8000
+(1 row)
+
+SELECT prolly_refresh_mount('head', :'c1') = :'c1' AS back_to_c1;
+ back_to_c1 
+------------
+ t
+(1 row)
+
+EXECUTE n;
+ count 
+-------
+ 10000
+(1 row)
+
+DEALLOCATE n;
+-- A collection keeps what a mount pins, though no branch names it; an
+-- unmount drops the pin.
+SELECT dolt_branch('scratch');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_checkout('scratch');
+           dolt_checkout            
+------------------------------------
+ {0,"Switched to branch 'scratch'"}
+(1 row)
+
+INSERT INTO ci.bag VALUES (99, 'only on scratch');
+SELECT length(dolt_commit('-Am', 'scratch only')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS scratch_commit \gset
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'pinned', ARRAY['bag']);
+ mount  
+--------
+ pinned
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SELECT dolt_branch('-D', 'scratch');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_gc('--full');
+ dolt_gc 
+---------
+ {0}
+(1 row)
+
+SELECT count(*) FROM pinned.bag WHERE v = 99;
+ count 
+-------
+     1
+(1 row)
+
+SELECT test_chunk_has(:'scratch_commit') AS pinned_commit_kept;
+ pinned_commit_kept 
+--------------------
+ t
+(1 row)
+
+SELECT prolly_unmount('pinned');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+SELECT count(*) FROM prolly_mounts() WHERE mount = 'pinned';
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM pg_class WHERE relnamespace = 'pinned'::regnamespace;
+ count 
+-------
+     0
+(1 row)
+
+SELECT prolly_unmount('old');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+SELECT prolly_unmount('head');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+SELECT count(*) FROM prolly_mounts();
+ count 
+-------
+     0
+(1 row)
+
+\c contrib_regression
+DROP DATABASE regress_snapshot_mounts;

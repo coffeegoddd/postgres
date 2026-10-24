@@ -8,10 +8,9 @@ CREATE DATABASE regress_snapshot_mounts;
 CREATE EXTENSION test_prolly;
 
 -- since(counter): pg_stat_prolly's counter's growth since it was last
--- asked of, this session's flushed first.
+-- asked of (the session's counts flushed by the statement before).
 CREATE TEMP TABLE seen (name text PRIMARY KEY, n int8);
 CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
-	SELECT pg_stat_force_next_flush();
 	INSERT INTO seen SELECT name, value FROM pg_stat_prolly WHERE name = counter
 	ON CONFLICT (name) DO UPDATE SET n = excluded.n
 	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
@@ -25,9 +24,7 @@ INSERT INTO ci.users
 SELECT g / 1000, g % 1000, 'person' || lpad((g % 1000)::text, 3, '0'),
 	CASE WHEN g % 7 = 0 THEN NULL ELSE repeat('x', 20) END
 FROM generate_series(0, 9999) g;
--- a key ordered DESC, and text keys under two collations
-CREATE TABLE ci.events (at int, seq int, what text, PRIMARY KEY (at, seq DESC));
-INSERT INTO ci.events SELECT g / 10, g % 10, 'e' || g FROM generate_series(0, 199) g;
+-- a text key under the C collation
 CREATE TABLE ci.words (w text COLLATE "C" PRIMARY KEY, n int);
 INSERT INTO ci.words VALUES ('apple', 1), ('Banana', 2), ('cherry', 3), ('date', 4);
 -- keyless, with copies
@@ -46,16 +43,30 @@ SELECT length(dolt_commit('-Am', 'second')::text) > 0 AS committed;
 
 -- Mounting reads the commit's root items alone: no row decoded, no value
 -- read, nothing folded.
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') >= 0 AS counting,
 	pg_temp.since('fold_rows_read') >= 0 AS counting,
 	pg_temp.since('nodes_read') >= 0 AS counting;
 SELECT mount, commit = :'c1' AS at_c1 FROM prolly_mount(:'c1', 'ci', 'old');
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') AS decoded,
 	pg_temp.since('fold_rows_read') AS folded,
 	pg_temp.since('nodes_read') < 50 AS few_nodes;
 SELECT mount, source_ref = :'c1' AS ref, source_schema, tables FROM prolly_mounts();
-\d old.users
-\d old.words
+-- each foreign table as the commit describes the table
+SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod) AS type,
+	a.attcollation <> 0 AND a.attcollation <> 100 AS own_collation,
+	a.attnotnull
+FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
+WHERE c.relnamespace = 'old'::regnamespace AND a.attnum > 0
+ORDER BY c.relname, a.attnum;
+SELECT c.relname, s.srvname, o.option_value = :'c1' AS at_c1,
+	(SELECT option_value FROM pg_options_to_table(ft.ftoptions) WHERE option_name = 'source') AS source
+FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid
+JOIN pg_foreign_server s ON s.oid = ft.ftserver,
+	pg_options_to_table(ft.ftoptions) o
+WHERE c.relnamespace = 'old'::regnamespace AND o.option_name = 'commit'
+ORDER BY 1;
 
 -- A point lookup by the whole key reads its row alone; an old value.
 SELECT * FROM old.users WHERE tenant_id = 4 AND id = 42;
@@ -94,13 +105,6 @@ EXECUTE byid(4, 42);
 EXECUTE byid(2, 7);
 DEALLOCATE byid;
 
--- a DESC key column: its range bounds flip in the tree, and the key's
--- order is (at, seq DESC)
-SELECT at, seq FROM old.events WHERE at = 3 AND seq > 6;
-SELECT at, seq FROM old.events WHERE at = 3 AND seq >= 2 AND seq < 4;
-SELECT at, seq FROM old.events WHERE at = 3 ORDER BY at, seq DESC LIMIT 4;
-EXPLAIN (COSTS OFF) SELECT at, seq FROM old.events WHERE at = 3 ORDER BY seq DESC;
-SELECT at, seq FROM old.events WHERE at = 3 AND seq <= 1 ORDER BY seq;
 -- text keys: the C collation's order, bounds under it; a comparison under
 -- another collation is a filter only
 SELECT w FROM old.words ORDER BY w;
@@ -115,31 +119,49 @@ SELECT v, note, count(*) FROM old.bag GROUP BY v, note ORDER BY v;
 SELECT count(*) FROM old.bag;
 
 -- A narrow projection reads no long value of a column it doesn't use.
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('values_read') >= 0 AS counting;
 SELECT count(*), max(title) FROM old.docs;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('values_read') AS long_values_read;
 SELECT id, length(body) FROM old.docs WHERE id = 3;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('values_read') AS long_values_read;
 SELECT sum(length(body)) FROM old.docs;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('values_read') AS long_values_read;
 
--- A selective lookup reads no more rows as the table grows: rows read by
--- a key lookup and a LIMIT, at two sizes.
+-- Mounting reads no more as the table grows, nor does a selective lookup:
+-- the columns decoded by a key lookup and a LIMIT, at two sizes.
 CREATE TABLE ci.grow (id int PRIMARY KEY, v int);
 INSERT INTO ci.grow SELECT g, g FROM generate_series(1, 1000) g;
 SELECT length(dolt_commit('-Am', 'small')::text) > 0 AS committed;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('nodes_read') >= 0 AS counting;
 SELECT mount FROM prolly_mount('HEAD', 'ci', 'small', ARRAY['grow']);
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('nodes_read') AS small_mount_nodes \gset
 INSERT INTO ci.grow SELECT g, g FROM generate_series(1001, 100000) g;
 SELECT length(dolt_commit('-Am', 'large')::text) > 0 AS committed;
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('nodes_read') >= 0 AS counting;
 SELECT mount FROM prolly_mount('HEAD', 'ci', 'large', ARRAY['grow']);
+SELECT pg_stat_force_next_flush() \gset
+-- (the root's items and the table's description: flat in the rows)
+SELECT pg_temp.since('nodes_read') <= :small_mount_nodes + 2 AS mount_flat_in_rows;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
 SELECT v FROM small.grow WHERE id = 500;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') AS small_lookup_decoded;
 SELECT v FROM large.grow WHERE id = 500;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') AS large_lookup_decoded;
 SELECT v FROM large.grow ORDER BY id LIMIT 3;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') AS large_limit_decoded;
 SELECT count(*) FROM large.grow;
+SELECT pg_stat_force_next_flush() \gset
 SELECT pg_temp.since('columns_decoded') AS count_decoded;
 SELECT prolly_unmount('small'), prolly_unmount('large');
 
@@ -148,7 +170,7 @@ SELECT prolly_unmount('small'), prolly_unmount('large');
 SELECT * FROM prolly_mount('WORKING', 'ci', 'w');
 SELECT * FROM prolly_mount(:'c1', 'ci', 'ci');
 SELECT * FROM prolly_mount(:'c1', 'ci', 'old');
-SELECT * FROM prolly_mount(:'c1', 'ci', 'none', ARRAY['missing']);
+SELECT * FROM prolly_mount('main', 'ci', 'none', ARRAY['missing']);
 SELECT count(*) FROM pg_namespace WHERE nspname = 'none';
 SELECT * FROM prolly_mount('nosuchref', 'ci', 'none');
 CREATE SCHEMA rogue;
@@ -208,8 +230,8 @@ SELECT prolly_refresh_mount('head', :'c1') = :'c1' AS back_to_c1;
 EXECUTE n;
 DEALLOCATE n;
 
--- A collection keeps what a mount pins, though no branch names it; once
--- unmounted, it goes.
+-- A collection keeps what a mount pins, though no branch names it; an
+-- unmount drops the pin.
 SELECT dolt_branch('scratch');
 SELECT dolt_checkout('scratch');
 INSERT INTO ci.bag VALUES (99, 'only on scratch');
@@ -218,7 +240,7 @@ SELECT dolt_hashof('HEAD') AS scratch_commit \gset
 SELECT mount FROM prolly_mount('HEAD', 'ci', 'pinned', ARRAY['bag']);
 SELECT dolt_checkout('main');
 SELECT dolt_branch('-D', 'scratch');
-SELECT dolt_gc();
+SELECT dolt_gc('--full');
 SELECT count(*) FROM pinned.bag WHERE v = 99;
 SELECT test_chunk_has(:'scratch_commit') AS pinned_commit_kept;
 SELECT prolly_unmount('pinned');

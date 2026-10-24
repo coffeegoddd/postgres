@@ -342,7 +342,7 @@ make_tables(const char *target, const ProllyHash *commit,
 		if (!found)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_TABLE),
-					 errmsg("commit %s has no table \"%s\"", hex, name)));
+					 errmsg("%s has no table \"%s\"", mi->source_ref, name)));
 		if (why)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -674,8 +674,8 @@ snapshot_open(Oid relid, Mounted *s)
 		memcmp(pinned.bytes, s->commit.bytes, pinned.len) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("snapshot mount \"%s\" doesn't pin commit %s of table \"%s\"",
-						s->mount, hex, get_rel_name(relid)),
+				 errmsg("snapshot mount \"%s\" doesn't pin the commit of table \"%s\"",
+						s->mount, get_rel_name(relid)),
 				 errhint("Mount the commit with prolly_mount(), or refresh the mount.")));
 	if (!PROLLY_CALL(refs(), commit_get, &s->commit, &info))
 		ereport(ERROR,
@@ -705,8 +705,8 @@ snapshot_open(Oid relid, Mounted *s)
 	if (!found)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("foreign table \"%s\" no longer has the columns of \"%s\" at commit %s",
-						get_rel_name(relid), s->source, hex),
+				 errmsg("foreign table \"%s\" no longer has the columns of \"%s\" as its commit has them",
+						get_rel_name(relid), s->source),
 				 errhint("Refresh its mount with prolly_refresh_mount().")));
 }
 
