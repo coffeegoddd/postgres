@@ -982,7 +982,19 @@ SELECT status_reused() AS reused;
 (1 row)
 
 -- (a transaction's own rows, in an answer taken while it wrote, aren't
--- there once it, or the savepoint they were written in, rolls back)
+-- there once it, or the savepoint they were written in, rolls back; each
+-- of those statuses takes the last answer)
+:reset
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
 BEGIN;
 INSERT INTO many.t22 VALUES (22, 'twenty-two');
 SELECT * FROM dolt_status ORDER BY 1;
@@ -1018,6 +1030,18 @@ SELECT * FROM dolt_status ORDER BY 1;
 (1 row)
 
 COMMIT;
+:flush
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT status_reused() AS reused_across_rollbacks;
+ reused_across_rollbacks 
+-------------------------
+                       4
+(1 row)
+
 RESET debug_prolly_verify_fold_caches;
 INSERT INTO many.t21 VALUES (21, 'twenty-one');
 SELECT * FROM dolt_status ORDER BY 1;

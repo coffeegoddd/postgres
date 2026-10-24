@@ -1530,6 +1530,20 @@ noted_utf8(const NotedChange *c)
 	return pg_server_to_any(c->name, strlen(c->name), PG_UTF8);
 }
 
+/* A table's change and its name in UTF-8, to sort by. */
+typedef struct SortedChange
+{
+	char	   *utf8;
+	NotedChange *change;
+} SortedChange;
+
+static int
+sorted_change_cmp(const void *a, const void *b)
+{
+	return strcmp(((const SortedChange *) a)->utf8,
+				  ((const SortedChange *) b)->utf8);
+}
+
 static bool
 list_member_name(List *names, const char *name)
 {
@@ -1537,12 +1551,6 @@ list_member_name(List *names, const char *name)
 		if (strcmp(n, name) == 0)
 			return true;
 	return false;
-}
-
-static bool
-same_roots(const ProllyHash *a, const ProllyHash *b)
-{
-	return a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0;
 }
 
 /*
@@ -1597,8 +1605,8 @@ tables_from_last(const char *from_ref, const ProllyNodeRef *from_root,
 	List	   *redone = NIL;
 
 	if (!last_tables.valid || last_tables.mark.branch != MyBranch ||
-		!same_roots(&last_tables.from_root, &from_root->hash) ||
-		!same_roots(&last_tables.to_root, &to_root->hash) ||
+		!same_hash(&last_tables.from_root, &from_root->hash) ||
+		!same_hash(&last_tables.to_root, &to_root->hash) ||
 		!PROLLY_HAS(refs, written_since) ||
 		!PROLLY_CALL(refs, written_since, &last_tables.mark,
 					 GetActiveSnapshot(), &relids, &nrelids))
@@ -1640,23 +1648,21 @@ tables_from_last(const char *from_ref, const ProllyNodeRef *from_root,
 	}
 	if (redone != NIL)
 	{
-		/* (back in the canonical tree's order) */
-		List	   *sorted = NIL;
+		/* (back in the canonical tree's order: by UTF-8 name, each once) */
+		int			n = list_length(tables);
+		SortedChange *sorted = palloc_array(SortedChange, Max(n, 1));
+		int			i = 0;
 
 		foreach_ptr(NotedChange, c, tables)
 		{
-			char	   *u = noted_utf8(c);
-			int			at = 0;
-
-			foreach_ptr(NotedChange, d, sorted)
-			{
-				if (strcmp(noted_utf8(d), u) > 0)
-					break;
-				at++;
-			}
-			sorted = list_insert_nth(sorted, at, c);
+			sorted[i].utf8 = noted_utf8(c);
+			sorted[i++].change = c;
 		}
-		tables = sorted;
+		qsort(sorted, n, sizeof(SortedChange), sorted_change_cmp);
+		tables = NIL;
+		for (i = 0; i < n; i++)
+			tables = lappend(tables, sorted[i].change);
+		pfree(sorted);
 	}
 	foreach_ptr(NotedChange, c, tables)
 		visit(c->name, c->kind, c->object, arg);

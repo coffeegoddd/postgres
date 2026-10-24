@@ -264,7 +264,9 @@ SELECT * FROM dolt_status ORDER BY 1;
 :flush
 SELECT status_reused() AS reused;
 -- (a transaction's own rows, in an answer taken while it wrote, aren't
--- there once it, or the savepoint they were written in, rolls back)
+-- there once it, or the savepoint they were written in, rolls back; each
+-- of those statuses takes the last answer)
+:reset
 BEGIN;
 INSERT INTO many.t22 VALUES (22, 'twenty-two');
 SELECT * FROM dolt_status ORDER BY 1;
@@ -278,6 +280,8 @@ SELECT * FROM dolt_status ORDER BY 1;
 ROLLBACK TO s;
 SELECT * FROM dolt_status ORDER BY 1;
 COMMIT;
+:flush
+SELECT status_reused() AS reused_across_rollbacks;
 RESET debug_prolly_verify_fold_caches;
 INSERT INTO many.t21 VALUES (21, 'twenty-one');
 SELECT * FROM dolt_status ORDER BY 1;

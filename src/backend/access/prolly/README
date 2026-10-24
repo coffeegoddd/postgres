@@ -837,7 +837,10 @@ description and baseline rows) and the refs know which tables were written
 since a mark it took before asking any change finder (written_since()):
 only those tables are compared again (pg_stat_prolly's status_reused), so
 a status after a row write costs about the tables written, not every
-table.  The answer is this backend's own.
+table.  The answer is this backend's own, and is kept only from a
+comparison of every table's changes read so: a table whose change finder
+can't tell its changes that way (a keyless or partitioned one) makes every
+status a fold, and status_reused never moves.
 debug_prolly_verify_fold_caches reads them all again and compares.
 
 
