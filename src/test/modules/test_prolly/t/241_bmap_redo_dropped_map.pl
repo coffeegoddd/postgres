@@ -127,10 +127,15 @@ full_page_writes = off
 	truncate($tpath, 8192) or die "truncate $tpath: $!";
 	my $log_from = -s $standby->logfile;
 	# (started by pg_ctl, not waited for: recovery may PANIC, and the
-	# postmaster exit, before a start would read its pid file)
-	PostgreSQL::Test::Utils::system_log('pg_ctl', '--no-wait',
-		'--pgdata' => $standby->data_dir,
-		'--log' => $standby->logfile, 'start');
+	# postmaster exit, before a start would read its pid file; in the
+	# node's own environment and with its cluster name, as start() does)
+	{
+		local %ENV = $standby->_get_env(PGAPPNAME => undef);
+		PostgreSQL::Test::Utils::system_log('pg_ctl', '--no-wait',
+			'--pgdata' => $standby->data_dir,
+			'--log' => $standby->logfile,
+			'--options' => '--cluster-name=' . $standby->name, 'start');
+	}
 	ok($standby->wait_for_log(qr/PANIC:  WAL contains references to invalid pages/,
 			$log_from),
 		'a standby whose map lost its root page fails recovery, its page invalid');
@@ -141,8 +146,12 @@ full_page_writes = off
 		usleep(100_000);
 	}
 	ok(!-e $pidfile, 'and its postmaster exits');
-	PostgreSQL::Test::Utils::system_log('pg_ctl', '--pgdata' => $standby->data_dir,
-		'--mode' => 'immediate', 'stop') if -e $pidfile;
+	if (-e $pidfile)
+	{
+		local %ENV = $standby->_get_env;
+		PostgreSQL::Test::Utils::system_log('pg_ctl',
+			'--pgdata' => $standby->data_dir, '--mode' => 'immediate', 'stop');
+	}
 	$node->stop;
 }
 
