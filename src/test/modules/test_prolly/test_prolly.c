@@ -120,7 +120,7 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_VALUE_ENCODER, "kept_values",
 	"begin encode end set_values decode_kept encode_kept", valenc_kept_values},
 	{PROLLY_IFACE_VALUE_ENCODER, "selected_columns",
-	"begin encode decode end set_values fields decode_field fields_alike field_compatible decode_columns",
+	"begin encode decode end set_values refs fields decode_field fields_alike field_compatible decode_columns project",
 	valenc_selected_columns},
 
 	/* reclamation */

@@ -1288,6 +1288,54 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 			if (wanted[1] && fields[1].out_of_line &&
 				counters.nodes_read == read_before)
 				elog(ERROR, "row %d: a long value asked for was not read", r);
+
+			/*
+			 * project(): the row with only the wanted columns, made of its
+			 * bytes alone (no value read), decoding as decode() does for
+			 * them, NULL for the others; its references some of the row's.
+			 */
+			{
+				StringInfoData proj;
+				StringInfoData prefs;
+				StringInfoData rrefs;
+				ProllyValue pv;
+
+				initStringInfo(&proj);
+				read_before = counters.nodes_read;
+				PROLLY_CALL(ve, project, enc, &row, wanted, &proj);
+				if (counters.nodes_read != read_before)
+					elog(ERROR, "row %d: project() read a value", r);
+				pv.data = (const uint8 *) proj.data;
+				pv.len = proj.len;
+				PROLLY_CALL(ve, decode, enc, &pv, some);
+				slot_getallattrs(some);
+				for (int c = 0; c < natts; c++)
+				{
+					if (TupleDescAttr(desc, c)->attisdropped ||
+						(r % 12 == 11 && c >= 4))
+						continue;
+					if (!wanted[c])
+					{
+						/* (a column with a missing value isn't NULL absent) */
+						if (!some->tts_isnull[c] &&
+							!TupleDescAttr(desc, c)->atthasmissing)
+							elog(ERROR, "row %d column %d: project() kept a column not asked for",
+								 r, c + 1);
+						continue;
+					}
+					check_same_column(TupleDescAttr(desc, c)->atttypid,
+									  all->tts_isnull[c], all->tts_values[c],
+									  some->tts_isnull[c], some->tts_values[c],
+									  r, c, "project()");
+				}
+				initStringInfo(&prefs);
+				initStringInfo(&rrefs);
+				PROLLY_CALL(ve, refs, enc, &pv, &prefs);
+				PROLLY_CALL(ve, refs, enc, &row, &rrefs);
+				if (prefs.len > rrefs.len)
+					elog(ERROR, "row %d: project() holds references the row doesn't", r);
+				pfree(proj.data);
+			}
 		}
 	}
 
