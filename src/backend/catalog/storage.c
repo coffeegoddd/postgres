@@ -932,6 +932,30 @@ smgrDoPendingDeletes(bool isCommit)
 
 		pfree(srels);
 	}
+
+	/* (what a top-level transaction prepared for its drops, let go of) */
+	if (nestLevel == 1)
+		smgrenddrops();
+}
+
+/*
+ *	smgrPreCommitPendingDeletes() -- Before the commit record of a top-level
+ *	transaction, let each storage manager prepare the deletes it will do at
+ *	commit (smgrprecommitdrop()).
+ *
+ * Not for a prepared transaction, whose deletes wait for COMMIT PREPARED.
+ */
+void
+smgrPreCommitPendingDeletes(void)
+{
+	Assert(GetCurrentTransactionNestLevel() == 1);
+	for (PendingRelDelete *pending = pendingDeletes; pending != NULL;
+		 pending = pending->next)
+	{
+		if (!pending->atCommit || pending->procNumber != INVALID_PROC_NUMBER)
+			continue;
+		smgrprecommitdrop(smgropen(pending->rlocator, INVALID_PROC_NUMBER));
+	}
 }
 
 /*

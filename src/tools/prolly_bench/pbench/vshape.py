@@ -51,9 +51,13 @@ MAP = ("bmap_map_pages_copied", "bmap_refcount_updates", "bmap_blocks_freed", "p
        "bmap_pages_preserved")
 APPLY = ("apply_rows", "apply_index_tuples")
 WORK = TREE + MAP + APPLY + ("catalog_rows_copied",)
+# What an operation reads of the catalogs: block fetches of every system
+# catalog and index (not a pg_stat_prolly counter; V9 reads it with them).
+CATALOG = ("catalog_blocks_read",)
 
 # Below these, a counter's values are noise to a fit.
 FLOORS = {name: 8.0 for name in WORK}
+FLOORS["catalog_blocks_read"] = 64.0
 FLOORS.update({"nodes_read": 32.0, "bmap_refcount_updates": 64.0, "bmap_blocks_freed": 64.0,
                "page_copies_shared": 64.0, "bmap_pages_preserved": 64.0})
 
@@ -93,6 +97,12 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     # a merge: the differences examined and written
     ("merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY)},
     ("merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
+    # as unrelated objects are added (shared tables, another branch's): a
+    # first use's copies, a commit's canonical form and a branch's delete
+    # read the branch's catalog rows only
+    ("first_use", "catalog"): {**_all("flat", CATALOG), "catalog_rows_copied": "flat"},
+    ("commit", "catalog"): _all("flat", CATALOG),
+    ("branch_delete", "catalog"): _all("flat", CATALOG),
 }
 
 

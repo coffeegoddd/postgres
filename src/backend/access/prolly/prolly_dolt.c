@@ -924,6 +924,32 @@ qualified_name(Oid relid)
 
 
 /*
+ * Hold the refs (to the transaction's end) before what reads the head and
+ * then replaces commits from it, as an amend or a rebase does: a commit
+ * another session made in between would be dropped from the branch, the
+ * head moved back past it.  The head read before is checked against the
+ * head once held: moved meanwhile, a serialization failure, to retry.
+ * True if a newer snapshot was pushed (refs' hold()), for the caller to pop.
+ */
+static bool
+hold_unmoved(const char *what)
+{
+	ProllyHash	seen;
+	ProllyHash	now;
+	bool		had = PROLLY_CALL(refs(), resolve, "HEAD", &seen);
+	bool		pushed = PROLLY_CALL(refs(), hold);
+	bool		has = PROLLY_CALL(refs(), resolve, "HEAD", &now);
+
+	if (had != has || (had && !same_hash(&seen, &now)))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("could not serialize access: branch \"%s\" moved while %s waited for it",
+						branch_ops()->current(), what),
+				 errhint("The transaction might succeed if retried.")));
+	return pushed;
+}
+
+/*
  * dolt_commit(VARIADIC args text[]) returns text[]: {commit id}
  *
  * -m/--message message (required, not empty), --author "Name <email>" (or
@@ -934,7 +960,9 @@ qualified_name(Oid relid)
  * --skip-empty (nothing to commit: no commit, and NULL), -f/--force
  * (constraint violations don't stop the commit, as in Dolt; the
  * transaction still can't commit with them unless dolt.allow_commit_conflicts
- * is on).
+ * is on), --amend (the head commit replaced by one of the working set with
+ * its parents, and its message unless -m gives one, as Dolt's: never
+ * empty, and refused with a merge in progress).
  */
 Datum
 dolt_commit(PG_FUNCTION_ARGS)
@@ -947,10 +975,13 @@ dolt_commit(PG_FUNCTION_ARGS)
 	bool		skip_empty = false;
 	bool		force = false;
 	bool		dated = false;
+	bool		amend = false;
 	bool		options = true;	/* until "--" */
 	ProllyHash	id = {0};
 	bool		committed = false;
 	ProllyMergeState ms;
+	ProllyCommitInfo amended;
+	bool		amend_pushed = false;
 	const char *result[1];
 
 	for (int i = 0; i < nargs; i++)
@@ -979,6 +1010,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 			skip_empty = true;
 		else if (is_option(a, "force"))
 			force = true;
+		else if (is_option(a, "amend"))
+			amend = true;
 		else if (short_flags(a) != NULL)
 		{
 			/* Short options together, as -Am message. */
@@ -1000,6 +1033,25 @@ dolt_commit(PG_FUNCTION_ARGS)
 		else
 			unsupported("dolt_commit", a);
 	}
+	if (amend)
+	{
+		ProllyHash	head;
+
+		amend_pushed = hold_unmoved("dolt_commit('--amend')");
+		if (PROLLY_CALL(refs(), merge_state, &ms))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("you are in the middle of a merge -- cannot amend")));
+		memset(&amended, 0, sizeof(amended));
+		if (!PROLLY_CALL(refs(), resolve, "HEAD", &head) ||
+			!PROLLY_CALL(refs(), commit_get, &head, &amended))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("nothing to amend"),
+					 errdetail("The branch has no commit.")));
+		if (message == NULL)
+			message = amended.message;
+	}
 	if (message == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1018,8 +1070,25 @@ dolt_commit(PG_FUNCTION_ARGS)
 	PG_TRY();
 	{
 		note_integration();
-		BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, message,
-													 allow_empty, &id));
+		if (amend)
+		{
+			if (!prolly_allow_commit_conflicts() &&
+				PROLLY_CALL(refs(), violations) != NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot commit with constraint violations"),
+						 errhint("Fix the rows and check them again with dolt_verify_constraints().")));
+			/* (the head the new commit's parent, as a commit on it is made) */
+			if (amended.nparents > 0)
+				PROLLY_CALL(refs(), set_head, &amended.parents[0]);
+			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), commit_with, message,
+											 amended.parents, amended.nparents,
+											 NULL, &id));
+			committed = true;
+		}
+		else
+			BRANCH_WRITES_HUSHED(committed = PROLLY_CALL(refs(), commit, message,
+														 allow_empty, &id));
 	}
 	PG_FINALLY();
 	{
@@ -1028,6 +1097,8 @@ dolt_commit(PG_FUNCTION_ARGS)
 		date_given = false;
 	}
 	PG_END_TRY();
+	if (amend_pushed)
+		PopActiveSnapshot();
 
 	/* Nothing changed: the root is its parent's, and nothing was recorded. */
 	if (!committed && skip_empty && !PROLLY_CALL(refs(), merge_state, &ms))
@@ -4540,7 +4611,11 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	}
 	if (continue_rebase)
 	{
+		bool		pushed = hold_unmoved("dolt_rebase('--continue')");
+
 		rebase_continue(result);
+		if (pushed)
+			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
 	}
 	if (npositional == 0)
@@ -4555,7 +4630,11 @@ dolt_rebase(PG_FUNCTION_ARGS)
 	rebase_start(upstream, keep_empty);
 	if (!interactive)
 	{
+		bool		pushed = hold_unmoved("dolt_rebase()");
+
 		rebase_continue(result);
+		if (pushed)
+			PopActiveSnapshot();
 		PG_RETURN_DATUM(text_array(2, result));
 	}
 	result[1] = psprintf("interactive rebase started on branch %s; "
@@ -5021,6 +5100,38 @@ typedef struct ReflogRow
 	bool		nulls[4];
 } ReflogRow;
 
+/* Every ref a root names, in its order: ReflogRef *. */
+static void
+reflog_collect(const char *ref, const ProllyHash *commit, void *arg)
+{
+	List	  **named = arg;
+	ReflogRef  *r = palloc(sizeof(ReflogRef));
+
+	r->ref = pstrdup(ref);
+	r->commit = *commit;
+	*named = lappend(*named, r);
+}
+
+/* Does a root name the refs a collection left, each at its commit? */
+static bool
+reflog_same_refs(const ProllyHash *root, List *left)
+{
+	List	   *named = NIL;
+	bool		same;
+
+	(void) PROLLY_CALL(refs(), root_refs, root, reflog_collect, &named);
+	same = list_length(named) == list_length(left);
+	for (int i = 0; same && i < list_length(named); i++)
+	{
+		ReflogRef  *a = list_nth(named, i);
+		ReflogRef  *b = list_nth(left, i);
+
+		same = strcmp(a->ref, b->ref) == 0 && same_hash(&a->commit, &b->commit);
+	}
+	list_free_deep(named);
+	return same;
+}
+
 static void
 reflog_ref(const char *ref, const ProllyHash *commit, void *arg)
 {
@@ -5085,7 +5196,11 @@ reflog_ref(const char *ref, const ProllyHash *commit, void *arg)
  * Each change of a ref (a branch's head, a remote-tracking branch's
  * commit) the chunk store still records, newest first: as Dolt's reflog,
  * read from the roots the store was moved to, each with its time; a
- * garbage collection forgets the moves before it.  An argument names one
+ * garbage collection forgets the moves before it.  As in Dolt, whose roots
+ * after a collection are each a ref's change, the first of them that
+ * changed a ref lists every ref it names; those before it that changed
+ * none (a working set's checkpoint, as the fold worker takes, which moves
+ * the root and no ref) list nothing.  An argument names one
  * ref ("main", or "refs/heads/main"); "--all" lists every ref, which they
  * all are here already.
  */
@@ -5100,6 +5215,9 @@ dolt_reflog(PG_FUNCTION_ARGS)
 	ReflogRoots rr = {0};
 	ReflogScan	rs = {0};
 	uint64		first;
+	ProllyHash	before = {0};
+	List	   *left = NIL;
+	bool		unchanged = false;
 
 	for (int i = 0; i < nargs; i++)
 	{
@@ -5129,13 +5247,26 @@ dolt_reflog(PG_FUNCTION_ARGS)
 	rr.roots = palloc(sizeof(ReflogRoot) * REFLOG_ROOTS);
 	PROLLY_CALL(cs, roots, PROLLY_CALL(cs, open, MyDatabaseId,
 									   MyDatabaseTableSpace),
-				reflog_root, &rr);
+				&before, reflog_root, &rr);
 	first = rr.n > REFLOG_ROOTS ? rr.n - REFLOG_ROOTS : 0;
+	/* (with the oldest roots passed over, it isn't the one before them) */
+	if (before.len > 0 && first == 0)
+	{
+		(void) PROLLY_CALL(refs(), root_refs, &before, reflog_collect, &left);
+		unchanged = true;
+	}
 	for (uint64 i = first; i < rr.n; i++)
 	{
 		ReflogRoot *r = &rr.roots[i % REFLOG_ROOTS];
 
 		CHECK_FOR_INTERRUPTS();
+		if (unchanged)
+		{
+			if (same_hash(&r->root, &before) ||
+				reflog_same_refs(&r->root, left))
+				continue;
+			unchanged = false;
+		}
 		rs.at = r->at;
 		(void) PROLLY_CALL(refs(), root_refs, &r->root, reflog_ref, &rs);
 	}

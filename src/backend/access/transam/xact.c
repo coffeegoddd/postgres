@@ -2428,6 +2428,14 @@ CommitTransaction(void)
 		PreCommit_CheckForSerializationFailure();
 
 	/*
+	 * What the relations dropped at commit will let go of, recorded as this
+	 * transaction's before its commit record (block-mapped storage queues
+	 * it for release), so that a crash after the commit loses none of it.
+	 */
+	if (!is_parallel_worker)
+		smgrPreCommitPendingDeletes();
+
+	/*
 	 * The chunks this transaction has left to write, reserved now that
 	 * nothing more puts any, and while an error still aborts it as any.
 	 */

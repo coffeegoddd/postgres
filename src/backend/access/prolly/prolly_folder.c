@@ -23,6 +23,20 @@
  * until it is written again.  Off, the launcher sleeps until the setting
  * changes.
  *
+ * With prolly_fold_worker_batch_rows set (it is 0, off, by default), a
+ * branch is folded once its writes are due, not at every pass: once the
+ * writers that ended since its last fold wrote
+ * prolly_fold_worker_batch_rows rows, once the first of them ended
+ * prolly_fold_worker_max_delay ago, or once its writes have stopped (none
+ * writing it, and none ended for a naptime); and, having nothing to batch,
+ * one no writer of which has ended since.  Each fold writes the tree
+ * nodes on the paths to the rows it changes, so a fold of many writes
+ * shares the upper nodes that folds of a few each write again: batching
+ * them is what keeps a busy branch's chunk writes near its rows' own.  A
+ * commit or a status folds what the worker hasn't yet, as ever: at most a
+ * batch's rows, or what came in the last max_delay.  A branch not yet due
+ * keeps the worker running, as a pending one does.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_folder.c
  *
@@ -53,11 +67,14 @@
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
+#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 bool		prolly_fold_worker = true;
 int			prolly_fold_worker_max_workers = 2;
 int			prolly_fold_worker_naptime = 200;
+int			prolly_fold_worker_batch_rows = 0;
+int			prolly_fold_worker_max_delay = 1000;
 
 /* The most databases, and branches of one, a pass looks at. */
 #define FOLDER_MAX_DATABASES	64
@@ -242,8 +259,7 @@ fold_branch(void *arg)
 
 typedef struct Moved
 {
-	Oid		   *branches;
-	uint64	   *generations;
+	ProllyMovedBranch *branches;
 	int			n;
 	char	  **names;			/* found by the visit, NULL: none */
 } Moved;
@@ -255,8 +271,29 @@ name_moved(const char *name, Oid branch, void *arg)
 
 	/* (kept past the transaction that read them) */
 	for (int i = 0; i < m->n; i++)
-		if (m->branches[i] == branch)
+		if (m->branches[i].branch == branch)
 			m->names[i] = MemoryContextStrdup(TopMemoryContext, name);
+}
+
+/*
+ * Is a fold of b due at now: has a batch of rows been written since the
+ * last, has the first of those writes waited max_delay, or have its writes
+ * stopped?  (A batch of 0 rows: every pass.)  One no writer of which has
+ * ended since (its first writer still open, say) has nothing to batch: due,
+ * so it's folded and seen as it is, and the worker can exit while that
+ * writer stays open.
+ */
+static bool
+fold_due(const ProllyMovedBranch *b, TimestampTz now)
+{
+	if (prolly_fold_worker_batch_rows <= 0 || b->since == 0 ||
+		b->rows >= (uint64) prolly_fold_worker_batch_rows)
+		return true;
+	if (TimestampDifferenceExceeds(b->since, now, prolly_fold_worker_max_delay))
+		return true;
+	return b->writers == 0 &&
+		TimestampDifferenceExceeds(b->last_ended, now,
+								   prolly_fold_worker_naptime);
 }
 
 /* What a pass did. */
@@ -274,16 +311,41 @@ typedef enum PassResult
 static PassResult
 fold_pass(const ProllyRefsRoutine *refs)
 {
-	Oid			branches[FOLDER_MAX_BRANCHES];
-	uint64		generations[FOLDER_MAX_BRANCHES];
+	ProllyMovedBranch moved[FOLDER_MAX_BRANCHES];
 	char	   *names[FOLDER_MAX_BRANCHES];
-	Moved		m = {branches, generations, 0, names};
+	Moved		m = {moved, 0, names};
 	bool		any = false;
 	bool		pending = false;
+	TimestampTz now;
+	int			ndue = 0;
 
-	m.n = refs->moved_branches(branches, generations, lengthof(branches));
+	m.n = refs->moved_branches(moved, lengthof(moved));
 	if (m.n == 0)
 		return PASS_IDLE;
+
+	/* (those not due yet left as moved, for a later pass) */
+	now = GetCurrentTimestamp();
+	for (int i = 0; i < m.n; i++)
+	{
+		if (fold_due(&moved[i], now))
+			moved[ndue++] = moved[i];
+		else
+		{
+			pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_DEFERRED, 1);
+			elog(DEBUG1, "fold worker left branch %u for a later pass: "
+				 UINT64_FORMAT " rows written since its last fold",
+				 moved[i].branch, moved[i].rows);
+		}
+	}
+	if (ndue < m.n)
+	{
+		/* (counted outside a transaction: flushed with the pass's stats) */
+		AtEOXact_PgStat_Prolly();
+		pending = true;
+	}
+	m.n = ndue;
+	if (m.n == 0)
+		return PASS_PENDING;
 	memset(names, 0, sizeof(names));
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
@@ -295,9 +357,9 @@ fold_pass(const ProllyRefsRoutine *refs)
 	{
 		bool		folded = false;
 
-		if (names[i] == NULL && branches[i] != MyBranch)
+		if (names[i] == NULL && moved[i].branch != MyBranch)
 		{
-			refs->saw_branch(branches[i], generations[i]);
+			refs->saw_branch(moved[i].branch, moved[i].generation);
 			continue;
 		}
 		StartTransactionCommand();
@@ -305,7 +367,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 		{
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* (the worker's own branch, the database's default, as it is) */
-			if (branches[i] == MyBranch)
+			if (moved[i].branch == MyBranch)
 				fold_branch(&folded);
 			else
 				branch_ops()->run_on(names[i], fold_branch, &folded);
@@ -318,9 +380,10 @@ fold_pass(const ProllyRefsRoutine *refs)
 				 * (seen as of before its fold read: a write since is seen
 				 * again next pass; one not folded stays to be folded)
 				 */
-				refs->saw_branch(branches[i], generations[i]);
+				refs->saw_branch(moved[i].branch, moved[i].generation);
+				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_FOLDS, 1);
 				elog(DEBUG1, "fold worker folded branch %u at generation %llu",
-					 branches[i], (unsigned long long) generations[i]);
+					 moved[i].branch, (unsigned long long) moved[i].generation);
 			}
 			else
 			{
@@ -332,7 +395,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 				AbortCurrentTransaction();
 				pending = true;
 				elog(DEBUG1, "fold worker left branch %u for its next pass: "
-					 "the refs held, or the branch moved", branches[i]);
+					 "the refs held, or the branch moved", moved[i].branch);
 			}
 		}
 		PG_CATCH();
@@ -347,7 +410,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 			 * (passed over until written again: an error that recurs isn't
 			 * met again every pass)
 			 */
-			refs->saw_branch(branches[i], generations[i]);
+			refs->saw_branch(moved[i].branch, moved[i].generation);
 		}
 		PG_END_TRY();
 		any = any || folded;

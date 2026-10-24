@@ -20,8 +20,10 @@
  * with the address it was asked by before anything reads it, so what the
  * walk follows is what the addresses say; a chunk the remote lacks is an
  * error, so every reference resolves, in the store or in what was
- * received.  Then each commit received is read, and its root checked to be
- * of this build's format.  Only then is what was received added to the
+ * received.  Then each commit received is read, its root checked to be
+ * of this build's format, and the height it records (if any) checked to
+ * be one more than its parents' most, as a merge base's walk takes it on
+ * trust.  Only then is what was received added to the
  * store, as one table file: nothing is found before the whole is checked,
  * and an error before leaves the store as it was.
  *
@@ -431,6 +433,40 @@ given_commit(ProllyDatabaseComponents *dc, const ProllyHash *id,
 	return false;
 }
 
+static bool
+history_lookup(const ProllyHash *id, ProllyCommitInfo *info, void *arg)
+{
+	ProllyDatabaseComponents *dc = arg;
+
+	return PROLLY_CALL(dc->refs, commit_get, id, info);
+}
+
+/*
+ * Refuse a commit (id, info) from a remote whose recorded height isn't
+ * one more than the most of its parents' (a root's: 1).  Heights order a
+ * merge base's walk, which ends on them, so one that's wrong could give a
+ * merge another base.  A commit recording none is walked, not trusted.
+ * heights (prolly_history_heights()) keeps the parents' found.
+ */
+static void
+check_height(ProllyDatabaseComponents *dc, const ProllyHash *id,
+			 const ProllyCommitInfo *info, HTAB *heights)
+{
+	int64		want = 1;
+
+	if (!info->has_height)
+		return;
+	for (int i = 0; i < info->nparents; i++)
+		want = Max(want, prolly_history_height(&info->parents[i], heights,
+											   history_lookup, dc) + 1);
+	if (info->height != want)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("the remote's commit %s records height " INT64_FORMAT ", not " INT64_FORMAT,
+						prolly_hash_hex(id), info->height, want),
+				 errdetail("A commit's height is one more than the greatest of its parents'.")));
+}
+
 /* Every commit received from those given: those the store hasn't. */
 static void
 check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
@@ -438,8 +474,10 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 	ProllyDatabaseComponents dc;
 	List	   *queue = NIL;
 	ProllySeen *seen;
+	HTAB	   *heights;
 
 	prolly_database_components(&dc);
+	heights = prolly_history_heights();
 	seen = prolly_seen_create("prolly received commits", 0, TRANSFER_BUDGET(2));
 	for (int i = 0; i < ncommits; i++)
 	{
@@ -473,6 +511,7 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 					 errmsg("the remote's commit %s is of another canonical format",
 							prolly_hash_hex(id)),
 					 errdetail("A database takes only commits of the format it makes.")));
+		check_height(&dc, id, &info, heights);
 		for (int i = 0; i < info.nparents; i++)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));
@@ -482,6 +521,7 @@ check_formats(Receiving *rv, const ProllyHash *commits, int ncommits)
 		}
 	}
 	prolly_seen_destroy(seen);
+	hash_destroy(heights);
 }
 
 static uint64
@@ -691,8 +731,10 @@ check_cloned_commits(const ProllyHash *commits, int ncommits)
 	ProllyDatabaseComponents dc;
 	List	   *queue = NIL;
 	ProllySeen *seen;
+	HTAB	   *heights;
 
 	prolly_database_components(&dc);
+	heights = prolly_history_heights();
 	seen = prolly_seen_create("prolly cloned commits", 0, 0);
 	for (int i = 0; i < ncommits; i++)
 	{
@@ -722,6 +764,7 @@ check_cloned_commits(const ProllyHash *commits, int ncommits)
 					 errmsg("the remote's commit %s is of another canonical format",
 							prolly_hash_hex(id)),
 					 errdetail("A database takes only commits of the format it makes.")));
+		check_height(&dc, id, &info, heights);
 		for (int i = 0; i < info.nparents; i++)
 		{
 			ProllyHash *p = palloc(sizeof(ProllyHash));
@@ -731,6 +774,7 @@ check_cloned_commits(const ProllyHash *commits, int ncommits)
 		}
 	}
 	prolly_seen_destroy(seen);
+	hash_destroy(heights);
 }
 
 static bool

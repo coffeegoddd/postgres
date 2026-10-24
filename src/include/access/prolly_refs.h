@@ -107,8 +107,9 @@ typedef struct ProllyMergeState
 /*
  * A constraint violation a merge (or cherry-pick) left on a branch: a row
  * of a table, as JSON, that breaks one of its constraints ("foreign key":
- * the row is in the table; "unique index", "check constraint", "not null":
- * the merge didn't write it), and what it breaks, as JSON.
+ * the row is in the table; "unique index", "exclusion constraint", "check
+ * constraint", "not null": the merge didn't write it), and what it breaks,
+ * as JSON.
  */
 typedef struct ProllyViolation
 {
@@ -198,6 +199,26 @@ typedef struct ProllyFoldMark
 	uint64		overflow;
 	uint64		epoch;
 } ProllyFoldMark;
+
+/*
+ * A branch written since the background folder last saw it
+ * (moved_branches()): the generation it's at, and what its writers since
+ * did, for the folder to judge whether a fold is due yet.  rows counts the
+ * rows the writers that ended since wrote on it (a multi-row insertion's
+ * every row; a writer of more branches than the refs note for one has
+ * those past them uncounted); since is when the first of them ended (0:
+ * none has), last_ended when the last did; writers, how many are writing
+ * it now.
+ */
+typedef struct ProllyMovedBranch
+{
+	Oid			branch;
+	uint64		generation;
+	uint64		rows;
+	TimestampTz since;
+	TimestampTz last_ended;
+	int			writers;
+} ProllyMovedBranch;
 
 typedef struct ProllyRefsRoutine
 {
@@ -541,14 +562,15 @@ typedef struct ProllyRefsRoutine
 	 * Optional, together, for a background folder (prolly_folder.c), from
 	 * shared memory, needing no database: the databases with a branch
 	 * written since the folder last saw it (at most max, their count); the
-	 * current database's such branches, each with the generation it's at;
+	 * current database's such branches, each with the generation it's at
+	 * and what was written since (ProllyMovedBranch);
 	 * that the folder saw branch at generation (written again since: still
 	 * moved); and that it can't fold any branch of database (gone, or
 	 * accepting no connections), so that none of its branches counts as
 	 * moved until written again.
 	 */
 	int			(*moved_databases) (Oid *databases, int max);
-	int			(*moved_branches) (Oid *branches, uint64 *generations, int max);
+	int			(*moved_branches) (ProllyMovedBranch *branches, int max);
 	void		(*saw_branch) (Oid branch, uint64 generation);
 	void		(*saw_database) (Oid database);
 
@@ -556,7 +578,8 @@ typedef struct ProllyRefsRoutine
 	 * Optional, together: which tables' rows may have changed since a fold
 	 * of a branch, for a canonicalizer that works out again only what
 	 * changed.  note_relation() is told, as note_write() is (and after
-	 * it), of each relation whose rows a write to branch changes.
+	 * it), of each relation whose rows a write to branch changes, and of
+	 * how many rows the write changed (moved_branches() counts them).
 	 * fold_mark() marks a fold by snap of branch, before it reads anything:
 	 * false where nothing could be known of it later (in recovery, while a
 	 * transaction is prepared, after the transaction's catalog changes, or
@@ -574,7 +597,7 @@ typedef struct ProllyRefsRoutine
 	 * catalog change moves what fold_mark() takes, and a sequence is read
 	 * each time.
 	 */
-	void		(*note_relation) (Oid branch, Oid relid);
+	void		(*note_relation) (Oid branch, Oid relid, int nrows);
 	bool		(*fold_mark) (Oid branch, Snapshot snap, ProllyFoldMark *mark);
 	bool		(*written_since) (const ProllyFoldMark *mark, Snapshot snap,
 								  Oid **relids, int *nrelids);
@@ -688,9 +711,14 @@ extern PGDLLIMPORT int prolly_kept_commits;
  * For refs implementations: a commit's info by its id (false if there is
  * no such commit), and the best common ancestor of two commits (no other
  * common one descending from it; of two such, the one furthest from the
- * history's roots, then the least id), found with it.  The walks visit a
- * commit at most once each: a's ancestors, b's down to the common ones,
- * and, with several of those, theirs and the history beneath them.
+ * history's roots, then the least id), found with it.  Where the commits
+ * record their heights, it reads the commits above the best common ones
+ * and their parents, and holds marks for those alone, however long the
+ * history beneath them (criss-cross merges, and a side reaching beneath
+ * the base through an older merge, included).  Otherwise
+ * the walks visit a commit at most once each: a's ancestors, b's down to
+ * the common ones, and, with several of those, theirs and the history
+ * beneath them.
  */
 typedef bool (*ProllyCommitLookup) (const ProllyHash *id,
 									ProllyCommitInfo *info, void *arg);

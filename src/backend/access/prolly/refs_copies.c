@@ -656,14 +656,18 @@ check_merge_conflicts(const char *what)
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
 		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
+		{
+			const char *type = ((ProllyViolation *) linitial(v))->type;
+
+			/* ("an exclusion constraint violation", but "a unique index ...") */
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with constraint violations", what),
-					 errdetail("Table \"%s\" has a row with a %s violation on branch \"%s\".",
-							   name,
-							   ((ProllyViolation *) linitial(v))->type,
-							   branch),
+					 errdetail("Table \"%s\" has a row with %s %s violation on branch \"%s\".",
+							   name, type[0] == 'e' ? "an" : "a",
+							   type, branch),
 					 errhint("Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.")));
+		}
 	}
 }
 
@@ -1531,7 +1535,8 @@ static void anchor_at_commit(const ProllyCommitInfo *commit);
 static void settle_rows(const ProllyNodeRef *target, const KnownSource *source);
 
 static void restore_pages(const ProllyCommitInfo *commit);
-static void keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
+static void keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
+					   const ProllyNodeRef *root,
 					   Snapshot snap);
 
 static void
@@ -1542,7 +1547,8 @@ settle(const ProllyCommitInfo *commit, const KnownSource *source)
 	settle_rows(&commit->root, source);
 	anchor_at_commit(commit);
 	if (ActiveSnapshotSet())
-		keep_pages(&commit->id, &commit->root, GetActiveSnapshot());
+		keep_pages(&commit->id, commit->nparents > 0 ? &commit->parents[0] : NULL,
+				   &commit->root, GetActiveSnapshot());
 }
 
 static void
@@ -2374,9 +2380,27 @@ kept_settled(void *arg)
  * Nothing is kept if a lock isn't free or another's writes may be on the
  * pages: a move back to the commit then writes its rows.
  */
+static bool copies_commit_get(const ProllyHash *id, ProllyCommitInfo *info);
+
+/*
+ * Was kept commit o replaced by a commit made on parent (NULL: not known),
+ * itself made on that parent?  (The parent itself, kept as a commit's
+ * usually is, isn't: no commit is read for it.)
+ */
+static bool
+kept_replaced(const KeptCommit *o, const ProllyHash *parent)
+{
+	ProllyCommitInfo was;
+
+	return parent != NULL && !same_hash(&o->commit, parent) &&
+		copies_commit_get(&o->commit, &was) && was.nparents > 0 &&
+		same_hash(&was.parents[0], parent);
+}
+
+/* (parent: the commit's first parent, NULL if it has none or isn't known) */
 static void
-keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
-		   Snapshot snap)
+keep_pages(const ProllyHash *commit_id, const ProllyHash *parent,
+		   const ProllyNodeRef *root, Snapshot snap)
 {
 	ProllyDatabaseComponents dc;
 	char	   *name;
@@ -2482,14 +2506,18 @@ keep_pages(const ProllyHash *commit_id, const ProllyNodeRef *root,
 	/*
 	 * (the commit first, then the others kept till there are enough; the
 	 * rest retired, let go of by a later keep once this transaction
-	 * commits, as a branch may be being made of them meanwhile)
+	 * commits, as a branch may be being made of them meanwhile.  One the
+	 * commit replaced, made on the same parent, is retired too: amended
+	 * away, or reworded or squashed by a rebase, it is no longer the
+	 * branch's, and kept it would push out the parent a reset goes back to)
 	 */
 	next = list_make1(kc);
 	foreach_ptr(KeptCommit, o, holding)
 	{
 		if (FullTransactionIdIsValid(o->retired))
 			next = lappend(next, o);
-		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits)
+		else if (!same_hash(&o->commit, commit_id) && live < prolly_kept_commits &&
+				 !kept_replaced(o, parent))
 		{
 			next = lappend(next, o);
 			live++;
@@ -2722,7 +2750,7 @@ copies_hold_unseen(void)
 	bool		found = false;
 
 	classes = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(classes, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
@@ -3908,7 +3936,7 @@ static void
 table_names(StringInfo out)
 {
 	Relation	rel = table_open(RelationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
 	HeapTuple	tup;
 	List	   *lines = NIL;
 	ListCell   *lc;
@@ -4212,7 +4240,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 	branch_set_baseline(name, &next, &root);
 	note_head_names(name, commit_id);
 	note_anchor(name, commit_id, &anchor);
-	keep_pages(commit_id, &root, snap);
+	keep_pages(commit_id, nparents > 0 ? &parents[0] : NULL, &root, snap);
 	UnregisterSnapshot(snap);
 	return true;
 }
@@ -4834,7 +4862,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 	note_anchor(name, commit_id, &anchor);
 	/* (kept only if the working set is what was committed) */
 	if (same_hash(&root.hash, &working_set->hash))
-		keep_pages(commit_id, &root, snap);
+		keep_pages(commit_id, nparents > 0 ? &parents[0] : NULL, &root, snap);
 	UnregisterSnapshot(snap);
 }
 

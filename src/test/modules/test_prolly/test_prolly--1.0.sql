@@ -313,6 +313,16 @@ CREATE FUNCTION test_chunk_segments(OUT name text, OUT chunks int,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
+-- What reading and editing a value tree of size bytes costs, each way: a
+-- slice of ilen bytes at offset read, the value read whole, the edit (del
+-- bytes at offset replaced by ilen) spliced, and made by rewriting it
+-- whole: the nodes read and written and the time taken.
+CREATE FUNCTION test_value_edit_cost(size int8, "offset" int8, del int8,
+	ilen int8, OUT method text, OUT nodes_read int8, OUT nodes_written int8,
+	OUT usec float8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
 -- Seal the journal's segment: appends go on to a new one.
 CREATE FUNCTION test_chunk_seal()
 RETURNS void
@@ -509,6 +519,11 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 -- n commits in a line after parent, each naming its root; the last one.
 CREATE FUNCTION test_commit_chain(parent text, n int)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+-- A commit after parent recording height as its own, right or not.
+CREATE FUNCTION test_commit_at_height(parent text, height int8)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 

@@ -1,0 +1,35 @@
+{
+		Name: "dolt_rebase errors: uncommitted changes before first --continue",
+		SetUpScript: []string{
+			"create table t (pk int primary key, c1 varchar(100));",
+			"call dolt_commit('-Am', 'creating table t');",
+			"call dolt_branch('branch1');",
+
+			"insert into t values (0, 'zero');",
+			"call dolt_commit('-am', 'inserting row 0 on main');",
+
+			"call dolt_checkout('branch1');",
+			"insert into t values (1, 'one');",
+			"call dolt_commit('-am', 'inserting row 1 on branch1');",
+			"update t set c1='uno' where pk=1;",
+			"call dolt_commit('-am', 'updating row 1 on branch1');",
+
+			"set @@autocommit=0;",
+		},
+		Assertions: []queries.ScriptTestAssertion{
+			{
+				Query: "call dolt_rebase('-i', 'main');",
+				Expected: []sql.Row{{0, "interactive rebase started on branch dolt_rebase_branch1; " +
+					"adjust the rebase plan in the dolt_rebase table, then " +
+					"continue rebasing by calling dolt_rebase('--continue')"}},
+			},
+			{
+				Query:    "insert into t values (100, 'hundo');",
+				Expected: []sql.Row{{gmstypes.NewOkResult(1)}},
+			},
+			{
+				Query:       "call dolt_rebase('--continue');",
+				ExpectedErr: dprocedures.ErrRebaseUncommittedChanges,
+			},
+		},
+	}

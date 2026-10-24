@@ -73,7 +73,8 @@ is(sql($sweep), '0 0', 'and a second finds nothing');
 is(sql($sum), $want, 'the table reads as before');
 
 # A drop stopped by a crash after its commit, before its blocks were
-# freed: the sweep frees them.
+# freed: they were queued before the commit record, so the sweep's drain
+# frees them and the sweep finds none held by nothing.
 sql(q{CREATE TABLE cow.d (a int8); INSERT INTO cow.d SELECT g FROM generate_series(1, 5000) g});
 # (its change log's blocks are freed with it, and their maps' nodes)
 my $dblocks = sql(q{SELECT (pg_relation_size('cow.d') + (pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.d'::regclass::oid)::regclass) + pg_relation_size(('pg_toast.pg_prolly_log_' || 'cow.d'::regclass::oid || '_index')::regclass))) / 8192});
@@ -93,8 +94,13 @@ $node->stop('immediate');
 eval { $d->quit; };
 $node->start;
 sql('CHECKPOINT');
+cmp_ok(sql(q{SELECT test_bmap_release_pending()}), '>', 0,
+	'a crash after a drop\'s commit leaves its blocks queued');
+my $free_before = sql(q{SELECT test_bmap_free_blocks()});
+is(sql(q{SELECT freed FROM test_bmap_release_drain()}), $dblocks,
+	'a drain frees the blocks of a relation dropped by a crash');
 my ($freed, $recounted) = split / /, sql($sweep);
-is($freed, $dblocks, 'a sweep frees the blocks of a relation dropped by a crash');
+is($freed, '0', 'and a sweep finds none held by nothing');
 is(sql($sum), $want, 'the other table reads as before');
 
 # Branch creation waits for a sweep counting the maps.

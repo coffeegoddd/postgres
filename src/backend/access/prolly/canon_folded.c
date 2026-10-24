@@ -1765,6 +1765,20 @@ shape_mappable(Canon *cn, Relation rel, BaseTable *bt,
 }
 
 /*
+ * Will a fold from bt map its rows to rel's shape now, *was getting the
+ * shape they were folded under: they can be (shape_mappable()), and doing
+ * so costs less than reading rel in full (prolly_fold_map_cheaper()).
+ * Asked by table_root() and dolt_pending_full_folds() alike.
+ */
+static bool
+shape_will_map(Canon *cn, Relation rel, BaseTable *bt,
+			   const StringInfoData *now, ProllyValue *was)
+{
+	return shape_mappable(cn, rel, bt, now, was) &&
+		prolly_fold_map_cheaper(rel);
+}
+
+/*
  * A prolly table's shape: the content hash of its baseline_shape()
  * (described in 'description'), and the collations ordering its keys,
  * added to the fold's (and to *collations if given).
@@ -1820,8 +1834,8 @@ table_shape_bytes(Canon *cn, Relation rel, const StringInfoData *description,
  * the change finder: from its baseline if it has one that holds for this
  * definition (described in 'description', dh its table_shape(): the same,
  * or one shape_holds() says its rows are as they were under), or one whose
- * rows map to it (shape_mappable()); with a next baseline being made, its
- * entry there too.  The same rows give the same
+ * rows will be mapped to it (shape_will_map()); with a next baseline
+ * being made, its entry there too.  The same rows give the same
  * tree whatever pages, order or history they come from.
  */
 static void
@@ -1849,7 +1863,7 @@ table_root(Canon *cn, CanonItem *it, Relation rel,
 		/* (when reading another table: not mapped, as its rows aren't read) */
 		if (!cn->no_rows &&
 			(!OidIsValid(cn->only) || RelationGetRelid(rel) == cn->only) &&
-			shape_mappable(cn, rel, bt, &shape, &tf.shape))
+			shape_will_map(cn, rel, bt, &shape, &tf.shape))
 			tf.reshaped = true;
 		else
 			bt = NULL;
@@ -3846,7 +3860,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	 * comparators they call.  Inspect every canonical table's key types.
 	 */
 	rel = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
@@ -3865,7 +3879,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	table_close(rel, AccessShareLock);
 
 	rel = table_open(DependRelationId, AccessShareLock);
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_depend d = (Form_pg_depend) GETSTRUCT(tup);
@@ -4391,7 +4405,7 @@ collect(Canon *cn)
 
 	/* Relations. */
 	pg_class = table_open(RelationRelationId, AccessShareLock);
-	scan = systable_beginscan(pg_class, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(pg_class, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
 	systable_endscan(scan);
@@ -4401,7 +4415,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_ns = table_open(NamespaceRelationId, AccessShareLock);
 
-		scan = systable_beginscan(pg_ns, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(pg_ns, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_namespace ns = (Form_pg_namespace) GETSTRUCT(tup);
@@ -4417,7 +4431,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_type = table_open(TypeRelationId, AccessShareLock);
 
-		scan = systable_beginscan(pg_type, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(pg_type, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_type typ = (Form_pg_type) GETSTRUCT(tup);
@@ -4441,7 +4455,7 @@ collect(Canon *cn)
 	{
 		Relation	pg_proc = table_open(ProcedureRelationId, AccessShareLock);
 
-		scan = systable_beginscan(pg_proc, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(pg_proc, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_proc proc = (Form_pg_proc) GETSTRUCT(tup);
@@ -4535,7 +4549,7 @@ refuse_undescribed(Canon *cn)
 			continue;
 		oidatt = get_object_attnum_oid(classid);
 		rel = table_open(classid, AccessShareLock);
-		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(rel, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			bool		isnull;
@@ -4584,7 +4598,7 @@ static void
 describe_collations(Canon *cn)
 {
 	Relation	rel = table_open(CollationRelationId, AccessShareLock);
-	SysScanDesc scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	SysScanDesc scan = catalog_branch_beginscan(rel, MyBranch);
 	HeapTuple	tup;
 
 	while ((tup = systable_getnext(scan)) != NULL)
@@ -4628,7 +4642,10 @@ describe_collations(Canon *cn)
  * type's to its multirange type): "x:" items named "source AS target",
  * each its method ("function" and the function's qualified signature,
  * "inout" or "binary") and its context ("explicit", "assignment" or
- * "implicit"), a line each.  (What initdb made casts no such type.)
+ * "implicit"), a line each.  (What initdb made casts no such type.)  Every
+ * cast is read, not only the branch's: one between a type an extension has
+ * in a versioned schema and a type outside, made outside the extension, is
+ * shared, as both its types are.
  */
 static void
 describe_casts(Canon *cn)
@@ -5435,7 +5452,7 @@ folded_pending_full(const ProllyNodeRef *baseline,
 	PG_TRY();
 	{
 		classes = table_open(RelationRelationId, AccessShareLock);
-		scan = systable_beginscan(classes, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(classes, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
@@ -5480,7 +5497,7 @@ folded_pending_full(const ProllyNodeRef *baseline,
 					   memcmp(bt->shape_hash.bytes, dh.bytes, dh.len) == 0) &&
 					 !shape_holds(rel, base_shape(&cn, bt),
 								  table_shape_bytes(&cn, rel, &desc, &shape)) &&
-					 !shape_mappable(&cn, rel, bt, &shape, &tf.shape))
+					 !shape_will_map(&cn, rel, bt, &shape, &tf.shape))
 				why = PROLLY_FULL_SHAPE_CHANGED;
 			else if (PROLLY_HAS(cn.finder, full_reason))
 			{
@@ -12671,8 +12688,7 @@ folded_identify(const ProllyValue *anchor, const ProllyValue *known, Oid only,
 	else
 	{
 		Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
-		SysScanDesc scan = systable_beginscan(pg_class, InvalidOid, false,
-											  NULL, 0, NULL);
+		SysScanDesc scan = catalog_branch_beginscan(pg_class, MyBranch);
 		HeapTuple	tup;
 
 		while ((tup = systable_getnext(scan)) != NULL)
