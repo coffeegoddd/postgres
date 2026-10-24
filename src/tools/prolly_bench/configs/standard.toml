@@ -39,6 +39,12 @@ tpch_scale = 1.0
 v_rows = 1000000
 sysbench_tables = 10
 sysbench_table_size = 1000000  # ~2.4 GB
+g_points = 5000000             # G and GV: ~0.5 GB of points
+g_buildings = 2000000
+g_large = 50
+g_large_vertices = 100000      # 1.6 MB each
+g_fleet = 1000000
+g_geog = 2000000
 
 # Several times RAM (92 GB on the development machine).  Needs ~300 GB free
 # on the device under test; not in the default sizes.
@@ -51,6 +57,12 @@ tpch_scale = 100.0
 v_rows = 100000000
 sysbench_tables = 10
 sysbench_table_size = 120000000  # ~290 GB
+g_points = 400000000
+g_buildings = 150000000
+g_large = 2000
+g_large_vertices = 100000
+g_fleet = 50000000
+g_geog = 100000000
 
 [workloads.S3]
 ranges = [100, 10000]

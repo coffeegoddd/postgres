@@ -32,6 +32,20 @@ setup_target($node, 'postgres', $am);
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
+# A session open across a crash: its server is gone, so quitting it may
+# find psql's pipe closed (some IPC::Run versions raise "ack Broken pipe").
+# That error is expected: the psql process is then reaped.  Any other is
+# raised.
+sub gone
+{
+	my ($session) = @_;
+	return if eval { $session->quit; 1 };
+	my $err = $@;
+	die $err unless $err =~ /Broken pipe/;
+	$session->{run}->kill_kill;
+	$session->{run}->finish;
+}
+
 # Per-table digests over EWKB, and which ids a GiST scan finds (every
 # geometry the probe box meets, the crashed writes' included) against a
 # sequential scan's.
@@ -75,7 +89,7 @@ $load->query_safe(q{BEGIN;
 
 my $expect = sql($digest);
 $node->stop('immediate');
-$load->quit;
+gone($load);
 $node->start;
 
 is(sql($digest), $expect, 'committed geometries survive a crash byte for byte');
@@ -114,7 +128,7 @@ SKIP:
 	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
 		WHERE wait_event = 'heap_update-before-pin'}) or die 'the update did not stop';
 	$node->stop('immediate');
-	$writer->quit;
+	gone($writer);
 	$node->start;
 	is(sql($digest), $before, 'a crash mid-statement keeps the committed geometries');
 	is(sql('SELECT count(*) FROM gis_load WHERE id > 20000'), '0',
@@ -171,7 +185,7 @@ SKIP:
 		$node->poll_query_until('postgres', qq{SELECT count(*) > 0 FROM pg_stat_activity
 			WHERE wait_event = '$point'}) or die "the commit did not stop at $point";
 		$node->stop('immediate');
-		$committer->quit;
+		gone($committer);
 		$node->start;
 
 		is(sql(q{SELECT dolt_hashof('HEAD')}), $c1,
