@@ -31,10 +31,15 @@ from typing import Optional
 # for the reads after it) neither.
 KINDS = ("read", "op", "set")
 
-# A phase 2 median over phase 1's above TOLERANCE, by more than FLOOR_MS,
-# is slower; below either it is noise.
+# A query is slower when its paired ratio passes its tolerance and its
+# phase 2 median is more than FLOOR_MS over phase 1's.  Its tolerance is
+# TOLERANCE, or more for a query whose phase 1 repetitions spread: 1 plus
+# NOISE_K times their median absolute deviation over their median (so a
+# query that moves 10% between repetitions before any cleanup isn't
+# called slower for moving as much after).
 TOLERANCE = 1.10
 FLOOR_MS = 1.0
+NOISE_K = 3.0
 
 _TIME_RE = re.compile(r"^Time: ([\d.]+) ms", re.M)
 _DIGEST_RE = re.compile(r"^v10\|(\w+)\|(\d+)\|(\w*)$", re.M)
@@ -107,16 +112,29 @@ class Finding:
     p1_ms: float            # phase 1's median
     p2_ms: float
     ratio: Optional[float]  # paired_ratio()
-    slower: bool            # over the tolerance, by more than the floor
+    tolerance: float        # the query's own: tolerance_of()
+    p1_min_ms: float        # phase 1's spread
+    p1_max_ms: float
+    slower: bool            # over its tolerance, by more than the floor
+
+
+def tolerance_of(p1: list[float], tolerance: float = TOLERANCE, k: float = NOISE_K) -> float:
+    """A query's tolerance: the fixed one, or its phase 1 noise's."""
+    med = statistics.median(p1)
+    if med <= 0:
+        return tolerance
+    mad = statistics.median(abs(x - med) for x in p1)
+    return max(tolerance, 1 + k * mad / med)
 
 
 def judge(cell: str, query: str, p1: list[float], p2: list[float],
           tolerance: float = TOLERANCE, floor_ms: float = FLOOR_MS) -> Finding:
     ratio = paired_ratio(p1, p2)
     a, b = statistics.median(p1), statistics.median(p2)
-    slower = ratio is not None and ratio > tolerance and b - a > floor_ms
+    tol = tolerance_of(p1, tolerance)
+    slower = ratio is not None and ratio > tol and b - a > floor_ms
     return Finding(cell, query, "heap" if query.startswith("heap_") else "prolly",
-                   a, b, ratio, slower)
+                   a, b, ratio, tol, min(p1), max(p1), slower)
 
 
 def findings(series: dict, cell: str, tolerance: float = TOLERANCE,
@@ -145,12 +163,14 @@ def metrics(series: dict, tolerance: float = TOLERANCE,
 
 
 def table(fs: list[Finding]) -> str:
-    lines = ["| Cell | Query | Engine | Phase 1 ms | Phase 2 ms | Paired ratio | Result |",
-             "|---|---|---|---|---|---|---|"]
+    lines = ["| Cell | Query | Engine | Phase 1 ms | Phase 1 range | Phase 2 ms | Paired ratio "
+             "| Tolerance | Result |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for f in fs:
         ratio = "" if f.ratio is None else f"{f.ratio:.3f}"
-        lines.append(f"| {f.cell} | {f.query} | {f.engine} | {f.p1_ms:.3f} | {f.p2_ms:.3f} "
-                     f"| {ratio} | {'slower' if f.slower else 'ok'} |")
+        lines.append(f"| {f.cell} | {f.query} | {f.engine} | {f.p1_ms:.3f} "
+                     f"| {f.p1_min_ms:.3f}-{f.p1_max_ms:.3f} | {f.p2_ms:.3f} "
+                     f"| {ratio} | {f.tolerance:.3f} | {'slower' if f.slower else 'ok'} |")
     return "\n".join(lines) + "\n"
 
 
@@ -189,6 +209,6 @@ def run(args) -> int:
         args.markdown.write_text(table(fs))
     failed = bool(slower) and args.gate_latency
     print(f"V cleanup: digests identical in {len(cells)} cells; {len(slower)} of {len(fs)} "
-          f"query latencies slower after cleanup (tolerance {args.tolerance}, floor "
+          f"query latencies slower after cleanup (tolerance at least {args.tolerance}, floor "
           f"{args.floor_ms} ms){'' if args.gate_latency else ', reported only'}")
     return 1 if failed else 0

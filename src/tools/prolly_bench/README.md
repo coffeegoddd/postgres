@@ -427,39 +427,53 @@ Phase 1 reads Q `reps` times (5); then every cleanup runs, in order:
 `VACUUM`, `VACUUM (FREEZE)`, `VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP
 ON)`, the first two again with `prolly.vacuum_copy_kept_pages` on, `VACUUM
 (ANALYZE)`, the release queue drained by autovacuum (a branch deleted and
-a table dropped first, autovacuum on until `pg_stat_prolly`'s
-`bmap_release_drained` reaches `bmap_release_queued`), `dolt_gc('--full')`,
-`dolt_gc()`, `prolly_page_sweep()` and `CHECKPOINT`, each timed
-(`cleanup_<step>_ms`); then phase 2 as phase 1.  The `warm` variant reads
-Q once unrecorded before each phase; `cold` restarts the server before
-every pass (the OS cache stays warm).  Each read runs with its rows
-discarded, timed as a client waits for it, then again inside a digest of
-its rows sorted by their text (count and md5), untimed.
+a table dropped first; autovacuum on, its automatic collections off, until
+`pg_stat_prolly`'s `bmap_release_drained` reaches `bmap_release_queued`,
+then every worker done), `dolt_gc('--full')`, `dolt_gc()`,
+`prolly_page_sweep()` and `CHECKPOINT`.  Each is timed
+(`cleanup_<step>_ms`), and its growth of `pg_stat_prolly`'s
+`gc_chunks_freed`, `gc_bytes_freed`, `bmap_blocks_freed`,
+`bmap_release_blocks_freed`, `bmap_release_drained`, `page_copies_shared`
+and `bmap_blocks_moved` recorded (`cleanup_<step>_<counter>`), with the
+sweep's row (`cleanup_page_sweep_freed`, `_recounted`, `_truncated`,
+`_moved`); each step's output and counts are in `v10-cleanups.json`.  The
+full collection must free chunks and the drain blocks, or the cell fails.
+After each, the blocks freed are written again (a table on a branch no
+query reads, made again) and every buffer evicted (`pg_buffercache`), so
+that a read of a block a cleanup freed finds that table's page; then Q is
+read, every digest checked.  Then phase 2 as phase 1.  The `warm` variant
+reads Q once unrecorded before each phase; `cold` restarts the server
+before every pass (the OS cache stays warm).  Each read runs with its
+rows discarded, timed as a client waits for it, then again inside a
+digest of its rows sorted by their text (count and md5), untimed.
 
-Correctness is a hard failure: a digest of either phase that isn't phase
-1's first fails the cell, naming the queries; so do `dolt_verify_folds()`
-finding a mismatch, `bt_index_check(..., true)` failing on main's or the
-side branch's indexes, and an error or warning in the server log after
-phase 1 began (but for an autovacuum task cancelled for a lock, and an
-automatic collection refused while another runs, which autovacuum
-reports and passes over: at the larger size each worker finds one due).
-Autovacuum's workers finish their pass after the drain before the next
-cleanup starts.  Latency is paired: for each query, repetition i of phase 2
-over repetition i of phase 1, the median of those ratios
+Correctness is a hard failure: a digest of either phase, or of a read
+after a cleanup, that isn't phase 1's first fails the cell, naming the
+queries; so do `dolt_verify_folds()` finding a mismatch,
+`bt_index_check(..., true)` failing on main's or the side branch's
+indexes, and any error or warning in the server log after phase 1 began
+(autovacuum's too).  Latency is paired: for each query, repetition i of
+phase 2 over repetition i of phase 1, the median of those ratios
 (`<query>_ratio`, with `<query>_p1_ms` and `<query>_p2_ms`), and per
 engine the median ratio (`prolly_ratio_median`, `heap_ratio_median`) and
-the queries slower (`prolly_queries_slower`): a ratio over 1.10 by more
-than 1 ms.  `vclean` reports every query as a table; latency fails it
-only with `--gate-latency`.  Each cell's per-pass digests and latencies
-are in its raw directory (`v10-series.json`), with every pass's script
-and output.
+the queries slower (`prolly_queries_slower`): a ratio over the query's
+tolerance by more than 1 ms.  A query's tolerance is 1.10, or more for one
+whose phase 1 repetitions spread: 1 plus 3 times their median absolute
+deviation over their median.  `vclean` reports every query as a table,
+with phase 1's range and the tolerance; latency fails it only with
+`--gate-latency`.  Each cell's per-pass digests and latencies are in its
+raw directory (`v10-series.json`), with every pass's script and output.
 
 CI runs the `pr` size (20,000 rows) on every pull request (`prolly.yml`'s
 release build), the correctness gated and the latencies reported in the
 job summary, and the `nightly` size (500,000 rows) nightly; the dedicated
 host (#247) runs it at full scale.  `src/test/modules/test_prolly`'s
 `t/360_cleanup_invariance.pl` is the correctness half without the
-harness, reading after each cleanup in turn, a restart and a crash.
+harness, reading after each cleanup in turn, a restart and a crash,
+with a history shaped so that each cleanup has work to do (kept-only
+pages, commits pushed out of the kept window, leaked blocks, stuck
+counts, a sweep's moves and its lowering of shared_below), and asserting
+that it did it.
 
 ```sh
 src/tools/prolly_bench/prolly_bench run V --am prolly --workloads V10 --config src/tools/prolly_bench/configs/v_cleanup.toml --out G

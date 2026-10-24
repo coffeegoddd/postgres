@@ -112,6 +112,7 @@ jobs:
           make -s -j4 -C src/test/modules COPT=-Werror
           make -s install
           make -s -C contrib/amcheck install
+          make -s -C contrib/pg_buffercache install
 
       - uses: actions/setup-java@v4
         with:

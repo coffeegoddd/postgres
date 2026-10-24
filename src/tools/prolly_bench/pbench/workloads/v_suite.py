@@ -876,7 +876,11 @@ class V10(VWorkload):
     (FREEZE), VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP ON), each of
     the first two again with prolly.vacuum_copy_kept_pages on, VACUUM
     (ANALYZE), the release queue drained by autovacuum, dolt_gc('--full'),
-    dolt_gc(), prolly_page_sweep() and CHECKPOINT; then phase 2 as phase 1.
+    dolt_gc(), prolly_page_sweep() and CHECKPOINT, each's output and
+    pg_stat_prolly's growth recorded (the collection must free chunks and
+    the drain blocks), and after each the blocks freed written again by
+    another table, every buffer evicted, and Q read (its digests checked);
+    then phase 2 as phase 1.
     Every digest of either phase must be phase 1's first: any difference
     fails the cell, as do dolt_verify_folds(), amcheck, and an error or
     warning in the server log after the cleanups.  Each query's latency
@@ -902,14 +906,19 @@ class V10(VWorkload):
     )
 
     # Log errors that are no sign of a cleanup gone wrong: background
-    # workers a shutdown terminates; an autovacuum worker's task cancelled
-    # for a lock another wants; an automatic collection refused because
-    # another collection (another worker's, or dolt_gc's) is running, which
-    # autovacuum reports and passes over (with the journal past
-    # prolly.gc_journal_threshold, each worker finds a collection due).
-    BENIGN = ("due to administrator command",
-              "57014 ERROR:  canceling autovacuum task",
-              "55P03 ERROR:  another collection of this database's chunk store is running")
+    # workers a shutdown terminates.
+    BENIGN = ("due to administrator command",)
+
+    # pg_stat_prolly's counters each cleanup's growth of is recorded
+    # (cleanup_<label>_<counter>)
+    COUNTERS = ("gc_chunks_freed", "gc_bytes_freed", "bmap_blocks_freed",
+                "bmap_release_blocks_freed", "bmap_release_drained", "page_copies_shared",
+                "bmap_blocks_moved")
+
+    # (cleanup, counter): a cleanup that must have freed something here
+    # (the collection: the branch deleted that nothing reads; the drain:
+    # the branch and table it deletes and drops first)
+    MUST_FREE = (("gc_full", "gc_chunks_freed"), ("release_queue", "bmap_release_blocks_freed"))
 
     # the current tables' reads the heap tables repeat
     HEAP_READS = ("point", "range", "full", "toast", "keyless", "remade", "index",
@@ -950,6 +959,7 @@ class V10(VWorkload):
         schema = targets.for_am(ctx.table_am).schema
         self._sql(ctx, f"""
             CREATE EXTENSION IF NOT EXISTS amcheck SCHEMA public;
+            CREATE EXTENSION IF NOT EXISTS pg_buffercache SCHEMA public;
             CREATE TABLE v10_t (id int PRIMARY KEY, k int NOT NULL, g int NOT NULL,
                 v text NOT NULL);
             CREATE INDEX v10_t_k ON v10_t (k);
@@ -1026,6 +1036,7 @@ class V10(VWorkload):
             INSERT INTO v10_big SELECT 2000000, string_agg(md5(g::text || 'side'), '')
                 FROM generate_series(1, 300) g;
             SELECT dolt_checkout('main');
+            SELECT dolt_branch('v10_churn');
 
             CREATE TABLE public.v10h_t USING heap AS SELECT * FROM v10_t;
             ALTER TABLE public.v10h_t ADD PRIMARY KEY (id);
@@ -1153,8 +1164,13 @@ class V10(VWorkload):
         drained = ("SELECT pg_stat_force_next_flush(); SELECT coalesce(sum(value) FILTER "
                    "(WHERE name = 'bmap_release_drained'), 0) || '|' || coalesce(sum(value) "
                    "FILTER (WHERE name = 'bmap_release_queued'), 0) FROM pg_stat_prolly")
+        # (autovacuum's automatic collections off meanwhile: the collections
+        # are cleanups of their own, after; and every worker would find one
+        # due once the journal is large)
         ctx.cluster.sql("ALTER SYSTEM SET autovacuum = on; "
-                        "ALTER SYSTEM SET autovacuum_naptime = '1s'; SELECT pg_reload_conf()")
+                        "ALTER SYSTEM SET autovacuum_naptime = '1s'; "
+                        "ALTER SYSTEM SET prolly.gc_journal_threshold = -1; "
+                        "SELECT pg_reload_conf()")
         try:
             deadline = time.monotonic() + 300
             while True:
@@ -1167,7 +1183,9 @@ class V10(VWorkload):
                 time.sleep(0.5)
         finally:
             ctx.cluster.sql("ALTER SYSTEM RESET autovacuum; "
-                            "ALTER SYSTEM RESET autovacuum_naptime; SELECT pg_reload_conf()")
+                            "ALTER SYSTEM RESET autovacuum_naptime; "
+                            "ALTER SYSTEM RESET prolly.gc_journal_threshold; "
+                            "SELECT pg_reload_conf()")
             # (the workers running finish their pass first, so that the
             # cleanups after don't run beside them)
             deadline = time.monotonic() + 300
@@ -1177,16 +1195,64 @@ class V10(VWorkload):
                     raise RuntimeError("V10: autovacuum workers still running after the drain")
                 time.sleep(0.5)
 
-    def cleanup(self, ctx) -> dict[str, float]:
-        out = {}
+    def _counters(self, ctx) -> dict[str, int]:
+        names = ", ".join(f"'{c}'" for c in self.COUNTERS)
+        out = self._sql(ctx, "SELECT pg_stat_force_next_flush();\n"
+                             "SELECT 'v10c|' || coalesce(json_object_agg(name, value), '{}') "
+                             f"FROM pg_stat_prolly WHERE name IN ({names});")
+        line = next(x for x in out.splitlines() if x.startswith("v10c|"))
+        return {k: int(v) for k, v in json.loads(line[5:]).items()}
+
+    def _churn(self, ctx, n: int) -> None:
+        """The blocks a cleanup freed written again, by a table on a branch
+        no query reads, and every buffer evicted: a read of a freed block
+        then finds that table's page, not a cached copy of what was there."""
+        self._sql(ctx, f"""
+            SELECT dolt_checkout('v10_churn');
+            DROP TABLE IF EXISTS v10_churn;
+            CREATE TABLE v10_churn (a int, b text);
+            INSERT INTO v10_churn SELECT g, repeat(md5(g::text), 8)
+                FROM generate_series(1, {max(6000, n // 4)}) g;
+            CHECKPOINT;
+            SELECT count(*) FROM public.pg_buffercache_evict_all();
+        """)
+
+    def cleanup(self, ctx, queries, base: dict[str, str]) -> tuple[dict[str, float], dict]:
+        """Each cleanup, timed, its output and pg_stat_prolly's growth
+        recorded; after each, the freed blocks written again and Q read,
+        every digest phase 1's."""
+        out: dict[str, float] = {}
+        record: dict = {}
         for label, sql in self.CLEANUPS:
+            before = self._counters(ctx)
             t0 = time.monotonic()
             if sql is None:
                 self._drain_release_queue(ctx)
+                result = ""
             else:
-                self._sql(ctx, sql)
+                result = self._sql(ctx, sql).strip()
             out[f"cleanup_{label}_ms"] = (time.monotonic() - t0) * 1000
-        return out
+            after = self._counters(ctx)
+            grew = {c: after.get(c, 0) - before.get(c, 0) for c in self.COUNTERS}
+            for c, v in grew.items():
+                out[f"cleanup_{label}_{c}"] = float(v)
+            if label == "page_sweep":
+                for k, v in zip(("freed", "recounted", "truncated", "moved"),
+                                result.splitlines()[-1].split("|")):
+                    out[f"cleanup_page_sweep_{k}"] = float(v)
+            record[label] = {"output": result, "counters": grew}
+            for need_label, counter in self.MUST_FREE:
+                if need_label == label and grew[counter] <= 0:
+                    raise RuntimeError(f"V10: cleanup {label} freed nothing ({counter} "
+                                       f"grew {grew[counter]})")
+            self._churn(ctx, self.rows(ctx))
+            digests, _ = self._pass(ctx, queries, f"v10-after-{label}")
+            bad = vclean.mismatches(base, digests)
+            if bad:
+                raise RuntimeError(f"V10: after cleanup {label}, these read other rows: "
+                                   + ", ".join(bad))
+        (ctx.raw_dir / "v10-cleanups.json").write_text(json.dumps(record, indent=1) + "\n")
+        return out, record
 
     @classmethod
     def log_problems(cls, log: str) -> list[str]:
@@ -1234,10 +1300,10 @@ class V10(VWorkload):
             if bad:
                 raise RuntimeError(f"V10: phase 1's pass {i} read other rows than its first: "
                                    + ", ".join(bad))
-        cleaned = self.cleanup(ctx)
+        cleaned, record = self.cleanup(ctx, queries, base)
         p2 = self.phase(ctx, queries, "phase2")
         series = {"cache": ctx.params["cache"], "commits": commits,
-                  "phase1": p1, "phase2": p2, "cleanup_ms": cleaned}
+                  "phase1": p1, "phase2": p2, "cleanup": cleaned, "cleanups": record}
         (ctx.raw_dir / "v10-series.json").write_text(json.dumps(series, indent=1) + "\n")
         for i, d in enumerate(p2["digests"]):
             bad = vclean.mismatches(base, d)

@@ -91,6 +91,15 @@ class LatencyTest(unittest.TestCase):
         self.assertFalse(vclean.judge("c", "point", [0.2] * 5, [0.4] * 5).slower)
         self.assertEqual(vclean.judge("c", "heap_full", [1], [1]).engine, "heap")
 
+    def test_noise(self):
+        # (phase 1 moving 20% between repetitions: 1.2x after isn't slower)
+        noisy = [10, 12, 8, 10, 11, 9, 10]
+        self.assertGreater(vclean.tolerance_of(noisy), 1.2)
+        self.assertFalse(vclean.judge("c", "full", noisy, [x * 1.2 for x in noisy]).slower)
+        self.assertTrue(vclean.judge("c", "full", noisy, [x * 2 for x in noisy]).slower)
+        # quiet: the fixed tolerance
+        self.assertEqual(vclean.tolerance_of([10] * 5), vclean.TOLERANCE)
+
     def series(self, p2=12.0):
         lat1 = {"full": [10.0] * 3, "heap_full": [5.0] * 3}
         lat2 = {"full": [p2] * 3, "heap_full": [5.0] * 3}
@@ -125,8 +134,8 @@ class LatencyTest(unittest.TestCase):
             args = self.args(d)
             args.markdown = md
             self.assertEqual(vclean.run(args), 0)
-            self.assertIn("| pr/warm-bgnone/1 | full | prolly | 10.000 | 12.000 | 1.200 | slower |",
-                          md.read_text())
+            self.assertIn("| pr/warm-bgnone/1 | full | prolly | 10.000 | 10.000-10.000 | 12.000 "
+                          "| 1.200 | 1.100 | slower |", md.read_text())
             args.gate_latency = True
             self.assertEqual(vclean.run(args), 1)
 
@@ -182,13 +191,78 @@ class WorkloadTest(unittest.TestCase):
             "07:16:20.443 PDT [2] 55P03 ERROR:  another collection of this database's "
             "chunk store is running",
             "07:16:21.443 PDT [3] 57014 ERROR:  canceling autovacuum task",
+            "07:16:21.500 PDT [8] 00000 LOG:  automatic vacuum of table",
             "07:16:22.000 PDT [4] 57P01 FATAL:  terminating background worker \"prolly fold "
             "launcher\" due to administrator command",
             "07:16:23.000 PDT [5] XX000 ERROR:  prolly tree node missing from its chunk store",
             "07:16:24.000 PDT [6] 01000 WARNING:  page verification failed",
             "07:16:25.000 PDT [7] 28000 FATAL:  role \"x\" does not exist"])
+        # (autovacuum's errors too: V10 runs its cleanups one at a time)
         self.assertEqual([line.split("]")[0][-1] for line in V10.log_problems(log)],
-                         ["5", "6", "7"])
+                         ["2", "3", "5", "6", "7"])
+
+    class Stubbed(V10):
+        """V10's cleanups against a fake server: each cleanup grows the
+        counters by grow[label], and the reads after it give digests[label]."""
+
+        def __init__(self, grow, digests=None):
+            self.grow, self.digests, self.now, self.ran = grow, digests or {}, {}, []
+
+        def rows(self, ctx):
+            return 20000
+
+        def _counters(self, ctx):
+            return dict(self.now)
+
+        def _sql(self, ctx, sql):
+            label = next(label for label, s in V10.CLEANUPS if s == sql)
+            self._grew(label)
+            return "0|0|0|0" if label == "page_sweep" else ""
+
+        def _drain_release_queue(self, ctx):
+            self._grew("release_queue")
+
+        def _grew(self, label):
+            self.ran.append(label)
+            for c, v in self.grow.get(label, {}).items():
+                self.now[c] = self.now.get(c, 0) + v
+
+        def _churn(self, ctx, n):
+            pass
+
+        def _pass(self, ctx, queries, tag):
+            return self.digests.get(self.ran[-1], {"q": "1|a"}), {}
+
+    class Ctx:
+        def __init__(self, raw):
+            self.raw_dir = raw
+
+    FREES = {"gc_full": {"gc_chunks_freed": 10}, "release_queue": {"bmap_release_blocks_freed": 5}}
+
+    def test_cleanups_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.Stubbed(self.FREES)
+            out, record = w.cleanup(self.Ctx(Path(tmp)), [], {"q": "1|a"})
+            self.assertEqual(w.ran, [label for label, _ in V10.CLEANUPS])
+            self.assertEqual(out["cleanup_gc_full_gc_chunks_freed"], 10.0)
+            self.assertEqual(out["cleanup_vacuum_gc_chunks_freed"], 0.0)
+            self.assertEqual(out["cleanup_page_sweep_moved"], 0.0)
+            self.assertEqual(record["release_queue"]["counters"]["bmap_release_blocks_freed"], 5)
+            self.assertTrue((Path(tmp) / "v10-cleanups.json").exists())
+
+    def test_cleanup_freeing_nothing_fails(self):
+        for label in ("gc_full", "release_queue"):
+            frees = {k: v for k, v in self.FREES.items() if k != label}
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(RuntimeError, f"cleanup {label} freed nothing"):
+                    self.Stubbed(frees).cleanup(self.Ctx(Path(tmp)), [], {"q": "1|a"})
+
+    def test_reads_checked_after_each_cleanup(self):
+        # (a read that differs right after the drain fails there)
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.Stubbed(self.FREES, {"release_queue": {"q": "1|b"}})
+            with self.assertRaisesRegex(RuntimeError, "after cleanup release_queue.*q"):
+                w.cleanup(self.Ctx(Path(tmp)), [], {"q": "1|a"})
 
     def test_sizes(self):
         self.assertEqual(V10.sizes(20000)["big"], 100)

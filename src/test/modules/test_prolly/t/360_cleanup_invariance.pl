@@ -1,14 +1,18 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Cleanup invariance: storage cleanup frees only what no read needs.  A
-# history that shares storage every way it can (kept commits, a kept
-# detached checkout, a branch used and then deleted, a dropped table and
-# one dropped and made again, a merge, snapshot and history mounts, dirty
-# working sets, TOAST values) is read by a fixed set of queries, each
-# result digested independent of row order.  Then each cleanup runs in
-# turn (every VACUUM variant, the release queue drained by autovacuum,
-# dolt_gc, dolt_gc('--full'), the page sweep, a checkpoint and a restart),
-# and after each the queries are read again: every digest must be what it
+# history that shares storage every way it can (kept commits, some pushed
+# out of the window, a kept detached checkout, a branch used and then
+# deleted, a dropped table and one dropped and made again, a merge,
+# snapshot and history mounts, dirty working sets, TOAST values) is read
+# by a fixed set of queries, each result digested independent of row
+# order.  Then each cleanup runs in turn (every VACUUM variant, the release
+# queue drained by autovacuum, dolt_gc('--full'), dolt_gc(), the page
+# sweep, a checkpoint, a restart and a crash), each shown to do its work
+# (pages copied, blocks and chunks freed, counts recounted, blocks moved,
+# shared_below lowered), and after each the blocks it freed are written
+# again by another table and every buffer evicted, so that a read of
+# storage it freed reads that table's pages: every digest must be what it
 # was before any cleanup.  Folds still match their trees, every index still
 # passes amcheck, and the server log has no errors or warnings.
 
@@ -36,6 +40,7 @@ my $rows = 3000;
 sql(qq{
 	CREATE EXTENSION test_prolly;
 	CREATE EXTENSION amcheck;
+	CREATE EXTENSION pg_buffercache;
 	CREATE SCHEMA ci VERSIONED;
 	CREATE TABLE ci.t (id int PRIMARY KEY, k int NOT NULL, g int NOT NULL,
 		v text NOT NULL);
@@ -135,6 +140,52 @@ sql(qq{
 		FROM generate_series(1, 300) g;
 	SELECT dolt_checkout('main');
 });
+# A branch nothing else is made from, with an insert-only table whose
+# pages only its commits' snapshots share, and six commits on it: the
+# first ones leave prolly.kept_commits' window, their snapshots let go of.
+# u2, of the same shape, is first used later by a branch the sweep must
+# then stop counting.  (No query checks out a commit of solo: a checkout
+# would share these pages.)
+sql(q{
+	SELECT dolt_branch('solo');
+	SELECT dolt_checkout('solo');
+	CREATE TABLE ci.u (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	CREATE TABLE ci.u2 (id int PRIMARY KEY, v text) WITH (autovacuum_enabled = off);
+	INSERT INTO ci.u SELECT g, repeat('u', 100) FROM generate_series(1, 3000) g;
+	INSERT INTO ci.u2 SELECT g, repeat('w', 100) FROM generate_series(1, 3000) g;
+	SELECT dolt_commit('-Am', 's1');
+});
+my $s1 = sql(q{SELECT dolt_checkout('solo'); SELECT dolt_hashof('HEAD')});
+$s1 = (split /\n/, $s1)[-1];
+for my $i (2 .. 6)
+{
+	sql(qq{
+		SELECT dolt_checkout('solo');
+		INSERT INTO ci.u SELECT g, 's$i' FROM generate_series($i * 10000, $i * 10000 + 19) g;
+		SELECT dolt_commit('-am', 's$i');
+	});
+}
+
+# On main, uncommitted: two tables extended in turn, so their blocks
+# alternate in the page store (one dropped before the sweep, which then
+# moves the other's down); and a table whose prune a crash will stop.
+sql(q{
+	CREATE TABLE ci.keep (a int PRIMARY KEY, b text) WITH (fillfactor = 10);
+	CREATE TABLE ci.gone_t (a int, b text) WITH (fillfactor = 10);
+	CREATE TABLE ci.leak (a int8 PRIMARY KEY, b int8);
+	INSERT INTO ci.leak SELECT g, g FROM generate_series(1, 3000) g;
+	DO $$
+	BEGIN
+		FOR i IN 1 .. 150 LOOP
+			INSERT INTO ci.keep SELECT g, repeat('k', 300)
+				FROM generate_series(i * 10, i * 10 + 9) g;
+			INSERT INTO ci.gone_t SELECT g, repeat('g', 300)
+				FROM generate_series(i * 10, i * 10 + 9) g;
+		END LOOP;
+	END $$;
+	SELECT dolt_branch('churn');
+});
+
 cmp_ok(sql(q{SELECT count(*) FROM pg_branch WHERE brname LIKE 'detached/%'}),
 	'>=', 1, 'a detached checkout is kept');
 
@@ -147,6 +198,8 @@ my @q = (
 	[ toast => 'SELECT id, md5(body), length(body) FROM ci.big' ],
 	[ keyless => 'SELECT * FROM ci.bag' ],
 	[ remade => 'SELECT * FROM ci.remade' ],
+	[ keep => 'SELECT * FROM ci.keep' ],
+	[ leak => 'SELECT * FROM ci.leak' ],
 	[ set => 'SET enable_seqscan = off' ],
 	[ set => 'SET enable_bitmapscan = off' ],
 	[ index => 'SELECT * FROM ci.t WHERE k = 51' ],
@@ -182,6 +235,10 @@ my @q = (
 	[ reset => "SELECT dolt_reset('--hard', '$c2')" ],
 	[ reset_t => 'SELECT * FROM ci.t' ],
 	[ reset_big => 'SELECT id, md5(body) FROM ci.big' ],
+	[ checkout => "SELECT dolt_checkout('solo')" ],
+	[ solo_u => 'SELECT * FROM ci.u' ],
+	[ solo_u2 => 'SELECT * FROM ci.u2' ],
+	[ unkept_u => "SELECT * FROM dolt_at('$s1', NULL::ci.u)" ],
 	[ checkout => "SELECT dolt_checkout('main')" ],
 	[ back_t => 'SELECT * FROM ci.t WHERE id <= 1000' ],);
 
@@ -222,53 +279,96 @@ my @names = map { $_->[0] } grep { $_->[0] !~ /^(set|checkout|change|reset)$/ } 
 is(scalar(keys %$base), scalar(@names), 'every query digested');
 for my $name (qw(point range full toast keyless remade index composite
 	index_only at_c1 mount_t mount_dropped mount_gone history_row
-	diff_c1_c2 diff_working log_main kept_t side_t reset_t))
+	diff_c1_c2 diff_working log_main kept_t side_t reset_t keep leak solo_u
+	solo_u2 unkept_u))
 {
 	unlike($base->{$name}, qr/^0\|/, "query $name reads rows");
 }
 is_deeply(digests(), $base, 'the queries read the same twice');
 
 # Every digest as it was before any cleanup; the queries that changed
-# named.
+# named.  First the blocks freed are written again, by a table on a branch
+# no query reads, and every buffer is evicted: a read of a freed block
+# then finds that table's page, not a cached copy of what was there.
 sub same_after
 {
 	my ($cleanup) = @_;
+	sql(q{
+		SELECT dolt_checkout('churn');
+		DROP TABLE IF EXISTS ci.churn;
+		CREATE TABLE ci.churn (a int, b text);
+		INSERT INTO ci.churn SELECT g, repeat(md5(g::text), 8) FROM generate_series(1, 6000) g;
+		CHECKPOINT;
+		SELECT count(*) FROM pg_buffercache_evict_all();
+	});
 	my $now = digests();
 	my @changed = grep { ($now->{$_} // 'missing') ne $base->{$_} } @names;
 	is(join(', ', @changed), '', "every query reads the same after $cleanup");
 }
 
-# each cleanup in turn, the queries read after each (their change and
-# hard reset of the scratch branch leaving the next cleanup garbage of its
-# own); the full collection before a default one, so that it collects a
-# store no default collection has settled first
-for my $cleanup (
-	'VACUUM',
-	'VACUUM (FREEZE)',
-	'VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP ON)',
-	'SET prolly.vacuum_copy_kept_pages = on; VACUUM',
-	'SET prolly.vacuum_copy_kept_pages = on; VACUUM (FREEZE)',
-	'VACUUM (ANALYZE)',
-	"SELECT dolt_gc('--full')",
-	'SELECT dolt_gc()',
-	'SELECT * FROM prolly_page_sweep()',
-	'CHECKPOINT')
+# pg_stat_prolly's counter, every session's counts flushed (each sql() is
+# a session, which flushes as it ends)
+sub counted
 {
-	my $done = sql($cleanup);
-	note "$cleanup: $done";
-	same_after($cleanup);
+	my ($name) = @_;
+	return sql(qq{SELECT value FROM pg_stat_prolly WHERE name = '$name'});
 }
 
-sql(q{SELECT pg_stat_force_next_flush()});
-is(sql(q{SELECT value > 0 FROM pg_stat_prolly WHERE name = 'gc_chunks_freed'}),
-	't', 'the collections freed chunks');
+my $visible_u = q{SELECT relallvisible || '/' || relpages FROM pg_class
+	WHERE oid = 'ci.u'::regclass};
+
+# VACUUM on main, and on solo's insert-only table: kept-only pages are
+# copied (set all-visible) only with prolly.vacuum_copy_kept_pages on.
+# (An aggressive VACUUM, FREEZE or DISABLE_PAGE_SKIPPING, copies them
+# either way, so those come after.)
+# u's map, on solo: its blocks' places in the page store
+my $u_map = q{SELECT dolt_checkout('solo');
+	SELECT string_agg(phys::text, ',' ORDER BY blkno)
+	FROM test_bmap_map(pg_relation_filenode('ci.u'))};
+sub last_line { return (split /\n/, $_[0])[-1]; }
+for my $copy ('off', 'on')
+{
+	my $setting = "SET prolly.vacuum_copy_kept_pages = $copy";
+	sql("$setting; VACUUM");
+	my $before = last_line(sql($u_map));
+	my $copies = counted('page_copies_shared');
+	my ($all, $pages) = split m{/},
+	  last_line(sql(qq{SELECT dolt_checkout('solo'); $setting; VACUUM ci.u; $visible_u}));
+	my @was = split /,/, $before;
+	my @now = split /,/, last_line(sql($u_map));
+	my $moved = grep { $was[$_] ne $now[$_] } 0 .. $#was;
+	if ($copy eq 'off')
+	{
+		is($moved, 0, 'VACUUM with copying off copies no kept-only page');
+		is($all, 0, 'and sets none all-visible');
+	}
+	else
+	{
+		is($moved, scalar(@was), 'VACUUM with copying on copies every kept-only page');
+		is($all, $pages, 'and sets every page all-visible');
+		cmp_ok(counted('page_copies_shared') - $copies, '>=', $moved,
+			'pg_stat_prolly counts the copies');
+	}
+	same_after("VACUUM, copying kept pages $copy");
+}
+for my $vacuum (
+	'VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP ON)',
+	'VACUUM (FREEZE)',
+	'SET prolly.vacuum_copy_kept_pages = on; VACUUM (FREEZE)',
+	'VACUUM (ANALYZE)')
+{
+	sql($vacuum);
+	same_after($vacuum);
+}
 
 # the side branch vacuumed too, from a session there
 sql(q{SELECT dolt_checkout('side'); VACUUM (FREEZE); SELECT dolt_checkout('main')});
 same_after('VACUUM on side');
 
 # a branch deleted and a table dropped queue their storage for release:
-# autovacuum drains the queue
+# autovacuum drains the queue (its automatic collections off meanwhile:
+# the collections are their own cleanup, below), and every worker is done
+# before the next cleanup
 sql(q{
 	SELECT dolt_branch('doomed', 'side');
 	SELECT dolt_checkout('doomed');
@@ -280,14 +380,118 @@ sql(q{
 	DROP TABLE public.scrap;
 });
 cmp_ok(sql(q{SELECT test_bmap_release_pending()}), '>', 0, 'storage is queued for release');
-$node->append_conf('postgresql.conf', 'autovacuum = on');
+my $released = counted('bmap_release_blocks_freed');
+$node->append_conf('postgresql.conf', "autovacuum = on\nprolly.gc_journal_threshold = -1");
 $node->reload;
 ok( $node->poll_query_until(
 		'postgres', q{SELECT test_bmap_release_pending() = 0}),
 	'autovacuum drains the release queue');
-same_after('autovacuum drained the release queue');
-$node->append_conf('postgresql.conf', 'autovacuum = off');
+$node->append_conf('postgresql.conf', "autovacuum = off\nprolly.gc_journal_threshold = 128");
 $node->reload;
+ok( $node->poll_query_until(
+		'postgres', q{SELECT count(*) = 0 FROM pg_stat_activity
+			WHERE backend_type = 'autovacuum worker'}),
+	'and its workers are done');
+cmp_ok(counted('bmap_release_blocks_freed') - $released, '>', 0,
+	'the drain freed blocks');
+same_after('autovacuum drained the release queue');
+
+# the collections: the full one before a default one, so that it collects
+# a store no default collection has settled first
+for my $gc ("SELECT dolt_gc('--full')", 'SELECT dolt_gc()')
+{
+	my $freed = counted('gc_chunks_freed');
+	sql($gc);
+	note "$gc: freed " . (counted('gc_chunks_freed') - $freed) . ' chunks';
+	cmp_ok(counted('gc_chunks_freed') - $freed, '>', 0, "$gc frees chunks")
+	  if $gc =~ /full/;
+	same_after($gc);
+}
+
+# What the sweep must act on:
+# - u2 first used by a branch, then the branch deleted: the sweep lowers
+#   u2's shared_below, and VACUUM, which left the shared pages, copies them
+# - stuck counts: 300 copies of t's map, all but five dropped
+# - gone_t dropped: keep's blocks above its holes are moved down
+# - a prune stopped by a crash after letting go of its old pages: they are
+#   allocated and nothing holds them
+sql(q{
+	SELECT dolt_branch('ub', 'solo');
+	SELECT dolt_checkout('ub');
+	SELECT count(*) FROM ci.u2;
+});
+my $visible_u2 = q{SELECT relallvisible || '/' || relpages FROM pg_class
+	WHERE oid = 'ci.u2'::regclass};
+my $out = sql(qq{SELECT dolt_checkout('solo');
+	SET prolly.vacuum_copy_kept_pages = on; VACUUM ci.u2; $visible_u2});
+like($out, qr/\n0\/\d+$/, 'VACUUM leaves the pages ub shares');
+sql(q{SELECT dolt_branch('-D', 'ub')});
+
+sql('DROP TABLE ci.gone_t');
+
+my $leaked = 0;
+if ($ENV{enable_injection_points} eq 'yes')
+{
+	sql('CREATE EXTENSION injection_points');
+	my $rel = sql(q{SELECT pg_relation_filenode('ci.leak')});
+	my ($lineage, $e1) = split /\|/,
+	  sql(qq{SELECT lineage, epoch FROM test_bmap_fold_begin($rel)});
+	sql(q{UPDATE ci.leak SET b = b + 1 WHERE a % 100 = 0});
+	my $e2 = sql(qq{SELECT epoch FROM test_bmap_fold_begin($rel)});
+	$leaked = sql(qq{SELECT count(DISTINCT old_block)
+		FROM test_bmap_fold_changes($rel, $lineage, $e1) WHERE kind = 'copy'});
+	# (the update is read: the base digest is of the rows before it)
+	$base->{leak} = digests()->{leak};
+	my $p = $node->background_psql('postgres', on_error_stop => 0);
+	$p->query_safe(q{SELECT injection_points_set_local();
+		SELECT injection_points_attach('bmap-pruned', 'wait')});
+	$p->query_until(qr/started/, qq{
+		\\echo started
+		SELECT test_bmap_fold_prune($rel, $lineage, $e2);
+	});
+	$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		WHERE wait_event = 'bmap-pruned'}) or die 'the prune did not stop';
+	# (the prune's records flushed before the crash, which keeps only
+	# the WAL written out)
+	my $pruned = sql('SELECT pg_current_wal_insert_lsn()');
+	sql(q{SELECT pg_logical_emit_message(false, 'flush', '', true)});
+	is(sql(qq{SELECT pg_current_wal_flush_lsn() >= '$pruned'}), 't',
+		'the prune\'s records are flushed');
+	$node->stop('immediate');
+	eval { $p->quit; };
+	$node->start;
+	cmp_ok($leaked, '>', 0, 'a crashed prune leaves blocks nothing holds');
+}
+
+# (after the crash: a copy test_bmap_unlink() drops is unlinked only by
+# a checkpoint, and one a crash came first to would still count)
+my $t_rel = sql(q{SELECT pg_relation_filenode('ci.t')});
+sql(qq{CREATE TABLE public.copies AS
+	SELECT test_bmap_share($t_rel) AS copy FROM generate_series(1, 300)});
+sql(q{WITH d AS (DELETE FROM public.copies
+		WHERE ctid NOT IN (SELECT ctid FROM public.copies LIMIT 5) RETURNING copy)
+	SELECT count(test_bmap_unlink(copy)) FROM d});
+cmp_ok(sql(qq{SELECT count(*) FROM test_bmap_tree($t_rel) WHERE refs = 255}), '>', 0,
+	'the copies leave stuck counts');
+sql('CHECKPOINT');
+my ($freed, $recounted, $truncated, $moved) =
+  split /\|/, sql(q{SELECT * FROM prolly_page_sweep()});
+note "sweep: freed $freed, recounted $recounted, truncated $truncated, moved $moved";
+if ($leaked)
+{
+	cmp_ok($freed, '>=', $leaked, 'the sweep frees the blocks nothing holds');
+}
+cmp_ok($recounted, '>', 0, 'the sweep recounts the stuck counts');
+cmp_ok($moved, '>', 0, 'the sweep moves blocks down');
+$out = sql(qq{SELECT dolt_checkout('solo');
+	SET prolly.vacuum_copy_kept_pages = on; VACUUM ci.u2; $visible_u2});
+my ($u2all, $u2pages) = $out =~ /(\d+)\/(\d+)$/;
+is($u2all, $u2pages, 'the sweep lowered shared_below: VACUUM copies the pages ub shared');
+sql(q{SELECT count(test_bmap_unlink(copy)) FROM public.copies; DROP TABLE public.copies});
+same_after('the page sweep');
+
+sql('CHECKPOINT');
+same_after('CHECKPOINT');
 
 # every cleanup again, now that the queue is drained and nothing is left
 # to free but what they free themselves
