@@ -251,8 +251,11 @@ def validate(cfg: dict, suite: str) -> None:
             if name in params and params[name] not in choices:
                 raise ConfigError(f"invalid {wid}.{name}")
         for name, choices in {"modes": {"serial", "throughput"},
-                              "background": {"none", "S1"},
-                              "locality": {"clustered", "scattered"}}.items():
+                              # (G5, the moving objects, behind the GV workloads)
+                              "background": {"none", "S1", "G5"},
+                              "locality": {"clustered", "scattered"},
+                              "overlap": {"disjoint", "overlapping"},
+                              "predicates": {"bbox", "intersects"}}.items():
             if name in params and (not params[name] or not set(params[name]) <= choices):
                 raise ConfigError(f"invalid {wid}.{name}")
         for name in ("clients", "ranges", "changes", "percents", "conflict_percent", "branches"):
