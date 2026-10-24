@@ -9060,10 +9060,13 @@ cmp_move_desc(const void *a, const void *b)
 
 /*
  * Move one relation's blocks from 'target' on, the highest first; the old
- * blocks go back to the allocator.
+ * blocks go back to the allocator.  With 'held' (the relation held against
+ * its drop), the moves stop once another waits for that hold: a DDL, or a
+ * move of the branch trying its locks, waits for no more than a move.
  */
 static uint64
-compact_relation(SMgrRelation reln, BlockNumber target)
+compact_relation(SMgrRelation reln, BlockNumber target,
+				 const LOCKTAG *held)
 {
 	RelFileLocator rel = reln->smgr_rlocator.locator;
 	CompactWalk cw = {target, 0, NULL, 0, 0};
@@ -9092,6 +9095,8 @@ compact_relation(SMgrRelation reln, BlockNumber target)
 	{
 		const CompactMove *m = &cw.moves[i];
 
+		if (held != NULL && i > 0 && LockHasWaiters(held, AccessShareLock, false))
+			break;
 		if (compact_page(reln, m->blkno, m->phys))
 		{
 			block_list_add(&freed, m->phys);
@@ -9114,6 +9119,7 @@ compact_relation(SMgrRelation reln, BlockNumber target)
 typedef struct CompactRead
 {
 	BlockNumber target;
+	const LOCKTAG *held;
 	uint64		moved;
 } CompactRead;
 
@@ -9122,18 +9128,20 @@ compact_read(SMgrRelation reln, void *arg)
 {
 	CompactRead *cr = arg;
 
-	cr->moved = compact_relation(reln, cr->target);
+	cr->moved = compact_relation(reln, cr->target, cr->held);
 }
 
 /*
  * Move the blocks of a database's page store in a tablespace (directory
  * 'path') that lie past its allocated count: how many moved.  Each relation
  * is moved in a subtransaction of its own, so one dropped or truncated
- * meanwhile is passed over, and held against its drop (hold_relation()):
- * one whose drop is in flight, its map about to be let go of and its
- * buffers dropped already, isn't moved at all (its pages would come back
- * into shared buffers, dirty, to be dropped again, and its blocks are
- * about to be freed anyway), nor is one locked by another.
+ * meanwhile is passed over, and held against its drop (hold_relation()),
+ * which is what keeps the WAL in order: a relation's drop removes its map
+ * as its commit record is replayed, so a move logged after that record (a
+ * drop committed, its map not yet let go of) would be replayed against no
+ * map, and a standby's recovery would fail there, again at every restart.
+ * One whose drop is in flight isn't moved at all, nor is one locked by
+ * another; and a relation's moves stop once another waits for its hold.
  */
 static uint64
 compact_store(RelFileLocator rel, const char *path)
@@ -9178,11 +9186,12 @@ compact_store(RelFileLocator rel, const char *path)
 		MemoryContextSwitchTo(oldcxt);
 		PG_TRY();
 		{
-			CompactRead cr = {target, 0};
+			CompactRead cr = {target, NULL, 0};
 			HeldRelation held;
 
 			if (hold_relation(reln->smgr_rlocator.locator, &held))
 			{
+				cr.held = &held.rel;
 				read_maybe_dropped(reln, compact_read, &cr);
 				let_go_relation(&held);
 			}

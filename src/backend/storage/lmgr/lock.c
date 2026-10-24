@@ -774,6 +774,25 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	LWLockAcquire(partitionLock, LW_SHARED);
 
 	/*
+	 * A lock taken by the fast path has no shared lock object of ours.  A
+	 * request that conflicts with it moves it into the shared table before
+	 * waiting, so there can be waiters only if the lock object exists, and
+	 * their modes are its waitMask.
+	 */
+	if (locallock->lock == NULL)
+	{
+		lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+													locktag,
+													locallock->hashcode,
+													HASH_FIND, NULL);
+		if (lock != NULL &&
+			(lockMethodTable->conflictTab[lockmode] & lock->waitMask) != 0)
+			hasWaiters = true;
+		LWLockRelease(partitionLock);
+		return hasWaiters;
+	}
+
+	/*
 	 * We don't need to re-find the lock or proclock, since we kept their
 	 * addresses in the locallock table, and they couldn't have been removed
 	 * while we were holding a lock on them.

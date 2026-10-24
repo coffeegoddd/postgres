@@ -2,9 +2,11 @@
 
 # A page sweep's compaction moves no page of a relation whose drop is in
 # flight: committed, its pages' buffers dropped, its map about to be let
-# go of and its blocks freed.  Moving them would bring its pages back into
-# shared buffers, dirty, for blocks about to be freed.  As the drop goes
-# on, a checkpoint writes nothing of it, and the page store stays whole.
+# go of.  A move then would be logged after the drop's commit record, whose
+# replay removes the map: a standby replaying it would find no map, and
+# fail there at every restart.  So the standby replays past the drop, and
+# the page store stays whole.  And a relation's moves stop once another
+# waits for compaction's hold on it: a DDL waits for one move, not all.
 
 use strict;
 use warnings FATAL => 'all';
@@ -26,6 +28,10 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 });
 $node->start;
+$node->backup('b');
+my $standby = PostgreSQL::Test::Cluster->new('compact_dropped_map_standby');
+$standby->init_from_backup($node, 'b', has_streaming => 1);
+$standby->start;
 
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
@@ -82,6 +88,11 @@ sql(q{SELECT injection_points_detach('bmap-dropped')});
 sql(q{SELECT injection_points_wakeup('bmap-dropped')});
 $drop->query_until(qr/done/, '');
 $drop->quit;
+sql(q{CREATE TABLE marker (a int)});
+ok($standby->poll_query_until('postgres', q{SELECT to_regclass('marker') IS NOT NULL}),
+	'a standby replays past the drop');
+$standby->restart;
+is($standby->safe_psql('postgres', q{SELECT count(*) FROM y}), '400', 'and after a restart');
 
 # the store whole: a sweep after frees t's blocks
 sql(q{SELECT count(*) FROM prolly_page_sweep()});
@@ -91,5 +102,52 @@ is(sql(q{SELECT count(*) FROM y WHERE b = repeat('y', 300)}), '400', 'and after 
 is(sql(q{SELECT count(*) FROM prolly_page_sweep() WHERE freed = 0}), '1',
 	'nothing left for a sweep to free');
 
+# a relation's moves stop once a DDL waits for compaction's hold on it
+sql(q{
+	CREATE TABLE t2 (a int PRIMARY KEY, b text) WITH (fillfactor = 10);
+	CREATE TABLE x2 (a int, b text) WITH (fillfactor = 10);
+});
+sql(q{DO $$
+	BEGIN
+		FOR i IN 1 .. 200 LOOP
+			INSERT INTO t2 SELECT g, repeat('t', 300) FROM generate_series(i * 10, i * 10 + 9) g;
+			INSERT INTO x2 SELECT g, repeat('x', 300) FROM generate_series(i * 10, i * 10 + 9) g;
+		END LOOP;
+	END $$});
+sql(q{DROP TABLE x2});
+sql(q{SELECT test_bmap_release_drain()});
+my $sweep = $node->background_psql('postgres');
+$sweep->query_safe(q{SELECT injection_points_set_local();
+	SELECT injection_points_attach('bmap-compact-room', 'wait')});
+$sweep->query_until(qr/started/, q{
+	\echo started
+	SELECT 'moved ' || moved FROM prolly_page_sweep();
+	\echo done
+});
+$node->poll_query_until('postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE wait_event = 'bmap-compact-room'}) or die 'the compaction did not stop';
+my $ddl = $node->background_psql('postgres');
+$ddl->query_until(qr/started/, q{
+	\echo started
+	ALTER TABLE t2 ADD COLUMN c int;
+	\echo done
+});
+ok( $node->poll_query_until(
+		'postgres', q{SELECT count(*) > 0 FROM pg_stat_activity
+		  WHERE query LIKE 'ALTER TABLE t2%' AND wait_event_type = 'Lock'}),
+	'a DDL waits for the compaction');
+sql(q{SELECT injection_points_detach('bmap-compact-room')});
+sql(q{SELECT injection_points_wakeup('bmap-compact-room')});
+my $swept = $sweep->query_until(qr/done/, '');
+$ddl->query_until(qr/done/, '');
+my ($nmoved) = $swept =~ /moved (\d+)/;
+# (t2's moves stop after the one under way; other relations' go on)
+cmp_ok($nmoved, '<', 50, 'which stops its moves of t2 (of some 500)');
+$sweep->quit;
+$ddl->quit;
+cmp_ok(sql(q{SELECT moved FROM prolly_page_sweep()}), '>', 0, 'a later sweep moves the rest');
+is(sql(q{SELECT count(*) FROM t2}), '2000', 't2 reads');
+
 $node->stop;
+$standby->stop;
 done_testing();
