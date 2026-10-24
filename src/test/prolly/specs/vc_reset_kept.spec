@@ -33,7 +33,7 @@ teardown
 }
 
 session s1
-setup			{ SET prolly.kept_commits = 2; }
+setup			{ SET prolly.kept_commits = 2; SET prolly.restore_min_changes = 0; }
 step s1_dirty	{ UPDATE vrk.t SET v = 'dirty' WHERE id <= 10; }
 # (the session's counts flushed as the step's transaction ends)
 step s1_flush	{ SELECT pg_stat_force_next_flush(); }

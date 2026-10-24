@@ -1737,6 +1737,58 @@ log_changes(Relation rel, const ProllyTreeEnv *env,
 	return ok;
 }
 
+/* (log entries counted, to a limit; an emptying stops the count unknown) */
+typedef struct EntryCount
+{
+	int			n;
+	int			limit;
+	bool		unknown;
+} EntryCount;
+
+static bool
+count_entry(HeapTuple entry, int32 delta, void *arg)
+{
+	EntryCount *c = arg;
+
+	if (entry == NULL)
+	{
+		c->unknown = true;
+		return false;
+	}
+	return ++c->n < c->limit;
+}
+
+/*
+ * Fewer than limit rows differ from the baseline's: log_changes()'s
+ * checks, and fewer than limit log entries since the baseline (each
+ * changes a row at most: the rows that differ are fewer still).  Only the
+ * entries' count is read, stopping at limit; no candidate is made.
+ */
+static bool
+log_fewer_changes(Relation rel, const ProllyTableFold *baseline, int limit)
+{
+	Snapshot	snap = GetActiveSnapshot();
+	ProllyComponents c;
+	ProllyFullFoldReason reason;
+	uint64		identity = 0;
+	State		st;
+	EntryCount	count = {0, Max(limit, 1), false};
+	ProllyLogPosition pos;
+
+	prolly_components_for_relation(rel, &c);
+	if (c.change_log)
+		identity = PROLLY_CALL(c.change_log, identity, rel);
+	if (prolly_full_fold_wanted(&reason) || identity == 0 ||
+		!parse_state(&baseline->state, &st) || st.log != identity ||
+		!sees_fold(snap, &st) || (st.flags & STATE_UNSETTLED) ||
+		storage_unseen(rel, snap))
+		return false;
+	pos = (ProllyLogPosition) {st.fxmax, st.fown, st.nxip, st.fxip};
+	(void) PROLLY_CALL(c.change_log, read, rel, snap, &pos, count_entry,
+					   &count);
+	return !count.unknown && count.n < count.limit;
+}
+
 /*
  * Why log_fold() from baseline would read rel in full, from the checks it
  * makes before reading the log (the log's entries can say so too: a
@@ -1923,4 +1975,5 @@ const ProllyChangeFinderRoutine prolly_changes_log = {
 	.full_reason = log_full_reason,
 	.fold_on_leave = log_fold_on_leave,
 	.changes = log_changes,
+	.fewer_changes = log_fewer_changes,
 };
