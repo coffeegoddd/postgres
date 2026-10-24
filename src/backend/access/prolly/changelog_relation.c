@@ -81,6 +81,7 @@
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1827,9 +1828,17 @@ relation_pending(Relation rel)
 	return sampled == 0 ? 0 : entries / sampled * nblocks;
 }
 
-/* The log's upkeep: rows deleted (hushed: no write of the table's branch). */
+/*
+ * The log's upkeep: rows deleted (hushed: no write of the table's branch).
+ * A trim (wait false) never waits for another transaction deleting a row:
+ * folds of the same branch trim the same rows, each its tables in its own
+ * order (a commit's fold and the fold worker's), so two waiting on each
+ * other's deletes in two logs deadlock.  The row is that one's to delete;
+ * if it aborts, a later fold trims it.  A transaction's own rows are
+ * deleted by it alone, so waiting for them never happens.
+ */
 static void
-delete_rows(Relation log, ItemPointerData *tids, int n)
+delete_rows(Relation log, ItemPointerData *tids, int n, bool wait)
 {
 	CommandId	cid;
 
@@ -1844,11 +1853,12 @@ delete_rows(Relation log, ItemPointerData *tids, int n)
 			TM_FailureData tmfd;
 			TM_Result	result;
 
-			/* (one another fold trimmed meanwhile is let be) */
+			/* (one another fold trimmed, or is trimming, is let be) */
 			result = heap_delete(log, &tids[i], cid, 0, InvalidSnapshot,
-								 true, &tmfd);
+								 wait, &tmfd);
 			if (result != TM_Ok && result != TM_Updated &&
-				result != TM_Deleted && result != TM_SelfModified)
+				result != TM_Deleted && result != TM_SelfModified &&
+				(wait || result != TM_BeingModified))
 				elog(ERROR, "unexpected result %d consuming a row of \"%s\"",
 					 (int) result, RelationGetRelationName(log));
 			CHECK_FOR_INTERRUPTS();
@@ -1900,7 +1910,7 @@ delete_own_rows(Relation log)
 	(void) scan_rows(log, index, snap, own, own, true, trim_row, t);
 	index_close(index, NoLock);
 	PopActiveSnapshot();
-	delete_rows(log, t->tids, t->n);
+	delete_rows(log, t->tids, t->n, true);
 }
 
 /*
@@ -1947,7 +1957,8 @@ relation_consume(Relation rel, Snapshot snapshot)
 							 FullTransactionIdFromU64(U64FromFullTransactionId(below) - 1),
 							 true, trim_row, &t);
 			index_close(index, NoLock);
-			delete_rows(log, t.tids, t.n);
+			delete_rows(log, t.tids, t.n, false);
+			INJECTION_POINT("prolly-log-trimmed", NULL);
 		}
 	}
 	table_close(log, NoLock);
