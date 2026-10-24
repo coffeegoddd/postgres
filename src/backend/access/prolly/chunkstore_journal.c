@@ -564,6 +564,7 @@ struct ProllyChunkStore
 	/* the GC generation the transaction (lxid) began in */
 	LocalTransactionId xact_lxid;
 	uint32		xact_generation;
+	uint64		xact_flushes;	/* flushes as it began */
 	ProllyChunkGc *gc;			/* a collection the transaction runs */
 
 	/*
@@ -678,9 +679,9 @@ hash_key(ProllyHash *key, const ProllyHash *hash)
  * collection's generation (the manifest's gc_generation), and let go of
  * whole once a read sees another, as the store's own reads then find
  * nothing of what was removed.  Those read from the files, and the
- * transaction's own once it commits (an eighth of the cache's bytes at
- * most): not while pending or transient, which an abort takes back, nor
- * one read through a source.
+ * chunks a transaction appends as it commits (pending_cached()): not while
+ * pending or transient, which an abort takes back, nor one read through a
+ * source.
  *
  * A chunk is kept the second time it is read from the files, not the
  * first: the hashes of those read once are remembered (as many as the
@@ -701,26 +702,6 @@ typedef struct CachedChunk
 
 static HTAB *chunk_cache = NULL;
 static dlist_head chunk_cache_lru = DLIST_STATIC_INIT(chunk_cache_lru);
-
-/*
- * The chunks the transaction puts, up to an eighth of the cache's bytes,
- * each with the (sub)transaction level that put it: let into the cache as
- * the transaction commits, stored then (an aborted subtransaction's
- * forgotten: its pending chunks are, never stored).  The next transaction
- * of a backend that writes a little at a time (dolt.transaction_commit)
- * reads first what this one wrote last: the refs' and the trees' upper
- * nodes, read from the cache rather than the files.
- */
-typedef struct WrittenChunk
-{
-	ProllyHash	key;
-	char	   *data;
-	uint32		len;
-	int			level;
-} WrittenChunk;
-
-static List *written_chunks = NIL;	/* in TopTransactionContext */
-static Size written_bytes = 0;
 static Size chunk_cache_bytes = 0;
 static MemoryContext chunk_cache_cxt = NULL;
 static uint32 chunk_cache_generation = 0;	/* what it holds is of */
@@ -876,7 +857,7 @@ chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
 /*
  * A chunk into the cache: one read from the files only once seen before
  * (one read once isn't let in), or, admit, at once (the transaction's own,
- * stored as it committed).
+ * stored as it commits).
  */
 static void
 chunk_cache_insert(const ProllyHash *key, const char *data, uint32 len,
@@ -2525,6 +2506,7 @@ xact_note(ProllyChunkStore *s)
 	refresh_segments(s);
 	s->xact_lxid = MyProc->vxid.lxid;
 	s->xact_generation = s->gc_generation;
+	s->xact_flushes = s->flushes;
 }
 
 /* Has a swap happened since the transaction began? */
@@ -2617,6 +2599,88 @@ check_root(ProllyChunkStore *s)
 				 errhint("Try the transaction again.")));
 	if (xact_straddles(s))
 		check_dropped(s, &s->new_root);
+}
+
+/*
+ * The chunks a transaction appends as it commits (its pending ones, an
+ * aborted subtransaction's gone from them), let into the cache: a backend
+ * writing a little at a time (dolt.transaction_commit) reads first, in its
+ * next transaction, what this one wrote last, the refs' and the trees'
+ * upper nodes, each once before it is replaced, which the cache would
+ * never keep (it lets in a chunk read from the files only on its second
+ * read).  Only a small transaction's: none appended before (no flush), at
+ * most an eighth of the cache's bytes, so a large one doesn't churn it;
+ * and only if no collection swapped the store since the transaction began
+ * (one dropped as stored already may be in a segment the swap removed).
+ * Let in before the commit record, where allocating may fail, and let go
+ * of again if the transaction aborts after all (provisional), so the cache
+ * holds only what the store has.
+ */
+static ProllyHash *provisional = NULL;
+static int	nprovisional = 0;
+
+static void
+pending_cached(ProllyChunkStore *s)
+{
+	HASH_SEQ_STATUS status;
+	IndexEntry *e;
+	Size		budget = chunk_cache_limit() / 8;
+	Size		total = 0;
+	long		n;
+
+	nprovisional = 0;
+	if (s != session_store || budget == 0 ||
+		MyProc->vxid.lxid != s->xact_lxid || s->flushes != s->xact_flushes ||
+		s->gc_generation != s->xact_generation)
+		return;
+	n = hash_get_num_entries(s->pending_index);
+	hash_seq_init(&status, s->pending_index);
+	while ((e = hash_seq_search(&status)) != NULL)
+		total += e->raw_len + sizeof(CachedChunk);
+	if (n == 0 || total > budget)
+		return;
+	if (provisional != NULL)
+		pfree(provisional);
+	provisional = MemoryContextAlloc(TopMemoryContext, n * sizeof(ProllyHash));
+	hash_seq_init(&status, s->pending_index);
+	while ((e = hash_seq_search(&status)) != NULL)
+	{
+		const char *rec = s->pending.data + e->offset;
+		ProllyHash	h;
+		Size		after;
+		const char *chunk = NULL;
+		Size		chunk_len = 0;
+
+		if (record_hash(rec, e->len, &h, &after))
+			chunk = record_chunk(rec, e->len, after, chunk_scratch(), &chunk_len);
+		if (chunk == NULL)
+			continue;
+		chunk_cache_insert(&e->hash, chunk, (uint32) chunk_len,
+						   s->gc_generation, true);
+		provisional[nprovisional++] = e->hash;
+	}
+}
+
+/* The transaction ended: what it let in kept (committed) or let go of. */
+static void
+pending_cached_end(bool commit)
+{
+	if (!commit && chunk_cache != NULL)
+	{
+		for (int i = 0; i < nprovisional; i++)
+		{
+			CachedChunk *c = hash_search(chunk_cache, &provisional[i],
+										 HASH_FIND, NULL);
+
+			if (c == NULL)
+				continue;
+			dlist_delete(&c->lru);
+			chunk_cache_bytes -= c->len + sizeof(CachedChunk);
+			pfree(c->data);
+			(void) hash_search(chunk_cache, &provisional[i], HASH_REMOVE, NULL);
+		}
+	}
+	nprovisional = 0;
 }
 
 /*
@@ -2935,21 +2999,14 @@ journal_xact_callback(XactEvent event, void *arg)
 			keep_touch_end();
 			/* the rest of the chunks and a root moved, written by committed() */
 			Assert(!s->at_commit);
+			/* (what it let into the cache stored now: a prepared one's not) */
+			pending_cached_end(event != XACT_EVENT_PREPARE);
 			if (s->commit_append.g != NULL)
 			{
 				pending_appended(s, s->commit_append.g, s->commit_append.offset,
 								 false);
 				s->commit_append.g = NULL;
 			}
-			/* (stored now: let into the cache, not a prepared one's) */
-			if (event != XACT_EVENT_PREPARE)
-			{
-				foreach_ptr(WrittenChunk, w, written_chunks)
-					chunk_cache_insert(&w->key, w->data, w->len,
-									   s->gc_generation, true);
-			}
-			written_chunks = NIL;
-			written_bytes = 0;
 			s->moving = false;
 			s->pad_offset = 0;
 			s->saved = NIL;
@@ -2961,6 +3018,7 @@ journal_xact_callback(XactEvent event, void *arg)
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
+			pending_cached_end(false);
 			if (s->gc != NULL)
 				gc_abort(s->gc);
 			keep_touch_end();
@@ -2972,8 +3030,6 @@ journal_xact_callback(XactEvent event, void *arg)
 			}
 			s->commit_append.g = NULL;
 			discard_pending(s);
-			written_chunks = NIL;
-			written_bytes = 0;
 			s->saved = NIL;
 			s->pending_saved = NIL;
 			s->through = NULL;
@@ -3035,29 +3091,6 @@ journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	if (s == NULL)
 		return;
 	pending_subxact(s, event, level);
-
-	/* (an aborted subtransaction's chunks never stored; a committed one's its parent's) */
-	if (written_chunks != NIL &&
-		(event == SUBXACT_EVENT_ABORT_SUB || event == SUBXACT_EVENT_COMMIT_SUB))
-	{
-		List	   *kept = NIL;
-		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
-
-		foreach_ptr(WrittenChunk, w, written_chunks)
-		{
-			if (w->level < level)
-				kept = lappend(kept, w);
-			else if (event == SUBXACT_EVENT_COMMIT_SUB)
-			{
-				w->level = level - 1;
-				kept = lappend(kept, w);
-			}
-			else
-				written_bytes -= w->len + sizeof(CachedChunk);
-		}
-		written_chunks = kept;
-		MemoryContextSwitchTo(old);
-	}
 
 	if (event == SUBXACT_EVENT_ABORT_SUB && s->gc != NULL)
 		gc_abort_sub(s->gc, level);
@@ -4461,21 +4494,6 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	hash_key(&key, hash);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL)
 		return;
-	if (s == session_store &&
-		written_bytes + len + sizeof(CachedChunk) <= chunk_cache_limit() / 8)
-	{
-		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
-		WrittenChunk *w = palloc(sizeof(WrittenChunk));
-
-		w->key = key;
-		w->data = palloc(Max(len, 1));
-		memcpy(w->data, data, len);
-		w->len = (uint32) len;
-		w->level = GetCurrentTransactionNestLevel();
-		written_chunks = lappend(written_chunks, w);
-		written_bytes += len + sizeof(CachedChunk);
-		MemoryContextSwitchTo(old);
-	}
 
 	/* pending as it was, if a subtransaction puts its first */
 	level = GetCurrentTransactionNestLevel();
@@ -5273,6 +5291,8 @@ journal_commit_writes(void)
 	if (s == NULL)
 		return false;
 	reserve_at_commit(s);
+	if (s->at_commit)
+		pending_cached(s);
 	if (s->moving)
 		INJECTION_POINT_LOAD("prolly-root-committing");
 	return s->at_commit;

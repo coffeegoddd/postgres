@@ -255,6 +255,28 @@ SELECT pg_stat_force_next_flush();
 SELECT value - :file_reads AS file_reads FROM pg_stat_prolly
   WHERE name = 'chunk_file_reads';
 
+-- What a commit lets into the cache costs nothing per subtransaction: a
+-- commit then many subtransactions in one transaction keep the backend's
+-- memory as it was.
+SET dolt.transaction_commit = off;
+DO $$
+DECLARE
+	before bigint;
+	after bigint;
+BEGIN
+	PERFORM dolt_commit('-Am', 'before subtransactions', '--allow-empty');
+	SELECT sum(total_bytes) INTO before FROM pg_backend_memory_contexts;
+	FOR i IN 1..20000 LOOP
+		BEGIN
+			PERFORM 1;
+		EXCEPTION WHEN OTHERS THEN NULL;
+		END;
+	END LOOP;
+	SELECT sum(total_bytes) INTO after FROM pg_backend_memory_contexts;
+	RAISE NOTICE 'memory bounded: %', after - before < 8 * 1024 * 1024;
+END $$;
+SET dolt.transaction_commit = on;
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');
