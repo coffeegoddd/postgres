@@ -405,7 +405,7 @@ SELECT test_check_dependencies(ARRAY[:'c2'], false);
 ERROR:  the check needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
 extension citext: in schema public, and the database has it in dep_ext
-HINT:  Make what is missing, then try again.
+HINT:  Extension citext is in schema dep_ext, and the commits need it in public: drop it and create it there (CREATE EXTENSION citext SCHEMA public), then try again.
 SELECT test_check_dependencies(ARRAY[:'c', :'c2'], false);
 ERROR:  the check needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
