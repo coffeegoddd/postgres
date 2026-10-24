@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 import subprocess
 import time
@@ -19,7 +20,7 @@ from contextlib import nullcontext
 from itertools import product
 from typing import Any
 
-from pbench import vgrowth, vshape
+from pbench import vclean, vgrowth, vshape
 from pbench.core import registry, targets
 from pbench.core.sqlerr import raise_for_sql_error
 from pbench.core.interfaces import Context, NotImplementedByEngine, Outcome, Window, Workload
@@ -845,3 +846,385 @@ class V8(VWorkload):
             out[f"{stage}_prolly_over_heap"] = (
                 total / float(r["heap_bytes"]) if total is not None and r["heap_bytes"] else None)
         return out
+
+
+@registry.workloads.register("V10")
+class V10(VWorkload):
+    """Cleanup invariance: the same queries read the same rows, and about
+    as fast, after storage cleanup as before it (vclean).
+
+    The history shares storage every way it can: a table with a primary
+    key, a secondary and a composite index, one with values out of line
+    (TOAST and hash pointers), and a keyless one; commits kept
+    (prolly.kept_commits) and a kept detached checkout; a branch used and
+    deleted whose commit a snapshot mount still reads, and another that
+    nothing reads (what a collection frees); a table dropped, and one
+    dropped and made again; a merge; a snapshot mount of the first commit
+    and a history mount; dirty working sets on main and on a side
+    branch.  Heap tables beside it in public hold main's rows as they are,
+    with the same indexes.
+
+    Q reads point, range, index, index-only, composite-index and full
+    scans of the current tables; dolt_at, the mounts and the history mount
+    at older commits, filtered; dolt_diff and dolt_log; a checkout of a
+    kept commit, of the side branch and of a branch it resets hard to a
+    kept commit, each read after; and the heap tables' same reads.  The
+    current tables' digests must equal the heap tables'.
+
+    Phase 1 reads Q R times ("reps"), after a warm-up pass (cache "warm")
+    or each after a restart (cache "cold"); then every cleanup runs: VACUUM, VACUUM
+    (FREEZE), VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP ON), each of
+    the first two again with prolly.vacuum_copy_kept_pages on, VACUUM
+    (ANALYZE), the release queue drained by autovacuum, dolt_gc('--full'),
+    dolt_gc(), prolly_page_sweep() and CHECKPOINT; then phase 2 as phase 1.
+    Every digest of either phase must be phase 1's first: any difference
+    fails the cell, as do dolt_verify_folds(), amcheck, and an error or
+    warning in the server log after the cleanups.  Each query's latency
+    is compared pairwise, phase 2 over phase 1 (vclean)."""
+
+    id, title = "V10", "Cleanup invariance"
+
+    CACHES = ("warm", "cold")
+
+    # (label, statements): each cleanup, in order
+    CLEANUPS = (
+        ("vacuum", "VACUUM"),
+        ("vacuum_freeze", "VACUUM (FREEZE)"),
+        ("vacuum_all_pages", "VACUUM (DISABLE_PAGE_SKIPPING, INDEX_CLEANUP ON)"),
+        ("vacuum_copy_kept", "SET prolly.vacuum_copy_kept_pages = on; VACUUM"),
+        ("vacuum_freeze_copy_kept", "SET prolly.vacuum_copy_kept_pages = on; VACUUM (FREEZE)"),
+        ("vacuum_analyze", "VACUUM (ANALYZE)"),
+        ("release_queue", None),
+        ("gc_full", "SELECT dolt_gc('--full')"),
+        ("gc", "SELECT dolt_gc()"),
+        ("page_sweep", "SELECT * FROM prolly_page_sweep()"),
+        ("checkpoint", "CHECKPOINT"),
+    )
+
+    # the current tables' reads the heap tables repeat
+    HEAP_READS = ("point", "range", "full", "toast", "keyless", "remade", "index",
+                  "composite", "index_only")
+
+    def variants(self, params):
+        # (one session's reads: never with a background workload)
+        out = []
+        for c in params.get("caches", list(self.CACHES)):
+            if c not in self.CACHES:
+                raise ValueError(f"V10's caches are {self.CACHES}, not {c!r}")
+            out.append((f"{c}-bgnone", {"background": "none", "cache": c}))
+        return out
+
+    def reps(self, ctx) -> int:
+        return int(ctx.params.get("reps", 5))
+
+    def tables(self, ctx):
+        return ["v10_t", "v10_big", "v10_bag", "v10_remade"]
+
+    def _sql(self, ctx, sql: str) -> str:
+        return ctx.cluster.sql(sql, dbname=ctx.dbname, options=ctx.session_options()).stdout
+
+    def _head(self, ctx) -> str:
+        return ctx.cluster.scalar("SELECT dolt_hashof('HEAD')", dbname=ctx.dbname)
+
+    @staticmethod
+    def sizes(n: int) -> dict[str, int]:
+        """The tables' rows at scale n (v_rows)."""
+        if n < 3000:
+            raise ValueError("V10 needs v_rows of at least 3000")
+        return {"t": n, "big": max(60, n // 200), "bag": max(500, n // 6),
+                "small": max(200, n // 15)}
+
+    def prepare(self, ctx):
+        n = self.rows(ctx)
+        z = self.sizes(n)
+        schema = targets.for_am(ctx.table_am).schema
+        self._sql(ctx, f"""
+            CREATE EXTENSION IF NOT EXISTS amcheck SCHEMA public;
+            CREATE TABLE v10_t (id int PRIMARY KEY, k int NOT NULL, g int NOT NULL,
+                v text NOT NULL);
+            CREATE INDEX v10_t_k ON v10_t (k);
+            CREATE INDEX v10_t_gk ON v10_t (g, k);
+            CREATE TABLE v10_big (id int PRIMARY KEY, body text NOT NULL);
+            ALTER TABLE v10_big ALTER COLUMN body SET STORAGE EXTERNAL;
+            CREATE TABLE v10_bag (a int, b text);
+            CREATE TABLE v10_dropped (id int PRIMARY KEY, v text);
+            CREATE TABLE v10_remade (id int PRIMARY KEY, v text);
+            INSERT INTO v10_t SELECT g, g % 97, g % 13, md5(g::text)
+                FROM generate_series(1, {n}) g;
+            INSERT INTO v10_big SELECT g, repeat(md5(g::text), 150)
+                FROM generate_series(1, {z['big']}) g;
+            INSERT INTO v10_bag SELECT g % 40, 'b' || (g % 40) FROM generate_series(1, {z['bag']}) g;
+            INSERT INTO v10_dropped SELECT g, 'd' || g FROM generate_series(1, {z['small']}) g;
+            INSERT INTO v10_remade SELECT g, 'old' || g FROM generate_series(1, {z['small']}) g;
+            {VC_SQL.commit('v10 c1')};
+        """)
+        c1 = self._head(ctx)
+        self._sql(ctx, f"""
+            UPDATE v10_t SET k = k + 1, v = 'c2' WHERE id % 10 = 0;
+            DELETE FROM v10_t WHERE id % 50 = 1;
+            UPDATE v10_big SET body = repeat(md5(id::text || 'c2'), 150) WHERE id <= 10;
+            DELETE FROM v10_bag WHERE a = 3;
+            SELECT dolt_commit('-am', 'v10 c2');
+        """)
+        c2 = self._head(ctx)
+        big = z["big"]
+        self._sql(ctx, f"""
+            SELECT dolt_branch('v10_gone');
+            SELECT dolt_checkout('v10_gone');
+            UPDATE v10_t SET v = 'gone' WHERE id BETWEEN 100 AND {n // 3};
+            INSERT INTO v10_big SELECT g, repeat(md5(g::text || 'gone'), 150)
+                FROM generate_series({big + 1}, {big + 20}) g;
+            SELECT dolt_commit('-am', 'v10 on gone');
+            SELECT prolly_mount('v10_gone', '{schema}', 'v10_gm', NULL);
+            SELECT dolt_checkout('main');
+            SELECT dolt_branch('-D', 'v10_gone');
+
+            SELECT dolt_branch('v10_lost');
+            SELECT dolt_checkout('v10_lost');
+            UPDATE v10_t SET v = 'lost' WHERE id <= {2 * n // 3};
+            UPDATE v10_big SET body = repeat(md5(id::text || 'lost'), 150);
+            SELECT dolt_commit('-am', 'v10 on lost');
+            SELECT dolt_checkout('main');
+            SELECT dolt_branch('-D', 'v10_lost');
+
+            SELECT dolt_branch('v10_side');
+            SELECT dolt_checkout('v10_side');
+            UPDATE v10_t SET v = 'side' WHERE id % 10 = 5;
+            INSERT INTO v10_big SELECT g, repeat(md5(g::text || 'side'), 150)
+                FROM generate_series({big + 21}, {big + 30}) g;
+            SELECT dolt_commit('-am', 'v10 on side');
+            SELECT dolt_checkout('main');
+
+            DROP TABLE v10_dropped;
+            DROP TABLE v10_remade;
+            CREATE TABLE v10_remade (id int PRIMARY KEY, w int NOT NULL);
+            INSERT INTO v10_remade SELECT g, g * 3 FROM generate_series(1, {z['small'] + 100}) g;
+            UPDATE v10_t SET g = g + 100 WHERE id % 7 = 0;
+            {VC_SQL.commit('v10 c3')};
+            SELECT dolt_merge('v10_side');
+
+            SELECT dolt_checkout('{c2}');
+            SELECT dolt_checkout('main');
+            SELECT prolly_mount('{c1}', '{schema}', 'v10_m1', NULL);
+            SELECT prolly_mount('HEAD', '{schema}', 'v10_hm', NULL, false, true);
+            SELECT dolt_branch('v10_scratch');
+            UPDATE v10_t SET v = 'dirty' WHERE id <= 40;
+            DELETE FROM v10_t WHERE id BETWEEN {n // 2} AND {n // 2 + 100};
+            INSERT INTO v10_big VALUES (1000000, repeat('dirty', 2000));
+            SELECT dolt_checkout('v10_side');
+            UPDATE v10_t SET v = 'side dirty' WHERE id BETWEEN 500 AND 520;
+            INSERT INTO v10_big SELECT 2000000, string_agg(md5(g::text || 'side'), '')
+                FROM generate_series(1, 300) g;
+            SELECT dolt_checkout('main');
+
+            CREATE TABLE public.v10h_t USING heap AS SELECT * FROM v10_t;
+            ALTER TABLE public.v10h_t ADD PRIMARY KEY (id);
+            CREATE INDEX v10h_t_k ON public.v10h_t (k);
+            CREATE INDEX v10h_t_gk ON public.v10h_t (g, k);
+            CREATE TABLE public.v10h_big USING heap AS SELECT * FROM v10_big;
+            ALTER TABLE public.v10h_big ADD PRIMARY KEY (id);
+            ALTER TABLE public.v10h_big ALTER COLUMN body SET STORAGE EXTERNAL;
+            CREATE TABLE public.v10h_bag USING heap AS SELECT * FROM v10_bag;
+            CREATE TABLE public.v10h_remade USING heap AS SELECT * FROM v10_remade;
+            ALTER TABLE public.v10h_remade ADD PRIMARY KEY (id);
+            ANALYZE;
+        """)
+        self._commits = {"c1": c1, "c2": c2}
+        (ctx.raw_dir / "v10-commits.json").write_text(json.dumps(self._commits) + "\n")
+
+    def queries(self, c1: str, c2: str, n: int) -> list[tuple[str, str, str]]:
+        """Q: (name, kind, sql), kinds as vclean.KINDS."""
+        current = {
+            "point": "SELECT * FROM {t} WHERE id = 777",
+            "range": f"SELECT * FROM {{t}} WHERE id BETWEEN 100 AND {100 + n // 10}",
+            "full": "SELECT * FROM {t}",
+            "toast": "SELECT id, md5(body), length(body) FROM {big}",
+            "keyless": "SELECT * FROM {bag}",
+            "remade": "SELECT * FROM {remade}",
+        }
+        indexed = {
+            "index": "SELECT * FROM {t} WHERE k = 51",
+            "composite": "SELECT * FROM {t} WHERE g = 3 AND k < 50",
+            "index_only": "SELECT g, k FROM {t} WHERE g = 105",
+        }
+        index_scans = [("", "set", "SET enable_seqscan = off"),
+                       ("", "set", "SET enable_bitmapscan = off")]
+        index_reset = [("", "set", "RESET enable_seqscan"), ("", "set", "RESET enable_bitmapscan")]
+        out: list[tuple[str, str, str]] = []
+        for prefix, names in (("", {"t": "v10_t", "big": "v10_big", "bag": "v10_bag",
+                                    "remade": "v10_remade"}),
+                              ("heap_", {"t": "public.v10h_t", "big": "public.v10h_big",
+                                         "bag": "public.v10h_bag",
+                                         "remade": "public.v10h_remade"})):
+            out += [(prefix + q, "read", sql.format(**names)) for q, sql in current.items()]
+            out += index_scans
+            out += [(prefix + q, "read", sql.format(**names)) for q, sql in indexed.items()]
+            out += index_reset
+        out += [
+            ("at_c1", "read", f"SELECT * FROM dolt_at('{c1}', NULL::v10_t) "
+                              f"WHERE id BETWEEN 10 AND {10 + n // 5}"),
+            ("at_c2_big", "read", f"SELECT id, md5(body) FROM dolt_at('{c2}', NULL::v10_big)"),
+            ("at_side", "read", "SELECT * FROM dolt_at('v10_side', NULL::v10_t) WHERE id % 10 = 5"),
+            ("mount_t", "read", f"SELECT * FROM v10_m1.v10_t WHERE id BETWEEN 50 AND {50 + n // 15}"),
+            ("mount_big", "read", "SELECT id, md5(body) FROM v10_m1.v10_big"),
+            ("mount_dropped", "read", "SELECT * FROM v10_m1.v10_dropped"),
+            ("mount_remade", "read", "SELECT * FROM v10_m1.v10_remade"),
+            ("mount_gone", "read", "SELECT * FROM v10_gm.v10_t WHERE v = 'gone'"),
+            ("mount_gone_big", "read", "SELECT id, md5(body) FROM v10_gm.v10_big"),
+            ("history_row", "read", "SELECT id, k, v, commit_hash FROM v10_hm.v10_t WHERE id = 10"),
+            ("history_c2", "read", f"SELECT id, v FROM v10_hm.v10_t WHERE commit_hash = '{c2}' "
+                                   f"AND id < {n // 10}"),
+            ("history_big", "read", "SELECT id, md5(body), commit_hash FROM v10_hm.v10_big "
+                                    "WHERE id <= 12"),
+            ("diff_c1_c2", "read", f"SELECT * FROM dolt_diff('{c1}', '{c2}', NULL::v10_t)"),
+            ("diff_working", "read", "SELECT * FROM dolt_diff('HEAD', 'WORKING', NULL::v10_t)"),
+            ("diff_big", "read", f"SELECT diff_type, md5(from_row::text), md5(to_row::text) "
+                                 f"FROM dolt_diff('{c2}', 'v10_side', NULL::v10_big)"),
+            ("log_main", "read", "SELECT commit_hash, message FROM dolt_log('main')"),
+            ("log_side", "read", "SELECT commit_hash, message FROM dolt_log('v10_side')"),
+            ("checkout_kept", "op", f"SELECT dolt_checkout('{c2}')"),
+            ("kept_t", "read", "SELECT * FROM v10_t"),
+            ("kept_big", "read", "SELECT id, md5(body) FROM v10_big"),
+            ("checkout_side", "op", "SELECT dolt_checkout('v10_side')"),
+            ("side_t", "read", "SELECT * FROM v10_t"),
+            ("side_big", "read", "SELECT id, md5(body) FROM v10_big"),
+            ("checkout_scratch", "op", "SELECT dolt_checkout('v10_scratch')"),
+            ("scratch_change", "op", "UPDATE v10_t SET v = 'scratch' WHERE id <= 100"),
+            ("reset_kept", "op", f"SELECT dolt_reset('--hard', '{c2}')"),
+            ("reset_t", "read", "SELECT * FROM v10_t"),
+            ("reset_big", "read", "SELECT id, md5(body) FROM v10_big"),
+            ("checkout_main", "op", "SELECT dolt_checkout('main')"),
+            ("back_t", "read", f"SELECT * FROM v10_t WHERE id <= {n // 3}"),
+        ]
+        return out
+
+    def _pass(self, ctx, queries, tag: str) -> tuple[dict[str, str], dict[str, float]]:
+        script = vclean.pass_script(queries)
+        (ctx.raw_dir / f"{tag}.sql").write_text(script)
+        res = ctx.cluster.sql(script, dbname=ctx.dbname, options=ctx.session_options(),
+                              check=False)
+        (ctx.raw_dir / f"{tag}.out").write_text(res.stdout + res.stderr)
+        raise_for_sql_error(res, script)
+        return vclean.parse_pass(res.stdout, queries)
+
+    def _restart(self, ctx):
+        # (pg_ctl waits for the start; pg_isready's probe would log a FATAL
+        # for its role)
+        ctx.cluster.stop()
+        ctx.cluster.start()
+
+    def phase(self, ctx, queries, label: str) -> dict:
+        """R passes of Q: each digest and latency per pass."""
+        cold = ctx.params["cache"] == "cold"
+        passes = []
+        if not cold:
+            passes.append(("warmup", self._pass(ctx, queries, f"v10-{label}-warmup")))
+        for i in range(self.reps(ctx)):
+            if cold:
+                self._restart(ctx)
+            passes.append((f"r{i}", self._pass(ctx, queries, f"v10-{label}-r{i}")))
+        measured = [p for name, p in passes if name != "warmup"]
+        return {"digests": [d for _, (d, _) in passes],
+                "latency_ms": {q: [lat[q] for _, lat in measured] for q in vclean.timed(queries)}}
+
+    def _drain_release_queue(self, ctx):
+        """Storage queued for release (a branch deleted, a table dropped),
+        drained by autovacuum's release step."""
+        self._sql(ctx, """
+            SELECT dolt_branch('v10_doomed', 'v10_side');
+            SELECT dolt_checkout('v10_doomed');
+            UPDATE v10_t SET v = 'doomed' WHERE id <= 500;
+            SELECT dolt_commit('-am', 'v10 doomed');
+            SELECT dolt_checkout('main');
+            SELECT dolt_branch('-D', 'v10_doomed');
+            CREATE TABLE public.v10_scrap AS SELECT g FROM generate_series(1, 20000) g;
+            DROP TABLE public.v10_scrap;
+        """)
+        drained = ("SELECT pg_stat_force_next_flush(); SELECT coalesce(sum(value) FILTER "
+                   "(WHERE name = 'bmap_release_drained'), 0) || '|' || coalesce(sum(value) "
+                   "FILTER (WHERE name = 'bmap_release_queued'), 0) FROM pg_stat_prolly")
+        ctx.cluster.sql("ALTER SYSTEM SET autovacuum = on; "
+                        "ALTER SYSTEM SET autovacuum_naptime = '1s'; SELECT pg_reload_conf()")
+        try:
+            deadline = time.monotonic() + 300
+            while True:
+                d, q = (int(x) for x in self._sql(ctx, drained).split()[-1].split("|"))
+                if q > 0 and d >= q:
+                    return
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"V10: autovacuum did not drain the release queue "
+                                       f"({d} of {q} entries drained)")
+                time.sleep(0.5)
+        finally:
+            ctx.cluster.sql("ALTER SYSTEM RESET autovacuum; "
+                            "ALTER SYSTEM RESET autovacuum_naptime; SELECT pg_reload_conf()")
+
+    def cleanup(self, ctx) -> dict[str, float]:
+        out = {}
+        for label, sql in self.CLEANUPS:
+            t0 = time.monotonic()
+            if sql is None:
+                self._drain_release_queue(ctx)
+            else:
+                self._sql(ctx, sql)
+            out[f"cleanup_{label}_ms"] = (time.monotonic() - t0) * 1000
+        return out
+
+    def check_after(self, ctx, log_pos: int) -> None:
+        """Folds match their trees, every index its table (main's and the
+        side branch's), and the log holds no error or warning."""
+        bad = self._sql(ctx, "SELECT count(*) FILTER (WHERE NOT matches) || '|' || count(*) "
+                             "FROM dolt_verify_folds()").split()[-1]
+        if bad.split("|")[0] != "0" or bad.split("|")[1] == "0":
+            raise RuntimeError(f"V10: dolt_verify_folds() after the cleanups: {bad} "
+                               "(mismatched|verified)")
+        indexes = ("SELECT 'v10i|' || coalesce(bool_and(public.bt_index_check(i.indexrelid, true) "
+                   "IS NOT NULL), false) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                   "JOIN pg_am a ON a.oid = c.relam AND a.amname = 'btree' "
+                   "WHERE i.indrelid IN (SELECT oid FROM pg_class WHERE relnamespace "
+                   "IN (current_schema()::regnamespace, 'public'::regnamespace) "
+                   "AND relkind = 'r')")
+        for branch in ("main", "v10_side"):
+            out = self._sql(ctx, f"SELECT dolt_checkout('{branch}');\n{indexes};")
+            if "v10i|true" not in out:
+                raise RuntimeError(f"V10: amcheck failed on {branch} after the cleanups: {out}")
+        problems = [line for line in ctx.cluster.log_since(log_pos).splitlines()
+                    if re.search(r"\b(ERROR|WARNING|PANIC|FATAL):", line)
+                    and "due to administrator command" not in line]
+        if problems:
+            raise RuntimeError("V10: the server log has errors or warnings:\n"
+                               + "\n".join(problems[:20]))
+
+    def operations(self, ctx):
+        commits = getattr(self, "_commits", None) or json.loads(
+            (ctx.raw_dir / "v10-commits.json").read_text())
+        queries = self.queries(commits["c1"], commits["c2"], self.rows(ctx))
+        log_pos = ctx.cluster.log_position()
+        p1 = self.phase(ctx, queries, "phase1")
+        base = p1["digests"][0]
+        for name in self.HEAP_READS:
+            if base[name] != base[f"heap_{name}"]:
+                raise RuntimeError(f"V10: {name} reads other rows than heap's "
+                                   f"({base[name]} != {base['heap_' + name]})")
+        for i, d in enumerate(p1["digests"]):
+            bad = vclean.mismatches(base, d)
+            if bad:
+                raise RuntimeError(f"V10: phase 1's pass {i} read other rows than its first: "
+                                   + ", ".join(bad))
+        cleaned = self.cleanup(ctx)
+        p2 = self.phase(ctx, queries, "phase2")
+        series = {"cache": ctx.params["cache"], "commits": commits,
+                  "phase1": p1, "phase2": p2, "cleanup_ms": cleaned}
+        (ctx.raw_dir / "v10-series.json").write_text(json.dumps(series, indent=1) + "\n")
+        for i, d in enumerate(p2["digests"]):
+            bad = vclean.mismatches(base, d)
+            if bad:
+                raise RuntimeError(f"V10: after the cleanups, pass {i} read other rows: "
+                                   + ", ".join(bad))
+        self.check_after(ctx, log_pos)
+        out = vclean.metrics(series)
+        out.update(cleaned)
+        out["digest_mismatches"] = 0.0
+        out["queries_digested"] = float(len(base))
+        return Outcome(metrics=out, transactions=len(p1["digests"]) + len(p2["digests"]),
+                       unit="pass")
