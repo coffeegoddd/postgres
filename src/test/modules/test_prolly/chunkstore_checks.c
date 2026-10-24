@@ -1903,6 +1903,50 @@ test_commit_chain(PG_FUNCTION_ARGS)
 }
 
 /*
+ * test_commit_at_height(parent, height): a commit after parent, naming
+ * parent's root, that records height as its height, whatever parent's is:
+ * as a commit made elsewhere might.  Its id.
+ */
+PG_FUNCTION_INFO_V1(test_commit_at_height);
+Datum
+test_commit_at_height(PG_FUNCTION_ARGS)
+{
+	const ProllyTreeRoutine *tree = prolly_tree_lookup("cow");
+	ProllyDatabaseComponents dc;
+	ProllyCommitInfo info;
+	ProllyTreeEnv env;
+	ProllyTreeBuilder *b;
+	ProllyNodeRef ref;
+	ProllyHash	parent;
+	uint64		height = (uint64) PG_GETARG_INT64(1);
+	char		hashed[1 + PROLLY_HASH_MAX_LEN];
+	char		parents[1 + PROLLY_HASH_MAX_LEN];
+	char		h[8];
+	char		time[8] = {0};
+
+	prolly_database_components(&dc);
+	text_hash(PG_GETARG_TEXT_PP(0), &parent);
+	if (!PROLLY_CALL(dc.refs, commit_get, &parent, &info))
+		elog(ERROR, "no such commit");
+	for (int i = 0; i < 8; i++)
+		h[i] = (char) (height >> (56 - 8 * i));
+	prolly_folded_tree_env(&env);
+	hashed[0] = (char) info.root.hash.len;
+	memcpy(hashed + 1, info.root.hash.bytes, info.root.hash.len);
+	parents[0] = (char) parent.len;
+	memcpy(parents + 1, parent.bytes, parent.len);
+	b = PROLLY_CALL(tree, build_begin, &env, CurrentMemoryContext);
+	commit_item(tree, b, "author", "test", 4);
+	commit_item(tree, b, "height", h, 8);
+	commit_item(tree, b, "message", "at a height", 11);
+	commit_item(tree, b, "parents", parents, 1 + parent.len);
+	commit_item(tree, b, "root", hashed, 1 + info.root.hash.len);
+	commit_item(tree, b, "time", time, 8);
+	PROLLY_CALL(tree, build_finish, b, &ref);
+	PG_RETURN_TEXT_P(hash_text(&ref.hash));
+}
+
+/*
  * test_commit_height(commit): the height the commit records; NULL if it
  * records none.
  */

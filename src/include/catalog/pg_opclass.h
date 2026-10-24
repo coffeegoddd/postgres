@@ -89,6 +89,7 @@ typedef FormData_pg_opclass *Form_pg_opclass;
 
 DECLARE_UNIQUE_INDEX(pg_opclass_am_name_nsp_index, 2686, OpclassAmNameNspIndexId, pg_opclass, btree(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops, opcbranch oid_ops));
 DECLARE_UNIQUE_INDEX_PKEY(pg_opclass_oid_index, 2687, OpclassOidIndexId, pg_opclass, btree(oid oid_ops, opcbranch oid_ops));
+DECLARE_INDEX(pg_opclass_branch_index, 9182, OperatorClassBranchIndexId, pg_opclass, btree(opcbranch oid_ops));
 
 MAKE_SYSCACHE(CLAAMNAMENSP, pg_opclass_am_name_nsp_index, 8);
 MAKE_SYSCACHE(CLAOID, pg_opclass_oid_index, 8);

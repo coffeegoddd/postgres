@@ -47,7 +47,7 @@ checkout keys|t
 merge violating|{0,1,"conflicts found"}
 violations|public.gis_ex 1, public.gis_uq 1
 unique violation|unique index
-exclusion violation|unique index
+exclusion violation|exclusion constraint
 nothing merged|2|2
 long key|54000 primary key of 128035 bytes exceeds the maximum 32724 for prolly table "gis_pk"
 checkout main|t

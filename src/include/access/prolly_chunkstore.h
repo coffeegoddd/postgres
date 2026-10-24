@@ -135,7 +135,11 @@
  *   (with or without a source), hears what prefetch() is told.
  * - roots() visits the roots the store was moved to that it still
  *   records, oldest first, with the time of each move: what a reflog is
- *   read from.  A collection may forget them.
+ *   read from.  A collection may forget them; it then sets *before to the
+ *   root the store was at before the oldest move visited (the root as the
+ *   collection began), so that a reader can tell what each move changed
+ *   from what the store already held.  Without one known, *before is
+ *   empty (len 0).
  * - prefetch() is told the chunks a walk is about to read (a node's
  *   children), so that a read-through source can fetch them at once, or
  *   the store read them together (optional): whether it heard them, and
@@ -357,10 +361,11 @@ typedef struct ProllyChunkStoreRoutine
 	/*
 	 * The roots the store was moved to, oldest first, each with when (the
 	 * reflog): those whose moves it still records, which a garbage
-	 * collection may forget (optional).
+	 * collection may forget, and in *before the root before the oldest of
+	 * them, if known (optional).
 	 */
-	void		(*roots) (ProllyChunkStore *store, ProllyChunkRootVisit visit,
-						  void *arg);
+	void		(*roots) (ProllyChunkStore *store, ProllyHash *before,
+						  ProllyChunkRootVisit visit, void *arg);
 
 	/* Chunks as stored, framed (optional). */
 	bool		(*get_stored) (ProllyChunkStore *store, const ProllyHash *hash,
