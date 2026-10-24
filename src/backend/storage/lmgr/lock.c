@@ -809,6 +809,92 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 }
 
 /*
+ * AnyLockHasWaiters -- whether another backend waits for a lock that
+ *		conflicts with one this backend holds (any lock method, any mode
+ *		held, fast-path ones included), or for its virtual transaction
+ *
+ * For work that holds its locks long and would rather give way than keep
+ * others waiting.  A fast-path lock this backend holds is found in the
+ * shared table only once a strong locker transferred it there, which it
+ * does before it waits, so a waiter conflicting with it is seen too.  So
+ * is the virtual transaction's own lock, which is in no local lock table:
+ * a backend waiting for it (WaitForLockers(), WaitForOlderSnapshots(), as
+ * the concurrent index and partition commands do) moves it to the shared
+ * table first (VirtualXactLock()).
+ */
+bool
+AnyLockHasWaiters(void)
+{
+	HASH_SEQ_STATUS status;
+	LOCALLOCK  *locallock;
+	bool		hasWaiters = false;
+
+	hash_seq_init(&status, LockMethodLocalHash);
+	while (!hasWaiters &&
+		   (locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
+	{
+		LockMethod	lockMethodTable;
+		LWLock	   *partitionLock;
+		LOCK	   *lock;
+
+		if (locallock->nLocks <= 0)
+			continue;
+		lockMethodTable = LockMethods[LOCALLOCK_LOCKMETHOD(*locallock)];
+		partitionLock = LockHashPartitionLock(locallock->hashcode);
+		LWLockAcquire(partitionLock, LW_SHARED);
+		lock = locallock->lock;
+		if (lock == NULL)
+			lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+														&locallock->tag.lock,
+														locallock->hashcode,
+														HASH_FIND, NULL);
+		if (lock != NULL &&
+			(lockMethodTable->conflictTab[locallock->tag.mode] &
+			 lock->waitMask) != 0)
+			hasWaiters = true;
+		LWLockRelease(partitionLock);
+	}
+	if (hasWaiters)
+		hash_seq_term(&status);
+	else
+	{
+		LocalTransactionId lxid;
+		bool		fastpath;
+
+		LWLockAcquire(&MyProc->fpInfoLock, LW_SHARED);
+		fastpath = MyProc->fpVXIDLock;
+		lxid = MyProc->fpLocalTransactionId;
+		LWLockRelease(&MyProc->fpInfoLock);
+
+		/* (as VirtualXactLockTableCleanup(): moved to the shared table) */
+		if (!fastpath && LocalTransactionIdIsValid(lxid))
+		{
+			VirtualTransactionId vxid;
+			LOCKTAG		locktag;
+			uint32		hashcode;
+			LWLock	   *partitionLock;
+			LOCK	   *lock;
+
+			vxid.procNumber = MyProcNumber;
+			vxid.localTransactionId = lxid;
+			SET_LOCKTAG_VIRTUALTRANSACTION(locktag, vxid);
+			hashcode = LockTagHashCode(&locktag);
+			partitionLock = LockHashPartitionLock(hashcode);
+			LWLockAcquire(partitionLock, LW_SHARED);
+			lock = (LOCK *) hash_search_with_hash_value(LockMethodLockHash,
+														&locktag, hashcode,
+														HASH_FIND, NULL);
+			if (lock != NULL &&
+				(LockMethods[DEFAULT_LOCKMETHOD]->conflictTab[ExclusiveLock] &
+				 lock->waitMask) != 0)
+				hasWaiters = true;
+			LWLockRelease(partitionLock);
+		}
+	}
+	return hasWaiters;
+}
+
+/*
  * LockAcquire -- Check for lock conflicts, sleep if conflict found,
  *		set lock if/when no conflicts.
  *

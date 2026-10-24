@@ -171,6 +171,9 @@
                                         # background after they're written
 #prolly_fold_worker_batch_rows = 0      # rows written that make a fold due
                                         # (0: every pass, no batching)
+#prolly_fold_worker_cost_delay = 0      # a fold's cost delay, as vacuum's
+                                        # (0: folds aren't paced)
+#prolly_fold_worker_cost_limit = -1     # its cost limit (-1: vacuum_cost_limit)
 #prolly_fold_worker_max_delay = 1s      # or the longest a write waits for one
 #prolly_fold_worker_max_workers = 2     # fold workers at once, one to a
                                         # database
