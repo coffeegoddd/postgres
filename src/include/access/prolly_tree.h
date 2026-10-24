@@ -311,6 +311,25 @@ typedef struct ProllyTreeRoutine
 								  const ProllyNodeRef *from,
 								  const ProllyNodeRef *to,
 								  uint64 max_nodes);
+
+	/*
+	 * Optional: the value a reference (value_write()'s) names, with bytes
+	 * [offset, offset + del) replaced by the ilen bytes at insert, its
+	 * reference appended to out: the reference value_write() gives the
+	 * edited bytes, made without reading or chunking the value whole.  The
+	 * leaves around the edit are read and cut again until a cut meets an
+	 * old one past it, and each level above is made again, from the start
+	 * of the node holding its first changed child, until its boundaries
+	 * meet the old ones; every other node is the old tree's.  So an edit
+	 * reads the nodes above the leaves (about one node in a hundred of the
+	 * tree) and the leaves around it, and writes O(depth + its length)
+	 * nodes; it never reads or chunks the value whole.  offset past the
+	 * value's end is an error; del past it, its end.
+	 */
+	void		(*value_splice) (const ProllyTreeEnv *env, const ProllyValue *ref,
+								 uint64 offset, uint64 del,
+								 const uint8 *insert, Size ilen,
+								 StringInfo out);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
@@ -318,9 +337,9 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
 	"value_present", "value_reference", "value_root", "key_max", \
-	"diff_unordered", "diff_estimate"
+	"diff_unordered", "diff_estimate", "value_splice"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK diff_estimate
+#define PROLLY_TREE_LAST_CALLBACK value_splice
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)
