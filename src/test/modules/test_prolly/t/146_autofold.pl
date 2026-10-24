@@ -16,7 +16,7 @@ $node->append_conf('postgresql.conf', qq{
 autovacuum_naptime = 1
 prolly.autofold_threshold = 0.05
 log_min_messages = debug1
-# (autovacuum leaves branches to the fold worker when it's on)
+# (the worker off: the folds the test waits for are autovacuum's)
 prolly_fold_worker = off
 });
 $node->start;

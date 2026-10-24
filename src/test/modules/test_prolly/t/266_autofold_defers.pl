@@ -1,9 +1,12 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# With the fold worker on, autovacuum's automatic fold (prolly.autofold_threshold)
-# leaves branches to it: two folders of one branch would each fold it, one
-# losing the race to the other, and autovacuum's checkpoint holds the refs
-# through its fold.  With the worker off, autovacuum folds as before.
+# Autovacuum's automatic fold (prolly.autofold_threshold) never waits for
+# a branch's refs: it folds before taking them, as the fold worker does,
+# and gives up, to try again next time, while another holds them; so a
+# commit never waits for it either.  And the fold worker's launcher takes
+# the databases written in turn, a worker leaving after a number of
+# passes: a database written without pause doesn't keep the only slot
+# from another for good.
 
 use strict;
 use warnings FATAL => 'all';
@@ -14,13 +17,11 @@ use Time::HiRes qw(usleep);
 
 my $node = PostgreSQL::Test::Cluster->new('autofold_defers');
 $node->init;
-# (the worker on but never started: its launcher sleeps a naptime first)
 $node->append_conf('postgresql.conf', qq{
 autovacuum = on
 autovacuum_naptime = 1s
-prolly.autofold_threshold = 0.05
-prolly_fold_worker = on
-prolly_fold_worker_naptime = 600s
+prolly.autofold_threshold = 0
+prolly_fold_worker = off
 log_min_messages = debug1
 });
 $node->start;
@@ -35,22 +36,70 @@ sql(q{
 });
 my $log = sql(q{SELECT 'pg_toast.pg_prolly_log_' || 's.t'::regclass::oid});
 
-# Written well past the threshold (and autovacuum's least entries), with
-# the worker on: autovacuum doesn't fold (several of its passes go by).
-my $offset = -s $node->logfile;
+# The log past the threshold, and the branch's refs held by a session's
+# open transaction, begun after the writes (they are what it sees), before
+# autovacuum's folds are turned on: autovacuum neither waits for the refs
+# nor folds.
 sql(q{UPDATE s.t SET v = 1 WHERE id <= 3000});
-usleep(5_000_000);
-is(sql(qq{SELECT count(*) > 0 FROM $log}), 't',
-	'with the fold worker on, autovacuum leaves the branch to it');
-unlike(slurp_file($node->logfile, $offset), qr/automatic fold of database/,
-	'and logs no automatic fold');
-
-# The worker off: autovacuum folds it.
-$node->append_conf('postgresql.conf', 'prolly_fold_worker = off');
+my $holder = $node->background_psql('postgres');
+$holder->query_safe(q{BEGIN});
+$holder->query_safe(q{SELECT dolt_reset('--soft', 'HEAD')});
+my $offset = -s $node->logfile;
+$node->append_conf('postgresql.conf', 'prolly.autofold_threshold = 0.05');
 $node->reload;
-ok( $node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM $log}),
-	'with the fold worker off, autovacuum folds the branch');
-like(slurp_file($node->logfile, $offset), qr/automatic fold of database/,
-	'as an automatic fold');
+my $waited = 0;
+for (1 .. 80)
+{
+	$waited = 1
+	  if sql(q{SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'autovacuum worker' AND wait_event_type = 'Lock'}) > 0;
+	usleep(100_000);
+}
+is($waited, 0, 'autovacuum waits for no lock while the refs are held');
+like(slurp_file($node->logfile, $offset), qr/automatic fold of database "postgres" given up/,
+	'it gives its fold up');
+is(sql(qq{SELECT count(*) > 0 FROM $log}), 't', 'the log keeps the writes');
+$holder->query_safe(q{COMMIT});
+$holder->quit;
+ok($node->poll_query_until('postgres', qq{SELECT count(*) = 0 FROM $log}),
+	'and folds once they are free');
+
+# The fold worker, one slot: a database written without pause and another
+# written once.  The other's writes are folded all the same.
+$node->append_conf('postgresql.conf', qq{
+prolly.autofold_threshold = 0
+prolly_fold_worker = on
+prolly_fold_worker_max_workers = 1
+prolly_fold_worker_naptime = 100ms
+});
+$node->reload;
+sql(q{CREATE DATABASE other});
+$node->safe_psql('other', q{
+	CREATE SCHEMA o VERSIONED;
+	CREATE TABLE o.t (id int PRIMARY KEY, v int);
+	INSERT INTO o.t SELECT g, 0 FROM generate_series(1, 100) g;
+	SELECT dolt_commit('-Am', 'base');
+});
+sql(q{CREATE PROCEDURE public.busy(n int) LANGUAGE plpgsql AS $$
+	BEGIN
+		FOR i IN 1..n LOOP
+			UPDATE s.t SET v = v + 1 WHERE id = 1 + i % 1000;
+			COMMIT;
+			PERFORM pg_sleep(0.02);
+		END LOOP;
+	END $$});
+my $busy = $node->background_psql('postgres');
+$busy->query_until(qr/started/, "\\echo started\nCALL busy(2000);\n");
+usleep(1_000_000);
+my $olog = $node->safe_psql('other',
+	q{SELECT 'pg_toast.pg_prolly_log_' || 'o.t'::regclass::oid});
+$node->safe_psql('other', q{UPDATE o.t SET v = 1});
+ok( $node->poll_query_until('other', qq{SELECT count(*) = 0 FROM $olog}),
+	'another database\'s writes are folded while one is written without pause');
+is(sql(q{SELECT count(*) > 0 FROM pg_stat_activity
+	WHERE query LIKE 'CALL busy%' AND state = 'active'}), 't',
+	'that one still being written');
+$busy->query_safe(q{SELECT 1});
+$busy->quit;
 
 done_testing();

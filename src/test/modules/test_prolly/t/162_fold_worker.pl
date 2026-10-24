@@ -86,8 +86,10 @@ my $reads_before = sql($read);
 my $retries_before = sql($retries);
 sql(q{UPDATE s.t SET v = 'held' WHERE id <= 20});
 usleep(1_000_000);
-cmp_ok(sql($retries) - $retries_before, '>=', 2,
-	'each pass that finds the refs held counts a retry');
+my $tried = sql($retries) - $retries_before;
+cmp_ok($tried, '>=', 2, 'a fold given up counts a retry');
+# (backed off: tried after 1, 3, 7, 15... passes, not each of the ~20)
+cmp_ok($tried, '<=', 8, 'tried again less and less often');
 is( sql(q{SELECT count(*) FROM pg_stat_activity
 		  WHERE backend_type = 'prolly fold worker' AND wait_event_type = 'Lock'}),
 	'0', 'the worker waits for no lock while the refs are held');

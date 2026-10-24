@@ -641,8 +641,13 @@ folds the batch not yet folded itself (so batching is off by default).
 pg_stat_prolly counts the worker's folds (fold_worker_folds), the
 branches it left for a later pass (fold_worker_deferred), and its
 attempts rolled back, the refs held or the branch moved meanwhile, to be
-made again (fold_worker_retries).  With the worker on, autovacuum's
-automatic fold (prolly.autofold_threshold) leaves branches to it.
+made again (fold_worker_retries), each branch's tries backed off (after
+1, 3, 7... passes, 63 at most).  The launcher takes the databases written
+in turn, and a worker exits after 64 passes, so a database written
+without pause doesn't keep a slot from the others.  Autovacuum's
+automatic fold (prolly.autofold_threshold), the backstop for the
+database's default branch, folds the same way, before taking the refs,
+and gives up while another holds them: a commit never waits for it.
 
 A rewrite of a versioned table (ALTER TABLE changing a column's type,
 REFRESH MATERIALIZED VIEW) reads and writes every row: as it ends, the
