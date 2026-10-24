@@ -700,6 +700,26 @@ typedef struct CachedChunk
 
 static HTAB *chunk_cache = NULL;
 static dlist_head chunk_cache_lru = DLIST_STATIC_INIT(chunk_cache_lru);
+
+/*
+ * The chunks the transaction puts, up to an eighth of the cache's bytes,
+ * each with the (sub)transaction level that put it: let into the cache as
+ * the transaction commits, stored then (an aborted subtransaction's
+ * forgotten: its pending chunks are, never stored).  The next transaction
+ * of a backend that writes a little at a time (dolt.transaction_commit)
+ * reads first what this one wrote last: the refs' and the trees' upper
+ * nodes, read from the cache rather than the files.
+ */
+typedef struct WrittenChunk
+{
+	ProllyHash	key;
+	char	   *data;
+	uint32		len;
+	int			level;
+} WrittenChunk;
+
+static List *written_chunks = NIL;	/* in TopTransactionContext */
+static Size written_bytes = 0;
 static Size chunk_cache_bytes = 0;
 static MemoryContext chunk_cache_cxt = NULL;
 static uint32 chunk_cache_generation = 0;	/* what it holds is of */
@@ -842,9 +862,24 @@ chunk_cache_evict(Size limit)
 	}
 }
 
+static void chunk_cache_insert(const ProllyHash *key, const char *data,
+							   uint32 len, uint32 generation, bool admit);
+
 static void
 chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
 				uint32 generation)
+{
+	chunk_cache_insert(key, data, len, generation, false);
+}
+
+/*
+ * A chunk into the cache: one read from the files only once seen before
+ * (one read once isn't let in), or, admit, at once (the transaction's own,
+ * stored as it committed).
+ */
+static void
+chunk_cache_insert(const ProllyHash *key, const char *data, uint32 len,
+				   uint32 generation, bool admit)
 {
 	Size		limit = chunk_cache_limit();
 	CachedChunk *c;
@@ -864,7 +899,7 @@ chunk_cache_put(const ProllyHash *key, const char *data, uint32 len,
 		chunk_cache_cxt = AllocSetContextCreate(TopMemoryContext,
 												"prolly chunk cache",
 												ALLOCSET_DEFAULT_SIZES);
-	if (!chunk_seen_before(key, limit))
+	if (!admit && !chunk_seen_before(key, limit))
 		return;
 	if (chunk_cache == NULL)
 	{
@@ -2905,6 +2940,15 @@ journal_xact_callback(XactEvent event, void *arg)
 								 false);
 				s->commit_append.g = NULL;
 			}
+			/* (stored now: let into the cache, not a prepared one's) */
+			if (event != XACT_EVENT_PREPARE)
+			{
+				foreach_ptr(WrittenChunk, w, written_chunks)
+					chunk_cache_insert(&w->key, w->data, w->len,
+									   s->gc_generation, true);
+			}
+			written_chunks = NIL;
+			written_bytes = 0;
 			s->moving = false;
 			s->pad_offset = 0;
 			s->saved = NIL;
@@ -2927,6 +2971,8 @@ journal_xact_callback(XactEvent event, void *arg)
 			}
 			s->commit_append.g = NULL;
 			discard_pending(s);
+			written_chunks = NIL;
+			written_bytes = 0;
 			s->saved = NIL;
 			s->pending_saved = NIL;
 			s->through = NULL;
@@ -2988,6 +3034,29 @@ journal_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	if (s == NULL)
 		return;
 	pending_subxact(s, event, level);
+
+	/* (an aborted subtransaction's chunks never stored; a committed one's its parent's) */
+	if (written_chunks != NIL &&
+		(event == SUBXACT_EVENT_ABORT_SUB || event == SUBXACT_EVENT_COMMIT_SUB))
+	{
+		List	   *kept = NIL;
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		foreach_ptr(WrittenChunk, w, written_chunks)
+		{
+			if (w->level < level)
+				kept = lappend(kept, w);
+			else if (event == SUBXACT_EVENT_COMMIT_SUB)
+			{
+				w->level = level - 1;
+				kept = lappend(kept, w);
+			}
+			else
+				written_bytes -= w->len + sizeof(CachedChunk);
+		}
+		written_chunks = kept;
+		MemoryContextSwitchTo(old);
+	}
 
 	if (event == SUBXACT_EVENT_ABORT_SUB && s->gc != NULL)
 		gc_abort_sub(s->gc, level);
@@ -4391,6 +4460,21 @@ journal_put(ProllyChunkStore *s, const ProllyHash *hash, const void *data,
 	hash_key(&key, hash);
 	if (hash_search(s->pending_index, &key, HASH_FIND, NULL) != NULL)
 		return;
+	if (s == session_store &&
+		written_bytes + len + sizeof(CachedChunk) <= chunk_cache_limit() / 8)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+		WrittenChunk *w = palloc(sizeof(WrittenChunk));
+
+		w->key = key;
+		w->data = palloc(Max(len, 1));
+		memcpy(w->data, data, len);
+		w->len = (uint32) len;
+		w->level = GetCurrentTransactionNestLevel();
+		written_chunks = lappend(written_chunks, w);
+		written_bytes += len + sizeof(CachedChunk);
+		MemoryContextSwitchTo(old);
+	}
 
 	/* pending as it was, if a subtransaction puts its first */
 	level = GetCurrentTransactionNestLevel();
