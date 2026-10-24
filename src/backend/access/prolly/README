@@ -426,6 +426,24 @@ takes all four of a table's write privileges, as every move does).  A
 change to a definition, or to rows it may not write so, and an
 integration of any other branch, take the head move's privileges.
 
+A move drops and makes again every table's policies and makes each
+definition it changes, as the session's role.  On a writer branch, a move
+whose every definition change makes an object what the writer base's head
+defines (a reset to the base, a merge of it, an integration's
+fast-forward) runs those statements as the least role that may make
+them, restricted (SECURITY_RESTRICTED_OPERATION): the owner of what it
+changes or drops, if they are one role, and the database's owner for what
+it makes; else (several owners, or a kind whose owner isn't looked up)
+the bootstrap superuser.  Otherwise a policy statement runs as its
+table's owner when the move leaves the table's policies as they are, or
+makes them the base's.  This rests on a move running no user code: its
+statements are deparsed definitions, run with check_function_bodies off,
+and no trigger or event trigger fires for its own DDL (internal history
+work's); the rows it writes go as the session's role, under its
+privileges.  A writer with its tables' grants alone so moves to what its
+base's writers defined, never to definitions of its own choosing on
+objects it doesn't own.
+
 Other shared state in the refs is guarded the same way.  Making a tag, and
 adding or removing a remote, takes prolly_writes_refs(); deleting a tag
 takes that or having made it ('G', its maker, recorded by dolt_tag()

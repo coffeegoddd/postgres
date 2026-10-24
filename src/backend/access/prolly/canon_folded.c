@@ -10410,6 +10410,20 @@ restore_locality(List *tables, List *to)
 	CommandCounterIncrement();
 }
 
+/* the database's owner */
+static Oid
+get_database_owner_role(void)
+{
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	Oid			owner;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	owner = ((Form_pg_database) GETSTRUCT(tup))->datdba;
+	ReleaseSysCache(tup);
+	return owner;
+}
+
 /* A table's policies, as items has its definition (NIL: none, or no table). */
 static List *
 table_policies(List *items, const char *name)
@@ -10501,9 +10515,21 @@ run_policy_statements(List *stmts)
 		}
 		GetUserIdAndSecContext(&save_user, &save_sec);
 		if (OidIsValid(owner) && !has_privs_of_role(save_user, owner))
-			SetUserIdAndSecContext(owner, save_sec | SECURITY_LOCAL_USERID_CHANGE);
-		rc = SPI_execute(ps->sql, false, 0);
-		SetUserIdAndSecContext(save_user, save_sec);
+		{
+			SetUserIdAndSecContext(owner, save_sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
+			PG_TRY();
+			{
+				rc = SPI_execute(ps->sql, false, 0);
+			}
+			PG_FINALLY();
+			{
+				SetUserIdAndSecContext(save_user, save_sec);
+			}
+			PG_END_TRY();
+		}
+		else
+			rc = SPI_execute(ps->sql, false, 0);
 		if (rc < 0)
 			elog(ERROR, "could not run \"%s\": %s", ps->sql,
 				 SPI_result_code_string(rc));
@@ -10544,6 +10570,105 @@ definitions_of_base(List *from, List *to, List *base)
 			return false;
 	}
 	return true;
+}
+
+/*
+ * The owner of the object a move's item names, as the session's branch has
+ * it now; InvalidOid if it has none of the name, or the item is of a kind
+ * whose owner isn't looked up so (routines, types, collations).
+ */
+static Oid
+item_owner(const MoveItem *it, bool *known)
+{
+	Oid			owner = InvalidOid;
+
+	*known = true;
+	if (it->kind == 'n')
+	{
+		HeapTuple	tup = SearchSysCache1(NAMESPACENAME,
+										  CStringGetDatum(unquoted(it->name)));
+
+		if (HeapTupleIsValid(tup))
+		{
+			owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+			ReleaseSysCache(tup);
+		}
+	}
+	else if (it->kind == 't' || it->kind == 'v' || it->kind == 'm' ||
+			 it->kind == 's' || it->kind == 'f')
+	{
+		Oid			relid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(it->name, NULL)),
+											 NoLock, true);
+		HeapTuple	tup;
+
+		if (OidIsValid(relid) &&
+			HeapTupleIsValid(tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid))))
+		{
+			owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
+			ReleaseSysCache(tup);
+		}
+	}
+	else
+		*known = false;
+	return owner;
+}
+
+/*
+ * The role a writer branch's move to its base's definitions
+ * (definitions_of_base()) runs its statements as: the least that may make
+ * them.  The owner of every object it changes or drops, if they are one
+ * role, and the database's owner for those it makes (made by it, they are
+ * its, as the base's writers' would be theirs had they made them here);
+ * else, objects of several owners, or of a kind whose owner isn't looked
+ * up, the bootstrap superuser, as no one role may make all of it.  The
+ * move runs no user code with it: its statements are deparsed definitions,
+ * run with check_function_bodies off, and neither triggers nor event
+ * triggers fire for a move's own DDL (internal history work's), so the
+ * authority makes only the base's definitions.
+ */
+static Oid
+move_authority(List *from, List *to)
+{
+	Oid			authority = InvalidOid;
+	ListCell   *lc;
+
+#define AUTHORITY_IS(role) \
+	do { \
+		if (!OidIsValid(authority)) \
+			authority = (role); \
+		else if (authority != (role)) \
+			return BOOTSTRAP_SUPERUSERID; \
+	} while (0)
+
+	foreach(lc, to)
+	{
+		MoveItem   *t = lfirst(lc);
+		MoveItem   *f = find_item(from, t->kind, t->name);
+		bool		known;
+		Oid			owner;
+
+		if (f != NULL && strcmp(f->def, t->def) == 0)
+			continue;
+		owner = item_owner(t, &known);
+		if (!known)
+			return BOOTSTRAP_SUPERUSERID;
+		AUTHORITY_IS(OidIsValid(owner) ? owner : get_database_owner_role());
+	}
+	foreach(lc, from)
+	{
+		MoveItem   *f = lfirst(lc);
+		bool		known;
+		Oid			owner;
+
+		if (find_item(to, f->kind, f->name) != NULL)
+			continue;
+		owner = item_owner(f, &known);
+		if (!known || !OidIsValid(owner))
+			return BOOTSTRAP_SUPERUSERID;
+		AUTHORITY_IS(owner);
+	}
+#undef AUTHORITY_IS
+	return OidIsValid(authority) ? authority : get_database_owner_role();
 }
 
 /*
@@ -10615,7 +10740,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	List	   *base;			/* the writer base's items, if any */
 	ProllyNodeRef base_root;
 	bool		as_base;		/* the move makes only the base's definitions:
-								 * its statements run with the authority to */
+								 * its statements run as authority */
+	Oid			authority = InvalidOid;
 	Oid			session_user = InvalidOid;
 	int			session_sec = 0;
 	List	   *remade = NIL;
@@ -10641,6 +10767,13 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	base = writer_base_items(&cn, &base_root);
 	to = move_items(&cn, to_root);
 	as_base = base != NIL && definitions_of_base(from, to, base);
+	if (as_base)
+	{
+		authority = move_authority(from, to);
+		/* (a role that may make them all already: as itself) */
+		if (has_privs_of_role(GetUserId(), authority))
+			as_base = false;
+	}
 	tm = type_moves(from, to);
 
 	/*
@@ -11173,11 +11306,17 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 	(void) set_config_option("client_min_messages", "warning", PGC_USERSET,
 							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 	SPI_connect();
+	/*
+	 * (the authority, restricted, for the statements; the session's role for
+	 * the rows.  An error between gives the session its role back as the
+	 * (sub)transaction aborts, which restores the user and security context
+	 * it began with.)
+	 */
 	if (as_base)
 	{
 		GetUserIdAndSecContext(&session_user, &session_sec);
-		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
-							   session_sec | SECURITY_LOCAL_USERID_CHANGE);
+		SetUserIdAndSecContext(authority, session_sec | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_RESTRICTED_OPERATION);
 	}
 	places = index_places(from);
 	run_policy_statements(policy_drops);
@@ -11226,8 +11365,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			SetUserIdAndSecContext(session_user, session_sec);
 		rows(arg);
 		if (as_base)
-			SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
-								   session_sec | SECURITY_LOCAL_USERID_CHANGE);
+			SetUserIdAndSecContext(authority, session_sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
 		MemoryContextSwitchTo(spi);
 	}
 	run_statements(sm.after);
@@ -11242,8 +11381,8 @@ move_schema(const ProllyNodeRef *from_root, const ProllyNodeRef *to_root,
 			SetUserIdAndSecContext(session_user, session_sec);
 		breaking(sm.added, arg);
 		if (as_base)
-			SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
-								   session_sec | SECURITY_LOCAL_USERID_CHANGE);
+			SetUserIdAndSecContext(authority, session_sec | SECURITY_LOCAL_USERID_CHANGE |
+								   SECURITY_RESTRICTED_OPERATION);
 		MemoryContextSwitchTo(spi);
 	}
 	run_statements(sm.validations);
