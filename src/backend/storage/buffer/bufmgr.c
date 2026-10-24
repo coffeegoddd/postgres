@@ -2857,6 +2857,15 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	IOContext	io_context = IOContextForStrategy(strategy);
 	instr_time	io_start;
 
+	/*
+	 * Before anything is taken for it, its storage may make room for the
+	 * blocks (block-mapped storage reusing what dropped relations held):
+	 * the extension lock isn't held yet, nor any other, as nobody takes the
+	 * lock holding another's.
+	 */
+	if (!(flags & EB_SKIP_EXTENSION_LOCK))
+		smgrbeforeextend(BMR_GET_SMGR(bmr), fork, extend_by);
+
 	LimitAdditionalPins(&extend_by);
 
 	/*
