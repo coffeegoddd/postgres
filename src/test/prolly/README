@@ -146,14 +146,18 @@ t/299_postgis_regress.pl runs regress/run_test.pl, with PostGIS's own
 hooks, for each suite (core, raster, topology, and sfcgal when built) in
 each mode: heap; prolly (public versioned, and every table a test makes
 in it checked to be a prolly table as it is made); prolly_txn (every
-transaction a Dolt commit); and heap_dump and prolly_dump
-(--dumprestore).  Each prolly mode's per-test outcomes are classified
-against its heap baseline: agree, regression, postgres_semantics (an
-intended difference, listed in postgis_regress_known with its issue),
-known_bug (a difference listed there with the issue that will fix it),
-crashed or timeout.  A regression, crash or timeout fails the group, and
-so does a listed difference that no longer differs.  The classification
-is in tmp_check/postgis_regress/summary.txt.  POSTGIS_REGRESS_SUITES and
+transaction a Dolt commit); and heap_dump and prolly_dump (--dumprestore:
+the database dumped and restored once PostGIS is installed, before the
+tests).  Each prolly mode's tests are compared with its heap baseline's,
+by outcome and, where both failed, by their output: agree, regression,
+postgres_semantics or known_bug (a difference listed in
+postgis_regress_known with its issue and the md5 of its diff), crashed or
+timeout.  A regression, crash or timeout fails the group, and so does a
+listed test whose diff changed or that agrees.  Schemas a suite makes
+itself (topology's, some tests') stay ordinary, so their tables are heap
+beside the versioned public; the summary counts, per suite and mode, the
+tables made on prolly and those made elsewhere.  The classification is in
+tmp_check/postgis_regress/summary.txt.  POSTGIS_REGRESS_SUITES and
 POSTGIS_REGRESS_MODES narrow a run, POSTGIS_REGRESS_TIMEOUT (seconds,
 3600) bounds each.
 
