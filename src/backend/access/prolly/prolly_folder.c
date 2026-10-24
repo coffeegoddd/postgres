@@ -394,6 +394,9 @@ fold_pass(const ProllyRefsRoutine *refs)
 				 */
 				AbortCurrentTransaction();
 				pending = true;
+				/* (counted outside a transaction: flushed with the pass's) */
+				pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_RETRIES, 1);
+				AtEOXact_PgStat_Prolly();
 				elog(DEBUG1, "fold worker left branch %u for its next pass: "
 					 "the refs held, or the branch moved", moved[i].branch);
 			}
