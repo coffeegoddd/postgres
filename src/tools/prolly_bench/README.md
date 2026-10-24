@@ -351,6 +351,7 @@ the two away. Each check must not grow faster than its target
 | `diff` | `dolt_diff` of that commit | rows; delta | `nodes_read` log in N; at most linear in Δ |
 | `merge` | `dolt_merge` of Δ rows, main changed elsewhere | rows; delta | tree work and map work log and rows applied flat in N; tree work and rows at most linear in Δ |
 | `ff_merge` | `dolt_merge` of Δ rows into main untouched since (a fast-forward) | rows; delta | as `merge` |
+| `txn_commit` | Δ rows committed as their transaction ends (`dolt.transaction_commit`), after another such | rows | tree work and chunk-file reads log in N |
 
 The work counters are tree work (`nodes_read`, `nodes_written`,
 `chunks_appended`, `fold_rows_read`, `log_pages_read`), map work

@@ -102,7 +102,7 @@ def series(checks=None):
         cs = {}
         for (check, sw), counters in vshape.TARGETS.items():
             if sw == sweep:
-                cs[check] = {c: [0] * 4 for c in vshape.WORK + vshape.CATALOG}
+                cs[check] = {c: [0] * 4 for c in (*vshape.WORK, *vshape.CATALOG, *counters)}
         for (check, sw, counter), values in (checks or {}).items():
             if sw == sweep:
                 cs[check][counter] = values
