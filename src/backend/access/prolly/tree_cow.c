@@ -1502,6 +1502,49 @@ cow_count(const ProllyTreeEnv *env, const ProllyNodeRef *root)
 	return total;
 }
 
+/*
+ * The keys below key: a descent of key's path, adding the counts of the
+ * children before the one that may hold it (an internal item's key is its
+ * child's greatest), then the leaf's keys before it.
+ */
+static uint64
+cow_rank(const ProllyTreeEnv *env, const ProllyNodeRef *root,
+		 const ProllyKey *key)
+{
+	ProllyNodeRef ref = *root;
+	uint64		below = 0;
+
+	for (;;)
+	{
+		TNode		node;
+		int			idx;
+		uint64		count;
+
+		node_read(env, &ref, &node);
+		idx = lower_bound(env, &node, key);
+		if (node.level == 0)
+		{
+			below += idx;
+			node_release(&node);
+			return below;
+		}
+		for (int i = 0; i < idx && i < node.nitems; i++)
+		{
+			ProllyNodeRef child;
+
+			node_child(env, &node, i, &child, &count);
+			below += count;
+		}
+		if (idx >= node.nitems)
+		{
+			node_release(&node);
+			return below;
+		}
+		node_child(env, &node, idx, &ref, &count);
+		node_release(&node);
+	}
+}
+
 /* Append h to *hashes, which holds *n of room for *max. */
 static void
 add_hash(ProllyHash **hashes, int *n, int *max, const ProllyHash *h)
@@ -3141,6 +3184,7 @@ const ProllyTreeRoutine prolly_tree_cow = {
 	.diff_nodes = cow_diff_nodes,
 	.diff_unordered = cow_diff_unordered,
 	.diff_estimate = cow_diff_estimate,
+	.rank = cow_rank,
 	.references = cow_references,
 	.value_write = write_value_tree,
 	.value_read = read_value,

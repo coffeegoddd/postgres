@@ -572,7 +572,6 @@ SELECT count(*) FROM old.users;
 ERROR:  permission denied for table users
 SELECT * FROM prolly_mount(:'c1', 'ci', 'mine', ARRAY['bag']);
 ERROR:  permission denied for database regress_snapshot_mounts
-CONTEXT:  SQL statement "CREATE SCHEMA mine"
 RESET ROLE;
 GRANT SELECT ON ci.users TO regress_mount_reader;
 SET ROLE regress_mount_reader;
@@ -583,7 +582,7 @@ SELECT count(*) FROM old.users;
 (1 row)
 
 SELECT prolly_unmount('old');
-ERROR:  must be owner of schema old
+ERROR:  must be the owner of snapshot mount "old"
 RESET ROLE;
 ALTER TABLE ci.users ENABLE ROW LEVEL SECURITY;
 SET ROLE regress_mount_reader;
@@ -724,6 +723,653 @@ SELECT count(*) FROM pg_class WHERE relnamespace = 'pinned'::regnamespace;
  count 
 -------
      0
+(1 row)
+
+-- Keys bounded by another integer type's operators (as btree is): a bigint
+-- key by an int4 value; values out of a smaller key's range are equal to
+-- no key, and bound all or none.
+CREATE TABLE ci.wide (id bigint PRIMARY KEY, s smallint, v int);
+CREATE UNIQUE INDEX ON ci.wide (s);
+INSERT INTO ci.wide SELECT g, g - 100, g FROM generate_series(1, 200) g;
+CREATE TABLE ci.small (s smallint PRIMARY KEY, v int);
+INSERT INTO ci.small SELECT g, g FROM generate_series(-100, 100) g;
+SELECT length(dolt_commit('-Am', 'integer keys')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'ints', ARRAY['wide', 'small']);
+ mount 
+-------
+ ints
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT v FROM ints.wide WHERE id = 42;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Foreign Scan on wide (actual rows=1.00 loops=1)
+   Filter: (id = 42)
+   Snapshot Access: primary key, 1 equal
+   Rows Read: 1
+(4 rows)
+
+SELECT v FROM ints.wide WHERE id = 42::smallint;
+ v  
+----
+ 42
+(1 row)
+
+SELECT count(*) FROM ints.wide WHERE id > 190::int4 AND id <= 195::int2;
+ count 
+-------
+     5
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT v FROM ints.small WHERE s = 7::int8;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Foreign Scan on small (actual rows=1.00 loops=1)
+   Filter: (s = '7'::bigint)
+   Snapshot Access: primary key, 1 equal
+   Rows Read: 1
+(4 rows)
+
+SELECT count(*) FROM ints.small WHERE s = 100000::int8;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ints.small WHERE s < 100000::int8;
+ count 
+-------
+   201
+(1 row)
+
+SELECT count(*) FROM ints.small WHERE s > 100000::int8;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM ints.small WHERE s > -100000::int8 AND s < -95;
+ count 
+-------
+     5
+(1 row)
+
+SELECT count(*) FROM ints.small WHERE s < -100000::int8;
+ count 
+-------
+     0
+(1 row)
+
+-- Estimates from the tree: keys between constant bounds counted exactly.
+CREATE FUNCTION pg_temp.plan_rows(q text) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	RETURN (j->0->'Plan'->>'Plan Rows')::float8;
+END $$;
+SELECT pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4') AS tenant_rows,
+	pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id = 4 AND id < 250') AS range_rows,
+	pg_temp.plan_rows('SELECT * FROM old.users WHERE tenant_id >= 8') AS last_two,
+	pg_temp.plan_rows('SELECT * FROM ints.wide WHERE id BETWEEN 11 AND 30') AS between_rows;
+ tenant_rows | range_rows | last_two | between_rows 
+-------------+------------+----------+--------------
+        1000 |        250 |     2000 |           20
+(1 row)
+
+-- Appendrel members: a union, an inheritance child and a partition of
+-- mounted tables, ordered and filtered by their parents' plans.
+SELECT count(*) FROM (SELECT v FROM ints.wide UNION ALL SELECT v FROM ints.wide) u;
+ count 
+-------
+   400
+(1 row)
+
+SELECT id FROM (SELECT id FROM ints.wide UNION ALL SELECT id FROM ints.wide) u
+ORDER BY id LIMIT 3;
+ id 
+----
+  1
+  1
+  2
+(3 rows)
+
+CREATE TABLE public.wide_parent (id bigint, s smallint, v int);
+ALTER FOREIGN TABLE ints.wide INHERIT public.wide_parent;
+SELECT count(*), max(id) FROM public.wide_parent;
+ count | max 
+-------+-----
+   200 | 200
+(1 row)
+
+SELECT id FROM public.wide_parent WHERE id < 4 ORDER BY id;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+ALTER FOREIGN TABLE ints.wide NO INHERIT public.wide_parent;
+CREATE TABLE public.small_parts (s smallint, v int) PARTITION BY RANGE (s);
+ALTER TABLE public.small_parts ATTACH PARTITION ints.small FOR VALUES FROM (-1000) TO (1000);
+SELECT count(*), min(s) FROM public.small_parts;
+ count | min  
+-------+------
+   201 | -100
+(1 row)
+
+SELECT s FROM public.small_parts WHERE s > 97 ORDER BY s;
+  s  
+-----
+  98
+  99
+ 100
+(3 rows)
+
+ALTER TABLE public.small_parts DETACH PARTITION ints.small;
+DROP TABLE public.small_parts, public.wide_parent;
+-- A rescan's bounds are freed for the next: memory stays flat over many.
+CREATE FUNCTION pg_temp.mem() RETURNS int8 LANGUAGE sql VOLATILE AS
+	$$SELECT sum(total_bytes)::int8 FROM pg_backend_memory_contexts$$;
+SELECT max(m) FILTER (WHERE g > 19000) - max(m) FILTER (WHERE g BETWEEN 900 AND 1000)
+	< 1000000 AS flat
+FROM (SELECT g, pg_temp.mem() AS m
+	  FROM generate_series(1, 20000) g,
+		   LATERAL (SELECT v FROM ints.wide w WHERE w.id = g % 200 OFFSET 0) x) t;
+ flat 
+------
+ t
+(1 row)
+
+SELECT prolly_unmount('ints');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+-- A foreign table naming a mount's pin and commit, but a table the mount
+-- didn't mount (so didn't check), is refused.
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'justbag', ARRAY['bag']);
+  mount  
+---------
+ justbag
+(1 row)
+
+SELECT f.option_value AS bag_commit FROM pg_foreign_table ft,
+	pg_options_to_table(ft.ftoptions) f
+WHERE ft.ftrelid = 'justbag.bag'::regclass AND f.option_name = 'commit' \gset
+CREATE FOREIGN TABLE justbag.users (tenant_id int, id int, email text, payload text)
+	SERVER prolly_local OPTIONS (mount 'justbag', commit :'bag_commit', source 'ci.users');
+SELECT count(*) FROM justbag.users;
+ERROR:  snapshot mount "justbag" doesn't mount "ci.users", which table "users" names
+DROP FOREIGN TABLE justbag.users;
+-- Who may mount where: not into a system schema or another's, not with no
+-- tables; only the mount's owner unmounts it; dropping a mount's schema
+-- releases its pin.
+SELECT * FROM prolly_mount('HEAD', 'ci', 'pg_catalog', ARRAY['bag']);
+ERROR:  a snapshot mount can't be in system schema "pg_catalog"
+SELECT * FROM prolly_mount('HEAD', 'ci', 'pg_mine', ARRAY['bag']);
+ERROR:  a snapshot mount can't be in system schema "pg_mine"
+SELECT * FROM prolly_mount('HEAD', 'ci', 'information_schema', ARRAY['bag']);
+ERROR:  a snapshot mount can't be in system schema "information_schema"
+SELECT * FROM prolly_mount('HEAD', 'ci', 'nothing', ARRAY[]::text[]);
+ERROR:  prolly_mount's tables can't be empty
+CREATE SCHEMA empty_src;
+SELECT * FROM prolly_mount('HEAD', 'empty_src', 'nothing');
+ERROR:  HEAD has no tables in schema "empty_src"
+CREATE ROLE regress_mount_other;
+CREATE SCHEMA owned_elsewhere;
+GRANT USAGE, CREATE ON SCHEMA owned_elsewhere TO regress_mount_other;
+SET ROLE regress_mount_other;
+SELECT * FROM prolly_mount('HEAD', 'ci', 'other', ARRAY['bag']);
+ERROR:  permission denied for database regress_snapshot_mounts
+SELECT * FROM prolly_mount('HEAD', 'ci', 'owned_elsewhere', ARRAY['bag']);
+ERROR:  must be owner of schema owned_elsewhere
+SELECT prolly_unmount('justbag');
+ERROR:  must be the owner of snapshot mount "justbag"
+RESET ROLE;
+SELECT count(*) FROM prolly_mounts() WHERE mount = 'justbag';
+ count 
+-------
+     1
+(1 row)
+
+DROP SCHEMA justbag CASCADE;
+NOTICE:  drop cascades to foreign table justbag.bag
+SELECT count(*) FROM prolly_mounts() WHERE mount = 'justbag';
+ count 
+-------
+     0
+(1 row)
+
+-- (rolled back: the pin stays)
+SELECT mount FROM prolly_mount('HEAD', 'ci', 'kept', ARRAY['bag']);
+ mount 
+-------
+ kept
+(1 row)
+
+BEGIN;
+DROP SCHEMA kept CASCADE;
+NOTICE:  drop cascades to foreign table kept.bag
+SELECT count(*) FROM prolly_mounts() WHERE mount = 'kept';
+ count 
+-------
+     0
+(1 row)
+
+ROLLBACK;
+SELECT count(*) FROM prolly_mounts() WHERE mount = 'kept';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM kept.bag;
+ count 
+-------
+     3
+(1 row)
+
+SELECT prolly_unmount('kept');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+REVOKE ALL ON SCHEMA owned_elsewhere FROM regress_mount_other;
+DROP SCHEMA kept, owned_elsewhere, empty_src;
+DROP ROLE regress_mount_other;
+-- Index trees: a mount with indexes builds a tree for each btree index the
+-- version has, as the version defines it; scans seek and order by them,
+-- reading the columns an index holds from its entries, the others from
+-- the data tree.
+CREATE SCHEMA ix VERSIONED;
+CREATE TABLE ix.users (
+	tenant_id int, id int, email text, payload text, note text,
+	PRIMARY KEY (tenant_id, id));
+CREATE INDEX users_tenant_email ON ix.users (tenant_id, email);
+CREATE INDEX users_email_desc ON ix.users (email DESC) INCLUDE (payload);
+CREATE UNIQUE INDEX users_note ON ix.users (note COLLATE "C");
+CREATE INDEX users_partial ON ix.users (email) WHERE tenant_id = 0;
+CREATE INDEX users_expr ON ix.users (lower(email));
+INSERT INTO ix.users
+SELECT g / 100, g % 100, 'person' || lpad((g % 100)::text, 3, '0'),
+	'p' || g, CASE WHEN g % 10 = 0 THEN NULL ELSE 'n' || g END
+FROM generate_series(0, 999) g;
+CREATE TABLE ix.bag (v int, w text);
+CREATE INDEX bag_w ON ix.bag (w);
+INSERT INTO ix.bag VALUES (1, 'a'), (1, 'a'), (2, 'b'), (3, NULL);
+SELECT length(dolt_commit('-Am', 'indexed')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+SELECT dolt_hashof('HEAD') AS ix1 \gset
+UPDATE ix.users SET email = 'changed' WHERE tenant_id = 4 AND id = 42;
+SELECT length(dolt_commit('-Am', 'changed')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+CREATE INDEX users_payload ON ix.users (payload);
+SELECT length(dolt_commit('-Am', 'a new index')::text) > 0 AS committed;
+ committed 
+-----------
+ t
+(1 row)
+
+-- a plain mount builds none: no row read
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT mount FROM prolly_mount(:'ix1', 'ix', 'plain');
+ mount 
+-------
+ plain
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') AS plain_decoded;
+ plain_decoded 
+---------------
+             0
+(1 row)
+
+SELECT indexes FROM prolly_mounts() WHERE mount = 'plain';
+ indexes 
+---------
+ {}
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT * FROM plain.users WHERE email = 'person042';
+              QUERY PLAN               
+---------------------------------------
+ Foreign Scan on users
+   Filter: (email = 'person042'::text)
+   Snapshot Access: full
+(3 rows)
+
+SELECT prolly_unmount('plain');
+ prolly_unmount 
+----------------
+ 
+(1 row)
+
+-- with indexes: each btree index of the version that can be followed (not
+-- the partial or the expression index, nor one made since)
+SELECT mount FROM prolly_mount(:'ix1', 'ix', 'ixm', NULL, true);
+ mount 
+-------
+ ixm
+(1 row)
+
+SELECT unnest(indexes) AS built FROM prolly_mounts() WHERE mount = 'ixm' ORDER BY 1;
+          built           
+--------------------------
+ bag.bag_w
+ users.users_email_desc
+ users.users_note
+ users.users_tenant_email
+(4 rows)
+
+-- equality on both columns, then the leading one and a range, in order
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM ixm.users WHERE tenant_id = 4 AND email = 'person042';
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Foreign Scan on users (actual rows=1.00 loops=1)
+   Filter: ((tenant_id = 4) AND (email = 'person042'::text))
+   Snapshot Access: index users_tenant_email, 2 equal, row lookups
+   Rows Read: 1
+(4 rows)
+
+SELECT tenant_id, id, email FROM ixm.users WHERE tenant_id = 4 AND email = 'person042';
+ tenant_id | id |   email   
+-----------+----+-----------
+         4 | 42 | person042
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM ixm.users WHERE tenant_id = 4 AND email >= 'person040' AND email < 'person050'
+ORDER BY email LIMIT 5;
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   ->  Foreign Scan on users (actual rows=5.00 loops=1)
+         Filter: ((email >= 'person040'::text) AND (email < 'person050'::text) AND (tenant_id = 4))
+         Snapshot Access: index users_tenant_email, 1 equal, range, row lookups
+         Rows Read: 5
+(5 rows)
+
+SELECT tenant_id, id, email FROM ixm.users
+WHERE tenant_id = 4 AND email > 'person040' AND email <= 'person044' ORDER BY email;
+ tenant_id | id |   email   
+-----------+----+-----------
+         4 | 41 | person041
+         4 | 42 | person042
+         4 | 43 | person043
+         4 | 44 | person044
+(4 rows)
+
+-- a DESC index holding payload: its columns from its entries, no row
+-- read; its bounds flip
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT email, payload FROM ixm.users WHERE email = 'person007';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Foreign Scan on users (actual rows=10.00 loops=1)
+   Filter: (email = 'person007'::text)
+   Snapshot Access: index users_email_desc, 1 equal
+   Rows Read: 10
+(4 rows)
+
+SELECT count(*), min(payload) FROM ixm.users WHERE email = 'person007';
+ count | min  
+-------+------
+    10 | p107
+(1 row)
+
+SELECT DISTINCT email FROM ixm.users WHERE email > 'person097' ORDER BY email DESC;
+   email   
+-----------
+ person099
+ person098
+(2 rows)
+
+SELECT DISTINCT email FROM ixm.users WHERE email >= 'person001' AND email < 'person003' ORDER BY email;
+   email   
+-----------
+ person001
+ person002
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT email FROM ixm.users ORDER BY email DESC LIMIT 3;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Limit
+   ->  Foreign Scan on users
+         Snapshot Access: index users_email_desc, 0 equal
+(3 rows)
+
+SELECT email FROM ixm.users ORDER BY email DESC LIMIT 3;
+   email   
+-----------
+ person099
+ person099
+ person099
+(3 rows)
+
+-- a unique index under its own collation, NULLs never equal
+EXPLAIN (COSTS OFF) SELECT id FROM ixm.users WHERE note = 'n41' COLLATE "C";
+                  QUERY PLAN                  
+----------------------------------------------
+ Foreign Scan on users
+   Filter: (note = 'n41'::text COLLATE "C")
+   Snapshot Access: index users_note, 1 equal
+(3 rows)
+
+SELECT tenant_id, id FROM ixm.users WHERE note = 'n41' COLLATE "C";
+ tenant_id | id 
+-----------+----
+         0 | 41
+(1 row)
+
+SELECT count(*) FROM ixm.users WHERE note IS NULL;
+ count 
+-------
+   100
+(1 row)
+
+-- the version's values: the row changed since is the old one here
+SELECT count(*) FROM ixm.users WHERE email = 'changed';
+ count 
+-------
+     0
+(1 row)
+
+-- the index made since isn't the version's
+EXPLAIN (COSTS OFF) SELECT id FROM ixm.users WHERE payload = 'p5';
+            QUERY PLAN            
+----------------------------------
+ Foreign Scan on users
+   Filter: (payload = 'p5'::text)
+   Snapshot Access: full
+(3 rows)
+
+-- keyless: each copy, by the index
+SELECT v, w FROM ixm.bag WHERE w = 'a';
+ v | w 
+---+---
+ 1 | a
+ 1 | a
+(2 rows)
+
+SELECT v FROM ixm.bag WHERE w IS NULL;
+ v 
+---
+ 3
+(1 row)
+
+-- a parameterized nested loop by an index
+SET enable_mergejoin = off;
+SET enable_hashjoin = off;
+EXPLAIN (COSTS OFF)
+SELECT u.id FROM (VALUES ('person005'), ('person077')) v(e)
+JOIN ixm.users u ON u.email = v.e;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Nested Loop
+   ->  Values Scan on "*VALUES*"
+   ->  Foreign Scan on users u
+         Filter: (email = "*VALUES*".column1)
+         Snapshot Access: index users_email_desc, 1 equal
+(5 rows)
+
+RESET enable_mergejoin;
+RESET enable_hashjoin;
+SELECT u.tenant_id, u.id FROM (VALUES ('person005'), ('person077')) v(e)
+JOIN ixm.users u ON u.email = v.e AND u.tenant_id = 3 ORDER BY 2;
+ tenant_id | id 
+-----------+----
+         3 |  5
+         3 | 77
+(2 rows)
+
+-- a collection keeps the index trees the pin keeps
+SELECT dolt_gc('--full');
+ dolt_gc 
+---------
+ {0}
+(1 row)
+
+SELECT count(*) FROM ixm.users WHERE email = 'person007';
+ count 
+-------
+    10
+(1 row)
+
+-- A refresh brings the trees to the new commit by the rows that differ:
+-- it decodes the changed row, not every row; then the next commit's new
+-- index, built whole.
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT prolly_refresh_mount('ixm', 'HEAD~1') = dolt_hashof('HEAD~1') AS refreshed;
+ refreshed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') < 50 AS refresh_decodes_changes;
+ refresh_decodes_changes 
+-------------------------
+ t
+(1 row)
+
+SELECT count(*) FROM ixm.users WHERE email = 'changed';
+ count 
+-------
+     1
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 0 AS counting;
+ counting 
+----------
+ t
+(1 row)
+
+SELECT prolly_refresh_mount('ixm', 'HEAD') = dolt_hashof('HEAD') AS refreshed;
+ refreshed 
+-----------
+ t
+(1 row)
+
+SELECT pg_stat_force_next_flush() \gset
+SELECT pg_temp.since('columns_decoded') >= 1000 AS new_index_built_whole;
+ new_index_built_whole 
+-----------------------
+ t
+(1 row)
+
+SELECT unnest(indexes) AS built FROM prolly_mounts() WHERE mount = 'ixm' ORDER BY 1;
+          built           
+--------------------------
+ bag.bag_w
+ users.users_email_desc
+ users.users_note
+ users.users_payload
+ users.users_tenant_email
+(5 rows)
+
+SELECT count(*) FROM ixm.users WHERE email = 'changed';
+ count 
+-------
+     1
+(1 row)
+
+SELECT tenant_id, id FROM ixm.users WHERE tenant_id = 4 AND email = 'changed';
+ tenant_id | id 
+-----------+----
+         4 | 42
+(1 row)
+
+SELECT count(*) FROM ixm.users WHERE tenant_id = 4 AND email = 'person042';
+ count 
+-------
+     0
+(1 row)
+
+SELECT id FROM ixm.users WHERE payload = 'p5';
+ id 
+----
+  5
+(1 row)
+
+-- and agrees with a mount built whole
+SELECT mount FROM prolly_mount('HEAD', 'ix', 'whole', NULL, true);
+ mount 
+-------
+ whole
+(1 row)
+
+SELECT (SELECT array_agg(i ORDER BY i) FROM prolly_mounts(), unnest(indexes) i
+		WHERE mount = 'ixm') IS NOT NULL AS listed;
+ listed 
+--------
+ t
+(1 row)
+
+SELECT bool_and(a.indexes = b.indexes) AS same_indexes
+FROM prolly_mounts() a, prolly_mounts() b WHERE a.mount = 'ixm' AND b.mount = 'whole';
+ same_indexes 
+--------------
+ t
+(1 row)
+
+SELECT prolly_unmount('whole'), prolly_unmount('ixm');
+ prolly_unmount | prolly_unmount 
+----------------+----------------
+                | 
 (1 row)
 
 SELECT prolly_unmount('old');

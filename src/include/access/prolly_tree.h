@@ -311,6 +311,14 @@ typedef struct ProllyTreeRoutine
 								  const ProllyNodeRef *from,
 								  const ProllyNodeRef *to,
 								  uint64 max_nodes);
+
+	/*
+	 * Optional: how many of root's keys are less than key, exactly, from
+	 * the subtree counts internal items record: the nodes on key's path
+	 * alone are read.  Two ranks count the keys in a range.
+	 */
+	uint64		(*rank) (const ProllyTreeEnv *env, const ProllyNodeRef *root,
+						 const ProllyKey *key);
 } ProllyTreeRoutine;
 
 #define PROLLY_TREE_CALLBACK_NAMES \
@@ -318,9 +326,9 @@ typedef struct ProllyTreeRoutine
 	"cursor_seek", "cursor_next", "cursor_close", "apply", "count", \
 	"walk", "diff", "diff_nodes", "references", "value_write", "value_read", \
 	"value_present", "value_reference", "value_root", "key_max", \
-	"diff_unordered", "diff_estimate"
+	"diff_unordered", "diff_estimate", "rank"
 #define PROLLY_TREE_FIRST_CALLBACK build_begin
-#define PROLLY_TREE_LAST_CALLBACK diff_estimate
+#define PROLLY_TREE_LAST_CALLBACK rank
 
 static inline const ProllyTreeRoutine *
 prolly_tree_lookup(const char *name)

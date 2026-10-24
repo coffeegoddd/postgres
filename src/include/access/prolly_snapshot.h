@@ -32,4 +32,10 @@
 extern void prolly_check_history_by_name(const char *name, const char *commit,
 										 bool lineage, const char *fn);
 
+/*
+ * Schema nsp is being dropped: a snapshot mount of its name goes with it,
+ * its pin released.
+ */
+extern void prolly_snapshot_schema_dropped(Oid nsp);
+
 #endif							/* PROLLY_SNAPSHOT_H */
