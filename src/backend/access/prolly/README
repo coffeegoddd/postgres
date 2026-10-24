@@ -629,7 +629,11 @@ settled, leaves the working set known to be a commit's root, each
 block-mapped relation stored with its tables (heaps, indexes, TOAST tables,
 change logs) is kept by a snapshot of its storage (bmap_snapshot_take(),
 through branch operations' keep()), O(1) in its size, a relation unchanged
-since a commit kept already reusing that one's.  Only while nothing else
+since a commit kept already reusing that one's.  A snapshot writes out only
+the relation's pages changed since its last snapshot (those its map walk
+finds), never visiting the buffers; redo of one still flushes the
+relation's buffers in a pass over them all, so a standby or crash recovery
+pays O(the buffers) per snapshot replayed.  Only while nothing else
 can be on the pages: the relations are locked against writers without
 waiting, and the snapshot the commit or move went by saw every writer of
 the branch that ended and nobody else is writing it; otherwise nothing is

@@ -5780,9 +5780,10 @@ bmap_snapshot_take(SMgrRelation reln)
 
 /*
  * bmap_snapshot_take() of each of rels[] (n of them), their ids into ids[]:
- * every cached page checked again before it next changes, once, their own
- * pages written out, and their page stores synced once each, as the transaction commits (bmapsyncshares()),
- * as a share's are.  For a caller that relies on the snapshots only once
+ * the generation of sharing raised once for them all, so that every cached
+ * page is checked again before it next changes; each relation's own pages
+ * written out; and their page stores synced once each, as the transaction
+ * commits (bmapsyncshares()), as a share's are.  For a caller that relies on the snapshots only once
  * its transaction has committed: until then a crash leaves them unsynced,
  * kept by nobody.  Each id is set as its snapshot is taken (the others 0),
  * so that, if one fails, the caller knows of those taken already.
@@ -11622,7 +11623,11 @@ bmap_redo(XLogReaderState *record)
 				 * logged, and the pages redo made of the records before
 				 * this go elsewhere once a remap moves the relation off
 				 * them: the snapshot's blocks would keep what they had
-				 * when redo began.
+				 * when redo began.  (Every buffer is visited, as before:
+				 * redo doesn't yet write only the pages changed since the
+				 * last snapshot, as bmap_snapshot_take() does, so a standby
+				 * or crash recovery replays each snapshot in O(the
+				 * buffers).)
 				 */
 				if (xlrec->op == BMAP_TREE_SNAPSHOT &&
 					XLogRecHasBlockRef(record, 1))

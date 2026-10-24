@@ -1539,8 +1539,9 @@ kept_locator(const BranchKeptRelation *k)
 #define KEEP_SNAPSHOTS_MAX	(BMAP_SNAPSHOTS_MAX - 4)
 
 /*
- * Snapshots to take, together (bmap_snapshot_take_many(): one look at
- * the buffers, and each page store synced once as the transaction
+ * Snapshots to take, together (bmap_snapshot_take_many(): the generation
+ * of sharing raised once, each relation's pages changed since its last
+ * snapshot written out, and each page store synced once as the transaction
  * commits, which the refs naming them commit with): each one's storage
  * and where its id goes.
  */
