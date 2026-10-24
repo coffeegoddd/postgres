@@ -1608,6 +1608,7 @@ PG_FUNCTION_INFO_V1(prolly_canonical_decode);
 PG_FUNCTION_INFO_V1(test_toast_hash_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer_bytes);
+PG_FUNCTION_INFO_V1(test_toast_identity);
 PG_FUNCTION_INFO_V1(test_receiver_recv);
 PG_FUNCTION_INFO_V1(test_toast_pointer_value);
 PG_FUNCTION_INFO_V1(test_toast_counters);
@@ -1688,6 +1689,18 @@ test_toast_pointer_bytes(PG_FUNCTION_ARGS)
 		elog(ERROR, "not a hash pointer");
 	PG_RETURN_BYTEA_P(cstring_to_text_with_len((const char *) v,
 											   VARSIZE_EXTERNAL(v)));
+}
+
+/* A value's pointer identity (toast_pointer_identity()), or NULL. */
+Datum
+test_toast_identity(PG_FUNCTION_ARGS)
+{
+	ToastPointerIdentity id;
+
+	if (get_typlen(get_fn_expr_argtype(fcinfo->flinfo, 0)) != -1 ||
+		!toast_pointer_identity((const struct varlena *) DatumGetPointer(PG_GETARG_DATUM(0)), &id))
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(cstring_to_text_with_len((const char *) id.bytes, sizeof(id.bytes)));
 }
 
 /*
