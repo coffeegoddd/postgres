@@ -656,14 +656,18 @@ check_merge_conflicts(const char *what)
 					 errhint("Resolve them with dolt_conflicts_resolve() first, or set dolt.allow_commit_conflicts to keep them.")));
 		v = violations_left(branch, violations_of(branch), &name);
 		if (v != NIL)
+		{
+			const char *type = ((ProllyViolation *) linitial(v))->type;
+
+			/* ("an exclusion constraint violation", but "a unique index ...") */
 			ereport(ERROR,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 					 errmsg("cannot %s a transaction with constraint violations", what),
-					 errdetail("Table \"%s\" has a row with a %s violation on branch \"%s\".",
-							   name,
-							   ((ProllyViolation *) linitial(v))->type,
-							   branch),
+					 errdetail("Table \"%s\" has a row with %s %s violation on branch \"%s\".",
+							   name, type[0] == 'e' ? "an" : "a",
+							   type, branch),
 					 errhint("Fix the rows and check them again with dolt_verify_constraints(), or set dolt.allow_commit_conflicts to keep them.")));
+		}
 	}
 }
 
