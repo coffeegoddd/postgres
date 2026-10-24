@@ -535,8 +535,9 @@ checkpoint of each branch written, in the background, so a status or a
 commit folds only what came since.  A branch whose writes go on is folded
 once its writers since its last fold wrote prolly_fold_worker_batch_rows
 rows (the refs count them, each row a write changes) or the first of them
-waited prolly_fold_worker_max_delay; one whose writes stopped (none ended
-for a naptime) at the next pass.  A fold writes the nodes on the paths to
+waited prolly_fold_worker_max_delay; one whose writes stopped (nobody
+writing it, and no writer ended for a naptime) at the next pass, as is one
+no writer of which ended since (nothing to batch).  A fold writes the nodes on the paths to
 the rows it changes, so folds of a few rows each write the upper nodes
 again: batching writes keeps a busy branch's chunk writes, WAL and journal
 near its rows' own.  pg_stat_prolly counts the worker's folds

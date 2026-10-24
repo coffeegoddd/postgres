@@ -27,7 +27,8 @@
  * writers that ended since its last fold wrote
  * prolly_fold_worker_batch_rows rows, once the first of them ended
  * prolly_fold_worker_max_delay ago, or once its writes have stopped (none
- * writing it, and none ended for a naptime).  Each fold writes the tree
+ * writing it, and none ended for a naptime); and, having nothing to batch,
+ * one no writer of which has ended since.  Each fold writes the tree
  * nodes on the paths to the rows it changes, so a fold of many writes
  * shares the upper nodes that folds of a few each write again: batching
  * them is what keeps a busy branch's chunk writes near its rows' own.  A
@@ -276,16 +277,18 @@ name_moved(const char *name, Oid branch, void *arg)
 /*
  * Is a fold of b due at now: has a batch of rows been written since the
  * last, has the first of those writes waited max_delay, or have its writes
- * stopped?  (A batch of 0 rows: every pass.)
+ * stopped?  (A batch of 0 rows: every pass.)  One no writer of which has
+ * ended since (its first writer still open, say) has nothing to batch: due,
+ * so it's folded and seen as it is, and the worker can exit while that
+ * writer stays open.
  */
 static bool
 fold_due(const ProllyMovedBranch *b, TimestampTz now)
 {
-	if (prolly_fold_worker_batch_rows <= 0 ||
+	if (prolly_fold_worker_batch_rows <= 0 || b->since == 0 ||
 		b->rows >= (uint64) prolly_fold_worker_batch_rows)
 		return true;
-	if (b->since != 0 &&
-		TimestampDifferenceExceeds(b->since, now, prolly_fold_worker_max_delay))
+	if (TimestampDifferenceExceeds(b->since, now, prolly_fold_worker_max_delay))
 		return true;
 	return b->writers == 0 &&
 		TimestampDifferenceExceeds(b->last_ended, now,
@@ -334,7 +337,11 @@ fold_pass(const ProllyRefsRoutine *refs)
 		}
 	}
 	if (ndue < m.n)
+	{
+		/* (counted outside a transaction: flushed with the pass's stats) */
+		AtEOXact_PgStat_Prolly();
 		pending = true;
+	}
 	m.n = ndue;
 	if (m.n == 0)
 		return PASS_PENDING;

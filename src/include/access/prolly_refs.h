@@ -203,9 +203,11 @@ typedef struct ProllyFoldMark
  * A branch written since the background folder last saw it
  * (moved_branches()): the generation it's at, and what its writers since
  * did, for the folder to judge whether a fold is due yet.  rows counts the
- * rows written by the writers that ended since (a multi-row insertion's
- * every row); since is when the first of them ended, last_ended when the
- * last did; writers, how many are writing it now.
+ * rows the writers that ended since wrote on it (a multi-row insertion's
+ * every row; a writer of more branches than the refs note for one has
+ * those past them uncounted); since is when the first of them ended (0:
+ * none has), last_ended when the last did; writers, how many are writing
+ * it now.
  */
 typedef struct ProllyMovedBranch
 {

@@ -187,8 +187,8 @@ static struct
 static int	nwritten_rels = 0;
 static bool written_rels_overflow = false;
 
-/* The rows it wrote, on any branch: each branch it wrote counts them all. */
-static uint64 rows_written = 0;
+/* The rows it wrote on each of the branches written[] names. */
+static uint64 written_rows[MAX_WRITTEN];
 
 static BranchGenerations *
 shared(void)
@@ -381,10 +381,7 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 		IsTransactionState())
 		return;
 	if (nwritten == 0 && !written_overflow)
-	{
-		rows_written = 0;
 		return;
-	}
 	xid = GetTopFullTransactionIdIfAny();
 	now = GetCurrentTimestamp();
 
@@ -403,7 +400,7 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 		e->generation = ++g->counter;
 		e->known = false;
 		note_ended(&e->ended, xid);
-		e->rows += rows_written;
+		e->rows += written_rows[i];
 		if (e->since == 0)
 			e->since = now;
 		e->last_ended = now;
@@ -426,7 +423,6 @@ end_writes(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 	written_overflow = false;
 	nwritten_rels = 0;
 	written_rels_overflow = false;
-	rows_written = 0;
 }
 
 void
@@ -459,6 +455,7 @@ branch_generations_note_write(Oid branch)
 	if (e != NULL && nwritten < MAX_WRITTEN)
 	{
 		e->writers++;
+		written_rows[nwritten] = 0;
 		written[nwritten++] = branch;
 	}
 	else
@@ -479,7 +476,15 @@ branch_generations_note_relation(Oid branch, Oid relid, int nrows)
 {
 	if (!OidIsValid(branch) || !OidIsValid(relid))
 		return;
-	rows_written += Max(nrows, 0);
+	/* (counted to its branch, the last noted first; none past MAX_WRITTEN) */
+	for (int i = nwritten - 1; i >= 0; i--)
+	{
+		if (written[i] == branch)
+		{
+			written_rows[i] += Max(nrows, 0);
+			break;
+		}
+	}
 	if (written_rels_overflow || written_overflow)
 		return;
 	if (nwritten_rels > 0 &&

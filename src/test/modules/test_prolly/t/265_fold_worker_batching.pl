@@ -81,9 +81,11 @@ my $writing = q{SELECT count(*) > 0 FROM pg_stat_activity
 # Fewer rows than a batch, written without a pause the length of a pass:
 # not folded while the writes go on.
 my $before = folds();
-$writer->query_safe(q{CALL trickle(200, 1)});
+my $deferred_before = deferred();
+$writer->query_safe(q{CALL trickle(400, 1)});
 is(folds() - $before, 0, 'a trickle of fewer rows than a batch is not folded');
-cmp_ok(deferred(), '>', 0, 'the worker left it for a later pass');
+cmp_ok(deferred() - $deferred_before, '>=', 2,
+	'the worker left it for a later pass, pass after pass, each counted');
 is(sql(qq{SELECT count(*) > 0 FROM $log}), 't', 'its log keeps the writes');
 
 # Once the writes stop, at the next pass.
@@ -136,8 +138,29 @@ ok($node->poll_query_until('postgres', $empty), 'all folded');
 is(sql(q{SELECT count(*) FROM dolt_diff('HEAD', 'WORKING', NULL::s.t)}),
 	'1000', 'the working set holds every write');
 sql(q{SELECT dolt_commit('-am', 'trickles')});
-is(sql(q{SELECT sum(v) FROM s.t}), 200 + 400 * 10 + 1000 + 1000,
+is(sql(q{SELECT sum(v) FROM s.t}), 400 + 400 * 10 + 1000 + 1000,
 	'every write was kept');
 is(sql(q{SELECT count(*) FROM dolt_status}), '0', 'clean after the commit');
+
+# A branch whose only writer is still open (its entry new since a restart)
+# has nothing to batch: the worker folds it as it is and exits, not
+# waiting out the writer's transaction in one of its slots.
+set_conf('prolly_fold_worker_batch_rows', '500');
+$node->restart;
+my $open = $node->background_psql('postgres');
+$open->query_until(qr/started/, "\\echo started\nBEGIN; INSERT INTO s.t VALUES (5001, 0); SELECT pg_sleep(15); COMMIT;\n");
+my $exited = 0;
+my $seen = 0;
+foreach my $i (1 .. 100)
+{
+	my $n = sql(q{SELECT count(*) FROM pg_stat_activity
+		WHERE backend_type = 'prolly fold worker'});
+	$seen = 1 if $n > 0;
+	if ($seen && $n == 0) { $exited = 1; last; }
+	usleep(100_000);
+}
+ok($seen, 'a worker started for the open writer\'s branch');
+ok($exited, 'and exits while the writer stays open');
+$open->quit;
 
 done_testing();
