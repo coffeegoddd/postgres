@@ -363,15 +363,19 @@ of other objects, a conflicted table renamed on either side, and one the
 other side's objects use in its version (a view over a column it added)
 fail as before, the last two saying so.
 
-A keyed row both sides of a merge changed is merged column by column.  A
-long value is held out of line by a reference naming its canonical bytes,
-so where a side's reference is base's, decoded by the same keying, that
-side didn't change the column: neither value is read (decode_row_kept()),
-and a merged row taking it is written with the reference
-(encode_row_kept()).  A large value neither side changed is not fetched to
-find that out, nor when the merged row is applied.  A column whose base
-value is unsure (below) is compared by value, as are values either side
-changed.
+A keyed row both sides of a merge changed is merged column by column, on
+its encoded fields (the keying's row_fields()): all three versions are
+rows of the table as defined now (a version of another shape is converted
+first), so a column's bytes name its value.  A column whose bytes one side
+left as base's takes the other's, one both changed alike keeps it, and the
+merged row is assembled from the fields taken (encode_row_fields()), long
+values by their references, no column decoded.  A large value neither side
+changed is not fetched to find that out, nor when the merged row is
+applied.  A row with a column whose base value is unsure (below) is
+decoded and compared by value instead, except that where a side's long
+value has base's reference neither is read (decode_row_kept()) and the
+merged row keeps the reference (encode_row_kept()).  An assert-enabled
+build merges each row both ways and checks they agree.
 
 When a type change admits both text and cast readings of the base, merge
 validates both interpretations before applying rows.  Each outcome walk

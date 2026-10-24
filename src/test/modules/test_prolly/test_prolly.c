@@ -122,6 +122,9 @@ static const ConformanceCase cases[] = {
 	{PROLLY_IFACE_VALUE_ENCODER, "selected_columns",
 	"begin encode decode end set_values fields decode_field fields_alike field_compatible decode_columns",
 	valenc_selected_columns},
+	{PROLLY_IFACE_VALUE_ENCODER, "assembled_rows",
+	"begin encode decode end set_values fields encode_fields",
+	valenc_assembled_rows},
 
 	/* reclamation */
 	{PROLLY_IFACE_RECLAMATION, "live_chunks_never_freed", "collect", NULL},
@@ -139,6 +142,8 @@ static const ConformanceCase cases[] = {
 	"open close row_shape shape_extends", keying_row_shapes},
 	{PROLLY_IFACE_TABLE_KEYING, "old_shapes",
 	"open encode_row decode_row close row_shape open_shape", keying_old_shapes},
+	{PROLLY_IFACE_TABLE_KEYING, "assembled_rows",
+	"open encode_row close row_fields encode_row_fields", keying_assembled_rows},
 
 	/* refs */
 	{PROLLY_IFACE_REFS, "branch_lifecycle",
