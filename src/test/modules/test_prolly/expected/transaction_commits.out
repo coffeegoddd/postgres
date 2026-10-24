@@ -548,13 +548,44 @@ BEGIN
 END $$;
 NOTICE:  memory bounded: t
 SET dolt.transaction_commit = on;
+-- A small commit reads each node it needs once, however often it descends
+-- it: the refs' root for each entry it gets and puts, the head's commit, the
+-- root's and the table's upper nodes for each row's seek and then the
+-- apply, each level of which starts from the root.  Three rows of a table
+-- three levels high read about their paths, not a descent per use.
+CREATE TABLE tc.tall (id int PRIMARY KEY, v int, pad text);
+INSERT INTO tc.tall SELECT g, 0, md5(g::text) FROM generate_series(1, 20000) g;
+UPDATE tc.tall SET v = 1 WHERE id IN (1, 10000, 19999);
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+UPDATE tc.tall SET v = 2 WHERE id IN (2, 10001, 20000);
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT value - :nodes AS nodes_read FROM pg_stat_prolly
+  WHERE name = 'nodes_read' \gset
+SELECT CASE WHEN :nodes_read <= 25 THEN 'at most 25' ELSE :nodes_read::text END
+  AS nodes_read;
+ nodes_read 
+------------
+ at most 25
+(1 row)
+
 -- Off again, writes wait for dolt_commit().
 RESET dolt.transaction_commit;
 INSERT INTO tc.t VALUES (10, 'later');
 SELECT pg_temp.commits() - :before AS commits;
  commits 
 ---------
-      29
+      33
 (1 row)
 
 SELECT dolt_reset('--hard');
@@ -571,7 +602,7 @@ SELECT dolt_branch('-D', 'tc_f');
 
 DROP TABLE tc_plain;
 DROP SCHEMA tc CASCADE;
-NOTICE:  drop cascades to 10 other objects
+NOTICE:  drop cascades to 11 other objects
 DETAIL:  drop cascades to table tc.t
 drop cascades to table tc.child
 drop cascades to table tc.u
@@ -582,6 +613,7 @@ drop cascades to table tc.sa
 drop cascades to table tc.num
 drop cascades to table tc.nbag
 drop cascades to table tc.cached
+drop cascades to table tc.tall
 SELECT length(dolt_commit('-Am', 'tc gone')::text) AS committed;
  committed 
 -----------
