@@ -358,6 +358,7 @@ tests += {
       't/221_reload_first_use.pl',
       't/226_shared_below_sweep.pl',
       't/227_shared_below_drop.pl',
+      't/344_compact_dropped_map.pl',
       't/340_bmap_sweep_dropped_map.pl',
       't/341_fold_trim_no_wait.pl',
       't/355_autovacuum_gc_busy.pl',
