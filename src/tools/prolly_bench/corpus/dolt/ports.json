@@ -42322,7 +42322,7 @@
       "index": 20,
       "name": "dolt_rebase: data conflicts with pick",
       "source_sha256": "104a17abaa1296d6b76c9fc1a4a7553a7a8753a53f8ada82e26d8bbba6c1e74d",
-      "scenario_sha256": "758ce13d3a44d5a9a45b590a05f00320002d37d2ea3781795b903e94f0ec4771",
+      "scenario_sha256": "5a6acfef4b27d5033e75d6df614701d38c6af94bb26578504ffb9b0f433201c8",
       "setup": [
         {
           "index": 0,
@@ -42504,8 +42504,10 @@
         },
         {
           "index": 12,
-          "steps": [],
-          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+          "steps": [
+            "assert-11-staged"
+          ],
+          "note": "Intended divergence (D1): Dolt's ErrRebaseUnstagedChanges. There is no staging area, so a resolution is staged as it is made: checked as dolt_status showing the resolved table staged, with nothing unstaged, which is why the --continue after dolt_add is the first here and goes on as Dolt's second does."
         },
         {
           "index": 13,
@@ -42600,7 +42602,7 @@
         "No staging area: -a/-A commit the whole working set. (D1)",
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
-        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+        "There is no staging area: a resolution is staged as it is made, so Dolt's error for continuing with it unstaged is checked as dolt_status showing it staged, and the --continue after dolt_add goes on. (D1)"
       ]
     },
     {
@@ -42610,7 +42612,7 @@
       "index": 21,
       "name": "dolt_rebase: data conflicts with squash",
       "source_sha256": "be0a24714c1798931ea627d0178bd3af119cc5bea3f057eb3c0235bfbc206fee",
-      "scenario_sha256": "bbd64ebb11c88ed258b010b202c66f177564bf16ffca01190d6c0dde18ea15b7",
+      "scenario_sha256": "a44b438252da01d426fe4803efaad2ffedd621215ea4e3fff9cb51a374f28a2e",
       "setup": [
         {
           "index": 0,
@@ -42785,8 +42787,10 @@
         },
         {
           "index": 11,
-          "steps": [],
-          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+          "steps": [
+            "assert-10-staged"
+          ],
+          "note": "Intended divergence (D1): Dolt's ErrRebaseUnstagedChanges. There is no staging area, so a resolution is staged as it is made: checked as dolt_status showing the resolved table staged, with nothing unstaged, which is why the --continue after dolt_add is the first here and goes on as Dolt's second does."
         },
         {
           "index": 12,
@@ -42881,7 +42885,7 @@
         "No staging area: -a/-A commit the whole working set. (D1)",
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
-        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+        "There is no staging area: a resolution is staged as it is made, so Dolt's error for continuing with it unstaged is checked as dolt_status showing it staged, and the --continue after dolt_add goes on. (D1)"
       ]
     },
     {
@@ -42891,7 +42895,7 @@
       "index": 22,
       "name": "dolt_rebase: data conflicts with fixup",
       "source_sha256": "b79be314479faa46ac0a3e1d6fc63ad5fc6e2f6cace5409648b86c6c01f6b47d",
-      "scenario_sha256": "7d5b4f85c6e18d0c5d9bee0bbc479bd707ebbfb70c7c5cb24373ac1fb59dd726",
+      "scenario_sha256": "ec7e6fb7f27e130993d241dfc392936aa374952b3d06ce4192675e4673d16bae",
       "setup": [
         {
           "index": 0,
@@ -43073,8 +43077,10 @@
         },
         {
           "index": 11,
-          "steps": [],
-          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+          "steps": [
+            "assert-10-staged"
+          ],
+          "note": "Intended divergence (D1): Dolt's ErrRebaseUnstagedChanges. There is no staging area, so a resolution is staged as it is made: checked as dolt_status showing the resolved table staged, with nothing unstaged, which is why the --continue after dolt_add is the first here and goes on as Dolt's second does."
         },
         {
           "index": 12,
@@ -43169,7 +43175,7 @@
         "No staging area: -a/-A commit the whole working set. (D1)",
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
-        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+        "There is no staging area: a resolution is staged as it is made, so Dolt's error for continuing with it unstaged is checked as dolt_status showing it staged, and the --continue after dolt_add goes on. (D1)"
       ]
     },
     {
@@ -43179,7 +43185,7 @@
       "index": 23,
       "name": "dolt_rebase: data conflicts with reword",
       "source_sha256": "10d9dd46b35e91a80683e1c9783ba9aa6fa635215f19290a98195e2143c73e29",
-      "scenario_sha256": "824b1f5f823aa3893d18871af972be7731623d6ac32f5a9dada9b02b0a9a3e3f",
+      "scenario_sha256": "3a73163ed9acb1210ec89977009bed08425a63b1a0d52b4bfc73faa4301cef2c",
       "setup": [
         {
           "index": 0,
@@ -43361,8 +43367,10 @@
         },
         {
           "index": 11,
-          "steps": [],
-          "note": "Not ported: there is no staging area (D1), so a resolution is never unstaged, and --continue goes on; the case is a partial port."
+          "steps": [
+            "assert-10-staged"
+          ],
+          "note": "Intended divergence (D1): Dolt's ErrRebaseUnstagedChanges. There is no staging area, so a resolution is staged as it is made: checked as dolt_status showing the resolved table staged, with nothing unstaged, which is why the --continue after dolt_add is the first here and goes on as Dolt's second does."
         },
         {
           "index": 12,
@@ -43450,7 +43458,7 @@
         "No staging area: -a/-A commit the whole working set. (D1)",
         "A first commit stands for Dolt's 'Initialize data repository': a prolly database starts with no commits.",
         "dolt_rebase's rebase_order is numeric(6,2), shown with its scale (1.00), as Postgres shows the type. (D3)",
-        "There is no staging area: a resolution is never unstaged, and Dolt's assertion of the error for one isn't ported, so the case is partial. (D1)"
+        "There is no staging area: a resolution is staged as it is made, so Dolt's error for continuing with it unstaged is checked as dolt_status showing it staged, and the --continue after dolt_add goes on. (D1)"
       ]
     },
     {
@@ -43460,7 +43468,7 @@
       "index": 24,
       "name": "dolt_rebase: schema conflicts",
       "source_sha256": "f9f2656196884cae0f67e5c0b547e8941eced7bcd816a9f92959be4c1cdd6136",
-      "scenario_sha256": "731a10f14908ab7bc7de6ba3b139d68746551c74c8f8710ff042929d440fa880",
+      "scenario_sha256": "02d3454ad14c299fddbd33915fecc91bf8054bedebff3566ef76c4a778d62689",
       "setup": [
         {
           "index": 0,
@@ -43576,9 +43584,10 @@
           "steps": [
             "assert-3",
             "assert-4",
+            "assert-4-schema",
             "assert-5"
           ],
-          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
+          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), and the failed pick kept no schema conflicts (checked: dolt_schema_conflicts is empty), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
         },
         {
           "index": 4,
@@ -43596,8 +43605,10 @@
         },
         {
           "index": 6,
-          "steps": [],
-          "note": "Not ported: prolly keeps no schema conflicts (there is no dolt_schema_conflicts; a schema conflict is an error, never kept), so the case is partial."
+          "steps": [
+            "assert-8"
+          ],
+          "note": "Preserved expected rows: none. In prolly that is because the failed --continue rolled itself back and kept nothing (checked before the abort too), not because the rebase aborted; a pick keeps no schema conflicts, so no rebase state holds any for an abort to leave behind. (D5)"
         }
       ],
       "adaptations": [

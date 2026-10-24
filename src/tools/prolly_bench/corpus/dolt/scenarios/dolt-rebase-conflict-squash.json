@@ -367,6 +367,25 @@
       }
     },
     {
+      "id": "assert-10-staged",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.core"
+      ],
+      "sql": "SELECT table_name, staged, status FROM dolt_status",
+      "expect": {
+        "rows": [
+          [
+            "public.t",
+            "t",
+            "modified"
+          ]
+        ],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-11",
       "session": "a",
       "op": "query",
