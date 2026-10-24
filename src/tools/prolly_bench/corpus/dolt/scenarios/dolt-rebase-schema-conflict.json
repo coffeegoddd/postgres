@@ -247,6 +247,19 @@
       }
     },
     {
+      "id": "assert-4-schema",
+      "session": "a",
+      "op": "query",
+      "requires": [
+        "vc.conflicts"
+      ],
+      "sql": "SELECT * FROM dolt_schema_conflicts",
+      "expect": {
+        "rows": [],
+        "order": "bag"
+      }
+    },
+    {
       "id": "assert-5",
       "session": "a",
       "op": "query",

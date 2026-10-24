@@ -43468,7 +43468,7 @@
       "index": 24,
       "name": "dolt_rebase: schema conflicts",
       "source_sha256": "f9f2656196884cae0f67e5c0b547e8941eced7bcd816a9f92959be4c1cdd6136",
-      "scenario_sha256": "f643c21280d8cbac8fa90b38be5ce98a0fbfb56318438c4f7727328dbc790246",
+      "scenario_sha256": "02d3454ad14c299fddbd33915fecc91bf8054bedebff3566ef76c4a778d62689",
       "setup": [
         {
           "index": 0,
@@ -43584,9 +43584,10 @@
           "steps": [
             "assert-3",
             "assert-4",
+            "assert-4-schema",
             "assert-5"
           ],
-          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
+          "note": "Dolt's ErrRebaseSchemaConflict checked as its SQLSTATE: a schema conflict, 40001 (D4). Its error rolls --continue back: the rebase is still in progress, on its branch with its plan (checked), and the failed pick kept no schema conflicts (checked: dolt_schema_conflicts is empty), where Dolt aborts it as it fails (D5). The abort is then made here, so the state after is Dolt's."
         },
         {
           "index": 4,
@@ -43607,7 +43608,7 @@
           "steps": [
             "assert-8"
           ],
-          "note": "Preserved expected rows: none, the rebase aborted; dolt_schema_conflicts as the view."
+          "note": "Preserved expected rows: none. In prolly that is because the failed --continue rolled itself back and kept nothing (checked before the abort too), not because the rebase aborted; a pick keeps no schema conflicts, so no rebase state holds any for an abort to leave behind. (D5)"
         }
       ],
       "adaptations": [
