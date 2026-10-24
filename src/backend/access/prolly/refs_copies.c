@@ -4254,9 +4254,9 @@ names_key(StringInfo key, const char *name)
  * the record's commit's share a history the name stays in.
  */
 static void
-note_lineage(const ProllyHash *head, const char *now, const char *before)
+note_lineage(const ProllyHash *head, const ProllyHash *parents, int nparents,
+			 const char *now, const char *before)
 {
-	ProllyCommitInfo info;
 	const char *bl = before ? strchr(before, '\n') : NULL;
 	ProllyHash	was;
 	StringInfoData key;
@@ -4264,8 +4264,7 @@ note_lineage(const ProllyHash *head, const char *now, const char *before)
 	char	   *hex;
 
 	if (bl == NULL || !prolly_hash_from_hex(before, bl - before, &was) ||
-		!copies_commit_get(head, &info) ||
-		(info.nparents == 1 && same_hash(&info.parents[0], &was)))
+		(nparents == 1 && same_hash(&parents[0], &was)))
 		return;
 	hex = prolly_hash_hex(head);
 	initStringInfo(&key);
@@ -4303,8 +4302,10 @@ note_lineage(const ProllyHash *head, const char *now, const char *before)
 	pfree(v.data);
 }
 
+/* (head made with parents, nparents of them) */
 static void
-note_head_names(const char *name, const ProllyHash *head)
+note_head_names(const char *name, const ProllyHash *head,
+				const ProllyHash *parents, int nparents)
 {
 	StringInfoData key;
 	StringInfoData v;
@@ -4317,7 +4318,7 @@ note_head_names(const char *name, const ProllyHash *head)
 	names_key(&key, name);
 	appendStringInfo(&v, "%s\n", hex);
 	table_names(&v);
-	note_lineage(head, v.data,
+	note_lineage(head, parents, nparents, v.data,
 				 refs_get(key.data, key.len, &before) ? before.data : NULL);
 	refs_put(key.data, key.len, &v);
 	pfree(hex);
@@ -4682,7 +4683,7 @@ commit_branch(const char *message, const ProllyHash *parents, int nparents,
 				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
-	note_head_names(name, commit_id);
+	note_head_names(name, commit_id, parents, nparents);
 	note_anchor(name, commit_id, &anchor);
 	keep_pages(commit_id, nparents > 0 ? &parents[0] : NULL, &root, snap);
 	UnregisterSnapshot(snap);
@@ -5317,7 +5318,7 @@ copies_commit_with(const char *message, const ProllyHash *parents,
 				 message, &identity, commit_id);
 	branch_set_head(name, commit_id);
 	branch_set_baseline(name, &next, &root);
-	note_head_names(name, commit_id);
+	note_head_names(name, commit_id, parents, nparents);
 	note_anchor(name, commit_id, &anchor);
 	/* (kept only if the working set is what was committed) */
 	if (same_hash(&root.hash, &working_set->hash))
