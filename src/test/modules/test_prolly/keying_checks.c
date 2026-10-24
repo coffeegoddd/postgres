@@ -606,6 +606,58 @@ valenc_decodes_earlier_layouts_body(const ProllyImplInfo *impl)
  * ------------------------------------------------------------------------
  */
 
+/*
+ * Rows assembled from fields: encode_row_fields() of a row's row_fields()
+ * is its row, and of columns taken from two rows the row encode_row()
+ * gives for their values, for a keyed and a keyless table.
+ */
+static void
+keying_assembled_rows_body(const ProllyImplInfo *impl)
+{
+	const ProllyKeyingRoutine *kr = (const ProllyKeyingRoutine *) impl;
+	Relation	tables[2];
+
+	tables[0] = make_table("conf_asm_pk", "id int PRIMARY KEY, t text, n int");
+	tables[1] = make_table("conf_asm_none", "id int, t text, n int");
+	for (int r = 0; r < 2; r++)
+	{
+		Relation	rel = tables[r];
+		ProllyKeying *k = PROLLY_CALL(kr, open, rel, CurrentMemoryContext);
+		EncodedRow	a;
+		EncodedRow	b;
+		EncodedRow	mixed;
+		ProllyValue ra;
+		ProllyValue rb;
+		ProllyEncodedField fa[3];
+		ProllyEncodedField fb[3];
+		ProllyEncodedField fm[3];
+		StringInfoData got;
+
+		encode(kr, k, rel, 42, "forty-two", -1, &a);
+		encode(kr, k, rel, 7, "seven", 9, &b);
+		encode(kr, k, rel, 42, "seven", 9, &mixed);
+		ra.data = (const uint8 *) a.row.data;
+		ra.len = a.row.len;
+		rb.data = (const uint8 *) b.row.data;
+		rb.len = b.row.len;
+		PROLLY_CALL(kr, row_fields, k, &ra, fa);
+		PROLLY_CALL(kr, row_fields, k, &rb, fb);
+		initStringInfo(&got);
+		PROLLY_CALL(kr, encode_row_fields, k, fa, &got);
+		if (!same_bytes(&got, &a.row))
+			elog(ERROR, "encode_row_fields() of a row's fields isn't the row");
+		fm[0] = fa[0];
+		fm[1] = fb[1];
+		fm[2] = fb[2];
+		resetStringInfo(&got);
+		PROLLY_CALL(kr, encode_row_fields, k, fm, &got);
+		if (!same_bytes(&got, &mixed.row))
+			elog(ERROR, "encode_row_fields() of two rows' fields isn't encode_row() of their values");
+		PROLLY_CALL(kr, close, k);
+		table_close(rel, AccessShareLock);
+	}
+}
+
 void
 keying_round_trip(const ProllyImplInfo *impl)
 {
@@ -634,6 +686,12 @@ void
 keying_old_shapes(const ProllyImplInfo *impl)
 {
 	rolled_back(keying_old_shapes_body, impl);
+}
+
+void
+keying_assembled_rows(const ProllyImplInfo *impl)
+{
+	rolled_back(keying_assembled_rows_body, impl);
 }
 
 void

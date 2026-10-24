@@ -204,6 +204,46 @@ SELECT length(dolt_commit('-am', 'forced')::text) > 0 AS committed;
 SELECT scans, incremental FROM work();
 RESET debug_prolly_force_full_fold;
 
+-- A status reads definitions without rows: the last read's are taken
+-- while nothing they're of changed (definitions_reused), no catalog read
+-- through, only sequences read again; rows written since don't change
+-- them.  It leaves the folds' own items be: the commit after it still
+-- works out only what was written.  (verify on: each taken is read again
+-- and compared.)
+CREATE FUNCTION reused() RETURNS bigint LANGUAGE sql AS $$
+	SELECT value FROM pg_stat_prolly WHERE name = 'definitions_reused'
+$$;
+UPDATE many.hot SET v = v + 1;
+SELECT length(dolt_commit('-am', 'before statuses')::text) > 0 AS committed;
+UPDATE many.hot SET v = v + 1;
+SELECT count(*) AS changes FROM dolt_status;
+:reset
+INSERT INTO many.t12 VALUES (12, 'twelve');
+SELECT * FROM dolt_status ORDER BY 1;
+SELECT nextval('many.seq') > 0 AS moved;
+:flush
+SELECT value AS nodes FROM pg_stat_prolly WHERE name = 'nodes_read' \gset
+SET debug_prolly_verify_fold_caches = off;
+SELECT * FROM dolt_status ORDER BY 1;
+RESET debug_prolly_verify_fold_caches;
+:flush
+SELECT 'statuses' AS read, scans, reused() FROM work();
+-- (each table's changes asked of its baseline entry alone, not the whole
+-- baseline read again for each table: ~890 nodes here, ~1200 that way)
+SELECT (SELECT value FROM pg_stat_prolly WHERE name = 'nodes_read') - :nodes
+	<= 1000 AS status_nodes_bounded;
+:reset
+SELECT length(dolt_commit('-am', 'after statuses')::text) > 0 AS committed;
+:flush
+SELECT 'commit after statuses' AS fold, * FROM work();
+-- (a definition changed: read again)
+ALTER TABLE many.t13 ADD COLUMN w int;
+:reset
+SELECT * FROM dolt_status ORDER BY 1;
+:flush
+SELECT 'status after DDL' AS read, scans > 0 AS scanned, reused() FROM work();
+SELECT length(dolt_commit('-Am', 'ddl')::text) > 0 AS committed;
+
 SELECT count(*) AS verify_mismatches FROM dolt_verify_folds() WHERE NOT matches;
 SELECT count(*) AS changes FROM dolt_status;
 

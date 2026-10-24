@@ -86,7 +86,7 @@ SELECT * FROM prolly_page_sweep();
 -- the relation changes: each page changed is copied, the snapshot keeps it
 UPDATE big SET b = 'changed' WHERE a % 100 = 0;
 DELETE FROM big WHERE a > 25000;
-VACUUM big;
+-- (no VACUUM: it would copy every page the snapshot alone shares, to set it all-visible)
 SELECT test_bmap_rows_digest(:big) <> :'big_rows' AS big_changed;
  big_changed 
 -------------
@@ -149,7 +149,7 @@ SELECT test_bmap_rows_digest(:then) = :'big_rows' AS then_written;
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated | moved 
 -------+-----------+-----------+-------
-     0 |         0 |      1626 |     0
+     0 |         0 |         0 |     0
 (1 row)
 
 -- letting the snapshot go: what only it held is freed
@@ -207,7 +207,7 @@ SELECT count(*) FROM test_bmap_snapshots(:big);
 SELECT * FROM prolly_page_sweep();
  freed | recounted | truncated | moved 
 -------+-----------+-----------+-------
-     0 |         0 |         0 |   250
+     0 |         0 |      1628 |  1916
 (1 row)
 
 -- letting go of a snapshot of an unchanged relation frees nothing

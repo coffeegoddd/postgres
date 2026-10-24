@@ -836,6 +836,13 @@ pkprefix_field_compatible(ProllyKeying *k, int attno, ProllyKeying *other,
 }
 
 static void
+pkprefix_encode_row_fields(ProllyKeying *k, const ProllyEncodedField *fields,
+						   StringInfo row)
+{
+	PROLLY_CALL(k->valenc_routine, encode_fields, k->valenc, fields, row);
+}
+
+static void
 pkprefix_project_row(ProllyKeying *k, const ProllyValue *row,
 					 const bool *wanted, StringInfo out)
 {
@@ -912,6 +919,7 @@ const ProllyKeyingRoutine prolly_keying_pk_or_prefix = {
 	.decode_field = pkprefix_decode_field,
 	.fields_alike = pkprefix_fields_alike,
 	.field_compatible = pkprefix_field_compatible,
+	.encode_row_fields = pkprefix_encode_row_fields,
 	.open_keyed = pkprefix_open_keyed,
 	.encode_key_bound = pkprefix_encode_key_bound,
 	.project_row = pkprefix_project_row,

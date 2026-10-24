@@ -154,6 +154,18 @@ typedef struct ProllyValueEncoderRoutine
 								   TupleTableSlot *slot);
 
 	/*
+	 * Optional: the row encode() gives for the values fields hold (by
+	 * attribute index, natts entries, each a field fields() gave of a row
+	 * this encoder decodes), assembled from their bytes without decoding
+	 * them: a reference copied, a value long enough to be out of line but
+	 * held inline (a long missing value) written to the value store as
+	 * encode() writes it.  The fields' bytes must be valid while it runs.
+	 */
+	void		(*encode_fields) (ProllyValueEncoder *enc,
+								  const ProllyEncodedField *fields,
+								  StringInfo out);
+
+	/*
 	 * Optional: append the encoding of row with only the attributes wanted
 	 * marks, the others NULL, made of row's own bytes: nothing decoded,
 	 * read out of line or written, and the references it holds are some
@@ -168,7 +180,7 @@ typedef struct ProllyValueEncoderRoutine
 	"begin", "layout", "begin_layout", "encode", "decode", "end", \
 	"set_values", "refs", "decode_kept", "encode_kept", "fields", \
 	"decode_field", "fields_alike", "field_compatible", "decode_columns", \
-	"project"
+	"encode_fields", "project"
 #define PROLLY_VALENC_FIRST_CALLBACK begin
 #define PROLLY_VALENC_LAST_CALLBACK project
 

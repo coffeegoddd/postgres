@@ -3174,6 +3174,24 @@ static int	nmade_sequences = 0;
 static MemoryContext items_cxt = NULL;
 static CanonItem *made_items = NULL;	/* items_made's, in key order */
 static int	nmade_items = 0;
+
+/*
+ * The last definitions read here (a fold of no table's rows, from a
+ * baseline): their tree, its items, sequences and what it left out, as of
+ * the catalog epoch it began at and the baseline it took the rows of.
+ * Kept apart from the folds' own items, which the next fold works out the
+ * changes from.
+ */
+static MadeTree defs_made;
+static bool defs_valid = false;
+static uint64 defs_epoch;
+static ProllyHash defs_baseline;
+static MemoryContext defs_cxt = NULL;
+static CanonItem *defs_items = NULL;
+static int	ndefs_items = 0;
+static Oid *defs_sequences = NULL;
+static int	ndefs_sequences = 0;
+static List *defs_left_out = NIL;	/* char *, in defs_cxt */
 static MemoryContext members_cxt = NULL;
 static HTAB *members = NULL;	/* Member, by object */
 static uint64 members_epoch;
@@ -3258,6 +3276,7 @@ fold_caches_xact(XactEvent event, void *arg)
 			made_tree_end(&dependencies_made, true);
 			made_tree_end(&items_made, true);
 			made_tree_end(&baseline_made, true);
+			made_tree_end(&defs_made, true);
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
@@ -3265,6 +3284,7 @@ fold_caches_xact(XactEvent event, void *arg)
 			made_tree_end(&dependencies_made, false);
 			made_tree_end(&items_made, false);
 			made_tree_end(&baseline_made, false);
+			made_tree_end(&defs_made, false);
 			break;
 		default:
 			break;
@@ -3290,6 +3310,7 @@ fold_caches_subxact(SubXactEvent event, SubTransactionId mySubid,
 	made_tree_sub(&dependencies_made, event, mySubid, parentSubid);
 	made_tree_sub(&items_made, event, mySubid, parentSubid);
 	made_tree_sub(&baseline_made, event, mySubid, parentSubid);
+	made_tree_sub(&defs_made, event, mySubid, parentSubid);
 }
 
 /*
@@ -3322,6 +3343,9 @@ fold_caches_begin(void)
 		members_cxt = AllocSetContextCreate(CacheMemoryContext,
 											"prolly extension members",
 											ALLOCSET_DEFAULT_SIZES);
+		defs_cxt = AllocSetContextCreate(CacheMemoryContext,
+										 "prolly folded definitions",
+										 ALLOCSET_DEFAULT_SIZES);
 		fold_caches_registered = true;
 	}
 	AcceptInvalidationMessages();
@@ -3342,6 +3366,7 @@ check_deparse_settings(void)
 		forget_descriptions();
 		items_at.valid = false;
 		baseline_at.valid = false;
+		defs_valid = false;
 		if (described_settings)
 			pfree(described_settings);
 		described_settings = MemoryContextStrdup(CacheMemoryContext, now.data);
@@ -3675,6 +3700,46 @@ remember_items(Canon *cn, const ProllyNodeRef *root)
 			made_sequences[nmade_sequences++] = made_items[i].relid;
 	}
 	made_tree(&items_made, root);
+}
+
+/*
+ * Keep cn's items (sorted), a fold of no table's rows from cn's baseline,
+ * as the last definitions read: not if the transaction changed a catalog
+ * (what it read is so only if it commits).
+ */
+static void
+remember_definitions(Canon *cn, const ProllyNodeRef *root)
+{
+	MemoryContext old;
+
+	defs_valid = false;
+	if (cn->baseline == NULL || XactHasInvalidations() || defs_cxt == NULL)
+		return;
+	MemoryContextReset(defs_cxt);
+	old = MemoryContextSwitchTo(defs_cxt);
+	defs_items = palloc_array(CanonItem, Max(list_length(cn->items), 1));
+	defs_sequences = palloc_array(Oid, Max(list_length(cn->items), 1));
+	ndefs_items = ndefs_sequences = 0;
+	foreach_ptr(CanonItem, it, cn->items)
+	{
+		CanonItem  *m = &defs_items[ndefs_items++];
+
+		initStringInfo(&m->key);
+		appendBinaryStringInfo(&m->key, it->key.data, it->key.len);
+		initStringInfo(&m->value);
+		appendBinaryStringInfo(&m->value, it->value.data, it->value.len);
+		m->relid = it->relid;
+		if (OidIsValid(it->relid) && strncmp(it->key.data, "s:", 2) == 0)
+			defs_sequences[ndefs_sequences++] = it->relid;
+	}
+	defs_left_out = NIL;
+	foreach_ptr(char, name, cn->left_out)
+		defs_left_out = lappend(defs_left_out, pstrdup(name));
+	MemoryContextSwitchTo(old);
+	defs_baseline = cn->baseline->hash;
+	defs_epoch = cn->at.catalog_epoch;
+	made_tree(&defs_made, root);
+	defs_valid = true;
 }
 
 /* An extension's version, from its catalog row. */
@@ -4964,7 +5029,11 @@ build_all(Canon *cn, ProllyNodeRef *root)
 			check_applied("canonical", root, &built);
 		*root = built;
 	}
-	if (!cn->verifying)
+	if (cn->verifying)
+		return;
+	if (cn->no_rows)
+		remember_definitions(cn, root);
+	else
 		remember_items(cn, root);
 }
 
@@ -5244,6 +5313,167 @@ fold_changed_only(Canon *cn, ProllyNodeRef *root)
 	return true;
 }
 
+static int
+defs_item_cmp(const void *a, const void *b)
+{
+	const CanonItem *x = a;
+	const CanonItem *y = b;
+	ProllyKey	kx = {(const uint8 *) x->key.data, x->key.len};
+	ProllyKey	ky = {(const uint8 *) y->key.data, y->key.len};
+
+	return prolly_bytes_compare(&kx, &ky, NULL);
+}
+
+/*
+ * The definitions as the last read here, if nothing they're of changed
+ * since (true): no catalog change since (this backend's catalog epoch,
+ * which every invalidation moves, and every one sent is taken in as the
+ * read begins), the same deparsing settings, the same baseline (each
+ * table's rows are its), and the tree still in the store.  Rows written
+ * since don't change them; sequences' values do, outside transactions, so
+ * every sequence's item is worked out again and applied.  With
+ * debug_prolly_verify_fold_caches, everything is read again and compared.
+ */
+static bool
+definitions_unchanged(Canon *cn, ProllyNodeRef *root)
+{
+	ProllyFullFoldReason reason;
+	ProllyEdit *edits;
+	CanonItem **changed;
+	int			nedits = 0;
+	int			save_nestlevel;
+	List	   *rels = NIL;
+
+	if (!defs_valid || cn->baseline == NULL || OidIsValid(cn->only) ||
+		defs_epoch != catalog_epoch || XactHasInvalidations() ||
+		prolly_full_fold_wanted(&reason) ||
+		defs_baseline.len != cn->baseline->hash.len ||
+		memcmp(defs_baseline.bytes, cn->baseline->hash.bytes,
+			   defs_baseline.len) != 0 ||
+		!made_tree_usable(cn, &defs_made))
+		return false;
+
+	for (int i = 0; i < ndefs_sequences; i++)
+	{
+		HeapTuple	tup = SearchSysCacheCopy1(RELOID,
+											  ObjectIdGetDatum(defs_sequences[i]));
+
+		/* (gone: a catalog change, which the epoch would have seen) */
+		if (!HeapTupleIsValid(tup))
+			return false;
+		rels = lappend(rels, tup);
+	}
+	cn->partial = true;
+	save_nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	foreach_ptr(HeapTupleData, tup, rels)
+		collect_relation(cn, (Form_pg_class) GETSTRUCT(tup));
+	AtEOXact_GUC(false, save_nestlevel);
+
+	list_sort(cn->items, item_cmp);
+	edits = palloc_array(ProllyEdit, Max(list_length(cn->items), 1));
+	changed = palloc_array(CanonItem *, Max(list_length(cn->items), 1));
+	foreach_ptr(CanonItem, it, cn->items)
+	{
+		CanonItem	probe;
+		CanonItem  *m;
+
+		probe.key = it->key;
+		m = bsearch(&probe, defs_items, ndefs_items, sizeof(CanonItem),
+					defs_item_cmp);
+		if (m == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly definitions read again found an object the last read didn't hold")));
+		if (m->value.len == it->value.len &&
+			memcmp(m->value.data, it->value.data, it->value.len) == 0)
+			continue;
+		changed[nedits] = it;
+		edits[nedits].key = (ProllyKey) {(const uint8 *) it->key.data, it->key.len};
+		edits[nedits].value = (ProllyValue) {(const uint8 *) it->value.data, it->value.len};
+		edits[nedits++].is_delete = false;
+	}
+	if (nedits == 0)
+		*root = defs_made.root;
+	else
+		PROLLY_CALL(cn->tree, apply, &cn->root_env, &defs_made.root, edits,
+					nedits, root);
+	for (int i = 0; i < nedits; i++)
+	{
+		CanonItem	probe;
+		CanonItem  *m;
+		MemoryContext old;
+
+		probe.key = changed[i]->key;
+		m = bsearch(&probe, defs_items, ndefs_items, sizeof(CanonItem),
+					defs_item_cmp);
+		old = MemoryContextSwitchTo(defs_cxt);
+		resetStringInfo(&m->value);
+		appendBinaryStringInfo(&m->value, changed[i]->value.data,
+							   changed[i]->value.len);
+		MemoryContextSwitchTo(old);
+	}
+	pfree(edits);
+	pfree(changed);
+	if (nedits > 0)
+		made_tree(&defs_made, root);
+	cn->left_out = NIL;
+	foreach_ptr(char, name, defs_left_out)
+		cn->left_out = lappend(cn->left_out, pstrdup(name));
+	pgstat_count_prolly(PGSTAT_PROLLY_DEFINITIONS_REUSED, 1);
+
+	/* (checked against reading them all again, its work not counted) */
+	if (debug_prolly_verify_fold_caches)
+	{
+		Canon		full;
+		ProllyNodeRef expect;
+		ListCell   *a;
+		ListCell   *b;
+		PgStat_Counter *stats = palloc_array(PgStat_Counter, PGSTAT_PROLLY_NUM_COUNTERS);
+		ProllyNodeCounters tree = *pgstat_prolly_tree_counters();
+
+		memcpy(stats, PendingProllyStats, sizeof(PendingProllyStats));
+		memset(&full, 0, sizeof(full));
+		full.reading = cn->reading;
+		full.no_rows = true;
+		canon_env(&full);
+		full.finder = cn->finder;
+		full.baseline = cn->baseline;
+		full.cached = true;
+		full.verifying = true;
+		prolly_fold_counted = false;
+		PG_TRY();
+		{
+			build_all(&full, &expect);
+		}
+		PG_FINALLY();
+		{
+			prolly_fold_counted = true;
+		}
+		PG_END_TRY();
+		memcpy(PendingProllyStats, stats, sizeof(PendingProllyStats));
+		*pgstat_prolly_tree_counters() = tree;
+		pfree(stats);
+		check_applied("definitions read again", root, &expect);
+		/* (and what they left out, the same objects) */
+		if (list_length(full.left_out) != list_length(cn->left_out))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("prolly definitions taken from this backend's last read leave out %d objects, read again %d",
+							list_length(cn->left_out), list_length(full.left_out))));
+		forboth(a, full.left_out, b, cn->left_out)
+		{
+			if (strcmp(lfirst(a), lfirst(b)) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("prolly definitions taken from this backend's last read leave out \"%s\", read again \"%s\"",
+								(char *) lfirst(b), (char *) lfirst(a))));
+		}
+	}
+	return true;
+}
+
 /*
  * The canonical tree: the last one built here with only what changed
  * since worked out again, if it can be (fold_changed_only()), else
@@ -5271,6 +5501,13 @@ build_canonical(Canon *cn, ProllyNodeRef *root)
 		PROLLY_CALL(dc.refs, fold_mark, MyBranch, GetActiveSnapshot(),
 					&cn->at.mark);
 	cn->at.valid = cn->marked;
+	if (cn->no_rows)
+	{
+		/* (definitions: the folds' items, and what they're as of, kept) */
+		if (!definitions_unchanged(cn, root))
+			build_all(cn, root);
+		return;
+	}
 	if (!fold_changed_only(cn, root))
 		build_all(cn, root);
 	if (cn->left_out != NIL)
@@ -5615,7 +5852,6 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 	if (ask->limit > 0 ? !PROLLY_HAS(cn.finder, fewer_changes) :
 		!PROLLY_HAS(cn.finder, changes))
 		return false;
-	load_baseline(&cn, baseline);
 
 	/* (the fold's snapshot: the transaction's writes, this statement's too) */
 	if (!IsInParallelMode())
@@ -5646,6 +5882,8 @@ table_changes_asked(const ProllyNodeRef *baseline, Oid relid,
 			appendStringInfoString(&key, "t:");
 			append_utf8(&key, qualified(form->relnamespace,
 										NameStr(form->relname)));
+			/* (the table's entry alone: a status asks each table so) */
+			load_baseline_keys(&cn, baseline, list_make1(&key));
 			/* (described as collect() describes it: see build_canonical()) */
 			fold_caches_begin();
 			check_deparse_settings();

@@ -64,6 +64,21 @@ typedef struct Needs
 	bool		read;			/* historical rows can be re-sorted */
 } Needs;
 
+/*
+ * What check_extension() found wrong, for the refusal's hint: each kind
+ * has its own remedy.
+ */
+typedef struct Problems
+{
+	bool		extension;		/* an extension to install or update */
+	bool		ordering;		/* an ordering extension at another version */
+	int			schemas;		/* extensions in another schema than needed */
+	char	   *schema_name;	/* the first of those, */
+	char	   *schema_needed;	/* the schema its commits need, */
+	char	   *schema_have;	/* the one it is in, */
+	bool		schema_relocatable; /* and whether it can be moved */
+} Problems;
+
 /* An extension to create. */
 typedef struct Install
 {
@@ -358,6 +373,14 @@ installed(const char *name, char **version, char **schema)
 	return true;
 }
 
+/* Whether an extension the database has can be moved to another schema. */
+static bool
+relocatable(const char *name)
+{
+	query("SELECT extrelocatable FROM pg_catalog.pg_extension WHERE extname = $1", 1, &name);
+	return SPI_processed > 0 && strcmp(column(0, 1), "t") == 0;
+}
+
 /*
  * The newest of the versions, by the update paths: the one every other can
  * be updated to.  NULL if none is.
@@ -415,7 +438,7 @@ only_version(List *versions, const char *version)
  * NULL otherwise.
  */
 static char *
-check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
+check_extension(NeededExtension *e, StringInfo missing, Problems *problems,
 				bool install)
 {
 	char	   *schema = strVal(linitial(e->schemas));
@@ -435,6 +458,7 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 	{
 		appendStringInfo(missing, "\nextension %s: orders keys at versions %s, which differ",
 						 e->name, string_list(e->ordering_versions));
+		problems->ordering = true;
 		return NULL;
 	}
 	if (installed(e->name, &have, &have_schema))
@@ -443,12 +467,20 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 		{
 			appendStringInfo(missing, "\nextension %s: in schema %s, and the database has it in %s",
 							 e->name, schema, have_schema);
+			if (problems->schemas++ == 0)
+			{
+				problems->schema_name = e->name;
+				problems->schema_needed = schema;
+				problems->schema_have = have_schema;
+				problems->schema_relocatable = relocatable(e->name);
+			}
 		}
 		if (e->ordering_versions &&
 			strcmp(strVal(linitial(e->ordering_versions)), have) != 0)
 		{
 			appendStringInfo(missing, "\nextension %s: orders keys at version %s, and the database has %s",
 							 e->name, strVal(linitial(e->ordering_versions)), have);
+			problems->ordering = true;
 			return NULL;
 		}
 		if (only_version(e->versions, have))
@@ -467,7 +499,7 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 						 list_length(e->versions) > 1 ? "versions " : "version ",
 						 e->versions ? string_list(e->versions) : "");
 		if (have)
-			*any_extension = true;
+			problems->extension = true;
 		return NULL;
 	}
 	paths = update_paths(e->name);
@@ -486,6 +518,7 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 	{
 		appendStringInfo(missing, "\nextension %s: version %s is needed, but keys require version %s",
 						 e->name, newest, strVal(linitial(e->ordering_versions)));
+		problems->ordering = true;
 		return NULL;
 	}
 	if (e->ordering_versions)
@@ -497,7 +530,7 @@ check_extension(NeededExtension *e, StringInfo missing, bool *any_extension,
 		{
 			appendStringInfo(missing, "\nextension %s: version %s, and the database has %s",
 							 e->name, newest, have);
-			*any_extension = true;
+			problems->extension = true;
 		}
 		return NULL;
 	}
@@ -657,6 +690,68 @@ collect_trees(List *trees, Needs *needs)
 		PROLLY_CALL(dc.canonicalizer, dependencies, lfirst(lc), note_need, needs);
 }
 
+/*
+ * The hint for a refusal: the remedy of each kind of problem found, in a
+ * fixed order (an extension in another schema, ordering versions,
+ * extensions to install or update), or the general one.  One kind gives
+ * its own sentence; several, their remedies joined, then "try again" once.
+ */
+static char *
+problems_hint(const Problems *problems)
+{
+	List	   *remedies = NIL;
+	StringInfoData hint;
+	ListCell   *lc;
+
+	if (problems->schemas == 1 && problems->schema_relocatable)
+		remedies = lappend(remedies, psprintf(
+			"move extension %s from schema %s to %s, where the commits need it "
+			"(ALTER EXTENSION %s SET SCHEMA %s)",
+			problems->schema_name, problems->schema_have, problems->schema_needed,
+			quote_identifier(problems->schema_name), quote_identifier(problems->schema_needed)));
+	else if (problems->schemas == 1)
+		remedies = lappend(remedies, psprintf(
+			"extension %s is in schema %s and can't be moved: drop it (which drops what depends "
+			"on it too) and create it in %s, where the commits need it (CREATE EXTENSION %s SCHEMA %s)",
+			problems->schema_name, problems->schema_have, problems->schema_needed,
+			quote_identifier(problems->schema_name), quote_identifier(problems->schema_needed)));
+	else if (problems->schemas > 1)
+		remedies = lappend(remedies,
+						   "move the extensions to the schemas the commits need "
+						   "(ALTER EXTENSION ... SET SCHEMA; one that can't be moved, drop, which "
+						   "drops what depends on it too, and create there with CREATE EXTENSION ... SCHEMA)");
+	if (problems->ordering)
+		remedies = lappend(remedies,
+						   "use a database with the recorded ordering-extension versions (after "
+						   "upgrading a branch, commit it before retrying a move or clone)");
+	if (problems->extension)
+		remedies = lappend(remedies,
+						   "install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE)");
+
+	/* (one kind alone keeps the sentence it has always had) */
+	if (remedies == NIL)
+		return "Make what is missing, then try again.";
+	if (list_length(remedies) == 1 && problems->ordering)
+		return "Use a database with the recorded ordering-extension versions. After upgrading a "
+			"branch, commit it before retrying a move or clone.";
+	if (list_length(remedies) == 1 && problems->extension)
+		return "Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), "
+			"then try again.";
+	initStringInfo(&hint);
+	foreach(lc, remedies)
+	{
+		const char *r = lfirst(lc);
+
+		if (hint.len == 0)
+			appendStringInfo(&hint, "%c%s", pg_toupper((unsigned char) r[0]), r + 1);
+		else
+			appendStringInfo(&hint, "; %s%s",
+							 foreach_current_index(lc) == list_length(remedies) - 1 ? "and " : "", r);
+	}
+	appendStringInfoString(&hint, ", then try again.");
+	return hint.data;
+}
+
 /* Check the needs, as prolly_check_dependencies() says. */
 static void
 check_needs(Needs *needs, bool install, const char *what)
@@ -664,8 +759,7 @@ check_needs(Needs *needs, bool install, const char *what)
 	StringInfoData missing;
 	List	   *installs = NIL;
 	ListCell   *lc;
-	bool		any_extension = false;
-	bool		ordering_extension = false;
+	Problems	problems = {0};
 
 	if (needs->extensions == NIL && needs->objects == NIL)
 		return;
@@ -676,17 +770,15 @@ check_needs(Needs *needs, bool install, const char *what)
 	foreach(lc, needs->extensions)
 	{
 		NeededExtension *e = lfirst(lc);
-		char	   *version = check_extension(e, &missing, &any_extension,
-											  install);
+		char	   *version = check_extension(e, &missing, &problems, install);
 
-		ordering_extension |= e->ordering_versions != NIL;
 		if (version == NULL)
 			continue;
 		if (!install)
 		{
 			appendStringInfo(&missing, "\nextension %s: version %s, not installed",
 							 e->name, version);
-			any_extension = true;
+			problems.extension = true;
 			continue;
 		}
 		{
@@ -712,11 +804,7 @@ check_needs(Needs *needs, bool install, const char *what)
 				 errmsg("the %s needs what this database lacks", what),
 				 errdetail_internal("Needed from outside the versioned schemas:%s",
 									missing.data),
-				 ordering_extension ?
-				 errhint("Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.") :
-				 any_extension ?
-				 errhint("Install or update the extensions (CREATE EXTENSION, ALTER EXTENSION ... UPDATE), then try again.") :
-				 errhint("Make what is missing, then try again.")));
+				 errhint_internal("%s", problems_hint(&problems))));
 
 	/*
 	 * The versioned schemas extensions are to be made in are made first,

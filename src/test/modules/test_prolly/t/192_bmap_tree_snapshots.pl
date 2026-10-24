@@ -58,7 +58,8 @@ sql('CHECKPOINT');
 my $snap = sql(qq{SELECT test_bmap_snapshot_take($rel)});
 sql(q{UPDATE t SET b = 'y' WHERE a % 50 = 0});
 sql(q{DELETE FROM t WHERE a > 5000});
-sql(q{VACUUM t});
+# (no VACUUM: it would copy every page the snapshot alone shares, to set
+# it all-visible, leaving none shared for the crash below to count twice)
 my $now = rows($node, $rel);
 isnt($now, $then, 'the table changed after the snapshot');
 
