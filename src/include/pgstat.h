@@ -754,9 +754,13 @@ typedef enum PgStat_ProllyCounter
 											 * head */
 	PGSTAT_PROLLY_BMAP_BLOCKS_MOVED,	/* page-store blocks a sweep moved
 										 * down, to shorten the store */
+	PGSTAT_PROLLY_FOLD_WORKER_FOLDS,	/* branches the fold worker folded */
+	PGSTAT_PROLLY_FOLD_WORKER_DEFERRED, /* branches a fold worker's pass
+										 * left for a later one, their
+										 * writes not due yet */
 } PgStat_ProllyCounter;
 
-#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_BMAP_BLOCKS_MOVED + 1)
+#define PGSTAT_PROLLY_NUM_COUNTERS (PGSTAT_PROLLY_FOLD_WORKER_DEFERRED + 1)
 
 typedef struct PgStat_ProllyStats
 {
