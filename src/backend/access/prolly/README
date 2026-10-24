@@ -221,6 +221,16 @@ The branch's own tables and columns are renamed to the merged names first
 are and only the other side's changes are written.  The anchor is then the
 merge's.
 
+A history read of a table's rows (dolt_at, dolt_history_table, dolt_diff,
+dolt_diff_table, by row type or by name) takes SELECT on the table here
+of the version's name, and that grant covers only the versions that are
+that table: those reached back from the working set through the head's
+history, or forward from one of them along another branch's commits,
+the name never without a table between (a rename followed).  A version of
+another table of its name, one dropped before this one was made, is read
+only by the database's owner or a member of pg_read_all_data.  A table
+dropped and made again within one commit isn't told from one kept (#891).
+
 Folded format 18 records identities in commits.  Formats are not kept
 compatible while the prototype iterates: this build reads, moves to and
 merges format 18 alone, and a root of format 17 or older has its tables'

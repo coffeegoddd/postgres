@@ -124,9 +124,43 @@ SELECT diff_type, from_row FROM dolt_diff_table('dn.secret');
 SELECT row FROM dolt_history_table('dn.secret');
 SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', 'dn.secret');
 SELECT diff_type, to_row FROM dolt_diff_table('dn.secret', 'HEAD~');
+-- the same versions read by the table's row type: the same rule, so the
+-- dropped table's rows aren't read on the grants of the one made again
+SELECT * FROM dolt_at('HEAD~2', NULL::dn.secret);
+SELECT * FROM dolt_history_table(NULL::dn.secret);
+SELECT * FROM dolt_diff('HEAD~2', 'HEAD', NULL::dn.secret);
+SELECT diff_type FROM dolt_diff_table(NULL::dn.secret);
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', NULL::dn.secret);
+SELECT diff_type, to_row FROM dolt_diff_table(NULL::dn.secret, 'HEAD~');
 RESET ROLE;
 -- (the database's owner reads both)
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');
+SELECT * FROM dolt_at('HEAD~2', NULL::dn.secret);
+
+-- another branch's commits: its version of this table (made from this
+-- table's history) is readable on its grants, as Dolt reads any commit;
+-- another table of its name, made on that branch, isn't
+SELECT dolt_branch('dn_side') IS NOT NULL AS made;
+SELECT dolt_branch('dn_other') IS NOT NULL AS made;
+SELECT dolt_checkout('dn_side') IS NOT NULL AS on_side;
+INSERT INTO dn.secret VALUES (3, 'side');
+SELECT length(dolt_commit('-am', 'side row')::text) AS committed;
+SELECT dolt_checkout('dn_other') IS NOT NULL AS on_other;
+DROP TABLE dn.secret;
+SELECT length(dolt_commit('-am', 'no secret')::text) AS committed;
+CREATE TABLE dn.secret (id int PRIMARY KEY, note text);
+INSERT INTO dn.secret VALUES (4, 'other secret');
+SELECT length(dolt_commit('-Am', 'another secret')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('dn_side', NULL::dn.secret) ORDER BY id;
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'dn_side', NULL::dn.secret);
+SELECT * FROM dolt_at('dn_other', NULL::dn.secret);
+SELECT * FROM dolt_diff('HEAD', 'dn_other', 'dn.secret');
+RESET ROLE;
+SELECT dolt_branch('-D', 'dn_side') IS NOT NULL AS deleted;
+SELECT dolt_branch('-D', 'dn_other') IS NOT NULL AS deleted;
 
 -- nor one made with a renamed one's old name: the renamed one's rows by
 -- that name, without SELECT on it

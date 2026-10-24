@@ -6335,6 +6335,10 @@ row_change(ProllyDiffSink *self, Oid relid, ProllyDiffKind kind,
 	MemoryContextSwitchTo(old);
 }
 
+static void check_typed_diff(Oid relid, const char *from_ref,
+							 const char *to_ref, List **lineages,
+							 const char *fn);
+
 /*
  * dolt_diff(from_ref text, to_ref text, tbl anyelement,
  *			 OUT diff_type text, OUT from_row anyelement,
@@ -6367,6 +6371,7 @@ dolt_diff(PG_FUNCTION_ARGS)
 	memset(&s, 0, sizeof(s));
 	s.sink.change = row_change;
 	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	check_typed_diff(relid, from_ref, to_ref, &s.lineages, "dolt_diff");
 	rows_begin(&s.rows, rel);
 	PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s.sink);
 	rows_end(&s.rows);
@@ -6528,6 +6533,76 @@ lineage_has(NameLineage *l, const char *ref, const char *name)
 	return st != NULL && strcmp(st->name, name) == 0;
 }
 
+/*
+ * Is the version ref has of the table named name l's table, in ref's
+ * history if not the session's?  One of the lineage's versions
+ * (lineage_has()), or one that later commits made of one of them, the
+ * name never without a table between: another branch's commit, made from
+ * the history this table shares.  Walked back from ref, a step at a time,
+ * until a path meets a version of the lineage (it is l's table only if it
+ * has l's name there) or its name was without a table (made since: another
+ * table).
+ */
+static bool
+lineage_reaches(NameLineage *l, const char *ref, const char *name)
+{
+	ProllyHash	h;
+	List	   *queue = NIL;
+	HTAB	   *seen;
+	HASHCTL		ctl = {0};
+	bool		found = false;
+
+	if (lineage_has(l, ref, name))
+		return true;
+	if (ref == NULL || pg_strcasecmp(ref, "WORKING") == 0 ||
+		pg_strcasecmp(ref, "STAGED") == 0 ||
+		!PROLLY_CALL(refs(), resolve, ref, &h))
+		return false;
+	ctl.keysize = PROLLY_HASH_MAX_LEN * 2 + 1;
+	ctl.entrysize = PROLLY_HASH_MAX_LEN * 2 + 1;
+	ctl.hcxt = CurrentMemoryContext;
+	seen = hash_create("prolly lineage reached", 64, &ctl,
+					   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	queue = lappend(lappend(queue, copy_hash(&h)), pstrdup(name));
+	while (queue != NIL && !found)
+	{
+		ProllyHash *at = linitial(queue);
+		char	   *at_name = lsecond(queue);
+		char	   *hex = hash_hex(at);
+		ProllyCommitInfo info;
+		bool		dup;
+
+		CHECK_FOR_INTERRUPTS();
+		queue = list_delete_first(list_delete_first(queue));
+		(void) hash_search(seen, hex, HASH_ENTER, &dup);
+		if (dup)
+			continue;
+		if (lineage_has(l, hex, at_name))
+		{
+			found = true;
+			break;
+		}
+		/* (a version of the lineage of another name: another table's) */
+		if (hash_search(l->steps, hex, HASH_FIND, NULL) != NULL)
+			continue;
+		if (!PROLLY_CALL(refs(), commit_get, at, &info))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("prolly commit %s is missing", hex)));
+		for (int i = 0; i < info.nparents; i++)
+		{
+			char	   *before = lineage_name_before(hash_hex(&info.parents[i]),
+													 hex, at_name);
+
+			if (before)
+				queue = lappend(lappend(queue, copy_hash(&info.parents[i])),
+								before);
+		}
+	}
+	hash_destroy(seen);
+	return found;
+}
+
 /* The lineage of the table here named now: from lineages, or begun. */
 static NameLineage *
 name_lineage(List **lineages, const char *now)
@@ -6601,9 +6676,9 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			continue;
 		l = name_lineage(lineages, names[i]);
 		if (!from_ok)
-			from_ok = lineage_has(l, from_ref, r->from_name);
+			from_ok = lineage_reaches(l, from_ref, r->from_name);
 		if (!to_ok)
-			to_ok = lineage_has(l, to_ref, r->to_name);
+			to_ok = lineage_reaches(l, to_ref, r->to_name);
 	}
 	if ((from_ok && to_ok) || reads_all)
 		return;
@@ -6620,6 +6695,67 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			 errmsg("%s can't read \"%s\": no table of that name is here to grant it",
 					fn, name),
 			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+}
+
+/* Does the user read every version, whatever its grants? */
+static bool
+reads_all_history(void)
+{
+	return object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()) ||
+		has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_DATA);
+}
+
+/*
+ * A history read of relid's table by its row type, as by name: a diff of
+ * it between two refs (from_ref NULL: from nothing) reads the versions
+ * the refs' changes pair with it, which check_named_rows() allows by the
+ * same rule as a read by name.  So a version of another table of its name
+ * (one dropped, and this one made again with its name) isn't read on this
+ * table's grants.
+ */
+static void
+check_typed_diff(Oid relid, const char *from_ref, const char *to_ref,
+				 List **lineages, const char *fn)
+{
+	List	   *rows = NIL;
+	SummaryRow *r;
+	char	   *name;
+
+	if (reads_all_history() || !PROLLY_HAS(diff_merge(), summary))
+		return;
+	name = qualified_name(relid);
+	if (name == NULL)
+		return;
+	PROLLY_CALL(diff_merge(), summary, from_ref, to_ref, false, collect_change, &rows);
+	r = named_table(rows, name);
+	if (r != NULL)
+		check_named_rows(r, from_ref, to_ref, lineages, fn);
+}
+
+/*
+ * A read of relid's table as ref has it (dolt_at(), dolt_history_table()),
+ * which reads ref's table of its name: refused if that is another table's
+ * version (check_named_rows()'s rule), unless the user reads every version.
+ */
+static void
+check_typed_at(Oid relid, const char *ref, List **lineages, const char *fn)
+{
+	List	   *rows = NIL;
+	SummaryRow *r;
+	char	   *name;
+
+	if (reads_all_history() || !PROLLY_HAS(diff_merge(), summary))
+		return;
+	name = qualified_name(relid);
+	if (name == NULL ||
+		lineage_reaches(name_lineage(lineages, name), ref, name))
+		return;
+	/* (no table of the name there: nothing of another's is read) */
+	PROLLY_CALL(diff_merge(), summary, NULL, ref, false, collect_change, &rows);
+	r = named_table(rows, name);
+	if (r == NULL || r->to_item == NULL)
+		return;
+	check_named_rows(r, NULL, ref, lineages, fn);
 }
 
 /* rows_begin_described() of a table's version, or refused. */
@@ -6753,7 +6889,10 @@ diff_step(RowDiffSink *s, Oid relid, const char *name, const char *from_ref,
 	if (name)
 		(void) diff_by_name(s, from_ref, to_ref, name, "dolt_diff_table");
 	else
+	{
+		check_typed_diff(relid, from_ref, to_ref, &s->lineages, "dolt_diff_table");
 		PROLLY_CALL(diff_merge(), diff, from_ref, to_ref, relid, &s->sink);
+	}
 }
 
 /*
@@ -6982,6 +7121,11 @@ dolt_at(PG_FUNCTION_ARGS)
 	memset(&s, 0, sizeof(s));
 	s.sink.change = at_change;
 	s.rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	{
+		List	   *lineages = NIL;
+
+		check_typed_at(relid, ref, &lineages, "dolt_at");
+	}
 	rows_begin(&s.rows, rel);
 	PROLLY_CALL(diff_merge(), diff, NULL, ref, relid, &s.sink);
 	rows_end(&s.rows);
@@ -7056,6 +7200,7 @@ dolt_history_table(PG_FUNCTION_ARGS)
 	Relation	rel;
 	AtSink		s;
 	ListCell   *lc;
+	List	   *lineages = NIL;
 
 	rel = open_row_type_table(relid, "dolt_history_table", ACL_SELECT);
 	InitMaterializedSRF(fcinfo, 0);
@@ -7073,6 +7218,7 @@ dolt_history_table(PG_FUNCTION_ARGS)
 		s.commit = &e->info;
 		s.hash = hash_hex(&e->info.id);
 		split_author(e->info.author, &s.committer, &email);
+		check_typed_at(relid, s.hash, &lineages, "dolt_history_table");
 		PROLLY_CALL(diff_merge(), diff, NULL, s.hash, relid, &s.sink);
 	}
 	rows_end(&s.rows);

@@ -630,3 +630,25 @@ OF` are built in D18's shapes.
   the user's review.
 - **Port:** an assertion of Dolt's refusal is omitted (the case is
   partial); test_prolly's `tags` test checks the read-only checkout.
+
+## D26. Reading a table's history takes its grants, over its lineage
+
+- **Dolt:** a user who may read a database reads any table at any commit
+  by hash, `AS OF` or a history table; privileges are on databases and
+  tables by name, not on versions.
+- **Prolly:** every history read of a table's rows (`dolt_at`,
+  `dolt_history_table`, `dolt_diff`, `dolt_diff_table`, by row type or
+  by name) takes `SELECT` on the table here of the version's name, and
+  that grant covers only versions that are that table: back through the
+  working set and the head's history, and forward from it along other
+  branches' commits, with the name never without a table between. A
+  version of another table of its name (one dropped, and a table made
+  again with its name in a later commit) is read only by the database's
+  owner or a member of `pg_read_all_data`. Any commit is otherwise read
+  by hash, as in Dolt.
+- **Why:** Postgres grants are on relations; a table made again with an
+  old name is another relation, and its grants don't cover the dropped
+  one's rows. Commits name tables by name and identity alone, so a table
+  dropped and made again within one commit (or in the working set) isn't
+  told from one kept: #891.
+- **Port:** ports run as a superuser; none is affected.
