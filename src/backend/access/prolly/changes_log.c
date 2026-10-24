@@ -84,6 +84,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/prolly_builtins.h"
+#include "access/prolly_folder.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
 #include "access/tableam.h"
@@ -842,6 +843,7 @@ merge_add(Finder *f, Merge *m, const ProllyEdit *edits, int nedits)
 		if (c <= 0)
 			m->more = PROLLY_CALL(f->tree, cursor_next, m->cur, &m->k, &m->v);
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 }
 
@@ -853,6 +855,7 @@ merge_finish(Finder *f, Merge *m, ProllyNodeRef *data)
 		PROLLY_CALL(f->tree, build_add, m->b, &m->k, &m->v);
 		m->more = PROLLY_CALL(f->tree, cursor_next, m->cur, &m->k, &m->v);
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	PROLLY_CALL(f->tree, cursor_close, m->cur);
 	PROLLY_CALL(f->tree, build_finish, m->b, data);
@@ -956,6 +959,7 @@ each_change(Finder *f, const ProllyNodeRef *data, ChangeEmit emit, void *arg)
 		else if (had)
 			go = emit(f, PROLLY_DIFF_REMOVED, &ck, &v, NULL, arg);
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	index_endscan(scan);
 	PROLLY_CALL(f->tree, cursor_close, cur);
@@ -1092,6 +1096,7 @@ next_part(Finder *f)
 			f->pending = true;
 		}
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	/* (the sort's end: the last row's copies are all read) */
 	if (f->pending && !f->give_up && f->bytes < budget)
@@ -1296,6 +1301,7 @@ apply_copies(Finder *f, const ProllyNodeRef *data_in, ProllyNodeRef *data)
 			nedits++;
 		}
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 	PROLLY_CALL(f->tree, cursor_close, cur);
 	f->work.rows_written += nedits;
@@ -1532,6 +1538,7 @@ own_copies(Finder *f, ItemPointerData *tids, int ntids)
 				break;
 		}
 		CHECK_FOR_INTERRUPTS();
+		prolly_fold_delay_point();
 	}
 }
 

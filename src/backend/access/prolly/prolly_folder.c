@@ -39,6 +39,10 @@
  * batch's rows, or what came in the last max_delay.  A branch not yet due
  * keeps the worker running, as a pending one does.
  *
+ * With prolly_fold_worker_cost_delay set (0, off, by default), the
+ * worker's folds are paced by the cost-based delay, as vacuum is: see
+ * pace_begin() below.
+ *
  * IDENTIFICATION
  *	  src/backend/access/prolly/prolly_folder.c
  *
@@ -49,8 +53,10 @@
 #include "access/prolly_builtins.h"
 #include "access/prolly_config.h"
 #include "access/prolly_folder.h"
+#include "access/prolly_types.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "commands/vacuum.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_database.h"
@@ -77,6 +83,9 @@ int			prolly_fold_worker_max_workers = 2;
 int			prolly_fold_worker_naptime = 200;
 int			prolly_fold_worker_batch_rows = 0;
 int			prolly_fold_worker_max_delay = 1000;
+double		prolly_fold_worker_cost_delay = 0;
+int			prolly_fold_worker_cost_limit = -1;
+bool		prolly_fold_paced = false;
 
 /* The most databases, and branches of one, a pass looks at. */
 #define FOLDER_MAX_DATABASES	64
@@ -279,6 +288,73 @@ fold_branch(void *arg)
 	}
 }
 
+/*
+ * Pacing.  A fold of the worker's, with prolly_fold_worker_cost_delay set,
+ * runs under the cost-based delay as a vacuum does: the buffer manager
+ * charges the pages it reads and dirties (the change logs', the tables',
+ * their indexes'), and prolly_fold_delay_point() the tree nodes it reads
+ * (as hit pages: decoded nodes are cached, and the store's files are read
+ * through the kernel's cache mostly) and writes (as dirtied pages: each is
+ * appended, WAL-logged and synced), then naps once the fold has spent
+ * prolly_fold_worker_cost_limit.  Off, nothing is charged, nor any delay
+ * point reached: a fold costs what it did.
+ */
+static uint64 paced_nodes_read;
+static uint64 paced_nodes_written;
+
+static void
+paced_nodes_seen(void)
+{
+	ProllyNodeCounters *c = pgstat_prolly_tree_counters();
+
+	paced_nodes_read = c->nodes_read;
+	paced_nodes_written = c->nodes_written;
+}
+
+static void
+pace_begin(void)
+{
+	if (prolly_fold_worker_cost_delay <= 0)
+		return;
+	vacuum_cost_delay = prolly_fold_worker_cost_delay;
+	vacuum_cost_limit = prolly_fold_worker_cost_limit > 0 ?
+		prolly_fold_worker_cost_limit : VacuumCostLimit;
+	VacuumCostBalance = 0;
+	VacuumCostActive = true;
+	paced_nodes_seen();
+	prolly_fold_paced = true;
+}
+
+static void
+pace_end(void)
+{
+	if (!prolly_fold_paced)
+		return;
+	prolly_fold_paced = false;
+	VacuumCostActive = false;
+	VacuumCostBalance = 0;
+}
+
+void
+prolly_fold_delay_point_paced(void)
+{
+	ProllyNodeCounters *c = pgstat_prolly_tree_counters();
+
+	/* (the counts move to the statistics when they're flushed) */
+	if (c->nodes_read < paced_nodes_read ||
+		c->nodes_written < paced_nodes_written)
+		paced_nodes_read = paced_nodes_written = 0;
+	VacuumCostBalance += (int) ((c->nodes_read - paced_nodes_read) *
+								VacuumCostPageHit +
+								(c->nodes_written - paced_nodes_written) *
+								VacuumCostPageDirty);
+	paced_nodes_seen();
+	if (VacuumCostActive && VacuumCostBalance >= vacuum_cost_limit &&
+		INTERRUPTS_CAN_BE_PROCESSED())
+		pgstat_count_prolly(PGSTAT_PROLLY_FOLD_WORKER_COST_DELAYS, 1);
+	vacuum_delay_point(false);
+}
+
 typedef struct Moved
 {
 	ProllyMovedBranch *branches;
@@ -448,11 +524,13 @@ fold_pass(const ProllyRefsRoutine *refs)
 		PG_TRY();
 		{
 			PushActiveSnapshot(GetTransactionSnapshot());
+			pace_begin();
 			/* (the worker's own branch, the database's default, as it is) */
 			if (moved[i].branch == MyBranch)
 				fold_branch(&folded);
 			else
 				branch_ops()->run_on(names[i], fold_branch, &folded);
+			pace_end();
 			PopActiveSnapshot();
 			if (folded)
 			{
@@ -488,6 +566,7 @@ fold_pass(const ProllyRefsRoutine *refs)
 		}
 		PG_CATCH();
 		{
+			pace_end();
 			HOLD_INTERRUPTS();
 			EmitErrorReport();
 			AbortOutOfAnyTransaction();

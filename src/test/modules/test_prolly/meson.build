@@ -375,6 +375,7 @@ tests += {
       't/298_rewrite_checkpoint_errors.pl',
       't/310_reflog_after_gc.pl',
       't/313_reflog_gc_slot.pl',
+      't/335_fold_worker_pacing.pl',
     ],
   },
 }
