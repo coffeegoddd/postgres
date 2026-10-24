@@ -72,8 +72,8 @@
 bool		prolly_fold_worker = true;
 int			prolly_fold_worker_max_workers = 2;
 int			prolly_fold_worker_naptime = 200;
-int			prolly_fold_worker_batch_rows = 10000;
-int			prolly_fold_worker_max_delay = 10000;
+int			prolly_fold_worker_batch_rows = 5000;
+int			prolly_fold_worker_max_delay = 1000;
 
 /* The most databases, and branches of one, a pass looks at. */
 #define FOLDER_MAX_DATABASES	64

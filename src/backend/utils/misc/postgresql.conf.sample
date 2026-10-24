@@ -169,8 +169,8 @@
                                         # (change requires restart)
 #prolly_fold_worker = on                 # fold branches' working sets in the
                                         # background after they're written
-#prolly_fold_worker_batch_rows = 10000  # rows written that make a fold due
-#prolly_fold_worker_max_delay = 10s     # or the longest a write waits for one
+#prolly_fold_worker_batch_rows = 5000   # rows written that make a fold due
+#prolly_fold_worker_max_delay = 1s      # or the longest a write waits for one
 #prolly_fold_worker_max_workers = 2     # fold workers at once, one to a
                                         # database
 #prolly_fold_worker_naptime = 200ms     # time between its passes
