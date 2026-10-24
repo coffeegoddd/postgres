@@ -361,7 +361,7 @@ SELECT length(dolt_commit('-Am', 'without sm12')::text) AS committed;
 -- Emptying a table row-level security is forced on applies its rows as
 -- the move writes them: refused, as writing them is, not left to a
 -- conversion that can't be made.
-CREATE ROLE regress_sm13;
+CREATE ROLE regress_sm13 IN ROLE pg_prolly_write;
 CREATE SCHEMA sm13 VERSIONED;
 GRANT ALL ON SCHEMA sm13 TO regress_sm13;
 SET ROLE regress_sm13;

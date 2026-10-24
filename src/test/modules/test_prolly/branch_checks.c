@@ -21,6 +21,7 @@
 #include "catalog/branch.h"
 #include "catalog/pg_branch.h"
 #include "fmgr.h"
+#include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/syscache.h"
@@ -104,4 +105,16 @@ test_branches_written(PG_FUNCTION_ARGS)
 		}
 	}
 	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(names, n, TEXTOID));
+}
+
+/*
+ * Whether another backend waits for a lock this one holds, or for its
+ * virtual transaction (AnyLockHasWaiters(), which a paced fold asks before
+ * each nap).
+ */
+PG_FUNCTION_INFO_V1(test_any_lock_has_waiters);
+Datum
+test_any_lock_has_waiters(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(AnyLockHasWaiters());
 }

@@ -109,7 +109,8 @@ SELECT dolt_checkout('main');
 SELECT dolt_branch('-d', 'kept');
 SELECT name FROM dolt_branches() ORDER BY name;
 
--- Making a branch takes CREATE on the database; deleting one, owning it.
+-- Making a branch takes CREATE on the database; deleting one, a head
+-- move's privileges: owning the branch (having made it) is enough.
 CREATE ROLE regress_branch_user;
 SET ROLE regress_branch_user;
 DO $$ BEGIN
@@ -124,15 +125,19 @@ DO $$ BEGIN
 END $$;
 SET ROLE regress_branch_user;
 SELECT dolt_branch('by_user');
-\set VERBOSITY terse
-SELECT dolt_branch('-d', 'by_user');
-\set VERBOSITY default
 RESET ROLE;
-SELECT dolt_branch('-d', 'by_user');
+SELECT dolt_branch('by_owner');
 DO $$ BEGIN
 	EXECUTE format('REVOKE CREATE ON DATABASE %I FROM regress_branch_user',
 				   current_database());
 END $$;
+SET ROLE regress_branch_user;
+\set VERBOSITY terse
+SELECT dolt_branch('-d', 'by_owner');
+\set VERBOSITY default
+SELECT dolt_branch('-d', 'by_user');
+RESET ROLE;
+SELECT dolt_branch('-d', 'by_owner');
 DROP ROLE regress_branch_user;
 
 -- A role a branch's copy references can't be dropped, even once no other

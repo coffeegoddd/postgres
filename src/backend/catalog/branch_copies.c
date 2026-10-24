@@ -971,16 +971,12 @@ copies_create(const char *name, const char *start_point)
 	return copies_make(name, start_point, NIL, false);
 }
 
+/* (deleting a branch moves its head away: the head move's privileges) */
 static void
 copies_check_drop(const char *name)
 {
 	PreventCommandIfReadOnly("dolt_branch()");
-	if (!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to delete branch \"%s\"", name),
-				 errdetail("Only the owner of database \"%s\" can delete its branches.",
-						   get_database_name(MyDatabaseId))));
+	prolly_check_head_move(name);
 }
 
 static void
@@ -1032,8 +1028,9 @@ copies_rename(const char *name, const char *newname, bool force)
 	HeapTuple	tup;
 	NameData	brname;
 
+	/* (the branch moved away from its name, and a new name taken) */
 	copies_check_drop(name);
-	copies_check_create(newname);
+	prolly_check_branch_rename(newname);
 	brel = table_open(BranchRelationId, ShareRowExclusiveLock);
 	branch = branch_oid(name, false);
 	if (branch == BRANCH_MAIN_OID)
@@ -1539,8 +1536,9 @@ kept_locator(const BranchKeptRelation *k)
 #define KEEP_SNAPSHOTS_MAX	(BMAP_SNAPSHOTS_MAX - 4)
 
 /*
- * Snapshots to take, together (bmap_snapshot_take_many(): one look at
- * the buffers, and each page store synced once as the transaction
+ * Snapshots to take, together (bmap_snapshot_take_many(): the generation
+ * of sharing raised once, each relation's pages changed since its last
+ * snapshot written out, and each page store synced once as the transaction
  * commits, which the refs naming them commit with): each one's storage
  * and where its id goes.
  */

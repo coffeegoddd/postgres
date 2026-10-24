@@ -182,7 +182,7 @@ SELECT * FROM mhm.ids WHERE id = 1;
 RESET enable_seqscan;
 SELECT dolt_commit('-Am', 'nothing') IS NULL AS committed;
 -- refreshing takes MAINTAIN, and so does moving its rows
-CREATE ROLE mhm_writer;
+CREATE ROLE mhm_writer IN ROLE pg_prolly_write;
 GRANT USAGE ON SCHEMA mhm TO mhm_writer;
 GRANT ALL ON mhm.t TO mhm_writer;
 GRANT SELECT ON mhm.sums, mhm.vs, mhm.ids TO mhm_writer;

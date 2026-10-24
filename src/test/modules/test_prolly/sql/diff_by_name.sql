@@ -151,12 +151,16 @@ SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~');
 SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~', 'dn.secret');
 SELECT table_name, rows_added FROM dolt_diff_stat('HEAD~', 'HEAD');
 RESET ROLE;
--- the head moved back to the dropped table's commit, by the reader: the
--- head's version is no longer this table's by the branch's record of its
--- head, so the step from the working set to the head vouches for nothing
+-- the head moved back to the dropped table's commit: not by the reader,
+-- whose SELECT moves no head; by the owner, after which the head's version
+-- is no longer this table's by the branch's record of its head, so the
+-- step from the working set to the head vouches for nothing
 SELECT dolt_hashof('HEAD') AS secret_head \gset
 SET ROLE regress_dn_reader;
 SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
+RESET ROLE;
+SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
+SET ROLE regress_dn_reader;
 SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
 SELECT row FROM dolt_history_table(NULL::dn.secret);
 SELECT row FROM dolt_history_table('dn.secret');
