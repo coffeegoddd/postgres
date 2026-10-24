@@ -496,6 +496,12 @@ typedef struct ProllyCanonRoutine
 	 */
 	const char *(*table_metadata) (const ProllyNodeRef *root, const char *name,
 								   ProllyHistoricalTable *t, bool *found);
+
+	/*
+	 * Optional: the names of root's tables in schema (qualified and quoted,
+	 * in the server's encoding), in root's order, from its items alone.
+	 */
+	List	   *(*table_names) (const ProllyNodeRef *root, const char *schema);
 } ProllyCanonRoutine;
 
 #define PROLLY_CANON_CALLBACK_NAMES \
@@ -506,9 +512,10 @@ typedef struct ProllyCanonRoutine
 	"in_format", "format", "walk_changes", "discard_undescribed", "fold_rows", \
 	"advance_baseline", "changes", "render", "splice", "splice_baseline", "read_definitions", "table_changes", "advance_own", \
 	"make_versioned_schemas", "pending_full", "identify", "renames", "merge_renames", \
-	"rename_description", "rename_root", "rename_objects", "table_metadata"
+	"rename_description", "rename_root", "rename_objects", "table_metadata", \
+	"table_names"
 #define PROLLY_CANON_FIRST_CALLBACK walk
-#define PROLLY_CANON_LAST_CALLBACK table_metadata
+#define PROLLY_CANON_LAST_CALLBACK table_names
 
 /*
  * The tree environment of folded canonical trees: the chunk store's,

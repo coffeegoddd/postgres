@@ -150,6 +150,7 @@
 #include "access/relation.h"
 #include "access/reloptions.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/tableam.h"
 #include "access/toast_compression.h"
 #include "access/xact.h"
@@ -177,6 +178,7 @@
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_ts_config.h"
@@ -13628,6 +13630,275 @@ folded_rename_objects(List *renames)
 	CommandCounterIncrement();
 }
 
+/*
+ * The name a root's "c:" items give a collation: "default", or the
+ * collation qualified.
+ */
+static char *
+collation_item_name(Oid coll)
+{
+	HeapTuple	tup;
+	Form_pg_collation form;
+	char	   *name;
+
+	if (coll == DEFAULT_COLLATION_OID)
+		return pstrdup("default");
+	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(coll));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for collation %u", coll);
+	form = (Form_pg_collation) GETSTRUCT(tup);
+	name = qualified(form->collnamespace, NameStr(form->collname));
+	ReleaseSysCache(tup);
+	return name;
+}
+
+/*
+ * The primary key's columns of a table's description (its PRIMARY KEY
+ * constraint's index statement) into t: NULL, or why they can't be ordered
+ * here as the version's tree is.
+ */
+static const char *
+historical_key(Canon *cn, const ProllyNodeRef *root, const char *name,
+			   const TableDef *td, List *colnames, ProllyHistoricalTable *t)
+{
+	char	   *pkname = NULL;
+	IndexStmt  *stmt = NULL;
+	ListCell   *lc;
+	ProllyComponents c;
+	List	   *stale;
+
+	foreach(lc, td->constraints)
+	{
+		const char *line = lfirst(lc);
+		const char *def = strchr(line, '\t');
+
+		/* (as folded_table_columns() has it: one that keys the rows) */
+		if (def && strncmp(def + 1, "PRIMARY KEY", 11) == 0 &&
+			strstr(def, "DEFERRABLE") == NULL &&
+			strstr(def, "WITHOUT OVERLAPS") == NULL)
+			pkname = unquoted(first_field(line));
+	}
+	t->keyed = (pkname != NULL);
+	if (!t->keyed)
+		return NULL;
+	foreach(lc, td->indexes)
+	{
+		List	   *parsed = raw_parser(lfirst(lc), RAW_PARSE_DEFAULT);
+		Node	   *n;
+
+		if (list_length(parsed) != 1)
+			continue;
+		n = linitial_node(RawStmt, parsed)->stmt;
+		if (IsA(n, IndexStmt) && ((IndexStmt *) n)->idxname &&
+			strcmp(((IndexStmt *) n)->idxname, pkname) == 0)
+			stmt = (IndexStmt *) n;
+	}
+	if (stmt == NULL || strcmp(stmt->accessMethod, "btree") != 0 ||
+		list_length(stmt->indexParams) > INDEX_MAX_KEYS)
+		return "its primary key's index isn't one a seek can follow";
+
+	prolly_history_components(&c);
+	stale = stale_collations(cn, root);
+	t->nkeys = 0;
+	foreach(lc, stmt->indexParams)
+	{
+		IndexElem  *e = lfirst_node(IndexElem, lc);
+		int			attno = 0;
+		Oid			type;
+		Oid			opclass;
+		Oid			coll;
+		int16		option = 0;
+		char	   *cname;
+		ListCell   *cl;
+		int			i = 0;
+
+		if (e->name == NULL)
+			return "its primary key has an expression";
+		foreach(cl, colnames)
+		{
+			i++;
+			if (strcmp(lfirst(cl), e->name) == 0)
+				attno = i;
+		}
+		if (attno == 0)
+			return "its primary key names a column it hasn't";
+		type = TupleDescAttr(t->desc, attno - 1)->atttypid;
+		opclass = e->opclass == NIL ? GetDefaultOpClass(type, BTREE_AM_OID) :
+			get_opclass_oid(BTREE_AM_OID, e->opclass, true);
+		coll = e->collation == NIL ? TupleDescAttr(t->desc, attno - 1)->attcollation :
+			get_collation_oid(e->collation, true);
+		if (!OidIsValid(opclass) || (e->collation != NIL && !OidIsValid(coll)))
+			return "its primary key's operator class or collation isn't one this database has";
+
+		/*
+		 * Built-in types, operator classes and collations only: an
+		 * extension's comparator may order keys otherwise than the
+		 * version's tree, and nothing proves it doesn't.
+		 */
+		if (type >= FirstNormalObjectId || opclass >= FirstNormalObjectId ||
+			coll >= FirstNormalObjectId)
+			return "its primary key is ordered by a type, operator class or collation that isn't built in";
+		if (OidIsValid(coll))
+		{
+			cname = collation_item_name(coll);
+			for (int j = 0; j + 1 < list_length(stale); j += 2)
+				if (strcmp(strVal(list_nth(stale, j)), cname) == 0)
+					return strVal(list_nth(stale, j + 1));
+		}
+		if (e->ordering == SORTBY_DESC)
+			option |= INDOPTION_DESC | INDOPTION_NULLS_FIRST;
+		if (e->nulls_ordering == SORTBY_NULLS_FIRST)
+			option |= INDOPTION_NULLS_FIRST;
+		else if (e->nulls_ordering == SORTBY_NULLS_LAST)
+			option &= ~INDOPTION_NULLS_FIRST;
+		t->key_attnos[t->nkeys] = attno;
+		t->opfamilies[t->nkeys] = get_opclass_family(opclass);
+		t->collations[t->nkeys] = coll;
+		t->options[t->nkeys] = option;
+		if (!PROLLY_CALL(c.key_encoder, supports, t->opfamilies[t->nkeys],
+						 type, coll))
+			return "the key encoder can't order its primary key";
+		t->nkeys++;
+	}
+
+	/* an ordering an extension recorded, changed since: refused, not re-sorted */
+	{
+		StringInfoData value;
+		char	   *keyname = psprintf("%s%s", ORDERING_PREFIX, name);
+		ProllyKey	key = {(const uint8 *) keyname, strlen(keyname)};
+
+		initStringInfo(&value);
+		if (PROLLY_CALL(cn->tree, get, &cn->env, root, &key, &value))
+		{
+			char	   *recorded = pg_any_to_server(value.data, value.len, PG_UTF8);
+			char	   *versions = strchr(recorded, '\n');
+
+			if (versions == NULL)
+				elog(ERROR, "invalid historical ordering metadata");
+			if (!ordering_current(versions + 1))
+				return "an extension ordering its primary key changed since";
+		}
+	}
+	return NULL;
+}
+
+static const char *
+folded_table_metadata(const ProllyNodeRef *root, const char *name,
+					  ProllyHistoricalTable *t, bool *found)
+{
+	Canon		cn;
+	char	   *utf8 = pg_server_to_any(name, strlen(name), PG_UTF8);
+	char	   *keyname = psprintf("t:%s", utf8);
+	ProllyKey	key = {(const uint8 *) keyname, strlen(keyname)};
+	StringInfoData item;
+	ProllyValue v;
+	ProllyValue description;
+	TableDef	td;
+	List	   *colnames = NIL;
+	ListCell   *lc;
+	int			i = 0;
+	int			nestlevel;
+	const char *why = NULL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	memset(t, 0, sizeof(*t));
+	initStringInfo(&item);
+	*found = PROLLY_CALL(cn.tree, get, &cn.env, root, &key, &item);
+	if (!*found)
+		return NULL;
+	if (!root_in_format(&cn, root))
+		return PROLLY_UNREADABLE_OLDER_FORMAT;
+	v.data = (const uint8 *) item.data;
+	v.len = item.len;
+	(void) tree_item(&key, &v, &t->data, &description);
+	parse_table_def(from_utf8(description.data, description.len), &td);
+
+	/* (names as the description writes them: qualified, under pg_catalog) */
+	nestlevel = NewGUCNestLevel();
+	(void) set_config_option("search_path", "pg_catalog", PGC_USERSET,
+							 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+	PG_TRY();
+	{
+		t->desc = CreateTemplateTupleDesc(list_length(td.columns));
+		foreach(lc, td.columns)
+		{
+			const char *line = lfirst(lc);
+			const char *type = strchr(line, '\t');
+			const char *collate = strstr(line, "\tcollate ");
+			ErrorSaveContext escontext = {T_ErrorSaveContext};
+			char	   *colname = unquoted(first_field(line));
+			Oid			typid;
+			int32		typmod;
+			Oid			coll;
+
+			if (type == NULL ||
+				!parseTypeString(first_field(type + 1), &typid, &typmod,
+								 (Node *) &escontext) || !OidIsValid(typid))
+			{
+				why = "one of its columns' types isn't one this database has";
+				break;
+			}
+			TupleDescInitEntry(t->desc, ++i, colname, typid, typmod, 0);
+			coll = get_typcollation(typid);
+			if (collate)
+			{
+				coll = get_collation_oid(stringToQualifiedNameList(first_field(collate + 9),
+																   NULL), true);
+				if (!OidIsValid(coll))
+				{
+					why = "one of its columns' collations isn't one this database has";
+					break;
+				}
+			}
+			TupleDescInitEntryCollation(t->desc, i, coll);
+			colnames = lappend(colnames, colname);
+		}
+		if (why == NULL)
+		{
+			TupleDescFinalize(t->desc);
+			why = historical_key(&cn, root, utf8, &td, colnames, t);
+		}
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, nestlevel);
+	}
+	PG_END_TRY();
+	return why;
+}
+
+static List *
+folded_table_names(const ProllyNodeRef *root, const char *schema)
+{
+	Canon		cn;
+	ProllyTreeCursor *c;
+	ProllyKey	k;
+	ProllyValue v;
+	ProllyKey	from = {(const uint8 *) "t:", 2};
+	List	   *names = NIL;
+
+	memset(&cn, 0, sizeof(cn));
+	canon_env(&cn);
+	c = PROLLY_CALL(cn.tree, cursor_open, &cn.env, root, CurrentMemoryContext);
+	PROLLY_CALL(cn.tree, cursor_seek, c, &from, ForwardScanDirection);
+	while (PROLLY_CALL(cn.tree, cursor_next, c, &k, &v))
+	{
+		char	   *name;
+		List	   *parts;
+
+		if (k.len < 2 || memcmp(k.data, "t:", 2) != 0)
+			break;
+		name = pg_any_to_server(pnstrdup((const char *) k.data + 2, k.len - 2),
+								k.len - 2, PG_UTF8);
+		parts = stringToQualifiedNameList(name, NULL);
+		if (list_length(parts) == 2 && strcmp(strVal(linitial(parts)), schema) == 0)
+			names = lappend(names, name);
+	}
+	PROLLY_CALL(cn.tree, cursor_close, c);
+	return names;
+}
+
 const ProllyCanonRoutine prolly_canon_folded = {
 	.info = {
 		.iface = PROLLY_IFACE_CANONICALIZER,
@@ -13673,4 +13944,6 @@ const ProllyCanonRoutine prolly_canon_folded = {
 	.rename_description = folded_rename_description,
 	.rename_root = folded_rename_root,
 	.rename_objects = folded_rename_objects,
+	.table_metadata = folded_table_metadata,
+	.table_names = folded_table_names,
 };
