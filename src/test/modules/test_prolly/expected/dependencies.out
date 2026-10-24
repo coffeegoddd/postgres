@@ -218,8 +218,8 @@ SELECT dolt_clone(:'url');					-- refused: the types and function
 ERROR:  the clone needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
 function dep_util."tab	in"(): not in this database
-function dep_util.twice(integer): not in this database
 type dep_util.mood: not in this database
+function dep_util.twice(integer): not in this database
 HINT:  Make what is missing, then try again.
 SELECT count(*) AS extensions FROM pg_extension WHERE extname <> 'plpgsql';
  extensions 

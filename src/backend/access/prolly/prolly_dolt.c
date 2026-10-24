@@ -10176,8 +10176,10 @@ dolt_clone(PG_FUNCTION_ARGS)
 	{
 		List	   *trees = NIL;
 		ListCell   *hc;
+		ListCell   *bc;
 
-		foreach(hc, h.commits)
+		/* (the branch checked out first: its configuration rows win) */
+		forboth(hc, h.commits, bc, h.branches)
 		{
 			ProllyCommitInfo info;
 
@@ -10190,7 +10192,10 @@ dolt_clone(PG_FUNCTION_ARGS)
 				ProllyNodeRef *tree = palloc(sizeof(ProllyNodeRef));
 
 				*tree = info.dependencies;
-				trees = lappend(trees, tree);
+				if (strcmp(lfirst(bc), branch) == 0)
+					trees = lcons(tree, trees);
+				else
+					trees = lappend(trees, tree);
 			}
 		}
 		prolly_check_dependencies(trees, true, "clone");

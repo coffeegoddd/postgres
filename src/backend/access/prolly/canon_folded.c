@@ -174,6 +174,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_enum.h"
 #include "catalog/pg_extension.h"
+#include "access/prolly_extconfig.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_opclass.h"
@@ -251,9 +252,11 @@ typedef struct CanonItem
 typedef struct BaseTable BaseTable;
 
 /*
- * The format a folded root is in: "18", whose commits record their
- * objects' identities beside it (folded_identify()), which a server of an
- * earlier format would read past, matching renamed objects by name; "17"
+ * The format a folded root is in: "19", whose dependencies record each
+ * extension's configuration rows (those pg_dump dumps with it:
+ * prolly_extconfig.h); "18" didn't, and was the first whose commits record
+ * their objects' identities beside it (folded_identify()), which a server
+ * of an earlier format would read past, matching renamed objects by name; "17"
  * had none, and was the first with extension send values normalized by
  * binary receive/send; "16", per-table ordering metadata and
  * ordering dependency flags (not readable by older servers); "15", a foreign
@@ -288,7 +291,7 @@ typedef struct BaseTable BaseTable;
  * its tables' rows unreadable here, and is neither moved to nor merged:
  * its definitions, row keying or identities aren't this format's.
  */
-#define FOLDED_FORMAT	"18"
+#define FOLDED_FORMAT	"19"
 #define ORDERING_PREFIX "!:ordering "
 
 /*
@@ -3164,6 +3167,30 @@ static HTAB *described = NULL;
 static char *described_settings = NULL;
 static MadeTree dependencies_made;
 static uint64 dependencies_epoch;
+
+/*
+ * The extensions with configuration tables the tree made last recorded,
+ * and their elements then: their rows aren't catalogs, so the tree is
+ * taken again only while they are what they were.
+ */
+static List *dependencies_configured;
+static char *dependencies_config;
+
+/*
+ * A digest of extensions' configuration elements, as one string: read
+ * without encoding the rows (prolly_extconfig_fingerprint()).
+ */
+static char *
+config_fingerprint(List *extoids)
+{
+	StringInfoData out;
+	ListCell   *lc;
+
+	initStringInfo(&out);
+	foreach(lc, extoids)
+		appendStringInfoString(&out, prolly_extconfig_fingerprint(lfirst_oid(lc)));
+	return out.data;
+}
 static MadeTree items_made;
 
 static FoldedAt items_at;
@@ -3812,7 +3839,7 @@ dependency_cmp(const ListCell *a, const ListCell *b)
  * object's address.
  */
 static Dependency *
-describe_dependency(const ObjectAddress *addr, List *ordering)
+describe_dependency(const ObjectAddress *addr, List *ordering, List **configured)
 {
 	Dependency *dep = palloc(sizeof(Dependency));
 	char	   *type = getObjectTypeDescription(addr, false);
@@ -3832,6 +3859,13 @@ describe_dependency(const ObjectAddress *addr, List *ordering)
 			value = lappend(value, "versioned");
 		if (list_member_oid(ordering, addr->objectId))
 			value = lappend(value, "ordering");
+		{
+			bool		has_config = false;
+
+			value = list_concat(value, prolly_extconfig_elements(addr->objectId, &has_config));
+			if (has_config)
+				*configured = lappend_oid(*configured, addr->objectId);
+		}
 		append_utf8(&dep->value, text_array_literal(value));
 	}
 	else
@@ -3902,6 +3936,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	ProllyTreeBuilder *b;
 	uint64		epoch;
 	bool		taken = false;
+	List	   *configured = NIL;
 
 	memset(&cn, 0, sizeof(cn));
 	canon_env(&cn);
@@ -3909,7 +3944,9 @@ folded_fold_dependencies(ProllyNodeRef *out)
 	/* (the tree made last, if nothing it was read from changed since: #483) */
 	fold_caches_begin();
 	epoch = catalog_epoch;
-	if (dependencies_epoch == epoch && made_tree_usable(&cn, &dependencies_made))
+	if (dependencies_epoch == epoch && made_tree_usable(&cn, &dependencies_made) &&
+		(dependencies_configured == NIL ||
+		 strcmp(config_fingerprint(dependencies_configured), dependencies_config) == 0))
 	{
 		*out = dependencies_made.root;
 		if (!debug_prolly_verify_fold_caches)
@@ -3988,7 +4025,7 @@ folded_fold_dependencies(ProllyNodeRef *out)
 			deps = lappend(deps, entry);
 	}
 	foreach(lc, deps)
-		lfirst(lc) = describe_dependency(lfirst(lc), ordering);
+		lfirst(lc) = describe_dependency(lfirst(lc), ordering, &configured);
 
 	list_sort(deps, dependency_cmp);
 	b = PROLLY_CALL(cn.tree, build_begin, &cn.env, CurrentMemoryContext);
@@ -4023,8 +4060,17 @@ folded_fold_dependencies(ProllyNodeRef *out)
 		PROLLY_CALL(cn.tree, build_finish, b, out);
 		if (catalog_epoch == epoch)
 		{
+			MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
 			made_tree(&dependencies_made, out);
 			dependencies_epoch = epoch;
+			list_free(dependencies_configured);
+			if (dependencies_config)
+				pfree(dependencies_config);
+			dependencies_configured = list_copy(configured);
+			MemoryContextSwitchTo(old);
+			dependencies_config = MemoryContextStrdup(TopMemoryContext,
+													  config_fingerprint(configured));
 		}
 	}
 	hash_destroy(seen);

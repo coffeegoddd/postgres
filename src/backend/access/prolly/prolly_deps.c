@@ -24,6 +24,7 @@
 
 #include "access/prolly_config.h"
 #include "access/prolly_deps.h"
+#include "access/prolly_extconfig.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -47,6 +48,8 @@ typedef struct NeededExtension
 	List	   *schemas;		/* String, distinct */
 	List	   *ordering_versions; /* String, exact versions ordering keys */
 	bool		versioned;		/* its schema is a versioned one */
+	List	   *configs;		/* char *: configuration elements, sorted */
+	List	   *preferred;		/* char *: the first tree's, sorted */
 } NeededExtension;
 
 /* An object the commits need. */
@@ -62,6 +65,7 @@ typedef struct Needs
 	List	   *objects;
 	List	   *except;			/* "name\nvalue": already needed, not checked */
 	bool		read;			/* historical rows can be re-sorted */
+	bool		first;			/* collecting the first tree */
 } Needs;
 
 /*
@@ -133,23 +137,36 @@ text_array_elements(const char *literal, int n, const char *what)
 	return text_array_elements_upto(literal, n, 0, NULL, what);
 }
 
-/* Canonical order: versioned, then ordering; either may be absent. */
+/*
+ * Canonical order: versioned, then ordering, either of which may be
+ * absent, then the extension's configuration elements, if any
+ * (prolly_extconfig.h), into *configs (char *) when given.  An extension
+ * may have any number of them.
+ */
 static Datum *
-extension_parts(const char *value, bool *versioned, bool *ordering)
+extension_parts_configs(const char *value, bool *versioned, bool *ordering,
+						List **configs)
 {
 	int			nparts;
-	Datum	   *parts = text_array_elements_upto(value, 2, 2, &nparts,
+	Datum	   *parts = text_array_elements_upto(value, 2, INT_MAX - 2, &nparts,
 												 "extension");
+	bool		config = false;
 
 	*versioned = *ordering = false;
 	for (int i = 2; i < nparts; i++)
 	{
 		char	   *flag = TextDatumGetCString(parts[i]);
 
-		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering)
+		if (strcmp(flag, "versioned") == 0 && !*versioned && !*ordering && !config)
 			*versioned = true;
-		else if (strcmp(flag, "ordering") == 0 && !*ordering)
+		else if (strcmp(flag, "ordering") == 0 && !*ordering && !config)
 			*ordering = true;
+		else if (prolly_extconfig_element(flag))
+		{
+			config = true;
+			if (configs)
+				*configs = lappend(*configs, flag);
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -160,6 +177,54 @@ extension_parts(const char *value, bool *versioned, bool *ordering)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("an ordering extension dependency must record a version")));
 	return parts;
+}
+
+static Datum *
+extension_parts(const char *value, bool *versioned, bool *ordering)
+{
+	return extension_parts_configs(value, versioned, ordering, NULL);
+}
+
+static int
+config_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp(lfirst(a), lfirst(b));
+}
+
+/*
+ * Merge one commit's configuration elements into an extension's needs.  An
+ * element may be there more than once (a keyless table's duplicate rows),
+ * so the needs keep each as many times as any one commit records it.
+ */
+static void
+note_configs(NeededExtension *e, List *configs)
+{
+	List	   *add = list_copy(configs);
+	List	   *merged = NIL;
+	int			i = 0;
+	int			j = 0;
+
+	list_sort(add, config_cmp);
+	while (i < list_length(e->configs) || j < list_length(add))
+	{
+		int			c;
+
+		if (i == list_length(e->configs))
+			c = 1;
+		else if (j == list_length(add))
+			c = -1;
+		else
+			c = strcmp(list_nth(e->configs, i), list_nth(add, j));
+		if (c <= 0)
+			merged = lappend(merged, list_nth(e->configs, i++));
+		else
+			merged = lappend(merged, list_nth(add, j));
+		if (c >= 0)
+			j++;
+	}
+	list_free(e->configs);
+	list_free(add);
+	e->configs = merged;
 }
 
 static NeededExtension *
@@ -230,7 +295,8 @@ note_need(const char *name, const char *value, void *arg)
 		char	   *quoted = pstrdup(name + strlen(EXTENSION_PREFIX));
 		bool		versioned;
 		bool		ordering;
-		Datum	   *parts = extension_parts(value, &versioned, &ordering);
+		List	   *configs = NIL;
+		Datum	   *parts = extension_parts_configs(value, &versioned, &ordering, &configs);
 		char	   *version = TextDatumGetCString(parts[0]);
 		char	   *schema = TextDatumGetCString(parts[1]);
 		List	   *names;
@@ -255,6 +321,12 @@ note_need(const char *name, const char *value, void *arg)
 		if (!list_member(e->schemas, makeString(schema)))
 			e->schemas = lappend(e->schemas, makeString(schema));
 		e->versioned = e->versioned || versioned;
+		note_configs(e, configs);
+		if (needs->first)
+		{
+			e->preferred = list_concat(e->preferred, configs);
+			list_sort(e->preferred, config_cmp);
+		}
 		return;
 	}
 	foreach(lc, needs->objects)
@@ -761,7 +833,11 @@ collect_trees(List *trees, Needs *needs)
 
 	prolly_database_components(&dc);
 	foreach(lc, trees)
+	{
+		needs->first = foreach_current_index(lc) == 0;
 		PROLLY_CALL(dc.canonicalizer, dependencies, lfirst(lc), note_need, needs);
+	}
+	needs->first = false;
 }
 
 /*
@@ -824,6 +900,38 @@ problems_hint(const Problems *problems)
 	}
 	appendStringInfoString(&hint, ", then try again.");
 	return hint.data;
+}
+
+/*
+ * Every configuration row the commits record must be in the database's
+ * configuration table: the commits' data may refer to them.  An extension
+ * just made (by a clone) gets them, and its sequences' states, as a
+ * restore of a dump gives an extension its configuration; for one the
+ * database had, a lacking row refuses the move.  A keyed table's row is
+ * there when its key is (the database's other columns are its own); a
+ * keyless table's, as many times as recorded.  Rows the database has
+ * besides are its own, and fine.
+ */
+static void
+check_configs(Needs *needs, List *installs, const char *what)
+{
+	StringInfoData missing;
+	ListCell   *lc;
+
+	initStringInfo(&missing);
+	foreach(lc, needs->extensions)
+	{
+		NeededExtension *e = lfirst(lc);
+		prolly_extconfig_apply(e->name, e->configs, e->preferred, find_install(installs, e->name) != NULL,
+							   &missing);
+	}
+	if (missing.len > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("the %s needs what this database lacks", what),
+				 errdetail_internal("Needed from outside the versioned schemas:%s", missing.data),
+				 errhint("Add the rows the commits record to the extension's configuration tables "
+						 "(those pg_dump dumps with the extension), then try again.")));
 }
 
 /* Check the needs, as prolly_check_dependencies() says. */
@@ -941,6 +1049,7 @@ check_needs(Needs *needs, bool install, const char *what)
 	}
 	foreach(lc, installs)
 		create_extension(installs, lfirst(lc));
+	check_configs(needs, installs, what);
 	SPI_finish();
 }
 

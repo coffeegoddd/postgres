@@ -44,8 +44,10 @@ test_install_data += files(
   'test_prolly_ext_detach--1.0.sql',
   'test_prolly_ext_readd.control',
   'test_prolly_ext_readd--1.0.sql',
-  'test_prolly_fixed.control',
+  'test_prolly_ext_config--1.0.sql',
+  'test_prolly_ext_config.control',
   'test_prolly_fixed--1.0.sql',
+  'test_prolly_fixed.control',
 )
 
 tests += {
@@ -140,6 +142,7 @@ tests += {
       'versioned_extensions',
       'extension_moves',
       'extension_clone',
+      'extension_config_rows',
       'text_types',
       'versioned_event_triggers',
       'internal_move_events',
