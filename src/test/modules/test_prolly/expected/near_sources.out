@@ -21,6 +21,9 @@ CREATE FUNCTION pg_temp.since(counter text) RETURNS int8 LANGUAGE sql AS $$
 	ON CONFLICT (name) DO UPDATE SET n = excluded.n
 	RETURNING n - coalesce((SELECT s.n FROM seen s WHERE s.name = counter), 0)
 $$;
+-- (no detached checkout kept: a kept one at the target would be the
+-- copies chosen, which kept_checkouts.sql and kept_planned.sql test)
+SET prolly.kept_checkouts = 0;
 CREATE SCHEMA ns VERSIONED;
 CREATE TABLE ns.t (id int PRIMARY KEY, v text);
 CREATE INDEX t_v ON ns.t (v);
