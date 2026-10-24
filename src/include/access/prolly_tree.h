@@ -321,10 +321,9 @@ typedef struct ProllyTreeRoutine
 	 * old one past it, and each level above is made again, from the start
 	 * of the node holding its first changed child, until its boundaries
 	 * meet the old ones; every other node is the old tree's.  So an edit
-	 * reads the nodes above the leaves (about one node in a hundred of the
-	 * tree) and the leaves around it, and writes O(depth + its length)
-	 * nodes; it never reads or chunks the value whole.  offset past the
-	 * value's end is an error; del past it, its end.
+	 * reads and writes the nodes along its path and around it: O(depth +
+	 * its length), as a slice reads, whatever the value's size.  offset
+	 * past the value's end is an error; del past it, its end.
 	 */
 	void		(*value_splice) (const ProllyTreeEnv *env, const ProllyValue *ref,
 								 uint64 offset, uint64 del,

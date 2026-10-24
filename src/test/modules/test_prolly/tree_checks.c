@@ -2334,7 +2334,7 @@ tree_value_splices(const ProllyImplInfo *impl)
 
 		/* a byte in the middle, in and out, then edits of every kind */
 		splice_matches(tr, &env, &val, &ref, val.len / 2, 0, "x", 1, &counters);
-		if (counters.nodes_written > 8 || counters.nodes_read > 64)
+		if (counters.nodes_written > 8 || counters.nodes_read > 12)
 			elog(ERROR, "inserting a byte in a %d-byte value wrote %llu nodes and read %llu",
 				 val.len, (unsigned long long) counters.nodes_written,
 				 (unsigned long long) counters.nodes_read);
@@ -2374,6 +2374,29 @@ tree_value_splices(const ProllyImplInfo *impl)
 		splice_matches(tr, &env, &val, &ref, val.len - 10, 1000, "end", 3, NULL);
 		pfree(ref.data);
 	}
+
+	/*
+	 * Heights changed by splices: a value of one level above its leaves
+	 * grown to two and more, shrunk back to one, then to a single leaf.
+	 */
+	resetStringInfo(&val);
+	while (val.len < 20000)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(&val, (char) (x >> 56));
+	}
+	initStringInfo(&ref);
+	PROLLY_CALL(tr, value_write, &env, (const uint8 *) val.data, val.len, &ref);
+	resetStringInfo(&ins);
+	while (ins.len < 4000000)
+	{
+		x = x * 6364136223846793005u + 1442695040888963407u;
+		appendStringInfoChar(&ins, (char) (x >> 56));
+	}
+	splice_matches(tr, &env, &val, &ref, 10000, 0, ins.data, ins.len, NULL);
+	splice_matches(tr, &env, &val, &ref, 5000, val.len - 20000, NULL, 0, NULL);
+	splice_matches(tr, &env, &val, &ref, 100, val.len - 1000, NULL, 0, NULL);
+	pfree(ref.data);
 
 	/* a small value grown past one leaf, emptied, grown again */
 	resetStringInfo(&val);
