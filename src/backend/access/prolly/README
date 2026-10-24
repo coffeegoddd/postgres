@@ -269,8 +269,14 @@ of its own (valenc_canonical.c, through the tree's value_write()), so
 rows holding the same value share it, and a row that is still long goes
 out of line whole.  Value trees are cut by a rolling hash and addressed
 by byte counts, so an insertion rewrites the chunks around it and a
-slice reads only its own.  A leaf records the references its value
-holds, so walks reach those trees without knowing the rows' layout.  The
+slice reads only its own.  An edit can be spliced into a value tree
+(the tree's value_splice()), giving the tree a write of the edited bytes
+would: the leaves around the edit are cut again, and each level above
+made again from the node on the edit's path until its nodes end where
+the old ones did, so it reads and writes the nodes along that path and
+the bytes around the edit, as a slice reads, whatever the value's size.
+A leaf records the references its value holds, so walks reach those
+trees without knowing the rows' layout.  The
 value memo (memo_shared.c) maps a TOAST pointer a fold met to the
 reference it made, so the next fold that meets the pointer (an UPDATE of
 another column kept it) doesn't read the value again.
