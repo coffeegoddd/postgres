@@ -1680,13 +1680,104 @@ SELECT dolt_branch('-D', 'uy_w');
  {0}
 (1 row)
 
+-- A refused row is looked up as it was, not as its JSON reads back: a
+-- jsonb null (not SQL NULL), an array's lower bound, and a float's every
+-- digit (whatever extra_float_digits is); and a composite of NULLs, which
+-- a NULLS NOT DISTINCT index holds distinct from a NULL, collides with no
+-- NULL.  (Each theirs row is refused for u, which collides too.)
+CREATE TYPE uy.pair AS (a int, b int);
+CREATE TABLE uy.v (pk int PRIMARY KEY, u int UNIQUE, jb jsonb UNIQUE,
+	ar int[] UNIQUE, f float8 UNIQUE, c uy.pair UNIQUE NULLS NOT DISTINCT);
+INSERT INTO uy.v VALUES (1, 1, '1', '{1}', 1, ROW(1, 1));
+SELECT length(dolt_commit('-Am', 'uy v base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('uy_v');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+INSERT INTO uy.v VALUES (2, 2, 'null', '{9}', 2, ROW(2, 2)),
+	(3, 3, '3', '[0:1]={5,6}', 3, ROW(3, 3)),
+	(4, 4, '4', '{4}', 0.1::float8 + 0.2::float8, ROW(4, 4)),
+	(5, 5, '5', '{55}', 5, ROW(NULL, NULL));
+SELECT length(dolt_commit('-am', 'uy v ours')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('uy_v');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'uy_v'"}
+(1 row)
+
+INSERT INTO uy.v VALUES (12, 2, 'null', '{12}', 12, ROW(12, 12)),
+	(13, 3, '13', '[0:1]={5,6}', 13, ROW(13, 13)),
+	(14, 4, '14', '{14}', 0.1::float8 + 0.2::float8, ROW(14, 14)),
+	(15, 5, '15', '{15}', 15, NULL);
+SELECT length(dolt_commit('-am', 'uy v theirs')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main');
+          dolt_checkout          
+---------------------------------
+ {0,"Switched to branch 'main'"}
+(1 row)
+
+SET extra_float_digits = 0;
+BEGIN;
+SELECT (dolt_merge('uy_v'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('uy.v') ORDER BY 1, 2;
+ pk |  index   
+----+----------
+ 12 | v_jb_key
+ 12 | v_u_key
+ 13 | v_ar_key
+ 13 | v_u_key
+ 14 | v_f_key
+ 14 | v_u_key
+ 15 | v_u_key
+ 2  | v_jb_key
+ 2  | v_u_key
+ 3  | v_ar_key
+ 3  | v_u_key
+ 4  | v_f_key
+ 4  | v_u_key
+ 5  | v_u_key
+(14 rows)
+
+ROLLBACK;
+RESET extra_float_digits;
+SELECT dolt_branch('-D', 'uy_v');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
 DROP SCHEMA uy CASCADE;
-NOTICE:  drop cascades to 5 other objects
+NOTICE:  drop cascades to 7 other objects
 DETAIL:  drop cascades to table uy.t
 drop cascades to type uy.n
 drop cascades to table uy.x
 drop cascades to table uy.s
 drop cascades to table uy.w
+drop cascades to type uy.pair
+drop cascades to table uy.v
 SELECT dolt_branch('-D', 'feature');
  dolt_branch 
 -------------

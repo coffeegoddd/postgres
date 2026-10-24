@@ -566,6 +566,38 @@ SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
 FROM dolt_constraint_violations('uy.w') ORDER BY 1, 2;
 ROLLBACK;
 SELECT dolt_branch('-D', 'uy_w');
+
+-- A refused row is looked up as it was, not as its JSON reads back: a
+-- jsonb null (not SQL NULL), an array's lower bound, and a float's every
+-- digit (whatever extra_float_digits is); and a composite of NULLs, which
+-- a NULLS NOT DISTINCT index holds distinct from a NULL, collides with no
+-- NULL.  (Each theirs row is refused for u, which collides too.)
+CREATE TYPE uy.pair AS (a int, b int);
+CREATE TABLE uy.v (pk int PRIMARY KEY, u int UNIQUE, jb jsonb UNIQUE,
+	ar int[] UNIQUE, f float8 UNIQUE, c uy.pair UNIQUE NULLS NOT DISTINCT);
+INSERT INTO uy.v VALUES (1, 1, '1', '{1}', 1, ROW(1, 1));
+SELECT length(dolt_commit('-Am', 'uy v base')::text) AS committed;
+SELECT dolt_branch('uy_v');
+INSERT INTO uy.v VALUES (2, 2, 'null', '{9}', 2, ROW(2, 2)),
+	(3, 3, '3', '[0:1]={5,6}', 3, ROW(3, 3)),
+	(4, 4, '4', '{4}', 0.1::float8 + 0.2::float8, ROW(4, 4)),
+	(5, 5, '5', '{55}', 5, ROW(NULL, NULL));
+SELECT length(dolt_commit('-am', 'uy v ours')::text) AS committed;
+SELECT dolt_checkout('uy_v');
+INSERT INTO uy.v VALUES (12, 2, 'null', '{12}', 12, ROW(12, 12)),
+	(13, 3, '13', '[0:1]={5,6}', 13, ROW(13, 13)),
+	(14, 4, '14', '{14}', 0.1::float8 + 0.2::float8, ROW(14, 14)),
+	(15, 5, '15', '{15}', 15, NULL);
+SELECT length(dolt_commit('-am', 'uy v theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+SET extra_float_digits = 0;
+BEGIN;
+SELECT (dolt_merge('uy_v'))[3:4];
+SELECT violating_row->>'pk' AS pk, violation_info->>'Name' AS index
+FROM dolt_constraint_violations('uy.v') ORDER BY 1, 2;
+ROLLBACK;
+RESET extra_float_digits;
+SELECT dolt_branch('-D', 'uy_v');
 DROP SCHEMA uy CASCADE;
 
 SELECT dolt_branch('-D', 'feature');

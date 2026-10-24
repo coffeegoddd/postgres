@@ -79,5 +79,35 @@ is($node->safe_psql('postgres', q{
 		ROLLBACK;
 	}), '40', 'each refused row and the row it collides with are recorded');
 
+# A NULLS NOT DISTINCT index of two columns: each pattern of the refused
+# row's NULLs is a lookup of its own, its test of the refused row a
+# one-time filter, so none scans the table whole.
+$node->safe_psql('postgres', q{
+	CREATE TABLE c.n (pk int PRIMARY KEY, a int, b int, UNIQUE NULLS NOT DISTINCT (a, b));
+	INSERT INTO c.n SELECT g, g, CASE WHEN g % 2 = 0 THEN g END FROM generate_series(1, 20000) g;
+	SELECT length(dolt_commit('-Am', 'n base')::text);
+	SELECT dolt_branch('n_side');
+	INSERT INTO c.n VALUES (100001, 500001, NULL), (100002, 500002, 7);
+	SELECT length(dolt_commit('-am', 'n ours')::text);
+	SELECT dolt_checkout('n_side');
+	INSERT INTO c.n VALUES (200001, 500001, NULL), (200002, 500002, 7);
+	SELECT length(dolt_commit('-am', 'n theirs')::text);
+	SELECT dolt_checkout('main');
+	ANALYZE c.n;
+});
+@q = completion_queries('n_side');
+is(scalar(@q), 1, 'one query for the NULLS NOT DISTINCT index');
+$plan = $node->safe_psql('postgres', "EXPLAIN (COSTS OFF) $q[0]");
+like($plan, qr/Index Scan using n_a_b_key/, 'its lookups use the index') or diag($plan);
+like($plan, qr/One-Time Filter/, 'each pattern of NULLs tested once per refused row');
+unlike($plan, qr/Seq Scan on n\b/, 'and none scans the table whole');
+is($node->safe_psql('postgres', q{
+		BEGIN;
+		SELECT FROM dolt_merge('n_side');
+		SELECT string_agg(violating_row->>'pk', ',' ORDER BY (violating_row->>'pk')::int)
+		FROM dolt_constraint_violations('c.n');
+		ROLLBACK;
+	}), '100001,100002,200001,200002', 'the rows collided with, NULL or not, are recorded');
+
 $node->stop;
 done_testing();
