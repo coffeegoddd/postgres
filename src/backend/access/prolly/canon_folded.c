@@ -13326,7 +13326,7 @@ settle_merged_names(List *objs, const char *table)
 
 static void
 folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
-					 List **renames, StringInfo identity)
+					 List *keep_ours, List **renames, StringInfo identity)
 {
 	List	   *merged = NIL;
 	List	   *tables = NIL;
@@ -13350,12 +13350,21 @@ folded_merge_renames(const ProllyNodeRef *roots, const ProllyValue *identities,
 		MergedObject *m = lfirst(lc);
 		ListCell   *cc;
 
+		bool		ours = false;
+
 		m->id.name = merged_name(m, NULL);
+
+		/* (kept as ours has it: ours' names, the table's and its columns') */
+		foreach_ptr(char, keep, keep_ours)
+			ours |= strcmp(keep, m->id.name) == 0;
+		if (ours && m->in[1])
+			m->id.name = pstrdup(m->in[1]->name);
 		foreach(cc, m->columns)
 		{
 			MergedObject *c = lfirst(cc);
 
-			c->id.name = merged_name(c, m->id.name);
+			c->id.name = ours && c->in[1] ? pstrdup(c->in[1]->name) :
+				merged_name(c, m->id.name);
 		}
 		settle_merged_names(m->columns, m->id.name);
 	}

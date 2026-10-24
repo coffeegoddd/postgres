@@ -5,7 +5,8 @@
 -- The other tables merge.  dolt_schema_conflicts lists each with its
 -- statements in the base, ours and theirs; dolt_conflicts_resolve()
 -- refuses them, as Dolt's does; a commit is refused while they remain;
--- dolt_merge('--abort') ends the merge.  Dolt's cases from its
+-- dolt_merge('--abort') ends the merge (a table a side renamed is kept
+-- under ours' name).  Dolt's cases from its
 -- SchemaChangeTestsSchemaConflicts, in both directions.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS test_prolly;
@@ -218,24 +219,42 @@ SELECT (dolt_merge('ty_text'))[2:4];
 ROLLBACK;
 
 -- a table renamed on one side (matched by identity) in such a conflict:
--- not kept, as the branch's table would take the merged name; refused,
+-- kept exactly as ours has it, ours' name and definition, a column ours
+-- renamed too; dolt_schema_conflicts shows each side's own statement
+-- under its own name; dolt_status shows the table once, as in conflict;
 -- both ways round
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;
 SELECT dolt_branch('rn_retype');
 SELECT dolt_branch('rn_rename');
 SELECT dolt_checkout('rn_retype') IS NOT NULL AS on_retype;
 ALTER TABLE sc.d ALTER COLUMN v TYPE text;
+INSERT INTO sc.d VALUES (30, 'thirty');
 SELECT length(dolt_commit('-am', 'rn text')::text) AS committed;
 SELECT dolt_checkout('rn_rename') IS NOT NULL AS on_rename;
 ALTER TABLE sc.d RENAME TO e;
+ALTER TABLE sc.e RENAME COLUMN pk TO id;
 ALTER TABLE sc.e ALTER COLUMN v TYPE bigint;
+INSERT INTO sc.e VALUES (40, 40);
 SELECT length(dolt_commit('-am', 'rn renamed')::text) AS committed;
 BEGIN;
 SELECT (dolt_merge('rn_retype'))[2:4];
+SELECT table_name, base_schema, our_schema, their_schema, description
+FROM dolt_schema_conflicts;
+SELECT * FROM sc.e ORDER BY id;
+SELECT to_regclass('sc.d') IS NULL AS no_d;
+SELECT table_name, staged, status FROM dolt_status ORDER BY table_name;
+SELECT (dolt_merge('--abort'))[4];
+SELECT * FROM sc.e ORDER BY id;
 ROLLBACK;
 SELECT dolt_checkout('rn_retype') IS NOT NULL AS on_retype;
 BEGIN;
 SELECT (dolt_merge('rn_rename'))[2:4];
+SELECT table_name, base_schema, our_schema, their_schema, description
+FROM dolt_schema_conflicts;
+SELECT * FROM sc.d ORDER BY pk;
+SELECT to_regclass('sc.e') IS NULL AS no_e;
+SELECT table_name, staged, status FROM dolt_status ORDER BY table_name;
+SELECT (dolt_merge('--abort'))[4];
 ROLLBACK;
 
 SELECT dolt_checkout('main') IS NOT NULL AS on_main;

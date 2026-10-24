@@ -94,6 +94,8 @@ typedef struct ProllyMergeState
 	int			nschema;
 	char	  **schema_tables;	/* in schema conflicts, kept as the branch
 								 * has them (names, qualified; palloc'd) */
+	char	  **schema_base_tables; /* each one's name in the base */
+	char	  **schema_their_tables;	/* and in theirs */
 	bool		pick;			/* a cherry-pick: its commit has one parent */
 	char	   *message;		/* a pick's: the picked commit's message */
 

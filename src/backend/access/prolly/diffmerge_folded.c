@@ -8625,11 +8625,21 @@ static bool keep_schema_conflicts = false;
 static List *schema_conflicted = NIL;
 
 /*
- * The tables a merge's alignment renamed on some side (each rename's table
- * and, for a table's, what it is renamed to): a schema conflict in one
- * isn't kept, as the branch's table would no longer be as it has it.
+ * The renames a merge's alignment made of each side (base, ours, theirs:
+ * ProllyRename *): a table in a schema conflict, kept as ours names it,
+ * is named otherwise in base and theirs by them.
  */
-static List *merge_renamed_tables = NIL;
+static List *merge_renames_made[3] = {NIL, NIL, NIL};
+
+/* The name side i of a merge gives the table the merge names name. */
+static char *
+side_name(int side, const char *name)
+{
+	foreach_ptr(ProllyRename, r, merge_renames_made[side])
+		if (r->column == NULL && strcmp(r->to, name) == 0)
+			return r->table;
+	return unconstify(char *, name);
+}
 
 static bool
 schema_conflicted_table(const MergeRows *mr, const char *name)
@@ -9227,9 +9237,59 @@ move_schema_merging(const ProllyNodeRef *ours, const ProllyNodeRef *merged,
  * The merged identity record goes into *identity.  False if no object
  * is named otherwise on any side: aligned is roots.
  */
+/*
+ * The tables of a merge (roots, renamed as renames say) that will be in a
+ * schema conflict a merge keeps, and that a side renamed (or renamed a
+ * column of): their merged names.  Found by merging the definitions as
+ * the merge will, renamed so, nothing written but the tree that makes.
+ */
+static List *
+renamed_schema_conflicts(const ProllyNodeRef *roots, List **renames)
+{
+	ProllyDatabaseComponents dc = components();
+	ProllyNodeRef renamed[3];
+	ProllyNodeRef merged;
+	List	   *kept = NIL;
+	List	   *keep = NIL;
+
+	for (int i = 0; i < 3; i++)
+	{
+		renamed[i] = roots[i];
+		if (renames[i] != NIL)
+			PROLLY_CALL(dc.canonicalizer, rename_root, &roots[i], renames[i],
+						&renamed[i]);
+	}
+	if (PROLLY_CALL(dc.canonicalizer, same_schema, &renamed[0], &renamed[1]) &&
+		PROLLY_CALL(dc.canonicalizer, same_schema, &renamed[0], &renamed[2]))
+		return NIL;
+	PROLLY_CALL(dc.canonicalizer, merge_schema, &renamed[0], &renamed[1],
+				&renamed[2], &merged, &kept);
+	foreach_ptr(char, name, kept)
+	{
+		bool		renamed_here = false;
+
+		for (int i = 0; i < 3 && !renamed_here; i++)
+			foreach_ptr(ProllyRename, r, renames[i])
+			{
+				/* (the table's, or a column's of it, as the side names it) */
+				if (r->column == NULL ? strcmp(r->to, name) == 0 :
+					strcmp(r->table, name) == 0)
+					renamed_here = true;
+				else if (r->column != NULL)
+					foreach_ptr(ProllyRename, t, renames[i])
+						if (t->column == NULL && strcmp(t->to, name) == 0 &&
+							strcmp(t->table, r->table) == 0)
+							renamed_here = true;
+			}
+		if (renamed_here)
+			keep = lappend(keep, name);
+	}
+	return keep;
+}
+
 static bool
 align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
-			ProllyNodeRef *aligned, StringInfo identity)
+			bool fail_on_conflict, ProllyNodeRef *aligned, StringInfo identity)
 {
 	ProllyDatabaseComponents dc = components();
 	StringInfoData ids[3];
@@ -9258,22 +9318,29 @@ align_merge(const ProllyNodeRef *roots, const MergeCommits *commits,
 	/* (none recording any, every object has its own name's identity) */
 	if (!any)
 		return false;
-	PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, renames, identity);
+	PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, NIL, renames,
+				identity);
 	if (renames[0] == NIL && renames[1] == NIL && renames[2] == NIL)
 		return false;
-	for (int i = 0; i < 3; i++)
+
+	/*
+	 * A table a side renamed that will be in a schema conflict is kept as
+	 * ours has it, ours' names its own and its columns': the names are
+	 * merged again so, base's and theirs' renamed to ours'.
+	 */
+	if (keep_schema_conflicts && !fail_on_conflict)
 	{
-		ListCell   *lc;
+		List	   *keep = renamed_schema_conflicts(roots, renames);
 
-		foreach(lc, renames[i])
+		if (keep != NIL)
 		{
-			ProllyRename *r = lfirst(lc);
-
-			merge_renamed_tables = lappend(merge_renamed_tables, r->table);
-			if (r->column == NULL)
-				merge_renamed_tables = lappend(merge_renamed_tables, r->to);
+			resetStringInfo(identity);
+			PROLLY_CALL(dc.canonicalizer, merge_renames, roots, values, keep,
+						renames, identity);
 		}
 	}
+	for (int i = 0; i < 3; i++)
+		merge_renames_made[i] = renames[i];
 	for (int i = 0; i < 3; i += 2)
 		if (renames[i] != NIL)
 			PROLLY_CALL(dc.canonicalizer, rename_root, &roots[i], renames[i],
@@ -9310,8 +9377,9 @@ merge_roots(const ProllyNodeRef *roots, const MergeCommits *commits,
 	int			conflicts;
 
 	initStringInfo(&identity);
-	merge_renamed_tables = NIL;
-	renamed = align_merge(roots, commits, aligned, &identity);
+	for (int i = 0; i < 3; i++)
+		merge_renames_made[i] = NIL;
+	renamed = align_merge(roots, commits, fail_on_conflict, aligned, &identity);
 	conflicts = merge_aligned(aligned, commits, fail_on_conflict, what, name,
 							  conflicted);
 	if (renamed || identity.len > 0)
@@ -9352,22 +9420,6 @@ merge_aligned(const ProllyNodeRef *roots, const MergeCommits *commits,
 					keep_schema_conflicts && !fail_on_conflict ?
 					&mr.schema_conflicts : NULL);
 		schema_conflicted = mr.schema_conflicts;
-
-		/*
-		 * (a table renamed on a side: kept, it would take the merged name,
-		 * and its versions be found under other names; refused instead)
-		 */
-		foreach_ptr(char, kept, mr.schema_conflicts)
-		{
-			foreach_ptr(char, renamed, merge_renamed_tables)
-				if (strcmp(kept, renamed) == 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("schema conflict: %s was changed differently on both sides, and renamed on one",
-									kept),
-							 errdetail("A schema conflict is kept only for a table neither side renamed."),
-							 errhint("Make the definitions agree on one side, or rename the table on the other side too, and merge again.")));
-		}
 		move_schema_merging(&roots[1], &merged, &mr);
 		merge_sequences(&roots[0], &roots[1], &roots[2]);
 		return mr.conflicts;
@@ -11482,8 +11534,15 @@ fill_merge_state(ProllyMergeState *ms, const ProllyHash *theirs,
 	memset(ms, 0, sizeof(*ms));
 	ms->nschema = list_length(schema_conflicted);
 	ms->schema_tables = palloc(sizeof(char *) * Max(ms->nschema, 1));
+	ms->schema_base_tables = palloc(sizeof(char *) * Max(ms->nschema, 1));
+	ms->schema_their_tables = palloc(sizeof(char *) * Max(ms->nschema, 1));
 	foreach(lc, schema_conflicted)
+	{
+		/* (each side's name: ours', as the merge kept it, and the others') */
+		ms->schema_base_tables[i] = side_name(0, lfirst(lc));
+		ms->schema_their_tables[i] = side_name(2, lfirst(lc));
 		ms->schema_tables[i++] = lfirst(lc);
+	}
 	i = 0;
 	ms->theirs = *theirs;
 	ms->base = *base;
