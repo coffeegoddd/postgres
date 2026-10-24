@@ -98,11 +98,11 @@ def series(checks=None):
     """A V9 cell's series: the rows sweep's checks, every counter of every
     target 0 but those given."""
     out = {}
-    for sweep in ("rows", "delta"):
+    for sweep in ("rows", "delta", "catalog"):
         cs = {}
         for (check, sw), counters in vshape.TARGETS.items():
             if sw == sweep:
-                cs[check] = {c: [0] * 4 for c in vshape.WORK}
+                cs[check] = {c: [0] * 4 for c in vshape.WORK + vshape.CATALOG}
         for (check, sw, counter), values in (checks or {}).items():
             if sw == sweep:
                 cs[check][counter] = values
@@ -204,6 +204,20 @@ class V9Test(unittest.TestCase):
         checked = {check for check, _ in vshape.TARGETS}
         self.assertEqual(set(labels), checked)
 
+    def test_unrelated_objects(self):
+        sql = V9.unrelated(512)
+        # K shared tables, and K on another branch made before the table's
+        self.assertEqual(sql.count("FOR g IN 1..512 LOOP"), 2)
+        self.assertIn("CREATE SCHEMA v9_plain;", sql)
+        self.assertLess(sql.index("dolt_commit"), sql.index("dolt_branch('v9_other')"))
+        self.assertTrue(sql.rstrip().endswith("SELECT dolt_checkout('main');"))
+
+    def test_catalog_reading_reads_no_catalog(self):
+        # (pg_stat_get_blocks_fetched over every OID a system catalog can
+        # have: no catalog scanned, so the reading doesn't grow with them)
+        self.assertNotIn("pg_class", V9.READ)
+        self.assertIn("catalog_blocks_read", V9.READ)
+
     def test_changes_are_delta_distinct_rows(self):
         sql = V9.change(64000, 700, 1)
         self.assertIn("generate_series(0, 699)", sql)
@@ -214,10 +228,15 @@ class V9Test(unittest.TestCase):
     def test_sweeps_validate(self):
         class Ctx:
             params = {}
-        self.assertEqual([n for n, _ in V9().sweeps(Ctx)["rows"]], LEVELS)
+        self.assertEqual([p[0] for p in V9().sweeps(Ctx)["rows"]], LEVELS)
+        self.assertEqual([p[2] for p in V9().sweeps(Ctx)["catalog"]], [32, 128, 512, 2048])
+        # (the rows and delta sweeps add no unrelated objects)
+        self.assertEqual({p[2] for p in V9().sweeps(Ctx)["rows"] + V9().sweeps(Ctx)["delta"]}, {0})
         for bad in ({"rows": [100, 200, 400, 800], "delta": 100},
                     {"rows": [1000, 2000, 4000]},
-                    {"deltas": [10, 20, 40, 80, 64000]}):
+                    {"deltas": [10, 20, 40, 80, 64000]},
+                    {"others": [0, 10, 100, 1000]},
+                    {"others": [10, 20, 40, 60]}):
             Ctx.params = bad
             with self.assertRaises(ValueError, msg=bad):
                 V9().sweeps(Ctx)

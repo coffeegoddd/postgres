@@ -249,13 +249,12 @@ branch_relations(void)
 	List	   *relids = NIL;
 	List	   *toasts = NIL;
 
-	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+	scan = catalog_branch_beginscan(rel, MyBranch);
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
 
-		if (c->relbranch != MyBranch)
-			continue;
+		Assert(c->relbranch == MyBranch);
 		if (c->relkind == RELKIND_TOASTVALUE)
 			toasts = lappend_oid(toasts, c->oid);
 		else
@@ -499,13 +498,12 @@ copy_rows(Oid target, List *fresh, const BranchKeptRelation *const *kept,
 		HeapTuple	tup;
 
 		/* rows added here are the target's, not seen by this scan */
-		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(rel, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
 			HeapTuple	copy;
 
-			if (catalog_row_branch(info, tup) != MyBranch)
-				continue;
+			Assert(catalog_row_branch(info, tup) == MyBranch);
 
 			/* out-of-line values get their own copies, as rows of their own */
 			copy = HeapTupleHasExternal(tup) ? toast_flatten_tuple(tup, desc)
@@ -571,11 +569,10 @@ delete_rows(void)
 		SysScanDesc scan;
 		HeapTuple	tup;
 
-		scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+		scan = catalog_branch_beginscan(rel, MyBranch);
 		while ((tup = systable_getnext(scan)) != NULL)
 		{
-			if (catalog_row_branch(info, tup) != MyBranch)
-				continue;
+			Assert(catalog_row_branch(info, tup) == MyBranch);
 			if (info->relid == RelationRelationId)
 			{
 				Form_pg_class c = (Form_pg_class) GETSTRUCT(tup);
@@ -1388,7 +1385,9 @@ copies_share(Oid source, List *relids, bool (*unchanged) (void *arg),
  * transaction commits, and one whose transaction aborted is let go of the
  * next time this backend keeps or restores (letting go writes, which an
  * abort can't), or, if it never does, as it exits.  (A crash in between
- * leaves the snapshot to its storage, until the relation is dropped.)
+ * leaves the snapshot to its storage, whose slot names the transaction
+ * that took it: the relation's next snapshot, or its page store's next
+ * sweep, lets go of it then.)
  */
 typedef struct TakenSnapshot
 {

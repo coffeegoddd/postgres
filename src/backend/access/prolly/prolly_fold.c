@@ -32,6 +32,7 @@ bool		debug_prolly_force_full_fold = false;
 bool		prolly_fold_counted = true;
 int			prolly_log_full_folds = -1;
 bool		prolly_fold_on_rewrite = true;
+double		prolly_map_reshaped_dead_ratio = 1.5;
 ProllyFullFold prolly_last_full_fold;
 
 static const char *const reason_names[PROLLY_FULL_REASONS] = {
@@ -718,6 +719,37 @@ prolly_fold_mappable(Relation rel, const ProllyValue *old)
 	MemoryContextSwitchTo(caller);
 	MemoryContextDelete(cxt);
 	return mappable;
+}
+
+/*
+ * (measured, roughly: a map costs about 0.46 us a row, a full fold about
+ * 0.36 us a live row and 0.07 us a dead version, so a map wins past a
+ * dead version or two a live row.  The dead versions are the table's
+ * statistics', as autovacuum reads them, and those can be wrong: they lag
+ * the writes by up to a second, are lost with a reset or a crash, are
+ * empty on a standby, and drop to none after a VACUUM though the heap
+ * stays as long.  Wrong, the choice costs only time, as both folds make
+ * the same tree; a table the statistics don't know of is read in full.)
+ */
+bool
+prolly_fold_map_cheaper(Relation rel)
+{
+	PgStat_StatTabEntry *t;
+	bool		may_free = false;
+	bool		cheaper;
+
+	if (prolly_map_reshaped_dead_ratio <= 0)
+		return true;
+	/* (the branch's own statistics: each branch has its relations' own) */
+	t = pgstat_fetch_stat_tabentry_ext(rel->rd_rel->relisshared,
+									   RelationGetStatsId(rel), &may_free);
+	if (t == NULL)
+		return false;
+	cheaper = (double) t->dead_tuples >=
+		prolly_map_reshaped_dead_ratio * (double) Max(t->live_tuples, 1);
+	if (may_free)
+		pfree(t);
+	return cheaper;
 }
 
 /*

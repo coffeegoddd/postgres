@@ -525,9 +525,16 @@ class V7(VWorkload):
 class V9(VWorkload):
     """Growth shapes: each version-control operation's work, counted in
     pg_stat_prolly, at four or more table sizes N (the "rows" sweep, Δ
-    fixed) and four or more change sizes Δ (the "delta" sweep, N fixed),
-    each point on a fresh database.  vshape fits each counter's growth and
-    gates it against the operation's target (vshape.TARGETS).
+    fixed), four or more change sizes Δ (the "delta" sweep, N fixed) and
+    four or more counts K of unrelated objects (the "catalog" sweep, N and
+    Δ fixed), each point on a fresh database.  vshape fits each counter's
+    growth and gates it against the operation's target (vshape.TARGETS).
+
+    The catalog sweep's unrelated objects are K shared tables in a plain
+    schema and K tables on another branch, made from a commit before the
+    table, so that it holds no copies of it: what an operation reads of
+    the catalogs (catalog_blocks_read, the block fetches of every system
+    catalog and index) is to be the table's, whatever else they hold.
 
     The table is narrow and filled to a tenth of each page (fillfactor
     10), so N rows are about N / 10 blocks: block-map work shows its shape
@@ -559,25 +566,57 @@ class V9(VWorkload):
     def tables(self, ctx):
         return []
 
-    def sweeps(self, ctx) -> dict[str, list[tuple[int, int]]]:
-        """Each sweep's points, (rows, delta)."""
+    def sweeps(self, ctx) -> dict[str, list[tuple[int, int, int]]]:
+        """Each sweep's points, (rows, delta, unrelated objects)."""
         p = ctx.params
         rows = [int(n) for n in p.get("rows", [4000, 16000, 64000, 256000])]
         deltas = [int(d) for d in p.get("deltas", [700, 2800, 11200, 44800])]
+        others = [int(k) for k in p.get("others", [32, 128, 512, 2048])]
         delta, fixed = int(p.get("delta", 10)), int(p.get("delta_rows", 64000))
-        for n in rows:
+        others_rows = int(p.get("others_rows", 4000))
+        for n in rows + [others_rows]:
             if delta >= n:
                 raise ValueError(f"V9's delta {delta} must be fewer than its rows {n}")
         for d in deltas:
             if d >= fixed:
                 raise ValueError(f"V9's delta {d} must be fewer than delta_rows {fixed}")
-        for levels in (rows, deltas):
-            if len(levels) < 4 or max(levels) / min(levels) < 8:
+        for levels in (rows, deltas, others):
+            if len(levels) < 4 or min(levels) <= 0 or max(levels) / min(levels) < 8:
                 raise ValueError("each V9 sweep needs four levels or more spanning 8x")
-        return {"rows": [(n, delta) for n in rows], "delta": [(fixed, d) for d in deltas]}
+        return {"rows": [(n, delta, 0) for n in rows],
+                "delta": [(fixed, d, 0) for d in deltas],
+                "catalog": [(others_rows, delta, k) for k in others]}
 
+    # (the catalogs' block fetches summed over every OID they can have, so
+    # that the reading reads no catalog itself)
     READ = ("SELECT pg_stat_force_next_flush();\n"
-            "SELECT 'v9|{label}|' || json_object_agg(name, value) FROM pg_stat_prolly;\n")
+            "SELECT 'v9|{label}|' || json_object_agg(name, value) FROM ("
+            "SELECT name, value FROM pg_stat_prolly UNION ALL "
+            "SELECT 'catalog_blocks_read', sum(pg_stat_get_blocks_fetched(o::oid))::bigint "
+            "FROM generate_series(1, 16383) o) r;\n")
+
+    @staticmethod
+    def unrelated(k: int) -> str:
+        """K shared tables in a plain schema and K tables on another branch,
+        made from a commit before the table's (committed a hundred at a
+        time, so that no transaction holds the locks of them all)."""
+        table = "(id int PRIMARY KEY, a text, b int, c date)"
+        return f"""
+            CREATE TABLE v9_first (id int PRIMARY KEY);
+            {VC_SQL.commit('v9 start')};
+            CREATE SCHEMA v9_plain;
+            DO $$ BEGIN FOR g IN 1..{k} LOOP
+                EXECUTE format('CREATE TABLE v9_plain.p%s {table}', g);
+                IF g % 100 = 0 THEN COMMIT; END IF;
+            END LOOP; END $$;
+            SELECT dolt_branch('v9_other');
+            SELECT dolt_checkout('v9_other');
+            DO $$ BEGIN FOR g IN 1..{k} LOOP
+                EXECUTE format('CREATE TABLE v9_o%s {table}', g);
+                IF g % 100 = 0 THEN COMMIT; END IF;
+            END LOOP; END $$;
+            SELECT dolt_checkout('main');
+        """
 
     @staticmethod
     def change(n: int, d: int, value: int) -> str:
@@ -611,15 +650,17 @@ class V9(VWorkload):
             ("branch_delete", "SELECT dolt_branch('-D', 'v9_b')"),
         ]
 
-    def point(self, ctx, sweep: str, n: int, d: int) -> dict[str, dict[str, int]]:
+    def point(self, ctx, sweep: str, n: int, d: int, k: int = 0) -> dict[str, dict[str, int]]:
         """One point's counted operations: {label: {counter: growth}}."""
-        db = f"v9_{sweep}_{n}_{d}"
+        db = f"v9_{sweep}_{n}_{d}_{k}"
         target = targets.for_am(ctx.table_am)
         ctx.cluster.sql(f"CREATE DATABASE {db}")
         try:
             setup = target.setup_sql(db)
             if setup:
                 ctx.cluster.sql(setup, dbname=db)
+            if k:
+                ctx.cluster.sql(self.unrelated(k), dbname=db, options=ctx.session_options())
             ctx.cluster.sql(f"""
                 CREATE TABLE v9 (id bigint PRIMARY KEY, v int NOT NULL, payload text NOT NULL)
                     WITH (fillfactor = 10, autovacuum_enabled = off);
@@ -634,9 +675,9 @@ class V9(VWorkload):
                 script += sql + ";\n"
                 if label:
                     script += self.READ.format(label=label)
-            (ctx.raw_dir / f"v9-{sweep}-{n}-{d}.sql").write_text(script)
+            (ctx.raw_dir / f"v9-{sweep}-{n}-{d}-{k}.sql").write_text(script)
             res = ctx.cluster.sql(script, dbname=db, options=ctx.session_options(), check=False)
-            (ctx.raw_dir / f"v9-{sweep}-{n}-{d}.out").write_text(res.stdout + res.stderr)
+            (ctx.raw_dir / f"v9-{sweep}-{n}-{d}-{k}.out").write_text(res.stdout + res.stderr)
             raise_for_sql_error(res, script)
         finally:
             ctx.cluster.sql(f"DROP DATABASE {db} WITH (FORCE)")
@@ -658,15 +699,15 @@ class V9(VWorkload):
         metrics: dict = {}
         points = 0
         for sweep, pts in self.sweeps(ctx).items():
-            levels = [n if sweep == "rows" else d for n, d in pts]
-            counted = [self.point(ctx, sweep, n, d) for n, d in pts]
+            levels = [{"rows": n, "delta": d, "catalog": k}[sweep] for n, d, k in pts]
+            counted = [self.point(ctx, sweep, n, d, k) for n, d, k in pts]
             points += len(pts)
             checks: dict = {}
             for label in counted[0]:
                 # (a counter the server doesn't report is missing, not 0)
                 names = set.intersection(*(set(c[label]) for c in counted))
                 checks[label] = {name: [c[label][name] for c in counted] for name in sorted(names)}
-                for name in vshape.WORK:
+                for name in vshape.WORK + vshape.CATALOG:
                     if name in checks[label]:
                         b = vshape.growth(levels, checks[label][name], vshape.FLOORS[name])
                         metrics[f"{label}_{sweep}_{name}_growth"] = b
