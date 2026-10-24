@@ -3135,13 +3135,14 @@ history_next_commit(MountScan *ss)
 			continue;
 		}
 		hex = prolly_hash_hex(&info.id);
+		/* (who may read the version first: why tells of its table) */
+		prolly_history_reader_check(h->reader, hex, xname);
 		if (why)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("can't read the history of \"%s\": %s",
 							ss->s.source, why),
 					 errdetail("Commit %s holds it so.", hex)));
-		prolly_history_reader_check(h->reader, hex, xname);
 		memset(cur, 0, sizeof(*cur));
 		cur->source = ss->s.source;
 		cur->commit = info.id;

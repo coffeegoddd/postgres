@@ -216,6 +216,30 @@ SELECT count(*) FROM ho.ordered;
 \set VERBOSITY default
 SELECT prolly_unmount('ho');
 DROP TABLE hs.ordered;
+-- A reader refused an older table's versions isn't told of that table's
+-- key: the refusal comes first.
+CREATE TABLE hs.odd (k test_ordering PRIMARY KEY, v int);
+INSERT INTO hs.odd VALUES (ROW(1), 1);
+SELECT length(dolt_commit('-Am', 'odd ordered')::text) > 0 AS committed;
+DROP TABLE hs.odd;
+SELECT length(dolt_commit('-Am', 'odd dropped')::text) > 0 AS committed;
+CREATE TABLE hs.odd (id int PRIMARY KEY, v int);
+INSERT INTO hs.odd VALUES (1, 1);
+SELECT length(dolt_commit('-Am', 'odd made again')::text) > 0 AS committed;
+SELECT mount FROM prolly_mount('HEAD', 'hs', 'hd', ARRAY['odd'], false, true);
+CREATE ROLE regress_history_odd;
+GRANT USAGE ON SCHEMA hs, hd TO regress_history_odd;
+GRANT SELECT ON hs.odd, hd.odd TO regress_history_odd;
+SET ROLE regress_history_odd;
+\set VERBOSITY terse
+SELECT count(*) FROM hd.odd;
+\set VERBOSITY default
+RESET ROLE;
+REVOKE ALL ON hs.odd, hd.odd FROM regress_history_odd;
+REVOKE ALL ON SCHEMA hs, hd FROM regress_history_odd;
+DROP ROLE regress_history_odd;
+SELECT prolly_unmount('hd');
+DROP TABLE hs.odd;
 DROP EXTENSION test_prolly_ordering;
 SELECT length(dolt_commit('-Am', 'no ordered')::text) > 0 AS committed;
 

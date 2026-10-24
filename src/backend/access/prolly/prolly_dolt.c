@@ -6434,25 +6434,41 @@ typedef struct NameLineage
 /*
  * The name in from of to's table name: name if the step's changes don't
  * list it; NULL if to made it (from has none), or a read left it out.
+ * The step's summary is made in a context of its own, freed after: only
+ * the name is kept, in the caller's.
  */
 static char *
 lineage_name_before(const char *from, const char *to, const char *name)
 {
+	MemoryContext caller = CurrentMemoryContext;
+	MemoryContext step = AllocSetContextCreate(caller, "prolly lineage step",
+											   ALLOCSET_DEFAULT_SIZES);
 	List	   *rows = NIL;
 	ListCell   *lc;
+	const char *before = name;
 
+	MemoryContextSwitchTo(step);
 	PROLLY_CALL(diff_merge(), summary, from, to, false, collect_change, &rows);
 	foreach(lc, rows)
 	{
 		SummaryRow *r = lfirst(lc);
 
 		if (r->not_covered && r->from_name && strcmp(r->from_name, name) == 0)
-			return NULL;
+		{
+			before = NULL;
+			break;
+		}
 		if (r->object == PROLLY_OBJECT_TABLE && r->to_name &&
 			strcmp(r->to_name, name) == 0)
-			return r->from_name;
+		{
+			before = r->from_name;
+			break;
+		}
 	}
-	return pstrdup(name);
+	MemoryContextSwitchTo(caller);
+	before = before ? pstrdup(before) : NULL;
+	MemoryContextDelete(step);
+	return (char *) before;
 }
 
 static void
