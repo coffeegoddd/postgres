@@ -226,6 +226,7 @@ tests += {
       'snapshot_mounts',
       'history_mounts',
       'head_move_privileges',
+      'writer_definitions',
     ],
     'regress_args': ['--temp-config', files('autofold_off.conf'),
                      '--temp-config', files('test_prolly.conf')],
