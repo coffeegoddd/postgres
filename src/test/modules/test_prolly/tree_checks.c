@@ -2246,3 +2246,73 @@ tree_held_references(const ProllyImplInfo *impl)
 					 (k * 2 + i + 1) % 8);
 	pfree(vbuf.data);
 }
+
+/*
+ * rank() counts the keys below a key exactly, present or not, at the ends
+ * too, after edits as well; and reads only the nodes on the key's path:
+ * no more than the tree's height.
+ */
+void
+tree_ranks(const ProllyImplInfo *impl)
+{
+	const ProllyTreeRoutine *tr = (const ProllyTreeRoutine *) impl;
+	ProllyTreeEnv env;
+	ProllyNodeCounters cnt = {0};
+	Ref		   *ref = palloc(sizeof(Ref));
+	ProllyNodeRef root;
+	uint64		height = 0;
+	static const int dels[] = {6, 600, 6006};
+	static const int absent[] = {ABSENT, ABSENT, ABSENT};
+
+	make_env(&env);
+	fill_ref(ref, 3, 1);
+	build_ref(tr, &env, ref, &root);
+	apply_batch(tr, &env, ref, dels, absent, lengthof(dels), &root);
+
+	/* (the height: the nodes a point lookup reads) */
+	{
+		KeyBuf		kb;
+		ProllyKey	key = key_of(MAX_KEY / 2, &kb);
+		StringInfoData v;
+
+		initStringInfo(&v);
+		env.counters = &cnt;
+		(void) PROLLY_CALL(tr, get, &env, &root, &key, &v);
+		height = cnt.nodes_read;
+		env.counters = NULL;
+	}
+	for (int k = -1; k <= MAX_KEY; k += 97)
+	{
+		KeyBuf		kb;
+		ProllyKey	key = key_of(Max(k, 0), &kb);
+		uint64		want = 0;
+		uint64		got;
+
+		for (int j = 0; j < Max(k, 0); j++)
+			if (ref->version[j] != ABSENT)
+				want++;
+		memset(&cnt, 0, sizeof(cnt));
+		env.counters = &cnt;
+		got = PROLLY_CALL(tr, rank, &env, &root, &key);
+		env.counters = NULL;
+		if (got != want)
+			elog(ERROR, "rank of key %d: %llu, not %llu", k,
+				 (unsigned long long) got, (unsigned long long) want);
+		if (cnt.nodes_read > height)
+			elog(ERROR, "rank of key %d read %llu nodes, a lookup %llu", k,
+				 (unsigned long long) cnt.nodes_read, (unsigned long long) height);
+	}
+	/* past every key: all of them */
+	{
+		uint8		big[5] = {0xff, 0xff, 0xff, 0xff, 0xff};
+		ProllyKey	key = {big, 5};
+		uint64		n = 0;
+
+		for (int j = 0; j < MAX_KEY; j++)
+			if (ref->version[j] != ABSENT)
+				n++;
+		if (PROLLY_CALL(tr, rank, &env, &root, &key) != n ||
+			PROLLY_CALL(tr, count, &env, &root) != n)
+			elog(ERROR, "rank past every key isn't the tree's count");
+	}
+}

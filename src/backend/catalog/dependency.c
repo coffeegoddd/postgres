@@ -19,6 +19,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "access/prolly_snapshot.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -1493,7 +1494,6 @@ doDeletion(const ObjectAddress *object, int flags)
 		case AccessMethodRelationId:
 		case AccessMethodOperatorRelationId:
 		case AccessMethodProcedureRelationId:
-		case NamespaceRelationId:
 		case TSParserRelationId:
 		case TSDictionaryRelationId:
 		case TSTemplateRelationId:
@@ -1504,6 +1504,12 @@ doDeletion(const ObjectAddress *object, int flags)
 		case EventTriggerRelationId:
 		case TransformRelationId:
 		case AuthMemRelationId:
+			DropObjectById(object);
+			break;
+
+		case NamespaceRelationId:
+			/* (a snapshot mount's schema: the mount, and its pin, go too) */
+			prolly_snapshot_schema_dropped(object->objectId);
 			DropObjectById(object);
 			break;
 

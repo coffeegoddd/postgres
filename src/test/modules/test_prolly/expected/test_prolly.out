@@ -160,6 +160,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | cow            | diff_reports_changes           | pass
  tree          | cow            | equal_keys_take_new_bytes      | pass
  tree          | cow            | counts_nodes                   | pass
+ tree          | cow            | ranks                          | pass
  tree          | cow            | diff_reads_changed_paths       | pass
  tree          | cow            | diff_across_heights            | pass
  tree          | cow            | diff_unordered_matches         | pass
@@ -180,6 +181,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | diff_reports_changes           | not implemented (missing build_begin, build_add, build_finish, apply, diff)
  tree          | stub           | equal_keys_take_new_bytes      | not implemented (missing build_begin, build_add, build_finish, apply, cursor_open, cursor_seek, cursor_next, cursor_close, diff)
  tree          | stub           | counts_nodes                   | not implemented (missing build_begin, build_add, build_finish, walk)
+ tree          | stub           | ranks                          | not implemented (missing build_begin, build_add, build_finish, apply, get, count, rank)
  tree          | stub           | diff_reads_changed_paths       | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff)
  tree          | stub           | diff_across_heights            | not implemented (missing build_begin, build_add, build_finish, walk, diff)
  tree          | stub           | diff_unordered_matches         | not implemented (missing build_begin, build_add, build_finish, apply, walk, diff_unordered)
@@ -188,7 +190,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  tree          | stub           | nodes_are_valid                | not implemented (missing build_begin, build_add, build_finish, walk)
  tree          | stub           | large_values                   | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, value_write, value_read, value_reference, value_root)
  tree          | stub           | held_references                | not implemented (missing build_begin, build_add, build_finish, apply, get, cursor_open, cursor_seek, cursor_next, cursor_close, walk, diff, diff_nodes, value_write, value_read)
- tree          | stub           | complete                       | not implemented (22 of 22 callbacks missing)
+ tree          | stub           | complete                       | not implemented (23 of 23 callbacks missing)
  table_keying  | pk_or_prefix   | identity                       | pass
  table_keying  | pk_or_prefix   | round_trip                     | pass
  table_keying  | pk_or_prefix   | keys_and_content               | pass
@@ -262,7 +264,7 @@ SELECT * FROM prolly_conformance() WHERE implementation NOT LIKE 'test%';
  matcache      | branches       | complete                       | pass
  matcache      | stub           | identity                       | pass
  matcache      | stub           | complete                       | not implemented (6 of 6 callbacks missing)
-(198 rows)
+(200 rows)
 
 -- Filters, and the suite passing and failing on the test-only hashes
 -- registered by this module.
@@ -280,6 +282,7 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | diff_reports_changes      | pass
  tree      | cow            | equal_keys_take_new_bytes | pass
  tree      | cow            | counts_nodes              | pass
+ tree      | cow            | ranks                     | pass
  tree      | cow            | diff_reads_changed_paths  | pass
  tree      | cow            | diff_across_heights       | pass
  tree      | cow            | diff_unordered_matches    | pass
@@ -289,7 +292,7 @@ SELECT * FROM prolly_conformance('tree', 'cow');
  tree      | cow            | large_values              | pass
  tree      | cow            | held_references           | pass
  tree      | cow            | complete                  | pass
-(20 rows)
+(21 rows)
 
 SELECT * FROM prolly_conformance('content_hash');
   interface   | implementation |            test             |                        result                        

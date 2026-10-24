@@ -183,6 +183,8 @@ static const ConformanceCase cases[] = {
 	tree_equal_keys_take_new_bytes},
 	{PROLLY_IFACE_TREE, "counts_nodes",
 	"build_begin build_add build_finish walk", tree_counts_nodes},
+	{PROLLY_IFACE_TREE, "ranks",
+	"build_begin build_add build_finish apply get count rank", tree_ranks},
 	{PROLLY_IFACE_TREE, "diff_reads_changed_paths",
 	"build_begin build_add build_finish apply walk diff",
 	tree_diff_reads_changed_paths},

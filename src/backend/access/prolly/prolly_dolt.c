@@ -6522,6 +6522,9 @@ check_named_rows(const SummaryRow *r, const char *from_ref, const char *to_ref,
 			 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
 }
 
+/* the versions and tables lineage_has() found alike, this backend's */
+static List *lineages_known = NIL;
+
 /*
  * check_named_rows() of one version, commit, of the table named name.
  */
@@ -6548,13 +6551,35 @@ prolly_check_history_by_name(const char *name, const char *commit,
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
 	check_history_rls(relid, fn);
-	if (lineage && !lineage_has(name_lineage(&lineages, name), commit, name))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
-						fn, name),
-				 errdetail("The name was without a table since that version, so the table here is another."),
-				 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+	if (!lineage)
+		return;
+
+	/*
+	 * (a version and the table here it was found to be, remembered: the
+	 * table dropped and made again, or another renamed to the name, is
+	 * another relation, so asks again)
+	 */
+	{
+		char	   *key = psprintf("%u %s %s", relid, commit, name);
+		ListCell   *lc;
+		MemoryContext old;
+
+		foreach(lc, lineages_known)
+			if (strcmp(lfirst(lc), key) == 0)
+				return;
+		if (!lineage_has(name_lineage(&lineages, name), commit, name))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("%s can't read \"%s\": the table of that name here isn't the one a version holds",
+							fn, name),
+					 errdetail("The name was without a table since that version, so the table here is another."),
+					 errhint("The database's owner, or a member of pg_read_all_data, can read it.")));
+		old = MemoryContextSwitchTo(TopMemoryContext);
+		if (list_length(lineages_known) >= 64)
+			lineages_known = list_delete_first(lineages_known);
+		lineages_known = lappend(lineages_known, pstrdup(key));
+		MemoryContextSwitchTo(old);
+	}
 }
 
 /* rows_begin_described() of a table's version, or refused. */

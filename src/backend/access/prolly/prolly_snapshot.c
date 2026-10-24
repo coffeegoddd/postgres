@@ -139,6 +139,7 @@ require_snapshots(void)
 
 typedef struct MountInfo
 {
+	Oid			owner;			/* the role that mounted it */
 	char	   *source_ref;
 	char	   *source_schema;
 	bool		all;			/* every table of the schema, at each refresh */
@@ -150,13 +151,13 @@ mount_info_write(const MountInfo *mi, StringInfo out)
 {
 	ListCell   *lc;
 
-	appendStringInfo(out, "%s\n%s\n%s\n%c\n", PIN_FORMAT, mi->source_ref,
-					 mi->source_schema, mi->all ? 'a' : 'n');
+	appendStringInfo(out, "%s\n%u\n%s\n%s\n%c\n", PIN_FORMAT, mi->owner,
+					 mi->source_ref, mi->source_schema, mi->all ? 'a' : 'n');
 	foreach(lc, mi->tables)
 		appendStringInfo(out, "%s\n", (char *) lfirst(lc));
 }
 
-/* (names never hold a newline: mount refuses one) */
+/* (names never hold a newline: mount refuses one; the owner is local) */
 static void
 mount_info_read(const char *data, int len, MountInfo *mi)
 {
@@ -182,12 +183,15 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 							 errhint("Unmount it and mount it again.")));
 				break;
 			case 1:
-				mi->source_ref = pstrdup(line);
+				mi->owner = (Oid) strtoul(line, NULL, 10);
 				break;
 			case 2:
-				mi->source_schema = pstrdup(line);
+				mi->source_ref = pstrdup(line);
 				break;
 			case 3:
+				mi->source_schema = pstrdup(line);
+				break;
+			case 4:
 				mi->all = (line[0] == 'a');
 				break;
 			default:
@@ -195,7 +199,7 @@ mount_info_read(const char *data, int len, MountInfo *mi)
 				break;
 		}
 	}
-	if (n < 4)
+	if (n < 5)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid snapshot mount record")));
@@ -327,6 +331,11 @@ make_tables(const char *target, const ProllyHash *commit,
 			mi->tables = lappend(mi->tables, pstrdup(strVal(lsecond(parts))));
 		}
 		MemoryContextSwitchTo(old);
+		if (mi->tables == NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_TABLE),
+					 errmsg("%s has no tables in schema \"%s\"", mi->source_ref,
+							mi->source_schema)));
 	}
 	foreach(lc, mi->tables)
 	{
@@ -385,16 +394,37 @@ drop_tables(const char *target, const MountInfo *mi)
 						 quote_qualified_identifier(target, lfirst(lc))));
 }
 
-/* Refuse a change to a mount by anyone but its schema's owner. */
+/* Refuse a change to a mount by anyone but the role that made it. */
 static void
-check_mount_owner(const char *target)
+check_mount_owner(const char *target, const MountInfo *mi)
+{
+	if (mi->owner != GetUserId() && !superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be the owner of snapshot mount \"%s\"", target)));
+}
+
+/*
+ * Refuse a mount's target the user may not make it in: a system schema
+ * (one named pg_*, or information_schema), or one the user doesn't own.
+ */
+static void
+check_target(const char *target)
 {
 	Oid			nsp = get_namespace_oid(target, true);
 
+	if (strncmp(target, "pg_", 3) == 0 || strcmp(target, "information_schema") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESERVED_NAME),
+				 errmsg("a snapshot mount can't be in system schema \"%s\"", target)));
 	if (OidIsValid(nsp) &&
-		!object_ownercheck(NamespaceRelationId, nsp, GetUserId()) &&
-		!object_ownercheck(DatabaseRelationId, MyDatabaseId, GetUserId()))
+		!object_ownercheck(NamespaceRelationId, nsp, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA, target);
+	if (!OidIsValid(nsp) &&
+		object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
+						ACL_CREATE) != ACLCHECK_OK)
+		aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_DATABASE,
+					   get_database_name(MyDatabaseId));
 }
 
 /*
@@ -430,6 +460,7 @@ prolly_mount(PG_FUNCTION_ARGS)
 	check_name(mi.source_schema, "schema");
 	check_name(target, "schema");
 	mi.source_ref = ref;
+	mi.owner = GetUserId();
 	mi.all = PG_ARGISNULL(3);
 	if (!mi.all)
 	{
@@ -451,6 +482,11 @@ prolly_mount(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
+	if (!mi.all && mi.tables == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("prolly_mount's tables can't be empty")));
+	check_target(target);
 	resolve_commit(ref, &commit, &info);
 	if (mount_lookup(target, NULL, NULL))
 		ereport(ERROR,
@@ -517,7 +553,7 @@ prolly_refresh_mount(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("schema \"%s\" is not a snapshot mount", target)));
-	check_mount_owner(target);
+	check_mount_owner(target, &mi);
 	if (!PG_ARGISNULL(1))
 	{
 		mi.source_ref = text_to_cstring(PG_GETARG_TEXT_PP(1));
@@ -562,13 +598,33 @@ prolly_unmount(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("schema \"%s\" is not a snapshot mount", target)));
-	check_mount_owner(target);
+	check_mount_owner(target, &mi);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	drop_tables(target, &mi);
 	SPI_finish();
 	PROLLY_CALL(refs(), pin_set, target, NULL, NULL);
 	PG_RETURN_VOID();
+}
+
+/*
+ * A schema nsp dropped (doDeletion()): if it is a snapshot mount's, the
+ * mount goes with it, its pin released, as unmounting it would.
+ */
+void
+prolly_snapshot_schema_dropped(Oid nsp)
+{
+	char	   *name;
+	ProllyHash	commit;
+	const ProllyRefsRoutine *r;
+
+	if (!IsNormalProcessingMode() || namespace_is_versioned(nsp))
+		return;
+	r = refs();
+	if (!PROLLY_HAS(r, pin_get) || (name = get_namespace_name(nsp)) == NULL)
+		return;
+	if (PROLLY_CALL(r, pin_get, name, &commit, NULL))
+		PROLLY_CALL(r, pin_set, name, NULL, NULL);
 }
 
 typedef struct MountsVisit
@@ -643,6 +699,7 @@ snapshot_open(Oid relid, Mounted *s)
 	char	   *hex = NULL;
 	ProllyHash	pinned;
 	ProllyCommitInfo info;
+	MountInfo	mi;
 	ListCell   *lc;
 	bool		found;
 	const char *why;
@@ -669,7 +726,7 @@ snapshot_open(Oid relid, Mounted *s)
 				 errmsg("foreign table \"%s\" isn't a snapshot mount's table",
 						get_rel_name(relid)),
 				 errhint("Make snapshot tables with prolly_mount().")));
-	if (!mount_lookup(s->mount, &pinned, NULL) ||
+	if (!mount_lookup(s->mount, &pinned, &mi) ||
 		pinned.len != s->commit.len ||
 		memcmp(pinned.bytes, s->commit.bytes, pinned.len) != 0)
 		ereport(ERROR,
@@ -677,6 +734,17 @@ snapshot_open(Oid relid, Mounted *s)
 				 errmsg("snapshot mount \"%s\" doesn't pin the commit of table \"%s\"",
 						s->mount, get_rel_name(relid)),
 				 errhint("Mount the commit with prolly_mount(), or refresh the mount.")));
+	/* (the mount's own tables alone: those it checked could be read) */
+	found = false;
+	foreach(lc, mi.tables)
+		if (strcmp(quote_qualified_identifier(mi.source_schema, lfirst(lc)),
+				   s->source) == 0)
+			found = true;
+	if (!found)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("snapshot mount \"%s\" doesn't mount \"%s\", which table \"%s\" names",
+						s->mount, s->source, get_rel_name(relid))));
 	if (!PROLLY_CALL(refs(), commit_get, &s->commit, &info))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -710,6 +778,26 @@ snapshot_open(Oid relid, Mounted *s)
 				 errhint("Refresh its mount with prolly_refresh_mount().")));
 }
 
+/* The keying of a version's rows: by its primary key, or by content. */
+static ProllyKeying *
+open_rows(const ProllyComponents *c, const ProllyHistoricalTable *t,
+		  const char *source, MemoryContext mcxt)
+{
+	ProllyKeying *k;
+
+	if (!t->keyed)
+		return PROLLY_CALL(c->keying, open_described, t->desc, mcxt);
+	if (!PROLLY_HAS(c->keying, open_keyed) ||
+		(k = PROLLY_CALL(c->keying, open_keyed, t->desc, t->nkeys,
+						 t->key_attnos, t->opfamilies, t->collations,
+						 t->options, mcxt)) == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("can't order the keys of \"%s\" as its version stores them",
+						source)));
+	return k;
+}
+
 /* ------------------------------------------------------------------------
  * Key bounds
  * ------------------------------------------------------------------------
@@ -731,9 +819,48 @@ typedef struct KeyBounds
 } KeyBounds;
 
 /*
+ * The integer types, whose cross-type btree operators (int84eq and the
+ * like) bound a key: a value of one converts exactly to another, or is out
+ * of its range (bound_value()).
+ */
+static bool
+integer_type(Oid type)
+{
+	return type == INT2OID || type == INT4OID || type == INT8OID;
+}
+
+/*
+ * A bound's value d of type from as the key column's type to: false if it
+ * is out of that type's range (no key equals it).
+ */
+static bool
+bound_value(Datum d, Oid from, Oid to, Datum *out)
+{
+	int64		v;
+
+	if (from == to)
+	{
+		*out = d;
+		return true;
+	}
+	v = from == INT2OID ? DatumGetInt16(d) : from == INT4OID ?
+		DatumGetInt32(d) : DatumGetInt64(d);
+	if (to == INT2OID && v >= PG_INT16_MIN && v <= PG_INT16_MAX)
+		*out = Int16GetDatum((int16) v);
+	else if (to == INT4OID && v >= PG_INT32_MIN && v <= PG_INT32_MAX)
+		*out = Int32GetDatum((int32) v);
+	else if (to == INT8OID)
+		*out = Int64GetDatum(v);
+	else
+		return false;
+	return true;
+}
+
+/*
  * Whether clause bounds key column k of rel: Var op expr (or expr op Var),
- * op a btree operator of the column's family for its type on both sides,
- * under the column's collation, expr not of rel and not volatile.  Sets
+ * op a btree operator of the column's family for its type on the left and
+ * on the right (or, for integers, another integer type), under the
+ * column's collation, expr not of rel and not volatile.  Sets
  * the strategy (as Var op expr) and expr.
  */
 static bool
@@ -779,7 +906,8 @@ key_clause(RelOptInfo *rel, const Mounted *s, int k, RestrictInfo *ri,
 		return false;
 	get_op_opfamily_properties(opno, s->t.opfamilies[k], false, &strat,
 							   &lefttype, &righttype);
-	if (lefttype != type || righttype != type || exprType(right) != type)
+	if (lefttype != type || exprType(right) != righttype ||
+		(righttype != type && !(integer_type(type) && integer_type(righttype))))
 		return false;
 	if (OidIsValid(s->t.collations[k]) && op->inputcollid != s->t.collations[k])
 		return false;
@@ -852,11 +980,166 @@ key_bounds(RelOptInfo *rel, const Mounted *s, List *clauses, KeyBounds *b)
 #define ITEM_COST		(cpu_tuple_cost)
 #define DECODE_COST		(4 * cpu_operator_cost)
 
+/*
+ * A seek's bounds, as keys of the tree's order: what a scan computes from
+ * its bound expressions' values, and the planner from constants, to count
+ * the keys between them.
+ */
+typedef struct Seek
+{
+	const Mounted *s;
+	ProllyComponents c;
+	ProllyKeying *k;
+	int			neq;
+	bool		has_lo;
+	bool		has_hi;
+	bool		lo_strict;		/* (in SQL's order) */
+	bool		hi_strict;
+
+	StringInfo	tree_lo;		/* NULL: none */
+	bool		tree_lo_strict;
+	StringInfo	tree_hi;
+	bool		tree_hi_strict;
+	bool		empty;			/* no key can be in them */
+} Seek;
+
+/*
+ * One of the tree's bounds: the equality prefix, then v (if has_v), as the
+ * least key with them (high: the greatest).
+ */
+static StringInfo
+tree_bound(Seek *sk, Datum *values, bool *isnull, bool has_v, Datum v,
+		   bool high)
+{
+	StringInfo	key = makeStringInfo();
+	int			n = sk->neq;
+
+	if (has_v)
+	{
+		values[n] = v;
+		isnull[n] = false;
+		n++;
+	}
+	PROLLY_CALL(sk->c.keying, encode_key_bound, sk->k, values, isnull, n,
+				high, key);
+	return key;
+}
+
+/*
+ * The sign of an integer bound's value: which way it is out of a smaller
+ * type's range.
+ */
+static int
+integer_sign(Datum d, Oid type)
+{
+	int64		v = type == INT2OID ? DatumGetInt16(d) : type == INT4OID ?
+		DatumGetInt32(d) : DatumGetInt64(d);
+
+	return v > 0 ? 1 : -1;
+}
+
+/*
+ * The bounds as keys of the tree's order, from the bounds' values (each
+ * NULL where nulls says, of the types types say: the equalities', then the
+ * lower bound's and the upper's, those the seek has), in the current
+ * memory context.  A strict lower bound is the greatest key with its
+ * values (keys after it are past them), an inclusive one the least; an
+ * upper bound the other way round.  On a DESC column SQL's lower bound is
+ * the tree's upper.  No key equals NULL or is past it, nor equals an
+ * integer out of its column's range; a range bound out of it is either
+ * past every key or none.
+ */
+static void
+compute_bounds(Seek *sk, const Datum *in, const bool *nulls, const Oid *types)
+{
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	const Mounted *s = sk->s;
+	int			i = 0;
+	Datum		lo = 0;
+	Datum		hi = 0;
+	bool		has_lo = sk->has_lo;
+	bool		has_hi = sk->has_hi;
+	bool		desc;
+	bool		has_tlo;
+	bool		has_thi;
+	Datum		tlo;
+	Datum		thi;
+	bool		tlo_strict;
+	bool		thi_strict;
+	int			nexprs = sk->neq + (sk->has_lo ? 1 : 0) + (sk->has_hi ? 1 : 0);
+
+	sk->empty = false;
+	sk->tree_lo = sk->tree_hi = NULL;
+	for (i = 0; i < nexprs; i++)
+	{
+		int			c = Min(i, sk->neq);
+		Oid			to = TupleDescAttr(s->t.desc, s->t.key_attnos[c] - 1)->atttypid;
+		bool		is_lo = (i == sk->neq && sk->has_lo);
+		bool		is_eq = (i < sk->neq);
+		Datum		d;
+
+		if (nulls[i])
+		{
+			sk->empty = true;
+			return;
+		}
+		if (!bound_value(in[i], types[i], to, &d))
+		{
+			int			sign = integer_sign(in[i], types[i]);
+
+			/* (equal to no key; past every key, or before every one) */
+			if (is_eq || (is_lo && sign > 0) || (!is_lo && sign < 0))
+			{
+				sk->empty = true;
+				return;
+			}
+			if (is_lo)
+				has_lo = false;
+			else
+				has_hi = false;
+			continue;
+		}
+		if (is_eq)
+		{
+			values[i] = d;
+			isnull[i] = false;
+		}
+		else if (is_lo)
+			lo = d;
+		else
+			hi = d;
+	}
+	if (sk->neq == 0 && !has_lo && !has_hi)
+		return;
+	desc = sk->neq < s->t.nkeys && (s->t.options[sk->neq] & INDOPTION_DESC) != 0;
+	has_tlo = desc ? has_hi : has_lo;
+	has_thi = desc ? has_lo : has_hi;
+	tlo = desc ? hi : lo;
+	thi = desc ? lo : hi;
+	tlo_strict = desc ? sk->hi_strict : sk->lo_strict;
+	thi_strict = desc ? sk->lo_strict : sk->hi_strict;
+	if (has_tlo || sk->neq > 0)
+	{
+		sk->tree_lo_strict = has_tlo && tlo_strict;
+		sk->tree_lo = tree_bound(sk, values, isnull, has_tlo, tlo,
+								 sk->tree_lo_strict);
+	}
+	if (has_thi || sk->neq > 0)
+	{
+		sk->tree_hi_strict = has_thi && thi_strict;
+		sk->tree_hi = tree_bound(sk, values, isnull, has_thi, thi,
+								 !sk->tree_hi_strict);
+	}
+}
+
 typedef struct MountPlan
 {
-	Mounted	s;
-	List	   *pathkeys;		/* the key's order, forward */
-	List	   *backward;		/* and backward */
+	Mounted		s;
+	ProllyComponents c;
+	ProllyKeying *k;			/* (keyed) for counting keys in bounds */
+	ProllyTreeEnv env;
+	ProllyKeyingRefs refs;
 } MountPlan;
 
 /* The key's order as pathkeys (NIL where it can't be told the planner). */
@@ -866,7 +1149,11 @@ key_pathkeys(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
 {
 	List	   *keys = NIL;
 
-	if (!s->t.keyed)
+	/*
+	 * (a base relation's alone: an appendrel member's equivalence members
+	 * are its parent's, translated, and making new ones for it is wrong)
+	 */
+	if (!s->t.keyed || rel->reloptkind != RELOPT_BASEREL)
 		return NIL;
 	for (int k = 0; k < s->t.nkeys; k++)
 	{
@@ -904,21 +1191,118 @@ key_pathkeys(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
 	return keys;
 }
 
+static int
+plan_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
+{
+	MountPlan  *ps = arg;
+
+	return PROLLY_CALL(ps->c.keying, compare, ps->k, a, b);
+}
+
+/* Whether the version's tree has key. */
+static bool
+tree_has(MountPlan *ps, const ProllyKey *key)
+{
+	StringInfoData v;
+	bool		found;
+
+	initStringInfo(&v);
+	found = PROLLY_CALL(ps->c.tree, get, &ps->env, &ps->s.t.data, key, &v);
+	pfree(v.data);
+	return found;
+}
+
+/*
+ * How many keys bounds b holds, exactly, where every bound is a constant
+ * and the tree counts by rank (the keys below each end); -1 if not.
+ */
+static double
+exact_rows(MountPlan *ps, const KeyBounds *b)
+{
+	Seek		sk = {0};
+	Datum		values[INDEX_MAX_KEYS + 2];
+	bool		nulls[INDEX_MAX_KEYS + 2];
+	Oid			types[INDEX_MAX_KEYS + 2];
+	int			n = 0;
+	uint64		lo;
+	uint64		hi;
+	Expr	   *exprs[INDEX_MAX_KEYS + 2];
+
+	if (!ps->s.t.keyed || ps->k == NULL || !PROLLY_HAS(ps->c.tree, rank))
+		return -1;
+	for (int c = 0; c < b->neq; c++)
+		exprs[n++] = b->eq[c];
+	if (b->lo)
+		exprs[n++] = b->lo;
+	if (b->hi)
+		exprs[n++] = b->hi;
+	for (int i = 0; i < n; i++)
+	{
+		if (!IsA(exprs[i], Const))
+			return -1;
+		values[i] = ((Const *) exprs[i])->constvalue;
+		nulls[i] = ((Const *) exprs[i])->constisnull;
+		types[i] = ((Const *) exprs[i])->consttype;
+	}
+	sk.s = &ps->s;
+	sk.c = ps->c;
+	sk.k = ps->k;
+	sk.neq = b->neq;
+	sk.has_lo = b->lo != NULL;
+	sk.has_hi = b->hi != NULL;
+	sk.lo_strict = b->lo_strict;
+	sk.hi_strict = b->hi_strict;
+	compute_bounds(&sk, values, nulls, types);
+	if (sk.empty)
+		return 0;
+	/*
+	 * (a bound of every key column is a key itself: rank() doesn't count
+	 * it, so a strict lower bound skips it and an inclusive upper takes it)
+	 */
+	if (sk.tree_lo)
+	{
+		ProllyKey	key = {(const uint8 *) sk.tree_lo->data, sk.tree_lo->len};
+
+		lo = PROLLY_CALL(ps->c.tree, rank, &ps->env, &ps->s.t.data, &key);
+		if (sk.tree_lo_strict && tree_has(ps, &key))
+			lo++;
+	}
+	else
+		lo = 0;
+	if (sk.tree_hi)
+	{
+		ProllyKey	key = {(const uint8 *) sk.tree_hi->data, sk.tree_hi->len};
+
+		hi = PROLLY_CALL(ps->c.tree, rank, &ps->env, &ps->s.t.data, &key);
+		if (!sk.tree_hi_strict && tree_has(ps, &key))
+			hi++;
+	}
+	else
+		hi = (uint64) ps->s.count;
+	return hi > lo ? (double) (hi - lo) : 0;
+}
+
 static void
 snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 					  Oid foreigntableid)
 {
 	MountPlan  *ps = palloc0(sizeof(MountPlan));
-	const ProllyTreeRoutine *tree;
-	ProllyTreeEnv env;
 	KeyBounds	b;
+	double		exact;
 
 	snapshot_open(foreigntableid, &ps->s);
 	prolly_check_history_by_name(ps->s.source, prolly_hash_hex(&ps->s.commit),
-								 false, "a snapshot mount");
-	tree = prolly_tree_lookup("cow");
-	prolly_folded_tree_env(&env);
-	ps->s.count = (double) PROLLY_CALL(tree, count, &env, &ps->s.t.data);
+								 true, "a snapshot mount");
+	prolly_history_components(&ps->c);
+	prolly_folded_tree_env(&ps->env);
+	ps->s.count = (double) PROLLY_CALL(ps->c.tree, count, &ps->env, &ps->s.t.data);
+	if (ps->s.t.keyed)
+	{
+		ps->k = open_rows(&ps->c, &ps->s.t, ps->s.source, CurrentMemoryContext);
+		ps->env.compare = plan_compare;
+		ps->env.compare_arg = ps;
+		prolly_keying_use_env(&ps->refs, ps->c.keying, ps->k, ps->c.tree, &ps->env);
+	}
 	baserel->fdw_private = ps;
 	baserel->tuples = ps->s.count;
 	baserel->rows = clamp_row_est(ps->s.count *
@@ -926,22 +1310,30 @@ snapshot_get_rel_size(PlannerInfo *root, RelOptInfo *baserel,
 														 baserel->baserestrictinfo,
 														 0, JOIN_INNER, NULL));
 	key_bounds(baserel, &ps->s, baserel->baserestrictinfo, &b);
+	exact = exact_rows(ps, &b);
+	if (exact >= 0)
+		baserel->rows = clamp_row_est(exact);
 	if (b.neq == ps->s.t.nkeys && ps->s.t.keyed)
 		baserel->rows = 1;
 }
 
 /* How many rows bounds b reads, of a table of count. */
 static double
-bounded_rows(PlannerInfo *root, RelOptInfo *rel, const Mounted *s,
+bounded_rows(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps,
 			 const KeyBounds *b, List *clauses)
 {
+	const Mounted *s = &ps->s;
 	List	   *used = NIL;
 	ListCell   *lc;
+	double		exact;
 
 	if (s->t.keyed && b->neq == s->t.nkeys)
 		return 1;
 	if (b->neq == 0 && b->lo == NULL && b->hi == NULL)
 		return Max(s->count, 1);
+	exact = exact_rows(ps, b);
+	if (exact >= 0)
+		return clamp_row_est(exact);
 	foreach(lc, clauses)
 	{
 		RestrictInfo *ri = lfirst(lc);
@@ -987,8 +1379,8 @@ add_paths(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, List *clauses,
 	key_bounds(rel, &ps->s, clauses, &b);
 	if (ppi && b.neq == 0 && b.lo == NULL && b.hi == NULL)
 		return;
-	read = bounded_rows(root, rel, &ps->s, &b, clauses);
-	rows = ppi ? clamp_row_est(Min(read, ppi->ppi_rows)) : rel->rows;
+	read = bounded_rows(root, rel, ps, &b, clauses);
+	rows = ppi ? clamp_row_est(Min(read, ppi->ppi_rows)) : Min(read, rel->rows);
 	if (ppi)
 		ppi->ppi_rows = rows;
 	depth = ps->s.count > 1 ? ceil(log(ps->s.count) / log(64.0)) + 1 : 1;
@@ -997,7 +1389,7 @@ add_paths(PlannerInfo *root, RelOptInfo *rel, MountPlan *ps, List *clauses,
 		read * cpu_operator_cost * list_length(rel->baserestrictinfo);
 	for (int dir = 0; dir < 2; dir++)
 	{
-		List	   *pathkeys = dir ? ps->backward : ps->pathkeys;
+		List	   *pathkeys = key_pathkeys(root, rel, &ps->s, dir == 1);
 
 		/* (backward only where it gives an order) */
 		if (dir == 1 && pathkeys == NIL)
@@ -1037,8 +1429,6 @@ snapshot_get_paths(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *ppis = NIL;
 	ListCell   *lc;
 
-	ps->pathkeys = key_pathkeys(root, baserel, &ps->s, false);
-	ps->backward = key_pathkeys(root, baserel, &ps->s, true);
 	add_paths(root, baserel, ps, baserel->baserestrictinfo, NULL);
 	if (!ps->s.t.keyed)
 		return;
@@ -1162,31 +1552,19 @@ snapshot_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 
 typedef struct MountScan
 {
-	Mounted	s;
-	ProllyComponents c;
-	ProllyKeying *k;
+	Mounted		s;
+	Seek		seek;			/* its components, keying and bounds */
 	ProllyTreeEnv env;
 	ProllyKeyingRefs refs;
-	const ProllyTreeRoutine *tree;
 	ProllyTreeCursor *cursor;
 	bool		backward;
-	int			neq;
-	bool		has_lo;
-	bool		has_hi;
-	bool		lo_strict;		/* (in SQL's order) */
-	bool		hi_strict;
 	List	   *exprs;			/* ExprStates of the bounds */
+	Oid		   *types;			/* and their types */
 	bool	   *wanted;			/* attributes decoded; NULL: all */
-
-	/* the bounds as keys of the tree's order; NULL: none */
-	StringInfo	tree_lo;
-	bool		tree_lo_strict;
-	StringInfo	tree_hi;
-	bool		tree_hi_strict;
-	bool		empty;			/* a bound is NULL: no row */
 	bool		done;
 	uint64		copies;			/* copies of the row in the slot still to give */
 	MemoryContext cxt;
+	MemoryContext boundcxt;		/* the bounds', reset at each (re)scan */
 
 	/* work, for EXPLAIN ANALYZE */
 	uint64		rows_read;
@@ -1199,7 +1577,7 @@ keying_compare(const ProllyKey *a, const ProllyKey *b, void *arg)
 {
 	MountScan  *ss = arg;
 
-	return PROLLY_CALL(ss->c.keying, compare, ss->k, a, b);
+	return PROLLY_CALL(ss->seek.c.keying, compare, ss->seek.k, a, b);
 }
 
 static void
@@ -1213,19 +1591,22 @@ snapshot_begin(ForeignScanState *node, int eflags)
 	List	   *strict = lfourth(priv);
 	List	   *cols = (List *) list_nth(priv, 4);
 	MemoryContext old;
+	ListCell   *lc;
+	int			i = 0;
 
 	node->fdw_state = ss;
 	ss->backward = intVal(linitial(priv)) != 0;
-	ss->neq = intVal(lsecond(priv));
-	ss->has_lo = linitial_int(has);
-	ss->has_hi = lsecond_int(has);
-	ss->lo_strict = linitial_int(strict);
-	ss->hi_strict = lsecond_int(strict);
+	ss->seek.neq = intVal(lsecond(priv));
+	ss->seek.has_lo = linitial_int(has);
+	ss->seek.has_hi = lsecond_int(has);
+	ss->seek.lo_strict = linitial_int(strict);
+	ss->seek.hi_strict = lsecond_int(strict);
 	ss->exprs = ExecInitExprList(fs->fdw_exprs, (PlanState *) node);
+	ss->types = palloc(sizeof(Oid) * Max(list_length(fs->fdw_exprs), 1));
+	foreach(lc, fs->fdw_exprs)
+		ss->types[i++] = exprType(lfirst(lc));
 	if (!(list_length(cols) == 1 && linitial_int(cols) == 0))
 	{
-		ListCell   *lc;
-
 		ss->wanted = palloc0(sizeof(bool) * Max(RelationGetDescr(rel)->natts, 1));
 		foreach(lc, cols)
 			ss->wanted[lfirst_int(lc) - 1] = true;
@@ -1235,131 +1616,47 @@ snapshot_begin(ForeignScanState *node, int eflags)
 
 	snapshot_open(RelationGetRelid(rel), &ss->s);
 	prolly_check_history_by_name(ss->s.source, prolly_hash_hex(&ss->s.commit),
-								 false, "a snapshot mount");
+								 true, "a snapshot mount");
+	ss->seek.s = &ss->s;
 	ss->cxt = AllocSetContextCreate(CurrentMemoryContext, "prolly snapshot scan",
 									ALLOCSET_DEFAULT_SIZES);
+	ss->boundcxt = AllocSetContextCreate(ss->cxt, "prolly snapshot scan bounds",
+										 ALLOCSET_SMALL_SIZES);
 	old = MemoryContextSwitchTo(ss->cxt);
-	prolly_history_components(&ss->c);
-	ss->tree = ss->c.tree;
-	if (ss->s.t.keyed)
-	{
-		if (!PROLLY_HAS(ss->c.keying, open_keyed) ||
-			(ss->k = PROLLY_CALL(ss->c.keying, open_keyed, ss->s.t.desc,
-								 ss->s.t.nkeys, ss->s.t.key_attnos,
-								 ss->s.t.opfamilies, ss->s.t.collations,
-								 ss->s.t.options, ss->cxt)) == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("can't order the keys of \"%s\" as commit %s stores them",
-							ss->s.source, prolly_hash_hex(&ss->s.commit))));
-	}
-	else
-		ss->k = PROLLY_CALL(ss->c.keying, open_described, ss->s.t.desc, ss->cxt);
+	prolly_history_components(&ss->seek.c);
+	ss->seek.k = open_rows(&ss->seek.c, &ss->s.t, ss->s.source, ss->cxt);
 	prolly_folded_tree_env(&ss->env);
 	ss->env.compare = keying_compare;
 	ss->env.compare_arg = ss;
-	prolly_keying_use_env(&ss->refs, ss->c.keying, ss->k, ss->tree, &ss->env);
+	prolly_keying_use_env(&ss->refs, ss->seek.c.keying, ss->seek.k,
+						  ss->seek.c.tree, &ss->env);
 	MemoryContextSwitchTo(old);
 	ss->nodes_before = pgstat_prolly_tree_counters()->nodes_read;
 }
 
-/*
- * One of the tree's bounds: the equality prefix, then v (if has_v), as the
- * least key with them (high: the greatest).
- */
-static StringInfo
-tree_bound(MountScan *ss, Datum *values, bool *isnull, bool has_v, Datum v,
-		   bool high)
-{
-	StringInfo	key = makeStringInfo();
-	int			n = ss->neq;
-
-	if (has_v)
-	{
-		values[n] = v;
-		isnull[n] = false;
-		n++;
-	}
-	PROLLY_CALL(ss->c.keying, encode_key_bound, ss->k, values, isnull, n,
-				high, key);
-	return key;
-}
-
-/*
- * The bounds as keys of the tree's order, from the bound expressions'
- * values now.  A strict lower bound is the greatest key with its values
- * (keys after it are past them), an inclusive one the least; an upper
- * bound the other way round.  On a DESC column SQL's lower bound is the
- * tree's upper.
- */
+/* The bounds, from the bound expressions' values now. */
 static void
 set_bounds(ForeignScanState *node, MountScan *ss)
 {
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
-	Datum		values[INDEX_MAX_KEYS];
-	bool		isnull[INDEX_MAX_KEYS];
+	int			n = list_length(ss->exprs);
+	Datum	   *values = palloc(sizeof(Datum) * Max(n, 1));
+	bool	   *nulls = palloc(sizeof(bool) * Max(n, 1));
 	ListCell   *lc;
 	int			i = 0;
-	Datum		lo = 0;
-	Datum		hi = 0;
-	bool		desc;
-	bool		has_tlo;
-	bool		has_thi;
-	Datum		tlo;
-	Datum		thi;
-	bool		tlo_strict;
-	bool		thi_strict;
 	MemoryContext old;
 
-	ss->empty = false;
-	ss->tree_lo = ss->tree_hi = NULL;
-	if (ss->neq == 0 && !ss->has_lo && !ss->has_hi)
-		return;
 	foreach(lc, ss->exprs)
 	{
-		bool		null;
-		Datum		d = ExecEvalExpr(lfirst(lc), econtext, &null);
-
-		/* (no row equals NULL, or is past it) */
-		if (null)
-		{
-			ss->empty = true;
-			return;
-		}
-		if (i < ss->neq)
-		{
-			values[i] = d;
-			isnull[i] = false;
-		}
-		else if (i == ss->neq && ss->has_lo)
-			lo = d;
-		else
-			hi = d;
+		values[i] = ExecEvalExpr(lfirst(lc), econtext, &nulls[i]);
 		i++;
 	}
-	desc = ss->neq < ss->s.t.nkeys &&
-		(ss->s.t.options[ss->neq] & INDOPTION_DESC) != 0;
-	has_tlo = desc ? ss->has_hi : ss->has_lo;
-	has_thi = desc ? ss->has_lo : ss->has_hi;
-	tlo = desc ? hi : lo;
-	thi = desc ? lo : hi;
-	tlo_strict = desc ? ss->hi_strict : ss->lo_strict;
-	thi_strict = desc ? ss->lo_strict : ss->hi_strict;
-
-	old = MemoryContextSwitchTo(ss->cxt);
-	if (has_tlo || ss->neq > 0)
-	{
-		ss->tree_lo_strict = has_tlo && tlo_strict;
-		ss->tree_lo = tree_bound(ss, values, isnull, has_tlo, tlo,
-								 ss->tree_lo_strict);
-	}
-	if (has_thi || ss->neq > 0)
-	{
-		ss->tree_hi_strict = has_thi && thi_strict;
-		ss->tree_hi = tree_bound(ss, values, isnull, has_thi, thi,
-								 !ss->tree_hi_strict);
-	}
+	MemoryContextReset(ss->boundcxt);
+	old = MemoryContextSwitchTo(ss->boundcxt);
+	compute_bounds(&ss->seek, values, nulls, ss->types);
 	MemoryContextSwitchTo(old);
+	pfree(values);
+	pfree(nulls);
 }
 
 static void
@@ -1369,20 +1666,20 @@ start_scan(ForeignScanState *node, MountScan *ss)
 	StringInfo	from;
 
 	set_bounds(node, ss);
-	ss->done = ss->empty;
+	ss->done = ss->seek.empty;
 	ss->copies = 0;
 	if (ss->done)
 		return;
 	if (ss->cursor == NULL)
-		ss->cursor = PROLLY_CALL(ss->tree, cursor_open, &ss->env, &ss->s.t.data,
-								 ss->cxt);
-	from = ss->backward ? ss->tree_hi : ss->tree_lo;
+		ss->cursor = PROLLY_CALL(ss->seek.c.tree, cursor_open, &ss->env,
+								 &ss->s.t.data, ss->cxt);
+	from = ss->backward ? ss->seek.tree_hi : ss->seek.tree_lo;
 	if (from)
 	{
 		at.data = (const uint8 *) from->data;
 		at.len = from->len;
 	}
-	PROLLY_CALL(ss->tree, cursor_seek, ss->cursor, from ? &at : NULL,
+	PROLLY_CALL(ss->seek.c.tree, cursor_seek, ss->cursor, from ? &at : NULL,
 				ss->backward ? BackwardScanDirection : ForwardScanDirection);
 }
 
@@ -1391,15 +1688,15 @@ compare_bound(MountScan *ss, const ProllyKey *key, StringInfo bound)
 {
 	ProllyKey	b = {(const uint8 *) bound->data, bound->len};
 
-	return PROLLY_CALL(ss->c.keying, compare, ss->k, key, &b);
+	return PROLLY_CALL(ss->seek.c.keying, compare, ss->seek.k, key, &b);
 }
 
-/* Is key past the end the scan goes toward (or short of its start)? */
+/* Is key past the end the scan goes toward? */
 static bool
 past_end(MountScan *ss, const ProllyKey *key)
 {
-	StringInfo	end = ss->backward ? ss->tree_lo : ss->tree_hi;
-	bool		strict = ss->backward ? ss->tree_lo_strict : ss->tree_hi_strict;
+	StringInfo	end = ss->backward ? ss->seek.tree_lo : ss->seek.tree_hi;
+	bool		strict = ss->backward ? ss->seek.tree_lo_strict : ss->seek.tree_hi_strict;
 	int			c;
 
 	if (end == NULL)
@@ -1410,11 +1707,12 @@ past_end(MountScan *ss, const ProllyKey *key)
 	return strict ? c >= 0 : c > 0;
 }
 
+/* Is key short of a strict start, a seek having put the scan at it? */
 static bool
 before_start(MountScan *ss, const ProllyKey *key)
 {
-	StringInfo	start = ss->backward ? ss->tree_hi : ss->tree_lo;
-	bool		strict = ss->backward ? ss->tree_hi_strict : ss->tree_lo_strict;
+	StringInfo	start = ss->backward ? ss->seek.tree_hi : ss->seek.tree_lo;
+	bool		strict = ss->backward ? ss->seek.tree_hi_strict : ss->seek.tree_lo_strict;
 	int			c;
 
 	if (start == NULL || !strict)
@@ -1448,7 +1746,7 @@ snapshot_iterate(ForeignScanState *node)
 		uint64		count;
 
 		CHECK_FOR_INTERRUPTS();
-		if (!PROLLY_CALL(ss->tree, cursor_next, ss->cursor, &key, &value))
+		if (!PROLLY_CALL(ss->seek.c.tree, cursor_next, ss->cursor, &key, &value))
 		{
 			ss->done = true;
 			break;
@@ -1460,10 +1758,10 @@ snapshot_iterate(ForeignScanState *node)
 		}
 		if (before_start(ss, &key))
 			continue;
-		PROLLY_CALL(ss->c.keying, parse_value_as, ss->k, !ss->s.t.keyed, &value,
-					&row, &count);
-		PROLLY_CALL(ss->c.keying, decode_row_columns, ss->k, &row, ss->wanted,
-					slot);
+		PROLLY_CALL(ss->seek.c.keying, parse_value_as, ss->seek.k,
+					!ss->s.t.keyed, &value, &row, &count);
+		PROLLY_CALL(ss->seek.c.keying, decode_row_columns, ss->seek.k, &row,
+					ss->wanted, slot);
 		ss->rows_read++;
 		ss->copies = count - 1;
 		return slot;
@@ -1489,9 +1787,9 @@ snapshot_end(ForeignScanState *node)
 		return;
 	ss->nodes_read = pgstat_prolly_tree_counters()->nodes_read - ss->nodes_before;
 	if (ss->cursor)
-		PROLLY_CALL(ss->tree, cursor_close, ss->cursor);
+		PROLLY_CALL(ss->seek.c.tree, cursor_close, ss->cursor);
 	ss->cursor = NULL;
-	PROLLY_CALL(ss->c.keying, close, ss->k);
+	PROLLY_CALL(ss->seek.c.keying, close, ss->seek.k);
 	MemoryContextDelete(ss->cxt);
 	ss->cxt = NULL;
 }
