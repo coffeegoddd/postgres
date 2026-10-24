@@ -1076,6 +1076,8 @@ check_same_column(Oid type, bool anull, Datum a, bool bnull, Datum b,
  * row's other columns reads no node of the value store.  Rows holding the
  * same long value give that column the same bytes (its reference), and a
  * row with a byte after its values is refused, as decode() refuses it.
+ * fields_alike() takes a column a row predates as its missing value, and
+ * field_compatible() holds only between columns that encode alike.
  */
 void
 valenc_selected_columns(const ProllyImplInfo *impl)
@@ -1154,7 +1156,7 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 					elog(ERROR, "row %d: a dropped column is stored", r);
 				continue;
 			}
-			if (fields[c].stored && fields[c].isnull != all->tts_isnull[c])
+			if (fields[c].isnull != all->tts_isnull[c])
 				elog(ERROR, "row %d column %d: fields() says %s", r, c + 1,
 					 fields[c].isnull ? "NULL" : "not NULL");
 			if (r % 12 == 11 && c >= 4 && fields[c].stored)
@@ -1199,6 +1201,69 @@ valenc_selected_columns(const ProllyImplInfo *impl)
 				counters.nodes_read == read_before)
 				elog(ERROR, "row %d: a long value asked for was not read", r);
 		}
+	}
+
+	/*
+	 * A row that predates column 7 has its missing value, 5: alike with a
+	 * row that stores 5 there, and not with one storing NULL or another
+	 * value, in either order.
+	 */
+	{
+		ProllyEncodedField predates[lengthof(cols)];
+		static const int stored[] = {5, -1, 6};
+
+		store_row(bsrc, before, 3, 0, "old");
+		resetStringInfo(&buf2);
+		PROLLY_CALL(ve, encode, benc, bsrc, &buf2);
+		{
+			ProllyValue a = {(const uint8 *) buf2.data, buf2.len};
+
+			PROLLY_CALL(ve, fields, enc, &a, predates);
+		}
+		if (predates[6].stored || !predates[6].missing || predates[6].isnull)
+			elog(ERROR, "a row predating a column with a missing value isn't given it");
+		for (int s = 0; s < lengthof(stored); s++)
+		{
+			ProllyValue b;
+			bool		alike;
+
+			store_row(src, cols, 3, 0, "old");
+			src->tts_isnull[6] = stored[s] < 0;
+			src->tts_values[6] = Int32GetDatum(stored[s]);
+			encode_row(ve, enc, src, &buf);
+			b.data = (const uint8 *) buf.data;
+			b.len = buf.len;
+			PROLLY_CALL(ve, fields, enc, &b, other);
+			for (int order = 0; order < 2; order++)
+			{
+				alike = PROLLY_CALL(ve, fields_alike, enc, 6,
+									order ? &other[6] : &predates[6],
+									order ? &predates[6] : &other[6]);
+				if (alike != (stored[s] == 5))
+					elog(ERROR, "a missing 5 and a stored %s compare %s",
+						 stored[s] < 0 ? "NULL" : psprintf("%d", stored[s]),
+						 alike ? "alike" : "different");
+			}
+		}
+	}
+
+	/*
+	 * Columns compare by their bytes across encoders only where they encode
+	 * alike: the same column in another layout, not another type.
+	 */
+	{
+		static const ColSpec retyped[] = {{COL_I8}, {COL_TEXT}};
+		TupleDesc	rdesc = make_desc(retyped, lengthof(retyped));
+		ProllyValueEncoder *renc = PROLLY_CALL(ve, begin, rdesc, CurrentMemoryContext);
+
+		if (!PROLLY_CALL(ve, field_compatible, enc, 0, benc, 0) ||
+			!PROLLY_CALL(ve, field_compatible, enc, 1, renc, 1))
+			elog(ERROR, "columns encoding alike are not compatible");
+		if (PROLLY_CALL(ve, field_compatible, enc, 0, renc, 0) ||
+			PROLLY_CALL(ve, field_compatible, enc, 3, benc, 3) ||
+			PROLLY_CALL(ve, field_compatible, enc, 1, enc, 2))
+			elog(ERROR, "a retyped or dropped column is compatible");
+		PROLLY_CALL(ve, end, renc);
 	}
 
 	/* the same long value in two rows: the same bytes, its reference */

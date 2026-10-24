@@ -192,6 +192,16 @@ typedef struct ProllyKeyingRoutine
 								 bool *isnull);
 
 	/*
+	 * Optional: the value encoder's fields_alike() and field_compatible()
+	 * of the keyings' own columns.
+	 */
+	bool		(*fields_alike) (ProllyKeying *k, int attno,
+								 const ProllyEncodedField *a,
+								 const ProllyEncodedField *b);
+	bool		(*field_compatible) (ProllyKeying *k, int attno,
+									 ProllyKeying *other, int other_attno);
+
+	/*
 	 * Optional: open_described(), keyed instead by a primary key of nkeys
 	 * of desc's columns (attnos, 1-based), with their btree operator
 	 * families, collations and INDOPTION_* options, as a version of a table
@@ -220,7 +230,8 @@ typedef struct ProllyKeyingRoutine
 	"decode_row", "compare", "close", "set_values", "row_refs", \
 	"decode_row_kept", "encode_key", "parse_value_as", "open_described", \
 	"row_shape", "shape_extends", "open_shape", "decode_row_columns", \
-	"row_fields", "decode_field", "open_keyed", "encode_key_bound"
+	"row_fields", "decode_field", "fields_alike", "field_compatible", \
+	"open_keyed", "encode_key_bound"
 #define PROLLY_KEYING_FIRST_CALLBACK open
 #define PROLLY_KEYING_LAST_CALLBACK encode_key_bound
 
