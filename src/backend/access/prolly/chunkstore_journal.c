@@ -204,7 +204,7 @@
 #define RECEIVED_ID			(UINT64CONST(1) << 63)
 #define RECEIVED_PREFIX		"prolly_received_"
 #define MANIFEST_MAGIC		"PRLYMAN1"
-#define MANIFEST_VERSION	4
+#define MANIFEST_VERSION	5
 #define TABLE_FILE_FORMAT	"basic"
 #define JOURNAL_MAGIC		"PRLYJRN1"
 #define JOURNAL_VERSION		4
@@ -368,6 +368,9 @@ typedef struct Manifest
 	uint32		gc_generation;
 	ProllyHash	root;			/* as of the manifest's writing: the root
 								 * while no segment it names has a ROOT */
+	ProllyHash	base;			/* the root before the oldest ROOT the
+								 * segments it names hold, as a collection
+								 * left it (none: not known) */
 	int			nfiles;
 	ManifestFile *files;
 	int			nsegments;		/* at least one */
@@ -555,6 +558,8 @@ struct ProllyChunkStore
 	uint64		manifests_seen; /* the shared count when it was read */
 	uint64		segments_seen;	/* likewise, for the segments */
 	uint32		gc_generation;	/* the manifest's, as last read */
+	ProllyHash	base;			/* likewise: the root before its segments'
+								 * oldest ROOT, if known */
 
 	/* the GC generation the transaction (lxid) began in */
 	LocalTransactionId xact_lxid;
@@ -2413,6 +2418,7 @@ load_segments(ProllyChunkStore *s, const Manifest *m, uint64 count)
 	list_free(s->segments);
 	s->segments = segs;
 	s->gc_generation = m->gc_generation;
+	s->base = m->base;
 
 	jindex_lock(s->ix, true);
 	js = jindex_scan(s->ix);
@@ -3122,6 +3128,8 @@ manifest_bytes(const Manifest *m, StringInfo out)
 	append_le(out, m->last_id, 8);
 	append_le(out, m->root.len, 1);
 	appendBinaryStringInfo(out, m->root.bytes, m->root.len);
+	append_le(out, m->base.len, 1);
+	appendBinaryStringInfo(out, m->base.bytes, m->base.len);
 	append_le(out, m->nfiles, 4);
 	for (int i = 0; i < m->nfiles; i++)
 	{
@@ -3221,7 +3229,7 @@ read_manifest_at(const char *path, Manifest *m)
 	version = (uint32) read_le(p + 8, 4);
 	if (version != MANIFEST_VERSION)
 		check_format(path, "manifest", version, MANIFEST_VERSION, NULL);
-	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 4 + 4 + 4 + 4)
+	if (st.st_size < 8 + 4 + FORMAT_SIZE + 4 + 8 + 1 + 1 + 4 + 4 + 4 + 4)
 		goto corrupt;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, buf, st.st_size - sizeof(crc));
@@ -3241,6 +3249,12 @@ read_manifest_at(const char *path, Manifest *m)
 		goto corrupt;
 	m->root.len = rootlen;
 	memcpy(m->root.bytes, p, rootlen);
+	p += rootlen;
+	rootlen = (uint8) *p++;
+	if (rootlen > PROLLY_HASH_MAX_LEN || end - p < rootlen + 4)
+		goto corrupt;
+	m->base.len = rootlen;
+	memcpy(m->base.bytes, p, rootlen);
 	p += rootlen;
 	nfiles = (uint32) read_le(p, 4);
 	p += 4;
@@ -7055,7 +7069,8 @@ journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
  * The roots the store was moved to, oldest first: the ROOT records of the
  * segments named, in their order, up to where this backend has read them
  * (skipping the ranges whose appends were in flight then).  A collection
- * retires the segments it collected, and their ROOT records with them.
+ * retires the segments it collected, and their ROOT records with them;
+ * the root they ended at is the manifest's base, given as *before.
  *
  * Only each record's length and kind are read (through a buffer) but for
  * the ROOT records, read whole and checked: the chunks between are passed
@@ -7065,13 +7080,15 @@ journal_segments(ProllyChunkStore *s, bool count, ProllyChunkFileVisit visit,
  */
 #define ROOTS_BUFFER	(64 * 1024)
 static void
-journal_roots(ProllyChunkStore *s, ProllyChunkRootVisit visit, void *arg)
+journal_roots(ProllyChunkStore *s, ProllyHash *before,
+			  ProllyChunkRootVisit visit, void *arg)
 {
 	char	   *buf = palloc(ROOTS_BUFFER);
 	char	   *rec = NULL;
 	Size		reclen = 0;
 
 	scan_journal(s);
+	*before = s->base;
 	jindex_lock(s->ix, false);
 	for (int si = 0; si < jindex_scan(s->ix)->nsegments; si++)
 	{
@@ -8411,6 +8428,16 @@ journal_gc_swap(ProllyChunkGc *gc, const uint8 *marks, const bool *keep,
 	nm.segments[gc->nretained] = gc->segment;
 	scan_journal(s);
 	nm.root = s->root;
+
+	/*
+	 * What a reflog reads from: the moves the segments kept record, after
+	 * the root as of the seal, which the collection kept whole.  (A move
+	 * in flight at the seal, its ROOT in a sealed segment, comes after it
+	 * and is forgotten: its changes are listed with the next move.)  Not
+	 * known with sealed segments kept: their moves are older than it.
+	 */
+	if (gc->nretained == 0)
+		nm.base = gc->m.root;
 	replace_manifest(s, &nm, XLOG_CHUNKS_SWAP);
 	jindex_append_unlock(s->ix);
 	gc->window = false;
