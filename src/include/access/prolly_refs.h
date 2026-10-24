@@ -29,6 +29,7 @@
 #include "access/prolly_tree.h"
 #include "access/prolly_types.h"
 #include "access/transam.h"
+#include "catalog/branch_ops.h"
 #include "datatype/timestamp.h"
 #include "utils/snapshot.h"
 
@@ -222,6 +223,30 @@ typedef struct ProllyMovedBranch
 	TimestampTz last_ended;
 	int			writers;
 } ProllyMovedBranch;
+
+/*
+ * A commit a branch's pages are kept as of: each table's relations as
+ * branch operations' keep() kept them (the table's own first), the
+ * branch's baseline then (len 0: none), and the transaction that kept
+ * them, which saw every writer of the pages end.
+ */
+typedef struct ProllyKeptTable
+{
+	const char *name;			/* qualified, as tables() names it */
+	int			nrels;
+	const BranchKeptRelation *rels;
+} ProllyKeptTable;
+
+typedef struct ProllyKeptCommit
+{
+	ProllyHash	commit;
+	ProllyHash	baseline;
+	FullTransactionId kept_by;
+	int			ntables;
+	const ProllyKeptTable *tables;
+} ProllyKeptCommit;
+
+typedef void (*ProllyKeptCommitVisit) (const ProllyKeptCommit *kept, void *arg);
 
 typedef struct ProllyRefsRoutine
 {
@@ -671,6 +696,14 @@ typedef struct ProllyRefsRoutine
 								const char *author, const char *message,
 								const StringInfoData *identity,
 								ProllyHash *commit_id);
+
+	/*
+	 * Optional: visit the commits branch name's pages are kept as of (see
+	 * prolly.kept_commits), newest first; not those retired.  What is
+	 * visited is the refs' as this transaction reads them.
+	 */
+	void		(*kept_commits) (const char *name, ProllyKeptCommitVisit visit,
+								 void *arg);
 } ProllyRefsRoutine;
 
 /*
@@ -713,9 +746,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"note_relation", "fold_mark", "written_since", "pending_full_folds", \
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
-	"rebase_state", "set_rebase_state", "commit_root"
+	"rebase_state", "set_rebase_state", "commit_root", "kept_commits"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK commit_root
+#define PROLLY_REFS_LAST_CALLBACK kept_commits
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

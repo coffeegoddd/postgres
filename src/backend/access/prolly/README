@@ -561,6 +561,27 @@ tables' entries from the kept baseline.  A commit that stops being kept is
 retired rather than let go of, and its pages are let go of by a later keep
 once the retiring transaction has committed.
 
+Kept commits are kept states of the materialization cache
+(prolly_matcache.h), beside kept checkouts: the cache's visit() gives
+each branch's kept commits (the refs' kept_commits(), each recording the
+transaction that kept it, which a snapshot must see committed: refs
+format 9) with their commits' roots, and every user of kept states takes both kinds.  A
+first use at a kept commit is made of its pages, found through the cache.
+A move of any branch (a reset, a checkout's move, a first use's) gives a
+table whose rows differ from the target's, where a kept commit of any
+branch holds the target's table and sharing costs less than writing the
+rows, and the transaction that kept it precedes every snapshot in the
+cluster, storage made of that commit's snapshots (branch operations'
+share_kept(): O(1) each, the source branch held against deletion and its
+relations against letting go of the pages, each relation stored alike on
+both and the source's still on the storage that kept it), its baseline
+entry taken from the kept baseline; and the move planner costs a first
+use's candidates with those tables shared, as it does a kept checkout's.
+So the old heads a branch has moved on from serve other branches until
+they retire.  (The pages are the source branch's: a snapshot older than
+their keeping could see versions it made and deleted before the commit,
+rows in no commit; while one is open the rows are written instead.)
+
 Kept materializations (prolly.kept_checkouts, 4 by default, per database)
 make a later checkout of the commit a branch switch, its dependencies
 checked as a first use checks them.  At a first use, the move planner

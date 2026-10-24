@@ -2,7 +2,8 @@
  *
  * matcache_branches.c
  *	  Materialization cache "branches": kept materializations are the hidden
- *	  branches of detached checkouts, kept after their sessions leave.
+ *	  branches of detached checkouts, kept after their sessions leave, and
+ *	  the commits branches keep their pages as of.
  *
  * A detached checkout of a commit is a session on a hidden branch at the
  * commit (PROLLY_DETACHED_PREFIX and its hash), its copies made by its
@@ -15,6 +16,12 @@
  * prolly.kept_checkouts of them per database: a later checkout of the
  * commit is a checkout of the branch, and a move or first use elsewhere
  * can give a table the storage of a kept branch that has its target's.
+ *
+ * A branch's pages are kept as of the last commits it was at, as the refs
+ * record (their kept_commits()): those are kept states too, a table's
+ * relations by snapshots of their storage, as immutable as a kept
+ * checkout's however the branch moves on.  Their budget is
+ * prolly.kept_commits, which the refs keep to.
  *
  * The checkout sweep lets go of the kept branches past the budget, least
  * recently checked out first.  Recency is kept in shared memory, a slot
@@ -35,6 +42,7 @@
 #include "access/prolly_deps.h"
 #include "access/prolly_shmem.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/branch.h"
 #include "catalog/branch_ops.h"
 #include "catalog/pg_branch.h"
@@ -133,6 +141,8 @@ typedef struct VisitKept
 	ProllyKeptVisit visit;
 	void	   *arg;
 	List	   *states;			/* ProllyKeptState *, visited after the scan */
+	List	   *branches;		/* ProllyKeptState *: the other branches,
+								 * their kept commits read after it */
 } VisitKept;
 
 static void
@@ -141,35 +151,114 @@ note_kept(const char *name, Oid branch, void *arg)
 	VisitKept  *vk = arg;
 	ProllyKeptState *s;
 
-	if (!detached_name(name))
-		return;
 	s = palloc0(sizeof(ProllyKeptState));
 	s->name = pstrdup(name);
 	s->branch = branch;
-	vk->states = lappend(vk->states, s);
+	if (detached_name(name))
+	{
+		s->kind = PROLLY_KEPT_CHECKOUT;
+		vk->states = lappend(vk->states, s);
+	}
+	else
+	{
+		s->kind = PROLLY_KEPT_COMMIT;
+		vk->branches = lappend(vk->branches, s);
+	}
+}
+
+/* Does snap see the transaction that kept a commit's pages committed? */
+static bool
+kept_seen(const ProllyKeptCommit *kc, Snapshot snap)
+{
+	TransactionId xid = XidFromFullTransactionId(kc->kept_by);
+
+	/*
+	 * (the refs show a keeping that committed, or this transaction's own;
+	 * so seen unless the snapshot was taken while it ran)
+	 */
+	if (!TransactionIdIsNormal(xid))
+		return false;
+	return TransactionIdIsCurrentTransactionId(xid) ||
+		!XidInMVCCSnapshot(xid, snap);
+}
+
+/* A branch's kept commits, each as a kept state. */
+typedef struct KeptCommits
+{
+	const ProllyKeptState *of;	/* its branch */
+	Snapshot	snap;
+	List	   *states;
+} KeptCommits;
+
+static void
+note_kept_commit(const ProllyKeptCommit *kc, void *arg)
+{
+	KeptCommits *k = arg;
+	ProllyKeptState *s;
+	ProllyKeptCommit *copy;
+	ProllyKeptTable *tables;
+
+	if (!kept_seen(kc, k->snap))
+		return;
+	copy = palloc(sizeof(ProllyKeptCommit));
+	*copy = *kc;
+	tables = palloc_array(ProllyKeptTable, Max(kc->ntables, 1));
+	for (int t = 0; t < kc->ntables; t++)
+	{
+		BranchKeptRelation *rels = palloc_array(BranchKeptRelation,
+												kc->tables[t].nrels);
+
+		memcpy(rels, kc->tables[t].rels,
+			   sizeof(BranchKeptRelation) * kc->tables[t].nrels);
+		tables[t].name = pstrdup(kc->tables[t].name);
+		tables[t].nrels = kc->tables[t].nrels;
+		tables[t].rels = rels;
+	}
+	copy->tables = tables;
+	s = palloc0(sizeof(ProllyKeptState));
+	*s = *k->of;
+	s->commit = kc->commit;
+	s->kept = copy;
+	k->states = lappend(k->states, s);
 }
 
 /*
- * The kept branches the snapshot sees made, whose commits' ordering
- * dependencies match the installed extensions: each with its head and
- * that commit's root.  (Visited once the branches are listed: a visit may
- * read catalogs of its own.)
+ * The kept branches the snapshot sees made, then the kept commits whose
+ * keeping it sees committed (every branch's but the kept branches', whose
+ * own pages serve as the branch), whose commits' ordering dependencies
+ * match the installed extensions: each with its commit and that commit's
+ * root.  (Visited once the branches are listed: a visit may read catalogs
+ * of its own.)
  */
 static void
 branches_visit(Snapshot snap, ProllyKeptVisit visit, void *arg)
 {
 	ProllyDatabaseComponents dc;
-	VisitKept	vk = {snap, visit, arg, NIL};
+	VisitKept	vk = {snap, visit, arg, NIL, NIL};
+	List	   *commits = NIL;
 
 	prolly_database_components(&dc);
 	branch_ops()->branches(note_kept, &vk);
 	foreach_ptr(ProllyKeptState, s, vk.states)
 	{
+		if (s->branch == MyBranch || !made_seen(s->branch, snap) ||
+			!PROLLY_CALL(dc.refs, resolve, s->name, &s->commit))
+			continue;
+		commits = lappend(commits, s);
+	}
+	if (PROLLY_HAS(dc.refs, kept_commits) && prolly_kept_commits > 0)
+		foreach_ptr(ProllyKeptState, b, vk.branches)
+		{
+			KeptCommits k = {b, snap, NIL};
+
+			PROLLY_CALL(dc.refs, kept_commits, b->name, note_kept_commit, &k);
+			commits = list_concat(commits, k.states);
+		}
+	foreach_ptr(ProllyKeptState, s, commits)
+	{
 		ProllyCommitInfo info;
 
-		if (s->branch == MyBranch || !made_seen(s->branch, snap) ||
-			!PROLLY_CALL(dc.refs, resolve, s->name, &s->commit) ||
-			!PROLLY_CALL(dc.refs, commit_get, &s->commit, &info) ||
+		if (!PROLLY_CALL(dc.refs, commit_get, &s->commit, &info) ||
 			!prolly_ordering_dependencies_match(&info))
 			continue;
 		s->root = info.root;
@@ -297,7 +386,7 @@ const ProllyMatCacheRoutine prolly_matcache_branches = {
 		.impl_id = 1,
 		.format_version = 1,
 		.name = "branches",
-		.description = "detached checkouts' hidden branches, kept read-only after their sessions leave",
+		.description = "detached checkouts' hidden branches, kept read-only after their sessions leave, and branches' kept commits",
 	},
 	.kept = branches_kept,
 	.visit = branches_visit,

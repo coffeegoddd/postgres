@@ -2,7 +2,8 @@
  *
  * prolly_matcache.h
  *	  Materialization cache interface: the local, physical states of
- *	  commits kept after the sessions that used them have left.
+ *	  commits kept after the sessions that used them have left, or as
+ *	  branches move on.
  *
  * A materialization is a commit's canonical state made Postgres's: its
  * tables' heap pages, indexes and TOAST tables, held by a branch's copies.
@@ -15,18 +16,33 @@
  * target's the storage of a kept state whose root holds the target's
  * table: the same data tree, definition, relations and physical layout.
  *
+ * A kept state is of one of two kinds, and either can serve a checkout, a
+ * reset or a first use, the move planner costing both alike:
+ * - a kept checkout: a branch that no transaction writes again, its
+ *   working set its head commit's root; a table is given its storage
+ *   (branch operations' share());
+ * - a kept commit: the pages a branch keeps as of one of the last commits
+ *   it was at (prolly.kept_commits, branch operations' keep()), each
+ *   table's relations by a snapshot of their storage, however the branch
+ *   has moved on since; a table is given storage made of its snapshots
+ *   (branch operations' share_kept(), or a first use's make_kept()).
+ *
  * Contract:
- * - A kept state is a branch (name, OID) that no transaction writes again,
- *   its working set its head commit's root.  visit() visits those whose
- *   making the snapshot sees committed (so every tuple their pages hold is
- *   one the snapshot sees as committed or aborted) and whose commit's
- *   ordering dependencies match the installed extensions (the indexes on
- *   their pages were built under them).  A visited state can be evicted
- *   by another session at any time; its user pins it first (the branch's
- *   share()) and skips it if it is gone.
- * - kept() says whether the branch called name is one.
- * - note_use() is called when a session checks out a kept state; evict()
- *   is given the kept states other than the session's, and lets go of the
+ * - visit() visits the kept states whose making the snapshot sees
+ *   committed (a kept checkout's branch, a kept commit's keeping
+ *   transaction: so every tuple their pages hold is one the snapshot sees
+ *   as committed or aborted) and whose commit's ordering dependencies
+ *   match the installed extensions (the indexes on their pages were built
+ *   under them): the session branch's kept commits too, but not the
+ *   session's own branch as a kept checkout.  A visited state can be let
+ *   go of by another session at any time; its user holds it first
+ *   (share() pins the branch; share_kept() and make_kept() lock the
+ *   relations against letting go of the pages) and skips it if it is
+ *   gone.
+ * - kept() says whether the branch called name is a kept checkout.
+ * - note_use() is called when a session checks out a kept checkout;
+ *   evict() is given the kept checkouts other than the session's, and lets
+ *   go of the
  *   idle ones (no session on them) past the budget, least recently used
  *   first, by calling drop() on each until within it: drop() deletes the
  *   branch, true if it is gone (deleted now, or by another meanwhile),
@@ -42,18 +58,27 @@
 #ifndef PROLLY_MATCACHE_H
 #define PROLLY_MATCACHE_H
 
+#include "access/prolly_refs.h"
 #include "access/prolly_registry.h"
 #include "access/prolly_types.h"
 #include "nodes/pg_list.h"
 #include "utils/snapshot.h"
 
+typedef enum ProllyKeptKind
+{
+	PROLLY_KEPT_CHECKOUT,
+	PROLLY_KEPT_COMMIT,
+} ProllyKeptKind;
+
 /* A kept materialization. */
 typedef struct ProllyKeptState
 {
+	ProllyKeptKind kind;
 	const char *name;			/* the branch holding it */
 	Oid			branch;			/* and its OID */
 	ProllyHash	commit;			/* the commit it is of */
 	ProllyNodeRef root;			/* that commit's canonical root */
+	const ProllyKeptCommit *kept;	/* a kept commit's pages (else NULL) */
 } ProllyKeptState;
 
 typedef void (*ProllyKeptVisit) (const ProllyKeptState *state, void *arg);
