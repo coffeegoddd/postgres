@@ -87,6 +87,26 @@ struct ProllyDiffSink
 						   const ProllyValue *after);	/* NULL if removed */
 };
 
+/*
+ * One column of an encoded row as the row stores it, found without making
+ * a Datum or reading a value out of line (a value encoder's fields(),
+ * prolly_valenc.h).  bytes points into the row and is valid while the
+ * row's bytes are.
+ */
+typedef struct ProllyEncodedField
+{
+	bool		stored;			/* the row holds the column; false: the row
+								 * ends before it, or the column was added
+								 * after the row's layout, so it is its
+								 * missing value or NULL */
+	bool		missing;		/* not stored: the column's missing value */
+	bool		isnull;			/* NULL, stored or not */
+	bool		out_of_line;	/* bytes is a reference to a value tree */
+	ProllyValue bytes;			/* the column's canonical bytes, or the
+								 * reference (a missing value's: in the
+								 * encoder, while it is open) */
+} ProllyEncodedField;
+
 /* Tree nodes read from and written to a chunk store, for counting work. */
 typedef struct ProllyNodeCounters
 {
