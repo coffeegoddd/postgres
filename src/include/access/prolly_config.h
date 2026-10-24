@@ -25,6 +25,7 @@
 #include "access/prolly_keyenc.h"
 #include "access/prolly_keying.h"
 #include "access/prolly_memo.h"
+#include "access/prolly_moveplan.h"
 #include "access/prolly_merge.h"
 #include "access/prolly_reclaim.h"
 #include "access/prolly_refs.h"

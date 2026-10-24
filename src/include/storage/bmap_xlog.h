@@ -60,6 +60,10 @@
  *						reference-count pages of the blocks the entries it
  *						takes in hold
  * XLOG_BMAP_TREE		a map's nodes (xl_bmap_tree says how)
+ * XLOG_BMAP_RELEASE	the release queue (xl_bmap_release says how): block 0
+ *						is its metapage, then its pages; a drain's record
+ *						then has reference-count pages, and, if it frees
+ *						blocks, the allocator's metapage and bitmap pages
  *
  * A leaf registered (EXTEND, REMAP, UNREF) is a page of the page store
  * (BMAP_STORE_RELNUMBER's main fork).  0x60 was a flat map's SHARE, and the
@@ -68,6 +72,7 @@
  */
 #define XLOG_BMAP_INIT			0x00
 #define XLOG_BMAP_CREATE		0x10
+#define XLOG_BMAP_RELEASE		0x20
 #define XLOG_BMAP_EXTEND		0x30
 #define XLOG_BMAP_TRUNCATE		0x40
 #define XLOG_BMAP_FREE			0x50
@@ -216,6 +221,43 @@ typedef struct xl_bmap_tree
 } xl_bmap_tree;
 
 /*
+ * RELEASE's main data: the page store, and what is done to its queue.
+ *
+ * BMAP_RELEASE_QUEUE	entries pushed, each a holder of what it names: a
+ *						dropped map's subtrees and blocks
+ * BMAP_RELEASE_DRAIN	entries popped, each a holder let go of: a block's
+ *						count one less, or, if nothing else held it, the
+ *						block freed (a node's children pushed first)
+ */
+#define BMAP_RELEASE_QUEUE		1
+#define BMAP_RELEASE_DRAIN		2
+
+typedef struct xl_bmap_release
+{
+	RelFileLocator locator;
+	uint32		op;
+	uint32		npopped;		/* (DRAIN) entries popped */
+} xl_bmap_release;
+
+/*
+ * An entry of the release queue: a tree's node of 'level', mapping from
+ * 'first', born at 'since' (the pointer to it, as a map has it); or a data
+ * block (level BMAP_QUEUED_BLOCK).  It holds the block as a map's pointer
+ * or entry does.
+ */
+#define BMAP_QUEUED_BLOCK		0xFFFF
+
+typedef struct BmapQueued
+{
+	BlockNumber block;
+	uint16		level;
+	uint16		unused;
+	BlockNumber first;
+	uint32		unused2;
+	XLogRecPtr	since;
+} BmapQueued;
+
+/*
  * Every block's data begins with a kind, saying which delta follows, and
  * flags.
  */
@@ -228,6 +270,8 @@ typedef struct xl_bmap_tree
 #define BMAP_DELTA_CHANGES	7
 #define BMAP_DELTA_ROOT		8
 #define BMAP_DELTA_SNAPSHOT	9
+#define BMAP_DELTA_QUEUE_META	10
+#define BMAP_DELTA_QUEUE	11
 
 #define BMAP_DELTA_INIT		0x01	/* initialize the page first */
 
@@ -307,6 +351,24 @@ typedef struct xl_bmap_snapshot_delta
 	uint32		slot;
 	xl_bmap_snapshot snap;
 } xl_bmap_snapshot_delta;
+
+/* Block data of the release queue's metapage: how many entries it has. */
+typedef struct xl_bmap_queue_meta_delta
+{
+	uint16		kind;			/* BMAP_DELTA_QUEUE_META */
+	uint16		flags;
+	uint32		nentries;
+} xl_bmap_queue_meta_delta;
+
+/* Block data of a release queue's page: entries set from slot 'first'. */
+typedef struct xl_bmap_queue_delta
+{
+	uint16		kind;			/* BMAP_DELTA_QUEUE */
+	uint16		flags;
+	uint32		first;
+	uint32		n;
+	/* BmapQueued entries[n] follow */
+} xl_bmap_queue_delta;
 
 /* Block data of a bitmap page: bits set to 'value'. */
 typedef struct xl_bmap_bits_delta

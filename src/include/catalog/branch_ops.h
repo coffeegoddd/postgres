@@ -85,9 +85,17 @@ typedef struct BranchOpsRoutine
 	/*
 	 * Make a branch as create does, without its checks of the session: the
 	 * copies of one that exists already in all but them, which its first
-	 * use makes.
+	 * use makes.  The copies of the tables emptied names (qualified names,
+	 * as the source branch has them; a name it hasn't, or of no plain
+	 * table, passed over) begin empty instead, as TRUNCATE leaves a table:
+	 * the table and its TOAST table given new storage, no page shared, its
+	 * indexes built over no rows, and its change log told it was emptied.
+	 * nowait: if a writer of start_point's is in the middle of changing it,
+	 * nothing is made and InvalidOid returned, rather than waiting for the
+	 * writer (which may be idle in its transaction for as long as it likes).
 	 */
-	Oid			(*make) (const char *name, const char *start_point);
+	Oid			(*make) (const char *name, const char *start_point,
+						 List *emptied, bool nowait);
 
 	/* Make name the session's branch. */
 	void		(*checkout) (const char *name);
@@ -177,11 +185,13 @@ typedef struct BranchOpsRoutine
 	 * them, used[] saying which were: O(1) in each relation's size, with
 	 * no lock that holds up the source's writers (only definition changes,
 	 * VACUUM and letting go of kept pages wait).  The source's other
-	 * relations are copied as make() copies them, locked against writers.
+	 * relations are copied as make() copies them, locked against writers,
+	 * the tables of emptied among them begun empty; nowait as for make()
+	 * (InvalidOid, nothing made, if a lock is held).
 	 */
 	Oid			(*make_kept) (const char *name, const char *source,
 							  const BranchKeptTable *tables, int ntables,
-							  bool *used);
+							  bool *used, List *emptied, bool nowait);
 } BranchOpsRoutine;
 
 /* the branch operations of this database */

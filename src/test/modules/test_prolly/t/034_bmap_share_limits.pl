@@ -92,6 +92,8 @@ SKIP:
 	like($err, qr/error triggered for injection point bmap-share-map-page/,
 		'the share failed partway');
 	sql(q{SELECT injection_points_detach('bmap-share-map-page')});
+	# (the aborted copy's storage, queued, let go of)
+	sql(q{SELECT * FROM test_bmap_release_drain()});
 	is(sql(qq{SELECT count(*) FROM test_bmap_map($big) WHERE refs <> 0}),
 		'0', 'no block is left counted for the aborted copy');
 }
