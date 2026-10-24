@@ -111,6 +111,15 @@ def validate_run(path: Path) -> list[str]:
         return [f"invalid result evidence: {e}"]
 
 
+def recorded_answers(run: Path, r: dict) -> dict | None:
+    """The answers a cell recorded (raw/answers.json: query name to result
+    digest), or None if it recorded none."""
+    if not r.get("raw_dir"):
+        return None
+    path = run / r["raw_dir"] / "answers.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
 def comparison_identity(cfg: dict, env: dict) -> str:
     # AM, source revision and server build (with its psql and pgbench) may
     # differ: these are the independent variables. Their exact hashes are retained as provenance.
@@ -172,4 +181,14 @@ def compatible(base: Path, other: Path, vary: str = "engine") -> list[str]:
                 reference = base_results.get(unbuilt(r["key"]))
                 if reference is None or tpch_answers(other / r["raw_dir"]) != tpch_answers(base / reference["raw_dir"]):
                     problems.append(f"TPC-H query parameters, types, row counts or actual answers differ: {r['key']}")
+            # (a workload's recorded answers, as the G suite's: the same
+            # queries must give the same results on both)
+            reference = base_results.get(unbuilt(r["key"]))
+            if r.get("status") == "ok" and reference is not None and reference.get("status") == "ok":
+                mine, theirs = recorded_answers(other, r), recorded_answers(base, reference)
+                if mine != theirs:
+                    differ = sorted(k for k in set(mine or {}) | set(theirs or {})
+                                    if (mine or {}).get(k) != (theirs or {}).get(k))
+                    problems.append(f"answers differ ({', '.join(differ[:5])}"
+                                    f"{', ...' if len(differ) > 5 else ''}): {r['key']}")
     return problems

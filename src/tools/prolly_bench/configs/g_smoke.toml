@@ -1,0 +1,63 @@
+# The G and GV suites at smoke quality: every workload once, small data,
+# a few clients, short windows.  For trying the workloads and for a quick
+# heap-against-prolly reading (G4 and G6 cover PostGIS's toast cache), not
+# for benchmark results (standard.toml).
+#
+#	prolly_bench run G --am heap,prolly --config configs/g_smoke.toml --pg-bin BUILD/inst/bin
+#	prolly_bench run GV --am prolly --config configs/g_smoke.toml --pg-bin BUILD/inst/bin
+
+[run]
+quality = "smoke"
+repetitions = 1
+clients = [1, 4]
+warmup_seconds = 2
+measure_seconds = 10
+sizes = ["small"]
+fio_baseline = false
+seed = 1
+collectors = ["wal", "pg_stat_io", "cpu", "space", "engine_counters"]
+required_collectors = ["wal", "pg_stat_io", "cpu", "space"]
+
+[postgres]
+shared_buffers = "1GB"
+max_wal_size = "8GB"
+checkpoint_timeout = "5min"
+fsync = "on"
+synchronous_commit = "on"
+full_page_writes = "on"
+max_connections = 64
+
+[sizes.small]
+g_points = 200000
+g_buildings = 50000
+g_large = 8
+g_large_vertices = 100000      # 1.6 MB each
+g_fleet = 20000
+g_geog = 100000
+
+[workloads.G3]
+k = [10]
+
+[workloads.G4]
+parallel = [0]
+iterations = 3
+
+[workloads.GV1]
+background = ["none"]
+changes = [1, 1000]
+iterations = 3
+
+[workloads.GV2]
+background = ["none"]
+changes = [1000]
+
+[workloads.GV3]
+background = ["none"]
+
+[workloads.GV4]
+background = ["none"]
+commits = 20
+
+[workloads.GV5]
+background = ["none"]
+iterations = 3
