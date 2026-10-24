@@ -167,6 +167,8 @@ jobs:
   # on a manual dispatch, on upstream sync pull requests (a Postgres merge
   # can break PostGIS's build; that is reported there, not gated, and
   # fixed by re-pinning PostGIS) and on pull requests labelled area:postgis.
+  # (A label is read when a push or a re-run starts the workflow: adding it
+  # takes effect on the pull request's next push or re-run, not at once.)
   postgis:
     name: PostGIS requirement groups
     if: >-

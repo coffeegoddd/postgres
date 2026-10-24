@@ -33,8 +33,18 @@ setup_target($node, 'postgres', $am);
 sub sql { return $node->safe_psql('postgres', $_[0]); }
 
 # A session open across a crash: its server is gone, so quitting it may
-# find the pipe closed (an error from some IPC::Run versions).
-sub gone { my ($session) = @_; eval { $session->quit }; }
+# find psql's pipe closed (some IPC::Run versions raise "ack Broken pipe").
+# That error is expected: the psql process is then reaped.  Any other is
+# raised.
+sub gone
+{
+	my ($session) = @_;
+	return if eval { $session->quit; 1 };
+	my $err = $@;
+	die $err unless $err =~ /Broken pipe/;
+	$session->{run}->kill_kill;
+	$session->{run}->finish;
+}
 
 # Per-table digests over EWKB, and which ids a GiST scan finds (every
 # geometry the probe box meets, the crashed writes' included) against a
