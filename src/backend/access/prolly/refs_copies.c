@@ -4620,11 +4620,23 @@ relations_kept(const ProllyHash *parent, const char *had, const char *now,
 					changed = true;
 			if (local != NIL && !changed)
 				keep = true;
-			/* (else as the parent had it: the same table, by its class) */
+			/*
+			 * (else as the parent had it: the same relation, or the same
+			 * table, by its class, asked only when the relation isn't there)
+			 */
 			else if (have)
 			{
-				Oid			cls = relation_class(relid);
+				char		want[16];
+				Oid			cls;
 
+				snprintf(want, sizeof(want), "\n%010u ", relid);
+				if (strncmp(v.data, want + 1, 11) == 0 || strstr(v.data, want) != NULL)
+				{
+					keep = true;
+					cls = InvalidOid;
+				}
+				else
+					cls = relation_class(relid);
 				for (const char *q = v.data; *q && !keep;)
 				{
 					const char *qend = strchrnul(q, '\n');
