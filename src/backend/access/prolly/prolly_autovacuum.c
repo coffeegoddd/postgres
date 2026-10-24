@@ -183,6 +183,14 @@ prolly_autovacuum_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("prolly.vacuum_copy_kept_pages",
+							 "Has VACUUM freeze, and set all-visible, pages shared only with the commits a table's pages are kept as of, copying them.",
+							 "Off, VACUUM leaves such pages as it leaves any shared page with nothing to reclaim, and only an aggressive VACUUM freezes them (copying them).  On, it freezes and sets them all-visible like unshared pages, at the cost of a copy of each page so changed, kept until its commit stops being kept.",
+							 &vacuum_copy_kept_pages,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("prolly.kept_commits",
 							"How many of the commits each branch was last at its pages are kept as of.",
 							"A hard reset to one of them gives the tables the pages kept, rather than writing their rows; each keeps the pages changed since.  0 keeps none.",

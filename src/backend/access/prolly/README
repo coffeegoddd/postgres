@@ -632,11 +632,14 @@ branch's baseline then and each table's relations and snapshots ('K').
 A snapshot's slot names the transaction that took it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
 included) is kept by nobody: the relation's next snapshot, or a page
-sweep, lets go of it.  VACUUM freezes and sets all-visible the pages a
-relation shares only with its own snapshots, copying them (the kept
-version goes once its commit stops being kept), but leaves as they are
-the pages another branch shares, which the block map tells apart by when
-each page's entry was born (its header's shared_below).  A share
+sweep, lets go of it.  VACUUM leaves the pages a relation shares only
+with its own snapshots as it leaves any shared page with nothing to
+reclaim (an aggressive VACUUM still freezes them, copying them).  With
+prolly.vacuum_copy_kept_pages on, it freezes and sets them all-visible,
+copying them (the kept version goes once its commit stops being kept),
+but still leaves as they are the pages another branch shares, which the
+block map tells apart by when each page's entry was born (its header's
+shared_below).  A share
 raises shared_below; once the other branch's map is let go of, a page
 sweep (prolly_page_sweep()), having counted every holder, lowers it to
 the newest entry another map still holds, so VACUUM treats those pages

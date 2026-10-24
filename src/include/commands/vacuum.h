@@ -347,6 +347,9 @@ extern PGDLLIMPORT int vacuum_multixact_failsafe_age;
 extern PGDLLIMPORT bool track_cost_delay_timing;
 extern PGDLLIMPORT bool vacuum_truncate;
 
+/* block-mapped storage: see vacuumlazy.c */
+extern PGDLLIMPORT bool vacuum_copy_kept_pages;
+
 /*
  * Relevant for vacuums implementing eager scanning. Normal vacuums may
  * eagerly scan some all-visible but not all-frozen pages. Since the goal

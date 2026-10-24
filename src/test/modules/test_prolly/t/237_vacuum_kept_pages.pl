@@ -22,6 +22,7 @@ prolly_fold_worker = off
 checkpoint_timeout = 1h
 wal_keep_size = '256MB'
 wal_consistency_checking = 'all'
+prolly.vacuum_copy_kept_pages = on
 });
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION test_prolly');
