@@ -82,6 +82,12 @@ SELECT DISTINCT refs FROM test_bmap_map(:src);
 (1 row)
 
 DROP TABLE cow.t;
+SELECT entries > 0 AS drained FROM test_bmap_release_drain();
+ drained 
+---------
+ t
+(1 row)
+
 SELECT test_bmap_free_blocks() - :free_before =
 	:nblocks + :tlog + :tlog_nodes + :src_nodes AS freed_by_drop;
  freed_by_drop 
@@ -110,6 +116,12 @@ SELECT count(test_bmap_unlink(copy)) FROM ucopies;
 
 SELECT test_bmap_free_blocks() AS free_before \gset
 DROP TABLE cow.u;
+SELECT entries > 0 AS drained FROM test_bmap_release_drain();
+ drained 
+---------
+ t
+(1 row)
+
 SELECT test_bmap_free_blocks() - :free_before = :ulog + :ulog_nodes AS stuck_left_allocated;
  stuck_left_allocated 
 ----------------------

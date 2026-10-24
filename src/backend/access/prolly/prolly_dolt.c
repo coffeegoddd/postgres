@@ -64,6 +64,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_type.h"
+#include "pgstat.h"
 #include "storage/bmap.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
@@ -536,6 +537,15 @@ writers(void)
 
 	prolly_database_components(&dc);
 	return dc.writers;
+}
+
+static const ProllyMatCacheRoutine *
+matcache(void)
+{
+	ProllyDatabaseComponents dc;
+
+	prolly_database_components(&dc);
+	return dc.matcache;
 }
 
 /* while set, the session's branch is written by an operation that commits */
@@ -1280,13 +1290,21 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
 		db->names = lappend(db->names, pstrdup(name));
 }
 
+
+/* What a sweep deletes its candidates with (sweep_one()). */
+typedef struct Sweep
+{
+	char	   *current;
+	MemoryContext cxt;
+	ResourceOwner owner;
+	bool		was_read_only;
+} Sweep;
+
 /*
- * The hidden branches no session is on any more (current is the session's
- * branch), deleted, each in a subtransaction: one a session is on, or
- * that the session may not delete, is left; any other error is the
- * checkout's.  Only in a transaction that can
- * write, or that is read-only only for the branch it started on (one
- * leaving a commit).
+ * Delete hidden branch name, in a subtransaction, if it is still one no
+ * session is on: true if it is gone, deleted now or (a commit's hidden
+ * branch) by another sweep meanwhile.  One a session is on, or that the
+ * session may not delete, is left; any other error is the checkout's.
  *
  * Another checkout can delete a candidate, or a session write on a writer
  * branch and leave it, while this one waits for the refs.  Each is asked
@@ -1294,14 +1312,79 @@ add_detached(const char *name, const ProllyHash *head, void *arg)
  * deleted, or one that is left, lets the refs go with the subtransaction,
  * so a checkout that deletes nothing holds up no other mover.
  */
+static bool
+sweep_one(const char *name, void *arg)
+{
+	Sweep	   *sw = arg;
+	DetachedBranches still = {NIL, sw->current, name, false};
+	bool		deleted = false;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(sw->cxt);
+	PG_TRY();
+	{
+		PROLLY_CALL(refs(), lock);
+		AcceptInvalidationMessages();
+		PROLLY_CALL(refs(), branches, add_detached, &still);
+		if (still.found)
+		{
+			BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
+											 name, true));
+			if (writer_branch_name(name))
+				PROLLY_CALL(writers(), set_writer_branch, name,
+							NULL, NULL);
+			ReleaseCurrentSubTransaction();
+			deleted = true;
+			if (detached_branch(name))
+				pgstat_count_prolly(PGSTAT_PROLLY_KEPT_CHECKOUTS_EVICTED, 1);
+		}
+		else
+		{
+			RollbackAndReleaseCurrentSubTransaction();
+			/* (a commit's hidden branch no longer one is gone: another's sweep) */
+			deleted = detached_branch(name);
+		}
+		MemoryContextSwitchTo(sw->cxt);
+		CurrentResourceOwner = sw->owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *ed;
+
+		MemoryContextSwitchTo(sw->cxt);
+		ed = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(sw->cxt);
+		CurrentResourceOwner = sw->owner;
+		/* (a cancel, or anything else, isn't the branch kept) */
+		if (ed->sqlerrcode != ERRCODE_OBJECT_IN_USE &&
+			ed->sqlerrcode != ERRCODE_INSUFFICIENT_PRIVILEGE)
+		{
+			XactReadOnly = sw->was_read_only;
+			ReThrowError(ed);
+		}
+		FreeErrorData(ed);
+	}
+	PG_END_TRY();
+	return deleted;
+}
+
+/*
+ * The hidden branches no session is on any more (current is the session's
+ * branch): writer branches done with are deleted; commits' hidden
+ * branches are kept materializations, which the materialization cache
+ * keeps up to its budget, deleting the rest (sweep_one() each); kept_only,
+ * only those.  Only in a transaction that can write, or that is read-only
+ * only for the branch it started on (one leaving a commit).
+ */
 static void
-sweep_detached(char *current)
+sweep_detached(char *current, bool kept_only)
 {
 	DetachedBranches db = {NIL, current, NULL, false};
-	MemoryContext cxt = CurrentMemoryContext;
-	ResourceOwner owner = CurrentResourceOwner;
-	ListCell   *lc;
-	bool		was_read_only = XactReadOnly;
+	Sweep		sw = {current, CurrentMemoryContext, CurrentResourceOwner,
+	XactReadOnly};
+	List	   *kept = NIL;
 
 	if ((XactReadOnly && !XactReadOnlyFromBranch) || RecoveryInProgress())
 		return;
@@ -1309,54 +1392,65 @@ sweep_detached(char *current)
 	if (db.names == NIL)
 		return;
 	XactReadOnly = false;
-	foreach(lc, db.names)
+	foreach_ptr(char, name, db.names)
 	{
-		char	   *name = (char *) lfirst(lc);
-		DetachedBranches still = {NIL, current, name, false};
-
-		BeginInternalSubTransaction(NULL);
-		MemoryContextSwitchTo(cxt);
-		PG_TRY();
-		{
-			PROLLY_CALL(refs(), lock);
-			AcceptInvalidationMessages();
-			PROLLY_CALL(refs(), branches, add_detached, &still);
-			if (still.found)
-			{
-				BRANCH_WRITES_HUSHED(PROLLY_CALL(refs(), branch_delete,
-												 name, true));
-				if (writer_branch_name(name))
-					PROLLY_CALL(writers(), set_writer_branch, name,
-								NULL, NULL);
-				ReleaseCurrentSubTransaction();
-			}
-			else
-				RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(cxt);
-			CurrentResourceOwner = owner;
-		}
-		PG_CATCH();
-		{
-			ErrorData  *ed;
-
-			MemoryContextSwitchTo(cxt);
-			ed = CopyErrorData();
-			FlushErrorState();
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(cxt);
-			CurrentResourceOwner = owner;
-			/* (a cancel, or anything else, isn't the branch kept) */
-			if (ed->sqlerrcode != ERRCODE_OBJECT_IN_USE &&
-				ed->sqlerrcode != ERRCODE_INSUFFICIENT_PRIVILEGE)
-			{
-				XactReadOnly = was_read_only;
-				ReThrowError(ed);
-			}
-			FreeErrorData(ed);
-		}
-		PG_END_TRY();
+		if (detached_branch(name))
+			kept = lappend(kept, name);
+		else if (!kept_only)
+			(void) sweep_one(name, &sw);
 	}
-	XactReadOnly = was_read_only;
+	if (kept != NIL)
+		PROLLY_CALL(matcache(), evict, kept, sweep_one, &sw);
+	XactReadOnly = sw.was_read_only;
+}
+
+/* Does the database have a commit's hidden branch?  (Read without the refs.) */
+static bool
+has_detached_branches(void)
+{
+	Relation	brel = table_open(BranchRelationId, AccessShareLock);
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	scan = systable_beginscan(brel, InvalidOid, false, NULL, 0, NULL);
+	while (!found && (tup = systable_getnext(scan)) != NULL)
+		found = detached_branch(NameStr(((Form_pg_branch) GETSTRUCT(tup))->brname));
+	systable_endscan(scan);
+	table_close(brel, AccessShareLock);
+	return found;
+}
+
+bool
+prolly_let_go_of_kept_states(void)
+{
+	int			budget = prolly_kept_checkouts;
+
+	if (!IsTransactionState() || RecoveryInProgress() || !has_detached_branches())
+		return false;
+	prolly_kept_checkouts = 0;
+	PG_TRY();
+	{
+		sweep_detached(branch_ops()->current(), true);
+	}
+	PG_FINALLY();
+	{
+		prolly_kept_checkouts = budget;
+	}
+	PG_END_TRY();
+	return true;
+}
+
+/*
+ * (objects of other databases, which may be their kept states', or of a
+ * commit's hidden branch here, one a session is on)
+ */
+bool
+prolly_kept_states_named(const char *detail)
+{
+	return detail != NULL &&
+		(strstr(detail, " in database ") != NULL ||
+		 strstr(detail, "branch \"" PROLLY_DETACHED_PREFIX) != NULL);
 }
 
 
@@ -1637,7 +1731,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	if (!create && strcmp(branch, branch_ops()->current()) == 0 &&
 		PROLLY_CALL(refs(), branch_lookup, branch, &(ProllyBranchId) {0}))
 	{
-		sweep_detached(branch);
+		sweep_detached(branch, false);
 		result[0] = "0";
 		result[1] = psprintf("Already on branch '%s'", branch);
 		PG_RETURN_DATUM(text_array(2, result));
@@ -1664,13 +1758,35 @@ dolt_checkout(PG_FUNCTION_ARGS)
 					 errmsg("branch or commit \"%s\" does not exist", branch)));
 		/* (a branch name has room for 40 digits: the whole hash) */
 		hidden = psprintf("%s%.40s", PROLLY_DETACHED_PREFIX, hash_hex(&id));
+		/*
+		 * (rolled back, the checkout leaves the session where it was: as a
+		 * hidden branch made by it goes, so does the session from one it
+		 * found)
+		 */
+		branch_return_on_abort();
 		if (!PROLLY_CALL(refs(), branch_lookup, hidden, &(ProllyBranchId) {0}))
 			create_branch(hidden, hash_hex(&id));
 		else if (!PROLLY_CALL(refs(), resolve, hidden, &head) || !same_hash(&head, &id))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("the hidden branch of commit %s has moved off it", hash_hex(&id))));
+		else if (PROLLY_CALL(matcache(), kept, hidden))
+		{
+			ProllyCommitInfo info;
+
+			/*
+			 * (its copies, kept, are the commit's as a first use would make
+			 * them: what the commit needs from outside is checked as a first
+			 * use checks it)
+			 */
+			if (PROLLY_CALL(refs(), commit_get, &id, &info))
+				prolly_check_commit_dependencies(&info, NULL, "checkout", false);
+			pgstat_count_prolly(PGSTAT_PROLLY_KEPT_CHECKOUTS_REUSED, 1);
+		}
 		checkout_branch(hidden);
+		PROLLY_CALL(matcache(), note_use, hidden);
+		/* (the hidden branches past the cache's budget go: not this one) */
+		sweep_detached(hidden, true);
 		MyBranchReadOnly = true;
 		if (!XactReadOnly)
 			XactReadOnlyFromBranch = true;
@@ -1687,7 +1803,7 @@ dolt_checkout(PG_FUNCTION_ARGS)
 	if (create)
 		create_branch(branch, start);
 	checkout_branch(branch);
-	sweep_detached(branch);
+	sweep_detached(branch, false);
 	result[0] = "0";
 	result[1] = psprintf("Switched to branch '%s'", branch);
 	PG_RETURN_DATUM(text_array(2, result));

@@ -134,6 +134,8 @@ $drop->query_until(qr/dropping/, q{\echo dropping
 DROP TABLE t;
 });
 $node->wait_for_event('client backend', 'bmap-dropped');
+# (what the drop queued, let go of by a drain while the map is still there)
+sql(q{SELECT * FROM test_bmap_release_drain()});
 cmp_ok(sql(q{SELECT test_bmap_free_blocks()}), '>', $free_before,
 	'its blocks are free');
 sql(q{CREATE TABLE r (a int, b text) WITH (fillfactor = 10);

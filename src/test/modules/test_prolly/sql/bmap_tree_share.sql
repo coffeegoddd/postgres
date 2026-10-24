@@ -17,7 +17,7 @@ SET debug_block_mapped_heap = on;
 CREATE FUNCTION pg_temp.counted() RETURNS TABLE (name text, value bigint)
 LANGUAGE sql AS $$
 	SELECT n, coalesce((SELECT p.value FROM pg_stat_prolly p WHERE p.name = n), -1)
-	FROM unnest('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed}'::text[]) n
+	FROM unnest('{bmap_map_pages_copied,bmap_refcount_updates,bmap_blocks_freed,bmap_release_refcount_updates,bmap_release_blocks_freed}'::text[]) n
 $$;
 
 -- two tables, of about 1000 and 10000 blocks, each over two subtrees
@@ -69,7 +69,8 @@ SELECT (SELECT refs FROM test_bmap_tree(:big) WHERE level = 1) AS source_node_re
 	(SELECT refs FROM test_bmap_tree(:big_copy) WHERE level = 1) AS copy_node_refs;
 SELECT * FROM prolly_page_sweep();
 
--- dropping a copy: a count less for each subtree, whatever the size
+-- dropping a copy: a count less for each subtree, whatever the size, by
+-- the drain of the subtrees the drop queued
 SELECT pg_stat_reset_shared('prolly');
 SELECT test_bmap_unlink(:small_copy);
 SELECT pg_stat_force_next_flush();

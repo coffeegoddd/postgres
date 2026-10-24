@@ -14,6 +14,7 @@
 
 #include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/prolly_matcache.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
@@ -1298,15 +1299,25 @@ DropRole(DropRoleStmt *stmt)
 		 * This needs to happen after we've completed removing any
 		 * pg_auth_members entries that can be removed silently, in order to
 		 * avoid spurious failures. See notes above for more details.
+		 *
+		 * Copies a cache of this database keeps (its kept detached
+		 * checkouts) shouldn't keep the role from going: if anything
+		 * depends on it, those no session is on are let go of, and the
+		 * check is made again.  Other databases' are named with a hint.
 		 */
 		if (checkSharedDependencies(AuthIdRelationId, roleid,
-									&detail, &detail_log))
+									&detail, &detail_log) &&
+			(!prolly_let_go_of_kept_states() ||
+			 checkSharedDependencies(AuthIdRelationId, roleid,
+									 &detail, &detail_log)))
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("role \"%s\" cannot be dropped because some objects depend on it",
 							NameStr(roleform->rolname)),
 					 errdetail_internal("%s", detail),
-					 errdetail_log("%s", detail_log)));
+					 errdetail_log("%s", detail_log),
+					 prolly_kept_states_named(detail) ?
+					 errhint("A database's kept detached checkouts (prolly.kept_checkouts) hold copies of its objects: in a database named, set prolly.kept_checkouts to 0 and check out a branch to let them go.") : 0));
 
 		/*
 		 * Remove the role from the pg_authid table

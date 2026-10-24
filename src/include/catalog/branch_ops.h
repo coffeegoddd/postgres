@@ -60,9 +60,17 @@ typedef struct BranchOpsRoutine
 	/*
 	 * Make a branch as create does, without its checks of the session: the
 	 * copies of one that exists already in all but them, which its first
-	 * use makes.
+	 * use makes.  The copies of the tables emptied names (qualified names,
+	 * as the source branch has them; a name it hasn't, or of no plain
+	 * table, passed over) begin empty instead, as TRUNCATE leaves a table:
+	 * the table and its TOAST table given new storage, no page shared, its
+	 * indexes built over no rows, and its change log told it was emptied.
+	 * nowait: if a writer of start_point's is in the middle of changing it,
+	 * nothing is made and InvalidOid returned, rather than waiting for the
+	 * writer (which may be idle in its transaction for as long as it likes).
 	 */
-	Oid			(*make) (const char *name, const char *start_point);
+	Oid			(*make) (const char *name, const char *start_point,
+						 List *emptied, bool nowait);
 
 	/* Make name the session's branch. */
 	void		(*checkout) (const char *name);
@@ -86,9 +94,13 @@ typedef struct BranchOpsRoutine
 	 * storage it had going when the transaction commits.  Each is locked
 	 * first, without waiting, as TRUNCATE locks it, and the source's as a
 	 * copy locks them (against writers); then unchanged(arg), if given, says
-	 * whether the source's are still as the caller found them.  False, with
-	 * nothing shared, if a lock isn't free, unchanged says no, or one isn't
-	 * on both branches alike or can't be shared (the locks taken are kept).
+	 * whether the source's are still as the caller found them.  The source
+	 * is held against deletion to the transaction's end.  False, with
+	 * nothing shared, if the source is being deleted, a lock isn't free,
+	 * unchanged says no, or one isn't on both branches alike (the same
+	 * kind, access method, columns as stored, TOAST table, and for an
+	 * index the same definition) or can't be shared (the locks taken are
+	 * kept).
 	 * Like TRUNCATE, it isn't MVCC-safe: a snapshot taken before it reads
 	 * the new storage once it commits.
 	 */

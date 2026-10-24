@@ -118,6 +118,20 @@ bmap_desc(StringInfo buf, XLogReaderState *record)
 					appendStringInfo(buf, "op %u", xlrec->op);
 				break;
 			}
+		case XLOG_BMAP_RELEASE:
+			{
+				xl_bmap_release *xlrec = (xl_bmap_release *) rec;
+
+				appendStringInfo(buf, "store %u/%u; ",
+								 xlrec->locator.spcOid, xlrec->locator.dbOid);
+				if (xlrec->op == BMAP_RELEASE_QUEUE)
+					appendStringInfoString(buf, "queue");
+				else if (xlrec->op == BMAP_RELEASE_DRAIN)
+					appendStringInfo(buf, "drain %u", xlrec->npopped);
+				else
+					appendStringInfo(buf, "op %u", xlrec->op);
+				break;
+			}
 		case XLOG_BMAP_SHRINK:
 			{
 				xl_bmap_shrink *xlrec = (xl_bmap_shrink *) rec;
@@ -165,6 +179,8 @@ bmap_identify(uint8 info)
 			return "PRESERVE";
 		case XLOG_BMAP_TREE:
 			return "TREE";
+		case XLOG_BMAP_RELEASE:
+			return "RELEASE";
 	}
 	return NULL;
 }

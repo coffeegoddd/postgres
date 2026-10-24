@@ -1001,6 +1001,65 @@ test_commit_with(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(hash_text(&id));
 }
 
+/* The commit ref resolves to, or error. */
+static void
+commit_of_ref(const ProllyDatabaseComponents *dc, text *ref,
+			  ProllyCommitInfo *info)
+{
+	ProllyHash	id;
+
+	resolve_ref(dc, ref, &id);
+	if (!PROLLY_CALL(dc->refs, commit_get, &id, info))
+		elog(ERROR, "commit of \"%s\" is missing", text_to_cstring(ref));
+	if (!info->has_dependencies)
+		elog(ERROR, "commit of \"%s\" records no dependencies",
+			 text_to_cstring(ref));
+}
+
+/*
+ * test_commit_root(source, parent): a commit of source's root and
+ * dependencies, parent its one parent, written by the refs' commit_root
+ * (nothing folded, no branch moved); its id.
+ */
+PG_FUNCTION_INFO_V1(test_commit_root);
+Datum
+test_commit_root(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyCommitInfo source;
+	ProllyHash	parent;
+	ProllyHash	id;
+
+	prolly_database_components(&dc);
+	commit_of_ref(&dc, PG_GETARG_TEXT_PP(0), &source);
+	resolve_ref(&dc, PG_GETARG_TEXT_PP(1), &parent);
+	PROLLY_CALL(dc.refs, commit_root, &source.root.hash,
+				&source.dependencies.hash, &parent, 1, "Root Writer <root@example.com>",
+				"committed root", NULL, &id);
+	PG_RETURN_TEXT_P(hash_text(&id));
+}
+
+/* test_commit_roots(ref): ref's commit's root and dependencies, as hex. */
+PG_FUNCTION_INFO_V1(test_commit_roots);
+Datum
+test_commit_roots(PG_FUNCTION_ARGS)
+{
+	ProllyDatabaseComponents dc;
+	ProllyCommitInfo info;
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	prolly_database_components(&dc);
+	commit_of_ref(&dc, PG_GETARG_TEXT_PP(0), &info);
+	values[0] = PointerGetDatum(hash_text(&info.root.hash));
+	values[1] = PointerGetDatum(hash_text(&info.dependencies.hash));
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc),
+													  values, nulls)));
+}
+
 /*
  * test_commit_identity(ref): the identity record ref's commit holds beside
  * its root, in the server's encoding (NULL: none, every object its own

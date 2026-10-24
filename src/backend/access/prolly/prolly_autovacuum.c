@@ -16,7 +16,10 @@
  * off; after a collection, they haven't.  Then, with more table files than
  * prolly.conjoin_max_files, it conjoins the smallest (the chunk store's
  * conjoin()), so a lookup searches no more files than that, as Dolt does
- * past 256.  It sweeps a page store when bmap_sweep_due() says so.  It
+ * past 256.  It drains the page stores' release queues (what dropped
+ * relations' storage held, let go of in the background: see bmap.c), at
+ * most prolly.release_max_per_pass entries a pass, under the cost-based
+ * delay.  It sweeps a page store when bmap_sweep_due() says so.  It
  * folds the working set (a checkpoint, as prolly_checkpoint() does) once a
  * table's change log holds more entries than prolly.autofold_threshold of
  * the table's rows, so a commit folds little (#511).  Each
@@ -63,6 +66,7 @@ int			prolly_conjoin_max_files = 256;
 int			prolly_gc_file_size = 65536;
 bool		prolly_log_copied_bytes = false;
 double		prolly_autofold_threshold = 0.05;
+int			prolly_release_max_per_pass = 1000000;
 
 /* fewer than two files would be conjoined at every pass: -1 turns it off */
 static bool
@@ -135,6 +139,14 @@ prolly_autovacuum_init(void)
 							PGC_SIGHUP,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.release_max_per_pass",
+							"How many release queue entries (dropped storage's subtrees and blocks) one autovacuum pass's release step lets go of at most in each tablespace, and one VACUUM command (or one autovacuum pass's VACUUMs) before vacuuming.",
+							"-1 sets no limit.  Draining is paced by the cost-based vacuum delay either way.",
+							&prolly_release_max_per_pass,
+							1000000, -1, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomBoolVariable("prolly.log_copied_bytes",
 							 "WAL-logs the bytes a chunk store copies from its own files, not where they come from.",
 							 "For debugging, and comparing the two.",
@@ -175,6 +187,14 @@ prolly_autovacuum_init(void)
 							 PGC_SIGHUP,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("prolly.kept_checkouts",
+							"How many detached checkouts' hidden branches a database keeps after their sessions leave.",
+							"A later checkout of the commit is then a branch switch, and a move or first use can share a kept checkout's tables instead of writing their rows.  0 keeps none.",
+							&prolly_kept_checkouts,
+							4, 0, 1000,
+							PGC_SUSET,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomBoolVariable("prolly.fold_verify_fatal",
 							 "Makes a fold the verifier finds wrong a PANIC, for testing.",
 							 NULL,
@@ -312,18 +332,14 @@ conjoin(void)
 				prolly_conjoin_max_files);
 }
 
-/*
- * Sweep the current database's page stores, in every tablespace that has
- * one (only those bmap_sweep_due() names, with due_only), adding to total.
- */
-void
-prolly_sweep_page_stores(bool due_only, BmapSweep *total)
+/* the tablespaces a database's page stores may be in */
+static List *
+store_tablespaces(void)
 {
 	Relation	rel = table_open(TableSpaceRelationId, AccessShareLock);
 	TableScanDesc scan = table_beginscan_catalog(rel, 0, NULL);
 	HeapTuple	tup;
 	List	   *spcs = NIL;
-	ListCell   *lc;
 
 	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
@@ -334,6 +350,18 @@ prolly_sweep_page_stores(bool due_only, BmapSweep *total)
 	}
 	table_endscan(scan);
 	table_close(rel, AccessShareLock);
+	return spcs;
+}
+
+/*
+ * Sweep the current database's page stores, in every tablespace that has
+ * one (only those bmap_sweep_due() names, with due_only), adding to total.
+ */
+void
+prolly_sweep_page_stores(bool due_only, BmapSweep *total)
+{
+	List	   *spcs = store_tablespaces();
+	ListCell   *lc;
 
 	memset(total, 0, sizeof(*total));
 	foreach(lc, spcs)
@@ -365,6 +393,49 @@ sweep(void)
 							 (unsigned long long) r.recounted,
 							 (unsigned long long) r.moved,
 							 (unsigned long long) r.truncated)));
+}
+
+/*
+ * Drain the current database's release queues, in each tablespace at most
+ * prolly.release_max_per_pass entries, a step at a time under the
+ * cost-based delay.  A queue another backend drains, or a sweep counts, is
+ * passed over.
+ */
+void
+prolly_release_page_stores(BmapRelease *total)
+{
+	List	   *spcs = store_tablespaces();
+	ListCell   *lc;
+
+	memset(total, 0, sizeof(*total));
+	VacuumUpdateCosts();
+	VacuumCostBalance = 0;
+	foreach(lc, spcs)
+	{
+		BmapRelease done = {0};
+
+		while ((prolly_release_max_per_pass < 0 ||
+				done.entries < (uint64) prolly_release_max_per_pass) &&
+			   bmap_release_step(lfirst_oid(lc), MyDatabaseId, false, &done))
+			vacuum_delay_point(false);
+		total->entries += done.entries;
+		total->freed += done.freed;
+		total->unrefs += done.unrefs;
+	}
+}
+
+static void
+release(void)
+{
+	BmapRelease r;
+
+	prolly_release_page_stores(&r);
+	ereport(DEBUG1,
+			(errmsg_internal("automatic release of database \"%s\": %llu entries, %llu blocks freed, %llu counts set",
+							 get_database_name(MyDatabaseId),
+							 (unsigned long long) r.entries,
+							 (unsigned long long) r.freed,
+							 (unsigned long long) r.unrefs)));
 }
 
 /* A log of fewer entries than this is never due, whatever its table's size. */
@@ -462,8 +533,8 @@ verify(void)
 void
 prolly_autovacuum(void)
 {
-	void		(*steps[]) (void) = {autofold, collect, move, conjoin, sweep,
-	verify};
+	void		(*steps[]) (void) = {autofold, collect, move, conjoin, release,
+	sweep, verify};
 
 	for (int i = 0; i < lengthof(steps); i++)
 	{
