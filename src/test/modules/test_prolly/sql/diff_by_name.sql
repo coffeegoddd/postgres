@@ -89,6 +89,15 @@ SELECT * FROM dolt_diff('HEAD~', 'HEAD', 'feel');
 
 -- the table of a version's name the session has: SELECT on it; a dropped
 -- one, no grant to check: the database's owner, or pg_read_all_data
+-- (a plan's row estimate for a query)
+CREATE FUNCTION pg_temp.estimated(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXECUTE 'EXPLAIN ' || q LOOP
+		RETURN substring(line from 'rows=[0-9]+');
+	END LOOP;
+END $$;
 CREATE ROLE regress_dn_reader;
 GRANT USAGE ON SCHEMA dn TO regress_dn_reader;
 SET ROLE regress_dn_reader;
@@ -124,9 +133,86 @@ SELECT diff_type, from_row FROM dolt_diff_table('dn.secret');
 SELECT row FROM dolt_history_table('dn.secret');
 SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', 'dn.secret');
 SELECT diff_type, to_row FROM dolt_diff_table('dn.secret', 'HEAD~');
+-- the same versions read by the table's row type: the same rule, so the
+-- dropped table's rows aren't read on the grants of the one made again
+SELECT * FROM dolt_at('HEAD~2', NULL::dn.secret);
+SELECT * FROM dolt_history_table(NULL::dn.secret);
+SELECT * FROM dolt_diff('HEAD~2', 'HEAD', NULL::dn.secret);
+SELECT diff_type FROM dolt_diff_table(NULL::dn.secret);
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+SELECT diff_type, to_row FROM dolt_diff('HEAD~', 'HEAD', NULL::dn.secret);
+SELECT diff_type, to_row FROM dolt_diff_table(NULL::dn.secret, 'HEAD~');
+-- a planner's estimate of the version's rows is history too: refused, the
+-- default estimate taken
+SELECT pg_temp.estimated('SELECT * FROM dolt_at(''HEAD~2'', NULL::dn.secret)');
+SELECT pg_temp.estimated('SELECT * FROM dolt_at(''HEAD'', NULL::dn.secret)');
+-- and a statistic of its rows: left out, and refused by name
+SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~');
+SELECT table_name, rows_deleted FROM dolt_diff_stat('HEAD~2', 'HEAD~', 'dn.secret');
+SELECT table_name, rows_added FROM dolt_diff_stat('HEAD~', 'HEAD');
+RESET ROLE;
+-- the head moved back to the dropped table's commit, by the reader: the
+-- head's version is no longer this table's by the branch's record of its
+-- head, so the step from the working set to the head vouches for nothing
+SELECT dolt_hashof('HEAD') AS secret_head \gset
+SET ROLE regress_dn_reader;
+SELECT dolt_reset('--soft', 'HEAD~2') IS NOT NULL AS moved;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
+SELECT row FROM dolt_history_table(NULL::dn.secret);
+SELECT row FROM dolt_history_table('dn.secret');
+SELECT * FROM dolt_at('WORKING', NULL::dn.secret);
+RESET ROLE;
+SELECT dolt_reset('--soft', :'secret_head') IS NOT NULL AS back;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret);
 RESET ROLE;
 -- (the database's owner reads both)
 SELECT diff_type, from_row, to_row FROM dolt_diff('HEAD~2', 'HEAD', 'dn.secret');
+SELECT * FROM dolt_at('HEAD~2', NULL::dn.secret);
+
+-- another branch's commits: its version of this table (made from this
+-- table's history) is readable on its grants, as Dolt reads any commit;
+-- another table of its name, made on that branch, isn't
+SELECT dolt_branch('dn_side') IS NOT NULL AS made;
+SELECT dolt_branch('dn_other') IS NOT NULL AS made;
+SELECT dolt_checkout('dn_side') IS NOT NULL AS on_side;
+INSERT INTO dn.secret VALUES (3, 'side');
+SELECT length(dolt_commit('-am', 'side row')::text) AS committed;
+SELECT dolt_checkout('dn_other') IS NOT NULL AS on_other;
+DROP TABLE dn.secret;
+SELECT length(dolt_commit('-am', 'no secret')::text) AS committed;
+CREATE TABLE dn.secret (id int PRIMARY KEY, note text);
+INSERT INTO dn.secret VALUES (4, 'other secret');
+SELECT length(dolt_commit('-Am', 'another secret')::text) AS committed;
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('dn_side', NULL::dn.secret) ORDER BY id;
+SELECT diff_type, to_row FROM dolt_diff('HEAD', 'dn_side', NULL::dn.secret);
+SELECT * FROM dolt_at('dn_other', NULL::dn.secret);
+SELECT * FROM dolt_diff('HEAD', 'dn_other', 'dn.secret');
+RESET ROLE;
+-- the head moved without a commit of the branch's (its record of its
+-- tables is of the commit before): a fast-forward to a later version of
+-- the table, and a soft reset to an earlier one, keep the reader reading
+-- the table's own history
+SELECT (dolt_merge('dn_side'))[2] AS fast_forward;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
+SELECT * FROM dolt_at('HEAD~', NULL::dn.secret) ORDER BY id;
+RESET ROLE;
+INSERT INTO dn.secret VALUES (5, 'five');
+SELECT length(dolt_commit('-am', 'row 5')::text) AS committed;
+SELECT dolt_hashof('HEAD') AS five_head \gset
+SELECT dolt_reset('--soft', 'HEAD~') IS NOT NULL AS moved;
+SET ROLE regress_dn_reader;
+SELECT * FROM dolt_at('HEAD', NULL::dn.secret) ORDER BY id;
+RESET ROLE;
+SELECT dolt_reset('--soft', :'five_head') IS NOT NULL AS back;
+-- (a head moved to the dropped table's commit and then committed records
+-- the re-made table at a commit whose parent holds the dropped one, which
+-- the names and identities alone can't tell from one table: #891, #895)
+SELECT dolt_branch('-D', 'dn_side') IS NOT NULL AS deleted;
+SELECT dolt_branch('-D', 'dn_other') IS NOT NULL AS deleted;
 
 -- nor one made with a renamed one's old name: the renamed one's rows by
 -- that name, without SELECT on it

@@ -175,6 +175,45 @@ ordering.  Older root formats retain the existing recommit requirement;
 committing a branch writes its current working state in the new format.
 
 
+Extension configuration rows
+----------------------------
+
+An extension's configuration tables (pg_extension.extconfig, such as
+PostGIS's spatial_ref_sys) are shared by every branch and aren't
+versioned, but the commits' data may refer to their rows (a column of a
+custom SRID).  So since folded format 19 an extension's dependency
+records, after its flags, what pg_dump dumps with it (prolly_extconfig.c):
+each row its extcondition selects (a user's, not its script's), column by
+column by name, each value in its canonical form, so a row is recorded the
+same whatever the committer's settings; and the state of each
+configuration sequence, and of each sequence a configuration table owns
+(an identity's, a serial's), once it has moved from its start.  They are
+read as the tables' owners with row security off, a search path of
+pg_catalog alone and fixed text settings, as pg_dump reads them, so
+nothing in the committer's schemas runs as the owner.  An extension
+without such rows is recorded as before.  A clone writes the rows its
+configuration tables lack into the extension it makes (by column name,
+overriding identities, generated columns left to be generated, through
+one prepared INSERT per table) and sets its sequences, as a restore of a
+dump does.  A move (checkout, reset, merge, cherry-pick, revert) to
+commits recording a row the database lacks is refused, naming the table;
+rows the database has besides are its own.  A table with a primary key
+(or a replica identity index) has its rows matched by key, so a row whose
+other columns were edited since is still there; heads recording one key
+with different values give a clone the checked-out branch's row, with a
+warning naming the table and the key.  A clone's writes check its
+extension's domains (on a column, in an array or a row) and lengths, as a
+restore's input would.  A keyless table's
+rows are matched whole, each as many times as recorded.  An element
+naming anything but one of the extension's configuration tables (or a
+sequence one owns) is refused, nothing an element holds is put in a query
+as text, and decoded text is checked to be valid in the database's
+encoding, as text's receive checks it.  The dependency tree is taken from
+the backend's cache only while a digest of the configuration tables
+matches: each visible row's place and inserting transaction, read without
+encoding any row.
+
+
 Identity across renames
 -----------------------
 
@@ -220,6 +259,24 @@ The branch's own tables and columns are renamed to the merged names first
 (rename_objects(), ALTER TABLE ... RENAME), so their rows stay where they
 are and only the other side's changes are written.  The anchor is then the
 merge's.
+
+A history read of a table's rows (dolt_at, dolt_history_table, dolt_diff,
+dolt_diff_table, by row type or by name) takes SELECT on the table here
+of the version's name, and that grant covers only the versions that are
+that table: those reached back from the working set through the head's
+history, or forward from one of them along another branch's commits,
+the name never without a table between (a rename followed).  A version of
+another table of its name, one dropped before this one was made, is read
+only by the database's owner or a member of pg_read_all_data.  The head's
+version is the table's only through the branch's record of its tables,
+made by its last commit, having the table's relation: at that commit, or
+at a head moved since without a commit to one of its descendants or
+ancestors, the name never without a table between.  A head moved to a
+commit holding a dropped table and then committed (#895), or a merge of a
+branch still holding it, isn't told from the table's own history either.
+A plan's row estimate of a version, and dolt_diff_stat's counts, are
+read on the same rule.  A table dropped and made again within one commit
+isn't told from one kept (#891).
 
 Folded format 18 records identities in commits.  Formats are not kept
 compatible while the prototype iterates: this build reads, moves to and
@@ -554,7 +611,13 @@ sweep, lets go of it.  VACUUM freezes and sets all-visible the pages a
 relation shares only with its own snapshots, copying them (the kept
 version goes once its commit stops being kept), but leaves as they are
 the pages another branch shares, which the block map tells apart by when
-each page's entry was born (its header's shared_below).  A
+each page's entry was born (its header's shared_below).  A share
+raises shared_below; once the other branch's map is let go of, a page
+sweep (prolly_page_sweep()), having counted every holder, lowers it to
+the newest entry another map still holds, so VACUUM treats those pages
+as unshared again.  It holds each such relation's branch meanwhile, as a
+session on it does, so a branch's deletion or rename tried then fails as
+if a session were on it (its detail says either may be).  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's

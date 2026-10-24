@@ -757,7 +757,7 @@ static List *new_branches = NIL;
 
 static bool branch_callbacks_registered = false;
 
-static void
+void
 branch_locktag(LOCKTAG *tag, Oid branch)
 {
 	SET_LOCKTAG_OBJECT(*tag, MyDatabaseId, BranchRelationId, branch, 0);

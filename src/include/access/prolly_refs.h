@@ -729,6 +729,18 @@ typedef struct ProllyRefsRoutine
 	bool		(*pin_get) (const char *name, ProllyHash *commit,
 							StringInfo info);
 	void		(*pins) (ProllyPinVisit visit, void *arg);
+
+	/*
+	 * Optional: the commit (*at) whose tables the session branch's own
+	 * record of them lists relation relid among, the record made by the
+	 * branch's last commit; false if it doesn't (a table made, or dropped
+	 * and made again, since that commit), or there is no record.  The
+	 * branch's head may have moved since without a commit (a reset, a
+	 * fast-forward): the record is still of the commit that made it.  A
+	 * history read takes a version of a table for the table here only
+	 * through this, as a commit holds tables by name and identity alone.
+	 */
+	bool		(*recorded_relation) (Oid relid, ProllyHash *at);
 } ProllyRefsRoutine;
 
 /*
@@ -772,9 +784,9 @@ extern PGDLLIMPORT int prolly_restore_min_changes;
 	"working_identity", "anchor_identity", "tag_write", "tag_get", \
 	"tag_lookup", "tag_set", "tags", \
 	"rebase_state", "set_rebase_state", "commit_root", "kept_commits", \
-	"pin_set", "pin_get", "pins"
+	"pin_set", "pin_get", "pins", "recorded_relation"
 #define PROLLY_REFS_FIRST_CALLBACK branch_create
-#define PROLLY_REFS_LAST_CALLBACK pins
+#define PROLLY_REFS_LAST_CALLBACK recorded_relation
 
 /*
  * For refs implementations: a commit's info by its id (false if there is

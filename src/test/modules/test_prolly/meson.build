@@ -44,8 +44,10 @@ test_install_data += files(
   'test_prolly_ext_detach--1.0.sql',
   'test_prolly_ext_readd.control',
   'test_prolly_ext_readd--1.0.sql',
-  'test_prolly_fixed.control',
+  'test_prolly_ext_config--1.0.sql',
+  'test_prolly_ext_config.control',
   'test_prolly_fixed--1.0.sql',
+  'test_prolly_fixed.control',
 )
 
 tests += {
@@ -140,6 +142,7 @@ tests += {
       'versioned_extensions',
       'extension_moves',
       'extension_clone',
+      'extension_config_rows',
       'text_types',
       'versioned_event_triggers',
       'internal_move_events',
@@ -348,6 +351,8 @@ tests += {
       't/212_vacuum_release_bounds.pl',
       't/220_near_source_writes.pl',
       't/221_reload_first_use.pl',
+      't/226_shared_below_sweep.pl',
+      't/227_shared_below_drop.pl',
       't/283_renamed_schema_conflict_restart.pl',
       't/225_kept_commit_snapshots.pl',
       't/266_autofold_defers.pl',

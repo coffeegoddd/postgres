@@ -1,18 +1,22 @@
 --
 -- PostGIS through a file remote: a clone into an empty database installs
--- PostGIS in the versioned public it had, and every table's values come
--- back byte-identical, its indexes agreeing with sequential scans; a
--- change pushed is fetched and pulled the same.  A clone into a database
+-- PostGIS in the versioned public it had, with the custom SRID the commits
+-- record, and every table's values come back byte-identical, its indexes
+-- agreeing with sequential scans; a change pushed is fetched and pulled
+-- the same.  A clone into a database
 -- whose PostGIS is in another schema is refused.
 --
 \set ECHO none
 on main|t
+custom srid commit|t
 remote|t
 push|t
 clone|t
 public versioned|t
 postgis installed|postgis in public,postgis_raster in public
 clone: same|t
+clone: custom srid|1
+clone: transformed as on the source|t
 clone: tables on prolly|t
 clone: index valid|t
 clone: plan uses it|t
