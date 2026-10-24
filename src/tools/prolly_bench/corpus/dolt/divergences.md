@@ -191,8 +191,17 @@ adapts.
 - **Prolly:** sequences are versioned objects, per branch and in each
   commit (user, 2026-10-16): a merge gives each sequence the larger of
   its two values, and a hard reset restores the commit's value, so a key
-  generated after it can repeat one handed out before. Schema conflicts
-  are errors naming the objects; the merge doesn't happen. A merge,
+  generated after it can repeat one handed out before. A table in a
+  schema conflict (both sides changed it in ways that don't merge, or one
+  dropped it and the other changed it) is kept as Dolt keeps it: as the
+  branch has it, its rows unmerged, recorded in the merge in progress and
+  listed in `dolt_schema_conflicts`; `dolt_conflicts_resolve()` refuses it
+  and a commit waits for `--abort`, as in Dolt. Other schema conflicts
+  (objects other than tables, renames to one name, inheritance and typed
+  tables, enum labels, a conflicted table renamed on either side, or one
+  the other side's objects use in its version) are errors naming the
+  objects, and the merge doesn't happen; so is any schema conflict of a
+  cherry-pick or revert. A merge,
   cherry-pick or revert into uncommitted changes is refused when it
   would change a table, sequence or materialized view with uncommitted
   changes, as Dolt's is. When definitions change, on either side or
@@ -205,8 +214,9 @@ adapts.
 - **Why:** a sequence is a schema object in Postgres, versioned with its
   schema; Postgres DDL can't be left half-merged in the catalogs.
 - **Port:** expected generated keys follow the commit's sequence value
-  (`dolt-reset-identity`, deferred with this ID); schema-conflict cases
-  expect the error, not rows; dirty-merge cases with definition changes
+  (`dolt-reset-identity`, deferred with this ID); table schema-conflict
+  cases expect Dolt's result and `dolt_schema_conflicts` rows (the
+  statements are Postgres's), other schema conflicts the error; dirty-merge cases with definition changes
   expect the refusal only in those cases.
 
 ## D7. Hashes

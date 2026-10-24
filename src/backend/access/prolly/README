@@ -350,6 +350,19 @@ no ref names.  commit_with() folds
 the working set (and the dependencies, from the catalogs) and writes its
 commit through it.
 
+A table both sides of a merge changed in ways that don't merge (its
+definitions changed differently, or one dropped it and the other changed
+it, its definition or only its rows) is a schema conflict.  dolt_merge()
+keeps it as the branch has it, definition and rows, records it in the
+merge in progress (the refs' merge names entry, by name, OID 0: refs
+format 8) and merges the other tables, as Dolt does;
+dolt_schema_conflicts shows its statements in the base, the head and
+theirs.  dolt_conflicts_resolve() refuses it, and the merge can't be
+committed until it is aborted.  A cherry-pick or revert, schema conflicts
+of other objects, a conflicted table renamed on either side, and one the
+other side's objects use in its version (a view over a column it added)
+fail as before, the last two saying so.
+
 A keyed row both sides of a merge changed is merged column by column.  A
 long value is held out of line by a reference naming its canonical bytes,
 so where a side's reference is base's, decoded by the same keying, that
@@ -608,7 +621,11 @@ commit after, the fold worker off or in the same transaction, folds only
 what changed since.  The checkpoint never waits for a lock (the rewrite
 holds its table exclusively, and a commit holding the branch may be about
 to read it): a lock not free at once skips it, leaving the table's next
-fold to read it in full.  dolt_pending_full_folds() lists the tables whose next
+fold to read it in full.  So does any other error the fold meets (it
+folds every table of the branch, and one may hold what a commit refuses),
+logged with the error's fields; a cancel, or an internal error (class
+XX), fails the rewrite instead.  pg_stat_prolly's
+rewrite_checkpoints_skipped counts the checkpoints skipped.  dolt_pending_full_folds() lists the tables whose next
 fold would read them in full, and why, from the baseline, the catalogs and
 each change finder's full_reason(), reading no rows.
 
