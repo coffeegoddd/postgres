@@ -1,0 +1,232 @@
+-- A merge converts the values it reads across a column's change of type
+-- (by the column's cast, or as the value's text form) under fixed
+-- settings: TimeZone UTC, ISO dates, the postgres IntervalStyle, the C
+-- locale's money, numbers and times, and the rest canonical text forms are
+-- written under.  So the same merge makes the same rows and the same
+-- commit whatever the merging session's settings.  (ALTER TABLE ... TYPE
+-- converts under the session's own settings, so a side's own ALTER can
+-- write a value the merge wouldn't.)
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS test_prolly;
+RESET client_min_messages;
+SET TimeZone = 'UTC';
+SET DateStyle = 'ISO, MDY';
+SET IntervalStyle = postgres;
+SET lc_monetary = 'C';
+SET lc_numeric = 'C';
+CREATE SCHEMA mc VERSIONED;
+CREATE TABLE mc.t (id int PRIMARY KEY, ts timestamptz, m money, d date,
+				   iv interval, n numeric);
+INSERT INTO mc.t
+SELECT g, '2024-03-01 12:00:00+00'::timestamptz + g * interval '1 hour',
+	   g * 1.25, date '2024-03-01' + g, g * interval '90 minutes', g * 1.5
+FROM generate_series(1, 4) g;
+SELECT length(dolt_commit('-Am', 'base')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_branch('mc_f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Both sides make every column text (under the fixed settings), and each
+-- changes a row of its own; both change row 4's ts.
+ALTER TABLE mc.t ALTER COLUMN ts TYPE text, ALTER COLUMN m TYPE text,
+	ALTER COLUMN d TYPE text, ALTER COLUMN iv TYPE text, ALTER COLUMN n TYPE text;
+UPDATE mc.t SET ts = 'ours', m = 'ours', d = 'ours', iv = 'ours', n = 'ours'
+WHERE id = 1;
+SELECT length(dolt_commit('-am', 'main: text')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('mc_f') IS NOT NULL AS on_f;
+ on_f 
+------
+ t
+(1 row)
+
+ALTER TABLE mc.t ALTER COLUMN ts TYPE text, ALTER COLUMN m TYPE text,
+	ALTER COLUMN d TYPE text, ALTER COLUMN iv TYPE text, ALTER COLUMN n TYPE text;
+UPDATE mc.t SET ts = 'theirs', m = 'theirs', d = 'theirs', iv = 'theirs',
+	n = 'theirs' WHERE id = 2;
+SELECT length(dolt_commit('-am', 'mc_f: text')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+SELECT dolt_branch('mc_pre');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+-- Merged under the fixed settings: base's values, read as text, are each
+-- side's where it didn't change them.
+SELECT (dolt_merge('mc_f', '--no-commit'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT length(dolt_commit('-am', 'merged', '--date', '2024-01-01 00:00:00+00')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT prolly_root_hash('HEAD') AS fixed_root \gset
+SELECT dolt_hashof('HEAD') AS fixed_commit \gset
+SELECT * FROM mc.t ORDER BY id;
+ id |           ts           |   m    |     d      |    iv    |   n    
+----+------------------------+--------+------------+----------+--------
+  1 | ours                   | ours   | ours       | ours     | ours
+  2 | theirs                 | theirs | theirs     | theirs   | theirs
+  3 | 2024-03-01 15:00:00+00 | $3.75  | 2024-03-04 | 04:30:00 | 4.5
+  4 | 2024-03-01 16:00:00+00 | $5.00  | 2024-03-05 | 06:00:00 | 6.0
+(4 rows)
+
+-- The same merge under other settings: the same rows, root and commit.
+SELECT dolt_reset('--hard', 'mc_pre');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+SET TimeZone = 'Asia/Tokyo';
+SET DateStyle = 'SQL, DMY';
+SET IntervalStyle = sql_standard;
+SET extra_float_digits = 0;
+-- (other locales where the system has them: money and numbers shown
+-- otherwise; not every system does, so a missing one is skipped)
+DO $$
+BEGIN
+	PERFORM set_config('lc_monetary', 'en_US.utf8', false);
+EXCEPTION WHEN invalid_parameter_value THEN
+	NULL;
+END $$;
+DO $$
+BEGIN
+	PERFORM set_config('lc_numeric', 'es_ES.utf8', false);
+EXCEPTION WHEN invalid_parameter_value THEN
+	NULL;
+END $$;
+SELECT (dolt_merge('mc_f', '--no-commit'))[3:4];
+       dolt_merge       
+------------------------
+ {0,"merge successful"}
+(1 row)
+
+SELECT length(dolt_commit('-am', 'merged', '--date', '2024-01-01 00:00:00+00')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT prolly_root_hash('HEAD') = :'fixed_root' AS same_root,
+	   dolt_hashof('HEAD') = :'fixed_commit' AS same_commit;
+ same_root | same_commit 
+-----------+-------------
+ t         | t
+(1 row)
+
+SELECT * FROM mc.t ORDER BY id;
+ id |           ts           |   m    |     d      |    iv    |   n    
+----+------------------------+--------+------------+----------+--------
+  1 | ours                   | ours   | ours       | ours     | ours
+  2 | theirs                 | theirs | theirs     | theirs   | theirs
+  3 | 2024-03-01 15:00:00+00 | $3.75  | 2024-03-04 | 04:30:00 | 4.5
+  4 | 2024-03-01 16:00:00+00 | $5.00  | 2024-03-05 | 06:00:00 | 6.0
+(4 rows)
+
+-- A conflict (both changed row 4's ts) is listed as the merge found it,
+-- in a session of other settings too: only row 4.
+SELECT dolt_reset('--hard', 'mc_pre');
+ dolt_reset 
+------------
+ {0}
+(1 row)
+
+UPDATE mc.t SET ts = 'ours again' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'main: row 4')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('mc_f') IS NOT NULL AS on_f;
+ on_f 
+------
+ t
+(1 row)
+
+UPDATE mc.t SET ts = 'theirs again' WHERE id = 4;
+SELECT length(dolt_commit('-am', 'mc_f: row 4')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+
+SELECT dolt_checkout('main') IS NOT NULL AS on_main;
+ on_main 
+---------
+ t
+(1 row)
+
+RESET TimeZone;
+RESET DateStyle;
+RESET IntervalStyle;
+RESET lc_monetary;
+RESET lc_numeric;
+RESET extra_float_digits;
+SET TimeZone = 'UTC';
+BEGIN;
+SELECT (dolt_merge('mc_f'))[3:4];
+      dolt_merge       
+-----------------------
+ {1,"conflicts found"}
+(1 row)
+
+SET LOCAL TimeZone = 'Asia/Tokyo';
+SET LOCAL DateStyle = 'SQL, DMY';
+SELECT (base_row).id, (our_row).ts AS ours, (their_row).ts AS theirs
+FROM dolt_conflicts(NULL::mc.t) ORDER BY 1;
+ id |    ours    |    theirs    
+----+------------+--------------
+  4 | ours again | theirs again
+(1 row)
+
+ROLLBACK;
+RESET ALL;
+SELECT dolt_branch('-D', 'mc_f');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+SELECT dolt_branch('-D', 'mc_pre');
+ dolt_branch 
+-------------
+ {0}
+(1 row)
+
+DROP SCHEMA mc CASCADE;
+NOTICE:  drop cascades to table mc.t
+SELECT length(dolt_commit('-Am', 'mc gone')::text) AS committed;
+ committed 
+-----------
+        42
+(1 row)
+

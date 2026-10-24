@@ -9410,6 +9410,8 @@ merge_matviews(MergeRows *mr)
 	SPI_finish();
 }
 
+static void merge_tables_rows(void *arg);
+
 /*
  * Each table's rows, after the definitions are merged (or alike): three-way
  * where both sides define it alike (against no rows, for a table both
@@ -9417,9 +9419,27 @@ merge_matviews(MergeRows *mr)
  * the other didn't change them.  The rows each table has now (mr->now, or
  * the branch folded) are made the rows it should have, whatever the
  * definitions' merge did to it (a table made again is empty).
+ *
+ * The values read across a column's change of type (by its cast, or as
+ * its text form) are converted with the settings canonical text forms are
+ * written under fixed (prolly_datum_fixed_text(): TimeZone UTC, ISO dates,
+ * the C locale's money, numbers and times, hex bytea, and the rest), not
+ * the merging session's: the same merge makes the same rows, and the same
+ * commit, in any session.  ALTER TABLE ... TYPE converts under the
+ * session's own settings, so a merged row's value can differ from the one
+ * a side's own ALTER wrote, where that session's settings weren't these.
  */
 static void
 merge_rows(void *arg)
+{
+	prolly_datum_fixed_text(merge_tables_rows, arg);
+	/* (a materialized view's query runs under the session's settings) */
+	merge_matviews((MergeRows *) arg);
+}
+
+/* merge_rows()'s rows, with the text settings fixed */
+static void
+merge_tables_rows(void *arg)
 {
 	MergeRows  *mr = arg;
 	List	   *now = mr->now;
@@ -9580,7 +9600,6 @@ merge_rows(void *arg)
 		if (!same_hash(&w->data.hash, &want->data.hash))
 			apply_rows(relid, w, want);
 	}
-	merge_matviews(mr);
 }
 
 /*
@@ -12984,6 +13003,39 @@ named_as_recorded(Oid relid, const ProllyMergeState *ms, const char *name)
 	return true;
 }
 
+/* A conflicted table's three versions, read as it is defined now. */
+typedef struct ConflictVersions
+{
+	Relation	rel;
+	const Table *now;
+	const Table *bt;
+	const Table *ot;
+	const Table *tt;
+	List	   *retyped;
+	List	   *both_retyped;
+	Table	   *b;
+	Table	   *o;
+	Table	   *t;
+	UnsureRows *unsure;
+	const Table *bp;			/* (out) */
+	const Table *op;
+	const Table *tp;
+} ConflictVersions;
+
+static void
+conflict_versions(void *arg)
+{
+	ConflictVersions *cv = arg;
+
+	cv->bp = as_defined_now(cv->rel, cv->bt, cv->now, READ_COMPARED, NULL,
+							cv->retyped, cv->both_retyped, false, cv->b,
+							cv->unsure, NULL);
+	cv->op = as_defined_now(cv->rel, cv->ot, cv->now, READ_SHOWN, NULL, NIL,
+							NIL, false, cv->o, NULL, NULL);
+	cv->tp = as_defined_now(cv->rel, cv->tt, cv->now, READ_SHOWN, NULL, NIL,
+							NIL, false, cv->t, NULL, NULL);
+}
+
 /*
  * Walk relid's changes in the merge in progress, as mode says, against
  * the branch's rows as they are now.  (A table the working set leaves out,
@@ -13077,13 +13129,16 @@ walk_conflicts(Oid relid, const ProllyMergeState *ms, WalkMode mode,
 	}
 	rel = table_open(relid, AccessShareLock);
 	retyped_columns(bt, ot, tt, &retyped, &both_retyped);
-	bp = as_defined_now(rel, bt, now, READ_COMPARED, NULL, retyped,
-						both_retyped,
-						false, &b, &unsure, NULL);
-	op = as_defined_now(rel, ot, now, READ_SHOWN, NULL, NIL, NIL, false, &o,
-						NULL, NULL);
-	tp = as_defined_now(rel, tt, now, READ_SHOWN, NULL, NIL, NIL, false, &t,
-						NULL, NULL);
+	{
+		/* (converted as the merge converted them: merge_rows()) */
+		ConflictVersions cv = {rel, now, bt, ot, tt, retyped, both_retyped,
+		&b, &o, &t, &unsure};
+
+		prolly_datum_fixed_text(conflict_versions, &cv);
+		bp = cv.bp;
+		op = cv.op;
+		tp = cv.tp;
+	}
 	table_close(rel, AccessShareLock);
 
 	/*
