@@ -297,7 +297,9 @@ dolt_diff_table, by row type or by name) takes SELECT on the table here
 of the version's name, and that grant covers only the versions that are
 that table, as relation-made history: every commit this database makes of
 a branch records the relations its working set's tables were ('L', refs
-format 14: each table's OID and qualified name), and a version is the
+format 16: each table's OID and qualified name, a line each, the name's
+backslashes and newlines escaped so that no name makes a line of its
+own; read strictly, a damaged record refused), and a version is the
 table's when its commit was made from the table's relation, reached back
 from the working set through the head and each commit's parents, a step
 taken only where both commits were made from it (its name at each, as
@@ -320,12 +322,17 @@ table such a move changed in the working set, uncommitted (set aside, or
 left out of the commit), is recorded only as of a relation of the class
 its first parent's record lists (refs' prolly_commit_local_tables, as the
 merge, pick or revert tells it).  Relations are compared by equivalence
-class ('Q', refs format 15): a relation a move makes again of a table (a
+class ('J'): a relation a move makes again of a table (a
 definition it can't alter in place, as a branch's first use may when its
 copies are moved to its head), or a merge, pick or revert makes of the
 other side's table (the class of the relation the commit it takes the
 version from was made from: prolly_move_provenance), is the same table
-as the one it comes from, whatever its OID.  What the records can't: a
+as the one it comes from, whatever its OID; what the move sets aside of
+the uncommitted changes and puts back is the branch's own, taking no
+class from those commits.  A class outlives its relation's drop: commits
+made from the dropped relation are still read through it, and a branch's
+copy of the relation, of the same OID, may still be in use.  What the
+records can't: a
 branch's first use may make its copies from another branch's relation
 (the table here's, moved to the old rows), and its commits are then that
 relation's; a move that brings the old table's rows (a merge, a hard

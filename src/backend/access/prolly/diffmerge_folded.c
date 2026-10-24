@@ -12113,6 +12113,29 @@ commit_over_local(const Local *l, const char *message, const ProllyHash *parents
 }
 
 /*
+ * folded_move_to() for a move of the branch's own (setting its uncommitted
+ * changes aside, or putting them back): what it makes is the branch's, not
+ * of the commits the merge, pick or revert around it takes versions from,
+ * so it runs without their provenance (prolly_move_provenance).
+ */
+static void
+own_move_to(const ProllyNodeRef *target, const ProllyNodeRef *folded)
+{
+	List	   *provenance = prolly_move_provenance;
+
+	prolly_move_provenance = NIL;
+	PG_TRY();
+	{
+		folded_move_to(target, folded);
+	}
+	PG_FINALLY();
+	{
+		prolly_move_provenance = provenance;
+	}
+	PG_END_TRY();
+}
+
+/*
  * Uncommitted changes a merge (or pick, or revert) changing definitions
  * goes ahead over: the branch moved to its head, writing only what they
  * changed, so the merge is made as over a clean working set and its
@@ -12121,7 +12144,7 @@ commit_over_local(const Local *l, const char *message, const ProllyHash *parents
 static void
 set_aside(Local *l)
 {
-	folded_move_to(&l->head, &l->working);
+	own_move_to(&l->head, &l->working);
 	l->aside = true;
 }
 
@@ -12284,7 +12307,7 @@ put_back(const Local *l, const char *what)
 
 	PG_TRY();
 	{
-		folded_move_to(&target, &merged);
+		own_move_to(&target, &merged);
 	}
 	PG_CATCH();
 	{

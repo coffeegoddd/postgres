@@ -232,6 +232,16 @@ typedef struct ProllyMovedBranch
 } ProllyMovedBranch;
 
 /*
+ * A relation a commit was made from (refs' commit_relations()): its OID,
+ * and the table's qualified name then (quoted as needed).
+ */
+typedef struct ProllyCommitRelation
+{
+	Oid			relid;
+	char	   *name;
+} ProllyCommitRelation;
+
+/*
  * A commit a branch's pages are kept as of: each table's relations as
  * branch operations' keep() kept them (the table's own first), the
  * branch's baseline then (len 0: none), and the transaction that kept
@@ -757,13 +767,14 @@ typedef struct ProllyRefsRoutine
 
 	/*
 	 * Optional: the relations commit was made from, as this database made
-	 * it: *lines, a line for each prolly table, its OID (10 digits), a
-	 * space, and its qualified name (palloc'd); false for a commit made
-	 * elsewhere (fetched, cloned, pushed here) or before they were kept.
-	 * A history read takes a version for the session's table only along
-	 * commits made from the table's relation.
+	 * it: *relations, a ProllyCommitRelation for each prolly table
+	 * (palloc'd); false for a commit made elsewhere (fetched, cloned,
+	 * pushed here) or before they were kept.  A history read takes a
+	 * version for the session's table only along commits made from the
+	 * table's relation.
 	 */
-	bool		(*commit_relations) (const ProllyHash *commit, char **lines);
+	bool		(*commit_relations) (const ProllyHash *commit,
+									 List **relations);
 
 	/*
 	 * Optional: relation relid's equivalence class, the relation it is the

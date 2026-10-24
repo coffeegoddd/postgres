@@ -8020,18 +8020,22 @@ move_classes_before(List *from, List *to, List *remade)
 			continue;
 		foreach(pc, prolly_move_provenance)
 		{
-			char	   *lines;
-			char	   *line = psprintf(" %s\n", t->name);
-			char	   *at;
+			List	   *relations;
+			ProllyCommitRelation *of = NULL;
+			ListCell   *rc;
 			MoveClass  *mc;
 
 			if (!PROLLY_HAS(dc.refs, commit_relations) ||
-				!PROLLY_CALL(dc.refs, commit_relations, lfirst(pc), &lines) ||
-				(at = strstr(lines, line)) == NULL || at - lines < 10)
+				!PROLLY_CALL(dc.refs, commit_relations, lfirst(pc), &relations))
+				continue;
+			foreach(rc, relations)
+				if (strcmp(((ProllyCommitRelation *) lfirst(rc))->name, t->name) == 0)
+					of = lfirst(rc);
+			if (of == NULL)
 				continue;
 			mc = palloc(sizeof(MoveClass));
 			mc->name = t->name;
-			mc->of = (Oid) strtoul(at - 10, NULL, 10);
+			mc->of = of->relid;
 			out = lappend(out, mc);
 			break;
 		}
