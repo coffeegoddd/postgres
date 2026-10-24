@@ -33,6 +33,11 @@
  * block.  The map fork's existence is the relation's; smgropen() chooses
  * this storage manager by it.
  *
+ * Sharing with other maps (a share, a copy of a snapshot) raises the
+ * header's shared_below to the map's epoch: an entry born since can be
+ * shared only with the map's own snapshots (bmappagesharedelsewhere()),
+ * which VACUUM changes as if unshared.
+ *
  * Sharing.  A node is held by every page that points to it, and a data
  * block by every leaf (and changes list) holding it, the reference counts
  * saying how many besides the first.  A share copies the root page alone,
@@ -201,11 +206,12 @@ int			block_map_replay_entries = 65536;
  * lists' headers carry.  Version 1 maps were flat, an entry per logical
  * block in the relation's own map fork; version 2's were trees of pages of
  * the page store, whose snapshots didn't say who took them; version 3's
- * release queue entries didn't say which drop's transaction they wait for.
- * This server reads only version 4 and refuses anything older
+ * release queue entries didn't say which drop's transaction they wait for;
+ * version 4's headers didn't say which entries may be shared with another
+ * map.  This server reads only version 5 and refuses anything older
  * (refuse_version()).
  */
-#define BMAP_VERSION		4
+#define BMAP_VERSION		5
 
 #define BMAP_PAGE_META		1
 #define BMAP_PAGE_HEADER	2
@@ -241,6 +247,9 @@ typedef struct BmapHeader
 								 * (0: never folded), as the changes list's
 								 * header says, here where each change
 								 * reads it */
+	uint32		shared_below;	/* entries born before it may be shared
+								 * with another map; those born since, only
+								 * with the map's own snapshots */
 } BmapHeader;
 
 /*
@@ -1144,6 +1153,8 @@ apply_header_delta(Page page, const xl_bmap_header_delta *delta)
 	PageGetBmapHeader(page)->nblocks = delta->nblocks;
 	PageGetBmapHeader(page)->epoch = delta->epoch;
 	PageGetBmapHeader(page)->fold_epoch = delta->fold_epoch;
+	if (delta->flags & BMAP_DELTA_SHARED_BELOW)
+		PageGetBmapHeader(page)->shared_below = delta->shared_below;
 }
 
 /* (whether it changed the page) */
@@ -5155,11 +5166,13 @@ tree_preserve(SMgrRelation src, BlockNumber nblocks, uint32 epoch)
  * map a share copies: the subtrees stay shared until either relation
  * changes something under one, which copies the path to it.  With 'from',
  * the pointers are those of a snapshot of src's, and dst's header gets
- * 'hdelta' in the same record.
+ * 'hdelta' in the same record, and src's header (held exclusively by the
+ * caller in 'sheader', if valid) 'shdelta'.
  */
 static void
 tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
-				const xl_bmap_header_delta *hdelta)
+				const xl_bmap_header_delta *hdelta, Buffer sheader,
+				const xl_bmap_header_delta *shdelta)
 {
 	RelFileLocator srel = src->smgr_rlocator.locator;
 	RelFileLocator drel = dst->smgr_rlocator.locator;
@@ -5219,7 +5232,7 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	xlrec.from = srel.relNumber;
 	xlrec.old_hw = xlrec.new_hw = InvalidBlockNumber;
 
-	XLogEnsureRecordSpace(2 + BMAP_TREE_TOPS, 3 + BMAP_TREE_TOPS);
+	XLogEnsureRecordSpace(3 + BMAP_TREE_TOPS, 4 + BMAP_TREE_TOPS);
 	START_CRIT_SECTION();
 	apply_root_delta(BufferGetPage(buf), &rdelta);
 	MarkBufferDirty(buf);
@@ -5227,6 +5240,11 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	{
 		apply_header_delta(BufferGetPage(headerbuf), hdelta);
 		MarkBufferDirty(headerbuf);
+	}
+	if (BufferIsValid(sheader))
+	{
+		apply_header_delta(BufferGetPage(sheader), shdelta);
+		MarkBufferDirty(sheader);
 	}
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
@@ -5237,11 +5255,19 @@ tree_share_root(SMgrRelation src, SMgrRelation dst, const BmapEntry *from,
 	{
 		XLogRegisterBuffer(id, headerbuf, REGBUF_STANDARD);
 		XLogRegisterBufData(id, hdelta, sizeof(*hdelta));
+		id++;
+	}
+	if (BufferIsValid(sheader))
+	{
+		XLogRegisterBuffer(id, sheader, REGBUF_STANDARD);
+		XLogRegisterBufData(id, shdelta, sizeof(*shdelta));
 	}
 	lsn = XLogInsert(RM_BMAP_ID, XLOG_BMAP_TREE);
 	PageSetLSN(BufferGetPage(buf), lsn);
 	if (hdelta)
 		PageSetLSN(BufferGetPage(headerbuf), lsn);
+	if (BufferIsValid(sheader))
+		PageSetLSN(BufferGetPage(sheader), lsn);
 	refs_set_lsn(&rp, lsn);
 	END_CRIT_SECTION();
 
@@ -5311,7 +5337,7 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 
 	/* src's own blocks preserved, its subtrees a holder more */
 	tree_preserve(src, nblocks, epoch);
-	tree_share_root(src, dst, NULL, NULL);
+	tree_share_root(src, dst, NULL, NULL, InvalidBuffer, NULL);
 	INJECTION_POINT("bmap-share-map-page", NULL);
 
 	/* the copy has the same changes since src's last fold */
@@ -5322,9 +5348,11 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 	check_page(BufferGetPage(dheader), BMAP_PAGE_HEADER, drel, BMAP_FORKNUM, 0);
 
 	sdelta.kind = ddelta.kind = BMAP_DELTA_HEADER;
-	sdelta.flags = ddelta.flags = 0;
+	sdelta.flags = ddelta.flags = BMAP_DELTA_SHARED_BELOW;
 	sdelta.nblocks = ddelta.nblocks = nblocks;
 	sdelta.epoch = ddelta.epoch = epoch + 1;
+	/* (every entry either has is the other's too) */
+	sdelta.shared_below = ddelta.shared_below = epoch + 1;
 	/* (the copy has src's list, as of src's fold) */
 	sdelta.fold_epoch = ddelta.fold_epoch =
 		PageGetBmapHeader(BufferGetPage(sheader))->fold_epoch;
@@ -5699,6 +5727,7 @@ snapshot_take_slot(SMgrRelation reln)
 	sdelta.snap.owner = U64FromFullTransactionId(owner);
 	sdelta.snap.nblocks = header->nblocks;
 	sdelta.snap.fold_epoch = header->fold_epoch;
+	sdelta.snap.epoch = hdelta.epoch;
 	for (int k = 0; k < BMAP_TREE_TOPS; k++)
 	{
 		sdelta.snap.tops[k].block = root.top[k].block;
@@ -5897,6 +5926,7 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst)
 	BmapRoot	root;
 	int			slot;
 	xl_bmap_header_delta hdelta;
+	xl_bmap_header_delta shdelta;
 
 	if (srel.spcOid != drel.spcOid || srel.dbOid != drel.dbOid)
 		elog(ERROR, "block-mapped relation %s can't share the blocks of %s, in another page store",
@@ -5918,13 +5948,30 @@ bmap_share_snapshot(SMgrRelation src, uint64 id, SMgrRelation dst)
 						(unsigned long long) id)));
 	create_map(dst);
 
-	/* (every entry of the snapshot was born before src's epoch) */
+	/*
+	 * (every entry of the snapshot was born before src's epoch, and is
+	 * dst's: src's born before the snapshot's epoch may now be shared with
+	 * another map, and all of dst's are)
+	 */
 	hdelta.kind = BMAP_DELTA_HEADER;
-	hdelta.flags = 0;
+	hdelta.flags = BMAP_DELTA_SHARED_BELOW;
 	hdelta.nblocks = root.snap[slot].nblocks;
 	hdelta.epoch = PageGetBmapHeader(BufferGetPage(headerbuf))->epoch;
 	hdelta.fold_epoch = 0;
-	tree_share_root(src, dst, snapshot_tops(&root.snap[slot]), &hdelta);
+	hdelta.shared_below = hdelta.epoch;
+	{
+		BmapHeader *sh = PageGetBmapHeader(BufferGetPage(headerbuf));
+
+		shdelta.kind = BMAP_DELTA_HEADER;
+		shdelta.flags = BMAP_DELTA_SHARED_BELOW;
+		shdelta.nblocks = sh->nblocks;
+		shdelta.epoch = sh->epoch;
+		shdelta.fold_epoch = sh->fold_epoch;
+		shdelta.shared_below = Max(sh->shared_below, root.snap[slot].epoch);
+	}
+	tree_share_root(src, dst, snapshot_tops(&root.snap[slot]), &hdelta,
+					shdelta.shared_below != PageGetBmapHeader(BufferGetPage(headerbuf))->shared_below ?
+					headerbuf : InvalidBuffer, &shdelta);
 	UnlockReleaseBuffer(headerbuf);
 	LockRelease(&sweeptag, ShareLock, false);
 	dst->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
@@ -5982,6 +6029,39 @@ bmappageisshared(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 		!tree_path_own(reln, blkno, epoch);
 	*copies = shared || entry.epoch < changes_fold_epoch(reln);
 	return shared;
+}
+
+/*
+ * Is logical block 'blkno''s block possibly held by another map, not only
+ * by this map's own snapshots?  Its entry born before the map's
+ * shared_below (raised by a share, and by a copy made of one of its
+ * snapshots) may be; one born since only by its snapshots, which keep the
+ * relation's pages as they were for its own branch.  A hint for callers
+ * weighing a copy's cost: preparing the page for a change copies it either
+ * way.
+ */
+bool
+bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blkno)
+{
+	RelFileLocator rel = reln->smgr_rlocator.locator;
+	Buffer		buf;
+	uint32		epoch;
+	uint32		shared_below;
+	BmapEntry	entry;
+	MapPage		mp;
+
+	if (forknum != MAIN_FORKNUM)
+		return false;
+	buf = map_read(rel, 0);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	check_page(BufferGetPage(buf), BMAP_PAGE_HEADER, rel, BMAP_FORKNUM, 0);
+	epoch = PageGetBmapHeader(BufferGetPage(buf))->epoch;
+	shared_below = PageGetBmapHeader(BufferGetPage(buf))->shared_below;
+	UnlockReleaseBuffer(buf);
+	if (!lookup_entry_at(reln, blkno, &entry, &mp, NULL) || entry.epoch >= epoch)
+		return false;
+	return entry.epoch < shared_below;
 }
 
 /*

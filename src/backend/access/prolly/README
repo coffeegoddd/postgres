@@ -496,7 +496,11 @@ branch's baseline then and each table's relations and snapshots ('K').
 A snapshot's slot names the transaction that took it, so one whose
 transaction doesn't commit (a crash between the keep and the commit
 included) is kept by nobody: the relation's next snapshot, or a page
-sweep, lets go of it.  A
+sweep, lets go of it.  VACUUM freezes and sets all-visible the pages a
+relation shares only with its own snapshots, copying them (the kept
+version goes once its commit stops being kept), but leaves as they are
+the pages another branch shares, which the block map tells apart by when
+each page's entry was born (its header's shared_below).  A
 move back to one of them (dolt_reset('--hard') to the head or the commit
 before, a merge's abort, a stash) first gives each table that changed
 since its pages back (restore()): new storage made of each relation's

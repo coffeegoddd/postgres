@@ -193,7 +193,8 @@ typedef struct xl_bmap_extend
  *						source's (relation 'from''s) pointers; block 0 is
  *						its root page, then the reference-count pages of the
  *						subtrees, each a holder more; a copy of a snapshot
- *						(BMAP_TREE_OF_SNAPSHOT) has its header last
+ *						(BMAP_TREE_OF_SNAPSHOT) has its header next, and
+ *						then, if its shared_below rose, the source's header
  * BMAP_TREE_SNAPSHOT	a snapshot of the tree kept, or let go of: block 0 is
  *						the root page, whose slot changes, then (when kept)
  *						the header (its epoch raised) and the
@@ -289,7 +290,11 @@ typedef struct xl_bmap_header_delta
 	BlockNumber nblocks;
 	uint32		epoch;
 	uint32		fold_epoch;		/* the last fold's (0: never folded) */
+	uint32		shared_below;	/* (BMAP_DELTA_SHARED_BELOW) */
 } xl_bmap_header_delta;
+
+/* a header delta that sets the header's shared_below too */
+#define BMAP_DELTA_SHARED_BELOW	0x02
 
 /*
  * Block data of a map page: entries set.  An entry whose block changes
@@ -337,7 +342,8 @@ typedef struct xl_bmap_root_delta
 /*
  * A snapshot a tree's root page keeps: its id (0: the slot is free), the
  * (sub)transaction that took it (a FullTransactionId), the relation's length
- * and last fold's epoch then, and the subtrees it holds.  A snapshot whose
+ * and last fold's epoch then, the epoch it raised the map's to (every entry
+ * it holds was born before), and the subtrees it holds.  A snapshot whose
  * transaction ended without committing, a crash included, is kept by nobody.
  */
 typedef struct xl_bmap_snapshot
@@ -346,6 +352,8 @@ typedef struct xl_bmap_snapshot
 	uint64		owner;
 	BlockNumber nblocks;
 	uint32		fold_epoch;
+	uint32		epoch;			/* the map's epoch it raised the map's to */
+	uint32		unused;
 	xl_bmap_top tops[BMAP_DELTA_ROOT_TOPS];
 } xl_bmap_snapshot;
 

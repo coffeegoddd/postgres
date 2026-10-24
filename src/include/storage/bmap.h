@@ -51,6 +51,8 @@ extern void bmapprepareforchange(SMgrRelation reln, ForkNumber forknum,
 extern bool bmappageisshared(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, bool *copies);
 extern void bmappredrop(SMgrRelation reln, bool isRedo);
+extern bool bmappagesharedelsewhere(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum);
 extern void bmapprecommitdrop(SMgrRelation reln);
 extern void bmapenddrops(void);
 extern void bmapbeforeextend(SMgrRelation reln, ForkNumber forknum,
