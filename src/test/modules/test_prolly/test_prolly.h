@@ -56,6 +56,7 @@ extern void tree_seeks_in_order(const ProllyImplInfo *impl);
 extern void tree_nodes_are_valid(const ProllyImplInfo *impl);
 extern void tree_large_values(const ProllyImplInfo *impl);
 extern void tree_held_references(const ProllyImplInfo *impl);
+extern void tree_value_splices(const ProllyImplInfo *impl);
 
 /* keying_checks.c */
 extern void keying_round_trip(const ProllyImplInfo *impl);

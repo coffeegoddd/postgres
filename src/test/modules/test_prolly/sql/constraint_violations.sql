@@ -141,7 +141,9 @@ SELECT length(dolt_commit('-am', 'fixed')::text) AS committed;
 -- writes each row, as one that isn't deferrable is: a row breaking it is
 -- recorded, not left for the end of the merge or the commit to refuse.
 -- So is a deferrable primary key, or one WITHOUT OVERLAPS (neither keys
--- its table's rows, so the merge doesn't decide rows by it).
+-- its table's rows, so the merge doesn't decide rows by it).  A row breaking
+-- an exclusion constraint (one WITHOUT OVERLAPS's too) is recorded as an
+-- "exclusion constraint", not a "unique index", naming the constraint.
 CREATE SCHEMA dv VERSIONED;
 CREATE TABLE dv.later (pk int PRIMARY KEY,
 	x int UNIQUE DEFERRABLE INITIALLY DEFERRED);
@@ -206,6 +208,12 @@ SELECT dolt_commit('-am', 'not with violations');
 ROLLBACK TO s;
 SELECT length(dolt_commit('-afm', 'forced')::text) AS committed;
 SELECT length(dolt_commit('--force', '--allow-empty', '-m', 'forced again')::text) AS committed;
+-- an amend too: refused with them, unless forced
+SAVEPOINT s;
+SELECT dolt_commit('--amend', '-m', 'amended with violations');
+ROLLBACK TO s;
+SELECT length(dolt_commit('--amend', '-f', '-m', 'amended, forced')::text) AS committed;
+SELECT message FROM dolt_log('main') LIMIT 1;
 COMMIT;
 SELECT message FROM dolt_log('main') ORDER BY commit_order DESC LIMIT 1;
 
@@ -391,6 +399,54 @@ COMMIT;
 SELECT count(*) AS left_over FROM dolt_constraint_violations();
 SELECT pid FROM cv.child WHERE id = 90;
 DELETE FROM cv.child WHERE id = 90;
+
+-- A row refused for an exclusion constraint is tried again after the
+-- others, as one refused for a unique index is: a later row may free its
+-- value.  Theirs shifts c down the 101..105 run (and pk 101's onto pk 3's
+-- old value), each row onto the value the next frees, so each, refused at
+-- first, is written once the row holding its value has moved: none of
+-- them is left a violation.  (pk 1's and 2's b collide with ours' unique
+-- index for good.)
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE SCHEMA ex VERSIONED;
+CREATE TABLE ex.a (pk int PRIMARY KEY, b int, c int);
+INSERT INTO ex.a VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+INSERT INTO ex.a SELECT 100 + g, 1000 + g, 100000 + g FROM generate_series(1, 5) g;
+SELECT length(dolt_commit('-Am', 'ex base')::text) AS committed;
+SELECT dolt_branch('ex_side');
+CREATE UNIQUE INDEX a_b ON ex.a (b);
+ALTER TABLE ex.a ADD CONSTRAINT a_c EXCLUDE USING gist (c WITH =);
+SELECT length(dolt_commit('-Am', 'ex ours')::text) AS committed;
+SELECT dolt_checkout('ex_side');
+UPDATE ex.a SET b = 20 WHERE pk = 1;
+UPDATE ex.a SET b = 30, c = 999 WHERE pk = 2;
+UPDATE ex.a SET b = 77, c = 999 WHERE pk = 3;
+UPDATE ex.a SET c = CASE pk WHEN 101 THEN 300 ELSE 100000 + pk - 101 END
+WHERE pk > 100;
+SELECT length(dolt_commit('-Am', 'ex theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('ex_side'))[3:4];
+SELECT violating_row->>'pk' AS pk, violation_type
+FROM dolt_constraint_violations('ex.a') ORDER BY 1;
+SELECT * FROM ex.a ORDER BY pk;
+ROLLBACK;
+SELECT dolt_branch('-D', 'ex_side');
+-- a commit of a transaction holding one is refused, naming it
+CREATE TABLE ex.x (pk int PRIMARY KEY, c int, EXCLUDE USING gist (c WITH =));
+SELECT length(dolt_commit('-Am', 'ex x')::text) AS committed;
+SELECT dolt_branch('ex_x');
+INSERT INTO ex.x VALUES (1, 5);
+SELECT length(dolt_commit('-am', 'ex x ours')::text) AS committed;
+SELECT dolt_checkout('ex_x');
+INSERT INTO ex.x VALUES (2, 5);
+SELECT length(dolt_commit('-am', 'ex x theirs')::text) AS committed;
+SELECT dolt_checkout('main');
+BEGIN;
+SELECT (dolt_merge('ex_x'))[3:4];
+COMMIT;
+SELECT dolt_branch('-D', 'ex_x');
+DROP SCHEMA ex CASCADE;
 
 SELECT dolt_branch('-D', 'feature');
 DROP SCHEMA cv CASCADE;

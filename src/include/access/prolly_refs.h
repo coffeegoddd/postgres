@@ -110,8 +110,9 @@ typedef struct ProllyMergeState
 /*
  * A constraint violation a merge (or cherry-pick) left on a branch: a row
  * of a table, as JSON, that breaks one of its constraints ("foreign key":
- * the row is in the table; "unique index", "check constraint", "not null":
- * the merge didn't write it), and what it breaks, as JSON.
+ * the row is in the table; "unique index", "exclusion constraint", "check
+ * constraint", "not null": the merge didn't write it), and what it breaks,
+ * as JSON.
  */
 typedef struct ProllyViolation
 {
