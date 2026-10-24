@@ -379,7 +379,7 @@ SELECT dolt_reset('--hard');
 
 -- Folding and moving need no privilege on the sequences beyond the
 -- branch's: a role that may only use one sees status and resets.
-CREATE ROLE seq_user;
+CREATE ROLE seq_user IN ROLE pg_prolly_write;
 GRANT USAGE ON SCHEMA app TO seq_user;
 GRANT ALL ON app.t TO seq_user;
 GRANT USAGE ON SEQUENCE app.s TO seq_user;

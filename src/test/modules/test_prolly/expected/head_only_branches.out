@@ -203,8 +203,8 @@ SET ROLE regress_ho_user;
 SELECT dolt_branch('ho_theirs');
 ERROR:  permission denied for database contrib_regression
 SELECT dolt_branch('-D', 'ho_mine');
-ERROR:  permission denied to delete branch "ho_mine"
-DETAIL:  Only the owner of database "contrib_regression" can delete its branches.
+ERROR:  permission denied to move the head of branch "ho_mine"
+DETAIL:  Only the branch's owner, the database's owner, and roles with the database's CREATE privilege or the privileges of the "pg_prolly_write" role may.
 SELECT pg_temp.copied('ho_mine') AS copied;
  copied 
 --------

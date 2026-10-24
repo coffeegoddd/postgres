@@ -71,7 +71,7 @@ SELECT dolt_reset('--hard', :'tsp_old');
 
 -- a user without CREATE on the tablespace: the move goes on, and the index
 -- it makes again stays in the default tablespace, with a warning
-CREATE ROLE regress_tsp_owner;
+CREATE ROLE regress_tsp_owner IN ROLE pg_prolly_write;
 CREATE SCHEMA tso VERSIONED;
 GRANT ALL ON SCHEMA tso TO regress_tsp_owner;
 SET ROLE regress_tsp_owner;
