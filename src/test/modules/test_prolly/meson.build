@@ -200,6 +200,7 @@ tests += {
       'jsonb_canonical',
       'float_canonical',
       'send_canonical',
+      'receive_refusals',
       'hash_pointers',
       'toast_identity',
       'toast_by_content',

@@ -554,7 +554,9 @@ class V9(VWorkload):
     working set (hard_reset); Δ rows committed again, main changed in
     another row, and the branch merged into main (merge); another branch of
     main with Δ rows changed and committed, merged into main untouched since
-    (ff_merge); the first branch deleted (branch_delete)."""
+    (ff_merge); Δ rows changed in a transaction that commits as it ends
+    (dolt.transaction_commit), after another such (txn_commit); the first
+    branch deleted (branch_delete)."""
 
     id, title = "V9", "Growth shapes"
 
@@ -659,6 +661,12 @@ class V9(VWorkload):
             ("", "SELECT dolt_commit('-am', 'v9 to fast-forward')"),
             ("", "SELECT dolt_checkout('main')"),
             ("ff_merge", "SELECT dolt_merge('v9_f')"),
+            # (Δ rows changed in a transaction that commits as it ends,
+            # after another such: its commit reads what the last one made)
+            ("", "SET dolt.transaction_commit = on"),
+            ("", f"UPDATE v9 SET v = 6 WHERE id = {n}"),
+            ("txn_commit", self.change(n, d, 5)),
+            ("", "RESET dolt.transaction_commit"),
             ("branch_delete", "SELECT dolt_branch('-D', 'v9_b')"),
         ]
 

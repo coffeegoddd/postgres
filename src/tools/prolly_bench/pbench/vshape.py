@@ -106,6 +106,11 @@ TARGETS: dict[tuple[str, str], dict[str, str]] = {
     ("ff_merge", "rows"): {**_all("log", TREE), **_all("flat", APPLY), **_all("log", MAP),
                            "bmap_map_pages_copied": "linear"},
     ("ff_merge", "delta"): {**_all("linear", TREE), **_all("linear", APPLY)},
+    # a transaction's own commit: Δ descents of the tree, and the chunks
+    # the last one wrote read from the cache, not the files.  (Not Δ: past
+    # the changes it keeps, maintenance_work_mem's, it commits the working
+    # set, a fold, as it should)
+    ("txn_commit", "rows"): {**_all("log", TREE), "chunk_file_reads": "log"},
     # as unrelated objects are added (shared tables, another branch's): a
     # first use's copies, a commit's canonical form and a branch's delete
     # read the branch's catalog rows only

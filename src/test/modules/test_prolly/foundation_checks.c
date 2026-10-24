@@ -1609,6 +1609,7 @@ PG_FUNCTION_INFO_V1(test_toast_hash_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer);
 PG_FUNCTION_INFO_V1(test_toast_pointer_bytes);
 PG_FUNCTION_INFO_V1(test_toast_identity);
+PG_FUNCTION_INFO_V1(test_receiver_recv);
 PG_FUNCTION_INFO_V1(test_toast_pointer_value);
 PG_FUNCTION_INFO_V1(test_toast_counters);
 
@@ -1700,6 +1701,37 @@ test_toast_identity(PG_FUNCTION_ARGS)
 		!toast_pointer_identity((const struct varlena *) DatumGetPointer(PG_GETARG_DATUM(0)), &id))
 		PG_RETURN_NULL();
 	PG_RETURN_BYTEA_P(cstring_to_text_with_len((const char *) id.bytes, sizeof(id.bytes)));
+}
+
+/*
+ * A receive for a text-like test type (text's input, output and send),
+ * failing by what the value says: "refuse" with a data exception
+ * (class 22), "refuse internal" with an internal error of its own,
+ * "serialize" with a serialization failure (40001), "deep" with
+ * statement_too_complex (54001); any other value it takes.
+ */
+Datum
+test_receiver_recv(PG_FUNCTION_ARGS)
+{
+	StringInfo	buf = (StringInfo) PG_GETARG_POINTER(0);
+	char	   *s = pnstrdup(buf->data + buf->cursor, buf->len - buf->cursor);
+
+	buf->cursor = buf->len;
+	if (strcmp(s, "refuse") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+				 errmsg("test_receiver refuses \"%s\"", s)));
+	if (strcmp(s, "refuse internal") == 0)
+		elog(ERROR, "test_receiver refuses \"%s\" internally", s);
+	if (strcmp(s, "serialize") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				 errmsg("test_receiver can't serialize")));
+	if (strcmp(s, "deep") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
+				 errmsg("test_receiver is too deep")));
+	PG_RETURN_TEXT_P(cstring_to_text(s));
 }
 
 Datum
