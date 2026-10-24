@@ -4515,9 +4515,10 @@ changes_blocks(const BmapChange *changes, uint32 n, BlockNumber *blocks)
  * the changes list if the relation has none.  *fold gets the list's lineage,
  * the fold's epoch and the relation's length.
  *
- * Pages cached and already prepared are marked to be prepared again.  A
- * change of one under way (its buffer already locked) completes in place;
- * whoever reads the page after this, with a lock, sees it.
+ * Pages cached and already prepared are to be prepared again: the
+ * generation of sharing is raised (MarkBufferedPagesShared()), visiting no
+ * buffer.  A change of one under way (its buffer already locked) completes
+ * in place; whoever reads the page after this, with a lock, sees it.
  */
 void
 bmap_fold_begin(SMgrRelation reln, BmapFold *fold)
@@ -5434,11 +5435,11 @@ bmapshare(SMgrRelation src, SMgrRelation dst)
 
 	/*
 	 * src's cached pages are checked again before they next change, as pages
-	 * read from now on are.  Done once src's map is unlocked, since it visits
-	 * every buffer.  A page found src's own before the epoch was raised may
-	 * change in place until it is marked; with src kept from changing, only
-	 * a hint or pruning can change it, and either holds for dst too, whose
-	 * page is the same (and gets it when flushed, below).
+	 * read from now on are: the generation of sharing is raised, visiting
+	 * no buffer.  A page found src's own before the epoch was raised may
+	 * change in place until then; with src kept from changing, only a hint
+	 * or pruning can change it, and either holds for dst too, whose page is
+	 * the same (and gets it when flushed, below).
 	 */
 	MarkBufferedPagesShared();
 
