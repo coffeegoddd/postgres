@@ -418,6 +418,68 @@ canonical_encode_kept(ProllyValueEncoder *enc, TupleTableSlot *slot,
 	encode_into(enc, slot, before, kept, out);
 }
 
+/*
+ * The row encode() gives for the values fields hold (by attribute index,
+ * as fields() gives them), from their bytes: a reference copied, bytes
+ * VALUE_INLINE_MAX or shorter inline, and longer ones (a long missing
+ * value, held inline) written out of line as encode() writes them.  A
+ * column the fields leave NULL is NULL, so trailing NULLs are left off
+ * but for a column with a missing value, as encode() does.
+ */
+static void
+canonical_encode_fields(ProllyValueEncoder *enc,
+						const ProllyEncodedField *fields, StringInfo out)
+{
+	int			n = 0;
+
+	if (enc->decode_only)
+		elog(ERROR, "a prolly encoder for an earlier row layout can only decode");
+	for (int j = 0; j < enc->nlive; j++)
+	{
+		int			i = enc->live_attno[j];
+
+		enc->nulls[j] = fields[i].isnull;
+		if (!enc->nulls[j] || enc->has_missing[j])
+			n = j + 1;
+	}
+	prolly_put_varint(out, n);
+	for (int j = 0; j < n; j += 8)
+	{
+		uint8		b = 0;
+
+		for (int k = 0; k < 8 && j + k < n; k++)
+			if (enc->nulls[j + k])
+				b |= 1 << k;
+		appendStringInfoChar(out, (char) b);
+	}
+	for (int j = 0; j < n; j++)
+	{
+		const ProllyEncodedField *f = &fields[enc->live_attno[j]];
+
+		if (enc->nulls[j])
+			continue;
+		if (f->out_of_line)
+			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) f->bytes.len);
+		else if (f->bytes.len > VALUE_INLINE_MAX)
+		{
+			StringInfoData ref;
+
+			if (enc->values == NULL)
+				no_values();
+			initStringInfo(&ref);
+			PROLLY_CALL(enc->values->tree, value_write, enc->values->env,
+						f->bytes.data, f->bytes.len, &ref);
+			prolly_put_varint(out, VALUE_INLINE_MAX + 1 + (uint64) ref.len);
+			appendBinaryStringInfo(out, ref.data, ref.len);
+			pfree(ref.data);
+			continue;
+		}
+		else
+			prolly_put_varint(out, f->bytes.len);
+		appendBinaryStringInfo(out, (const char *) f->bytes.data, f->bytes.len);
+	}
+}
+
 /* Called with each out-of-line value of a row: its column and reference. */
 typedef void (*RowRefVisit) (int column, const char *ref, uint64 len,
 							 void *arg);
@@ -1002,5 +1064,6 @@ const ProllyValueEncoderRoutine prolly_valenc_canonical = {
 	.fields_alike = canonical_fields_alike,
 	.field_compatible = canonical_field_compatible,
 	.decode_columns = canonical_decode_columns,
+	.encode_fields = canonical_encode_fields,
 	.project = canonical_project,
 };

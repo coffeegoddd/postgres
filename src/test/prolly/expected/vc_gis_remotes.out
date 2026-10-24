@@ -28,5 +28,5 @@ pull: same|t
 ERROR:  the clone needs what this database lacks
 DETAIL:  Needed from outside the versioned schemas:
 extension postgis: in schema public, and the database has it in gis
-HINT:  Use a database with the recorded ordering-extension versions. After upgrading a branch, commit it before retrying a move or clone.
+HINT:  Extension postgis is in schema gis and can't be moved: drop it (which drops what depends on it too) and create it in public, where the commits need it (CREATE EXTENSION postgis SCHEMA public), then try again.
 nothing cloned|t
